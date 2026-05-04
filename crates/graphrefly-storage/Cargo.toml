@@ -1,0 +1,28 @@
+[package]
+name        = "graphrefly-storage"
+description = "GraphReFly storage tier dispatch + Node-side persistence (memory, file, redb)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[dependencies]
+graphrefly-core  = { workspace = true }
+graphrefly-graph = { workspace = true }   # for Codec types
+
+# Persistence backends — each gated behind its own feature
+redb             = { workspace = true, optional = true }
+tempfile         = { version = "3", optional = true }   # atomic-rename helpers for FileStorage
+
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+
+[features]
+default = ["memory", "file", "redb-store"]
+memory     = []
+file       = ["dep:tempfile"]
+redb-store = ["dep:redb"]
+# Future: sqlite-store via rusqlite, when there's a clear use case beyond redb.

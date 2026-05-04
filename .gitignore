@@ -1,0 +1,54 @@
+# Cargo build artifacts
+/target/
+**/target/
+**/*.rs.bk
+
+# Cargo.lock — kept committed because this workspace contains binary-producing
+# crates (cdylib bindings). Per Cargo guidance: lib-only repos omit it; repos
+# that build binaries commit it for reproducible builds.
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts from binding tools
+**/*.node
+**/*.wasm
+**/*.so.*
+**/*.dylib
+**/*.dll
+**/dist/
+**/pkg/
+
+# Python (pyo3 bindings)
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.venv/
+**/.python-version
+
+# Node (napi-rs bindings)
+**/node_modules/
+**/.npmrc
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+**/coverage/
+**/lcov.info
+
+# Profiling
+**/perf.data*
+**/flamegraph.svg
+
+# advisory DB cache (managed by cargo-deny)
+**/advisory-db/

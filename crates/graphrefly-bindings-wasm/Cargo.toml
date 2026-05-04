@@ -1,0 +1,43 @@
+[package]
+name        = "graphrefly-bindings-wasm"
+description = "GraphReFly WebAssembly bindings (browser, Cloudflare Workers, Deno, Bun)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+graphrefly-core       = { workspace = true, optional = true }
+graphrefly-graph      = { workspace = true, optional = true }
+graphrefly-operators  = { workspace = true, optional = true }
+
+wasm-bindgen          = { version = "0.2" }
+js-sys                = { version = "0.3" }
+serde-wasm-bindgen    = { version = "0.6", optional = true }
+
+# Smaller binaries on wasm target.
+[features]
+default     = ["tracing"]
+
+tracing     = ["dep:graphrefly-core"]
+standard    = ["tracing", "graph-codec", "operators"]
+
+graph-codec = ["dep:graphrefly-graph"]
+operators   = ["dep:graphrefly-operators"]
+serde       = ["dep:serde-wasm-bindgen"]
+
+# Note: storage + structures NOT exposed via WASM target. Edge runtimes
+# don't have a useful filesystem, and `imbl` works fine in WASM but
+# Phase 14 op-log persistence is server-side. WASM users get the
+# in-memory reactive substrate; persistence stays on the napi/pyo3
+# distributions.
+#
+# Profile: `[profile.release]` lives at the workspace root. WASM-specific
+# `opt-level = "z"` is configured there under a target-specific profile
+# override (`[profile.release.package.graphrefly-bindings-wasm]`).

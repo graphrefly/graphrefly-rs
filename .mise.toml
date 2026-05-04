@@ -1,0 +1,23 @@
+# mise tool versions for graphrefly-rs.
+#
+# Run `mise trust && mise install` once after cloning to set up the
+# toolchain. Pinned versions match `rust-toolchain.toml` (rustup users
+# get the same version automatically without needing mise).
+
+[tools]
+rust = "1.95"
+
+# JS-binding tooling (only needed when working on graphrefly-bindings-js).
+# Uncomment when M1 binding work begins.
+# node = "22"
+# pnpm = "10"
+
+# Python-binding tooling (only needed when working on graphrefly-bindings-py).
+# Uncomment when M6 binding work begins.
+# python = "3.13"
+# uv = "0.5"
+
+[env]
+# Disable cargo's default incremental compilation in CI for smaller artifacts.
+# Local dev uses CARGO_INCREMENTAL=1 (cargo's default).
+# CARGO_INCREMENTAL = "0"

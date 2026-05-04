@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members  = ["crates/*"]
+default-members = [
+    "crates/graphrefly-core",
+    "crates/graphrefly-graph",
+    "crates/graphrefly-operators",
+    "crates/graphrefly-storage",
+    "crates/graphrefly-structures",
+]
+# Bindings crates (js / py / wasm) excluded from default-members because they
+# require napi-rs / maturin / wasm-pack toolchains. Build them via their own
+# tooling: `pnpm build` for js, `maturin develop` for py, `wasm-pack build`
+# for wasm.
+
+[workspace.package]
+version      = "0.0.0"                # pre-release; not yet published
+edition      = "2021"
+rust-version = "1.95"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/graphrefly/graphrefly-rs"
+homepage     = "https://graphrefly.dev"
+authors      = ["David Chen Allio <clfhhc@gmail.com>"]
+
+# ---------------------------------------------------------------------------
+# Shared dependencies — child crates inherit via `workspace = true` and
+# enable feature subsets per-crate. One place to bump versions.
+# ---------------------------------------------------------------------------
+
+[workspace.dependencies]
+# In-workspace crates (path deps; bumped together pre-1.0)
+graphrefly-core       = { path = "crates/graphrefly-core",       version = "0.0.0" }
+graphrefly-graph      = { path = "crates/graphrefly-graph",      version = "0.0.0" }
+graphrefly-operators  = { path = "crates/graphrefly-operators",  version = "0.0.0" }
+graphrefly-storage    = { path = "crates/graphrefly-storage",    version = "0.0.0" }
+graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.0" }
+
+# Concurrency primitives
+parking_lot = { version = "0.12", default-features = false }
+ahash       = { version = "0.8" }
+
+# Errors / logging
+thiserror   = { version = "1" }
+tracing     = { version = "0.1" }
+
+# Serialization stack — graph + storage + structures
+serde                 = { version = "1",   features = ["derive"] }
+serde_ipld_dagcbor    = { version = "0.6" }
+ciborium              = { version = "0.2" }
+serde_json            = { version = "1"   }
+bincode               = { version = "1.3" }
+
+# Content addressing — V1–V3 CIDs
+cid                   = { version = "0.11" }
+multihash             = { version = "0.19" }
+multibase             = { version = "0.9" }
+blake3                = { version = "1.5" }
+sha2                  = { version = "0.10" }
+
+# Compression — DagCborZstdCodec
+zstd                  = { version = "0.13" }
+
+# Persistent collections — Phase 14 op-log substrate
+imbl                  = { version = "3"    }
+
+# Storage backend — replaces sqliteStorage for ACID per-tier transactions
+redb                  = { version = "2"    }
+
+# Test-only
+proptest              = { version = "1"    }
+criterion             = { version = "0.5"  }
+loom                  = { version = "0.7"  }
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = "symbols"
+
+# WASM target: optimize for size over speed (matters for browser/edge
+# binary download size; speed gap vs. opt-level=3 is small in practice).
+[profile.release.package.graphrefly-bindings-wasm]
+opt-level = "z"
+
+# Mild optimization for dependencies in dev so test runs are fast.
+# Our own crates stay opt-level=0 for fast incremental compiles.
+[profile.dev.package."*"]
+opt-level = 1

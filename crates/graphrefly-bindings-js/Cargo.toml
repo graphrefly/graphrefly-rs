@@ -1,0 +1,52 @@
+[package]
+name        = "graphrefly-bindings-js"
+description = "GraphReFly JavaScript bindings via napi-rs"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lib]
+crate-type = ["cdylib"]   # napi-rs requires cdylib output
+
+[dependencies]
+graphrefly-core       = { workspace = true, optional = true }
+graphrefly-graph      = { workspace = true, optional = true }
+graphrefly-operators  = { workspace = true, optional = true }
+graphrefly-storage    = { workspace = true, optional = true }
+graphrefly-structures = { workspace = true, optional = true }
+
+# napi-rs runtime — the FFI scaffolding to V8.
+# napi9 targets Node.js 12+ ABI (broad compatibility).
+napi        = { version = "2.16", default-features = false, features = ["napi9", "tokio_rt"] }
+napi-derive = { version = "2.16" }
+
+[build-dependencies]
+napi-build  = { version = "2" }
+
+[features]
+# Build profiles — pick one when CI compiles a distribution.
+default  = ["tracing"]
+
+# `tracing` = lightweight build for the @graphrefly/lite distribution
+# (just dispatch + observe; no graph, no operators, no storage).
+tracing  = ["dep:graphrefly-core"]
+
+# `standard` = typical agent harness use; @graphrefly/standard.
+standard = ["tracing", "graph-codec", "operators"]
+
+# `full` = heavy server workloads with persistence and structures.
+full     = ["standard", "storage", "structures"]
+
+# Capability features — composable; usually selected via a profile above.
+graph-codec = ["dep:graphrefly-graph"]
+operators   = ["dep:graphrefly-operators"]
+storage     = ["dep:graphrefly-storage"]
+structures  = ["dep:graphrefly-structures"]
+
+# Note: `[profile.release]` lives at the workspace root (Cargo only honors
+# profiles defined there). Aggressive size optimization (lto, codegen-units=1,
+# strip) is configured workspace-wide.
