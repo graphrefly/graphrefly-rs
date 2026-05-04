@@ -14,6 +14,7 @@ crate-type = ["cdylib"]   # napi-rs requires cdylib output
 
 [dependencies]
 graphrefly-core       = { workspace = true, optional = true }
+ahash                 = { workspace = true, optional = true }
 graphrefly-graph      = { workspace = true, optional = true }
 graphrefly-operators  = { workspace = true, optional = true }
 graphrefly-storage    = { workspace = true, optional = true }
@@ -33,7 +34,7 @@ default  = ["tracing"]
 
 # `tracing` = lightweight build for the @graphrefly/lite distribution
 # (just dispatch + observe; no graph, no operators, no storage).
-tracing  = ["dep:graphrefly-core"]
+tracing  = ["dep:graphrefly-core", "dep:ahash"]
 
 # `standard` = typical agent harness use; @graphrefly/standard.
 standard = ["tracing", "graph-codec", "operators"]

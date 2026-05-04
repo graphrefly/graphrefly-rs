@@ -39,6 +39,10 @@ graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.
 parking_lot = { version = "0.12", default-features = false }
 ahash       = { version = "0.8" }
 
+# Small-collection primitives
+smallvec    = { version = "1.13", features = ["union"] }
+indexmap    = { version = "2.6" }
+
 # Errors / logging
 thiserror   = { version = "1" }
 tracing     = { version = "0.1" }

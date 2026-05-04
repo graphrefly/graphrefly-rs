@@ -1,31 +1,46 @@
 //! napi-rs JavaScript bindings for `GraphReFly`.
 //!
-//! Exposes the Rust core via the napi-rs FFI to Node.js. The published
-//! npm packages (`@graphrefly/lite`, `@graphrefly/standard`,
-//! `@graphrefly/full`) are built from this crate with different feature
-//! flags via CI matrix.
+//! v0 FFI bench scope: minimal surface to measure (a) raw napi-rs call
+//! overhead and (b) end-to-end emit throughput from JS through the Rust
+//! dispatcher. Full feature parity (subscribe with JS callbacks, custom
+//! equals, dynamic deps, set_deps, etc.) lands once v0 numbers justify it.
 //!
-//! Each platform (linux-x64, linux-arm64, darwin-x64, darwin-arm64,
-//! win-x64) gets its own compiled `.node` binary published as a separate
-//! npm subpackage; the parent package selects the right binary at
-//! install time via npm's `optionalDependencies`.
+//! # FFI cost-measurement strategy
 //!
-//! # Status
+//! 1. `noop_call()` — empty FFI round-trip; measures pure napi-rs overhead.
+//! 2. `rust_emit_loop(n)` — N emits inside Rust (single FFI call); measures
+//!    Rust dispatcher cost amortized over many ops.
+//! 3. `Core::emit(node_id, value)` — one FFI call per emit; measures end-to-end.
 //!
-//! Scaffold. Bindings land progressively as each crate (core, graph,
-//! operators, storage, structures) reaches feature parity with
-//! graphrefly-ts.
+//! Per-call FFI overhead = (T_js_loop / N) - (T_rust_loop / N), measured.
 
+#![forbid(unsafe_code)]
 #![warn(rust_2018_idioms, unreachable_pub)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
+#[cfg(feature = "tracing")]
+mod core_bindings;
+
 use napi_derive::napi;
 
-/// Smoke export to verify the napi build chain works end-to-end.
-/// Will be replaced by real bindings during M1.
+/// Smoke export — verifies napi-rs link works.
 #[napi]
-#[must_use] 
+#[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Empty FFI round-trip. Measures pure napi-rs call overhead with no Rust work.
+/// Bench: `for (let i = 0; i < N; i++) noop_call();` — divide by N for per-call cost.
+#[napi]
+pub const fn noop_call() {}
+
+/// FFI round-trip with one integer return. Measures napi-rs overhead with a
+/// minimal payload (single i32). Real workloads always return *something* —
+/// this captures the "common case" baseline that `noop_call` can't.
+#[napi]
+#[must_use]
+pub const fn noop_call_returning_int() -> i32 {
+    42
 }

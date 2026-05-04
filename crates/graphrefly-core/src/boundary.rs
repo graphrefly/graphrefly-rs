@@ -1,0 +1,172 @@
+//! The FFI surface — the only path from Core to user code.
+//!
+//! Mirrors `BindingBoundary` in
+//! `~/src/graphrefly-ts/src/__experiments__/handle-core/core.ts:122–126`.
+//!
+//! # Boundary discipline (handle-protocol cleaving plane)
+//!
+//! The Core never sees user values `T`. When the dispatcher needs to invoke
+//! user code, run a custom equals oracle, or release a value-handle's
+//! refcount, it calls into [`BindingBoundary`]. The binding-side implementation
+//! resolves handles to values, runs the user code, and returns either a new
+//! handle or a no-op signal.
+//!
+//! In a Rust core compiled to a napi-rs / pyo3 / wasm-bindgen cdylib, the
+//! `impl BindingBoundary` lives in the bindings crate; it owns the
+//! value registry (`HashMap<HandleId, T>` plus a value→handle dedup map).
+//!
+//! Per the rust-port session doc Part 2: this trait is the *only* mandatory
+//! FFI crossing per fn-fire. Internal protocol bookkeeping (DIRTY propagation,
+//! batch coalescing, equals-substitution under identity, version counters,
+//! PAUSE/RESUME, INVALIDATE, first-run gate) stays Core-internal — zero FFI.
+
+use crate::handle::{FnId, HandleId, NodeId};
+
+/// What the binding side returns when the Core invokes a fn via
+/// [`BindingBoundary::invoke_fn`].
+///
+/// Mirrors `FnResult` in `core.ts:105–107`.
+#[derive(Clone, Debug)]
+pub enum FnResult {
+    /// fn produced a value, registered as `handle`. The Core treats this
+    /// as outgoing DATA — equals-substitution against the cache may rewrite
+    /// it to RESOLVED on the wire (R1.3.2).
+    Data {
+        handle: HandleId,
+        /// For dynamic nodes only: the dep indices fn actually read this run.
+        /// Static derived nodes pass `None`. See dynamic-node semantics in the
+        /// canonical spec §2.8 / Lock 2.B.
+        tracked: Option<Vec<usize>>,
+    },
+
+    /// fn ran but produced no emission this wave. The Core sends RESOLVED
+    /// to subscribers if the node was already DIRTY this wave; otherwise no
+    /// outgoing message.
+    Noop {
+        /// Same as `Data::tracked` — dynamic nodes only.
+        tracked: Option<Vec<usize>>,
+    },
+}
+
+/// The FFI surface: every Core → user-code crossing goes through one of these
+/// three methods.
+///
+/// # Thread safety
+///
+/// `Send + Sync` because the Core dispatcher is sync but may be called from
+/// multiple binding threads (e.g. multiple Node Workers sharing one Core via
+/// `Arc<Core>`). Implementors must serialize access to the value registry
+/// internally if needed. Free-threaded Python parity is the target — see
+/// `~/src/graphrefly-py` `compat/asyncio.py` for the current shape that
+/// will simplify dramatically once this trait is the substrate.
+pub trait BindingBoundary: Send + Sync {
+    /// Invoke a user function. The Core knows the fn's identity (`fn_id`) and
+    /// the current dep handles; the binding side dereferences them, runs the
+    /// fn, registers the output, and returns the new handle.
+    ///
+    /// Performance contract per the rust-port session doc: ONE FFI call per
+    /// fn fire, regardless of dep count. The binding side bulk-dereferences
+    /// `dep_handles` in one go before calling user code.
+    ///
+    /// Errors thrown by user code are reported by returning a [`FnResult::Data`]
+    /// with a handle that resolves to an error value; the Core then forwards
+    /// `[ERROR, handle]` per R1.2.5. (Or the binding side surfaces them via a
+    /// separate channel — exact error-propagation discipline is binding-side.)
+    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult;
+
+    /// Custom equals oracle. Called only when a node declares
+    /// `EqualsMode::Custom`. Identity equals (the default) is a `u64` compare
+    /// inside the Core — zero FFI per check.
+    ///
+    /// Per `H2 IdentityEqualsIsPureCore` ASSUME in
+    /// `~/src/graphrefly-ts/docs/research/handle-protocol.tla`,
+    /// the binding-side impl MUST extend identity (i.e. always treat
+    /// `a == b` as equal at the handle level). Otherwise a node could observe
+    /// its own cached value as different from itself — a fundamental violation.
+    fn custom_equals(&self, equals_handle: FnId, a: HandleId, b: HandleId) -> bool;
+
+    /// Decrement the refcount on `handle`. Called when the Core no longer
+    /// holds `handle` in any cache slot or message buffer. The binding side
+    /// drops the underlying value when its refcount reaches zero.
+    ///
+    /// Implementing this as a no-op is safe during prototyping; it matters
+    /// for memory pressure under sustained load. The TS prototype's
+    /// `bindings.ts` uses this to drive a `Map<HandleId, { value, refcount }>`.
+    fn release_handle(&self, handle: HandleId);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handle::{FnId, HandleId, NodeId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test double mirroring `bindings.ts` `BindingBoundary` test patterns —
+    /// counts FFI crossings per method to verify the cleaving plane's
+    /// "zero FFI on identity-equals path" claim experimentally.
+    #[allow(clippy::struct_field_names)]
+    struct TestBinding {
+        invoke_count: AtomicU64,
+        equals_count: AtomicU64,
+        release_count: AtomicU64,
+    }
+
+    impl TestBinding {
+        fn new() -> Self {
+            Self {
+                invoke_count: AtomicU64::new(0),
+                equals_count: AtomicU64::new(0),
+                release_count: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl BindingBoundary for TestBinding {
+        fn invoke_fn(&self, _node_id: NodeId, _fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
+            self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            // Echo first dep handle as result; not realistic but exercises the path.
+            let handle = dep_handles.first().copied().unwrap_or(HandleId::new(99));
+            FnResult::Data {
+                handle,
+                tracked: None,
+            }
+        }
+
+        fn custom_equals(&self, _equals_handle: FnId, a: HandleId, b: HandleId) -> bool {
+            self.equals_count.fetch_add(1, Ordering::SeqCst);
+            a == b
+        }
+
+        fn release_handle(&self, _handle: HandleId) {
+            self.release_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn boundary_calls_route_correctly() {
+        let b = TestBinding::new();
+        let result = b.invoke_fn(NodeId::new(1), FnId::new(2), &[HandleId::new(7)]);
+        match result {
+            FnResult::Data { handle, .. } => assert_eq!(handle, HandleId::new(7)),
+            FnResult::Noop { .. } => panic!("expected Data variant"),
+        }
+        assert!(b.custom_equals(FnId::new(3), HandleId::new(7), HandleId::new(7)));
+        assert!(!b.custom_equals(FnId::new(3), HandleId::new(7), HandleId::new(8)));
+        b.release_handle(HandleId::new(7));
+
+        assert_eq!(b.invoke_count.load(Ordering::SeqCst), 1);
+        assert_eq!(b.equals_count.load(Ordering::SeqCst), 2);
+        assert_eq!(b.release_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn binding_is_send_and_sync() {
+        // Compile-time check: BindingBoundary impls must be Send + Sync.
+        // If TestBinding ever gains a !Send field, this fails to compile.
+        fn assert_send_sync<T: Send + Sync>() {}
+        // dyn-trait variant is the production shape (Core holds Arc<dyn BindingBoundary>).
+        fn assert_dyn_send_sync<T: ?Sized + Send + Sync>() {}
+        assert_send_sync::<TestBinding>();
+        assert_dyn_send_sync::<dyn BindingBoundary>();
+    }
+}

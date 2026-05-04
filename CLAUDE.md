@@ -90,14 +90,15 @@ These are the spec-level invariants every implementation honors. Canonical text 
 
 Beyond the cross-language spec:
 
-1. **Compiler-enforced thread safety.** `Send` + `Sync` discipline applies to every public type. No `Rc<T>` or `RefCell<T>` in shared state — use `Arc<T>` + `Mutex<T>` / `parking_lot::ReentrantMutex<T>`.
-2. **Per-subgraph `parking_lot::ReentrantMutex`.** Mirrors the graphrefly-py per-subgraph RLock parity goal. Two threads operating on different subgraphs run truly parallel; same subgraph serializes via the lock.
-3. **No async runtime in Core.** The Core dispatcher is sync. `tokio` only enters the picture in `graphrefly-storage` (for blocking I/O off-thread via napi-rs / pyo3) and in bindings; never in `graphrefly-core`.
-4. **No `unwrap()` / `expect()` on user-facing paths.** Domain errors via `thiserror`-derived enums. `unwrap` only in tests, build scripts, or genuinely-impossible-by-construction paths (with a comment explaining why).
-5. **`#[must_use]` on every public fn that returns a value.** Errors and unused emissions are the most common bug class; the lint catches them.
-6. **`clippy::pedantic` + `rust_2018_idioms` warn-by-default** in every crate's `lib.rs`. Allow on a per-need basis with a comment, never silently.
-7. **Public types live behind newtype wrappers** (`NodeId(u64)`, `HandleId(u64)`, etc.). Don't expose raw integers — they collide structurally with each other and with user counters.
-8. **Snapshot serialization uses `serde_ipld_dagcbor`** for content-addressed paths and `ciborium` for non-content-addressed snapshots. **Never** mix codec choice with content-addressing semantics.
+1. **No `unsafe`. Anywhere. In any crate of this workspace.** Enforced by `#![forbid(unsafe_code)]` at every crate root. If a feature seems to need unsafe (FFI hot paths, raw pointer tricks, manual memory layout), the answer is to find a safe abstraction (parking_lot, dashmap, imbl, redb, napi-rs / pyo3 wrappers) — not to allow the lint. The Rust port's value over TS / PY is *compiler-enforced safety*; bypassing it forfeits the win. If you genuinely cannot find a safe path, escalate to spec-level discussion before adding unsafe.
+2. **Compiler-enforced thread safety.** `Send` + `Sync` discipline applies to every public type. No `Rc<T>` or `RefCell<T>` in shared state — use `Arc<T>` + `Mutex<T>` / `parking_lot::ReentrantMutex<T>`.
+3. **Per-subgraph `parking_lot::ReentrantMutex`.** Mirrors the graphrefly-py per-subgraph RLock parity goal. Two threads operating on different subgraphs run truly parallel; same subgraph serializes via the lock.
+4. **No async runtime in Core.** The Core dispatcher is sync. `tokio` only enters the picture in `graphrefly-storage` (for blocking I/O off-thread via napi-rs / pyo3) and in bindings; never in `graphrefly-core`.
+5. **No `unwrap()` / `expect()` on user-facing paths.** Domain errors via `thiserror`-derived enums. `unwrap` only in tests, build scripts, or genuinely-impossible-by-construction paths (with a comment explaining why).
+6. **`#[must_use]` on every public fn that returns a value.** Errors and unused emissions are the most common bug class; the lint catches them.
+7. **`clippy::pedantic` + `rust_2018_idioms` warn-by-default** in every crate's `lib.rs`. Allow on a per-need basis with a comment, never silently.
+8. **Public types live behind newtype wrappers** (`NodeId(u64)`, `HandleId(u64)`, etc.). Don't expose raw integers — they collide structurally with each other and with user counters.
+9. **Snapshot serialization uses `serde_ipld_dagcbor`** for content-addressed paths and `ciborium` for non-content-addressed snapshots. **Never** mix codec choice with content-addressing semantics.
 
 ## Memory principles (inherited from graphrefly-ts)
 
