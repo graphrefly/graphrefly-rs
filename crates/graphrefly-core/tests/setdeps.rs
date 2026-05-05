@@ -31,7 +31,7 @@ fn straight_rewire_a_to_b() {
             _ => panic!("type"),
         }
     });
-    let (_rec, _) = rt.subscribe_recorder(c);
+    let _rec = rt.subscribe_recorder(c);
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
     let calls_before = *calls.lock().unwrap();
 
@@ -62,7 +62,7 @@ fn additive_rewire_a_to_a_b() {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
-    let (_rec, _) = rt.subscribe_recorder(c);
+    let _rec = rt.subscribe_recorder(c);
 
     // Add B as a dep. C's fn now receives [a_value, b_value].
     // We need a fn that handles both 1-dep and 2-dep cases — but the closure
@@ -90,7 +90,7 @@ fn full_removal_to_empty_deps() {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
-    let (_rec, _) = rt.subscribe_recorder(c);
+    let _rec = rt.subscribe_recorder(c);
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
 
     rt.core.set_deps(c, &[]).expect("rewire to empty ok");
@@ -114,7 +114,7 @@ fn idempotent_no_change() {
             _ => panic!("type"),
         }
     });
-    let (_rec, _) = rt.subscribe_recorder(c);
+    let _rec = rt.subscribe_recorder(c);
     let calls_before = *calls.lock().unwrap();
 
     // Idempotent rewire: same deps.
@@ -153,7 +153,7 @@ fn cycle_rejected() {
         TestValue::Int(n) => Some(TestValue::Int(*n + 1)),
         _ => panic!("type"),
     });
-    let (_rec, _) = rt.subscribe_recorder(d);
+    let _rec = rt.subscribe_recorder(d);
 
     // Try to rewire B to depend on D. Existing chain: B → C → D. Adding the
     // edge D → B would close a cycle (B → C → D → B).
@@ -209,7 +209,7 @@ fn cache_preserved_across_rewire() {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
-    let (_rec, _) = rt.subscribe_recorder(c);
+    let _rec = rt.subscribe_recorder(c);
     let cache_before = rt.cache_value(c);
     assert_eq!(cache_before, Some(TestValue::Int(100)));
 
@@ -217,4 +217,218 @@ fn cache_preserved_across_rewire() {
     rt.core.set_deps(c, &[b.id]).expect("rewire ok");
     // Cache preserved per ROM/RAM (Q7).
     assert_eq!(rt.cache_value(c), cache_before);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-node rewire (regression: 2026-05-05 audit fix)
+// ---------------------------------------------------------------------------
+// Pre-fix bug: after `set_deps` on a dynamic, `tracked` was cleared but
+// `has_fired_once` stayed true. The deliver gate
+// `!has_fired_once || tracked.contains(&dep_idx)` then resolved to false for
+// every new dep, so fn never re-fired and the node sat on stale cache
+// derived from the old dep set. The fix in `Core::set_deps` resets
+// `has_fired_once = false` for Dynamic so the next dep delivery satisfies
+// the first-fire branch.
+
+#[test]
+fn dynamic_rewire_refires_fn_on_new_deps() {
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(Some(TestValue::Int(20)));
+    let calls = Arc::new(std::sync::Mutex::new(0u32));
+    let calls_inner = calls.clone();
+    // Dynamic node: returns deps[0] verbatim and tracks all deps it received.
+    let n = rt.dynamic(&[a.id], move |deps| {
+        *calls_inner.lock().unwrap() += 1;
+        let value = match &deps[0] {
+            TestValue::Int(v) => Some(TestValue::Int(*v)),
+            _ => None,
+        };
+        let tracked: Vec<usize> = (0..deps.len()).collect();
+        (value, Some(tracked))
+    });
+    let _rec = rt.subscribe_recorder(n);
+    // Dynamic fired once on first activation with [10].
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(rt.cache_value(n), Some(TestValue::Int(10)));
+
+    // Rewire to [b.id] (cached value 20).
+    rt.core.set_deps(n, &[b.id]).expect("rewire ok");
+    // Pre-fix: this assertion fails — fn never re-fired so cache stuck at 10.
+    assert_eq!(
+        rt.cache_value(n),
+        Some(TestValue::Int(20)),
+        "dynamic must re-fire on rewire to a dep with cached DATA"
+    );
+    assert!(
+        *calls.lock().unwrap() >= 2,
+        "fn should have fired at least once post-rewire"
+    );
+
+    // Subsequent updates on the new dep continue to fire fn (tracked
+    // repopulated by the fn on its post-rewire fire).
+    let calls_after_rewire = *calls.lock().unwrap();
+    b.set(TestValue::Int(99));
+    assert_eq!(rt.cache_value(n), Some(TestValue::Int(99)));
+    assert!(*calls.lock().unwrap() > calls_after_rewire);
+
+    // Old dep no longer triggers fires.
+    let calls_before_old = *calls.lock().unwrap();
+    a.set(TestValue::Int(7));
+    assert_eq!(*calls.lock().unwrap(), calls_before_old);
+}
+
+// ---------------------------------------------------------------------------
+// QA pass — Phase 13.8 Q1 terminal-rejection policy + F1 refcount leak fix
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rewire_terminal_node_rejected() {
+    // Per Phase 13.8 Q1: a terminal node cannot be rewired. Recovery is via
+    // the resubscribable subscribe path on a fresh subscriber.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(Some(TestValue::Int(20)));
+    let c = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => panic!("type"),
+    });
+    let _rec = rt.subscribe_recorder(c);
+    rt.core.complete(c);
+    let result = rt.core.set_deps(c, &[b.id]);
+    assert!(matches!(result, Err(SetDepsError::TerminalNode { .. })));
+}
+
+#[test]
+fn rewire_to_terminal_non_resubscribable_dep_rejected() {
+    // Phase 13.8 Q1: terminal non-resubscribable dep is rejected. Adds-only
+    // — kept deps are unaffected.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(Some(TestValue::Int(20)));
+    let c = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => panic!("type"),
+    });
+    let _rec = rt.subscribe_recorder(c);
+    // Terminate b — it's not resubscribable.
+    rt.core.complete(b.id);
+    let result = rt.core.set_deps(c, &[b.id]);
+    match result {
+        Err(SetDepsError::TerminalDep { dep, .. }) => assert_eq!(dep, b.id),
+        other => panic!("expected TerminalDep, got {other:?}"),
+    }
+}
+
+#[test]
+fn rewire_to_terminal_resubscribable_dep_accepted() {
+    // Phase 13.8 Q1: resubscribable terminal deps are allowed — subscribing
+    // / activating them resets their lifecycle.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(Some(TestValue::Int(20)));
+    rt.core.set_resubscribable(b.id, true);
+    let c = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => panic!("type"),
+    });
+    let _rec = rt.subscribe_recorder(c);
+    // Terminate b but it's flagged resubscribable.
+    rt.core.complete(b.id);
+    let result = rt.core.set_deps(c, &[b.id]);
+    assert!(
+        result.is_ok(),
+        "resubscribable terminal dep should be accepted"
+    );
+}
+
+#[test]
+fn rewire_with_kept_terminal_dep_does_not_re_check() {
+    // Already-present terminal deps (kept across rewire) are not re-checked.
+    // Their terminal status was accepted at the time they terminated.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(Some(TestValue::Int(20)));
+    let c = rt.derived(&[a.id, b.id], |deps| match (&deps[0], &deps[1]) {
+        (TestValue::Int(av), TestValue::Int(bv)) => Some(TestValue::Int(av + bv)),
+        _ => panic!("type"),
+    });
+    let _rec = rt.subscribe_recorder(c);
+    // Terminate a — c's auto-cascade gating doesn't fire because b is still
+    // live. a stays in c's deps as a terminal-but-kept slot.
+    rt.core.complete(a.id);
+    // Rewire c, keeping a (a stays terminal but is not newly-added → no re-check).
+    let result = rt.core.set_deps(c, &[a.id, b.id]);
+    assert!(result.is_ok(), "kept terminal dep is not re-validated");
+}
+
+#[test]
+fn rewire_releases_error_handles_in_removed_dep_slots() {
+    // F1 audit fix regression: when a removed dep had `Error(h)` in its
+    // dep_terminals slot (retained by terminate_node), set_deps must release
+    // the handle to avoid a refcount leak.
+    let rt = TestRuntime::new();
+    let p = rt.state(Some(TestValue::Int(1)));
+    let q = rt.state(Some(TestValue::Int(2)));
+    let consumer = rt.derived(&[p.id, q.id], |deps| match (&deps[0], &deps[1]) {
+        (TestValue::Int(pv), TestValue::Int(qv)) => Some(TestValue::Int(pv + qv)),
+        _ => panic!("type"),
+    });
+    let _rec = rt.subscribe_recorder(consumer);
+
+    // Trigger ERROR on p. p has only one child (consumer); consumer has one
+    // other live dep (q), so consumer does NOT auto-cascade. The retains:
+    //   intern(err)            → refcount = 1
+    //   p.terminal Error(err)  → refcount = 2 (terminate_node retain)
+    //   consumer.dep_terminals[idx_p] = Error(err) → refcount = 3 (cascade retain)
+    let err = rt.binding.intern(TestValue::Str("p-err".into()));
+    rt.core.error(p.id, err);
+    let count_after_error = rt.binding.refcount_of(err);
+    assert_eq!(
+        count_after_error, 3,
+        "err refcount = intern(1) + p.terminal(1) + consumer.dep_terminals(1)"
+    );
+
+    // Rewire consumer to drop p. F1 fix releases the consumer.dep_terminals
+    // slot retain for err.
+    rt.core.set_deps(consumer, &[q.id]).expect("rewire ok");
+    let count_after_rewire = rt.binding.refcount_of(err);
+    assert_eq!(
+        count_after_rewire, 2,
+        "set_deps must release the per-slot Error retain when removing the dep \
+         (refcount 3 → 2: intern(1) + p.terminal(1) preserved)"
+    );
+}
+
+#[test]
+fn dynamic_rewire_to_sentinel_dep_holds_until_dep_emits() {
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.state(None); // sentinel
+    let calls = Arc::new(std::sync::Mutex::new(0u32));
+    let calls_inner = calls.clone();
+    let n = rt.dynamic(&[a.id], move |deps| {
+        *calls_inner.lock().unwrap() += 1;
+        let value = match &deps[0] {
+            TestValue::Int(v) => Some(TestValue::Int(*v)),
+            _ => None,
+        };
+        (value, Some((0..deps.len()).collect()))
+    });
+    let _rec = rt.subscribe_recorder(n);
+    let calls_at_setup = *calls.lock().unwrap();
+
+    // Rewire to sentinel — push-on-subscribe finds no cache → no delivery →
+    // fn doesn't fire.
+    rt.core.set_deps(n, &[b.id]).expect("rewire ok");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        calls_at_setup,
+        "no fire while new dep is sentinel"
+    );
+
+    // Now b emits — first-run gate releases, fn fires.
+    b.set(TestValue::Int(50));
+    assert!(*calls.lock().unwrap() > calls_at_setup);
+    assert_eq!(rt.cache_value(n), Some(TestValue::Int(50)));
 }

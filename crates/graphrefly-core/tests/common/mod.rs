@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
     BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
-    SubscriptionId,
+    Subscription,
 };
 
 #[derive(Clone, Debug)]
@@ -64,6 +64,8 @@ enum PrimitiveKey {
 }
 
 type FnImpl = Arc<dyn Fn(&[TestValue]) -> Option<TestValue> + Send + Sync>;
+type DynamicFnImpl =
+    Arc<dyn Fn(&[TestValue]) -> (Option<TestValue>, Option<Vec<usize>>) + Send + Sync>;
 type EqualsImpl = Arc<dyn Fn(&TestValue, &TestValue) -> bool + Send + Sync>;
 
 struct RegistryInner {
@@ -74,6 +76,9 @@ struct RegistryInner {
     primitive_index: HashMap<PrimitiveKey, HandleId>,
     object_index: HashMap<usize, HandleId>,
     fns: HashMap<FnId, FnImpl>,
+    /// Dynamic fns return both a value and a tracked-deps set. A given fn_id
+    /// is in EITHER `fns` OR `dynamic_fns`; never both.
+    dynamic_fns: HashMap<FnId, DynamicFnImpl>,
     custom_equals: HashMap<FnId, EqualsImpl>,
 }
 
@@ -92,6 +97,7 @@ impl TestBinding {
                 primitive_index: HashMap::new(),
                 object_index: HashMap::new(),
                 fns: HashMap::new(),
+                dynamic_fns: HashMap::new(),
                 custom_equals: HashMap::new(),
             }),
         })
@@ -147,6 +153,20 @@ impl TestBinding {
             .count()
     }
 
+    /// Inspector for the current refcount on a specific handle. Returns 0 if
+    /// the handle has been fully released or never existed. Used by audit-fix
+    /// regression tests that need to verify retain/release pairs balance
+    /// even when a handle stays alive through other shares.
+    pub fn refcount_of(&self, handle: HandleId) -> u64 {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .refcounts
+            .get(&handle)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn register_fn<F>(&self, f: F) -> FnId
     where
         F: Fn(&[TestValue]) -> Option<TestValue> + Send + Sync + 'static,
@@ -155,6 +175,17 @@ impl TestBinding {
         let id = FnId::new(inner.next_fn_id);
         inner.next_fn_id += 1;
         inner.fns.insert(id, Arc::new(f));
+        id
+    }
+
+    pub fn register_dynamic_fn<F>(&self, f: F) -> FnId
+    where
+        F: Fn(&[TestValue]) -> (Option<TestValue>, Option<Vec<usize>>) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock().expect("registry lock");
+        let id = FnId::new(inner.next_fn_id);
+        inner.next_fn_id += 1;
+        inner.dynamic_fns.insert(id, Arc::new(f));
         id
     }
 
@@ -174,6 +205,27 @@ impl BindingBoundary for TestBinding {
     fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
         // Resolve all dep handles to values (one boundary call per fire — the
         // FFI cost-model claim from the rust-port session doc).
+        let dep_values: Vec<TestValue> = dep_handles.iter().map(|&h| self.deref(h)).collect();
+
+        // Dispatch to dynamic_fns first; fall back to plain fns.
+        let dyn_f = self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .dynamic_fns
+            .get(&fn_id)
+            .cloned();
+        if let Some(f) = dyn_f {
+            let (value, tracked) = f(&dep_values);
+            return match value {
+                Some(v) => {
+                    let handle = self.intern(v);
+                    FnResult::Data { handle, tracked }
+                }
+                None => FnResult::Noop { tracked },
+            };
+        }
+
         let f = self
             .inner
             .lock()
@@ -182,7 +234,6 @@ impl BindingBoundary for TestBinding {
             .get(&fn_id)
             .cloned()
             .unwrap_or_else(|| panic!("unknown fn_id {fn_id:?}"));
-        let dep_values: Vec<TestValue> = dep_handles.iter().map(|&h| self.deref(h)).collect();
         match f(&dep_values) {
             Some(value) => {
                 let handle = self.intern(value);
@@ -231,6 +282,11 @@ impl BindingBoundary for TestBinding {
             }
             inner.refcounts.remove(&handle);
         }
+    }
+
+    fn retain_handle(&self, handle: HandleId) {
+        let mut inner = self.inner.lock().expect("registry lock");
+        *inner.refcounts.entry(handle).or_insert(0) += 1;
     }
 }
 
@@ -285,13 +341,30 @@ impl TestRuntime {
             .register_derived(deps, fn_id, EqualsMode::Custom(eq_id))
     }
 
+    /// Register a dynamic node. The fn returns `(value, tracked_indices)`:
+    /// `tracked_indices` declares which dep indices fn actually read this
+    /// run. Untracked deps still update cache but do not re-fire fn.
+    pub fn dynamic<F>(&self, deps: &[NodeId], f: F) -> NodeId
+    where
+        F: Fn(&[TestValue]) -> (Option<TestValue>, Option<Vec<usize>>) + Send + Sync + 'static,
+    {
+        let fn_id = self.binding.register_dynamic_fn(f);
+        self.core
+            .register_dynamic(deps, fn_id, EqualsMode::Identity)
+    }
+
     /// Subscribe a sink that records events into a shared `Vec<RecordedEvent>`.
-    /// Returns the recorder + subscription id.
-    pub fn subscribe_recorder(&self, node_id: NodeId) -> (Recorder, SubscriptionId) {
+    /// The returned [`Recorder`] owns the [`Subscription`] — when the recorder
+    /// drops, the sink unsubscribes. Tests bind to a named variable
+    /// (`let rec = ...` or `let _rec = ...`); binding to bare `_` drops
+    /// immediately and unsubscribes before the test can act, which is rarely
+    /// what you want.
+    pub fn subscribe_recorder(&self, node_id: NodeId) -> Recorder {
         let recorder = Recorder::new();
         let sink: Sink = recorder.sink(self.binding.clone());
-        let sub_id = self.core.subscribe(node_id, sink);
-        (recorder, sub_id)
+        let sub = self.core.subscribe(node_id, sink);
+        recorder.attach(sub);
+        recorder
     }
 
     pub fn cache_value(&self, node_id: NodeId) -> Option<TestValue> {
@@ -335,17 +408,33 @@ pub enum RecordedEvent {
     Dirty,
     Data(TestValue),
     Resolved,
+    Invalidate,
+    Pause(graphrefly_core::LockId),
+    Resume(graphrefly_core::LockId),
+    Complete,
+    Error(TestValue),
+    Teardown,
 }
 
-#[derive(Clone)]
+/// Records events from a subscriber. Owns its [`Subscription`] once attached
+/// — drop the recorder to unsubscribe.
+///
+/// Not `Clone` because it owns the Subscription (which is not Clone). If a
+/// test wants to inspect events from multiple places, share the inner
+/// `events` Arc via [`Self::events`].
 pub struct Recorder {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
+    /// Holds the subscription so that dropping the Recorder unsubscribes.
+    /// `Option` so [`Self::new`] can construct the recorder before the sink
+    /// is registered, then [`Self::attach`] fills it in.
+    subscription: Mutex<Option<Subscription>>,
 }
 
 impl Recorder {
     pub fn new() -> Self {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
+            subscription: Mutex::new(None),
         }
     }
 
@@ -359,11 +448,27 @@ impl Recorder {
                     Message::Dirty => RecordedEvent::Dirty,
                     Message::Resolved => RecordedEvent::Resolved,
                     Message::Data(h) => RecordedEvent::Data(binding.deref(*h)),
-                    other => panic!("unexpected message in test sink: {other:?}"),
+                    Message::Invalidate => RecordedEvent::Invalidate,
+                    Message::Pause(l) => RecordedEvent::Pause(*l),
+                    Message::Resume(l) => RecordedEvent::Resume(*l),
+                    Message::Complete => RecordedEvent::Complete,
+                    Message::Error(h) => RecordedEvent::Error(binding.deref(*h)),
+                    Message::Teardown => RecordedEvent::Teardown,
                 };
                 guard.push(recorded);
             }
         })
+    }
+
+    pub fn attach(&self, sub: Subscription) {
+        *self.subscription.lock().expect("recorder lock") = Some(sub);
+    }
+
+    /// Manually unsubscribe early (before recorder drop). Useful for tests
+    /// that want to verify post-unsubscribe behavior without dropping the
+    /// whole recorder.
+    pub fn unsubscribe(&self) {
+        *self.subscription.lock().expect("recorder lock") = None;
     }
 
     pub fn snapshot(&self) -> Vec<RecordedEvent> {

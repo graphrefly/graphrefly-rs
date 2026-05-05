@@ -23,7 +23,9 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use graphrefly_core::{BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, NodeId};
+use graphrefly_core::{
+    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, NodeId, Subscription,
+};
 use napi_derive::napi;
 
 // ---------------------------------------------------------------------------
@@ -142,6 +144,11 @@ impl BindingBoundary for BenchBinding {
     fn release_handle(&self, h: HandleId) {
         self.registry.lock().expect("registry lock").release(h);
     }
+
+    fn retain_handle(&self, h: HandleId) {
+        let mut reg = self.registry.lock().expect("registry lock");
+        *reg.refcounts.entry(h).or_insert(0) += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +172,10 @@ pub enum BuiltinFn {
 pub struct BenchCore {
     core: Core,
     binding: Arc<BenchBinding>,
+    /// Holds noop subscriptions so they stay alive for the bench's lifetime.
+    /// Per §10.12, dropping a `Subscription` deregisters it; the bench needs
+    /// nodes activated for the whole run, so we keep them here.
+    subscriptions: Mutex<Vec<Subscription>>,
 }
 
 #[napi]
@@ -176,7 +187,11 @@ impl BenchCore {
     pub fn new() -> Self {
         let binding = BenchBinding::new();
         let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
-        Self { core, binding }
+        Self {
+            core,
+            binding,
+            subscriptions: Mutex::new(Vec::new()),
+        }
     }
 
     /// Register a state node with an i32 initial value. Returns the node id
@@ -189,19 +204,14 @@ impl BenchCore {
             .lock()
             .expect("registry lock")
             .intern(BenchValue::Int(initial));
-        u32::try_from(self.core.register_state(handle).raw())
-            .expect("node id exceeds u32")
+        u32::try_from(self.core.register_state(handle).raw()).expect("node id exceeds u32")
     }
 
     /// Register a state node with sentinel cache (no initial value).
     #[napi]
     pub fn register_state_sentinel(&self) -> u32 {
-        u32::try_from(
-            self.core
-                .register_state(graphrefly_core::NO_HANDLE)
-                .raw(),
-        )
-        .expect("node id exceeds u32")
+        u32::try_from(self.core.register_state(graphrefly_core::NO_HANDLE).raw())
+            .expect("node id exceeds u32")
     }
 
     /// Register a derived node with a built-in fn shape. `dep_ids` are the
@@ -221,7 +231,10 @@ impl BenchCore {
         reg.next_fn_id += 1;
         reg.fns.insert(fn_id, fn_impl);
         drop(reg);
-        let deps: Vec<NodeId> = dep_ids.into_iter().map(|id| NodeId::new(u64::from(id))).collect();
+        let deps: Vec<NodeId> = dep_ids
+            .into_iter()
+            .map(|id| NodeId::new(u64::from(id)))
+            .collect();
         u32::try_from(
             self.core
                 .register_derived(&deps, fn_id, EqualsMode::Identity)
@@ -231,17 +244,18 @@ impl BenchCore {
     }
 
     /// Subscribe a noop sink to a node — required to activate compute nodes.
-    /// Returns the subscription id (u32) for symmetry; we don't expose unsub
-    /// in v0 bench.
+    /// The Subscription is retained inside `BenchCore` so it lives for the
+    /// bench's lifetime (per §10.12 RAII semantics). Returns the index in the
+    /// subscriptions vec for tests that want to release one early via
+    /// [`Self::unsubscribe_index`].
     #[napi]
     pub fn subscribe_noop(&self, node_id: u32) -> u32 {
         let sink: graphrefly_core::Sink = Arc::new(|_| {});
-        u32::try_from(
-            self.core
-                .subscribe(NodeId::new(u64::from(node_id)), sink)
-                .raw(),
-        )
-        .expect("sub id exceeds u32")
+        let sub = self.core.subscribe(NodeId::new(u64::from(node_id)), sink);
+        let mut subs = self.subscriptions.lock().expect("subscriptions lock");
+        let idx = subs.len();
+        subs.push(sub);
+        u32::try_from(idx).expect("subscription index exceeds u32")
     }
 
     /// Emit an i32 value on a state node. Single FFI call per emit.

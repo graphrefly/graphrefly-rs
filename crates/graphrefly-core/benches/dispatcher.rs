@@ -201,9 +201,12 @@ fn bench_large_fanout(c: &mut Criterion) {
         let core = Core::new(binding.clone());
         let (s, leaves) = build_fanout(&core, n);
         // Subscribe to all leaves so they activate and propagation is exercised.
-        for &leaf in &leaves {
-            let _ = core.subscribe(leaf, noop_sink());
-        }
+        // Per §10.12 RAII: bind to a Vec so subscriptions live for the whole
+        // bench iteration block (binding to bare `_` would unsub immediately).
+        let _subs: Vec<_> = leaves
+            .iter()
+            .map(|&leaf| core.subscribe(leaf, noop_sink()))
+            .collect();
 
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {

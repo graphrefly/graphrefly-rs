@@ -54,4 +54,6 @@ pub use boundary::{BindingBoundary, FnResult};
 pub use clock::{monotonic_ns, wall_clock_ns};
 pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 pub use message::{Message, Messages};
-pub use node::{Core, EqualsMode, NodeKind, SetDepsError, Sink, SubscriptionId};
+pub use node::{
+    Core, EqualsMode, NodeKind, PauseError, ResumeReport, SetDepsError, Sink, Subscription,
+};

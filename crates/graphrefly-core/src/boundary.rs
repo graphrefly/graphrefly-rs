@@ -93,6 +93,19 @@ pub trait BindingBoundary: Send + Sync {
     /// for memory pressure under sustained load. The TS prototype's
     /// `bindings.ts` uses this to drive a `Map<HandleId, { value, refcount }>`.
     fn release_handle(&self, handle: HandleId);
+
+    /// Increment the refcount on `handle`. Called when the Core takes an
+    /// additional reference to an existing handle that the binding side
+    /// already interned — currently used by the pause buffer (a buffered
+    /// `Data(H)` outlives the cache slot that originally interned `H`, so
+    /// the buffer needs its own refcount share to keep `H` alive across
+    /// later cache replacements).
+    ///
+    /// Default: no-op. Bindings that don't track refcounts (e.g., trivial
+    /// always-alive registries) can leave the default. Bindings that do
+    /// (TS `bindings.ts`, the test runtime, the napi-rs bench harness) must
+    /// override to bump the per-handle refcount.
+    fn retain_handle(&self, _handle: HandleId) {}
 }
 
 #[cfg(test)]

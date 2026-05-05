@@ -25,7 +25,7 @@ use wasm_bindgen::prelude::*;
 
 /// Smoke export to verify the wasm-bindgen build chain works.
 #[wasm_bindgen]
-#[must_use] 
+#[must_use]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }

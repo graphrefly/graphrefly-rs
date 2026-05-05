@@ -18,7 +18,7 @@ use common::{RecordedEvent, TestObject, TestRuntime, TestValue};
 fn emitting_same_primitive_twice_yields_one_data_one_resolved() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Int(42));
     s.set(TestValue::Int(42)); // same handle (interned) → RESOLVED
     let data = rec.data_values();
@@ -41,7 +41,7 @@ fn emitting_same_primitive_twice_yields_one_data_one_resolved() {
 fn emitting_same_object_reference_twice_yields_one_data_one_resolved() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     let obj = Arc::new(TestObject {
         label: "x".into(),
         x: 1,
@@ -56,7 +56,7 @@ fn emitting_same_object_reference_twice_yields_one_data_one_resolved() {
 fn structurally_equal_distinct_objects_produce_two_data() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Object(Arc::new(TestObject {
         label: "x".into(),
         x: 1,
@@ -93,7 +93,7 @@ fn derived_with_two_state_deps_does_not_fire_until_both_emit() {
         };
         Some(TestValue::Int(av + bv))
     });
-    let (_rec, _) = rt.subscribe_recorder(sum);
+    let _rec = rt.subscribe_recorder(sum);
     assert_eq!(*calls.lock().unwrap(), 0);
     assert_eq!(rt.cache_value(sum), None);
 
@@ -121,7 +121,7 @@ fn derived_with_pre_initialized_state_deps_fires_on_first_subscribe() {
             _ => panic!("type mismatch"),
         }
     });
-    let (rec, _) = rt.subscribe_recorder(sum);
+    let rec = rt.subscribe_recorder(sum);
     // Both deps cached → push-on-subscribe → fn fires.
     assert_eq!(*calls.lock().unwrap(), 1);
     assert_eq!(rt.cache_value(sum), Some(TestValue::Int(30)));
@@ -153,7 +153,7 @@ fn diamond_one_update_at_root_fires_d_once() {
             _ => panic!("type"),
         }
     });
-    let (_rec, _) = rt.subscribe_recorder(d);
+    let _rec = rt.subscribe_recorder(d);
     // Initial: a=1 → b=2, c=3, d=5. d fires once.
     assert_eq!(*d_calls.lock().unwrap(), 1);
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(5)));
@@ -181,7 +181,7 @@ fn diamond_emitted_data_at_root_yields_one_data_at_sink() {
         (TestValue::Int(bv), TestValue::Int(cv)) => Some(TestValue::Int(bv + cv)),
         _ => panic!("type"),
     });
-    let (rec, _) = rt.subscribe_recorder(sum);
+    let rec = rt.subscribe_recorder(sum);
     let initial_data = rec.count(|e| matches!(e, RecordedEvent::Data(_)));
     a.set(TestValue::Int(5));
     let final_data = rec.count(|e| matches!(e, RecordedEvent::Data(_)));
@@ -198,7 +198,7 @@ fn diamond_emitted_data_at_root_yields_one_data_at_sink() {
 fn late_subscriber_to_state_with_cached_value_receives_data() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(99)));
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     assert_eq!(rec.data_values(), vec![TestValue::Int(99)]);
 }
 
@@ -206,7 +206,7 @@ fn late_subscriber_to_state_with_cached_value_receives_data() {
 fn late_subscriber_to_sentinel_state_receives_only_start() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     assert_eq!(rec.data_values(), Vec::<TestValue>::new());
     assert_eq!(rec.snapshot(), vec![RecordedEvent::Start]);
 }
@@ -231,7 +231,7 @@ fn derived_with_custom_deep_equals_dedups_structurally_equal_outputs() {
             _ => false,
         },
     );
-    let (rec, _) = rt.subscribe_recorder(wrapper);
+    let rec = rt.subscribe_recorder(wrapper);
     let initial_data = rec.count(|e| matches!(e, RecordedEvent::Data(_)));
     assert_eq!(initial_data, 1); // initial activation
 
@@ -263,7 +263,7 @@ fn emitting_no_handle_panics() {
 fn null_is_a_valid_data_payload() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    let (rec, _) = rt.subscribe_recorder(s.id);
+    let rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Null);
     assert_eq!(rec.data_values(), vec![TestValue::Null]);
 }
