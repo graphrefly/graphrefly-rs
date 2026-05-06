@@ -20,6 +20,11 @@ graphrefly-operators  = { workspace = true, optional = true }
 graphrefly-storage    = { workspace = true, optional = true }
 graphrefly-structures = { workspace = true, optional = true }
 
+# Used to construct `FnResult::Batch` emissions for the batch-fn binding
+# surface. SmallVec inline-2 mirrors the Core's `FnResult::Batch.emissions`
+# shape so building a batch doesn't heap-alloc on the common case.
+smallvec              = { workspace = true }
+
 # napi-rs runtime — the FFI scaffolding to V8.
 # napi9 targets Node.js 12+ ABI (broad compatibility).
 napi        = { version = "2.16", default-features = false, features = ["napi9", "tokio_rt"] }

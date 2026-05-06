@@ -61,6 +61,46 @@ Each entry records context, options, and rationale for future reference.
 - **Rationale:** Belt-and-suspenders approach. The explicit `Drop` is the primary safety mechanism; field ordering is defensive.
 - **Affects:** graphrefly-graph `observe.rs` (`GraphObserveAllReactive` field order + Drop impl).
 
+### D009 — M3 operator architecture: option (c) Core-dispatch with `OperatorOp` `NodeKind` variant
+- **Date:** 2026-05-06
+- **Context:** First operators slice (Slice C-1) needs an architecture lock before code lands. Three options: (a) operators-as-derived-factories (TS-canonical shape; sugar over `register_derived`), (b) pre-canned fn impls registered with the binding (operators crate ships `Box<dyn Fn(&[DepBatch])>` builders), (c) Core dispatches via new `NodeKind::Operator(OperatorOp)` variant; binding extends FFI surface with bulk projection methods.
+- **Options:** A=derived-factory, B=pre-canned fn impls, C=Core dispatch.
+- **Decision:** C — Core dispatch with `NodeKind::Operator(OperatorOp)` and bulk projection FFI methods (`project_each` / `predicate_each` / `fold_each`) on `BindingBoundary`. Operator-specific logic (filter wave-exclusivity, distinct-by-identity, pairwise prev-value) becomes Core-internal — zero FFI for operators that don't need user callbacks.
+- **Rationale:** Maximum perf (one FFI per fire regardless of batch length, internal short-circuits for filter/distinct), and the substrate (`DepRecord` + `DepBatch` + `FnResult::Batch`) was already designed for this dispatch shape. The user explicitly requires that the operators crate not import the graph layer — operators must consume `Core` only, which option C satisfies via direct `Core::register_operator` calls.
+- **Affects:** graphrefly-core (NodeKind extension, OperatorOp enum, fire_fn dispatch fork, new BindingBoundary methods), graphrefly-operators (factories), graphrefly-bindings-js (FFI surface widening).
+
+### D010 — Operator user-callback boundary: option (b) helper trait + (c) builder per knob-heavy op
+- **Date:** 2026-05-06
+- **Context:** Operators with user callbacks (`map(project)`, `filter(predicate)`, `scan(reducer, seed)`) need to plumb Rust closures or JS-facing fn ids through to the FFI surface. Three options: (a) caller pre-registers FnId, (b) operators crate accepts `Box<dyn Fn>` and registers via a thin `OperatorBinding` helper trait, (c) builder struct per operator with chained config.
+- **Options:** A=pre-registered FnId, B=Box<dyn Fn> via helper trait, C=builder per operator.
+- **Decision:** B for ergonomic ops (map / filter / scan / distinctUntilChanged) + C for knob-heavy ops (throttle / retry / circuitBreaker etc.).
+- **Rationale:** B hides the register-then-pass-FnId dance for the common case; C is justified when an operator has 3+ config knobs. A is too verbose at the call site for trivial wins.
+- **Affects:** graphrefly-operators (OperatorBinding trait + operator factories).
+
+### D011 — `partial: bool` register option lifted into Core
+- **Date:** 2026-05-06
+- **Context:** R5.4 partial-mode is operator-specific (map/filter/scan want partial-on; withLatestFrom/combine want partial-off). Core's R2.5.3 first-run gate is currently unconditional. Without a `partial` knob, operators can't opt out of the gate.
+- **Options:** A=keep first-run gate hardcoded (operators that need partial-on can't ship), B=add `partial: bool` to `register_derived` / `register_dynamic` / `register_operator`.
+- **Decision:** B — Core gains a `partial: bool` register option. Default `false` (existing behavior preserved). Operators set their own default per type.
+- **Rationale:** R5.4 needs Core support for the partial-true mode; this is the right time to plumb it (alongside the operator dispatch extension).
+- **Affects:** graphrefly-core (register_* signature extension; first-run gate conditional).
+
+### D012 — Filter is silent-drop (no RESOLVED on rejected items)
+- **Date:** 2026-05-06
+- **Context:** R1.3.3.b filter wave-exclusivity. TS legacy emits RESOLVED when entire wave rejects; never per-dropped-item. Question: does Rust port mirror, or take a cleaner shape now that Slice B's R1.3.1.a fix removed spurious DIRTY?
+- **Options:** A=mirror TS (RESOLVED on fully-rejected wave), B=silent drop (no DIRTY, no RESOLVED, no settle when predicate rejects).
+- **Decision:** B — silent drop. Subscribers see no message for dropped values. Cleaner; falls out naturally of the R1.3.1.a fix.
+- **Rationale:** With R1.3.1.a (DIRTY only queued when not-already-dirty), filter doesn't need to settle if it never dirtied. Edge case for upstream-broadcast DIRTY: Core suppresses Operator-Filter's downstream DIRTY when the predicate fully rejects, OR Operator-Filter queues a single RESOLVED to drain its self-DIRTY without forwarding. Implementation choice deferred to slice C-1.
+- **Affects:** graphrefly-core (Operator dispatch path), graphrefly-operators (filter factory).
+
+### D013 — M3 Slice A /qa + napi DepBatch parity + M2 parity-tests widening (B + C + D batch)
+- **Date:** 2026-05-06
+- **Context:** Three follow-up gaps surfaced post-M3 Slice A+B: deferred batch-accumulation tests for the new DepRecord substrate; deferred napi-rs DepBatch parity; M2 close-gate residual D6 (parity-tests not yet widened).
+- **Options:** A=M3 operators (next milestone), B=parity-tests widening, C=Slice A /qa tests, D=napi-rs DepBatch parity.
+- **Decision:** B + C + D combined batch (skip A operator slice for this batch — large architecture decisions need their own slice).
+- **Rationale:** All three are smaller, lower-risk, close known gaps. C and D exercise the substrate end-to-end. B closes the M2-close-gate residual without touching graphrefly-rs.
+- **Affects:** graphrefly-core (`tests/dep_batch.rs`), graphrefly-bindings-js (`BuiltinBatchFn` + `BatchEmissionJs` + `DepBatchJs` + `register_batch_derived` + `batch_emit_messages`), graphrefly-ts/packages/parity-tests (`scenarios/graph/*`).
+
 ### D008 — Slice F /qa decisions (P1–P7 fix priorities)
 - **Date:** 2026-05-06
 - **Context:** Adversarial review of Slice F surfaced 7 priority correctness bugs (P1–P7). Each had clear fix shape but some had architecture-touching trade-offs (subscribe contract, push-on-subscribe semantics, Weak-capture refactor, parity-test scope).

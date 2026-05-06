@@ -24,11 +24,12 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, LockId, NodeId,
-    Subscription,
+    BindingBoundary, Core, DepBatch, EqualsMode, FnEmission, FnId, FnResult, HandleId, LockId,
+    NodeId, Subscription,
 };
 use napi::Error as NapiError;
 use napi_derive::napi;
+use smallvec::SmallVec;
 
 // ---------------------------------------------------------------------------
 // Value registry — owned by the Rust side for v0 FFI bench.
@@ -44,13 +45,29 @@ enum BenchValue {
     Str(String),
 }
 
+/// User-side emission shape for the FnResult::Batch builtin fn registry.
+/// Distinct from `graphrefly_core::FnEmission` because builtin fns emit
+/// `BenchValue`s; the binding interns them into HandleIds at fire time.
+#[derive(Clone, Debug)]
+enum BenchEmission {
+    Data(BenchValue),
+    Complete,
+    Error(BenchValue),
+}
+
+type SingleFnImpl = Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync>;
+type BatchFnImpl = Arc<dyn Fn(&[DepBatch], &Registry) -> Vec<BenchEmission> + Send + Sync>;
+
 struct Registry {
     next_handle: u64,
     values: ahash::AHashMap<HandleId, BenchValue>,
     primitive_index: ahash::AHashMap<BenchValue, HandleId>,
     refcounts: ahash::AHashMap<HandleId, u64>,
-    /// Pre-baked fn implementations.
-    fns: ahash::AHashMap<FnId, Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync>>,
+    /// Pre-baked single-emission fn implementations (`FnResult::Data`).
+    fns: ahash::AHashMap<FnId, SingleFnImpl>,
+    /// Pre-baked batch fn implementations — fire returns `FnResult::Batch`
+    /// with multiple emissions per wave. Models `actions.down(msgs)`.
+    batch_fns: ahash::AHashMap<FnId, BatchFnImpl>,
     next_fn_id: u64,
 }
 
@@ -62,6 +79,7 @@ impl Registry {
             primitive_index: ahash::AHashMap::new(),
             refcounts: ahash::AHashMap::new(),
             fns: ahash::AHashMap::new(),
+            batch_fns: ahash::AHashMap::new(),
             next_fn_id: 1,
         }
     }
@@ -113,6 +131,38 @@ impl BenchBinding {
 
 impl BindingBoundary for BenchBinding {
     fn invoke_fn(&self, _: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        // Try batch fns first — they receive `&[DepBatch]` directly and may
+        // emit multiple values per fire (FnResult::Batch).
+        //
+        // Single registry lock acquisition across the whole batch-fn fire:
+        // fn lookup + value deref (via &Registry passed to the closure) +
+        // emission intern. Eliminates the prior 3-acquisition TOCTOU window
+        // where another thread could mutate `primitive_index` between phases.
+        // No re-entrancy possible: the closure only reads via `&Registry`
+        // (no `&mut`), and Core never re-enters the binding mid-fire.
+        let batch_f = {
+            let reg = self.registry.lock().expect("registry lock");
+            reg.batch_fns.get(&fn_id).cloned()
+        };
+        if let Some(f) = batch_f {
+            let mut reg = self.registry.lock().expect("registry lock");
+            let emissions = f(dep_data, &reg);
+            let converted: SmallVec<[FnEmission; 2]> = emissions
+                .into_iter()
+                .map(|e| match e {
+                    BenchEmission::Data(v) => FnEmission::Data(reg.intern(v)),
+                    BenchEmission::Complete => FnEmission::Complete,
+                    BenchEmission::Error(v) => FnEmission::Error(reg.intern(v)),
+                })
+                .collect();
+            return FnResult::Batch {
+                emissions: converted,
+                tracked: None,
+            };
+        }
+
+        // Single-emission path: latest-value-per-dep, returns at most one
+        // FnResult::Data (or FnResult::Noop).
         let reg = self.registry.lock().expect("registry lock");
         let f = reg
             .fns
@@ -166,6 +216,45 @@ pub enum BuiltinFn {
     /// `f(x) = x + 1` (Int only) — measures dispatch + simple computation.
     AddOne,
 }
+
+/// Built-in batch fn shapes — fire returns `FnResult::Batch` with one
+/// emission per dep-batch entry (R1.3.6.b multi-emit).
+///
+/// Demonstrates the `actions.down(msgs)` substrate through the napi
+/// boundary. Real JS-callback batch fns require TSFN and come later.
+#[napi(string_enum)]
+pub enum BuiltinBatchFn {
+    /// For each handle in `dep_data[0].data`, emit `value + 1` as a
+    /// `FnEmission::Data`. Demonstrates K-emit-per-fire coalescing through
+    /// the FFI: a 3-emit batch on the source produces a 3-emission Batch
+    /// result, all delivered in the same wave.
+    MapAddOneBatch,
+    /// Emit `value * 10` for each input, then a `FnEmission::Complete` —
+    /// demonstrates terminal-in-batch (R1.3.4.a: terminals stop further
+    /// processing within the same Batch).
+    MulTenThenComplete,
+}
+
+/// User-side emission shape for the batch surfaces. The kind discriminator
+/// is a string so JS callers don't depend on enum integer values.
+///
+/// - `kind: "data"` — `value` is the i32 payload
+/// - `kind: "complete"` — `value` ignored
+/// - `kind: "error"` — `value` is the i32 error-code payload
+///
+/// Cleaner than mirroring the Rust `FnEmission` tagged union directly: at
+/// the JS layer one struct shape covers all three variants and TypeScript
+/// consumers can narrow on `kind`.
+#[napi(object)]
+pub struct BatchEmissionJs {
+    pub kind: String,
+    pub value: Option<i32>,
+}
+
+// Note: a `DepBatchJs` napi struct was considered for inspecting per-dep
+// wave state from JS. Dropped because there's no consumer yet — the M3
+// Slice A regression tests live Rust-side via `register_raw_fn` capture.
+// Re-add if a JS-side parity scenario needs to verify R1.3.6.b shape.
 
 // ---------------------------------------------------------------------------
 // JS-facing API: a single `BenchCore` class with the minimum to bench.
@@ -504,6 +593,169 @@ impl BenchCore {
     #[napi]
     pub fn has_fired_once(&self, node_id: u32) -> bool {
         self.core.has_fired_once(NodeId::new(u64::from(node_id)))
+    }
+
+    // -------------------------------------------------------------------
+    // M3 — DepBatch + FnResult::Batch parity surface
+    //
+    // `register_batch_derived` exposes the FnResult::Batch substrate —
+    // a derived node whose fn fire returns multiple emissions (R1.3.6.b
+    // coalescing on the output side). `batch_emit_messages` is the
+    // user-facing batch: a heterogeneous wave of data/complete/error
+    // emissions applied atomically inside a `Core::batch` scope.
+    // -------------------------------------------------------------------
+
+    /// Register a derived node whose fn returns `FnResult::Batch` with
+    /// one emission per input batch entry. Demonstrates the M3 Slice B
+    /// `FnResult::Batch` substrate through the napi boundary.
+    ///
+    /// The fn fires once per wave; its output emissions all flow within
+    /// the same wave. `EqualsMode::Identity` is hardcoded because
+    /// `FnResult::Batch` skips equals substitution per R1.3.2.d (multi-
+    /// message waves pass through verbatim) — the equals mode only
+    /// affects single-emission `FnResult::Data` paths, which a batch fn
+    /// doesn't produce.
+    ///
+    /// # Panics
+    ///
+    /// Bench builtins (`MapAddOneBatch`, `MulTenThenComplete`) panic if
+    /// a dep handle resolves to a non-Int value or is missing from the
+    /// registry. These are bench helpers; production batch fns will
+    /// surface domain errors via dedicated channels.
+    #[napi]
+    pub fn register_batch_derived(&self, dep_ids: Vec<u32>, builtin: BuiltinBatchFn) -> u32 {
+        let fn_impl: BatchFnImpl = match builtin {
+            BuiltinBatchFn::MapAddOneBatch => Arc::new(|deps: &[DepBatch], reg: &Registry| {
+                let mut emissions = Vec::new();
+                if let Some(d) = deps.first() {
+                    for h in &d.data {
+                        match reg.deref(*h) {
+                            Some(BenchValue::Int(n)) => {
+                                emissions.push(BenchEmission::Data(BenchValue::Int(n + 1)));
+                            }
+                            Some(other) => {
+                                panic!("MapAddOneBatch only supports Int dep values, got {other:?}",)
+                            }
+                            None => panic!("MapAddOneBatch: dep handle {h:?} not in registry"),
+                        }
+                    }
+                }
+                emissions
+            }),
+            BuiltinBatchFn::MulTenThenComplete => Arc::new(|deps: &[DepBatch], reg: &Registry| {
+                let mut emissions = Vec::new();
+                if let Some(d) = deps.first() {
+                    for h in &d.data {
+                        match reg.deref(*h) {
+                            Some(BenchValue::Int(n)) => {
+                                emissions.push(BenchEmission::Data(BenchValue::Int(n * 10)));
+                            }
+                            Some(other) => panic!(
+                                "MulTenThenComplete only supports Int dep values, got {other:?}",
+                            ),
+                            None => panic!("MulTenThenComplete: dep handle {h:?} not in registry",),
+                        }
+                    }
+                }
+                emissions.push(BenchEmission::Complete);
+                emissions
+            }),
+        };
+        let mut reg = self.binding.registry.lock().expect("registry lock");
+        let fn_id = FnId::new(reg.next_fn_id);
+        reg.next_fn_id += 1;
+        reg.batch_fns.insert(fn_id, fn_impl);
+        drop(reg);
+        let deps: Vec<NodeId> = dep_ids
+            .into_iter()
+            .map(|id| NodeId::new(u64::from(id)))
+            .collect();
+        u32::try_from(
+            self.core
+                .register_derived(&deps, fn_id, EqualsMode::Identity)
+                .raw(),
+        )
+        .expect("node id exceeds u32")
+    }
+
+    /// User-facing batch — apply a sequence of mixed emissions on a state
+    /// node in one wave. Internally uses `Core::batch` to coalesce; each
+    /// emission maps to the underlying source-level call (`emit` /
+    /// `complete` / `error`) inside the batch scope.
+    ///
+    /// This is the "user-facing batch" surface: cleaner than mirroring
+    /// `FnResult::Batch` directly (which is a fn-fire return shape, not a
+    /// caller-driven wave). Heterogeneous waves of mixed emissions are
+    /// expressible without exposing the internal `FnEmission` enum to JS.
+    ///
+    /// # Errors
+    ///
+    /// Returns `napi::Error` (NOT panic) when:
+    /// - Any `kind` is not one of `"data"` / `"complete"` / `"error"`.
+    /// - `kind` is `"data"` or `"error"` and `value` is `None` (R1.2.5
+    ///   intent: payload must be supplied at construction; silent default
+    ///   to `0` would mask user error and produce phantom-zero events
+    ///   indistinguishable from legitimate `0` payloads).
+    ///
+    /// All input is validated up-front BEFORE opening the batch, so a
+    /// malformed `msgs` never produces a partially-applied wave.
+    #[napi]
+    pub fn batch_emit_messages(
+        &self,
+        node_id: u32,
+        msgs: Vec<BatchEmissionJs>,
+    ) -> Result<(), NapiError> {
+        // Up-front validation — bad input MUST NOT open a batch.
+        for (i, m) in msgs.iter().enumerate() {
+            match m.kind.as_str() {
+                "data" | "error" => {
+                    if m.value.is_none() {
+                        return Err(NapiError::from_reason(format!(
+                            "batch_emit_messages: msgs[{i}] kind={:?} requires a `value` field",
+                            m.kind
+                        )));
+                    }
+                }
+                "complete" => {}
+                other => {
+                    return Err(NapiError::from_reason(format!(
+                        "batch_emit_messages: msgs[{i}] unknown kind {other:?} (expected \"data\" / \"complete\" / \"error\")",
+                    )));
+                }
+            }
+        }
+
+        let nid = NodeId::new(u64::from(node_id));
+        self.core.batch(|| {
+            for m in msgs {
+                match m.kind.as_str() {
+                    "data" => {
+                        let v = m.value.expect("validated up-front");
+                        let h = self
+                            .binding
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .intern(BenchValue::Int(v));
+                        self.core.emit(nid, h);
+                    }
+                    "complete" => self.core.complete(nid),
+                    "error" => {
+                        let v = m.value.expect("validated up-front");
+                        let h = self
+                            .binding
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .intern(BenchValue::Int(v));
+                        self.core.error(nid, h);
+                    }
+                    _ => unreachable!("validated up-front"),
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 

@@ -510,6 +510,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "smallvec",
 ]
 
 [[package]]

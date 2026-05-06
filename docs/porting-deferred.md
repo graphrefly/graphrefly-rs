@@ -717,30 +717,107 @@ is acceptable for the M2 close but worth tracking for future slices.
   `subscribe_topology` and dedup against the namespace fire.
 - **Source:** Slice F /qa Edge Case Hunter F10 (2026-05-06).
 
-### D6 — `packages/parity-tests/scenarios/graph/` not yet widened for the M2 surface
+## M2 parity-tests fragility (post-/qa, 2026-05-06)
 
-- **What:** Per the porting-to-rs skill workflow, M2-close should add
-  `describe.each(impls)` parity scenarios under
-  `~/src/graphrefly-ts/packages/parity-tests/scenarios/graph/` (sugar
-  wrappers, remove, edges, signal, describe-reactive,
-  observe-all-reactive). Slice F deliberately scoped this out — the
-  `Impl` interface widening + ~300-500 LOC of scenario coverage is
-  large enough to warrant a dedicated follow-up slice with proper
-  surface coverage.
-- **Why deferred:** scope tightness for Slice F + per user direction
-  P8(b) at /qa decision time. The legacy-only parity test gate
-  remains operative; the rustImpl arm is `null` until
-  `@graphrefly/native` publishes anyway.
-- **Lift point:** dedicated "M2 parity-tests" slice. Recommended
-  scenarios:
-  - `scenarios/graph/sugar.test.ts` — set/get/invalidate/complete/error
-  - `scenarios/graph/remove.test.ts` — namespace-during-cascade ordering
-  - `scenarios/graph/edges.test.ts` — recursive vs local + anon
-  - `scenarios/graph/signal.test.ts` — Pause/Resume/Invalidate + meta filter
-  - `scenarios/graph/describe-reactive.test.ts` — push-on-subscribe + change events
-  - `scenarios/graph/observe-all-reactive.test.ts` — auto-subscribe late nodes + subscribe-once contract
-- **Source:** Slice F /qa Edge Case Hunter F11 (2026-05-06); user
-  decision P8=(b) at /qa decision time.
+Surfaced during /qa of the B+C+D batch. The six new `scenarios/graph/`
+scenarios pass against `legacyImpl` but rest on assumptions that may not
+generalize cleanly when `rustImpl` activates. Tracked rather than fixed
+in-batch because (a) `rustImpl` is still `null` (no observable divergence
+yet), and (b) tightening would require either spec-citation amendments or
+shape-adapter design that's better addressed in a follow-up slice.
+
+### MP1 — `describe-reactive` parity tests assume synchronous flush outside `batch()`
+
+- **What:** [packages/parity-tests/scenarios/graph/describe-reactive.test.ts](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/graph/describe-reactive.test.ts)
+  "emits a fresh snapshot when a node is added/removed" tests call
+  `g.state(...)` / `g.remove(...)` outside an explicit `batch()` and
+  immediately read `snaps.length` to detect the new snapshot. TS legacy's
+  `_describeReactive` uses `registerBatchFlushHook` which fires
+  synchronously when `bump()` is called outside a batch.
+- **Why deferred:** if Rust's reactive describe coalesces namespace
+  changes through a different mechanism (e.g., a wave-end notify), the
+  test could become non-deterministic across impls.
+- **Lift point:** wrap the mutation + assertion in `g.batch(() => {...})`
+  to make the coalescing point explicit, OR add a spec-cited assertion
+  that namespace-change → reactive-describe push is synchronous.
+- **Source:** Slice B+C+D /qa Blind Hunter #8 + Edge Case Hunter #11
+  (2026-05-06).
+
+### MP2 — `sugar.test.ts` derived-fn data shape may not match across impls
+
+- **What:** the "g.set chained through derived produces propagated DATA"
+  test passes a `(data) => result[]` fn where `data[0]` is treated as
+  `T[]` (a plain array of values). TS legacy's `GraphDerivedFn` exposes
+  `data` as `readonly (readonly unknown[] | undefined)[]` — per-dep
+  batches. The test happens to work because `batch0.map(...)` over a
+  homogeneous batch returns a sensible result.
+- **Why deferred:** Rust's binding may expose dep batches via a different
+  shape (e.g., `DepBatch`-like struct, or a flat per-emit array). Without
+  an `Impl.derivedFn` adapter or shape-locking interface, the test will
+  silently break or pass-with-different-semantics when `rustImpl`
+  activates.
+- **Lift point:** add `Impl.derivedFn(deps, fn) -> Node` factory or
+  document the canonical batch shape contract in scenario docstring.
+- **Source:** Slice B+C+D /qa Blind Hunter #10 (2026-05-06).
+
+### MP3 — `signal.test.ts` tier-3 rejection assumes synchronous throw
+
+- **What:** `expect(() => g.signal([[impl.DATA, 99]])).toThrow();` requires
+  the impl to validate synchronously inside the call. TS legacy's
+  `signal()` validates in a `for...of` BEFORE `_signalDeliver`, so
+  rejection IS synchronous.
+- **Why deferred:** Rust port's `signal(SignalKind)` is a closed enum
+  (no `Data` variant — see D3 above), so this test can't even map to
+  the Rust binding's surface 1:1 today. The test asserts TS-impl-specific
+  shape.
+- **Lift point:** when rustImpl activates, either widen `SignalKind` to
+  include a Data variant that rejects (matching the test), or update the
+  test to use the impl's shape.
+- **Source:** Slice B+C+D /qa Blind Hunter #15 + Edge Case Hunter #9
+  (2026-05-06).
+
+### MP4 — `observe-all-reactive.test.ts` unsubscribe test conflates deactivation with sink-list-clear
+
+- **What:** the "unsubscribe stops further events" test calls `unsub()`
+  then asserts no further events. TS legacy achieves this via single-
+  subscriber deactivation (last sink unsubscribes → derived deactivates →
+  `disposed = true` → `actions.emit` no-ops). Rust port's
+  `GraphObserveAllReactive` clears its own sink list on unsub
+  independently. The test pins one mechanism but the behavior is
+  semantically the same.
+- **Why deferred:** the divergence isn't observable in the current
+  single-sink test scenario. It would surface in a 2-sink test where one
+  unsubscribes and the other expects to keep receiving events.
+- **Lift point:** add a parallel test where two sinks are subscribed,
+  one unsubs, and assert the other still receives events. That pins the
+  cross-impl contract precisely.
+- **Source:** Slice B+C+D /qa Edge Case Hunter #10 (2026-05-06).
+
+---
+
+### ~~D6 — `packages/parity-tests/scenarios/graph/` not yet widened for the M2 surface~~ — RESOLVED 2026-05-06
+
+Six scenario files landed under
+`~/src/graphrefly-ts/packages/parity-tests/scenarios/graph/`: `sugar.test.ts`
+(R3.2.1 named-sugar — set/invalidate/complete/error/derived-propagation),
+`remove.test.ts` (R3.2.3 — node + mount remove), `edges.test.ts` (R3.3.1 —
+local + recursive + `_anon_<id>` for unnamed), `signal.test.ts` (R3.7.1 —
+INVALIDATE broadcast + recursion into mounts + tier-3 rejection),
+`describe-reactive.test.ts` (R3.6.1 — initial snapshot + add + remove
+events), `observe-all-reactive.test.ts` (R3.6.2 — unsubscribe-stops-events;
+late-node auto-subscribe skipped).
+
+The `Impl` interface widened with `Graph` + tier symbols (`INVALIDATE` /
+`PAUSE` / `RESUME` / `COMPLETE` / `ERROR` / `TEARDOWN`). 18 scenarios
+passing; 2 skipped tests (with comments) cover Rust-port-only enhancements
+not yet backported to TS legacy: `R3.7.3 ordering` (TS clears namespace
+before TEARDOWN — Rust port reordered in Slice F /qa P1) and
+`observe({ reactive: true })` auto-subscribe-late-nodes (Rust port adds
+this via namespace-change sinks — TS legacy snapshots at observe-time).
+When @graphrefly/native publishes and rustImpl activates, those skips
+become divergence assertions that fail loud.
+
+Closed 2026-05-06.
 
 ---
 
