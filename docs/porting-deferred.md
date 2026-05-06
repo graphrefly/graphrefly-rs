@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-05
+last_updated: 2026-05-05 (Slice E+ /qa)
 ---
 
 # Porting flags & deferred concerns
@@ -349,6 +349,280 @@ Verified by `handshake_tier_split_*` tests in
 `inv7_handshake_first_message_is_start_*` proptests still hold —
 they assert `Start` is the first message in the FIRST sink call, not
 that the entire handshake is one call. Closed 2026-05-05.
+
+## M2 Slice E+ /qa — closed audit fixes
+
+The /qa pass on Slice E+ landed five patches: A2 (`NameError::Destroyed`
+returned from `add` instead of `assert!` panic — symmetric with
+`MountError::Destroyed`), B1 (mount/mount_new TOCTOU — parent inner
+lock held across validation + insert), B2 (graph-layer meta filter
+in `signal_invalidate` per R3.7.2 + new `Core::meta_companions_of`
+accessor), B3 (`destroy()` reorder — namespace cleared AFTER teardown
+cascade per R3.7.3), B4 (`describe()` `meta` field added per
+canonical Appendix B JSON schema — always None in this slice; field
+reserved). Plus auto-applicables: A1 (`assert!(matches!(...))` on
+test variant checks), A3 (`#[must_use]` on `GraphObserveOne`), A4
+(`signal_invalidate` short-circuits on destroyed graph), A5
+(`status_of` doc-comment about reactive describe terminating
+substate), A6 (regression test for parent.destroy propagating to
+user-held child clones), B8 (`Graph::set_deps` rustdoc `# Hazards`
+block referencing D1).
+
+7 new regression tests added: `destroy_propagates_destroyed_flag_to_user_held_child_clone`,
+`destroy_preserves_namespace_during_teardown_cascade`,
+`signal_invalidate_skips_meta_companions`,
+`signal_invalidate_on_destroyed_graph_is_noop`,
+`describe_meta_field_omitted_when_none`,
+`describe_meta_field_round_trips_via_json`,
+`meta_companions_of_returns_registered_companions` (Core-side).
+`add_after_destroy_panics` rewritten to
+`add_after_destroy_returns_destroyed_error`.
+
+Test count post-/qa: 227 (was 220 pre-/qa, 174 pre-Slice-E+).
+`cargo clippy --all-targets -D warnings` clean. `cargo fmt --check`
+clean. `#![forbid(unsafe_code)]` preserved.
+
+## M2 Slice E+ — read-side introspection + composition divergences
+
+### `describe()` `value` field surfaces raw `HandleId`, not user-rendered `T`
+
+- **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs)
+  `NodeDescribe.value: Option<HandleId>`. Canonical TS surfaces `value: T`
+  directly — the binding-side registry resolves `HandleId → T` before
+  serialization.
+- **Why divergent:** Core operates on opaque `HandleId` integers per the
+  handle-protocol cleaving plane. Producing `T` would require a Core-side
+  binding callback, which conflicts with the cleaving-plane invariant.
+- **Lift point:** binding crates (`graphrefly-bindings-js`, `-py`) provide
+  a thin wrapper (e.g. `describe_with_values`) that walks the handle-id
+  output and substitutes the registered user value before serializing for
+  end-user JSON consumption.
+- **Source:** Slice E+ (2026-05-05); documented in `describe.rs` module
+  docs and §11 Implementation Deltas.
+
+### `observe_all()` snapshot-at-subscribe-time semantics
+
+- **What:** [crates/graphrefly-graph/src/observe.rs](../crates/graphrefly-graph/src/observe.rs)
+  `GraphObserveAll::subscribe` registers sinks against the namespace at
+  the moment of the call. Nodes named AFTER the subscribe call are NOT
+  auto-subscribed.
+- **Why deferred:** observing late-added nodes requires a Core-level
+  topology-change notification primitive (a stream of "node registered"
+  events). That primitive is the foundation for `describe({ reactive:
+  true })` / `observe({ reactive: true })` / `observe({ changeset:
+  true })`. Slice E+ defers all reactive-mode observation; the
+  consumer-side workaround is to re-call `observe_all()` at known
+  topology-change boundaries.
+- **Source:** Slice E+ (2026-05-05); deliberate scope cut per Q5 lock.
+
+### `signal_invalidate` does not snapshot the namespace under a single lock
+
+- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
+  `Graph::signal_invalidate` collects own-graph node ids + child Graphs
+  under one `inner.lock()`, then drops the lock and walks them.
+  Concurrent `add` / `mount_new` / `unmount` calls during the walk are
+  visible (new nodes added after the snapshot are NOT invalidated;
+  unmounted children may already be detached when the recursive call
+  hits them).
+- **Why divergent:** holding the namespace lock across the recursive
+  invalidation walk would serialize all graph mutations against
+  invalidate cascades — fine in practice (signal_invalidate is
+  typically setup/teardown-time, not on the hot path), but the
+  acquisition-order rule is "Graph → Core only", and the Core
+  invalidate cascade re-enters the Graph layer would deadlock against
+  a Graph-held lock. Snapshotting first preserves the rule.
+- **Source:** Slice E+ (2026-05-05).
+
+### Anonymous Core nodes surface as `_anon_<NodeId>` strings in describe deps
+
+- **What:** when a named node depends on a Core-registered node that
+  has no namespace entry (e.g. registered via `Graph::core().register_state(...)`
+  rather than `Graph::state(name, ...)`), `describe()` surfaces the
+  dep name as `_anon_<NodeId.raw()>`. The anonymous node itself is
+  NOT enumerated as a top-level node in the output.
+- **Why divergent:** describe() is the named-graph view; anonymous
+  Core-only nodes belong to the underlying dispatcher, not the
+  namespace. Surfacing them as first-class nodes would dilute the
+  namespace contract. Surfacing them only as edges keeps the output
+  lossless without elevating them.
+- **Lift point:** if a future user-facing demand surfaces, add an
+  optional `describe({ include_anon: true })` mode that synthesizes
+  `_anon_<id>` entries into `nodes`. v1 pattern: `Graph::add(id, "name")`
+  to bring an anonymous node into the namespace.
+- **Source:** Slice E+ (2026-05-05); per Q3 lock.
+
+### `try_resolve` does not support `..::sibling::node` cross-subgraph paths (R3.5.2)
+
+- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
+  `try_resolve` only supports root-relative descent. Canonical R3.5.2:
+  *"Cross-subgraph references use relative paths from the shared
+  parent."* The `..::sibling::node` form requires walking up via
+  `inner.parent.upgrade()` per `..` segment.
+- **Why deferred:** non-trivial path-parser change with edge cases
+  (multiple `..`, traversal past the root, `..` after a name segment).
+  Not blocking M2 — sibling resolution from inside a child graph is a
+  Phase 4+ pattern need (harnessLoop sibling wiring), not yet in
+  scope.
+- **Workaround:** resolve from the shared parent: pass the parent
+  `Graph` clone to fns that need cross-subgraph reach, or use
+  `Graph::node` from the parent.
+- **Source:** Slice E+ /qa Edge Case Hunter F3 (2026-05-05).
+
+### `try_resolve` returns `None` silently for malformed paths
+
+- **What:** Empty paths (`""`), leading separator (`"::foo"`),
+  trailing separator (`"foo::"`), and double-separator (`"a::::b"`)
+  all silently resolve to `None` rather than reporting a malformed
+  path. Caller cannot distinguish "absent" from "syntactically
+  invalid."
+- **Why deferred:** changing the return type to `Result<Option<NodeId>,
+  PathError>` is a public-API break for narrow benefit; in v1, all
+  paths are constructed by graph code (sugar constructors validate at
+  registration). Document the behavior explicitly.
+- **Source:** Slice E+ /qa Blind Hunter + Edge Case Hunter F9
+  (2026-05-05).
+
+### `audit_of` recursive node/mount counts are racy under concurrent mutation
+
+- **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
+  `audit_of` snapshots `inner.children.values()` then drops the lock
+  before recursing. Concurrent `state(...)` / `mount_new(...)` on a
+  child Graph during `unmount` produces inconsistent
+  `RemoveAudit { node_count, mount_count }`.
+- **Why deferred:** the unmount flow detaches the child from the
+  parent BEFORE auditing, so the only writers racing the audit are
+  threads that hold a `Graph` clone of the child. That is a narrow
+  scenario and `RemoveAudit` is best-effort diagnostic data anyway.
+  The proper fix (lock-ordering pass with multi-level locks across
+  parent + descendants) is overkill for the current usage.
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+
+### `Graph::set_deps` exposes the D1 (set_deps-from-firing-fn) hazard at a wider surface
+
+- **What:** Pre-Slice-E+, hitting D1 (Dynamic `tracked` corruption
+  from re-entrant `set_deps`) required reaching through `.core()`.
+  `Graph::set_deps` is now public sugar at the namespace layer,
+  widening the surface.
+- **Why deferred:** the structural fix (thread-local "currently
+  firing" stack rejecting `SetDepsError::ReentrantOnFiringNode`)
+  belongs with the broader D1 work, not bolted on at the Graph
+  layer. For now, `Graph::set_deps`'s rustdoc carries a `# Hazards`
+  block cross-referencing D1.
+- **Source:** Slice E+ /qa Edge Case Hunter F7 (2026-05-05).
+
+### `GraphObserveOne::up()` decomposed into `pause` / `resume` / `invalidate` methods (R3.6.2 divergence)
+
+- **What:** Canonical R3.6.2 specifies `up(messages: Messages)` as a
+  unified upstream-injection API. Rust's `GraphObserveOne` exposes
+  `pause(lock_id)` / `resume(lock_id)` / `invalidate()` as separate
+  methods to avoid allocating a `Vec<Message>` on every upstream
+  call.
+- **Why divergent:** Rust ergonomics + non-allocating signature.
+  Cross-binding wrappers may reassemble a unified `up(messages)` if
+  needed.
+- **Source:** Slice E+ /qa Edge Case Hunter F12 (2026-05-05).
+
+### `GraphObserveAll::subscribe` accumulates Subscriptions into one shared vec
+
+- **What:** Multiple `subscribe` calls on the same handle stash all
+  per-node `Subscription`s into a single `subs` vec. There's no way
+  to detach a single `subscribe` call's sinks independently — the
+  user must drop the handle (which detaches everyone).
+- **Why deferred:** v1 ergonomic decision. Per-call disposal would
+  return `Vec<Subscription>` and surface the per-node subscription
+  shape; current API hides that. Lifts when reactive observe
+  changeset variants land (which need per-call accounting).
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+
+### Unmount-vs-destroy not distinguishable on the reactive stream
+
+- **What:** Observers see `[Complete, Teardown]` whether the user
+  called `parent.unmount("p")` or `child.destroy()` directly. Only
+  the unmount caller sees `RemoveAudit`; subscribers can't tell why
+  their node terminated.
+- **Why deferred:** add-on observability concern. Tracker
+  retrospective patterns may need this distinction; lifts via either
+  a new `Message::Unmount` variant (protocol expansion — needs spec
+  amendment) or a "reason" field on `RemoveAudit` plumbed through
+  the wave.
+- **Source:** Slice E+ /qa Edge Case Hunter F6 (2026-05-05).
+
+### `_anon_<id>` deps could collide with a user-named node `_anon_<id>`
+
+- **What:** `describe()` surfaces unnamed Core deps as
+  `_anon_<NodeId.raw()>` strings in `nodes[].deps` and `edges`.
+  A user who names a node `_anon_5` AND has an anonymous Core
+  node with `NodeId::raw() == 5` produces an ambiguous output —
+  two distinct nodes share the same dep label.
+- **Why deferred:** low-probability collision (raw NodeIds are not
+  stable across builds). Format ambiguity is the issue, not
+  correctness. Fix lifts when the `_anon_<id>` convention is
+  replaced with a structured shape (e.g., a separate
+  `anonymous: HashMap<u64, NodeDescribe>` map alongside the named
+  `nodes` map).
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+
+### `ancestors()` cycle insurance
+
+- **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
+  `ancestors` walks Weak parent pointers without a visited-set
+  check. If a future regression lets `mount` accept a cycle (e.g.,
+  through internal `with_core` escape hatches), `ancestors` would
+  loop forever.
+- **Why deferred:** current API surface prevents cycles
+  (`mount.AlreadyMounted` rejects double-parent). `with_core` is
+  `pub(crate)` only. Belt-and-braces cycle guard is cheap; defer
+  until a cycle slips past mount validation.
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+
+### Port-coverage gaps in canonical §3 Graph surface
+
+These canonical-spec methods are NOT yet implemented in
+`graphrefly-graph` and are not blocking M2 close, but should be
+tracked for parity:
+
+- **`graph.signal(messages)` general broadcast (R3.7.1)** — Rust only
+  exposes `signal_invalidate`. PAUSE/RESUME variants per-graph would
+  need a per-graph LockId convention (or accept user-supplied lock
+  ids).
+- **Sugar wrappers `graph.set(name, h)`, `graph.get(name)`,
+  `graph.invalidate(name)`, `graph.complete(name)`,
+  `graph.error(name, err)` (R3.2.1)** — Rust exposes id-based
+  `emit/cache_of/invalidate/complete/error` only. Trivial wrappers
+  that resolve `name → NodeId` and forward.
+- **`graph.tagFactory(factory, factoryArgs)` (R3.1.2)** — provenance
+  annotation for `describe()` / snapshot replay.
+- **`graph.resourceProfile()` (R3.6.3)** — runtime profile
+  (subscriber counts, fan-in/out). Used by debugging utilities.
+- **`graph.setVersioning(level)` (R3.2.4)** — bulk versioning level
+  apply. Waits on §7 Node Versioning port.
+- **`graph.remove(name)` for individual nodes (R3.2.3)** — Rust has
+  `unmount(name)` for subgraphs only. Canonical `remove(name)`
+  works for both nodes AND mounted subgraphs and returns
+  `GraphRemoveAudit`. Rust would need a node-removal path that
+  fires TEARDOWN on the named node and clears its namespace entry.
+- **`graph.edges(opts?)` (R3.3.1)** — currently only available via
+  `describe().edges`. A direct accessor with `opts.recursive: true`
+  for mount-walking is convenient.
+- **Source:** Slice E+ /qa Edge Case Hunter port-coverage gap audit
+  (2026-05-05).
+
+### Cross-Core (multi-binding) mount rejected with `MountError::CoreMismatch`
+
+- **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
+  `mount(name, child)` rejects when `parent.core` and `child.core`
+  point to different dispatchers (verified via
+  `Core::same_dispatcher` / `Arc::ptr_eq`). The user can `mount_new`
+  a fresh subgraph sharing the parent's Core, or rebuild the child
+  against the parent's Core.
+- **Why deferred:** cross-Core mount requires the bindings layer
+  to negotiate value-handle translation across registries. Open
+  Question 1 in `archive/docs/SESSION-rust-port-architecture.md`
+  Part 6 ("Cross-language handle-space composition") — explicit
+  serialize bridge or process-boundary semantics. Post-M6 work.
+- **Source:** Slice E+ (2026-05-05); reference Open Question 1.
+
+---
 
 ## Spec divergences acknowledged in v1
 

@@ -127,7 +127,7 @@ impl Drop for HandshakeFireGuard {
 /// state is one-shot at this layer; release happens on resubscribable
 /// terminal-lifecycle reset, a separate slice).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DepTerminal {
+pub enum TerminalKind {
     Complete,
     Error(HandleId),
 }
@@ -412,12 +412,12 @@ pub(crate) struct NodeRecord {
     /// Terminal lifecycle state for THIS node's outgoing stream. Once set,
     /// further `emit` calls are silent no-ops, fn no longer fires, and only
     /// the terminal message has been queued downstream.
-    pub(crate) terminal: Option<DepTerminal>,
+    pub(crate) terminal: Option<TerminalKind>,
     /// Per-dep terminal slots aligned with `deps`. None = dep is live.
     /// Some = dep emitted COMPLETE/ERROR. When ALL entries are Some, the
     /// node auto-cascades its own terminal per Lock 2.B (ERROR dominates
     /// COMPLETE — first error wins; if no errors, COMPLETE).
-    pub(crate) dep_terminals: Vec<Option<DepTerminal>>,
+    pub(crate) dep_terminals: Vec<Option<TerminalKind>>,
     /// True after the first TEARDOWN has been processed for this node
     /// (R2.6.4 / Lock 6.F). Subsequent TEARDOWN deliveries are idempotent
     /// — the auto-prepended COMPLETE only fires on the first one. Without
@@ -593,6 +593,19 @@ impl Core {
             );
         });
         self.state.lock()
+    }
+
+    /// Whether `self` and `other` point to the same dispatcher state.
+    /// True when one was produced by `Clone`-ing the other (or they
+    /// were both cloned from a common ancestor); false for two
+    /// independently `Core::new`-constructed instances even with the
+    /// same binding.
+    ///
+    /// Used by `graphrefly-graph`'s `mount` to enforce the "shared-Core
+    /// only" v1 invariant — cross-Core mount is post-M6.
+    #[must_use]
+    pub fn same_dispatcher(&self, other: &Core) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     /// Configure the Core-global cap on pause replay buffer length. When set,
@@ -818,8 +831,8 @@ impl Core {
             }
             if let Some(t) = terminal {
                 tier_slices.push(vec![match t {
-                    DepTerminal::Complete => Message::Complete,
-                    DepTerminal::Error(h) => Message::Error(h),
+                    TerminalKind::Complete => Message::Complete,
+                    TerminalKind::Error(h) => Message::Error(h),
                 }]);
             }
             if torn_down {
@@ -900,11 +913,11 @@ impl Core {
         let handles_to_release: Vec<HandleId> = {
             let rec = s.require_node(node_id);
             let mut hs = Vec::new();
-            if let Some(DepTerminal::Error(h)) = rec.terminal {
+            if let Some(TerminalKind::Error(h)) = rec.terminal {
                 hs.push(h);
             }
             for slot in &rec.dep_terminals {
-                if let Some(DepTerminal::Error(h)) = slot {
+                if let Some(TerminalKind::Error(h)) = slot {
                     hs.push(*h);
                 }
             }
@@ -1092,6 +1105,91 @@ impl Core {
     }
 
     // -------------------------------------------------------------------
+    // Read-side inspection helpers (Slice E+, M2)
+    //
+    // Non-panicking accessors for graph-layer introspection (`describe()`,
+    // `observe()`, `node_count()`). All five return Option/empty for
+    // unknown ids — they're meant to back walks over `node_ids()` where
+    // the caller already knows the ids are valid, plus debugging /
+    // dry-run probes that prefer "absence" over "panic".
+    //
+    // Keep these strictly read-only: no wave entry, no binding callbacks,
+    // no lock release. Each takes the state lock once, copies a small
+    // value, and drops the lock.
+    // -------------------------------------------------------------------
+
+    /// Snapshot of every registered `NodeId` in unspecified order. The
+    /// order matches `HashMap` iteration over the internal node table —
+    /// callers that need stable ordering should track names at the
+    /// `Graph` layer (canonical spec §3.5 namespace).
+    #[must_use]
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.lock_state().nodes.keys().copied().collect()
+    }
+
+    /// Total number of nodes registered in this Core.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.lock_state().nodes.len()
+    }
+
+    /// Returns `Some(kind)` for known nodes, `None` for unknown.
+    #[must_use]
+    pub fn kind_of(&self, node_id: NodeId) -> Option<NodeKind> {
+        self.lock_state().nodes.get(&node_id).map(|r| r.kind)
+    }
+
+    /// Snapshot of the node's deps in declaration order. Empty for
+    /// unknown nodes or for state nodes (which have no deps).
+    #[must_use]
+    pub fn deps_of(&self, node_id: NodeId) -> Vec<NodeId> {
+        self.lock_state()
+            .nodes
+            .get(&node_id)
+            .map(|r| r.deps.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns `Some(kind)` if the node has terminated (R1.3.4) — the
+    /// pair `Some(Complete)` / `Some(Error(h))` mirrors the wire message
+    /// the node emitted. `None` for live nodes or unknown ids.
+    #[must_use]
+    pub fn is_terminal(&self, node_id: NodeId) -> Option<TerminalKind> {
+        self.lock_state()
+            .nodes
+            .get(&node_id)
+            .and_then(|r| r.terminal)
+    }
+
+    /// Whether the node has wave-scoped DIRTY pending (a tier-1 message
+    /// queued but the matching tier-3 settle has not yet flushed).
+    /// `false` for unknown ids. Mostly useful for `describe()` status
+    /// classification (R3.6.1 `"dirty"`).
+    #[must_use]
+    pub fn is_dirty(&self, node_id: NodeId) -> bool {
+        self.lock_state()
+            .nodes
+            .get(&node_id)
+            .is_some_and(|r| r.dirty)
+    }
+
+    /// Snapshot of `parent`'s meta companion list (R1.3.9.d / R2.3.3 —
+    /// the companions added via [`Self::add_meta_companion`]). Empty
+    /// for unknown ids or for nodes with no companions registered.
+    ///
+    /// Used by the graph layer's `signal_invalidate` to filter meta
+    /// children out of the broadcast (canonical R3.7.2 — meta caches
+    /// are preserved across graph-wide INVALIDATE).
+    #[must_use]
+    pub fn meta_companions_of(&self, parent: NodeId) -> Vec<NodeId> {
+        self.lock_state()
+            .nodes
+            .get(&parent)
+            .map(|r| r.meta_companions.clone())
+            .unwrap_or_default()
+    }
+
+    // -------------------------------------------------------------------
     // Wave engine — lives in `crate::batch` (Slice C-1 module split;
     // Slice A close M1 refactor lifted the binding-callback re-entrance
     // restrictions). The methods are still on `Core`; see `batch.rs` for:
@@ -1129,7 +1227,7 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn complete(&self, node_id: NodeId) {
-        self.emit_terminal(node_id, DepTerminal::Complete);
+        self.emit_terminal(node_id, TerminalKind::Complete);
     }
 
     /// Emit `[ERROR, error_handle]` (R1.3.4) on `node_id`. `error_handle`
@@ -1146,7 +1244,7 @@ impl Core {
             error_handle != NO_HANDLE,
             "NO_HANDLE is not a valid ERROR payload (R1.2.5)"
         );
-        self.emit_terminal(node_id, DepTerminal::Error(error_handle));
+        self.emit_terminal(node_id, TerminalKind::Error(error_handle));
         // The caller's intern share for `error_handle` is NOT transferred
         // to any slot — `terminate_node` takes its OWN retain for every
         // populated `terminal` and `dep_terminals` slot. Release the
@@ -1156,7 +1254,7 @@ impl Core {
         self.binding.release_handle(error_handle);
     }
 
-    fn emit_terminal(&self, node_id: NodeId, terminal: DepTerminal) {
+    fn emit_terminal(&self, node_id: NodeId, terminal: TerminalKind) {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -1177,15 +1275,15 @@ impl Core {
     /// Iterative implementation (Slice A-bigger, M1-close): a work-queue
     /// drives the cascade so deep linear chains don't overflow the OS
     /// thread stack. Mirrors `path_from_to`'s explicit-stack pattern.
-    fn terminate_node(&self, s: &mut CoreState, node_id: NodeId, terminal: DepTerminal) {
-        let mut work: Vec<(NodeId, DepTerminal)> = vec![(node_id, terminal)];
+    fn terminate_node(&self, s: &mut CoreState, node_id: NodeId, terminal: TerminalKind) {
+        let mut work: Vec<(NodeId, TerminalKind)> = vec![(node_id, terminal)];
         while let Some((id, t)) = work.pop() {
             if s.require_node(id).terminal.is_some() {
                 continue; // Idempotent — already terminal.
             }
             // Take a refcount share for the terminal slot so the error
             // handle outlives the binding-side intern's transient share.
-            if let DepTerminal::Error(h) = t {
+            if let TerminalKind::Error(h) = t {
                 self.binding.retain_handle(h);
             }
             s.require_node_mut(id).terminal = Some(t);
@@ -1194,8 +1292,8 @@ impl Core {
             s.pending_fires.remove(&id);
             // Queue the wire message (tier 5 — bypasses pause buffer).
             let msg = match t {
-                DepTerminal::Complete => Message::Complete,
-                DepTerminal::Error(h) => Message::Error(h),
+                TerminalKind::Complete => Message::Complete,
+                TerminalKind::Error(h) => Message::Error(h),
             };
             self.queue_notify(s, id, msg);
             // Cascade to children.
@@ -1217,7 +1315,7 @@ impl Core {
                     }
                     child.dep_terminals[idx] = Some(t);
                 }
-                if let DepTerminal::Error(h) = t {
+                if let TerminalKind::Error(h) = t {
                     self.binding.retain_handle(h);
                 }
                 // Auto-cascade gating: if all deps now terminal, push child
@@ -1242,13 +1340,13 @@ impl Core {
 
 /// Lock 2.B cascade-terminal selection: ERROR dominates COMPLETE; first
 /// ERROR seen wins. Caller has already verified all deps are terminal.
-fn pick_cascade_terminal(dep_terminals: &[Option<DepTerminal>]) -> DepTerminal {
+fn pick_cascade_terminal(dep_terminals: &[Option<TerminalKind>]) -> TerminalKind {
     for t in dep_terminals {
-        if let Some(DepTerminal::Error(h)) = t {
-            return DepTerminal::Error(*h);
+        if let Some(TerminalKind::Error(h)) = t {
+            return TerminalKind::Error(*h);
         }
     }
-    DepTerminal::Complete
+    TerminalKind::Complete
 }
 
 // -----------------------------------------------------------------------
@@ -1347,7 +1445,7 @@ impl Core {
                     // children's own terminal slots per Lock 2.B.
                     let already_terminal = s.require_node(id).terminal.is_some();
                     if !already_terminal {
-                        self.terminate_node(s, id, DepTerminal::Complete);
+                        self.terminate_node(s, id, TerminalKind::Complete);
                     }
                     // Wire emission of the TEARDOWN itself (tier 6).
                     self.queue_notify(s, id, Message::Teardown);
@@ -1774,7 +1872,7 @@ impl Core {
         // We need to preserve dep_handles AND dep_terminals for unchanged deps
         // and reset for added. Build new vecs aligned to new_deps_vec.
         //
-        // Refcount discipline (F1 audit fix): each `Some(DepTerminal::Error(h))`
+        // Refcount discipline (F1 audit fix): each `Some(TerminalKind::Error(h))`
         // slot owns a refcount share retained at `terminate_node` time. When a
         // dep is REMOVED, its slot is dropped — the corresponding handle's
         // share must be released here, otherwise it leaks until Core drop.
@@ -1782,7 +1880,7 @@ impl Core {
         // them after the lock is no longer needed for inspection.
         let (new_dep_handles, new_dep_terminals, removed_terminal_handles): (
             Vec<HandleId>,
-            Vec<Option<DepTerminal>>,
+            Vec<Option<TerminalKind>>,
             Vec<HandleId>,
         ) = {
             let rec = s.require_node(n);
@@ -1792,7 +1890,7 @@ impl Core {
                 .copied()
                 .zip(rec.dep_handles.iter().copied())
                 .collect();
-            let old_terminal_pairs: HashMap<NodeId, Option<DepTerminal>> = rec
+            let old_terminal_pairs: HashMap<NodeId, Option<TerminalKind>> = rec
                 .deps
                 .iter()
                 .copied()
@@ -1810,7 +1908,7 @@ impl Core {
             // dep is in `removed` and the slot held an Error).
             let mut to_release: Vec<HandleId> = Vec::new();
             for d in &removed {
-                if let Some(Some(DepTerminal::Error(h))) = old_terminal_pairs.get(d) {
+                if let Some(Some(TerminalKind::Error(h))) = old_terminal_pairs.get(d) {
                     to_release.push(*h);
                 }
             }
@@ -2015,11 +2113,11 @@ impl Drop for CoreState {
             if rec.cache != NO_HANDLE {
                 self.binding.release_handle(rec.cache);
             }
-            if let Some(DepTerminal::Error(h)) = rec.terminal {
+            if let Some(TerminalKind::Error(h)) = rec.terminal {
                 self.binding.release_handle(h);
             }
             for slot in &rec.dep_terminals {
-                if let Some(DepTerminal::Error(h)) = *slot {
+                if let Some(TerminalKind::Error(h)) = *slot {
                     self.binding.release_handle(h);
                 }
             }

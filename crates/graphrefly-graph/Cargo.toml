@@ -12,11 +12,17 @@ authors.workspace      = true
 [dependencies]
 graphrefly-core       = { workspace = true }
 
+# Namespace + lifecycle bookkeeping
+indexmap              = { workspace = true, features = ["serde"] }
+parking_lot           = { workspace = true }
+
 # Serialization stack
 serde                 = { workspace = true, features = ["derive"] }
+# serde_json is non-optional now — describe()'s `meta` field uses
+# serde_json::Value for free-form JSON metadata (canonical Appendix B).
+serde_json            = { workspace = true }
 serde_ipld_dagcbor    = { workspace = true, optional = true }
 ciborium              = { workspace = true, optional = true }
-serde_json            = { workspace = true, optional = true }
 
 # Content addressing — V1–V3 CIDs (roadmap Phase 6.1–6.3)
 cid                   = { workspace = true, optional = true }
@@ -32,10 +38,9 @@ thiserror             = { workspace = true }
 tracing               = { workspace = true }
 
 [features]
-default            = ["dag-cbor", "json", "content-addressing"]
+default            = ["dag-cbor", "content-addressing"]
 dag-cbor           = ["dep:serde_ipld_dagcbor"]
 cbor               = ["dep:ciborium"]
-json               = ["dep:serde_json"]
 content-addressing = ["dep:cid", "dep:multihash", "dep:multibase", "dep:blake3"]
 sha2-interop       = ["dep:sha2"]
 zstd-codec         = ["dep:zstd", "dag-cbor"]

@@ -59,4 +59,5 @@ pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 pub use message::{Message, Messages};
 pub use node::{
     Core, EqualsMode, NodeKind, PauseError, ResumeReport, SetDepsError, Sink, Subscription,
+    TerminalKind,
 };
