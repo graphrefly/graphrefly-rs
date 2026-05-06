@@ -377,16 +377,19 @@ fn rewire_releases_error_handles_in_removed_dep_slots() {
     let _rec = rt.subscribe_recorder(consumer);
 
     // Trigger ERROR on p. p has only one child (consumer); consumer has one
-    // other live dep (q), so consumer does NOT auto-cascade. The retains:
-    //   intern(err)            → refcount = 1
-    //   p.terminal Error(err)  → refcount = 2 (terminate_node retain)
-    //   consumer.dep_terminals[idx_p] = Error(err) → refcount = 3 (cascade retain)
+    // other live dep (q), so consumer does NOT auto-cascade. The retains
+    // (after Slice A-bigger /qa item D fix to `Core::error`):
+    //   p.terminal Error(err)              → refcount = 1 (terminate_node retain)
+    //   consumer.dep_terminals[idx_p] Error(err) → refcount = 2 (cascade retain)
+    // (The intern share is released by `Core::error` itself, since
+    // `terminate_node` takes its own slot retain.)
     let err = rt.binding.intern(TestValue::Str("p-err".into()));
     rt.core.error(p.id, err);
     let count_after_error = rt.binding.refcount_of(err);
     assert_eq!(
-        count_after_error, 3,
-        "err refcount = intern(1) + p.terminal(1) + consumer.dep_terminals(1)"
+        count_after_error, 2,
+        "err refcount = p.terminal(1) + consumer.dep_terminals(1) \
+         (intern share released by Core::error)"
     );
 
     // Rewire consumer to drop p. F1 fix releases the consumer.dep_terminals
@@ -394,9 +397,9 @@ fn rewire_releases_error_handles_in_removed_dep_slots() {
     rt.core.set_deps(consumer, &[q.id]).expect("rewire ok");
     let count_after_rewire = rt.binding.refcount_of(err);
     assert_eq!(
-        count_after_rewire, 2,
+        count_after_rewire, 1,
         "set_deps must release the per-slot Error retain when removing the dep \
-         (refcount 3 → 2: intern(1) + p.terminal(1) preserved)"
+         (refcount 2 → 1: p.terminal(1) preserved)"
     );
 }
 

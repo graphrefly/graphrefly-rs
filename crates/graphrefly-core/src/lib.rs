@@ -44,11 +44,14 @@
     clippy::doc_markdown,
 )]
 
+mod batch;
 pub mod boundary;
 pub mod clock;
 pub mod handle;
 pub mod message;
 pub mod node;
+
+pub use batch::BatchGuard;
 
 pub use boundary::{BindingBoundary, FnResult};
 pub use clock::{monotonic_ns, wall_clock_ns};

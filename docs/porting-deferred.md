@@ -97,75 +97,69 @@ until a bench reproducer makes them pay for themselves.
   already bounded by the wave's pending set. Bench-driven re-look.
 - **Source:** Slice A+B audit (2026-05-05).
 
-### `pick_next_fire` is O(n²) over pending set
+### `pick_next_fire` transitive upstream walk is O(N·V) per pick
 
-- **What:** [node.rs:409-419](../crates/graphrefly-core/src/node.rs) — for each
-  candidate node in `pending_fires`, scans all its deps to check
-  `pending_fires.contains`. At pending-size N with average dep-count D,
-  this is O(N·D) per pick.
-- **Why deferred:** current implementation is correct under the wave-drain
-  invariant (every wave eventually picks a topologically-ready node). Likely
-  to dominate at high fanout (>100 simultaneously-firing nodes). Replace with
-  a per-node `unresolved_dep_count` counter when bench shows the cost.
-- **Source:** Slice A+B audit (2026-05-05).
+- **What:** [batch.rs](../crates/graphrefly-core/src/batch.rs) `pick_next_fire`
+  + `transitive_upstream_settled` — for each candidate in `pending_fires`,
+  BFS-walks transitive ancestors via `deps` to verify none is currently
+  pending. With pending-size N and graph size V, worst-case O(N·V) per
+  pick (vs the prior immediate-only check's O(N·D) where D is direct deps).
+- **Why deferred:** the immediate-only check (Slice A+B) was incorrect for
+  graphs deeper than 1 hop: a downstream join-node could fire prematurely
+  on stale upstream when a sibling branch fired first. Slice C-1.5
+  switched to the transitive walk to fix the diamond glitch the strict
+  tests surfaced. Performance is an acceptable trade vs correctness.
+  Replace with a per-node `unresolved_dep_count` counter (decrement when an
+  upstream settles, fire when count hits zero) when bench shows the cost
+  — that's O(1) per pick.
+- **Source:** Slice C-1.5 (2026-05-05). Original O(n²) flag was Slice A+B.
 
 ---
 
 ## v1 dispatcher limitations (intentional, with planned lift points)
 
-### Re-entrance forbidden during sink fire and `invoke_fn` call
+### Fn re-entrance via `BindingBoundary::invoke_fn` and `custom_equals` still forbidden
 
-- **What:** `parking_lot::Mutex<CoreState>` is held while sinks fire (in
-  `flush_notifications`) and while `BindingBoundary::invoke_fn` runs. A sink
-  or fn that calls back into `Core::emit` / `pause` / `resume` / `invalidate`
-  deadlocks.
-- **Why deferred:** lifting this requires either (a) a `parking_lot::ReentrantMutex`
-  + interior `RefCell`-style cells, or (b) a "snapshot pending notifications,
-  drop the lock, fire" rewrite. Both are M1-close hardening territory. Bindings
-  side can structure usage to never re-enter (queue follow-up work onto a
-  separate channel).
-- **Source:** [node.rs](../crates/graphrefly-core/src/node.rs) module doc; QA pass 2026-05-05.
+- **What:** `flush_notifications` now drops the state lock before firing
+  sinks (Slice A-bigger), so wave-end sinks can re-enter Core safely.
+  But the lock is **still held across two binding callbacks**:
+  - `BindingBoundary::invoke_fn` in `fire_fn` — fn callbacks that
+    re-enter Core deadlock.
+  - `BindingBoundary::custom_equals` in `commit_emission` →
+    `handles_equal` — custom-equals callbacks that re-enter Core
+    deadlock.
+- **Why deferred:** lifting both requires `run_wave` / `drain_and_flush`
+  / `fire_fn` / `commit_emission` to take ownership of the `MutexGuard`
+  (so per-iteration drop-around-binding-call becomes possible) and
+  refactoring all 5 `run_wave` callers + `activate_derived` +
+  `BatchGuard::drop`. Estimated 400–500 LOC of churn — scoped out of
+  Slice A-bigger /qa (2026-05-05) to keep the touch surface manageable;
+  tracked here for a follow-up slice. Sink re-entrance — the more
+  common pattern — is fully supported.
+- **Source:** Slice A-bigger (2026-05-05); scope confirmed in Slice
+  A-bigger /qa (2026-05-05) when item E option 2 was scoped out.
 
-### Inconsistent sink-fire lock discipline: `flush_notifications` vs `resume`
+### Subscribe-time handshake fires lock-held; re-entrance from handshake panics
 
-- **What:** `flush_notifications` (the wave-end sink dispatch path) fires
-  sinks while the `parking_lot::Mutex<CoreState>` is held. `Core::resume`
-  drops the lock before firing replay sinks. A sink that works under one
-  discipline may deadlock under the other.
-- **Why deferred:** v1 single-mutex is the bigger limitation; the asymmetry
-  is acceptable given that `resume` is an out-of-wave dispatch (no further
-  Core mutation expected). Pick one discipline at M1-close (likely the
-  drop-then-fire pattern from `resume`, applied to all sink paths).
-- **Source:** Edge Case Hunter QA finding, 2026-05-05; comparison of
-  `flush_notifications` vs `Core::resume` Phase 2.
-
-### `subscribe` drop-then-reacquire race against concurrent emit
-
-- **What:** [`Core::subscribe`](../crates/graphrefly-core/src/node.rs) computes
-  the START handshake under the lock, drops the lock to fire the handshake
-  sink (so the user callback doesn't run with the Core lock held), then
-  re-acquires to register the sink in the subscribers map. A second thread
-  that calls `Core::emit` between drop and re-acquire sees an empty
-  subscriber set for the new sub and can produce messages the new sub never
-  receives.
-- **Why deferred:** v1 single-mutex assumes external serialization for
-  concurrent `subscribe` + `emit` patterns. Production fix lands when
-  re-entrance discipline is reworked (see above) — likely by registering
-  the sink first, then snapshotting cache/terminal state under the lock,
-  then firing the handshake.
-- **Source:** Edge Case Hunter QA finding, 2026-05-05.
-
-### Activation walk uses recursion (no internal-subscription marker)
-
-- **What:** [`Core::activate_derived`](../crates/graphrefly-core/src/node.rs)
-  recurses to walk the dep tree and populate dep_handles. Deep chains
-  (~thousands of nodes) could overflow the call stack.
-- **Why deferred:** real-world graphs rarely chain that deep; the TS prototype
-  uses a `NOOP_SINK` marker to keep deps activated which we don't replicate
-  yet (deactivation cleanup is "out of scope for v1" per the inline comment).
-  Convert to iterative walk + internal-subscription tracking when M2 graph
-  semantics make node activation/deactivation a real concern.
-- **Source:** [node.rs:284-320](../crates/graphrefly-core/src/node.rs).
+- **What:** `Core::subscribe` registers the new sink under the state
+  lock and fires the handshake `[Start, Data(cache)?, ...]` to that sink
+  while still holding the lock. A handshake-time sink callback that
+  calls back into Core hits the **`IN_HANDSHAKE_FIRE` thread-local
+  diagnostic** (Slice A-bigger /qa item A) and panics with a clear
+  message instead of silently deadlocking. Verified by
+  `handshake_sink_reentry_panics_with_diagnostic_not_deadlocks` in
+  `tests/lock_discipline.rs`.
+- **Why divergent:** the lock-held handshake is the trade-off for the
+  subscribe-vs-emit race fix (Slice A-bigger). Atomic register-and-fire
+  keeps Start strictly before any concurrent wave's tier-1+ messages.
+  The alternative (register-then-drop-then-fire) re-introduces the
+  ordering hazard: a concurrent flush could deliver wave messages to
+  the new sink before our handshake fires. Lifts together with the
+  pending `MutexGuard`-ownership refactor — that work also lets the
+  handshake split into separate tier-grouped sink calls (closing the
+  R1.3.5.a divergence).
+- **Source:** Slice A-bigger (2026-05-05); diagnostic added in Slice
+  A-bigger /qa (2026-05-05).
 
 ### Deactivation cleanup not yet modeled
 
@@ -177,20 +171,13 @@ until a bench reproducer makes them pay for themselves.
   subgraph mount/unmount that makes deactivation observable.
 - **Source:** [node.rs](../crates/graphrefly-core/src/node.rs) inline comment.
 
-### Cascade recursion can stack-overflow on deep chains
+### ~~Cascade recursion can stack-overflow on deep chains~~ — RESOLVED in Slice A-bigger
 
-- **What:** [`Core::terminate_node`](../crates/graphrefly-core/src/node.rs),
-  [`Core::teardown_inner`](../crates/graphrefly-core/src/node.rs), and
-  [`Core::invalidate_inner`](../crates/graphrefly-core/src/node.rs) recurse
-  for every cascade hop. A linear chain of ~10k+ nodes auto-cascading
-  COMPLETE/ERROR/TEARDOWN/INVALIDATE will recurse that deep on the OS thread
-  stack. The wave-drain guard caps `pending_fires` iterations at 10k, but
-  the cascade paths don't go through that drain.
-- **Why deferred:** real graphs rarely chain that deep. Convert to iterative
-  walk (BFS/DFS via explicit Vec stack) when bench / proptest exercises
-  deep chains. `path_from_to` (used for cycle detection) is already
-  iterative — pattern is established.
-- **Source:** Blind Hunter QA finding, 2026-05-05.
+`Core::terminate_node`, `Core::teardown_inner`, `Core::invalidate_inner`,
+and `Core::activate_derived` now use `Vec`-based work queues instead of
+recursing into the OS thread stack. Linear chains of 5000 nodes cascade
+without overflow (verified by `tests/cascade_depth.rs`). Closed
+2026-05-05.
 
 ### Wave-drain `pick_next_fire` cycle fallback can busy-loop
 
@@ -220,6 +207,25 @@ until a bench reproducer makes them pay for themselves.
 - **Source:** Edge Case Hunter QA finding, 2026-05-05.
 
 ---
+
+### Subscribe handshake delivered as single sink call (R1.3.5.a divergence)
+
+- **What:** `Core::subscribe` synthesizes the START handshake (`[Start]`,
+  optionally `[Start, Data(v)]` for cached state) under the state lock and
+  fires it via a single `sink(&handshake)` call. TS's R1.3.5.a routes
+  `Start` through the same `downWithBatch` path as other messages, so a
+  cached source's handshake splits into two sink calls (tier 0 `[Start]`,
+  then tier 3 `[Data(v)]`).
+- **Why divergent:** v1 simplification — subscribe is out-of-wave, so the
+  handshake doesn't need batch deferral. The single-call shape is observed
+  by `inv7_handshake_first_message_is_start_*` (Slice C-2 proptest).
+- **Why still here after Slice A-bigger:** the per-tier split would land
+  naturally when fn re-entrance lifts (the same `MutexGuard`-ownership
+  refactor lets the handshake route through `pending_notify` + the
+  two-pass tier-then-node flush). Held back from Slice A-bigger because
+  that refactor was scoped out alongside fn re-entrance.
+- **Source:** Slice C-2 (2026-05-05); test expectation aligned to the
+  current Rust shape pending the lock-discipline rework.
 
 ## Spec divergences acknowledged in v1
 

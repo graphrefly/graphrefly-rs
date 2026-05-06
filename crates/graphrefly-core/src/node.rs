@@ -25,38 +25,88 @@
 //!   resubscribable terminal node resets lifecycle, except after TEARDOWN
 //!   (per F3 audit guard: TEARDOWN is permanent).
 //!
+//! # Module split (Slice C-1, 2026-05-05)
+//!
+//! Wave-engine internals (drain loop, fire selection, emission commit, sink
+//! dispatch) live in [`crate::batch`]. The split is purely organizational —
+//! the methods are still on `Core`. See `batch.rs` for the wave-engine
+//! entry points (`run_wave`, `drain_and_flush`, `commit_emission`,
+//! `queue_notify`, `deliver_data_to_consumer`).
+//!
 //! # Out of scope (later slices / milestones)
 //!
 //! - Deactivation cleanup (RAM nodes clear cache when sink count → 0) — M2.
-//! - Property-test fixtures via `proptest` — Slice C.
-//! - `batch.rs` extraction (wave coalescing into its own module) — Slice C.
-//! - ReentrantMutex / lock-released sink fire — M1-close hardening.
 //!
 //! See [`migration-status.md`](../../../docs/migration-status.md) for the
 //! milestone tracker and [`porting-deferred.md`](../../../docs/porting-deferred.md)
 //! for surfaced concerns deferred to evidence-driven slices.
 //!
-//! # Re-entrance discipline
+//! # Re-entrance discipline (Slice A-bigger landed)
 //!
-//! The dispatcher uses `parking_lot::Mutex<CoreState>`. Sinks fire while the
-//! lock is held — so a sink that calls back into `Core::emit` would deadlock.
-//! v1 bench tests do not re-enter from sinks. Production hardening will move
-//! to `ReentrantMutex` with internal `RefCell`-style cells, OR collect
-//! notifications inside the lock and fire outside; that's a follow-up.
+//! - **Wave-end sink fires** drop the state lock first. A subscriber's sink
+//!   that calls back into `Core::emit` / `pause` / `resume` / `invalidate` /
+//!   `complete` / `error` / `teardown` re-acquires the lock cleanly and runs
+//!   a nested wave (`s.in_tick` is cleared before the deferred-fire phase).
+//! - **`BindingBoundary::invoke_fn`** fires lock-released (Slice A-bigger).
+//! - **`BindingBoundary::custom_equals`** fires lock-released (Slice A-bigger).
+//! - **Subscribe-time handshake** is the one remaining lock-held callback.
+//!   Trade-off for the subscribe-vs-emit race fix: the new sink is registered
+//!   under the lock and the handshake fires under the lock, so concurrent
+//!   emits on other threads observe the new sink in normal happens-after
+//!   order. A handshake-time sink callback that re-enters Core hits a
+//!   debug-mode diagnostic via [`reentrance_guard`]'s thread-local flag.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use indexmap::IndexMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::boundary::{BindingBoundary, FnResult};
+use crate::boundary::BindingBoundary;
 use crate::clock::monotonic_ns;
 use crate::handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 use crate::message::Message;
+
+thread_local! {
+    /// Set to `true` while a [`Core::subscribe`] handshake sink callback is
+    /// running on this thread. The state lock is held during the handshake
+    /// fire (trade-off for the subscribe-vs-emit race fix), so any Core
+    /// method called by the handshake sink would deadlock.
+    ///
+    /// [`Core::lock_state`] checks this flag before acquiring the state
+    /// lock and panics with a clear diagnostic instead of letting the
+    /// program hang. Lifts together with the lock-released-handshake
+    /// rework planned alongside the `MutexGuard`-ownership refactor.
+    static IN_HANDSHAKE_FIRE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Handle returned by [`HandshakeFireGuard::enter`] that clears the
+/// thread-local handshake-fire flag on drop. Using RAII ensures the flag
+/// is cleared even if the sink callback panics.
+struct HandshakeFireGuard;
+
+impl HandshakeFireGuard {
+    fn enter() -> Self {
+        IN_HANDSHAKE_FIRE.with(|f| {
+            debug_assert!(
+                !f.get(),
+                "nested handshake-fire entry — subscribe is not re-entrant"
+            );
+            f.set(true);
+        });
+        Self
+    }
+}
+
+impl Drop for HandshakeFireGuard {
+    fn drop(&mut self) {
+        IN_HANDSHAKE_FIRE.with(|f| f.set(false));
+    }
+}
 
 /// Terminal-lifecycle state — once set on a node, the node will not emit
 /// further DATA; per-dep slots on consumers also use this to track which
@@ -68,7 +118,7 @@ use crate::message::Message;
 /// state is one-shot at this layer; release happens on resubscribable
 /// terminal-lifecycle reset, a separate slice).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum DepTerminal {
+pub(crate) enum DepTerminal {
     Complete,
     Error(HandleId),
 }
@@ -194,7 +244,7 @@ pub type Sink = Arc<dyn Fn(&[Message]) + Send + Sync>;
 ///   the Core-global `pause_buffer_cap`; it is reported on resume so callers
 ///   can detect overflow without re-tracking it externally.
 #[derive(Debug)]
-enum PauseState {
+pub(crate) enum PauseState {
     Active,
     Paused {
         /// Active lock holders. `SmallVec` keeps the common 1–2 lock case
@@ -218,7 +268,7 @@ enum PauseState {
 }
 
 impl PauseState {
-    fn is_paused(&self) -> bool {
+    pub(crate) fn is_paused(&self) -> bool {
         matches!(self, Self::Paused { .. })
     }
 
@@ -292,7 +342,7 @@ impl PauseState {
     /// caller's responsibility — see [`Core::queue_notify`] for the
     /// retain/release discipline. The buffer itself is just a message
     /// container; refcounts cross the binding boundary.
-    fn push_buffered(&mut self, msg: Message, cap: Option<usize>) -> Vec<Message> {
+    pub(crate) fn push_buffered(&mut self, msg: Message, cap: Option<usize>) -> Vec<Message> {
         let mut overflow_dropped: Vec<Message> = Vec::new();
         if let Self::Paused {
             buffer, dropped, ..
@@ -327,45 +377,45 @@ pub enum PauseError {
 /// and complicate the wave-cleanup phase that resets only the wave-scoped
 /// pair (`dirty`, `involved_this_wave`).
 #[allow(clippy::struct_excessive_bools)]
-struct NodeRecord {
-    deps: Vec<NodeId>,
-    kind: NodeKind,
-    fn_id: Option<FnId>,
-    equals: EqualsMode,
+pub(crate) struct NodeRecord {
+    pub(crate) deps: Vec<NodeId>,
+    pub(crate) kind: NodeKind,
+    pub(crate) fn_id: Option<FnId>,
+    pub(crate) equals: EqualsMode,
 
     // Mutable state
-    cache: HandleId,
+    pub(crate) cache: HandleId,
     /// Per-dep handle of last DATA seen. Same length as `deps`.
-    dep_handles: Vec<HandleId>,
-    has_fired_once: bool,
-    subscribers: HashMap<SubscriptionId, Sink>,
+    pub(crate) dep_handles: Vec<HandleId>,
+    pub(crate) has_fired_once: bool,
+    pub(crate) subscribers: HashMap<SubscriptionId, Sink>,
     /// For dynamic nodes: which dep indices fn actually tracks.
     /// For static derived: all indices, populated at construction.
-    tracked: HashSet<usize>,
+    pub(crate) tracked: HashSet<usize>,
 
     // Wave-scoped state — cleared at wave end.
-    dirty: bool,
-    involved_this_wave: bool,
+    pub(crate) dirty: bool,
+    pub(crate) involved_this_wave: bool,
 
     /// Per-node pause state. Default `Active`. See [`PauseState`].
-    pause_state: PauseState,
+    pub(crate) pause_state: PauseState,
 
     /// Terminal lifecycle state for THIS node's outgoing stream. Once set,
     /// further `emit` calls are silent no-ops, fn no longer fires, and only
     /// the terminal message has been queued downstream.
-    terminal: Option<DepTerminal>,
+    pub(crate) terminal: Option<DepTerminal>,
     /// Per-dep terminal slots aligned with `deps`. None = dep is live.
     /// Some = dep emitted COMPLETE/ERROR. When ALL entries are Some, the
     /// node auto-cascades its own terminal per Lock 2.B (ERROR dominates
     /// COMPLETE — first error wins; if no errors, COMPLETE).
-    dep_terminals: Vec<Option<DepTerminal>>,
+    pub(crate) dep_terminals: Vec<Option<DepTerminal>>,
     /// True after the first TEARDOWN has been processed for this node
     /// (R2.6.4 / Lock 6.F). Subsequent TEARDOWN deliveries are idempotent
     /// — the auto-prepended COMPLETE only fires on the first one. Without
     /// this flag, a redundant TEARDOWN delivered via the cascade plus an
     /// explicit `core.teardown(node)` would re-emit `[COMPLETE, TEARDOWN]`
     /// to subscribers per delivery, which is incorrect.
-    has_received_teardown: bool,
+    pub(crate) has_received_teardown: bool,
     /// Per R2.2.7 / R2.5.3 — resubscribable terminal lifecycle.
     /// When `true` AND `terminal == Some(...)`, a fresh subscribe call
     /// will reset the node: clear `terminal`, `has_fired_once`,
@@ -374,42 +424,71 @@ struct NodeRecord {
     /// subscriber then receives a vanilla `[START]` (or `[START, DATA(cache)]`
     /// for state nodes whose cache survived the reset) handshake.
     /// Default `false`.
-    resubscribable: bool,
+    pub(crate) resubscribable: bool,
     /// Meta companion nodes attached to this node per R1.3.9.d. When this
     /// node tears down, its meta companions are torn down FIRST (before
     /// the main node's auto-COMPLETE + TEARDOWN wire emission), so
     /// observers see companions terminate before the parent. The ordering
     /// is load-bearing — meta nodes typically subscribe to parent state
     /// that becomes inconsistent during the parent's destruction phase.
-    meta_companions: Vec<NodeId>,
+    pub(crate) meta_companions: Vec<NodeId>,
 }
 
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
 ///
 /// v1 single-mutex; per-subgraph `ReentrantMutex` parallelism is a later
 /// optimization (CLAUDE.md Rust invariant 3).
-struct CoreState {
-    next_node_id: u64,
-    next_subscription_id: u64,
-    next_lock_id: u64,
-    nodes: HashMap<NodeId, NodeRecord>,
+pub(crate) struct CoreState {
+    pub(crate) next_node_id: u64,
+    pub(crate) next_subscription_id: u64,
+    pub(crate) next_lock_id: u64,
+    pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     /// Inverted adjacency: `parent → children`. Updated on registration.
-    children: HashMap<NodeId, HashSet<NodeId>>,
+    pub(crate) children: HashMap<NodeId, HashSet<NodeId>>,
     /// Nodes whose fn we owe a fire to — drained by [`Core::run_wave`].
-    pending_fires: HashSet<NodeId>,
+    pub(crate) pending_fires: HashSet<NodeId>,
     /// Per-node outgoing message buffer; flushed at wave end. Insertion-
     /// ordered so flush order is deterministic — load-bearing for
     /// R1.3.9.d meta-TEARDOWN ordering: when a parent and its meta
     /// companion both have queued messages in the same wave, the meta
     /// (queued first via `teardown_inner`'s recursion order) flushes
     /// first.
-    pending_notify: IndexMap<NodeId, Vec<Message>>,
-    in_tick: bool,
+    pub(crate) pending_notify: IndexMap<NodeId, Vec<Message>>,
+    pub(crate) in_tick: bool,
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
     /// breakage. Default `None`.
-    pause_buffer_cap: Option<usize>,
+    pub(crate) pause_buffer_cap: Option<usize>,
+    /// Deferred sink-fire jobs collected by `flush_notifications`. The wave
+    /// engine populates this under the state lock during the flush phase;
+    /// `run_wave` then drops the lock and fires the jobs. Each tuple is
+    /// `(sinks_for_one_node_one_phase, phase_messages)`. Empty between waves.
+    pub(crate) deferred_flush_jobs: crate::batch::DeferredJobs,
+    /// Payload-handle releases owed for messages that landed in
+    /// `pending_notify` during this wave (one per `payload_handle()`).
+    /// `run_wave` releases these after sinks fire and the lock is dropped,
+    /// balancing the retain done in `queue_notify`.
+    pub(crate) deferred_handle_releases: Vec<HandleId>,
+    /// Binding-boundary handle for `Drop`-time refcount balancing.
+    /// `Core` also holds a clone of this Arc; storing it here lets
+    /// `Drop for CoreState` walk every retained slot and release the
+    /// binding-side share when the last `Core` clone drops. Without this,
+    /// `cache` / `terminal` / `dep_terminals` Error / pause-buffer payload
+    /// handle refs leak in the binding registry until process exit.
+    pub(crate) binding: Arc<dyn BindingBoundary>,
+    /// Pre-wave cache snapshots used to restore state if the wave aborts
+    /// mid-flight (e.g., a `Core::batch` closure panics). Each entry is
+    /// `(node_id → old_cache_handle)` — the handle the node held BEFORE
+    /// the wave started writing to it. The snapshotted handle holds a
+    /// retain (taken when the snapshot was inserted) so it stays alive
+    /// for restoration. On wave success, snapshots are dropped and their
+    /// retains released. On wave abort (`BatchGuard::drop` panic-discard
+    /// path), each cache slot is restored from the snapshot — the slot's
+    /// current handle is released, and the snapshot's retain transfers
+    /// to the cache slot. Only populated for in-flight waves; empty
+    /// between waves.
+    pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
 }
 
 /// The handle-protocol Core dispatcher.
@@ -419,8 +498,8 @@ struct CoreState {
 /// value to threads.
 #[derive(Clone)]
 pub struct Core {
-    state: Arc<Mutex<CoreState>>,
-    binding: Arc<dyn BindingBoundary>,
+    pub(crate) state: Arc<Mutex<CoreState>>,
+    pub(crate) binding: Arc<dyn BindingBoundary>,
 }
 
 impl Core {
@@ -439,9 +518,37 @@ impl Core {
                 pending_notify: IndexMap::new(),
                 in_tick: false,
                 pause_buffer_cap: None,
+                deferred_flush_jobs: Vec::new(),
+                deferred_handle_releases: Vec::new(),
+                binding: binding.clone(),
+                wave_cache_snapshots: HashMap::new(),
             })),
             binding,
         }
+    }
+
+    /// Acquire the state lock, with a re-entrance check that panics with a
+    /// clear diagnostic if called from inside a [`Core::subscribe`]
+    /// handshake sink callback.
+    ///
+    /// All public Core methods route their lock acquisition through here
+    /// so that handshake-time re-entrance produces a panic rather than a
+    /// silent deadlock against the held lock. Subscribers' wave-end sinks
+    /// (post drop-then-fire) are NOT subject to this restriction — the
+    /// flag is set ONLY while the handshake fires under the lock; the
+    /// drop-then-fire path clears the lock first.
+    pub(crate) fn lock_state(&self) -> MutexGuard<'_, CoreState> {
+        IN_HANDSHAKE_FIRE.with(|f| {
+            assert!(
+                !f.get(),
+                "Core method called from inside a subscribe handshake sink \
+                 callback — this would deadlock the state lock. Handshake \
+                 sinks must consume the [Start, Data?, ...] payload \
+                 synchronously without re-entering Core. v1 limitation; \
+                 lifts with the planned MutexGuard-ownership refactor."
+            );
+        });
+        self.state.lock()
     }
 
     /// Configure the Core-global cap on pause replay buffer length. When set,
@@ -450,7 +557,7 @@ impl Core {
     /// resume callback (see [`ResumeReport`]). `None` (default) means
     /// unbounded; messages buffer indefinitely until the lockset clears.
     pub fn set_pause_buffer_cap(&self, cap: Option<usize>) {
-        self.state.lock().pause_buffer_cap = cap;
+        self.lock_state().pause_buffer_cap = cap;
     }
 
     /// Allocate a unique [`LockId`] for use with [`Self::pause`] /
@@ -458,7 +565,7 @@ impl Core {
     /// id-allocation scheme; user-supplied ids work too.
     #[must_use]
     pub fn alloc_lock_id(&self) -> LockId {
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         let id = LockId::new(s.next_lock_id);
         s.next_lock_id += 1;
         id
@@ -471,7 +578,7 @@ impl Core {
     /// Register a state node. `initial` may be [`NO_HANDLE`] to start sentinel.
     #[must_use]
     pub fn register_state(&self, initial: HandleId) -> NodeId {
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         let id = s.alloc_node_id();
         let rec = NodeRecord {
             deps: Vec::new(),
@@ -499,6 +606,12 @@ impl Core {
 
     /// Register a derived (static) node. `fn_id` invokes via the binding;
     /// `equals` defaults to identity in callers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element of `deps` is not a registered node id. The
+    /// panic message includes the offending id. Production bindings should
+    /// validate dep ids before calling.
     #[must_use]
     pub fn register_derived(&self, deps: &[NodeId], fn_id: FnId, equals: EqualsMode) -> NodeId {
         self.register_computed(deps, fn_id, equals, NodeKind::Derived)
@@ -506,6 +619,12 @@ impl Core {
 
     /// Register a dynamic node — fn declares its actually-tracked dep indices
     /// per fire (canonical spec §2.8 / Lock 2.B).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element of `deps` is not a registered node id. The
+    /// panic message includes the offending id. Production bindings should
+    /// validate dep ids before calling.
     #[must_use]
     pub fn register_dynamic(&self, deps: &[NodeId], fn_id: FnId, equals: EqualsMode) -> NodeId {
         self.register_computed(deps, fn_id, equals, NodeKind::Dynamic)
@@ -518,7 +637,7 @@ impl Core {
         equals: EqualsMode,
         kind: NodeKind,
     ) -> NodeId {
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         let id = s.alloc_node_id();
         // Static derived tracks all deps; dynamic starts empty and fills via fn return.
         let tracked: HashSet<usize> = match kind {
@@ -581,10 +700,33 @@ impl Core {
     /// Activation (R2.2.3 step 5): if this is the first subscriber and the
     /// node is a derived/dynamic compute, recursively activate deps so their
     /// cached handles fill our `dep_handles`.
+    #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription {
+        // Slice A-bigger lock-discipline rework: the handshake fire used to
+        // happen with the lock dropped, then the sink was registered. That
+        // left a race window where a concurrent emit on another thread
+        // could run a wave between drop and re-acquire — the new sink wasn't
+        // yet in `subscribers`, so the wave's flush bypassed it and the
+        // new sub silently missed messages.
+        //
+        // The new shape: register the sink **first** under the lock, then
+        // build and fire the handshake while still holding the lock, then
+        // run activation (which produces deferred flush jobs), then drop
+        // the lock and fire the deferred jobs. Concurrent emits on other
+        // threads block on the state lock until we release; once they run,
+        // their flush fires the now-registered new sink with normal wave
+        // messages — observed AFTER the handshake by happens-before.
+        //
+        // Trade-off: the handshake sink fires with the state lock held, so
+        // a handshake callback that calls back into Core (`emit`, `pause`,
+        // etc.) deadlocks. Slice A-bigger lifts this for `flush_notifications`
+        // sinks (drop-then-fire); the handshake stays lock-held because the
+        // alternative — register-then-drop-then-fire — re-introduces the
+        // ordering hazard above (concurrent flush could deliver wave
+        // messages to the new sink before our handshake's [Start] fires).
         let sub_id;
-        {
-            let mut s = self.state.lock();
+        let (jobs, releases) = {
+            let mut s = self.lock_state();
             sub_id = s.alloc_sub_id();
 
             // Resubscribable reset: terminal + flagged → clear lifecycle
@@ -604,8 +746,7 @@ impl Core {
                 self.reset_for_fresh_lifecycle(&mut s, node_id);
             }
 
-            // Build the START handshake (R1.2.3) — outside the subscribers map
-            // because it goes only to the new sink, not the established set.
+            // Snapshot handshake state under lock.
             let (cache, kind, first_subscriber, terminal, torn_down) = {
                 let rec = s.require_node(node_id);
                 (
@@ -621,34 +762,50 @@ impl Core {
             } else {
                 vec![Message::Start, Message::Data(cache)]
             };
-            // Replay the terminal so a late subscriber sees a clean
-            // end-of-stream signal. (Resubscribable nodes that were eligible
-            // for reset have `terminal == None` after `reset_for_fresh_lifecycle`
-            // — no replay there.)
             if let Some(t) = terminal {
                 handshake.push(match t {
                     DepTerminal::Complete => Message::Complete,
                     DepTerminal::Error(h) => Message::Error(h),
                 });
             }
-            // Replay TEARDOWN if the node has been torn down. Per F3, a
-            // torn-down node cannot be reset even if resubscribable, so
-            // late subscribers always see the full lifecycle replay
-            // `[..., COMPLETE|ERROR, TEARDOWN]`.
             if torn_down {
                 handshake.push(Message::Teardown);
             }
-            // Lock briefly released for the sink call.
-            drop(s);
-            sink(&handshake);
-            // Re-acquire to register the sink.
-            let mut s = self.state.lock();
-            s.require_node_mut(node_id).subscribers.insert(sub_id, sink);
-            // Activate compute on first subscriber (push deps' cached handles down).
+
+            // Register sink BEFORE firing the handshake so a concurrent emit
+            // (which would block on this lock) sees the sink registered when
+            // it eventually runs — its post-our-drop wave will flush to the
+            // new sink in normal happens-after order.
+            s.require_node_mut(node_id)
+                .subscribers
+                .insert(sub_id, sink.clone());
+
+            // Fire the handshake under the lock so it lands strictly before
+            // any concurrent wave's tier-1+ messages can reach this sink.
+            // Set the thread-local re-entrance flag so any Core method the
+            // handshake sink might call panics with a clear diagnostic
+            // instead of silently deadlocking on the held state lock. The
+            // RAII guard clears the flag even if `sink` panics.
+            {
+                let _reentrance_guard = HandshakeFireGuard::enter();
+                sink(&handshake);
+            }
+
+            // Activate compute on first subscriber. This may queue messages
+            // into pending_notify and populate deferred_flush_jobs via the
+            // activation drain; we'll fire them lock-released below.
             if first_subscriber && kind != NodeKind::State {
                 self.activate_derived(&mut s, node_id);
             }
-        }
+
+            Self::drain_deferred(&mut s)
+        };
+        // Lock released — fire any activation-time deferred work
+        // (Dirty/Data pairs the activated derived produced during fn-fire).
+        // Concurrent emits on other threads can now interleave; their waves
+        // will run lock-released sink fires per the standard discipline.
+        self.fire_deferred(jobs, releases);
+
         Subscription {
             state: Arc::downgrade(&self.state),
             node_id,
@@ -670,7 +827,7 @@ impl Core {
     /// behavior; changing it after the fact would change semantics for
     /// existing sinks).
     pub fn set_resubscribable(&self, node_id: NodeId, resubscribable: bool) {
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         let rec = s.require_node_mut(node_id);
         assert!(
             rec.subscribers.is_empty(),
@@ -741,40 +898,88 @@ impl Core {
         }
     }
 
-    fn activate_derived(&self, s: &mut CoreState, node_id: NodeId) {
-        // Recursive activation: for each dep with no cache yet (compute, never fired),
-        // give it an internal subscription so its activation runs.
-        // Then push its cached handle into our dep_handles slot.
-        //
-        // This must run inside a wave so any first-fire emissions propagate
-        // correctly; we set in_tick if not already and drain at the end.
+    /// Activate `root` and any transitive uncached compute deps so their
+    /// caches fill our dep_handles slots.
+    ///
+    /// Slice A-bigger (M1-close): converted from depth-first recursion to
+    /// an iterative two-pass walk. Pre-fix: a 5000-node linear chain
+    /// overflowed the OS thread stack on subscribe (each chain link
+    /// recurses).
+    ///
+    /// Walk shape:
+    ///   1. **Discover phase (DFS via Vec stack):** starting at `root`,
+    ///      walk transitively-needing-activation deps via the `deps`
+    ///      chain. Build an ordering where each node appears AFTER all
+    ///      of its uncached compute deps — i.e., reverse topological
+    ///      among the visited subgraph.
+    ///   2. **Deliver phase (forward iteration):** for each visited
+    ///      node in dep-first order, push deps' caches into the node's
+    ///      `dep_handles` slots. Caches that were sentinel pre-walk are
+    ///      now filled because their parent activated earlier in the
+    ///      iteration. Adds the node to `pending_fires` if it has all
+    ///      deps now non-sentinel; the wave-engine drain fires the fn.
+    fn activate_derived(&self, s: &mut CoreState, root: NodeId) {
         let already_in_tick = s.in_tick;
         if !already_in_tick {
             s.in_tick = true;
         }
-        let dep_ids: Vec<NodeId> = s.require_node(node_id).deps.clone();
-        for (i, dep_id) in dep_ids.iter().copied().enumerate() {
-            let dep_kind;
-            let dep_cache;
-            let dep_has_fired;
-            {
-                let dep_rec = s.require_node(dep_id);
-                dep_kind = dep_rec.kind;
-                dep_cache = dep_rec.cache;
-                dep_has_fired = dep_rec.has_fired_once;
+
+        // Phase 1: discover. DFS to collect every compute node reachable
+        // via `deps` that doesn't yet have a cache and hasn't fired.
+        // Record them in dep-first (post-order) so phase 2 can deliver
+        // caches forward. Frame is `(node_id, finalize)` — `finalize=false`
+        // means "first visit: push deps then re-push self with finalize=true";
+        // `finalize=true` means "deps have been expanded, append self to
+        // `order`."
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut order: Vec<NodeId> = Vec::new();
+        let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
+        while let Some((id, finalize)) = stack.pop() {
+            if finalize {
+                // Deps have been processed (popped before this re-visit).
+                // Append to ordering for phase 2.
+                order.push(id);
+                continue;
             }
-            if dep_kind != NodeKind::State && dep_cache == NO_HANDLE && !dep_has_fired {
-                // Internal subscription marker — just recurse.
-                self.activate_derived(s, dep_id);
+            if !visited.insert(id) {
+                continue; // Already in order (shared dep across multiple paths).
             }
-            // Re-read cache after possible activation.
-            let dep_cache_after = s.require_node(dep_id).cache;
-            if dep_cache_after != NO_HANDLE {
-                self.deliver_data_to_consumer(s, node_id, i, dep_cache_after);
+            // Push self with finalize=true so we come back after our deps.
+            stack.push((id, true));
+            let dep_ids: Vec<NodeId> = s.require_node(id).deps.clone();
+            for dep_id in dep_ids {
+                let (dep_kind, dep_cache, dep_has_fired) = {
+                    let dep_rec = s.require_node(dep_id);
+                    (dep_rec.kind, dep_rec.cache, dep_rec.has_fired_once)
+                };
+                if dep_kind != NodeKind::State
+                    && dep_cache == NO_HANDLE
+                    && !dep_has_fired
+                    && !visited.contains(&dep_id)
+                {
+                    stack.push((dep_id, false));
+                }
             }
         }
+
+        // Phase 2: deliver caches in dep-first order. For each node, walk
+        // its deps and call `deliver_data_to_consumer` for any with caches.
+        for &id in &order {
+            let dep_ids: Vec<NodeId> = s.require_node(id).deps.clone();
+            for (i, dep_id) in dep_ids.iter().copied().enumerate() {
+                let dep_cache = s.require_node(dep_id).cache;
+                if dep_cache != NO_HANDLE {
+                    self.deliver_data_to_consumer(s, id, i, dep_cache);
+                }
+            }
+        }
+
         if !already_in_tick {
             self.drain_and_flush(s);
+            // Wave-state cleanup so a subsequent user emit doesn't see
+            // `was_dirty=true` left over from this activation. See the
+            // R1.3.1.a comment retained from the recursive version.
+            s.clear_wave_state();
             s.in_tick = false;
         }
     }
@@ -799,325 +1004,53 @@ impl Core {
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
         );
-        let mut s = self.state.lock();
-        {
-            let rec = s.require_node(node_id);
-            assert!(
-                rec.kind == NodeKind::State,
-                "emit() is for state nodes only; derived emits via fn"
-            );
-            if rec.terminal.is_some() {
-                // Terminal — release the handle the caller just interned
-                // (it would otherwise leak; cache slot ownership doesn't
-                // transfer because we're not advancing cache).
-                let _ = rec; // drop the immutable borrow
-                self.binding.release_handle(new_handle);
-                return;
+        let (jobs, releases) = {
+            let mut s = self.lock_state();
+            {
+                let rec = s.require_node(node_id);
+                assert!(
+                    rec.kind == NodeKind::State,
+                    "emit() is for state nodes only; derived emits via fn"
+                );
+                if rec.terminal.is_some() {
+                    // Terminal — release the handle the caller just interned
+                    // (it would otherwise leak; cache slot ownership doesn't
+                    // transfer because we're not advancing cache).
+                    let _ = rec; // drop the immutable borrow
+                    drop(s);
+                    self.binding.release_handle(new_handle);
+                    return;
+                }
             }
-        }
-        self.run_wave(&mut s, |this, s| {
-            this.commit_emission(s, node_id, new_handle);
-        });
+            self.run_wave(&mut s, |this, s| {
+                this.commit_emission(s, node_id, new_handle);
+            });
+            Self::drain_deferred(&mut s)
+        };
+        // Lock dropped — fire sinks + release retains.
+        self.fire_deferred(jobs, releases);
     }
 
     /// Read a node's current cache. Returns [`NO_HANDLE`] if sentinel.
     #[must_use]
     pub fn cache_of(&self, node_id: NodeId) -> HandleId {
-        self.state.lock().require_node(node_id).cache
+        self.lock_state().require_node(node_id).cache
     }
 
     /// Whether the node's fn has fired at least once (compute) OR it has had
     /// a non-sentinel value (state).
     #[must_use]
     pub fn has_fired_once(&self, node_id: NodeId) -> bool {
-        self.state.lock().require_node(node_id).has_fired_once
+        self.lock_state().require_node(node_id).has_fired_once
     }
 
     // -------------------------------------------------------------------
-    // Wave engine
+    // Wave engine — moved to `crate::batch` (Slice C-1 refactor; sibling
+    // module split, no semantic change). The methods below are still on
+    // `Core`; see `batch.rs` for `run_wave`, `drain_and_flush`,
+    // `pick_next_fire`, `fire_fn`, `commit_emission`, `handles_equal`,
+    // `deliver_data_to_consumer`, `queue_notify`, `flush_notifications`.
     // -------------------------------------------------------------------
-
-    fn run_wave<F>(&self, s: &mut CoreState, thunk: F)
-    where
-        F: FnOnce(&Self, &mut CoreState),
-    {
-        if s.in_tick {
-            // Re-entrant: the outer wave's drain loop will pick up our queued work.
-            thunk(self, s);
-            return;
-        }
-        s.in_tick = true;
-        thunk(self, s);
-        self.drain_and_flush(s);
-        // Wave cleanup
-        for rec in s.nodes.values_mut() {
-            rec.dirty = false;
-            rec.involved_this_wave = false;
-        }
-        s.in_tick = false;
-    }
-
-    fn drain_and_flush(&self, s: &mut CoreState) {
-        // Drain pending fires until quiescent.
-        let mut guard = 0u32;
-        while !s.pending_fires.is_empty() {
-            guard += 1;
-            assert!(
-                guard < 10_000,
-                "wave drain exceeded 10k iterations (cycle?)"
-            );
-            let Some(next) = self.pick_next_fire(s) else {
-                break;
-            };
-            self.fire_fn(s, next);
-        }
-        // Phase 2: deliver wave-close to subscribers.
-        self.flush_notifications(s);
-    }
-
-    /// Pick a node whose deps are all settled (no upstream pending fire).
-    /// Topological-ish order ensures diamond resolution: D fires once,
-    /// after both B and C settle.
-    fn pick_next_fire(&self, s: &CoreState) -> Option<NodeId> {
-        for &id in &s.pending_fires {
-            let rec = s.require_node(id);
-            let all_deps_settled = rec.deps.iter().all(|d| !s.pending_fires.contains(d));
-            if all_deps_settled {
-                return Some(id);
-            }
-        }
-        // Cycle: pick any (may stabilize via guard, or assert).
-        s.pending_fires.iter().copied().next()
-    }
-
-    fn fire_fn(&self, s: &mut CoreState, node_id: NodeId) {
-        s.pending_fires.remove(&node_id);
-        let (fn_id, dep_handles, kind) = {
-            let rec = s.require_node(node_id);
-            // Terminal node — fn never fires again (R1.3.4 / Lock 2.B).
-            if rec.terminal.is_some() {
-                return;
-            }
-            // First-run gate: every dep must have a handle before fn fires.
-            if rec.dep_handles.contains(&NO_HANDLE) {
-                return;
-            }
-            let Some(fn_id) = rec.fn_id else { return };
-            (fn_id, rec.dep_handles.clone(), rec.kind)
-        };
-        // Drop the borrow across the binding call. The lock IS held; the
-        // binding side must not re-enter Core methods (CLAUDE.md re-entrance
-        // discipline; sinks fire later in flush phase).
-        let result = self.binding.invoke_fn(node_id, fn_id, &dep_handles);
-
-        {
-            let rec = s.require_node_mut(node_id);
-            rec.has_fired_once = true;
-            // Dynamic: fn declares its tracked dep indices.
-            if kind == NodeKind::Dynamic {
-                let tracked = match &result {
-                    FnResult::Data { tracked, .. } | FnResult::Noop { tracked } => tracked.clone(),
-                };
-                if let Some(t) = tracked {
-                    rec.tracked = t.into_iter().collect();
-                }
-            }
-        }
-
-        match result {
-            FnResult::Noop { .. } => {
-                // No emission this wave — RESOLVED if we already DIRTY'd subscribers.
-                let already_dirty = s.require_node(node_id).dirty;
-                if already_dirty {
-                    self.queue_notify(s, node_id, Message::Resolved);
-                }
-            }
-            FnResult::Data { handle, .. } => {
-                self.commit_emission(s, node_id, handle);
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Emission commit — equals-substitution lives here
-    // -------------------------------------------------------------------
-
-    fn commit_emission(&self, s: &mut CoreState, node_id: NodeId, new_handle: HandleId) {
-        assert!(
-            new_handle != NO_HANDLE,
-            "NO_HANDLE is not a valid DATA payload"
-        );
-        let (old_handle, equals_mode, was_dirty) = {
-            let rec = s.require_node(node_id);
-            (rec.cache, rec.equals, rec.dirty)
-        };
-        let is_data = !self.handles_equal(equals_mode, old_handle, new_handle);
-
-        // R1.3.1.a: DIRTY precedes tier-3 in the same wave.
-        if !was_dirty {
-            s.require_node_mut(node_id).dirty = true;
-            self.queue_notify(s, node_id, Message::Dirty);
-        }
-
-        if is_data {
-            s.require_node_mut(node_id).cache = new_handle;
-            // Refcount: release prior cache handle.
-            if old_handle != NO_HANDLE {
-                self.binding.release_handle(old_handle);
-            }
-            self.queue_notify(s, node_id, Message::Data(new_handle));
-            // Propagate to children
-            let child_ids: Vec<NodeId> = s
-                .children
-                .get(&node_id)
-                .map(|c| c.iter().copied().collect())
-                .unwrap_or_default();
-            for child_id in child_ids {
-                let dep_idx = s
-                    .require_node(child_id)
-                    .deps
-                    .iter()
-                    .position(|&d| d == node_id);
-                if let Some(idx) = dep_idx {
-                    self.deliver_data_to_consumer(s, child_id, idx, new_handle);
-                }
-            }
-        } else {
-            // RESOLVED: handle unchanged. Don't release; old still in use.
-            self.queue_notify(s, node_id, Message::Resolved);
-            // Children that haven't been involved this wave still need DIRTY+RESOLVED
-            // for the wave-mask bookkeeping (so their subscribers see consistent
-            // wave-close on diamond fan-in).
-            let child_ids: Vec<NodeId> = s
-                .children
-                .get(&node_id)
-                .map(|c| c.iter().copied().collect())
-                .unwrap_or_default();
-            for child_id in child_ids {
-                let already_involved = s.require_node(child_id).involved_this_wave;
-                if !already_involved {
-                    {
-                        let child = s.require_node_mut(child_id);
-                        child.involved_this_wave = true;
-                        child.dirty = true;
-                    }
-                    self.queue_notify(s, child_id, Message::Dirty);
-                    self.queue_notify(s, child_id, Message::Resolved);
-                }
-            }
-        }
-    }
-
-    fn handles_equal(&self, mode: EqualsMode, a: HandleId, b: HandleId) -> bool {
-        if a == b {
-            return true; // identity-on-handles always sufficient
-        }
-        // Sentinel on either side: not equal, no boundary call.
-        if a == NO_HANDLE || b == NO_HANDLE {
-            return false;
-        }
-        match mode {
-            EqualsMode::Identity => false,
-            EqualsMode::Custom(handle) => self.binding.custom_equals(handle, a, b),
-        }
-    }
-
-    fn deliver_data_to_consumer(
-        &self,
-        s: &mut CoreState,
-        consumer_id: NodeId,
-        dep_idx: usize,
-        handle: HandleId,
-    ) {
-        let kind;
-        let tracked_or_first_fire;
-        {
-            let consumer = s.require_node_mut(consumer_id);
-            consumer.dep_handles[dep_idx] = handle;
-            consumer.involved_this_wave = true;
-            kind = consumer.kind;
-            tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);
-        }
-        match kind {
-            NodeKind::Derived => {
-                s.pending_fires.insert(consumer_id);
-            }
-            NodeKind::Dynamic => {
-                if tracked_or_first_fire {
-                    s.pending_fires.insert(consumer_id);
-                }
-            }
-            NodeKind::State => {
-                // State nodes don't have deps, so this branch is unreachable
-                // in practice. No-op for safety.
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Subscriber notification
-    // -------------------------------------------------------------------
-
-    fn queue_notify(&self, s: &mut CoreState, node_id: NodeId, msg: Message) {
-        // Pause routing decision (R1.3.7.b tier table, §10.2 buffering):
-        //   Tier 3 (DATA / RESOLVED) and Tier 4 (INVALIDATE) buffer while
-        //   paused; all other tiers (DIRTY tier 1, PAUSE/RESUME tier 2,
-        //   COMPLETE/ERROR tier 5, TEARDOWN tier 6) bypass the buffer and
-        //   flush immediately. START (tier 0) is per-subscription and never
-        //   transits queue_notify.
-        let buffered_tier = matches!(msg.tier(), 3 | 4);
-        let cap = s.pause_buffer_cap;
-        // Refcount discipline (paired with resume drain):
-        //   1. Pre-buffer: retain the payload handle (if any) so the buffer's
-        //      own ownership share keeps it alive across later cache
-        //      replacements that would otherwise release_handle the
-        //      previously-cached `H`.
-        //   2. On cap overflow: release the dropped message's payload handle
-        //      to balance step 1.
-        //   3. On resume: release each replayed message's payload handle in
-        //      `Core::resume` to balance step 1 (sinks observe the value but
-        //      don't own a refcount share).
-        // Note that `Subscribers.is_empty()` shortcut deliberately runs AFTER
-        // the pause-state check would, but BEFORE the retain — if the node
-        // has zero subscribers, we drop the message altogether and do not
-        // retain (no buffer entry to keep alive).
-        let rec = s.require_node_mut(node_id);
-        if rec.subscribers.is_empty() {
-            return;
-        }
-        if buffered_tier && rec.pause_state.is_paused() {
-            if let Some(h) = msg.payload_handle() {
-                self.binding.retain_handle(h);
-            }
-            let dropped_msgs = rec.pause_state.push_buffered(msg, cap);
-            // Drop borrow on rec before calling binding for the dropped
-            // payloads' release_handle (binding mutex is independent of
-            // CoreState mutex, but staying conservative).
-            for dm in dropped_msgs {
-                if let Some(h) = dm.payload_handle() {
-                    self.binding.release_handle(h);
-                }
-            }
-            return;
-        }
-        s.pending_notify.entry(node_id).or_default().push(msg);
-    }
-
-    fn flush_notifications(&self, s: &mut CoreState) {
-        // Fire sinks while holding the lock. v1 limitation: sinks must not
-        // call back into Core methods (would deadlock on the parking_lot
-        // Mutex). Production hardening will move to ReentrantMutex with
-        // internal cells, OR snapshot+drop+fire — see module doc.
-        let pending = std::mem::take(&mut s.pending_notify);
-        for (node_id, msgs) in pending {
-            let Some(rec) = s.nodes.get(&node_id) else {
-                continue;
-            };
-            for sink in rec.subscribers.values() {
-                sink(&msgs);
-            }
-        }
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -1163,77 +1096,91 @@ impl Core {
             "NO_HANDLE is not a valid ERROR payload (R1.2.5)"
         );
         self.emit_terminal(node_id, DepTerminal::Error(error_handle));
+        // The caller's intern share for `error_handle` is NOT transferred
+        // to any slot — `terminate_node` takes its OWN retain for every
+        // populated `terminal` and `dep_terminals` slot. Release the
+        // caller's share here (mirrors `Core::emit`'s short-circuit
+        // release on terminal). Without this, every `error()` call leaks
+        // one binding-side handle ref. Slice A-bigger /qa item D fix.
+        self.binding.release_handle(error_handle);
     }
 
     fn emit_terminal(&self, node_id: NodeId, terminal: DepTerminal) {
-        let mut s = self.state.lock();
-        assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
-        self.run_wave(&mut s, |this, s| {
-            this.terminate_node(s, node_id, terminal);
-        });
+        let (jobs, releases) = {
+            let mut s = self.lock_state();
+            assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
+            self.run_wave(&mut s, |this, s| {
+                this.terminate_node(s, node_id, terminal);
+            });
+            Self::drain_deferred(&mut s)
+        };
+        self.fire_deferred(jobs, releases);
     }
 
     /// Set the node's terminal slot, queue the wire message, and cascade to
     /// children. Idempotent on already-terminal node (no-op).
+    ///
+    /// Iterative implementation (Slice A-bigger, M1-close): a work-queue
+    /// drives the cascade so deep linear chains don't overflow the OS
+    /// thread stack. Mirrors `path_from_to`'s explicit-stack pattern.
     fn terminate_node(&self, s: &mut CoreState, node_id: NodeId, terminal: DepTerminal) {
-        if s.require_node(node_id).terminal.is_some() {
-            return; // Idempotent — already terminal.
-        }
-        // Take a refcount share for the terminal slot so the error handle
-        // outlives the binding-side intern's transient share.
-        if let DepTerminal::Error(h) = terminal {
-            self.binding.retain_handle(h);
-        }
-        s.require_node_mut(node_id).terminal = Some(terminal);
-        // Drain pending fires for this node — fn won't fire on a terminal node.
-        s.pending_fires.remove(&node_id);
-        // Queue the wire message (tier 5 — bypasses pause buffer).
-        let msg = match terminal {
-            DepTerminal::Complete => Message::Complete,
-            DepTerminal::Error(h) => Message::Error(h),
-        };
-        self.queue_notify(s, node_id, msg);
-        // Cascade to children.
-        let child_ids: Vec<NodeId> = s
-            .children
-            .get(&node_id)
-            .map(|c| c.iter().copied().collect())
-            .unwrap_or_default();
-        for child_id in child_ids {
-            let dep_idx = s
-                .require_node(child_id)
-                .deps
-                .iter()
-                .position(|&d| d == node_id);
-            let Some(idx) = dep_idx else { continue };
-            // Mark this child's per-dep terminal slot. Take a retain on the
-            // error handle for the slot share.
-            {
-                let child = s.require_node_mut(child_id);
-                if child.dep_terminals[idx].is_some() {
-                    // Idempotent — child already saw this dep terminate.
-                    continue;
-                }
-                child.dep_terminals[idx] = Some(terminal);
+        let mut work: Vec<(NodeId, DepTerminal)> = vec![(node_id, terminal)];
+        while let Some((id, t)) = work.pop() {
+            if s.require_node(id).terminal.is_some() {
+                continue; // Idempotent — already terminal.
             }
-            if let DepTerminal::Error(h) = terminal {
+            // Take a refcount share for the terminal slot so the error
+            // handle outlives the binding-side intern's transient share.
+            if let DepTerminal::Error(h) = t {
                 self.binding.retain_handle(h);
             }
-            // Auto-cascade gating: if all deps now terminal, propagate.
-            let cascade = {
-                let child = s.require_node(child_id);
-                if child.terminal.is_some() {
-                    None // Already terminated — no-op.
-                } else if child.dep_terminals.iter().all(Option::is_some) {
-                    Some(pick_cascade_terminal(&child.dep_terminals))
-                } else {
-                    None
-                }
+            s.require_node_mut(id).terminal = Some(t);
+            // Drain pending fires for this node — fn won't fire on a
+            // terminal node.
+            s.pending_fires.remove(&id);
+            // Queue the wire message (tier 5 — bypasses pause buffer).
+            let msg = match t {
+                DepTerminal::Complete => Message::Complete,
+                DepTerminal::Error(h) => Message::Error(h),
             };
-            if let Some(t) = cascade {
-                // Recurse with the chosen terminal. A retain happens inside
-                // terminate_node for the child's own terminal slot.
-                self.terminate_node(s, child_id, t);
+            self.queue_notify(s, id, msg);
+            // Cascade to children.
+            let child_ids: Vec<NodeId> = s
+                .children
+                .get(&id)
+                .map(|c| c.iter().copied().collect())
+                .unwrap_or_default();
+            for child_id in child_ids {
+                let dep_idx = s.require_node(child_id).deps.iter().position(|&d| d == id);
+                let Some(idx) = dep_idx else { continue };
+                // Mark this child's per-dep terminal slot. Take a retain on
+                // the error handle for the slot share.
+                {
+                    let child = s.require_node_mut(child_id);
+                    if child.dep_terminals[idx].is_some() {
+                        // Idempotent — child already saw this dep terminate.
+                        continue;
+                    }
+                    child.dep_terminals[idx] = Some(t);
+                }
+                if let DepTerminal::Error(h) = t {
+                    self.binding.retain_handle(h);
+                }
+                // Auto-cascade gating: if all deps now terminal, push child
+                // onto the work queue with the chosen terminal.
+                let cascade = {
+                    let child = s.require_node(child_id);
+                    if child.terminal.is_some() {
+                        None // Already terminated — no-op.
+                    } else if child.dep_terminals.iter().all(Option::is_some) {
+                        Some(pick_cascade_terminal(&child.dep_terminals))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(t_child) = cascade {
+                    work.push((child_id, t_child));
+                }
             }
         }
     }
@@ -1275,45 +1222,84 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn teardown(&self, node_id: NodeId) {
-        let mut s = self.state.lock();
-        assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
-        self.run_wave(&mut s, |this, s| {
-            this.teardown_inner(s, node_id);
-        });
+        let (jobs, releases) = {
+            let mut s = self.lock_state();
+            assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
+            self.run_wave(&mut s, |this, s| {
+                this.teardown_inner(s, node_id);
+            });
+            Self::drain_deferred(&mut s)
+        };
+        self.fire_deferred(jobs, releases);
     }
 
-    fn teardown_inner(&self, s: &mut CoreState, node_id: NodeId) {
-        if s.require_node(node_id).has_received_teardown {
-            return; // Idempotent (R2.6.4).
+    /// Iterative teardown walk (Slice A-bigger, M1-close).
+    ///
+    /// The recursive shape was:
+    ///   ```text
+    ///   teardown(n):
+    ///     if torn_down: return
+    ///     mark torn_down
+    ///     for meta in metas: teardown(meta)
+    ///     terminate_node + queue Teardown
+    ///     for child in children: teardown(child)
+    ///   ```
+    /// Deep linear chains (~10k nodes) overflowed the OS thread stack.
+    ///
+    /// The iterative shape uses a `Vec<Action>` stack with `Visit` and
+    /// `EmitTeardown` actions. `Visit(n)` marks `n` torn-down (or no-ops
+    /// if already), then pushes (in reverse order so LIFO pops in forward
+    /// order) `Visit(child_K), …, Visit(child_1), EmitTeardown(n),
+    /// Visit(meta_M), …, Visit(meta_1)`. The R1.3.9.d "metas first, then
+    /// self, then children" ordering is preserved by the push order:
+    /// metas pop first, recursively expand and emit; then `EmitTeardown(n)`
+    /// pops and runs `terminate_node` + queue `Teardown`; then children
+    /// pop. Idempotency via `has_received_teardown` keeps each node
+    /// visited at most once even when multi-parent diamonds re-enter via
+    /// a sibling path.
+    fn teardown_inner(&self, s: &mut CoreState, root: NodeId) {
+        enum Action {
+            Visit(NodeId),
+            EmitTeardown(NodeId),
         }
-        s.require_node_mut(node_id).has_received_teardown = true;
-        // Meta TEARDOWN ordering (R1.3.9.d) — companions tear down BEFORE
-        // the main node's auto-COMPLETE + TEARDOWN wire emission so
-        // observers see companion lifecycle terminate first. Recursive:
-        // a meta-of-meta tears down first, all the way down.
-        let metas: Vec<NodeId> = s.require_node(node_id).meta_companions.clone();
-        for meta in metas {
-            self.teardown_inner(s, meta);
-        }
-        // Auto-prepend COMPLETE if not yet terminal. terminate_node handles
-        // the auto-cascade to children's own terminal slots (Lock 2.B).
-        let already_terminal = s.require_node(node_id).terminal.is_some();
-        if !already_terminal {
-            self.terminate_node(s, node_id, DepTerminal::Complete);
-        }
-        // Wire emission of the TEARDOWN itself (tier 6).
-        self.queue_notify(s, node_id, Message::Teardown);
-        // Cascade tear-down to regular children (the deps→consumers
-        // direction). Idempotency on `has_received_teardown` keeps each
-        // child visited once even when multi-parent diamonds re-enter via
-        // a sibling path.
-        let child_ids: Vec<NodeId> = s
-            .children
-            .get(&node_id)
-            .map(|c| c.iter().copied().collect())
-            .unwrap_or_default();
-        for child_id in child_ids {
-            self.teardown_inner(s, child_id);
+        let mut stack: Vec<Action> = vec![Action::Visit(root)];
+        while let Some(action) = stack.pop() {
+            match action {
+                Action::Visit(id) => {
+                    if s.require_node(id).has_received_teardown {
+                        continue; // Idempotent (R2.6.4).
+                    }
+                    s.require_node_mut(id).has_received_teardown = true;
+                    // Push order: children first (pop LAST), then
+                    // EmitTeardown(id), then metas (pop FIRST). Reverse
+                    // each list so within-group order matches the original
+                    // recursive iteration.
+                    let children: Vec<NodeId> = s
+                        .children
+                        .get(&id)
+                        .map(|c| c.iter().copied().collect())
+                        .unwrap_or_default();
+                    for &child in children.iter().rev() {
+                        stack.push(Action::Visit(child));
+                    }
+                    stack.push(Action::EmitTeardown(id));
+                    let metas: Vec<NodeId> = s.require_node(id).meta_companions.clone();
+                    for &meta in metas.iter().rev() {
+                        stack.push(Action::Visit(meta));
+                    }
+                }
+                Action::EmitTeardown(id) => {
+                    // Auto-prepend COMPLETE if not yet terminal. The (now
+                    // iterative) terminate_node handles auto-cascade to
+                    // children's own terminal slots per Lock 2.B.
+                    let already_terminal = s.require_node(id).terminal.is_some();
+                    if !already_terminal {
+                        self.terminate_node(s, id, DepTerminal::Complete);
+                    }
+                    // Wire emission of the TEARDOWN itself (tier 6).
+                    self.queue_notify(s, id, Message::Teardown);
+                }
+            }
         }
     }
 
@@ -1328,13 +1314,23 @@ impl Core {
     ///
     /// Idempotent on duplicate registration of the same companion.
     ///
+    /// # Lifecycle constraint
+    ///
+    /// Intended for **setup-time** wiring — call this before `parent` or
+    /// `companion` enters a wave. Mid-wave registration (especially during
+    /// a teardown cascade in flight) is implementation-defined: the new
+    /// edge takes effect on the *next* wave. Adding a companion to a
+    /// torn-down parent silently no-ops (the parent will not tear down
+    /// again). For dynamic companion attachment with deterministic
+    /// ordering, prefer constructing the wiring before subscribers exist.
+    ///
     /// # Panics
     ///
     /// Panics if either node id is unknown, or if `parent == companion`
     /// (a node cannot be its own meta companion — would loop on TEARDOWN).
     pub fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
         assert!(parent != companion, "node cannot be its own meta companion");
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         assert!(s.nodes.contains_key(&parent), "unknown parent {parent:?}");
         assert!(
             s.nodes.contains_key(&companion),
@@ -1384,48 +1380,67 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown, consistent with `emit` / `pause`.
     pub fn invalidate(&self, node_id: NodeId) {
-        let mut s = self.state.lock();
-        // Verify the node exists (consistent panic across operations).
-        assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
-        self.run_wave(&mut s, |this, s| {
-            this.invalidate_inner(s, node_id);
-        });
+        let (jobs, releases) = {
+            let mut s = self.lock_state();
+            assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
+            self.run_wave(&mut s, |this, s| {
+                this.invalidate_inner(s, node_id);
+            });
+            Self::drain_deferred(&mut s)
+        };
+        self.fire_deferred(jobs, releases);
     }
 
-    fn invalidate_inner(&self, s: &mut CoreState, node_id: NodeId) {
-        // Never-populated / already-invalidated: no-op (R1.4 idempotency).
-        let old_handle = s.require_node(node_id).cache;
-        if old_handle == NO_HANDLE {
-            return;
-        }
-        // Clear cache + release the handle's slot ownership.
-        s.require_node_mut(node_id).cache = NO_HANDLE;
-        self.binding.release_handle(old_handle);
-        // Wire emission. Pause-aware via queue_notify.
-        self.queue_notify(s, node_id, Message::Invalidate);
-        // Cascade: for each child, clear the dep_handles slot referencing
-        // this node and recurse. Collect ids first to avoid invalidating
-        // the iterator while mutating children's dep_handles.
-        let child_ids: Vec<NodeId> = s
-            .children
-            .get(&node_id)
-            .map(|c| c.iter().copied().collect())
-            .unwrap_or_default();
-        for child_id in child_ids {
-            let dep_idx = s
-                .require_node(child_id)
-                .deps
-                .iter()
-                .position(|&d| d == node_id);
-            if let Some(idx) = dep_idx {
-                // Reset the child's dep_handles entry — the handle stored
-                // there was just released. Subsequent first-run-gate checks
-                // see NO_HANDLE and re-close the gate.
-                s.require_node_mut(child_id).dep_handles[idx] = NO_HANDLE;
-                // Recursively invalidate. If the child's cache is already
-                // NO_HANDLE (e.g., never populated, or already invalidated
-                // earlier this wave), the recursive call is a no-op.
-                self.invalidate_inner(s, child_id);
+    /// Iterative invalidate cascade (Slice A-bigger, M1-close).
+    ///
+    /// The recursive shape was a depth-first cache-clear walk:
+    ///   ```text
+    ///   invalidate(n):
+    ///     if cache(n) == NO_HANDLE: return  // already-invalidated guard
+    ///     cache(n) = NO_HANDLE; release handle
+    ///     queue Invalidate(n)
+    ///     for child in children:
+    ///       child.dep_handles[idx] = NO_HANDLE
+    ///       invalidate(child)
+    ///   ```
+    /// Deep linear chains overflowed the OS thread stack. The work-queue
+    /// rewrite has no ordering subtleties (unlike teardown's R1.3.9.d
+    /// metas-first constraint) — Invalidate is a tier-4 broadcast where
+    /// the never-populated / already-invalidated guard provides natural
+    /// idempotency for diamond fan-in.
+    fn invalidate_inner(&self, s: &mut CoreState, root: NodeId) {
+        let mut work: Vec<NodeId> = vec![root];
+        while let Some(node_id) = work.pop() {
+            // Never-populated / already-invalidated: no-op (R1.4 idempotency).
+            let old_handle = s.require_node(node_id).cache;
+            if old_handle == NO_HANDLE {
+                continue;
+            }
+            // Clear cache + release the handle's slot ownership.
+            s.require_node_mut(node_id).cache = NO_HANDLE;
+            self.binding.release_handle(old_handle);
+            // Wire emission. Pause-aware via queue_notify.
+            self.queue_notify(s, node_id, Message::Invalidate);
+            // Cascade: for each child, clear the dep_handles slot referencing
+            // this node and push child onto the work queue.
+            let child_ids: Vec<NodeId> = s
+                .children
+                .get(&node_id)
+                .map(|c| c.iter().copied().collect())
+                .unwrap_or_default();
+            for child_id in child_ids {
+                let dep_idx = s
+                    .require_node(child_id)
+                    .deps
+                    .iter()
+                    .position(|&d| d == node_id);
+                if let Some(idx) = dep_idx {
+                    // Reset the child's dep_handles entry — the handle
+                    // stored there was just released. Subsequent
+                    // first-run-gate checks see NO_HANDLE and re-close.
+                    s.require_node_mut(child_id).dep_handles[idx] = NO_HANDLE;
+                    work.push(child_id);
+                }
             }
         }
     }
@@ -1459,7 +1474,7 @@ impl Core {
     /// Re-acquiring the same `lock_id` is an idempotent no-op (matches TS
     /// convention, R1.2.6 silent on the case).
     pub fn pause(&self, node_id: NodeId, lock_id: LockId) -> Result<(), PauseError> {
-        let mut s = self.state.lock();
+        let mut s = self.lock_state();
         let rec = s
             .nodes
             .get_mut(&node_id)
@@ -1483,7 +1498,7 @@ impl Core {
     ) -> Result<Option<ResumeReport>, PauseError> {
         // Phase 1 (lock-held): collect drained buffer + sink Arcs.
         let (sinks, messages, dropped) = {
-            let mut s = self.state.lock();
+            let mut s = self.lock_state();
             let rec = s
                 .nodes
                 .get_mut(&node_id)
@@ -1642,15 +1657,19 @@ impl Core {
     /// locality is what makes the F1 refcount-leak collection work.
     #[allow(clippy::too_many_lines)]
     pub fn set_deps(&self, n: NodeId, new_deps: &[NodeId]) -> Result<(), SetDepsError> {
-        let mut s = self.state.lock();
-        // Validate node exists and is compute.
-        let kind = s.nodes.get(&n).ok_or(SetDepsError::UnknownNode(n))?.kind;
+        let mut s = self.lock_state();
+        // Validate node exists and is compute. Read-once via the helper so
+        // subsequent code can use `require_node(n)` without re-checking.
+        let (kind, is_terminal) = {
+            let rec = s.nodes.get(&n).ok_or(SetDepsError::UnknownNode(n))?;
+            (rec.kind, rec.terminal.is_some())
+        };
         if kind == NodeKind::State {
             return Err(SetDepsError::NotComputeNode(n));
         }
         // Reject if `n` itself is terminal (Phase 13.8 Q1: terminal nodes
         // cannot be rewired; recovery is via resubscribable subscribe).
-        if s.nodes[&n].terminal.is_some() {
+        if is_terminal {
             return Err(SetDepsError::TerminalNode { n });
         }
         // Self-rewire rejection.
@@ -1668,7 +1687,7 @@ impl Core {
         // `d` is already reachable from `n` via existing data-flow edges
         // (so `n → ... → d` exists, and the new `d → n` closes the loop).
         // DFS from `n` along `children` edges, looking for each added dep.
-        let current_deps: HashSet<NodeId> = s.nodes[&n].deps.iter().copied().collect();
+        let current_deps: HashSet<NodeId> = s.require_node(n).deps.iter().copied().collect();
         let new_deps_set: HashSet<NodeId> = new_deps.iter().copied().collect();
         let added: HashSet<NodeId> = new_deps_set.difference(&current_deps).copied().collect();
         for &d in &added {
@@ -1797,7 +1816,7 @@ impl Core {
                 needs_wave = true;
             }
         }
-        if needs_wave {
+        let (jobs, releases) = if needs_wave {
             self.run_wave(&mut s, |this, s| {
                 for (added_dep, cache) in additions_with_cache {
                     let dep_idx = s.require_node(n).deps.iter().position(|&d| d == added_dep);
@@ -1806,14 +1825,19 @@ impl Core {
                     }
                 }
             });
-        }
+            Self::drain_deferred(&mut s)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // Drop the state lock before crossing the binding boundary for the
-        // F1 refcount-fix releases. Keeps the lock-discipline split (binding
-        // calls outside the state lock) consistent with the resume drain.
+        // F1 refcount-fix releases AND the deferred sink fires. Keeps the
+        // lock-discipline split (binding calls outside the state lock)
+        // consistent with the resume drain.
         drop(s);
         for h in removed_terminal_handles {
             self.binding.release_handle(h);
         }
+        self.fire_deferred(jobs, releases);
         Ok(())
     }
 
@@ -1860,15 +1884,100 @@ impl CoreState {
         id
     }
 
-    fn require_node(&self, id: NodeId) -> &NodeRecord {
+    /// Clear wave-scoped flags (`dirty`, `involved_this_wave`) on every
+    /// node. Run at the end of every wave (regular drain via `run_wave`,
+    /// activation drain via `activate_derived`, and `BatchGuard::drop`'s
+    /// drain). Centralized so a future wave-state field can't be missed
+    /// at one of the cleanup sites.
+    pub(crate) fn clear_wave_state(&mut self) {
+        for rec in self.nodes.values_mut() {
+            rec.dirty = false;
+            rec.involved_this_wave = false;
+        }
+    }
+
+    pub(crate) fn require_node(&self, id: NodeId) -> &NodeRecord {
         self.nodes
             .get(&id)
             .unwrap_or_else(|| panic!("unknown node {id:?}"))
     }
 
-    fn require_node_mut(&mut self, id: NodeId) -> &mut NodeRecord {
+    pub(crate) fn require_node_mut(&mut self, id: NodeId) -> &mut NodeRecord {
         self.nodes
             .get_mut(&id)
             .unwrap_or_else(|| panic!("unknown node {id:?}"))
+    }
+}
+
+/// Release every binding-side refcount share owned by this `CoreState`
+/// when the last `Core` clone drops the inner Mutex.
+///
+/// Without this, every retained handle in `cache` / `terminal` Error /
+/// `dep_terminals` Error / pause-buffer-payload would leak in the binding
+/// registry until process exit. Production bindings (napi-rs, pyo3,
+/// wasm-bindgen) all maintain handle-ref maps that grow unbounded without
+/// this cleanup.
+///
+/// Safe to call during panic unwinding — `BindingBoundary::release_handle`
+/// is the only call, and a panicking binding during cleanup would already
+/// have been a problem in normal operation.
+impl Drop for CoreState {
+    fn drop(&mut self) {
+        // Drain pending in-flight retains too, so a panic mid-wave doesn't
+        // strand the queue_notify retains in `deferred_handle_releases`.
+        let pending = std::mem::take(&mut self.pending_notify);
+        let deferred_releases = std::mem::take(&mut self.deferred_handle_releases);
+        // `deferred_flush_jobs` carries `Vec<Sink>` clones — those Arcs
+        // drop naturally when this CoreState drops; no handles to release
+        // there.
+        let _ = std::mem::take(&mut self.deferred_flush_jobs);
+
+        // Per-node retained handles:
+        //   - `cache` (1 retain per non-NO_HANDLE state cache or
+        //     populated compute cache).
+        //   - `terminal == Some(Error(h))` (1 retain on the terminal slot).
+        //   - `dep_terminals[i] == Some(Error(h))` (1 retain per consumer's
+        //     terminated-dep slot).
+        //   - `pause_state` paused buffer messages with payload handles
+        //     (1 retain per buffered Data/Error).
+        for rec in self.nodes.values() {
+            if rec.cache != NO_HANDLE {
+                self.binding.release_handle(rec.cache);
+            }
+            if let Some(DepTerminal::Error(h)) = rec.terminal {
+                self.binding.release_handle(h);
+            }
+            for slot in &rec.dep_terminals {
+                if let Some(DepTerminal::Error(h)) = *slot {
+                    self.binding.release_handle(h);
+                }
+            }
+            if let PauseState::Paused { buffer, .. } = &rec.pause_state {
+                for msg in buffer {
+                    if let Some(h) = msg.payload_handle() {
+                        self.binding.release_handle(h);
+                    }
+                }
+            }
+        }
+
+        // Pending wave retains.
+        for msgs in pending.values() {
+            for msg in msgs {
+                if let Some(h) = msg.payload_handle() {
+                    self.binding.release_handle(h);
+                }
+            }
+        }
+        for h in deferred_releases {
+            self.binding.release_handle(h);
+        }
+        // Wave-cache snapshot retains (defensive — should normally be
+        // empty by the time Core drops, but a panicked-mid-wave Core
+        // could leave them populated).
+        let snapshots = std::mem::take(&mut self.wave_cache_snapshots);
+        for (_, h) in snapshots {
+            self.binding.release_handle(h);
+        }
     }
 }
