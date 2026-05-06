@@ -6,46 +6,49 @@
 //! (registration, subscription, pause/resume, terminal cascade,
 //! `set_deps`) live there.
 //!
-//! # Slice C-1: split point
-//!
-//! This module was extracted from [`super::node`] in Slice C-1 (M1-close
-//! refactor; no semantic change). The methods are still on [`Core`] —
-//! Rust supports `impl Core` blocks across multiple files in the same
-//! crate. The split is purely organizational: it keeps the wave engine
-//! reviewable as a unit and makes the dispatcher's "non-wave" concerns
-//! (subscribe handshakes, terminal cascade graph walk, dep-mutation
-//! validation) easier to audit independently.
-//!
-//! See [`migration-status.md`](../../../docs/migration-status.md) for the
-//! milestone tracker.
-//!
 //! # Wave engine entry points
 //!
-//! - [`Core::run_wave`] — wave entry. Runs `thunk` (which queues the
-//!   triggering messages), then drains all transitive fn-fires until
-//!   `pending_fires` is empty, then flushes per-subscriber notifications.
-//! - [`Core::drain_and_flush`] — drain phase + flush phase. Called
-//!   internally by `run_wave`; also reachable from [`super::node`] for
-//!   the `activate_derived` path that sets up dep handles for a
-//!   newly-subscribed compute node.
+//! - [`Core::run_wave`] — wave entry. Claims `in_tick` under the state lock,
+//!   runs `op` lock-released, then drains all transitive fn-fires and
+//!   flushes per-subscriber notifications. Each fn-fire iteration drops
+//!   the state lock around `BindingBoundary::invoke_fn` so user fn callbacks
+//!   can re-enter Core safely.
+//! - [`Core::drain_and_flush`] — drain phase + flush phase. Acquires/drops
+//!   the state lock per iteration around `invoke_fn`.
 //! - [`Core::commit_emission`] — equals-substitution + DIRTY/DATA/RESOLVED
-//!   queueing + child propagation. Called from `emit()` (state node
-//!   mutation) and `fire_fn` (compute node fn return).
+//!   queueing + child propagation. `&self`-only; bracket-fires
+//!   `BindingBoundary::custom_equals` lock-released.
 //! - [`Core::queue_notify`] — per-subscriber message queueing with
-//!   pause-buffer routing. Called from `commit_emission` (this module),
-//!   plus `terminate_node`, `teardown_inner`, and `invalidate_inner`
-//!   (in [`super::node`]).
+//!   pause-buffer routing. Snapshots the subscriber list at first-touch-
+//!   per-wave so late subscribers (installed mid-wave between drain
+//!   iterations) don't receive duplicate deliveries from messages already
+//!   queued before they subscribed.
 //! - [`Core::deliver_data_to_consumer`] — single-edge propagation; marks
 //!   the consumer for fn-fire if its tracked-deps set is satisfied.
 //!   Called from `commit_emission`, plus `activate_derived` and
 //!   `set_deps` in [`super::node`].
 //!
-//! # Re-entrance discipline (carried over from the v1 dispatcher)
+//! # Re-entrance discipline (Slice A close — M1 fully lock-released)
 //!
-//! Sinks fire while the `parking_lot::Mutex<CoreState>` is held. A sink
-//! that calls back into `Core::emit` deadlocks. Production hardening
-//! (Slice A-bigger, M1-close) replaces this with snapshot-then-drop-then-
-//! fire across all sink-fire sites; see [`super::node`] module doc.
+//! - **Wave-end sink fires** drop the state lock first (Slice A-bigger
+//!   discipline).
+//! - **`BindingBoundary::invoke_fn`** in `fire_fn` fires lock-released —
+//!   user fn callbacks may re-enter `Core::emit` / `pause` / `resume` /
+//!   `invalidate` / `complete` / `error` / `teardown` and run a nested
+//!   wave (the existing `s.in_tick` re-entrance gate composes
+//!   transparently).
+//! - **`BindingBoundary::custom_equals`** in `commit_emission`'s equals
+//!   check fires lock-released.
+//! - **Subscribe-time handshake** is the one remaining lock-held callback.
+//!   It now fires per-tier (`[Start]`, `[Data(v)]`, `[Complete|Error]`,
+//!   `[Teardown]`) as separate sink calls, matching the canonical R1.3.5.a
+//!   tier-split. Re-entrance from a handshake sink callback panics with
+//!   the [`reentrance_guard`] diagnostic.
+
+use std::sync::Arc;
+
+use indexmap::map::Entry;
+use parking_lot::ArcReentrantMutexGuard;
 
 use crate::boundary::FnResult;
 use crate::handle::{HandleId, NodeId, NO_HANDLE};
@@ -58,53 +61,68 @@ use crate::node::{Core, CoreState, EqualsMode, NodeKind, Sink};
 /// content. Drained from `CoreState` and fired lock-released.
 pub(crate) type DeferredJobs = Vec<(Vec<Sink>, Vec<Message>)>;
 
+/// Per-node wave-end notification queue.
+///
+/// Subscribers are snapshotted on the FIRST `queue_notify` call for the
+/// node within a wave. Subsequent calls append messages but reuse the
+/// snapshot. This makes late subscribers (installed between fn-fire
+/// iterations now that the state lock is dropped per-iteration) invisible
+/// to messages already queued before they subscribed — they get the
+/// already-fresh post-commit cache via their handshake, but do not
+/// double-receive the wave's `[Dirty, Data]` that would otherwise duplicate
+/// the value.
+///
+/// Bookkeeping: `payload_retains` is the count of `payload_handle()`
+/// retains owed to the binding when this entry's messages release at
+/// flush time. Each push of a payload-bearing message bumps it; flush
+/// drains it via `deferred_handle_releases`.
+pub(crate) struct PendingPerNode {
+    pub(crate) sinks: Vec<Sink>,
+    pub(crate) messages: Vec<Message>,
+}
+
 impl Core {
     // -------------------------------------------------------------------
     // Wave entry + drain
     // -------------------------------------------------------------------
 
-    /// Wave entry. The caller passes a thunk that performs the wave's
-    /// triggering operation (`commit_emission`, `terminate_node`, etc.) under
-    /// the held lock. After the thunk returns, this method drains all
-    /// transitive fn-fires, collects sink-fire jobs into
-    /// `s.deferred_flush_jobs`, runs wave cleanup, then **drops the lock and
-    /// fires the deferred jobs** so subscribers run lock-released.
+    /// Wave entry. The caller passes a closure that performs the wave's
+    /// triggering operation (`commit_emission`, `terminate_node`, etc.).
+    /// The closure runs lock-released; closure-internal Core methods
+    /// acquire the state lock as they go.
     ///
-    /// Re-entrant note: if the wave engine is already in-tick (the thunk
-    /// itself was invoked from inside another wave), the thunk runs and
-    /// returns immediately — the outer wave's drain handles the queued
-    /// work. The drop-then-fire dance happens only at the outermost wave.
+    /// **Implementation:** delegates to [`Self::begin_batch`] for the
+    /// wave's RAII lifecycle. The returned `BatchGuard` holds the
+    /// `wave_owner` re-entrant mutex for the wave's duration (cross-thread
+    /// emits block; same-thread re-entry passes through), claims `in_tick`,
+    /// and on drop runs the drain + flush + sink-fire phases — OR, if the
+    /// closure panicked, the panic-discard path that restores cache
+    /// snapshots and clears in_tick. This unification gives `run_wave` the
+    /// same panic-safety guarantee as the user-facing `Core::batch`.
     ///
-    /// Lock-release discipline (Slice A-bigger, M1-close): all sink-fire
-    /// sites in the dispatcher now follow the snapshot-then-drop-then-fire
-    /// pattern. A sink that calls back into `Core::emit` / `pause` / `resume`
-    /// / `invalidate` / `complete` / `error` / `teardown` re-acquires the
-    /// lock fresh and runs a nested wave (the existing `s.in_tick` re-entrance
-    /// gate composes with this transparently — nested calls observe
-    /// `in_tick = false` because we cleared it before firing sinks). What
-    /// is *still* held lock-during-callback is `BindingBoundary::invoke_fn`
-    /// (fn re-entrance into Core deadlocks); that lift is a follow-up.
-    pub(crate) fn run_wave<F>(&self, s: &mut CoreState, thunk: F)
+    /// **Re-entrance:** a closure invoked from inside another wave — the
+    /// inner `run_wave`'s `begin_batch` observes `in_tick=true`, the
+    /// returned guard is non-owning (`owns_tick=false`), drop is a no-op.
+    /// The outer wave's drain picks up the inner closure's queued work.
+    ///
+    /// **Lock-release discipline (Slice A close, M1):** all binding-side
+    /// callbacks except the subscribe-time handshake fire lock-released.
+    /// Sinks that re-enter Core run a nested wave; user fns that re-enter
+    /// Core run a nested wave; custom-equals oracles that re-enter Core
+    /// run a nested wave. Cross-thread emits block at `wave_owner` until
+    /// the in-flight wave's drain completes — preserving the user-facing
+    /// "emit returning means subscribers have observed" contract.
+    pub(crate) fn run_wave<F>(&self, op: F)
     where
-        F: FnOnce(&Self, &mut CoreState),
+        F: FnOnce(&Self),
     {
-        if s.in_tick {
-            // Re-entrant: the outer wave's drain loop will pick up our queued work.
-            thunk(self, s);
-            return;
-        }
-        s.in_tick = true;
-        thunk(self, s);
-        self.drain_and_flush(s);
-        // Wave cleanup — clear wave-scoped flags and the in-tick gate
-        // BEFORE firing sinks, so a sink that re-enters Core sees a clean
-        // wave-state and can start its own fresh wave.
-        s.clear_wave_state();
-        s.in_tick = false;
-        // Commit snapshots — wave succeeded, snapshot retains are no longer
-        // needed for restoration. The handles release into the binding-side
-        // refcount; the cache slots already hold the new values.
-        self.commit_wave_cache_snapshots(s);
+        // The guard holds wave_owner + claims in_tick. On normal scope
+        // exit it drains + flushes + fires sinks. On panic-during-op it
+        // restores cache snapshots + clears in_tick (panic-discard).
+        let _guard = self.begin_batch();
+        op(self);
+        // _guard drops here → drain or panic-discard, depending on whether
+        // op() returned normally.
     }
 
     /// Release retains held by `wave_cache_snapshots` and clear the map.
@@ -136,10 +154,7 @@ impl Core {
         let snapshots = std::mem::take(&mut s.wave_cache_snapshots);
         let mut releases = Vec::with_capacity(snapshots.len());
         for (node_id, old_handle) in snapshots {
-            // Skip if the node was unregistered in the meantime (defensive;
-            // can't happen in v1).
             let Some(rec) = s.nodes.get_mut(&node_id) else {
-                // The snapshot retain is orphaned — release directly.
                 releases.push(old_handle);
                 continue;
             };
@@ -151,22 +166,36 @@ impl Core {
         releases
     }
 
-    pub(crate) fn drain_and_flush(&self, s: &mut CoreState) {
-        // Drain pending fires until quiescent.
+    /// Drain pending fires until quiescent, then flush wave-end notifications
+    /// to subscribers. Each fire iteration drops the state lock around the
+    /// binding's `invoke_fn` callback so user fns may re-enter Core safely.
+    ///
+    /// `&self`-only — manages its own locking. Called from [`Self::run_wave`]
+    /// and [`super::node::Core::activate_derived`] (via `run_wave`).
+    pub(crate) fn drain_and_flush(&self) {
         let mut guard = 0u32;
-        while !s.pending_fires.is_empty() {
+        loop {
             guard += 1;
             assert!(
                 guard < 10_000,
                 "wave drain exceeded 10k iterations (cycle?)"
             );
-            let Some(next) = self.pick_next_fire(s) else {
-                break;
+            // Pick next fire under a short lock.
+            let next = {
+                let s = self.lock_state();
+                if s.pending_fires.is_empty() {
+                    break;
+                }
+                self.pick_next_fire(&s)
             };
-            self.fire_fn(s, next);
+            let Some(next) = next else { break };
+            // fire_fn manages its own locking around invoke_fn.
+            self.fire_fn(next);
         }
-        // Phase 2: deliver wave-close to subscribers.
-        self.flush_notifications(s);
+        // Final flush phase under the lock — populates deferred_flush_jobs
+        // from pending_notify (already carries per-node sink snapshots).
+        let mut s = self.lock_state();
+        self.flush_notifications(&mut s);
     }
 
     /// Pick a node whose **transitive** upstream is fully settled.
@@ -176,17 +205,15 @@ impl Core {
     /// glitch prevention requires transitive (not immediate-only) reasoning
     /// — for graph `A → {B, C, E}; D = combine(B, C); F = combine(D, E)`,
     /// a wave that fires `E` first adds `F` to `pending_fires` before `D`
-    /// is added (`D` only enters `pending_fires` after `B` and `C` fire).
-    /// An immediate-only readiness check would mistakenly pick `F` because
-    /// neither `D` nor `E` are in `pending_fires` at that moment, firing
-    /// `F` against the stale activation-time `D` cache and again later
-    /// when `D` actually settles. Transitive upstream walk catches `B`/`C`
-    /// pending and correctly defers `F`.
+    /// is added. An immediate-only readiness check would mistakenly pick
+    /// `F` because neither `D` nor `E` are in `pending_fires` at that
+    /// moment, firing `F` against the stale activation-time `D` cache and
+    /// again later when `D` actually settles. Transitive upstream walk
+    /// catches `B`/`C` pending and correctly defers `F`.
     ///
     /// Cost: O(V) per candidate; worst case O(N·V) per pick. The existing
     /// porting-deferred entry on `pick_next_fire` perf flagged this as a
-    /// future per-node `unresolved_dep_count` refactor; the diamond
-    /// correctness comes first.
+    /// future per-node `unresolved_dep_count` refactor.
     fn pick_next_fire(&self, s: &CoreState) -> Option<NodeId> {
         for &id in &s.pending_fires {
             if Self::transitive_upstream_settled(s, id) {
@@ -201,13 +228,9 @@ impl Core {
 
     fn transitive_upstream_settled(s: &CoreState, node_id: NodeId) -> bool {
         let rec = s.require_node(node_id);
-        // Empty deps (e.g. a state node — shouldn't normally be in
-        // pending_fires, but defensive) → trivially settled.
         if rec.deps.is_empty() {
             return true;
         }
-        // BFS up via `deps`. Return false on first hit in pending_fires;
-        // skip nodes already visited in this walk.
         let mut visited: ahash::AHashSet<NodeId> = ahash::AHashSet::new();
         let mut stack: Vec<NodeId> = rec.deps.clone();
         while let Some(id) = stack.pop() {
@@ -228,30 +251,59 @@ impl Core {
         true
     }
 
-    fn fire_fn(&self, s: &mut CoreState, node_id: NodeId) {
-        s.pending_fires.remove(&node_id);
-        let (fn_id, dep_handles, kind) = {
+    /// Fire a node's fn lock-released around `invoke_fn`.
+    ///
+    /// Phase 1 (lock-held): remove from pending_fires, snapshot fn_id +
+    /// dep_handles + kind. Skip if terminal, first-run-gate-closed, or
+    /// stateless.
+    ///
+    /// Phase 2 (lock-released): call `BindingBoundary::invoke_fn`. User fn
+    /// callbacks may re-enter Core (`emit`, `pause`, etc.) and run a nested
+    /// wave — the in_tick gate composes naturally because nested calls
+    /// observe `in_tick = true` and skip their own drain.
+    ///
+    /// Phase 3 (lock-held): mark `has_fired_once`, store dynamic-tracked,
+    /// decide between Noop+RESOLVED and Data.
+    ///
+    /// Phase 4: if Data, call `commit_emission` (which manages its own
+    /// locking around `custom_equals`).
+    fn fire_fn(&self, node_id: NodeId) {
+        // Phase 1: snapshot inputs.
+        let prep: Option<(crate::handle::FnId, Vec<HandleId>, NodeKind)> = {
+            let mut s = self.lock_state();
+            s.pending_fires.remove(&node_id);
             let rec = s.require_node(node_id);
-            // Terminal node — fn never fires again (R1.3.4 / Lock 2.B).
-            if rec.terminal.is_some() {
-                return;
+            // Skip: terminal, first-run-gate-closed, or stateless.
+            if rec.terminal.is_some() || rec.dep_handles.contains(&NO_HANDLE) {
+                None
+            } else {
+                rec.fn_id
+                    .map(|fn_id| (fn_id, rec.dep_handles.clone(), rec.kind))
             }
-            // First-run gate: every dep must have a handle before fn fires.
-            if rec.dep_handles.contains(&NO_HANDLE) {
-                return;
-            }
-            let Some(fn_id) = rec.fn_id else { return };
-            (fn_id, rec.dep_handles.clone(), rec.kind)
         };
-        // Drop the borrow across the binding call. The lock IS held; the
-        // binding side must not re-enter Core methods (CLAUDE.md re-entrance
-        // discipline; sinks fire later in flush phase).
+        let Some((fn_id, dep_handles, kind)) = prep else {
+            return;
+        };
+
+        // Phase 2: invoke fn lock-released.
         let result = self.binding.invoke_fn(node_id, fn_id, &dep_handles);
 
-        {
+        // Phase 3: apply result under the lock — defensive terminal check
+        // (a sibling cascade may have terminated this node during phase 2).
+        let to_emit: Option<HandleId> = {
+            let mut s = self.lock_state();
+            // Defensive: node may have terminated mid-phase-2 via a sibling
+            // cascade (a fn that re-entered `Core::error` on a path that
+            // cascaded here). If so, the result's payload retain is dropped
+            // (binding intern share) and we no-op.
+            if s.require_node(node_id).terminal.is_some() {
+                if let FnResult::Data { handle, .. } = &result {
+                    self.binding.release_handle(*handle);
+                }
+                return;
+            }
             let rec = s.require_node_mut(node_id);
             rec.has_fired_once = true;
-            // Dynamic: fn declares its tracked dep indices.
             if kind == NodeKind::Dynamic {
                 let tracked = match &result {
                     FnResult::Data { tracked, .. } | FnResult::Noop { tracked } => tracked.clone(),
@@ -260,19 +312,22 @@ impl Core {
                     rec.tracked = t.into_iter().collect();
                 }
             }
-        }
-
-        match result {
-            FnResult::Noop { .. } => {
-                // No emission this wave — RESOLVED if we already DIRTY'd subscribers.
-                let already_dirty = s.require_node(node_id).dirty;
-                if already_dirty {
-                    self.queue_notify(s, node_id, Message::Resolved);
+            match result {
+                FnResult::Noop { .. } => {
+                    let already_dirty = s.require_node(node_id).dirty;
+                    if already_dirty {
+                        self.queue_notify(&mut s, node_id, Message::Resolved);
+                    }
+                    None
                 }
+                FnResult::Data { handle, .. } => Some(handle),
             }
-            FnResult::Data { handle, .. } => {
-                self.commit_emission(s, node_id, handle);
-            }
+        };
+
+        // Phase 4: commit_emission if Data. Manages its own locking around
+        // custom_equals.
+        if let Some(handle) = to_emit {
+            self.commit_emission(node_id, handle);
         }
     }
 
@@ -280,72 +335,93 @@ impl Core {
     // Emission commit — equals-substitution lives here
     // -------------------------------------------------------------------
 
-    pub(crate) fn commit_emission(&self, s: &mut CoreState, node_id: NodeId, new_handle: HandleId) {
+    /// Apply a node's emission. `&self`-only; brackets the equals check
+    /// around a lock release so `BindingBoundary::custom_equals` can re-enter
+    /// Core safely.
+    ///
+    /// Phase 1 (lock-held): defensive terminal short-circuit; snapshot
+    /// equals_mode + old cache handle.
+    ///
+    /// Phase 2 (lock-released): call `handles_equal` — `EqualsMode::Identity`
+    /// is a pure `u64` compare with no boundary call; `EqualsMode::Custom`
+    /// crosses to the binding's `custom_equals` oracle, which may re-enter
+    /// Core.
+    ///
+    /// Phase 3 (lock-held): set cache, queue Dirty + Data/Resolved into
+    /// pending_notify (which snapshots subscribers on first touch),
+    /// propagate to children.
+    pub(crate) fn commit_emission(&self, node_id: NodeId, new_handle: HandleId) {
         assert!(
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4) for node {node_id:?}",
         );
-        // Defensive R1.3.4 terminal guard. Current call sites (`Core::emit`
-        // and `fire_fn`) already screen out terminal nodes, so this is dead
-        // for v1 — but a future operator's fn returning Data on a node that
-        // became terminal mid-wave (e.g., via a sibling rewire path) would
-        // silently violate "no DIRTY/DATA/RESOLVED after COMPLETE/ERROR"
-        // without this. Released the caller's intern share if we short-
-        // circuit (mirrors `Core::emit`'s terminal short-circuit).
+
+        // Phase 1: terminal short-circuit + snapshot equals/cache.
+        let snapshot = {
+            let s = self.lock_state();
+            let rec = s.require_node(node_id);
+            if rec.terminal.is_some() {
+                drop(s);
+                self.binding.release_handle(new_handle);
+                return;
+            }
+            (rec.cache, rec.equals)
+        };
+        let (old_handle, equals_mode) = snapshot;
+
+        // Phase 2: equals check (lock-released for Custom).
+        let is_data = !self.handles_equal_lock_released(equals_mode, old_handle, new_handle);
+
+        // Phase 3: apply emission under the lock. Defensive terminal
+        // re-check — a concurrent cascade between phase 2 and phase 3
+        // could have terminated the node.
+        let mut s = self.lock_state();
         if s.require_node(node_id).terminal.is_some() {
+            drop(s);
             self.binding.release_handle(new_handle);
             return;
         }
-        let (old_handle, equals_mode) = {
-            let rec = s.require_node(node_id);
-            (rec.cache, rec.equals)
-        };
-        let is_data = !self.handles_equal(equals_mode, old_handle, new_handle);
 
-        // R1.3.1.a + R1.3.6.b: each `commit_emission` produces one DIRTY
-        // followed by one tier-3 settlement (DATA or RESOLVED). For K
-        // consecutive `emit` calls on a state node within one wave (e.g.
-        // inside `batch()`), each emit's commit_emission queues its own
-        // DIRTY/settlement pair, so subscribers see K DIRTYs balanced by
-        // K settlements. The previous "skip DIRTY when already dirty"
-        // optimization left subscribers with 1 DIRTY + K settlements when
-        // an equals-match emit's RESOLVED-children-broadcast had already
-        // queued DIRTY for a downstream node and a later value-changing
-        // emit then triggered the same downstream's fn-fire — net imbalance.
-        // The `dirty` flag stays purely for the RESOLVED-children-broadcast
-        // gate on `involved_this_wave` (kept as `true` after first set so
-        // wave cleanup resets it) but no longer gates DIRTY queueing.
         s.require_node_mut(node_id).dirty = true;
-        self.queue_notify(s, node_id, Message::Dirty);
+        self.queue_notify(&mut s, node_id, Message::Dirty);
 
         if is_data {
-            // Snapshot the OLD cache before overwriting, so a `BatchGuard`
-            // panic-discard can roll back to pre-wave state. We retain the
-            // old handle via the snapshot slot (it transfers from the cache
-            // slot's existing retain — no new binding-side retain needed,
-            // we just elide the `release_handle(old_handle)` below when
-            // snapshotting). On wave commit, snapshots are dropped and
-            // their retains released. On wave abort, the snapshot's retain
-            // transfers back to the restored cache slot.
-            let snapshot_taken = if s.in_tick && old_handle != NO_HANDLE {
+            // P3 (Slice A close /qa): re-read CURRENT cache. Same-thread
+            // re-entry from a `custom_equals` oracle that called back into
+            // `Core::emit` on this same node during phase 2's lock-released
+            // equals check could have advanced the cache between phase 1's
+            // snapshot (`old_handle`) and this point. The wave-owner mutex
+            // (Q2) prevents cross-thread concurrent commits, but same-thread
+            // nested commits are intentionally allowed. Releasing
+            // `old_handle` instead of the actual displaced handle would
+            // cause a double-release on the binding side AND leak the
+            // intermediate cache (the value the nested commit wrote).
+            //
+            // Note: `is_data` was computed against `(old_handle, new_handle)`
+            // during phase 2; if the cache moved, the equals decision could
+            // be stale. For Identity equals: if `current_cache == new_handle`,
+            // we'll redundantly emit DATA when RESOLVED would suffice
+            // (benign — subscribers see one extra DATA in the rare race).
+            // For Custom equals racing the same-node: undefined, documented
+            // in `porting-deferred.md`.
+            let current_cache = s.require_node(node_id).cache;
+            let snapshot_taken = if s.in_tick && current_cache != NO_HANDLE {
                 use std::collections::hash_map::Entry;
                 match s.wave_cache_snapshots.entry(node_id) {
                     Entry::Vacant(slot) => {
-                        slot.insert(old_handle);
+                        slot.insert(current_cache);
                         true
                     }
-                    Entry::Occupied(_) => false, // first snapshot for this node already exists
+                    Entry::Occupied(_) => false,
                 }
             } else {
                 false
             };
             s.require_node_mut(node_id).cache = new_handle;
-            // Refcount: release prior cache handle UNLESS we just snapshotted
-            // it (snapshot owns the retain now, on behalf of potential restore).
-            if old_handle != NO_HANDLE && !snapshot_taken {
-                self.binding.release_handle(old_handle);
+            if current_cache != NO_HANDLE && !snapshot_taken {
+                self.binding.release_handle(current_cache);
             }
-            self.queue_notify(s, node_id, Message::Data(new_handle));
+            self.queue_notify(&mut s, node_id, Message::Data(new_handle));
             // Propagate to children
             let child_ids: Vec<NodeId> = s
                 .children
@@ -359,15 +435,15 @@ impl Core {
                     .iter()
                     .position(|&d| d == node_id);
                 if let Some(idx) = dep_idx {
-                    self.deliver_data_to_consumer(s, child_id, idx, new_handle);
+                    self.deliver_data_to_consumer(&mut s, child_id, idx, new_handle);
                 }
             }
         } else {
             // RESOLVED: handle unchanged. Don't release; old still in use.
-            self.queue_notify(s, node_id, Message::Resolved);
-            // Children that haven't been involved this wave still need DIRTY+RESOLVED
-            // for the wave-mask bookkeeping (so their subscribers see consistent
-            // wave-close on diamond fan-in).
+            self.queue_notify(&mut s, node_id, Message::Resolved);
+            // Children that haven't been involved this wave still need
+            // DIRTY+RESOLVED for wave-mask bookkeeping (so their subscribers
+            // see consistent wave-close on diamond fan-in).
             let child_ids: Vec<NodeId> = s
                 .children
                 .get(&node_id)
@@ -381,18 +457,19 @@ impl Core {
                         child.involved_this_wave = true;
                         child.dirty = true;
                     }
-                    self.queue_notify(s, child_id, Message::Dirty);
-                    self.queue_notify(s, child_id, Message::Resolved);
+                    self.queue_notify(&mut s, child_id, Message::Dirty);
+                    self.queue_notify(&mut s, child_id, Message::Resolved);
                 }
             }
         }
     }
 
-    fn handles_equal(&self, mode: EqualsMode, a: HandleId, b: HandleId) -> bool {
+    /// Equals check that crosses the binding boundary lock-released for
+    /// `EqualsMode::Custom`. Caller must NOT hold the state lock.
+    fn handles_equal_lock_released(&self, mode: EqualsMode, a: HandleId, b: HandleId) -> bool {
         if a == b {
             return true; // identity-on-handles always sufficient
         }
-        // Sentinel on either side: not equal, no boundary call.
         if a == NO_HANDLE || b == NO_HANDLE {
             return false;
         }
@@ -428,8 +505,7 @@ impl Core {
                 }
             }
             NodeKind::State => {
-                // State nodes don't have deps, so this branch is unreachable
-                // in practice. No-op for safety.
+                // State nodes don't have deps; unreachable in practice.
             }
         }
     }
@@ -438,57 +514,83 @@ impl Core {
     // Subscriber notification
     // -------------------------------------------------------------------
 
+    /// Queue a wave-end message for `node_id`'s subscribers.
+    ///
+    /// **Sink-snapshot-on-first-touch:** the per-wave subscriber list is
+    /// snapshotted the first time `queue_notify` is called for each node
+    /// in a wave (via the `Vacant` arm of `pending_notify.entry()`).
+    /// Subsequent calls for the same node append messages but reuse the
+    /// snapshot. This makes late subscribers (installed mid-wave between
+    /// fn-fire iterations now that the state lock drops per-iteration)
+    /// invisible to messages already queued before they subscribed —
+    /// avoiding the duplicate-Data delivery hazard where a late subscriber
+    /// would see `[Start, Data(post)]` from its handshake AND `[Dirty,
+    /// Data(post)]` from the wave's flush.
+    ///
+    /// Pause routing decision (R1.3.7.b tier table, §10.2 buffering):
+    ///   Tier 3 (DATA / RESOLVED) and Tier 4 (INVALIDATE) buffer while
+    ///   paused; all other tiers (DIRTY tier 1, PAUSE/RESUME tier 2,
+    ///   COMPLETE/ERROR tier 5, TEARDOWN tier 6) bypass the buffer and
+    ///   flush immediately. START (tier 0) is per-subscription and never
+    ///   transits queue_notify.
     pub(crate) fn queue_notify(&self, s: &mut CoreState, node_id: NodeId, msg: Message) {
-        // Pause routing decision (R1.3.7.b tier table, §10.2 buffering):
-        //   Tier 3 (DATA / RESOLVED) and Tier 4 (INVALIDATE) buffer while
-        //   paused; all other tiers (DIRTY tier 1, PAUSE/RESUME tier 2,
-        //   COMPLETE/ERROR tier 5, TEARDOWN tier 6) bypass the buffer and
-        //   flush immediately. START (tier 0) is per-subscription and never
-        //   transits queue_notify.
         let buffered_tier = matches!(msg.tier(), 3 | 4);
         let cap = s.pause_buffer_cap;
-        // Refcount discipline:
-        //   - For pause-buffer storage (paused + tier-3/4): retain on push,
-        //     release on overflow drop or in `Core::resume`'s drain.
-        //   - For pending_notify storage (every payload-bearing message
-        //     queued for the wave-end flush): retain on push, release in
-        //     `flush_notifications` after the sink fires. This is required
-        //     because `commit_emission` releases the prior cache handle
-        //     before the wave drains — without the pending_notify retain,
-        //     a coalesced multi-emit (`emit(s, h1)` then `emit(s, h2)`
-        //     inside one wave, e.g. via `Core::batch`) would underflow h1's
-        //     refcount when emit2's commit_emission release fires before
-        //     the wave-end flush. v1 single-emit-per-wave never exercised
-        //     this; user-facing batch (Slice C-1.5) does.
-        //
-        // Subscribers.is_empty() shortcut deliberately runs BEFORE the retain
-        // — zero subscribers means the message is dropped altogether and
-        // never queued, so there's no buffer slot to keep alive.
-        let rec = s.require_node_mut(node_id);
-        if rec.subscribers.is_empty() {
-            return;
-        }
-        if buffered_tier && rec.pause_state.is_paused() {
-            if let Some(h) = msg.payload_handle() {
-                self.binding.retain_handle(h);
+
+        // Pause-routing branch — handles its own retain/release and returns
+        // before we touch `pending_notify`, so the rec borrow is contained.
+        {
+            let rec = s.require_node_mut(node_id);
+            if rec.subscribers.is_empty() {
+                return;
             }
-            let dropped_msgs = rec.pause_state.push_buffered(msg, cap);
-            // Drop borrow on rec before calling binding for the dropped
-            // payloads' release_handle (binding mutex is independent of
-            // CoreState mutex, but staying conservative).
-            for dm in dropped_msgs {
-                if let Some(h) = dm.payload_handle() {
-                    self.binding.release_handle(h);
+            if buffered_tier && rec.pause_state.is_paused() {
+                if let Some(h) = msg.payload_handle() {
+                    self.binding.retain_handle(h);
                 }
+                let dropped_msgs = rec.pause_state.push_buffered(msg, cap);
+                for dm in dropped_msgs {
+                    if let Some(h) = dm.payload_handle() {
+                        self.binding.release_handle(h);
+                    }
+                }
+                return;
             }
-            return;
         }
-        // Non-paused queue: retain payload handle so coalesced multi-emit
-        // doesn't dangle. Released in `flush_notifications`.
+
+        // Non-paused queue path: retain payload handle and queue into
+        // pending_notify with a per-wave subscriber snapshot taken at
+        // first touch. Released in `flush_notifications` after sinks fire.
         if let Some(h) = msg.payload_handle() {
             self.binding.retain_handle(h);
         }
-        s.pending_notify.entry(node_id).or_default().push(msg);
+
+        // Snapshot subscribers on first touch per wave. We need to read
+        // `subscribers` separately from the `pending_notify.entry()` borrow
+        // because both are fields of `CoreState` and split-borrowing
+        // through a method call (`require_node_mut`) defeats the borrow
+        // checker. So precompute the snapshot iff the entry is vacant.
+        let needs_snapshot = !s.pending_notify.contains_key(&node_id);
+        let sinks_snapshot: Vec<Sink> = if needs_snapshot {
+            s.require_node(node_id)
+                .subscribers
+                .values()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        match s.pending_notify.entry(node_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(PendingPerNode {
+                    sinks: sinks_snapshot,
+                    messages: vec![msg],
+                });
+            }
+            Entry::Occupied(mut slot) => {
+                slot.get_mut().messages.push(msg);
+            }
+        }
     }
 
     /// Collect wave-end sink-fire jobs into `s.deferred_flush_jobs` and the
@@ -516,9 +618,7 @@ impl Core {
     ///
     /// Within a single phase, per-node insertion order (IndexMap iteration)
     /// is preserved — an emit on A before B → A's phase-2 messages flush
-    /// before B's. Within a single node, message order is preserved
-    /// (e.g. `[Data(h1), Data(h2)]` from coalesced multi-emits stays in
-    /// emit order).
+    /// before B's. Within a single node, message order is preserved.
     fn flush_notifications(&self, s: &mut CoreState) {
         const PHASES: &[&[u8]] = &[
             &[1],    // DIRTY
@@ -528,8 +628,9 @@ impl Core {
         ];
         let pending = std::mem::take(&mut s.pending_notify);
         for &phase_tiers in PHASES {
-            for (node_id, msgs) in &pending {
-                let phase_msgs: Vec<Message> = msgs
+            for (_node_id, entry) in &pending {
+                let phase_msgs: Vec<Message> = entry
+                    .messages
                     .iter()
                     .copied()
                     .filter(|m| phase_tiers.contains(&m.tier()))
@@ -537,22 +638,20 @@ impl Core {
                 if phase_msgs.is_empty() {
                     continue;
                 }
-                let Some(rec) = s.nodes.get(node_id) else {
-                    continue;
-                };
-                let sinks: Vec<Sink> = rec.subscribers.values().cloned().collect();
-                if sinks.is_empty() {
+                if entry.sinks.is_empty() {
                     continue;
                 }
-                s.deferred_flush_jobs.push((sinks, phase_msgs));
+                // Clone the per-node sink snapshot — same Arcs, cheap.
+                let sinks_clone: Vec<Sink> = entry.sinks.iter().map(Arc::clone).collect();
+                s.deferred_flush_jobs.push((sinks_clone, phase_msgs));
             }
         }
         // Refcount release: balance the retain done in `queue_notify` for
         // every payload-bearing message that landed in pending_notify.
         // Deferred to post-lock-drop so the binding's release path can't
         // re-enter Core under our lock.
-        for msgs in pending.values() {
-            for msg in msgs {
+        for entry in pending.values() {
+            for msg in &entry.messages {
                 if let Some(h) = msg.payload_handle() {
                     s.deferred_handle_releases.push(h);
                 }
@@ -640,6 +739,13 @@ impl Core {
     /// wave (only the outermost guard drains).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch(&self) -> BatchGuard {
+        // Acquire the wave-owner re-entrant mutex BEFORE the state lock.
+        // Same-thread re-entry passes through (e.g. fn → emit → run_wave →
+        // begin_batch from inside outer wave's invoke_fn); cross-thread
+        // entries block until the in-flight wave's `_wave_guard` drops.
+        // `lock_arc()` is `!Send` — strengthens BatchGuard's `!Send`
+        // guarantee at the type level.
+        let wave_guard = self.wave_owner.lock_arc();
         let owns_tick = {
             let mut s = self.lock_state();
             let was_in = s.in_tick;
@@ -651,6 +757,7 @@ impl Core {
         BatchGuard {
             core: self.clone(),
             owns_tick,
+            _wave_guard: wave_guard,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -669,20 +776,22 @@ impl Core {
 /// On thread panic during the closure body, the drop path discards pending
 /// tier-3+ delivery rather than firing sinks (avoids cascading panics).
 /// Subscribers observe **no tier-3+ delivery for the panicked wave**.
-/// State-node cache writes that already executed inside the closure (via
-/// `Core::emit`'s inline `commit_emission`) remain committed — subsequent
-/// `cache_of` calls return the post-panic state. The atomicity guarantee is
-/// sink-observability, not state-rollback.
+/// State-node cache writes that already executed inside the closure are
+/// rolled back via wave-cache snapshots — `cache_of(s)` returns the pre-
+/// panic value. The atomicity guarantee covers both sink-observability and
+/// cache state.
 ///
 /// # Thread safety
 ///
 /// `BatchGuard` is **`!Send`** by design. `begin_batch` claims the
-/// per-`Core` `in_tick` flag on the calling thread; sending the guard to
-/// another thread and dropping it there would clear `in_tick` from a
-/// different thread than the one that set it, breaking the implicit
-/// thread-local "I own the wave scope" semantic. The marker
-/// (`PhantomData<*const ()>`) makes the type unsuitable for cross-thread
-/// transfer at the type level. Verified by the doctest below.
+/// per-`Core` `in_tick` flag AND the per-`Core` `wave_owner` re-entrant
+/// mutex on the calling thread; sending the guard to another thread
+/// and dropping it there would clear `in_tick` and release `wave_owner`
+/// from a different thread than the one that acquired them, breaking
+/// both the thread-local "I own the wave scope" semantic and
+/// `parking_lot::ReentrantMutex`'s ownership invariant. The
+/// `_wave_guard` field is `!Send` (`ArcReentrantMutexGuard<()>`); the
+/// `PhantomData<*const ()>` marker is belt-and-suspenders.
 ///
 /// ```compile_fail
 /// use graphrefly_core::{BatchGuard, BindingBoundary, Core, FnId, FnResult, HandleId, NodeId};
@@ -705,9 +814,16 @@ impl Core {
 pub struct BatchGuard {
     core: Core,
     owns_tick: bool,
-    // !Send marker. `*const ()` is neither Send nor Sync, so a guard can
-    // never be moved to another thread or shared across them — matches the
-    // thread-local nature of the in_tick claim.
+    /// Re-entrant mutex guard held for the wave's duration. Drop releases
+    /// `wave_owner`, allowing cross-thread waves blocked at
+    /// `Core::begin_batch` to proceed. Same-thread re-entry (nested
+    /// `begin_batch` from a fn callback) re-acquires this mutex
+    /// transparently.
+    ///
+    /// `ArcReentrantMutexGuard<()>` is `!Send`, so `BatchGuard` is `!Send`
+    /// at the type level — sending across threads would violate
+    /// `parking_lot::ReentrantMutex`'s thread-ownership invariant.
+    _wave_guard: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
@@ -720,16 +836,13 @@ impl Drop for BatchGuard {
             // Discard pending wave work to avoid firing sinks during
             // unwind (sink panic during unwind would abort the process).
             //
-            // Restore wave-cache snapshots — for each state node whose
-            // cache was advanced during the panicked closure, roll back
-            // to the pre-wave value. Subscribers see no tier-3+ delivery,
-            // AND `cache_of(s)` returns the pre-panic state — atomicity
-            // guarantee covers both observability and state.
-            //
             // Refcount discipline: pending_notify entries (or any
             // already-collected deferred_handle_releases from a partial
             // drain) hold a queue_notify-time retain on every payload
             // handle. Release them here so the discard doesn't leak.
+            //
+            // Wave-cache snapshots restore pre-panic cache values so the
+            // atomicity guarantee covers state, not just observability.
             let (pending, deferred_releases, restored_releases) = {
                 let mut s = self.core.lock_state();
                 let pending = std::mem::take(&mut s.pending_notify);
@@ -743,8 +856,8 @@ impl Drop for BatchGuard {
             };
             // Lock dropped — release retains lock-released so the binding
             // can't deadlock against an internal binding mutex.
-            for msgs in pending.values() {
-                for msg in msgs {
+            for entry in pending.values() {
+                for msg in &entry.messages {
                     if let Some(h) = msg.payload_handle() {
                         self.core.binding.release_handle(h);
                     }
@@ -758,13 +871,13 @@ impl Drop for BatchGuard {
             }
             return;
         }
+        // Successful drain — drain_and_flush manages its own locking.
+        self.core.drain_and_flush();
+        // Wave cleanup + extract deferred jobs under the lock.
         let (jobs, releases) = {
             let mut s = self.core.lock_state();
-            self.core.drain_and_flush(&mut s);
             s.clear_wave_state();
             s.in_tick = false;
-            // Wave succeeded — drop snapshot retains (no longer needed for
-            // restoration; cache slots already hold the new values).
             self.core.commit_wave_cache_snapshots(&mut s);
             Core::drain_deferred(&mut s)
         };

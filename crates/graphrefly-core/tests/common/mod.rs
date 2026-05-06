@@ -13,6 +13,7 @@
 #![allow(dead_code)] // Some helpers used only by certain test files.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
@@ -424,6 +425,14 @@ pub enum RecordedEvent {
 /// `events` Arc via [`Self::events`].
 pub struct Recorder {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
+    /// Per-call event counts — `call_boundaries[i]` is the number of events
+    /// in the i-th sink call. Sum equals `events.len()`. Used by R1.3.5.a
+    /// handshake-tier-split tests that need to verify "the [Start] and
+    /// [Data(v)] handshake came as 2 separate sink calls, not 1 batched
+    /// call".
+    call_boundaries: Arc<Mutex<Vec<usize>>>,
+    /// Number of sink calls observed. Cheap to read from any thread.
+    call_count: Arc<AtomicU64>,
     /// Holds the subscription so that dropping the Recorder unsubscribes.
     /// `Option` so [`Self::new`] can construct the recorder before the sink
     /// is registered, then [`Self::attach`] fills it in.
@@ -434,12 +443,16 @@ impl Recorder {
     pub fn new() -> Self {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
+            call_boundaries: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(AtomicU64::new(0)),
             subscription: Mutex::new(None),
         }
     }
 
     pub fn sink(&self, binding: Arc<TestBinding>) -> Sink {
         let events = self.events.clone();
+        let call_boundaries = self.call_boundaries.clone();
+        let call_count = self.call_count.clone();
         Arc::new(move |msgs: &[Message]| {
             let mut guard = events.lock().expect("recorder lock");
             for msg in msgs {
@@ -457,7 +470,27 @@ impl Recorder {
                 };
                 guard.push(recorded);
             }
+            call_boundaries
+                .lock()
+                .expect("recorder lock")
+                .push(msgs.len());
+            call_count.fetch_add(1, Ordering::SeqCst);
         })
+    }
+
+    /// Number of times the sink was invoked. Each `sink(&[...])` callback
+    /// is one call regardless of `msgs.len()`. Used by tier-split tests.
+    #[must_use]
+    pub fn call_count(&self) -> u64 {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    /// Per-call message counts in arrival order — `[2, 1]` means two
+    /// sink invocations: the first delivered 2 messages, the second
+    /// delivered 1.
+    #[must_use]
+    pub fn call_boundaries(&self) -> Vec<usize> {
+        self.call_boundaries.lock().expect("recorder lock").clone()
     }
 
     pub fn attach(&self, sub: Subscription) {

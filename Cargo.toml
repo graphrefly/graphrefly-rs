@@ -36,7 +36,9 @@ graphrefly-storage    = { path = "crates/graphrefly-storage",    version = "0.0.
 graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.0" }
 
 # Concurrency primitives
-parking_lot = { version = "0.12", default-features = false }
+# `arc_lock` enables `Arc<ReentrantMutex<()>>::lock_arc()` returning an
+# owned `ArcReentrantMutexGuard` (Slice A close /qa wave-owner mutex).
+parking_lot = { version = "0.12", default-features = false, features = ["arc_lock"] }
 ahash       = { version = "0.8" }
 
 # Small-collection primitives

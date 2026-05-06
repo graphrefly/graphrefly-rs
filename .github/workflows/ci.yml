@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # `RUSTFLAGS: -D warnings` is applied per-step in the `rust` job below
+  # rather than globally — the napi-rs binding crate has macro-generated
+  # FFI items that trip pedantic-tier lints that don't apply to FFI
+  # surfaces.
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Rust: check + test + clippy + fmt + cargo-deny on the pinned 1.95
+  # toolchain (workspace `rust-toolchain.toml`). Excludes binding crates
+  # from `cargo test`/`cargo build` via workspace `default-members` —
+  # they need their own toolchains (napi-rs, maturin, wasm-pack) and
+  # land separately in the binding-specific jobs below.
+  # ---------------------------------------------------------------------
+  rust:
+    name: Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.95"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ matrix.toolchain }}
+
+      - name: Cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check (default-members)
+        run: cargo check
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Cargo clippy (default-members, all targets, pedantic-tier)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Cargo test (default-members)
+        run: cargo test --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Cargo doc (no deps; catches broken intra-doc links)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # ---------------------------------------------------------------------
+  # Supply-chain audit via cargo-deny — license allowlist, advisory
+  # database, version-unification warnings. Pinned action version so
+  # `cargo install cargo-deny` doesn't recompile from source on every
+  # CI run.
+  # ---------------------------------------------------------------------
+  deny:
+    name: cargo deny (supply-chain audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # ---------------------------------------------------------------------
+  # napi-rs JavaScript binding — builds + lints. Doesn't run tests
+  # (the binding's tests are JS-side and live in graphrefly-ts's
+  # bench harness). The build verifies the cdylib link works.
+  # ---------------------------------------------------------------------
+  bindings-js:
+    name: napi-rs binding (cdylib build + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          components: clippy
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bindings-js
+
+      - name: Build napi-rs binding (lib + cdylib)
+        run: cargo build -p graphrefly-bindings-js --features tracing
+
+      # Clippy here is informational — napi-rs macro-generated code +
+      # FFI-exported `pub fn` items trip clippy::pedantic warnings that
+      # don't apply to FFI surfaces. Build success is the bar; clippy
+      # output is captured for review.
+      - name: Clippy on bindings-js (informational)
+        run: cargo clippy -p graphrefly-bindings-js --features tracing
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------
+  # TLA+ model checks — runs the canonical handle-protocol scenarios
+  # from `~/src/graphrefly-ts/docs/research/`. The Rust port refines
+  # the same wave_protocol invariants; any drift between the Rust
+  # impl and the spec MUST surface here too.
+  #
+  # The MC harnesses live in graphrefly-ts. CI fetches them via raw
+  # GitHub URLs so this workflow doesn't need a sibling-repo checkout.
+  # When TS's MC files change, this CI picks them up on next run.
+  #
+  # Each TLC run uses ~10s of CPU on a small state space (the MCs are
+  # tuned for fast verification — diamond + rewire scenarios).
+  # ---------------------------------------------------------------------
+  tlc:
+    name: TLA+ model check (wave_protocol scenarios)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Java (TLC requires JRE 11+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download TLA+ tools
+        run: |
+          curl -fL --retry 3 -o /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          test -s /tmp/tla2tools.jar
+
+      - name: Fetch MC harnesses from graphrefly-ts (handle-protocol + wave-protocol-rewire)
+        # NOTE: pinned via the `TLA_REF` env var. `main` is the Rust port's
+        # default tracking branch — it picks up canonical-spec amendments
+        # immediately. Pin to a release SHA / tag once graphrefly-ts cuts
+        # versioned releases (post-v1.0). Tracked in
+        # `docs/porting-deferred.md` under "CI hardening".
+        env:
+          TLA_REF: main
+        shell: bash -euo pipefail {0}
+        run: |
+          mkdir -p /tmp/tla
+          BASE="https://raw.githubusercontent.com/graphrefly/graphrefly-ts/${TLA_REF}/docs/research"
+          for f in handle-protocol.tla handle_protocol_MC.tla handle_protocol_MC.cfg \
+                   wave_protocol_rewire.tla wave_protocol_rewire_MC.tla \
+                   wave_protocol_rewire_MC.cfg; do
+            curl -fL --retry 3 -o "/tmp/tla/$f" "$BASE/$f"
+            test -s "/tmp/tla/$f"
+          done
+
+      - name: TLC — handle_protocol_MC (diamond + handle-protocol refinement)
+        working-directory: /tmp/tla
+        # `set -euo pipefail` ensures a failed `java` invocation (OOM,
+        # classpath error, etc.) propagates through `tee` instead of being
+        # masked by `tee`'s exit code. The explicit `grep` checks cover
+        # TLC's logical failures (invariant violations, "Error:" lines).
+        shell: bash -euo pipefail {0}
+        run: |
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
+            -tool -workers auto -config handle_protocol_MC.cfg handle_protocol_MC.tla \
+            | tee handle.log
+          # TLC reports "Model checking completed" on success; "Error:" or
+          # "Invariant ... is violated" on failure.
+          grep -q "Model checking completed" handle.log
+          ! grep -q "is violated" handle.log
+          ! grep -qi "^error:" handle.log
+
+      - name: TLC — wave_protocol_rewire_MC (set_deps substrate)
+        working-directory: /tmp/tla
+        shell: bash -euo pipefail {0}
+        run: |
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
+            -tool -workers auto -config wave_protocol_rewire_MC.cfg wave_protocol_rewire_MC.tla \
+            | tee rewire.log
+          grep -q "Model checking completed" rewire.log
+          ! grep -q "is violated" rewire.log
+          ! grep -qi "^error:" rewire.log

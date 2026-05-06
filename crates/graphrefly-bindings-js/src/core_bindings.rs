@@ -24,8 +24,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, NodeId, Subscription,
+    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, LockId, NodeId, Subscription,
 };
+use napi::Error as NapiError;
 use napi_derive::napi;
 
 // ---------------------------------------------------------------------------
@@ -300,6 +301,215 @@ impl BenchCore {
             self.core.emit(nid, h);
         }
     }
+
+    // -------------------------------------------------------------------
+    // Slice A close (M1) parity — wave-emitting + lifecycle methods
+    //
+    // Each new public Core method gets a thin wrapper here so JS / TS
+    // tests can drive it. Error surfaces use `napi::Error` for the
+    // standard JS Error shape; structured Rust errors stringify into
+    // the message body.
+    //
+    // LockId is exposed as `u32` to JS (matches NodeId's napi shape).
+    // The Core's u64 LockId space is wider, but tests fit comfortably
+    // in u32. Use `alloc_lock_id` for collision-free allocation.
+    // -------------------------------------------------------------------
+
+    /// Allocate a fresh `LockId` for use with [`Self::pause`] /
+    /// [`Self::resume`]. Core's lock-id space is `u64`; JS gets a `u32`.
+    /// If Core has allocated more than `u32::MAX` lock ids over its
+    /// lifetime, returns an error rather than silently clamping (which
+    /// would alias every subsequent allocation to the same id and cause
+    /// cross-controller pause leak — see the `LockId`-collision note in
+    /// `porting-deferred.md`).
+    #[napi]
+    pub fn alloc_lock_id(&self) -> Result<u32, NapiError> {
+        u32::try_from(self.core.alloc_lock_id().raw()).map_err(|_| {
+            NapiError::from_reason(
+                "alloc_lock_id exceeded u32 range — Core has allocated more \
+                 than u32::MAX lock ids; bench binding cannot widen without \
+                 BigInt — restart the BenchCore or migrate to BigInt-typed binding",
+            )
+        })
+    }
+
+    /// Configure the Core-global pause replay buffer cap. `None`
+    /// (no value) means unbounded; messages buffer indefinitely until
+    /// the lockset clears. Per-node override is not exposed at this
+    /// layer in v1.
+    #[napi]
+    pub fn set_pause_buffer_cap(&self, cap: Option<u32>) {
+        self.core.set_pause_buffer_cap(cap.map(|c| c as usize));
+    }
+
+    /// Acquire a pause lock. While paused, tier-3 (DATA/RESOLVED) and
+    /// tier-4 (INVALIDATE) outgoing messages buffer in the node's pause
+    /// buffer; other tiers flush immediately.
+    #[napi]
+    pub fn pause(&self, node_id: u32, lock_id: u32) -> Result<(), NapiError> {
+        self.core
+            .pause(
+                NodeId::new(u64::from(node_id)),
+                LockId::new(u64::from(lock_id)),
+            )
+            .map_err(|e| NapiError::from_reason(format!("{e}")))
+    }
+
+    /// Release a pause lock. Returns the resume report when the final
+    /// lock releases (`replayed` + `dropped` counts); `None` when more
+    /// locks are still held.
+    #[napi]
+    pub fn resume(&self, node_id: u32, lock_id: u32) -> Result<Option<ResumeReportJs>, NapiError> {
+        self.core
+            .resume(
+                NodeId::new(u64::from(node_id)),
+                LockId::new(u64::from(lock_id)),
+            )
+            .map(|opt| {
+                opt.map(|r| ResumeReportJs {
+                    replayed: r.replayed,
+                    dropped: r.dropped,
+                })
+            })
+            .map_err(|e| NapiError::from_reason(format!("{e}")))
+    }
+
+    /// True if the node currently holds at least one pause lock.
+    #[napi]
+    pub fn is_paused(&self, node_id: u32) -> bool {
+        self.core.is_paused(NodeId::new(u64::from(node_id)))
+    }
+
+    /// Number of pause locks currently held on the node.
+    #[napi]
+    pub fn pause_lock_count(&self, node_id: u32) -> u32 {
+        u32::try_from(self.core.pause_lock_count(NodeId::new(u64::from(node_id))))
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Test inspector: whether `node_id` currently holds the given `lock_id`.
+    #[napi]
+    pub fn holds_pause_lock(&self, node_id: u32, lock_id: u32) -> bool {
+        self.core.holds_pause_lock(
+            NodeId::new(u64::from(node_id)),
+            LockId::new(u64::from(lock_id)),
+        )
+    }
+
+    /// Clear `node_id`'s cache and cascade `[INVALIDATE]` to dependents.
+    /// No-op if the node was never populated (R1.4 idempotency).
+    #[napi]
+    pub fn invalidate(&self, node_id: u32) {
+        self.core.invalidate(NodeId::new(u64::from(node_id)));
+    }
+
+    /// Emit `[COMPLETE]` (R1.3.4) on `node_id`. After this call the node
+    /// is terminal: subsequent emits are silent no-ops, fn no longer
+    /// fires, and children's `dep_terminals` slots cascade per Lock 2.B.
+    #[napi]
+    pub fn complete(&self, node_id: u32) {
+        self.core.complete(NodeId::new(u64::from(node_id)));
+    }
+
+    /// Emit `[ERROR]` on `node_id` with a primitive i32 error payload.
+    /// JS bench-binding limitation: the error is a fresh i32 interned
+    /// here (no JS Error object roundtrip). Real bindings that want
+    /// arbitrary error payloads will surface a separate path.
+    #[napi]
+    pub fn error_int(&self, node_id: u32, err_code: i32) {
+        let h = self
+            .binding
+            .registry
+            .lock()
+            .expect("registry lock")
+            .intern(BenchValue::Int(err_code));
+        self.core.error(NodeId::new(u64::from(node_id)), h);
+    }
+
+    /// Tear `node_id` down (R2.6.4). Auto-prepends COMPLETE if not yet
+    /// terminal; cascades through children. Idempotent on duplicate
+    /// delivery via `has_received_teardown`.
+    #[napi]
+    pub fn teardown(&self, node_id: u32) {
+        self.core.teardown(NodeId::new(u64::from(node_id)));
+    }
+
+    /// Attach `companion` as a meta companion of `parent` (R1.3.9.d).
+    /// Companions tear down before their parent in TEARDOWN ordering.
+    #[napi]
+    pub fn add_meta_companion(&self, parent: u32, companion: u32) {
+        self.core.add_meta_companion(
+            NodeId::new(u64::from(parent)),
+            NodeId::new(u64::from(companion)),
+        );
+    }
+
+    /// Mark `node_id` as resubscribable per R2.2.7. Resubscribable nodes
+    /// reset their terminal-lifecycle state on a fresh subscribe (unless
+    /// they have received TEARDOWN). Configuration call — must be made
+    /// before the node has any active subscribers.
+    #[napi]
+    pub fn set_resubscribable(&self, node_id: u32, resubscribable: bool) {
+        self.core
+            .set_resubscribable(NodeId::new(u64::from(node_id)), resubscribable);
+    }
+
+    /// Coalesce multiple emits into a single wave. Emits inside the
+    /// closure-equivalent — for the napi binding, we expose the simpler
+    /// shape "emit a list of ints in one wave" since closures don't
+    /// cross cleanly over FFI.
+    ///
+    /// On panic in the binding-side, the RAII `BatchGuard` discards
+    /// pending tier-3+ work; subscribers do not observe a half-built
+    /// wave.
+    #[napi]
+    pub fn batch_emit_ints(&self, node_id: u32, values: Vec<i32>) {
+        let nid = NodeId::new(u64::from(node_id));
+        let handles: Vec<HandleId> = {
+            let mut reg = self.binding.registry.lock().expect("registry lock");
+            values
+                .into_iter()
+                .map(|v| reg.intern(BenchValue::Int(v)))
+                .collect()
+        };
+        // begin_batch returns a BatchGuard that drops at scope end.
+        let _guard = self.core.begin_batch();
+        for h in handles {
+            self.core.emit(nid, h);
+        }
+        // _guard drops here → drain + flush.
+    }
+
+    /// Atomically rewire a node's deps. New deps are validated for
+    /// existence and cycle-freedom; terminal-rejection policy applies
+    /// per Phase 13.8 Q1. Returns `Err` with a stringified
+    /// `SetDepsError` describing the rejection.
+    #[napi]
+    pub fn set_deps(&self, node_id: u32, new_dep_ids: Vec<u32>) -> Result<(), NapiError> {
+        let n = NodeId::new(u64::from(node_id));
+        let new_deps: Vec<NodeId> = new_dep_ids
+            .into_iter()
+            .map(|id| NodeId::new(u64::from(id)))
+            .collect();
+        self.core
+            .set_deps(n, &new_deps)
+            .map_err(|e| NapiError::from_reason(format!("{e}")))
+    }
+
+    /// Read whether the node has fired its fn at least once (compute) OR
+    /// has had a non-sentinel value (state). Useful as a smoke test for
+    /// the activation drain in the new lock-released drain.
+    #[napi]
+    pub fn has_fired_once(&self, node_id: u32) -> bool {
+        self.core.has_fired_once(NodeId::new(u64::from(node_id)))
+    }
+}
+
+/// JS-exposed mirror of [`graphrefly_core::ResumeReport`].
+#[napi(object)]
+pub struct ResumeReportJs {
+    pub replayed: u32,
+    pub dropped: u32,
 }
 
 // ---------------------------------------------------------------------------

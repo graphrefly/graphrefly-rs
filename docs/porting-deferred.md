@@ -118,35 +118,157 @@ until a bench reproducer makes them pay for themselves.
 
 ## v1 dispatcher limitations (intentional, with planned lift points)
 
-### Fn re-entrance via `BindingBoundary::invoke_fn` and `custom_equals` still forbidden
+### ~~Fn re-entrance via `BindingBoundary::invoke_fn` and `custom_equals` still forbidden~~ — RESOLVED in Slice A close
 
-- **What:** `flush_notifications` now drops the state lock before firing
-  sinks (Slice A-bigger), so wave-end sinks can re-enter Core safely.
-  But the lock is **still held across two binding callbacks**:
-  - `BindingBoundary::invoke_fn` in `fire_fn` — fn callbacks that
-    re-enter Core deadlock.
-  - `BindingBoundary::custom_equals` in `commit_emission` →
-    `handles_equal` — custom-equals callbacks that re-enter Core
-    deadlock.
-- **Why deferred:** lifting both requires `run_wave` / `drain_and_flush`
-  / `fire_fn` / `commit_emission` to take ownership of the `MutexGuard`
-  (so per-iteration drop-around-binding-call becomes possible) and
-  refactoring all 5 `run_wave` callers + `activate_derived` +
-  `BatchGuard::drop`. Estimated 400–500 LOC of churn — scoped out of
-  Slice A-bigger /qa (2026-05-05) to keep the touch surface manageable;
-  tracked here for a follow-up slice. Sink re-entrance — the more
-  common pattern — is fully supported.
-- **Source:** Slice A-bigger (2026-05-05); scope confirmed in Slice
-  A-bigger /qa (2026-05-05) when item E option 2 was scoped out.
+`Core::fire_fn` and `Core::commit_emission` were rewritten as
+three-phase operations: snapshot inputs under the lock → drop lock →
+call binding → reacquire lock → apply result. User fns may now
+re-enter `Core::emit` / `pause` / `resume` / `invalidate` / `complete`
+/ `error` / `teardown` from inside `invoke_fn` and run a nested wave;
+custom equals oracles may re-enter Core during evaluation.
+
+`run_wave` and `drain_and_flush` are now `&self`-only and manage
+their own locking. `BatchGuard::drop` and `activate_derived` updated
+to match. ~400-500 LOC of churn as estimated.
+
+Verified by `tests/lock_released.rs` (2026-05-05) — 13 regression
+tests covering fn re-entrance via emit/pause/resume/invalidate, custom
+equals re-entrance, and a concurrent emit during invoke_fn deadlock
+test. Closed 2026-05-05.
+
+### Late subscriber + multi-emit-per-wave snapshot gap (D2 — needs rethink)
+
+- **What:** the sinks-snapshot-on-first-touch fix (Slice A close, M1)
+  freezes a node's per-wave subscriber list at the FIRST `queue_notify`
+  push. If a subscriber is installed BETWEEN two emits to the same node
+  in one wave (e.g. inside `batch(|| { emit(s, h1); subscribe(s, late);
+  emit(s, h2); })`), `late` doesn't appear in the entry's snapshot —
+  emit 2's `Dirty + Data(h2)` flushes only to existing subscribers.
+  `late` sees `[Start, Data(h1)]` from its handshake and nothing more
+  this wave; actual cache is `h2` after the wave settles.
+- **Why divergent:** R1.3.5.a (subscriber sees consistent post-handshake
+  view) is silently weakened in this niche scenario. The single-emit-
+  per-wave + late subscribe case (the canonical race the snapshot fix
+  targets) IS correct.
+- **Why deferred (per user direction, 2026-05-05 /qa):** the three
+  candidate fixes have non-trivial trade-offs:
+  - **Re-snapshot every push** — fixes correctness but allocates
+    O(emits × subscribers) per wave; penalizes the common case.
+  - **Walk pending_notify on subscribe and append new sink** — would
+    re-introduce the duplicate-Data bug for the single-emit + late
+    subscribe case (the snapshot fix's original target).
+  - **Per-message subscriber tracking** — most expressive but heavy.
+  The user's direction: park as a documented v1 limitation and revisit
+  when the design shape shifts (likely alongside DS-14 changesets,
+  which already touches per-emit metadata).
+- **Source:** Slice A close /qa Edge Case Hunter finding (2026-05-05);
+  user decision Q1=(a) defer with rethink note.
+
+### Cross-thread emit blocks until in-flight wave completes (D3)
+
+- **What:** with the wave-owner re-entrant mutex (Slice A close /qa,
+  M1), cross-thread `Core::emit` calls block at
+  `wave_owner.lock_arc()` until the in-flight wave's drain + flush +
+  sink-fire completes. Same-thread re-entry passes through.
+- **Why divergent:** TS is single-threaded; PY is GIL-serialized.
+  Rust is the first impl with parallel access. The wave-owner mutex
+  is the chosen serialization point. Without it, the lock-released
+  drain (Slice A close) would let a concurrent `emit` absorb into
+  the in-flight wave's `pending_notify` and return BEFORE its
+  subscribers fire — breaking the user-facing contract that `emit`
+  returning means subscribers have observed.
+- **Trade-offs accepted:**
+  - Concurrent threads cannot drive parallel waves on the same Core.
+    Per-subgraph parallelism (CLAUDE.md invariant 3) is the planned
+    parallel-throughput axis; M2's mount/unmount work surfaces it.
+  - A blocked thread waits for the owner thread's fn fires + sink
+    fires to complete. If a fn or sink is slow, blockers wait.
+- **Verified by:** `concurrent_emit_blocks_until_in_flight_wave_completes`
+  in `tests/lock_released.rs`.
+- **Source:** Slice A close /qa Blind Hunter + Edge Case Hunter findings
+  (2026-05-05); user decision Q2=(b) wave-owner mutex.
+
+### Set_deps from inside firing node's fn corrupts Dynamic `tracked` indices (D1)
+
+- **What:** lock-released `invoke_fn` (Slice A close, M1) means a user
+  fn for a Dynamic node `n` can re-enter `Core::set_deps(n, &new_deps)`
+  during its own fire. Phase 1 of `fire_fn` snapshotted dep_handles
+  BEFORE invoke_fn. The fn returns `FnResult::Data { tracked: Some([2,
+  3]) }` — those indices refer to the dep ordering the fn was invoked
+  with. `set_deps` rewrote the deps to a new ordering. Phase 3 stores
+  the returned `tracked` into `rec.tracked` against the NEW dep
+  ordering — index 2/3 now points at different nodes.
+- **Why deferred:** narrow scenario (recursive `set_deps` from the
+  firing node's own fn). The existing "Mid-fn rewire re-entrancy
+  hazard" Phase 13.8 carry-forward acknowledges related concerns. Real
+  fix: reject `set_deps(n, ...)` with `SetDepsError::ReentrantOnFiringNode`
+  via a thread-local "currently firing" stack, OR document that
+  `tracked` indices are tied to the dep ordering the fn was invoked
+  with and verify alignment in phase 3.
+- **Source:** Slice A close /qa Edge Case Hunter finding (2026-05-05).
+
+### Per-tier handshake panic on tier-N leaves sink registered (D4)
+
+- **What:** the per-tier handshake split (R1.3.5.a alignment, Slice A
+  close) fires `[Start]`, `[Data(v)]`, `[Complete|Error]`, `[Teardown]`
+  as separate sink calls. The sink is installed in `subscribers` BEFORE
+  the handshake fires (race-fix discipline from Slice A-bigger). If a
+  user sink panics on tier N (e.g. `[Data(v)]`) during handshake, the
+  panic unwinds out of `subscribe()` before the `Subscription` handle
+  is returned. The sink stays registered in `subscribers`; subsequent
+  waves' `flush_notifications` will fire it (its `Arc<dyn Fn>` clone
+  in `pending_notify[node].sinks` is alive).
+- **Why deferred:** pre-existing pattern from Slice A-bigger (the
+  subscribe-vs-emit race fix). The per-tier split multiplies the panic
+  surface but doesn't introduce the leak. `Drop for CoreState` releases
+  the sink Arc when the last `Core` drops, so it's not a memory leak,
+  but a panicking sink could keep panicking on every subsequent wave's
+  flush. Real fix lands with the staging-buffer machinery for the
+  handshake re-entrance lift.
+- **Source:** Slice A close /qa Blind Hunter finding (2026-05-05).
+
+### `commit_emission` cache-race documentation (D5 — adjunct to P3)
+
+- **What:** P3 fixed the refcount-leak side of the cache-race window
+  (phase 3 re-reads current cache and releases the actual displaced
+  handle, not the snapshot). But `is_data` was computed in phase 2
+  against `(old_handle, new_handle)`. If a same-thread nested
+  `commit_emission` advanced the cache between phase 1 and phase 3,
+  the equals decision is stale relative to the actual displaced cache.
+- **Behavior:** for Identity equals, this means the user's emit may
+  redundantly produce `Data(new_handle)` when `Resolved` would have
+  sufficed (subscribers observe one extra `[Dirty, Data(new)]` in
+  the rare race). Refcount math is correct; subscribers see a benign
+  no-op duplicate. For Custom equals oracles racing the same-node
+  commit, the equals decision is undefined — oracle was given
+  `(old, new)` but the actual semantic question is `(current, new)`.
+- **Why deferred:** the only sound fix is to re-evaluate `is_data` in
+  phase 3 against the current cache, which requires another lock-
+  released equals call (chicken-and-egg cycle for Custom). Scope:
+  document the limitation; reject if it surfaces as a real consumer
+  pain point.
+- **Source:** Slice A close /qa Blind Hunter + Edge Case Hunter findings
+  (2026-05-05).
+
+### CI hardening — pin TLA fetch to release SHA (post-1.0)
+
+- **What:** `.github/workflows/ci.yml`'s `tlc` job fetches MC harnesses
+  from `graphrefly-ts/main` via raw GitHub URLs. Today this picks up
+  spec amendments immediately, which is the desired tracking shape
+  for pre-1.0. Once graphrefly-ts cuts versioned releases, the
+  `TLA_REF` env var should pin to a release SHA / tag instead of
+  `main` for supply-chain auditability.
+- **Source:** Slice A close /qa Blind Hunter finding (2026-05-05).
 
 ### Subscribe-time handshake fires lock-held; re-entrance from handshake panics
 
 - **What:** `Core::subscribe` registers the new sink under the state
-  lock and fires the handshake `[Start, Data(cache)?, ...]` to that sink
-  while still holding the lock. A handshake-time sink callback that
-  calls back into Core hits the **`IN_HANDSHAKE_FIRE` thread-local
-  diagnostic** (Slice A-bigger /qa item A) and panics with a clear
-  message instead of silently deadlocking. Verified by
+  lock and fires the per-tier handshake (`[Start]`, optionally
+  `[Data(cache)]`, `[Complete]` / `[Error(h)]`, `[Teardown]`) to that
+  sink while still holding the lock. A handshake-time sink callback
+  that calls back into Core hits the **`IN_HANDSHAKE_FIRE`
+  thread-local diagnostic** (Slice A-bigger /qa item A) and panics
+  with a clear message instead of silently deadlocking. Verified by
   `handshake_sink_reentry_panics_with_diagnostic_not_deadlocks` in
   `tests/lock_discipline.rs`.
 - **Why divergent:** the lock-held handshake is the trade-off for the
@@ -154,12 +276,18 @@ until a bench reproducer makes them pay for themselves.
   keeps Start strictly before any concurrent wave's tier-1+ messages.
   The alternative (register-then-drop-then-fire) re-introduces the
   ordering hazard: a concurrent flush could deliver wave messages to
-  the new sink before our handshake fires. Lifts together with the
-  pending `MutexGuard`-ownership refactor — that work also lets the
-  handshake split into separate tier-grouped sink calls (closing the
-  R1.3.5.a divergence).
+  the new sink before our handshake fires.
+- **Why still here after Slice A close:** Slice A close lifted fn
+  re-entrance and custom_equals re-entrance, and split the handshake
+  into per-tier sink calls (closing R1.3.5.a). But the handshake still
+  fires lock-held — lifting it requires per-sink "handshake pending"
+  staging-buffer machinery (queue concurrent wave messages destined
+  for this sink until handshake completes, then drain). Larger
+  surgery than the Slice A close refactor; tracked for M1-close+
+  follow-up.
 - **Source:** Slice A-bigger (2026-05-05); diagnostic added in Slice
-  A-bigger /qa (2026-05-05).
+  A-bigger /qa (2026-05-05); per-tier delivery landed in Slice A
+  close (2026-05-05).
 
 ### Deactivation cleanup not yet modeled
 
@@ -208,24 +336,19 @@ without overflow (verified by `tests/cascade_depth.rs`). Closed
 
 ---
 
-### Subscribe handshake delivered as single sink call (R1.3.5.a divergence)
+### ~~Subscribe handshake delivered as single sink call (R1.3.5.a divergence)~~ — RESOLVED in Slice A close
 
-- **What:** `Core::subscribe` synthesizes the START handshake (`[Start]`,
-  optionally `[Start, Data(v)]` for cached state) under the state lock and
-  fires it via a single `sink(&handshake)` call. TS's R1.3.5.a routes
-  `Start` through the same `downWithBatch` path as other messages, so a
-  cached source's handshake splits into two sink calls (tier 0 `[Start]`,
-  then tier 3 `[Data(v)]`).
-- **Why divergent:** v1 simplification — subscribe is out-of-wave, so the
-  handshake doesn't need batch deferral. The single-call shape is observed
-  by `inv7_handshake_first_message_is_start_*` (Slice C-2 proptest).
-- **Why still here after Slice A-bigger:** the per-tier split would land
-  naturally when fn re-entrance lifts (the same `MutexGuard`-ownership
-  refactor lets the handshake route through `pending_notify` + the
-  two-pass tier-then-node flush). Held back from Slice A-bigger because
-  that refactor was scoped out alongside fn re-entrance.
-- **Source:** Slice C-2 (2026-05-05); test expectation aligned to the
-  current Rust shape pending the lock-discipline rework.
+`Core::subscribe` now builds the handshake as per-tier slices and
+fires each non-empty slice as a separate sink call:
+`[Start]`, optionally `[Data(cache)]`, optionally `[Complete]` /
+`[Error(h)]`, optionally `[Teardown]`. Cached state subscribes
+produce 2 sink calls; torn-down state produces up to 4.
+
+Verified by `handshake_tier_split_*` tests in
+`tests/lock_released.rs` (2026-05-05). The
+`inv7_handshake_first_message_is_start_*` proptests still hold —
+they assert `Start` is the first message in the FIRST sink call, not
+that the entire handshake is one call. Closed 2026-05-05.
 
 ## Spec divergences acknowledged in v1
 
