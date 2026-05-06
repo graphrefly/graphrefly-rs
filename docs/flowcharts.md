@@ -27,10 +27,10 @@
 flowchart LR
     subgraph Pure["Pure Rust core (compiles to any target)"]
         core["graphrefly-core<br/>dispatcher + protocol<br/>(M1)"]
-        graph["graphrefly-graph<br/>Graph container<br/>(M2)"]
+        graph_crate["graphrefly-graph<br/>Graph container<br/>(M2)"]
         ops["graphrefly-operators<br/>(M3 — blocked)"]
         storage["graphrefly-storage<br/>(M4 — blocked)"]
-        struct["graphrefly-structures<br/>(M5 — blocked)"]
+        structures["graphrefly-structures<br/>(M5 — blocked)"]
     end
 
     subgraph Bindings["FFI bindings (cdylib)"]
@@ -39,10 +39,10 @@ flowchart LR
         wasm["graphrefly-bindings-wasm<br/>(blocked)"]
     end
 
-    core -. depends on .-> graph
+    core -. depends on .-> graph_crate
     core -. depends on .-> ops
     core -. depends on .-> storage
-    core -. depends on .-> struct
+    core -. depends on .-> structures
     js --> core
     py --> core
     wasm --> core
@@ -142,57 +142,84 @@ flowchart LR
 ```mermaid
 classDiagram
     class Core {
-        +state: Arc&lt;Mutex&lt;CoreState&gt;&gt;
-        +binding: Arc&lt;dyn BindingBoundary&gt;
-        +wave_owner: Arc&lt;ReentrantMutex&lt;()&gt;&gt;
-        --
+        +state
+        +binding
+        +wave_owner
         +new(binding) Core
-        +clone() Core (cheap Arc bump)
+        +clone() Core
         +same_dispatcher(other) bool
     }
     class CoreState {
-        <<lock-protected>>
-        +nodes: HashMap&lt;NodeId, NodeRecord&gt;
-        +children: HashMap&lt;NodeId, HashSet&lt;NodeId&gt;&gt;
-        +pending_fires: HashSet&lt;NodeId&gt;
-        +pending_notify: IndexMap&lt;NodeId, PendingPerNode&gt;
-        +in_tick: bool
-        +pause_buffer_cap: Option&lt;usize&gt;
-        +deferred_flush_jobs: Vec&lt;(Vec&lt;Sink&gt;, Vec&lt;Message&gt;)&gt;
-        +deferred_handle_releases: Vec&lt;HandleId&gt;
-        +wave_cache_snapshots: HashMap&lt;NodeId, HandleId&gt;
-        +topology_sinks: HashMap&lt;u64, TopologySink&gt;
-        +next_node_id: u64
-        +next_subscription_id: u64
-        +next_lock_id: u64
-        +next_topology_id: u64
-        +binding: Arc&lt;dyn BindingBoundary&gt;
+        <<lockProtected>>
+        +nodes
+        +children
+        +pending_fires
+        +pending_notify
+        +in_tick
+        +pause_buffer_cap
+        +deferred_flush_jobs
+        +deferred_handle_releases
+        +wave_cache_snapshots
+        +topology_sinks
+        +next_node_id
+        +next_subscription_id
+        +next_lock_id
+        +next_topology_id
+        +binding
     }
     class NodeRecord {
-        +deps: Vec&lt;NodeId&gt;
-        +kind: NodeKind (State / Derived / Dynamic)
-        +fn_id: Option&lt;FnId&gt;
-        +equals: EqualsMode
-        +cache: HandleId
-        +dep_handles: Vec&lt;HandleId&gt;
-        +has_fired_once: bool
-        +subscribers: HashMap&lt;SubscriptionId, Sink&gt;
-        +tracked: HashSet&lt;usize&gt;
-        +dirty: bool
-        +involved_this_wave: bool
-        +pause_state: PauseState
-        +terminal: Option&lt;TerminalKind&gt;
-        +dep_terminals: Vec&lt;Option&lt;TerminalKind&gt;&gt;
-        +has_received_teardown: bool
-        +resubscribable: bool
-        +meta_companions: Vec&lt;NodeId&gt;
+        +deps
+        +kind
+        +fn_id
+        +equals
+        +cache
+        +dep_handles
+        +has_fired_once
+        +subscribers
+        +tracked
+        +dirty
+        +involved_this_wave
+        +pause_state
+        +terminal
+        +dep_terminals
+        +has_received_teardown
+        +resubscribable
+        +meta_companions
     }
-    Core --> CoreState : Arc&lt;Mutex&lt;...&gt;&gt;
-    Core --> "wave_owner" : Arc&lt;ReentrantMutex&lt;()&gt;&gt;
+    Core --> CoreState : state Arc Mutex
     CoreState "1" *-- "*" NodeRecord : nodes
 
-    note for Core "Cloning Core is cheap (3 Arc bumps).<br/>All clones share dispatcher state.<br/>Slice A close /qa added wave_owner."
+    note for Core "Cloning Core is cheap (3 Arc bumps). All clones share dispatcher state. Slice A close /qa added wave_owner ReentrantMutex (cross-thread serialize)."
 ```
+
+**Field types** (omitted from diagram to avoid Mermaid generic-syntax limitations):
+
+| Class | Field | Type |
+|-------|-------|------|
+| `Core` | `state` | `Arc<Mutex<CoreState>>` |
+| `Core` | `binding` | `Arc<dyn BindingBoundary>` |
+| `Core` | `wave_owner` | `Arc<ReentrantMutex<()>>` |
+| `CoreState` | `nodes` | `HashMap<NodeId, NodeRecord>` |
+| `CoreState` | `children` | `HashMap<NodeId, HashSet<NodeId>>` |
+| `CoreState` | `pending_fires` | `HashSet<NodeId>` |
+| `CoreState` | `pending_notify` | `IndexMap<NodeId, PendingPerNode>` |
+| `CoreState` | `pause_buffer_cap` | `Option<usize>` |
+| `CoreState` | `deferred_flush_jobs` | `Vec<(Vec<Sink>, Vec<Message>)>` |
+| `CoreState` | `deferred_handle_releases` | `Vec<HandleId>` |
+| `CoreState` | `wave_cache_snapshots` | `HashMap<NodeId, HandleId>` |
+| `CoreState` | `topology_sinks` | `HashMap<u64, TopologySink>` |
+| `NodeRecord` | `deps` | `Vec<NodeId>` |
+| `NodeRecord` | `kind` | `NodeKind` (`State` / `Derived` / `Dynamic`) |
+| `NodeRecord` | `fn_id` | `Option<FnId>` |
+| `NodeRecord` | `equals` | `EqualsMode` |
+| `NodeRecord` | `cache` | `HandleId` |
+| `NodeRecord` | `dep_handles` | `Vec<HandleId>` |
+| `NodeRecord` | `subscribers` | `HashMap<SubscriptionId, Sink>` |
+| `NodeRecord` | `tracked` | `HashSet<usize>` |
+| `NodeRecord` | `pause_state` | `PauseState` |
+| `NodeRecord` | `terminal` | `Option<TerminalKind>` |
+| `NodeRecord` | `dep_terminals` | `Vec<Option<TerminalKind>>` |
+| `NodeRecord` | `meta_companions` | `Vec<NodeId>` |
 
 🟦 The **wave_owner re-entrant mutex** is Rust-specific. TS is single-threaded; PY is GIL-serialized; Rust is the first impl with parallel access. Acquired in `begin_batch` BEFORE the state lock — same-thread re-entry passes through, cross-thread emits block.
 
@@ -593,30 +620,30 @@ sequenceDiagram
     participant BG as BatchGuard
     participant CS as CoreState
     participant Snap as wave_cache_snapshots
-    participant B as binding.release_handle
+    participant B as binding release_handle
 
-    U->>BG: begin_batch()
-    BG->>CS: lock; in_tick = true; drop
-    Note over BG: _wave_guard holds wave_owner
+    U->>BG: begin_batch
+    BG->>CS: lock; in_tick true; drop
+    Note over BG: wave_guard holds wave_owner
 
     rect rgba(255, 200, 200, 0.2)
         Note over U,B: User closure panics partway through
-        U->>U: emit(s_a, h1)
-        U->>CS: commit_emission writes cache[s_a] := h1<br/>wave_cache_snapshots.insert(s_a, old_h_a)
-        U->>U: emit(s_b, h2)
-        U->>CS: commit_emission writes cache[s_b] := h2<br/>wave_cache_snapshots.insert(s_b, old_h_b)
-        U--xU: panic!()
+        U->>U: emit s_a h1
+        U->>CS: commit_emission writes cache s_a then h1<br/>wave_cache_snapshots insert s_a old_h_a
+        U->>U: emit s_b h2
+        U->>CS: commit_emission writes cache s_b then h2<br/>wave_cache_snapshots insert s_b old_h_b
+        U-->>U: PANIC
     end
 
-    BG->>BG: Drop::drop sees thread::panicking() == true
+    BG->>BG: Drop sees thread is panicking
     BG->>CS: lock
-    BG->>CS: pending = take(pending_notify)
-    BG->>CS: deferred_releases = take(deferred_handle_releases)
-    BG->>CS: take(deferred_flush_jobs)
-    BG->>CS: pending_fires.clear()
-    BG->>Snap: restore_wave_cache_snapshots:<br/>for (node, old_h):<br/>  current = replace(rec.cache, old_h);<br/>  if current != NO_HANDLE:<br/>    queue current for release
-    BG->>CS: clear_wave_state();<br/>in_tick = false; drop
-    BG->>B: release retains lock-released:<br/>  pending payload handles<br/>  deferred_releases<br/>  restored_releases (displaced caches)
+    BG->>CS: pending = take pending_notify
+    BG->>CS: deferred_releases = take deferred_handle_releases
+    BG->>CS: take deferred_flush_jobs
+    BG->>CS: clear pending_fires
+    BG->>Snap: restore_wave_cache_snapshots<br/>for each node old_h pair<br/>current = replace rec cache with old_h<br/>if current is not NO_HANDLE<br/>queue current for release
+    BG->>CS: clear_wave_state<br/>in_tick false; drop
+    BG->>B: release retains lock-released<br/>pending payload handles<br/>deferred_releases<br/>restored_releases (displaced caches)
 
     Note over U,B: Subscribers observe NOTHING from the panicked wave.<br/>cache_of(s_a) returns old_h_a, not h1.
 ```
@@ -942,27 +969,37 @@ Where each handle's refcount share lives, who retains it, who releases it.
 classDiagram
     class TopologyEvent {
         <<enum>>
-        NodeRegistered(NodeId)
-        NodeTornDown(NodeId)
-        DepsChanged { node, old_deps, new_deps }
+        NodeRegistered
+        NodeTornDown
+        DepsChanged
     }
     class TopologySink {
-        <<type alias>>
-        Arc&lt;dyn Fn(&amp;TopologyEvent) + Send + Sync&gt;
+        <<typeAlias>>
     }
     class TopologySubscription {
-        -id: u64
-        -state: Weak&lt;Mutex&lt;CoreState&gt;&gt;
-        +Drop: silent no-op if Core gone;<br/>else topology_sinks.remove(id)
+        -id
+        -state
+        +Drop
     }
     class Core {
         +subscribe_topology(sink) TopologySubscription
-        +pub(crate) fire_topology_event(event)
+        +fire_topology_event(event)
     }
     Core --> TopologySink : sinks
     Core ..> TopologyEvent : fires
-    TopologySubscription ..> Core : Weak
+    TopologySubscription ..> Core : Weak ref
 ```
+
+**Variant payloads:**
+- `TopologyEvent::NodeRegistered(NodeId)`
+- `TopologyEvent::NodeTornDown(NodeId)`
+- `TopologyEvent::DepsChanged { node, old_deps, new_deps }`
+
+**Type aliases / fields:**
+- `TopologySink = Arc<dyn Fn(&TopologyEvent) + Send + Sync>`
+- `TopologySubscription { id: u64, state: Weak<Mutex<CoreState>> }`
+- `Drop` impl: silent no-op if Core gone; else `topology_sinks.remove(id)`.
+- `Core::fire_topology_event` is `pub(crate)`.
 
 ```mermaid
 flowchart LR
@@ -983,30 +1020,43 @@ flowchart LR
 ```mermaid
 classDiagram
     class Graph {
-        +core: Core (Arc-cloned)
-        +inner: Arc&lt;Mutex&lt;GraphInner&gt;&gt;
-        --
+        +core
+        +inner
         +new(name, binding) Graph
-        +clone() Graph (cheap — both Arc bumps)
-        +core() &amp;Core (escape hatch)
+        +clone() Graph
+        +core() readonly
     }
     class GraphInner {
-        <<lock-protected>>
-        +name: String
-        +names: IndexMap&lt;String, NodeId&gt;
-        +names_inverse: IndexMap&lt;NodeId, String&gt;
-        +children: IndexMap&lt;String, Graph&gt;
-        +parent: Option&lt;Weak&lt;Mutex&lt;GraphInner&gt;&gt;&gt;
-        +destroyed: bool
-        +namespace_sinks: IndexMap&lt;u64, NamespaceChangeSink&gt;
-        +next_ns_sink_id: u64
+        <<lockProtected>>
+        +name
+        +names
+        +names_inverse
+        +children
+        +parent
+        +destroyed
+        +namespace_sinks
+        +next_ns_sink_id
     }
-    Graph --> GraphInner : Arc&lt;Mutex&lt;...&gt;&gt;
-    Graph ..> Graph : children (mounted)
-    GraphInner --> "parent" : Weak (cycle break)
+    Graph --> GraphInner : Arc Mutex
+    Graph ..> Graph : children mounted
 
-    note for Graph "Lock acquisition rule:<br/>Graph → Core only, never Core → Graph.<br/>Two-graph operations (mount): parent → child."
+    note for Graph "Lock acquisition rule: Graph then Core only, never Core then Graph. Two-graph operations like mount: parent then child."
 ```
+
+**Field types:**
+
+| Class | Field | Type |
+|-------|-------|------|
+| `Graph` | `core` | `Core` (Arc-cloned) |
+| `Graph` | `inner` | `Arc<Mutex<GraphInner>>` |
+| `GraphInner` | `name` | `String` |
+| `GraphInner` | `names` | `IndexMap<String, NodeId>` |
+| `GraphInner` | `names_inverse` | `IndexMap<NodeId, String>` |
+| `GraphInner` | `children` | `IndexMap<String, Graph>` |
+| `GraphInner` | `parent` | `Option<Weak<Mutex<GraphInner>>>` (cycle break) |
+| `GraphInner` | `destroyed` | `bool` |
+| `GraphInner` | `namespace_sinks` | `IndexMap<u64, NamespaceChangeSink>` |
+| `GraphInner` | `next_ns_sink_id` | `u64` |
 
 🟦 `Weak<Mutex<GraphInner>>` for `parent` is Rust-specific compile-time cycle prevention (TS uses a strong ref + manual cycle break).
 
@@ -1165,38 +1215,51 @@ flowchart TB
 ```mermaid
 classDiagram
     class GraphObserveOne {
-        -graph: Graph
-        -node_id: NodeId
+        -graph
+        -node_id
         +subscribe(sink) Subscription
-        +pause(lock) Result&lt;(), PauseError&gt;
-        +resume(lock) Result&lt;Option&lt;ResumeReport&gt;, PauseError&gt;
+        +pause(lock)
+        +resume(lock)
         +invalidate()
     }
     class GraphObserveAll {
-        -graph: Graph
-        -subs: Vec&lt;Subscription&gt;
-        +subscribe&lt;F&gt;(sink) usize
-        --
-        Drop: drops all subs in vec
+        -graph
+        -subs
+        +subscribe(sink) usize
     }
     class GraphObserveAllReactive {
-        -graph: Graph
-        -ns_sink_id: Option&lt;u64&gt;
-        -inner: Arc&lt;Mutex&lt;ObserveAllReactiveInner&gt;&gt;
+        -graph
+        -ns_sink_id
+        -inner
         +subscribe(sink)
-        --
-        Drop: unsub ns sink BEFORE inner drops<br/>(deadlock prevention)
     }
     class ObserveAllReactiveInner {
-        +subscribed: HashSet&lt;NodeId&gt;
-        +subs: Vec&lt;Subscription&gt;
+        +subscribed
+        +subs
     }
 
-    GraphObserveAllReactive --> ObserveAllReactiveInner : Arc&lt;Mutex&lt;...&gt;&gt;
+    GraphObserveAllReactive --> ObserveAllReactiveInner : Arc Mutex
 
-    note for GraphObserveOne "🟨 R3.6.2 divergence (F12):<br/>Canonical up(messages); Rust decomposes to<br/>pause(lock) / resume(lock) / invalidate()<br/>to avoid Vec&lt;Message&gt; alloc per upstream call."
-    note for GraphObserveAll "🟨 Snapshot-at-subscribe-time:<br/>nodes added AFTER subscribe() not auto-subscribed.<br/>Use observe_all_reactive() for dynamic membership."
+    note for GraphObserveOne "R3.6.2 divergence (F12): Canonical up(messages); Rust decomposes to pause(lock) / resume(lock) / invalidate() to avoid Vec allocation per upstream call."
+    note for GraphObserveAll "Snapshot-at-subscribe-time: nodes added AFTER subscribe not auto-subscribed. Use observe_all_reactive for dynamic membership."
 ```
+
+**Field types and Drop semantics:**
+
+| Class | Field / signature | Type / behavior |
+|-------|-------------------|-----------------|
+| `GraphObserveOne` | `graph` | `Graph` |
+| `GraphObserveOne` | `node_id` | `NodeId` |
+| `GraphObserveOne` | `pause(lock)` | `Result<(), PauseError>` |
+| `GraphObserveOne` | `resume(lock)` | `Result<Option<ResumeReport>, PauseError>` |
+| `GraphObserveAll` | `subs` | `Vec<Subscription>` |
+| `GraphObserveAll` | `subscribe<F>(sink)` | generic over closure type |
+| `GraphObserveAll` | `Drop` | drops all `Subscription`s in vec |
+| `GraphObserveAllReactive` | `ns_sink_id` | `Option<u64>` |
+| `GraphObserveAllReactive` | `inner` | `Arc<Mutex<ObserveAllReactiveInner>>` |
+| `GraphObserveAllReactive` | `Drop` | unsubscribe namespace sink BEFORE `inner` drops (deadlock prevention) |
+| `ObserveAllReactiveInner` | `subscribed` | `HashSet<NodeId>` |
+| `ObserveAllReactiveInner` | `subs` | `Vec<Subscription>` |
 
 ---
 
