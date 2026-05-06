@@ -12,10 +12,30 @@ use graphrefly_core::{
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 
-use crate::mount::{MountError, RemoveAudit};
+use crate::mount::{GraphRemoveAudit, MountError};
 
 /// Namespace path separator (canonical spec R3.5.1).
 pub(crate) const PATH_SEP: &str = "::";
+
+/// Errors from [`Graph::remove`].
+#[derive(Debug, thiserror::Error)]
+pub enum RemoveError {
+    #[error("Graph::remove: name `{0}` not found (neither a node nor a mounted subgraph)")]
+    NotFound(String),
+    #[error("Graph::remove: graph has been destroyed")]
+    Destroyed,
+}
+
+/// Signal kind for [`Graph::signal`] (canonical R3.7.1).
+#[derive(Debug, Clone, Copy)]
+pub enum SignalKind {
+    /// Wipe caches (with meta filtering per R3.7.2).
+    Invalidate,
+    /// Pause every named node with the given lock.
+    Pause(LockId),
+    /// Resume every named node with the given lock.
+    Resume(LockId),
+}
 
 /// Errors from name registration.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +56,12 @@ pub enum NameError {
 /// own lock for the wave engine — these two locks never nest in the
 /// same direction (`Graph` → `Core` only, never `Core` → `Graph`), avoiding
 /// deadlock by acquisition order.
+/// Callback type for graph-level namespace change notifications.
+/// Used by reactive describe and reactive `observe_all` to react to
+/// `add()`, `remove()`, mount/unmount, and `destroy()` — events that
+/// change the graph's namespace AFTER Core registration completes.
+pub(crate) type NamespaceChangeSink = Arc<dyn Fn() + Send + Sync>;
+
 pub(crate) struct GraphInner {
     pub(crate) name: String,
     /// Local namespace: name → `NodeId`. Insertion order is load-bearing
@@ -56,6 +82,10 @@ pub(crate) struct GraphInner {
     pub(crate) parent: Option<Weak<Mutex<GraphInner>>>,
     /// True after `destroy()` completes — subsequent mutations refuse.
     pub(crate) destroyed: bool,
+    /// Namespace-change sinks — fired from `add()`, `remove()`, etc.
+    /// after the inner lock is dropped. Keyed by subscription id.
+    pub(crate) namespace_sinks: IndexMap<u64, NamespaceChangeSink>,
+    pub(crate) next_ns_sink_id: u64,
 }
 
 /// Graph container — Phase 1+ public API.
@@ -115,6 +145,8 @@ impl Graph {
                 children: IndexMap::new(),
                 parent,
                 destroyed: false,
+                namespace_sinks: IndexMap::new(),
+                next_ns_sink_id: 0,
             })),
         }
     }
@@ -137,6 +169,36 @@ impl Graph {
     #[must_use]
     pub fn is_valid_name(name: &str) -> bool {
         !name.contains(PATH_SEP)
+    }
+
+    /// Subscribe to namespace changes (add, remove, mount, unmount,
+    /// destroy). The sink fires AFTER the inner lock is dropped, so
+    /// it can safely call `describe()` or other Graph methods.
+    ///
+    /// Returns a subscription id for unsubscription.
+    pub(crate) fn subscribe_namespace_change(&self, sink: NamespaceChangeSink) -> u64 {
+        let mut inner = self.inner.lock();
+        let id = inner.next_ns_sink_id;
+        inner.next_ns_sink_id += 1;
+        inner.namespace_sinks.insert(id, sink);
+        id
+    }
+
+    /// Unsubscribe a namespace-change sink by id.
+    pub(crate) fn unsubscribe_namespace_change(&self, id: u64) {
+        self.inner.lock().namespace_sinks.shift_remove(&id);
+    }
+
+    /// Fire all namespace-change sinks. Called AFTER inner lock is
+    /// dropped from `add()`, `remove()`, etc.
+    pub(crate) fn fire_namespace_change(&self) {
+        let sinks: Vec<NamespaceChangeSink> = {
+            let inner = self.inner.lock();
+            inner.namespace_sinks.values().cloned().collect()
+        };
+        for sink in sinks {
+            sink();
+        }
     }
 
     fn validate_name(name: &str) -> Result<(), NameError> {
@@ -170,6 +232,8 @@ impl Graph {
         }
         inner.names.insert(name.clone(), node_id);
         inner.names_inverse.insert(node_id, name);
+        drop(inner);
+        self.fire_namespace_change();
         Ok(node_id)
     }
 
@@ -298,6 +362,191 @@ impl Graph {
     }
 
     // -------------------------------------------------------------------
+    // Named-sugar wrappers (canonical spec §3.2.1)
+    //
+    // `set(name, h)` / `get(name)` / `invalidate(name)` / `complete(name)`
+    // / `error(name, h)` — thin resolve-then-forward wrappers so callers
+    // can operate by name instead of `NodeId`.
+    // -------------------------------------------------------------------
+
+    /// Emit a value on a named state node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not resolve to a node.
+    pub fn set(&self, name: &str, handle: HandleId) {
+        let id = self.node(name);
+        self.core.emit(id, handle);
+    }
+
+    /// Read the cached value of a named node. Returns
+    /// [`graphrefly_core::NO_HANDLE`] if sentinel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not resolve.
+    #[must_use]
+    pub fn get(&self, name: &str) -> HandleId {
+        let id = self.node(name);
+        self.core.cache_of(id)
+    }
+
+    /// Clear the cache of a named node and cascade `[INVALIDATE]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not resolve.
+    pub fn invalidate_by_name(&self, name: &str) {
+        let id = self.node(name);
+        self.core.invalidate(id);
+    }
+
+    /// Mark a named node terminal with COMPLETE.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not resolve.
+    pub fn complete_by_name(&self, name: &str) {
+        let id = self.node(name);
+        self.core.complete(id);
+    }
+
+    /// Mark a named node terminal with ERROR.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not resolve.
+    pub fn error_by_name(&self, name: &str, error_handle: HandleId) {
+        let id = self.node(name);
+        self.core.error(id, error_handle);
+    }
+
+    // -------------------------------------------------------------------
+    // Remove (canonical spec §3.2.3)
+    // -------------------------------------------------------------------
+
+    /// Remove a named node OR mounted subgraph. Fires `[TEARDOWN]` on the
+    /// node (which cascades to meta children per R1.3.9.d). For subgraphs,
+    /// delegates to [`Self::unmount`]. Returns [`GraphRemoveAudit`]
+    /// describing what was removed.
+    ///
+    /// Sinks observing TEARDOWN can resolve the node's name via
+    /// [`Graph::name_of`] / [`Graph::try_resolve`] for the duration of
+    /// the cascade — namespace clearing happens AFTER the teardown
+    /// returns (R3.2.3 / R3.7.3 ordering, mirroring `destroy()`).
+    ///
+    /// Returns `Err(RemoveError::NotFound)` if `name` is unknown (neither
+    /// a local node nor a mounted subgraph). Returns
+    /// `Err(RemoveError::Destroyed)` if the graph (or, in the subgraph
+    /// branch, an ancestor in the unmount path) has been destroyed.
+    #[must_use = "remove returns Err on missing name; ignoring may hide bugs"]
+    pub fn remove(&self, name: &str) -> Result<GraphRemoveAudit, RemoveError> {
+        // Check if it's a mounted subgraph first.
+        {
+            let inner = self.inner.lock();
+            if inner.destroyed {
+                return Err(RemoveError::Destroyed);
+            }
+            if inner.children.contains_key(name) {
+                drop(inner);
+                return self.unmount(name).map_err(|e| match e {
+                    crate::mount::MountError::Destroyed => RemoveError::Destroyed,
+                    _ => RemoveError::NotFound(name.to_owned()),
+                });
+            }
+        }
+        // Otherwise resolve the named node WITHOUT clearing the
+        // namespace yet — sinks observing TEARDOWN must be able to
+        // call name_of / try_resolve mid-cascade (R3.7.3 discipline,
+        // mirroring destroy() per Slice E+ /qa B3).
+        let node_id = {
+            let inner = self.inner.lock();
+            if inner.destroyed {
+                return Err(RemoveError::Destroyed);
+            }
+            *inner
+                .names
+                .get(name)
+                .ok_or_else(|| RemoveError::NotFound(name.to_owned()))?
+        };
+        // R3.2.3: TEARDOWN cascades through metas + downstream consumers.
+        // Namespace stays intact during the cascade so sinks can
+        // resolve names.
+        self.core.teardown(node_id);
+        // Now clear the namespace entry.
+        {
+            let mut inner = self.inner.lock();
+            inner.names.shift_remove(name);
+            inner.names_inverse.shift_remove(&node_id);
+        }
+        self.fire_namespace_change();
+        Ok(GraphRemoveAudit {
+            node_count: 1,
+            mount_count: 0,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // Edges (canonical spec §3.3.1)
+    // -------------------------------------------------------------------
+
+    /// Derive edges from the current topology. Returns `[from, to]`
+    /// pairs where both names are local namespace entries (or
+    /// `_anon_<id>` for unnamed Core-only deps — including deps
+    /// living in sibling graphs that share this graph's Core but
+    /// are not in this graph's local namespace).
+    ///
+    /// When `recursive` is true, recurses into mounted subgraphs and
+    /// qualifies names with `::` path separators.
+    #[must_use]
+    pub fn edges(&self, recursive: bool) -> Vec<(String, String)> {
+        self.edges_inner("", recursive)
+    }
+
+    fn edges_inner(&self, prefix: &str, recursive: bool) -> Vec<(String, String)> {
+        // Single-pass build: one walk over `inner.names` produces
+        // both the qualified-name list (for emitting edges) and the
+        // id→qualified-name lookup (for resolving deps to names).
+        let inner = self.inner.lock();
+        let qualified: Vec<(String, NodeId)> = inner
+            .names
+            .iter()
+            .map(|(n, id)| (format!("{prefix}{n}"), *id))
+            .collect();
+        let names_map: IndexMap<NodeId, String> = qualified
+            .iter()
+            .map(|(name, id)| (*id, name.clone()))
+            .collect();
+        let children: Vec<(String, Graph)> = if recursive {
+            inner
+                .children
+                .iter()
+                .map(|(n, g)| (n.clone(), g.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(inner);
+
+        let mut result: Vec<(String, String)> = Vec::new();
+        for (to_name, id) in &qualified {
+            let dep_ids = self.core.deps_of(*id);
+            for dep_id in dep_ids {
+                let from_name = names_map
+                    .get(&dep_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{prefix}_anon_{}", dep_id.raw()));
+                result.push((from_name, to_name.clone()));
+            }
+        }
+        for (child_name, child_graph) in children {
+            let child_prefix = format!("{prefix}{child_name}::");
+            result.extend(child_graph.edges_inner(&child_prefix, true));
+        }
+        result
+    }
+
+    // -------------------------------------------------------------------
     // Lifecycle pass-throughs (canonical spec §3.7)
     // -------------------------------------------------------------------
 
@@ -411,6 +660,67 @@ impl Graph {
     // Graph-level lifecycle (canonical spec §3.7)
     // -------------------------------------------------------------------
 
+    /// General broadcast (canonical R3.7.1). Sends `kind` to every
+    /// named node in this graph plus recursively into mounted children.
+    ///
+    /// Supported kinds:
+    /// - `SignalKind::Invalidate` — with meta filtering per R3.7.2.
+    /// - `SignalKind::Pause(lock_id)` — pause every named node.
+    /// - `SignalKind::Resume(lock_id)` — resume every named node.
+    ///
+    /// Idempotent on a destroyed graph (no-op).
+    pub fn signal(&self, kind: SignalKind) {
+        match kind {
+            SignalKind::Invalidate => self.signal_invalidate(),
+            SignalKind::Pause(lock_id) => self.signal_pause(lock_id),
+            SignalKind::Resume(lock_id) => self.signal_resume(lock_id),
+        }
+    }
+
+    fn signal_pause(&self, lock_id: LockId) {
+        let (own_ids, child_clones) = {
+            let inner = self.inner.lock();
+            if inner.destroyed {
+                return;
+            }
+            (
+                inner.names.values().copied().collect::<Vec<_>>(),
+                inner.children.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for id in own_ids {
+            // Ignore UnknownNode from concurrent removal between the
+            // namespace snapshot above and this pause call. (Multi-pauser
+            // pause is idempotent on duplicate locks; the only failure
+            // mode reachable here is a teardown race.)
+            let _ = self.core.pause(id, lock_id);
+        }
+        for child in child_clones {
+            child.signal_pause(lock_id);
+        }
+    }
+
+    fn signal_resume(&self, lock_id: LockId) {
+        let (own_ids, child_clones) = {
+            let inner = self.inner.lock();
+            if inner.destroyed {
+                return;
+            }
+            (
+                inner.names.values().copied().collect::<Vec<_>>(),
+                inner.children.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for id in own_ids {
+            // Ignore UnknownNode from concurrent removal between
+            // namespace snapshot and this resume call.
+            let _ = self.core.resume(id, lock_id);
+        }
+        for child in child_clones {
+            child.signal_resume(lock_id);
+        }
+    }
+
     /// Broadcast `[INVALIDATE]` to every named node in this graph plus
     /// recursively into mounted children. Meta companions (R1.3.9.d /
     /// R2.3.3) are filtered out per canonical R3.7.2: their cached
@@ -493,10 +803,13 @@ impl Graph {
         // Clear registries AFTER the teardown cascade fires so sinks
         // observing TEARDOWN can still resolve names via the graph
         // namespace. R3.7.3 ordering.
-        let mut inner = self.inner.lock();
-        inner.names.clear();
-        inner.names_inverse.clear();
-        inner.children.clear();
+        {
+            let mut inner = self.inner.lock();
+            inner.names.clear();
+            inner.names_inverse.clear();
+            inner.children.clear();
+        }
+        self.fire_namespace_change();
     }
 
     // -------------------------------------------------------------------
@@ -532,9 +845,9 @@ impl Graph {
 
     /// Detach a previously-mounted subgraph. Tears it down (TEARDOWN
     /// cascade across the child's nodes + recursively into the child's
-    /// mounts) and returns a [`RemoveAudit`] describing what was
+    /// mounts) and returns a [`GraphRemoveAudit`] describing what was
     /// removed.
-    pub fn unmount(&self, name: &str) -> Result<RemoveAudit, MountError> {
+    pub fn unmount(&self, name: &str) -> Result<GraphRemoveAudit, MountError> {
         crate::mount::unmount(self, name)
     }
 

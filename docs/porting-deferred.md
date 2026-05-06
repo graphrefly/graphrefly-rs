@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-05 (Slice E+ /qa)
+last_updated: 2026-05-06 (M2 Slice F /qa)
 ---
 
 # Porting flags & deferred concerns
@@ -400,20 +400,15 @@ clean. `#![forbid(unsafe_code)]` preserved.
 - **Source:** Slice E+ (2026-05-05); documented in `describe.rs` module
   docs and §11 Implementation Deltas.
 
-### `observe_all()` snapshot-at-subscribe-time semantics
+### ~~`observe_all()` snapshot-at-subscribe-time semantics~~ — RESOLVED in Slice F
 
-- **What:** [crates/graphrefly-graph/src/observe.rs](../crates/graphrefly-graph/src/observe.rs)
-  `GraphObserveAll::subscribe` registers sinks against the namespace at
-  the moment of the call. Nodes named AFTER the subscribe call are NOT
-  auto-subscribed.
-- **Why deferred:** observing late-added nodes requires a Core-level
-  topology-change notification primitive (a stream of "node registered"
-  events). That primitive is the foundation for `describe({ reactive:
-  true })` / `observe({ reactive: true })` / `observe({ changeset:
-  true })`. Slice E+ defers all reactive-mode observation; the
-  consumer-side workaround is to re-call `observe_all()` at known
-  topology-change boundaries.
-- **Source:** Slice E+ (2026-05-05); deliberate scope cut per Q5 lock.
+`Graph::observe_all_reactive()` (Slice F, 2026-05-06) auto-subscribes
+late-added named nodes via Graph-level namespace-change notifications.
+The original `observe_all()` (snapshot-at-subscribe-time) remains
+available as the non-reactive variant. Drop-order discipline prevents
+a deadlock where the topology sink closure's `Arc<inner>` could be the
+last reference and try to drop `Subscription`s under `CoreState` lock.
+Closed 2026-05-06.
 
 ### `signal_invalidate` does not snapshot the namespace under a single lock
 
@@ -577,35 +572,33 @@ clean. `#![forbid(unsafe_code)]` preserved.
 
 ### Port-coverage gaps in canonical §3 Graph surface
 
-These canonical-spec methods are NOT yet implemented in
-`graphrefly-graph` and are not blocking M2 close, but should be
-tracked for parity:
+These canonical-spec methods are tracked for parity. Items marked
+~~resolved~~ landed in M2 Slice F (2026-05-06).
 
-- **`graph.signal(messages)` general broadcast (R3.7.1)** — Rust only
-  exposes `signal_invalidate`. PAUSE/RESUME variants per-graph would
-  need a per-graph LockId convention (or accept user-supplied lock
-  ids).
-- **Sugar wrappers `graph.set(name, h)`, `graph.get(name)`,
-  `graph.invalidate(name)`, `graph.complete(name)`,
-  `graph.error(name, err)` (R3.2.1)** — Rust exposes id-based
-  `emit/cache_of/invalidate/complete/error` only. Trivial wrappers
-  that resolve `name → NodeId` and forward.
+- ~~**`graph.signal(messages)` general broadcast (R3.7.1)**~~ —
+  **RESOLVED in Slice F.** `Graph::signal(SignalKind)` with
+  `Invalidate` / `Pause(lock)` / `Resume(lock)` variants.
+- ~~**Sugar wrappers (R3.2.1)**~~ — **RESOLVED in Slice F.**
+  `set(name, h)` / `get(name)` / `invalidate_by_name(name)` /
+  `complete_by_name(name)` / `error_by_name(name, h)`.
+- ~~**`graph.remove(name)` (R3.2.3)**~~ — **RESOLVED in Slice F.**
+  Handles both individual named nodes (TEARDOWN + namespace removal)
+  and mounted subgraphs (delegates to `unmount`). Returns
+  `GraphRemoveAudit`.
+- ~~**`graph.edges(opts?)` (R3.3.1)**~~ — **RESOLVED in Slice F.**
+  `Graph::edges(recursive: bool) -> Vec<(String, String)>` with
+  recursive mount-walking and `_anon_<id>` for unnamed deps.
 - **`graph.tagFactory(factory, factoryArgs)` (R3.1.2)** — provenance
-  annotation for `describe()` / snapshot replay.
+  annotation for `describe()` / snapshot replay. Deferred.
 - **`graph.resourceProfile()` (R3.6.3)** — runtime profile
   (subscriber counts, fan-in/out). Used by debugging utilities.
+  Deferred.
 - **`graph.setVersioning(level)` (R3.2.4)** — bulk versioning level
-  apply. Waits on §7 Node Versioning port.
-- **`graph.remove(name)` for individual nodes (R3.2.3)** — Rust has
-  `unmount(name)` for subgraphs only. Canonical `remove(name)`
-  works for both nodes AND mounted subgraphs and returns
-  `GraphRemoveAudit`. Rust would need a node-removal path that
-  fires TEARDOWN on the named node and clears its namespace entry.
-- **`graph.edges(opts?)` (R3.3.1)** — currently only available via
-  `describe().edges`. A direct accessor with `opts.recursive: true`
-  for mount-walking is convenient.
+  apply. Waits on §7 Node Versioning port. Deferred.
+- **napi-rs `BenchGraph` class** — Graph API bindings for JS
+  consumers. Deferred until graph-layer API is consumer-driven.
 - **Source:** Slice E+ /qa Edge Case Hunter port-coverage gap audit
-  (2026-05-05).
+  (2026-05-05); updated 2026-05-06 (Slice F close).
 
 ### Cross-Core (multi-binding) mount rejected with `MountError::CoreMismatch`
 
@@ -621,6 +614,133 @@ tracked for parity:
   Part 6 ("Cross-language handle-space composition") — explicit
   serialize bridge or process-boundary semantics. Post-M6 work.
 - **Source:** Slice E+ (2026-05-05); reference Open Question 1.
+
+---
+
+## M2 Slice F /qa — deferred concerns (D1–D6)
+
+QA pass on Slice F surfaced these v1 limitations / divergences. Each
+is acceptable for the M2 close but worth tracking for future slices.
+
+### D1 — `edges()` cross-graph deps surface as `_anon_<id>` for sibling-graph nodes
+
+- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
+  `edges_inner` builds `names_map` from the local namespace only.
+  Two graphs sharing a Core (parent + mounted child OR siblings under
+  a common ancestor) can have cross-graph dep edges (a node in Graph A
+  depends on a node in Graph B). When `edges(false)` is called on A,
+  the dep id is not in A's namespace → emitted as `_anon_<id>`,
+  even though it IS named in B.
+- **Why deferred:** v1 acceptable behavior for the namespace-scoped
+  edges accessor. The `recursive: true` walk also misses sibling
+  references (it only descends into mounted children of the calling
+  graph). Same shape as the existing Slice E+ /qa "`try_resolve` no
+  `..::sibling::node`" deferral.
+- **Lift point:** if cross-graph edge resolution surfaces as a real
+  consumer need (e.g., describe-the-whole-shared-Core view), add an
+  `edges_in_core(opts)` accessor or a `Graph::root().edges(true)`
+  walk that builds a unified id→qualified-name map across the entire
+  shared-Core mount tree.
+- **Source:** Slice F /qa Blind Hunter + Edge Case Hunter (2026-05-06).
+
+### D2 — `GraphObserveAllReactive::subscribed` HashSet grows unboundedly
+
+- **What:** [crates/graphrefly-graph/src/observe.rs](../crates/graphrefly-graph/src/observe.rs)
+  `ObserveAllReactiveInner::subscribed` records every `NodeId` ever
+  subscribed; it is never pruned for torn-down nodes. For long-running
+  graphs with high node turnover, memory grows linearly with total
+  nodes ever created (not currently live).
+- **Why deferred:** v1 acceptable for short-lived graphs (the typical
+  reactive-observe lifecycle is a UI session, not a server-uptime
+  span). Pruning requires a `Core::subscribe_topology` listener for
+  `NodeTornDown` events to remove ids from `subscribed` — adds a
+  second subscription per reactive observer.
+- **Lift point:** when M3+ surfaces a long-running consumer that
+  exhibits the leak under bench, wire a topology subscription that
+  prunes `subscribed` on `NodeTornDown(id)`.
+- **Source:** Slice F /qa Blind Hunter (2026-05-06).
+
+### D3 — `signal()` `SignalKind` enum narrower than canonical's open `Messages`
+
+- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
+  `SignalKind` is closed at `Invalidate / Pause(LockId) / Resume(LockId)`.
+  Canonical R3.7.1's `signal(messages: Messages, opts?)` is open-ended;
+  `[[ERROR, h]]` and `[[COMPLETE]]` graph-wide broadcasts are
+  representable in TS but rejected at the type level in Rust.
+- **Why divergent:** v1 narrow surface. Adding `SignalKind::Complete` /
+  `SignalKind::Error(HandleId)` requires deciding meta-filter semantics
+  for terminal broadcast (R3.7.2 explicit only for INVALIDATE — see
+  D4). Pre-1.0; closed enum is easier to extend than to retract later.
+- **Lift point:** if a consumer needs graph-wide COMPLETE/ERROR
+  (e.g., shutting a whole subgraph terminally without TEARDOWN
+  cascade), extend the enum and decide R3.7.2's coverage scope.
+- **Source:** Slice F /qa Edge Case Hunter F6 (2026-05-06).
+
+### D4 — `signal(Pause/Resume)` does not filter meta companions
+
+- **What:** Canonical R3.7.2 explicitly requires meta filtering for
+  `INVALIDATE` (meta children's auto-derived caches must not be wiped).
+  The spec is silent on PAUSE/RESUME meta filtering. Rust's
+  `signal_pause` / `signal_resume` pause/resume every named node
+  including any meta companions; `signal_invalidate` does filter
+  metas.
+- **Why deferred:** spec ambiguity. Symmetry argument suggests metas
+  should NOT be paused independently of their parent (their lifecycle
+  is bound to the parent's), but no canonical rule explicitly
+  requires it. TS impl behavior should be checked; if TS skips meta
+  on PAUSE/RESUME and Rust doesn't, that's a parity gap.
+- **Lift point:** raise an issue against `~/src/graphrefly` to
+  extend R3.7.2 to cover PAUSE/RESUME explicitly, OR verify against
+  TS production behavior and align.
+- **Source:** Slice F /qa Edge Case Hunter F7 (2026-05-06).
+
+### D5 — `describe_reactive` does not fire on `set_deps` topology changes
+
+- **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs)
+  `describe_reactive` subscribes to Graph-level namespace-change sinks
+  (fired from `add` / `remove` / `mount` / `unmount` / `destroy`).
+  Core's `DepsChanged` topology event from `set_deps` does NOT trigger
+  the namespace sink — but `describe()` output's edges DO change when
+  deps change (edges are derived from `core.deps_of`). The reactive
+  describe stream is therefore incomplete: it tracks namespace
+  mutations but misses dep mutations even though dep mutations affect
+  the describe payload.
+- **Why divergent:** layering decision per D006 in the decision log.
+  Core topology events are Core-internal; Graph-level reactivity
+  tracks Graph-level mutations. Composing a unified stream requires
+  either (a) Graph subscribes to Core topology and forwards
+  `DepsChanged` as a namespace-change, (b) the user composes both
+  subscriptions manually with dedup. The describe rustdoc explicitly
+  documents the workaround.
+- **Lift point:** when consumers actually need it, internalize the
+  composition by having `describe_reactive` ALSO subscribe to Core's
+  `subscribe_topology` and dedup against the namespace fire.
+- **Source:** Slice F /qa Edge Case Hunter F10 (2026-05-06).
+
+### D6 — `packages/parity-tests/scenarios/graph/` not yet widened for the M2 surface
+
+- **What:** Per the porting-to-rs skill workflow, M2-close should add
+  `describe.each(impls)` parity scenarios under
+  `~/src/graphrefly-ts/packages/parity-tests/scenarios/graph/` (sugar
+  wrappers, remove, edges, signal, describe-reactive,
+  observe-all-reactive). Slice F deliberately scoped this out — the
+  `Impl` interface widening + ~300-500 LOC of scenario coverage is
+  large enough to warrant a dedicated follow-up slice with proper
+  surface coverage.
+- **Why deferred:** scope tightness for Slice F + per user direction
+  P8(b) at /qa decision time. The legacy-only parity test gate
+  remains operative; the rustImpl arm is `null` until
+  `@graphrefly/native` publishes anyway.
+- **Lift point:** dedicated "M2 parity-tests" slice. Recommended
+  scenarios:
+  - `scenarios/graph/sugar.test.ts` — set/get/invalidate/complete/error
+  - `scenarios/graph/remove.test.ts` — namespace-during-cascade ordering
+  - `scenarios/graph/edges.test.ts` — recursive vs local + anon
+  - `scenarios/graph/signal.test.ts` — Pause/Resume/Invalidate + meta filter
+  - `scenarios/graph/describe-reactive.test.ts` — push-on-subscribe + change events
+  - `scenarios/graph/observe-all-reactive.test.ts` — auto-subscribe late nodes + subscribe-once contract
+- **Source:** Slice F /qa Edge Case Hunter F11 (2026-05-06); user
+  decision P8=(b) at /qa decision time.
 
 ---
 

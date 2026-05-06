@@ -50,6 +50,7 @@ pub mod clock;
 pub mod handle;
 pub mod message;
 pub mod node;
+pub mod topology;
 
 pub use batch::BatchGuard;
 
@@ -61,3 +62,4 @@ pub use node::{
     Core, EqualsMode, NodeKind, PauseError, ResumeReport, SetDepsError, Sink, Subscription,
     TerminalKind,
 };
+pub use topology::{TopologyEvent, TopologySink, TopologySubscription};

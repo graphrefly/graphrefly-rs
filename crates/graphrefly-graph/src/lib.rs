@@ -48,7 +48,10 @@ mod graph;
 mod mount;
 mod observe;
 
-pub use describe::{EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus, NodeTypeStr};
-pub use graph::{Graph, NameError};
-pub use mount::{MountError, RemoveAudit};
-pub use observe::{GraphObserveAll, GraphObserveOne};
+pub use describe::{
+    DescribeSink, EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus, NodeTypeStr,
+    ReactiveDescribeHandle,
+};
+pub use graph::{Graph, NameError, RemoveError, SignalKind};
+pub use mount::{GraphRemoveAudit, MountError};
+pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne};

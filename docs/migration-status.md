@@ -2,9 +2,9 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-05)
+## Current state (2026-05-06)
 
-**M1 closed; M2 read-side introspection + composition landed.** Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
+**M1 closed; M2 closed (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06).** Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
 
 **DS-14 locked + Phase 14 landed in TS** ([archive/docs/SESSION-DS-14-changesets-design.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-DS-14-changesets-design.md)). Rust port greenlit per [SESSION-rust-port-architecture.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) Part 10 lock. M1 parity work (Slice A+B 2026-05-05 + Slice C-1/C-1.5/C-2 + A-bigger + Slice A close 2026-05-05) is now feature-complete: PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR cascade, TEARDOWN-precedes-COMPLETE, resubscribable terminals, meta-TEARDOWN ordering, §10.12 RAII Subscription, dynamic-rewire audit fix, drop-then-fire wave-end sinks, iterative cascades for deep chains, two-phase tier-then-node flush, RAII batch + cache-snapshot rollback, lock-released `invoke_fn` + `custom_equals`, R1.3.5.a per-tier handshake delivery.
 
@@ -34,6 +34,7 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | M1 (napi-rs parity) | `graphrefly-bindings-js` | ✅ landed | 2026-05-05 (Slice B): pause / resume / alloc_lock_id / invalidate / complete / error_int / teardown / add_meta_companion / set_resubscribable / batch_emit_ints / set_deps / has_fired_once / set_pause_buffer_cap / is_paused / pause_lock_count / holds_pause_lock instance methods on `BenchCore`. `ResumeReportJs` napi object. Builds clean. |
 | CI scaffold | (workspace) | ✅ landed | 2026-05-05 (Slice C): `.github/workflows/ci.yml` — `cargo fmt --check` / `cargo check` / `cargo clippy --all-targets -D warnings` / `cargo test --all-targets` / `cargo doc` against Rust 1.95 toolchain matrix; cargo-deny job (license + advisory check); bindings-js cdylib build job; TLA+ TLC step runs `handle_protocol_MC` + `wave_protocol_rewire_MC` against the canonical scenarios fetched from `graphrefly-ts`. |
 | M2 (starter slice) | `graphrefly-graph` | ✅ landed | 2026-05-05 (Slice D): `Graph` container holding `Arc<Core>`; sugar constructors (`state` / `derived` / `dynamic`); lifecycle pass-throughs (`subscribe` / `emit` / `cache_of` / `complete` / `error` / `teardown` / `invalidate` / `pause` / `resume` / `set_deps` / `set_resubscribable` / `add_meta_companion` / `batch`); `Graph::clone` is cheap Arc bump. 10 tests. Superseded by Slice E+ (the sugar API was hard-broken to take `name` per canonical §3.9). |
+| M2 (Slice F — gap fills + reactive) | `graphrefly-graph` + `graphrefly-core` | ✅ landed | 2026-05-06 (Slice F): R3.2.1 named-sugar wrappers, R3.2.3 remove(name), R3.3.1 edges(opts), R3.7.1 signal(kind), Core topology-change notification primitive, reactive describe, reactive observe_all auto-subscribe, GraphRemoveAudit rename. 33 new tests (18 gap_fills + 8 topology + 7 reactive). |
 | M2 (read-side + composition) | `graphrefly-graph` + `graphrefly-core` | ✅ landed | 2026-05-05 (Slice E+): Core inspection helpers (`node_ids` / `node_count` / `kind_of` / `deps_of` / `is_terminal` / `is_dirty` / `same_dispatcher`); `TerminalKind` made public (renamed from `DepTerminal`); Graph namespace (canonical §3.5: `add` / `node` / `try_resolve` / `name_of` / `node_count` / `node_names`); canonical §3.9 sugar API (`state(name, initial)` / `derived(name, deps, fn_id, equals)` / `dynamic(name, deps, fn_id, equals)`); mount/unmount (canonical §3.4: `mount` / `mount_new` / `mount_with` / `unmount` / `ancestors`, shared-Core only with `RemoveAudit`); lifecycle (canonical §3.7: `destroy` cascade, `signal_invalidate`); `Graph::describe()` JSON form (canonical §3.6 + Appendix B); `Graph::observe()` / `Graph::observe_all()` default sink-style (canonical §3.6.2 default mode only). **Out of scope** (subsequent slices): reactive describe / observe (`Node<...>` returns), async-iterable observe, non-JSON describe formats (pretty/mermaid/d2/stage-log), explain/reachable, snapshot/CIDs, DS-14 `mutate()`, cross-Core mount, meta annotations, versioning fields. 227 tests workspace-wide post-/qa (was 174 pre-Slice-E+). |
 | M3 | `graphrefly-operators` | ⏸ blocked | After M2 close |
 | M4 | `graphrefly-storage` | ⏸ blocked | After M2 + DS-14 (`restoreSnapshot mode: "diff"` WAL replay shape) |
@@ -99,6 +100,101 @@ The Rust impl should pass the same 22 invariant tests plus additional Rust-speci
 ## Open architectural questions
 
 Moved to [`porting-deferred.md`](porting-deferred.md) under the "Open questions from SESSION-rust-port-architecture.md Part 6" section. That file is the single home for surfaced-but-deferred concerns; this status file tracks landed-vs-pending milestones.
+
+## M2 — closed 2026-05-06
+
+M2 is formally closed. All canonical §3 surfaces scoped for the Rust port's M2 milestone have landed across Slice D (starter), Slice E+ (read-side + composition), Slice E+ /qa (adversarial review), and Slice F (gap fills + reactive).
+
+### What landed in Slice F (2026-05-06)
+
+**Port-coverage gap fills (R3.2.1, R3.2.3, R3.3.1, R3.7.1):**
+- `Graph::set(name, handle)` / `get(name)` / `invalidate_by_name(name)` / `complete_by_name(name)` / `error_by_name(name, handle)` — named-sugar wrappers (canonical R3.2.1).
+- `Graph::remove(name) -> Result<GraphRemoveAudit, RemoveError>` — removes individual named nodes (sends TEARDOWN) or delegates to `unmount()` for mounted subgraphs (canonical R3.2.3).
+- `Graph::edges(recursive: bool) -> Vec<(String, String)>` — direct edge accessor with recursive mount-walking and `_anon_<id>` for unnamed deps (canonical R3.3.1).
+- `Graph::signal(kind: SignalKind)` with `SignalKind::Invalidate` / `Pause(lock)` / `Resume(lock)` — general broadcast (canonical R3.7.1).
+- `RemoveAudit` renamed to `GraphRemoveAudit` — avoids name collision with future Core-level `RemoveAudit`.
+
+**Core topology-change notification primitive:**
+- `TopologyEvent` enum: `NodeRegistered(NodeId)`, `NodeTornDown(NodeId)`, `DepsChanged { node, old_deps, new_deps }`.
+- `Core::subscribe_topology(sink) -> TopologySubscription` — RAII subscription, fires synchronously after state lock drops from registration / teardown / set_deps call sites.
+- `TopologySubscription` drops cleanly (even if Core is already dropped, via `Weak` ref).
+- Sinks are NOT nodes — they sit outside the reactive graph to avoid circularity.
+
+**Reactive describe:**
+- `Graph::describe_reactive(sink) -> ReactiveDescribeHandle` — sink fires with a fresh `GraphDescribeOutput` on every namespace mutation (add, remove, destroy). RAII handle; dropping unsubscribes.
+- Uses Graph-level namespace-change sinks (not Core topology events) to avoid the ordering gap where Core fires `NodeRegistered` before `Graph::add()` inserts the name.
+
+**Reactive observe_all (auto-subscribe):**
+- `Graph::observe_all_reactive() -> GraphObserveAllReactive` — subscribes to all current named nodes AND auto-subscribes late-added nodes via namespace-change notifications.
+- Drop-order discipline: namespace sink unsubscribes BEFORE inner `Subscription`s drop, preventing a deadlock where the sink closure's `Arc<inner>` would be the last reference and try to drop `Subscription`s under `CoreState` lock.
+
+### What did NOT land (deferred from M2 scope)
+
+- **`tagFactory` / `resourceProfile` / `setVersioning`** — deferred per user direction; tracked in `porting-deferred.md`.
+- **napi-rs `BenchGraph` class** — deferred; needs napi-rs dev environment and is a binding-layer concern, not a correctness surface.
+- **Reactive `describe({ reactive: "diff" })` (changeset mode)** — deferred to Phase 14 op-log changeset protocol.
+- **`describe({ explain })` / `describe({ reachable })`** — deferred (causal chain + reachability walks).
+- **Non-JSON describe formats** — pretty / mermaid / d2 / stage-log.
+- **Async-iterable observe modes** — structured / timeline / causal / derived.
+
+### Test count post-M2-close
+
+268 tests green workspace-wide (was 260 pre-/qa, 227 post-Slice-E+ /qa). New tests: 18 gap_fills + 10 topology + 11 reactive = 39 new (post-/qa: +1 gap_fills regression for P1, +2 topology for P2 cascade, +5 reactive net for P3/P5/P7 push-on-subscribe). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved across all crates that had it pre-/qa.
+
+### M3 blockers identified
+
+- **R1.3.6.b batched delivery** — Rust Core delivers single-latest-handle per dep per wave. Canonical spec requires operators to receive full batch arrays (`data[0]`, `data[1]`, etc.) per dep. This is a structural difference that must be resolved before M3 operators port. Tracked as a future M3 architectural concern, not an M2 item.
+
+---
+
+## Slice F /qa — adversarial review fixes — landed 2026-05-06
+
+QA pass on Slice F surfaced ~25 active findings via two adversarial subagents (Blind Hunter, Edge Case Hunter); ~10 rejected (matched existing deferred entries or false alarms). Applied 7 priority patches (P1–P7) + 7 auto-applicable polish (A1–A7); 6 new deferral entries (D1–D6) added to `porting-deferred.md`.
+
+### What landed
+
+**P1 — `Graph::remove()` namespace-clear-after-teardown reorder.** Pre-fix: `shift_remove(name)` ran inside the lock block before `core.teardown(node_id)` fired; sinks observing TEARDOWN would call `name_of(id)` mid-cascade and see `None`. Now mirrors `destroy()`'s Slice E+ /qa B3 ordering: snapshot id under lock, drop lock, teardown cascades with namespace intact, then reacquire lock and clear name+inverse. Regression test `remove_preserves_namespace_during_teardown_cascade` confirms via a sink observing Teardown and resolving `name_of(s)` → `Some("temp")`. R3.2.3 / R3.7.3 ordering.
+
+**P2 — Cascaded teardown fires `NodeTornDown` for every cascaded id.** Pre-fix: `Core::teardown(root)` fired `NodeTornDown(root)` only, leaving meta companions and downstream auto-cascaded consumers invisible to topology subscribers. Reactive describe / observe_all silently retained ghost nodes. Now `teardown_inner` returns `Vec<NodeId>` of every node that emits a TEARDOWN; `Core::teardown` iterates the collection and fires `NodeTornDown` for each AFTER `run_wave` returns and the lock drops. Regression tests `teardown_cascade_fires_node_torn_down_for_each_node` (root + auto-cascaded derived) and `teardown_cascade_fires_for_meta_companions` (root + meta) confirm.
+
+**P3 — `mount` / `mount_new` / `unmount` fire `fire_namespace_change` on the parent.** Pre-fix: only `add()` / `remove()` / `destroy()` fired the namespace-change hook; mount/unmount were namespace-changing operations that reactive describe / observe_all missed silently. Now mount-path operations call `parent.fire_namespace_change()` AFTER the parent inner lock drops (and AFTER the child's destroy completes for unmount). Regression tests `describe_reactive_fires_on_mount_new`, `describe_reactive_fires_on_unmount`, `observe_all_reactive_handles_late_mount`.
+
+**P4 — `GraphObserveAllReactive::subscribe()` race fix: install ns listener BEFORE initial snapshot.** Pre-fix: snapshot taken first → namespace listener installed last. A node added between the two was missed (snapshot didn't see it; listener wasn't yet installed when add fired). Now listener registers first, then the snapshot pass walks current names; `inner.subscribed.insert(id)` dedups against the listener's first fire so an idempotent overlap is harmless.
+
+**P5 — `GraphObserveAllReactive::subscribe()` panics on second call (subscribe-once contract).** Pre-fix: a second `subscribe(...)` call overwrote `self.ns_sink_id` without unsubscribing the prior, leaking the first namespace sink permanently (until graph drop). Now `assert!(self.ns_sink_id.is_none(), …)` enforces the v1 single-shot contract. Rebuild a fresh `observe_all_reactive()` handle to install another sink. Regression test `observe_all_reactive_subscribe_twice_panics` (`#[should_panic(expected = "single-shot")]`).
+
+**P6 — Reactive sinks capture `Weak<Mutex<GraphInner>>` + `Core` (clone) instead of strong `Graph`.** Pre-fix: sink closures held `graph.clone()` (strong Arc<inner>); the closure was stored INSIDE `inner.namespace_sinks`, forming a cycle. Normal RAII (drop handle → unsubscribe → break cycle) worked, but `mem::forget(handle)` would extend the Arc cycle, leaking GraphInner via the namespace_sinks → sink → Graph → namespace_sinks path. Now sinks capture a `Weak<Mutex<GraphInner>>` + `Core` clone; on each fire they `weak.upgrade()` and reconstruct `Graph { core, inner }` for the `describe()` / namespace walk. The cycle is broken at the namespace_sinks → sink edge. (Note: the handle's own `graph: Graph` strong field still keeps GraphInner alive while the handle exists — by design.)
+
+**P7 — `Graph::describe_reactive(sink)` fires the initial snapshot synchronously before installing the listener.** Pre-fix: sink fired only on later changes; the current state was silently dropped. Per R3.6.1 / spec §2.5.2 push-on-subscribe, reactive observers must receive the cached state. Now `sink(&self.describe())` runs once before `subscribe_namespace_change`, so consumers always start from a known baseline (matches dynamic graph visualization expectations). Existing tests `describe_reactive_fires_on_new_node` / `describe_reactive_fires_on_remove` / `describe_reactive_stops_on_drop` / `describe_reactive_accumulates_nodes` updated to expect initial+post snapshots; new test `describe_reactive_pushes_initial_snapshot` covers the contract directly.
+
+**A1 — `Graph::remove`'s mount-branch maps `MountError::Destroyed` → `RemoveError::Destroyed`** instead of collapsing every `MountError` variant into `NotFound`. Other variants (NotMounted, etc.) remain `NotFound`.
+
+**A2 — `signal_pause` / `signal_resume` comment fix:** "Ignore UnknownNode from concurrent removal between snapshot and call" replaces the misleading "already paused with this lock" reference (multi-pauser pause is idempotent on duplicate locks; the only failure mode is a teardown race).
+
+**A3 — `#[must_use]` on `Graph::remove`, `TopologySubscription`, `ReactiveDescribeHandle`.** All three are RAII-bearing; without `must_use`, `let _ = g.describe_reactive(sink);` silently drops the handle and the sink never fires.
+
+**A4 — Send + Sync compile-time asserts** for `ReactiveDescribeHandle` and `GraphObserveAllReactive` (mirror the existing assert on `TopologySubscription`).
+
+**A5 — `Core::subscribe_topology` rustdoc updated** to document: (a) sinks fire OUTSIDE the state lock and MAY re-enter Core (lock-released discipline); (b) `NodeRegistered(id)` fires before `Graph::add()` inserts the name → namespace lookups from inside the sink see `None`; (c) `NodeTornDown(id)` fires for the root AND every cascaded meta + downstream consumer; (d) idempotent `set_deps` (deps unchanged as a set) does not fire `DepsChanged`.
+
+**A6 — `edges_inner` single-pass refactor.** Pre-fix: built `names_iter` and `names_map` via two separate walks of `inner.names`. Now one walk produces both via `Vec<(qualified_name, NodeId)>` and `IndexMap<NodeId, qualified_name>` derived from the same pairs. Edge case docs updated to mention sibling-graph `_anon_<id>` resolution.
+
+**A7 — 5 clippy `doc_markdown` nits** resolved: `observe_all`, `NodeIds`, `CoreState`, `set_deps`, `namespace_sinks` properly backticked across `graph.rs`, `observe.rs`, `describe.rs`, `topology.rs`.
+
+### Group 3 deferrals (added to porting-deferred.md as D1–D6)
+
+- **D1** — `edges()` cross-graph deps surface as `_anon_<id>` for sibling-graph nodes (sibling-resolution gap pattern).
+- **D2** — `subscribed: HashSet<NodeId>` in `GraphObserveAllReactive` grows unboundedly across torn-down nodes.
+- **D3** — `signal()`'s `SignalKind` enum is narrower than canonical's open `Messages` (no `[[ERROR]]` / `[[COMPLETE]]` broadcast).
+- **D4** — `signal(Pause/Resume)` does not filter meta companions; R3.7.2 explicit only for INVALIDATE — spec ambiguity for non-invalidate.
+- **D5** — `describe_reactive` does not fire on `set_deps` topology changes (documented divergence; consumer composes with `core.subscribe_topology()`).
+- **D6** — `packages/parity-tests/scenarios/graph/` not yet widened for the M2 surface (Slice F deliberate cut; tracked as M2-close-gate residual).
+
+### Test count post-/qa
+
+268 tests green workspace-wide (was 260 pre-/qa, 227 post-Slice-E+ /qa). 8 net-new regression tests: +1 in `gap_fills.rs` (`remove_preserves_namespace_during_teardown_cascade`); +2 in `topology.rs` (`teardown_cascade_fires_node_torn_down_for_each_node`, `teardown_cascade_fires_for_meta_companions`); +5 in `reactive.rs` (`describe_reactive_pushes_initial_snapshot`, `describe_reactive_fires_on_mount_new`, `describe_reactive_fires_on_unmount`, `observe_all_reactive_handles_late_mount`, `observe_all_reactive_subscribe_twice_panics`). 4 existing reactive tests updated to expect initial+post snapshots. `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved on `graphrefly-core` and `graphrefly-graph`.
+
+---
 
 ## Slice E+ /qa — adversarial review fixes — landed 2026-05-05
 

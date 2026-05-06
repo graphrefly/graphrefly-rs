@@ -34,7 +34,7 @@ pub enum MountError {
 /// Result of [`Graph::unmount`] (and exposed for future
 /// [`Graph::remove`] parity, canonical spec §3.2.1 `GraphRemoveAudit`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoveAudit {
+pub struct GraphRemoveAudit {
     /// Number of nodes torn down (own + recursive into mounts).
     pub node_count: usize,
     /// Number of mounts torn down (recursive count).
@@ -67,24 +67,29 @@ pub(crate) fn mount(parent: &Graph, name: String, child: Graph) -> Result<Graph,
     // parent → child, never child → parent — there is no Graph code
     // that acquires a parent lock from inside a child lock). Both are
     // `parking_lot::Mutex` so the hold is short and contention-bound.
-    let mut parent_inner = parent.inner.lock();
-    if parent_inner.destroyed {
-        return Err(MountError::Destroyed);
-    }
-    if parent_inner.children.contains_key(&name) {
-        return Err(MountError::NameCollision(name));
-    }
-    if parent_inner.names.contains_key(&name) {
-        return Err(MountError::NodeNameCollision(name));
-    }
     {
-        let mut child_inner = child.inner.lock();
-        if child_inner.parent.is_some() {
-            return Err(MountError::AlreadyMounted);
+        let mut parent_inner = parent.inner.lock();
+        if parent_inner.destroyed {
+            return Err(MountError::Destroyed);
         }
-        child_inner.parent = Some(Arc::downgrade(&parent.inner));
+        if parent_inner.children.contains_key(&name) {
+            return Err(MountError::NameCollision(name));
+        }
+        if parent_inner.names.contains_key(&name) {
+            return Err(MountError::NodeNameCollision(name));
+        }
+        {
+            let mut child_inner = child.inner.lock();
+            if child_inner.parent.is_some() {
+                return Err(MountError::AlreadyMounted);
+            }
+            child_inner.parent = Some(Arc::downgrade(&parent.inner));
+        }
+        parent_inner.children.insert(name, child.clone());
     }
-    parent_inner.children.insert(name, child.clone());
+    // Fire AFTER lock drops (P3 — reactive describe / observe_all
+    // must see mounts as namespace changes).
+    parent.fire_namespace_change();
     Ok(child)
 }
 
@@ -97,22 +102,27 @@ pub(crate) fn mount_new(parent: &Graph, name: String) -> Result<Graph, MountErro
     // insert (TOCTOU fix from /qa Slice E+). `Graph::with_core` does
     // not take any lock that conflicts — it allocates `Arc<Mutex<...>>`
     // for the new child's GraphInner.
-    let mut parent_inner = parent.inner.lock();
-    if parent_inner.destroyed {
-        return Err(MountError::Destroyed);
-    }
-    if parent_inner.children.contains_key(&name) {
-        return Err(MountError::NameCollision(name));
-    }
-    if parent_inner.names.contains_key(&name) {
-        return Err(MountError::NodeNameCollision(name));
-    }
-    let child = Graph::with_core(name.clone(), parent.core.clone(), Some(parent_weak));
-    parent_inner.children.insert(name, child.clone());
+    let child = {
+        let mut parent_inner = parent.inner.lock();
+        if parent_inner.destroyed {
+            return Err(MountError::Destroyed);
+        }
+        if parent_inner.children.contains_key(&name) {
+            return Err(MountError::NameCollision(name));
+        }
+        if parent_inner.names.contains_key(&name) {
+            return Err(MountError::NodeNameCollision(name));
+        }
+        let child = Graph::with_core(name.clone(), parent.core.clone(), Some(parent_weak));
+        parent_inner.children.insert(name, child.clone());
+        child
+    };
+    // Fire AFTER lock drops (P3).
+    parent.fire_namespace_change();
     Ok(child)
 }
 
-pub(crate) fn unmount(parent: &Graph, name: &str) -> Result<RemoveAudit, MountError> {
+pub(crate) fn unmount(parent: &Graph, name: &str) -> Result<GraphRemoveAudit, MountError> {
     let child = {
         let mut parent_inner = parent.inner.lock();
         if parent_inner.destroyed {
@@ -127,6 +137,8 @@ pub(crate) fn unmount(parent: &Graph, name: &str) -> Result<RemoveAudit, MountEr
     // Detach + destroy.
     child.inner.lock().parent = None;
     child.destroy();
+    // Fire on the parent AFTER the child's destroy completes (P3).
+    parent.fire_namespace_change();
     Ok(audit)
 }
 
@@ -160,7 +172,7 @@ pub(crate) fn ancestors(graph: &Graph, include_self: bool) -> Vec<Graph> {
     chain
 }
 
-fn audit_of(graph: &Graph) -> RemoveAudit {
+fn audit_of(graph: &Graph) -> GraphRemoveAudit {
     let inner = graph.inner.lock();
     let own = inner.names.len();
     let mount_count_self = inner.children.len();
@@ -173,7 +185,7 @@ fn audit_of(graph: &Graph) -> RemoveAudit {
         node_count += sub.node_count;
         mount_count += sub.mount_count;
     }
-    RemoveAudit {
+    GraphRemoveAudit {
         node_count,
         mount_count,
     }

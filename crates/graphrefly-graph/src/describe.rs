@@ -1,7 +1,7 @@
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
-//! Only the JSON struct hierarchy lands in Slice E+. Pretty / mermaid
-//! / d2 / stage-log / explain / reachable / reactive variants are
+//! Static JSON form (Slice E+) + reactive describe (Slice F+). Pretty
+//! / mermaid / d2 / stage-log / explain / reachable variants are
 //! deferred (subsequent slices).
 //!
 //! # Value rendering divergence (TS spec)
@@ -15,11 +15,14 @@
 //! consumption. Documented divergence per §11 Implementation Deltas
 //! (handle-protocol cleaving plane).
 
-use graphrefly_core::{HandleId, NodeId, NodeKind, TerminalKind, NO_HANDLE};
+use std::sync::{Arc, Weak};
+
+use graphrefly_core::{Core, HandleId, NodeId, NodeKind, TerminalKind, NO_HANDLE};
 use indexmap::IndexMap;
+use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 
-use crate::graph::Graph;
+use crate::graph::{Graph, GraphInner};
 
 /// Top-level `describe()` output (canonical Appendix B JSON schema).
 ///
@@ -245,5 +248,91 @@ fn status_of(
             }
         }
         NodeKind::Derived | NodeKind::Dynamic => NodeStatus::Pending,
+    }
+}
+
+// -------------------------------------------------------------------
+// Reactive describe (canonical §3.6.1 `reactive: true` mode)
+// -------------------------------------------------------------------
+
+/// Sink type for reactive describe — receives a fresh `GraphDescribeOutput`
+/// on every namespace change.
+pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
+
+/// RAII handle for a reactive describe subscription. Dropping it stops
+/// the namespace listener and frees the describe-sink.
+///
+/// The reactive describe fires synchronously from Graph-level
+/// namespace mutations (`add`, `remove`, `destroy`, `mount`,
+/// `unmount`, and the cascaded teardowns of `core.teardown`). Each
+/// fire re-snapshots the full `Graph::describe()` and delivers it
+/// to the sink.
+#[must_use = "ReactiveDescribeHandle holds the subscription; dropping it unsubscribes"]
+pub struct ReactiveDescribeHandle {
+    graph: Graph,
+    ns_sink_id: u64,
+}
+
+impl Drop for ReactiveDescribeHandle {
+    fn drop(&mut self) {
+        self.graph.unsubscribe_namespace_change(self.ns_sink_id);
+    }
+}
+
+// Send + Sync compile-time assertion.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReactiveDescribeHandle>();
+};
+
+impl Graph {
+    /// Subscribe to live topology snapshots. The sink fires immediately
+    /// with the current [`GraphDescribeOutput`] (push-on-subscribe per
+    /// canonical §2.5.2 / R3.6.1) and then again with a fresh snapshot
+    /// every time a node is added, removed, mounted, unmounted, or the
+    /// graph is destroyed.
+    ///
+    /// Returns a [`ReactiveDescribeHandle`] — dropping it unsubscribes.
+    ///
+    /// This is the `reactive: true` mode from canonical §3.6.1. The
+    /// `reactive: "diff"` (changeset) mode is deferred to Phase 14.
+    ///
+    /// Note: `set_deps` topology changes fire via Core's topology
+    /// primitive, not this Graph-level namespace hook. If callers also
+    /// need `set_deps` notifications, compose with
+    /// [`graphrefly_core::Core::subscribe_topology`].
+    ///
+    /// The sink captures only a [`Weak`] reference to the graph's inner
+    /// state, so the `namespace_sinks` → sink → Graph → `namespace_sinks`
+    /// Arc cycle is broken at the sink edge (see P6 in the Slice F /qa
+    /// closing notes).
+    pub fn describe_reactive(&self, sink: DescribeSink) -> ReactiveDescribeHandle {
+        // Push-on-subscribe: fire current snapshot once before installing
+        // the listener. Sink runs without any Graph lock held.
+        sink(&self.describe());
+
+        // Capture Weak<inner> + Core (clone) to break the
+        // namespace_sinks → sink → Graph → namespace_sinks Arc cycle.
+        // If the user leaks the handle, the graph still drops cleanly
+        // because the sink's Weak ref does not keep `inner` alive.
+        let weak_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.inner);
+        let core: Core = self.core.clone();
+        let ns_sink = Arc::new(move || {
+            let Some(arc_inner) = weak_inner.upgrade() else {
+                // Graph dropped; silent no-op.
+                return;
+            };
+            let graph = Graph {
+                core: core.clone(),
+                inner: arc_inner,
+            };
+            let snapshot = graph.describe();
+            sink(&snapshot);
+        });
+        let ns_sink_id = self.subscribe_namespace_change(ns_sink);
+        ReactiveDescribeHandle {
+            graph: self.clone(),
+            ns_sink_id,
+        }
     }
 }

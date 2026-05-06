@@ -506,6 +506,9 @@ pub(crate) struct CoreState {
     /// to the cache slot. Only populated for in-flight waves; empty
     /// between waves.
     pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
+    /// Topology-change sinks. Keyed by subscription id for O(1) removal.
+    pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
+    pub(crate) next_topology_id: u64,
 }
 
 /// The handle-protocol Core dispatcher.
@@ -565,6 +568,8 @@ impl Core {
                 deferred_handle_releases: Vec::new(),
                 binding: binding.clone(),
                 wave_cache_snapshots: HashMap::new(),
+                topology_sinks: HashMap::new(),
+                next_topology_id: 1,
             })),
             binding,
             wave_owner: Arc::new(ReentrantMutex::new(())),
@@ -658,6 +663,8 @@ impl Core {
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
+        drop(s);
+        self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
         id
     }
 
@@ -727,6 +734,8 @@ impl Core {
             assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
             s.children.entry(dep).or_default().insert(id);
         }
+        drop(s);
+        self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
         id
     }
 
@@ -1378,10 +1387,20 @@ impl Core {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
         }
-        self.run_wave(|this| {
+        let torn_down: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
+        let torn_down_for_wave = torn_down.clone();
+        self.run_wave(move |this| {
             let mut s = this.lock_state();
-            this.teardown_inner(&mut s, node_id);
+            let collected = this.teardown_inner(&mut s, node_id);
+            torn_down_for_wave.lock().extend(collected);
         });
+        // Fire NodeTornDown for every cascaded id (root + metas +
+        // downstream consumers that auto-cascaded). Outside the state
+        // lock, matching fire_topology_event discipline.
+        let ids = std::mem::take(&mut *torn_down.lock());
+        for id in ids {
+            self.fire_topology_event(&crate::topology::TopologyEvent::NodeTornDown(id));
+        }
     }
 
     /// Iterative teardown walk (Slice A-bigger, M1-close).
@@ -1408,12 +1427,16 @@ impl Core {
     /// pop. Idempotency via `has_received_teardown` keeps each node
     /// visited at most once even when multi-parent diamonds re-enter via
     /// a sibling path.
-    fn teardown_inner(&self, s: &mut CoreState, root: NodeId) {
+    fn teardown_inner(&self, s: &mut CoreState, root: NodeId) -> Vec<NodeId> {
         enum Action {
             Visit(NodeId),
             EmitTeardown(NodeId),
         }
         let mut stack: Vec<Action> = vec![Action::Visit(root)];
+        // Topology accumulator: every node that actually emits TEARDOWN
+        // (i.e. each `EmitTeardown(id)` site, NOT each `Visit` — visits
+        // for already-torn-down nodes short-circuit on idempotency).
+        let mut torn_down: Vec<NodeId> = Vec::new();
         while let Some(action) = stack.pop() {
             match action {
                 Action::Visit(id) => {
@@ -1449,9 +1472,11 @@ impl Core {
                     }
                     // Wire emission of the TEARDOWN itself (tier 6).
                     self.queue_notify(s, id, Message::Teardown);
+                    torn_down.push(id);
                 }
             }
         }
+        torn_down
     }
 
     /// Attach `companion` as a meta companion of `parent` per R1.3.9.d.
@@ -1866,6 +1891,9 @@ impl Core {
         }
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
+        // Snapshot old deps (ordered) for topology event, before mutation.
+        let old_deps_vec: Vec<NodeId> = s.require_node(n).deps.clone();
+
         // Carry out the rewire atomically.
         // 1. Update the node's deps + dep_handles, clearing dirtyMask bits for removed.
         let new_deps_vec: Vec<NodeId> = new_deps.to_vec();
@@ -1976,6 +2004,12 @@ impl Core {
         // releases. Keeps the lock-discipline split (binding calls outside
         // the state lock) consistent with the rest of the dispatcher.
         drop(s);
+        // Fire topology event after lock is dropped.
+        self.fire_topology_event(&crate::topology::TopologyEvent::DepsChanged {
+            node: n,
+            old_deps: old_deps_vec,
+            new_deps: new_deps_vec.clone(),
+        });
         if !added_for_wave.is_empty() {
             self.run_wave(|this| {
                 let mut s = this.lock_state();
