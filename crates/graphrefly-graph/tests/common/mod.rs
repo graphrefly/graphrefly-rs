@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use graphrefly_core::{BindingBoundary, FnId, FnResult, HandleId, NodeId};
+use graphrefly_core::{BindingBoundary, DepBatch, FnId, FnResult, HandleId, NodeId};
 
 pub struct StubBinding {
     pub retains: AtomicUsize,
@@ -24,12 +24,12 @@ impl StubBinding {
 }
 
 impl BindingBoundary for StubBinding {
-    fn invoke_fn(&self, _node_id: NodeId, _fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
-        // Identity passthrough: emit the first dep, or noop if no deps.
-        dep_handles
+    fn invoke_fn(&self, _node_id: NodeId, _fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        // Identity passthrough: emit the first dep's latest, or noop if no deps.
+        dep_data
             .first()
-            .map_or(FnResult::Noop { tracked: None }, |&h| FnResult::Data {
-                handle: h,
+            .map_or(FnResult::Noop { tracked: None }, |db| FnResult::Data {
+                handle: db.latest(),
                 tracked: None,
             })
     }

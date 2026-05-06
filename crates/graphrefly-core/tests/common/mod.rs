@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
+    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
     Subscription,
 };
 
@@ -67,6 +67,10 @@ enum PrimitiveKey {
 type FnImpl = Arc<dyn Fn(&[TestValue]) -> Option<TestValue> + Send + Sync>;
 type DynamicFnImpl =
     Arc<dyn Fn(&[TestValue]) -> (Option<TestValue>, Option<Vec<usize>>) + Send + Sync>;
+/// Raw fn that returns a fully-formed `FnResult` — used by tests that need
+/// `FnResult::Batch` or other non-standard return shapes. The closure
+/// captures its own `Arc<TestBinding>` for handle interning.
+type RawFnImpl = Arc<dyn Fn(&[DepBatch]) -> FnResult + Send + Sync>;
 type EqualsImpl = Arc<dyn Fn(&TestValue, &TestValue) -> bool + Send + Sync>;
 
 struct RegistryInner {
@@ -80,6 +84,9 @@ struct RegistryInner {
     /// Dynamic fns return both a value and a tracked-deps set. A given fn_id
     /// is in EITHER `fns` OR `dynamic_fns`; never both.
     dynamic_fns: HashMap<FnId, DynamicFnImpl>,
+    /// Raw fns that return a fully-formed `FnResult` — for testing
+    /// `FnResult::Batch` and other advanced emission patterns.
+    raw_fns: HashMap<FnId, RawFnImpl>,
     custom_equals: HashMap<FnId, EqualsImpl>,
 }
 
@@ -99,6 +106,7 @@ impl TestBinding {
                 object_index: HashMap::new(),
                 fns: HashMap::new(),
                 dynamic_fns: HashMap::new(),
+                raw_fns: HashMap::new(),
                 custom_equals: HashMap::new(),
             }),
         })
@@ -200,13 +208,44 @@ impl TestBinding {
         inner.custom_equals.insert(id, Arc::new(f));
         id
     }
+
+    /// Register a raw fn that returns a fully-formed `FnResult` — for testing
+    /// `FnResult::Batch` and other advanced emission patterns. The closure
+    /// receives `&[DepBatch]` directly (not resolved values).
+    pub fn register_raw_fn<F>(&self, f: F) -> FnId
+    where
+        F: Fn(&[DepBatch]) -> FnResult + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock().expect("registry lock");
+        let id = FnId::new(inner.next_fn_id);
+        inner.next_fn_id += 1;
+        inner.raw_fns.insert(id, Arc::new(f));
+        id
+    }
 }
 
 impl BindingBoundary for TestBinding {
-    fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
-        // Resolve all dep handles to values (one boundary call per fire — the
-        // FFI cost-model claim from the rust-port session doc).
-        let dep_values: Vec<TestValue> = dep_handles.iter().map(|&h| self.deref(h)).collect();
+    fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        // Dispatch to raw_fns first — these get full DepBatch control for
+        // testing FnResult::Batch and other advanced patterns.
+        let raw_f = self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .raw_fns
+            .get(&fn_id)
+            .cloned();
+        if let Some(f) = raw_f {
+            return f(dep_data);
+        }
+
+        // Resolve each dep's latest handle to a value. Outside batch() scope
+        // this is the single DATA handle; inside batch() it's the last of the
+        // K coalesced emits. Existing test fns see the same &[TestValue] shape
+        // they always did — batch-array-aware tests use register_dynamic_fn
+        // and inspect the full DepBatch slice via a separate path if needed.
+        let dep_values: Vec<TestValue> =
+            dep_data.iter().map(|db| self.deref(db.latest())).collect();
 
         // Dispatch to dynamic_fns first; fall back to plain fns.
         let dyn_f = self

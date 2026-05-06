@@ -378,24 +378,66 @@ pub enum PauseError {
     UnknownNode(NodeId),
 }
 
+/// Per-dep record. Replaces the parallel `deps` / `dep_handles` /
+/// `dep_terminals` vectors from v1. Canonical spec R2.9.b alignment.
+///
+/// Each entry tracks one dep's lifecycle state, wave-scoped batch data,
+/// and cross-wave `prev_data` for `ctx.prevData` access.
+pub(crate) struct DepRecord {
+    /// The dep node this record tracks.
+    pub(crate) node: NodeId,
+    /// Last DATA handle from the end of the previous wave. [`NO_HANDLE`]
+    /// means the dep has never emitted DATA.
+    pub(crate) prev_data: HandleId,
+    /// Per-dep dirty flag — awaiting DATA/RESOLVED for current wave.
+    pub(crate) dirty: bool,
+    /// Per-dep involved-this-wave flag. Distinguishes:
+    /// - `involved && data_batch.is_empty()` → dep settled RESOLVED
+    /// - `!involved && data_batch.is_empty()` → dep was not in this wave
+    pub(crate) involved_this_wave: bool,
+    /// DATA handles accumulated this wave. Outside `batch()` scope, at most
+    /// 1 element. Inside `batch()`, K emits on the source produce K entries
+    /// per R1.3.6.b coalescing. Each handle holds a `retain_handle` share
+    /// taken at `deliver_data_to_consumer` time; released at wave-end
+    /// rotation in `clear_wave_state`.
+    pub(crate) data_batch: SmallVec<[HandleId; 1]>,
+    /// Terminal state for this dep. `None` = dep is live.
+    /// `Some` = dep emitted COMPLETE/ERROR. When ALL entries are Some,
+    /// the node auto-cascades per Lock 2.B (ERROR dominates COMPLETE).
+    pub(crate) terminal: Option<TerminalKind>,
+}
+
+impl DepRecord {
+    fn new(node: NodeId) -> Self {
+        Self {
+            node,
+            prev_data: NO_HANDLE,
+            dirty: false,
+            involved_this_wave: false,
+            data_batch: SmallVec::new(),
+            terminal: None,
+        }
+    }
+}
+
 /// Internal node record. Mirrors `core.ts:132–154`.
 ///
-/// The 5 bool fields (`has_fired_once`, `dirty`, `involved_this_wave`,
+/// The 4 bool fields (`has_fired_once`, `dirty`, `involved_this_wave`,
 /// `has_received_teardown`, `resubscribable`) each represent an orthogonal
 /// lifecycle concern. Collapsing them into a bitfield would obscure intent
 /// and complicate the wave-cleanup phase that resets only the wave-scoped
 /// pair (`dirty`, `involved_this_wave`).
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct NodeRecord {
-    pub(crate) deps: Vec<NodeId>,
+    /// Per-dep records. Replaces the old parallel `deps` / `dep_handles` /
+    /// `dep_terminals` vecs. Dep NodeIds derived via `dep_ids()`.
+    pub(crate) dep_records: Vec<DepRecord>,
     pub(crate) kind: NodeKind,
     pub(crate) fn_id: Option<FnId>,
     pub(crate) equals: EqualsMode,
 
     // Mutable state
     pub(crate) cache: HandleId,
-    /// Per-dep handle of last DATA seen. Same length as `deps`.
-    pub(crate) dep_handles: Vec<HandleId>,
     pub(crate) has_fired_once: bool,
     pub(crate) subscribers: HashMap<SubscriptionId, Sink>,
     /// For dynamic nodes: which dep indices fn actually tracks.
@@ -413,11 +455,6 @@ pub(crate) struct NodeRecord {
     /// further `emit` calls are silent no-ops, fn no longer fires, and only
     /// the terminal message has been queued downstream.
     pub(crate) terminal: Option<TerminalKind>,
-    /// Per-dep terminal slots aligned with `deps`. None = dep is live.
-    /// Some = dep emitted COMPLETE/ERROR. When ALL entries are Some, the
-    /// node auto-cascades its own terminal per Lock 2.B (ERROR dominates
-    /// COMPLETE — first error wins; if no errors, COMPLETE).
-    pub(crate) dep_terminals: Vec<Option<TerminalKind>>,
     /// True after the first TEARDOWN has been processed for this node
     /// (R2.6.4 / Lock 6.F). Subsequent TEARDOWN deliveries are idempotent
     /// — the auto-prepended COMPLETE only fires on the first one. Without
@@ -428,11 +465,8 @@ pub(crate) struct NodeRecord {
     /// Per R2.2.7 / R2.5.3 — resubscribable terminal lifecycle.
     /// When `true` AND `terminal == Some(...)`, a fresh subscribe call
     /// will reset the node: clear `terminal`, `has_fired_once`,
-    /// `has_received_teardown`, all `dep_handles` to `NO_HANDLE`, all
-    /// `dep_terminals` to `None`, and drain the pause lockset. The new
-    /// subscriber then receives a vanilla `[START]` (or `[START, DATA(cache)]`
-    /// for state nodes whose cache survived the reset) handshake.
-    /// Default `false`.
+    /// `has_received_teardown`, all dep_records to sentinel, and drain the
+    /// pause lockset. Default `false`.
     pub(crate) resubscribable: bool,
     /// Meta companion nodes attached to this node per R1.3.9.d. When this
     /// node tears down, its meta companions are torn down FIRST (before
@@ -441,6 +475,41 @@ pub(crate) struct NodeRecord {
     /// is load-bearing — meta nodes typically subscribe to parent state
     /// that becomes inconsistent during the parent's destruction phase.
     pub(crate) meta_companions: Vec<NodeId>,
+}
+
+impl NodeRecord {
+    /// Iterator over dep NodeIds in declaration order.
+    pub(crate) fn dep_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.dep_records.iter().map(|r| r.node)
+    }
+
+    /// Collected dep NodeIds — for call sites that need a `Vec<NodeId>`.
+    pub(crate) fn dep_ids_vec(&self) -> Vec<NodeId> {
+        self.dep_ids().collect()
+    }
+
+    /// Number of deps.
+    pub(crate) fn dep_count(&self) -> usize {
+        self.dep_records.len()
+    }
+
+    /// True if any dep is in sentinel state (never emitted DATA and no
+    /// data this wave). Replaces the old `dep_handles.contains(&NO_HANDLE)`.
+    pub(crate) fn has_sentinel_deps(&self) -> bool {
+        self.dep_records
+            .iter()
+            .any(|r| r.prev_data == NO_HANDLE && r.data_batch.is_empty())
+    }
+
+    /// Find the index of a dep by NodeId.
+    pub(crate) fn dep_index_of(&self, dep_id: NodeId) -> Option<usize> {
+        self.dep_records.iter().position(|r| r.node == dep_id)
+    }
+
+    /// True if ALL dep terminal slots are populated (Lock 2.B cascade check).
+    pub(crate) fn all_deps_terminal(&self) -> bool {
+        !self.dep_records.is_empty() && self.dep_records.iter().all(|r| r.terminal.is_some())
+    }
 }
 
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
@@ -506,6 +575,13 @@ pub(crate) struct CoreState {
     /// to the cache slot. Only populated for in-flight waves; empty
     /// between waves.
     pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
+    /// Nodes that need an auto-Resolved at wave end if they don't receive
+    /// a tier-3+ message from their own commit_emission. Populated by
+    /// the RESOLVED child propagation in `commit_emission` (which queues
+    /// Dirty but defers Resolved to avoid double-settlement). Drained by
+    /// the auto-resolve sweep in `drain_and_flush`. Cleared by
+    /// `clear_wave_state`.
+    pub(crate) pending_auto_resolve: ahash::AHashSet<NodeId>,
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
@@ -568,6 +644,7 @@ impl Core {
                 deferred_handle_releases: Vec::new(),
                 binding: binding.clone(),
                 wave_cache_snapshots: HashMap::new(),
+                pending_auto_resolve: ahash::AHashSet::new(),
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
             })),
@@ -643,12 +720,11 @@ impl Core {
         let mut s = self.lock_state();
         let id = s.alloc_node_id();
         let rec = NodeRecord {
-            deps: Vec::new(),
+            dep_records: Vec::new(),
             kind: NodeKind::State,
             fn_id: None,
             equals: EqualsMode::Identity,
             cache: initial,
-            dep_handles: Vec::new(),
             has_fired_once: initial != NO_HANDLE,
             subscribers: HashMap::new(),
             tracked: HashSet::new(),
@@ -656,7 +732,6 @@ impl Core {
             involved_this_wave: false,
             pause_state: PauseState::Active,
             terminal: None,
-            dep_terminals: Vec::new(),
             has_received_teardown: false,
             resubscribable: false,
             meta_companions: Vec::new(),
@@ -708,13 +783,13 @@ impl Core {
             NodeKind::Derived => (0..deps.len()).collect(),
             NodeKind::Dynamic | NodeKind::State => HashSet::new(),
         };
+        let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
         let rec = NodeRecord {
-            deps: deps.to_vec(),
+            dep_records,
             kind,
             fn_id: Some(fn_id),
             equals,
             cache: NO_HANDLE,
-            dep_handles: vec![NO_HANDLE; deps.len()],
             has_fired_once: false,
             subscribers: HashMap::new(),
             tracked,
@@ -722,7 +797,6 @@ impl Core {
             involved_this_wave: false,
             pause_state: PauseState::Active,
             terminal: None,
-            dep_terminals: vec![None; deps.len()],
             has_received_teardown: false,
             resubscribable: false,
             meta_companions: Vec::new(),
@@ -911,12 +985,12 @@ impl Core {
     /// Reset a resubscribable node's terminal-lifecycle state. Called from
     /// `subscribe` when a late subscriber arrives at a flagged node.
     ///
-    /// Released: terminal-slot retain (Error handle), all dep_terminals
-    /// retains (Error handles in any per-dep terminal slots).
+    /// Released: terminal-slot retain (Error handle), all per-dep terminal
+    /// retains (Error handles), all data_batch retains.
     /// Cleared: `terminal`, `has_fired_once`, `has_received_teardown`, all
-    /// `dep_handles` to `NO_HANDLE`, all `dep_terminals` to `None`, the
-    /// pause lockset (any held locks are released — replay buffer drops
-    /// silently because there are no subscribers to flush to).
+    /// dep_records to sentinel, the pause lockset (any held locks are
+    /// released — replay buffer drops silently because there are no
+    /// subscribers to flush to).
     fn reset_for_fresh_lifecycle(&self, s: &mut CoreState, node_id: NodeId) {
         // Collect handles to release (after dropping the borrow).
         let handles_to_release: Vec<HandleId> = {
@@ -925,9 +999,13 @@ impl Core {
             if let Some(TerminalKind::Error(h)) = rec.terminal {
                 hs.push(h);
             }
-            for slot in &rec.dep_terminals {
-                if let Some(TerminalKind::Error(h)) = slot {
-                    hs.push(*h);
+            for dr in &rec.dep_records {
+                if let Some(TerminalKind::Error(h)) = dr.terminal {
+                    hs.push(h);
+                }
+                // Release data_batch retains.
+                for &h in &dr.data_batch {
+                    hs.push(h);
                 }
             }
             hs
@@ -950,11 +1028,12 @@ impl Core {
             rec.terminal = None;
             rec.has_fired_once = rec.cache != NO_HANDLE && rec.kind == NodeKind::State;
             rec.has_received_teardown = false;
-            for slot in &mut rec.dep_handles {
-                *slot = NO_HANDLE;
-            }
-            for slot in &mut rec.dep_terminals {
-                *slot = None;
+            for dr in &mut rec.dep_records {
+                dr.prev_data = NO_HANDLE;
+                dr.data_batch.clear(); // retains already collected above
+                dr.terminal = None;
+                dr.dirty = false;
+                dr.involved_this_wave = false;
             }
             rec.pause_state = PauseState::Active;
             rec.involved_this_wave = false;
@@ -1007,7 +1086,7 @@ impl Core {
     ///      fires the fn lock-released around `invoke_fn`.
     pub(crate) fn activate_derived(&self, s: &mut CoreState, root: NodeId) {
         // Phase 1: discover. DFS to collect every compute node reachable
-        // via `deps` that doesn't yet have a cache and hasn't fired.
+        // via deps that doesn't yet have a cache and hasn't fired.
         // Record them in dep-first (post-order) so phase 2 can deliver
         // caches forward. Frame is `(node_id, finalize)` — `finalize=false`
         // means "first visit: push deps then re-push self with finalize=true";
@@ -1025,7 +1104,7 @@ impl Core {
                 continue;
             }
             stack.push((id, true));
-            let dep_ids: Vec<NodeId> = s.require_node(id).deps.clone();
+            let dep_ids: Vec<NodeId> = s.require_node(id).dep_ids_vec();
             for dep_id in dep_ids {
                 let (dep_kind, dep_cache, dep_has_fired) = {
                     let dep_rec = s.require_node(dep_id);
@@ -1044,7 +1123,7 @@ impl Core {
         // Phase 2: deliver caches in dep-first order. For each node, walk
         // its deps and call `deliver_data_to_consumer` for any with caches.
         for &id in &order {
-            let dep_ids: Vec<NodeId> = s.require_node(id).deps.clone();
+            let dep_ids: Vec<NodeId> = s.require_node(id).dep_ids_vec();
             for (i, dep_id) in dep_ids.iter().copied().enumerate() {
                 let dep_cache = s.require_node(dep_id).cache;
                 if dep_cache != NO_HANDLE {
@@ -1155,7 +1234,7 @@ impl Core {
         self.lock_state()
             .nodes
             .get(&node_id)
-            .map(|r| r.deps.clone())
+            .map(NodeRecord::dep_ids_vec)
             .unwrap_or_default()
     }
 
@@ -1312,17 +1391,17 @@ impl Core {
                 .map(|c| c.iter().copied().collect())
                 .unwrap_or_default();
             for child_id in child_ids {
-                let dep_idx = s.require_node(child_id).deps.iter().position(|&d| d == id);
+                let dep_idx = s.require_node(child_id).dep_index_of(id);
                 let Some(idx) = dep_idx else { continue };
                 // Mark this child's per-dep terminal slot. Take a retain on
                 // the error handle for the slot share.
                 {
                     let child = s.require_node_mut(child_id);
-                    if child.dep_terminals[idx].is_some() {
+                    if child.dep_records[idx].terminal.is_some() {
                         // Idempotent — child already saw this dep terminate.
                         continue;
                     }
-                    child.dep_terminals[idx] = Some(t);
+                    child.dep_records[idx].terminal = Some(t);
                 }
                 if let TerminalKind::Error(h) = t {
                     self.binding.retain_handle(h);
@@ -1333,8 +1412,8 @@ impl Core {
                     let child = s.require_node(child_id);
                     if child.terminal.is_some() {
                         None // Already terminated — no-op.
-                    } else if child.dep_terminals.iter().all(Option::is_some) {
-                        Some(pick_cascade_terminal(&child.dep_terminals))
+                    } else if child.all_deps_terminal() {
+                        Some(pick_cascade_terminal(&child.dep_records))
                     } else {
                         None
                     }
@@ -1349,10 +1428,10 @@ impl Core {
 
 /// Lock 2.B cascade-terminal selection: ERROR dominates COMPLETE; first
 /// ERROR seen wins. Caller has already verified all deps are terminal.
-fn pick_cascade_terminal(dep_terminals: &[Option<TerminalKind>]) -> TerminalKind {
-    for t in dep_terminals {
-        if let Some(TerminalKind::Error(h)) = t {
-            return TerminalKind::Error(*h);
+fn pick_cascade_terminal(dep_records: &[DepRecord]) -> TerminalKind {
+    for dr in dep_records {
+        if let Some(TerminalKind::Error(h)) = dr.terminal {
+            return TerminalKind::Error(h);
         }
     }
     TerminalKind::Complete
@@ -1596,24 +1675,37 @@ impl Core {
             self.binding.release_handle(old_handle);
             // Wire emission. Pause-aware via queue_notify.
             self.queue_notify(s, node_id, Message::Invalidate);
-            // Cascade: for each child, clear the dep_handles slot referencing
-            // this node and push child onto the work queue.
+            // Cascade: for each child, clear the dep record's prev_data
+            // referencing this node and push child onto the work queue.
             let child_ids: Vec<NodeId> = s
                 .children
                 .get(&node_id)
                 .map(|c| c.iter().copied().collect())
                 .unwrap_or_default();
             for child_id in child_ids {
-                let dep_idx = s
-                    .require_node(child_id)
-                    .deps
-                    .iter()
-                    .position(|&d| d == node_id);
+                let dep_idx = s.require_node(child_id).dep_index_of(node_id);
                 if let Some(idx) = dep_idx {
-                    // Reset the child's dep_handles entry — the handle
-                    // stored there was just released. Subsequent
-                    // first-run-gate checks see NO_HANDLE and re-close.
-                    s.require_node_mut(child_id).dep_handles[idx] = NO_HANDLE;
+                    // Reset the child's dep record — the handle was just
+                    // released. Subsequent first-run-gate checks see
+                    // sentinel and re-close.
+                    //
+                    // Snapshot prev_data + data_batch retains for deferred
+                    // release, then clear the record. Two-phase to satisfy
+                    // the borrow checker (nodes + deferred_handle_releases
+                    // are separate CoreState fields).
+                    let (old_prev, batch_hs): (HandleId, SmallVec<[HandleId; 1]>) = {
+                        let dr = &s.require_node(child_id).dep_records[idx];
+                        (dr.prev_data, dr.data_batch.clone())
+                    };
+                    if old_prev != NO_HANDLE {
+                        s.deferred_handle_releases.push(old_prev);
+                    }
+                    for h in batch_hs {
+                        s.deferred_handle_releases.push(h);
+                    }
+                    let dr = &mut s.require_node_mut(child_id).dep_records[idx];
+                    dr.prev_data = NO_HANDLE;
+                    dr.data_batch.clear();
                     work.push(child_id);
                 }
             }
@@ -1862,7 +1954,7 @@ impl Core {
         // `d` is already reachable from `n` via existing data-flow edges
         // (so `n → ... → d` exists, and the new `d → n` closes the loop).
         // DFS from `n` along `children` edges, looking for each added dep.
-        let current_deps: HashSet<NodeId> = s.require_node(n).deps.iter().copied().collect();
+        let current_deps: HashSet<NodeId> = s.require_node(n).dep_ids().collect();
         let new_deps_set: HashSet<NodeId> = new_deps.iter().copied().collect();
         let added: HashSet<NodeId> = new_deps_set.difference(&current_deps).copied().collect();
         for &d in &added {
@@ -1892,69 +1984,68 @@ impl Core {
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
         // Snapshot old deps (ordered) for topology event, before mutation.
-        let old_deps_vec: Vec<NodeId> = s.require_node(n).deps.clone();
+        let old_deps_vec: Vec<NodeId> = s.require_node(n).dep_ids_vec();
 
         // Carry out the rewire atomically.
-        // 1. Update the node's deps + dep_handles, clearing dirtyMask bits for removed.
+        // 1. Build new dep_records, preserving DepRecord state for kept deps.
         let new_deps_vec: Vec<NodeId> = new_deps.to_vec();
-        // We need to preserve dep_handles AND dep_terminals for unchanged deps
-        // and reset for added. Build new vecs aligned to new_deps_vec.
         //
         // Refcount discipline (F1 audit fix): each `Some(TerminalKind::Error(h))`
         // slot owns a refcount share retained at `terminate_node` time. When a
         // dep is REMOVED, its slot is dropped — the corresponding handle's
         // share must be released here, otherwise it leaks until Core drop.
-        // Collect handles to release while we still hold the borrow; release
-        // them after the lock is no longer needed for inspection.
-        let (new_dep_handles, new_dep_terminals, removed_terminal_handles): (
-            Vec<HandleId>,
-            Vec<Option<TerminalKind>>,
-            Vec<HandleId>,
-        ) = {
+        // Also release data_batch retains for removed deps.
+        let (new_dep_records, removed_handles): (Vec<DepRecord>, Vec<HandleId>) = {
             let rec = s.require_node(n);
-            let old_handle_pairs: HashMap<NodeId, HandleId> = rec
-                .deps
+            // Index old dep_records by NodeId for O(1) lookup of kept deps.
+            let old_by_node: HashMap<NodeId, &DepRecord> =
+                rec.dep_records.iter().map(|dr| (dr.node, dr)).collect();
+            let new_records: Vec<DepRecord> = new_deps_vec
                 .iter()
-                .copied()
-                .zip(rec.dep_handles.iter().copied())
+                .map(|&d| {
+                    if let Some(old) = old_by_node.get(&d) {
+                        // Kept dep: preserve all state (prev_data, data_batch,
+                        // terminal, wave flags). Subscriptions stay live.
+                        DepRecord {
+                            node: d,
+                            prev_data: old.prev_data,
+                            dirty: old.dirty,
+                            involved_this_wave: old.involved_this_wave,
+                            data_batch: old.data_batch.clone(),
+                            terminal: old.terminal,
+                        }
+                    } else {
+                        // Added dep: fresh sentinel record.
+                        DepRecord::new(d)
+                    }
+                })
                 .collect();
-            let old_terminal_pairs: HashMap<NodeId, Option<TerminalKind>> = rec
-                .deps
-                .iter()
-                .copied()
-                .zip(rec.dep_terminals.iter().copied())
-                .collect();
-            let handles = new_deps_vec
-                .iter()
-                .map(|d| old_handle_pairs.get(d).copied().unwrap_or(NO_HANDLE))
-                .collect();
-            let terms = new_deps_vec
-                .iter()
-                .map(|d| old_terminal_pairs.get(d).copied().unwrap_or(None))
-                .collect();
-            // Collect Error handles from REMOVED dep slots (slots whose
-            // dep is in `removed` and the slot held an Error).
+            // Collect handles to release from REMOVED dep records.
             let mut to_release: Vec<HandleId> = Vec::new();
             for d in &removed {
-                if let Some(Some(TerminalKind::Error(h))) = old_terminal_pairs.get(d) {
-                    to_release.push(*h);
+                if let Some(old) = old_by_node.get(d) {
+                    if let Some(TerminalKind::Error(h)) = old.terminal {
+                        to_release.push(h);
+                    }
+                    // Release data_batch retains for removed deps.
+                    for &h in &old.data_batch {
+                        to_release.push(h);
+                    }
                 }
             }
-            (handles, terms, to_release)
+            (new_records, to_release)
         };
         // Clear dirtyMask bit by re-emitting the wave-bookkeeping: we don't
         // currently model a per-dep dirtyMask explicitly (we use the boolean
         // `dirty` flag at node level). Removing a dep's entry from the implicit
         // mask is therefore implicit — by removing the dep, future emissions
-        // from it can't re-arm the bit. The `involved_this_wave` flag stays
-        // wave-scoped and gets cleared at wave end. The setDeps action itself
-        // does NOT change the dirty boolean unless all deps are cleared; in
-        // that case we settle.
+        // from it can't re-arm the bit. The per-dep `involved_this_wave` flag
+        // stays wave-scoped and gets cleared at wave end. The setDeps action
+        // itself does NOT change the dirty boolean unless all deps are cleared;
+        // in that case we settle.
         {
             let rec = s.require_node_mut(n);
-            rec.deps.clone_from(&new_deps_vec);
-            rec.dep_handles = new_dep_handles;
-            rec.dep_terminals = new_dep_terminals;
+            rec.dep_records = new_dep_records;
             // Re-derive `tracked` for static derived: all indices.
             // For dynamic: clear `tracked` AND reset `has_fired_once` so the
             // next dep delivery satisfies the first-fire branch in
@@ -2031,14 +2122,14 @@ impl Core {
                     if cache == NO_HANDLE {
                         continue;
                     }
-                    let dep_idx = s.require_node(n).deps.iter().position(|&d| d == *added_dep);
+                    let dep_idx = s.require_node(n).dep_index_of(*added_dep);
                     if let Some(idx) = dep_idx {
                         this.deliver_data_to_consumer(&mut s, n, idx, cache);
                     }
                 }
             });
         }
-        for h in removed_terminal_handles {
+        for h in removed_handles {
             self.binding.release_handle(h);
         }
         Ok(())
@@ -2087,15 +2178,48 @@ impl CoreState {
         id
     }
 
-    /// Clear wave-scoped flags (`dirty`, `involved_this_wave`) on every
+    /// Clear wave-scoped flags and rotate per-dep batch data on every
     /// node. Run at the end of every wave (regular drain via `run_wave`,
     /// activation drain via `activate_derived`, and `BatchGuard::drop`'s
     /// drain). Centralized so a future wave-state field can't be missed
     /// at one of the cleanup sites.
+    ///
+    /// Per-dep rotation (R2.9.b / R1.3.6.b):
+    /// - `prev_data` ← last element of `data_batch` (or unchanged if empty).
+    ///   The last batch entry's retain transfers to `prev_data`; the old
+    ///   `prev_data`'s retain is released. All earlier batch entries are
+    ///   released.
+    /// - `data_batch` cleared.
+    /// - Per-dep `dirty` and `involved_this_wave` cleared.
+    ///
+    /// Handle releases are pushed to `deferred_handle_releases` for
+    /// post-lock-drop release by the caller.
     pub(crate) fn clear_wave_state(&mut self) {
+        self.pending_auto_resolve.clear();
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;
+            for dr in &mut rec.dep_records {
+                let batch_len = dr.data_batch.len();
+                if batch_len > 0 {
+                    // Release all batch entries EXCEPT the last — the last
+                    // entry's retain transfers to prev_data.
+                    for &h in &dr.data_batch[..batch_len - 1] {
+                        self.deferred_handle_releases.push(h);
+                    }
+                    // Release the OLD prev_data (its retain was from the
+                    // previous wave's rotation or from initial delivery).
+                    if dr.prev_data != NO_HANDLE {
+                        self.deferred_handle_releases.push(dr.prev_data);
+                    }
+                    // Rotate: last batch entry becomes new prev_data.
+                    // Its retain carries over — no extra retain needed.
+                    dr.prev_data = dr.data_batch[batch_len - 1];
+                    dr.data_batch.clear();
+                }
+                dr.dirty = false;
+                dr.involved_this_wave = false;
+            }
         }
     }
 
@@ -2150,9 +2274,17 @@ impl Drop for CoreState {
             if let Some(TerminalKind::Error(h)) = rec.terminal {
                 self.binding.release_handle(h);
             }
-            for slot in &rec.dep_terminals {
-                if let Some(TerminalKind::Error(h)) = *slot {
+            for dr in &rec.dep_records {
+                if let Some(TerminalKind::Error(h)) = dr.terminal {
                     self.binding.release_handle(h);
+                }
+                // Release data_batch retains (in-flight wave data).
+                for &h in &dr.data_batch {
+                    self.binding.release_handle(h);
+                }
+                // Release prev_data retain (cross-wave persistence).
+                if dr.prev_data != NO_HANDLE {
+                    self.binding.release_handle(dr.prev_data);
                 }
             }
             if let PauseState::Paused { buffer, .. } = &rec.pause_state {

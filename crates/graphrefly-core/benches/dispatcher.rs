@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
+    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
 };
 use parking_lot::Mutex;
 
@@ -57,7 +57,7 @@ impl BenchBinding {
 }
 
 impl BindingBoundary for BenchBinding {
-    fn invoke_fn(&self, _: NodeId, _: FnId, _dep_handles: &[HandleId]) -> FnResult {
+    fn invoke_fn(&self, _: NodeId, _: FnId, _dep_data: &[DepBatch]) -> FnResult {
         *self.invoke_count.lock() += 1;
         // Always return a fresh handle — exercises the full DATA path.
         // For identity-equals dedup tests we use a different fn that returns

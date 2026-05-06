@@ -26,7 +26,7 @@ use std::time::Duration;
 use common::{RecordedEvent, Recorder, TestBinding, TestRuntime, TestValue};
 
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
+    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
 };
 
 // ---------------------------------------------------------------------------
@@ -554,7 +554,7 @@ impl ReentrantBinding {
 }
 
 impl BindingBoundary for ReentrantBinding {
-    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
+    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
         // Re-enter Core::cache_of mid-fire — depends on lock being
         // released around this call.
         if let (Some(core), Some(probe)) = (
@@ -563,7 +563,7 @@ impl BindingBoundary for ReentrantBinding {
         ) {
             let _ = core.cache_of(probe);
         }
-        self.inner.invoke_fn(node_id, fn_id, dep_handles)
+        self.inner.invoke_fn(node_id, fn_id, dep_data)
     }
 
     fn custom_equals(&self, equals_handle: FnId, a: HandleId, b: HandleId) -> bool {

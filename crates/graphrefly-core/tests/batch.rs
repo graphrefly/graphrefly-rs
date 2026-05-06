@@ -24,9 +24,10 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use graphrefly_core::{Message, NodeId, Sink};
+use graphrefly_core::{EqualsMode, FnEmission, FnResult, Message, NodeId, Sink};
+use smallvec::smallvec;
 
-use common::{TestRuntime, TestValue};
+use common::{RecordedEvent, TestRuntime, TestValue};
 
 // ---------------------------------------------------------------------------
 // Global event log — used to verify cross-node ordering invariants
@@ -747,5 +748,292 @@ fn flush_preserves_per_node_message_order_within_tier() {
         new_data,
         vec![TestValue::Int(1), TestValue::Int(2), TestValue::Int(3),],
         "coalesced emits should deliver in emit order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FnResult::Batch tests — M3 Slice B (R1.3.2.d, R1.3.3.c, R1.3.1.a)
+// ---------------------------------------------------------------------------
+
+/// Multi-DATA Batch: fn returns Batch with two Data emissions.
+/// Downstream subscriber should see one Dirty + two Data values.
+#[test]
+fn batch_fn_result_multi_data_delivers_all_values() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+
+    // Register a raw fn that returns Batch with two Data emissions.
+    let binding = rt.binding.clone();
+    let fn_id = rt
+        .binding
+        .register_raw_fn(move |dep_data: &[graphrefly_core::DepBatch]| {
+            let input = dep_data[0].latest();
+            let v = binding.deref(input);
+            let TestValue::Int(n) = v else {
+                panic!("expected Int")
+            };
+            // Emit two values: n*10 and n*100
+            let h1 = binding.intern(TestValue::Int(n * 10));
+            let h2 = binding.intern(TestValue::Int(n * 100));
+            FnResult::Batch {
+                emissions: smallvec![FnEmission::Data(h1), FnEmission::Data(h2)],
+                tracked: None,
+            }
+        });
+
+    let derived = rt
+        .core
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity);
+    let rec = rt.subscribe_recorder(derived);
+
+    // Initial activation: fn fires with s=0 → emits 0, 0
+    let events = rec.snapshot();
+    assert!(
+        events.contains(&RecordedEvent::Start),
+        "should see Start from handshake"
+    );
+
+    // Now emit a real value
+    s.set(TestValue::Int(5));
+    let data = rec.data_values();
+    assert_eq!(
+        data,
+        vec![
+            TestValue::Int(0),   // activation: first batch emission (0*10)
+            TestValue::Int(0),   // activation: second batch emission (0*100)
+            TestValue::Int(50),  // wave: first batch emission (5*10)
+            TestValue::Int(500), // wave: second batch emission (5*100)
+        ],
+    );
+}
+
+/// Batch with Data + Complete: fn emits a final value then terminates.
+#[test]
+fn batch_fn_result_data_then_complete() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+
+    let binding = rt.binding.clone();
+    let fn_id = rt
+        .binding
+        .register_raw_fn(move |dep_data: &[graphrefly_core::DepBatch]| {
+            let h = dep_data[0].latest();
+            let v = binding.deref(h);
+            let TestValue::Int(n) = v else {
+                panic!("expected Int")
+            };
+            let data_h = binding.intern(TestValue::Int(n * 2));
+            FnResult::Batch {
+                emissions: smallvec![FnEmission::Data(data_h), FnEmission::Complete],
+                tracked: None,
+            }
+        });
+
+    let derived = rt
+        .core
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity);
+    let rec = rt.subscribe_recorder(derived);
+
+    let events = rec.snapshot();
+    // Should see: Start, Dirty, Data(2), Complete.
+    // Note: Teardown is NOT auto-emitted by complete() — it's a separate
+    // explicit action (Core::teardown). Terminal cascade only emits COMPLETE.
+    assert!(events.contains(&RecordedEvent::Data(TestValue::Int(2))));
+    assert!(events.contains(&RecordedEvent::Complete));
+}
+
+/// Batch with Data + Error: fn emits a value then errors.
+#[test]
+fn batch_fn_result_data_then_error() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+
+    let binding = rt.binding.clone();
+    let fn_id = rt
+        .binding
+        .register_raw_fn(move |dep_data: &[graphrefly_core::DepBatch]| {
+            let h = dep_data[0].latest();
+            let v = binding.deref(h);
+            let TestValue::Int(n) = v else {
+                panic!("expected Int")
+            };
+            let data_h = binding.intern(TestValue::Int(n * 3));
+            let err_h = binding.intern(TestValue::Str("boom".into()));
+            FnResult::Batch {
+                emissions: smallvec![FnEmission::Data(data_h), FnEmission::Error(err_h)],
+                tracked: None,
+            }
+        });
+
+    let derived = rt
+        .core
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity);
+    let rec = rt.subscribe_recorder(derived);
+
+    let events = rec.snapshot();
+    assert!(events.contains(&RecordedEvent::Data(TestValue::Int(3))));
+    assert!(events.contains(&RecordedEvent::Error(TestValue::Str("boom".into()))));
+}
+
+/// R1.3.1.a: DIRTY queued only once per wave even with multi-Data Batch.
+#[test]
+fn batch_fn_result_dirty_queued_once_per_wave() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+
+    let binding = rt.binding.clone();
+    let fn_id = rt
+        .binding
+        .register_raw_fn(move |dep_data: &[graphrefly_core::DepBatch]| {
+            let h = dep_data[0].latest();
+            let v = binding.deref(h);
+            let TestValue::Int(n) = v else {
+                panic!("expected Int")
+            };
+            let h1 = binding.intern(TestValue::Int(n));
+            let h2 = binding.intern(TestValue::Int(n + 1));
+            let h3 = binding.intern(TestValue::Int(n + 2));
+            FnResult::Batch {
+                emissions: smallvec![
+                    FnEmission::Data(h1),
+                    FnEmission::Data(h2),
+                    FnEmission::Data(h3),
+                ],
+                tracked: None,
+            }
+        });
+
+    let derived = rt
+        .core
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity);
+    let rec = rt.subscribe_recorder(derived);
+
+    // Trigger a wave
+    s.set(TestValue::Int(10));
+
+    let events = rec.snapshot();
+    // Count Dirty events in the post-activation wave.
+    // After Start + activation events, the wave from s.set(10) should
+    // have exactly ONE Dirty (R1.3.1.a), then three Data values.
+    let dirty_count = events
+        .iter()
+        .filter(|e| matches!(e, RecordedEvent::Dirty))
+        .count();
+    let data_count = events
+        .iter()
+        .filter(|e| matches!(e, RecordedEvent::Data(_)))
+        .count();
+
+    // Activation wave: 1 Dirty + 3 Data. Post-activation wave: 1 Dirty + 3 Data.
+    // Total: 2 Dirty, 6 Data.
+    assert_eq!(
+        dirty_count, 2,
+        "expected exactly 2 Dirty events (one per wave)"
+    );
+    assert_eq!(
+        data_count, 6,
+        "expected 6 Data events (3 per wave × 2 waves)"
+    );
+}
+
+/// R1.3.2.d: Equals substitution does NOT apply to Batch emissions.
+/// Even if the Batch emits a value equal to cache, it should still
+/// deliver DATA (not RESOLVED).
+///
+/// Strategy: the derived fn always returns Batch{Data(h_fixed)} regardless
+/// of input. On activation, cache becomes h_fixed. On the second wave
+/// (triggered by s.set(99)), the fn fires again and returns the SAME
+/// handle — under single-Data FnResult this would be RESOLVED via identity
+/// equals, but Batch's commit_emission_verbatim skips the check.
+#[test]
+fn batch_fn_result_no_equals_substitution() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(42)));
+
+    let binding = rt.binding.clone();
+    let fn_id = rt
+        .binding
+        .register_raw_fn(move |_dep_data: &[graphrefly_core::DepBatch]| {
+            // Always intern the same value — dedup gives the same HandleId
+            // each call. Under single-Data FnResult, identity equals would
+            // compare handles and emit RESOLVED. Batch skips the check.
+            let h = binding.intern(TestValue::Int(999));
+            FnResult::Batch {
+                emissions: smallvec![FnEmission::Data(h)],
+                tracked: None,
+            }
+        });
+
+    let derived = rt
+        .core
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity);
+    let rec = rt.subscribe_recorder(derived);
+
+    // Activation: fn fires, returns Batch{Data(h_fixed)}. Cache = h_fixed.
+    // Now emit a DIFFERENT value on s so derived fires again.
+    s.set(TestValue::Int(99));
+
+    let events = rec.snapshot();
+    let data_count = events
+        .iter()
+        .filter(|e| matches!(e, RecordedEvent::Data(_)))
+        .count();
+
+    // Activation: 1 Data(999). Post-activation wave: fn returns same
+    // h_fixed → commit_emission_verbatim → DATA (no equals check).
+    // Total: 2 Data events.
+    assert_eq!(
+        data_count, 2,
+        "Batch should deliver DATA even when equal to cache"
+    );
+}
+
+/// Batch emissions propagate to children — children accumulate all
+/// Data handles in their dep_batch per R1.3.6.b.
+#[test]
+fn batch_fn_result_propagates_to_grandchild() {
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+
+    // Middle node: returns Batch with two Data values.
+    let binding = rt.binding.clone();
+    let fn_id_mid = rt
+        .binding
+        .register_raw_fn(move |dep_data: &[graphrefly_core::DepBatch]| {
+            let h = dep_data[0].latest();
+            let v = binding.deref(h);
+            let TestValue::Int(n) = v else {
+                panic!("expected Int")
+            };
+            let h1 = binding.intern(TestValue::Int(n * 10));
+            let h2 = binding.intern(TestValue::Int(n * 20));
+            FnResult::Batch {
+                emissions: smallvec![FnEmission::Data(h1), FnEmission::Data(h2)],
+                tracked: None,
+            }
+        });
+    let mid = rt
+        .core
+        .register_derived(&[s.id], fn_id_mid, EqualsMode::Identity);
+
+    // Grandchild: simple derived that passes through latest value.
+    let grandchild = rt.derived(&[mid], |vals| Some(vals[0].clone()));
+    let rec = rt.subscribe_recorder(grandchild);
+
+    // Trigger a wave.
+    s.set(TestValue::Int(5));
+
+    let data = rec.data_values();
+    // Grandchild sees mid's latest cache value per wave.
+    // Activation: mid emits 10, 20 → grandchild fn fires once with latest=20 → Data(20).
+    // Wave: mid emits 50, 100 → grandchild fn fires once with latest=100 → Data(100).
+    // (Grandchild is a simple derived — fires once per wave with latest.)
+    assert!(
+        data.contains(&TestValue::Int(20)),
+        "activation: grandchild sees mid's last batch value"
+    );
+    assert!(
+        data.contains(&TestValue::Int(100)),
+        "wave: grandchild sees mid's last batch value"
     );
 }

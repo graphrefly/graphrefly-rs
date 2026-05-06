@@ -4,7 +4,7 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 ## Current state (2026-05-06)
 
-**M1 closed; M2 closed (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06).** Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
+**M1 closed; M2 closed; M3 Slice A landed (2026-05-06).** M3 Slice A: per-dep `DepRecord` struct + `DepBatch` FFI type + R1.3.6.b batch-array delivery — structural prerequisite for M3 operator ports. M2 (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06). Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
 
 **DS-14 locked + Phase 14 landed in TS** ([archive/docs/SESSION-DS-14-changesets-design.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-DS-14-changesets-design.md)). Rust port greenlit per [SESSION-rust-port-architecture.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) Part 10 lock. M1 parity work (Slice A+B 2026-05-05 + Slice C-1/C-1.5/C-2 + A-bigger + Slice A close 2026-05-05) is now feature-complete: PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR cascade, TEARDOWN-precedes-COMPLETE, resubscribable terminals, meta-TEARDOWN ordering, §10.12 RAII Subscription, dynamic-rewire audit fix, drop-then-fire wave-end sinks, iterative cascades for deep chains, two-phase tier-then-node flush, RAII batch + cache-snapshot rollback, lock-released `invoke_fn` + `custom_equals`, R1.3.5.a per-tier handshake delivery.
 
@@ -36,7 +36,8 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | M2 (starter slice) | `graphrefly-graph` | ✅ landed | 2026-05-05 (Slice D): `Graph` container holding `Arc<Core>`; sugar constructors (`state` / `derived` / `dynamic`); lifecycle pass-throughs (`subscribe` / `emit` / `cache_of` / `complete` / `error` / `teardown` / `invalidate` / `pause` / `resume` / `set_deps` / `set_resubscribable` / `add_meta_companion` / `batch`); `Graph::clone` is cheap Arc bump. 10 tests. Superseded by Slice E+ (the sugar API was hard-broken to take `name` per canonical §3.9). |
 | M2 (Slice F — gap fills + reactive) | `graphrefly-graph` + `graphrefly-core` | ✅ landed | 2026-05-06 (Slice F): R3.2.1 named-sugar wrappers, R3.2.3 remove(name), R3.3.1 edges(opts), R3.7.1 signal(kind), Core topology-change notification primitive, reactive describe, reactive observe_all auto-subscribe, GraphRemoveAudit rename. 33 new tests (18 gap_fills + 8 topology + 7 reactive). |
 | M2 (read-side + composition) | `graphrefly-graph` + `graphrefly-core` | ✅ landed | 2026-05-05 (Slice E+): Core inspection helpers (`node_ids` / `node_count` / `kind_of` / `deps_of` / `is_terminal` / `is_dirty` / `same_dispatcher`); `TerminalKind` made public (renamed from `DepTerminal`); Graph namespace (canonical §3.5: `add` / `node` / `try_resolve` / `name_of` / `node_count` / `node_names`); canonical §3.9 sugar API (`state(name, initial)` / `derived(name, deps, fn_id, equals)` / `dynamic(name, deps, fn_id, equals)`); mount/unmount (canonical §3.4: `mount` / `mount_new` / `mount_with` / `unmount` / `ancestors`, shared-Core only with `RemoveAudit`); lifecycle (canonical §3.7: `destroy` cascade, `signal_invalidate`); `Graph::describe()` JSON form (canonical §3.6 + Appendix B); `Graph::observe()` / `Graph::observe_all()` default sink-style (canonical §3.6.2 default mode only). **Out of scope** (subsequent slices): reactive describe / observe (`Node<...>` returns), async-iterable observe, non-JSON describe formats (pretty/mermaid/d2/stage-log), explain/reachable, snapshot/CIDs, DS-14 `mutate()`, cross-Core mount, meta annotations, versioning fields. 227 tests workspace-wide post-/qa (was 174 pre-Slice-E+). |
-| M3 | `graphrefly-operators` | ⏸ blocked | After M2 close |
+| M3 (Slice A — DepRecord + batch-array) | `graphrefly-core` | ✅ landed | 2026-05-06: Per-dep `DepRecord` struct replaces parallel vecs, `DepBatch` public FFI type, `invoke_fn(&[DepBatch])` signature, R1.3.6.b batch accumulation + wave-end rotation, retain/release discipline on `data_batch`. 267 tests green. |
+| M3 (operators) | `graphrefly-operators` | ⏸ blocked | After M3 Slice A structural foundation |
 | M4 | `graphrefly-storage` | ⏸ blocked | After M2 + DS-14 (`restoreSnapshot mode: "diff"` WAL replay shape) |
 | M5 | `graphrefly-structures` | ⏸ blocked | After M2 + DS-14 (op-log changesets) — STRONG DEFER per Phase 14 guardrail |
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
@@ -143,7 +144,95 @@ M2 is formally closed. All canonical §3 surfaces scoped for the Rust port's M2 
 
 ### M3 blockers identified
 
-- **R1.3.6.b batched delivery** — Rust Core delivers single-latest-handle per dep per wave. Canonical spec requires operators to receive full batch arrays (`data[0]`, `data[1]`, etc.) per dep. This is a structural difference that must be resolved before M3 operators port. Tracked as a future M3 architectural concern, not an M2 item.
+- ✅ **R1.3.6.b batched delivery** — **RESOLVED** in M3 Slice A (2026-05-06). `DepRecord.data_batch: SmallVec<[HandleId; 1]>` accumulates per-dep DATA handles per wave. `DepBatch` FFI type exposes `data`/`prev_data`/`involved` to `invoke_fn`. Wave-end rotation in `clear_wave_state` handles retain/release discipline. SmallVec inline-1 avoids heap alloc for the common single-emit case.
+
+## M3 Slice A — Per-dep DepRecord + R1.3.6.b batch-array delivery — landed 2026-05-06
+
+Core-level structural refactor. Prerequisite for M3 operator ports (operators need full per-dep batch arrays per wave, not just the latest handle).
+
+### What landed
+
+- **`DepRecord` struct** — replaces parallel `deps: Vec<NodeId>` / `dep_handles: Vec<HandleId>` / `dep_terminals: Vec<Option<TerminalKind>>` in `NodeRecord` with a unified `dep_records: Vec<DepRecord>`. Each record: `node`, `prev_data`, `dirty`, `involved_this_wave`, `data_batch: SmallVec<[HandleId; 1]>`, `terminal`.
+- **`DepBatch` public FFI type** — passed to `BindingBoundary::invoke_fn(&[DepBatch])`. Fields: `data` (batch array), `prev_data` (last wave's final DATA), `involved` (dep dirtied→settled this wave). Helper methods: `latest()`, `is_sentinel()`.
+- **`deliver_data_to_consumer` batch accumulation** — pushes to `data_batch` with `retain_handle` instead of overwriting a single slot. Each DATA handle in the batch owns its own retain share.
+- **Wave-end rotation in `clear_wave_state`** — last batch entry's retain transfers to `prev_data`; old `prev_data` released; all earlier batch entries released via `deferred_handle_releases`.
+- **SmallVec<[HandleId; 1]>** — inline storage for the common single-emit case; heap alloc only for multi-emit batch inside `batch()` scope.
+- **Helper methods on `NodeRecord`** — `dep_ids()`, `dep_ids_vec()`, `dep_count()`, `has_sentinel_deps()`, `dep_index_of()`, `all_deps_terminal()`.
+- **All `BindingBoundary` implementations updated** — `TestBinding`, `StubBinding`, `BenchBinding`, `ReentrantBinding`, boundary.rs `TestBinding`, bench `BenchBinding` — all use `&[DepBatch]` signature with `db.latest()` for backward-compatible value resolution.
+
+### Files touched
+
+| File | Change |
+|------|--------|
+| `crates/graphrefly-core/src/boundary.rs` | `DepBatch` struct + `invoke_fn` signature |
+| `crates/graphrefly-core/src/node.rs` | `DepRecord` struct, `NodeRecord` refactor, all lifecycle methods |
+| `crates/graphrefly-core/src/batch.rs` | `fire_fn`, `deliver_data_to_consumer`, `commit_emission`, `transitive_upstream_settled` |
+| `crates/graphrefly-core/src/lib.rs` | `DepBatch` re-export |
+| `crates/graphrefly-core/tests/common/mod.rs` | `TestBinding::invoke_fn` |
+| `crates/graphrefly-core/tests/lock_released.rs` | `ReentrantBinding::invoke_fn` |
+| `crates/graphrefly-core/benches/dispatcher.rs` | `BenchBinding::invoke_fn` |
+| `crates/graphrefly-graph/tests/common/mod.rs` | `StubBinding::invoke_fn` |
+| `crates/graphrefly-bindings-js/src/core_bindings.rs` | `BenchBinding::invoke_fn` |
+
+### Test count
+
+267 tests green workspace-wide (no new tests in this slice — structural refactor only; all 267 existing tests pass against the new `DepRecord`/`DepBatch` substrate). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+### What did NOT land in M3 Slice A
+
+- **New batch-accumulation tests** — verifying K-emit coalescing, `prev_data` rotation, per-dep `involved` flags. These should land in an M3 Slice A /qa pass.
+- **Reusable scratch buffer** — Q2 decision was C (reusable per-Core), but the current impl allocates a fresh `Vec<DepBatch>` per fire. Deferred to bench-driven optimization when the allocation shows up in profiling.
+- **napi-rs binding parity for DepBatch** — the JS-facing `BenchCore` doesn't expose `DepBatch` to JavaScript yet; the `BenchBinding` uses `db.latest()` internally. Full JS-facing batch-array exposure lands with the napi-rs M3 binding slice.
+
+---
+
+## M3 Slice B — FnResult::Batch + commit_emission DIRTY fix — landed 2026-05-06
+
+Core-level extension adding multi-emission support to `invoke_fn` return type. Enables operators to emit multiple DATA values and terminal messages within a single wave (modeling TS `actions.down(msgs)`). Also fixes R1.3.1.a DIRTY synthesis to be conditional on not-already-dirty, and fixes a latent double-settlement bug in RESOLVED child propagation.
+
+### What landed
+
+- **`FnEmission` enum** — `Data(HandleId)`, `Complete`, `Error(HandleId)`. Elements of a multi-message wave, passed inside `FnResult::Batch`.
+- **`FnResult::Batch` variant** — `{ emissions: SmallVec<[FnEmission; 2]>, tracked: Option<Vec<usize>> }`. Models `actions.down(msgs)` from the canonical spec. Processed in sequence within the same wave. No equals substitution on any Data emission (R1.3.2.d / R1.3.3.c).
+- **`commit_emission_verbatim`** — Same as `commit_emission`'s DATA branch but skips Phase 2 (equals check). Used by `FnResult::Batch` processing where multi-message waves pass through verbatim.
+- **`fire_fn` Phase 3–4 rewrite** — `FireAction` enum (`None`, `SingleData`, `Batch`) dispatches: single Data → `commit_emission` (equals substitution applies), Batch → iterate emissions through `commit_emission_verbatim` / `complete()` / `error()`.
+- **R1.3.1.a conditional DIRTY** — `commit_emission` and `commit_emission_verbatim` only queue Dirty if `!already_dirty`. Fixes spec violation where multiple DATA emissions in the same wave produced spurious Dirty messages.
+- **RESOLVED child propagation fix** — Removed eager Resolved queueing from the RESOLVED branch's child propagation. Replaced with `pending_auto_resolve` tracking + post-drain sweep in `drain_and_flush`. Fixes double-settlement bug (1 Dirty balanced by 2 settlements) exposed by the R1.3.1.a conditional change, where a child could receive Resolved from propagation AND Data from its own commit_emission in the same wave. The sweep routes through `queue_notify` so paused nodes get the auto-Resolved into their pause buffer.
+- **`RawFnImpl` test infrastructure** — `register_raw_fn` on `TestBinding` allows tests to return arbitrary `FnResult` variants (including Batch) from fn callbacks.
+
+### Files touched
+
+| File | Change |
+|------|--------|
+| `crates/graphrefly-core/src/boundary.rs` | `FnEmission` enum, `FnResult::Batch` variant, test match arm |
+| `crates/graphrefly-core/src/batch.rs` | `fire_fn` rewrite, `commit_emission_verbatim`, R1.3.1.a conditional DIRTY, RESOLVED child propagation fix, auto-resolve sweep |
+| `crates/graphrefly-core/src/node.rs` | `pending_auto_resolve` field on `CoreState`, `clear_wave_state` update |
+| `crates/graphrefly-core/src/lib.rs` | `FnEmission` re-export |
+| `crates/graphrefly-core/tests/common/mod.rs` | `RawFnImpl`, `register_raw_fn`, `invoke_fn` dispatch |
+| `crates/graphrefly-core/tests/batch.rs` | 6 new tests |
+
+### New tests (6)
+
+1. `batch_fn_result_multi_data_delivers_all_values` — Batch with 2 Data emissions, both delivered to subscriber + propagated to grandchild
+2. `batch_fn_result_data_then_complete` — Data + Complete in Batch, terminal cascade
+3. `batch_fn_result_data_then_error` — Data + Error in Batch, error cascade
+4. `batch_fn_result_dirty_queued_once_per_wave` — R1.3.1.a: only 1 Dirty per wave with 3 Data Batch
+5. `batch_fn_result_no_equals_substitution` — R1.3.2.d: Batch skips equals even when handle equals cache
+6. `batch_fn_result_propagates_to_grandchild` — children accumulate batch entries from Batch parent
+
+### Test count
+
+273 tests green workspace-wide (was 267 pre-slice). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+### /qa fixes (4)
+
+**F1 — Empty `FnResult::Batch` settlement (R1.3.1.a).** An empty emissions vec left the node dirty with no tier-3 settlement. Now treated as equivalent to `FnResult::Noop` — queues RESOLVED if node was dirty.
+
+**F2 — `pending_auto_resolve` dedup.** Changed from `Vec<NodeId>` to `AHashSet<NodeId>`. Diamond fan-in where multiple parents settle RESOLVED no longer produces duplicate entries (the post-drain sweep was already idempotent via the tier-3 check, but the `Vec` grew unboundedly on wide diamonds).
+
+**F3 — Break after terminal in Batch loop.** `commit_batch` now stops processing after the first `Complete` or `Error` emission (R1.3.4.a). Remaining handles are released. Extracted Batch processing into `commit_batch` helper (clippy `too_many_lines` fix).
+
+**F4 — `#[must_use]` on `FnEmission`.** Added `#[must_use = "FnEmission may contain handles that must be processed or released"]` to prevent silent handle leaks from discarded emissions.
 
 ---
 

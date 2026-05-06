@@ -20,17 +20,87 @@
 //! batch coalescing, equals-substitution under identity, version counters,
 //! PAUSE/RESUME, INVALIDATE, first-run gate) stays Core-internal — zero FFI.
 
-use crate::handle::{FnId, HandleId, NodeId};
+use smallvec::SmallVec;
+
+use crate::handle::{FnId, HandleId, NodeId, NO_HANDLE};
+
+/// Per-dep batch data passed to [`BindingBoundary::invoke_fn`].
+///
+/// Mirrors the canonical spec R2.9.b `DepRecord` shape at the FFI boundary.
+/// Each entry represents one dep's state for the current wave:
+///
+/// - `data` — DATA handles accumulated this wave (R1.3.6.b coalescing).
+///   Empty means the dep settled RESOLVED or was not involved.
+/// - `prev_data` — last DATA handle from the end of the previous wave.
+///   [`NO_HANDLE`] if the dep has never emitted DATA.
+/// - `involved` — `true` iff the dep was dirtied-then-settled this wave.
+///   Distinguishes "RESOLVED in wave" (`involved && data.is_empty()`) from
+///   "not involved" (`!involved && data.is_empty()`).
+#[derive(Clone, Debug)]
+pub struct DepBatch {
+    /// DATA handles accumulated this wave. Outside `batch()` scope, at most
+    /// 1 element. Inside `batch()`, K consecutive emits on the same source
+    /// produce K entries per R1.3.6.b coalescing.
+    pub data: SmallVec<[HandleId; 1]>,
+    /// Last DATA handle from the end of the previous wave. [`NO_HANDLE`]
+    /// means the dep has never emitted DATA.
+    pub prev_data: HandleId,
+    /// Whether this dep was involved (dirtied → settled) in the current wave.
+    pub involved: bool,
+}
+
+impl DepBatch {
+    /// The "latest" handle for this dep — the last DATA in the current wave's
+    /// batch, falling back to `prev_data` if no DATA arrived this wave.
+    /// Returns [`NO_HANDLE`] only when the dep has never emitted.
+    #[must_use]
+    pub fn latest(&self) -> HandleId {
+        self.data.last().copied().unwrap_or(self.prev_data)
+    }
+
+    /// Convenience: is this dep in sentinel state (never emitted DATA)?
+    #[must_use]
+    pub fn is_sentinel(&self) -> bool {
+        self.prev_data == NO_HANDLE && self.data.is_empty()
+    }
+}
+
+/// A single emission within a [`FnResult::Batch`] — one element of an
+/// `actions.down(msgs)` call. Processed in sequence within the same wave.
+#[derive(Clone, Debug)]
+#[must_use = "FnEmission may contain handles that must be processed or released"]
+pub enum FnEmission {
+    /// DATA payload. Processed via `commit_emission` — sets cache, queues
+    /// Dirty (if not already dirty per R1.3.1.a) + Data, propagates to
+    /// children. No equals substitution in Batch context (R1.3.2.d /
+    /// R1.3.3.c: multi-message waves pass through verbatim).
+    Data(HandleId),
+    /// COMPLETE terminal. Cascades per R1.3.4 / Lock 2.B.
+    Complete,
+    /// ERROR terminal with error-value handle. Cascades per R1.3.4;
+    /// ERROR dominates COMPLETE (Lock 2.B).
+    Error(HandleId),
+}
 
 /// What the binding side returns when the Core invokes a fn via
 /// [`BindingBoundary::invoke_fn`].
 ///
-/// Mirrors `FnResult` in `core.ts:105–107`.
+/// Models the three emission modes from the canonical spec:
+/// - `FnResult::Data` — single DATA, equals substitution applies (R1.3.2).
+///   Maps to `actions.emit(v)` in sugar constructors.
+/// - `FnResult::Batch` — multi-message wave, no equals substitution
+///   (R1.3.2.d / R1.3.3.c). Maps to `actions.down(msgs)`.
+/// - `FnResult::Noop` — no emission. RESOLVED if node was DIRTY.
+///
+/// Per R2.4.5, the fn return value in the canonical spec is cleanup hooks
+/// only — all emission is explicit via actions. The Rust Core folds the
+/// emission into `FnResult` as a pragmatic simplification; the binding
+/// layer maps between the two representations.
 #[derive(Clone, Debug)]
 pub enum FnResult {
-    /// fn produced a value, registered as `handle`. The Core treats this
-    /// as outgoing DATA — equals-substitution against the cache may rewrite
-    /// it to RESOLVED on the wire (R1.3.2).
+    /// fn produced a single value. The Core treats this as outgoing DATA —
+    /// equals-substitution against the cache may rewrite it to RESOLVED
+    /// on the wire (R1.3.2).
     Data {
         handle: HandleId,
         /// For dynamic nodes only: the dep indices fn actually read this run.
@@ -43,6 +113,17 @@ pub enum FnResult {
     /// to subscribers if the node was already DIRTY this wave; otherwise no
     /// outgoing message.
     Noop {
+        /// Same as `Data::tracked` — dynamic nodes only.
+        tracked: Option<Vec<usize>>,
+    },
+
+    /// Multi-message wave — models `actions.down(msgs)`. Emissions are
+    /// processed in sequence within the same wave. No equals substitution
+    /// on any Data emission (R1.3.2.d: substitution only on single-DATA
+    /// waves; R1.3.3.c: multi-DATA passes verbatim). DIRTY auto-prefix
+    /// only on first Data per R1.3.1.a.
+    Batch {
+        emissions: SmallVec<[FnEmission; 2]>,
         /// Same as `Data::tracked` — dynamic nodes only.
         tracked: Option<Vec<usize>>,
     },
@@ -61,18 +142,21 @@ pub enum FnResult {
 /// will simplify dramatically once this trait is the substrate.
 pub trait BindingBoundary: Send + Sync {
     /// Invoke a user function. The Core knows the fn's identity (`fn_id`) and
-    /// the current dep handles; the binding side dereferences them, runs the
-    /// fn, registers the output, and returns the new handle.
+    /// the current dep batch data; the binding side dereferences handles,
+    /// runs the fn, registers the output, and returns the new handle.
     ///
-    /// Performance contract per the rust-port session doc: ONE FFI call per
-    /// fn fire, regardless of dep count. The binding side bulk-dereferences
-    /// `dep_handles` in one go before calling user code.
+    /// `dep_data` carries per-dep batch arrays (R1.3.6.b coalescing): outside
+    /// `batch()` scope each dep has at most 1 DATA handle; inside `batch()`,
+    /// K consecutive emits on the same source produce K entries per dep.
+    /// The binding side bulk-dereferences all handles, calls user code, and
+    /// returns the result — one FFI call per fn fire regardless of dep count
+    /// or batch depth.
     ///
     /// Errors thrown by user code are reported by returning a [`FnResult::Data`]
     /// with a handle that resolves to an error value; the Core then forwards
     /// `[ERROR, handle]` per R1.2.5. (Or the binding side surfaces them via a
     /// separate channel — exact error-propagation discipline is binding-side.)
-    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult;
+    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult;
 
     /// Custom equals oracle. Called only when a node declares
     /// `EqualsMode::Custom`. Identity equals (the default) is a `u64` compare
@@ -135,10 +219,10 @@ mod tests {
     }
 
     impl BindingBoundary for TestBinding {
-        fn invoke_fn(&self, _node_id: NodeId, _fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
+        fn invoke_fn(&self, _node_id: NodeId, _fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
             self.invoke_count.fetch_add(1, Ordering::SeqCst);
-            // Echo first dep handle as result; not realistic but exercises the path.
-            let handle = dep_handles.first().copied().unwrap_or(HandleId::new(99));
+            // Echo first dep's latest handle as result; not realistic but exercises the path.
+            let handle = dep_data.first().map_or(HandleId::new(99), DepBatch::latest);
             FnResult::Data {
                 handle,
                 tracked: None,
@@ -158,10 +242,15 @@ mod tests {
     #[test]
     fn boundary_calls_route_correctly() {
         let b = TestBinding::new();
-        let result = b.invoke_fn(NodeId::new(1), FnId::new(2), &[HandleId::new(7)]);
+        let dep = DepBatch {
+            data: smallvec::smallvec![HandleId::new(7)],
+            prev_data: NO_HANDLE,
+            involved: true,
+        };
+        let result = b.invoke_fn(NodeId::new(1), FnId::new(2), &[dep]);
         match result {
             FnResult::Data { handle, .. } => assert_eq!(handle, HandleId::new(7)),
-            FnResult::Noop { .. } => panic!("expected Data variant"),
+            FnResult::Noop { .. } | FnResult::Batch { .. } => panic!("expected Data variant"),
         }
         assert!(b.custom_equals(FnId::new(3), HandleId::new(7), HandleId::new(7)));
         assert!(!b.custom_equals(FnId::new(3), HandleId::new(7), HandleId::new(8)));

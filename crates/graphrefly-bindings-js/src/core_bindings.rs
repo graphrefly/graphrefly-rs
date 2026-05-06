@@ -24,7 +24,8 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, LockId, NodeId, Subscription,
+    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, LockId, NodeId,
+    Subscription,
 };
 use napi::Error as NapiError;
 use napi_derive::napi;
@@ -111,16 +112,17 @@ impl BenchBinding {
 }
 
 impl BindingBoundary for BenchBinding {
-    fn invoke_fn(&self, _: NodeId, fn_id: FnId, dep_handles: &[HandleId]) -> FnResult {
+    fn invoke_fn(&self, _: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
         let reg = self.registry.lock().expect("registry lock");
         let f = reg
             .fns
             .get(&fn_id)
             .cloned()
             .unwrap_or_else(|| panic!("unknown fn_id {fn_id:?}"));
-        let dep_values: Vec<BenchValue> = dep_handles
+        let dep_values: Vec<BenchValue> = dep_data
             .iter()
-            .map(|&h| {
+            .map(|db| {
+                let h = db.latest();
                 reg.deref(h)
                     .unwrap_or_else(|| panic!("unknown handle {h:?}"))
             })

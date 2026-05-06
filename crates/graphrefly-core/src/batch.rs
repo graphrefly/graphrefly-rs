@@ -50,7 +50,9 @@ use std::sync::Arc;
 use indexmap::map::Entry;
 use parking_lot::ArcReentrantMutexGuard;
 
-use crate::boundary::FnResult;
+use smallvec::SmallVec;
+
+use crate::boundary::{DepBatch, FnEmission, FnResult};
 use crate::handle::{HandleId, NodeId, NO_HANDLE};
 use crate::message::Message;
 use crate::node::{Core, CoreState, EqualsMode, NodeKind, Sink};
@@ -192,9 +194,26 @@ impl Core {
             // fire_fn manages its own locking around invoke_fn.
             self.fire_fn(next);
         }
-        // Final flush phase under the lock — populates deferred_flush_jobs
-        // from pending_notify (already carries per-node sink snapshots).
+        // Auto-resolve sweep: nodes registered in pending_auto_resolve
+        // by the RESOLVED child propagation need a Resolved if they didn't
+        // fire and settle via their own commit_emission. Check pending_notify
+        // for each candidate — if it has Dirty but no tier-3+ message, the
+        // node never settled and needs auto-Resolved. Route through
+        // queue_notify so paused nodes get the Resolved into their pause
+        // buffer.
         let mut s = self.lock_state();
+        let candidates = std::mem::take(&mut s.pending_auto_resolve);
+        for node_id in candidates {
+            let needs_resolve = s
+                .pending_notify
+                .get(&node_id)
+                .is_some_and(|entry| !entry.messages.iter().any(|m| m.tier() >= 3));
+            if needs_resolve {
+                self.queue_notify(&mut s, node_id, Message::Resolved);
+            }
+        }
+        // Final flush phase — populates deferred_flush_jobs
+        // from pending_notify (already carries per-node sink snapshots).
         self.flush_notifications(&mut s);
     }
 
@@ -228,11 +247,11 @@ impl Core {
 
     fn transitive_upstream_settled(s: &CoreState, node_id: NodeId) -> bool {
         let rec = s.require_node(node_id);
-        if rec.deps.is_empty() {
+        if rec.dep_count() == 0 {
             return true;
         }
         let mut visited: ahash::AHashSet<NodeId> = ahash::AHashSet::new();
-        let mut stack: Vec<NodeId> = rec.deps.clone();
+        let mut stack: Vec<NodeId> = rec.dep_ids_vec();
         while let Some(id) = stack.pop() {
             if !visited.insert(id) {
                 continue;
@@ -241,9 +260,9 @@ impl Core {
                 return false;
             }
             if let Some(r) = s.nodes.get(&id) {
-                for &d in &r.deps {
-                    if !visited.contains(&d) {
-                        stack.push(d);
+                for dep_id in r.dep_ids() {
+                    if !visited.contains(&dep_id) {
+                        stack.push(dep_id);
                     }
                 }
             }
@@ -254,8 +273,8 @@ impl Core {
     /// Fire a node's fn lock-released around `invoke_fn`.
     ///
     /// Phase 1 (lock-held): remove from pending_fires, snapshot fn_id +
-    /// dep_handles + kind. Skip if terminal, first-run-gate-closed, or
-    /// stateless.
+    /// dep_records → DepBatch + kind. Skip if terminal, first-run-gate-closed,
+    /// or stateless.
     ///
     /// Phase 2 (lock-released): call `BindingBoundary::invoke_fn`. User fn
     /// callbacks may re-enter Core (`emit`, `pause`, etc.) and run a nested
@@ -263,42 +282,73 @@ impl Core {
     /// observe `in_tick = true` and skip their own drain.
     ///
     /// Phase 3 (lock-held): mark `has_fired_once`, store dynamic-tracked,
-    /// decide between Noop+RESOLVED and Data.
+    /// decide between Noop+RESOLVED, single Data, or Batch.
     ///
-    /// Phase 4: if Data, call `commit_emission` (which manages its own
-    /// locking around `custom_equals`).
+    /// Phase 4: commit emissions. Single Data goes through
+    /// `commit_emission` (with equals substitution). Batch emissions are
+    /// processed in sequence — Data via `commit_emission_verbatim` (no
+    /// equals substitution per R1.3.2.d / R1.3.3.c), Complete/Error via
+    /// terminal cascade.
     fn fire_fn(&self, node_id: NodeId) {
-        // Phase 1: snapshot inputs.
-        let prep: Option<(crate::handle::FnId, Vec<HandleId>, NodeKind)> = {
+        enum FireAction {
+            None,
+            SingleData(HandleId),
+            Batch(SmallVec<[FnEmission; 2]>),
+        }
+
+        // Phase 1: snapshot inputs — build DepBatch per dep from dep_records.
+        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, NodeKind)> = {
             let mut s = self.lock_state();
             s.pending_fires.remove(&node_id);
             let rec = s.require_node(node_id);
             // Skip: terminal, first-run-gate-closed, or stateless.
-            if rec.terminal.is_some() || rec.dep_handles.contains(&NO_HANDLE) {
+            if rec.terminal.is_some() || rec.has_sentinel_deps() {
                 None
             } else {
-                rec.fn_id
-                    .map(|fn_id| (fn_id, rec.dep_handles.clone(), rec.kind))
+                rec.fn_id.map(|fn_id| {
+                    let dep_batches: Vec<DepBatch> = rec
+                        .dep_records
+                        .iter()
+                        .map(|dr| DepBatch {
+                            data: dr.data_batch.clone(),
+                            prev_data: dr.prev_data,
+                            involved: dr.involved_this_wave,
+                        })
+                        .collect();
+                    (fn_id, dep_batches, rec.kind)
+                })
             }
         };
-        let Some((fn_id, dep_handles, kind)) = prep else {
+        let Some((fn_id, dep_batches, kind)) = prep else {
             return;
         };
 
         // Phase 2: invoke fn lock-released.
-        let result = self.binding.invoke_fn(node_id, fn_id, &dep_handles);
+        let result = self.binding.invoke_fn(node_id, fn_id, &dep_batches);
 
         // Phase 3: apply result under the lock — defensive terminal check
         // (a sibling cascade may have terminated this node during phase 2).
-        let to_emit: Option<HandleId> = {
+        let action: FireAction = {
             let mut s = self.lock_state();
             // Defensive: node may have terminated mid-phase-2 via a sibling
             // cascade (a fn that re-entered `Core::error` on a path that
-            // cascaded here). If so, the result's payload retain is dropped
-            // (binding intern share) and we no-op.
+            // cascaded here). If so, release any payload handles and no-op.
             if s.require_node(node_id).terminal.is_some() {
-                if let FnResult::Data { handle, .. } = &result {
-                    self.binding.release_handle(*handle);
+                match &result {
+                    FnResult::Data { handle, .. } => {
+                        self.binding.release_handle(*handle);
+                    }
+                    FnResult::Batch { emissions, .. } => {
+                        for em in emissions {
+                            match em {
+                                FnEmission::Data(h) | FnEmission::Error(h) => {
+                                    self.binding.release_handle(*h);
+                                }
+                                FnEmission::Complete => {}
+                            }
+                        }
+                    }
+                    FnResult::Noop { .. } => {}
                 }
                 return;
             }
@@ -306,7 +356,9 @@ impl Core {
             rec.has_fired_once = true;
             if kind == NodeKind::Dynamic {
                 let tracked = match &result {
-                    FnResult::Data { tracked, .. } | FnResult::Noop { tracked } => tracked.clone(),
+                    FnResult::Data { tracked, .. }
+                    | FnResult::Noop { tracked }
+                    | FnResult::Batch { tracked, .. } => tracked.clone(),
                 };
                 if let Some(t) = tracked {
                     rec.tracked = t.into_iter().collect();
@@ -318,16 +370,68 @@ impl Core {
                     if already_dirty {
                         self.queue_notify(&mut s, node_id, Message::Resolved);
                     }
-                    None
+                    FireAction::None
                 }
-                FnResult::Data { handle, .. } => Some(handle),
+                FnResult::Data { handle, .. } => FireAction::SingleData(handle),
+                FnResult::Batch { emissions, .. } if emissions.is_empty() => {
+                    // Empty Batch is equivalent to Noop — settle with
+                    // RESOLVED if the node was dirty (R1.3.1.a).
+                    let already_dirty = s.require_node(node_id).dirty;
+                    if already_dirty {
+                        self.queue_notify(&mut s, node_id, Message::Resolved);
+                    }
+                    FireAction::None
+                }
+                FnResult::Batch { emissions, .. } => FireAction::Batch(emissions),
             }
         };
 
-        // Phase 4: commit_emission if Data. Manages its own locking around
-        // custom_equals.
-        if let Some(handle) = to_emit {
-            self.commit_emission(node_id, handle);
+        // Phase 4: commit emissions.
+        match action {
+            FireAction::None => {}
+            // Single Data — equals substitution applies (R1.3.2).
+            FireAction::SingleData(handle) => {
+                self.commit_emission(node_id, handle);
+            }
+            // Batch — process in sequence. No equals substitution
+            // (R1.3.2.d / R1.3.3.c: multi-message waves pass verbatim).
+            FireAction::Batch(emissions) => {
+                self.commit_batch(node_id, emissions);
+            }
+        }
+    }
+
+    /// Process a `FnResult::Batch` emissions sequence. Each `Data` goes
+    /// through `commit_emission_verbatim` (no equals substitution per
+    /// R1.3.2.d / R1.3.3.c). Terminal emissions (`Complete` / `Error`)
+    /// cascade per R1.3.4; processing stops at the first terminal and
+    /// remaining handles are released (R1.3.4.a: no further messages
+    /// after terminal).
+    fn commit_batch(&self, node_id: NodeId, emissions: SmallVec<[FnEmission; 2]>) {
+        let mut iter = emissions.into_iter();
+        for em in iter.by_ref() {
+            match em {
+                FnEmission::Data(handle) => {
+                    self.commit_emission_verbatim(node_id, handle);
+                }
+                FnEmission::Complete => {
+                    self.complete(node_id);
+                    break;
+                }
+                FnEmission::Error(handle) => {
+                    self.error(node_id, handle);
+                    break;
+                }
+            }
+        }
+        // Release handles from any emissions after the terminal break.
+        for em in iter {
+            match em {
+                FnEmission::Data(h) | FnEmission::Error(h) => {
+                    self.binding.release_handle(h);
+                }
+                FnEmission::Complete => {}
+            }
         }
     }
 
@@ -382,8 +486,13 @@ impl Core {
             return;
         }
 
+        // R1.3.1.a condition (b): synthesize DIRTY only if node not already
+        // dirty from an earlier emission in the same wave.
+        let already_dirty = s.require_node(node_id).dirty;
         s.require_node_mut(node_id).dirty = true;
-        self.queue_notify(&mut s, node_id, Message::Dirty);
+        if !already_dirty {
+            self.queue_notify(&mut s, node_id, Message::Dirty);
+        }
 
         if is_data {
             // P3 (Slice A close /qa): re-read CURRENT cache. Same-thread
@@ -429,11 +538,7 @@ impl Core {
                 .map(|c| c.iter().copied().collect())
                 .unwrap_or_default();
             for child_id in child_ids {
-                let dep_idx = s
-                    .require_node(child_id)
-                    .deps
-                    .iter()
-                    .position(|&d| d == node_id);
+                let dep_idx = s.require_node(child_id).dep_index_of(node_id);
                 if let Some(idx) = dep_idx {
                     self.deliver_data_to_consumer(&mut s, child_id, idx, new_handle);
                 }
@@ -441,9 +546,14 @@ impl Core {
         } else {
             // RESOLVED: handle unchanged. Don't release; old still in use.
             self.queue_notify(&mut s, node_id, Message::Resolved);
-            // Children that haven't been involved this wave still need
-            // DIRTY+RESOLVED for wave-mask bookkeeping (so their subscribers
-            // see consistent wave-close on diamond fan-in).
+            // Children that haven't been involved this wave need DIRTY
+            // propagation so their subscribers see wave-open. Don't queue
+            // Resolved here — the child may later receive DATA in the same
+            // wave (e.g. batch scope with multiple emits on the same source)
+            // and fire, settling via commit_emission. Eagerly queueing
+            // Resolved would double-settle the Dirty. The post-drain
+            // auto-resolve sweep in drain_and_flush settles any node with
+            // Dirty but no tier-3 message.
             let child_ids: Vec<NodeId> = s
                 .children
                 .get(&node_id)
@@ -458,7 +568,7 @@ impl Core {
                         child.dirty = true;
                     }
                     self.queue_notify(&mut s, child_id, Message::Dirty);
-                    self.queue_notify(&mut s, child_id, Message::Resolved);
+                    s.pending_auto_resolve.insert(child_id);
                 }
             }
         }
@@ -479,6 +589,67 @@ impl Core {
         }
     }
 
+    /// Commit a DATA emission **without** equals substitution — used by
+    /// `FnResult::Batch` processing where multi-message waves pass through
+    /// verbatim per R1.3.2.d / R1.3.3.c. DIRTY auto-prefix respects
+    /// R1.3.1.a condition (b): only queued if node not already dirty.
+    ///
+    /// Structurally identical to the DATA branch of [`Self::commit_emission`]
+    /// but skips the Phase 2 equals check entirely.
+    fn commit_emission_verbatim(&self, node_id: NodeId, new_handle: HandleId) {
+        assert!(
+            new_handle != NO_HANDLE,
+            "NO_HANDLE is not a valid DATA payload (R1.2.4) for node {node_id:?}",
+        );
+
+        let mut s = self.lock_state();
+        let rec = s.require_node(node_id);
+        if rec.terminal.is_some() {
+            drop(s);
+            self.binding.release_handle(new_handle);
+            return;
+        }
+
+        // R1.3.1.a condition (b): DIRTY only if not already dirty.
+        let already_dirty = s.require_node(node_id).dirty;
+        s.require_node_mut(node_id).dirty = true;
+        if !already_dirty {
+            self.queue_notify(&mut s, node_id, Message::Dirty);
+        }
+
+        // Always DATA — no equals substitution for Batch emissions.
+        let current_cache = s.require_node(node_id).cache;
+        let snapshot_taken = if s.in_tick && current_cache != NO_HANDLE {
+            use std::collections::hash_map::Entry;
+            match s.wave_cache_snapshots.entry(node_id) {
+                Entry::Vacant(slot) => {
+                    slot.insert(current_cache);
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }
+        } else {
+            false
+        };
+        s.require_node_mut(node_id).cache = new_handle;
+        if current_cache != NO_HANDLE && !snapshot_taken {
+            self.binding.release_handle(current_cache);
+        }
+        self.queue_notify(&mut s, node_id, Message::Data(new_handle));
+        // Propagate to children
+        let child_ids: Vec<NodeId> = s
+            .children
+            .get(&node_id)
+            .map(|c| c.iter().copied().collect())
+            .unwrap_or_default();
+        for child_id in child_ids {
+            let dep_idx = s.require_node(child_id).dep_index_of(node_id);
+            if let Some(idx) = dep_idx {
+                self.deliver_data_to_consumer(&mut s, child_id, idx, new_handle);
+            }
+        }
+    }
+
     pub(crate) fn deliver_data_to_consumer(
         &self,
         s: &mut CoreState,
@@ -486,11 +657,17 @@ impl Core {
         dep_idx: usize,
         handle: HandleId,
     ) {
+        // Retain the handle for the batch accumulation slot — each DATA
+        // handle in `data_batch` owns a retain share, released at wave-end
+        // rotation in `clear_wave_state`.
+        self.binding.retain_handle(handle);
+
         let kind;
         let tracked_or_first_fire;
         {
             let consumer = s.require_node_mut(consumer_id);
-            consumer.dep_handles[dep_idx] = handle;
+            consumer.dep_records[dep_idx].data_batch.push(handle);
+            consumer.dep_records[dep_idx].involved_this_wave = true;
             consumer.involved_this_wave = true;
             kind = consumer.kind;
             tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);
@@ -794,12 +971,12 @@ impl Core {
 /// `PhantomData<*const ()>` marker is belt-and-suspenders.
 ///
 /// ```compile_fail
-/// use graphrefly_core::{BatchGuard, BindingBoundary, Core, FnId, FnResult, HandleId, NodeId};
+/// use graphrefly_core::{BatchGuard, BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, NodeId};
 /// use std::sync::Arc;
 ///
 /// struct Stub;
 /// impl BindingBoundary for Stub {
-///     fn invoke_fn(&self, _: NodeId, _: FnId, _: &[HandleId]) -> FnResult {
+///     fn invoke_fn(&self, _: NodeId, _: FnId, _: &[DepBatch]) -> FnResult {
 ///         FnResult::Noop { tracked: None }
 ///     }
 ///     fn custom_equals(&self, _: FnId, _: HandleId, _: HandleId) -> bool { false }
@@ -846,11 +1023,13 @@ impl Drop for BatchGuard {
             let (pending, deferred_releases, restored_releases) = {
                 let mut s = self.core.lock_state();
                 let pending = std::mem::take(&mut s.pending_notify);
-                let deferred_releases = std::mem::take(&mut s.deferred_handle_releases);
                 let _: DeferredJobs = std::mem::take(&mut s.deferred_flush_jobs);
                 s.pending_fires.clear();
                 let restored = self.core.restore_wave_cache_snapshots(&mut s);
+                // clear_wave_state pushes batch-handle releases into
+                // deferred_handle_releases, so take it AFTER the clear.
                 s.clear_wave_state();
+                let deferred_releases = std::mem::take(&mut s.deferred_handle_releases);
                 s.in_tick = false;
                 (pending, deferred_releases, restored)
             };
