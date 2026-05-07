@@ -1143,3 +1143,69 @@ parity work — recorded here for traceability.
   remaining out-of-scope items (deactivation, proptest, batch.rs,
   ReentrantMutex) to a clearly-labeled section. Added cross-links to
   `migration-status.md` and `porting-deferred.md`.
+
+## M3 Slice D — subscription-managed combinator deferrals
+
+Surfaced during /qa adversarial review (2026-05-07).
+
+### D1: TEARDOWN propagation through producers
+
+- **Context:** When a producer receives TEARDOWN from an upstream source, the
+  current implementation ignores it (sinks only match Data/Complete/Error).
+  TS legacy propagates TEARDOWN through the subscription chain.
+- **Risk:** Low — producers manage their own subscription lifecycle via
+  `producer_deactivate`. TEARDOWN from upstream is a signal that the upstream
+  is permanently dead, but the producer's deactivation already drops
+  subscriptions when the last downstream subscriber leaves.
+- **Trigger:** Evidence of TEARDOWN-through-producer being observable in a
+  parity scenario. Monitor when M4+ lifecycle scenarios land.
+
+### D2: Sink Arc cycle audit
+
+- **Context:** Each operator sink captures `Arc<Mutex<State>>` + `Core` clone +
+  `Arc<dyn ProducerBinding>`. The Recorder Weak-capture fix (landed in D-ops)
+  broke one such cycle, but other cycles may lurk in complex topologies where
+  producer sinks indirectly prevent deactivation.
+- **Risk:** Medium — memory leak under sustained subscribe/unsubscribe churn.
+- **Trigger:** Bench pass with subscriber churn workload showing RSS growth.
+
+### D3: Predicate-based kind derivation as an `Option<OperatorOp>`
+
+- **Context:** `NodeRecord::kind()` derives from 4 fields via if/else chain.
+  An alternative is to store an `Option<NodeKind>` computed once at
+  registration. Current approach is simpler and avoids one more field.
+- **Risk:** None — purely an internal API ergonomic question.
+- **Trigger:** If `kind()` becomes a hot path in profiling.
+
+### D4: concat phase-0 COMPLETE from second source
+
+- **Context:** If `second` completes during phase 0 (before `first`),
+  the current impl ignores the Complete and drains pending on phase
+  transition. But the second source is now permanently done — after
+  drain, concat should also complete. Current code relies on second's
+  Complete being re-observed, which won't happen (Complete fires once).
+- **Risk:** Medium — concat hangs if first completes after second
+  already completed during phase 0.
+- **Trigger:** Parity scenario: `s2.complete(); s1.complete()` → concat
+  should complete after draining.
+
+### D5: Subscription::Drop race under concurrent unsubscribe
+
+- **Context:** `Subscription::Drop` fires `producer_deactivate` lock-released
+  when sink count reaches 0. If two threads race to drop the last two
+  subscriptions, both could see count=1 before decrement, leading to
+  double-deactivate or missed deactivate.
+- **Risk:** Low — current refcount is under the state lock; the race
+  requires truly concurrent Drop calls, which the ReentrantMutex
+  serializes. But worth verifying under `loom` or `shuttle`.
+- **Trigger:** Concurrency stress test with rapid subscribe/unsubscribe.
+
+### D6: Parity test coverage gaps
+
+- **Context:** Current parity scenarios cover the happy path (DATA
+  forwarding, buffering, phase transitions) but not edge cases:
+  zip with 3+ sources, race pre-winner error, concat error during
+  phase 0, takeUntil source error, empty zip/race.
+- **Risk:** Low — Rust-side unit tests cover these, but cross-impl
+  parity assertions would catch behavioral divergences.
+- **Trigger:** Expand parity scenarios when rustImpl arm activates.

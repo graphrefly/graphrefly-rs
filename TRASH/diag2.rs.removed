@@ -1,0 +1,27 @@
+mod common;
+use common::{OpRuntime, TestValue};
+use graphrefly_operators::last;
+
+#[test]
+fn diag_post_drop_state() {
+    let rt = OpRuntime::new();
+    let source = rt.state_int(None);
+    let n = last(&rt.core, source).into_node();
+    rt.core.set_resubscribable(n, true);
+
+    let observed = rt.intern_int(5);
+    eprintln!("after intern: refcount={}", rt.binding.refcount_of(observed));
+
+    let rec1 = rt.subscribe_recorder(n);
+    rt.emit_int(source, 5);
+    eprintln!("after emit: refcount={}", rt.binding.refcount_of(observed));
+    rt.core.complete(source);
+    eprintln!("after complete: refcount={}", rt.binding.refcount_of(observed));
+    eprintln!("rec1 events: {:?}", rec1.events());
+    drop(rec1);
+    eprintln!("after drop(rec1): refcount={}", rt.binding.refcount_of(observed));
+    eprintln!("n is terminal: {:?}", rt.core.is_terminal(n));
+
+    let _rec2 = rt.subscribe_recorder(n);
+    eprintln!("after _rec2 subscribe: refcount={}", rt.binding.refcount_of(observed));
+}

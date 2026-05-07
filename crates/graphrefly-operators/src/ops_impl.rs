@@ -67,10 +67,12 @@ impl ZipState {
 /// Each upstream DATA handle is `retain_handle`-bumped before being
 /// pushed onto a queue (the inbound message's payload retain belongs
 /// to the wave-end-flush release path; we take our own share for the
-/// queue). On pop, we transfer the share into the `pack_tuple` call's
-/// expected handle ownership. After `pack_tuple` returns the new
-/// tuple handle, we release each component handle's queue share and
-/// emit the tuple.
+/// queue). On pop, component handles are passed to `pack_tuple` which
+/// must NOT consume or release them — the caller (zip) retains
+/// ownership throughout the call and releases each component handle's
+/// queue share after `pack_tuple` returns. The returned tuple handle
+/// has a pre-bumped retain (binding convention per D020 doc on
+/// [`BindingBoundary::pack_tuple`]).
 #[must_use]
 pub fn zip(
     core: &Core,
@@ -100,12 +102,17 @@ pub fn zip(
             let binding_inner = binding_clone.clone();
             let sink: Sink = Arc::new(move |msgs| {
                 // Phase 1 (lock held): mutate queues + collect actions.
-                enum Action {
-                    EmitTuple(HandleId),
+                // Phase 2 (lock released): pack tuples + re-enter Core.
+                enum PostLockAction {
+                    /// Pack popped handles into a tuple, release components, emit.
+                    PackAndEmit(Vec<HandleId>),
                     Complete,
                     Error(HandleId),
                 }
-                let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+                let mut post_actions: SmallVec<[PostLockAction; 4]> = SmallVec::new();
+                // Handles to release after the lock drops (P2:
+                // drain queues on terminate to avoid handle leaks).
+                let mut to_release: SmallVec<[HandleId; 8]> = SmallVec::new();
                 {
                     let mut s = state_inner.lock().unwrap();
                     if s.terminated {
@@ -116,17 +123,15 @@ pub fn zip(
                             Message::Data(h) => {
                                 binding_inner.retain_handle(*h);
                                 s.queues[idx].push_back(*h);
+                                // Collect complete tuples — pack_tuple runs
+                                // after the lock drops (P5).
                                 while s.queues.iter().all(|q| !q.is_empty()) {
                                     let popped: Vec<HandleId> = s
                                         .queues
                                         .iter_mut()
                                         .map(|q| q.pop_front().unwrap())
                                         .collect();
-                                    let tuple_h = binding_inner.pack_tuple(pack_fn_id, &popped);
-                                    for h in &popped {
-                                        binding_inner.release_handle(*h);
-                                    }
-                                    actions.push(Action::EmitTuple(tuple_h));
+                                    post_actions.push(PostLockAction::PackAndEmit(popped));
                                 }
                             }
                             Message::Complete => {
@@ -135,7 +140,11 @@ pub fn zip(
                                 // tuples from it — terminate.
                                 if s.queues[idx].is_empty() && !s.terminated {
                                     s.terminated = true;
-                                    actions.push(Action::Complete);
+                                    // P2: release all remaining queued handles.
+                                    for q in &mut s.queues {
+                                        to_release.extend(q.drain(..));
+                                    }
+                                    post_actions.push(PostLockAction::Complete);
                                 }
                             }
                             Message::Error(h) => {
@@ -143,19 +152,35 @@ pub fn zip(
                                     s.errored = true;
                                     s.terminated = true;
                                     binding_inner.retain_handle(*h);
-                                    actions.push(Action::Error(*h));
+                                    // P2: release all remaining queued handles.
+                                    for q in &mut s.queues {
+                                        to_release.extend(q.drain(..));
+                                    }
+                                    post_actions.push(PostLockAction::Error(*h));
                                 }
                             }
                             _ => {}
                         }
                     }
                 }
-                // Phase 2 (lock released): re-enter Core.
-                for action in actions {
+                // Release leaked queue handles outside the lock.
+                for h in to_release {
+                    binding_inner.release_handle(h);
+                }
+                // Phase 2 (lock released): pack tuples + re-enter Core.
+                // P5: pack_tuple runs outside the per-zip lock to avoid
+                // deadlock if the binding's pack_tuple re-enters.
+                for action in post_actions {
                     match action {
-                        Action::EmitTuple(h) => core_inner.emit(producer_id, h),
-                        Action::Complete => core_inner.complete(producer_id),
-                        Action::Error(h) => core_inner.error(producer_id, h),
+                        PostLockAction::PackAndEmit(popped) => {
+                            let tuple_h = binding_inner.pack_tuple(pack_fn_id, &popped);
+                            for h in &popped {
+                                binding_inner.release_handle(*h);
+                            }
+                            core_inner.emit(producer_id, tuple_h);
+                        }
+                        PostLockAction::Complete => core_inner.complete(producer_id),
+                        PostLockAction::Error(h) => core_inner.error(producer_id, h),
                     }
                 }
             });
@@ -225,6 +250,7 @@ pub fn concat(
                 Error(HandleId),
             }
             let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+            let mut to_release: SmallVec<[HandleId; 4]> = SmallVec::new();
             {
                 let mut s = state_for_second.lock().unwrap();
                 if s.terminated {
@@ -238,6 +264,7 @@ pub fn concat(
                                 binding_for_second.retain_handle(*h);
                                 s.pending.push_back(*h);
                             } else {
+                                binding_for_second.retain_handle(*h);
                                 actions.push(Action::Emit(*h));
                             }
                         }
@@ -254,12 +281,18 @@ pub fn concat(
                         Message::Error(h) => {
                             if !s.terminated {
                                 s.terminated = true;
+                                binding_for_second.retain_handle(*h);
+                                // P2: release buffered pending handles.
+                                to_release.extend(s.pending.drain(..));
                                 actions.push(Action::Error(*h));
                             }
                         }
                         _ => {}
                     }
                 }
+            }
+            for h in to_release {
+                binding_for_second.release_handle(h);
             }
             for action in actions {
                 match action {
@@ -273,6 +306,7 @@ pub fn concat(
 
         let state_for_first = state.clone();
         let core_for_first = core_clone.clone();
+        let binding_for_first = binding_clone.clone();
         let first_sink: Sink = Arc::new(move |msgs| {
             // first.Complete triggers the phase transition (handled
             // via `s.phase = 1` + draining pending into `actions`),
@@ -287,6 +321,7 @@ pub fn concat(
                 Error(HandleId),
             }
             let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+            let mut to_release: SmallVec<[HandleId; 4]> = SmallVec::new();
             {
                 let mut s = state_for_first.lock().unwrap();
                 if s.terminated {
@@ -298,12 +333,14 @@ pub fn concat(
                 for m in msgs {
                     match m {
                         Message::Data(h) => {
+                            binding_for_first.retain_handle(*h);
                             actions.push(Action::Emit(*h));
                         }
                         Message::Complete => {
                             // Phase transition: drain pending second-data,
                             // then continue forwarding from second.
                             s.phase = 1;
+                            // Pending handles already retained at buffer time.
                             for h in s.pending.drain(..) {
                                 actions.push(Action::Emit(h));
                             }
@@ -311,12 +348,18 @@ pub fn concat(
                         Message::Error(h) => {
                             if !s.terminated {
                                 s.terminated = true;
+                                binding_for_first.retain_handle(*h);
+                                // P2: release buffered pending handles.
+                                to_release.extend(s.pending.drain(..));
                                 actions.push(Action::Error(*h));
                             }
                         }
                         _ => {}
                     }
                 }
+            }
+            for h in to_release {
+                binding_for_first.release_handle(h);
             }
             for action in actions {
                 match action {
@@ -340,13 +383,17 @@ pub fn concat(
 struct RaceState {
     /// Index of the winning source, or `None` if no winner yet.
     winner: Option<usize>,
+    /// Per-source completed flags. When all complete without a winner,
+    /// the producer completes (P4: no-winner all-complete termination).
+    completed: Vec<bool>,
     terminated: bool,
 }
 
 impl RaceState {
-    fn new() -> Self {
+    fn new(n: usize) -> Self {
         Self {
             winner: None,
+            completed: vec![false; n],
             terminated: false,
         }
     }
@@ -372,12 +419,12 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
             core_clone.complete(producer_id);
             return;
         }
-        let _ = binding_clone; // unused in race; reserved for future tuple-equals customizations
-        let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new()));
+        let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
             let state_inner = state.clone();
             let core_inner = core_clone.clone();
+            let binding_inner = binding_clone.clone();
             let sink: Sink = Arc::new(move |msgs| {
                 enum Action {
                     Emit(HandleId),
@@ -390,25 +437,33 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
                     if s.terminated {
                         return;
                     }
-                    // Pre-winner: this dep can become the winner on
-                    // first DATA; ignore until then.
-                    let am_winner = match s.winner {
-                        None => false,
-                        Some(w) => w == idx,
-                    };
                     for m in msgs {
                         match m {
                             Message::Data(h) => {
+                                // P3: check s.winner live each iteration —
+                                // this source may have just become the winner
+                                // earlier in this batch.
                                 if s.winner.is_none() {
                                     s.winner = Some(idx);
+                                    binding_inner.retain_handle(*h);
                                     actions.push(Action::Emit(*h));
-                                } else if am_winner {
+                                } else if s.winner == Some(idx) {
+                                    binding_inner.retain_handle(*h);
                                     actions.push(Action::Emit(*h));
                                 }
                                 // else: loser DATA — ignore.
                             }
                             Message::Complete => {
-                                if am_winner && !s.terminated {
+                                s.completed[idx] = true;
+                                if s.winner == Some(idx) && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                } else if s.winner.is_none()
+                                    && s.completed.iter().all(|&c| c)
+                                    && !s.terminated
+                                {
+                                    // P4: all sources completed without a
+                                    // winner — terminate the producer.
                                     s.terminated = true;
                                     actions.push(Action::Complete);
                                 }
@@ -418,8 +473,9 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
                                 // Errors from any source pre-winner OR
                                 // from the winner cascade; loser errors
                                 // post-winner are ignored.
-                                if (s.winner.is_none() || am_winner) && !s.terminated {
+                                if (s.winner.is_none() || s.winner == Some(idx)) && !s.terminated {
                                     s.terminated = true;
+                                    binding_inner.retain_handle(*h);
                                     actions.push(Action::Error(*h));
                                 }
                             }
@@ -473,7 +529,7 @@ pub fn take_until(
     notifier: NodeId,
 ) -> NodeId {
     let core_clone = core.clone();
-    let _binding_clone = binding.clone();
+    let binding_clone = binding.clone();
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
@@ -482,6 +538,7 @@ pub fn take_until(
         // Source sink: forward DATA, propagate terminals.
         let state_for_source = state.clone();
         let core_for_source = core_clone.clone();
+        let binding_for_source = binding_clone.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Action {
                 Emit(HandleId),
@@ -496,7 +553,10 @@ pub fn take_until(
                 }
                 for m in msgs {
                     match m {
-                        Message::Data(h) => actions.push(Action::Emit(*h)),
+                        Message::Data(h) => {
+                            binding_for_source.retain_handle(*h);
+                            actions.push(Action::Emit(*h));
+                        }
                         Message::Complete => {
                             if !s.terminated {
                                 s.terminated = true;
@@ -506,6 +566,7 @@ pub fn take_until(
                         Message::Error(h) => {
                             if !s.terminated {
                                 s.terminated = true;
+                                binding_for_source.retain_handle(*h);
                                 actions.push(Action::Error(*h));
                             }
                         }
@@ -526,6 +587,7 @@ pub fn take_until(
         // Notifier sink: any DATA → terminate; ERROR → cascade.
         let state_for_notifier = state.clone();
         let core_for_notifier = core_clone.clone();
+        let binding_for_notifier = binding_clone.clone();
         let notifier_sink: Sink = Arc::new(move |msgs| {
             enum Action {
                 Complete,
@@ -551,6 +613,7 @@ pub fn take_until(
                         Message::Error(h) => {
                             if !s.terminated {
                                 s.terminated = true;
+                                binding_for_notifier.retain_handle(*h);
                                 action = Some(Action::Error(*h));
                                 break;
                             }

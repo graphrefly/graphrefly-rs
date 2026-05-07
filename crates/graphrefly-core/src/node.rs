@@ -1129,7 +1129,16 @@ impl Core {
         // Validation:
         //   - State (no deps + no fn + no op) is the only kind with `initial`.
         //   - Dynamic flag only meaningful when fn + non-empty deps.
+        //   - Operator (op present) must have deps (P9: operator without deps
+        //     would skip activation — use a producer instead).
         let is_state_shape = deps.is_empty() && fn_id.is_none() && op.is_none();
+        if op.is_some() {
+            assert!(
+                !deps.is_empty(),
+                "register: operator nodes require at least one dep — \
+                 use register_producer for subscription-managed combinators"
+            );
+        }
         if initial != NO_HANDLE {
             assert!(
                 is_state_shape,
