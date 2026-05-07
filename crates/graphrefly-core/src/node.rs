@@ -1773,12 +1773,21 @@ impl Core {
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
         );
         // Validate + terminal short-circuit under a brief lock.
+        //
+        // emit() is valid for State and Producer nodes — both are
+        // intrinsic sources whose values are not derived from declared
+        // deps. State nodes get emit() from user code; Producer nodes
+        // get emit() from sink callbacks the producer's build closure
+        // registered (sink fires → re-enter Core → emit on self).
+        // Derived / Dynamic / Operator nodes emit via their fn return
+        // value through fire_fn / fire_operator, NOT via emit().
         {
             let s = self.lock_state();
             let rec = s.require_node(node_id);
             assert!(
-                rec.is_state(),
-                "emit() is for state nodes only; derived emits via fn"
+                rec.is_state() || rec.is_producer(),
+                "emit() is for state or producer nodes only; \
+                 derived/dynamic/operator emit via their fn return value"
             );
             if rec.terminal.is_some() {
                 drop(s);

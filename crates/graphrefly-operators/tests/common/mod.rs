@@ -31,7 +31,10 @@ use smallvec::SmallVec;
 use graphrefly_core::{
     BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, Subscription, NO_HANDLE,
 };
-use graphrefly_operators::OperatorBinding;
+use graphrefly_operators::{
+    producer::{default_producer_deactivate, ProducerBuildFn, ProducerCtx, ProducerStorage},
+    OperatorBinding, ProducerBinding,
+};
 
 // ---------------------------------------------------------------------
 // TestValue — what user code sees.
@@ -86,8 +89,20 @@ type EqualsFn = Arc<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>;
 type PairwiseFn = Arc<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>;
 type PackerFn = Arc<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>;
 
+type ProducerBuildArc = Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
+
 pub struct InnerBinding {
     state: Mutex<RegistryState>,
+    /// Per-producer-node storage shared with [`ProducerCtx`]. Outside
+    /// the main `state` Mutex so the producer's build closure can
+    /// access it without nested-locking against `state`.
+    producer_storage: ProducerStorage,
+    /// Self-Core back-reference, set post-construction via
+    /// [`InnerBinding::set_core_ref`]. Required for
+    /// [`ProducerCtx::new`] to construct a Core ref. Creates an Arc
+    /// cycle (Core → binding → core_ref → Core); broken explicitly
+    /// when the test runtime drops via [`OpRuntime::drop`].
+    core_ref: Mutex<Option<Core>>,
 }
 
 struct RegistryState {
@@ -101,6 +116,9 @@ struct RegistryState {
     equals: HashMap<FnId, EqualsFn>,
     pairwises: HashMap<FnId, PairwiseFn>,
     packers: HashMap<FnId, PackerFn>,
+    /// Producer build closures, keyed by FnId allocated at register
+    /// time. Looked up by `invoke_fn` when a producer node fires.
+    producer_builds: HashMap<FnId, ProducerBuildArc>,
     next_fn_id: u64,
 }
 
@@ -118,9 +136,37 @@ impl InnerBinding {
                 equals: HashMap::new(),
                 pairwises: HashMap::new(),
                 packers: HashMap::new(),
+                producer_builds: HashMap::new(),
                 next_fn_id: 1,
             }),
+            producer_storage: Arc::new(parking_lot::Mutex::new(ahash::AHashMap::new())),
+            core_ref: Mutex::new(None),
         })
+    }
+
+    /// Access the producer-state storage. Used by the
+    /// [`ProducerBinding`] impl + by tests that want to assert on the
+    /// storage's invariants (e.g. "deactivation cleared the entry").
+    pub fn producer_storage(&self) -> &ProducerStorage {
+        &self.producer_storage
+    }
+
+    /// Set the binding's self-Core back-reference. Called by
+    /// [`OpRuntime::new`] after Core construction.
+    pub fn set_core_ref(&self, core: Core) {
+        *self.core_ref.lock() = Some(core);
+    }
+
+    /// Take the Core ref out (breaks the Arc cycle on shutdown).
+    /// Called from [`OpRuntime::drop`].
+    pub fn take_core_ref(&self) -> Option<Core> {
+        self.core_ref.lock().take()
+    }
+
+    fn test_core_ref(&self) -> Core {
+        self.core_ref.lock().clone().expect(
+            "InnerBinding::set_core_ref must be called post-construction for producer dispatch",
+        )
     }
 
     /// Intern a value, returning the (possibly-shared) handle. Bumps
@@ -167,13 +213,40 @@ impl InnerBinding {
 impl BindingBoundary for InnerBinding {
     fn invoke_fn(
         &self,
-        _node_id: NodeId,
-        _fn_id: FnId,
+        node_id: NodeId,
+        fn_id: FnId,
         _dep_data: &[graphrefly_core::DepBatch],
     ) -> graphrefly_core::FnResult {
-        // Operator tests don't go through invoke_fn — fire_operator's
-        // dispatch path doesn't touch invoke_fn for Operator nodes.
-        unreachable!("InnerBinding only supports operator dispatch")
+        // Producer dispatch (Slice D, D031): if the FnId is a registered
+        // producer build closure, run it with a ProducerCtx. The build
+        // closure subscribes to upstream sources via the ctx; emissions
+        // come later from sink callbacks re-entering Core. The fn
+        // itself returns Noop because there's no immediate emission.
+        let build = self.state.lock().producer_builds.get(&fn_id).cloned();
+        if let Some(build) = build {
+            // Need a Core ref for ProducerCtx::core(). Tests that
+            // exercise producers do so via `OpRuntime::set_core_self_ref`
+            // which gives the binding a Weak<...> — but for the v1
+            // substrate we accept the cycle and clone Core via
+            // `OpRuntime::core_arc`. The build closure captured Core
+            // at registration time (via the operator factory), so it
+            // doesn't need ctx.core(); ctx is just for `subscribe_to`.
+            //
+            // For ctx.core() to work, we'd need a binding-side Core
+            // ref. Operators that use ctx.core() directly aren't in
+            // scope for the substrate tests (operators capture Core
+            // at factory time). So we panic if a build closure tries
+            // ctx.core() — tests must construct a separate ctx with
+            // their own Core ref if needed.
+            let core_ref = self.test_core_ref();
+            let ctx = ProducerCtx::new(node_id, &core_ref, &self.producer_storage);
+            build(ctx);
+            return graphrefly_core::FnResult::Noop { tracked: None };
+        }
+        // Operator tests don't go through invoke_fn beyond producer
+        // dispatch — fire_operator's path doesn't touch invoke_fn for
+        // Operator nodes.
+        unreachable!("InnerBinding only supports operator + producer dispatch (got fn_id {fn_id:?} not in registry)")
     }
 
     fn custom_equals(&self, equals_handle: FnId, a: HandleId, b: HandleId) -> bool {
@@ -196,7 +269,6 @@ impl BindingBoundary for InnerBinding {
         }
         *count -= 1;
         if *count == 0 {
-            // Drop the value. Keep refcount entry at 0 for diagnostic.
             if let Some(v) = s.values.remove(&h) {
                 s.by_value.remove(&v);
             }
@@ -276,6 +348,25 @@ impl BindingBoundary for InnerBinding {
             .expect("packer not registered");
         f(handles)
     }
+
+    fn producer_deactivate(&self, node_id: NodeId) {
+        // Default behavior — drop the producer's storage entry, which
+        // cascades into Subscription drops + sink unsubscription.
+        default_producer_deactivate(&self.producer_storage, node_id);
+    }
+}
+
+impl ProducerBinding for InnerBinding {
+    fn register_producer_build(&self, build: ProducerBuildFn) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.producer_builds.insert(id, Arc::from(build));
+        id
+    }
+
+    fn producer_storage(&self) -> &ProducerStorage {
+        &self.producer_storage
+    }
 }
 
 impl OperatorBinding for InnerBinding {
@@ -330,19 +421,24 @@ pub struct OpRuntime {
     pub core: Core,
     pub binding: Arc<InnerBinding>,
     pub op_binding: Arc<dyn OperatorBinding>,
+    pub producer_binding: Arc<dyn ProducerBinding>,
 }
 
 impl OpRuntime {
     pub fn new() -> Self {
         let inner = InnerBinding::new();
         let core = Core::new(inner.clone() as Arc<dyn BindingBoundary>);
-        // Cast Arc<InnerBinding> to Arc<dyn OperatorBinding> for the
-        // operator-factory APIs.
+        // Set the binding's self-Core back-ref. Required for producer
+        // dispatch (the `invoke_fn` path constructs a `ProducerCtx`
+        // with this ref).
+        inner.set_core_ref(core.clone());
         let op_binding: Arc<dyn OperatorBinding> = inner.clone();
+        let producer_binding: Arc<dyn ProducerBinding> = inner.clone();
         Self {
             core,
             binding: inner,
             op_binding,
+            producer_binding,
         }
     }
 
@@ -389,6 +485,24 @@ impl OpRuntime {
             binding.intern(TestValue::Tuple(values))
         })
     }
+
+    /// Register a packer FnId for tuple-packing in zip / combine ops.
+    /// Returns the FnId to pass to the operator factory.
+    pub fn register_tuple_packer(&self) -> FnId {
+        let packer = self.make_packer();
+        self.op_binding.register_packer(packer)
+    }
+}
+
+impl Drop for OpRuntime {
+    fn drop(&mut self) {
+        // Break the binding ⇆ Core Arc cycle introduced by
+        // `set_core_ref`. Without this, every OpRuntime leaks Core
+        // state (the binding's `core_ref` keeps Core alive; Core
+        // keeps binding alive via its `binding` Arc). Tests rely on
+        // refcount assertions, so this matters.
+        self.binding.take_core_ref();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -433,8 +547,22 @@ impl Recorder {
     }
 
     fn sink(&self) -> Sink {
-        let inner = self.inner.clone();
+        // Capture `Weak<RecorderInner>` (NOT Arc) so that dropping the
+        // Recorder triggers `Subscription::Drop` even when the sink
+        // is still in the producer's `subscribers` map. Otherwise the
+        // sink Arc → RecorderInner → sub → Subscription cycle pins
+        // RecorderInner alive (sink holds it) and Subscription::Drop
+        // never fires until Core drops, breaking the
+        // `producer_deactivate` lifecycle hook.
+        //
+        // Sink fires post-Recorder-drop become silent no-ops, which
+        // matches the user's intent (they dropped the Recorder, so
+        // they don't want events anymore).
+        let inner_weak: std::sync::Weak<RecorderInner> = Arc::downgrade(&self.inner);
         Arc::new(move |msgs: &[Message]| {
+            let Some(inner) = inner_weak.upgrade() else {
+                return;
+            };
             inner.fire_count.fetch_add(1, Ordering::SeqCst);
             let mut events = inner.events.lock();
             for &m in msgs {

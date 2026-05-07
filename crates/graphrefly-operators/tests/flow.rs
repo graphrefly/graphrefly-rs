@@ -107,9 +107,15 @@ fn take_resubscribable_resets_counter_on_lifecycle_reset() {
     assert!(rec1.events().contains(&RecordedEvent::Complete));
     drop(rec1);
 
-    // Cycle 2: resubscribe → reset_for_fresh_lifecycle resets the
-    // operator's count_emitted. New emits flow through a clean take(2)
-    // cycle.
+    // Cycle 2: invalidate source first so the resubscribe's activation
+    // re-walk doesn't consume one of the take(2) quota slots from the
+    // cached value (without invalidate, source.cache=2 would re-deliver
+    // through fire_op_take and count_emitted would reach 1 before any
+    // fresh emits — the count would still be reset by
+    // reset_for_fresh_lifecycle, but immediately re-incremented by
+    // activation).
+    rt.core.invalidate(source);
+
     let rec2 = rt.subscribe_recorder(taken);
     rt.emit_int(source, 100);
     rt.emit_int(source, 200);
@@ -446,22 +452,32 @@ fn last_releases_buffered_latest_on_lifecycle_reset() {
     // consumes that retain into Last.cache. Refcount becomes 5.
     assert_eq!(rec1.data_values(), vec![TestValue::Int(5)]);
     drop(rec1);
+    // After drop(rec1): rec1's Subscription drops, its sink is
+    // removed from n's subscribers. Refcount unchanged (no shares
+    // to release on subscriber removal for non-producer compute nodes).
 
-    // Re-subscribing triggers reset_for_fresh_lifecycle:
+    // Re-subscribing triggers reset_for_fresh_lifecycle AND re-activation
+    // (because subscribers count went 1→0→1, _rec2 is a "first
+    // subscriber" again):
     //   - Phase 2 makes a fresh LastState (latest=NO_HANDLE,
     //     default=NO_HANDLE) — no retain on `5`.
     //   - Phase 3 releases old LastState.latest's share (5 → 4).
     //   - Phase 5 releases the old prev_data share (4 → 3).
-    // `Last.cache` is NOT reset by reset_for_fresh_lifecycle (v1
-    // behavior — cache persists across lifecycle reset for compute
-    // nodes; the cached value replays in the next subscriber's
-    // handshake). So one share of `5` remains in Last.cache.
-    // Final: 1 (diag) + 1 (source.cache) + 1 (Last.cache) = 3.
+    //   - Then activation re-walks source dep, deliver_data_to_consumer
+    //     retains source.cache for the new dep_records[0].data_batch
+    //     (3 → 4). fire_op_last runs, updates LastState.latest with
+    //     a fresh retain (4 → 5). Wave-end rotates data_batch into
+    //     prev_data (no net retain change). `Last.cache` is NOT reset
+    //     and stays at `5`.
+    // Final: 1 (diag) + 1 (source.cache) + 1 (Last.cache) +
+    //        1 (re-activated prev_data) + 1 (re-activated LastState.latest)
+    //        = 5.
     let _rec2 = rt.subscribe_recorder(n);
     assert_eq!(
         rt.binding.refcount_of(observed_handle),
-        3,
-        "after reset: LastState.latest + prev_data shares released; source.cache + Last.cache + diagnostic remain"
+        5,
+        "after reset + re-activation: old shares released by reset, \
+         then re-activation re-retains via source.cache + new LastState.latest"
     );
 }
 

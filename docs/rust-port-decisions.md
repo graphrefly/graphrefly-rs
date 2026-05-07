@@ -285,3 +285,27 @@ Each entry records context, options, and rationale for future reference.
 - **Decision:** Add `BindingBoundary::producer_deactivate(_node_id: NodeId)` with default no-op. Bindings that ship producers override it. Fires lock-released (after `Subscription::Drop` releases the state lock) so the binding's deactivation impl may re-enter Core (`release_handle`, even `subscribe` for unusual scenarios).
 - **Rationale:** Single new FFI method. Default no-op keeps existing bindings (TestBinding, BenchBinding, etc.) compatible without forced edits. Re-entrance allowed because lock-released.
 - **Affects:** graphrefly-core `BindingBoundary::producer_deactivate` (new default-no-op method); `Subscription::Drop` (clones Arc<dyn BindingBoundary> out of state, calls `producer_deactivate` after lock drops).
+
+### D036 — `ProducerBinding` super-trait + `ProducerCtx` in `graphrefly-operators::producer`
+- **Date:** 2026-05-06
+- **Context:** D-ops needed an ergonomic API for subscribing to upstream sources from inside a producer fn body (zip/concat/race/takeUntil pattern). Per D034 / D031, the producer-state surface lives binding-side (symmetric with FnCtx), not in Core.
+- **Options:** A) Single trait method `register_producer_build` returning a FnId; binding stores closures + state map. B) Generic `Any`-backed scratch slot in Core's `op_scratch`; closure captures Core/binding refs. C) New Core-level method `Core::subscribe_for_producer(producer_node, source, sink)`.
+- **Decision:** A — `ProducerBinding: BindingBoundary` super-trait with `register_producer_build(build: ProducerBuildFn) -> FnId` + `producer_storage() -> &ProducerStorage`. `ProducerCtx::subscribe_to(source, sink)` calls `Core::subscribe` and stuffs the resulting `Subscription` into the binding's `producer_storage[node_id]`. `default_producer_deactivate(storage, node_id)` is the helper bindings call from their `BindingBoundary::producer_deactivate` impl to drop the storage entry (which cascades into Subscription drops).
+- **Rationale:** Pure binding-layer pattern; Core stays minimal. Symmetric with `OperatorBinding` (D015) — both extend `BindingBoundary` with closure-registration + storage. Multi-binding parity preserved (each binding implements the trait its own way; the operators crate ships a default helper).
+- **Affects:** graphrefly-operators `producer` module (new); operator factories (`zip` / `concat` / `race` / `take_until`) accept `&Arc<dyn ProducerBinding>` at registration.
+
+### D037 — Op-specific state captured in build-closure Arcs (not stored in `producer_storage.op_state`)
+- **Date:** 2026-05-06
+- **Context:** Each producer op needs per-instance mutable state (zip's per-source FIFOs, concat's phase flag, race's winner index, takeUntil's terminated flag). Two storage options surface in the design.
+- **Options:** A) Store state in the build closure's captures via `Arc<Mutex<OpState>>`; sinks capture clones. B) Store state in `ProducerNodeState::op_state: Option<Box<dyn Any>>` (binding-side per-node slot); sinks resolve via `binding.producer_storage().lock().get(node_id).op_state.downcast_mut()`.
+- **Decision:** A — closure captures. The build closure constructs `Arc<Mutex<OpState>>` on each activation; sinks capture clones. State lifetime tracks Subscription lifetime: when producer_deactivate fires and drops the storage entry → Subscriptions drop → sinks drop → state Arc count decrements → state drops with the last sink.
+- **Rationale:** Mirrors TS impl exactly (each producer fn body creates fresh local state per activation via JS closure capture). Simpler than `Any`-downcast machinery in `op_state` slot. Each activation gets a fresh state instance — no cross-cycle pollution. The `op_state` field on `ProducerNodeState` stays available for future ops that want trait-object storage but is unused by the four core ops.
+- **Affects:** graphrefly-operators `ops_impl.rs` (closure-capture pattern in each operator).
+
+### D038 — Widen `Core::emit` to accept Producer nodes (not just State)
+- **Date:** 2026-05-06
+- **Context:** Producer ops' sink callbacks need to call `Core::emit(producer_node, h)` to drive emissions on the producer node. Pre-D038 `Core::emit` panicked on non-State nodes (Slice A close discipline: "emit() is for state nodes only; derived emits via fn").
+- **Options:** A) Widen the assertion to accept State OR Producer. B) Add a separate `Core::emit_producer(node_id, h)` method. C) Have producers commit emissions via a different path (e.g., `Core::commit_emission_for_producer`).
+- **Decision:** A — widen `Core::emit`'s assertion to `rec.is_state() || rec.is_producer()`. Producer is conceptually a sink-driven source: state-driven sources accept user `emit`; producer-driven sources accept sink-callback `emit`. Both bypass the fn-return-value emission path used by Derived/Dynamic/Operator.
+- **Rationale:** State and Producer are both intrinsic-source kinds. Unifying their emission API matches the canonical-spec data model where producer is "node(fn)" and emits via `actions.emit` (which maps to `Core::emit` at the FFI plane). Adding a separate method would duplicate the same logic.
+- **Affects:** graphrefly-core `Core::emit` (assertion widened, doc updated).

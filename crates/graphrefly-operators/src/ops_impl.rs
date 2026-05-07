@@ -1,0 +1,576 @@
+//! Concrete implementations of the four subscription-managed combinators
+//! (zip / concat / race / takeUntil). Built on the
+//! [`super::producer::ProducerCtx`] substrate.
+
+// Each sink closure runs a small phase-1/phase-2 dance (lock state,
+// collect actions, drop lock, replay actions). The match-then-if
+// structure inside phase 1 is intentional for readability; collapsing
+// to `match { Some(...) if cond => ... }` obscures the lock-discipline.
+#![allow(clippy::collapsible_if, clippy::collapsible_match)]
+// `zip` is genuinely large (multi-arity tuple-pack with terminal-
+// cascade handling). Splitting would obscure the concurrent state-
+// machine logic across helpers without clear benefit.
+#![allow(clippy::too_many_lines)]
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use graphrefly_core::{Core, HandleId, Message, NodeId, Sink};
+use smallvec::SmallVec;
+
+use super::producer::{ProducerBinding, ProducerCtx};
+
+// =====================================================================
+// zip — pair handles N-wise across N sources
+// =====================================================================
+
+/// Per-zip-node state: one FIFO queue per source, plus a flag for each
+/// source's terminal. Lives behind `Arc<Mutex<_>>` captured by the
+/// build + sink closures.
+struct ZipState {
+    queues: Vec<VecDeque<HandleId>>,
+    completed: Vec<bool>,
+    errored: bool,
+    terminated: bool,
+}
+
+impl ZipState {
+    fn new(n: usize) -> Self {
+        Self {
+            queues: (0..n).map(|_| VecDeque::new()).collect(),
+            completed: vec![false; n],
+            errored: false,
+            terminated: false,
+        }
+    }
+}
+
+/// `zip(s1, s2, ..., sN)` — collect one value from each source, emit a
+/// tuple, repeat. Models RxJS / TS `zip`:
+///
+/// - Each upstream DATA pushes into that source's per-source queue.
+/// - When **every** queue has at least one entry, pop one from each,
+///   pack into a tuple via [`graphrefly_core::BindingBoundary::pack_tuple`],
+///   and emit on the producer.
+/// - On any source's COMPLETE: if its queue is empty, terminate the
+///   producer with COMPLETE. Otherwise continue draining; terminate
+///   when this source's queue becomes empty (zip can't produce a
+///   tuple without input from every source).
+/// - On any source's ERROR: terminate the producer with the same
+///   ERROR (first error wins, like merge per Slice C-2 D022).
+///
+/// Empty source list (`n == 0`) emits a single empty-tuple event then
+/// completes. Single source (`n == 1`) is identity-passthrough.
+///
+/// # Refcount discipline
+///
+/// Each upstream DATA handle is `retain_handle`-bumped before being
+/// pushed onto a queue (the inbound message's payload retain belongs
+/// to the wave-end-flush release path; we take our own share for the
+/// queue). On pop, we transfer the share into the `pack_tuple` call's
+/// expected handle ownership. After `pack_tuple` returns the new
+/// tuple handle, we release each component handle's queue share and
+/// emit the tuple.
+#[must_use]
+pub fn zip(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    sources: Vec<NodeId>,
+    pack_fn_id: graphrefly_core::FnId,
+) -> NodeId {
+    let n = sources.len();
+    let core_clone = core.clone();
+    let binding_clone = binding.clone();
+    let core_for_build = core_clone.clone();
+
+    let build = Box::new(move |ctx: ProducerCtx<'_>| {
+        let producer_id = ctx.node_id();
+        if n == 0 {
+            // Empty zip emits an empty tuple immediately, then completes.
+            let tuple_h = binding_clone.pack_tuple(pack_fn_id, &[]);
+            core_for_build.emit(producer_id, tuple_h);
+            core_for_build.complete(producer_id);
+            return;
+        }
+        let state: Arc<Mutex<ZipState>> = Arc::new(Mutex::new(ZipState::new(n)));
+
+        for (idx, &source) in sources.iter().enumerate() {
+            let state_inner = state.clone();
+            let core_inner = core_for_build.clone();
+            let binding_inner = binding_clone.clone();
+            let sink: Sink = Arc::new(move |msgs| {
+                // Phase 1 (lock held): mutate queues + collect actions.
+                enum Action {
+                    EmitTuple(HandleId),
+                    Complete,
+                    Error(HandleId),
+                }
+                let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+                {
+                    let mut s = state_inner.lock().unwrap();
+                    if s.terminated {
+                        return;
+                    }
+                    for m in msgs {
+                        match m {
+                            Message::Data(h) => {
+                                binding_inner.retain_handle(*h);
+                                s.queues[idx].push_back(*h);
+                                while s.queues.iter().all(|q| !q.is_empty()) {
+                                    let popped: Vec<HandleId> = s
+                                        .queues
+                                        .iter_mut()
+                                        .map(|q| q.pop_front().unwrap())
+                                        .collect();
+                                    let tuple_h = binding_inner.pack_tuple(pack_fn_id, &popped);
+                                    for h in &popped {
+                                        binding_inner.release_handle(*h);
+                                    }
+                                    actions.push(Action::EmitTuple(tuple_h));
+                                }
+                            }
+                            Message::Complete => {
+                                s.completed[idx] = true;
+                                // If this source's queue is empty, no more
+                                // tuples from it — terminate.
+                                if s.queues[idx].is_empty() && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                }
+                            }
+                            Message::Error(h) => {
+                                if !s.errored && !s.terminated {
+                                    s.errored = true;
+                                    s.terminated = true;
+                                    binding_inner.retain_handle(*h);
+                                    actions.push(Action::Error(*h));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Phase 2 (lock released): re-enter Core.
+                for action in actions {
+                    match action {
+                        Action::EmitTuple(h) => core_inner.emit(producer_id, h),
+                        Action::Complete => core_inner.complete(producer_id),
+                        Action::Error(h) => core_inner.error(producer_id, h),
+                    }
+                }
+            });
+            ctx.subscribe_to(source, sink);
+        }
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+}
+
+// =====================================================================
+// concat — sequentially forward `first` then `second`
+// =====================================================================
+
+struct ConcatState {
+    /// 0 = forwarding `first`; 1 = `first` complete, forwarding `second`.
+    phase: u8,
+    /// Buffered DATA from `second` that arrived during phase 0 (before
+    /// `first` completed). Drained on phase transition.
+    pending: VecDeque<HandleId>,
+    terminated: bool,
+}
+
+impl ConcatState {
+    fn new() -> Self {
+        Self {
+            phase: 0,
+            pending: VecDeque::new(),
+            terminated: false,
+        }
+    }
+}
+
+/// `concat(first, second)` — forward DATA from `first` until it
+/// completes, then drain any DATA `second` emitted during phase 1
+/// (buffered) and continue forwarding `second`. ERROR from either
+/// source terminates the producer with the same ERROR.
+///
+/// Subscribes to BOTH sources at activation time (matches TS impl in
+/// `extra/operators/combine.ts:332-379` so `second.subscribe` doesn't
+/// race after `first` completes). DATA from `second` during phase 0
+/// is buffered, not forwarded.
+#[must_use]
+pub fn concat(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    first: NodeId,
+    second: NodeId,
+) -> NodeId {
+    let core_clone = core.clone();
+    let binding_clone = binding.clone();
+
+    let build = Box::new(move |ctx: ProducerCtx<'_>| {
+        let producer_id = ctx.node_id();
+        let state: Arc<Mutex<ConcatState>> = Arc::new(Mutex::new(ConcatState::new()));
+
+        // Subscribe to second FIRST so phase-0 DATA buffering catches
+        // synchronous initial emissions.
+        let state_for_second = state.clone();
+        let core_for_second = core_clone.clone();
+        let binding_for_second = binding_clone.clone();
+        let second_sink: Sink = Arc::new(move |msgs| {
+            enum Action {
+                Emit(HandleId),
+                Complete,
+                Error(HandleId),
+            }
+            let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+            {
+                let mut s = state_for_second.lock().unwrap();
+                if s.terminated {
+                    return;
+                }
+                for m in msgs {
+                    match m {
+                        Message::Data(h) => {
+                            if s.phase == 0 {
+                                // Buffer for later drain.
+                                binding_for_second.retain_handle(*h);
+                                s.pending.push_back(*h);
+                            } else {
+                                actions.push(Action::Emit(*h));
+                            }
+                        }
+                        Message::Complete => {
+                            if s.phase == 1 && !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Complete);
+                            }
+                            // If phase==0, ignore (concat is "first then
+                            // second"; second completing before first means
+                            // second's pending will drain on phase
+                            // transition, then complete).
+                        }
+                        Message::Error(h) => {
+                            if !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Error(*h));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for action in actions {
+                match action {
+                    Action::Emit(h) => core_for_second.emit(producer_id, h),
+                    Action::Complete => core_for_second.complete(producer_id),
+                    Action::Error(h) => core_for_second.error(producer_id, h),
+                }
+            }
+        });
+        ctx.subscribe_to(second, second_sink);
+
+        let state_for_first = state.clone();
+        let core_for_first = core_clone.clone();
+        let first_sink: Sink = Arc::new(move |msgs| {
+            // first.Complete triggers the phase transition (handled
+            // via `s.phase = 1` + draining pending into `actions`),
+            // but never queues an Action::Complete itself — that
+            // belongs to second.Complete via `second_sink`. Keep the
+            // shared 3-variant Action type for symmetry with the
+            // other sinks; mark Complete dead-code-allowed here.
+            #[allow(dead_code)]
+            enum Action {
+                Emit(HandleId),
+                Complete,
+                Error(HandleId),
+            }
+            let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+            {
+                let mut s = state_for_first.lock().unwrap();
+                if s.terminated {
+                    return;
+                }
+                if s.phase != 0 {
+                    return; // first is done; ignore stale messages.
+                }
+                for m in msgs {
+                    match m {
+                        Message::Data(h) => {
+                            actions.push(Action::Emit(*h));
+                        }
+                        Message::Complete => {
+                            // Phase transition: drain pending second-data,
+                            // then continue forwarding from second.
+                            s.phase = 1;
+                            for h in s.pending.drain(..) {
+                                actions.push(Action::Emit(h));
+                            }
+                        }
+                        Message::Error(h) => {
+                            if !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Error(*h));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for action in actions {
+                match action {
+                    Action::Emit(h) => core_for_first.emit(producer_id, h),
+                    Action::Complete => core_for_first.complete(producer_id),
+                    Action::Error(h) => core_for_first.error(producer_id, h),
+                }
+            }
+        });
+        ctx.subscribe_to(first, first_sink);
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+}
+
+// =====================================================================
+// race — first source to emit DATA wins; losers are ignored
+// =====================================================================
+
+struct RaceState {
+    /// Index of the winning source, or `None` if no winner yet.
+    winner: Option<usize>,
+    terminated: bool,
+}
+
+impl RaceState {
+    fn new() -> Self {
+        Self {
+            winner: None,
+            terminated: false,
+        }
+    }
+}
+
+/// `race(s1, s2, ..., sN)` — subscribes to all sources; the first to
+/// emit DATA wins. Subsequent traffic from the winner is forwarded;
+/// losers' messages are no-ops (per Q4=(b) — losers stay subscribed
+/// but their sink callbacks short-circuit). Saves the dynamic
+/// rewiring cost of explicitly unsubscribing losers.
+///
+/// Empty source list completes immediately. Single source is
+/// identity-passthrough.
+#[must_use]
+pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId>) -> NodeId {
+    let n = sources.len();
+    let core_clone = core.clone();
+    let binding_clone = binding.clone();
+
+    let build = Box::new(move |ctx: ProducerCtx<'_>| {
+        let producer_id = ctx.node_id();
+        if n == 0 {
+            core_clone.complete(producer_id);
+            return;
+        }
+        let _ = binding_clone; // unused in race; reserved for future tuple-equals customizations
+        let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new()));
+
+        for (idx, &source) in sources.iter().enumerate() {
+            let state_inner = state.clone();
+            let core_inner = core_clone.clone();
+            let sink: Sink = Arc::new(move |msgs| {
+                enum Action {
+                    Emit(HandleId),
+                    Complete,
+                    Error(HandleId),
+                }
+                let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+                {
+                    let mut s = state_inner.lock().unwrap();
+                    if s.terminated {
+                        return;
+                    }
+                    // Pre-winner: this dep can become the winner on
+                    // first DATA; ignore until then.
+                    let am_winner = match s.winner {
+                        None => false,
+                        Some(w) => w == idx,
+                    };
+                    for m in msgs {
+                        match m {
+                            Message::Data(h) => {
+                                if s.winner.is_none() {
+                                    s.winner = Some(idx);
+                                    actions.push(Action::Emit(*h));
+                                } else if am_winner {
+                                    actions.push(Action::Emit(*h));
+                                }
+                                // else: loser DATA — ignore.
+                            }
+                            Message::Complete => {
+                                if am_winner && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                }
+                                // else: loser complete — ignore.
+                            }
+                            Message::Error(h) => {
+                                // Errors from any source pre-winner OR
+                                // from the winner cascade; loser errors
+                                // post-winner are ignored.
+                                if (s.winner.is_none() || am_winner) && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Error(*h));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for action in actions {
+                    match action {
+                        Action::Emit(h) => core_inner.emit(producer_id, h),
+                        Action::Complete => core_inner.complete(producer_id),
+                        Action::Error(h) => core_inner.error(producer_id, h),
+                    }
+                }
+            });
+            ctx.subscribe_to(source, sink);
+        }
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+}
+
+// =====================================================================
+// takeUntil — terminate when notifier emits DATA
+// =====================================================================
+
+struct TakeUntilState {
+    terminated: bool,
+}
+
+impl TakeUntilState {
+    fn new() -> Self {
+        Self { terminated: false }
+    }
+}
+
+/// `take_until(source, notifier)` — forward DATA from `source` until
+/// `notifier` emits its first DATA, then terminate the producer with
+/// COMPLETE. Errors from either source cascade. Source COMPLETE
+/// terminates the producer.
+///
+/// Notifier DATA is consumed but never forwarded (zero-FFI on the
+/// notifier path — we don't dereference its payload, just use the
+/// emission as a signal).
+#[must_use]
+pub fn take_until(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    source: NodeId,
+    notifier: NodeId,
+) -> NodeId {
+    let core_clone = core.clone();
+    let _binding_clone = binding.clone();
+
+    let build = Box::new(move |ctx: ProducerCtx<'_>| {
+        let producer_id = ctx.node_id();
+        let state: Arc<Mutex<TakeUntilState>> = Arc::new(Mutex::new(TakeUntilState::new()));
+
+        // Source sink: forward DATA, propagate terminals.
+        let state_for_source = state.clone();
+        let core_for_source = core_clone.clone();
+        let source_sink: Sink = Arc::new(move |msgs| {
+            enum Action {
+                Emit(HandleId),
+                Complete,
+                Error(HandleId),
+            }
+            let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
+            {
+                let mut s = state_for_source.lock().unwrap();
+                if s.terminated {
+                    return;
+                }
+                for m in msgs {
+                    match m {
+                        Message::Data(h) => actions.push(Action::Emit(*h)),
+                        Message::Complete => {
+                            if !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Complete);
+                            }
+                        }
+                        Message::Error(h) => {
+                            if !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Error(*h));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for action in actions {
+                match action {
+                    Action::Emit(h) => core_for_source.emit(producer_id, h),
+                    Action::Complete => core_for_source.complete(producer_id),
+                    Action::Error(h) => core_for_source.error(producer_id, h),
+                }
+            }
+        });
+        ctx.subscribe_to(source, source_sink);
+
+        // Notifier sink: any DATA → terminate; ERROR → cascade.
+        let state_for_notifier = state.clone();
+        let core_for_notifier = core_clone.clone();
+        let notifier_sink: Sink = Arc::new(move |msgs| {
+            enum Action {
+                Complete,
+                Error(HandleId),
+            }
+            let mut action: Option<Action> = None;
+            {
+                let mut s = state_for_notifier.lock().unwrap();
+                if s.terminated {
+                    return;
+                }
+                for m in msgs {
+                    match m {
+                        Message::Data(_) => {
+                            // Any DATA on notifier → complete the producer.
+                            // We don't emit notifier DATA downstream.
+                            if !s.terminated {
+                                s.terminated = true;
+                                action = Some(Action::Complete);
+                                break;
+                            }
+                        }
+                        Message::Error(h) => {
+                            if !s.terminated {
+                                s.terminated = true;
+                                action = Some(Action::Error(*h));
+                                break;
+                            }
+                        }
+                        // Notifier COMPLETE without prior DATA: nothing to
+                        // do — source continues independently.
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(a) = action {
+                match a {
+                    Action::Complete => core_for_notifier.complete(producer_id),
+                    Action::Error(h) => core_for_notifier.error(producer_id, h),
+                }
+            }
+        });
+        ctx.subscribe_to(notifier, notifier_sink);
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+}

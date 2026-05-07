@@ -54,12 +54,19 @@
 pub mod binding;
 pub mod combine;
 pub mod flow;
+pub mod ops_impl;
+pub mod producer;
 pub mod transform;
 
 pub use binding::OperatorBinding;
 pub use combine::{combine as combine_latest, merge, with_latest_from, MergeRegistration};
 pub use flow::{
     element_at, find, first, last, last_with_default, skip, take, take_while, FlowRegistration,
+};
+pub use ops_impl::{concat, race, take_until, zip};
+pub use producer::{
+    default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
+    ProducerStorage,
 };
 pub use transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan, OperatorRegistration,
