@@ -213,15 +213,29 @@ fn type_str_of(kind: NodeKind) -> NodeTypeStr {
 /// Canonical-spec §3.6.1 status mapping.
 ///
 /// Precedence (high to low): `errored` > `completed` > `dirty` >
-/// (`settled` if `fired` else `pending`) > `sentinel`.
+/// (cache-cleared discriminator) > (`settled` if `cache != NO_HANDLE`)
+/// > (`pending` for unfired compute) > (`sentinel` for state).
 ///
-/// Reactive-describe note: when both `terminal.is_some()` AND
-/// `dirty == true` (a wave that began before the terminal was
-/// installed and still has unflushed tier-1 traffic), this static
-/// classifier reports the terminal status. Reactive describe will
-/// need a `terminating` substate to surface the unflushed wave —
-/// not modeled here because the static walk happens between waves
-/// in practice.
+/// # R1.3.7.b post-INVALIDATE classification (Slice F, A8 — 2026-05-07)
+///
+/// Per canonical R1.3.7.b: "The emitting node's status transitions to
+/// 'sentinel' (no value, nothing pending) — NOT 'dirty' (value about to
+/// change) — because INVALIDATE has cleared the cache outright with no new
+/// value pending."
+///
+/// Implementation: a *fired* compute node with `cache == NO_HANDLE` and no
+/// terminal and no DIRTY pending has been `INVALIDATE`-d (the only path that
+/// clears the cache without setting a terminal). Report `Sentinel`, NOT
+/// `Settled` (the prior bug). State nodes use the same logic — `cache == NO_HANDLE`
+/// always means `Sentinel` regardless of `fired`.
+///
+/// # Reactive-describe note
+///
+/// When both `terminal.is_some()` AND `dirty == true` (a wave that began
+/// before the terminal was installed and still has unflushed tier-1 traffic),
+/// this static classifier reports the terminal status. Reactive describe will
+/// need a `terminating` substate to surface the unflushed wave — not modeled
+/// here because the static walk happens between waves in practice.
 fn status_of(
     kind: NodeKind,
     cache: HandleId,
@@ -237,22 +251,26 @@ fn status_of(
     if dirty {
         return NodeStatus::Dirty;
     }
-    if fired {
-        return NodeStatus::Settled;
-    }
-    // Not fired. State sentinel vs compute pending vs state-with-cache.
-    match kind {
-        NodeKind::State => {
-            if cache == NO_HANDLE {
-                NodeStatus::Sentinel
-            } else {
-                NodeStatus::Settled
+    // R1.3.7.b: `cache == NO_HANDLE` discriminates Sentinel vs Settled
+    // BEFORE the `fired` check, so post-INVALIDATE on fired compute nodes
+    // correctly reports `Sentinel` (was incorrectly `Settled` pre-A8).
+    if cache == NO_HANDLE {
+        return match kind {
+            NodeKind::State => NodeStatus::Sentinel,
+            NodeKind::Producer | NodeKind::Derived | NodeKind::Dynamic | NodeKind::Operator(_) => {
+                if fired {
+                    // Compute node that previously fired but currently has
+                    // sentinel cache → INVALIDATE wiped it. R1.3.7.b says
+                    // status is `sentinel`, not `pending` (pending = first-fire
+                    // gate not yet satisfied).
+                    NodeStatus::Sentinel
+                } else {
+                    NodeStatus::Pending
+                }
             }
-        }
-        NodeKind::Producer | NodeKind::Derived | NodeKind::Dynamic | NodeKind::Operator(_) => {
-            NodeStatus::Pending
-        }
+        };
     }
+    NodeStatus::Settled
 }
 
 // -------------------------------------------------------------------

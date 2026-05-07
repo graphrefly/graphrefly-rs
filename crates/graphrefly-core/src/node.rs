@@ -65,6 +65,7 @@
 //!   subscribe path drops it, preserving R1.3.5.a happens-after ordering.
 
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -284,6 +285,40 @@ pub enum NodeFnOrOp {
     Op(OperatorOp),
 }
 
+/// Pause behavior mode (canonical-spec §2.6 — three modes shipped in TS;
+/// Slice F audit, 2026-05-07 — closed the Rust port gap).
+///
+/// | Mode | Outgoing tier-3 routing while paused | RESUME behavior |
+/// |---|---|---|
+/// | [`PausableMode::Default`] | suppress fn-fire upstream (no DIRTY emitted) | fire fn ONCE on RESUME if any dep delivered DATA during pause; collapses N pause-window writes into one settle |
+/// | [`PausableMode::ResumeAll`] | buffer outgoing tier-3 / tier-4 messages per-wave | replay each buffered wave verbatim on RESUME |
+/// | [`PausableMode::Off`] | dispatcher ignores PAUSE; tier-3 flushes immediately | no-op (no buffer to drain) |
+///
+/// Default is [`PausableMode::Default`] per canonical §2.6 — every untagged
+/// source picks it up. Memory profile is O(1) per node (no buffer); the
+/// trade-off is "subscribers see one consolidated DATA on RESUME" rather
+/// than the K mid-pause emissions verbatim.
+///
+/// Note: tier-1 (DIRTY) / tier-2 (PAUSE/RESUME) / tier-5 (COMPLETE/ERROR) /
+/// tier-6 (TEARDOWN) bypass pause regardless of mode — they remain
+/// observable so leaked pause-controllers cannot strand subscribers.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PausableMode {
+    /// Suppress fn-fire while paused; fire once on RESUME if any dep
+    /// delivered DATA during the pause window. Canonical default.
+    #[default]
+    Default,
+    /// Buffer outgoing tier-3 / tier-4 messages per-wave; replay on
+    /// RESUME. Use when subscribers need verbatim emit history (e.g. an
+    /// audit log, replay-on-reconnect bridge).
+    ResumeAll,
+    /// Dispatcher ignores PAUSE for this node — tier-3 flushes
+    /// immediately even while a lock is held. Use for nodes whose value
+    /// production is intrinsically pause-immune (telemetry counters,
+    /// monotonic timers).
+    Off,
+}
+
 /// Per-kind opts for [`Core::register`]. Cross-kind config knobs live
 /// here; per-kind specifics (deps, fn_or_op) live on
 /// [`NodeRegistration`].
@@ -303,6 +338,16 @@ pub struct NodeOpts {
     /// per fire. Only meaningful when `fn_or_op == Some(Fn(_))` AND
     /// deps non-empty.
     pub is_dynamic: bool,
+    /// Pause behavior mode (canonical §2.6). Default is
+    /// [`PausableMode::Default`]. See [`PausableMode`] for the trade-offs.
+    pub pausable: PausableMode,
+    /// Replay buffer cap (canonical R2.6.5 / Lock 6.G — Slice E1, 2026-05-07).
+    /// `None` (default) disables; `Some(N)` keeps a circular buffer of the
+    /// last N DATA emissions and replays them to late subscribers as part
+    /// of the per-tier handshake (between [`Message::Start`] and any
+    /// terminal slice). Only DATA is buffered; RESOLVED entries are NOT
+    /// (R2.6.5 explicit "DATA only").
+    pub replay_buffer: Option<usize>,
 }
 
 impl Default for NodeOpts {
@@ -312,6 +357,8 @@ impl Default for NodeOpts {
             equals: EqualsMode::Identity,
             partial: false,
             is_dynamic: false,
+            pausable: PausableMode::Default,
+            replay_buffer: None,
         }
     }
 }
@@ -493,12 +540,24 @@ pub(crate) enum PauseState {
         /// cycle starts fresh).
         dropped: u32,
         /// Wall-clock-monotonic ns when the lock first transitioned this node
-        /// from `Active` to `Paused`. Reserved for the overflow-error detail
-        /// path (TS Lock 6.A `pauseStartNs`); exposed to callers via a future
-        /// `ResumeReport.pause_duration_ns` extension when an overflow is
-        /// reported. Not currently read; allowed dead until that wires in.
-        #[allow(dead_code)]
+        /// from `Active` to `Paused`. Used by R1.3.8.c overflow ERROR
+        /// synthesis to compute `lock_held_duration_ms` in the diagnostic
+        /// payload (Slice F, A3 — 2026-05-07).
         started_at_ns: u64,
+        /// True after the first overflow event in this pause cycle has been
+        /// reported via [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
+        /// Subsequent overflows in the same cycle don't re-emit ERROR
+        /// (canonical R1.3.8.c: "once per overflow event"). Cleared on
+        /// final RESUME (next pause cycle starts fresh).
+        overflow_reported: bool,
+        /// Default-mode bookkeeping (Slice F audit close, 2026-05-07).
+        /// Set to `true` when an upstream dep delivery arrives while this
+        /// node is paused with [`PausableMode::Default`]. On final RESUME,
+        /// if `true`, the node is added back to `pending_fires` so the fn
+        /// fires once with the consolidated dep state. Always `false` for
+        /// `ResumeAll` mode (the buffered messages are the consolidation
+        /// mechanism there). Cleared on final RESUME.
+        pending_wave: bool,
     },
 }
 
@@ -533,6 +592,8 @@ impl PauseState {
                     buffer: VecDeque::new(),
                     dropped: 0,
                     started_at_ns: monotonic_ns(),
+                    overflow_reported: false,
+                    pending_wave: false,
                 };
             }
             Self::Paused { locks, .. } => {
@@ -540,6 +601,26 @@ impl PauseState {
                     locks.push(lock_id);
                 }
             }
+        }
+    }
+
+    /// Mark that an upstream dep delivered DATA to a node paused with
+    /// [`PausableMode::Default`]. The node will re-enter `pending_fires`
+    /// on final RESUME via [`Self::take_pending_wave`].
+    pub(crate) fn mark_pending_wave(&mut self) {
+        if let Self::Paused { pending_wave, .. } = self {
+            *pending_wave = true;
+        }
+    }
+
+    /// Read and clear the `pending_wave` flag. Called from
+    /// [`Core::resume`] when transitioning Paused → Active. Returns `true`
+    /// only if the node was paused with `pending_wave` set.
+    pub(crate) fn take_pending_wave(&mut self) -> bool {
+        if let Self::Paused { pending_wave, .. } = self {
+            std::mem::replace(pending_wave, false)
+        } else {
+            false
         }
     }
 
@@ -573,28 +654,84 @@ impl PauseState {
     /// the dropped messages so the caller can release any payload handles
     /// they reference. `cap` of `None` means unbounded.
     ///
+    /// Returns [`PushBufferedResult`] carrying both the dropped messages
+    /// (for refcount release) and whether this push triggered the FIRST
+    /// overflow event in the current pause cycle (for R1.3.8.c ERROR
+    /// synthesis — the caller schedules a single ERROR per cycle).
+    ///
     /// Note: refcount management for the message's payload handle is the
     /// caller's responsibility — see [`Core::queue_notify`] for the
     /// retain/release discipline. The buffer itself is just a message
     /// container; refcounts cross the binding boundary.
-    pub(crate) fn push_buffered(&mut self, msg: Message, cap: Option<usize>) -> Vec<Message> {
-        let mut overflow_dropped: Vec<Message> = Vec::new();
+    pub(crate) fn push_buffered(&mut self, msg: Message, cap: Option<usize>) -> PushBufferedResult {
+        let mut result = PushBufferedResult::default();
         if let Self::Paused {
-            buffer, dropped, ..
+            buffer,
+            dropped,
+            overflow_reported,
+            ..
         } = self
         {
             buffer.push_back(msg);
             if let Some(c) = cap {
                 while buffer.len() > c {
                     if let Some(dropped_msg) = buffer.pop_front() {
-                        overflow_dropped.push(dropped_msg);
+                        result.dropped_msgs.push(dropped_msg);
                     }
                     *dropped = dropped.saturating_add(1);
                 }
             }
+            // R1.3.8.c (Slice F, A3): flag first overflow this cycle.
+            if !result.dropped_msgs.is_empty() && !*overflow_reported {
+                *overflow_reported = true;
+                result.first_overflow_this_cycle = true;
+            }
         }
-        overflow_dropped
+        result
     }
+
+    /// Snapshot the diagnostic for an R1.3.8.c overflow ERROR synthesis.
+    /// Returns `(dropped_count, lock_held_ns)`. Caller must already know
+    /// the configured cap (it's a Core-global value, not per-PauseState).
+    pub(crate) fn overflow_diagnostic(&self) -> Option<(u32, u64)> {
+        match self {
+            Self::Active => None,
+            Self::Paused {
+                dropped,
+                started_at_ns,
+                ..
+            } => {
+                let lock_held_ns = monotonic_ns().saturating_sub(*started_at_ns);
+                Some((*dropped, lock_held_ns))
+            }
+        }
+    }
+}
+
+/// Return shape for [`PauseState::push_buffered`]. Carries both the dropped
+/// messages (for refcount release) and an "is this the first overflow this
+/// cycle" flag (for R1.3.8.c ERROR synthesis scheduling).
+#[derive(Default)]
+pub(crate) struct PushBufferedResult {
+    pub(crate) dropped_msgs: Vec<Message>,
+    pub(crate) first_overflow_this_cycle: bool,
+}
+
+/// Pending R1.3.8.c overflow ERROR synthesis entry. Recorded by
+/// [`Core::queue_notify`] when the pause buffer first overflows in a cycle;
+/// drained at wave-end after the lock-released call to
+/// [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
+///
+/// `configured_max` is captured at scheduling time rather than read at
+/// drain — the user could change `pause_buffer_cap` between schedule and
+/// drain, and the diagnostic reads "the cap that was in effect when the
+/// overflow happened."
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPauseOverflow {
+    pub(crate) node_id: NodeId,
+    pub(crate) dropped_count: u32,
+    pub(crate) configured_max: usize,
+    pub(crate) lock_held_ns: u64,
 }
 
 /// Errors returnable by [`Core::pause`] and [`Core::resume`].
@@ -602,6 +739,21 @@ impl PauseState {
 pub enum PauseError {
     #[error("pause/resume: unknown node {0:?}")]
     UnknownNode(NodeId),
+}
+
+/// Errors returnable by [`Core::up`] (canonical R1.4.1).
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum UpError {
+    /// Node id is not registered.
+    #[error("up: unknown node {0:?}")]
+    UnknownNode(NodeId),
+    /// Tier-3 (DATA / RESOLVED) and tier-5 (COMPLETE / ERROR) are
+    /// downstream-only per R1.4.1; rejected at the boundary.
+    #[error(
+        "up: tier {tier} is forbidden upstream — value (tier 3) and \
+         terminal-lifecycle (tier 5) planes are downstream-only per R1.4.1"
+    )]
+    TierForbidden { tier: u8 },
 }
 
 /// Per-dep record. Replaces the parallel `deps` / `dep_handles` /
@@ -692,6 +844,20 @@ pub(crate) struct NodeRecord {
 
     /// Per-node pause state. Default `Active`. See [`PauseState`].
     pub(crate) pause_state: PauseState,
+    /// Pause behavior mode (canonical-spec §2.6). Set at registration via
+    /// [`NodeOpts::pausable`]. Default [`PausableMode::Default`] suppresses
+    /// fn-fire while paused and consolidates N pause-window dep deliveries
+    /// into one fn-fire on RESUME; `ResumeAll` buffers tier-3/4 outgoing
+    /// for verbatim replay; `Off` ignores PAUSE entirely. See
+    /// [`PausableMode`].
+    pub(crate) pausable: PausableMode,
+    /// Replay buffer cap (R2.6.5 / Lock 6.G — Slice E1, 2026-05-07).
+    /// `None` disables; `Some(N)` keeps a circular VecDeque of the last N
+    /// DATA-handle emissions for late-subscriber replay. Each handle in
+    /// the buffer owns one binding-side retain share, released on evict
+    /// (cap exceeded) or in `Drop for CoreState`.
+    pub(crate) replay_buffer_cap: Option<usize>,
+    pub(crate) replay_buffer: VecDeque<HandleId>,
 
     /// Terminal lifecycle state for THIS node's outgoing stream. Once set,
     /// further `emit` calls are silent no-ops, fn no longer fires, and only
@@ -872,6 +1038,21 @@ pub(crate) struct CoreState {
     /// per-node override can be added later as a pure addition without API
     /// breakage. Default `None`.
     pub(crate) pause_buffer_cap: Option<usize>,
+    /// Core-global cap on wave-drain iterations before
+    /// [`crate::batch::Core::drain_and_flush`] aborts with a diagnostic panic.
+    /// Replaces the prior `MAX_DRAIN_ITERATIONS` hard-coded constant
+    /// (R4.3 / Lock 2.F′). Default `10_000`.
+    ///
+    /// The drain loop bound exists to surface runtime cycles
+    /// (e.g. an operator that re-arms its own `pending_fires` slot during
+    /// `invoke_fn`) as a panic with context, rather than letting Core
+    /// spin forever. Structural cycles via [`Core::set_deps`] are
+    /// rejected at edge-mutation time (`SetDepsError::WouldCreateCycle`);
+    /// registration is structurally cycle-safe by construction (the new
+    /// node's id is not allocated until AFTER deps are validated, so deps
+    /// cannot transitively reach the new node). The drain bound is the
+    /// safety net for runtime cycles that bypass both static checks.
+    pub(crate) max_batch_drain_iterations: u32,
     /// Deferred sink-fire jobs collected by `flush_notifications`. The wave
     /// engine populates this under the state lock during the flush phase;
     /// `run_wave` then drops the lock and fires the jobs. Each tuple is
@@ -911,6 +1092,49 @@ pub(crate) struct CoreState {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
+    /// A6 reentrancy guard (Slice F, 2026-05-07): the stack of NodeIds whose
+    /// fn is currently being invoked on the wave-owner thread. Pushed at the
+    /// top of `fire_fn` (just before the lock-released `invoke_fn` call) and
+    /// popped on return / unwind via the [`crate::batch::FiringGuard`] RAII
+    /// helper. [`Core::set_deps`] consults this set and rejects with
+    /// [`SetDepsError::ReentrantOnFiringNode`] if `n` is currently firing —
+    /// preventing the D1 `tracked` index corruption (see
+    /// `porting-deferred.md` "Set_deps from inside firing node's fn corrupts
+    /// Dynamic `tracked` indices").
+    ///
+    /// Stack rather than set so nested fn re-entrance (Producer subscribing
+    /// to a fn that itself fires another fn) tracks every concurrently-firing
+    /// node on the wave-owner. `Vec` rather than `HashSet` because the
+    /// expected depth is small (typically 1, occasionally 2–3 with
+    /// higher-order operators) and linear scan is faster than hash for that
+    /// size.
+    pub(crate) currently_firing: Vec<NodeId>,
+    /// R1.3.8.c pause-overflow ERROR synthesis queue (Slice F, A3 —
+    /// 2026-05-07). Recorded by [`Core::queue_notify`] when the pause
+    /// buffer first overflows in a cycle; drained at wave-end after the
+    /// lock-released call to
+    /// [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
+    ///
+    /// One entry per (node × pause-cycle); subsequent overflows in the
+    /// same cycle don't re-queue (gated by `PauseState::overflow_reported`).
+    pub(crate) pending_pause_overflow: Vec<PendingPauseOverflow>,
+    /// Slice G (R1.3.2.d / R1.3.3.a — 2026-05-07): nodes that have emitted
+    /// at least one tier-3 message (Data or Resolved) in the CURRENT wave.
+    /// Wave-scoped (cleared in `clear_wave_state`). Used by
+    /// [`crate::batch::Core::commit_emission`] to detect "this is a
+    /// subsequent emit at this node in the same wave" — when set,
+    /// equals substitution is skipped (would produce a R1.3.3.a-violating
+    /// mixed wave) and any prior Resolved entries in pending_notify or
+    /// the pause buffer are rewritten to Data using the wave-start cache
+    /// snapshot.
+    ///
+    /// Distinct from `pending_pause_overflow` (per-pause-cycle, not
+    /// per-wave) and `wave_cache_snapshots` (per-wave snapshot, but only
+    /// populated on Data path pre-Slice-G). Populated by both Data and
+    /// Resolved branches of `commit_emission`; NOT populated by
+    /// `commit_emission_verbatim` (Batch path passes through verbatim
+    /// per R1.3.3.c).
+    pub(crate) tier3_emitted_this_wave: ahash::AHashSet<NodeId>,
 }
 
 /// The handle-protocol Core dispatcher.
@@ -959,13 +1183,20 @@ impl Core {
             state: Arc::new(Mutex::new(CoreState {
                 next_node_id: 1,
                 next_subscription_id: 1,
-                next_lock_id: 1,
+                // A4 (Slice F, 2026-05-07): start `next_lock_id` at `1 << 32`.
+                // User-supplied `LockId::new(N)` constructors stay in the low
+                // u32 range (the napi-rs binding marshals `u32` → `LockId`);
+                // `alloc_lock_id` can no longer collide with them. Lift the
+                // floor higher (e.g. `1 << 63`) only if a u32 caller starts
+                // using lock ids beyond `u32::MAX`.
+                next_lock_id: 1u64 << 32,
                 nodes: HashMap::new(),
                 children: HashMap::new(),
                 pending_fires: HashSet::new(),
                 pending_notify: IndexMap::new(),
                 in_tick: false,
                 pause_buffer_cap: None,
+                max_batch_drain_iterations: 10_000,
                 deferred_flush_jobs: Vec::new(),
                 deferred_handle_releases: Vec::new(),
                 binding: binding.clone(),
@@ -973,6 +1204,9 @@ impl Core {
                 pending_auto_resolve: ahash::AHashSet::new(),
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
+                currently_firing: Vec::new(),
+                pending_pause_overflow: Vec::new(),
+                tier3_emitted_this_wave: ahash::AHashSet::new(),
             })),
             binding,
             wave_owner: Arc::new(ReentrantMutex::new(())),
@@ -1013,6 +1247,164 @@ impl Core {
     /// unbounded; messages buffer indefinitely until the lockset clears.
     pub fn set_pause_buffer_cap(&self, cap: Option<usize>) {
         self.lock_state().pause_buffer_cap = cap;
+    }
+
+    /// Configure the replay buffer cap on `node_id` (R2.6.5 / Lock 6.G —
+    /// Slice E1, 2026-05-07). `None` disables the buffer. `Some(N)` keeps
+    /// the last `N` DATA emissions in a circular buffer; late subscribers
+    /// receive them as part of the per-tier handshake (between START and
+    /// any terminal). Switching from a larger cap to a smaller cap evicts
+    /// the front of the buffer to fit; switching to `None` drains the
+    /// buffer entirely. Each evicted/drained handle's retain is released
+    /// back to the binding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_id` is not registered.
+    pub fn set_replay_buffer_cap(&self, node_id: NodeId, cap: Option<usize>) {
+        // QA A7 (2026-05-07): normalize `Some(0)` to `None`. Two ways to
+        // express "disabled" is confusing: `push_replay_buffer` already
+        // treats `Some(0)` as no-op, so persisting it adds nothing.
+        let cap = match cap {
+            Some(0) => None,
+            other => other,
+        };
+        let to_release: Vec<HandleId> = {
+            let mut s = self.lock_state();
+            let rec = s.require_node_mut(node_id);
+            rec.replay_buffer_cap = cap;
+            match cap {
+                None => rec.replay_buffer.drain(..).collect(),
+                Some(c) => {
+                    let mut drained = Vec::new();
+                    while rec.replay_buffer.len() > c {
+                        if let Some(h) = rec.replay_buffer.pop_front() {
+                            drained.push(h);
+                        }
+                    }
+                    drained
+                }
+            }
+        };
+        for h in to_release {
+            self.binding.release_handle(h);
+        }
+    }
+
+    /// Reconfigure the pause mode for `node_id` (canonical §2.6 — Slice F
+    /// audit close, 2026-05-07). Default for new nodes is
+    /// [`PausableMode::Default`]; switch to [`PausableMode::ResumeAll`]
+    /// for nodes whose pause-window emit history must be observable
+    /// verbatim, or [`PausableMode::Off`] for nodes intrinsically
+    /// pause-immune.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_id` is not registered, or if the node currently
+    /// holds any pause locks (changing mode mid-pause would lose buffered
+    /// content or strand a `pending_wave` flag — make the change before
+    /// pausing).
+    pub fn set_pausable_mode(&self, node_id: NodeId, mode: PausableMode) {
+        let mut s = self.lock_state();
+        let rec = s.require_node_mut(node_id);
+        assert!(
+            !rec.pause_state.is_paused(),
+            "set_pausable_mode({node_id:?}, ...): cannot change mode while paused; \
+             resume all locks first"
+        );
+        rec.pausable = mode;
+    }
+
+    /// Configure the wave-drain iteration cap (R4.3 / Lock 2.F′). The wave
+    /// engine aborts a drain after `cap` iterations with a diagnostic panic.
+    /// Default is `10_000` — high enough to avoid false positives on legitimate
+    /// fan-in cascades, low enough to surface runtime cycles within seconds.
+    ///
+    /// Lower this only when running adversarial / property-based tests that
+    /// want fast cycle detection. Raise it only with concrete evidence that a
+    /// legitimate workload needs more iterations than the default — and even
+    /// then, prefer to tune the workload (per-subgraph batching, etc.) over
+    /// raising the cap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cap == 0` — a zero cap would abort every wave on the very
+    /// first iteration, deadlocking any subsequent dispatcher work.
+    pub fn set_max_batch_drain_iterations(&self, cap: u32) {
+        assert!(cap > 0, "max_batch_drain_iterations must be > 0");
+        self.lock_state().max_batch_drain_iterations = cap;
+    }
+
+    /// Send a message UPSTREAM from `node_id` to each of its declared deps
+    /// (canonical R1.4.1 — Slice F audit, F2 / 2026-05-07).
+    ///
+    /// The dispatcher rejects tier-3 (DATA / RESOLVED) and tier-5
+    /// (COMPLETE / ERROR) per R1.4.1: value and terminal-lifecycle planes
+    /// are downstream-only. All other tiers (0 START, 1 DIRTY, 2 PAUSE /
+    /// RESUME, 4 INVALIDATE, 6 TEARDOWN) pass.
+    ///
+    /// # Routing per tier
+    ///
+    /// - **Tier 0 ([`Message::Start`]):** no-op. START is a per-subscription
+    ///   handshake, not a routable wire signal — sending it upstream has no
+    ///   well-defined target.
+    /// - **Tier 1 ([`Message::Dirty`]):** no-op. The dep's "something
+    ///   changed" notification is its own [`Self::emit`] / commit
+    ///   responsibility; ignoring upstream DIRTY hints is safe.
+    /// - **Tier 2 ([`Message::Pause`] / [`Message::Resume`]):** translates
+    ///   to [`Self::pause`] / [`Self::resume`] on each dep. Lock id is
+    ///   forwarded verbatim. Errors from individual deps are accumulated
+    ///   in the `dep_errors` field of the returned report.
+    /// - **Tier 4 ([`Message::Invalidate`]):** translates to
+    ///   [`Self::invalidate`] on each dep. Note: canonical R1.4.2
+    ///   distinguishes "downstream INVALIDATE" (cache clear + cascade) from
+    ///   "upstream INVALIDATE" (plain forward, no self-process). The Rust
+    ///   port v1 SIMPLIFICATION delegates to the same `Core::invalidate`
+    ///   path — upstream INVALIDATE here DOES clear dep caches and cascade.
+    ///   If a "plain forward" mode surfaces as a real consumer need, add
+    ///   `up_with_options`.
+    /// - **Tier 6 ([`Message::Teardown`]):** translates to
+    ///   [`Self::teardown`] on each dep. Cascades per the standard
+    ///   teardown path.
+    ///
+    /// # Errors
+    ///
+    /// - [`UpError::UnknownNode`] — `node_id` is not registered.
+    /// - [`UpError::TierForbidden`] — tier 3 or tier 5.
+    pub fn up(&self, node_id: NodeId, message: Message) -> Result<(), UpError> {
+        // QA A10 (2026-05-07): check unknown node BEFORE tier rejection
+        // for consistent error UX — `up(unknown, Data)` and
+        // `up(unknown, Pause)` both report `UnknownNode` rather than
+        // splitting on the tier.
+        let dep_ids: Vec<NodeId> = {
+            let s = self.lock_state();
+            let rec = s.nodes.get(&node_id).ok_or(UpError::UnknownNode(node_id))?;
+            rec.dep_ids_vec()
+        };
+        let tier = message.tier();
+        if tier == 3 || tier == 5 {
+            return Err(UpError::TierForbidden { tier });
+        }
+        for dep_id in dep_ids {
+            match message {
+                Message::Pause(lock) => {
+                    let _ = self.pause(dep_id, lock);
+                }
+                Message::Resume(lock) => {
+                    let _ = self.resume(dep_id, lock);
+                }
+                Message::Invalidate => {
+                    self.invalidate(dep_id);
+                }
+                Message::Teardown => {
+                    self.teardown(dep_id);
+                }
+                // Tier 0 START + tier 1 DIRTY: no-op upstream per the
+                // routing table above.
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Allocate a unique [`LockId`] for use with [`Self::pause`] /
@@ -1057,6 +1449,13 @@ impl Core {
     /// - `reg.opts.initial` is non-sentinel for a non-state shape (deps
     ///   non-empty, or fn_or_op present). State nodes are the only kind
     ///   with an initial cache.
+    /// - A dep is terminal (COMPLETE / ERROR) AND not resubscribable —
+    ///   would create a permanent wedge.
+    ///
+    /// All four are construction-time programming errors. QA D3 typed-error
+    /// promotion was attempted 2026-05-07 but reverted due to scope
+    /// (~150 call sites including tests / operators / graph / bindings);
+    /// scheduled as its own slice. See `porting-deferred.md`.
     #[must_use]
     pub fn register(&self, reg: NodeRegistration) -> NodeId {
         let NodeRegistration {
@@ -1069,6 +1468,8 @@ impl Core {
             equals,
             partial,
             is_dynamic,
+            pausable,
+            replay_buffer,
         } = opts;
 
         // Derive the field shape from fn_or_op + deps.
@@ -1114,6 +1515,19 @@ impl Core {
             assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
         }
 
+        // Slice F audit (2026-05-07): mirror `set_deps`'s `TerminalDep`
+        // rejection at registration time. Adding a non-resubscribable
+        // terminal node as a dep at registration creates a permanent wedge.
+        for &dep in &deps {
+            let dep_rec = s.require_node(dep);
+            assert!(
+                dep_rec.terminal.is_none() || dep_rec.resubscribable,
+                "register: dep {dep:?} is terminal and not resubscribable; \
+                 mark it resubscribable before terminating, or remove it \
+                 from the dep list"
+            );
+        }
+
         // `tracked`: Static derived + Operator track all deps; Dynamic
         // starts empty and fills via fn return; State / Producer have no
         // deps so tracked is empty.
@@ -1143,6 +1557,9 @@ impl Core {
             dirty: false,
             involved_this_wave: false,
             pause_state: PauseState::Active,
+            pausable,
+            replay_buffer_cap: replay_buffer,
+            replay_buffer: VecDeque::new(),
             terminal: None,
             has_received_teardown: false,
             resubscribable: false,
@@ -1172,9 +1589,8 @@ impl Core {
             fn_or_op: None,
             opts: NodeOpts {
                 initial,
-                equals: EqualsMode::Identity,
                 partial,
-                is_dynamic: false,
+                ..NodeOpts::default()
             },
         })
     }
@@ -1193,11 +1609,9 @@ impl Core {
             deps: Vec::new(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
             opts: NodeOpts {
-                initial: NO_HANDLE,
-                equals: EqualsMode::Identity,
                 // Producers have no deps — the first-run gate is degenerate.
                 partial: true,
-                is_dynamic: false,
+                ..NodeOpts::default()
             },
         })
     }
@@ -1220,10 +1634,9 @@ impl Core {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
             opts: NodeOpts {
-                initial: NO_HANDLE,
                 equals,
                 partial,
-                is_dynamic: false,
+                ..NodeOpts::default()
             },
         })
     }
@@ -1247,10 +1660,10 @@ impl Core {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
             opts: NodeOpts {
-                initial: NO_HANDLE,
                 equals,
                 partial,
                 is_dynamic: true,
+                ..NodeOpts::default()
             },
         })
     }
@@ -1330,10 +1743,9 @@ impl Core {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Op(op)),
             opts: NodeOpts {
-                initial: NO_HANDLE,
                 equals: opts.equals,
                 partial: opts.partial,
-                is_dynamic: false,
+                ..NodeOpts::default()
             },
         })
     }
@@ -1436,6 +1848,36 @@ impl Core {
             if cache != NO_HANDLE {
                 tier_slices.push(vec![Message::Data(cache)]);
             }
+            // Slice E1 (R2.6.5 / Lock 6.G): replay buffered DATA between
+            // [Start] (and the cache slice, if present) and any terminal.
+            // Each buffered handle becomes a separate per-tier slice so
+            // late subscribers see the historical Data sequence as
+            // distinct sink calls.
+            //
+            // Dedupe: when a cache slice is present and the buffer's last
+            // entry is the same handle (the typical case — cache always
+            // tracks the last DATA emitted, and the buffer's tail entry
+            // is that same DATA), skip the last buffer entry to avoid
+            // delivering Data(cache) twice. For state nodes whose cache
+            // survives unsubscribe, the buffer may have older entries
+            // the cache doesn't reflect; the dedupe only drops the
+            // single trailing entry that equals cache. (QA A1, 2026-05-07)
+            let replay_handles: Vec<HandleId> = {
+                let rec = s.require_node(node_id);
+                let cap = rec.replay_buffer_cap.unwrap_or(0);
+                if cap == 0 {
+                    Vec::new()
+                } else {
+                    let mut v: Vec<HandleId> = rec.replay_buffer.iter().copied().collect();
+                    if cache != NO_HANDLE && v.last() == Some(&cache) {
+                        v.pop();
+                    }
+                    v
+                }
+            };
+            for h in &replay_handles {
+                tier_slices.push(vec![Message::Data(*h)]);
+            }
             if let Some(t) = terminal {
                 tier_slices.push(vec![match t {
                     TerminalKind::Complete => Message::Complete,
@@ -1461,8 +1903,38 @@ impl Core {
         // Fire handshake LOCK-RELEASED. Sink may re-enter Core; same-
         // thread re-entry passes through `wave_owner` reentrantly.
         // Cross-thread emits block at `wave_owner` until our scope ends.
+        //
+        // A7 (Slice F, 2026-05-07): per-tier slice fire is wrapped in
+        // `catch_unwind`. The sink is installed in `subscribers` BEFORE
+        // the handshake fires (load-bearing — concurrent threads observe
+        // the sink immediately). If a sink panics on tier N, the panic
+        // would otherwise unwind out of `subscribe` BEFORE the
+        // `Subscription` handle is constructed, leaving the sink
+        // registered in `subscribers` with no user-held handle to drop.
+        // Subsequent waves' `flush_notifications` would re-fire the
+        // panicking sink forever.
+        //
+        // On panic: remove the sink from `subscribers` (via the
+        // already-allocated `sub_id`), drop `_wave_guard` cleanly via
+        // RAII, and resume the unwind so the user observes the panic at
+        // the call site. Same effect as the user dropping the
+        // `Subscription` immediately, but pre-emptive.
         for slice in &tier_slices {
-            sink(slice);
+            let sink_clone = sink.clone();
+            let slice_ref: &[Message] = slice;
+            let result = catch_unwind(AssertUnwindSafe(|| sink_clone(slice_ref)));
+            if let Err(panic_payload) = result {
+                // Remove the orphaned sink. Best-effort: if the node was
+                // since torn down (e.g., the sink itself called teardown
+                // before panicking), the entry may already be gone.
+                {
+                    let mut s = self.lock_state();
+                    if let Some(rec) = s.nodes.get_mut(&node_id) {
+                        rec.subscribers.remove(&sub_id);
+                    }
+                }
+                std::panic::resume_unwind(panic_payload);
+            }
         }
 
         // Run activation if needed. `run_wave` re-acquires `wave_owner`
@@ -1554,6 +2026,11 @@ impl Core {
                         pulled.push(h);
                     }
                 }
+            }
+            // Slice E1: drain the replay buffer too — the new subscriber
+            // gets a fresh lifecycle and shouldn't see prior emissions.
+            for h in rec.replay_buffer.drain(..) {
+                pulled.push(h);
             }
             // Reset wave / lifecycle state.
             rec.terminal = None;
@@ -1963,6 +2440,39 @@ impl Core {
             // Drain pending fires for this node — fn won't fire on a
             // terminal node.
             s.pending_fires.remove(&id);
+            // R1.3.8.b / Slice F (A3, 2026-05-07): if this node was paused
+            // when terminating (the canonical case is the R1.3.8.c overflow
+            // ERROR synthesis path), drain the pause buffer and release
+            // each payload's queue_notify-time retain. Without this, the
+            // buffer leaks one share per buffered DATA/RESOLVED/INVALIDATE.
+            // Subscribers receive the terminal directly via the cascade
+            // below (tier-5 bypasses the pause buffer); the buffered
+            // content is moot post-terminal.
+            let drained: Vec<HandleId> = {
+                let rec = s.require_node_mut(id);
+                let mut drained: Vec<HandleId> = Vec::new();
+                if rec.pause_state.is_paused() {
+                    // Take the buffered messages out, then collapse the
+                    // pause state to Active so subsequent code observes a
+                    // clean lifecycle. Idempotent on Active (no-op).
+                    let prev = std::mem::replace(&mut rec.pause_state, PauseState::Active);
+                    if let PauseState::Paused { buffer, .. } = prev {
+                        drained.extend(buffer.into_iter().filter_map(Message::payload_handle));
+                    }
+                }
+                // QA A4 (2026-05-07): drain replay buffer on terminate. A
+                // non-resubscribable terminal ends the lifecycle; without
+                // this drain the buffer's retains leak until `Drop for
+                // CoreState`. Resubscribable nodes' replay buffers are
+                // also drained (when they're hit by a terminal cascade);
+                // a fresh subscribe rebuilds the buffer from scratch as
+                // part of `reset_for_fresh_lifecycle`.
+                drained.extend(rec.replay_buffer.drain(..));
+                drained
+            };
+            for h in drained {
+                self.binding.release_handle(h);
+            }
             // Queue the wire message (tier 5 — bypasses pause buffer).
             let msg = match t {
                 TerminalKind::Complete => Message::Complete,
@@ -2360,6 +2870,23 @@ impl Core {
             .nodes
             .get_mut(&node_id)
             .ok_or(PauseError::UnknownNode(node_id))?;
+        // QA A5 (2026-05-07): terminated nodes can't be re-paused. Without
+        // this check, a stale pause-controller calling pause() on an
+        // already-terminated node would re-arm `pause_state` to Paused.
+        // The terminate_node path collapses pause_state → Active and
+        // drains the buffer (A3-related), but doesn't gate subsequent
+        // pause() calls. Treat as idempotent no-op (consistent with how
+        // emit/complete/error early-return on terminal).
+        if rec.terminal.is_some() {
+            return Ok(());
+        }
+        // Slice F audit close (2026-05-07): `PausableMode::Off` means the
+        // dispatcher ignores PAUSE for this node — tier-3 flushes
+        // immediately, fn fires immediately. Treat the call as a successful
+        // no-op so callers don't need to special-case.
+        if rec.pausable == PausableMode::Off {
+            return Ok(());
+        }
         rec.pause_state.add_lock(lock_id);
         Ok(())
     }
@@ -2377,32 +2904,54 @@ impl Core {
         node_id: NodeId,
         lock_id: LockId,
     ) -> Result<Option<ResumeReport>, PauseError> {
-        // Phase 1 (lock-held): collect drained buffer + sink Arcs.
-        let (sinks, messages, dropped) = {
+        // Phase 1 (lock-held): collect drained buffer + pending-wave flag +
+        // sink Arcs. For default-mode nodes whose `pending_wave` was set
+        // during pause, schedule a single fn-fire by adding to
+        // `pending_fires` BEFORE we exit the lock — the wave engine picks
+        // it up on the next drain tick.
+        let (sinks, messages, dropped, pending_wave_for_default) = {
             let mut s = self.lock_state();
             let rec = s
                 .nodes
                 .get_mut(&node_id)
                 .ok_or(PauseError::UnknownNode(node_id))?;
+            // For Off mode, pause/resume are no-ops by construction.
+            if rec.pausable == PausableMode::Off {
+                return Ok(None);
+            }
+            let was_default_mode = rec.pausable == PausableMode::Default;
+            // Capture pending_wave BEFORE remove_lock collapses the state.
+            let pending_wave = if was_default_mode {
+                rec.pause_state.take_pending_wave()
+            } else {
+                false
+            };
             let Some((buffer, dropped)) = rec.pause_state.remove_lock(lock_id) else {
+                // Not the final-resume — restore the pending_wave flag we
+                // tentatively cleared, since we're not transitioning to
+                // Active yet.
+                if pending_wave {
+                    rec.pause_state.mark_pending_wave();
+                }
                 return Ok(None);
             };
             let sinks: Vec<Sink> = rec.subscribers.values().cloned().collect();
             let messages: Vec<Message> = buffer.into_iter().collect();
-            (sinks, messages, dropped)
+            // Default-mode pending-wave handling: schedule the fn-fire so
+            // the wave engine consolidates the pause-window dep deliveries
+            // into one fn execution. State nodes don't fire fn (no
+            // `pending_fires` membership has effect for them).
+            if pending_wave && was_default_mode {
+                s.pending_fires.insert(node_id);
+            }
+            (sinks, messages, dropped, pending_wave && was_default_mode)
         };
         let replayed = u32::try_from(messages.len()).unwrap_or(u32::MAX);
 
-        // Phase 2 (lock-released): fire sinks. Re-entrance into Core
-        // methods from a sink would re-acquire the parking_lot::Mutex; per
-        // the v1 limitation that's documented as forbidden, but we still
-        // release the lock here so a sink that *only* needs the binding
-        // (e.g., resolves a handle to a value via the registry) doesn't
-        // hold the Core lock unnecessarily during user callback execution.
-        // This deviates slightly from `flush_notifications` (which fires
-        // sinks with the lock held); resume is the only path that drops
-        // the lock for sink fires today, justified by it being a discrete
-        // out-of-wave dispatch.
+        // Phase 2 (lock-released): fire sinks for ResumeAll-buffered
+        // messages. Default-mode resume produces no buffered replay (the
+        // consolidated fn-fire produces fresh wave traffic via the standard
+        // commit_emission path).
         if !messages.is_empty() {
             for sink in &sinks {
                 sink(&messages);
@@ -2414,6 +2963,17 @@ impl Core {
                     self.binding.release_handle(h);
                 }
             }
+        }
+
+        // Phase 4 (default-mode): drain the consolidated fn-fire scheduled
+        // in Phase 1. `run_wave` re-acquires `wave_owner` reentrantly + runs
+        // the standard drain pipeline; the new fn-fire emerges as a normal
+        // wave's worth of messages to subscribers.
+        if pending_wave_for_default {
+            self.run_wave(|_this| {
+                // The pending_fires entry was pushed in Phase 1 under the
+                // lock. run_wave's drain picks it up.
+            });
         }
         Ok(Some(ResumeReport { replayed, dropped }))
     }
@@ -2511,6 +3071,28 @@ pub enum SetDepsError {
          either mark it resubscribable before terminate, or remove the dep from new_deps"
     )]
     TerminalDep { n: NodeId, dep: NodeId },
+
+    /// `n` itself is currently mid-fire — a user fn for `n` re-entered Core
+    /// via `set_deps(n, ...)` from inside `n`'s own `invoke_fn` /
+    /// `project_each` / `predicate_each` / etc. Phase 1 of the dispatcher
+    /// snapshotted `dep_handles` BEFORE the lock-released callback; the
+    /// callback returning a `tracked` set indexed against THAT ordering
+    /// would corrupt indices if the rewire re-orders deps mid-fire.
+    /// Rejected to preserve the dynamic-tracked-indices invariant (D1).
+    ///
+    /// Workaround: schedule the rewire from a different node's fn (via
+    /// `Core::emit` on a state node and observing the emit downstream),
+    /// or perform the rewire after the wave completes (e.g. from a sink
+    /// callback that is itself outside any fn-fire scope).
+    ///
+    /// Slice F (2026-05-07) — A6.
+    #[error(
+        "set_deps({n:?}, ...): rejected — node {n:?} is currently mid-fire \
+         (set_deps from inside the firing node's own fn would corrupt the \
+         Dynamic `tracked` indices snapshot taken before invoke_fn). \
+         Schedule the rewire outside this fire scope."
+    )]
+    ReentrantOnFiringNode { n: NodeId },
 }
 
 impl Core {
@@ -2556,6 +3138,16 @@ impl Core {
         // cannot be rewired; recovery is via resubscribable subscribe).
         if is_terminal {
             return Err(SetDepsError::TerminalNode { n });
+        }
+        // A6 reentrancy guard (Slice F, 2026-05-07): reject if `n` is
+        // currently mid-fire on the wave-owner thread. Closes the D1 hazard
+        // where `Phase 1` snapshotted `dep_handles` against pre-rewire dep
+        // ordering and `Phase 3` would store the returned `tracked` indices
+        // against post-rewire ordering. Same-thread re-entry is the only
+        // path that matters — cross-thread emits already block on
+        // `wave_owner` per the M1 design.
+        if s.currently_firing.contains(&n) {
+            return Err(SetDepsError::ReentrantOnFiringNode { n });
         }
         // Self-rewire rejection.
         if new_deps.contains(&n) {
@@ -2815,6 +3407,23 @@ impl CoreState {
     /// post-lock-drop release by the caller.
     pub(crate) fn clear_wave_state(&mut self) {
         self.pending_auto_resolve.clear();
+        // A6 (Slice F, 2026-05-07): currently_firing is push/pop balanced
+        // by FiringGuard's RAII (including on panic). It should already be
+        // empty here, but defensively clear in case a future code path
+        // forgets the guard.
+        self.currently_firing.clear();
+        // A3 (Slice F, 2026-05-07): pending_pause_overflow is normally
+        // drained by drain_and_flush via the synthesis loop. If a wave is
+        // panic-discarded BEFORE the synthesis runs (e.g. invoke_fn panics
+        // before a paused-overflow has a chance to synthesize), we drop the
+        // queued entries silently — the binding never sees ERROR for that
+        // overflow event, but the pause buffer's `dropped` count is
+        // unchanged so callers can still detect via ResumeReport. Re-firing
+        // the synthesis on the next wave would be confusing (the overflow
+        // event is logically scoped to the panicked wave).
+        self.pending_pause_overflow.clear();
+        // Slice G: tier3 emit tracking is wave-scoped.
+        self.tier3_emitted_this_wave.clear();
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;
@@ -2912,6 +3521,10 @@ impl Drop for CoreState {
                         self.binding.release_handle(h);
                     }
                 }
+            }
+            // Slice E1: release replay-buffer retains.
+            for &h in &rec.replay_buffer {
+                self.binding.release_handle(h);
             }
             // Operator scratch (Slice C-3, D026): generic per-operator
             // state struct. Each variant's release_handles releases the

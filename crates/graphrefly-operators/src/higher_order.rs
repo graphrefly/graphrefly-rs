@@ -251,35 +251,49 @@ pub fn switch_map(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch per `feedback_use_tier_for_signal_routing.md`
+                // and canonical §4.2 ("Always use the provided tier utilities
+                // rather than hardcoding type checks"). Tier 3 carries
+                // DATA/RESOLVED — only DATA has a payload_handle, so the
+                // `payload_handle().is_some()` test discriminates within
+                // the tier without referring to specific variants. Tier 5
+                // carries COMPLETE/ERROR — same shape (Error has handle,
+                // Complete doesn't).
                 for m in msgs {
-                    match m {
-                        Message::Data(h) => {
-                            // switchMap: only the LATEST outer DATA in the
-                            // batch matters (TS legacy "skip to last in
-                            // the batch to avoid creating + immediately
-                            // discarding N-1 inners"). Track the handle;
-                            // we'll project + subscribe once after the
-                            // lock drops. Skipped handles need no retain.
-                            plan.latest_outer_h = Some(*h);
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                // switchMap: only the LATEST outer DATA in the
+                                // batch matters (TS legacy "skip to last in
+                                // the batch to avoid creating + immediately
+                                // discarding N-1 inners"). Track the handle;
+                                // we'll project + subscribe once after the
+                                // lock drops. Skipped handles need no retain.
+                                plan.latest_outer_h = Some(h);
+                            }
+                            // else: Resolved on outer source — no action.
                         }
-                        Message::Complete => {
-                            s.source_done = true;
-                            if s.inner_sub.is_none()
-                                && plan.latest_outer_h.is_none()
-                                && !s.terminated
-                            {
-                                s.terminated = true;
-                                plan.self_complete = true;
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_outer.retain_handle(h);
+                                    plan.self_error = Some(h);
+                                }
+                            } else {
+                                // Complete
+                                s.source_done = true;
+                                if s.inner_sub.is_none()
+                                    && plan.latest_outer_h.is_none()
+                                    && !s.terminated
+                                {
+                                    s.terminated = true;
+                                    plan.self_complete = true;
+                                }
                             }
                         }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_outer.retain_handle(*h);
-                                plan.self_error = Some(*h);
-                            }
-                        }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action on outer source.
                     }
                 }
                 if let Some(h) = plan.latest_outer_h {
@@ -468,44 +482,52 @@ pub fn exhaust_map(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch (canonical §4.2; see
+                // `feedback_use_tier_for_signal_routing.md`).
                 for m in msgs {
-                    match m {
-                        Message::Data(h) => {
-                            // First DATA per active window wins.
-                            // Remember the first one we accept; subsequent
-                            // batch entries (or DATAs after) drop.
-                            if s.inner_sub.is_none() && plan.first_outer_h.is_none() {
-                                binding_for_outer.retain_handle(*h);
-                                plan.first_outer_h = Some(*h);
-                                plan.first_retained = true;
-                            }
-                        }
-                        Message::Complete => {
-                            s.source_done = true;
-                            if s.inner_sub.is_none()
-                                && plan.first_outer_h.is_none()
-                                && !s.terminated
-                            {
-                                s.terminated = true;
-                                plan.self_complete = true;
-                            }
-                        }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                // Release any retain we took for first_outer_h —
-                                // we won't be projecting it.
-                                if plan.first_retained {
-                                    if let Some(h0) = plan.first_outer_h.take() {
-                                        binding_for_outer.release_handle(h0);
-                                        plan.first_retained = false;
-                                    }
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                // First DATA per active window wins.
+                                // Remember the first one we accept; subsequent
+                                // batch entries (or DATAs after) drop.
+                                if s.inner_sub.is_none() && plan.first_outer_h.is_none() {
+                                    binding_for_outer.retain_handle(h);
+                                    plan.first_outer_h = Some(h);
+                                    plan.first_retained = true;
                                 }
-                                binding_for_outer.retain_handle(*h);
-                                plan.self_error = Some(*h);
+                            }
+                            // else: Resolved on outer source — no action.
+                        }
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    // Release any retain we took for
+                                    // first_outer_h — we won't be projecting it.
+                                    if plan.first_retained {
+                                        if let Some(h0) = plan.first_outer_h.take() {
+                                            binding_for_outer.release_handle(h0);
+                                            plan.first_retained = false;
+                                        }
+                                    }
+                                    binding_for_outer.retain_handle(h);
+                                    plan.self_error = Some(h);
+                                }
+                            } else {
+                                // Complete
+                                s.source_done = true;
+                                if s.inner_sub.is_none()
+                                    && plan.first_outer_h.is_none()
+                                    && !s.terminated
+                                {
+                                    s.terminated = true;
+                                    plan.self_complete = true;
+                                }
                             }
                         }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }
@@ -734,32 +756,40 @@ pub fn merge_map_with_concurrency(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch (canonical §4.2; see
+                // `feedback_use_tier_for_signal_routing.md`).
                 for m in msgs {
-                    match m {
-                        Message::Data(h) => {
-                            // Retain on enqueue — released by drain
-                            // after invoke_project.
-                            binding_for_outer.retain_handle(*h);
-                            s.buffer.push_back(*h);
-                        }
-                        Message::Complete => {
-                            s.source_done = true;
-                            if s.active == 0 && s.buffer.is_empty() && !s.terminated {
-                                s.terminated = true;
-                                self_complete_now = true;
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Retain on enqueue — released by drain
+                                // after invoke_project.
+                                binding_for_outer.retain_handle(h);
+                                s.buffer.push_back(h);
                             }
+                            // else: Resolved on outer source — no action.
                         }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_outer.retain_handle(*h);
-                                while let Some(q) = s.buffer.pop_front() {
-                                    binding_for_outer.release_handle(q);
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_outer.retain_handle(h);
+                                    while let Some(q) = s.buffer.pop_front() {
+                                        binding_for_outer.release_handle(q);
+                                    }
+                                    error_action = Some(h);
                                 }
-                                error_action = Some(*h);
+                            } else {
+                                // Complete
+                                s.source_done = true;
+                                if s.active == 0 && s.buffer.is_empty() && !s.terminated {
+                                    s.terminated = true;
+                                    self_complete_now = true;
+                                }
                             }
                         }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }

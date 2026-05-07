@@ -285,6 +285,49 @@ pub trait BindingBoundary: Send + Sync {
     /// on captured handle shares, or even `subscribe` for re-activation
     /// scenarios — though the latter is unusual) is permitted.
     fn producer_deactivate(&self, _node_id: NodeId) {}
+
+    /// R1.3.8.c / Lock 6.A — synthesize an ERROR payload when a paused
+    /// node's pause buffer overflows the configured cap. Called once per
+    /// overflow event (the first drop of a pause cycle); the returned
+    /// handle becomes the payload of `Message::Error` that Core then
+    /// emits via the standard terminal cascade.
+    ///
+    /// Bindings that ship their own diagnostic shape (e.g. structured
+    /// `{ code, nodeId, dropped, configuredMax, lockHeldDurationMs }`
+    /// JSON for the JS / Python sides) override this to intern such a
+    /// value and return its handle.
+    ///
+    /// **Default returns `None`** — Rust core falls back to the silent
+    /// drop + `ResumeReport.dropped` path. This preserves backward
+    /// compatibility for bindings that haven't yet wired up R1.3.8.c.
+    /// New bindings SHOULD implement this method to satisfy the
+    /// canonical-spec invariant.
+    ///
+    /// **Returning `None` consumes the overflow event for the cycle**
+    /// (QA A9, 2026-05-07): the per-pause-cycle `overflow_reported` flag
+    /// is set BEFORE this hook is called, so a `None` return doesn't
+    /// re-attempt synthesis on subsequent overflows in the same cycle.
+    /// If the binding is going to dynamically wire up the hook
+    /// (configuration-driven), do so before any pause cycle that may
+    /// overflow.
+    ///
+    /// Fires lock-released. The binding may re-enter Core (typical
+    /// implementation just calls `intern_value` and returns).
+    ///
+    /// `lock_held_duration_ms` is the wall-clock-monotonic duration in
+    /// milliseconds since the node first transitioned `Active → Paused`
+    /// at the start of this pause cycle; it gives consumers a sense of
+    /// how long a leaked controller held the lockset before overflow.
+    /// Sub-millisecond durations truncate to `0` (QA A8, 2026-05-07).
+    fn synthesize_pause_overflow_error(
+        &self,
+        _node_id: NodeId,
+        _dropped_count: u32,
+        _configured_max: usize,
+        _lock_held_duration_ms: u64,
+    ) -> Option<HandleId> {
+        None
+    }
 }
 
 #[cfg(test)]

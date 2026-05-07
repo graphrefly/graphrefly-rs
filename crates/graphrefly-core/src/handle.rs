@@ -114,6 +114,23 @@ impl FnId {
 /// Each node maintains a lockset (`HashSet<LockId>`); `paused` derives from
 /// `lockset.is_empty()`. Unknown-lockId `Resume` is a no-op (idempotent
 /// dispose).
+///
+/// # Allocation ranges (Slice F, A4 — 2026-05-07)
+///
+/// To prevent collision between user-supplied and dispatcher-allocated lock
+/// ids:
+///
+/// - `[0, 1<<32)` — **user range.** Direct callers of [`LockId::new`] (and
+///   the napi-rs binding's `u32 → LockId` marshalling) live here. Pick any
+///   value you like; the dispatcher will not allocate any id in this range.
+/// - `[1<<32, u64::MAX]` — **dispatcher range.** [`crate::Core::alloc_lock_id`]
+///   draws from this range, starting at `1<<32` and incrementing. Allocation
+///   is monotonic; no recycling.
+///
+/// Both constructors are public — the range convention is by construction at
+/// the dispatcher, not by visibility on the type. If a binding marshals lock
+/// ids beyond `u32::MAX` from user-facing input, raise the dispatcher floor
+/// (`CoreState::next_lock_id`) at construction time.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
 pub struct LockId(u64);
 

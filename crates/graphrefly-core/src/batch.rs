@@ -83,6 +83,55 @@ pub(crate) struct PendingPerNode {
     pub(crate) messages: Vec<Message>,
 }
 
+/// RAII helper for the A6 reentrancy guard (Slice F, 2026-05-07).
+///
+/// Pushes `node_id` onto [`CoreState::currently_firing`] on construction,
+/// pops it on Drop. [`Core::set_deps`] consults the stack and rejects
+/// `set_deps(N, ...)` from inside N's own fn-fire with
+/// [`crate::node::SetDepsError::ReentrantOnFiringNode`] — closing the
+/// D1 hazard where Phase-1's snapshot of `dep_handles` would refer to
+/// a different dep ordering than Phase-3's `tracked` storage.
+///
+/// Wraps the lock-released `invoke_fn` (and operator-equivalent FFI
+/// callbacks like `project_each` / `predicate_each`). Drop fires even
+/// on panic, so the stack stays balanced under user-fn unwinds.
+///
+/// Membership semantics (NOT strict LIFO): the only consumer of
+/// `currently_firing` is `Core::set_deps`'s reentrancy check, which uses
+/// `contains(&n)` — a set-membership test. Drop pops the right-most
+/// matching `node_id` via `rposition` + `swap_remove`. For a stack like
+/// `[A, B, A]` (A's fn re-enters B, B's fn re-enters A), B's drop pops
+/// the SECOND A (index 1) via swap_remove, leaving `[A, A]` — the
+/// physical order of the remaining As may not match construction order,
+/// but membership is preserved. If a future call site needs strict LIFO
+/// (e.g. "pop the most recently fired node"), switch to `pop()` + assert
+/// the popped value equals `self.node_id`. (QA A6, 2026-05-07)
+pub(crate) struct FiringGuard {
+    core: Core,
+    node_id: NodeId,
+}
+
+impl FiringGuard {
+    pub(crate) fn new(core: &Core, node_id: NodeId) -> Self {
+        core.lock_state().currently_firing.push(node_id);
+        Self {
+            core: core.clone(),
+            node_id,
+        }
+    }
+}
+
+impl Drop for FiringGuard {
+    fn drop(&mut self) {
+        let mut s = self.core.lock_state();
+        if let Some(pos) = s.currently_firing.iter().rposition(|n| *n == self.node_id) {
+            s.currently_firing.swap_remove(pos);
+        }
+        // else: already popped by an external rebalance — silent no-op
+        // for Drop discipline (panic-in-Drop is poison).
+    }
+}
+
 /// Borrow the per-operator scratch slot as `&T`. Panics if the slot is
 /// uninitialized or the contained type doesn't match `T` — both are
 /// invariant violations for any `fire_op_*` helper that should only be
@@ -203,19 +252,64 @@ impl Core {
     pub(crate) fn drain_and_flush(&self) {
         let mut guard = 0u32;
         loop {
-            guard += 1;
-            assert!(
-                guard < 10_000,
-                "wave drain exceeded 10k iterations (cycle?)"
-            );
-            // Pick next fire under a short lock.
-            let next = {
+            // R1.3.8.c (Slice F, A3): if no fires are pending but there are
+            // queued pause-overflow ERRORs, synthesize them now. The
+            // resulting ERROR cascade may add to pending_fires (children
+            // settling their terminal state), so we loop back to drain.
+            let synth_pending = {
+                let mut s = self.lock_state();
+                if s.pending_fires.is_empty() && !s.pending_pause_overflow.is_empty() {
+                    std::mem::take(&mut s.pending_pause_overflow)
+                } else {
+                    Vec::new()
+                }
+            };
+            for entry in synth_pending {
+                // Lock-released call to the binding hook. Default impl
+                // returns None — the binding has opted out of R1.3.8.c
+                // and we fall back to silent-drop + ResumeReport.dropped.
+                let handle = self.binding.synthesize_pause_overflow_error(
+                    entry.node_id,
+                    entry.dropped_count,
+                    entry.configured_max,
+                    entry.lock_held_ns / 1_000_000,
+                );
+                if let Some(h) = handle {
+                    // Re-enter Core::error to terminate the node and
+                    // cascade. We're inside a wave (`in_tick = true`),
+                    // so error() gets a non-owning batch guard — it
+                    // doesn't try to start its own drain. The cascade
+                    // queues into our outer drain via pending_fires
+                    // and pending_notify.
+                    self.error(entry.node_id, h);
+                }
+            }
+
+            // Pick next fire under a short lock. Also re-read the configured
+            // drain cap so callers can tune via `Core::set_max_batch_drain_iterations`
+            // without restarting waves mid-flight.
+            let (next, cap, pending_size) = {
                 let s = self.lock_state();
                 if s.pending_fires.is_empty() {
                     break;
                 }
-                self.pick_next_fire(&s)
+                let cap = s.max_batch_drain_iterations;
+                let pending_size = s.pending_fires.len();
+                let next = self.pick_next_fire(&s);
+                (next, cap, pending_size)
             };
+            guard += 1;
+            assert!(
+                guard < cap,
+                "wave drain exceeded {cap} iterations \
+                 (pending_fires={pending_size}). Most likely cause: a runtime \
+                 cycle introduced by an operator that re-arms its own pending_fires \
+                 slot from inside `invoke_fn` (e.g. a producer that subscribes to \
+                 itself, or a fn that calls Core::emit on a node whose fn fires \
+                 the original node again). Structural cycles via set_deps are \
+                 rejected at edge-mutation time. Tune via Core::set_max_batch_drain_iterations \
+                 only with concrete evidence the workload needs more iterations."
+            );
             let Some(next) = next else { break };
             // fire_fn manages its own locking around invoke_fn.
             self.fire_fn(next);
@@ -332,6 +426,7 @@ impl Core {
     /// processed in sequence — Data via `commit_emission_verbatim` (no
     /// equals substitution per R1.3.2.d / R1.3.3.c), Complete/Error via
     /// terminal cascade.
+    #[allow(clippy::too_many_lines)] // Slice G added Noop / Batch tier-3 guards
     fn fire_regular(&self, node_id: NodeId) {
         enum FireAction {
             None,
@@ -367,8 +462,15 @@ impl Core {
             return;
         };
 
-        // Phase 2: invoke fn lock-released.
-        let result = self.binding.invoke_fn(node_id, fn_id, &dep_batches);
+        // Phase 2: invoke fn lock-released. A6 reentrancy guard is scoped to
+        // the FFI call only — Phase 3's lock-held state mutation is not part
+        // of "currently firing" because set_deps would already block on the
+        // state lock by then. Drop on the guard pops the stack even if
+        // invoke_fn panics, keeping `currently_firing` balanced.
+        let result = {
+            let _firing = FiringGuard::new(self, node_id);
+            self.binding.invoke_fn(node_id, fn_id, &dep_batches)
+        };
 
         // Phase 3: apply result under the lock — defensive terminal check
         // (a sibling cascade may have terminated this node during phase 2).
@@ -410,8 +512,14 @@ impl Core {
             }
             match result {
                 FnResult::Noop { .. } => {
+                    // Slice G: skip Resolved if a prior emission in the same
+                    // wave already queued tier-3 (would violate R1.3.3.a).
                     let already_dirty = s.require_node(node_id).dirty;
-                    if already_dirty {
+                    let already_tier3 = s
+                        .pending_notify
+                        .get(&node_id)
+                        .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+                    if already_dirty && !already_tier3 {
                         self.queue_notify(&mut s, node_id, Message::Resolved);
                     }
                     FireAction::None
@@ -419,9 +527,14 @@ impl Core {
                 FnResult::Data { handle, .. } => FireAction::SingleData(handle),
                 FnResult::Batch { emissions, .. } if emissions.is_empty() => {
                     // Empty Batch is equivalent to Noop — settle with
-                    // RESOLVED if the node was dirty (R1.3.1.a).
+                    // RESOLVED if the node was dirty (R1.3.1.a). Slice G:
+                    // skip if a prior emission already queued tier-3.
                     let already_dirty = s.require_node(node_id).dirty;
-                    if already_dirty {
+                    let already_tier3 = s
+                        .pending_notify
+                        .get(&node_id)
+                        .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+                    if already_dirty && !already_tier3 {
                         self.queue_notify(&mut s, node_id, Message::Resolved);
                     }
                     FireAction::None
@@ -517,6 +630,28 @@ impl Core {
         };
         let (old_handle, equals_mode) = snapshot;
 
+        // Slice G (2026-05-07): R1.3.2.d says equals substitution only
+        // fires for SINGLE-DATA waves at one node. Detect "this is a
+        // subsequent emit in the same wave at this node" via the
+        // wave-scoped `tier3_emitted_this_wave` set. If set → multi-emit
+        // wave: skip equals, queue Data verbatim, retroactively rewrite
+        // any prior Resolved (queued by an earlier same-value emit's
+        // equals match) to Data using the wave-start cache snapshot.
+        // Outside batch / first emit: standard per-emit equals path.
+        let is_subsequent_emit_in_wave = {
+            let s = self.lock_state();
+            s.tier3_emitted_this_wave.contains(&node_id)
+        };
+
+        if is_subsequent_emit_in_wave {
+            // Multi-emit wave detected. Skip equals, queue Data verbatim.
+            // Also rewrite any prior Resolved entries to Data using the
+            // wave-start cache snapshot.
+            self.rewrite_prior_resolved_to_data(node_id);
+            self.commit_emission_verbatim(node_id, new_handle);
+            return;
+        }
+
         // Phase 2: equals check (lock-released for Custom).
         let is_data = !self.handles_equal_lock_released(equals_mode, old_handle, new_handle);
 
@@ -543,20 +678,7 @@ impl Core {
             // re-entry from a `custom_equals` oracle that called back into
             // `Core::emit` on this same node during phase 2's lock-released
             // equals check could have advanced the cache between phase 1's
-            // snapshot (`old_handle`) and this point. The wave-owner mutex
-            // (Q2) prevents cross-thread concurrent commits, but same-thread
-            // nested commits are intentionally allowed. Releasing
-            // `old_handle` instead of the actual displaced handle would
-            // cause a double-release on the binding side AND leak the
-            // intermediate cache (the value the nested commit wrote).
-            //
-            // Note: `is_data` was computed against `(old_handle, new_handle)`
-            // during phase 2; if the cache moved, the equals decision could
-            // be stale. For Identity equals: if `current_cache == new_handle`,
-            // we'll redundantly emit DATA when RESOLVED would suffice
-            // (benign — subscribers see one extra DATA in the rare race).
-            // For Custom equals racing the same-node: undefined, documented
-            // in `porting-deferred.md`.
+            // snapshot (`old_handle`) and this point.
             let current_cache = s.require_node(node_id).cache;
             let snapshot_taken = if s.in_tick && current_cache != NO_HANDLE {
                 use std::collections::hash_map::Entry;
@@ -574,6 +696,12 @@ impl Core {
             if current_cache != NO_HANDLE && !snapshot_taken {
                 self.binding.release_handle(current_cache);
             }
+            // Slice E1 (R2.6.5 / Lock 6.G): push DATA into the replay
+            // buffer if the node opted in. RESOLVED entries are NOT
+            // buffered (canonical "DATA only").
+            self.push_replay_buffer(&mut s, node_id, new_handle);
+            // Slice G: mark this node as having emitted tier-3 in this wave.
+            s.tier3_emitted_this_wave.insert(node_id);
             self.queue_notify(&mut s, node_id, Message::Data(new_handle));
             // Propagate to children
             let child_ids: Vec<NodeId> = s
@@ -589,15 +717,19 @@ impl Core {
             }
         } else {
             // RESOLVED: handle unchanged. Don't release; old still in use.
+            // Slice G: snapshot cache so a subsequent same-wave emit can
+            // rewrite this Resolved to Data using the snapshot.
+            let current_cache = s.require_node(node_id).cache;
+            if s.in_tick && current_cache != NO_HANDLE {
+                use std::collections::hash_map::Entry;
+                if let Entry::Vacant(slot) = s.wave_cache_snapshots.entry(node_id) {
+                    self.binding.retain_handle(current_cache);
+                    slot.insert(current_cache);
+                }
+            }
+            // Slice G: mark this node as having emitted tier-3 in this wave.
+            s.tier3_emitted_this_wave.insert(node_id);
             self.queue_notify(&mut s, node_id, Message::Resolved);
-            // Children that haven't been involved this wave need DIRTY
-            // propagation so their subscribers see wave-open. Don't queue
-            // Resolved here — the child may later receive DATA in the same
-            // wave (e.g. batch scope with multiple emits on the same source)
-            // and fire, settling via commit_emission. Eagerly queueing
-            // Resolved would double-settle the Dirty. The post-drain
-            // auto-resolve sweep in drain_and_flush settles any node with
-            // Dirty but no tier-3 message.
             let child_ids: Vec<NodeId> = s
                 .children
                 .get(&node_id)
@@ -615,6 +747,52 @@ impl Core {
                     s.pending_auto_resolve.insert(child_id);
                 }
             }
+        }
+    }
+
+    /// Slice G: when a multi-emit wave is detected at `node_id` (a second
+    /// emit arrives while a prior tier-3 message is still pending), rewrite
+    /// any `Resolved` entries from earlier emits to `Data(snapshot_cache)`
+    /// so the wave conforms to R1.3.3.a (≥1 DATA OR exactly 1 RESOLVED).
+    /// Touches both `pending_notify` (immediate-flush path) and the per-node
+    /// pause buffer (paused path).
+    fn rewrite_prior_resolved_to_data(&self, node_id: NodeId) {
+        let mut s = self.lock_state();
+        let snapshot = match s.wave_cache_snapshots.get(&node_id).copied() {
+            Some(h) if h != NO_HANDLE => h,
+            // No snapshot available — the prior Resolved was queued without
+            // a cache (sentinel pre-emit). Nothing to rewrite to; the
+            // multi-emit case from sentinel is fine (verbatim Data path).
+            _ => return,
+        };
+        let mut retains_needed = 0u32;
+        // Pending_notify path.
+        if let Some(entry) = s.pending_notify.get_mut(&node_id) {
+            for msg in &mut entry.messages {
+                if matches!(msg, Message::Resolved) {
+                    *msg = Message::Data(snapshot);
+                    retains_needed += 1;
+                }
+            }
+        }
+        // Pause-buffer path.
+        if let Some(rec) = s.nodes.get_mut(&node_id) {
+            if let crate::node::PauseState::Paused { buffer, .. } = &mut rec.pause_state {
+                for msg in &mut *buffer {
+                    if matches!(msg, Message::Resolved) {
+                        *msg = Message::Data(snapshot);
+                        retains_needed += 1;
+                    }
+                }
+            }
+        }
+        drop(s);
+        // Each rewritten Resolved → Data adds a payload retain that
+        // queue_notify would otherwise have taken at emit time. The
+        // snapshot already owns one retain (taken when cache was
+        // snapshotted); we need one fresh retain per rewrite.
+        for _ in 0..retains_needed {
+            self.binding.retain_handle(snapshot);
         }
     }
 
@@ -679,6 +857,17 @@ impl Core {
         if current_cache != NO_HANDLE && !snapshot_taken {
             self.binding.release_handle(current_cache);
         }
+        // Slice E1: replay buffer push (R2.6.5 / Lock 6.G).
+        self.push_replay_buffer(&mut s, node_id, new_handle);
+        // Slice G QA fix (A2, 2026-05-07): mark tier3_emitted_this_wave
+        // even on the verbatim path. A subsequent commit_emission at the
+        // same node in the same wave needs this flag to detect multi-emit
+        // and skip equals substitution; without it, a Batch-then-standard
+        // sequence would queue Resolved into a wave that already has Data
+        // — violating R1.3.3.a. The Batch path itself still passes
+        // verbatim per R1.3.3.c (we don't re-run equals here); we just
+        // record that "this node has emitted tier-3 in this wave."
+        s.tier3_emitted_this_wave.insert(node_id);
         self.queue_notify(&mut s, node_id, Message::Data(new_handle));
         // Propagate to children
         let child_ids: Vec<NodeId> = s
@@ -691,6 +880,34 @@ impl Core {
             if let Some(idx) = dep_idx {
                 self.deliver_data_to_consumer(&mut s, child_id, idx, new_handle);
             }
+        }
+    }
+
+    /// Slice E1 (R2.6.5 / Lock 6.G): push a DATA handle into the node's
+    /// replay buffer if opted in. Evicts oldest if cap exceeded; takes a
+    /// fresh retain on push. RESOLVED is NOT buffered per canonical
+    /// "DATA only" — call sites only invoke this for Data emissions.
+    ///
+    /// Evicted handle is queued into `s.deferred_handle_releases`
+    /// (released lock-released at flush time) per the binding-boundary
+    /// lock-release discipline — `release_handle` may re-enter Core via
+    /// finalizers and must not run while the state lock is held
+    /// (QA A3, 2026-05-07).
+    fn push_replay_buffer(&self, s: &mut CoreState, node_id: NodeId, new_handle: HandleId) {
+        let rec = s.require_node_mut(node_id);
+        let cap = match rec.replay_buffer_cap {
+            Some(c) if c > 0 => c,
+            _ => return,
+        };
+        self.binding.retain_handle(new_handle);
+        rec.replay_buffer.push_back(new_handle);
+        let evicted = if rec.replay_buffer.len() > cap {
+            rec.replay_buffer.pop_front()
+        } else {
+            None
+        };
+        if let Some(h) = evicted {
+            s.deferred_handle_releases.push(h);
         }
     }
 
@@ -743,6 +960,13 @@ impl Core {
         if !proceed {
             return;
         }
+
+        // A6 (Slice F, 2026-05-07): track operator fire on the
+        // `currently_firing` stack so a binding-side project/predicate/fold
+        // FFI callback that re-enters `Core::set_deps(node_id, ...)` is
+        // rejected with `SetDepsError::ReentrantOnFiringNode`. Drop pops
+        // the stack on panic too.
+        let _firing = FiringGuard::new(self, node_id);
 
         match op {
             OperatorOp::Map { fn_id } => self.fire_op_map(node_id, fn_id),
@@ -798,7 +1022,15 @@ impl Core {
         if !already_dirty {
             self.queue_notify(&mut s, node_id, Message::Dirty);
         }
-        self.queue_notify(&mut s, node_id, Message::Resolved);
+        // Slice G: skip Resolved if pending_notify already has a tier-3
+        // message — adding Resolved would violate R1.3.3.a.
+        let already_tier3 = s
+            .pending_notify
+            .get(&node_id)
+            .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+        if !already_tier3 {
+            self.queue_notify(&mut s, node_id, Message::Resolved);
+        }
     }
 
     /// `OperatorOp::Map` dispatch.
@@ -1498,6 +1730,16 @@ impl Core {
         let is_dynamic;
         let is_state;
         let tracked_or_first_fire;
+        // Slice F audit close (2026-05-07): default-mode pause suppression.
+        // If the consumer is paused with `PausableMode::Default`, the
+        // canonical-spec §2.6 behavior is to suppress fn-fire and consolidate
+        // pause-window dep deliveries into one fn execution on RESUME.
+        // Mark `pending_wave` on the pause state instead of adding to
+        // `pending_fires`. The dep state still advances (the data_batch push
+        // above is unchanged), and clear_wave_state still rotates the latest
+        // dep DATA into prev_data — so when the fn ultimately fires on
+        // RESUME, it sees the consolidated post-pause state.
+        let suppressed_for_default_pause;
         {
             let consumer = s.require_node_mut(consumer_id);
             consumer.dep_records[dep_idx].data_batch.push(handle);
@@ -1506,6 +1748,16 @@ impl Core {
             is_dynamic = consumer.is_dynamic;
             is_state = consumer.is_state();
             tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);
+            suppressed_for_default_pause = consumer.pause_state.is_paused()
+                && consumer.pausable == crate::node::PausableMode::Default;
+            if suppressed_for_default_pause {
+                consumer.pause_state.mark_pending_wave();
+            }
+        }
+        if suppressed_for_default_pause {
+            // Default-mode pause: don't add to pending_fires; RESUME will
+            // schedule one consolidated fire.
+            return;
         }
         if is_state {
             // State nodes don't have deps; unreachable in practice.
@@ -1545,6 +1797,50 @@ impl Core {
     ///   flush immediately. START (tier 0) is per-subscription and never
     ///   transits queue_notify.
     pub(crate) fn queue_notify(&self, s: &mut CoreState, node_id: NodeId, msg: Message) {
+        // R1.3.3.a / R1.3.3.d (Slice G — re-added 2026-05-07): dev-mode
+        // wave-content invariant assertion. The tier-3 slot at one node in
+        // one wave is either ≥1 DATA or exactly 1 RESOLVED — never mixed,
+        // never multiple RESOLVED. Slice G moved equals substitution from
+        // per-emit to wave-end coalescing; this assert pins that the
+        // dispatcher itself never queues a violating combination at the
+        // queue_notify granularity. Resolved arrivals come from:
+        //   1. The auto-resolve sweep in `drain_and_flush` (gates on
+        //      `!any tier-3` so it can't add to a wave with Data).
+        //   2. The wave-end equals-substitution pass (rewrites in place,
+        //      doesn't go through queue_notify).
+        // Both honor R1.3.3.a by construction post-Slice-G.
+        #[cfg(debug_assertions)]
+        if matches!(msg.tier(), 3) {
+            if let Some(entry) = s.pending_notify.get(&node_id) {
+                let has_data = entry.messages.iter().any(|m| matches!(m, Message::Data(_)));
+                let resolved_count = entry
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, Message::Resolved))
+                    .count();
+                let incoming_is_data = matches!(msg, Message::Data(_));
+                if incoming_is_data {
+                    debug_assert!(
+                        resolved_count == 0,
+                        "R1.3.3.a violation at {node_id:?}: queueing Data into a \
+                         wave that already contains Resolved — Slice G should have \
+                         prevented this via wave-end coalescing"
+                    );
+                } else {
+                    debug_assert!(
+                        !has_data,
+                        "R1.3.3.a violation at {node_id:?}: queueing Resolved into a \
+                         wave that already contains Data"
+                    );
+                    debug_assert!(
+                        resolved_count == 0,
+                        "R1.3.3.a violation at {node_id:?}: multiple Resolved in one \
+                         wave at one node"
+                    );
+                }
+            }
+        }
+
         let buffered_tier = matches!(msg.tier(), 3 | 4);
         let cap = s.pause_buffer_cap;
 
@@ -1555,14 +1851,48 @@ impl Core {
             if rec.subscribers.is_empty() {
                 return;
             }
-            if buffered_tier && rec.pause_state.is_paused() {
+            // Slice F audit close (2026-05-07): pause routing depends on mode.
+            //   - `ResumeAll`: buffer tier-3/4 for verbatim replay on RESUME.
+            //   - `Default` + STATE node: state nodes have no fn-fire to
+            //     suppress, so buffer like resumeAll (collapse-to-latest is
+            //     a future enhancement; v1 keeps verbatim).
+            //   - `Default` + COMPUTE node: suppression happens upstream at
+            //     fn-fire scheduling (see `deliver_data_to_consumer`); no
+            //     outgoing tier-3 is produced from this node while paused,
+            //     so this branch is unreachable for compute-default-paused.
+            //     Fallthrough to the non-paused queue path is fine.
+            //   - `Off`: pause is ignored entirely — tier-3 flushes
+            //     immediately. Fallthrough.
+            let mode_buffers_tier3 = match rec.pausable {
+                crate::node::PausableMode::ResumeAll => true,
+                crate::node::PausableMode::Default => rec.is_state(),
+                crate::node::PausableMode::Off => false,
+            };
+            if buffered_tier && mode_buffers_tier3 && rec.pause_state.is_paused() {
                 if let Some(h) = msg.payload_handle() {
                     self.binding.retain_handle(h);
                 }
-                let dropped_msgs = rec.pause_state.push_buffered(msg, cap);
-                for dm in dropped_msgs {
+                let push_result = rec.pause_state.push_buffered(msg, cap);
+                for dm in push_result.dropped_msgs {
                     if let Some(h) = dm.payload_handle() {
                         self.binding.release_handle(h);
+                    }
+                }
+                // R1.3.8.c (Slice F, A3): on first overflow this cycle,
+                // schedule a synthesized ERROR for wave-end emission.
+                // `cap` is `Some` here (an overflow can only happen with a
+                // configured cap), so `unwrap` is safe.
+                if push_result.first_overflow_this_cycle {
+                    if let Some((dropped_count, lock_held_ns)) =
+                        rec.pause_state.overflow_diagnostic()
+                    {
+                        s.pending_pause_overflow
+                            .push(crate::node::PendingPauseOverflow {
+                                node_id,
+                                dropped_count,
+                                configured_max: cap.unwrap_or(0),
+                                lock_held_ns,
+                            });
                     }
                 }
                 return;

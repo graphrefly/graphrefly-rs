@@ -207,6 +207,16 @@ fn complete_cascades_through_diamond() {
 fn complete_buffers_through_pause_only_for_buffered_tiers() {
     // Tier 5 (COMPLETE) is NOT buffered while paused — it bypasses pause
     // per spec § 1.3.7.b. Verify this end-to-end.
+    //
+    // Slice F (A3, 2026-05-07) tightening: when a paused node is terminated
+    // (COMPLETE / ERROR), the dispatcher now drains the pause buffer and
+    // releases payload retains as part of `terminate_node` — without this,
+    // buffered DATA would (a) leak refcount shares forever, and (b) be
+    // observable via resume AFTER the terminal had already fired, violating
+    // the natural lifecycle order (no DATA after COMPLETE). The previous
+    // version of this test asserted `replayed == 1` post-complete, which
+    // exercised the bug; the new assertion is `replayed == 0` because the
+    // buffer is drained by the terminal cascade.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let rec = rt.subscribe_recorder(s.id);
@@ -216,7 +226,7 @@ fn complete_buffers_through_pause_only_for_buffered_tiers() {
     rt.core.pause(s.id, lock).expect("pause");
 
     s.set(TestValue::Int(1)); // tier 3 — buffered
-    rt.core.complete(s.id); // tier 5 — bypasses buffer
+    rt.core.complete(s.id); // tier 5 — bypasses buffer; ALSO drains buffer
 
     // Subscriber should have seen COMPLETE immediately even while paused.
     let mid_complete = rec.snapshot()[baseline..]
@@ -225,9 +235,25 @@ fn complete_buffers_through_pause_only_for_buffered_tiers() {
         .count();
     assert_eq!(mid_complete, 1, "COMPLETE bypasses pause buffer");
 
-    // The buffered DATA(1) gets replayed on resume (still flushable).
-    let report = rt.core.resume(s.id, lock).expect("resume").expect("final");
-    assert_eq!(report.replayed, 1);
+    // After complete drained the buffer, the resume call sees the node is
+    // no longer paused (terminate_node collapsed pause_state to Active).
+    // Per `Core::resume` semantics, an unknown lockId on an unpaused node
+    // returns `Ok(None)` — the lockset is empty, no final-resume report.
+    let report = rt.core.resume(s.id, lock).expect("resume");
+    assert!(
+        report.is_none(),
+        "node was unpaused by complete; resume is a no-op"
+    );
+
+    // No further DATA emissions after COMPLETE.
+    let post_complete_data = rec.snapshot()[baseline..]
+        .iter()
+        .filter(|e| matches!(e, RecordedEvent::Data(_)))
+        .count();
+    assert_eq!(
+        post_complete_data, 0,
+        "no DATA can flow after the terminal cascade"
+    );
 }
 
 #[test]

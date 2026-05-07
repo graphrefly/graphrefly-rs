@@ -329,6 +329,14 @@ fn lock_ids_are_unique() {
 
 #[test]
 fn pause_buffers_derived_data_through_diamond() {
+    // Slice F audit close (2026-05-07): rewritten for `PausableMode::ResumeAll`.
+    // Pre-rewrite this asserted ResumeAll semantics under what was then the
+    // (incorrectly chosen) sole pause mode. With canonical §2.6 default mode
+    // now the default, ResumeAll must be opted into. See the parallel
+    // `pause_default_mode_consolidates_to_one_fn_fire_on_resume` for the
+    // canonical-default case.
+    use graphrefly_core::PausableMode;
+
     let rt = TestRuntime::new();
     let a = rt.state(Some(TestValue::Int(1)));
     let b = rt.derived(&[a.id], |deps| match &deps[0] {
@@ -348,6 +356,9 @@ fn pause_buffers_derived_data_through_diamond() {
             _ => panic!("type"),
         }
     });
+    // Opt into ResumeAll BEFORE subscribe so the activation wave runs
+    // under the same semantics the rest of the test expects.
+    rt.core.set_pausable_mode(d, PausableMode::ResumeAll);
     let rec = rt.subscribe_recorder(d);
 
     // Initial activation: a=1 → b=2, c=3, d=5 (one fire).
@@ -371,7 +382,7 @@ fn pause_buffers_derived_data_through_diamond() {
         .count();
     assert_eq!(
         mid_data_count, 0,
-        "d's outgoing DATA buffered while d is paused"
+        "d's outgoing DATA buffered while d is paused (ResumeAll mode)"
     );
 
     let report = rt.core.resume(d, lock).expect("resume").expect("final");

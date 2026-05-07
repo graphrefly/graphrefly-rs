@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use graphrefly_core::{Core, HandleId, Message, NodeId, Sink};
+use graphrefly_core::{Core, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
 
 use super::producer::{ProducerBinding, ProducerCtx};
@@ -118,48 +118,58 @@ pub fn zip(
                     if s.terminated {
                         return;
                     }
+                    // Tier-based dispatch (canonical §4.2; see
+                    // `feedback_use_tier_for_signal_routing.md`). Tier 3
+                    // payload_handle.is_some() = DATA; tier 5
+                    // payload_handle.is_some() = ERROR else COMPLETE.
                     for m in msgs {
-                        match m {
-                            Message::Data(h) => {
-                                binding_inner.retain_handle(*h);
-                                s.queues[idx].push_back(*h);
-                                // Collect complete tuples — pack_tuple runs
-                                // after the lock drops (P5).
-                                while s.queues.iter().all(|q| !q.is_empty()) {
-                                    let popped: Vec<HandleId> = s
-                                        .queues
-                                        .iter_mut()
-                                        .map(|q| q.pop_front().unwrap())
-                                        .collect();
-                                    post_actions.push(PostLockAction::PackAndEmit(popped));
-                                }
-                            }
-                            Message::Complete => {
-                                s.completed[idx] = true;
-                                // If this source's queue is empty, no more
-                                // tuples from it — terminate.
-                                if s.queues[idx].is_empty() && !s.terminated {
-                                    s.terminated = true;
-                                    // P2: release all remaining queued handles.
-                                    for q in &mut s.queues {
-                                        to_release.extend(q.drain(..));
+                        match m.tier() {
+                            3 => {
+                                if let Some(h) = m.payload_handle() {
+                                    binding_inner.retain_handle(h);
+                                    s.queues[idx].push_back(h);
+                                    // Collect complete tuples — pack_tuple runs
+                                    // after the lock drops (P5).
+                                    while s.queues.iter().all(|q| !q.is_empty()) {
+                                        let popped: Vec<HandleId> = s
+                                            .queues
+                                            .iter_mut()
+                                            .map(|q| q.pop_front().unwrap())
+                                            .collect();
+                                        post_actions.push(PostLockAction::PackAndEmit(popped));
                                     }
-                                    post_actions.push(PostLockAction::Complete);
                                 }
+                                // else: Resolved on a source — no action.
                             }
-                            Message::Error(h) => {
-                                if !s.errored && !s.terminated {
-                                    s.errored = true;
-                                    s.terminated = true;
-                                    binding_inner.retain_handle(*h);
-                                    // P2: release all remaining queued handles.
-                                    for q in &mut s.queues {
-                                        to_release.extend(q.drain(..));
+                            5 => {
+                                if let Some(h) = m.payload_handle() {
+                                    // Error
+                                    if !s.errored && !s.terminated {
+                                        s.errored = true;
+                                        s.terminated = true;
+                                        binding_inner.retain_handle(h);
+                                        // P2: release all remaining queued handles.
+                                        for q in &mut s.queues {
+                                            to_release.extend(q.drain(..));
+                                        }
+                                        post_actions.push(PostLockAction::Error(h));
                                     }
-                                    post_actions.push(PostLockAction::Error(*h));
+                                } else {
+                                    // Complete
+                                    s.completed[idx] = true;
+                                    // If this source's queue is empty, no more
+                                    // tuples from it — terminate.
+                                    if s.queues[idx].is_empty() && !s.terminated {
+                                        s.terminated = true;
+                                        // P2: release all remaining queued handles.
+                                        for q in &mut s.queues {
+                                            to_release.extend(q.drain(..));
+                                        }
+                                        post_actions.push(PostLockAction::Complete);
+                                    }
                                 }
                             }
-                            _ => {}
+                            _ => {} // Tiers 0/1/2/4/6 — no action.
                         }
                     }
                 }
@@ -261,42 +271,49 @@ pub fn concat(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch (canonical §4.2).
                 for m in msgs {
-                    match m {
-                        Message::Data(h) => {
-                            if s.phase == 0 {
-                                // Buffer for later drain.
-                                binding_for_second.retain_handle(*h);
-                                s.pending.push_back(*h);
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                if s.phase == 0 {
+                                    // Buffer for later drain.
+                                    binding_for_second.retain_handle(h);
+                                    s.pending.push_back(h);
+                                } else {
+                                    binding_for_second.retain_handle(h);
+                                    actions.push(Action::Emit(h));
+                                }
+                            }
+                            // else: Resolved on second source — no action.
+                        }
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_second.retain_handle(h);
+                                    // P2: release buffered pending handles.
+                                    to_release.extend(s.pending.drain(..));
+                                    actions.push(Action::Error(h));
+                                }
                             } else {
-                                binding_for_second.retain_handle(*h);
-                                actions.push(Action::Emit(*h));
+                                // Complete
+                                if s.phase == 1 && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                } else if s.phase == 0 {
+                                    // D041 / D4 fix: remember that second
+                                    // completed during phase 0. On phase
+                                    // transition, after draining `pending`,
+                                    // first_sink will self-complete
+                                    // (second's Complete fires once and
+                                    // won't be re-observed).
+                                    s.second_completed = true;
+                                }
                             }
                         }
-                        Message::Complete => {
-                            if s.phase == 1 && !s.terminated {
-                                s.terminated = true;
-                                actions.push(Action::Complete);
-                            } else if s.phase == 0 {
-                                // D041 / D4 fix: remember that second
-                                // completed during phase 0. On phase
-                                // transition, after draining `pending`,
-                                // first_sink will self-complete
-                                // (second's Complete fires once and
-                                // won't be re-observed).
-                                s.second_completed = true;
-                            }
-                        }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_second.retain_handle(*h);
-                                // P2: release buffered pending handles.
-                                to_release.extend(s.pending.drain(..));
-                                actions.push(Action::Error(*h));
-                            }
-                        }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }
@@ -351,37 +368,44 @@ pub fn concat(
                     if s.terminated || s.phase != 0 {
                         break;
                     }
-                    match m {
-                        Message::Data(h) => {
-                            binding_for_first.retain_handle(*h);
-                            actions.push(Action::Emit(*h));
-                        }
-                        Message::Complete => {
-                            // Phase transition: drain pending second-data,
-                            // then continue forwarding from second.
-                            s.phase = 1;
-                            // Pending handles already retained at buffer time.
-                            for h in s.pending.drain(..) {
+                    // Tier-based dispatch (canonical §4.2).
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                binding_for_first.retain_handle(h);
                                 actions.push(Action::Emit(h));
                             }
-                            // D041 / D4 fix: if second already completed
-                            // during phase 0, self-complete now (its
-                            // Complete fired once and won't re-fire).
-                            if s.second_completed && !s.terminated {
-                                s.terminated = true;
-                                actions.push(Action::Complete);
+                            // else: Resolved on first source — no action.
+                        }
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_first.retain_handle(h);
+                                    // P2: release buffered pending handles.
+                                    to_release.extend(s.pending.drain(..));
+                                    actions.push(Action::Error(h));
+                                }
+                            } else {
+                                // Complete — phase transition: drain pending
+                                // second-data, then continue forwarding from
+                                // second.
+                                s.phase = 1;
+                                // Pending handles already retained at buffer time.
+                                for h in s.pending.drain(..) {
+                                    actions.push(Action::Emit(h));
+                                }
+                                // D041 / D4 fix: if second already completed
+                                // during phase 0, self-complete now (its
+                                // Complete fired once and won't re-fire).
+                                if s.second_completed && !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                }
                             }
                         }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_first.retain_handle(*h);
-                                // P2: release buffered pending handles.
-                                to_release.extend(s.pending.drain(..));
-                                actions.push(Action::Error(*h));
-                            }
-                        }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }
@@ -464,49 +488,57 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
                     if s.terminated {
                         return;
                     }
+                    // Tier-based dispatch (canonical §4.2).
                     for m in msgs {
-                        match m {
-                            Message::Data(h) => {
-                                // P3: check s.winner live each iteration —
-                                // this source may have just become the winner
-                                // earlier in this batch.
-                                if s.winner.is_none() {
-                                    s.winner = Some(idx);
-                                    binding_inner.retain_handle(*h);
-                                    actions.push(Action::Emit(*h));
-                                } else if s.winner == Some(idx) {
-                                    binding_inner.retain_handle(*h);
-                                    actions.push(Action::Emit(*h));
+                        match m.tier() {
+                            3 => {
+                                if let Some(h) = m.payload_handle() {
+                                    // P3: check s.winner live each iteration —
+                                    // this source may have just become the winner
+                                    // earlier in this batch.
+                                    if s.winner.is_none() {
+                                        s.winner = Some(idx);
+                                        binding_inner.retain_handle(h);
+                                        actions.push(Action::Emit(h));
+                                    } else if s.winner == Some(idx) {
+                                        binding_inner.retain_handle(h);
+                                        actions.push(Action::Emit(h));
+                                    }
+                                    // else: loser DATA — ignore.
                                 }
-                                // else: loser DATA — ignore.
+                                // else: Resolved on a source — no action.
                             }
-                            Message::Complete => {
-                                s.completed[idx] = true;
-                                if s.winner == Some(idx) && !s.terminated {
-                                    s.terminated = true;
-                                    actions.push(Action::Complete);
-                                } else if s.winner.is_none()
-                                    && s.completed.iter().all(|&c| c)
-                                    && !s.terminated
-                                {
-                                    // P4: all sources completed without a
-                                    // winner — terminate the producer.
-                                    s.terminated = true;
-                                    actions.push(Action::Complete);
+                            5 => {
+                                if let Some(h) = m.payload_handle() {
+                                    // Error — from any source pre-winner OR from
+                                    // the winner cascade; loser errors post-winner
+                                    // are ignored.
+                                    if (s.winner.is_none() || s.winner == Some(idx))
+                                        && !s.terminated
+                                    {
+                                        s.terminated = true;
+                                        binding_inner.retain_handle(h);
+                                        actions.push(Action::Error(h));
+                                    }
+                                } else {
+                                    // Complete
+                                    s.completed[idx] = true;
+                                    if s.winner == Some(idx) && !s.terminated {
+                                        s.terminated = true;
+                                        actions.push(Action::Complete);
+                                    } else if s.winner.is_none()
+                                        && s.completed.iter().all(|&c| c)
+                                        && !s.terminated
+                                    {
+                                        // P4: all sources completed without a
+                                        // winner — terminate the producer.
+                                        s.terminated = true;
+                                        actions.push(Action::Complete);
+                                    }
+                                    // else: loser complete — ignore.
                                 }
-                                // else: loser complete — ignore.
                             }
-                            Message::Error(h) => {
-                                // Errors from any source pre-winner OR
-                                // from the winner cascade; loser errors
-                                // post-winner are ignored.
-                                if (s.winner.is_none() || s.winner == Some(idx)) && !s.terminated {
-                                    s.terminated = true;
-                                    binding_inner.retain_handle(*h);
-                                    actions.push(Action::Error(*h));
-                                }
-                            }
-                            _ => {}
+                            _ => {} // Tiers 0/1/2/4/6 — no action.
                         }
                     }
                 }
@@ -578,26 +610,33 @@ pub fn take_until(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch (canonical §4.2).
                 for m in msgs {
-                    match m {
-                        Message::Data(h) => {
-                            binding_for_source.retain_handle(*h);
-                            actions.push(Action::Emit(*h));
+                    match m.tier() {
+                        3 => {
+                            if let Some(h) = m.payload_handle() {
+                                binding_for_source.retain_handle(h);
+                                actions.push(Action::Emit(h));
+                            }
+                            // else: Resolved on source — no action.
                         }
-                        Message::Complete => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                actions.push(Action::Complete);
+                        5 => {
+                            if let Some(h) = m.payload_handle() {
+                                // Error
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_source.retain_handle(h);
+                                    actions.push(Action::Error(h));
+                                }
+                            } else {
+                                // Complete
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    actions.push(Action::Complete);
+                                }
                             }
                         }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_source.retain_handle(*h);
-                                actions.push(Action::Error(*h));
-                            }
-                        }
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }
@@ -626,28 +665,34 @@ pub fn take_until(
                 if s.terminated {
                     return;
                 }
+                // Tier-based dispatch (canonical §4.2).
                 for m in msgs {
-                    match m {
-                        Message::Data(_) => {
+                    match m.tier() {
+                        3 => {
                             // Any DATA on notifier → complete the producer.
-                            // We don't emit notifier DATA downstream.
-                            if !s.terminated {
+                            // (Resolved alone — no payload — no action.)
+                            // We don't emit notifier DATA downstream, so we
+                            // don't even need to extract the handle.
+                            if m.payload_handle().is_some() && !s.terminated {
                                 s.terminated = true;
                                 action = Some(Action::Complete);
                                 break;
                             }
                         }
-                        Message::Error(h) => {
-                            if !s.terminated {
-                                s.terminated = true;
-                                binding_for_notifier.retain_handle(*h);
-                                action = Some(Action::Error(*h));
-                                break;
+                        5 => {
+                            // Error: cascade. Complete (payload_handle.is_none())
+                            // without prior DATA: nothing to do — source
+                            // continues independently.
+                            if let Some(h) = m.payload_handle() {
+                                if !s.terminated {
+                                    s.terminated = true;
+                                    binding_for_notifier.retain_handle(h);
+                                    action = Some(Action::Error(h));
+                                    break;
+                                }
                             }
                         }
-                        // Notifier COMPLETE without prior DATA: nothing to
-                        // do — source continues independently.
-                        _ => {}
+                        _ => {} // Tiers 0/1/2/4/6 — no action.
                     }
                 }
             }

@@ -61,6 +61,7 @@ pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 pub use message::{Message, Messages};
 pub use node::{
     Core, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration, OperatorOp, OperatorOpts,
-    PauseError, ResumeReport, SetDepsError, Sink, Subscription, TerminalKind,
+    PausableMode, PauseError, ResumeReport, SetDepsError, Sink, Subscription, TerminalKind,
+    UpError,
 };
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};

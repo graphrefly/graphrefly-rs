@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-07 (M3 Slice E + handshake lock-released rework + Slice E /qa)
+last_updated: 2026-05-07 (Slice F — canonical-spec correctness pass; Cat-B reframings)
 ---
 
 # Porting flags & deferred concerns
@@ -34,85 +34,27 @@ group; if a group grows past ~5 items, split it.
 
 The session doc Part 11 directive: "do not pre-optimize hot paths before
 profiling; use criterion benchmarks to identify actual bottlenecks. The §10
-analysis identifies *likely* wins — verify with data."
+analysis identifies *likely* wins — verify with data." Pass 5 of the v0 bench
+(SmallVec + ChildEdge dep_idx caching, both regressed) already validated the
+principle.
 
-Pass 5 of the v0 bench (SmallVec + ChildEdge dep_idx caching, both regressed)
-already validated the principle. The following §10 items are kept deferred
-until a bench reproducer makes them pay for themselves.
+The following items are kept deferred as a single bucket. **Do not pick them
+up without a criterion bench reproducer that makes them pay for themselves.**
+Add a per-item entry only if a bench surfaces the cost.
 
-### §10.3 — Diamond resolution bitmask
+| § | What | Current shape | Optimization |
+|---|---|---|---|
+| 10.3 | Diamond resolution bookkeeping | `pending_fires: HashSet<NodeId>` + per-node `involved_this_wave` | `WaveTracker { settled: u64, all_deps_mask: u64 }` bitmask (O(1) is_complete vs O(n)). Pays only on fan-in beyond ~32 deps. |
+| 10.4 | Per-dep indexing | position-based `deps.iter().position(...)` per child propagation | Stable `slot_index` per DepRecord; restructures `tracked: HashSet<usize>` + wave-mask bookkeeping. |
+| 10.5 | Wave-end notification buffer | `pending_notify: IndexMap<NodeId, Vec<Message>>` (alloc per active node) | Single `BatchFrame { pending: Vec<(NodeId, ...)> }` arena per wave. |
+| 10.6 | Sink iteration | `subscribers: HashMap<SubId, Sink>`, flush iterates under lock | Epoch iteration / snapshot-spread (TS pattern). Rust avoids snapshot cost because sink re-entrance discipline differs (see "Late subscriber + multi-emit-per-wave snapshot gap" below for the related correctness gap). |
+| 10.13 | First-run gate scan | `dep_records.iter().any(|r| r.prev_data == NO_HANDLE && r.data_batch.is_empty())` | `received_mask: u64` + `all_deps_mask` bitmask. Largely redundant — wave engine only re-adds nodes to `pending_fires` after real DATA delivery. |
+| —    | `pick_next_fire` transitive upstream walk | O(N·V) BFS per pick (correctness fix from Slice C-1.5, was O(n²) immediate-only and incorrect for >1-hop diamonds) | Per-node `unresolved_dep_count` counter (decrement on settle, fire on zero) — O(1) per pick. |
 
-- **What:** [graphrefly-core/src/node.rs](../crates/graphrefly-core/src/node.rs) uses
-  `pending_fires: HashSet<NodeId>` + per-node `involved_this_wave: bool` instead
-  of the §10.3 `WaveTracker { settled: u64, all_deps_mask: u64 }` bitmask.
-- **Why deferred:** correct as-is; bitmask is O(1) `is_complete()` vs current
-  O(n) wave bookkeeping. Pays for itself only on hot fan-in paths beyond ~32
-  deps. Re-look when bench surfaces such a path.
-- **Source:** Slice A+B audit (2026-05-05).
-
-### §10.4 — Stable `slot_index` per DepRecord
-
-- **What:** position-based dep indexing throughout the dispatcher
-  (`commit_emission` uses `deps.iter().position(|&d| d == node_id)` per
-  child propagation, O(n_deps) per delivery). On `set_deps`, we rebuild a
-  `Vec<HandleId>` aligned to the new dep order rather than using a stable
-  slot id.
-- **Why deferred:** correct as-is for current rewire scenarios (set_deps
-  preserves dep_handles[i] alignment by node_id). The §10.4 stable slot
-  refactor would also restructure `tracked: HashSet<usize>` and the wave-mask
-  bookkeeping. Big change with no current pain point.
-- **Source:** Slice A+B audit (2026-05-05).
-
-### §10.5 — Single-arena BatchFrame
-
-- **What:** wave-end notifications buffer through
-  `pending_notify: HashMap<NodeId, Vec<Message>>` (one allocation per active
-  node). §10.5 prescribes a single `BatchFrame { pending: Vec<(NodeId, ...)> }`
-  per wave.
-- **Why deferred:** v0 bench did not show buffer alloc as a bottleneck. The
-  HashMap shape also makes diamond fan-in coalescing and per-node tier-3
-  rewriting straightforward; the arena would push that complexity into the
-  flush phase.
-- **Source:** Slice A+B audit (2026-05-05).
-
-### §10.6 — Sink list epoch iteration
-
-- **What:** `subscribers: HashMap<SubscriptionId, Sink>`; flush iterates
-  `rec.subscribers.values()` while the lock is held. TS spreads
-  `[...this._sinks]` to handle mid-iteration unsubscribe.
-- **Why deferred:** Rust avoids the snapshot-spread cost because sink
-  re-entrance into Core is forbidden by the v1 lock discipline (sinks fire
-  while `parking_lot::Mutex<CoreState>` is held; recursive unsubscribe would
-  deadlock long before it could mutate the subscribers map). When the
-  re-entrance limitation lifts (see "v1 limitations" below), revisit §10.6.
-- **Source:** Slice A+B audit (2026-05-05).
-
-### §10.13 — First-run gate bitmask
-
-- **What:** `fire_fn` checks `if rec.dep_handles.contains(&NO_HANDLE) { return }`
-  — O(n_deps) linear scan per fn-fire attempt.
-- **Why deferred:** trivial bitmask refactor (`received_mask: u64` + `all_deps_mask`),
-  but mostly redundant given that the wave engine only re-adds a node to
-  `pending_fires` when a dep has actually delivered DATA. The hot path is
-  already bounded by the wave's pending set. Bench-driven re-look.
-- **Source:** Slice A+B audit (2026-05-05).
-
-### `pick_next_fire` transitive upstream walk is O(N·V) per pick
-
-- **What:** [batch.rs](../crates/graphrefly-core/src/batch.rs) `pick_next_fire`
-  + `transitive_upstream_settled` — for each candidate in `pending_fires`,
-  BFS-walks transitive ancestors via `deps` to verify none is currently
-  pending. With pending-size N and graph size V, worst-case O(N·V) per
-  pick (vs the prior immediate-only check's O(N·D) where D is direct deps).
-- **Why deferred:** the immediate-only check (Slice A+B) was incorrect for
-  graphs deeper than 1 hop: a downstream join-node could fire prematurely
-  on stale upstream when a sibling branch fired first. Slice C-1.5
-  switched to the transitive walk to fix the diamond glitch the strict
-  tests surfaced. Performance is an acceptable trade vs correctness.
-  Replace with a per-node `unresolved_dep_count` counter (decrement when an
-  upstream settles, fire when count hits zero) when bench shows the cost
-  — that's O(1) per pick.
-- **Source:** Slice C-1.5 (2026-05-05). Original O(n²) flag was Slice A+B.
+**Source:** Slice A+B audit (2026-05-05); pick_next_fire entry from Slice C-1.5
+(2026-05-05). Collapsed into a single bucket 2026-05-07 (Slice F doc cleanup)
+per user direction — individual entries were prior-art noise relative to "do
+not pre-optimize."
 
 ---
 
@@ -136,7 +78,7 @@ tests covering fn re-entrance via emit/pause/resume/invalidate, custom
 equals re-entrance, and a concurrent emit during invoke_fn deadlock
 test. Closed 2026-05-05.
 
-### Late subscriber + multi-emit-per-wave snapshot gap (D2 — needs rethink)
+### Late subscriber + multi-emit-per-wave snapshot gap (D2 — Rust-only dispatcher design)
 
 - **What:** the sinks-snapshot-on-first-touch fix (Slice A close, M1)
   freezes a node's per-wave subscriber list at the FIRST `queue_notify`
@@ -150,27 +92,35 @@ test. Closed 2026-05-05.
   view) is silently weakened in this niche scenario. The single-emit-
   per-wave + late subscribe case (the canonical race the snapshot fix
   targets) IS correct.
-- **Why deferred (per user direction, 2026-05-05 /qa):** the three
-  candidate fixes have non-trivial trade-offs:
-  - **Re-snapshot every push** — fixes correctness but allocates
-    O(emits × subscribers) per wave; penalizes the common case.
-  - **Walk pending_notify on subscribe and append new sink** — would
-    re-introduce the duplicate-Data bug for the single-emit + late
+- **Why deferred (UPDATED 2026-05-07 audit):** This is a Rust-only
+  dispatcher design concern — TS production has no equivalent because it
+  snapshots `[...this._sinks]` AT DELIVERY TIME PER EMIT
+  ([packages/legacy-pure-ts/src/core/node.ts:3583-3617](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/legacy-pure-ts/src/core/node.ts)),
+  not once per wave. TS's single-threaded synchronous dispatch makes the
+  failure mode literally unreachable. The Rust port batched the snapshot
+  to amortize cost across the lock-released drain; the gap is the
+  trade-off. **Original "wait for DS-14" framing was a layer mismatch** —
+  DS-14's `BaseChange<T>` per-emit metadata lives in
+  `bundle.mutations` envelopes, not on dispatcher-level
+  `pending_notify` entries. DS-14 will not produce a substrate that
+  resolves this trade-off. Pick one of the three candidate fixes on its
+  merits when M2+ surfaces a real consumer:
+  - **Re-snapshot every push** — fixes correctness, allocates O(emits ×
+    subscribers) per wave.
+  - **Walk pending_notify on subscribe and append new sink** —
+    re-introduces the duplicate-Data bug for the single-emit + late
     subscribe case (the snapshot fix's original target).
-  - **Per-message subscriber tracking** — most expressive but heavy.
-  The user's direction: park as a documented v1 limitation and revisit
-  when the design shape shifts (likely alongside DS-14 changesets,
-  which already touches per-emit metadata).
+  - **Per-message subscriber tracking** — most expressive, heaviest.
 - **Source:** Slice A close /qa Edge Case Hunter finding (2026-05-05);
-  user decision Q1=(a) defer with rethink note.
+  reframed 2026-05-07 per cross-repo audit confirming Rust-only nature.
 
-### Cross-thread emit blocks until in-flight wave completes (D3)
+### Cross-thread emit blocks until in-flight wave completes (D3 — UPDATED 2026-05-07)
 
 - **What:** with the wave-owner re-entrant mutex (Slice A close /qa,
   M1), cross-thread `Core::emit` calls block at
   `wave_owner.lock_arc()` until the in-flight wave's drain + flush +
   sink-fire completes. Same-thread re-entry passes through.
-- **Why divergent:** TS is single-threaded; PY is GIL-serialized.
+- **Why this design:** TS is single-threaded; PY is GIL-serialized.
   Rust is the first impl with parallel access. The wave-owner mutex
   is the chosen serialization point. Without it, the lock-released
   drain (Slice A close) would let a concurrent `emit` absorb into
@@ -179,14 +129,25 @@ test. Closed 2026-05-05.
   returning means subscribers have observed.
 - **Trade-offs accepted:**
   - Concurrent threads cannot drive parallel waves on the same Core.
-    Per-subgraph parallelism (CLAUDE.md invariant 3) is the planned
-    parallel-throughput axis; M2's mount/unmount work surfaces it.
   - A blocked thread waits for the owner thread's fn fires + sink
     fires to complete. If a fn or sink is slow, blockers wait.
+- **Per-subgraph parallelism status (UPDATED 2026-05-07):** the original
+  entry said "M2's mount/unmount work surfaces" per-subgraph
+  parallelism. M2 closed 2026-05-06, but mount/unmount landed without
+  per-subgraph mutex granularity — Core is still single-mutex per
+  CLAUDE.md Rust invariant 3 ("planned"), not per Slice E+ implementation.
+  **Real defer condition:** consumer pressure for cross-thread parallel
+  waves on the same Core. Until then, the wave-owner mutex is the
+  correct shape and not a "v1 limitation" — it's the v1 design.
+  When/if pressure surfaces, scope a dedicated per-subgraph-mutex
+  design slice (substantial refactor: lock-ordering protocol, cross-
+  subgraph wave handoff, deadlock prevention).
 - **Verified by:** `concurrent_emit_blocks_until_in_flight_wave_completes`
   in `tests/lock_released.rs`.
 - **Source:** Slice A close /qa Blind Hunter + Edge Case Hunter findings
-  (2026-05-05); user decision Q2=(b) wave-owner mutex.
+  (2026-05-05); user decision Q2=(b) wave-owner mutex; reframed
+  2026-05-07 — "M2 unblocks this" was incorrect; per-subgraph mutex
+  needs its own design slice.
 
 ### Set_deps from inside firing node's fn corrupts Dynamic `tracked` indices (D1)
 
@@ -918,6 +879,114 @@ Closed 2026-05-06.
 
 ---
 
+## ~~R1.3.2.d / R1.3.3.a equals-substitution scope violation~~ — RESOLVED 2026-05-07 in Slice G
+
+Closed by the per-wave equals coalescing fix in
+[`crates/graphrefly-core/src/batch.rs`](../crates/graphrefly-core/src/batch.rs)
+`Core::commit_emission`. The dispatcher now uses a wave-scoped
+`tier3_emitted_this_wave: AHashSet<NodeId>` to detect "subsequent emit at
+this node in the same wave." On a subsequent emit:
+
+1. Skip equals substitution (would violate R1.3.2.d).
+2. Queue Data verbatim.
+3. Retroactively rewrite any prior `Resolved` entries (in pending_notify
+   AND in the per-node pause buffer) to `Data(snapshot)` using the
+   wave-start cache snapshot, taking fresh retains as needed.
+
+Auto-resolve / Noop / empty-Batch / settle_dirty_resolved paths now also
+guard against queueing Resolved into a wave that already has Data.
+
+The F1 dev-mode `debug_assert` is re-added in `queue_notify` and locks the
+R1.3.3.a invariant in dev / test builds. Regression tests:
+`slice_g_batch_multi_same_value_emit_does_not_produce_multi_resolved`
+(multi-emit batch produces multi-DATA, no multi-Resolved) and
+`slice_g_single_emit_equals_match_still_produces_resolved` (R1.3.2.a
+preserved for single-emit). All 411 tests pass with F1 active.
+
+## QA-surfaced divergences (Slice F audit follow-on QA, 2026-05-07)
+
+### `Core::up(INVALIDATE)` cascades through dep instead of R1.4.2 plain-forward
+
+- **What:** Canonical R1.4.2 says upstream INVALIDATE is "plain forward —
+  does not self-process INVALIDATE on intermediate or terminal nodes."
+  Rust v1's [`Core::up`](../crates/graphrefly-core/src/node.rs)
+  Tier-4 routing delegates to `self.invalidate(dep_id)` per dep, which
+  DOES clear the dep's cache and cascade INVALIDATE downstream.
+- **Why divergent:** consumer-friendly v1 simplification. Calling
+  `core.up(node, Invalidate)` to "nudge deps to invalidate" actively
+  wipes their caches; users expecting plain-forward semantics get
+  surprise sibling-subgraph invalidation.
+- **Lift point:** when a real consumer hits the divergence, lift to a
+  plain-forward path (queue `Message::Invalidate` to dep's subscribers
+  without `Core::invalidate`) OR add `up_with_options` for
+  per-call control.
+- **Source:** Slice F audit follow-on /qa Edge Case Hunter (2026-05-07);
+  user decision D2=(a).
+
+### `pending_pause_overflow` cleared on panic-unwind silently drops queued ERROR
+
+- **What:** [`clear_wave_state`](../crates/graphrefly-core/src/node.rs)
+  unconditionally clears `pending_pause_overflow` on every wave-end,
+  including the panic-discard path in `BatchGuard::drop`. Scenario: a
+  wave queues a pause-overflow `PendingPauseOverflow` event, then a
+  different fn panics mid-wave. The panic-discard path skips the
+  synthesis loop and clears the queue → ERROR silently lost.
+- **Why divergent:** `BatchGuard` panic-discard atomicity says "the
+  wave didn't happen." Re-queueing overflow events would partially
+  break that invariant. The pause buffer's `dropped` counter IS
+  preserved (consumers polling `ResumeReport.dropped` post-resume
+  still see the count), but the diagnostic ERROR with
+  `lockHeldDurationMs` etc. is lost for that specific wave.
+- **Why deferred:** narrow scenario (pause overflow + same-wave panic
+  + binding implements `synthesize_pause_overflow_error`). The fn
+  panic itself is louder than the missing diagnostic.
+- **Lift point:** if consumers report missing ERRORs in production
+  panic-recovery scenarios, defer overflow events across waves with
+  explicit ordering semantics.
+- **Source:** Slice F audit follow-on /qa Edge Case Hunter
+  (2026-05-07); user decision D4=(a).
+
+### `Core::up` from inside fn-fire — composition note (false-positive defense)
+
+- **What:** Initially flagged by /qa as a hazard ("nested run_wave
+  resets wave-state mid-outer-wave"). Confirmed FALSE POSITIVE: nested
+  `run_wave` calls observe `in_tick=true` and acquire a non-owning
+  `BatchGuard` (line 2156: `if !self.owns_tick { return; }`). Drop
+  returns immediately without `clear_wave_state`. Outer wave's Slice G
+  / A3 / A6 state survives intact.
+- **Status:** documentation-only entry to capture the verification.
+  Same-thread re-entrant `actions.up(...)` calls compose cleanly with
+  the outer wave; cross-thread emits block on `wave_owner` per the
+  M1 design.
+- **Source:** Slice F audit follow-on /qa Edge Case Hunter EC#3
+  (2026-05-07) — flagged + verified false-positive; user decision
+  D1=(c) doc-only.
+
+### D3 — `register` / `set_pausable_mode` typed-error refactor — DEFERRED to dedicated slice
+
+- **What:** /qa surfaced inconsistency between `register`'s panicking
+  contract (`assert!` on unknown dep / operator-without-deps /
+  initial-only-for-state / scan-reduce-seed-sentinel / new
+  terminal-dep-rejection) and `set_deps::TerminalDep` returning a
+  typed `Result<_, SetDepsError>`. The user picked option (a) —
+  promote to typed errors for full unification.
+- **Why deferred:** scope larger than estimated mid-QA — ~150+ call
+  sites across tests / operators / graph / bindings each need
+  `.expect("register")` or `?` propagation, plus refcount-discipline
+  for the error paths (e.g., scratch handle release on early return).
+  Started the refactor in /qa, but couldn't complete within remaining
+  context budget without leaving the code in a half-broken state.
+  Reverted to the panicking contract for this QA pass.
+- **Lift point:** schedule as a dedicated slice — "Slice H — register
+  + set_pausable_mode typed-error promotion." Will introduce
+  `RegisterError { UnknownDep, OperatorWithoutDeps,
+  InitialOnlyForStateNodes, OperatorSeedSentinel, TerminalDep }` +
+  `SetPausableModeError::WhilePaused`, change all `register*` and
+  `set_pausable_mode` signatures, sweep all call sites with
+  `.expect()` / `?`. ~200-300 LOC of mechanical churn.
+- **Source:** Slice F audit follow-on /qa user decision D3=(a) +
+  scope discovery 2026-05-07.
+
 ## Spec divergences acknowledged in v1
 
 These are deliberate simplifications relative to the TS production
@@ -953,21 +1022,33 @@ divergence; M1-close hardening or M2 work may revisit.
   recommendation: pick one allocation scheme per consumer.
 - **Source:** Edge Case Hunter QA finding, 2026-05-05.
 
-### DIRTY-without-DATA across pause-resume boundary
+### ~~Cross-wave DIRTY-then-DATA under PAUSE (was "DIRTY-without-DATA across pause-resume")~~ — RESOLVED 2026-05-07 in Slice F audit follow-on
 
-- **What:** Spec §1.3.1.b says "every DIRTY is followed by tier-3 in the
-  same wave." When a node is paused mid-wave, DIRTY (tier 1) flushes
-  immediately while DATA (tier 3) buffers. Subscribers see DIRTY without
-  the matching DATA/RESOLVED until resume drains the buffer.
-- **Why divergent:** matches TS production behavior — pause is explicitly
-  out-of-wave for tier-3 ordering. The "same-wave" pairing invariant
-  applies to non-paused waves only. Subscribers that pair DIRTY with
-  expected tier-3 must tolerate cross-wave delivery under pause. Document;
-  do not change.
-- **Source:** Edge Case Hunter QA finding, 2026-05-05; TS reference at
-  `~/src/graphrefly-ts/src/core/node.ts:3179-3192` (only `resumeAll` mode
-  buffers; default mode in TS suppresses fn-fire instead). Rust v1 unifies
-  on the buffer-and-replay shape.
+The canonical fix landed: `PausableMode::{Default, ResumeAll, Off}` enum
+on `NodeOpts`, with `Default` (the canonical default per spec §2.6) now
+suppressing fn-fire upstream while paused — so neither tier-1 DIRTY nor
+tier-3 DATA propagates from the paused node during the pause window.
+On final RESUME, fn fires once with consolidated dep state. Closes the
+cross-wave DIRTY-then-DATA gap that prompted the original
+"DIRTY-without-DATA" framing.
+
+The cross-repo audit (2026-05-07) confirmed:
+
+- **R1.3.1.b** is about intra-wave glitch-free ordering, NOT same-wave
+  subscriber pairing across PAUSE.
+- **§2.6** documents three modes (`true`/Default, `"resumeAll"`,
+  `false`/Off); all three are canonical. The original Rust v1 choice
+  to "canonicalize on resumeAll" was a regression — `Default` is the
+  default for every untagged source.
+- TS reference for `Default` mode: `legacy-pure-ts/src/core/node.ts:2556-2558`
+  (`_pendingWave = true` gate) + `node.ts:3103-3106`
+  (`_maybeRunFnOnSettlement()` on RESUME).
+
+Rust impl in `crates/graphrefly-core/src/node.rs` `PauseState::Paused.pending_wave`
+flag + `Core::set_pausable_mode` setter + `deliver_data_to_consumer`
+suppression branch + `Core::resume` Phase-4 consolidated fn-fire schedule.
+Regression: `item5_default_mode_consolidates_to_one_fn_fire_on_resume` in
+`tests/slice_f_corrections.rs`. Closed 2026-05-07.
 
 ### `set_deps` mid-wave full-removal leaves stuck DIRTY without RESOLVED
 
@@ -1006,12 +1087,22 @@ divergence; M1-close hardening or M2 work may revisit.
   never released (the resubscribable reset path is the only release site
   for these slots). Each terminal node leaks one retain per cascade
   destination.
-- **Why deferred:** correct for v1 (terminal nodes are one-shot at this
-  layer; no node deletion / unsubscribe-deactivation yet). Real fix lands
-  with M2 graph-layer node-deletion and the deactivation cleanup path —
-  both will release these slots when the node leaves the live graph.
+- **Why deferred (UPDATED 2026-05-07 audit):** Cross-repo audit confirmed
+  the lift point is **Rust M2 deactivation cleanup**, NOT TS Phase 14.
+  The TS `_deactivate` impl
+  ([packages/legacy-pure-ts/src/core/node.ts:2185-2294](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/legacy-pure-ts/src/core/node.ts))
+  clears all per-dep settled-state on last-sink-detach (calls
+  `resetDepRecord(d)` for each dep, clears `_pauseBuffer`, `_replayBuffer`,
+  `_pauseLocks`, and `_cached` for compute nodes). TS doesn't refcount
+  handles, so the "leak per cascade destination" shape is structurally
+  different — but the *discipline* is exactly what Rust needs to mirror:
+  release per-dep `Handle` refs in `dep_terminals[idx]` + own `terminal`
+  slot when deactivation lands. **No TS Phase 14 dep.** Cross-link to
+  the "Deactivation cleanup not yet modeled" entry — both lift together
+  at the M2 deactivation work.
 - **Source:** Migration-status.md "Carried forward" section reinforced by
-  Blind Hunter QA finding, 2026-05-05.
+  Blind Hunter QA finding, 2026-05-05; cross-repo audit 2026-05-07
+  confirmed Rust-M2 dependency (not TS).
 
 ## Open questions from SESSION-rust-port-architecture.md Part 6
 
