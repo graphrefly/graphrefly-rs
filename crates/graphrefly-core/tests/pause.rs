@@ -358,7 +358,9 @@ fn pause_buffers_derived_data_through_diamond() {
     });
     // Opt into ResumeAll BEFORE subscribe so the activation wave runs
     // under the same semantics the rest of the test expects.
-    rt.core.set_pausable_mode(d, PausableMode::ResumeAll);
+    rt.core
+        .set_pausable_mode(d, PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(d);
 
     // Initial activation: a=1 → b=2, c=3, d=5 (one fire).

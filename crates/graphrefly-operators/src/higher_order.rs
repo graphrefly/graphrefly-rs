@@ -375,6 +375,7 @@ pub fn switch_map(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 fn make_switch_on_complete(
@@ -585,6 +586,7 @@ pub fn exhaust_map(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 fn make_exhaust_on_complete(
@@ -820,6 +822,7 @@ pub fn merge_map_with_concurrency(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 /// Iteratively pop from `buffer` and spawn inners until cap is reached

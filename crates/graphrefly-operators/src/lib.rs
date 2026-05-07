@@ -53,6 +53,7 @@
 
 pub mod binding;
 pub mod combine;
+pub mod error;
 pub mod flow;
 pub mod higher_order;
 pub mod ops_impl;
@@ -61,6 +62,7 @@ pub mod transform;
 
 pub use binding::OperatorBinding;
 pub use combine::{combine as combine_latest, merge, with_latest_from, MergeRegistration};
+pub use error::OperatorFactoryError;
 pub use flow::{
     element_at, find, first, last, last_with_default, skip, take, take_while, FlowRegistration,
 };

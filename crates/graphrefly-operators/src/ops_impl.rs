@@ -200,6 +200,7 @@ pub fn zip(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 // =====================================================================
@@ -425,6 +426,7 @@ pub fn concat(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 // =====================================================================
@@ -556,6 +558,7 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }
 
 // =====================================================================
@@ -708,4 +711,5 @@ pub fn take_until(
 
     let fn_id = binding.register_producer_build(build);
     core.register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable")
 }

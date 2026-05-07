@@ -270,7 +270,9 @@ fn last_with_default_on_empty_stream_emits_default() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let default = rt.intern_int(42);
-    let n = last_with_default(&rt.core, source, default).into_node();
+    let n = last_with_default(&rt.core, source, default)
+        .unwrap()
+        .into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.core.complete(source);
@@ -284,7 +286,9 @@ fn last_with_default_prefers_latest_over_default() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let default = rt.intern_int(42);
-    let n = last_with_default(&rt.core, source, default).into_node();
+    let n = last_with_default(&rt.core, source, default)
+        .unwrap()
+        .into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 7);
@@ -392,7 +396,9 @@ fn last_with_default_releases_default_on_core_drop() {
         default_handle = rt.intern_int(99);
         // Caller's intern share: 1.
         assert_eq!(binding.refcount_of(default_handle), 1);
-        let _n = last_with_default(&rt.core, source, default_handle).into_node();
+        let _n = last_with_default(&rt.core, source, default_handle)
+            .unwrap()
+            .into_node();
         // Core retained inside register_operator: now 2.
         assert_eq!(
             binding.refcount_of(default_handle),

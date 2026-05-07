@@ -14,6 +14,7 @@ use std::sync::Arc;
 use graphrefly_core::{Core, FnId, HandleId, NodeId, OperatorOp, OperatorOpts};
 
 use crate::binding::OperatorBinding;
+use crate::error::OperatorFactoryError;
 use crate::transform::OperatorRegistration;
 
 /// Boxed packer closure type — converts N HandleIds to a single tuple HandleId.
@@ -33,23 +34,27 @@ pub type PackerFn = Box<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>;
 /// - `packer` — closure that takes N `HandleId`s and returns a single
 ///   tuple `HandleId`. The binding wraps `Fn(&[T]) -> Tuple` into this.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `sources` is empty.
+/// - [`OperatorFactoryError::EmptySources`] — `sources` is empty.
+/// - [`OperatorFactoryError::Register`] — Core-layer registration error
+///   (unknown / terminal-non-resubscribable dep).
 pub fn combine(
     core: &Core,
     binding: &Arc<dyn OperatorBinding>,
     sources: &[NodeId],
     packer: PackerFn,
-) -> OperatorRegistration {
-    assert!(!sources.is_empty(), "combine requires at least one source");
+) -> Result<OperatorRegistration, OperatorFactoryError> {
+    if sources.is_empty() {
+        return Err(OperatorFactoryError::EmptySources);
+    }
     let pack_fn = binding.register_packer(packer);
     let opts = OperatorOpts::default(); // partial: false — gate all deps
-    let node = core.register_operator(sources, OperatorOp::Combine { pack_fn }, opts);
-    OperatorRegistration {
+    let node = core.register_operator(sources, OperatorOp::Combine { pack_fn }, opts)?;
+    Ok(OperatorRegistration {
         node,
         fn_id: pack_fn,
-    }
+    })
 }
 
 /// `with_latest_from(primary, secondary)` — fire-on-primary-only.
@@ -79,11 +84,15 @@ pub fn with_latest_from(
 ) -> OperatorRegistration {
     let pack_fn = binding.register_packer(packer);
     let opts = OperatorOpts::default(); // partial: false — gate both deps
-    let node = core.register_operator(
-        &[primary, secondary],
-        OperatorOp::WithLatestFrom { pack_fn },
-        opts,
-    );
+    let node = core
+        .register_operator(
+            &[primary, secondary],
+            OperatorOp::WithLatestFrom { pack_fn },
+            opts,
+        )
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration {
         node,
         fn_id: pack_fn,
@@ -116,26 +125,37 @@ impl MergeRegistration {
 /// - `core` — the Core dispatcher.
 /// - `sources` — N dep node ids.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `sources` is empty.
-pub fn merge(core: &Core, sources: &[NodeId]) -> MergeRegistration {
-    assert!(!sources.is_empty(), "merge requires at least one source");
+/// - [`OperatorFactoryError::EmptySources`] — `sources` is empty.
+/// - [`OperatorFactoryError::Register`] — Core-layer registration error
+///   (unknown / terminal-non-resubscribable dep).
+pub fn merge(core: &Core, sources: &[NodeId]) -> Result<MergeRegistration, OperatorFactoryError> {
+    if sources.is_empty() {
+        return Err(OperatorFactoryError::EmptySources);
+    }
     let opts = OperatorOpts {
         partial: true, // merge fires as soon as ANY dep delivers
         ..OperatorOpts::default()
     };
-    let node = core.register_operator(sources, OperatorOp::Merge, opts);
-    MergeRegistration { node }
+    let node = core.register_operator(sources, OperatorOp::Merge, opts)?;
+    Ok(MergeRegistration { node })
 }
 
 /// Convenience: `merge` with an explicit [`FnId`] return for API
 /// consistency. Since merge is zero-FFI, the `FnId` is a sentinel.
 /// Prefer [`merge`] unless you need the [`OperatorRegistration`] shape.
-pub fn merge_as_op(core: &Core, sources: &[NodeId]) -> OperatorRegistration {
-    let reg = merge(core, sources);
-    OperatorRegistration {
+///
+/// # Errors
+///
+/// Same conditions as [`merge`].
+pub fn merge_as_op(
+    core: &Core,
+    sources: &[NodeId],
+) -> Result<OperatorRegistration, OperatorFactoryError> {
+    let reg = merge(core, sources)?;
+    Ok(OperatorRegistration {
         node: reg.node,
         fn_id: FnId::new(0), // sentinel — no closure registered
-    }
+    })
 }

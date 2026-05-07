@@ -105,7 +105,7 @@ fn edges_emitted_in_dep_order_per_consumer() {
 fn unnamed_dep_surfaces_as_anon_name() {
     let g = Graph::new("system", binding());
     // Register an anonymous Core node (no namespace entry).
-    let raw = g.core().register_state(HandleId::new(5), false);
+    let raw = g.core().register_state(HandleId::new(5), false).unwrap();
     // Now name a derived that depends on the anonymous node + a named one.
     let named = g.state("named", Some(HandleId::new(7))).unwrap();
     g.derived("d", &[raw, named], FnId::new(1), EqualsMode::Identity)

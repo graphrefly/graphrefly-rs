@@ -59,7 +59,8 @@ fn single_emit_outside_batch_yields_data_len_1() {
 
     let d = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
 
     captured.lock().unwrap().clear(); // discard activation fire
@@ -89,7 +90,8 @@ fn k_emit_in_batch_coalesces_into_one_fire_with_k_data_entries() {
 
     let d = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
     captured.lock().unwrap().clear();
 
@@ -125,7 +127,8 @@ fn prev_data_rotates_to_last_batch_entry_across_waves() {
 
     let d = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
     captured.lock().unwrap().clear();
 
@@ -174,7 +177,8 @@ fn uninvolved_dep_shows_data_empty_and_involved_false() {
 
     let d = rt
         .core
-        .register_derived(&[s1.id, s2.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s1.id, s2.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
     // Drain activation fires (handshake tier-split R1.3.5.a may produce
     // multiple captured fires). Core is fully synchronous so a single
@@ -218,7 +222,8 @@ fn resolved_in_wave_yields_involved_true_with_empty_data() {
 
     let d = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
     captured.lock().unwrap().clear();
 
@@ -268,7 +273,8 @@ fn k_emit_batch_refcounts_balance_after_wave_end() {
         .register_raw_fn(|_deps| FnResult::Noop { tracked: None });
     let d = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
 
     let h_a = rt.binding.intern(TestValue::Int(101));
@@ -332,7 +338,8 @@ fn multi_dep_each_dep_rotates_prev_data_independently() {
 
     let d = rt
         .core
-        .register_derived(&[a.id, b.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[a.id, b.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let _rec = rt.subscribe_recorder(d);
     captured.lock().unwrap().clear();
 

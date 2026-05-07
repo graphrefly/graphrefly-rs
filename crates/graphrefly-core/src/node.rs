@@ -756,6 +756,82 @@ pub enum UpError {
     TierForbidden { tier: u8 },
 }
 
+/// Errors returnable by [`Core::register`] and its sugar wrappers
+/// ([`Core::register_state`], [`Core::register_producer`],
+/// [`Core::register_derived`], [`Core::register_dynamic`],
+/// [`Core::register_operator`]).
+///
+/// Slice H (2026-05-07) promoted these from `assert!`/`panic!` to typed
+/// errors so that callers can recover from contract violations without
+/// process abort. Every variant corresponds to a construction-time
+/// invariant that the caller is responsible for upholding; the dispatcher
+/// rejects the registration before any reactive state is created (so
+/// there is no `Message::Error` channel through which to surface the
+/// failure — these are imperative-layer errors, not reactive ones).
+///
+/// All variants are zero-side-effect: when [`Core::register`] returns
+/// `Err`, no node has been added to the graph and any handle retains
+/// taken on the way in (e.g. operator scratch seed retains via
+/// [`BindingBoundary::retain_handle`]) have been released.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum RegisterError {
+    /// One of the supplied dep ids is not a registered node.
+    #[error("register: unknown dep {0:?}")]
+    UnknownDep(NodeId),
+
+    /// `op` was supplied (operator node) but `deps` was empty. Operator
+    /// nodes need at least one dep — for subscription-managed combinators
+    /// with no declared deps, use [`Core::register_producer`] instead.
+    #[error(
+        "register: operator nodes require at least one dep — \
+         use register_producer for subscription-managed combinators"
+    )]
+    OperatorWithoutDeps,
+
+    /// [`NodeOpts::initial`] was set to a real handle but the registration
+    /// shape is not a state node (state nodes are `deps.is_empty() &&
+    /// fn_id.is_none() && op.is_none()`). Initial cache only makes sense
+    /// for state nodes.
+    #[error("register: NodeOpts::initial only valid for state nodes (no deps + no fn + no op)")]
+    InitialOnlyForStateNodes,
+
+    /// A supplied dep is terminal (COMPLETE / ERROR) AND not
+    /// resubscribable. Adding it would create a permanent wedge — the dep
+    /// will never re-emit, so the registered node would be stuck.
+    /// Mirrors [`SetDepsError::TerminalDep`] at registration time.
+    #[error(
+        "register: dep {0:?} is terminal and not resubscribable; \
+         mark it resubscribable before terminating, or remove it from the dep list"
+    )]
+    TerminalDep(NodeId),
+
+    /// A stateful operator ([`OperatorOp::Scan`] / [`OperatorOp::Reduce`])
+    /// was registered with `seed = NO_HANDLE`. R2.5.3 first-run gate
+    /// requires the seed to be a real handle so that the operator can
+    /// emit on its first fire.
+    #[error("register: operator seed must be a real handle (R2.5.3); got NO_HANDLE")]
+    OperatorSeedSentinel,
+}
+
+/// Errors returnable by [`Core::set_pausable_mode`].
+///
+/// Slice H (2026-05-07) promoted these from `assert!`/`panic!` to typed
+/// errors. Same imperative-layer error model as [`RegisterError`].
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum SetPausableModeError {
+    /// `node_id` is not a registered node.
+    #[error("set_pausable_mode: unknown node {0:?}")]
+    UnknownNode(NodeId),
+    /// The node currently holds at least one pause lock. Changing pausable
+    /// mode mid-pause would lose buffered content or strand a
+    /// `pending_wave` flag — resume all locks first.
+    #[error(
+        "set_pausable_mode: cannot change pausable mode while paused; \
+         resume all locks first"
+    )]
+    WhilePaused,
+}
+
 /// Per-dep record. Replaces the parallel `deps` / `dep_handles` /
 /// `dep_terminals` vectors from v1. Canonical spec R2.9.b alignment.
 ///
@@ -1174,6 +1250,67 @@ pub struct Core {
     pub(crate) wave_owner: Arc<ReentrantMutex<()>>,
 }
 
+/// RAII guard that owns an [`OperatorScratch`] until either (a) the
+/// caller `take()`s it for installation, or (b) the guard drops on an
+/// early return / unwind, in which case the scratch's handle retains
+/// are released via [`OperatorScratch::release_handles`].
+///
+/// Slice H /qa F1 + F2 (2026-05-07): closes two related correctness
+/// gaps in `Core::register`:
+///
+/// 1. **TOCTOU window** — the original three-phase split called
+///    `lock_state()` twice (once for validation, once for insertion),
+///    so a concurrent `Core::complete(dep)` on a non-resubscribable
+///    dep could slip in between the two acquisitions and re-create
+///    the wedge `RegisterError::TerminalDep` was designed to prevent.
+///    The guard plus a single locked region for both phases closes
+///    this gap (release runs lock-released because guard variables
+///    drop in reverse declaration order — guard declared BEFORE
+///    `lock_state()`, so the lock guard drops first).
+///
+/// 2. **Panic-unsafe scratch leak** — without an RAII drop, a panic
+///    between `make_op_scratch` (Phase 2) and the explicit
+///    `if let Err(e)` cleanup branch (e.g., `lock_state()` reentrance
+///    assert, OOM-as-panic on Vec growth in dep iteration) would
+///    drop the `Box<dyn OperatorScratch>` without releasing the
+///    seed/default retain. The guard's `Drop` impl releases on any
+///    unwind path.
+///
+/// Lock-discipline: the guard holds `&dyn BindingBoundary` (through
+/// the `Arc<dyn BindingBoundary>` it borrows from). On `Drop`, it
+/// invokes `release_handles` lock-released — fires AFTER any
+/// `MutexGuard<CoreState>` declared later in the same scope drops
+/// (LIFO destruction order). Mirrors `Core::resume` Phase 2 release
+/// pattern.
+struct ScratchReleaseGuard<'a> {
+    scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
+    binding: &'a dyn BindingBoundary,
+}
+
+impl<'a> ScratchReleaseGuard<'a> {
+    fn new(
+        scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
+        binding: &'a dyn BindingBoundary,
+    ) -> Self {
+        Self { scratch, binding }
+    }
+
+    /// Take ownership of the scratch — disarms the release-on-drop
+    /// behavior. Used on the success path to install the scratch on
+    /// `NodeRecord.op_scratch`.
+    fn take(mut self) -> Option<Box<dyn crate::op_state::OperatorScratch>> {
+        self.scratch.take()
+    }
+}
+
+impl Drop for ScratchReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut scratch) = self.scratch.take() {
+            scratch.release_handles(self.binding);
+        }
+    }
+}
+
 impl Core {
     /// Construct a fresh Core wired to the given binding. Pause buffer cap
     /// defaults to unbounded; set via [`Self::set_pause_buffer_cap`].
@@ -1298,21 +1435,29 @@ impl Core {
     /// verbatim, or [`PausableMode::Off`] for nodes intrinsically
     /// pause-immune.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `node_id` is not registered, or if the node currently
-    /// holds any pause locks (changing mode mid-pause would lose buffered
-    /// content or strand a `pending_wave` flag — make the change before
-    /// pausing).
-    pub fn set_pausable_mode(&self, node_id: NodeId, mode: PausableMode) {
+    /// - [`SetPausableModeError::UnknownNode`] — `node_id` is not
+    ///   registered.
+    /// - [`SetPausableModeError::WhilePaused`] — the node currently
+    ///   holds at least one pause lock. Changing mode mid-pause would
+    ///   lose buffered content or strand a `pending_wave` flag — resume
+    ///   all locks first.
+    pub fn set_pausable_mode(
+        &self,
+        node_id: NodeId,
+        mode: PausableMode,
+    ) -> Result<(), SetPausableModeError> {
         let mut s = self.lock_state();
-        let rec = s.require_node_mut(node_id);
-        assert!(
-            !rec.pause_state.is_paused(),
-            "set_pausable_mode({node_id:?}, ...): cannot change mode while paused; \
-             resume all locks first"
-        );
+        let rec = s
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(SetPausableModeError::UnknownNode(node_id))?;
+        if rec.pause_state.is_paused() {
+            return Err(SetPausableModeError::WhilePaused);
+        }
         rec.pausable = mode;
+        Ok(())
     }
 
     /// Configure the wave-drain iteration cap (R4.3 / Lock 2.F′). The wave
@@ -1441,23 +1586,44 @@ impl Core {
     /// that need uncommon combinations (e.g., a partial-true derived) can
     /// invoke this method directly.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// - Any element of `reg.deps` is not a registered node id.
-    /// - `reg` carries `Op(Scan)` / `Op(Reduce)` with a `NO_HANDLE` seed
-    ///   (R2.5.3 — stateful folders must have a real seed).
-    /// - `reg.opts.initial` is non-sentinel for a non-state shape (deps
-    ///   non-empty, or fn_or_op present). State nodes are the only kind
-    ///   with an initial cache.
-    /// - A dep is terminal (COMPLETE / ERROR) AND not resubscribable —
-    ///   would create a permanent wedge.
+    /// Errors are returned in evaluation order — earlier phases short-circuit
+    /// later ones, so a single registration produces at most one variant.
     ///
-    /// All four are construction-time programming errors. QA D3 typed-error
-    /// promotion was attempted 2026-05-07 but reverted due to scope
-    /// (~150 call sites including tests / operators / graph / bindings);
-    /// scheduled as its own slice. See `porting-deferred.md`.
-    #[must_use]
-    pub fn register(&self, reg: NodeRegistration) -> NodeId {
+    /// **Phase 1 — lock-released, side-effect-free validation:**
+    /// - [`RegisterError::OperatorWithoutDeps`] — `reg` carries an op but
+    ///   `deps` is empty. Operator nodes need at least one dep — for
+    ///   subscription-managed combinators with no declared deps, use
+    ///   [`Self::register_producer`] instead.
+    /// - [`RegisterError::InitialOnlyForStateNodes`] — `reg.opts.initial`
+    ///   is non-sentinel for a non-state shape (deps non-empty, or
+    ///   fn_or_op present). State nodes are the only kind with an initial
+    ///   cache.
+    ///
+    /// **Phase 2 — operator scratch construction (lock-released):**
+    /// - [`RegisterError::OperatorSeedSentinel`] — `reg` carries `Op(Scan)`
+    ///   / `Op(Reduce)` with a `NO_HANDLE` seed. R2.5.3 — stateful folders
+    ///   must have a real seed.
+    ///
+    /// **Phase 3 — state-lock validation (folded with insertion under a
+    /// single lock acquisition per /qa F1 to prevent TOCTOU between
+    /// validation and `nodes.insert`):**
+    /// - [`RegisterError::UnknownDep`] — any element of `reg.deps` is not
+    ///   a registered node id.
+    /// - [`RegisterError::TerminalDep`] — a dep is terminal (COMPLETE /
+    ///   ERROR) AND not resubscribable — would create a permanent wedge.
+    ///
+    /// All errors are construction-time invariants — the dispatcher
+    /// rejects the registration before any reactive state is created.
+    /// On `Err`, no node has been added and any handle retains taken on
+    /// the way in (operator scratch seed retains via
+    /// [`BindingBoundary::retain_handle`]) have been released
+    /// lock-released — see [`ScratchReleaseGuard`] for the RAII
+    /// discipline that covers both early-return AND unwind paths.
+    /// `Last { default }` retains its `default` handle on the same
+    /// release path.
+    pub fn register(&self, reg: NodeRegistration) -> Result<NodeId, RegisterError> {
         let NodeRegistration {
             deps,
             fn_or_op,
@@ -1479,54 +1645,71 @@ impl Core {
             None => (None, None),
         };
 
-        // Validation:
+        // Phase 1 — lock-released, side-effect-free validation. Errors
+        // here return BEFORE any handle retain is taken.
+        //
         //   - State (no deps + no fn + no op) is the only kind with `initial`.
         //   - Dynamic flag only meaningful when fn + non-empty deps.
         //   - Operator (op present) must have deps (P9: operator without deps
         //     would skip activation — use a producer instead).
         let is_state_shape = deps.is_empty() && fn_id.is_none() && op.is_none();
-        if op.is_some() {
-            assert!(
-                !deps.is_empty(),
-                "register: operator nodes require at least one dep — \
-                 use register_producer for subscription-managed combinators"
-            );
+        if op.is_some() && deps.is_empty() {
+            return Err(RegisterError::OperatorWithoutDeps);
         }
-        if initial != NO_HANDLE {
-            assert!(
-                is_state_shape,
-                "register: NodeOpts::initial only valid for state nodes (no deps + no fn + no op)"
-            );
+        if initial != NO_HANDLE && !is_state_shape {
+            return Err(RegisterError::InitialOnlyForStateNodes);
         }
 
-        // Build per-operator scratch struct + take any required handle
-        // retains BEFORE the state lock is acquired (binding callbacks
-        // outside the lock).
+        // Phase 2 — build per-operator scratch struct (may take handle
+        // retains via `binding.retain_handle` for Scan/Reduce/Last seed).
+        // Lock-released per Slice E (D045) handshake discipline. Returns
+        // `OperatorSeedSentinel` BEFORE retain so an Err leaves no
+        // dangling handles.
         let scratch = match op {
-            Some(operator_op) => self.make_op_scratch(operator_op),
+            Some(operator_op) => self.make_op_scratch(operator_op)?,
             None => None,
         };
 
+        // Wrap scratch in an RAII guard immediately after Phase 2. From
+        // here on, ANY early return / unwind path correctly releases the
+        // scratch's handle retains via `OperatorScratch::release_handles`
+        // (Slice H /qa F2 — defense against panics between Phase 2 and
+        // Phase 3 cleanup branch). Lock-released because the guard is
+        // declared BEFORE `lock_state()` below — variable destruction
+        // order is reverse declaration order, so the `MutexGuard` drops
+        // first on any return path.
+        let scratch_guard = ScratchReleaseGuard::new(scratch, &*self.binding);
+
+        // Phase 3 — state-lock-required validation, FOLDED with insertion
+        // under a single `lock_state()` acquisition per /qa F1. The
+        // pre-/qa version split this into two acquisitions (one for
+        // validation, one for `alloc_node_id` + `nodes.insert`), opening
+        // a TOCTOU window where a concurrent `Core::complete(dep)` on a
+        // non-resubscribable dep could slip in and recreate the wedge
+        // `TerminalDep` was designed to prevent. Single locked region
+        // closes the gap.
         let mut s = self.lock_state();
-        let id = s.alloc_node_id();
 
-        // Validate all deps exist before mutating state.
         for &dep in &deps {
-            assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
+            if !s.nodes.contains_key(&dep) {
+                return Err(RegisterError::UnknownDep(dep));
+            }
         }
-
         // Slice F audit (2026-05-07): mirror `set_deps`'s `TerminalDep`
         // rejection at registration time. Adding a non-resubscribable
         // terminal node as a dep at registration creates a permanent wedge.
         for &dep in &deps {
             let dep_rec = s.require_node(dep);
-            assert!(
-                dep_rec.terminal.is_none() || dep_rec.resubscribable,
-                "register: dep {dep:?} is terminal and not resubscribable; \
-                 mark it resubscribable before terminating, or remove it \
-                 from the dep list"
-            );
+            if dep_rec.terminal.is_some() && !dep_rec.resubscribable {
+                return Err(RegisterError::TerminalDep(dep));
+            }
         }
+
+        // Validation passed — install. Take scratch out of the guard
+        // (disarms the release-on-drop) and continue using `s`.
+        let installed_scratch = scratch_guard.take();
+
+        let id = s.alloc_node_id();
 
         // `tracked`: Static derived + Operator track all deps; Dynamic
         // starts empty and fills via fn return; State / Producer have no
@@ -1565,7 +1748,7 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
-            op_scratch: scratch,
+            op_scratch: installed_scratch,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -1574,7 +1757,7 @@ impl Core {
         }
         drop(s);
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
-        id
+        Ok(id)
     }
 
     /// Sugar over [`Self::register`] — register a state node. `initial`
@@ -1582,8 +1765,17 @@ impl Core {
     ///
     /// `partial` is accepted for surface consistency (D019); for state
     /// nodes it has no effect (state nodes don't fire fn).
-    #[must_use]
-    pub fn register_state(&self, initial: HandleId, partial: bool) -> NodeId {
+    ///
+    /// # Errors
+    ///
+    /// State registration is structurally simple — no deps, no op — so
+    /// the only reachable variant is none in practice. Returns
+    /// [`Result`] for surface consistency with [`Self::register`].
+    pub fn register_state(
+        &self,
+        initial: HandleId,
+        partial: bool,
+    ) -> Result<NodeId, RegisterError> {
         self.register(NodeRegistration {
             deps: Vec::new(),
             fn_or_op: None,
@@ -1603,8 +1795,13 @@ impl Core {
     /// The fn body uses the binding's `ProducerCtx`-equivalent helper
     /// (see `graphrefly-operators::producer`) to subscribe to other Core
     /// nodes — the zip / concat / race / takeUntil pattern.
-    #[must_use]
-    pub fn register_producer(&self, fn_id: FnId) -> NodeId {
+    ///
+    /// # Errors
+    ///
+    /// Producer registration has no user-supplied deps, so structurally
+    /// none of [`RegisterError`]'s variants are reachable. Returns
+    /// [`Result`] for surface consistency with [`Self::register`].
+    pub fn register_producer(&self, fn_id: FnId) -> Result<NodeId, RegisterError> {
         self.register(NodeRegistration {
             deps: Vec::new(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
@@ -1619,17 +1816,19 @@ impl Core {
     /// Sugar over [`Self::register`] — register a derived (static) node.
     /// `partial` controls the R2.5.3 first-run gate (D011).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any element of `deps` is not a registered node id.
-    #[must_use]
+    /// - [`RegisterError::UnknownDep`] — any element of `deps` is not
+    ///   registered.
+    /// - [`RegisterError::TerminalDep`] — a dep is terminal and not
+    ///   resubscribable.
     pub fn register_derived(
         &self,
         deps: &[NodeId],
         fn_id: FnId,
         equals: EqualsMode,
         partial: bool,
-    ) -> NodeId {
+    ) -> Result<NodeId, RegisterError> {
         self.register(NodeRegistration {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
@@ -1645,17 +1844,19 @@ impl Core {
     /// declares its actually-tracked dep indices per fire). `partial`
     /// controls the R2.5.3 first-run gate (D011).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any element of `deps` is not a registered node id.
-    #[must_use]
+    /// - [`RegisterError::UnknownDep`] — any element of `deps` is not
+    ///   registered.
+    /// - [`RegisterError::TerminalDep`] — a dep is terminal and not
+    ///   resubscribable.
     pub fn register_dynamic(
         &self,
         deps: &[NodeId],
         fn_id: FnId,
         equals: EqualsMode,
         partial: bool,
-    ) -> NodeId {
+    ) -> Result<NodeId, RegisterError> {
         self.register(NodeRegistration {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
@@ -1673,51 +1874,69 @@ impl Core {
     /// Shared between `register_operator` (initial install) and
     /// `reset_for_fresh_lifecycle` (resubscribable cycle re-install).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `op` is `Scan` / `Reduce` with a [`NO_HANDLE`] seed
-    /// (R2.5.3 — stateful folders must have a real seed).
-    fn make_op_scratch(&self, op: OperatorOp) -> Option<Box<dyn crate::op_state::OperatorScratch>> {
+    /// Returns [`RegisterError::OperatorSeedSentinel`] if `op` is `Scan`
+    /// / `Reduce` with a [`NO_HANDLE`] seed (R2.5.3 — stateful folders
+    /// must have a real seed). Refcount discipline: the seed-sentinel
+    /// check happens BEFORE [`BindingBoundary::retain_handle`], so an
+    /// `Err` leaves no handles dangling.
+    fn make_op_scratch(
+        &self,
+        op: OperatorOp,
+    ) -> Result<Option<Box<dyn crate::op_state::OperatorScratch>>, RegisterError> {
         use crate::op_state::{
             DistinctState, LastState, PairwiseState, ReduceState, ScanState, SkipState, TakeState,
             TakeWhileState,
         };
+        // Slice H (2026-05-07): Scan/Reduce seed-sentinel checks happen
+        // BEFORE retain_handle so an Err return leaves no handles dangling.
+        //
+        // Slice H /qa F13 (2026-05-07): for retaining variants, allocate
+        // the `Box<State>` BEFORE calling `binding.retain_handle`. If
+        // `Box::new` panics (e.g., OOM-as-panic), no retain has happened
+        // yet — no leak. If `retain_handle` panics after Box succeeds,
+        // the `Box<State>` is dropped on unwind; State has no handle yet
+        // (we haven't touched the registry refcount), so still no leak.
+        // Caller wraps the returned scratch in `ScratchReleaseGuard` to
+        // cover panics AFTER make_op_scratch returns.
         match op {
             OperatorOp::Scan { seed, .. } => {
-                assert!(
-                    seed != NO_HANDLE,
-                    "Scan seed must be a real handle (R2.5.3); got NO_HANDLE"
-                );
+                if seed == NO_HANDLE {
+                    return Err(RegisterError::OperatorSeedSentinel);
+                }
+                let state = Box::new(ScanState { acc: seed });
                 self.binding.retain_handle(seed);
-                Some(Box::new(ScanState { acc: seed }))
+                Ok(Some(state))
             }
             OperatorOp::Reduce { seed, .. } => {
-                assert!(
-                    seed != NO_HANDLE,
-                    "Reduce seed must be a real handle (R2.5.3); got NO_HANDLE"
-                );
+                if seed == NO_HANDLE {
+                    return Err(RegisterError::OperatorSeedSentinel);
+                }
+                let state = Box::new(ReduceState { acc: seed });
                 self.binding.retain_handle(seed);
-                Some(Box::new(ReduceState { acc: seed }))
+                Ok(Some(state))
             }
-            OperatorOp::DistinctUntilChanged { .. } => Some(Box::new(DistinctState::default())),
-            OperatorOp::Pairwise { .. } => Some(Box::new(PairwiseState::default())),
-            OperatorOp::Take { .. } => Some(Box::new(TakeState::default())),
-            OperatorOp::Skip { .. } => Some(Box::new(SkipState::default())),
-            OperatorOp::TakeWhile { .. } => Some(Box::new(TakeWhileState)),
+            OperatorOp::DistinctUntilChanged { .. } => Ok(Some(Box::new(DistinctState::default()))),
+            OperatorOp::Pairwise { .. } => Ok(Some(Box::new(PairwiseState::default()))),
+            OperatorOp::Take { .. } => Ok(Some(Box::new(TakeState::default()))),
+            OperatorOp::Skip { .. } => Ok(Some(Box::new(SkipState::default()))),
+            OperatorOp::TakeWhile { .. } => Ok(Some(Box::new(TakeWhileState))),
             OperatorOp::Last { default } => {
+                let state = Box::new(LastState {
+                    latest: NO_HANDLE,
+                    default,
+                });
                 if default != NO_HANDLE {
                     self.binding.retain_handle(default);
                 }
-                Some(Box::new(LastState {
-                    latest: NO_HANDLE,
-                    default,
-                }))
+                Ok(Some(state))
             }
             OperatorOp::Map { .. }
             | OperatorOp::Filter { .. }
             | OperatorOp::Combine { .. }
             | OperatorOp::WithLatestFrom { .. }
-            | OperatorOp::Merge => None,
+            | OperatorOp::Merge => Ok(None),
         }
     }
 
@@ -1733,12 +1952,23 @@ impl Core {
     /// stored at [`NodeRecord::op_scratch`], and Core takes one retain
     /// share via [`BindingBoundary::retain_handle`].
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any element of `deps` is not a registered node id, or if
-    /// the seed handle for `Scan` / `Reduce` is `NO_HANDLE`.
-    #[must_use]
-    pub fn register_operator(&self, deps: &[NodeId], op: OperatorOp, opts: OperatorOpts) -> NodeId {
+    /// - [`RegisterError::OperatorWithoutDeps`] — `deps` is empty (use
+    ///   [`Self::register_producer`] instead).
+    /// - [`RegisterError::OperatorSeedSentinel`] — `op` is
+    ///   [`OperatorOp::Scan`] / [`OperatorOp::Reduce`] with a
+    ///   [`NO_HANDLE`] seed.
+    /// - [`RegisterError::UnknownDep`] — any element of `deps` is not
+    ///   registered.
+    /// - [`RegisterError::TerminalDep`] — a dep is terminal and not
+    ///   resubscribable.
+    pub fn register_operator(
+        &self,
+        deps: &[NodeId],
+        op: OperatorOp,
+        opts: OperatorOpts,
+    ) -> Result<NodeId, RegisterError> {
         self.register(NodeRegistration {
             deps: deps.to_vec(),
             fn_or_op: Some(NodeFnOrOp::Op(op)),
@@ -2074,7 +2304,15 @@ impl Core {
         // the new retains first, we floor the refcount at ≥1 before
         // any release happens.
         let new_scratch = match prev_op {
-            Some(op) => self.make_op_scratch(op),
+            // Slice H: the OperatorOp stored on NodeRecord previously
+            // passed `make_op_scratch` validation at registration time
+            // (RegisterError::OperatorSeedSentinel for Scan/Reduce
+            // sentinel seeds; Last { default: NO_HANDLE } is accepted
+            // and never errors). Re-running it here on the same op
+            // value is structurally guaranteed to succeed.
+            Some(op) => self
+                .make_op_scratch(op)
+                .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time"),
             None => None,
         };
 

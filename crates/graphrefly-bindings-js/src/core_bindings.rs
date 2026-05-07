@@ -296,18 +296,21 @@ impl BenchCore {
             .lock()
             .expect("registry lock")
             .intern(BenchValue::Int(initial));
-        u32::try_from(self.core.register_state(handle, false).raw()).expect("node id exceeds u32")
+        let id = self
+            .core
+            .register_state(handle, false)
+            .expect("invariant: state registration is structurally infallible");
+        u32::try_from(id.raw()).expect("node id exceeds u32")
     }
 
     /// Register a state node with sentinel cache (no initial value).
     #[napi]
     pub fn register_state_sentinel(&self) -> u32 {
-        u32::try_from(
-            self.core
-                .register_state(graphrefly_core::NO_HANDLE, false)
-                .raw(),
-        )
-        .expect("node id exceeds u32")
+        let id = self
+            .core
+            .register_state(graphrefly_core::NO_HANDLE, false)
+            .expect("invariant: state registration is structurally infallible");
+        u32::try_from(id.raw()).expect("node id exceeds u32")
     }
 
     /// Register a derived node with a built-in fn shape. `dep_ids` are the
@@ -331,12 +334,11 @@ impl BenchCore {
             .into_iter()
             .map(|id| NodeId::new(u64::from(id)))
             .collect();
-        u32::try_from(
-            self.core
-                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-                .raw(),
-        )
-        .expect("node id exceeds u32")
+        let id = self
+            .core
+            .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+            .expect("invariant: caller has validated dep ids before calling register_derived");
+        u32::try_from(id.raw()).expect("node id exceeds u32")
     }
 
     /// Subscribe a noop sink to a node — required to activate compute nodes.
@@ -674,12 +676,11 @@ impl BenchCore {
             .into_iter()
             .map(|id| NodeId::new(u64::from(id)))
             .collect();
-        u32::try_from(
-            self.core
-                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-                .raw(),
-        )
-        .expect("node id exceeds u32")
+        let id = self
+            .core
+            .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+            .expect("invariant: caller has validated dep ids before calling register_derived");
+        u32::try_from(id.raw()).expect("node id exceeds u32")
     }
 
     /// User-facing batch — apply a sequence of mixed emissions on a state

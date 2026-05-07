@@ -150,14 +150,16 @@ fn a6_set_deps_from_firing_fn_rejected_with_reentrant_error() {
 
     let s1_init = inner.intern(TestValue::Int(10));
     let s2_init = inner.intern(TestValue::Int(20));
-    let s1 = core.register_state(s1_init, false);
-    let s2 = core.register_state(s2_init, false);
+    let s1 = core.register_state(s1_init, false).unwrap();
+    let s2 = core.register_state(s2_init, false).unwrap();
 
     let fn_id = inner.register_fn(|deps: &[TestValue]| match deps[0] {
         TestValue::Int(n) => Some(TestValue::Int(n * 2)),
         _ => None,
     });
-    let n = core.register_derived(&[s1], fn_id, EqualsMode::Identity, false);
+    let n = core
+        .register_derived(&[s1], fn_id, EqualsMode::Identity, false)
+        .unwrap();
 
     // Configure D1Binding: when firing n, attempt set_deps(n, [s2]).
     *d1.target.lock().unwrap() = Some(n);
@@ -327,7 +329,7 @@ fn a3_pause_overflow_synthesizes_error_once_per_cycle() {
     core.set_pause_buffer_cap(Some(2));
 
     let initial = inner.intern(TestValue::Int(0));
-    let s = core.register_state(initial, false);
+    let s = core.register_state(initial, false).unwrap();
 
     // Subscribe with a recorder so we can observe the cascade.
     let events = Arc::new(Mutex::new(Vec::<RecordedEvent>::new()));
@@ -437,8 +439,10 @@ fn a3_overflow_silently_dropped_when_binding_returns_none() {
 // =====================================================================
 
 #[test]
-#[should_panic(expected = "is terminal and not resubscribable")]
 fn item4_register_rejects_non_resubscribable_terminal_dep() {
+    // Slice H (2026-05-07): promoted from `should_panic` to typed-error
+    // assertion — the rejection now returns `Err(RegisterError::TerminalDep)`
+    // rather than panicking.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
     // Subscribe so completion has somewhere to land.
@@ -447,13 +451,16 @@ fn item4_register_rejects_non_resubscribable_terminal_dep() {
     // Terminate s WITHOUT marking resubscribable.
     rt.core.complete(s.id);
 
-    // Attempting to register a derived with s as a dep should panic.
     let fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| Some(deps[0].clone()));
-    let _wedge = rt
+    let result = rt
         .core
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+    assert_eq!(
+        result,
+        Err(graphrefly_core::RegisterError::TerminalDep(s.id))
+    );
 }
 
 #[test]
@@ -472,7 +479,8 @@ fn item4_register_accepts_resubscribable_terminal_dep() {
     // Should not panic.
     let _ok = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
 }
 
 // =====================================================================
@@ -496,7 +504,7 @@ fn item5_default_mode_consolidates_to_one_fn_fire_on_resume() {
         }
     });
     // Default mode is the default; explicit for clarity in this test.
-    rt.core.set_pausable_mode(n, PausableMode::Default);
+    rt.core.set_pausable_mode(n, PausableMode::Default).unwrap();
     let rec = rt.subscribe_recorder(n);
 
     // Activation fires fn once.
@@ -591,7 +599,7 @@ fn item5_off_mode_pause_is_no_op() {
             _ => None,
         }
     });
-    rt.core.set_pausable_mode(n, PausableMode::Off);
+    rt.core.set_pausable_mode(n, PausableMode::Off).unwrap();
     let _rec = rt.subscribe_recorder(n);
     let baseline = *calls.lock().unwrap();
 
@@ -608,13 +616,19 @@ fn item5_off_mode_pause_is_no_op() {
 }
 
 #[test]
-#[should_panic(expected = "cannot change mode while paused")]
 fn item5_set_pausable_mode_rejects_when_paused() {
+    // Slice H (2026-05-07): promoted from `should_panic` to typed-error
+    // assertion — the rejection now returns
+    // `Err(SetPausableModeError::WhilePaused)` rather than panicking.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let lock = rt.core.alloc_lock_id();
     rt.core.pause(s.id, lock).expect("pause");
-    rt.core.set_pausable_mode(s.id, PausableMode::ResumeAll);
+    let result = rt.core.set_pausable_mode(s.id, PausableMode::ResumeAll);
+    assert_eq!(
+        result,
+        Err(graphrefly_core::SetPausableModeError::WhilePaused)
+    );
 }
 
 // =====================================================================

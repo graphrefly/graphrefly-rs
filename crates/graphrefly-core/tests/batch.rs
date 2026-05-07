@@ -783,7 +783,8 @@ fn batch_fn_result_multi_data_delivers_all_values() {
 
     let derived = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let rec = rt.subscribe_recorder(derived);
 
     // Initial activation: fn fires with s=0 → emits 0, 0
@@ -831,7 +832,8 @@ fn batch_fn_result_data_then_complete() {
 
     let derived = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let rec = rt.subscribe_recorder(derived);
 
     let events = rec.snapshot();
@@ -867,7 +869,8 @@ fn batch_fn_result_data_then_error() {
 
     let derived = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let rec = rt.subscribe_recorder(derived);
 
     let events = rec.snapshot();
@@ -905,7 +908,8 @@ fn batch_fn_result_dirty_queued_once_per_wave() {
 
     let derived = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let rec = rt.subscribe_recorder(derived);
 
     // Trigger a wave
@@ -966,7 +970,8 @@ fn batch_fn_result_no_equals_substitution() {
 
     let derived = rt
         .core
-        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
+        .unwrap();
     let rec = rt.subscribe_recorder(derived);
 
     // Activation: fn fires, returns Batch{Data(h_fixed)}. Cache = h_fixed.
@@ -1014,7 +1019,8 @@ fn batch_fn_result_propagates_to_grandchild() {
         });
     let mid = rt
         .core
-        .register_derived(&[s.id], fn_id_mid, EqualsMode::Identity, false);
+        .register_derived(&[s.id], fn_id_mid, EqualsMode::Identity, false)
+        .unwrap();
 
     // Grandchild: simple derived that passes through latest value.
     let grandchild = rt.derived(&[mid], |vals| Some(vals[0].clone()));

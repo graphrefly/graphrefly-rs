@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-07 (Slice F — canonical-spec correctness pass; Cat-B reframings)
+last_updated: 2026-05-07 (Slice H — register + set_pausable_mode typed-error promotion)
 ---
 
 # Porting flags & deferred concerns
@@ -962,30 +962,41 @@ preserved for single-emit). All 411 tests pass with F1 active.
   (2026-05-07) — flagged + verified false-positive; user decision
   D1=(c) doc-only.
 
-### D3 — `register` / `set_pausable_mode` typed-error refactor — DEFERRED to dedicated slice
+### ~~D3 — `register` / `set_pausable_mode` typed-error refactor~~ — RESOLVED 2026-05-07 in Slice H
 
-- **What:** /qa surfaced inconsistency between `register`'s panicking
-  contract (`assert!` on unknown dep / operator-without-deps /
-  initial-only-for-state / scan-reduce-seed-sentinel / new
-  terminal-dep-rejection) and `set_deps::TerminalDep` returning a
-  typed `Result<_, SetDepsError>`. The user picked option (a) —
-  promote to typed errors for full unification.
-- **Why deferred:** scope larger than estimated mid-QA — ~150+ call
-  sites across tests / operators / graph / bindings each need
-  `.expect("register")` or `?` propagation, plus refcount-discipline
-  for the error paths (e.g., scratch handle release on early return).
-  Started the refactor in /qa, but couldn't complete within remaining
-  context budget without leaving the code in a half-broken state.
-  Reverted to the panicking contract for this QA pass.
-- **Lift point:** schedule as a dedicated slice — "Slice H — register
-  + set_pausable_mode typed-error promotion." Will introduce
-  `RegisterError { UnknownDep, OperatorWithoutDeps,
-  InitialOnlyForStateNodes, OperatorSeedSentinel, TerminalDep }` +
-  `SetPausableModeError::WhilePaused`, change all `register*` and
-  `set_pausable_mode` signatures, sweep all call sites with
-  `.expect()` / `?`. ~200-300 LOC of mechanical churn.
-- **Source:** Slice F audit follow-on /qa user decision D3=(a) +
-  scope discovery 2026-05-07.
+Slice H landed the typed-error promotion as scheduled. New types:
+
+- `RegisterError::{UnknownDep, OperatorWithoutDeps,
+  InitialOnlyForStateNodes, OperatorSeedSentinel, TerminalDep}` —
+  every variant zero-side-effect on `Err` (no node added to graph,
+  scratch handle retains released lock-released).
+- `SetPausableModeError::{UnknownNode, WhilePaused}` — widened to
+  also surface `UnknownNode` (previously panicked via
+  `require_node_mut`), per user direction Q3=widen for surface
+  consistency with `Core::up::UpError`.
+
+`Core::register` restructured into three phases (lock-released
+validation → scratch creation → state-lock validation with
+refcount-discipline early-return). `make_op_scratch` returns `Result`
+with seed-sentinel check BEFORE any `retain_handle` so `Err` from
+that path takes no retains; `Err` from later phases releases scratch
+via `OperatorScratch::release_handles` lock-released. `reset_for_fresh_lifecycle`
+uses `.expect()` because seed validity is guaranteed at registration time.
+
+Sweep applied across ~150 call sites: tests `.unwrap()`,
+production-shape sites in `graphrefly-operators` / `graphrefly-graph`
+/ `graphrefly-bindings-js` use `.expect("invariant: …")`. `Graph::derived` /
+`Graph::dynamic` / `Graph::state` got `# Panics` doc sections — their
+public `Result<NodeId, NameError>` return covers namespace conflicts
+only; Core-layer `RegisterError` is treated as caller-contract
+violation and surfaces as panic.
+
+10 new regression tests in `tests/slice_h.rs` cover each error variant
+plus refcount-leak verification. **427 tests pass workspace-wide**
+(was 417 pre-Slice-H).
+
+**Source:** Slice F audit follow-on /qa decision D3=(a) (2026-05-07);
+implemented same day.
 
 ## Spec divergences acknowledged in v1
 
@@ -1486,3 +1497,201 @@ in the same slice (D046) — recorded here for traceability.
   assertion now activates for any non-legacy impl (including
   rustImpl once it publishes), so divergences become loud failures
   instead of silent skips.
+
+## QA-surfaced divergences (Slice H /qa, 2026-05-07)
+
+The /qa pass on Slice H surfaced three concerns that were NOT fixed in
+the slice itself. Each captured here with what / why-deferred / source.
+
+### F3 — `reset_for_fresh_lifecycle` calls `make_op_scratch` lock-held
+
+- **What:** Slice H's `Core::register` was explicitly restructured to
+  take operator-scratch handle retains LOCK-RELEASED ("Phase 2 —
+  lock-released per Slice E (D045) handshake discipline" — comment in
+  `node.rs`). The matching code path in `Core::reset_for_fresh_lifecycle`
+  (resubscribable terminal cycle) calls `make_op_scratch(prev_op)`
+  (which calls `binding.retain_handle(seed)`) AND
+  `scratch.release_handles(...)` while holding the state-lock guard.
+- **Why deferred:** pre-existing v1 lock-discipline divergence. Slice H
+  touched the function signature only (added `.expect()` to the now-
+  `Result`-returning `make_op_scratch`); it did not change the lock
+  scope. Real fix: refactor `reset_for_fresh_lifecycle` to drop the
+  state lock, call `make_op_scratch` lock-released, then re-acquire the
+  lock to install + queue handle releases via the existing
+  `deferred_handle_releases` queue (Slice F audit infra). Mirrors the
+  three-phase pattern Slice H landed in `register`.
+- **Lift point:** schedule as part of any future "lock-discipline
+  audit" slice that walks all `binding.{retain_handle, release_handle,
+  invoke_fn, custom_equals, ...}` callers and pushes lock-released
+  invocation across the board. Existing porting-deferred entries
+  ("Audit fixes landed in Slice A+B" §10.10 family) already cover most
+  of the surface; this one slipped because it's behind a
+  resubscribable-terminal-reset code path that few tests exercise.
+- **Source:** Slice H /qa Edge Case Hunter F3 (2026-05-07).
+
+### F11 — Phase 3 closure walks deps twice in `Core::register`
+
+- **What:** Slice H's `Core::register` Phase 3 (now folded with
+  insertion under a single `lock_state()` per /qa F1) walks `deps`
+  twice — first to check `s.nodes.contains_key(&dep)`, then to check
+  `dep_rec.terminal && !dep_rec.resubscribable` via `s.require_node(dep)`.
+  `require_node` uses an internal panic on missing key, so the first
+  loop's job is to pre-validate before the second loop calls into it.
+- **Why deferred:** functionally correct but redundant work. A single
+  loop using `s.nodes.get(&dep)` and matching on `Option<&NodeRecord>`
+  would avoid the double iteration AND avoid `require_node`'s panic
+  path (which is a code-smell for a validating function). Cleanup
+  opportunity, not a correctness fix.
+- **Lift point:** opportunistic — fold into any future register
+  refactor or a small "code-cleanup" pass.
+- **Source:** Slice H /qa Blind Hunter F11 (2026-05-07).
+
+### F17 — Asymmetric `UnknownNode` typed-error surface
+
+- **What:** Slice H widened `Core::set_pausable_mode` to surface
+  `UnknownNode` as a typed error variant (per user direction Q3=widen).
+  The other `require_node_mut` callers in `Core` (`set_resubscribable`,
+  `complete`, `error`, `add_meta_companion`, `pause` / `resume`-via-
+  `up`, etc.) still panic on unknown ids. Public surface is now
+  asymmetric: a JS binding that catches `set_pausable_mode` errors
+  gracefully will still abort the process on `complete(unknown_id)`.
+- **Why deferred:** out of Slice H scope (the slice scope per
+  porting-deferred D3 was specifically `register*` + `set_pausable_mode`).
+  Extending to all `require_node_mut` callers needs its own design call:
+  which methods get widened (e.g., `complete` / `error` are
+  user-facing terminal-emit methods — strong case for typed errors;
+  `add_meta_companion` is binding-internal), and what the unified
+  error surface looks like. Could reuse a single `NodeRefError ::
+  UnknownNode` shared across all the methods, or keep per-method enums.
+- **Lift point:** schedule as "Slice H follow-on — widen `UnknownNode`
+  typed-error surface to remaining `require_node_mut` callers" if and
+  when binding-side error UX consistency becomes a real consumer
+  concern.
+- **Source:** Slice H /qa Blind Hunter F12 (2026-05-07).
+
+## Audit fixes landed in Slice H /qa (2026-05-07)
+
+These were surfaced by Slice H /qa adversarial review and resolved
+in-slice rather than deferred:
+
+### F1 + F2 — TOCTOU race + panic-unsafe scratch leak — FIXED
+
+- **What was broken (F1):** the original Slice H restructured
+  `Core::register` into three phases with a closure-scoped
+  `lock_state()` for Phase 3 validation, then a fresh `lock_state()`
+  for Phase 4 insertion. Pre-Slice-H code held the lock continuously
+  across both phases. The split opened a TOCTOU window where a
+  concurrent `Core::complete(dep)` on a non-resubscribable dep on
+  another `Core` clone could slip in between the two lock acquisitions,
+  recreating the wedge `RegisterError::TerminalDep` was designed to
+  prevent.
+- **What was broken (F2):** `OperatorScratch` impls have no `Drop` impl
+  that calls `release_handles`. Any panic between `make_op_scratch`
+  (Phase 2) and the explicit `if let Err(e)` cleanup branch (e.g.,
+  `lock_state()` reentrance assert, OOM-as-panic on Vec growth in dep
+  iteration) would drop the `Box<dyn OperatorScratch>` without
+  releasing the seed/default retain.
+- **Fix:** Introduced `ScratchReleaseGuard<'a>` RAII wrapper in
+  `node.rs`. Wraps the scratch immediately after Phase 2; on early
+  return / panic, the guard's `Drop` calls `release_handles` lock-
+  released (variable destruction order: guard declared BEFORE
+  `lock_state()`, so the `MutexGuard` drops first). On the success
+  path, `scratch_guard.take()` disarms the guard and hands ownership
+  to `NodeRecord.op_scratch`. Phase 3 + Phase 4 now share a SINGLE
+  `lock_state()` acquisition — closes the TOCTOU window and gives the
+  guard a single LIFO scope to land in.
+
+### F4 — `Last { default }` early-return refcount discipline test — ADDED
+
+- **What was broken:** the original Slice H tests covered Scan-seed
+  refcount discipline (UnknownDep) and Reduce-seed (TerminalDep), but
+  not Last-default. A regression that dropped Last from the early-
+  release branch would not be caught.
+- **Fix:** Added
+  `register_operator_last_with_default_with_unknown_dep_does_not_leak_default`
+  in `tests/slice_h.rs` mirroring the Scan/Reduce variants.
+
+### F5 — `register_err_does_not_add_node_to_graph` tightened — FIXED
+
+- **What was broken:** the test discarded the `Result` variant via
+  `let _ = ...` and asserted only `node_count` unchanged. A regression
+  that silently `Ok`'d would still pass the test.
+- **Fix:** test now binds the result and asserts
+  `Err(RegisterError::UnknownDep(bogus))` AND `node_count` unchanged.
+
+### F6 — error-precedence test — ADDED
+
+- **What was broken:** Phase 1 (`OperatorWithoutDeps`) vs Phase 2
+  (`OperatorSeedSentinel`) ordering was implicit. A future refactor
+  swapping the checks would silently change the variant returned for
+  `register_operator(&[], OperatorOp::Scan { seed: NO_HANDLE, .. })`.
+- **Fix:** added `op_without_deps_takes_precedence_over_seed_sentinel`
+  in `tests/slice_h.rs` pinning Phase 1 → Phase 2 ordering.
+
+### F7 — operator factory `assert!`s promoted to typed `OperatorFactoryError` — FIXED
+
+- **What was broken:** factory-layer asserts in `combine.rs::combine`,
+  `combine.rs::merge`, and `flow.rs::last_with_default_with` panicked
+  on bad inputs (empty sources, NO_HANDLE default), creating a
+  surface inconsistency: `Core::register*` returned typed errors,
+  but the factories above panicked.
+- **Fix:** new `crates/graphrefly-operators/src/error.rs` with
+  `OperatorFactoryError::{EmptySources, ZeroDefault, Register(_)}`.
+  `From<RegisterError>` derive makes `register_operator(...)?`
+  propagation transparent. `combine` / `merge` / `merge_as_op` /
+  `last_with_default` / `last_with_default_with` all return
+  `Result<_, OperatorFactoryError>`. 9 new regression tests in
+  `tests/slice_h_factory_errors.rs` cover both factory-layer variants
+  AND `From<RegisterError>` propagation.
+
+### F8 — Last-shaped `.expect` messages tightened — FIXED
+
+- **What was broken:** `last_with` and `last_with_default_with` used a
+  generic invariant message mentioning "seed" — but `Last` has
+  `default`, not `seed`.
+- **Fix:** wording now says "default" not "seed" for Last variants.
+
+### F9 — `Eq` derive added to `RegisterError` / `SetPausableModeError` — FIXED
+
+- **Fix:** zero-cost — both enums now derive `Eq` so consumers can use
+  them as `HashSet`/`HashMap` keys.
+
+### F10 — stray `FnResult` import in test file — FIXED
+
+- **Fix:** dropped `FnResult` from `tests/slice_h.rs` imports + the
+  unused-suppression sentinel.
+
+### F12 — `# Errors` rustdoc cites phase numbers — FIXED
+
+- **Fix:** `Core::register`'s `# Errors` block now annotates each
+  variant with its phase (Phase 1: lock-released, Phase 2: scratch,
+  Phase 3: state-lock validation) so the doc matches the runtime check
+  order.
+
+### F13 — `make_op_scratch` Box-before-retain ordering — FIXED
+
+- **What was broken:** for Scan/Reduce/Last, `binding.retain_handle`
+  ran BEFORE `Box::new`. If `Box::new` panicked (OOM-as-panic), the
+  retain was taken with no Box to anchor it — leak.
+- **Fix:** allocate the state struct first, then call
+  `retain_handle`. Defense against alloc panics.
+
+### F14 — `reset_for_fresh_lifecycle` `expect` message clarified — FIXED
+
+- **Fix:** message no longer claims "seed was validated" (misleading
+  for `Last { default: NO_HANDLE }` which has no seed); now reads
+  "stored OperatorOp passed make_op_scratch validation at registration
+  time."
+
+### F15 — `RegisterError` rustdoc mentions Last default retain — FIXED
+
+- **Fix:** top-level `RegisterError` docstring now explicitly notes
+  that `Last { default }` retains its `default` handle on the same
+  release path as Scan/Reduce seeds.
+
+### F16 — `set_pausable_mode_on_unknown_node_errors` test pinned no-mutation — FIXED
+
+- **Fix:** test now sets a known node's mode to `Off`, attempts to
+  change a bogus id (gets `UnknownNode` as expected), then re-sets the
+  known node's mode to `Off` (succeeds, proving no partial state
+  mutation happened on the failed call).

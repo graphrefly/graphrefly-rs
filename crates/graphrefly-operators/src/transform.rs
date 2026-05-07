@@ -97,7 +97,11 @@ where
     F: Fn(HandleId) -> HandleId + Send + Sync + 'static,
 {
     let fn_id = binding.register_projector(Box::new(project));
-    let node = core.register_operator(&[source], OperatorOp::Map { fn_id }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Map { fn_id }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }
 
@@ -131,7 +135,11 @@ where
     F: Fn(HandleId) -> bool + Send + Sync + 'static,
 {
     let fn_id = binding.register_predicate(Box::new(predicate));
-    let node = core.register_operator(&[source], OperatorOp::Filter { fn_id }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Filter { fn_id }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }
 
@@ -172,7 +180,11 @@ where
     F: Fn(HandleId, HandleId) -> HandleId + Send + Sync + 'static,
 {
     let fn_id = binding.register_folder(Box::new(fold));
-    let node = core.register_operator(&[source], OperatorOp::Scan { fn_id, seed }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Scan { fn_id, seed }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }
 
@@ -209,7 +221,11 @@ where
     F: Fn(HandleId, HandleId) -> HandleId + Send + Sync + 'static,
 {
     let fn_id = binding.register_folder(Box::new(fold));
-    let node = core.register_operator(&[source], OperatorOp::Reduce { fn_id, seed }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Reduce { fn_id, seed }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }
 
@@ -253,11 +269,15 @@ where
     F: Fn(HandleId, HandleId) -> bool + Send + Sync + 'static,
 {
     let equals_fn_id = binding.register_equals(Box::new(equals));
-    let node = core.register_operator(
-        &[source],
-        OperatorOp::DistinctUntilChanged { equals_fn_id },
-        opts,
-    );
+    let node = core
+        .register_operator(
+            &[source],
+            OperatorOp::DistinctUntilChanged { equals_fn_id },
+            opts,
+        )
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration {
         node,
         fn_id: equals_fn_id,
@@ -296,6 +316,10 @@ where
     F: Fn(HandleId, HandleId) -> HandleId + Send + Sync + 'static,
 {
     let fn_id = binding.register_pairwise_packer(Box::new(pack));
-    let node = core.register_operator(&[source], OperatorOp::Pairwise { fn_id }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Pairwise { fn_id }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }

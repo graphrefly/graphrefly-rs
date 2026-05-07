@@ -150,7 +150,7 @@ fn r_d030_producer_kind_derives_from_field_shape() {
     // fn_id but no op should report Producer.
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
     assert_eq!(core.kind_of(producer), Some(NodeKind::Producer));
 }
 
@@ -158,7 +158,7 @@ fn r_d030_producer_kind_derives_from_field_shape() {
 fn r_d030_state_kind_unchanged_after_unification() {
     // State node: empty deps + no fn + no op → State.
     let (core, _binding) = make_runtime();
-    let s = core.register_state(NO_HANDLE, false);
+    let s = core.register_state(NO_HANDLE, false).unwrap();
     assert_eq!(core.kind_of(s), Some(NodeKind::State));
 }
 
@@ -169,42 +169,50 @@ fn r_d030_unified_register_dispatches_correctly() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
 
-    let state = core.register(NodeRegistration {
-        deps: Vec::new(),
-        fn_or_op: None,
-        opts: NodeOpts::default(),
-    });
+    let state = core
+        .register(NodeRegistration {
+            deps: Vec::new(),
+            fn_or_op: None,
+            opts: NodeOpts::default(),
+        })
+        .unwrap();
     assert_eq!(core.kind_of(state), Some(NodeKind::State));
 
-    let producer = core.register(NodeRegistration {
-        deps: Vec::new(),
-        fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
-        opts: NodeOpts {
-            partial: true,
-            ..Default::default()
-        },
-    });
+    let producer = core
+        .register(NodeRegistration {
+            deps: Vec::new(),
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                partial: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
     assert_eq!(core.kind_of(producer), Some(NodeKind::Producer));
 
-    let derived = core.register(NodeRegistration {
-        deps: vec![state],
-        fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
-        opts: NodeOpts {
-            equals: EqualsMode::Identity,
-            ..Default::default()
-        },
-    });
+    let derived = core
+        .register(NodeRegistration {
+            deps: vec![state],
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                equals: EqualsMode::Identity,
+                ..Default::default()
+            },
+        })
+        .unwrap();
     assert_eq!(core.kind_of(derived), Some(NodeKind::Derived));
 
-    let dynamic = core.register(NodeRegistration {
-        deps: vec![state],
-        fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
-        opts: NodeOpts {
-            is_dynamic: true,
-            partial: true,
-            ..Default::default()
-        },
-    });
+    let dynamic = core
+        .register(NodeRegistration {
+            deps: vec![state],
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                is_dynamic: true,
+                partial: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
     assert_eq!(core.kind_of(dynamic), Some(NodeKind::Dynamic));
 }
 
@@ -216,7 +224,7 @@ fn r_d030_unified_register_dispatches_correctly() {
 fn r_d031_producer_fn_fires_once_on_first_subscribe() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     assert_eq!(
         binding.fn_invocation_count(producer),
@@ -240,7 +248,7 @@ fn r_d031_producer_fn_does_not_re_fire_on_additional_subscribers() {
     // subscribers attach without re-firing.
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     let _sub1 = core.subscribe(producer, noop_sink());
     let _sub2 = core.subscribe(producer, noop_sink());
@@ -261,7 +269,7 @@ fn r_d031_producer_fn_does_not_re_fire_on_additional_subscribers() {
 fn r_d031_producer_deactivate_fires_on_last_unsub() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     let sub = core.subscribe(producer, noop_sink());
     assert_eq!(
@@ -281,7 +289,7 @@ fn r_d031_producer_deactivate_fires_on_last_unsub() {
 fn r_d031_producer_deactivate_does_not_fire_when_one_of_many_unsubs() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     let sub1 = core.subscribe(producer, noop_sink());
     let _sub2 = core.subscribe(producer, noop_sink());
@@ -302,7 +310,7 @@ fn r_d031_producer_deactivate_does_not_fire_when_one_of_many_unsubs() {
 fn r_d031_producer_re_fires_fn_after_deactivate_then_resubscribe() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     let sub1 = core.subscribe(producer, noop_sink());
     assert_eq!(binding.fn_invocation_count(producer), 1);
@@ -325,7 +333,7 @@ fn r_d031_producer_re_fires_fn_after_deactivate_then_resubscribe() {
 #[test]
 fn r_d031_deactivate_does_not_fire_for_state_nodes() {
     let (core, binding) = make_runtime();
-    let s = core.register_state(NO_HANDLE, false);
+    let s = core.register_state(NO_HANDLE, false).unwrap();
 
     let sub = core.subscribe(s, noop_sink());
     drop(sub);
@@ -342,9 +350,11 @@ fn r_d031_deactivate_does_not_fire_for_derived_nodes() {
     // Even non-producer compute nodes (Derived) don't fire
     // producer_deactivate. The hook is keyed on `is_producer()`.
     let (core, binding) = make_runtime();
-    let s = core.register_state(NO_HANDLE, false);
+    let s = core.register_state(NO_HANDLE, false).unwrap();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
-    let derived = core.register_derived(&[s], fn_id, EqualsMode::Identity, true);
+    let derived = core
+        .register_derived(&[s], fn_id, EqualsMode::Identity, true)
+        .unwrap();
 
     let sub = core.subscribe(derived, noop_sink());
     drop(sub);
@@ -370,7 +380,7 @@ fn r_d031_producer_returning_data_emits_value() {
         handle: payload,
         tracked: None,
     });
-    let producer = core.register_producer(fn_id);
+    let producer = core.register_producer(fn_id).unwrap();
 
     let received: Arc<Mutex<Vec<HandleId>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
@@ -401,10 +411,14 @@ fn r_d030_kind_of_is_derived_metadata_not_stored() {
     let (core, binding) = make_runtime();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
 
-    let state = core.register_state(NO_HANDLE, false);
-    let producer = core.register_producer(fn_id);
-    let derived = core.register_derived(&[state], fn_id, EqualsMode::Identity, false);
-    let dynamic = core.register_dynamic(&[state], fn_id, EqualsMode::Identity, true);
+    let state = core.register_state(NO_HANDLE, false).unwrap();
+    let producer = core.register_producer(fn_id).unwrap();
+    let derived = core
+        .register_derived(&[state], fn_id, EqualsMode::Identity, false)
+        .unwrap();
+    let dynamic = core
+        .register_dynamic(&[state], fn_id, EqualsMode::Identity, true)
+        .unwrap();
 
     assert_eq!(core.kind_of(state), Some(NodeKind::State));
     assert_eq!(core.kind_of(producer), Some(NodeKind::Producer));

@@ -324,6 +324,15 @@ impl Graph {
     /// Register a state node under `name`. `initial` of `None` starts
     /// sentinel; `Some(h)` pre-populates the cache. Returns the
     /// underlying `NodeId`.
+    ///
+    /// # Panics
+    ///
+    /// Structurally never panics — state-node registration has no
+    /// reachable [`graphrefly_core::RegisterError`] variants for any
+    /// caller-supplied input (state nodes have no deps and no operator
+    /// scratch). The `.expect()` is present to satisfy the typed-error
+    /// surface from Slice H; the `Result` return covers `NameError`
+    /// (namespace conflicts) only.
     pub fn state(
         &self,
         name: impl Into<String>,
@@ -331,7 +340,8 @@ impl Graph {
     ) -> Result<NodeId, NameError> {
         let id = self
             .core
-            .register_state(initial.unwrap_or(graphrefly_core::NO_HANDLE), false);
+            .register_state(initial.unwrap_or(graphrefly_core::NO_HANDLE), false)
+            .expect("invariant: register_state has no error variants reachable for caller-controlled inputs");
         self.add(id, name)
     }
 
@@ -339,6 +349,14 @@ impl Graph {
     /// with all deps tracked. Defaults to gated first-run (R2.5.3); use
     /// [`Self::derived_with_partial`] for the partial-mode variant
     /// (D011 / R5.4).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element of `deps` is not a registered node id, or
+    /// if a dep is terminal and not resubscribable. The `Result` return
+    /// covers `NameError` (namespace conflicts); construction-time
+    /// errors at the Core layer ([`graphrefly_core::RegisterError`]) are
+    /// caller-contract violations and surface as panics.
     pub fn derived(
         &self,
         name: impl Into<String>,
@@ -346,12 +364,23 @@ impl Graph {
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self.core.register_derived(deps, fn_id, equals, false);
+        let id = self
+            .core
+            .register_derived(deps, fn_id, equals, false)
+            .expect("invariant: caller has validated dep ids before calling register_derived");
         self.add(id, name)
     }
 
     /// Register a dynamic-derived node — fn declares which dep indices
     /// it actually read this run. Defaults to gated first-run (R2.5.3).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element of `deps` is not a registered node id, or
+    /// if a dep is terminal and not resubscribable. The `Result` return
+    /// covers `NameError` (namespace conflicts); construction-time
+    /// errors at the Core layer ([`graphrefly_core::RegisterError`]) are
+    /// caller-contract violations and surface as panics.
     pub fn dynamic(
         &self,
         name: impl Into<String>,
@@ -359,7 +388,10 @@ impl Graph {
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self.core.register_dynamic(deps, fn_id, equals, false);
+        let id = self
+            .core
+            .register_dynamic(deps, fn_id, equals, false)
+            .expect("invariant: caller has validated dep ids before calling register_dynamic");
         self.add(id, name)
     }
 

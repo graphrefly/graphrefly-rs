@@ -37,6 +37,7 @@ use std::sync::Arc;
 use graphrefly_core::{Core, HandleId, NodeId, OperatorOp, OperatorOpts, NO_HANDLE};
 
 use crate::binding::OperatorBinding;
+use crate::error::OperatorFactoryError;
 use crate::transform::{filter, OperatorRegistration};
 
 /// Registration output for flow operators that don't carry a user
@@ -81,7 +82,11 @@ pub fn take(core: &Core, source: NodeId, count: u32) -> FlowRegistration {
 
 /// [`take`] with explicit [`OperatorOpts`].
 pub fn take_with(core: &Core, source: NodeId, count: u32, opts: OperatorOpts) -> FlowRegistration {
-    let node = core.register_operator(&[source], OperatorOp::Take { count }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Take { count }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     FlowRegistration { node }
 }
 
@@ -95,7 +100,11 @@ pub fn skip(core: &Core, source: NodeId, count: u32) -> FlowRegistration {
 
 /// [`skip`] with explicit [`OperatorOpts`].
 pub fn skip_with(core: &Core, source: NodeId, count: u32, opts: OperatorOpts) -> FlowRegistration {
-    let node = core.register_operator(&[source], OperatorOp::Skip { count }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Skip { count }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     FlowRegistration { node }
 }
 
@@ -132,7 +141,11 @@ where
     F: Fn(HandleId) -> bool + Send + Sync + 'static,
 {
     let fn_id = binding.register_predicate(Box::new(predicate));
-    let node = core.register_operator(&[source], OperatorOp::TakeWhile { fn_id }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::TakeWhile { fn_id }, opts)
+        .expect(
+            "invariant: caller has validated dep ids and seed before calling register_operator",
+        );
     OperatorRegistration { node, fn_id }
 }
 
@@ -153,7 +166,9 @@ pub fn last(core: &Core, source: NodeId) -> FlowRegistration {
 
 /// [`last`] with explicit [`OperatorOpts`].
 pub fn last_with(core: &Core, source: NodeId, opts: OperatorOpts) -> FlowRegistration {
-    let node = core.register_operator(&[source], OperatorOp::Last { default: NO_HANDLE }, opts);
+    let node = core
+        .register_operator(&[source], OperatorOp::Last { default: NO_HANDLE }, opts)
+        .expect("invariant: caller has validated dep id before calling last()");
     FlowRegistration { node }
 }
 
@@ -166,27 +181,36 @@ pub fn last_with(core: &Core, source: NodeId, opts: OperatorOpts) -> FlowRegistr
 /// caller should retain a share for themselves if they want to
 /// reference the handle elsewhere.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `default == NO_HANDLE` — use [`last`] for the no-default
-/// behavior instead.
-pub fn last_with_default(core: &Core, source: NodeId, default: HandleId) -> FlowRegistration {
+/// - [`OperatorFactoryError::ZeroDefault`] — `default == NO_HANDLE`. Use
+///   [`last`] for the no-default behavior instead.
+/// - [`OperatorFactoryError::Register`] — Core-layer registration error
+///   (unknown / terminal-non-resubscribable `source`).
+pub fn last_with_default(
+    core: &Core,
+    source: NodeId,
+    default: HandleId,
+) -> Result<FlowRegistration, OperatorFactoryError> {
     last_with_default_with(core, source, default, OperatorOpts::default())
 }
 
 /// [`last_with_default`] with explicit [`OperatorOpts`].
+///
+/// # Errors
+///
+/// Same conditions as [`last_with_default`].
 pub fn last_with_default_with(
     core: &Core,
     source: NodeId,
     default: HandleId,
     opts: OperatorOpts,
-) -> FlowRegistration {
-    assert!(
-        default != NO_HANDLE,
-        "last_with_default requires a real default handle; use last() for no-default"
-    );
-    let node = core.register_operator(&[source], OperatorOp::Last { default }, opts);
-    FlowRegistration { node }
+) -> Result<FlowRegistration, OperatorFactoryError> {
+    if default == NO_HANDLE {
+        return Err(OperatorFactoryError::ZeroDefault);
+    }
+    let node = core.register_operator(&[source], OperatorOp::Last { default }, opts)?;
+    Ok(FlowRegistration { node })
 }
 
 // ---------------------------------------------------------------------

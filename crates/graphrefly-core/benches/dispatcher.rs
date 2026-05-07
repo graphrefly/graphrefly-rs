@@ -86,32 +86,42 @@ fn noop_sink() -> Sink {
 
 fn build_chain(core: &Core, length: usize) -> (NodeId, NodeId) {
     // s = state; chain of `length` derived nodes each reading from previous.
-    let s = core.register_state(HandleId::new(1), false);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
     let mut prev = s;
     let dummy_fn = FnId::new(0);
     for _ in 0..length {
-        prev = core.register_derived(&[prev], dummy_fn, EqualsMode::Identity, false);
+        prev = core
+            .register_derived(&[prev], dummy_fn, EqualsMode::Identity, false)
+            .unwrap();
     }
     (s, prev)
 }
 
 fn build_diamond(core: &Core, fanout: usize) -> (NodeId, NodeId) {
     // s → {d1..dN} → sink; sink has all dN as deps.
-    let s = core.register_state(HandleId::new(1), false);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
     let dummy_fn = FnId::new(0);
     let inner: Vec<NodeId> = (0..fanout)
-        .map(|_| core.register_derived(&[s], dummy_fn, EqualsMode::Identity, false))
+        .map(|_| {
+            core.register_derived(&[s], dummy_fn, EqualsMode::Identity, false)
+                .unwrap()
+        })
         .collect();
-    let sink = core.register_derived(&inner, dummy_fn, EqualsMode::Identity, false);
+    let sink = core
+        .register_derived(&inner, dummy_fn, EqualsMode::Identity, false)
+        .unwrap();
     (s, sink)
 }
 
 fn build_fanout(core: &Core, fanout: usize) -> (NodeId, Vec<NodeId>) {
     // s → {leaf1..leafN}, no further reduction.
-    let s = core.register_state(HandleId::new(1), false);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
     let dummy_fn = FnId::new(0);
     let leaves: Vec<NodeId> = (0..fanout)
-        .map(|_| core.register_derived(&[s], dummy_fn, EqualsMode::Identity, false))
+        .map(|_| {
+            core.register_derived(&[s], dummy_fn, EqualsMode::Identity, false)
+                .unwrap()
+        })
         .collect();
     (s, leaves)
 }
@@ -126,7 +136,7 @@ fn bench_state_emit_identity_dedup(c: &mut Criterion) {
 
     let binding = BenchBinding::new();
     let core = Core::new(binding.clone());
-    let s = core.register_state(HandleId::new(1), false);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
     let _sub = core.subscribe(s, noop_sink());
     let same = HandleId::new(1);
 
@@ -144,7 +154,7 @@ fn bench_state_emit_changing(c: &mut Criterion) {
 
     let binding = BenchBinding::new();
     let core = Core::new(binding.clone());
-    let s = core.register_state(HandleId::new(1), false);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
     let _sub = core.subscribe(s, noop_sink());
 
     group.bench_function("emit_fresh_handle_each", |b| {

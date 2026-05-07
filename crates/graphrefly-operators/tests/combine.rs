@@ -17,7 +17,7 @@ fn combine_emits_tuple_on_any_dep_fire() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer());
+    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
 
     // Both deps have initial values → first-run gate satisfied at subscribe →
@@ -57,7 +57,7 @@ fn combine_first_run_gate_holds_until_all_deps_fire() {
     let a = rt.state_int(None);
     let b = rt.state_int(None);
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer());
+    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
 
     // No data yet — gate holds.
@@ -84,7 +84,7 @@ fn combine_3_deps() {
     let b = rt.state_int(Some(2));
     let c = rt.state_int(Some(3));
 
-    let combined = combine(&rt.core, &rt.op_binding, &[a, b, c], rt.make_packer());
+    let combined = combine(&rt.core, &rt.op_binding, &[a, b, c], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(combined.node);
 
     let data = rec.data_values();
@@ -117,7 +117,7 @@ fn combine_complete_when_all_deps_complete() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer());
+    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
     rec.clear();
 
@@ -286,7 +286,7 @@ fn merge_forwards_all_dep_data_verbatim() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]);
+    let m = merge(&rt.core, &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // Push-on-subscribe: merge is partial:true, so fires on first dep.
@@ -321,7 +321,7 @@ fn merge_zero_ffi_no_binding_call() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]);
+    let m = merge(&rt.core, &[a, b]).unwrap();
     let _rec = rt.subscribe_recorder(m.node);
 
     // If any FFI method were called, InnerBinding would unreachable! on
@@ -337,7 +337,7 @@ fn merge_complete_when_all_deps_complete() {
     let b = rt.state_int(Some(2));
     let c = rt.state_int(Some(3));
 
-    let m = merge(&rt.core, &[a, b, c]);
+    let m = merge(&rt.core, &[a, b, c]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
     rec.clear();
 
@@ -361,7 +361,7 @@ fn merge_error_cascades_when_all_deps_terminal() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]);
+    let m = merge(&rt.core, &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
     rec.clear();
 
@@ -388,7 +388,7 @@ fn merge_partial_mode_fires_on_first_dep() {
     let a = rt.state_int(None); // sentinel
     let b = rt.state_int(None); // sentinel
 
-    let m = merge(&rt.core, &[a, b]);
+    let m = merge(&rt.core, &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // No data yet — both sentinel.
@@ -406,7 +406,7 @@ fn merge_many_sources() {
     let rt = OpRuntime::new();
     let sources: Vec<_> = (0..5).map(|i| rt.state_int(Some(i))).collect();
 
-    let m = merge(&rt.core, &sources);
+    let m = merge(&rt.core, &sources).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // Push-on-subscribe delivers each source's initial value.

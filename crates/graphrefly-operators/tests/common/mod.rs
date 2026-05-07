@@ -487,7 +487,7 @@ impl OpRuntime {
             Some(n) => self.intern_int(n),
             None => NO_HANDLE,
         };
-        self.core.register_state(h, false)
+        self.core.register_state(h, false).unwrap()
     }
 
     pub fn subscribe_recorder(&self, node: NodeId) -> Recorder {
