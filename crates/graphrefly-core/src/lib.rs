@@ -50,6 +50,7 @@ pub mod clock;
 pub mod handle;
 pub mod message;
 pub mod node;
+pub(crate) mod op_state;
 pub mod topology;
 
 pub use batch::BatchGuard;

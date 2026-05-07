@@ -676,6 +676,43 @@ These canonical-spec methods are tracked for parity. Items marked
 
 ---
 
+## M3 Slice C-3 — flow operator deferrals
+
+### Flow operator counters reset only on resubscribable terminal cycle (D028)
+
+- **What:** TS legacy `take.ts` resets `taken` / `skipped` / `done` / `latest` on every deactivation (when last subscriber leaves) per Lock 6.D. Rust v1's [`crates/graphrefly-core/src/op_state.rs`](../crates/graphrefly-core/src/op_state.rs) state structs only reset via `reset_for_fresh_lifecycle` — the resubscribable terminal lifecycle reset path. Non-resubscribable nodes whose subscribers go to zero and then come back DON'T reset their flow-operator state.
+- **Why divergent:** matches the broader "Deactivation cleanup not yet modeled" deferral. Rust v1 only models the terminal-resubscribable lifecycle reset; full deactivation/reactivation cleanup awaits M2-graph mount/unmount work that surfaces deactivation as observable.
+- **Lift point:** when deactivation cleanup lands, call `OperatorScratch::release_handles` + reinstall fresh scratch on deactivation (mirrors `reset_for_fresh_lifecycle` shape — the substrate is already in place via the trait's `release_handles` method).
+- **Source:** Slice C-3 close (2026-05-06); D028.
+
+### `take_until(source, notifier)` not yet ported
+
+- **What:** TS `take.ts` exports `takeUntil(source, notifier, opts?)` — forwards `source` until `notifier` matches `predicate`, then `Complete`. Implementation uses the producer pattern (manual subscribe to two sources). Not in the Slice C-3 scope.
+- **Why deferred:** the Core-dispatch `OperatorOp` family (Take/Skip/TakeWhile/Last) handles single-dep / count / predicate gates cleanly. `takeUntil` is fundamentally a 2-dep subscription-managed operator (D020 category B) — different infrastructure. Lands with the future subscription-managed slice that also covers `zip` / `concat` / `race` / `switchMap` / `mergeMap` / `concatMap`.
+- **Source:** Slice C-3 close (2026-05-06); D024 scope decision.
+
+### Operator describe doesn't surface flow-variant discriminant
+
+- **What:** Same as the existing Slice C-1 deferral ("Operator describe doesn't surface per-operator discriminant"). `Graph::describe()` reports the new `Take` / `Skip` / `TakeWhile` / `Last` variants as `type: "operator"` without indicating which flow op they are. Consumers see "this is an operator" but not "this is a take(3)".
+- **Why deferred:** belongs with the canonical describe extension that surfaces operator catalog metadata (Phase 4+ pattern). v1 acceptable.
+- **Source:** Slice C-3 close (2026-05-06); inherits from Slice C-1 deferral.
+
+### `predicate_each` length-mismatch silently truncates `take_while` in release builds (Slice C-3 /qa D1)
+
+- **What:** [`fire_op_take_while`](../crates/graphrefly-core/src/batch.rs) loops over `inputs` and reads `pass.get(i).copied().unwrap_or(false)` (`batch.rs` ~1382). A `debug_assert!` catches `pass.len() != inputs.len()` in debug builds. In release builds, a binding-side bug returning a too-short `Vec<bool>` causes `unwrap_or(false)` to read missing entries as `false` → first-false short-circuit → `done` + `self.complete()`. Silent self-completion. The same defect class affects `fire_op_filter`, but there it just silently drops items without terminating — less catastrophic.
+- **Why deferred:** binding contract violation; no production binding (napi-rs / pyo3 / wasm-bindgen) should violate the contract. Promoting `debug_assert!` to `assert!` would crash release builds on a misbehaving binding rather than silently truncate; that's a defensible tradeoff for v1 but not blocking. A unified `binding_contract_check_pass_len(pass, inputs)` helper that asserts in all builds is the cleaner long-term fix.
+- **Lift point:** when bench evidence shows operator dispatch is hot enough to warrant pre-validation cost, OR when a real binding bug shows up in production. Until then, defensive `unwrap_or(false)` is acceptable.
+- **Source:** Slice C-3 /qa Edge Case Hunter (2026-05-06).
+
+### Future napi-rs `last(src, opts?)` adapter must accept `{ defaultValue: T }` shape (Slice C-3 /qa D2)
+
+- **What:** TS legacy `last(source, options?: { defaultValue?: T })` accepts an optional opts object; `Object.hasOwn(options, "defaultValue")` distinguishes "no default" (key absent) from "explicit undefined default" (key present). Rust core splits this into two factories: [`last`](../crates/graphrefly-operators/src/flow.rs) (no default — emits only `Complete` on empty stream) and [`last_with_default`](../crates/graphrefly-operators/src/flow.rs) (real default handle required). The parity-test scenario [`packages/parity-tests/scenarios/operators/flow.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/flow.test.ts) calls `impl.last(src, { defaultValue: 42 })` against `legacyImpl`. When `rustImpl` activates, the napi-rs binding must dispatch `impl.last(src, { defaultValue: V })` to the Rust `last_with_default(src, intern(V))` factory and `impl.last(src)` (no opts) to `last(src)`.
+- **Why deferred:** parity surface concern for the future binding slice; not a Rust core concern. The Rust dispatch is correct (the two factories cover the two semantic cases); only the JS-binding adapter layer needs to bridge.
+- **Lift point:** when the napi-rs operator binding lands (M3 close-gate residual, alongside the TSFN custom-equals work). The binding's `last(src, opts?)` adapter inspects `opts` and `Object.hasOwn(opts, "defaultValue")`, then dispatches accordingly. The Rust-only edge of `defaultValue: undefined` (TS distinguishes "explicit undefined" from "absent") is acceptably collapsed (Rust has no `undefined`); document the divergence in the binding's adapter.
+- **Source:** Slice C-3 /qa Edge Case Hunter (2026-05-06).
+
+---
+
 ## M2 Slice F /qa — deferred concerns (D1–D6)
 
 QA pass on Slice F surfaced these v1 limitations / divergences. Each

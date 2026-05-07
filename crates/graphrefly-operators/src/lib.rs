@@ -6,19 +6,27 @@
 //! dedup, batch handling) runs entirely in Rust; only the user-supplied
 //! `(T) -> U` callback crosses the FFI boundary on each fire.
 //!
-//! # Status (Slice C-1, 2026-05-06)
+//! # Status (Slice C-3, 2026-05-06)
 //!
-//! Transform module landed: [`map`], [`filter`], [`scan`], [`reduce`],
-//! [`distinct_until_changed`], [`pairwise`]. Architecture per
-//! `docs/rust-port-decisions.md` D009–D019.
+//! Transform module: [`map`], [`filter`], [`scan`], [`reduce`],
+//! [`distinct_until_changed`], [`pairwise`] (Slice C-1, D009–D019).
+//! Combine module: [`combine_latest`], [`merge`], [`with_latest_from`]
+//! (Slice C-2, D020–D023). Flow module: [`take`], [`skip`],
+//! [`take_while`], [`last`], [`last_with_default`] + [`first`],
+//! [`find`], [`element_at`] sugar (Slice C-3, D024–D029). Per-operator
+//! state lives behind a generic
+//! [`OperatorScratch`](graphrefly_core::op_state::OperatorScratch)
+//! slot on `NodeRecord` (D026 — replaces the typed `operator_state`
+//! field used by Slices C-1 / C-2).
 //!
 //! # Module layout (planned)
 //!
 //! - [`transform`] — map, filter, scan, reduce, distinctUntilChanged,
 //!   pairwise (✅ Slice C-1)
 //! - [`combine`] — combine, merge, withLatestFrom (✅ Slice C-2)
+//! - [`flow`] — take, skip, takeWhile, last + first/find/element_at
+//!   sugar (✅ Slice C-3)
 //! - `temporal` — throttle, debounce, sample
-//! - `flow` — take, skip, takeWhile, skipWhile
 //! - `switching` — switchMap, mergeMap, concatMap
 //! - `gating` — valve, gate, budgetGate, policyGate
 //! - `resilience` — retry, circuitBreaker, timeout, fallback,
@@ -45,10 +53,14 @@
 
 pub mod binding;
 pub mod combine;
+pub mod flow;
 pub mod transform;
 
 pub use binding::OperatorBinding;
 pub use combine::{combine as combine_latest, merge, with_latest_from, MergeRegistration};
+pub use flow::{
+    element_at, find, first, last, last_with_default, skip, take, take_while, FlowRegistration,
+};
 pub use transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan, OperatorRegistration,
 };

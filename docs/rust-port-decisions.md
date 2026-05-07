@@ -191,3 +191,51 @@ Each entry records context, options, and rationale for future reference.
 - **Decision:** B — defer. Identity-equals means combine always emits (no dedup between waves). Acceptable for v1; users can add custom equals via `OperatorOpts` if needed.
 - **Rationale:** No bench evidence that tuple dedup is load-bearing. Matches "no optimization without evidence" principle.
 - **Affects:** porting-deferred.md (new deferral entry).
+
+### D024 — M3 Slice C-3 scope: bundle flow operators (take/skip/takeWhile/last + sugar)
+- **Date:** 2026-05-06
+- **Context:** Next operators slice after C-2 (combinators). Flow operators are single-dep, count/predicate-based, fit existing `OperatorOp` + `fire_operator` pattern naturally. `takeUntil` requires producer/subscription-managed pattern (D020 category B) — separate slice.
+- **Options:** A) Bundle take + skip + takeWhile + last + sugar (first/find/element_at). B) Split into stateless (take/skip/first) and stateful (takeWhile/last/find/element_at). C) Add `takeUntil` too via subscription-managed primitive.
+- **Decision:** A — bundle take + skip + takeWhile + last (+ first/find/element_at sugar) in one slice. Defer `takeUntil` to a later subscription-managed slice.
+- **Rationale:** Coherent slice (~900–1200 lines including the `op_scratch` migration per D026). `takeUntil`'s producer pattern is fundamentally different infrastructure; doesn't fit this slice's scope.
+- **Affects:** graphrefly-core (4 new OperatorOp variants, fire_op_* helpers, NodeKind::skips_auto_cascade for Last), graphrefly-operators (flow.rs), parity-tests (operators/flow.test.ts).
+
+### D025 — `last` factory shape: two factories (`last` + `last_with_default`)
+- **Date:** 2026-05-06
+- **Context:** TS `last(source, options?: { defaultValue?: T })` accepts an optional default. Rust factory shape options.
+- **Options:** A) Two factories (`last(source)` errors-on-empty as silent no-op, `last_with_default(source, default)` always emits). B) Single `last(source, default: Option<HandleId>)`. C) `OperatorOpts`-style `last(source, opts: LastOpts { default: Option<HandleId> })`.
+- **Decision:** A — two factories. `last(source)` emits only `Complete` on empty stream (subscriber sees `[Start, Complete]` — no Data); `last_with_default(source, default)` emits `[Start, Data(default), Complete]` on empty stream.
+- **Rationale:** Mirrors existing scan/reduce + scan_with/reduce_with split for `OperatorOpts`. Cleanest call-site for the no-default common case.
+- **Affects:** graphrefly-operators `flow.rs` factories.
+
+### D026 — Per-node generic scratch slot: `op_scratch: Option<Box<dyn OperatorScratch>>` (replaces typed `operator_state: HandleId`)
+- **Date:** 2026-05-06
+- **Context:** Take/Skip need a `u32` counter that spans waves; the existing `operator_state: HandleId` slot can't carry primitive integers. Three architectural options for adding cross-wave operator state.
+- **Options:** A) Add a parallel typed field `operator_count: u32` on `NodeRecord` for Take/Skip; keep `operator_state: HandleId` for handle-bearing ops. B) Replace `operator_state` with a generic `Box<dyn OperatorScratch>` slot; each operator defines its own state struct (e.g., `TakeState { count_emitted: u32 }`, `ScanState { acc: HandleId }`, `LastState { latest: HandleId }`). C) Per-OperatorOp variant carries inline state (conflates registration config with runtime state).
+- **Decision:** B + migrate existing operators in this slice (Q6 path (i)). Add `OperatorScratch: Any + Send + Sync` trait with `release_handles(binding)` method; replace `operator_state: HandleId` field; refactor Scan/Reduce/Distinct/Pairwise's `fire_op_*` helpers to use `op_scratch_mut::<TheirState>(rec)`. New Flow operators use `op_scratch` natively.
+- **Rationale:** User explicitly anticipates more state needs. Generic scratch scales to N operators with one `NodeRecord` field; release path consolidated through trait method (no per-operator Drop case in `Drop for CoreState`). Heap allocation per stateful operator instance is acceptable (per-node, not per-fire). Migrating in the same slice avoids dual-mechanism debt.
+- **Affects:** graphrefly-core `node.rs` (new `OperatorScratch` trait, `op_scratch` field, removal of `operator_state` field), `batch.rs` (`op_scratch_mut` helper, refactor of all 4 existing `fire_op_*` helpers + 4 new ones), `Drop for CoreState` (walk op_scratch + call release_handles), `reset_for_fresh_lifecycle` (call release_handles + clear scratch).
+
+### D027 — `take(0)` edge case: allow at factory; first fire emits zero items then self-completes
+- **Date:** 2026-05-06
+- **Context:** TS `take.ts:33` short-circuits at registration: returns a node that emits `[COMPLETE]` immediately on first fire. Rust port options.
+- **Options:** A) Reject at factory (`assert!(count > 0)`). B) Allow `0`; `fire_op_take` immediately self-terminates on first dep delivery (no Data emit). C) Match TS exactly — emit Complete on registration (before any dep fire).
+- **Decision:** B — allow `count = 0` at factory. First time `fire_op_take` runs (dep delivers DATA), we increment counter zero times in the per-input loop, find `count_emitted >= count` immediately, emit `Complete`, self-terminate via `Core::complete(node_id)`.
+- **Rationale:** Simpler than C (no special registration-time path); doesn't reject a legitimate degenerate use case. Subscriber sees `[Start, Dirty, Complete]` on first fire — predictable.
+- **Affects:** graphrefly-core `fire_op_take`, graphrefly-operators `take` factory.
+
+### D028 — Flow operator deactivation parity: only resubscribable terminal lifecycle reset clears scratch
+- **Date:** 2026-05-06
+- **Context:** TS Lock 6.D resets Take's `taken` / Skip's `skipped` / TakeWhile's `done` / Last's `latest` on deactivation (when last subscriber leaves). Rust v1 has the broader "deactivation cleanup not yet modeled" deferral; only resubscribable terminal lifecycle reset (`reset_for_fresh_lifecycle`) is wired.
+- **Options:** A) Match TS — wire deactivation hook for these operators (introduces partial deactivation cleanup). B) Match Rust v1's existing pattern — clear scratch only via `reset_for_fresh_lifecycle`.
+- **Decision:** B — match Rust v1 pattern. Document divergence in `porting-deferred.md`. A take(n) re-subscribed mid-stream (without terminal cycle) won't reset its counter in Rust v1.
+- **Rationale:** Matches the broader "deactivation cleanup not yet modeled" deferral; lifts together with M2-graph mount/unmount work. Avoids partial deactivation hook for one operator family.
+- **Affects:** graphrefly-core `reset_for_fresh_lifecycle` (calls `release_handles` + clears scratch); porting-deferred.md (new entry).
+
+### D029 — TakeWhile reuses `BindingBoundary::predicate_each` (no new FFI)
+- **Date:** 2026-05-06
+- **Context:** TakeWhile needs a `Fn(T) -> bool` predicate. Filter already exposes `predicate_each(fn_id, &[HandleId]) -> Vec<bool>`.
+- **Options:** A) Add a new FFI surface for take-while (e.g., `predicate_each_until_false`). B) Reuse `predicate_each`; `fire_op_take_while` iterates results, emits up to first `false`, then self-completes.
+- **Decision:** B — reuse `predicate_each`. Slightly wasteful when the predicate is expensive AND most-of-batch will be cut off, but the FFI surface stays narrow.
+- **Rationale:** No bench evidence the wasted predicate calls matter. Adding a new FFI surface for a perf optimization without evidence violates Pass 5 directive.
+- **Affects:** graphrefly-core `fire_op_take_while`, graphrefly-operators `take_while` factory.

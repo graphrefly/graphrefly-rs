@@ -145,20 +145,24 @@ pub enum NodeKind {
     /// Untracked dep updates flow through cache but do NOT re-fire fn.
     Dynamic,
     /// Operator node: built-in dispatch path for transform / combine /
-    /// resilience operators. The `OperatorOp` discriminant selects the
-    /// per-operator FFI path ([`BindingBoundary::project_each`] etc.); Core
-    /// manages per-operator state (`acc` / `prev`) directly via the
-    /// `operator_state` slot on `NodeRecord`. Per Slice C-1 (D009).
+    /// flow / resilience operators. The `OperatorOp` discriminant selects
+    /// the per-operator FFI path ([`BindingBoundary::project_each`] etc.);
+    /// Core manages per-operator state via the generic `op_scratch` slot
+    /// on `NodeRecord` (D026). Per Slice C-1 (D009) / Slice C-3 (D026).
     Operator(OperatorOp),
 }
 
 impl NodeKind {
     /// True if this kind opts OUT of Lock 2.B auto-cascade. Operator(Reduce)
-    /// must intercept upstream COMPLETE so it can emit its accumulator before
-    /// the cascade terminates it; instead of cascading, terminate_node queues
-    /// such children for fn-fire so `fire_operator` can handle the terminal.
+    /// and Operator(Last) must intercept upstream COMPLETE so they can emit
+    /// their accumulator / buffered value before the cascade terminates them;
+    /// instead of cascading, terminate_node queues such children for fn-fire
+    /// so `fire_operator` can handle the terminal.
     pub(crate) fn skips_auto_cascade(self) -> bool {
-        matches!(self, NodeKind::Operator(OperatorOp::Reduce { .. }))
+        matches!(
+            self,
+            NodeKind::Operator(OperatorOp::Reduce { .. } | OperatorOp::Last { .. })
+        )
     }
 }
 
@@ -181,7 +185,8 @@ pub enum OperatorOp {
     Filter { fn_id: FnId },
     /// `scan(source, fold, seed)` — left-fold emitting each new accumulator.
     /// `seed` is captured at registration; `acc` lives in
-    /// `NodeRecord::operator_state` and persists across waves until
+    /// [`ScanState`](super::op_state::ScanState) inside
+    /// [`NodeRecord::op_scratch`] and persists across waves until
     /// resubscribable reset. Calls `BindingBoundary::fold_each(fn_id, acc,
     /// &inputs) -> SmallVec<HandleId>` per fire.
     Scan { fn_id: FnId, seed: HandleId },
@@ -226,6 +231,40 @@ pub enum OperatorOp {
     /// Each dep's batch handles are retained and emitted individually.
     /// COMPLETE cascades when all deps complete (R1.3.4.b).
     Merge,
+
+    // ----- Slice C-3: flow operators (D024) -----
+    /// `take(source, count)` — emits the first `count` DATA values then
+    /// self-completes via `Core::complete`. Tracks `count_emitted` in
+    /// [`TakeState`](super::op_state::TakeState). When upstream completes
+    /// before `count` is reached, the standard auto-cascade propagates
+    /// COMPLETE. `count == 0` is allowed: the first fire emits zero
+    /// items then immediately self-completes (D027).
+    Take { count: u32 },
+
+    /// `skip(source, count)` — drops the first `count` DATA values; once
+    /// the threshold is crossed, subsequent DATAs pass through verbatim.
+    /// Tracks `count_skipped` in [`SkipState`](super::op_state::SkipState).
+    /// On a wave where every input is still in the skip window, queues
+    /// DIRTY+RESOLVED to settle (D018 pattern).
+    Skip { count: u32 },
+
+    /// `takeWhile(source, predicate)` — emits while `predicate(input)`
+    /// holds; on the first `false`, emits any preceding passes then
+    /// self-completes via `Core::complete`. Reuses
+    /// [`BindingBoundary::predicate_each`] (D029); after the first
+    /// `false`, subsequent inputs in the same batch are dropped.
+    TakeWhile { fn_id: FnId },
+
+    /// `last(source)` / `last_with_default(source, default)` — buffers
+    /// the latest DATA; on upstream COMPLETE, emits `Data(latest)` then
+    /// `Complete`. The `default` field is `NO_HANDLE` for the no-default
+    /// factory (emits only `Complete` on empty stream), or a registered
+    /// default handle (emits `Data(default)` + `Complete` on empty
+    /// stream). Storage: [`LastState`](super::op_state::LastState) holds
+    /// `latest` (live buffer) and `default` (registration-time, stable).
+    /// Opts out of Lock 2.B auto-cascade so it can intercept upstream
+    /// COMPLETE.
+    Last { default: HandleId },
 }
 
 /// Registration options for [`Core::register_operator`].
@@ -585,20 +624,26 @@ pub(crate) struct NodeRecord {
     /// State/Derived/Dynamic nodes the field is settable but the gated
     /// path remains the typical caller default.
     pub(crate) partial: bool,
-    /// Operator state slot (Slice C-1). For [`OperatorOp::Scan`] /
-    /// [`OperatorOp::Reduce`], holds the running accumulator handle —
-    /// initialized to the operator's seed at registration, updated each
-    /// fire, retained across waves. For [`OperatorOp::DistinctUntilChanged`]
-    /// / [`OperatorOp::Pairwise`], holds the previous emitted value
-    /// (`NO_HANDLE` = no prior value). Unused for `Map` / `Filter` /
-    /// non-operator kinds (stays `NO_HANDLE`).
+    /// Generic per-operator scratch slot (Slice C-3, D026). Replaces
+    /// the typed `operator_state: HandleId` field used by Slices C-1 / C-2.
+    /// `None` for non-operator kinds and operators with no cross-wave
+    /// state (Map / Filter / Combine / WithLatestFrom / Merge); `Some`
+    /// for stateful operators ([`OperatorOp::Scan`] / [`Reduce`] /
+    /// [`DistinctUntilChanged`] / [`Pairwise`] / [`Take`] / [`Skip`] /
+    /// [`TakeWhile`] / [`Last`]).
     ///
-    /// **Refcount discipline:** Core retains one share of this handle for
-    /// the slot's lifetime. The retain is taken when the slot is written
-    /// (registration for seed; per-fire update for live state); the
-    /// previous handle is released on overwrite. Cleared (with release) by
-    /// `Drop for CoreState` and by `reset_for_fresh_lifecycle`.
-    pub(crate) operator_state: HandleId,
+    /// The boxed value implements
+    /// [`OperatorScratch`](crate::op_state::OperatorScratch); its
+    /// `release_handles` method is called from
+    /// [`reset_for_fresh_lifecycle`] (resubscribable terminal cycle) and
+    /// from [`Drop for CoreState`].
+    ///
+    /// **Refcount discipline:** the state struct owns whatever handle
+    /// shares it stores (e.g., [`ScanState::acc`](crate::op_state::ScanState::acc),
+    /// [`LastState::latest`](crate::op_state::LastState::latest)).
+    /// Per-fire helpers retain the new value before releasing the old;
+    /// `release_handles` releases the current shares at end-of-life.
+    pub(crate) op_scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
 }
 
 impl NodeRecord {
@@ -864,7 +909,7 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
-            operator_state: NO_HANDLE,
+            op_scratch: None,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -913,14 +958,73 @@ impl Core {
         self.register_computed(deps, fn_id, equals, NodeKind::Dynamic, partial)
     }
 
-    /// Register a built-in operator node (Slice C-1, D009). The operator
-    /// dispatch path lives in `fire_operator`; `op` selects which
-    /// per-operator FFI method on [`BindingBoundary`] gets called per fire.
+    /// Build a fresh [`OperatorScratch`](crate::op_state::OperatorScratch)
+    /// box for an operator variant, taking any required handle retains.
+    /// Shared between `register_operator` (initial install) and
+    /// `reset_for_fresh_lifecycle` (resubscribable cycle re-install).
     ///
-    /// For stateful operators ([`OperatorOp::Scan`] / [`OperatorOp::Reduce`]),
-    /// the seed handle is captured into `operator_state` and Core takes one
-    /// retain share via [`BindingBoundary::retain_handle`]. The share is
-    /// released on overwrite (per fire) and on [`Drop`] for [`CoreState`].
+    /// # Panics
+    ///
+    /// Panics if `op` is `Scan` / `Reduce` with a [`NO_HANDLE`] seed
+    /// (R2.5.3 — stateful folders must have a real seed).
+    fn make_op_scratch(&self, op: OperatorOp) -> Option<Box<dyn crate::op_state::OperatorScratch>> {
+        use crate::op_state::{
+            DistinctState, LastState, PairwiseState, ReduceState, ScanState, SkipState, TakeState,
+            TakeWhileState,
+        };
+        match op {
+            OperatorOp::Scan { seed, .. } => {
+                assert!(
+                    seed != NO_HANDLE,
+                    "Scan seed must be a real handle (R2.5.3); got NO_HANDLE"
+                );
+                self.binding.retain_handle(seed);
+                Some(Box::new(ScanState { acc: seed }))
+            }
+            OperatorOp::Reduce { seed, .. } => {
+                assert!(
+                    seed != NO_HANDLE,
+                    "Reduce seed must be a real handle (R2.5.3); got NO_HANDLE"
+                );
+                self.binding.retain_handle(seed);
+                Some(Box::new(ReduceState { acc: seed }))
+            }
+            OperatorOp::DistinctUntilChanged { .. } => Some(Box::new(DistinctState::default())),
+            OperatorOp::Pairwise { .. } => Some(Box::new(PairwiseState::default())),
+            OperatorOp::Take { .. } => Some(Box::new(TakeState::default())),
+            OperatorOp::Skip { .. } => Some(Box::new(SkipState::default())),
+            OperatorOp::TakeWhile { .. } => Some(Box::new(TakeWhileState)),
+            OperatorOp::Last { default } => {
+                if default != NO_HANDLE {
+                    self.binding.retain_handle(default);
+                }
+                Some(Box::new(LastState {
+                    latest: NO_HANDLE,
+                    default,
+                }))
+            }
+            OperatorOp::Map { .. }
+            | OperatorOp::Filter { .. }
+            | OperatorOp::Combine { .. }
+            | OperatorOp::WithLatestFrom { .. }
+            | OperatorOp::Merge => None,
+        }
+    }
+
+    /// Register a built-in operator node (Slice C-1, D009; D026 generic
+    /// scratch). The operator dispatch path lives in `fire_operator`;
+    /// `op` selects which per-operator FFI method on [`BindingBoundary`]
+    /// gets called per fire.
+    ///
+    /// For stateful operators ([`OperatorOp::Scan`] / [`Reduce`] /
+    /// [`Last`] with a default), the seed/default handle is captured
+    /// into the appropriate
+    /// [`OperatorScratch`](crate::op_state::OperatorScratch) struct
+    /// stored at [`NodeRecord::op_scratch`], and Core takes one retain
+    /// share via [`BindingBoundary::retain_handle`]. The share is
+    /// released on per-fire overwrite (Scan/Reduce acc; Last latest)
+    /// and at end-of-life via
+    /// [`OperatorScratch::release_handles`](crate::op_state::OperatorScratch::release_handles).
     ///
     /// # Panics
     ///
@@ -929,21 +1033,12 @@ impl Core {
     /// stateful operators must have a real seed).
     #[must_use]
     pub fn register_operator(&self, deps: &[NodeId], op: OperatorOp, opts: OperatorOpts) -> NodeId {
-        // Seed validation for stateful folders.
-        let seed_handle = match op {
-            OperatorOp::Scan { seed, .. } | OperatorOp::Reduce { seed, .. } => {
-                assert!(
-                    seed != NO_HANDLE,
-                    "Scan/Reduce seed must be a real handle (R2.5.3); got NO_HANDLE"
-                );
-                seed
-            }
-            _ => NO_HANDLE,
-        };
-        // Retain the seed share so the operator_state slot owns it.
-        if seed_handle != NO_HANDLE {
-            self.binding.retain_handle(seed_handle);
-        }
+        // Build the per-operator scratch struct + take any necessary
+        // handle retains. Each Box<dyn OperatorScratch> owns the shares
+        // it stores; release_handles is the only release path at
+        // end-of-life. Helper is shared with reset_for_fresh_lifecycle
+        // so the resubscribable cycle re-seeds with the same shape.
+        let scratch = self.make_op_scratch(op);
 
         let mut s = self.lock_state();
         let id = s.alloc_node_id();
@@ -967,7 +1062,7 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial: opts.partial,
-            operator_state: seed_handle,
+            op_scratch: scratch,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -1013,7 +1108,7 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
-            operator_state: NO_HANDLE,
+            op_scratch: None,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -1206,9 +1301,11 @@ impl Core {
     /// released — replay buffer drops silently because there are no
     /// subscribers to flush to).
     fn reset_for_fresh_lifecycle(&self, s: &mut CoreState, node_id: NodeId) {
-        // Collect handles to release (after dropping the borrow).
-        let handles_to_release: Vec<HandleId> = {
-            let rec = s.require_node(node_id);
+        // Phase 1: collect wave-state handle releases + take the old
+        // op_scratch + reset other state. Take all mutations under one
+        // borrow so the post-borrow phases don't re-walk dep_records.
+        let (op_kind_copy, mut old_scratch, handles_to_release, pause_buffer_payloads) = {
+            let rec = s.require_node_mut(node_id);
             let mut hs = Vec::new();
             if let Some(TerminalKind::Error(h)) = rec.terminal {
                 hs.push(h);
@@ -1217,28 +1314,24 @@ impl Core {
                 if let Some(TerminalKind::Error(h)) = dr.terminal {
                     hs.push(h);
                 }
-                // Release data_batch retains.
                 for &h in &dr.data_batch {
                     hs.push(h);
                 }
+                // Slice C-3 /qa: also release `prev_data`. Prior to this
+                // collection, `reset_for_fresh_lifecycle` overwrote
+                // `dr.prev_data = NO_HANDLE` without releasing the old
+                // handle, leaking one share per dep per resubscribable
+                // cycle. The leak was masked because no test exercised
+                // the per-dep `prev_data` retain across a lifecycle
+                // reset; surfaced by the T1 tightening of
+                // `last_releases_buffered_latest_on_lifecycle_reset`.
+                if dr.prev_data != NO_HANDLE {
+                    hs.push(dr.prev_data);
+                }
             }
-            // Operator state slot — for Distinct/Pairwise (`prev`), reset
-            // to NO_HANDLE so the first post-reset fire treats the next
-            // value as the seed of a fresh stream. For Scan/Reduce
-            // (`acc`), reset to the seed so accumulation restarts. The
-            // current handle's retain is released here; the new seed
-            // retain is taken below.
-            if rec.operator_state != NO_HANDLE {
-                hs.push(rec.operator_state);
-            }
-            hs
-        };
-        let pause_buffer_payloads: Vec<HandleId> = {
-            let rec = s.require_node_mut(node_id);
-            // Take pause_state's buffer; release any retained payload
-            // handles (they were retained at queue_notify time; buffer is
-            // dropped without flushing because the new subscriber is the
-            // only consumer and they get a clean start).
+            // Take pause_state's buffer; collect its payload handles for
+            // release (they were retained at queue_notify time; buffer
+            // drops because the new subscriber starts fresh).
             let mut pulled = Vec::new();
             if let PauseState::Paused { ref mut buffer, .. } = rec.pause_state {
                 for msg in buffer.drain(..) {
@@ -1247,13 +1340,13 @@ impl Core {
                     }
                 }
             }
-            // Reset everything.
+            // Reset wave / lifecycle state.
             rec.terminal = None;
             rec.has_fired_once = rec.cache != NO_HANDLE && rec.kind == NodeKind::State;
             rec.has_received_teardown = false;
             for dr in &mut rec.dep_records {
                 dr.prev_data = NO_HANDLE;
-                dr.data_batch.clear(); // retains already collected above
+                dr.data_batch.clear();
                 dr.terminal = None;
                 dr.dirty = false;
                 dr.involved_this_wave = false;
@@ -1261,46 +1354,54 @@ impl Core {
             rec.pause_state = PauseState::Active;
             rec.involved_this_wave = false;
             rec.dirty = false;
-            // P7 (Slice A close /qa): for Dynamic nodes, clear `tracked`
-            // so the post-reset first fire repopulates it from the fn's
-            // returned tracked-deps set. Mirrors the `set_deps` Dynamic
-            // path's discipline. Without this, a resubscribed dynamic
-            // node's first fire would use the OLD tracked set — masked
-            // today by `has_fired_once = false` (first-fire branch ignores
-            // `tracked`), but a latent foot-gun. Derived's `tracked` is
-            // `(0..deps.len())` from registration and stays valid across
-            // a lifecycle reset, so we leave it alone.
+            // P7 (Slice A close /qa): Dynamic nodes clear `tracked` so
+            // the post-reset first fire repopulates from the fn's
+            // returned tracked-deps set.
             if rec.kind == NodeKind::Dynamic {
                 rec.tracked.clear();
             }
-            // Operator state reset (Slice C-1): re-seed Scan/Reduce's
-            // accumulator from the captured seed; clear Distinct/Pairwise's
-            // previous value. The handle dropped above is released by the
-            // caller; the new seed needs its own retain share.
-            let next_state = match rec.kind {
-                NodeKind::Operator(
-                    OperatorOp::Scan { seed, .. } | OperatorOp::Reduce { seed, .. },
-                ) => seed,
-                _ => NO_HANDLE,
-            };
-            rec.operator_state = next_state;
-            pulled
+            // Take the old scratch out so we can release its handles and
+            // install a fresh one. Operator kind is copied for the
+            // rebuild step below.
+            let kind = rec.kind;
+            let old = std::mem::take(&mut rec.op_scratch);
+            (kind, old, hs, pulled)
         };
-        // Take the seed retain BEFORE we release the prior slot's share;
-        // the binding may collapse the registry slot when refcount hits
-        // zero, and Scan/Reduce's seed could share a handle with the prior
-        // slot if the caller installed them via the same value.
-        let next_seed_retain = {
-            let rec = s.require_node(node_id);
-            if rec.operator_state == NO_HANDLE {
-                None
-            } else {
-                Some(rec.operator_state)
-            }
+
+        // Phase 2 (Slice C-3 /qa P1 — RETAIN-BEFORE-RELEASE ordering):
+        // build the fresh scratch FIRST, taking new retains on any
+        // seed/default handles. This must run BEFORE Phase 3 releases
+        // the old scratch's shares — if old `acc` (Scan/Reduce) or old
+        // `latest` (Last) aliases the new `seed`/`default` (common:
+        // `fold(seed, x) == seed` interns to the same registry entry),
+        // releasing the old share first could collapse the binding's
+        // registry slot to zero (production bindings remove the value
+        // entry on refcount-zero — see `tests/common/mod.rs:191-204`),
+        // and a subsequent `retain_handle` on the new seed would bump a
+        // refcount on a slot whose value has been removed. By taking
+        // the new retains first, we floor the refcount at ≥1 before
+        // any release happens.
+        let new_scratch = match op_kind_copy {
+            NodeKind::Operator(op) => self.make_op_scratch(op),
+            _ => None,
         };
-        if let Some(h) = next_seed_retain {
-            self.binding.retain_handle(h);
+
+        // Phase 3: NOW release handles owned by the old op_scratch
+        // (Scan/Reduce acc, Distinct/Pairwise prev, Last latest +
+        // default). Safe per Phase 2's retain-first floor. The boxed
+        // value is consumed and dropped after.
+        if let Some(scratch) = old_scratch.as_mut() {
+            scratch.release_handles(&*self.binding);
         }
+        drop(old_scratch);
+
+        // Phase 4: install the fresh scratch.
+        {
+            let rec = s.require_node_mut(node_id);
+            rec.op_scratch = new_scratch;
+        }
+
+        // Phase 5: release wave-state handles collected in phase 1.
         for h in handles_to_release {
             self.binding.release_handle(h);
         }
@@ -2545,7 +2646,7 @@ impl Drop for CoreState {
         //     terminated-dep slot).
         //   - `pause_state` paused buffer messages with payload handles
         //     (1 retain per buffered Data/Error).
-        for rec in self.nodes.values() {
+        for rec in self.nodes.values_mut() {
             if rec.cache != NO_HANDLE {
                 self.binding.release_handle(rec.cache);
             }
@@ -2572,12 +2673,12 @@ impl Drop for CoreState {
                     }
                 }
             }
-            // Operator state slot (Slice C-1) — Scan/Reduce hold the
-            // running accumulator; Distinct/Pairwise hold the previous
-            // value. Each retain is taken on slot write (registration or
-            // per-fire update); released here on Core drop.
-            if rec.operator_state != NO_HANDLE {
-                self.binding.release_handle(rec.operator_state);
+            // Operator scratch (Slice C-3, D026): generic per-operator
+            // state struct. Each variant's release_handles releases the
+            // shares it owns (Scan/Reduce acc, Distinct/Pairwise prev,
+            // Last latest + default; Take/Skip/TakeWhile own no handles).
+            if let Some(scratch) = rec.op_scratch.as_mut() {
+                scratch.release_handles(&*self.binding);
             }
         }
 

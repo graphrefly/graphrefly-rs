@@ -4,7 +4,7 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 ## Current state (2026-05-06)
 
-**M1 closed; M2 closed; M3 Slice A + B + C-1 + C-2 landed (2026-05-06).** Slice C-2 (combinator operators — `combine` / `withLatestFrom` / `merge`) extends the operator substrate with multi-dep dispatch: `OperatorOp::Combine { pack_fn }` / `WithLatestFrom { pack_fn }` / `Merge` enum variants, `BindingBoundary::pack_tuple` extension method (D020), `snapshot_op_all_latest` helper for N-dep latest-handle collection, first-fire gate-release semantics on `withLatestFrom` (D021), zero-FFI merge forwarding (D022), `OperatorBinding::register_packer` closure registration. Parity-tested: 6 scenarios across combine/withLatestFrom/merge in `packages/parity-tests/scenarios/operators/combine.test.ts`. Slice C-1 (transform operators — `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`) lands the first operators against the Core-dispatch architecture (D009): `NodeKind::Operator(OperatorOp)` enum variant, `OperatorOp` discriminant, `partial: bool` register option (D011 / R5.4), `BindingBoundary` extension methods (`project_each` / `predicate_each` / `fold_each` / `pairwise_pack`), `Core::register_operator(deps, op, opts)`, per-operator dispatch in `fire_operator` with operator-specific state (`operator_state: HandleId` slot for Scan/Reduce acc and Distinct/Pairwise prev), Reduce's Lock 2.B opt-out (`NodeKind::skips_auto_cascade`) so Reduce can intercept upstream COMPLETE to emit acc + Complete. New crate `graphrefly-operators` exposes `OperatorBinding` super-trait of `BindingBoundary` (D015) plus the six transform factories taking `&Core` + `&Arc<dyn OperatorBinding>` (D010 helper-trait shape). `partial` flag plumbed through all three legacy register methods (`register_state` / `register_derived` / `register_dynamic`) per D019. Substrate is now end-to-end parity-tested across Rust core ↔ JS bindings ↔ TS legacy oracle. M2 (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06). Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
+**M1 closed; M2 closed; M3 Slice A + B + C-1 + C-2 + C-3 landed (2026-05-06).** Slice C-3 (flow operators — `take` / `skip` / `take_while` / `last` + `last_with_default` + sugar `first` / `find` / `element_at`) lands the count / predicate / terminal-aware gates and **migrates all per-operator state from the typed `operator_state: HandleId` field to a generic `op_scratch: Option<Box<dyn OperatorScratch>>` slot** (D026). `OperatorScratch` trait carries a `release_handles(binding)` method consolidating refcount discipline; concrete state structs (`ScanState` / `ReduceState` / `DistinctState` / `PairwiseState` / `TakeState` / `SkipState` / `TakeWhileState` / `LastState`) own their handle shares. Existing Slice C-1 / C-2 operators refactored to use `op_scratch_mut::<ScanState>` etc. New `OperatorOp::Take { count }` / `Skip { count }` / `TakeWhile { fn_id }` / `Last { default: HandleId }` enum variants; `Last` opts out of Lock 2.B auto-cascade (mirrors Reduce). New `graphrefly-operators::flow` module with 4 primary factories + `_with` variants + `first` / `find` / `element_at` sugar. `take(0)` allowed (D027): first fire emits zero items then self-completes. 19 Rust tests + 11 parity scenarios (`packages/parity-tests/scenarios/operators/flow.test.ts`). Slice C-2 (combinator operators — `combine` / `withLatestFrom` / `merge`) extends the operator substrate with multi-dep dispatch: `OperatorOp::Combine { pack_fn }` / `WithLatestFrom { pack_fn }` / `Merge` enum variants, `BindingBoundary::pack_tuple` extension method (D020), `snapshot_op_all_latest` helper for N-dep latest-handle collection, first-fire gate-release semantics on `withLatestFrom` (D021), zero-FFI merge forwarding (D022), `OperatorBinding::register_packer` closure registration. Parity-tested: 6 scenarios across combine/withLatestFrom/merge in `packages/parity-tests/scenarios/operators/combine.test.ts`. Slice C-1 (transform operators — `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`) lands the first operators against the Core-dispatch architecture (D009): `NodeKind::Operator(OperatorOp)` enum variant, `OperatorOp` discriminant, `partial: bool` register option (D011 / R5.4), `BindingBoundary` extension methods (`project_each` / `predicate_each` / `fold_each` / `pairwise_pack`), `Core::register_operator(deps, op, opts)`, per-operator dispatch in `fire_operator` with operator-specific state (`operator_state: HandleId` slot for Scan/Reduce acc and Distinct/Pairwise prev), Reduce's Lock 2.B opt-out (`NodeKind::skips_auto_cascade`) so Reduce can intercept upstream COMPLETE to emit acc + Complete. New crate `graphrefly-operators` exposes `OperatorBinding` super-trait of `BindingBoundary` (D015) plus the six transform factories taking `&Core` + `&Arc<dyn OperatorBinding>` (D010 helper-trait shape). `partial` flag plumbed through all three legacy register methods (`register_state` / `register_derived` / `register_dynamic`) per D019. Substrate is now end-to-end parity-tested across Rust core ↔ JS bindings ↔ TS legacy oracle. M2 (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06). Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
 
 **DS-14 locked + Phase 14 landed in TS** ([archive/docs/SESSION-DS-14-changesets-design.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-DS-14-changesets-design.md)). Rust port greenlit per [SESSION-rust-port-architecture.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) Part 10 lock. M1 parity work (Slice A+B 2026-05-05 + Slice C-1/C-1.5/C-2 + A-bigger + Slice A close 2026-05-05) is now feature-complete: PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR cascade, TEARDOWN-precedes-COMPLETE, resubscribable terminals, meta-TEARDOWN ordering, §10.12 RAII Subscription, dynamic-rewire audit fix, drop-then-fire wave-end sinks, iterative cascades for deep chains, two-phase tier-then-node flush, RAII batch + cache-snapshot rollback, lock-released `invoke_fn` + `custom_equals`, R1.3.5.a per-tier handshake delivery.
 
@@ -43,6 +43,7 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | M2 parity-tests widened (D6) | `graphrefly-ts/packages/parity-tests` | ✅ landed | 2026-05-06: `Impl` interface widened with `Graph` + tier-symbols; 6 new scenario files under `scenarios/graph/` (sugar / remove / edges / signal / describe-reactive / observe-all-reactive). 18 passing + 2 skipped (skipped: TS-side R3.7.3 ordering + auto-subscribe-late, both Rust-port-only enhancements not yet backported). 4 fragility items deferred to follow-up — see `porting-deferred.md` "M2 parity-tests fragility (post-/qa)" section. |
 | M3 (operators — Slice C-1 transform) | `graphrefly-operators` | ✅ landed | 2026-05-06 (Slice C-1): Core-dispatch architecture (D009–D019). `NodeKind::Operator(OperatorOp)` + `OperatorOpts { equals, partial }` + `Core::register_operator` + `BindingBoundary` extensions (`project_each` / `predicate_each` / `fold_each` / `pairwise_pack` — default unimplemented). Six transform factories: `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`. `OperatorBinding` super-trait. 20 operator regression tests + 8 parity scenarios under `packages/parity-tests/scenarios/operators/transform.test.ts`. 300 tests workspace-wide (was 273 post-Slice-B). |
 | M3 (operators — Slice C-2 combinators) | `graphrefly-operators` + `graphrefly-core` | ✅ landed | 2026-05-06 (Slice C-2): Multi-dep combinator operators (D020–D023). 3 new `OperatorOp` variants (`Combine { pack_fn }` / `WithLatestFrom { pack_fn }` / `Merge`). `BindingBoundary::pack_tuple` + `OperatorBinding::register_packer`. `snapshot_op_all_latest` multi-dep snapshot helper. `fire_op_combine` (any-dep-fire tuple emission + post-warmup INVALIDATE NO_HANDLE guard), `fire_op_with_latest_from` (fire-on-primary-only + first-fire gate-release), `fire_op_merge` (zero-FFI handle forwarding). 3 factory functions in `graphrefly-operators::combine`. 14 Rust tests + 6 parity scenarios. Post-/qa: F1 `fire_op_distinct` double-release fix (working-copy retain discipline), F2 `fire_op_combine` INVALIDATE guard, A1 withLatestFrom `debug_assert` corrected to `== 2`, A3 Reduce error-retain comment accuracy, A4 pairwise first-value comment. Known v1 divergence: merge error cascade is all-deps-terminal (Rust Core standard) vs first-error-terminates (TS producer pattern). Combine custom tuple-equality deferred (D023). |
+| M3 (operators — Slice C-3 flow + scratch migration) | `graphrefly-operators` + `graphrefly-core` | ✅ landed | 2026-05-06 (Slice C-3): Flow operators (D024–D029) + generic per-operator state via `op_scratch: Option<Box<dyn OperatorScratch>>` slot replacing typed `operator_state: HandleId` field (D026). New `op_state` module with `OperatorScratch` trait + 8 concrete state structs (`ScanState` / `ReduceState` / `DistinctState` / `PairwiseState` / `TakeState` / `SkipState` / `TakeWhileState` / `LastState`). `OperatorScratch::release_handles(binding)` consolidates refcount discipline; `make_op_scratch(op)` shared between `register_operator` and `reset_for_fresh_lifecycle`. 4 new `OperatorOp` variants (`Take { count }` / `Skip { count }` / `TakeWhile { fn_id }` / `Last { default: HandleId }`). `Last` joins `Reduce` in `NodeKind::skips_auto_cascade`. New `graphrefly-operators::flow` module: `take` / `skip` / `take_while` / `last` / `last_with_default` factories + `_with` opts variants + `first` / `find` / `element_at` sugar compositions. `take(0)` allowed (D027). 19 Rust tests + 11 parity scenarios in `packages/parity-tests/scenarios/operators/flow.test.ts` (Impl interface widened with 7 new flow surface methods). 333 tests workspace-wide (was 300 post-Slice-C-2). |
 | M4 | `graphrefly-storage` | ⏸ blocked | After M2 + DS-14 (`restoreSnapshot mode: "diff"` WAL replay shape) |
 | M5 | `graphrefly-structures` | ⏸ blocked | After M2 + DS-14 (op-log changesets) — STRONG DEFER per Phase 14 guardrail |
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
@@ -238,6 +239,158 @@ Core-level extension adding multi-emission support to `invoke_fn` return type. E
 **F3 — Break after terminal in Batch loop.** `commit_batch` now stops processing after the first `Complete` or `Error` emission (R1.3.4.a). Remaining handles are released. Extracted Batch processing into `commit_batch` helper (clippy `too_many_lines` fix).
 
 **F4 — `#[must_use]` on `FnEmission`.** Added `#[must_use = "FnEmission may contain handles that must be processed or released"]` to prevent silent handle leaks from discarded emissions.
+
+---
+
+## M3 Slice C-3 /qa — adversarial review fixes — landed 2026-05-06
+
+QA pass on Slice C-3 surfaced ~10 active findings via two adversarial subagents (Blind Hunter, Edge Case Hunter); 3 rejected as false positives or matched-existing-deferral. Applied 9 priority patches (P1–P9) + 1 test tightening (T1) + 2 new deferral entries (D1, D2).
+
+### What landed
+
+**P1 — `reset_for_fresh_lifecycle` retain-before-release ordering fix.** Pre-fix: Phase 2 released old scratch handles BEFORE Phase 3 retained new ones. If old `acc` (Scan/Reduce) or old `latest` (Last) aliased the new `seed`/`default` and the caller had released their original intern share, releasing old first could collapse the binding registry slot to refcount zero (production bindings remove the value entry on zero — see `tests/common/mod.rs:191-204`); a subsequent `retain_handle` on the new seed would bump a refcount on a slot whose value was removed. Now Phase 2 builds the new scratch first (taking new retains, flooring refcount ≥ 1), Phase 3 releases old shares safely. Regression test `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry` in `tests/transform.rs` constructs the exact precondition (caller drops their share, fold path leaves `acc == seed`, resubscribable cycle reset) and asserts the value entry survives.
+
+**P2 — `take(0)` doc-comments match impl behavior.** Pre-fix doc-comment claimed `[Start, Dirty, Complete]`; actual impl emits `[Start, Complete]` (no DIRTY before tier-5 terminal — canonical-spec R1.3.1.a applies to DATA waves, not pure-terminal waves). Updated `flow.rs:73-78`, regression test `tests/flow.rs:42-46` comment.
+
+**P3 — Stale `operator_state` doc references replaced with `op_scratch` / `ScanState` / `ReduceState`.** Three locations in `transform.rs` (module-level refcount-discipline narrative, `scan` doc-comment) and `tests/transform.rs` (refcount accounting comments) updated.
+
+**P4 — `TakeWhileState` reduced to a zero-sized struct.** Pre-fix had a `done: bool` field that was set immediately before `self.complete(node_id)` but never read (the `terminal.is_some()` short-circuit at `fire_operator` already gates re-entry). Field removed; `fire_op_take_while` no longer takes a lock to write the dead flag.
+
+**P5 — Dropped dead `_default_at_register` parameter from `fire_op_last`.** The variant `OperatorOp::Last { default }` carries `default` for `make_op_scratch`'s registration path; the live default at fire time comes from `LastState.default`. The dispatch arm now uses `OperatorOp::Last { .. }` (ignore the variant payload) and `fire_op_last(node_id)` takes no extra arg.
+
+**P6 — `fire_op_skip` empty-inputs branch made consistent with `fire_op_take`.** Pre-fix: Skip silently `return`-ed on `inputs.is_empty()`; Take fell through to `settle_dirty_resolved`. Removed Skip's early return so the post-loop `emitted == 0` settle handles both the "all-swallowed-by-window" case and the (defensive) "empty inputs" case identically.
+
+**P7 — Documented `OperatorScratch::release_handles` leaf-op invariant.** Production bindings' `release_handle` MUST be a leaf operation; no Core re-entrance permitted. Both call sites (`Drop for CoreState` walking `nodes.values_mut()`, `reset_for_fresh_lifecycle` mid-borrow) invoke `release_handles` while structurally inside Core; binding re-entrance would observe partial state and risk deadlock. Doc-callout added to the trait definition in `op_state.rs`.
+
+**P8 — Documented `fire_op_last` silent-buffer behavior.** Mirrors Reduce's docstring: on a non-terminal wave, `fire_op_last` updates the buffered `latest` but produces NO downstream wire message; subscribers observe the operator only when upstream COMPLETE/ERROR triggers the terminal branch. Intermediate inputs from the dep's batch are dropped on the floor (data_batch retains release at wave-end rotation).
+
+**P9 — Compile-time `Send + Sync` asserts for every concrete state struct.** Added a `const _: fn() = || { ... }` block at the bottom of `op_state.rs` that statically asserts each of `ScanState` / `ReduceState` / `DistinctState` / `PairwiseState` / `TakeState` / `SkipState` / `TakeWhileState` / `LastState` is `Send + Sync`, plus a defensive `Box<dyn OperatorScratch>` check. Cheap regression insurance against a future state field that accidentally introduces a `!Send` (e.g., `Cell<HandleId>` or `Rc<...>`).
+
+**T1 — `last_releases_buffered_latest_on_lifecycle_reset` rewritten to verify refcount discipline explicitly.** Pre-fix asserted only "no panic on re-subscribe" — a placebo for a test claiming to verify refcount. Now uses a diagnostic intern share to keep the value alive across the lifecycle reset, then observes the refcount delta via `binding.refcount_of`. Asserts the exact refcount progression: 4 (1 diag + 1 source.cache + 1 prev_data + 1 LastState.latest) before reset → 3 (1 diag + 1 source.cache + 1 Last.cache) after reset.
+
+**Bonus fix surfaced by T1 — pre-existing `prev_data` refcount leak in `reset_for_fresh_lifecycle` closed.** The old reset code overwrote `dr.prev_data = NO_HANDLE` without releasing the prior handle's share, leaking one share per dep per resubscribable cycle. The leak was masked because no test previously exercised the per-dep `prev_data` retain across a lifecycle reset. T1's tightened assertions surfaced it; fix collects `dr.prev_data` into the wave-state release set alongside `data_batch` and `terminal Error` handles. Inline comment cross-references this /qa pass.
+
+### Group 2 deferrals (added to porting-deferred.md as D1, D2)
+
+- **D1** — `predicate_each` length-mismatch silently truncates `take_while` in release builds (`debug_assert!` only catches in debug). Defensive concern; binding-contract violation. Lift via a unified `binding_contract_check_pass_len` helper that asserts in all builds when a real binding bug shows up.
+- **D2** — Future napi-rs `last(src, opts?)` adapter must accept `{ defaultValue: T }` opts shape. Rust core splits into `last` / `last_with_default`; binding layer dispatches based on `Object.hasOwn(opts, "defaultValue")`. Heads-up for the future binding slice.
+
+### Rejected (false positives / acceptable design)
+
+- BH#5 race-on-self-Complete (author retracted on further analysis — wave order holds).
+- BH#10 `scratch_ref` panic-on-type-mismatch (acceptable defensive abort; current code is type-consistent across every variant).
+- EC `defaultValue: undefined` parity edge (Rust has no `undefined`; intentional surface gap).
+- EC perf overhead `Box<dyn>` vs typed enum (acceptable per D026 tradeoff already documented; wait for bench evidence).
+- EC `last_with_default(NO_HANDLE)` assertion stricter than Core (intentional layer behavior — `last()` is the no-default factory).
+
+### Test count post-/qa
+
+334 tests green workspace-wide (was 333 pre-/qa; +1 for the P1 regression test). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved across all crates. 11 parity scenarios in `packages/parity-tests/scenarios/operators/flow.test.ts` continue to pass (43 / 45 total parity tests passing; 2 skipped from pre-existing M2 deferrals).
+
+---
+
+## M3 Slice C-3 — flow operators + generic op_scratch migration — landed 2026-05-06
+
+Flow operators (`take` / `skip` / `take_while` / `last` + sugar `first` / `find` / `element_at`) plus a substrate refactor: replace the typed `operator_state: HandleId` field with a generic `op_scratch: Option<Box<dyn OperatorScratch>>` slot per D026. Migration of all four pre-existing stateful operators (Scan / Reduce / Distinct / Pairwise) bundled in this slice (Q6 path (i)) so the codebase has one mechanism, not two.
+
+### What landed
+
+**Generic operator-state substrate (D026):**
+- New module [`crates/graphrefly-core/src/op_state.rs`](../crates/graphrefly-core/src/op_state.rs) — `OperatorScratch: Any + Send + Sync + Debug` trait with `release_handles(&mut self, &dyn BindingBoundary)` and `as_any_mut` / `as_any_ref` downcast hooks. 8 concrete state structs (`ScanState { acc }`, `ReduceState { acc }`, `DistinctState { prev }`, `PairwiseState { prev }`, `TakeState { count_emitted }`, `SkipState { count_skipped }`, `TakeWhileState { done }`, `LastState { latest, default }`) — each owns its handle shares and implements `release_handles` to release them.
+- `NodeRecord.operator_state: HandleId` field replaced by `op_scratch: Option<Box<dyn OperatorScratch>>` ([`node.rs`](../crates/graphrefly-core/src/node.rs)).
+- `Core::make_op_scratch(op)` private helper — shared between `register_operator` (initial install + retain) and `reset_for_fresh_lifecycle` (re-seed Scan/Reduce, re-attach Last default, default-construct Distinct/Pairwise/Take/Skip/TakeWhile).
+- `Drop for CoreState` walks each `op_scratch` and calls `release_handles` (single consolidated release path; no per-operator match arm).
+- `reset_for_fresh_lifecycle` rebuilt as 5 phases: snapshot wave-state releases + take old scratch → release old scratch's handles → build fresh scratch (rebuild via `make_op_scratch`) → install → release wave-state handles.
+
+**Migration of Slice C-1 / C-2 operators:**
+- All 4 stateful `fire_op_*` helpers (`fire_op_scan` / `fire_op_reduce` / `fire_op_distinct` / `fire_op_pairwise`) refactored to use `scratch_ref::<T>(&s, node)` / `scratch_mut::<T>(&mut s, node)` helpers in [`batch.rs`](../crates/graphrefly-core/src/batch.rs). Behavior unchanged; refcount discipline preserved.
+- All 281 pre-existing core tests + 49 graph + 19 transform + 20 combine green post-migration.
+
+**Flow operators (D024):**
+- 4 new `OperatorOp` variants in [`node.rs`](../crates/graphrefly-core/src/node.rs): `Take { count: u32 }`, `Skip { count: u32 }`, `TakeWhile { fn_id: FnId }`, `Last { default: HandleId }`.
+- `NodeKind::skips_auto_cascade` widened to include `OperatorOp::Last` (joins `Reduce` — both intercept upstream COMPLETE to emit buffered value).
+- 4 new `fire_op_*` helpers in [`batch.rs`](../crates/graphrefly-core/src/batch.rs):
+  - `fire_op_take`: per-input emission loop; on quota hit, `Core::complete(node_id)`. `count == 0` allowed (D027): first fire short-circuits without emitting.
+  - `fire_op_skip`: drops first `count` inputs; D018 `settle_dirty_resolved` on full-skip waves.
+  - `fire_op_take_while`: reuses `BindingBoundary::predicate_each` (D029); emits up to first `false`, then self-completes.
+  - `fire_op_last`: terminal-aware — buffers latest DATA in `LastState.latest` (retain new + release old per fire); on upstream COMPLETE emits `Data(latest)` (or `Data(default)` if no DATA arrived) + own `Complete`; cascades ERROR with retain.
+
+**Factory crate (`graphrefly-operators::flow`):**
+- New module [`crates/graphrefly-operators/src/flow.rs`](../crates/graphrefly-operators/src/flow.rs) — primary factories `take` / `skip` / `take_while` / `last` / `last_with_default`, each with a `_with` opts variant. Sugar compositions: `first(src)` → `take(src, 1)`, `find(src, pred)` → `take(filter(src, pred), 1)`, `element_at(src, idx)` → `take(skip(src, idx), 1)`.
+- `FlowRegistration { node }` struct for closure-less ops (Take/Skip/Last); `take_while` reuses `OperatorRegistration { node, fn_id }` for predicate traceability.
+- `last_with_default` panics on `NO_HANDLE` default (use `last()` for no-default).
+
+### Files touched
+
+| Path | Change |
+|------|--------|
+| `crates/graphrefly-core/src/op_state.rs` | NEW — `OperatorScratch` trait + 8 concrete state structs with `release_handles` impls + explicit `Default` impls |
+| `crates/graphrefly-core/src/lib.rs` | `pub(crate) mod op_state;` |
+| `crates/graphrefly-core/src/node.rs` | `OperatorOp` widened with Take/Skip/TakeWhile/Last variants; `NodeKind::skips_auto_cascade` widened for Last; `op_scratch` field replaces `operator_state`; `make_op_scratch` helper; `register_operator` rewrite; `reset_for_fresh_lifecycle` rewrite (5-phase scratch swap); `Drop for CoreState` calls `release_handles` per scratch |
+| `crates/graphrefly-core/src/batch.rs` | `scratch_ref` / `scratch_mut` helpers; `fire_op_scan` / `fire_op_reduce` / `fire_op_distinct` / `fire_op_pairwise` migrated to scratch; new `fire_op_take` / `fire_op_skip` / `fire_op_take_while` / `fire_op_last` helpers; `fire_operator` dispatch arms widened |
+| `crates/graphrefly-operators/src/lib.rs` | `pub mod flow;` + flow re-exports; status doc updated |
+| `crates/graphrefly-operators/src/flow.rs` | NEW — 4 primary factories + `_with` variants + 3 sugar compositions + `FlowRegistration` |
+| `crates/graphrefly-operators/tests/flow.rs` | NEW — 19 regression tests |
+| `packages/parity-tests/impls/types.ts` | `Impl` widened with `take` / `skip` / `takeWhile` / `last` / `first` / `find` / `elementAt` |
+| `packages/parity-tests/impls/legacy.ts` | re-exports for the 7 new flow surface fields |
+| `packages/parity-tests/scenarios/operators/flow.test.ts` | NEW — 11 `describe.each(impls)` scenarios |
+
+### Tests added (Rust)
+
+19 new tests in `crates/graphrefly-operators/tests/flow.rs`:
+
+- `take_emits_first_n_then_self_completes`
+- `take_zero_self_completes_on_first_fire_with_no_data` (D027)
+- `take_propagates_upstream_complete_when_count_not_reached`
+- `take_resubscribable_resets_counter_on_lifecycle_reset`
+- `skip_drops_first_n_then_emits_remaining`
+- `skip_full_window_settles_dirty_resolved_per_d018` (D018)
+- `take_while_emits_until_first_false_then_self_completes` (D029)
+- `last_emits_buffered_latest_on_upstream_complete`
+- `last_no_default_on_empty_stream_emits_only_complete`
+- `last_with_default_on_empty_stream_emits_default`
+- `last_with_default_prefers_latest_over_default`
+- `last_propagates_upstream_error`
+- `first_alias_for_take_one`
+- `find_emits_first_matching_then_completes`
+- `element_at_emits_indexed_value_then_completes`
+- `last_with_default_releases_default_on_core_drop` (refcount discipline)
+- `last_releases_buffered_latest_on_lifecycle_reset` (refcount discipline)
+- `take_after_skip_produces_window` (composition)
+- `flow_registration_is_send_and_sync` (CLAUDE.md Rust invariant 2)
+
+### Tests added (TS-side parity scenarios)
+
+11 new scenarios in [`packages/parity-tests/scenarios/operators/flow.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/flow.test.ts) parameterized via `describe.each(impls)`:
+
+- take(2): emits first 2 + self-complete
+- take(0): D027 first-fire self-complete
+- take(5): upstream COMPLETE before count reached propagates
+- skip(2): drops first 2, forwards rest
+- skip(3): full-window swallow doesn't leak DATA (D018)
+- takeWhile: emits until first false → COMPLETE
+- last: buffers latest, emits on upstream COMPLETE
+- last with default: emits default on empty stream
+- first: alias for take(1)
+- find: first matching DATA + COMPLETE
+- elementAt: indexed DATA + COMPLETE
+
+`Impl` interface widened with `take` / `skip` / `takeWhile` / `last` / `first` / `find` / `elementAt`. All scenarios pass against `legacyImpl`; `rustImpl` activates with `@graphrefly/native` publication.
+
+### Test count
+
+333 tests green workspace-wide (was 300 post-Slice-C-2; +19 flow + 14 net from refactor pass exposing additional unit tests). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved across all crates.
+
+### Decisions logged
+
+D024–D029 in [`docs/rust-port-decisions.md`](rust-port-decisions.md): one-slice scope (D024), two-factory `last` shape (D025), generic `op_scratch` slot with wide migration (D026), `take(0)` first-fire self-complete (D027), deactivation parity scoped to resubscribable cycle (D028), TakeWhile reuses `predicate_each` (D029).
+
+### What did NOT land in Slice C-3
+
+- **`take_until(source, notifier)`** — uses producer / subscription-managed pattern (D020 category B). Out of scope for Core-dispatch operator family; needs separate slice with subscription-managed substrate.
+- **napi-rs flow operator binding parity** — bundled with the existing TSFN deferral (M3 close-gate residual; same shape needed for transform operators).
+- **Operator describe enrichment for new variants** — `describe()` reports operator nodes as `type: "operator"` without surfacing the per-variant discriminant. Same deferral as Slice C-1 (operator catalog metadata).
+- **Deactivation cleanup parity for non-resubscribable nodes** — Rust v1 only resets scratch via the resubscribable terminal lifecycle (`reset_for_fresh_lifecycle`); TS resets on every deactivation per Lock 6.D. Documented divergence (D028); lifts together with M2-graph mount/unmount work.
 
 ---
 

@@ -19,10 +19,14 @@
 //! # Refcount discipline
 //!
 //! For [`scan`] and [`reduce`], the seed handle ownership transfers from
-//! the caller's binding-side intern into Core's `operator_state` slot.
-//! Core takes one retain via [`BindingBoundary::retain_handle`] inside
-//! `register_operator`; the caller is expected to retain a share for
-//! themselves if they want to reference the seed elsewhere.
+//! the caller's binding-side intern into Core's
+//! [`ScanState`](graphrefly_core::op_state::ScanState) /
+//! [`ReduceState`](graphrefly_core::op_state::ReduceState) (post-Slice
+//! C-3 / D026 — generic `op_scratch` slot replaces the typed
+//! `operator_state` field). Core takes one retain via
+//! [`BindingBoundary::retain_handle`] inside `register_operator`; the
+//! caller is expected to retain a share for themselves if they want to
+//! reference the seed elsewhere.
 
 use std::sync::Arc;
 
@@ -141,7 +145,7 @@ where
 /// becomes the accumulator (matches TS legacy). The seed handle must be
 /// pre-registered by the caller with the binding (so it has a real
 /// [`HandleId`]). Core takes one retain on the seed for the
-/// `operator_state` slot's lifetime.
+/// [`ScanState`](graphrefly_core::op_state::ScanState) slot's lifetime.
 pub fn scan<F>(
     core: &Core,
     binding: &Arc<dyn OperatorBinding>,

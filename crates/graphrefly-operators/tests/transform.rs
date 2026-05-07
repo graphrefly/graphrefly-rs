@@ -5,7 +5,7 @@
 
 mod common;
 
-use graphrefly_core::{Core, OperatorOpts, NO_HANDLE};
+use graphrefly_core::{BindingBoundary, Core, OperatorOpts, NO_HANDLE};
 use graphrefly_operators::transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan,
 };
@@ -532,9 +532,9 @@ fn scan_seed_retain_balances_on_core_drop() {
             },
             seed_h,
         );
-        // Core retains the seed for operator_state lifetime.
+        // Core retains the seed for ScanState's lifetime (D026 op_scratch).
         // refcount_of(seed_h) should be ≥ 2: 1 from intern (caller's
-        // share) + 1 from Core's operator_state retain.
+        // share) + 1 from Core's retain in `make_op_scratch`.
         assert!(
             binding.refcount_of(seed_h) >= 2,
             "seed retain bumped: {}",
@@ -549,6 +549,102 @@ fn scan_seed_retain_balances_on_core_drop() {
         binding.refcount_of(seed_h),
         1,
         "after Core drop, seed retain should be just the caller's share"
+    );
+}
+
+/// Slice C-3 /qa P1 regression: `reset_for_fresh_lifecycle` must take
+/// new seed retains BEFORE releasing the old `acc` share. If old `acc`
+/// and new `seed` alias the same handle and the caller has already
+/// dropped their intern share, the prior phase order (release-old →
+/// retain-new) would collapse the binding's registry slot to refcount
+/// zero, removing the value entry. The fix: build the new scratch
+/// FIRST (taking new retains), THEN release the old scratch's shares.
+///
+/// Scenario:
+/// 1. Caller interns seed (refcount = 1) and passes to scan.
+/// 2. Core takes one retain inside `register_operator` (refcount = 2).
+/// 3. Caller releases their share (refcount = 1, just Core's slot).
+/// 4. The scan's fold path leaves `acc == seed` (e.g., wave with no
+///    DATA), so the slot still owns one share of the seed handle.
+/// 5. Mark scan resubscribable; subscribe + emit no DATA + complete +
+///    drop subscriber + re-subscribe → triggers
+///    `reset_for_fresh_lifecycle`.
+/// 6. Inside reset:
+///    - With the OLD ordering, releasing acc would drop refcount to 0,
+///      remove the value, then the new seed retain would bump a refcount
+///      on a dead slot. Subsequent `binding.deref(seed)` would panic.
+///    - With the NEW ordering, the new seed retain (refcount 1 → 2)
+///      runs FIRST, so the subsequent acc release (refcount 2 → 1)
+///      cannot collapse the slot. The value entry stays alive.
+#[test]
+fn scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry() {
+    let rt = OpRuntime::new();
+    let source = rt.state_int(None);
+    let seed_h = rt.intern_int(0); // refcount = 1
+
+    let binding = rt.binding.clone();
+    let scanned = scan(
+        &rt.core,
+        &rt.op_binding,
+        source,
+        move |acc, x| {
+            // fold(acc, x) = acc + x. With x=0, the result interns to
+            // the same handle as acc (when seed is also 0). This makes
+            // acc == seed across waves.
+            let a = binding.deref(acc).int();
+            let v = binding.deref(x).int();
+            binding.intern(TestValue::Int(a + v))
+        },
+        seed_h,
+    )
+    .into_node();
+
+    // Core retained: refcount = 2.
+    assert_eq!(rt.binding.refcount_of(seed_h), 2);
+
+    // Caller releases their intern share. Now refcount = 1 (Core's
+    // slot only). The seed value entry is alive ONLY because of Core's
+    // slot retain — exactly the precondition that makes the
+    // OLD-ordering bug manifest.
+    rt.binding.release_handle(seed_h);
+    assert_eq!(rt.binding.refcount_of(seed_h), 1);
+
+    // Mark resubscribable so the second subscribe triggers the
+    // lifecycle reset.
+    rt.core.set_resubscribable(scanned, true);
+
+    // Cycle 1: subscribe, complete the source without emitting any
+    // DATA. This means scan's fold never runs; `acc` stays equal to
+    // `seed_h`. Then drop the subscriber.
+    let rec1 = rt.subscribe_recorder(scanned);
+    rt.core.complete(source);
+    assert!(rec1.events().contains(&RecordedEvent::Complete));
+    drop(rec1);
+
+    // Cycle 2: subscribe again. This triggers
+    // reset_for_fresh_lifecycle. Under the FIXED phase order, the new
+    // seed retain (refcount 1 → 2) runs BEFORE the old acc release
+    // (refcount 2 → 1), so the registry slot survives. Under the
+    // BROKEN phase order, the slot would have been removed and a
+    // subsequent deref would panic.
+    let _rec2 = rt.subscribe_recorder(scanned);
+
+    // The seed handle's value must still resolve. If the slot was
+    // collapsed and re-bumped on a dead entry, `deref` panics with
+    // "dangling handle".
+    let v = rt.binding.deref(seed_h);
+    assert_eq!(v, TestValue::Int(0), "seed value entry must survive");
+
+    // Refcount discipline: cycle 2's reset re-installed a fresh
+    // ScanState with `acc = seed`, taking one new retain. The old
+    // ScanState's acc retain was released. Net refcount unchanged
+    // (still 1, since the cache slot also independently retained the
+    // seed when fold's no-fire path... actually scan never emitted, so
+    // cache stays NO_HANDLE — only the ScanState slot retains).
+    assert_eq!(
+        rt.binding.refcount_of(seed_h),
+        1,
+        "after reset: one slot-share remains"
     );
 }
 

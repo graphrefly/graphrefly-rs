@@ -83,6 +83,32 @@ pub(crate) struct PendingPerNode {
     pub(crate) messages: Vec<Message>,
 }
 
+/// Borrow the per-operator scratch slot as `&T`. Panics if the slot is
+/// uninitialized or the contained type doesn't match `T` — both are
+/// invariant violations for any `fire_op_*` helper that should only be
+/// called from `fire_operator`'s match arm for the matching variant.
+fn scratch_ref<T: crate::op_state::OperatorScratch>(s: &CoreState, node_id: NodeId) -> &T {
+    s.require_node(node_id)
+        .op_scratch
+        .as_ref()
+        .expect("op_scratch slot uninitialized for operator node")
+        .as_any_ref()
+        .downcast_ref::<T>()
+        .expect("op_scratch type mismatch")
+}
+
+/// Mutable borrow of the per-operator scratch slot. Same invariants as
+/// [`scratch_ref`].
+fn scratch_mut<T: crate::op_state::OperatorScratch>(s: &mut CoreState, node_id: NodeId) -> &mut T {
+    s.require_node_mut(node_id)
+        .op_scratch
+        .as_mut()
+        .expect("op_scratch slot uninitialized for operator node")
+        .as_any_mut()
+        .downcast_mut::<T>()
+        .expect("op_scratch type mismatch")
+}
+
 impl Core {
     // -------------------------------------------------------------------
     // Wave entry + drain
@@ -734,6 +760,13 @@ impl Core {
                 self.fire_op_with_latest_from(node_id, pack_fn);
             }
             OperatorOp::Merge => self.fire_op_merge(node_id),
+            OperatorOp::Take { count } => self.fire_op_take(node_id, count),
+            OperatorOp::Skip { count } => self.fire_op_skip(node_id, count),
+            OperatorOp::TakeWhile { fn_id } => self.fire_op_take_while(node_id, fn_id),
+            // The variant carries `default` for `register_operator`'s
+            // `make_op_scratch` path; once registered, the live default
+            // is read from `LastState::default` inside `fire_op_last`.
+            OperatorOp::Last { .. } => self.fire_op_last(node_id),
         }
     }
 
@@ -830,10 +863,11 @@ impl Core {
 
     /// `OperatorOp::Scan` dispatch — left-fold emitting each new acc.
     fn fire_op_scan(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        use crate::op_state::ScanState;
         let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
         let acc = {
             let s = self.lock_state();
-            s.require_node(node_id).operator_state
+            scratch_ref::<ScanState>(&s, node_id).acc
         };
         {
             let mut s = self.lock_state();
@@ -851,16 +885,15 @@ impl Core {
             new_states.len(),
             inputs.len()
         );
-        // Phase 3a: update operator_state to the LAST new acc — that is
-        // the running fold's persistent state. Take an extra retain for
-        // the slot; release the prior acc's slot retain.
+        // Phase 3a: update ScanState.acc to the LAST new acc. Take an
+        // extra retain for the slot; release the prior acc's slot retain.
         let last_acc = new_states.last().copied();
         if let Some(last) = last_acc {
             let prev_acc = {
                 let mut s = self.lock_state();
-                let rec = s.require_node_mut(node_id);
-                let prev = rec.operator_state;
-                rec.operator_state = last;
+                let scratch = scratch_mut::<ScanState>(&mut s, node_id);
+                let prev = scratch.acc;
+                scratch.acc = last;
                 prev
             };
             // Take the slot's retain on the new acc.
@@ -882,10 +915,11 @@ impl Core {
     /// `OperatorOp::Reduce` dispatch — accumulates silently; emits acc on
     /// upstream COMPLETE (cascades ERROR verbatim).
     fn fire_op_reduce(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        use crate::op_state::ReduceState;
         let (inputs, terminal) = self.snapshot_op_dep0(node_id);
         let acc = {
             let s = self.lock_state();
-            s.require_node(node_id).operator_state
+            scratch_ref::<ReduceState>(&s, node_id).acc
         };
         {
             let mut s = self.lock_state();
@@ -903,7 +937,7 @@ impl Core {
             new_states.len(),
             inputs.len()
         );
-        // Update operator_state to last new acc; release intermediate
+        // Update ReduceState.acc to last new acc; release intermediate
         // states (we don't emit them) and the prior acc's slot retain.
         let last_acc = new_states.last().copied();
         let intermediates_to_release: Vec<HandleId> = if new_states.len() > 1 {
@@ -914,9 +948,9 @@ impl Core {
         let prev_acc_to_release = if let Some(last) = last_acc {
             let prev_acc = {
                 let mut s = self.lock_state();
-                let rec = s.require_node_mut(node_id);
-                let prev = rec.operator_state;
-                rec.operator_state = last;
+                let scratch = scratch_mut::<ReduceState>(&mut s, node_id);
+                let prev = scratch.acc;
+                scratch.acc = last;
                 prev
             };
             self.binding.retain_handle(last);
@@ -954,11 +988,11 @@ impl Core {
                 // and emit Data(acc) + Complete.
                 let final_acc = {
                     let s = self.lock_state();
-                    s.require_node(node_id).operator_state
+                    scratch_ref::<ReduceState>(&s, node_id).acc
                 };
                 if final_acc != crate::handle::NO_HANDLE {
                     // Emission needs its own retain (slot's retain is
-                    // owned by operator_state until reset/Drop).
+                    // owned by ReduceState.acc until reset/Drop).
                     self.binding.retain_handle(final_acc);
                     self.commit_emission_verbatim(node_id, final_acc);
                 }
@@ -978,10 +1012,11 @@ impl Core {
 
     /// `OperatorOp::DistinctUntilChanged` dispatch.
     fn fire_op_distinct(&self, node_id: NodeId, equals_fn_id: crate::handle::FnId) {
+        use crate::op_state::DistinctState;
         let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
         let mut prev = {
             let s = self.lock_state();
-            s.require_node(node_id).operator_state
+            scratch_ref::<DistinctState>(&s, node_id).prev
         };
         {
             let mut s = self.lock_state();
@@ -994,7 +1029,7 @@ impl Core {
         // (which releases old_prev on each non-equal item) and phase 3
         // (which releases the slot's original handle) each have their own
         // share. Without this, the loop's release of old_prev (== original
-        // operator_state) double-releases against phase 3's stale_slot
+        // DistinctState.prev) double-releases against phase 3's stale_slot
         // release.
         if prev != crate::handle::NO_HANDLE {
             self.binding.retain_handle(prev);
@@ -1026,15 +1061,15 @@ impl Core {
                 emitted += 1;
             }
         }
-        // Phase 3: persist prev into operator_state slot. Release the
+        // Phase 3: persist prev into DistinctState.prev slot. Release the
         // slot's original retain (stale_slot) — this is the slot-owned
         // share, independent of the working-copy share released in the
         // loop above.
         {
             let mut s = self.lock_state();
-            let rec = s.require_node_mut(node_id);
-            let stale_slot = rec.operator_state;
-            rec.operator_state = prev;
+            let scratch = scratch_mut::<DistinctState>(&mut s, node_id);
+            let stale_slot = scratch.prev;
+            scratch.prev = prev;
             if stale_slot != prev && stale_slot != crate::handle::NO_HANDLE {
                 drop(s);
                 self.binding.release_handle(stale_slot);
@@ -1056,10 +1091,11 @@ impl Core {
     /// `OperatorOp::Pairwise` dispatch — emits `(prev, current)` tuples
     /// starting after the second value (first input swallowed, sets `prev`).
     fn fire_op_pairwise(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        use crate::op_state::PairwiseState;
         let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
         let mut prev = {
             let s = self.lock_state();
-            s.require_node(node_id).operator_state
+            scratch_ref::<PairwiseState>(&s, node_id).prev
         };
         {
             let mut s = self.lock_state();
@@ -1072,7 +1108,7 @@ impl Core {
         for &h in &inputs {
             if prev == crate::handle::NO_HANDLE {
                 // First-ever value — swallow, set prev. Retain for the
-                // operator_state slot (persisted in phase 3 below).
+                // PairwiseState.prev slot (persisted in phase 3 below).
                 self.binding.retain_handle(h);
                 prev = h;
                 continue;
@@ -1088,12 +1124,12 @@ impl Core {
             self.binding.release_handle(old_prev);
             emitted += 1;
         }
-        // Persist prev into operator_state slot.
+        // Persist prev into PairwiseState.prev slot.
         {
             let mut s = self.lock_state();
-            let rec = s.require_node_mut(node_id);
-            let stale_slot = rec.operator_state;
-            rec.operator_state = prev;
+            let scratch = scratch_mut::<PairwiseState>(&mut s, node_id);
+            let stale_slot = scratch.prev;
+            scratch.prev = prev;
             if stale_slot != prev && stale_slot != crate::handle::NO_HANDLE {
                 drop(s);
                 self.binding.release_handle(stale_slot);
@@ -1211,6 +1247,241 @@ impl Core {
         for &h in &all_handles {
             self.binding.retain_handle(h);
             self.commit_emission_verbatim(node_id, h);
+        }
+    }
+
+    // =================================================================
+    // Slice C-3: flow operators (D024)
+    // =================================================================
+
+    /// `OperatorOp::Take` dispatch — emits the first `count` DATA values
+    /// then self-completes via `Core::complete`. When `count == 0`, the
+    /// first fire emits zero items then immediately self-completes
+    /// (D027). Cross-wave counter lives in
+    /// [`TakeState::count_emitted`](super::op_state::TakeState::count_emitted).
+    fn fire_op_take(&self, node_id: NodeId, count: u32) {
+        use crate::op_state::TakeState;
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        // Snapshot current counter; mark fired regardless of input count
+        // (activation gate already satisfied or partial-mode).
+        let mut count_emitted = {
+            let s = self.lock_state();
+            scratch_ref::<TakeState>(&s, node_id).count_emitted
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        // Already at quota before any input this wave — self-complete
+        // immediately. Covers `count == 0` (first-fire short-circuit) and
+        // any defensive re-entry after the terminal-skip in `fire_operator`
+        // already guards against double-complete.
+        if count_emitted >= count {
+            self.complete(node_id);
+            return;
+        }
+        // Per-input emission loop. Each pass takes a fresh retain for the
+        // cache slot; data_batch slot's retain is released at wave-end
+        // rotation independently.
+        for &h in &inputs {
+            self.binding.retain_handle(h);
+            self.commit_emission_verbatim(node_id, h);
+            count_emitted = count_emitted.saturating_add(1);
+            if count_emitted >= count {
+                break;
+            }
+        }
+        // Persist the updated counter.
+        {
+            let mut s = self.lock_state();
+            scratch_mut::<TakeState>(&mut s, node_id).count_emitted = count_emitted;
+        }
+        // Self-complete if we hit the quota this wave. Upstream COMPLETE
+        // (terminal == Some(Complete)) without us hitting the count
+        // propagates via the standard auto-cascade — we don't intercept it.
+        if count_emitted >= count {
+            self.complete(node_id);
+            return;
+        }
+        // If upstream is already Errored and we haven't hit count, the
+        // standard cascade will propagate it. If the wave delivered no
+        // inputs (e.g. RESOLVED from upstream), settle DIRTY+RESOLVED so
+        // subscribers see the wave close.
+        if inputs.is_empty() && terminal.is_none() {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    /// `OperatorOp::Skip` dispatch — drops the first `count` DATA values,
+    /// then forwards the rest. Cross-wave counter lives in
+    /// [`SkipState::count_skipped`](super::op_state::SkipState::count_skipped).
+    /// On a wave where every input is still in the skip window, settles
+    /// DIRTY+RESOLVED (D018 pattern) so subscribers see the wave close.
+    fn fire_op_skip(&self, node_id: NodeId, count: u32) {
+        use crate::op_state::SkipState;
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        let mut count_skipped = {
+            let s = self.lock_state();
+            scratch_ref::<SkipState>(&s, node_id).count_skipped
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        // No early-return on empty inputs: the post-loop `emitted == 0`
+        // settle handles the empty-inputs case identically to the
+        // all-swallowed-by-skip-window case (Slice C-3 /qa P6 — symmetry
+        // with `fire_op_take`).
+        let mut emitted = 0usize;
+        for &h in &inputs {
+            if count_skipped < count {
+                count_skipped = count_skipped.saturating_add(1);
+                // Drop this input — the data_batch slot still owns its
+                // retain (released at wave-end rotation). No emission.
+                continue;
+            }
+            // Past the skip window — emit verbatim. Take a fresh retain
+            // for the cache slot.
+            self.binding.retain_handle(h);
+            self.commit_emission_verbatim(node_id, h);
+            emitted += 1;
+        }
+        // Persist the updated counter.
+        {
+            let mut s = self.lock_state();
+            scratch_mut::<SkipState>(&mut s, node_id).count_skipped = count_skipped;
+        }
+        if emitted == 0 {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    /// `OperatorOp::TakeWhile` dispatch — emits while the predicate
+    /// holds; on the first `false`, emits any preceding passes from the
+    /// same batch then self-completes via `Core::complete`. Reuses
+    /// [`BindingBoundary::predicate_each`] (D029).
+    fn fire_op_take_while(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        // Phase 2: predicate per input.
+        let pass = self.binding.predicate_each(fn_id, &inputs);
+        debug_assert!(
+            pass.len() == inputs.len(),
+            "predicate_each returned {} bools for {} inputs",
+            pass.len(),
+            inputs.len()
+        );
+        // Phase 3: emit each input until the first false; then
+        // self-complete. `fire_operator`'s `terminal.is_some()`
+        // short-circuit gates re-entry after the self-complete cascade
+        // installs the terminal slot — no extra `done` flag needed.
+        let mut emitted = 0usize;
+        let mut first_false_seen = false;
+        for (i, &h) in inputs.iter().enumerate() {
+            if pass.get(i).copied().unwrap_or(false) {
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+                emitted += 1;
+            } else {
+                first_false_seen = true;
+                break;
+            }
+        }
+        if first_false_seen {
+            self.complete(node_id);
+            return;
+        }
+        if emitted == 0 {
+            // Whole batch passed but was empty (impossible here since
+            // inputs.is_empty() returned early above) — defensive only.
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    /// `OperatorOp::Last` dispatch — buffers the latest DATA; emits
+    /// `Data(latest)` (or `Data(default)` if no DATA arrived and a
+    /// default was registered) then `Complete` on upstream COMPLETE.
+    /// On upstream ERROR, propagates verbatim. Storage:
+    /// [`LastState`](super::op_state::LastState).
+    ///
+    /// **Silent-buffer semantics (mirrors Reduce):** on a non-terminal
+    /// wave (`terminal == None`), `fire_op_last` updates the buffered
+    /// `latest` handle but produces NO downstream wire message —
+    /// subscribers observe the operator only when upstream
+    /// COMPLETE/ERROR triggers the terminal branch. Intermediate
+    /// inputs from the dep's batch are dropped on the floor (their
+    /// `data_batch` retains release at wave-end rotation
+    /// independently). Per-wave settlement on intermediate waves is
+    /// the canonical behavior for terminal-aware operators.
+    fn fire_op_last(&self, node_id: NodeId) {
+        use crate::op_state::LastState;
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+
+        // Phase 2: buffer the latest input handle (if any). Retain new,
+        // release old. data_batch slot's retain is released at wave-end
+        // rotation independently — the LastState slot keeps its own
+        // share so the value survives across waves.
+        if let Some(&new_latest) = inputs.last() {
+            let prev_latest = {
+                let mut s = self.lock_state();
+                let scratch = scratch_mut::<LastState>(&mut s, node_id);
+                let prev = scratch.latest;
+                scratch.latest = new_latest;
+                prev
+            };
+            self.binding.retain_handle(new_latest);
+            if prev_latest != crate::handle::NO_HANDLE {
+                self.binding.release_handle(prev_latest);
+            }
+        }
+
+        // Phase 3: emit on terminal. Buffer-only fires (no terminal yet)
+        // produce no downstream message — Reduce-style silent
+        // accumulation. The post-drain auto-resolve sweep is a no-op
+        // because pending_notify has no entry for Last.
+        match terminal {
+            None => {}
+            Some(TerminalKind::Complete) => {
+                // Read the live latest + default. If latest != NO_HANDLE,
+                // emit it. Otherwise, if default != NO_HANDLE, emit default.
+                // Otherwise, emit only Complete (empty stream, no default).
+                let (latest, default) = {
+                    let s = self.lock_state();
+                    let scratch = scratch_ref::<LastState>(&s, node_id);
+                    (scratch.latest, scratch.default)
+                };
+                let to_emit = if latest != crate::handle::NO_HANDLE {
+                    Some(latest)
+                } else if default != crate::handle::NO_HANDLE {
+                    Some(default)
+                } else {
+                    None
+                };
+                if let Some(h) = to_emit {
+                    // Emission needs its own retain — the LastState slot
+                    // keeps its share until reset/Drop.
+                    self.binding.retain_handle(h);
+                    self.commit_emission_verbatim(node_id, h);
+                }
+                self.complete(node_id);
+            }
+            Some(TerminalKind::Error(h)) => {
+                // Take a fresh share for the error cascade — the
+                // dep_records[0].terminal slot keeps its own share
+                // (released by reset_for_fresh_lifecycle / Drop).
+                self.binding.retain_handle(h);
+                self.error(node_id, h);
+            }
         }
     }
 
