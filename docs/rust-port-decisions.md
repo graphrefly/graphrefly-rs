@@ -101,6 +101,54 @@ Each entry records context, options, and rationale for future reference.
 - **Rationale:** All three are smaller, lower-risk, close known gaps. C and D exercise the substrate end-to-end. B closes the M2-close-gate residual without touching graphrefly-rs.
 - **Affects:** graphrefly-core (`tests/dep_batch.rs`), graphrefly-bindings-js (`BuiltinBatchFn` + `BatchEmissionJs` + `DepBatchJs` + `register_batch_derived` + `batch_emit_messages`), graphrefly-ts/packages/parity-tests (`scenarios/graph/*`).
 
+### D014 — M3 Slice C-1 scope: bundle full transform module in one slice
+- **Date:** 2026-05-06
+- **Context:** First operators slice. Three viable cuts: A=one slice (substrate + 6 ops), B=three slices (substrate+map / filter+distinct / scan+reduce+pairwise), C=two slices (stateless / stateful).
+- **Options:** A / B / C.
+- **Decision:** A — bundle substrate + all 6 transform operators (map / filter / scan / reduce / distinctUntilChanged / pairwise) in one slice.
+- **Rationale:** End-to-end value; substrate gets exercised by all operator shapes (stateless / stateful / terminal-aware). The pre-locked architecture (D009–D012) is sufficient to ship the full transform module without iteration on the FFI shape.
+- **Affects:** graphrefly-core (NodeKind extension, OperatorOp/OperatorState enums, fire_fn dispatch fork, BindingBoundary extensions, partial flag), graphrefly-operators (OperatorBinding trait + factories), tests, parity-tests.
+
+### D015 — `OperatorBinding` lives in graphrefly-operators
+- **Date:** 2026-05-06
+- **Context:** The closure-registration helper trait per D010 needs a home. Two options: graphrefly-core (alongside `BindingBoundary`) vs graphrefly-operators (alongside the factories that need it).
+- **Options:** A=graphrefly-core, B=graphrefly-operators.
+- **Decision:** B — graphrefly-operators.
+- **Rationale:** Cleaner layering. `BindingBoundary` is the Core-callable FFI surface (lives in core); `OperatorBinding` is operator-factory ergonomics (lives where the factories are). Bindings impl both traits for the same struct.
+- **Affects:** graphrefly-operators `binding.rs`.
+
+### D016 — Projector signature is `Fn(HandleId) -> HandleId`
+- **Date:** 2026-05-06
+- **Context:** Operator user closures fundamentally take `T` and return `R`, but the FFI surface is opaque `HandleId`. Confirm: binding-side `register_projector` wraps `Fn(T) -> R` into `Fn(HandleId) -> HandleId` by deref+intern.
+- **Options:** A=Core sees `T`, B=Core sees `HandleId` only with binding-side wrapping.
+- **Decision:** B — `register_projector` accepts `Box<dyn Fn(HandleId) -> HandleId + Send + Sync>`. The binding-side helper that converts `Fn(T) -> R` to this shape is a binding concern (e.g., a `BoxedRustBinding::wrap_projector<T, R>(f)` constructor).
+- **Rationale:** Preserves the handle-protocol cleaving plane invariant (Core sees opaque `HandleId` only). Binding-side wrapping is a convenience, not a Core concern.
+- **Affects:** graphrefly-operators `binding.rs` (trait definition + sample wrapping helper for the test binding).
+
+### D017 — Operator equals defaults to Identity, overridable via `OperatorOpts`
+- **Date:** 2026-05-06
+- **Context:** R5.7 transform-operator output equals discipline. Should operator output cache participate in equals substitution like a regular Derived?
+- **Options:** A=hardcoded Identity (no override), B=Identity default with override.
+- **Decision:** B — `OperatorOpts { equals: EqualsMode, partial: bool }` with `Default::default()` returning `Identity` + `false`.
+- **Rationale:** Matches the Derived/Dynamic equals discipline; users who need custom output equals (e.g., distinct-via-derived shape) can opt in.
+- **Affects:** graphrefly-core `register_operator` signature.
+
+### D018 — Filter silent-drop emits self-RESOLVED on full-reject
+- **Date:** 2026-05-06
+- **Context:** Filter wave-exclusivity (D012). When predicate fully rejects a wave, two sub-options: (a) let upstream-broadcast DIRTY ride and queue a single RESOLVED to drain, (b) suppress Operator-Filter's downstream DIRTY broadcast entirely.
+- **Options:** A=let DIRTY ride + RESOLVED on full-reject, B=suppress DIRTY entirely.
+- **Decision:** A — let DIRTY ride; queue RESOLVED on full-reject.
+- **Rationale:** Doesn't fight the cross-node two-phase tier-then-node flush. Aligns with the existing "no-op equals propagates DIRTY+RESOLVED" pattern (already deferred). Mixed-batch waves (some pass, some reject) emit DIRTY + per-pass DATA; full-reject emits DIRTY + RESOLVED. Per-rejected-item RESOLVED is suppressed (matches TS).
+- **Affects:** graphrefly-core `fire_fn` filter dispatch path.
+
+### D019 — `partial: bool` added to all three register methods
+- **Date:** 2026-05-06
+- **Context:** D011 lifts `partial` into Core. Question: do we plumb it through `register_state` / `register_derived` / `register_dynamic` (public-API break, mechanical), use a `RegisterOpts` struct (cleaner but bigger break), or use a separate `set_partial(node)` setter (no break but state mutation hazard)?
+- **Options:** A=positional arg, B=RegisterOpts struct, C=setter.
+- **Decision:** A — add `partial: bool` as a trailing positional arg to all three. State takes 2 args (initial, partial); Derived/Dynamic take 4 args (deps, fn_id, equals, partial). For State, partial is a no-op (state nodes don't fire fn) but kept for surface consistency.
+- **Rationale:** Pre-1.0; breaking the registration surface is cheap. RegisterOpts struct could come later as a unifying refactor — for now, the positional add keeps call-site updates mechanical.
+- **Affects:** graphrefly-core `Core::register_*` signatures + every call site (tests, benches, graph crate, bindings).
+
 ### D008 — Slice F /qa decisions (P1–P7 fix priorities)
 - **Date:** 2026-05-06
 - **Context:** Adversarial review of Slice F surfaced 7 priority correctness bugs (P1–P7). Each had clear fix shape but some had architecture-touching trade-offs (subscribe contract, push-on-subscribe semantics, Weak-capture refactor, parity-test scope).
@@ -111,3 +159,35 @@ Each entry records context, options, and rationale for future reference.
   - **P8(b):** `packages/parity-tests/scenarios/graph/` widening deferred to a dedicated follow-up slice (D6 in `porting-deferred.md`). Slice F /qa scope kept tight at the Rust impl + tests.
 - **Rationale:** P1–P4, P6 are pure correctness fixes that defeat slice goals if left in. P5(a) prefers explicit failure over silent leak; v1 callers can always rebuild the handle. P7(a) aligns with the dynamic graph visualization use case (UI subscribes, sees current state immediately, then deltas).
 - **Affects:** `graphrefly-core/src/{node.rs,topology.rs}`, `graphrefly-graph/src/{graph.rs,mount.rs,describe.rs,observe.rs}`, regression tests across `tests/{topology.rs,gap_fills.rs,reactive.rs}`.
+
+### D020 — M3 Slice C-2 scope: Combine + WithLatestFrom + Merge (Core-dispatch)
+- **Date:** 2026-05-06
+- **Context:** M3 Slice C-1 (transform operators) landed. Next operators slice targets multi-dep combinators. Operators split into three categories: (a) multi-dep Core-dispatch (combine, withLatestFrom, merge), (b) subscription-managed (zip, concat, race), (c) higher-order (switchMap, exhaustMap, concatMap, mergeMap). Category (a) fits the existing Core-dispatch pattern; (b) and (c) need new infrastructure.
+- **Options:** A) All combinators in one slice. B) Category (a) only. C) (a) + (b).
+- **Decision:** B — Combine + WithLatestFrom + Merge only. Multi-dep Core-dispatch operators that extend the existing `OperatorOp` + `fire_operator` pattern.
+- **Rationale:** Coherent slice (~1000 lines). Subscription-managed and higher-order operators need different infrastructure (dynamic inner subscription management) — separate slice.
+- **Affects:** graphrefly-core (OperatorOp variants, fire_op_* dispatch, BindingBoundary pack_tuple), graphrefly-operators (factories + OperatorBinding), parity-tests.
+
+### D021 — WithLatestFrom semantics: match GraphReFly Phase 10.5 (partial: false gate)
+- **Date:** 2026-05-06
+- **Context:** Q1 — what semantics for withLatestFrom? RxJS/callbag silently drop primary emissions when secondary hasn't emitted. GraphReFly (Phase 10.5) uses `partial: false` first-run gate to hold until both deps deliver, then "fire on primary alone" post-warmup.
+- **Options:** A) RxJS-style silent drop. B) GraphReFly Phase 10.5 gate. C) Redefine.
+- **Decision:** B — match GraphReFly Phase 10.5. Gate holds until both deps deliver real DATA. Post-warmup: fire on primary alone, sample secondary from `dep_records[1].prev_data`. INVALIDATE guard: if `prev_data == NO_HANDLE` and batch empty post-warmup → settle with RESOLVED.
+- **Rationale:** Strictly better than RxJS (handles cache invalidation). Already proven in production TS. The first-run gate is a Core primitive — no extra machinery needed.
+- **Affects:** graphrefly-core `fire_op_with_latest_from`, graphrefly-operators `with_latest_from` factory.
+
+### D022 — Merge is zero-FFI Core-dispatch
+- **Date:** 2026-05-06
+- **Context:** Merge forwards all dep DATA handles verbatim — no transformation. In TS, it uses producer pattern (manual subscribes). In Rust, can be an OperatorOp variant with N deps.
+- **Options:** A) Producer-style (subscription-managed). B) Core-dispatch OperatorOp with zero FFI on fire.
+- **Decision:** B — `OperatorOp::Merge` with no `fn_id`. `fire_op_merge` collects all dep batch handles, retains each, emits each verbatim. Zero binding calls on fire path.
+- **Rationale:** Merge doesn't transform values — just forwards. Core already handles DIRTY/COMPLETE tracking. Zero FFI is maximally efficient.
+- **Affects:** graphrefly-core `fire_op_merge`.
+
+### D023 — Combine custom tuple-equality deferred
+- **Date:** 2026-05-06
+- **Context:** TS combine implements element-wise custom equals for tuple dedup. In Rust, each `pack_tuple` call produces a fresh HandleId → identity-equals never deduplicates.
+- **Options:** A) Implement tuple custom equals now. B) Defer — identity-equals is v1 default.
+- **Decision:** B — defer. Identity-equals means combine always emits (no dedup between waves). Acceptable for v1; users can add custom equals via `OperatorOpts` if needed.
+- **Rationale:** No bench evidence that tuple dedup is load-bearing. Matches "no optimization without evidence" principle.
+- **Affects:** porting-deferred.md (new deferral entry).

@@ -55,7 +55,7 @@ use smallvec::SmallVec;
 use crate::boundary::{DepBatch, FnEmission, FnResult};
 use crate::handle::{HandleId, NodeId, NO_HANDLE};
 use crate::message::Message;
-use crate::node::{Core, CoreState, EqualsMode, NodeKind, Sink};
+use crate::node::{Core, CoreState, EqualsMode, NodeKind, OperatorOp, Sink, TerminalKind};
 
 /// Deferred sink-fire jobs collected during `flush_notifications`. Each
 /// entry pairs a snapshot of the sink Arcs to fire with the messages to
@@ -270,6 +270,25 @@ impl Core {
         true
     }
 
+    /// Wave drain entry point. Dispatches by `NodeKind` to either the
+    /// regular fn-fire path ([`Self::fire_regular`]) or the operator
+    /// dispatch ([`Self::fire_operator`]).
+    pub(crate) fn fire_fn(&self, node_id: NodeId) {
+        let kind = {
+            let s = self.lock_state();
+            s.nodes.get(&node_id).map(|r| r.kind)
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        match kind {
+            NodeKind::Operator(op) => self.fire_operator(node_id, op),
+            NodeKind::State | NodeKind::Derived | NodeKind::Dynamic => {
+                self.fire_regular(node_id);
+            }
+        }
+    }
+
     /// Fire a node's fn lock-released around `invoke_fn`.
     ///
     /// Phase 1 (lock-held): remove from pending_fires, snapshot fn_id +
@@ -289,7 +308,7 @@ impl Core {
     /// processed in sequence — Data via `commit_emission_verbatim` (no
     /// equals substitution per R1.3.2.d / R1.3.3.c), Complete/Error via
     /// terminal cascade.
-    fn fire_fn(&self, node_id: NodeId) {
+    fn fire_regular(&self, node_id: NodeId) {
         enum FireAction {
             None,
             SingleData(HandleId),
@@ -301,8 +320,9 @@ impl Core {
             let mut s = self.lock_state();
             s.pending_fires.remove(&node_id);
             let rec = s.require_node(node_id);
-            // Skip: terminal, first-run-gate-closed, or stateless.
-            if rec.terminal.is_some() || rec.has_sentinel_deps() {
+            // Skip: terminal, first-run-gate-closed (R2.5.3 / R5.4 — partial
+            // mode opts out of the gate per D011), or stateless.
+            if rec.terminal.is_some() || (!rec.partial && rec.has_sentinel_deps()) {
                 None
             } else {
                 rec.fn_id.map(|fn_id| {
@@ -650,6 +670,550 @@ impl Core {
         }
     }
 
+    // ===================================================================
+    // Operator dispatch (Slice C-1, D009).
+    //
+    // `fire_operator` is the entry point for nodes whose `kind` is
+    // `NodeKind::Operator(_)`. It branches on the `OperatorOp` discriminant
+    // to per-operator helpers that snapshot inputs under the lock, drop the
+    // lock to call the binding's bulk projection FFI, and reacquire to
+    // apply emissions via `commit_emission_verbatim` (no per-item equals
+    // dedup at the wire — operator output passes verbatim per the same
+    // R1.3.2.d / R1.3.3.c rule that governs `FnResult::Batch`).
+    //
+    // **Refcount discipline:** inputs sourced from `dep_records[i].data_batch`
+    // share retains owned by the wave's data-batch slot (released at
+    // wave-end rotation in `clear_wave_state`). Operators that emit those
+    // handles unchanged (`Filter`, `DistinctUntilChanged`, `Pairwise`'s
+    // `prev` carry-over) take an additional retain via `retain_handle`
+    // before passing to `commit_emission_verbatim` — the cache slot owns
+    // its own share, independent of the data-batch slot's. Operators that
+    // produce fresh handles (`Map` / `Scan` / `Reduce` / `Pairwise`'s
+    // packed tuples) receive retains pre-bumped by the binding's bulk-
+    // projection method.
+    // ===================================================================
+
+    /// Operator dispatch entry. Pre-checks (terminal short-circuit, first-
+    /// run gate accounting for `partial`, terminal-aware fire for `Reduce`)
+    /// happen here; per-operator behavior lives in the `fire_op_*` helpers.
+    fn fire_operator(&self, node_id: NodeId, op: OperatorOp) {
+        // Phase 1 (lock-held): remove from pending_fires, evaluate skip.
+        let proceed = {
+            let mut s = self.lock_state();
+            s.pending_fires.remove(&node_id);
+            let rec = s.require_node(node_id);
+            if rec.terminal.is_some() {
+                false
+            } else {
+                // First-run gate (R2.5.3 / R5.4). Partial-mode operators
+                // (D011) opt out of the gate; otherwise we wait for every
+                // dep to have delivered at least one real handle. Terminal-
+                // aware operators (currently `Reduce`) additionally count a
+                // dep terminal as "real input" so they can fire on
+                // upstream COMPLETE-without-DATA and emit the seed.
+                let has_real_input = !rec.has_sentinel_deps()
+                    || rec.dep_records.iter().any(|dr| dr.terminal.is_some());
+                rec.partial || has_real_input
+            }
+        };
+        if !proceed {
+            return;
+        }
+
+        match op {
+            OperatorOp::Map { fn_id } => self.fire_op_map(node_id, fn_id),
+            OperatorOp::Filter { fn_id } => self.fire_op_filter(node_id, fn_id),
+            OperatorOp::Scan { fn_id, .. } => self.fire_op_scan(node_id, fn_id),
+            OperatorOp::Reduce { fn_id, .. } => self.fire_op_reduce(node_id, fn_id),
+            OperatorOp::DistinctUntilChanged { equals_fn_id } => {
+                self.fire_op_distinct(node_id, equals_fn_id);
+            }
+            OperatorOp::Pairwise { fn_id } => self.fire_op_pairwise(node_id, fn_id),
+            OperatorOp::Combine { pack_fn } => self.fire_op_combine(node_id, pack_fn),
+            OperatorOp::WithLatestFrom { pack_fn } => {
+                self.fire_op_with_latest_from(node_id, pack_fn);
+            }
+            OperatorOp::Merge => self.fire_op_merge(node_id),
+        }
+    }
+
+    /// Snapshot the operator's single dep batch (transform constraint —
+    /// R5.7 single-dep). Returns `(inputs, terminal)` where `inputs` is a
+    /// fresh `Vec<HandleId>` (no retains) and `terminal` reflects
+    /// `dep_records[0].terminal` at snapshot time.
+    fn snapshot_op_dep0(&self, node_id: NodeId) -> (Vec<HandleId>, Option<TerminalKind>) {
+        let s = self.lock_state();
+        let rec = s.require_node(node_id);
+        debug_assert!(
+            !rec.dep_records.is_empty(),
+            "transform operator must have ≥1 dep"
+        );
+        let dr = &rec.dep_records[0];
+        (dr.data_batch.iter().copied().collect(), dr.terminal)
+    }
+
+    /// Emit DIRTY (if not already dirty) followed by RESOLVED. Used by
+    /// silent-drop operators (Filter / DistinctUntilChanged / Pairwise)
+    /// when a wave's inputs all suppress and the operator needs to settle
+    /// the wave for its subscribers (D018 — let DIRTY ride; queue RESOLVED
+    /// on full-reject).
+    fn settle_dirty_resolved(&self, node_id: NodeId) {
+        let mut s = self.lock_state();
+        if s.require_node(node_id).terminal.is_some() {
+            return;
+        }
+        let already_dirty = s.require_node(node_id).dirty;
+        s.require_node_mut(node_id).dirty = true;
+        if !already_dirty {
+            self.queue_notify(&mut s, node_id, Message::Dirty);
+        }
+        self.queue_notify(&mut s, node_id, Message::Resolved);
+    }
+
+    /// `OperatorOp::Map` dispatch.
+    fn fire_op_map(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        // Mark fired regardless of input count (activation gate already
+        // satisfied or partial-mode).
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        // Phase 2 (lock-released): bulk project. Binding returns one
+        // handle per input, each with a retain share already taken.
+        let outputs = self.binding.project_each(fn_id, &inputs);
+        // Phase 3: emit each output. `commit_emission_verbatim` consumes
+        // the retain into the cache slot (and releases the prior cache
+        // handle internally).
+        for h in outputs {
+            self.commit_emission_verbatim(node_id, h);
+        }
+    }
+
+    /// `OperatorOp::Filter` dispatch (D012/D018).
+    fn fire_op_filter(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        // Phase 2: predicate per input.
+        let pass = self.binding.predicate_each(fn_id, &inputs);
+        debug_assert!(
+            pass.len() == inputs.len(),
+            "predicate_each returned {} bools for {} inputs",
+            pass.len(),
+            inputs.len()
+        );
+        // Phase 3: emit passing items verbatim. Take a fresh retain for
+        // each — the data_batch slot still owns its retain (released at
+        // wave-end rotation), and the cache slot needs its own.
+        let mut emitted = 0usize;
+        for (i, &h) in inputs.iter().enumerate() {
+            if pass.get(i).copied().unwrap_or(false) {
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+                emitted += 1;
+            }
+        }
+        // D018: full-reject settles with DIRTY+RESOLVED.
+        if emitted == 0 {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    /// `OperatorOp::Scan` dispatch — left-fold emitting each new acc.
+    fn fire_op_scan(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        let acc = {
+            let s = self.lock_state();
+            s.require_node(node_id).operator_state
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        // Phase 2: fold each input through. Returns N new handles, each
+        // with a fresh retain.
+        let new_states = self.binding.fold_each(fn_id, acc, &inputs);
+        debug_assert!(
+            new_states.len() == inputs.len(),
+            "fold_each returned {} accs for {} inputs",
+            new_states.len(),
+            inputs.len()
+        );
+        // Phase 3a: update operator_state to the LAST new acc — that is
+        // the running fold's persistent state. Take an extra retain for
+        // the slot; release the prior acc's slot retain.
+        let last_acc = new_states.last().copied();
+        if let Some(last) = last_acc {
+            let prev_acc = {
+                let mut s = self.lock_state();
+                let rec = s.require_node_mut(node_id);
+                let prev = rec.operator_state;
+                rec.operator_state = last;
+                prev
+            };
+            // Take the slot's retain on the new acc.
+            self.binding.retain_handle(last);
+            // Release the prior slot's retain (post-lock to keep binding
+            // free to re-enter Core safely).
+            if prev_acc != crate::handle::NO_HANDLE {
+                self.binding.release_handle(prev_acc);
+            }
+        }
+        // Phase 3b: emit each intermediate acc verbatim. `new_states`
+        // entries each carry one retain from `fold_each`; that retain is
+        // consumed by `commit_emission_verbatim` into the cache slot.
+        for h in new_states {
+            self.commit_emission_verbatim(node_id, h);
+        }
+    }
+
+    /// `OperatorOp::Reduce` dispatch — accumulates silently; emits acc on
+    /// upstream COMPLETE (cascades ERROR verbatim).
+    fn fire_op_reduce(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        let acc = {
+            let s = self.lock_state();
+            s.require_node(node_id).operator_state
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        // Phase 2: accumulate (silent — no per-input emit).
+        let new_states = if inputs.is_empty() {
+            SmallVec::<[HandleId; 1]>::new()
+        } else {
+            self.binding.fold_each(fn_id, acc, &inputs)
+        };
+        debug_assert!(
+            new_states.len() == inputs.len(),
+            "fold_each returned {} accs for {} inputs",
+            new_states.len(),
+            inputs.len()
+        );
+        // Update operator_state to last new acc; release intermediate
+        // states (we don't emit them) and the prior acc's slot retain.
+        let last_acc = new_states.last().copied();
+        let intermediates_to_release: Vec<HandleId> = if new_states.len() > 1 {
+            new_states[..new_states.len() - 1].to_vec()
+        } else {
+            Vec::new()
+        };
+        let prev_acc_to_release = if let Some(last) = last_acc {
+            let prev_acc = {
+                let mut s = self.lock_state();
+                let rec = s.require_node_mut(node_id);
+                let prev = rec.operator_state;
+                rec.operator_state = last;
+                prev
+            };
+            self.binding.retain_handle(last);
+            if prev_acc == crate::handle::NO_HANDLE {
+                None
+            } else {
+                Some(prev_acc)
+            }
+        } else {
+            None
+        };
+        // Release intermediate fold results (Reduce only emits the LAST,
+        // but only on terminal). Each was retained by `fold_each`.
+        for h in intermediates_to_release {
+            self.binding.release_handle(h);
+        }
+        if let Some(h) = prev_acc_to_release {
+            self.binding.release_handle(h);
+        }
+
+        // Phase 3: emit on terminal.
+        match terminal {
+            None => {
+                // Still accumulating; no emit. Subscribers see no message
+                // for this wave (silent accumulation). The first wave that
+                // pushes Reduce to fire produces a Dirty entry on the
+                // upstream's commit, but Reduce itself doesn't queue any
+                // tier-3 since R5 silently absorbs. v1: leave the
+                // post-drain auto-resolve sweep to settle nothing —
+                // pending_notify has no entry for Reduce so the sweep is
+                // a no-op.
+            }
+            Some(TerminalKind::Complete) => {
+                // Read the live acc (may be the seed if no DATA arrived)
+                // and emit Data(acc) + Complete.
+                let final_acc = {
+                    let s = self.lock_state();
+                    s.require_node(node_id).operator_state
+                };
+                if final_acc != crate::handle::NO_HANDLE {
+                    // Emission needs its own retain (slot's retain is
+                    // owned by operator_state until reset/Drop).
+                    self.binding.retain_handle(final_acc);
+                    self.commit_emission_verbatim(node_id, final_acc);
+                }
+                self.complete(node_id);
+            }
+            Some(TerminalKind::Error(h)) => {
+                // Core::error transfers the caller's share into the
+                // cascade (node.terminal + per-child dep_terminal slots);
+                // no release at the error() boundary. Take a fresh share
+                // here so the cascade owns it independently of the
+                // dep_records[0].terminal slot's share.
+                self.binding.retain_handle(h);
+                self.error(node_id, h);
+            }
+        }
+    }
+
+    /// `OperatorOp::DistinctUntilChanged` dispatch.
+    fn fire_op_distinct(&self, node_id: NodeId, equals_fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        let mut prev = {
+            let s = self.lock_state();
+            s.require_node(node_id).operator_state
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        // Take a working-copy retain on the initial prev so both the loop
+        // (which releases old_prev on each non-equal item) and phase 3
+        // (which releases the slot's original handle) each have their own
+        // share. Without this, the loop's release of old_prev (== original
+        // operator_state) double-releases against phase 3's stale_slot
+        // release.
+        if prev != crate::handle::NO_HANDLE {
+            self.binding.retain_handle(prev);
+        }
+        // Phase 2: per-input equals(prev, current). Each non-equal input
+        // is emitted and becomes the new prev. Equals fn_id reuses
+        // `BindingBoundary::custom_equals`.
+        let mut emitted = 0usize;
+        for &h in &inputs {
+            let equal = if prev == crate::handle::NO_HANDLE {
+                false
+            } else if prev == h {
+                true
+            } else {
+                self.binding.custom_equals(equals_fn_id, prev, h)
+            };
+            if !equal {
+                // Emit this input verbatim.
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+                // Update prev: take retain on new prev, release old
+                // (working-copy retain from above or from prior iteration).
+                self.binding.retain_handle(h);
+                let old_prev = prev;
+                prev = h;
+                if old_prev != crate::handle::NO_HANDLE {
+                    self.binding.release_handle(old_prev);
+                }
+                emitted += 1;
+            }
+        }
+        // Phase 3: persist prev into operator_state slot. Release the
+        // slot's original retain (stale_slot) — this is the slot-owned
+        // share, independent of the working-copy share released in the
+        // loop above.
+        {
+            let mut s = self.lock_state();
+            let rec = s.require_node_mut(node_id);
+            let stale_slot = rec.operator_state;
+            rec.operator_state = prev;
+            if stale_slot != prev && stale_slot != crate::handle::NO_HANDLE {
+                drop(s);
+                self.binding.release_handle(stale_slot);
+            }
+        }
+        // Release the working-copy retain on the final prev if it was
+        // never released in the loop (i.e. no non-equal items passed,
+        // prev == original). In that case stale_slot == prev, so phase 3
+        // didn't release it either — but the working-copy retain is still
+        // outstanding. Release it now.
+        if emitted == 0 && prev != crate::handle::NO_HANDLE {
+            self.binding.release_handle(prev);
+        }
+        if emitted == 0 {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    /// `OperatorOp::Pairwise` dispatch — emits `(prev, current)` tuples
+    /// starting after the second value (first input swallowed, sets `prev`).
+    fn fire_op_pairwise(&self, node_id: NodeId, fn_id: crate::handle::FnId) {
+        let (inputs, _terminal) = self.snapshot_op_dep0(node_id);
+        let mut prev = {
+            let s = self.lock_state();
+            s.require_node(node_id).operator_state
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            return;
+        }
+        let mut emitted = 0usize;
+        for &h in &inputs {
+            if prev == crate::handle::NO_HANDLE {
+                // First-ever value — swallow, set prev. Retain for the
+                // operator_state slot (persisted in phase 3 below).
+                self.binding.retain_handle(h);
+                prev = h;
+                continue;
+            }
+            // Pack (prev, current) into a tuple handle. Binding returns a
+            // fresh retain on the packed handle.
+            let packed = self.binding.pairwise_pack(fn_id, prev, h);
+            self.commit_emission_verbatim(node_id, packed);
+            // Advance prev: take retain on h, release old prev.
+            self.binding.retain_handle(h);
+            let old_prev = prev;
+            prev = h;
+            self.binding.release_handle(old_prev);
+            emitted += 1;
+        }
+        // Persist prev into operator_state slot.
+        {
+            let mut s = self.lock_state();
+            let rec = s.require_node_mut(node_id);
+            let stale_slot = rec.operator_state;
+            rec.operator_state = prev;
+            if stale_slot != prev && stale_slot != crate::handle::NO_HANDLE {
+                drop(s);
+                self.binding.release_handle(stale_slot);
+            }
+        }
+        if emitted == 0 {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
+    // =================================================================
+    // Slice C-2: multi-dep combinator operators (D020)
+    // =================================================================
+
+    /// Snapshot all deps' "latest" handle for multi-dep combinators.
+    /// For each dep: returns `data_batch.last()` if non-empty (dep fired
+    /// this wave), else `prev_data` (last handle from previous wave).
+    /// Also returns whether dep[0] (primary) had DATA this wave —
+    /// needed by `fire_op_with_latest_from`.
+    fn snapshot_op_all_latest(&self, node_id: NodeId) -> (SmallVec<[HandleId; 4]>, bool) {
+        let s = self.lock_state();
+        let rec = s.require_node(node_id);
+        let primary_fired = rec
+            .dep_records
+            .first()
+            .is_some_and(|dr| !dr.data_batch.is_empty());
+        let latest: SmallVec<[HandleId; 4]> = rec
+            .dep_records
+            .iter()
+            .map(|dr| dr.data_batch.last().copied().unwrap_or(dr.prev_data))
+            .collect();
+        (latest, primary_fired)
+    }
+
+    /// `OperatorOp::Combine` dispatch — N-dep combineLatest. Packs the
+    /// latest handle per dep into a tuple via `pack_tuple`, emits on
+    /// any dep fire. First-run gate (R2.5.3, partial: false) guarantees
+    /// all deps have a real handle on first fire. Post-warmup INVALIDATE
+    /// guard: if any dep's prev_data was cleared, settles with RESOLVED
+    /// instead of packing a NO_HANDLE into the tuple.
+    fn fire_op_combine(&self, node_id: NodeId, pack_fn: crate::handle::FnId) {
+        let (latest, _primary_fired) = self.snapshot_op_all_latest(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        // Post-warmup INVALIDATE guard: a dep may have been invalidated
+        // (prev_data cleared to NO_HANDLE) and not yet re-delivered.
+        if latest.contains(&crate::handle::NO_HANDLE) {
+            self.settle_dirty_resolved(node_id);
+            return;
+        }
+        let tuple_handle = self.binding.pack_tuple(pack_fn, &latest);
+        self.commit_emission_verbatim(node_id, tuple_handle);
+    }
+
+    /// `OperatorOp::WithLatestFrom` dispatch — 2-dep, fire-on-primary-only
+    /// (D021 / Phase 10.5). Emits `[primary, secondary]` pair only when
+    /// dep[0] (primary) has DATA in the wave. If only dep[1] fires →
+    /// RESOLVED. Post-warmup INVALIDATE guard: if secondary latest is
+    /// `NO_HANDLE` (INVALIDATE cleared it), settles with RESOLVED.
+    fn fire_op_with_latest_from(&self, node_id: NodeId, pack_fn: crate::handle::FnId) {
+        let (latest, primary_fired) = self.snapshot_op_all_latest(node_id);
+        let first_fire = {
+            let mut s = self.lock_state();
+            let rec = s.require_node_mut(node_id);
+            let was_first = !rec.has_fired_once;
+            rec.has_fired_once = true;
+            was_first
+        };
+        // On first fire (gate release), always emit — the first-run gate
+        // guarantees both deps have values (via prev_data fallback in
+        // snapshot). On subsequent fires, only emit when primary fires.
+        if !first_fire && !primary_fired {
+            // Secondary-only update — no downstream DATA.
+            self.settle_dirty_resolved(node_id);
+            return;
+        }
+        // Post-warmup INVALIDATE guard: secondary may have been invalidated
+        // (prev_data cleared to NO_HANDLE) and not yet re-delivered.
+        debug_assert!(latest.len() == 2, "withLatestFrom requires exactly 2 deps");
+        if latest[1] == crate::handle::NO_HANDLE {
+            self.settle_dirty_resolved(node_id);
+            return;
+        }
+        let tuple_handle = self.binding.pack_tuple(pack_fn, &latest);
+        self.commit_emission_verbatim(node_id, tuple_handle);
+    }
+
+    /// `OperatorOp::Merge` dispatch — N-dep, forward all DATA handles
+    /// verbatim (D022). Zero FFI on fire: no transformation. Each dep's
+    /// batch handles are collected, retained, and emitted individually.
+    fn fire_op_merge(&self, node_id: NodeId) {
+        // Collect all batch handles from all deps (flat).
+        let all_handles: Vec<HandleId> = {
+            let s = self.lock_state();
+            let rec = s.require_node(node_id);
+            rec.dep_records
+                .iter()
+                .flat_map(|dr| dr.data_batch.iter().copied())
+                .collect()
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if all_handles.is_empty() {
+            // All deps settled RESOLVED this wave — no DATA to forward.
+            self.settle_dirty_resolved(node_id);
+            return;
+        }
+        // Emit each handle verbatim. Take a fresh retain per handle
+        // (independent of the dep batch's retain which gets released at
+        // wave-end). Matches Filter's discipline for passing inputs.
+        for &h in &all_handles {
+            self.binding.retain_handle(h);
+            self.commit_emission_verbatim(node_id, h);
+        }
+    }
+
     pub(crate) fn deliver_data_to_consumer(
         &self,
         s: &mut CoreState,
@@ -673,7 +1237,7 @@ impl Core {
             tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);
         }
         match kind {
-            NodeKind::Derived => {
+            NodeKind::Derived | NodeKind::Operator(_) => {
                 s.pending_fires.insert(consumer_id);
             }
             NodeKind::Dynamic => {

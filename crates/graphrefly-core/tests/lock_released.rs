@@ -589,13 +589,13 @@ fn invoke_fn_can_call_core_cache_of_directly() {
 
     // Set up a state probe + a derived whose fn will re-enter Core.
     let probe_h = binding.inner.intern(TestValue::Int(42));
-    let probe_id = core.register_state(probe_h);
+    let probe_id = core.register_state(probe_h, false);
     *binding.probe_node.lock().unwrap() = Some(probe_id);
 
     let in_h = binding.inner.intern(TestValue::Int(1));
-    let in_id = core.register_state(in_h);
+    let in_id = core.register_state(in_h, false);
     let fn_id = binding.inner.register_fn(|deps| Some(deps[0].clone()));
-    let d = core.register_derived(&[in_id], fn_id, EqualsMode::Identity);
+    let d = core.register_derived(&[in_id], fn_id, EqualsMode::Identity, false);
 
     // Subscribe to drive activation → fn fires → invoke_fn re-enters
     // Core::cache_of(probe_id). If lock-held, deadlock; if lock-released,

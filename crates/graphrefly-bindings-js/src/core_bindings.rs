@@ -296,14 +296,18 @@ impl BenchCore {
             .lock()
             .expect("registry lock")
             .intern(BenchValue::Int(initial));
-        u32::try_from(self.core.register_state(handle).raw()).expect("node id exceeds u32")
+        u32::try_from(self.core.register_state(handle, false).raw()).expect("node id exceeds u32")
     }
 
     /// Register a state node with sentinel cache (no initial value).
     #[napi]
     pub fn register_state_sentinel(&self) -> u32 {
-        u32::try_from(self.core.register_state(graphrefly_core::NO_HANDLE).raw())
-            .expect("node id exceeds u32")
+        u32::try_from(
+            self.core
+                .register_state(graphrefly_core::NO_HANDLE, false)
+                .raw(),
+        )
+        .expect("node id exceeds u32")
     }
 
     /// Register a derived node with a built-in fn shape. `dep_ids` are the
@@ -329,7 +333,7 @@ impl BenchCore {
             .collect();
         u32::try_from(
             self.core
-                .register_derived(&deps, fn_id, EqualsMode::Identity)
+                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
                 .raw(),
         )
         .expect("node id exceeds u32")
@@ -672,7 +676,7 @@ impl BenchCore {
             .collect();
         u32::try_from(
             self.core
-                .register_derived(&deps, fn_id, EqualsMode::Identity)
+                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
                 .raw(),
         )
         .expect("node id exceeds u32")

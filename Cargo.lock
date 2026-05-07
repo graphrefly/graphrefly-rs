@@ -576,8 +576,11 @@ dependencies = [
 name = "graphrefly-operators"
 version = "0.0.0"
 dependencies = [
+ "ahash",
  "graphrefly-core",
+ "parking_lot",
  "proptest",
+ "smallvec",
  "thiserror",
  "tracing",
 ]

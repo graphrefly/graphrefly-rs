@@ -190,6 +190,68 @@ pub trait BindingBoundary: Send + Sync {
     /// (TS `bindings.ts`, the test runtime, the napi-rs bench harness) must
     /// override to bump the per-handle refcount.
     fn retain_handle(&self, _handle: HandleId) {}
+
+    // -----------------------------------------------------------------
+    // Operator FFI surface (Slice C-1, D009). Bulk projection methods
+    // for the built-in operator dispatch path. Default impls panic so
+    // bindings that don't ship operators (e.g., minimal test bindings
+    // that only exercise raw fn-fire) don't pay the registry cost; the
+    // dispatch path only routes here when an `Operator(_)` node fires,
+    // so a binding that doesn't register operator nodes never reaches
+    // these defaults.
+    //
+    // Each method returns the per-input result. Caller (Core) owns the
+    // resulting handles' retains — the binding must `retain_handle`-bump
+    // any handles it returns that share an existing registry slot.
+    // -----------------------------------------------------------------
+
+    /// `OperatorOp::Map` — element-wise transform. For each input handle,
+    /// the binding dereferences to `T`, calls the user `Fn(T) -> R`, and
+    /// returns the new handle. Output length equals input length.
+    fn project_each(&self, _fn_id: FnId, _inputs: &[HandleId]) -> SmallVec<[HandleId; 1]> {
+        unimplemented!("project_each: this binding does not support operators (D009)")
+    }
+
+    /// `OperatorOp::Filter` — element-wise predicate. For each input
+    /// handle, the binding dereferences to `T`, calls the user
+    /// `Fn(T) -> bool`, and returns the boolean. Output length equals
+    /// input length.
+    fn predicate_each(&self, _fn_id: FnId, _inputs: &[HandleId]) -> SmallVec<[bool; 4]> {
+        unimplemented!("predicate_each: this binding does not support operators (D009)")
+    }
+
+    /// `OperatorOp::Scan` / `OperatorOp::Reduce` — left-fold. The binding
+    /// dereferences `acc` to `R` and each input to `T`, runs
+    /// `Fn(R, T) -> R` for each input feeding the previous result forward,
+    /// and returns each intermediate `R` as a fresh handle. Output length
+    /// equals input length (Scan emits each entry; Reduce uses only the
+    /// last). The starting `acc` is owned by Core; the binding must NOT
+    /// release it.
+    fn fold_each(
+        &self,
+        _fn_id: FnId,
+        _acc: HandleId,
+        _inputs: &[HandleId],
+    ) -> SmallVec<[HandleId; 1]> {
+        unimplemented!("fold_each: this binding does not support operators (D009)")
+    }
+
+    /// `OperatorOp::Pairwise` — pack `(prev, current)` into a tuple value.
+    /// Called once per pair (Core iterates and updates `prev` between
+    /// calls). Returns the binding-side handle for the new tuple value.
+    fn pairwise_pack(&self, _fn_id: FnId, _prev: HandleId, _current: HandleId) -> HandleId {
+        unimplemented!("pairwise_pack: this binding does not support operators (D009)")
+    }
+
+    /// `OperatorOp::Combine` / `OperatorOp::WithLatestFrom` — pack N
+    /// handles into a single tuple/array handle (Slice C-2, D020). The
+    /// binding dereferences each input handle to `T`, constructs a tuple
+    /// value (e.g., `[T0, T1, ..., Tn]`), and returns the new handle.
+    /// The returned handle has a pre-bumped retain (caller takes ownership
+    /// without additional `retain_handle` call).
+    fn pack_tuple(&self, _fn_id: FnId, _handles: &[HandleId]) -> HandleId {
+        unimplemented!("pack_tuple: this binding does not support combinator operators (D020)")
+    }
 }
 
 #[cfg(test)]

@@ -331,12 +331,14 @@ impl Graph {
     ) -> Result<NodeId, NameError> {
         let id = self
             .core
-            .register_state(initial.unwrap_or(graphrefly_core::NO_HANDLE));
+            .register_state(initial.unwrap_or(graphrefly_core::NO_HANDLE), false);
         self.add(id, name)
     }
 
     /// Register a static-derived node — fn fires on every dep change
-    /// with all deps tracked.
+    /// with all deps tracked. Defaults to gated first-run (R2.5.3); use
+    /// [`Self::derived_with_partial`] for the partial-mode variant
+    /// (D011 / R5.4).
     pub fn derived(
         &self,
         name: impl Into<String>,
@@ -344,12 +346,12 @@ impl Graph {
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self.core.register_derived(deps, fn_id, equals);
+        let id = self.core.register_derived(deps, fn_id, equals, false);
         self.add(id, name)
     }
 
     /// Register a dynamic-derived node — fn declares which dep indices
-    /// it actually read this run.
+    /// it actually read this run. Defaults to gated first-run (R2.5.3).
     pub fn dynamic(
         &self,
         name: impl Into<String>,
@@ -357,7 +359,7 @@ impl Graph {
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self.core.register_dynamic(deps, fn_id, equals);
+        let id = self.core.register_dynamic(deps, fn_id, equals, false);
         self.add(id, name)
     }
 

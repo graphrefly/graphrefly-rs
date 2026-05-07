@@ -75,7 +75,7 @@ fn derived_registers_named_with_dep_lookup() {
 fn add_registers_pre_existing_core_node() {
     let g = Graph::new("system", binding());
     // bypass sugar: register raw via Core, then bring into namespace.
-    let raw_id = g.core().register_state(HandleId::new(42));
+    let raw_id = g.core().register_state(HandleId::new(42), false);
     let returned = g.add(raw_id, "raw").unwrap();
     assert_eq!(returned, raw_id);
     assert_eq!(g.node("raw"), raw_id);
@@ -88,7 +88,7 @@ fn node_count_matches_namespace_size() {
     g.state("b", None).unwrap();
     g.state("c", None).unwrap();
     // unnamed Core node — does NOT count in namespace.
-    let _hidden = g.core().register_state(HandleId::new(9));
+    let _hidden = g.core().register_state(HandleId::new(9), false);
     assert_eq!(g.node_count(), 3);
     assert_eq!(g.core().node_count(), 4);
 }

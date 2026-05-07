@@ -133,7 +133,7 @@ pub enum TerminalKind {
 }
 
 /// Node kind discriminant. State nodes are ROM (cache survives deactivation);
-/// compute nodes (`Derived`, `Dynamic`) are RAM (cache cleared on
+/// compute nodes (`Derived`, `Dynamic`, `Operator`) are RAM (cache cleared on
 /// deactivation — not yet modeled in v1).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum NodeKind {
@@ -144,6 +144,109 @@ pub enum NodeKind {
     /// Dynamic node: fn declares which dep indices it actually read this run.
     /// Untracked dep updates flow through cache but do NOT re-fire fn.
     Dynamic,
+    /// Operator node: built-in dispatch path for transform / combine /
+    /// resilience operators. The `OperatorOp` discriminant selects the
+    /// per-operator FFI path ([`BindingBoundary::project_each`] etc.); Core
+    /// manages per-operator state (`acc` / `prev`) directly via the
+    /// `operator_state` slot on `NodeRecord`. Per Slice C-1 (D009).
+    Operator(OperatorOp),
+}
+
+impl NodeKind {
+    /// True if this kind opts OUT of Lock 2.B auto-cascade. Operator(Reduce)
+    /// must intercept upstream COMPLETE so it can emit its accumulator before
+    /// the cascade terminates it; instead of cascading, terminate_node queues
+    /// such children for fn-fire so `fire_operator` can handle the terminal.
+    pub(crate) fn skips_auto_cascade(self) -> bool {
+        matches!(self, NodeKind::Operator(OperatorOp::Reduce { .. }))
+    }
+}
+
+/// Built-in operator discriminant. Selects the per-operator dispatch path
+/// in `fire_operator` (`crates/graphrefly-core/src/batch.rs`). Each variant
+/// carries the binding-side closure ids (and seed handle for stateful
+/// folders) needed for the wave-execution path; Core stores no user values
+/// itself per the handle-protocol cleaving plane.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum OperatorOp {
+    /// `map(source, project)` — element-wise transform. Calls
+    /// `BindingBoundary::project_each(fn_id, &inputs)` per fire; emits each
+    /// returned handle via `commit_emission_verbatim` (R1.3.2.d batch
+    /// semantics — no equals substitution between batch entries).
+    Map { fn_id: FnId },
+    /// `filter(source, predicate)` — silent-drop selection (D012/D018).
+    /// Calls `BindingBoundary::predicate_each(fn_id, &inputs)`; emits each
+    /// passing input verbatim. If zero pass on a wave that dirtied the
+    /// node, queues a single `RESOLVED` to settle (D018).
+    Filter { fn_id: FnId },
+    /// `scan(source, fold, seed)` — left-fold emitting each new accumulator.
+    /// `seed` is captured at registration; `acc` lives in
+    /// `NodeRecord::operator_state` and persists across waves until
+    /// resubscribable reset. Calls `BindingBoundary::fold_each(fn_id, acc,
+    /// &inputs) -> SmallVec<HandleId>` per fire.
+    Scan { fn_id: FnId, seed: HandleId },
+    /// `reduce(source, fold, seed)` — left-fold emitting once on upstream
+    /// COMPLETE. Accumulates silently while source DATA flows; on
+    /// dep[0].terminal == Some(Complete), emits `[Data(acc), Complete]`.
+    /// On `Error(h)`, propagates the error verbatim. Opts out of Lock 2.B
+    /// auto-cascade (see `NodeKind::skips_auto_cascade`).
+    Reduce { fn_id: FnId, seed: HandleId },
+    /// `distinctUntilChanged(source, equals)` — suppresses adjacent
+    /// duplicates. Calls `BindingBoundary::custom_equals(equals_fn_id,
+    /// prev, current)` per input; emits non-equal items verbatim and
+    /// updates `prev`. If zero items pass on a wave that dirtied the node,
+    /// queues `RESOLVED` (matches Filter discipline).
+    DistinctUntilChanged { equals_fn_id: FnId },
+    /// `pairwise(source)` — emits `(prev, current)` pairs starting after
+    /// the second value. First value swallowed (sets `prev`). Calls
+    /// `BindingBoundary::pairwise_pack(fn_id, prev, current)` per pair to
+    /// produce the binding-side tuple handle.
+    Pairwise { fn_id: FnId },
+
+    // ----- Slice C-2: multi-dep combinators (D020) -----
+    /// `combine(...sources)` — N-dep combineLatest. On any dep fire, packs
+    /// the latest handle per dep into a single tuple handle via
+    /// `BindingBoundary::pack_tuple(pack_fn, &handles)`. First-run gate
+    /// (`partial: false` default) holds until all deps deliver real DATA
+    /// (R2.5.3). COMPLETE cascades when all deps complete (R1.3.4.b).
+    Combine { pack_fn: FnId },
+
+    /// `withLatestFrom(primary, secondary)` — 2-dep, fire-on-primary-only
+    /// (D021, Phase 10.5). Packs `[primary, secondary]` via
+    /// `BindingBoundary::pack_tuple(pack_fn, &handles)` when dep[0]
+    /// (primary) has DATA in the wave. If only dep[1] (secondary) fires,
+    /// settles with RESOLVED (D018 pattern). First-run gate holds until
+    /// both deps deliver (R2.5.3 `partial: false`). Post-warmup INVALIDATE
+    /// guard: if secondary `prev_data == NO_HANDLE` and batch empty after
+    /// warmup, settles with RESOLVED (no stale pair).
+    WithLatestFrom { pack_fn: FnId },
+
+    /// `merge(...sources)` — N-dep, forward all DATA handles verbatim
+    /// (D022). Zero FFI on fire: no transformation, no binding call.
+    /// Each dep's batch handles are retained and emitted individually.
+    /// COMPLETE cascades when all deps complete (R1.3.4.b).
+    Merge,
+}
+
+/// Registration options for [`Core::register_operator`].
+///
+/// `equals` controls operator output dedup (R5.7 — defaults to identity).
+/// `partial` controls the R2.5.3 first-run gate (R5.4 — operator dispatch
+/// fires on first DATA from any dep when `true`; default `false` matches
+/// the gated derived discipline).
+#[derive(Copy, Clone, Debug)]
+pub struct OperatorOpts {
+    pub equals: EqualsMode,
+    pub partial: bool,
+}
+
+impl Default for OperatorOpts {
+    fn default() -> Self {
+        Self {
+            equals: EqualsMode::Identity,
+            partial: false,
+        }
+    }
 }
 
 /// Equality mode for a node's outgoing emissions.
@@ -475,6 +578,27 @@ pub(crate) struct NodeRecord {
     /// is load-bearing — meta nodes typically subscribe to parent state
     /// that becomes inconsistent during the parent's destruction phase.
     pub(crate) meta_companions: Vec<NodeId>,
+    /// R5.4 / D011 partial-mode: when `true`, fire_fn skips the R2.5.3
+    /// first-run gate — the node fires as soon as ANY dep delivers a
+    /// real handle, even if other deps remain sentinel. Defaults to
+    /// `false` (gated). Lifted into Core for operator support; for
+    /// State/Derived/Dynamic nodes the field is settable but the gated
+    /// path remains the typical caller default.
+    pub(crate) partial: bool,
+    /// Operator state slot (Slice C-1). For [`OperatorOp::Scan`] /
+    /// [`OperatorOp::Reduce`], holds the running accumulator handle —
+    /// initialized to the operator's seed at registration, updated each
+    /// fire, retained across waves. For [`OperatorOp::DistinctUntilChanged`]
+    /// / [`OperatorOp::Pairwise`], holds the previous emitted value
+    /// (`NO_HANDLE` = no prior value). Unused for `Map` / `Filter` /
+    /// non-operator kinds (stays `NO_HANDLE`).
+    ///
+    /// **Refcount discipline:** Core retains one share of this handle for
+    /// the slot's lifetime. The retain is taken when the slot is written
+    /// (registration for seed; per-fire update for live state); the
+    /// previous handle is released on overwrite. Cleared (with release) by
+    /// `Drop for CoreState` and by `reset_for_fresh_lifecycle`.
+    pub(crate) operator_state: HandleId,
 }
 
 impl NodeRecord {
@@ -715,8 +839,12 @@ impl Core {
     // -------------------------------------------------------------------
 
     /// Register a state node. `initial` may be [`NO_HANDLE`] to start sentinel.
+    ///
+    /// `partial` is plumbed through for surface consistency with the other
+    /// register methods (D019); for State nodes it has no effect (state
+    /// nodes don't fire fn).
     #[must_use]
-    pub fn register_state(&self, initial: HandleId) -> NodeId {
+    pub fn register_state(&self, initial: HandleId, partial: bool) -> NodeId {
         let mut s = self.lock_state();
         let id = s.alloc_node_id();
         let rec = NodeRecord {
@@ -735,6 +863,8 @@ impl Core {
             has_received_teardown: false,
             resubscribable: false,
             meta_companions: Vec::new(),
+            partial,
+            operator_state: NO_HANDLE,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -744,7 +874,8 @@ impl Core {
     }
 
     /// Register a derived (static) node. `fn_id` invokes via the binding;
-    /// `equals` defaults to identity in callers.
+    /// `equals` defaults to identity in callers. `partial` controls the
+    /// R2.5.3 first-run gate (D011).
     ///
     /// # Panics
     ///
@@ -752,12 +883,19 @@ impl Core {
     /// panic message includes the offending id. Production bindings should
     /// validate dep ids before calling.
     #[must_use]
-    pub fn register_derived(&self, deps: &[NodeId], fn_id: FnId, equals: EqualsMode) -> NodeId {
-        self.register_computed(deps, fn_id, equals, NodeKind::Derived)
+    pub fn register_derived(
+        &self,
+        deps: &[NodeId],
+        fn_id: FnId,
+        equals: EqualsMode,
+        partial: bool,
+    ) -> NodeId {
+        self.register_computed(deps, fn_id, equals, NodeKind::Derived, partial)
     }
 
     /// Register a dynamic node — fn declares its actually-tracked dep indices
-    /// per fire (canonical spec §2.8 / Lock 2.B).
+    /// per fire (canonical spec §2.8 / Lock 2.B). `partial` controls the
+    /// R2.5.3 first-run gate (D011).
     ///
     /// # Panics
     ///
@@ -765,8 +903,81 @@ impl Core {
     /// panic message includes the offending id. Production bindings should
     /// validate dep ids before calling.
     #[must_use]
-    pub fn register_dynamic(&self, deps: &[NodeId], fn_id: FnId, equals: EqualsMode) -> NodeId {
-        self.register_computed(deps, fn_id, equals, NodeKind::Dynamic)
+    pub fn register_dynamic(
+        &self,
+        deps: &[NodeId],
+        fn_id: FnId,
+        equals: EqualsMode,
+        partial: bool,
+    ) -> NodeId {
+        self.register_computed(deps, fn_id, equals, NodeKind::Dynamic, partial)
+    }
+
+    /// Register a built-in operator node (Slice C-1, D009). The operator
+    /// dispatch path lives in `fire_operator`; `op` selects which
+    /// per-operator FFI method on [`BindingBoundary`] gets called per fire.
+    ///
+    /// For stateful operators ([`OperatorOp::Scan`] / [`OperatorOp::Reduce`]),
+    /// the seed handle is captured into `operator_state` and Core takes one
+    /// retain share via [`BindingBoundary::retain_handle`]. The share is
+    /// released on overwrite (per fire) and on [`Drop`] for [`CoreState`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if any element of `deps` is not a registered node id, or if
+    /// the seed handle for `Scan` / `Reduce` is `NO_HANDLE` (per R2.5.3
+    /// stateful operators must have a real seed).
+    #[must_use]
+    pub fn register_operator(&self, deps: &[NodeId], op: OperatorOp, opts: OperatorOpts) -> NodeId {
+        // Seed validation for stateful folders.
+        let seed_handle = match op {
+            OperatorOp::Scan { seed, .. } | OperatorOp::Reduce { seed, .. } => {
+                assert!(
+                    seed != NO_HANDLE,
+                    "Scan/Reduce seed must be a real handle (R2.5.3); got NO_HANDLE"
+                );
+                seed
+            }
+            _ => NO_HANDLE,
+        };
+        // Retain the seed share so the operator_state slot owns it.
+        if seed_handle != NO_HANDLE {
+            self.binding.retain_handle(seed_handle);
+        }
+
+        let mut s = self.lock_state();
+        let id = s.alloc_node_id();
+        // Operators track all declared deps (no dynamic-tracked dance).
+        let tracked: HashSet<usize> = (0..deps.len()).collect();
+        let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
+        let rec = NodeRecord {
+            dep_records,
+            kind: NodeKind::Operator(op),
+            fn_id: None,
+            equals: opts.equals,
+            cache: NO_HANDLE,
+            has_fired_once: false,
+            subscribers: HashMap::new(),
+            tracked,
+            dirty: false,
+            involved_this_wave: false,
+            pause_state: PauseState::Active,
+            terminal: None,
+            has_received_teardown: false,
+            resubscribable: false,
+            meta_companions: Vec::new(),
+            partial: opts.partial,
+            operator_state: seed_handle,
+        };
+        s.nodes.insert(id, rec);
+        s.children.insert(id, HashSet::new());
+        for &dep in deps {
+            assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
+            s.children.entry(dep).or_default().insert(id);
+        }
+        drop(s);
+        self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
+        id
     }
 
     fn register_computed(
@@ -775,13 +986,14 @@ impl Core {
         fn_id: FnId,
         equals: EqualsMode,
         kind: NodeKind,
+        partial: bool,
     ) -> NodeId {
         let mut s = self.lock_state();
         let id = s.alloc_node_id();
         // Static derived tracks all deps; dynamic starts empty and fills via fn return.
         let tracked: HashSet<usize> = match kind {
             NodeKind::Derived => (0..deps.len()).collect(),
-            NodeKind::Dynamic | NodeKind::State => HashSet::new(),
+            NodeKind::Dynamic | NodeKind::State | NodeKind::Operator(_) => HashSet::new(),
         };
         let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
         let rec = NodeRecord {
@@ -800,6 +1012,8 @@ impl Core {
             has_received_teardown: false,
             resubscribable: false,
             meta_companions: Vec::new(),
+            partial,
+            operator_state: NO_HANDLE,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -1008,6 +1222,15 @@ impl Core {
                     hs.push(h);
                 }
             }
+            // Operator state slot — for Distinct/Pairwise (`prev`), reset
+            // to NO_HANDLE so the first post-reset fire treats the next
+            // value as the seed of a fresh stream. For Scan/Reduce
+            // (`acc`), reset to the seed so accumulation restarts. The
+            // current handle's retain is released here; the new seed
+            // retain is taken below.
+            if rec.operator_state != NO_HANDLE {
+                hs.push(rec.operator_state);
+            }
             hs
         };
         let pause_buffer_payloads: Vec<HandleId> = {
@@ -1050,8 +1273,34 @@ impl Core {
             if rec.kind == NodeKind::Dynamic {
                 rec.tracked.clear();
             }
+            // Operator state reset (Slice C-1): re-seed Scan/Reduce's
+            // accumulator from the captured seed; clear Distinct/Pairwise's
+            // previous value. The handle dropped above is released by the
+            // caller; the new seed needs its own retain share.
+            let next_state = match rec.kind {
+                NodeKind::Operator(
+                    OperatorOp::Scan { seed, .. } | OperatorOp::Reduce { seed, .. },
+                ) => seed,
+                _ => NO_HANDLE,
+            };
+            rec.operator_state = next_state;
             pulled
         };
+        // Take the seed retain BEFORE we release the prior slot's share;
+        // the binding may collapse the registry slot when refcount hits
+        // zero, and Scan/Reduce's seed could share a handle with the prior
+        // slot if the caller installed them via the same value.
+        let next_seed_retain = {
+            let rec = s.require_node(node_id);
+            if rec.operator_state == NO_HANDLE {
+                None
+            } else {
+                Some(rec.operator_state)
+            }
+        };
+        if let Some(h) = next_seed_retain {
+            self.binding.retain_handle(h);
+        }
         for h in handles_to_release {
             self.binding.release_handle(h);
         }
@@ -1408,22 +1657,51 @@ impl Core {
                 }
                 // Auto-cascade gating: if all deps now terminal, push child
                 // onto the work queue with the chosen terminal.
-                let cascade = {
+                //
+                // Slice C-1: kinds that opt out of Lock 2.B (currently
+                // `Operator(Reduce)`) intercept upstream COMPLETE so they
+                // can emit their accumulator before terminating. Instead of
+                // cascading, queue the child for fn-fire — `fire_operator`
+                // sees `dep_records[0].terminal` set and emits the
+                // appropriate batch (Data(acc) + Complete on COMPLETE,
+                // Error(h) on ERROR).
+                let action = {
                     let child = s.require_node(child_id);
                     if child.terminal.is_some() {
-                        None // Already terminated — no-op.
+                        ChildAction::None // Already terminated — no-op.
                     } else if child.all_deps_terminal() {
-                        Some(pick_cascade_terminal(&child.dep_records))
+                        if child.kind.skips_auto_cascade() {
+                            ChildAction::QueueFire
+                        } else {
+                            ChildAction::Cascade(pick_cascade_terminal(&child.dep_records))
+                        }
                     } else {
-                        None
+                        ChildAction::None
                     }
                 };
-                if let Some(t_child) = cascade {
-                    work.push((child_id, t_child));
+                match action {
+                    ChildAction::None => {}
+                    ChildAction::Cascade(t_child) => {
+                        work.push((child_id, t_child));
+                    }
+                    ChildAction::QueueFire => {
+                        s.pending_fires.insert(child_id);
+                    }
                 }
             }
         }
     }
+}
+
+/// Outcome of Lock 2.B child gating in `terminate_node`'s cascade walk.
+enum ChildAction {
+    /// No cascade; child is already terminal or not yet all-deps-terminal.
+    None,
+    /// Auto-cascade with the picked terminal kind (ERROR dominates COMPLETE).
+    Cascade(TerminalKind),
+    /// Queue child for fn-fire instead of cascading. Used by operator
+    /// kinds that intercept upstream terminal (Operator(Reduce)).
+    QueueFire,
 }
 
 /// Lock 2.B cascade-terminal selection: ERROR dominates COMPLETE; first
@@ -2056,7 +2334,7 @@ impl Core {
             // re-runs fn unconditionally; fn's returned `tracked` then
             // repopulates `rec.tracked` and normal selective-deps semantics
             // resume from the next dep update onward.
-            if rec.kind == NodeKind::Derived {
+            if rec.kind == NodeKind::Derived || matches!(rec.kind, NodeKind::Operator(_)) {
                 rec.tracked = (0..new_deps_vec.len()).collect();
             } else if rec.kind == NodeKind::Dynamic {
                 rec.tracked.clear();
@@ -2293,6 +2571,13 @@ impl Drop for CoreState {
                         self.binding.release_handle(h);
                     }
                 }
+            }
+            // Operator state slot (Slice C-1) — Scan/Reduce hold the
+            // running accumulator; Distinct/Pairwise hold the previous
+            // value. Each retain is taken on slot write (registration or
+            // per-fire update); released here on Core drop.
+            if rec.operator_state != NO_HANDLE {
+                self.binding.release_handle(rec.operator_state);
             }
         }
 

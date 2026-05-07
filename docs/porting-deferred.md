@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-06 (M2 Slice F /qa)
+last_updated: 2026-05-06 (M3 Slice C-2 close)
 ---
 
 # Porting flags & deferred concerns
@@ -614,6 +614,65 @@ These canonical-spec methods are tracked for parity. Items marked
   Part 6 ("Cross-language handle-space composition") — explicit
   serialize bridge or process-boundary semantics. Post-M6 work.
 - **Source:** Slice E+ (2026-05-05); reference Open Question 1.
+
+---
+
+## M3 Slice C-1 — operator deferrals
+
+### napi-rs operator binding parity not yet shipped
+
+- **What:** `BenchCore` ([`crates/graphrefly-bindings-js/src/core_bindings.rs`](../crates/graphrefly-bindings-js/src/core_bindings.rs)) does NOT expose `register_map` / `register_filter` / `register_scan` etc. The Slice C-1 substrate is reachable from JS only via direct `Core::register_operator` + a binding-side `OperatorBinding` impl that doesn't yet exist for napi.
+- **Why deferred:** operator factories take `Box<dyn Fn(HandleId) -> HandleId + Send + Sync>` closures. Wiring JS callbacks across napi requires tsfn (thread-safe function) plumbing — same shape needed for the deferred TSFN-based JS-callback fns / TSFN custom-equals work (see "Slice B — napi-rs binding parity" closing section in `migration-status.md`). Bundling them lets one tsfn refactor cover both paths.
+- **Lift point:** when a JS consumer needs operators OR when TSFN custom-equals lands, expose `register_map(deps, project_fn)` etc. on `BenchCore` (or a richer `BenchOperators` companion class). Wire `parity-tests/impls/rust.ts` to flip non-null at the same time so the existing transform parity scenarios activate against rustImpl.
+- **Source:** Slice C-1 close (2026-05-06).
+
+### pyo3 operator binding deferred to M6
+
+- **What:** `graphrefly-bindings-py` is scaffold-only. Operators surface lands with M6 closing the graphrefly-py G.6 parity gap.
+- **Why deferred:** M6 is gated by M5 (structures); operators surface there is naturally part of the M6 milestone.
+- **Source:** Slice C-1 close (2026-05-06).
+
+### `OperatorOpts.equals` is currently a no-op for transform operators
+
+- **What:** `Core::register_operator(deps, op, opts)` accepts `opts.equals: EqualsMode` and stores it on `NodeRecord.equals`. But all transform operators emit via `commit_emission_verbatim`, which skips equals substitution (R1.3.2.d / R1.3.3.c). `opts.equals` therefore has no observable effect for the current Slice C-1 operators.
+- **Why deferred:** the field is reserved for future operators that explicitly want wire-level cache-vs-new equals dedup (e.g., a "distinctOutput" variant that combines distinctUntilChanged's prev-comparison with cache-substitution semantics). v1 ergonomics: keep the field in the struct so future callers don't break.
+- **Lift point:** when a future operator opts in, add a `commit_emission` (with-substitution) path to its `fire_op_*` helper.
+- **Source:** Slice C-1 close (2026-05-06).
+
+### `fire_operator` first-run gate uses linear-scan `has_sentinel_deps()`
+
+- **What:** `fire_operator`'s pre-fire skip check calls `rec.has_sentinel_deps()` (O(n_deps) linear scan). For transform operators (single-dep, R5.7), this is O(1) in practice. But for future multi-dep operators (combine, withLatestFrom), it's O(n_deps) per fire.
+- **Why deferred:** mirrors the §10.13 deferred concern for `fire_regular`; the `received_mask: u64` bitmask refactor would land alongside that work. Bench-driven re-look.
+- **Source:** Slice C-1 close (2026-05-06).
+
+### Operator describe doesn't surface per-operator discriminant
+
+- **What:** `Graph::describe()` reports operator nodes as `type: "operator"` but doesn't include the `OperatorOp` discriminant (Map vs Filter vs Scan etc.) or the registered `FnId` references. Consumers see "this is an operator" but not "this is a map".
+- **Why deferred:** belongs with the canonical describe extension that surfaces operator catalog metadata (Phase 4+ pattern). v1 acceptable — the namespace + edges are sufficient for current consumers.
+- **Lift point:** add an `operator: { kind: "map" | "filter" | ... }` field to `NodeDescribe` when the operator catalog substrate lands.
+- **Source:** Slice C-1 close (2026-05-06).
+
+## M3 Slice C-2 — combinator operator deferrals
+
+### Merge first-error-terminates divergence (D022)
+
+- **What:** TS `merge` terminates immediately on the first upstream `ERROR` (producer pattern with manual subscribe propagation). Rust `merge` uses Core's standard dep-terminal cascade (R1.3.4.b): error propagates only when ALL deps are terminal, and `ERROR` dominates over `COMPLETE`.
+- **Why divergent:** Rust combinators register as standard operator nodes and inherit Core's uniform cascade behavior. TS merge uses a hand-wired producer pattern that intercepts errors eagerly. Unifying would require either a special "first-terminal" mode in Core (complexity tax on every node) or a producer-pattern escape hatch outside Core dispatch.
+- **Lift point:** if a consumer needs first-error semantics, add `OperatorOpts::cascade: CascadeMode::FirstTerminal | AllTerminal` enum (new register_operator option). Deferred until evidence surfaces.
+- **Source:** Slice C-2 close (2026-05-06); documented in combine.rs Rust test `merge_error_cascades_when_all_deps_terminal`.
+
+### Combine custom tuple-equality deferred (D023)
+
+- **What:** `combine` and `withLatestFrom` emit via `commit_emission_verbatim` (skips cache-vs-new equals check). A custom equals that compares tuple contents element-wise (avoiding downstream re-fire when only one dep changed to the same value) is not wired.
+- **Why deferred:** the `EqualsMode::Custom(FnId)` machinery exists in Core but tuple-equality requires the binding to implement a cross-handle deep comparison that knows the internal structure of the packed tuple. No current consumer exercises this path; default Identity mode (always emit) is correct if slightly chatty.
+- **Lift point:** when a consumer needs dedup on tuple outputs, wire `opts.equals: EqualsMode::Custom(eq_fn)` through `combine`/`with_latest_from` factory signatures and switch from `commit_emission_verbatim` to `commit_emission` (with-substitution path).
+- **Source:** Slice C-2 close (2026-05-06).
+
+### WithLatestFrom first-fire gate-release emits on any dep (semantic note)
+
+- **What:** On the FIRST fire (first-run gate transitioning `has_fired_once` false→true), `fire_op_with_latest_from` unconditionally emits the `[primary, secondary]` pair regardless of which dep triggered the wave. This means if the gate release is triggered by a secondary-only delivery, it still emits (since the gate guarantees both deps have real values via `prev_data`).
+- **Why this way:** TS uses `partial: false` which holds until all deps deliver, then fires the fn which sees both deps' data. The fn naturally emits regardless of which dep triggered (it has no concept of "primary fired this wave"). Rust's wave-end batch clearing means `primary_fired=false` on secondary-triggered gate release, so the first-fire special case is needed for parity with TS.
+- **Source:** Slice C-2 close (2026-05-06); fix in `batch.rs::fire_op_with_latest_from`.
 
 ---
 

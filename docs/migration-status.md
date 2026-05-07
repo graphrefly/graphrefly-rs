@@ -4,7 +4,7 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 ## Current state (2026-05-06)
 
-**M1 closed; M2 closed; M3 Slice A + B landed (2026-05-06); follow-up batch (2026-05-06): C — DepBatch regression coverage, D — napi-rs DepBatch + FnResult::Batch parity, plus B — M2 parity-tests widened (TS-side).** Substrate is now end-to-end parity-tested across Rust core ↔ JS bindings ↔ TS legacy oracle. M2 (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06). Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
+**M1 closed; M2 closed; M3 Slice A + B + C-1 + C-2 landed (2026-05-06).** Slice C-2 (combinator operators — `combine` / `withLatestFrom` / `merge`) extends the operator substrate with multi-dep dispatch: `OperatorOp::Combine { pack_fn }` / `WithLatestFrom { pack_fn }` / `Merge` enum variants, `BindingBoundary::pack_tuple` extension method (D020), `snapshot_op_all_latest` helper for N-dep latest-handle collection, first-fire gate-release semantics on `withLatestFrom` (D021), zero-FFI merge forwarding (D022), `OperatorBinding::register_packer` closure registration. Parity-tested: 6 scenarios across combine/withLatestFrom/merge in `packages/parity-tests/scenarios/operators/combine.test.ts`. Slice C-1 (transform operators — `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`) lands the first operators against the Core-dispatch architecture (D009): `NodeKind::Operator(OperatorOp)` enum variant, `OperatorOp` discriminant, `partial: bool` register option (D011 / R5.4), `BindingBoundary` extension methods (`project_each` / `predicate_each` / `fold_each` / `pairwise_pack`), `Core::register_operator(deps, op, opts)`, per-operator dispatch in `fire_operator` with operator-specific state (`operator_state: HandleId` slot for Scan/Reduce acc and Distinct/Pairwise prev), Reduce's Lock 2.B opt-out (`NodeKind::skips_auto_cascade`) so Reduce can intercept upstream COMPLETE to emit acc + Complete. New crate `graphrefly-operators` exposes `OperatorBinding` super-trait of `BindingBoundary` (D015) plus the six transform factories taking `&Core` + `&Arc<dyn OperatorBinding>` (D010 helper-trait shape). `partial` flag plumbed through all three legacy register methods (`register_state` / `register_derived` / `register_dynamic`) per D019. Substrate is now end-to-end parity-tested across Rust core ↔ JS bindings ↔ TS legacy oracle. M2 (Slice F — port-coverage gap fills + topology primitive + reactive describe/observe; Slice F /qa applied 2026-05-06). Slice A close (lock-released `invoke_fn` + `custom_equals` + R1.3.5.a handshake tier-split + sink-snapshot-on-first-touch race fix) + Slice B (napi-rs binding parity for the new Core methods) + Slice C (CI workflow with rust + clippy + fmt + cargo-deny + TLC steps) + Slice D (M2 starter — `graphrefly-graph` Graph container with sugar constructors + lifecycle pass-throughs) + Slice E+ (M2 read-side: Core inspection + Graph namespace + mount/unmount + describe() JSON + observe() default sink-style) all landed 2026-05-05.
 
 **DS-14 locked + Phase 14 landed in TS** ([archive/docs/SESSION-DS-14-changesets-design.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-DS-14-changesets-design.md)). Rust port greenlit per [SESSION-rust-port-architecture.md](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) Part 10 lock. M1 parity work (Slice A+B 2026-05-05 + Slice C-1/C-1.5/C-2 + A-bigger + Slice A close 2026-05-05) is now feature-complete: PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR cascade, TEARDOWN-precedes-COMPLETE, resubscribable terminals, meta-TEARDOWN ordering, §10.12 RAII Subscription, dynamic-rewire audit fix, drop-then-fire wave-end sinks, iterative cascades for deep chains, two-phase tier-then-node flush, RAII batch + cache-snapshot rollback, lock-released `invoke_fn` + `custom_equals`, R1.3.5.a per-tier handshake delivery.
 
@@ -41,7 +41,8 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | M3 (Slice A /qa — DepBatch tests) | `graphrefly-core` | ✅ landed (post-/qa) | 2026-05-06: `tests/dep_batch.rs` adds 7 regression tests covering K-emit coalescing, `prev_data` rotation, `involved` flag distinction, refcount discipline, multi-dep diamonds. Post-/qa hardening: A1 tightened refcount assertions to exact equality (was lenient `<=+1`); A2 fixed tautological assertion in resolved-in-wave; A3 strengthened multi-dep assertion to exact-handle equality (was `assert_ne! NO_HANDLE`); A4 added wave-1 `prev_data` activation-baseline assertion; A5 documented activation drain discipline. 281 tests green. |
 | M3 (napi-rs Batch parity) | `graphrefly-bindings-js` | ✅ landed (post-/qa) | 2026-05-06: `BuiltinBatchFn` enum (`MapAddOneBatch` / `MulTenThenComplete`); `BatchEmissionJs` napi struct (`kind` / `value`); `register_batch_derived(deps, builtin)` exposes `FnResult::Batch` substrate; `batch_emit_messages(node, msgs)` exposes user-facing heterogeneous wave (data/complete/error). Post-/qa hardening: D1 reject `None` value for data/error kinds (R1.2.5 intent); D2 return `napi::Result` with up-front msgs validation before `Core::batch` opens (no panic-mid-batch); D3 dropped speculative `DepBatchJs` (no consumer yet); D4 single registry-lock acquisition across batch-fn fire (was 3 acquisitions); A6 panic-on-non-Int in builtin batch fns (was silent skip); A7 closure-form `Core::batch(\|\|...)`; A8 added R1.3.2.d comment justifying hardcoded `EqualsMode::Identity`. cdylib builds clean. |
 | M2 parity-tests widened (D6) | `graphrefly-ts/packages/parity-tests` | ✅ landed | 2026-05-06: `Impl` interface widened with `Graph` + tier-symbols; 6 new scenario files under `scenarios/graph/` (sugar / remove / edges / signal / describe-reactive / observe-all-reactive). 18 passing + 2 skipped (skipped: TS-side R3.7.3 ordering + auto-subscribe-late, both Rust-port-only enhancements not yet backported). 4 fragility items deferred to follow-up — see `porting-deferred.md` "M2 parity-tests fragility (post-/qa)" section. |
-| M3 (operators) | `graphrefly-operators` | ⏸ pending | Slice C-1 — first operators (transform module). Architecture pre-locked for option (c) Core-dispatch with `OperatorOp` `NodeKind` variant + bulk projection FFI surface; Q1–Q4 logged in `docs/rust-port-decisions.md`. |
+| M3 (operators — Slice C-1 transform) | `graphrefly-operators` | ✅ landed | 2026-05-06 (Slice C-1): Core-dispatch architecture (D009–D019). `NodeKind::Operator(OperatorOp)` + `OperatorOpts { equals, partial }` + `Core::register_operator` + `BindingBoundary` extensions (`project_each` / `predicate_each` / `fold_each` / `pairwise_pack` — default unimplemented). Six transform factories: `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`. `OperatorBinding` super-trait. 20 operator regression tests + 8 parity scenarios under `packages/parity-tests/scenarios/operators/transform.test.ts`. 300 tests workspace-wide (was 273 post-Slice-B). |
+| M3 (operators — Slice C-2 combinators) | `graphrefly-operators` + `graphrefly-core` | ✅ landed | 2026-05-06 (Slice C-2): Multi-dep combinator operators (D020–D023). 3 new `OperatorOp` variants (`Combine { pack_fn }` / `WithLatestFrom { pack_fn }` / `Merge`). `BindingBoundary::pack_tuple` + `OperatorBinding::register_packer`. `snapshot_op_all_latest` multi-dep snapshot helper. `fire_op_combine` (any-dep-fire tuple emission + post-warmup INVALIDATE NO_HANDLE guard), `fire_op_with_latest_from` (fire-on-primary-only + first-fire gate-release), `fire_op_merge` (zero-FFI handle forwarding). 3 factory functions in `graphrefly-operators::combine`. 14 Rust tests + 6 parity scenarios. Post-/qa: F1 `fire_op_distinct` double-release fix (working-copy retain discipline), F2 `fire_op_combine` INVALIDATE guard, A1 withLatestFrom `debug_assert` corrected to `== 2`, A3 Reduce error-retain comment accuracy, A4 pairwise first-value comment. Known v1 divergence: merge error cascade is all-deps-terminal (Rust Core standard) vs first-error-terminates (TS producer pattern). Combine custom tuple-equality deferred (D023). |
 | M4 | `graphrefly-storage` | ⏸ blocked | After M2 + DS-14 (`restoreSnapshot mode: "diff"` WAL replay shape) |
 | M5 | `graphrefly-structures` | ⏸ blocked | After M2 + DS-14 (op-log changesets) — STRONG DEFER per Phase 14 guardrail |
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
@@ -237,6 +238,99 @@ Core-level extension adding multi-emission support to `invoke_fn` return type. E
 **F3 — Break after terminal in Batch loop.** `commit_batch` now stops processing after the first `Complete` or `Error` emission (R1.3.4.a). Remaining handles are released. Extracted Batch processing into `commit_batch` helper (clippy `too_many_lines` fix).
 
 **F4 — `#[must_use]` on `FnEmission`.** Added `#[must_use = "FnEmission may contain handles that must be processed or released"]` to prevent silent handle leaks from discarded emissions.
+
+---
+
+## M3 Slice C-1 — transform operators (Core-dispatch architecture) — landed 2026-05-06
+
+First operators slice. Lands the substrate (`NodeKind::Operator`, `OperatorOp` discriminant, `partial` flag, `BindingBoundary` extension methods, `Core::register_operator`, per-operator dispatch in `fire_operator`) plus the six transform operators (`map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise`) in one bundled slice (Q1=A per `docs/rust-port-decisions.md` D014).
+
+### What landed
+
+- **`NodeKind::Operator(OperatorOp)` enum variant** in [`crates/graphrefly-core/src/node.rs`](../crates/graphrefly-core/src/node.rs). `OperatorOp` discriminant carries per-operator `FnId`s and seeds: `Map { fn_id }`, `Filter { fn_id }`, `Scan { fn_id, seed }`, `Reduce { fn_id, seed }`, `DistinctUntilChanged { equals_fn_id }`, `Pairwise { fn_id }`. `NodeKind::skips_auto_cascade()` accessor flags Reduce so it intercepts upstream COMPLETE.
+- **`OperatorOpts { equals, partial }`** registration struct (D017). `Core::register_operator(deps, op, opts) -> NodeId` validates seeds (Scan/Reduce reject `NO_HANDLE`), retains the seed handle for the `operator_state` slot's lifetime, registers the inverted edge map.
+- **`partial: bool`** field on `NodeRecord` (D011 / R5.4 / D019) — plumbed through `register_state` / `register_derived` / `register_dynamic` as a positional arg. Operators may opt out of the R2.5.3 first-run gate via `OperatorOpts::partial = true`.
+- **`operator_state: HandleId`** slot on `NodeRecord` for stateful operators (Scan/Reduce acc, Distinct/Pairwise prev). `NO_HANDLE` for stateless operators / non-operator kinds. Released by `Drop for CoreState` and re-seeded on `reset_for_fresh_lifecycle` (resubscribable lifecycle reset).
+- **`BindingBoundary` extension** in [`crates/graphrefly-core/src/boundary.rs`](../crates/graphrefly-core/src/boundary.rs): `project_each` / `predicate_each` / `fold_each` / `pairwise_pack` with default `unimplemented!()` so non-operator bindings don't pay. Each method takes a flattened `&[HandleId]` slice and returns the per-input result; one FFI per fire (R5.7 batch-mapping shape).
+- **`fire_operator` dispatch** in [`crates/graphrefly-core/src/batch.rs`](../crates/graphrefly-core/src/batch.rs). Branches on `OperatorOp` to per-variant helpers (`fire_op_map` / `fire_op_filter` / `fire_op_scan` / `fire_op_reduce` / `fire_op_distinct` / `fire_op_pairwise`). Each follows the existing three-phase shape (snapshot inputs → drop lock → call binding FFI → reacquire). Filter D018: full-reject queues `[Dirty, Resolved]` to settle. Reduce: terminal-aware (emits `Data(acc)` + `Complete` on upstream COMPLETE; cascades ERROR verbatim).
+- **Reduce auto-cascade opt-out.** `terminate_node`'s child propagation uses a new `ChildAction { None | Cascade(t) | QueueFire }` enum: when a child opts out via `kind.skips_auto_cascade()`, push to `pending_fires` instead of cascading so the operator's `fire_operator` sees the dep terminal and emits the seed/acc.
+- **`graphrefly-operators` crate** ([`crates/graphrefly-operators/`](../crates/graphrefly-operators/)). New `OperatorBinding` super-trait of `BindingBoundary` (D015) for closure registration: `register_projector` / `register_predicate` / `register_folder` / `register_equals` / `register_pairwise_packer`, each taking `Box<dyn Fn(...) + Send + Sync>` (D016). Six transform factories accept `&Core` + `&Arc<dyn OperatorBinding>` + `source: NodeId` + user closure (+ seed for folders) and return `OperatorRegistration { node, fn_id }`. `*_with` variants accept explicit `OperatorOpts`.
+
+### Files touched
+
+| Path | Change |
+|------|--------|
+| `crates/graphrefly-core/src/node.rs` | `OperatorOp` + `OperatorOpts` + `NodeKind::Operator` + `partial`/`operator_state` fields + `register_operator` + `register_state/derived/dynamic` partial arg + `ChildAction` cascade-gating + reset_for_fresh_lifecycle re-seed + Drop release |
+| `crates/graphrefly-core/src/boundary.rs` | 4 new `BindingBoundary` methods (default unimplemented) |
+| `crates/graphrefly-core/src/batch.rs` | `fire_fn` dispatch fork → `fire_operator` + 6 per-variant helpers + `settle_dirty_resolved` + `snapshot_op_dep0` + partial-flag check in `fire_regular`'s skip gate |
+| `crates/graphrefly-core/src/lib.rs` | re-export `OperatorOp` + `OperatorOpts` |
+| `crates/graphrefly-operators/Cargo.toml` | dev-dep ahash; deps parking_lot + smallvec |
+| `crates/graphrefly-operators/src/lib.rs` | module wiring + re-exports |
+| `crates/graphrefly-operators/src/binding.rs` | `OperatorBinding` super-trait |
+| `crates/graphrefly-operators/src/transform.rs` | 6 factories + 6 `_with` variants + `OperatorRegistration` |
+| `crates/graphrefly-operators/tests/common/mod.rs` | `InnerBinding` (`BindingBoundary` + `OperatorBinding`) + `OpRuntime` + `Recorder` |
+| `crates/graphrefly-operators/tests/transform.rs` | 20 regression tests |
+| `crates/graphrefly-graph/src/graph.rs` | pass `false` for partial through 3 sugar wrappers |
+| `crates/graphrefly-graph/src/describe.rs` | `NodeKind::Operator(_)` arms in `type_str_of` and `status_of` |
+| `crates/graphrefly-bindings-js/src/core_bindings.rs` | call-site updates for `partial` arg |
+| `crates/graphrefly-core/tests/{common/mod.rs, batch.rs, dep_batch.rs, lock_released.rs}` | call-site updates |
+| `crates/graphrefly-core/benches/dispatcher.rs` | call-site updates |
+| `crates/graphrefly-graph/tests/{describe.rs, gap_fills.rs, namespace.rs}` | call-site updates |
+
+### Tests added (Rust)
+
+20 new tests in [`crates/graphrefly-operators/tests/transform.rs`](../crates/graphrefly-operators/tests/transform.rs):
+
+- `map_per_value_projection_in_single_emit_wave`
+- `map_batch_emits_one_dirty_per_wave_per_r1_3_1_a` (R1.3.1.a)
+- `filter_passes_only_matching_items`
+- `filter_full_reject_emits_dirty_resolved_per_d018` (D012/D018)
+- `filter_mixed_wave_no_resolved_when_at_least_one_passes`
+- `scan_emits_running_accumulator_per_input`
+- `scan_persists_acc_across_waves`
+- `reduce_emits_acc_on_upstream_complete`
+- `reduce_no_data_emits_seed_on_complete`
+- `reduce_propagates_upstream_error`
+- `distinct_until_changed_suppresses_consecutive_duplicates`
+- `distinct_emits_on_first_value_always`
+- `pairwise_emits_pairs_starting_from_second_value`
+- `pairwise_first_value_alone_emits_nothing`
+- `map_does_not_leak_handles_after_drop`
+- `scan_seed_retain_balances_on_core_drop` (refcount discipline)
+- `map_does_not_fire_on_sentinel_source_until_first_emit` (R2.5.3)
+- `operator_opts_default_is_identity_and_gated`
+- `no_handle_const_is_recognized`
+- `op_binding_is_send_and_sync` (CLAUDE.md Rust invariant 2)
+
+### Tests added (TS-side parity scenarios)
+
+8 new scenarios in [`packages/parity-tests/scenarios/operators/transform.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/transform.test.ts) parameterized via `describe.each(impls)`:
+
+- map: per-value projection
+- filter: passes matching + full-reject settles
+- scan: running-accumulator emission
+- reduce: emit-on-COMPLETE (no DATA → seed; with DATA → final acc)
+- distinctUntilChanged: adjacent-dup suppression
+- pairwise: (prev, current) emission
+
+`Impl` interface widened with `map` / `filter` / `scan` / `reduce` / `distinctUntilChanged` / `pairwise` plus `RESOLVED` + `DIRTY` tier symbols. All scenarios pass against `legacyImpl`; `rustImpl` activates with `@graphrefly/native` publication.
+
+### Test count
+
+300 tests green workspace-wide (was 273 post-Slice-B; +20 operator tests + 7 indirect via the partial-flag plumbing). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved across all crates.
+
+### Decisions logged
+
+D014–D019 in [`docs/rust-port-decisions.md`](rust-port-decisions.md): one-slice scope (A), `OperatorBinding` lives in operators crate, `Fn(HandleId) -> HandleId` projector signature, equals defaults to Identity, filter silent-drop with self-RESOLVED on full-reject, `partial: bool` added to all three legacy register methods.
+
+### What did NOT land in Slice C-1
+
+- **napi-rs operator binding parity** — `BenchCore` currently has no `register_map` / `register_filter` / etc. surface. Operator FFI for JS callbacks via napi tsfn is post-bench-study work; tracked as M3 close-gate residual (see `porting-deferred.md`).
+- **pyo3 operator binding** — same deferral, lands with M6.
+- **Operator describe/observe enrichment** — `describe()` exposes `Operator` as `NodeTypeStr::Operator` but doesn't surface the per-operator discriminant (Map vs Filter etc.) yet. Belongs with the future canonical describe extension that surfaces operator catalog metadata.
+- **`partial`-mode operators** — no transform operator uses partial=true. Plumbing is in place for combine/withLatestFrom in future slices.
+- **Operator `OperatorOpts.equals` for wire-level dedup** — currently a no-op for transform operators (which use `commit_emission_verbatim`). Reserved for future operators that DO want wire-level equals substitution.
+- **`fire_operator` first-run gate fast-path** — gate check uses linear-scan `has_sentinel_deps()`. Same shape as the §10.13 deferred concern; bench-driven re-look.
 
 ---
 

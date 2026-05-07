@@ -11,10 +11,13 @@ authors.workspace      = true
 
 [dependencies]
 graphrefly-core = { workspace = true }
+parking_lot     = { workspace = true }
+smallvec        = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
 
 [dev-dependencies]
+ahash           = { workspace = true }
 proptest        = { workspace = true }
 
 [features]

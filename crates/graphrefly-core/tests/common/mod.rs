@@ -350,7 +350,7 @@ impl TestRuntime {
             Some(v) => self.binding.intern(v),
             None => HandleId::new(0), // NO_HANDLE
         };
-        let id = self.core.register_state(initial_handle);
+        let id = self.core.register_state(initial_handle, false);
         StateHandle {
             id,
             binding: self.binding.clone(),
@@ -366,7 +366,7 @@ impl TestRuntime {
     {
         let fn_id = self.binding.register_fn(f);
         self.core
-            .register_derived(deps, fn_id, EqualsMode::Identity)
+            .register_derived(deps, fn_id, EqualsMode::Identity, false)
     }
 
     /// Derived with custom equals.
@@ -378,7 +378,7 @@ impl TestRuntime {
         let fn_id = self.binding.register_fn(f);
         let eq_id = self.binding.register_custom_equals(equals);
         self.core
-            .register_derived(deps, fn_id, EqualsMode::Custom(eq_id))
+            .register_derived(deps, fn_id, EqualsMode::Custom(eq_id), false)
     }
 
     /// Register a dynamic node. The fn returns `(value, tracked_indices)`:
@@ -390,7 +390,7 @@ impl TestRuntime {
     {
         let fn_id = self.binding.register_dynamic_fn(f);
         self.core
-            .register_dynamic(deps, fn_id, EqualsMode::Identity)
+            .register_dynamic(deps, fn_id, EqualsMode::Identity, false)
     }
 
     /// Subscribe a sink that records events into a shared `Vec<RecordedEvent>`.

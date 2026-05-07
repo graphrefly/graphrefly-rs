@@ -270,7 +270,7 @@ fn edges_recursive_into_mounts() {
 fn edges_cross_graph_dep_shows_as_anon() {
     let g = Graph::new("test", common::binding());
     // Register a node through Core without naming it.
-    let anon = g.core().register_state(h(1));
+    let anon = g.core().register_state(h(1), false);
     g.derived("d", &[anon], FnId::new(1), EqualsMode::Identity)
         .unwrap();
 
