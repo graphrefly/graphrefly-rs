@@ -55,7 +55,7 @@ use smallvec::SmallVec;
 use crate::boundary::{DepBatch, FnEmission, FnResult};
 use crate::handle::{HandleId, NodeId, NO_HANDLE};
 use crate::message::Message;
-use crate::node::{Core, CoreState, EqualsMode, NodeKind, OperatorOp, Sink, TerminalKind};
+use crate::node::{Core, CoreState, EqualsMode, OperatorOp, Sink, TerminalKind};
 
 /// Deferred sink-fire jobs collected during `flush_notifications`. Each
 /// entry pairs a snapshot of the sink Arcs to fire with the messages to
@@ -296,20 +296,18 @@ impl Core {
         true
     }
 
-    /// Wave drain entry point. Dispatches by `NodeKind` to either the
+    /// Wave drain entry point. Dispatches via `rec.op` to either the
     /// regular fn-fire path ([`Self::fire_regular`]) or the operator
     /// dispatch ([`Self::fire_operator`]).
     pub(crate) fn fire_fn(&self, node_id: NodeId) {
-        let kind = {
+        let op = {
             let s = self.lock_state();
-            s.nodes.get(&node_id).map(|r| r.kind)
+            s.nodes.get(&node_id).and_then(|r| r.op)
         };
-        let Some(kind) = kind else {
-            return;
-        };
-        match kind {
-            NodeKind::Operator(op) => self.fire_operator(node_id, op),
-            NodeKind::State | NodeKind::Derived | NodeKind::Dynamic => {
+        match op {
+            Some(operator_op) => self.fire_operator(node_id, operator_op),
+            None => {
+                // State / Derived / Dynamic / Producer all dispatch via fn_id.
                 self.fire_regular(node_id);
             }
         }
@@ -342,7 +340,7 @@ impl Core {
         }
 
         // Phase 1: snapshot inputs — build DepBatch per dep from dep_records.
-        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, NodeKind)> = {
+        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, bool)> = {
             let mut s = self.lock_state();
             s.pending_fires.remove(&node_id);
             let rec = s.require_node(node_id);
@@ -361,11 +359,11 @@ impl Core {
                             involved: dr.involved_this_wave,
                         })
                         .collect();
-                    (fn_id, dep_batches, rec.kind)
+                    (fn_id, dep_batches, rec.is_dynamic)
                 })
             }
         };
-        let Some((fn_id, dep_batches, kind)) = prep else {
+        let Some((fn_id, dep_batches, is_dynamic)) = prep else {
             return;
         };
 
@@ -400,7 +398,7 @@ impl Core {
             }
             let rec = s.require_node_mut(node_id);
             rec.has_fired_once = true;
-            if kind == NodeKind::Dynamic {
+            if is_dynamic {
                 let tracked = match &result {
                     FnResult::Data { tracked, .. }
                     | FnResult::Noop { tracked }
@@ -1497,28 +1495,29 @@ impl Core {
         // rotation in `clear_wave_state`.
         self.binding.retain_handle(handle);
 
-        let kind;
+        let is_dynamic;
+        let is_state;
         let tracked_or_first_fire;
         {
             let consumer = s.require_node_mut(consumer_id);
             consumer.dep_records[dep_idx].data_batch.push(handle);
             consumer.dep_records[dep_idx].involved_this_wave = true;
             consumer.involved_this_wave = true;
-            kind = consumer.kind;
+            is_dynamic = consumer.is_dynamic;
+            is_state = consumer.is_state();
             tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);
         }
-        match kind {
-            NodeKind::Derived | NodeKind::Operator(_) => {
+        if is_state {
+            // State nodes don't have deps; unreachable in practice.
+        } else if is_dynamic {
+            if tracked_or_first_fire {
                 s.pending_fires.insert(consumer_id);
             }
-            NodeKind::Dynamic => {
-                if tracked_or_first_fire {
-                    s.pending_fires.insert(consumer_id);
-                }
-            }
-            NodeKind::State => {
-                // State nodes don't have deps; unreachable in practice.
-            }
+        } else {
+            // Derived / Operator / Producer (Producer has no deps so won't
+            // reach here, but the predicate-based dispatch handles it
+            // uniformly).
+            s.pending_fires.insert(consumer_id);
         }
     }
 

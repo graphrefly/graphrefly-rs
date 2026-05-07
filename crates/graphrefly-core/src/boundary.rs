@@ -252,6 +252,39 @@ pub trait BindingBoundary: Send + Sync {
     fn pack_tuple(&self, _fn_id: FnId, _handles: &[HandleId]) -> HandleId {
         unimplemented!("pack_tuple: this binding does not support combinator operators (D020)")
     }
+
+    // -----------------------------------------------------------------
+    // Producer lifecycle (Slice D, D031, D035). Producers are nodes
+    // with no deps + a fn — fn fires once on first subscribe and may
+    // call `Core::subscribe` from inside its body to wire up upstream
+    // sources (the zip / concat / race / takeUntil pattern).
+    //
+    // The binding maintains its own per-producer state (subscription
+    // handles, captured closure state) outside Core. When the LAST
+    // subscriber unsubscribes from a producer, Core invokes
+    // `producer_deactivate(node_id)` so the binding can drop that
+    // state — which transitively drops the producer's upstream
+    // subscriptions via `Subscription::Drop`.
+    //
+    // The hook fires lock-released (after the state lock is dropped),
+    // so the binding's deactivation impl may re-enter Core if needed
+    // (e.g., calling `release_handle` on captured handle shares).
+    //
+    // Symmetric with FnCtx: Core hands the binding a lifecycle signal
+    // and lets the binding shape its ergonomic surface (the
+    // `ProducerCtx` helper in `graphrefly-operators::producer` is one
+    // such shape; bindings may roll their own).
+    // -----------------------------------------------------------------
+
+    /// Called when a producer node loses its last subscriber. The binding
+    /// should drop any per-node state for `node_id` — captured closures,
+    /// `Vec<Subscription>` to upstream sources, etc. Default no-op for
+    /// bindings that don't ship producers.
+    ///
+    /// Fires lock-released; re-entrance into Core (e.g., `release_handle`
+    /// on captured handle shares, or even `subscribe` for re-activation
+    /// scenarios — though the latter is unusual) is permitted.
+    fn producer_deactivate(&self, _node_id: NodeId) {}
 }
 
 #[cfg(test)]

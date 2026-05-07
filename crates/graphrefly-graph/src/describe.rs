@@ -203,6 +203,7 @@ fn ser_opt_handle<S: Serializer>(value: &Option<HandleId>, ser: S) -> Result<S::
 fn type_str_of(kind: NodeKind) -> NodeTypeStr {
     match kind {
         NodeKind::State => NodeTypeStr::State,
+        NodeKind::Producer => NodeTypeStr::Producer,
         NodeKind::Derived => NodeTypeStr::Derived,
         NodeKind::Dynamic => NodeTypeStr::Dynamic,
         NodeKind::Operator(_) => NodeTypeStr::Operator,
@@ -248,7 +249,9 @@ fn status_of(
                 NodeStatus::Settled
             }
         }
-        NodeKind::Derived | NodeKind::Dynamic | NodeKind::Operator(_) => NodeStatus::Pending,
+        NodeKind::Producer | NodeKind::Derived | NodeKind::Dynamic | NodeKind::Operator(_) => {
+            NodeStatus::Pending
+        }
     }
 }
 

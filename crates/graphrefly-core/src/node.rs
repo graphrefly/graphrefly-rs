@@ -132,13 +132,33 @@ pub enum TerminalKind {
     Error(HandleId),
 }
 
-/// Node kind discriminant. State nodes are ROM (cache survives deactivation);
-/// compute nodes (`Derived`, `Dynamic`, `Operator`) are RAM (cache cleared on
-/// deactivation — not yet modeled in v1).
+/// Node kind discriminant — **derived metadata** computed from
+/// [`NodeRecord`]'s field shape (D030 unification, Slice D).
+///
+/// Core no longer stores `kind` as a field; it's computed on demand from
+/// `(deps.is_empty(), fn_id.is_some(), op.is_some(), is_dynamic)`,
+/// mirroring TS's data model where `NodeImpl` has no `_kind` field. The
+/// shape uniquely identifies the kind:
+///
+/// | deps      | fn_id | op   | is_dynamic | kind     |
+/// |-----------|-------|------|-----------|----------|
+/// | empty     | None  | None | -         | State    |
+/// | empty     | Some  | None | -         | Producer |
+/// | non-empty | Some  | None | false     | Derived  |
+/// | non-empty | Some  | None | true      | Dynamic  |
+/// | non-empty | None  | Some | -         | Operator |
+///
+/// Public API ([`Core::kind_of`]) derives this enum on each call. State
+/// nodes are ROM (cache survives deactivation); compute nodes
+/// (Derived / Dynamic / Operator) and producers are RAM.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum NodeKind {
     /// Source node: cache is intrinsic, no fn, no deps. Mutated via [`Core::emit`].
     State,
+    /// Producer node: fn fires once on first subscribe. No deps;
+    /// emissions arrive via sinks the fn subscribes to (zip / concat /
+    /// race / takeUntil pattern). Slice D / D031.
+    Producer,
     /// Derived node: fn fires on every dep change; all deps tracked.
     Derived,
     /// Dynamic node: fn declares which dep indices it actually read this run.
@@ -288,6 +308,80 @@ impl Default for OperatorOpts {
     }
 }
 
+/// Closure-form fn id OR typed operator discriminant — the two dispatch
+/// paths a node can use. State / passthrough nodes pass `None` to
+/// [`Core::register`] (no fn at all).
+#[derive(Copy, Clone, Debug)]
+pub enum NodeFnOrOp {
+    /// Closure-form: invokes [`BindingBoundary::invoke_fn`] per fire.
+    /// Used for Derived / Dynamic / Producer.
+    Fn(FnId),
+    /// Typed-op: routes to a `fire_op_*` helper that calls per-operator
+    /// FFI methods (`project_each` / `predicate_each` / `fold_each` /
+    /// `pairwise_pack` / `pack_tuple`). Used for Operator nodes.
+    Op(OperatorOp),
+}
+
+/// Per-kind opts for [`Core::register`]. Cross-kind config knobs live
+/// here; per-kind specifics (deps, fn_or_op) live on
+/// [`NodeRegistration`].
+#[derive(Copy, Clone, Debug)]
+pub struct NodeOpts {
+    /// Initial cached value. Only valid for state nodes (no deps + no
+    /// fn + no op). [`NO_HANDLE`] starts the node sentinel.
+    pub initial: HandleId,
+    /// Equality mode for outgoing emissions (R1.3.2). Defaults to
+    /// [`EqualsMode::Identity`].
+    pub equals: EqualsMode,
+    /// First-run gate (R2.5.3 / D011). When `true`, the node fires as
+    /// soon as ANY dep delivers a real handle; when `false` (default),
+    /// the node holds until every dep has delivered.
+    pub partial: bool,
+    /// Dynamic flag (R2.5.3) — fn declares actually-tracked dep indices
+    /// per fire. Only meaningful when `fn_or_op == Some(Fn(_))` AND
+    /// deps non-empty.
+    pub is_dynamic: bool,
+}
+
+impl Default for NodeOpts {
+    fn default() -> Self {
+        Self {
+            initial: NO_HANDLE,
+            equals: EqualsMode::Identity,
+            partial: false,
+            is_dynamic: false,
+        }
+    }
+}
+
+/// Unified node-registration descriptor (D030, Slice D).
+///
+/// All node kinds (State / Producer / Derived / Dynamic / Operator)
+/// register through [`Core::register`] with a `NodeRegistration`. The
+/// kind is **derived from the field shape** of the registration —
+/// `(deps.is_empty(), fn_or_op variant)`:
+///
+/// | deps      | fn_or_op   | is_dynamic | resulting kind |
+/// |-----------|-----------|-----------|----------------|
+/// | empty     | None      | -         | State          |
+/// | empty     | Some(Fn)  | -         | Producer       |
+/// | non-empty | Some(Fn)  | false     | Derived        |
+/// | non-empty | Some(Fn)  | true      | Dynamic        |
+/// | non-empty | Some(Op)  | -         | Operator       |
+///
+/// The sugar wrappers ([`Core::register_state`], [`Core::register_producer`],
+/// etc.) build a `NodeRegistration` and delegate.
+#[derive(Clone, Debug)]
+pub struct NodeRegistration {
+    /// Upstream deps in declaration order. Empty for state / producer.
+    pub deps: Vec<NodeId>,
+    /// Closure-form fn id or typed-op discriminant. `None` for state /
+    /// passthrough.
+    pub fn_or_op: Option<NodeFnOrOp>,
+    /// Cross-kind config knobs.
+    pub opts: NodeOpts,
+}
+
 /// Equality mode for a node's outgoing emissions.
 ///
 /// `Identity` is the default: cache vs. new handle compare is a `u64` equal —
@@ -352,10 +446,38 @@ impl Drop for Subscription {
         // Silent no-op if Core is gone. This keeps Drop infallible (no panics
         // from a dropped subscription racing a dropped Core) and avoids
         // surprising users with errors on shutdown.
-        if let Some(state) = self.state.upgrade() {
+        //
+        // Producer deactivation (Slice D, D031): if removing this sub
+        // empties the subscribers map AND the node is a producer, fire
+        // `BindingBoundary::producer_deactivate(node_id)` AFTER releasing
+        // the state lock. The binding then drops its per-node state
+        // (subscriptions to upstream sources, captured closure state),
+        // which transitively unsubs from upstreams via their own
+        // `Subscription::Drop`. Re-entrance into Core from the deactivate
+        // hook is permitted since the lock is released first.
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let (was_last_sub, is_producer, binding) = {
             let mut s = state.lock();
-            if let Some(rec) = s.nodes.get_mut(&self.node_id) {
-                rec.subscribers.remove(&self.sub_id);
+            let Some(rec) = s.nodes.get_mut(&self.node_id) else {
+                return;
+            };
+            rec.subscribers.remove(&self.sub_id);
+            let last = rec.subscribers.is_empty();
+            let producer = rec.is_producer();
+            // Clone the binding Arc out so we can call producer_deactivate
+            // lock-released. Cheap (Arc::clone).
+            let binding = if last && producer {
+                Some(s.binding.clone())
+            } else {
+                None
+            };
+            (last, producer, binding)
+        };
+        if was_last_sub && is_producer {
+            if let Some(binding) = binding {
+                binding.producer_deactivate(self.node_id);
             }
         }
     }
@@ -562,20 +684,36 @@ impl DepRecord {
     }
 }
 
-/// Internal node record. Mirrors `core.ts:132–154`.
+/// Internal node record. Mirrors `core.ts:132–154` post-D030 unification.
 ///
-/// The 4 bool fields (`has_fired_once`, `dirty`, `involved_this_wave`,
-/// `has_received_teardown`, `resubscribable`) each represent an orthogonal
-/// lifecycle concern. Collapsing them into a bitfield would obscure intent
-/// and complicate the wave-cleanup phase that resets only the wave-scoped
-/// pair (`dirty`, `involved_this_wave`).
+/// **Kind is derived, not stored** (D030, Slice D). `(dep_records.is_empty(),
+/// fn_id, op, is_dynamic)` uniquely identifies the kind — see [`NodeKind`].
+/// Helper methods (`is_state()`, `is_producer()`, `is_compute()`,
+/// `is_operator()`, `skips_auto_cascade()`, `kind()`) cover the common
+/// predicates without unpacking via [`Core::kind_of`].
+///
+/// The 5 bool fields (`has_fired_once`, `dirty`, `involved_this_wave`,
+/// `has_received_teardown`, `resubscribable`, `is_dynamic`) each represent
+/// an orthogonal concern. `is_dynamic` is constant per node (set at
+/// register time); the others are mutable lifecycle state. Collapsing
+/// them into a bitfield would obscure intent.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct NodeRecord {
     /// Per-dep records. Replaces the old parallel `deps` / `dep_handles` /
     /// `dep_terminals` vecs. Dep NodeIds derived via `dep_ids()`.
     pub(crate) dep_records: Vec<DepRecord>,
-    pub(crate) kind: NodeKind,
+    /// User-fn id for closure-form dispatch. `Some` for Derived / Dynamic /
+    /// Producer; `None` for State / Operator. (Operator dispatch goes via
+    /// [`Self::op`] instead.)
     pub(crate) fn_id: Option<FnId>,
+    /// Operator discriminant for typed-op dispatch. `Some` for Operator
+    /// nodes; `None` otherwise. Mutually exclusive with `fn_id` (a node is
+    /// either closure-form OR typed-op, never both).
+    pub(crate) op: Option<OperatorOp>,
+    /// True for Dynamic nodes (R2.5.3 — fn declares actually-tracked dep
+    /// indices per fire). False for everything else. Only meaningful when
+    /// `fn_id.is_some()` AND `!dep_records.is_empty()`.
+    pub(crate) is_dynamic: bool,
     pub(crate) equals: EqualsMode,
 
     // Mutable state
@@ -647,6 +785,63 @@ pub(crate) struct NodeRecord {
 }
 
 impl NodeRecord {
+    // ---- Kind predicates (D030 — derived from field shape) ----
+
+    /// True iff this is a state node (no deps, no fn, no op).
+    pub(crate) fn is_state(&self) -> bool {
+        self.dep_records.is_empty() && self.fn_id.is_none() && self.op.is_none()
+    }
+
+    /// True iff this is a producer node (no deps + has fn + no op).
+    /// Producers fire fn once on first subscribe; cleanup fires via
+    /// [`BindingBoundary::producer_deactivate`] (D031, Slice D).
+    pub(crate) fn is_producer(&self) -> bool {
+        self.dep_records.is_empty() && self.fn_id.is_some() && self.op.is_none()
+    }
+
+    /// True iff this is a compute node (Derived / Dynamic / Operator) —
+    /// has at least one dep AND either a fn or an op.
+    #[allow(dead_code)] // Convenience predicate; callers may use is_state/is_producer instead.
+    pub(crate) fn is_compute(&self) -> bool {
+        !self.dep_records.is_empty() && (self.fn_id.is_some() || self.op.is_some())
+    }
+
+    /// True iff this is an Operator node (has op set).
+    #[allow(dead_code)] // Direct `op.is_some()` is more common; this is a readability sugar.
+    pub(crate) fn is_operator(&self) -> bool {
+        self.op.is_some()
+    }
+
+    /// True iff this node opts OUT of Lock 2.B auto-cascade —
+    /// Operator(Reduce) / Operator(Last) intercept upstream COMPLETE.
+    pub(crate) fn skips_auto_cascade(&self) -> bool {
+        match self.op {
+            Some(op) => NodeKind::Operator(op).skips_auto_cascade(),
+            None => false,
+        }
+    }
+
+    /// Compute the public-API [`NodeKind`] from the field shape (D030).
+    /// Used by [`Core::kind_of`] and rare internal sites that need the
+    /// enum (most use the predicate methods above).
+    pub(crate) fn kind(&self) -> NodeKind {
+        if let Some(op) = self.op {
+            NodeKind::Operator(op)
+        } else if self.dep_records.is_empty() {
+            if self.fn_id.is_some() {
+                NodeKind::Producer
+            } else {
+                NodeKind::State
+            }
+        } else if self.is_dynamic {
+            NodeKind::Dynamic
+        } else {
+            NodeKind::Derived
+        }
+    }
+
+    // ---- Existing accessors ----
+
     /// Iterator over dep NodeIds in declaration order.
     pub(crate) fn dep_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.dep_records.iter().map(|r| r.node)
@@ -880,27 +1075,110 @@ impl Core {
     }
 
     // -------------------------------------------------------------------
-    // Registration
+    // Registration — unified `register()` (D030, Slice D)
+    //
+    // All node kinds (State / Producer / Derived / Dynamic / Operator)
+    // funnel through `Core::register(NodeRegistration) -> NodeId`. Sugar
+    // wrappers (`register_state` / `register_producer` / `register_derived`
+    // / `register_dynamic` / `register_operator`) build a `NodeRegistration`
+    // and delegate. There is no parallel registration path internally.
     // -------------------------------------------------------------------
 
-    /// Register a state node. `initial` may be [`NO_HANDLE`] to start sentinel.
+    /// Unified node registration (D030).
     ///
-    /// `partial` is plumbed through for surface consistency with the other
-    /// register methods (D019); for State nodes it has no effect (state
-    /// nodes don't fire fn).
+    /// `reg` describes the node's identity (deps + closure-form fn id OR
+    /// typed-op + per-kind opts). The kind is **derived from the field
+    /// shape**, not stored — see [`NodeKind`].
+    ///
+    /// Sugar wrappers below ([`Self::register_state`],
+    /// [`Self::register_producer`], [`Self::register_derived`],
+    /// [`Self::register_dynamic`], [`Self::register_operator`]) build the
+    /// registration for the common kinds and delegate here. Direct callers
+    /// that need uncommon combinations (e.g., a partial-true derived) can
+    /// invoke this method directly.
+    ///
+    /// # Panics
+    ///
+    /// - Any element of `reg.deps` is not a registered node id.
+    /// - `reg` carries `Op(Scan)` / `Op(Reduce)` with a `NO_HANDLE` seed
+    ///   (R2.5.3 — stateful folders must have a real seed).
+    /// - `reg.opts.initial` is non-sentinel for a non-state shape (deps
+    ///   non-empty, or fn_or_op present). State nodes are the only kind
+    ///   with an initial cache.
     #[must_use]
-    pub fn register_state(&self, initial: HandleId, partial: bool) -> NodeId {
+    pub fn register(&self, reg: NodeRegistration) -> NodeId {
+        let NodeRegistration {
+            deps,
+            fn_or_op,
+            opts,
+        } = reg;
+        let NodeOpts {
+            initial,
+            equals,
+            partial,
+            is_dynamic,
+        } = opts;
+
+        // Derive the field shape from fn_or_op + deps.
+        let (fn_id, op) = match fn_or_op {
+            Some(NodeFnOrOp::Fn(f)) => (Some(f), None),
+            Some(NodeFnOrOp::Op(o)) => (None, Some(o)),
+            None => (None, None),
+        };
+
+        // Validation:
+        //   - State (no deps + no fn + no op) is the only kind with `initial`.
+        //   - Dynamic flag only meaningful when fn + non-empty deps.
+        let is_state_shape = deps.is_empty() && fn_id.is_none() && op.is_none();
+        if initial != NO_HANDLE {
+            assert!(
+                is_state_shape,
+                "register: NodeOpts::initial only valid for state nodes (no deps + no fn + no op)"
+            );
+        }
+
+        // Build per-operator scratch struct + take any required handle
+        // retains BEFORE the state lock is acquired (binding callbacks
+        // outside the lock).
+        let scratch = match op {
+            Some(operator_op) => self.make_op_scratch(operator_op),
+            None => None,
+        };
+
         let mut s = self.lock_state();
         let id = s.alloc_node_id();
+
+        // Validate all deps exist before mutating state.
+        for &dep in &deps {
+            assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
+        }
+
+        // `tracked`: Static derived + Operator track all deps; Dynamic
+        // starts empty and fills via fn return; State / Producer have no
+        // deps so tracked is empty.
+        let tracked: HashSet<usize> = if op.is_some() {
+            (0..deps.len()).collect()
+        } else if is_dynamic {
+            HashSet::new()
+        } else if fn_id.is_some() && !deps.is_empty() {
+            // Static derived
+            (0..deps.len()).collect()
+        } else {
+            HashSet::new()
+        };
+
+        let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
+
         let rec = NodeRecord {
-            dep_records: Vec::new(),
-            kind: NodeKind::State,
-            fn_id: None,
-            equals: EqualsMode::Identity,
+            dep_records,
+            fn_id,
+            op,
+            is_dynamic,
+            equals,
             cache: initial,
             has_fired_once: initial != NO_HANDLE,
             subscribers: HashMap::new(),
-            tracked: HashSet::new(),
+            tracked,
             dirty: false,
             involved_this_wave: false,
             pause_state: PauseState::Active,
@@ -909,24 +1187,66 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
-            op_scratch: None,
+            op_scratch: scratch,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
+        for &dep in &deps {
+            s.children.entry(dep).or_default().insert(id);
+        }
         drop(s);
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
         id
     }
 
-    /// Register a derived (static) node. `fn_id` invokes via the binding;
-    /// `equals` defaults to identity in callers. `partial` controls the
-    /// R2.5.3 first-run gate (D011).
+    /// Sugar over [`Self::register`] — register a state node. `initial`
+    /// may be [`NO_HANDLE`] to start sentinel.
+    ///
+    /// `partial` is accepted for surface consistency (D019); for state
+    /// nodes it has no effect (state nodes don't fire fn).
+    #[must_use]
+    pub fn register_state(&self, initial: HandleId, partial: bool) -> NodeId {
+        self.register(NodeRegistration {
+            deps: Vec::new(),
+            fn_or_op: None,
+            opts: NodeOpts {
+                initial,
+                equals: EqualsMode::Identity,
+                partial,
+                is_dynamic: false,
+            },
+        })
+    }
+
+    /// Sugar over [`Self::register`] — register a producer node (D031,
+    /// Slice D). No deps; fn fires once on first subscribe; cleanup runs
+    /// via [`BindingBoundary::producer_deactivate`] when the last
+    /// subscriber unsubscribes.
+    ///
+    /// The fn body uses the binding's `ProducerCtx`-equivalent helper
+    /// (see `graphrefly-operators::producer`) to subscribe to other Core
+    /// nodes — the zip / concat / race / takeUntil pattern.
+    #[must_use]
+    pub fn register_producer(&self, fn_id: FnId) -> NodeId {
+        self.register(NodeRegistration {
+            deps: Vec::new(),
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                initial: NO_HANDLE,
+                equals: EqualsMode::Identity,
+                // Producers have no deps — the first-run gate is degenerate.
+                partial: true,
+                is_dynamic: false,
+            },
+        })
+    }
+
+    /// Sugar over [`Self::register`] — register a derived (static) node.
+    /// `partial` controls the R2.5.3 first-run gate (D011).
     ///
     /// # Panics
     ///
-    /// Panics if any element of `deps` is not a registered node id. The
-    /// panic message includes the offending id. Production bindings should
-    /// validate dep ids before calling.
+    /// Panics if any element of `deps` is not a registered node id.
     #[must_use]
     pub fn register_derived(
         &self,
@@ -935,18 +1255,25 @@ impl Core {
         equals: EqualsMode,
         partial: bool,
     ) -> NodeId {
-        self.register_computed(deps, fn_id, equals, NodeKind::Derived, partial)
+        self.register(NodeRegistration {
+            deps: deps.to_vec(),
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                initial: NO_HANDLE,
+                equals,
+                partial,
+                is_dynamic: false,
+            },
+        })
     }
 
-    /// Register a dynamic node — fn declares its actually-tracked dep indices
-    /// per fire (canonical spec §2.8 / Lock 2.B). `partial` controls the
-    /// R2.5.3 first-run gate (D011).
+    /// Sugar over [`Self::register`] — register a dynamic node (fn
+    /// declares its actually-tracked dep indices per fire). `partial`
+    /// controls the R2.5.3 first-run gate (D011).
     ///
     /// # Panics
     ///
-    /// Panics if any element of `deps` is not a registered node id. The
-    /// panic message includes the offending id. Production bindings should
-    /// validate dep ids before calling.
+    /// Panics if any element of `deps` is not a registered node id.
     #[must_use]
     pub fn register_dynamic(
         &self,
@@ -955,7 +1282,16 @@ impl Core {
         equals: EqualsMode,
         partial: bool,
     ) -> NodeId {
-        self.register_computed(deps, fn_id, equals, NodeKind::Dynamic, partial)
+        self.register(NodeRegistration {
+            deps: deps.to_vec(),
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                initial: NO_HANDLE,
+                equals,
+                partial,
+                is_dynamic: true,
+            },
+        })
     }
 
     /// Build a fresh [`OperatorScratch`](crate::op_state::OperatorScratch)
@@ -1011,115 +1347,34 @@ impl Core {
         }
     }
 
-    /// Register a built-in operator node (Slice C-1, D009; D026 generic
-    /// scratch). The operator dispatch path lives in `fire_operator`;
-    /// `op` selects which per-operator FFI method on [`BindingBoundary`]
-    /// gets called per fire.
+    /// Sugar over [`Self::register`] — register a built-in operator node
+    /// (Slice C-1, D009; D026 generic scratch). The operator dispatch path
+    /// lives in `fire_operator`; `op` selects which per-operator FFI
+    /// method on [`BindingBoundary`] gets called per fire.
     ///
     /// For stateful operators ([`OperatorOp::Scan`] / [`Reduce`] /
     /// [`Last`] with a default), the seed/default handle is captured
     /// into the appropriate
     /// [`OperatorScratch`](crate::op_state::OperatorScratch) struct
     /// stored at [`NodeRecord::op_scratch`], and Core takes one retain
-    /// share via [`BindingBoundary::retain_handle`]. The share is
-    /// released on per-fire overwrite (Scan/Reduce acc; Last latest)
-    /// and at end-of-life via
-    /// [`OperatorScratch::release_handles`](crate::op_state::OperatorScratch::release_handles).
+    /// share via [`BindingBoundary::retain_handle`].
     ///
     /// # Panics
     ///
     /// Panics if any element of `deps` is not a registered node id, or if
-    /// the seed handle for `Scan` / `Reduce` is `NO_HANDLE` (per R2.5.3
-    /// stateful operators must have a real seed).
+    /// the seed handle for `Scan` / `Reduce` is `NO_HANDLE`.
     #[must_use]
     pub fn register_operator(&self, deps: &[NodeId], op: OperatorOp, opts: OperatorOpts) -> NodeId {
-        // Build the per-operator scratch struct + take any necessary
-        // handle retains. Each Box<dyn OperatorScratch> owns the shares
-        // it stores; release_handles is the only release path at
-        // end-of-life. Helper is shared with reset_for_fresh_lifecycle
-        // so the resubscribable cycle re-seeds with the same shape.
-        let scratch = self.make_op_scratch(op);
-
-        let mut s = self.lock_state();
-        let id = s.alloc_node_id();
-        // Operators track all declared deps (no dynamic-tracked dance).
-        let tracked: HashSet<usize> = (0..deps.len()).collect();
-        let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
-        let rec = NodeRecord {
-            dep_records,
-            kind: NodeKind::Operator(op),
-            fn_id: None,
-            equals: opts.equals,
-            cache: NO_HANDLE,
-            has_fired_once: false,
-            subscribers: HashMap::new(),
-            tracked,
-            dirty: false,
-            involved_this_wave: false,
-            pause_state: PauseState::Active,
-            terminal: None,
-            has_received_teardown: false,
-            resubscribable: false,
-            meta_companions: Vec::new(),
-            partial: opts.partial,
-            op_scratch: scratch,
-        };
-        s.nodes.insert(id, rec);
-        s.children.insert(id, HashSet::new());
-        for &dep in deps {
-            assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
-            s.children.entry(dep).or_default().insert(id);
-        }
-        drop(s);
-        self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
-        id
-    }
-
-    fn register_computed(
-        &self,
-        deps: &[NodeId],
-        fn_id: FnId,
-        equals: EqualsMode,
-        kind: NodeKind,
-        partial: bool,
-    ) -> NodeId {
-        let mut s = self.lock_state();
-        let id = s.alloc_node_id();
-        // Static derived tracks all deps; dynamic starts empty and fills via fn return.
-        let tracked: HashSet<usize> = match kind {
-            NodeKind::Derived => (0..deps.len()).collect(),
-            NodeKind::Dynamic | NodeKind::State | NodeKind::Operator(_) => HashSet::new(),
-        };
-        let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
-        let rec = NodeRecord {
-            dep_records,
-            kind,
-            fn_id: Some(fn_id),
-            equals,
-            cache: NO_HANDLE,
-            has_fired_once: false,
-            subscribers: HashMap::new(),
-            tracked,
-            dirty: false,
-            involved_this_wave: false,
-            pause_state: PauseState::Active,
-            terminal: None,
-            has_received_teardown: false,
-            resubscribable: false,
-            meta_companions: Vec::new(),
-            partial,
-            op_scratch: None,
-        };
-        s.nodes.insert(id, rec);
-        s.children.insert(id, HashSet::new());
-        for &dep in deps {
-            // Validate dep exists; record inverted edge.
-            assert!(s.nodes.contains_key(&dep), "unknown dep {dep:?}");
-            s.children.entry(dep).or_default().insert(id);
-        }
-        drop(s);
-        self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
-        id
+        self.register(NodeRegistration {
+            deps: deps.to_vec(),
+            fn_or_op: Some(NodeFnOrOp::Op(op)),
+            opts: NodeOpts {
+                initial: NO_HANDLE,
+                equals: opts.equals,
+                partial: opts.partial,
+                is_dynamic: false,
+            },
+        })
     }
 
     // -------------------------------------------------------------------
@@ -1203,11 +1458,11 @@ impl Core {
             }
 
             // Snapshot handshake state under lock.
-            let (cache, kind, first_subscriber, terminal, torn_down) = {
+            let (cache, is_state, first_subscriber, terminal, torn_down) = {
                 let rec = s.require_node(node_id);
                 (
                     rec.cache,
-                    rec.kind,
+                    rec.is_state(),
                     rec.subscribers.is_empty(),
                     rec.terminal,
                     rec.has_received_teardown,
@@ -1246,7 +1501,11 @@ impl Core {
                 }
             }
 
-            let needs_activation = first_subscriber && kind != NodeKind::State;
+            // First subscriber on a non-state node needs activation.
+            // Producers (no deps + fn) need fn to fire once on activation;
+            // Derived/Dynamic/Operator (deps + fn/op) need dep-walk
+            // activation. State nodes (no fn, no deps) need nothing.
+            let needs_activation = first_subscriber && !is_state;
             (sub_id, needs_activation)
         };
 
@@ -1304,7 +1563,7 @@ impl Core {
         // Phase 1: collect wave-state handle releases + take the old
         // op_scratch + reset other state. Take all mutations under one
         // borrow so the post-borrow phases don't re-walk dep_records.
-        let (op_kind_copy, mut old_scratch, handles_to_release, pause_buffer_payloads) = {
+        let (prev_op, mut old_scratch, handles_to_release, pause_buffer_payloads) = {
             let rec = s.require_node_mut(node_id);
             let mut hs = Vec::new();
             if let Some(TerminalKind::Error(h)) = rec.terminal {
@@ -1342,7 +1601,7 @@ impl Core {
             }
             // Reset wave / lifecycle state.
             rec.terminal = None;
-            rec.has_fired_once = rec.cache != NO_HANDLE && rec.kind == NodeKind::State;
+            rec.has_fired_once = rec.cache != NO_HANDLE && rec.is_state();
             rec.has_received_teardown = false;
             for dr in &mut rec.dep_records {
                 dr.prev_data = NO_HANDLE;
@@ -1357,15 +1616,15 @@ impl Core {
             // P7 (Slice A close /qa): Dynamic nodes clear `tracked` so
             // the post-reset first fire repopulates from the fn's
             // returned tracked-deps set.
-            if rec.kind == NodeKind::Dynamic {
+            if rec.is_dynamic {
                 rec.tracked.clear();
             }
             // Take the old scratch out so we can release its handles and
-            // install a fresh one. Operator kind is copied for the
+            // install a fresh one. Operator op is copied for the
             // rebuild step below.
-            let kind = rec.kind;
+            let prev_op = rec.op;
             let old = std::mem::take(&mut rec.op_scratch);
-            (kind, old, hs, pulled)
+            (prev_op, old, hs, pulled)
         };
 
         // Phase 2 (Slice C-3 /qa P1 — RETAIN-BEFORE-RELEASE ordering):
@@ -1381,9 +1640,9 @@ impl Core {
         // refcount on a slot whose value has been removed. By taking
         // the new retains first, we floor the refcount at ≥1 before
         // any release happens.
-        let new_scratch = match op_kind_copy {
-            NodeKind::Operator(op) => self.make_op_scratch(op),
-            _ => None,
+        let new_scratch = match prev_op {
+            Some(op) => self.make_op_scratch(op),
+            None => None,
         };
 
         // Phase 3: NOW release handles owned by the old op_scratch
@@ -1456,11 +1715,11 @@ impl Core {
             stack.push((id, true));
             let dep_ids: Vec<NodeId> = s.require_node(id).dep_ids_vec();
             for dep_id in dep_ids {
-                let (dep_kind, dep_cache, dep_has_fired) = {
+                let (dep_is_state, dep_cache, dep_has_fired) = {
                     let dep_rec = s.require_node(dep_id);
-                    (dep_rec.kind, dep_rec.cache, dep_rec.has_fired_once)
+                    (dep_rec.is_state(), dep_rec.cache, dep_rec.has_fired_once)
                 };
-                if dep_kind != NodeKind::State
+                if !dep_is_state
                     && dep_cache == NO_HANDLE
                     && !dep_has_fired
                     && !visited.contains(&dep_id)
@@ -1472,8 +1731,18 @@ impl Core {
 
         // Phase 2: deliver caches in dep-first order. For each node, walk
         // its deps and call `deliver_data_to_consumer` for any with caches.
+        // Producer nodes (no deps + has fn — Slice D, D031) have no deps
+        // to walk; queue them directly into `pending_fires` so the wave
+        // engine fires their fn once on activation.
         for &id in &order {
-            let dep_ids: Vec<NodeId> = s.require_node(id).dep_ids_vec();
+            let (dep_ids, is_producer) = {
+                let rec = s.require_node(id);
+                (rec.dep_ids_vec(), rec.is_producer())
+            };
+            if is_producer {
+                s.pending_fires.insert(id);
+                continue;
+            }
             for (i, dep_id) in dep_ids.iter().copied().enumerate() {
                 let dep_cache = s.require_node(dep_id).cache;
                 if dep_cache != NO_HANDLE {
@@ -1508,7 +1777,7 @@ impl Core {
             let s = self.lock_state();
             let rec = s.require_node(node_id);
             assert!(
-                rec.kind == NodeKind::State,
+                rec.is_state(),
                 "emit() is for state nodes only; derived emits via fn"
             );
             if rec.terminal.is_some() {
@@ -1571,10 +1840,11 @@ impl Core {
         self.lock_state().nodes.len()
     }
 
-    /// Returns `Some(kind)` for known nodes, `None` for unknown.
+    /// Returns `Some(kind)` for known nodes, `None` for unknown. Kind is
+    /// **derived** from the field shape per D030 — see [`NodeKind`].
     #[must_use]
     pub fn kind_of(&self, node_id: NodeId) -> Option<NodeKind> {
-        self.lock_state().nodes.get(&node_id).map(|r| r.kind)
+        self.lock_state().nodes.get(&node_id).map(NodeRecord::kind)
     }
 
     /// Snapshot of the node's deps in declaration order. Empty for
@@ -1771,7 +2041,7 @@ impl Core {
                     if child.terminal.is_some() {
                         ChildAction::None // Already terminated — no-op.
                     } else if child.all_deps_terminal() {
-                        if child.kind.skips_auto_cascade() {
+                        if child.skips_auto_cascade() {
                             ChildAction::QueueFire
                         } else {
                             ChildAction::Cascade(pick_cascade_terminal(&child.dep_records))
@@ -2306,11 +2576,15 @@ impl Core {
         let mut s = self.lock_state();
         // Validate node exists and is compute. Read-once via the helper so
         // subsequent code can use `require_node(n)` without re-checking.
-        let (kind, is_terminal) = {
+        let (is_state, is_producer, is_terminal) = {
             let rec = s.nodes.get(&n).ok_or(SetDepsError::UnknownNode(n))?;
-            (rec.kind, rec.terminal.is_some())
+            (rec.is_state(), rec.is_producer(), rec.terminal.is_some())
         };
-        if kind == NodeKind::State {
+        if is_state || is_producer {
+            // State and Producer nodes have no declared deps — set_deps
+            // is meaningless. Producer nodes manage their own subscriptions
+            // through the binding's ProducerCtx; mutating their (empty)
+            // dep set would not affect that.
             return Err(SetDepsError::NotComputeNode(n));
         }
         // Reject if `n` itself is terminal (Phase 13.8 Q1: terminal nodes
@@ -2435,11 +2709,12 @@ impl Core {
             // re-runs fn unconditionally; fn's returned `tracked` then
             // repopulates `rec.tracked` and normal selective-deps semantics
             // resume from the next dep update onward.
-            if rec.kind == NodeKind::Derived || matches!(rec.kind, NodeKind::Operator(_)) {
-                rec.tracked = (0..new_deps_vec.len()).collect();
-            } else if rec.kind == NodeKind::Dynamic {
+            if rec.is_dynamic {
                 rec.tracked.clear();
                 rec.has_fired_once = false;
+            } else {
+                // Derived (static) and Operator track all deps.
+                rec.tracked = (0..new_deps_vec.len()).collect();
             }
         }
 

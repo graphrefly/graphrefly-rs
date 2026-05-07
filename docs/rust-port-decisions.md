@@ -239,3 +239,49 @@ Each entry records context, options, and rationale for future reference.
 - **Decision:** B — reuse `predicate_each`. Slightly wasteful when the predicate is expensive AND most-of-batch will be cut off, but the FFI surface stays narrow.
 - **Rationale:** No bench evidence the wasted predicate calls matter. Adding a new FFI surface for a perf optimization without evidence violates Pass 5 directive.
 - **Affects:** graphrefly-core `fire_op_take_while`, graphrefly-operators `take_while` factory.
+
+### D030 — Drop `NodeKind` enum from `NodeRecord`; kind is derived metadata
+- **Date:** 2026-05-06
+- **Context:** Slice D substrate prep. Per the user direction "find a good way to unify them, not just internal dispatch; node in TS is not mere internal dispatching." The TS `NodeImpl` has no `_kind` field — kind is determined by `(deps.length, fn.is_some(), _isDynamic)`. Rust port had a `kind: NodeKind` field on `NodeRecord` that duplicated information already encoded in the field shape; adding new kinds (Producer, AutoTrack) required new enum variants + new register methods + new fire helpers.
+- **Options:** A) Keep `kind` field as-is; add `Producer` variant; B) Drop `kind` field, derive on demand from `(deps.is_empty(), fn_id, op, is_dynamic)`; C) Tag-union refactor (NodeKindShape enum that owns deps + fn/op together).
+- **Decision:** B — drop the `kind: NodeKind` field. `NodeRecord` now carries `fn_id: Option<FnId>` + `op: Option<OperatorOp>` + `is_dynamic: bool`. Helper methods (`is_state()`, `is_producer()`, `is_compute()`, `is_operator()`, `skips_auto_cascade()`, `kind()`) cover predicate needs. Public API `Core::kind_of(id) -> Option<NodeKind>` derives the enum on each call.
+- **Rationale:** Mirrors TS data model exactly. Adding new shapes (Producer this slice; AutoTrack later) becomes additive — Producer is just `(deps.is_empty() && fn_id.is_some())`, no new enum variant or register method needed for the substrate. Eliminates the "kind must stay in sync with field shape" invariant. Single source of truth.
+- **Affects:** graphrefly-core `NodeRecord` shape; ~15 internal match sites switched from `match rec.kind` to predicate methods or `match rec.op`; `kind_of` derives via `NodeRecord::kind()`. `NodeKind` enum stays as the public API surface (with new `Producer` variant added).
+
+### D031 — Producer node kind via unified `register()` shape (D030 corollary)
+- **Date:** 2026-05-06
+- **Context:** Subscription-managed combinators (zip / concat / race / takeUntil) need a node shape that fires its fn once on first subscribe and uses the binding to manage its own subscriptions to upstream sources (the TS producer pattern in `extra/operators/combine.ts:332-379`). Pre-D030 this would have required a new `NodeKind::Producer` variant + new register method + new fire-helper.
+- **Options:** A) Add `register_producer` as sugar over the unified `register()` (D030 substrate makes this a one-line wrapper); B) Keep producer registration entirely binding-side (binding registers a State node, then manually wires fn-firing).
+- **Decision:** A — `Core::register_producer(fn_id) -> NodeId` sugar over `register()` with `deps: vec![], fn_or_op: Some(NodeFnOrOp::Fn(fn_id))`. Producer kind is derived from the field shape; no new enum variant in `NodeRecord`, no new fire helper. The wave engine fires the fn via the existing `fire_regular` path on first subscribe (queued by `activate_derived` walking the order vec).
+- **Rationale:** D030 made this nearly free. Adds one new variant to the public `NodeKind` enum (for `kind_of` reporting) + one new sugar method + one new line in `activate_derived` (queue producer in `pending_fires`). Total substrate cost: ~30 LOC.
+- **Affects:** graphrefly-core `NodeKind::Producer` variant, `Core::register_producer`, `activate_derived` producer queue branch.
+
+### D032 — Producer fn signature unchanged: `Fn(&[DepBatch]) -> FnResult` with empty dep_data
+- **Date:** 2026-05-06
+- **Context:** Producer fn fires lock-released with no deps. The existing `BindingBoundary::invoke_fn(node_id, fn_id, dep_data)` signature works for producers if dep_data is just an empty slice — the binding's fn body uses captured state (Core ref + binding ref) to call `Core::subscribe` from inside.
+- **Options:** A) Keep invoke_fn unchanged; producer fn body sees `dep_data: &[]` (empty); B) Add a new `invoke_producer_fn(node_id, fn_id, ctx: ProducerCtx)` method on BindingBoundary.
+- **Decision:** A — invoke_fn stays. Empty dep_data is the natural representation for a no-deps node. The binding constructs its ergonomic ProducerCtx wrapper from inside its fn body using captured Arc refs (the same pattern FnCtx uses today — see D034).
+- **Rationale:** Symmetric with how FnCtx-equivalent state is binding-side, not Core-side (D034). No new FFI surface. Bindings that don't ship producers don't pay any cost.
+- **Affects:** None — invoke_fn signature unchanged.
+
+### D033 — Producer state lives in the binding, not Core's `op_scratch`
+- **Date:** 2026-05-06
+- **Context:** Subscription-managed producers need to track upstream `Subscription` handles so they can be dropped on producer deactivation. Two storage options.
+- **Options:** A) Store in `NodeRecord::op_scratch` (Core-side); B) Store in the binding's per-node state map (binding-side); C) Hybrid — Core knows about subs but binding owns state.
+- **Decision:** B — binding owns producer state. Core invokes `BindingBoundary::producer_deactivate(node_id)` on last unsubscribe; the binding drops its per-node entry, which transitively drops the Subscription handles via their Drop impl (they reach back into Core::state to remove the sink).
+- **Rationale:** (1) Symmetric with FnCtx — both are binding-side wrappers around Core primitives. (2) `Subscription::Drop` re-enters Core's state lock; if subs lived in `op_scratch` (which is accessed under the lock), the drop-path would deadlock. Binding ownership lets the deactivate hook fire lock-released so Subscription drops re-enter cleanly. (3) Multi-binding parity — each binding (napi-rs / pyo3 / wasm) ships its own idiomatic ergonomic wrapper.
+- **Affects:** graphrefly-core `BindingBoundary::producer_deactivate(node_id)` lifecycle hook (default no-op); binding implementations own producer state maps.
+
+### D034 — FnCtx is binding-side; ProducerCtx follows the same pattern
+- **Date:** 2026-05-06
+- **Context:** During the substrate design discussion, surfaced that the Rust port has NO Core-side FnCtx — `BindingBoundary::invoke_fn(node_id, fn_id, dep_data: &[DepBatch])` only passes opaque per-dep state. Each binding (napi-rs, etc.) constructs its own ergonomic FnCtx-shape from `dep_data` for the user fn. Same pattern applies to ProducerCtx.
+- **Decision:** Document the symmetry. Core provides primitives (`subscribe`, `emit`, lifecycle hooks); the binding wraps them into ctx-shaped APIs for user closures. ProducerCtx lives in `graphrefly-operators::producer` (Commit 2) as the default Rust-side helper; bindings may use it directly OR replace with their own version.
+- **Rationale:** Symmetric layering. Core stays minimal; binding ergonomics are binding-side.
+- **Affects:** Architecture / design clarification; no code changes.
+
+### D035 — `BindingBoundary::producer_deactivate(node_id)` lifecycle hook
+- **Date:** 2026-05-06
+- **Context:** Producer needs a way to signal the binding "drop your per-node state" when the last subscriber leaves. Hook fires from `Subscription::Drop` when the just-removed sub was the last one on a producer node.
+- **Decision:** Add `BindingBoundary::producer_deactivate(_node_id: NodeId)` with default no-op. Bindings that ship producers override it. Fires lock-released (after `Subscription::Drop` releases the state lock) so the binding's deactivation impl may re-enter Core (`release_handle`, even `subscribe` for unusual scenarios).
+- **Rationale:** Single new FFI method. Default no-op keeps existing bindings (TestBinding, BenchBinding, etc.) compatible without forced edits. Re-entrance allowed because lock-released.
+- **Affects:** graphrefly-core `BindingBoundary::producer_deactivate` (new default-no-op method); `Subscription::Drop` (clones Arc<dyn BindingBoundary> out of state, calls `producer_deactivate` after lock drops).
