@@ -54,17 +54,16 @@
 //! - **`BindingBoundary::custom_equals`** fires lock-released.
 //!   `commit_emission` brackets the equals check around a lock release;
 //!   custom equals oracles may re-enter Core safely.
-//! - **Subscribe-time handshake** is the one remaining lock-held callback.
-//!   Trade-off for the subscribe-vs-emit race fix: the new sink is registered
-//!   under the lock and the handshake fires under the lock (per-tier — see
-//!   [`Core::subscribe`] for R1.3.5.a tier-split), so concurrent emits on
-//!   other threads observe the new sink in normal happens-after order. A
-//!   handshake-time sink callback that re-enters Core hits the
-//!   `IN_HANDSHAKE_FIRE` thread-local diagnostic and panics with a clear
-//!   message (lifting it requires per-sink staging-buffer machinery; tracked
-//!   in `porting-deferred.md`).
+//! - **Subscribe-time handshake** also fires lock-released. [`Core::subscribe`]
+//!   acquires the [`Core::wave_owner`] re-entrant mutex first (cross-thread
+//!   serialization), installs the sink under the state lock, drops the state
+//!   lock, then fires the per-tier handshake (`[Start]` / `[Data(cache)]?` /
+//!   `[Complete]?` / `[Error(h)]?` / `[Teardown]?` per R1.3.5.a) lock-released.
+//!   A handshake-time sink callback may re-enter Core (`emit` / `complete` /
+//!   `error` / `subscribe`); same-thread re-entry passes through `wave_owner`
+//!   transparently. Cross-thread emits block on `wave_owner` until the
+//!   subscribe path drops it, preserving R1.3.5.a happens-after ordering.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
@@ -79,43 +78,6 @@ use crate::boundary::BindingBoundary;
 use crate::clock::monotonic_ns;
 use crate::handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 use crate::message::Message;
-
-thread_local! {
-    /// Set to `true` while a [`Core::subscribe`] handshake sink callback is
-    /// running on this thread. The state lock is held during the handshake
-    /// fire (trade-off for the subscribe-vs-emit race fix), so any Core
-    /// method called by the handshake sink would deadlock.
-    ///
-    /// [`Core::lock_state`] checks this flag before acquiring the state
-    /// lock and panics with a clear diagnostic instead of letting the
-    /// program hang. Lifts together with the lock-released-handshake
-    /// rework planned alongside the `MutexGuard`-ownership refactor.
-    static IN_HANDSHAKE_FIRE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Handle returned by [`HandshakeFireGuard::enter`] that clears the
-/// thread-local handshake-fire flag on drop. Using RAII ensures the flag
-/// is cleared even if the sink callback panics.
-struct HandshakeFireGuard;
-
-impl HandshakeFireGuard {
-    fn enter() -> Self {
-        IN_HANDSHAKE_FIRE.with(|f| {
-            debug_assert!(
-                !f.get(),
-                "nested handshake-fire entry — subscribe is not re-entrant"
-            );
-            f.set(true);
-        });
-        Self
-    }
-}
-
-impl Drop for HandshakeFireGuard {
-    fn drop(&mut self) {
-        IN_HANDSHAKE_FIRE.with(|f| f.set(false));
-    }
-}
 
 /// Terminal-lifecycle state — once set on a node, the node will not emit
 /// further DATA; per-dep slots on consumers also use this to track which
@@ -1017,27 +979,17 @@ impl Core {
         }
     }
 
-    /// Acquire the state lock, with a re-entrance check that panics with a
-    /// clear diagnostic if called from inside a [`Core::subscribe`]
-    /// handshake sink callback.
+    /// Acquire the state lock.
     ///
-    /// All public Core methods route their lock acquisition through here
-    /// so that handshake-time re-entrance produces a panic rather than a
-    /// silent deadlock against the held lock. Subscribers' wave-end sinks
-    /// (post drop-then-fire) are NOT subject to this restriction — the
-    /// flag is set ONLY while the handshake fires under the lock; the
-    /// drop-then-fire path clears the lock first.
+    /// Post-Slice-E: `Core::subscribe` fires the per-tier handshake
+    /// LOCK-RELEASED with `wave_owner` held; sink callbacks may freely
+    /// re-enter Core (`emit` / `complete` / `error` / nested `subscribe`).
+    /// Same-thread re-entry passes through `wave_owner`'s `ReentrantMutex`
+    /// transparently; cross-thread emits block on `wave_owner` until the
+    /// outer subscribe completes, preserving R1.3.5.a happens-after
+    /// ordering. The previous `IN_HANDSHAKE_FIRE` panic-diagnostic is no
+    /// longer needed.
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, CoreState> {
-        IN_HANDSHAKE_FIRE.with(|f| {
-            assert!(
-                !f.get(),
-                "Core method called from inside a subscribe handshake sink \
-                 callback — this would deadlock the state lock. Handshake \
-                 sinks must consume the [Start, Data?, ...] payload \
-                 synchronously without re-entering Core. v1 limitation; \
-                 lifts with the planned MutexGuard-ownership refactor."
-            );
-        });
         self.state.lock()
     }
 
@@ -1415,37 +1367,36 @@ impl Core {
     /// cached handles fill our `dep_handles`.
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription {
-        // Subscribe protocol (Slice A close, M1):
+        // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
         //
-        // 1. Under the state lock: alloc sub_id, run resubscribable reset
-        //    if applicable, build the per-tier handshake slices, install
-        //    the sink in `subscribers`, fire the handshake as separate
-        //    sink calls per tier, observe whether activation is needed.
-        // 2. Lock dropped: if first compute subscriber, run a wave via
-        //    `run_wave` to drive activation + drain. The activation thunk
-        //    re-acquires the lock briefly to walk deps and queue fires;
-        //    `run_wave` drains lock-released around `invoke_fn`.
+        // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
+        //    through, cross-thread blocks). This is the cross-thread
+        //    serialization point that preserves R1.3.5.a happens-after
+        //    ordering across the lock-released handshake fire.
+        // 2. Acquire state lock briefly: alloc sub_id, run resubscribable
+        //    reset if applicable, snapshot handshake state, install sink
+        //    in `subscribers`. Drop state lock.
+        // 3. Fire handshake LOCK-RELEASED. Per-tier slices (R1.3.5.a):
+        //    `[Start]` / `[Data(cache)]?` / `[Complete]?` / `[Error(h)]?`
+        //    / `[Teardown]?`. Empty tiers are skipped. Sink callbacks
+        //    may re-enter Core freely — same-thread re-entry passes
+        //    through `wave_owner` reentrantly.
+        // 4. Run activation under `run_wave` if needed (first subscriber
+        //    on a non-state node).
+        // 5. Drop `wave_owner`.
         //
-        // Race-fix discipline (carried from Slice A-bigger): the sink is
-        // installed BEFORE the handshake fires AND BEFORE the lock drops,
-        // so concurrent emits on other threads (which block on the state
-        // lock) observe the new sink when they eventually acquire. Their
-        // wave's flush queues the new sink into `pending_notify`'s per-
-        // wave snapshot at first touch, ensuring happens-after delivery
-        // relative to our handshake.
-        //
-        // Handshake re-entrance: the handshake fires lock-held, so a
-        // handshake-time sink callback that re-enters Core hits the
-        // `IN_HANDSHAKE_FIRE` thread-local diagnostic and panics with a
-        // clear message instead of deadlocking. Lifting this requires a
-        // staging-buffer machinery (per-sink "handshake pending" flag);
-        // tracked in `porting-deferred.md` as M1-close+ work.
-        //
-        // R1.3.5.a tier-split: each tier of the handshake fires as a
-        // separate sink call — `[Start]`, `[Data(cache)]`, `[Complete]` /
-        // `[Error(h)]`, `[Teardown]`. This matches TS's `downWithBatch`
-        // routing for cached-source subscribes. Empty tiers are skipped.
-        let (sub_id, needs_activation) = {
+        // Race-fix discipline: the sink is installed in `subscribers`
+        // BEFORE the state lock drops, so concurrent threads that
+        // acquire `wave_owner` after our scope sees the sink already
+        // registered. Cross-thread emits block on `wave_owner` until
+        // we drop it, ensuring all our handshake calls land before
+        // any concurrent wave's flush observes the sink.
+
+        // Acquire wave_owner first — cross-thread serialization point.
+        // `lock_arc()` is `!Send`; same-thread reentrant.
+        let _wave_guard = self.wave_owner.lock_arc();
+
+        let (sub_id, tier_slices, needs_activation) = {
             let mut s = self.lock_state();
             let sub_id = s.alloc_sub_id();
 
@@ -1495,32 +1446,27 @@ impl Core {
                 tier_slices.push(vec![Message::Teardown]);
             }
 
-            // Install sink BEFORE firing handshake so concurrent emits
-            // observe it when they acquire the lock (race fix).
+            // Install sink BEFORE dropping state lock so any thread that
+            // subsequently acquires `wave_owner` (after our scope ends)
+            // sees the sink already registered.
             s.require_node_mut(node_id)
                 .subscribers
                 .insert(sub_id, sink.clone());
 
-            // Fire handshake per-tier under the lock. Re-entrance from a
-            // handshake sink callback panics with a clear diagnostic.
-            {
-                let _reentrance_guard = HandshakeFireGuard::enter();
-                for slice in &tier_slices {
-                    sink(slice);
-                }
-            }
-
-            // First subscriber on a non-state node needs activation.
-            // Producers (no deps + fn) need fn to fire once on activation;
-            // Derived/Dynamic/Operator (deps + fn/op) need dep-walk
-            // activation. State nodes (no fn, no deps) need nothing.
             let needs_activation = first_subscriber && !is_state;
-            (sub_id, needs_activation)
+            (sub_id, tier_slices, needs_activation)
+            // state lock drops here
         };
 
-        // Lock dropped — run activation under run_wave. The activation
-        // thunk re-acquires the lock briefly; run_wave drains lock-
-        // released around `invoke_fn`.
+        // Fire handshake LOCK-RELEASED. Sink may re-enter Core; same-
+        // thread re-entry passes through `wave_owner` reentrantly.
+        // Cross-thread emits block at `wave_owner` until our scope ends.
+        for slice in &tier_slices {
+            sink(slice);
+        }
+
+        // Run activation if needed. `run_wave` re-acquires `wave_owner`
+        // reentrantly + manages its own state-lock acquisition.
         if needs_activation {
             self.run_wave(|this| {
                 let mut s = this.lock_state();
@@ -1533,6 +1479,7 @@ impl Core {
             node_id,
             sub_id,
         }
+        // _wave_guard drops here, releasing wave_owner.
     }
 
     /// Mark `node_id` as resubscribable per R2.2.7. Resubscribable nodes

@@ -1,25 +1,29 @@
-//! Slice A-bigger — drop-then-fire lock discipline tests.
+//! Lock-discipline tests — sink re-entrance into Core.
 //!
-//! Verifies the v1 sink-fire-with-lock-held re-entrance limitation has
-//! been lifted **for wave-end flush**. A sink that calls back into
-//! `Core::emit` / `pause` / `resume` / `invalidate` / `complete` /
-//! `error` / `teardown` during its own wave-end callback no longer
-//! deadlocks — `flush_notifications` snapshots sink-fire jobs under
-//! the lock, drops it, then fires.
+//! Verifies that sinks can call back into Core (`emit` / `pause` /
+//! `resume` / `invalidate` / `complete` / `error` / `teardown`) without
+//! deadlock. Two paths are covered:
 //!
-//! Caveats verified by these tests:
-//! - **Subscribe-time handshake fires lock-held.** Re-entrance from a
-//!   handshake-time sink call still deadlocks (the lock-held handshake
-//!   is the trade-off for the subscribe-vs-emit race fix; sink registers
-//!   under lock + handshake fires under lock + activation runs under
-//!   lock = atomic with respect to concurrent emits). Tests use a
-//!   `armed` flag to opt out of re-entrance during the handshake call.
-//! - **Fn re-entrance via `BindingBoundary::invoke_fn`** is still
-//!   forbidden in v1 — that path holds the state lock across the binding
-//!   call. Lifting this is a follow-up.
+//! - **Wave-end flush** (Slice A-bigger): `flush_notifications` snapshots
+//!   sink-fire jobs under the lock, drops it, then fires lock-released.
+//!   Same-thread re-entry from sink callbacks works.
+//! - **Subscribe-time handshake** (Slice E rework): `Core::subscribe`
+//!   acquires `wave_owner` (re-entrant) first, installs the sink under
+//!   the state lock, drops the state lock, then fires the per-tier
+//!   handshake lock-released. Sink callbacks may re-enter Core; same-
+//!   thread re-entry passes through `wave_owner` transparently.
+//!   Cross-thread emits block on `wave_owner` until the subscribe scope
+//!   ends, preserving R1.3.5.a happens-after ordering.
 //!
-//! See also `tests/cascade_depth.rs` for cascade-recursion → iterative
-//! walk tests (item 6 in the slice scope).
+//! Tests at the bottom of this file use an `armed` flag to opt out of
+//! re-entrance during the initial handshake call where they only want
+//! to test the wave-end-flush path; the dedicated handshake re-entry
+//! test (`handshake_sink_can_reenter_core_emit_on_other_node`) verifies
+//! the Slice E rework.
+//!
+//! Fn re-entrance via [`BindingBoundary::invoke_fn`] was lifted in Slice
+//! A close (lock-released `invoke_fn`); custom-equals re-entrance was
+//! lifted in the same slice.
 
 mod common;
 
@@ -168,44 +172,47 @@ fn sink_can_complete_another_node_from_callback() {
 }
 
 #[test]
-fn handshake_sink_reentry_panics_with_diagnostic_not_deadlocks() {
-    // Verifies the re-entrance diagnostic for the lock-held subscribe
-    // handshake fire. A handshake-time sink callback that calls back into
-    // Core would silently deadlock on the held state lock — the thread-
-    // local IN_HANDSHAKE_FIRE guard converts that into a clear panic.
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+fn handshake_sink_can_reenter_core_emit_on_other_node() {
+    // Slice E rework: the handshake now fires LOCK-RELEASED with
+    // `wave_owner` held. A handshake-time sink callback can re-enter
+    // Core (`emit` on a different node, here) without deadlock or
+    // panic. Same-thread re-entry passes through `wave_owner`'s
+    // ReentrantMutex transparently. This unblocks the canonical
+    // higher-order operator pattern (subscribe to inner state with
+    // cache; sink re-enters via `Core::emit(producer_id, h)`).
     use std::sync::Arc;
 
     let rt = Arc::new(TestRuntime::new());
     let s = rt.state(Some(TestValue::Int(0)));
     let s_id = s.id;
-    let other = rt.state(Some(TestValue::Int(0)));
+    let other = rt.state(None);
     let other_id = other.id;
 
+    // Subscribe a passive sink to `other` so we can observe re-entrant
+    // emits hitting it.
+    let other_rec = rt.subscribe_recorder(other_id);
+
     let rt_inner = Arc::clone(&rt);
-    let sink: graphrefly_core::Sink = Arc::new(move |_msgs: &[graphrefly_core::Message]| {
-        // Re-enter Core from the very first sink call (handshake fire).
-        // Should panic via the diagnostic, not deadlock.
-        let h = rt_inner.binding.intern(TestValue::Int(99));
-        rt_inner.core.emit(other_id, h);
+    let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
+        // On the [Data(cache)] tier, re-enter Core to emit on `other`.
+        for m in msgs {
+            if matches!(m, graphrefly_core::Message::Data(_)) {
+                let h = rt_inner.binding.intern(TestValue::Int(99));
+                rt_inner.core.emit(other_id, h);
+            }
+        }
     });
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = rt.core.subscribe(s_id, sink);
-    }));
+    // No panic; re-entrant emit lands on `other_rec`.
+    let _sub = rt.core.subscribe(s_id, sink);
+
+    let other_events = other_rec.snapshot();
+    let saw_99 = other_events
+        .iter()
+        .any(|e| matches!(e, common::RecordedEvent::Data(TestValue::Int(99))));
     assert!(
-        result.is_err(),
-        "handshake re-entrance should panic with diagnostic, not deadlock or succeed"
-    );
-    let panic_payload = result.expect_err("panic payload");
-    let panic_msg = panic_payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic_payload.downcast_ref::<&'static str>().copied())
-        .unwrap_or("(non-string panic)");
-    assert!(
-        panic_msg.contains("handshake"),
-        "panic message should mention 'handshake'; got: {panic_msg}"
+        saw_99,
+        "other should observe Data(99) emitted from the handshake sink; got {other_events:?}"
     );
 }
 

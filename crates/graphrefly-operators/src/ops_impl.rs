@@ -202,6 +202,10 @@ struct ConcatState {
     /// Buffered DATA from `second` that arrived during phase 0 (before
     /// `first` completed). Drained on phase transition.
     pending: VecDeque<HandleId>,
+    /// Set to true if `second` completed during phase 0. On phase
+    /// transition, after draining `pending`, concat self-completes
+    /// because `second` won't emit Complete again (D041 / D-ops /qa D4).
+    second_completed: bool,
     terminated: bool,
 }
 
@@ -210,6 +214,7 @@ impl ConcatState {
         Self {
             phase: 0,
             pending: VecDeque::new(),
+            second_completed: false,
             terminated: false,
         }
     }
@@ -272,11 +277,15 @@ pub fn concat(
                             if s.phase == 1 && !s.terminated {
                                 s.terminated = true;
                                 actions.push(Action::Complete);
+                            } else if s.phase == 0 {
+                                // D041 / D4 fix: remember that second
+                                // completed during phase 0. On phase
+                                // transition, after draining `pending`,
+                                // first_sink will self-complete
+                                // (second's Complete fires once and
+                                // won't be re-observed).
+                                s.second_completed = true;
                             }
-                            // If phase==0, ignore (concat is "first then
-                            // second"; second completing before first means
-                            // second's pending will drain on phase
-                            // transition, then complete).
                         }
                         Message::Error(h) => {
                             if !s.terminated {
@@ -310,11 +319,8 @@ pub fn concat(
         let first_sink: Sink = Arc::new(move |msgs| {
             // first.Complete triggers the phase transition (handled
             // via `s.phase = 1` + draining pending into `actions`),
-            // but never queues an Action::Complete itself — that
-            // belongs to second.Complete via `second_sink`. Keep the
-            // shared 3-variant Action type for symmetry with the
-            // other sinks; mark Complete dead-code-allowed here.
-            #[allow(dead_code)]
+            // and may also self-complete the producer if `second`
+            // already completed during phase 0 (D041 / D4 fix).
             enum Action {
                 Emit(HandleId),
                 Complete,
@@ -331,6 +337,20 @@ pub fn concat(
                     return; // first is done; ignore stale messages.
                 }
                 for m in msgs {
+                    // Slice E /qa: defensive per-iteration `terminated`
+                    // guard. The outer guard at the top of the lock
+                    // block catches a `terminated` set BEFORE this
+                    // batch arrived; this per-iteration check catches
+                    // the case where an earlier message in the SAME
+                    // batch transitioned us terminal (e.g., post-
+                    // Complete the phase moved to 1, but a defensively-
+                    // emitted stale `[Data]` later in the same batch
+                    // would otherwise queue a useless retain that
+                    // `core.emit` would discard on a terminal
+                    // producer).
+                    if s.terminated || s.phase != 0 {
+                        break;
+                    }
                     match m {
                         Message::Data(h) => {
                             binding_for_first.retain_handle(*h);
@@ -343,6 +363,13 @@ pub fn concat(
                             // Pending handles already retained at buffer time.
                             for h in s.pending.drain(..) {
                                 actions.push(Action::Emit(h));
+                            }
+                            // D041 / D4 fix: if second already completed
+                            // during phase 0, self-complete now (its
+                            // Complete fired once and won't re-fire).
+                            if s.second_completed && !s.terminated {
+                                s.terminated = true;
+                                actions.push(Action::Complete);
                             }
                         }
                         Message::Error(h) => {

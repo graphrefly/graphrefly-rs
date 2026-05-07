@@ -309,3 +309,71 @@ Each entry records context, options, and rationale for future reference.
 - **Decision:** A — widen `Core::emit`'s assertion to `rec.is_state() || rec.is_producer()`. Producer is conceptually a sink-driven source: state-driven sources accept user `emit`; producer-driven sources accept sink-callback `emit`. Both bypass the fn-return-value emission path used by Derived/Dynamic/Operator.
 - **Rationale:** State and Producer are both intrinsic-source kinds. Unifying their emission API matches the canonical-spec data model where producer is "node(fn)" and emits via `actions.emit` (which maps to `Core::emit` at the FFI plane). Adding a separate method would duplicate the same logic.
 - **Affects:** graphrefly-core `Core::emit` (assertion widened, doc updated).
+
+### D039 — M3 next-batch sequencing: Option 2 (D-ops /qa cleanup) before Option 1 (Slice E higher-order)
+- **Date:** 2026-05-07
+- **Context:** D-ops landed 2026-05-07 with /qa surfacing D1–D6 deferred concerns. D4 (concat phase-0 COMPLETE bug — concat hangs if `s2` completes before `s1` during phase-0) is a real correctness bug. Higher-order operators (switchMap/exhaustMap/concatMap/mergeMap) are the natural next operator category but stack on the producer substrate.
+- **Options:** A) Land Slice E (higher-order) immediately; address D-ops /qa items as follow-ups. B) Land D-ops /qa cleanup first (D4 concat fix + D2 Arc cycle audit + D5 loom check + D6 parity widening), then Slice E. C) Bundle D-ops /qa front-loaded into Slice E as one larger slice.
+- **Decision:** B — Option 2 (D-ops /qa cleanup) first as its own coherent slice, then Option 1 (Slice E) as a separate slice.
+- **Rationale:** D4 is a real hang in a shipped operator; fixing before stacking new producer-pattern code avoids building on a known bug. D2 Arc cycle audit protects the higher-order operators (which reuse the same producer substrate). Splitting keeps each slice's blast radius contained.
+- **Affects:** Sequencing only; no code shape impact.
+
+### D040 — Idiomatic Rust shape convention: codebase already converged
+- **Date:** 2026-05-07
+- **Context:** Surveyed Rust port for TS-shape-mirroring patterns (TS `number | "unbounded"` style). Asked whether codebase needs broad refactor toward more idiomatic Rust shapes.
+- **Findings:** Rust port is already ~95% idiomatic — newtype wrappers (`NodeId`/`HandleId`/`LockId`/`FnId`), `EqualsMode` enum vs TS strings, `Option<T>` for "absent/unbounded" instead of sentinel values, `Result<T, E>` with `thiserror` for fallible operations. The relevant precedent for "unbounded vs cap" is `pause_buffer_cap: Option<usize>` (None = unbounded; Some(n) = cap; Some(0) = degenerate-but-allowed).
+- **Decision:** No codebase-wide refactor needed. Convention to apply for future "unbounded vs cap" shapes: `Option<u32>` (or `Option<usize>` where natural), matching the `pause_buffer_cap` precedent. Don't deviate to `NonZeroU32` since the existing precedent doesn't enforce non-zero either.
+- **Rationale:** Consistency with established convention beats stricter typing on case-by-case basis. If a future slice needs non-zero enforcement, lift convention then; for now, preserve uniformity.
+- **Affects:** mergeMap concurrency (D043 below), any future "cap" parameter.
+
+### D041 — D4 fix: concat phase-0 COMPLETE handoff
+- **Date:** 2026-05-07
+- **Context:** Current concat impl ignores `second` source COMPLETE during phase 0 (before `first` completes). After phase transition (when `first` completes), concat drains `pending` then waits for new `second` data — but `second` already completed during phase 0, and Complete fires once. Result: concat hangs.
+- **Options:** A) Track `second_completed_in_phase_0` flag in concat state; on phase transition, if flag is set AND `pending` is empty post-drain, self-complete immediately. B) Track per-source phase + completion separately; combine at transition. C) Re-subscribe second source post-transition (defeats the producer-pattern semantics).
+- **Decision:** A — track `second_completed: bool` in the concat closure-captured state. On phase transition (after `first` Complete arrives), drain `pending`, then if `second_completed && pending.is_empty()`, call `Core::complete(node_id)` lock-released.
+- **Rationale:** Simplest fix; matches TS legacy semantics. The flag is cheap (one bool added to ConcatState). Refcount discipline: pending entries are already tracked for retain/release on drain.
+- **Affects:** `crates/graphrefly-operators/src/ops_impl.rs::concat` (ConcatState + sink behavior); regression test in `tests/subscription.rs`; parity scenario in `scenarios/operators/subscription.test.ts`.
+
+### D042 — D5 loom verification: extract Subscription drop-path under loom-compat primitives
+- **Date:** 2026-05-07
+- **Context:** D-ops /qa flagged D5: `Subscription::Drop` race under concurrent unsubscribe could allow double-deactivate or missed-deactivate when two threads race to drop the last two subscriptions. User direction: formal loom model-check.
+- **Options:** A) Inline conditional compilation (`#[cfg(loom)] use loom::sync::Mutex; #[cfg(not(loom))] use parking_lot::Mutex;`) across affected modules — broad blast radius, every Mutex/Arc swap. B) Extract minimal race-prone state into a separate `SubscriberRegistry` module with loom-compat primitives directly; `parking_lot::Mutex<SubscriberRegistry>` wraps for production; loom test instantiates with `loom::sync::Mutex` directly. C) Use `shuttle` instead (PCT scheduler, no instrumentation needed) — different tool, similar role.
+- **Decision:** B — extract the race-prone subscriber-count + producer-deactivate decision into a focused testable shape. Add `loom` as a dev-dep gated on `cfg(loom)`. New test file `crates/graphrefly-core/tests/loom_subscription.rs` runs `RUSTFLAGS="--cfg loom" cargo test --test loom_subscription`.
+- **Rationale:** Minimal blast radius; aligns with how loom is typically integrated in well-engineered Rust libraries (e.g., tokio). Avoids broad cfg-gating across the codebase. Decision logic to verify: "the thread that observes count==1 before its decrement is the sole one that fires producer_deactivate".
+- **Affects:** New dev-dep `loom`; new test file; possible minor refactor to `Subscription::Drop` to make the decision logic locally-testable.
+
+### D043 — mergeMap concurrency: `Option<u32>` (None = unbounded)
+- **Date:** 2026-05-07
+- **Context:** TS `MergeMapOptions` has `concurrency?: number` (default Infinity = unbounded). Rust port shape choice.
+- **Options:** A) `concurrency: Option<u32>` (None = unbounded; Some(n) = cap). B) `concurrency: Option<NonZeroU32>` (compile-time rejection of 0). C) Custom enum `MergeConcurrency::Unbounded | Limit(u32)`.
+- **Decision:** A — `Option<u32>`. Mirrors `pause_buffer_cap: Option<usize>` convention from D040.
+- **Rationale:** Codebase consistency (D040). `concurrency: Some(0)` is degenerate (would queue everything indefinitely) but matches `pause_buffer_cap: Some(0)`'s degenerate behavior.
+- **Affects:** `graphrefly-operators::higher_order::merge_map` factory signature.
+
+### D044 — Higher-order operator slice scope: switchMap → exhaustMap → concatMap → mergeMap, all four in one slice
+- **Date:** 2026-05-07
+- **Context:** TS `extra/operators/higher-order.ts` exports four higher-order operators. Land all in one slice or split?
+- **Decision:** All four in one slice (Slice E), in TS-source order: switchMap → exhaustMap → concatMap → mergeMap.
+- **Rationale:** All four share the producer-pattern substrate (D-substrate) and reuse the projector closure shape `Fn(T) -> Node<R>`. Bundling preserves the slice cadence (~600–900 LOC including tests + parity, similar to Slice C-3 + D-ops scope). User explicitly approved.
+- **Affects:** `graphrefly-operators::higher_order` module (new); 4 new factory functions; binding extension for projector registration; tests + parity scenarios.
+
+### D046 — Slice E /qa: inner-sub tracking moves out of producer_storage; INVALIDATE/TEARDOWN forwarded
+- **Date:** 2026-05-07
+- **Context:** Adversarial review of Slice E surfaced three correlated issues: (P1) `switch_map`'s phase-1 retain on `outer_h` was conditional on `!terminated` while phase-2 release was unconditional, causing a refcount underflow on `[Data, Error]` same-batch waves. (P2) `merge_map` / `concat_map` accumulated completed-inner `Subscription`s in `producer_storage[producer_id].subs` indefinitely — O(N) memory leak per producer over inner-completion lifetime. (Cached-outer) `ctx.subscribe_to(source, outer_sink)` calls `core.subscribe` BEFORE pushing the outer sub; if `source` is cached, the synchronous handshake fires outer_sink → invokes project + subscribes to inner → `push_inner_sub` lands at `subs[0]` → outer subscribe returns → outer sub lands at `subs[1]`. `subs = [inner, outer]`. Subsequent `drop_inner_subs` truncates to len 1, dropping the OUTER sub. (P3) `build_inner_sink` only handled Data/Complete/Error; INVALIDATE/TEARDOWN from inner were silently dropped.
+- **Decision:**
+  - Move inner-sub tracking OUT of `producer_storage.subs` and into per-op state Mutex: `SwitchState.inner_sub: Option<Subscription>`, `ExhaustState.inner_sub: Option<Subscription>`, `MergeMapState.inner_subs: HashMap<u64, Subscription>` keyed by per-op `next_inner_id`. `producer_storage.subs` holds only the OUTER source sub (single entry, no positional invariants). Removes `drop_inner_subs` / `push_inner_sub` helpers.
+  - `switch_map` phase-1: track `latest_retained: bool`; phase-2 release gated on `latest_retained` (P1 fix).
+  - `build_inner_sink` forwards `Message::Invalidate` → `Core::invalidate(producer_id)` and `Message::Teardown` → `Core::teardown(producer_id)`. DIRTY/RESOLVED/PAUSE/RESUME/Start still dropped (acknowledged divergence). (P3 option A.)
+  - `merge_map` drain converted from recursive `spawn_inner` (on_complete → spawn_inner → core.subscribe → on_complete → ...) to iterative loop guarded by thread-local `MERGE_DRAIN_ACTIVE`. Outermost drain owns the loop; nested `on_complete` invocations only decrement state and return. Prevents stack overflow on pathological pre-completed-inner buffer drains.
+  - `pending_inner_ids: AHashSet<u64>` on MergeMapState distinguishes "spawn started, on_complete not yet fired" from "on_complete fired during subscribe". Post-subscribe code skips inserting the dead sub if `on_complete` already removed the id.
+- **Rationale:** All four issues share a root cause — positional/lifecycle dependence on `producer_storage.subs`. The state-Mutex-per-op refactor cleans up the shape and prevents future positional bugs (e.g., adding a notifier sub for new combinators). INVALIDATE forwarding closes a real spec gap (R1.2.7); TEARDOWN forwarding propagates inner destruction correctly. Iterative drain via thread-local guard prevents stack overflow without complex trampolining.
+- **Affects:** `crates/graphrefly-operators/src/higher_order.rs` (full refactor), `tests/higher_order.rs` (new regression tests: P1 [Data, Error] underflow, P2 storage-no-accumulation, cached-outer outer-sub-survives, INVALIDATE forwarding); `crates/graphrefly-operators/src/ops_impl.rs` (concat first_sink defensive per-iteration `terminated` check); `packages/parity-tests/scenarios/operators/subscription.test.ts` (`test.skip` → `test.runIf(impl.name !== "legacy-pure-ts")` so Rust-port-only assertions activate when rustImpl publishes).
+
+### D045 — Subscribe handshake fires lock-released; remove IN_HANDSHAKE_FIRE diagnostic
+- **Date:** 2026-05-07
+- **Context:** Slice E surfaced a v1 limitation: cached-inner state nodes can't be subscribed from inside higher-order operator sinks because the handshake fires lock-held with the `IN_HANDSHAKE_FIRE` thread-local panic-diagnostic. User pushback: "How come there are so many v1 limitations. Can we not introduce that many limitation and fix them directly?"
+- **Options:** A) Defer the limitation; document it as v1 (original Slice E plan). B) Per-sink staging-buffer machinery (queue concurrent wave messages destined for the new sink until handshake completes, then drain) — substantial refactor. C) Acquire `wave_owner` re-entrant mutex first, then drop state lock before firing handshake. Cross-thread emits block on `wave_owner`; same-thread re-entry from sinks passes through reentrantly.
+- **Decision:** C — `Core::subscribe` acquires `wave_owner.lock_arc()` first, takes state lock briefly to install the sink + snapshot handshake state, drops state lock, fires per-tier handshake LOCK-RELEASED. `IN_HANDSHAKE_FIRE` thread-local + `HandshakeFireGuard` removed; `lock_state()` no longer asserts. Same-thread sink re-entry into Core (`emit` / `complete` / `error` / nested `subscribe`) is now safe. Cross-thread emits still preserve R1.3.5.a happens-after via `wave_owner` serialization (already established by Slice A close /qa Q2 wave-owner mutex).
+- **Rationale:** ~50 LOC change (much less than the per-sink staging-buffer alternative). Reuses existing `wave_owner` infrastructure rather than adding new machinery. Unblocks the canonical Slice E user pattern (`switch_map(outer, |n| state(Some(n*10)))`) — cached inner state nodes work transparently. User pushback was correct: the limitation was unnecessary.
+- **Affects:** `graphrefly-core::node.rs` (subscribe path; module doc; remove `IN_HANDSHAKE_FIRE` thread-local + `HandshakeFireGuard` struct + assertion in `lock_state`). Test rewrite: `tests/lock_discipline.rs::handshake_sink_reentry_panics_with_diagnostic_not_deadlocks` → `handshake_sink_can_reenter_core_emit_on_other_node` (negative-becomes-positive). `tests/higher_order.rs` updated to use realistic cached-inner pattern. Closes the porting-deferred entries: "Subscribe-time handshake fires lock-held; re-entrance from handshake panics" + "Cached-inner handshake re-entry panics in v1".
+

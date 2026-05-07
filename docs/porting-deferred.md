@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-06 (M3 Slice C-2 close)
+last_updated: 2026-05-07 (M3 Slice E + handshake lock-released rework + Slice E /qa)
 ---
 
 # Porting flags & deferred concerns
@@ -212,20 +212,26 @@ test. Closed 2026-05-05.
 - **What:** the per-tier handshake split (R1.3.5.a alignment, Slice A
   close) fires `[Start]`, `[Data(v)]`, `[Complete|Error]`, `[Teardown]`
   as separate sink calls. The sink is installed in `subscribers` BEFORE
-  the handshake fires (race-fix discipline from Slice A-bigger). If a
-  user sink panics on tier N (e.g. `[Data(v)]`) during handshake, the
-  panic unwinds out of `subscribe()` before the `Subscription` handle
-  is returned. The sink stays registered in `subscribers`; subsequent
-  waves' `flush_notifications` will fire it (its `Arc<dyn Fn>` clone
-  in `pending_notify[node].sinks` is alive).
-- **Why deferred:** pre-existing pattern from Slice A-bigger (the
-  subscribe-vs-emit race fix). The per-tier split multiplies the panic
-  surface but doesn't introduce the leak. `Drop for CoreState` releases
-  the sink Arc when the last `Core` drops, so it's not a memory leak,
-  but a panicking sink could keep panicking on every subsequent wave's
-  flush. Real fix lands with the staging-buffer machinery for the
-  handshake re-entrance lift.
-- **Source:** Slice A close /qa Blind Hunter finding (2026-05-05).
+  the handshake fires. If a user sink panics on tier N (e.g.
+  `[Data(v)]`) during handshake, the panic unwinds out of `subscribe()`
+  before the `Subscription` handle is returned. The sink stays
+  registered in `subscribers`; subsequent waves' `flush_notifications`
+  will fire it (its `Arc<dyn Fn>` clone in
+  `pending_notify[node].sinks` is alive).
+- **Why deferred:** still a real concern after Slice E's lock-released
+  handshake rework — the sink installation happens before the
+  handshake fires (so concurrent subsequent emits observe it). A
+  panicking handshake-time sink leaves the sink in `subscribers`
+  without returning a `Subscription`, so the user has no handle to
+  drop. `Drop for CoreState` releases the sink Arc when the last
+  `Core` drops, so it's not a memory leak, but a panicking sink
+  keeps panicking on every subsequent wave's flush.
+- **Lift point:** wrap the lock-released handshake fire in
+  `catch_unwind`; on panic, remove the sink from subscribers and
+  re-raise. Small change (~20 LOC); not blocking.
+- **Source:** Slice A close /qa Blind Hunter finding (2026-05-05);
+  partially superseded by Slice E rework (D045) but the panic-leaves-
+  sink behavior remains.
 
 ### `commit_emission` cache-race documentation (D5 — adjunct to P3)
 
@@ -260,34 +266,29 @@ test. Closed 2026-05-05.
   `main` for supply-chain auditability.
 - **Source:** Slice A close /qa Blind Hunter finding (2026-05-05).
 
-### Subscribe-time handshake fires lock-held; re-entrance from handshake panics
+### ~~Subscribe-time handshake fires lock-held; re-entrance from handshake panics~~ — RESOLVED 2026-05-07 (Slice E rework, D045)
 
-- **What:** `Core::subscribe` registers the new sink under the state
-  lock and fires the per-tier handshake (`[Start]`, optionally
-  `[Data(cache)]`, `[Complete]` / `[Error(h)]`, `[Teardown]`) to that
-  sink while still holding the lock. A handshake-time sink callback
-  that calls back into Core hits the **`IN_HANDSHAKE_FIRE`
-  thread-local diagnostic** (Slice A-bigger /qa item A) and panics
-  with a clear message instead of silently deadlocking. Verified by
-  `handshake_sink_reentry_panics_with_diagnostic_not_deadlocks` in
-  `tests/lock_discipline.rs`.
-- **Why divergent:** the lock-held handshake is the trade-off for the
-  subscribe-vs-emit race fix (Slice A-bigger). Atomic register-and-fire
-  keeps Start strictly before any concurrent wave's tier-1+ messages.
-  The alternative (register-then-drop-then-fire) re-introduces the
-  ordering hazard: a concurrent flush could deliver wave messages to
-  the new sink before our handshake fires.
-- **Why still here after Slice A close:** Slice A close lifted fn
-  re-entrance and custom_equals re-entrance, and split the handshake
-  into per-tier sink calls (closing R1.3.5.a). But the handshake still
-  fires lock-held — lifting it requires per-sink "handshake pending"
-  staging-buffer machinery (queue concurrent wave messages destined
-  for this sink until handshake completes, then drain). Larger
-  surgery than the Slice A close refactor; tracked for M1-close+
-  follow-up.
-- **Source:** Slice A-bigger (2026-05-05); diagnostic added in Slice
-  A-bigger /qa (2026-05-05); per-tier delivery landed in Slice A
-  close (2026-05-05).
+`Core::subscribe` now acquires `wave_owner.lock_arc()` first
+(re-entrant), takes the state lock briefly to install the sink +
+snapshot handshake state, drops the state lock, then fires the
+per-tier handshake LOCK-RELEASED. Sink callbacks may re-enter Core
+freely (`emit` / `complete` / `error` / nested `subscribe`); same-
+thread re-entry passes through `wave_owner` transparently. Cross-
+thread emits block on `wave_owner` until the subscribe scope ends,
+preserving R1.3.5.a happens-after ordering.
+
+`IN_HANDSHAKE_FIRE` thread-local + `HandshakeFireGuard` struct
+removed; `lock_state()` no longer asserts. Verified by
+`handshake_sink_can_reenter_core_emit_on_other_node` in
+`tests/lock_discipline.rs` (the previous panic-expecting test
+inverted: now expects re-entrant emit to succeed).
+
+The Slice E rework was prompted by user pushback on accumulating v1
+limitations. The cached-inner subscribe pattern that previously
+panicked (`switch_map(outer, |n| state(Some(n*10)))`) now works
+transparently. ~50 LOC change, reuses existing `wave_owner`
+infrastructure from Slice A close /qa Q2 — no per-sink
+staging-buffer machinery required. Closed 2026-05-07.
 
 ### Deactivation cleanup not yet modeled
 
@@ -1160,14 +1161,30 @@ Surfaced during /qa adversarial review (2026-05-07).
 - **Trigger:** Evidence of TEARDOWN-through-producer being observable in a
   parity scenario. Monitor when M4+ lifecycle scenarios land.
 
-### D2: Sink Arc cycle audit
+### ~~D2: Sink Arc cycle audit~~ — AUDITED 2026-05-07 (no fix needed)
 
-- **Context:** Each operator sink captures `Arc<Mutex<State>>` + `Core` clone +
-  `Arc<dyn ProducerBinding>`. The Recorder Weak-capture fix (landed in D-ops)
-  broke one such cycle, but other cycles may lurk in complex topologies where
-  producer sinks indirectly prevent deactivation.
-- **Risk:** Medium — memory leak under sustained subscribe/unsubscribe churn.
-- **Trigger:** Bench pass with subscriber churn workload showing RSS growth.
+Audit of all four producer ops (`zip` / `concat` / `race` /
+`take_until`) and the Slice E higher-order ops (`switch_map` /
+`exhaust_map` / `merge_map` / `concat_map`) identified one cycle path:
+sink → Core (clone) → CoreState → nodes → upstream.subscribers → sink.
+
+This cycle **breaks correctly via `Subscription::Drop`** — when the
+last user-held Subscription on a producer drops, `producer_deactivate`
+fires; the binding's `producer_storage[producer_id]` entry drops,
+which transitively drops all internal Subscriptions, which removes
+all sinks from upstream subscribers maps, which decrements all Core
+clones the sinks held. Existing test
+`producer_storage_cleared_on_deactivation` in
+`tests/subscription.rs` confirms the chain.
+
+The Recorder Weak-capture fix was for a DIFFERENT cycle shape (sink
+↔ user-held RecorderInner). Producer-op sinks don't have the
+"user-held inner" pattern. **No code change required.**
+
+Practical leak only occurs if user leaks their public-facing
+Subscription on the producer node — same shape as any sink that
+captures Core. Documented in `producer.rs` module docs as a known
+v1 pattern; v2 may switch to `Weak<Core>` upgrade-on-fire.
 
 ### D3: Predicate-based kind derivation as an `Option<OperatorOp>`
 
@@ -1177,28 +1194,35 @@ Surfaced during /qa adversarial review (2026-05-07).
 - **Risk:** None — purely an internal API ergonomic question.
 - **Trigger:** If `kind()` becomes a hot path in profiling.
 
-### D4: concat phase-0 COMPLETE from second source
+### ~~D4: concat phase-0 COMPLETE from second source~~ — RESOLVED 2026-05-07 (D041)
 
-- **Context:** If `second` completes during phase 0 (before `first`),
-  the current impl ignores the Complete and drains pending on phase
-  transition. But the second source is now permanently done — after
-  drain, concat should also complete. Current code relies on second's
-  Complete being re-observed, which won't happen (Complete fires once).
-- **Risk:** Medium — concat hangs if first completes after second
-  already completed during phase 0.
-- **Trigger:** Parity scenario: `s2.complete(); s1.complete()` → concat
-  should complete after draining.
+`ConcatState.second_completed: bool` flag tracks whether `second`
+emitted Complete during phase 0. On `first` Complete, the phase
+transition drains `pending`, then checks `second_completed` and
+self-completes lock-released if so. Regression test
+`concat_completes_when_second_completes_before_first_in_phase_zero`
+in `tests/subscription.rs`. Parity scenario in
+`packages/parity-tests/scenarios/operators/subscription.test.ts`
+(skipped against TS legacy as a Rust-port-only fix; activates as a
+divergence assertion when rustImpl publishes).
 
-### D5: Subscription::Drop race under concurrent unsubscribe
+### ~~D5: Subscription::Drop race under concurrent unsubscribe~~ — VERIFIED 2026-05-07 (D042)
 
-- **Context:** `Subscription::Drop` fires `producer_deactivate` lock-released
-  when sink count reaches 0. If two threads race to drop the last two
-  subscriptions, both could see count=1 before decrement, leading to
-  double-deactivate or missed deactivate.
-- **Risk:** Low — current refcount is under the state lock; the race
-  requires truly concurrent Drop calls, which the ReentrantMutex
-  serializes. But worth verifying under `loom` or `shuttle`.
-- **Trigger:** Concurrency stress test with rapid subscribe/unsubscribe.
+Loom model-check landed in `crates/graphrefly-core/tests/loom_subscription.rs`
+(3 tests: concurrent_drop_of_last_two_subs_fires_deactivate_exactly_once,
+concurrent_drop_with_one_remaining_sub_does_not_fire_deactivate,
+drop_of_last_sub_on_non_producer_node_does_not_deactivate). Confirms
+across all loom-permuted thread interleavings that
+`producer_deactivate` fires exactly once when the last two subs are
+dropped concurrently. Run via `RUSTFLAGS="--cfg loom" cargo test
+--test loom_subscription`. Default-build skips the test (cfg-gated)
+so no impact on CI's standard test loop.
+
+The current production impl in `crates/graphrefly-core/src/node.rs`
+`impl Drop for Subscription` is correct because the decrement +
+"was-last?" check happen under the SAME `parking_lot::Mutex<CoreState>`
+acquisition (no TOCTOU window). The loom test is insurance against a
+future regression that splits the two operations.
 
 ### D6: Parity test coverage gaps
 
@@ -1209,3 +1233,165 @@ Surfaced during /qa adversarial review (2026-05-07).
 - **Risk:** Low — Rust-side unit tests cover these, but cross-impl
   parity assertions would catch behavioral divergences.
 - **Trigger:** Expand parity scenarios when rustImpl arm activates.
+- **Update 2026-05-07:** Partially closed by D6 widening (Slice E-prep
+  /qa cleanup) — added `zip` with 3 sources, `race` no-winner
+  all-complete (skipped Rust-port-only), `race` pre-winner ERROR,
+  `concat` phase-0 COMPLETE (skipped Rust-port-only D041), `concat`
+  phase-0 ERROR, `takeUntil` source ERROR. Remaining gaps: empty
+  `zip` / `race` (deferred).
+
+---
+
+## M3 Slice E — higher-order operator deferrals
+
+### ~~Cached-inner handshake re-entry panics in v1~~ — RESOLVED 2026-05-07 (Slice E rework, D045)
+
+Closed by the lock-released handshake rework above. `switch_map` /
+`exhaust_map` / `concat_map` / `merge_map` /
+`merge_map_with_concurrency` now accept cached inner state nodes
+without restriction. Realistic user code (`switch_map(outer, |n|
+state(Some(n*10)))`) works transparently.
+
+`tests/higher_order.rs` updated to use the cached-inner pattern
+(`state_int(Some(v))`); the previous "uncached workaround" module
+doc removed. Closed 2026-05-07.
+
+### DIRTY/RESOLVED forwarding from inner — Rust producer divergence
+
+- **What:** TS legacy `forwardInner` in
+  `extra/operators/higher-order.ts` forwards `DIRTY` / `RESOLVED` from
+  the inner subscription to the outer output via `a.down([m])`. Rust
+  port's `build_inner_sink` drops them silently and relies on Core's
+  wave engine to emit DIRTY/RESOLVED on the producer's own emits.
+- **Why divergent:** in TS, the outer's `a` is a NodeActions surface
+  that lets the user explicitly control wave signals. In Rust, the
+  producer pattern's only emission path is `Core::emit` (which itself
+  generates DIRTY/Data/Resolved per Core's wave engine). Manual
+  forwarding would generate duplicate DIRTY messages.
+- **Observable behavior:** matches TS in the standard
+  `DATA / COMPLETE / ERROR` cases. Diverges on the rare case where
+  inner emits a no-data wave (DIRTY+RESOLVED with no DATA) — Rust's
+  outer downstream sees no signal, while TS forwards DIRTY+RESOLVED.
+  Practical impact: minimal, since "no-data wave through higher-order"
+  is a rare pattern.
+- **Lift point:** if a real consumer needs the wave-signal forwarding,
+  add `Core::emit_signal(producer, signal)` lock-released method.
+- **Source:** Slice E (2026-05-07); documented in `higher_order.rs`
+  module doc.
+- **Update 2026-05-07 (Slice E /qa, D046 P3):** scope NARROWED. Only
+  `DIRTY` / `RESOLVED` / `PAUSE` / `RESUME` / `START` are dropped
+  silently. `INVALIDATE` and `TEARDOWN` are now FORWARDED via
+  `Core::invalidate(producer_id)` / `Core::teardown(producer_id)`
+  respectively (closes the R1.2.7 INVALIDATE forwarding gap and
+  propagates inner permanent-destruction via R2.6.4 TEARDOWN).
+
+---
+
+## Audit fixes landed in M3 Slice E /qa (2026-05-07)
+
+These were surfaced by the Slice E /qa adversarial review and resolved
+in the same slice (D046) — recorded here for traceability.
+
+### P1 — switch_map `[Data, Error]` same-batch refcount underflow — FIXED
+
+- **What was broken:** `switch_map`'s phase-1 `retain_handle(outer_h)`
+  was gated on `!s.terminated`; if `Error` arrived later in the same
+  batch (setting `terminated=true` mid-loop), the retain was skipped.
+  But phase-2's `release_handle(outer_h)` was unconditional, causing a
+  binding-side refcount underflow on the chosen handle.
+- **Fix:** `Plan.latest_retained: bool` flag tracks whether phase-1
+  performed the retain. Phase-2's project + release block is gated on
+  `latest_retained`, so the [Data, Error] same-batch path correctly
+  skips both the retain AND the release. Regression test:
+  `switch_map_data_then_error_in_same_batch_does_not_underflow_handle`
+  asserts the data handle's refcount is preserved across the batch.
+
+### P2 — merge_map / concat_map completed-inner Subscriptions accumulating in producer_storage — FIXED
+
+- **What was broken:** `spawn_inner`'s `on_complete` decremented `active`
+  + dequeued next, but never removed the completed inner's
+  `Subscription` from `producer_storage[producer_id].subs`. Long-running
+  merge_map / concat_map → unbounded `subs.len()` growth.
+- **Fix:** moved inner-sub tracking out of `producer_storage.subs`
+  into `MergeMapState.inner_subs: HashMap<u64, Subscription>` keyed
+  by per-op `next_inner_id`. Each `on_complete` removes its specific
+  id (lock-released drop). `producer_storage.subs` now holds only
+  the outer source sub (single entry, no positional concerns).
+  Regression test:
+  `merge_map_does_not_accumulate_completed_inner_subs_in_producer_storage`.
+
+### Cached-outer-source positional ordering bug — FIXED (latent)
+
+- **What was broken:** `ctx.subscribe_to(source, outer_sink)` calls
+  `core.subscribe(source, outer_sink)` BEFORE pushing the outer
+  Subscription. If `source` is cached, the synchronous handshake
+  fires `outer_sink` → `outer_sink` invokes `project` + subscribes
+  to inner → `push_inner_sub` lands at `subs[0]` → outer subscribe
+  returns → outer sub lands at `subs[1]`. Now `subs = [inner, outer]`.
+  Subsequent `drop_inner_subs` truncated to len 1, dropping the
+  OUTER sub → operator stalls.
+- **Fix:** same refactor as P2 — inner subs no longer live in
+  `producer_storage.subs`, eliminating the positional ambiguity.
+  Regression test: `switch_map_with_cached_outer_does_not_drop_outer_sub`.
+
+### P3 — INVALIDATE / TEARDOWN forwarding from inner — FIXED
+
+- **What was broken:** `build_inner_sink` only forwarded
+  Data/Complete/Error; INVALIDATE / TEARDOWN / DIRTY / RESOLVED /
+  PAUSE / RESUME hit `_ => {}`. Real concern: inner cache
+  invalidation (R1.2.7) didn't surface to producer subscribers;
+  inner permanent destruction (R2.6.4 TEARDOWN) didn't propagate.
+- **Fix:** `build_inner_sink` now matches `Message::Invalidate` →
+  `Core::invalidate(producer_id)` and `Message::Teardown` →
+  `Core::teardown(producer_id)`. DIRTY/RESOLVED/PAUSE/RESUME/Start
+  remain dropped (acknowledged divergence — see entry above).
+  Regression test: `switch_map_forwards_inner_invalidate_to_producer`.
+
+### Recursive `spawn_inner` stack-overflow risk — FIXED
+
+- **What was broken:** `merge_map`'s `on_complete` recursively called
+  `spawn_inner` to drain the next buffered DATA. For pathological
+  pre-completed-inner buffers (synchronous Complete during the
+  subscribe handshake), recursion depth grew with buffer size →
+  stack overflow on 10k+ buffered items with all pre-completed
+  inners.
+- **Fix:** thread-local `MERGE_DRAIN_ACTIVE: Cell<bool>` guard
+  breaks the recursion. The outermost drain owns the loop; nested
+  `on_complete` invocations only decrement state and return. The
+  outermost loop iterates until the buffer is empty or cap is
+  reached. `pending_inner_ids: AHashSet<u64>` distinguishes
+  "spawn started, on_complete not yet fired" from "on_complete
+  fired during subscribe" — post-subscribe code skips inserting
+  the dead sub if the id was already removed.
+
+### Concat first_sink defensive per-iteration `terminated` check — FIXED
+
+- **What was broken:** the outer `if s.terminated || s.phase != 0
+  { return; }` guard at the top of the lock block didn't catch a
+  `terminated` set BY an earlier message in the SAME batch (e.g.,
+  defensively-emitted stale `[Data, Complete, Data]`).
+- **Fix:** added per-iteration `if s.terminated || s.phase != 0
+  { break; }` inside the `for m in msgs` loop. Defensive only —
+  the realistic source contract precludes this.
+
+### Send + Sync compile-time asserts on higher-order state structs — ADDED
+
+- Added a `const _: fn() = || { ... }` block at the bottom of
+  `higher_order.rs` that statically asserts `SwitchState`,
+  `ExhaustState`, `MergeMapState`, and `ProjectFn` are
+  `Send + Sync`. Cheap regression insurance against a future state
+  field that accidentally introduces a `!Send` (e.g., `Cell` /
+  `Rc<...>`).
+
+### TS parity scenarios — `test.skip` → `test.runIf` for Rust-port-only assertions — FIXED
+
+- **What was broken:** the two Rust-port-only divergence assertions
+  (concat-phase-0 self-complete, race no-winner all-complete) used
+  static `test.skip(...)` which would NEVER activate even when
+  `rustImpl` publishes — the tests were dead until manually
+  unskipped.
+- **Fix:** replaced `test.skip(...)` with
+  `test.runIf(impl.name !== "legacy-pure-ts")(...)`. The
+  assertion now activates for any non-legacy impl (including
+  rustImpl once it publishes), so divergences become loud failures
+  instead of silent skips.

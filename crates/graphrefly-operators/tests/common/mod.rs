@@ -32,6 +32,7 @@ use graphrefly_core::{
     BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, Subscription, NO_HANDLE,
 };
 use graphrefly_operators::{
+    higher_order::{HigherOrderBinding, ProjectFn},
     producer::{default_producer_deactivate, ProducerBuildFn, ProducerCtx, ProducerStorage},
     OperatorBinding, ProducerBinding,
 };
@@ -91,6 +92,8 @@ type PackerFn = Arc<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>;
 
 type ProducerBuildArc = Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
 
+type ProjectArc = Arc<dyn Fn(HandleId) -> NodeId + Send + Sync>;
+
 pub struct InnerBinding {
     state: Mutex<RegistryState>,
     /// Per-producer-node storage shared with [`ProducerCtx`]. Outside
@@ -116,6 +119,7 @@ struct RegistryState {
     equals: HashMap<FnId, EqualsFn>,
     pairwises: HashMap<FnId, PairwiseFn>,
     packers: HashMap<FnId, PackerFn>,
+    projects: HashMap<FnId, ProjectArc>,
     /// Producer build closures, keyed by FnId allocated at register
     /// time. Looked up by `invoke_fn` when a producer node fires.
     producer_builds: HashMap<FnId, ProducerBuildArc>,
@@ -136,6 +140,7 @@ impl InnerBinding {
                 equals: HashMap::new(),
                 pairwises: HashMap::new(),
                 packers: HashMap::new(),
+                projects: HashMap::new(),
                 producer_builds: HashMap::new(),
                 next_fn_id: 1,
             }),
@@ -413,6 +418,26 @@ impl OperatorBinding for InnerBinding {
     }
 }
 
+impl HigherOrderBinding for InnerBinding {
+    fn register_project(&self, project: ProjectFn) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.projects.insert(id, Arc::from(project));
+        id
+    }
+
+    fn invoke_project(&self, fn_id: FnId, value: HandleId) -> NodeId {
+        let f: ProjectArc = self
+            .state
+            .lock()
+            .projects
+            .get(&fn_id)
+            .cloned()
+            .expect("project closure not registered");
+        f(value)
+    }
+}
+
 // ---------------------------------------------------------------------
 // OpRuntime — Core + binding glue for tests.
 // ---------------------------------------------------------------------
@@ -422,6 +447,7 @@ pub struct OpRuntime {
     pub binding: Arc<InnerBinding>,
     pub op_binding: Arc<dyn OperatorBinding>,
     pub producer_binding: Arc<dyn ProducerBinding>,
+    pub ho_binding: Arc<dyn HigherOrderBinding>,
 }
 
 impl OpRuntime {
@@ -434,11 +460,13 @@ impl OpRuntime {
         inner.set_core_ref(core.clone());
         let op_binding: Arc<dyn OperatorBinding> = inner.clone();
         let producer_binding: Arc<dyn ProducerBinding> = inner.clone();
+        let ho_binding: Arc<dyn HigherOrderBinding> = inner.clone();
         Self {
             core,
             binding: inner,
             op_binding,
             producer_binding,
+            ho_binding,
         }
     }
 

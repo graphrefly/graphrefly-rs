@@ -234,6 +234,60 @@ fn concat_propagates_error_from_second_after_handoff() {
     assert!(errored);
 }
 
+/// D041 / D-ops /qa D4 regression: if `second` completes during phase 0
+/// (before `first` completes), concat must self-complete after draining
+/// `pending` on phase transition. Pre-fix concat would hang because
+/// `second.Complete` fired only once and would not be re-observed
+/// post-handoff.
+#[test]
+fn concat_completes_when_second_completes_before_first_in_phase_zero() {
+    let rt = OpRuntime::new();
+    let s1 = rt.state_int(None);
+    let s2 = rt.state_int(None);
+    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let rec = rt.subscribe_recorder(c);
+
+    // Phase 0: s1 emits, then s2 emits + completes (buffered).
+    rt.emit_int(s1, 1);
+    rt.emit_int(s2, 99);
+    rt.core.complete(s2);
+
+    // s1 still going — concat must NOT have completed yet (s2's
+    // pending is still buffered).
+    let pre_handoff_events = rec.events();
+    let completed_pre = pre_handoff_events
+        .iter()
+        .any(|e| matches!(e, RecordedEvent::Complete));
+    assert!(
+        !completed_pre,
+        "concat must not complete before s1 completes; got {pre_handoff_events:?}"
+    );
+
+    // s1 completes -> phase transition: drains pending(99) -> sees
+    // second_completed=true -> self-completes.
+    rt.core.complete(s1);
+
+    let events = rec.events();
+    let data: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            RecordedEvent::Data(TestValue::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        data,
+        vec![1, 99],
+        "expected pending(99) drained on handoff; got {data:?}"
+    );
+
+    let completed = events.iter().any(|e| matches!(e, RecordedEvent::Complete));
+    assert!(
+        completed,
+        "concat must self-complete after handoff when second already completed in phase 0; got {events:?}"
+    );
+}
+
 // =====================================================================
 // race — first source to emit DATA wins
 // =====================================================================

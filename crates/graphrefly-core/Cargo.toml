@@ -21,6 +21,14 @@ tracing     = { workspace = true }
 proptest    = { workspace = true }
 criterion   = { workspace = true }
 
+# loom is a concurrency model checker that permutes thread interleavings.
+# Used only when compiling with `--cfg loom`. Tests that depend on loom
+# must gate themselves with `#[cfg(loom)]` because loom replaces stdlib
+# atomics/sync primitives. Run via:
+#   RUSTFLAGS="--cfg loom" cargo test --test loom_subscription
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name    = "dispatcher"
 harness = false
@@ -33,3 +41,9 @@ std          = []
 # Concurrency permutation testing via loom. Enable in CI for the per-subgraph
 # RLock + dispatch tests.
 loom-checked = []
+
+[lints.rust]
+# Loom is enabled via `RUSTFLAGS="--cfg loom"`, not a Cargo feature.
+# Tell cargo about the cfg so the default build doesn't emit the
+# unexpected_cfgs warning for `#![cfg(loom)]` test gates.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
