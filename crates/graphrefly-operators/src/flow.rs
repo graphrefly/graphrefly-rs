@@ -2,7 +2,7 @@
 //! gates that bound which `DATA` reaches the downstream output.
 //!
 //! Mirrors the TS shapes in
-//! `~/src/graphrefly-ts/packages/legacy-pure-ts/src/extra/operators/take.ts`,
+//! `~/src/graphrefly-ts/packages/pure-ts/src/extra/operators/take.ts`,
 //! driven by Core dispatch ([`graphrefly_core::OperatorOp::Take`] /
 //! [`Skip`] / [`TakeWhile`] / [`Last`]) instead of derived-fn factories.
 //!

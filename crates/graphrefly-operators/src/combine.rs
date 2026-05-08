@@ -1,7 +1,7 @@
 //! Multi-dep combinator operators (Slice C-2, D020).
 //!
 //! Mirrors the TS shapes in
-//! `~/src/graphrefly-ts/packages/legacy-pure-ts/src/extra/operators/combine.ts`,
+//! `~/src/graphrefly-ts/packages/pure-ts/src/extra/operators/combine.ts`,
 //! but driven by Core dispatch ([`graphrefly_core::OperatorOp`]) instead
 //! of derived-fn factories.
 //!

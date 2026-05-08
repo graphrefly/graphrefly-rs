@@ -1,7 +1,7 @@
 //! Transform operators (R5.7) — element-wise mappings and folds.
 //!
 //! Mirrors the TS shapes in
-//! `~/src/graphrefly-ts/packages/legacy-pure-ts/src/extra/operators/transform.ts`,
+//! `~/src/graphrefly-ts/packages/pure-ts/src/extra/operators/transform.ts`,
 //! but driven by Core dispatch ([`graphrefly_core::OperatorOp`]) instead
 //! of derived-fn factories. Per Slice C-1 / D009.
 //!

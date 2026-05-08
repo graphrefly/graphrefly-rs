@@ -116,7 +116,7 @@ TLA+ verified `wave_protocol_rewire.tla` — 35,950 distinct states, 0 violation
 ## 4. Parity test coverage
 
 `packages/parity-tests/scenarios/` covers M1 + M2 with the following structure:
-- `core/` — base dispatcher invariants (run today against `legacyImpl`; `rustImpl` activates with napi parity)
+- `core/` — base dispatcher invariants (run today against `pureTsImpl`; `rustImpl` activates with napi parity)
 - `graph/sugar.test.ts`, `graph/remove.test.ts`, `graph/edges.test.ts`, `graph/signal.test.ts`, `graph/describe-reactive.test.ts`, `graph/observe-all-reactive.test.ts` — 6 scenarios from Slice F D6 widening (18 passing + 2 skipped per `test.runIf`)
 
 **Missing parity scenarios (suggested for M3 napi binding activation):**

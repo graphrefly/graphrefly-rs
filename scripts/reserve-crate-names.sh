@@ -42,11 +42,23 @@ cd "$(dirname "$0")/.."
 
 DRY_RUN=""
 if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN="--dry-run"
+  DRY_RUN="1"
   echo "===> DRY RUN MODE — no publishes will be made."
+  echo "===> Note: dry-run only validates the leaf crate (graphrefly-core)."
+  echo "     Downstream crates (-graph / -operators / -storage / -structures)"
+  echo "     are SKIPPED in dry-run because cargo always resolves their deps"
+  echo "     against crates.io even with --no-verify, and -core isn't published"
+  echo "     yet during dry-run. This is a fundamental cargo behavior, not a"
+  echo "     script bug. The leaf crate's dry-run validates the shared"
+  echo "     workspace metadata (description, license, repository, homepage,"
+  echo "     authors) which all 5 crates inherit via 'workspace = true' — so"
+  echo "     a clean leaf dry-run is good evidence that all 5 manifests are"
+  echo "     publish-ready."
+  echo ""
 fi
 
-# Verify cargo login state (skip in dry-run since we don't talk to crates.io).
+# Verify cargo login state (skip in dry-run since we don't talk to crates.io
+# beyond the leaf crate's index check, which is non-auth).
 if [[ -z "$DRY_RUN" ]]; then
   if [[ ! -f "$HOME/.cargo/credentials.toml" && ! -f "$HOME/.cargo/credentials" ]]; then
     echo "ERROR: cargo not logged in to crates.io."
@@ -67,11 +79,26 @@ echo "===> Workspace version: $WORKSPACE_VERSION"
 
 # Publish in dependency order. Each tier waits for crates.io indexing
 # (~30–60s) before the next tier so dependents resolve correctly.
-publish_crate() {
+publish_leaf() {
   local crate="$1"
   echo ""
+  echo "===> Publishing $crate (leaf, no in-workspace deps) ..."
+  if [[ -n "$DRY_RUN" ]]; then
+    cargo publish -p "$crate" --dry-run
+  else
+    cargo publish -p "$crate"
+  fi
+}
+
+publish_dependent() {
+  local crate="$1"
+  if [[ -n "$DRY_RUN" ]]; then
+    echo "===> Skipping $crate in dry-run (depends on a not-yet-published crate)."
+    return
+  fi
+  echo ""
   echo "===> Publishing $crate ..."
-  cargo publish -p "$crate" $DRY_RUN
+  cargo publish -p "$crate"
 }
 
 wait_for_index() {
@@ -83,17 +110,17 @@ wait_for_index() {
 }
 
 # Tier 1 — foundational; no in-workspace deps.
-publish_crate graphrefly-core
+publish_leaf graphrefly-core
 wait_for_index 60
 
 # Tier 2 — depends only on -core.
-publish_crate graphrefly-graph
-publish_crate graphrefly-operators
+publish_dependent graphrefly-graph
+publish_dependent graphrefly-operators
 wait_for_index 30
 
 # Tier 3 — depends on -core and -graph.
-publish_crate graphrefly-storage
-publish_crate graphrefly-structures
+publish_dependent graphrefly-storage
+publish_dependent graphrefly-structures
 
 echo ""
 echo "===> Done. Verify with: cargo search graphrefly-core"

@@ -584,7 +584,7 @@ impl BindingBoundary for BenchBinding {
 // The user-side JS sink `(msgs: number[]) => void` receives a flat-encoded
 // message batch: alternating (variantCode, payload) u32 pairs. JS adapter
 // translates variant codes to canonical message-type symbols (DATA /
-// RESOLVED / etc., re-exported from `@graphrefly/legacy-pure-ts` per D066)
+// RESOLVED / etc., re-exported from `@graphrefly/pure-ts` per D066)
 // and dereferences payload handles via the JS-side mirror map (D073).
 //
 // **Sync bridge.** Sinks fire from inside a wave running on a tokio

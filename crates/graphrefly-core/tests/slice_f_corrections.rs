@@ -443,7 +443,7 @@ fn a3_overflow_silently_dropped_when_binding_returns_none() {
 // =====================================================================
 // Item 4 (audit-driven 2026-05-07) — register rejects non-resubscribable
 // terminal dep, mirroring `set_deps`'s `TerminalDep` rejection. TS reference:
-// `legacy-pure-ts/src/core/node.ts:1635-1648` (`_addDep` throws). Without
+// `pure-ts/src/core/node.ts:1635-1648` (`_addDep` throws). Without
 // this, the new node's first-run gate never closes (the dep will never emit
 // again), creating a permanent stuck wedge.
 // =====================================================================

@@ -95,7 +95,7 @@ test. Closed 2026-05-05.
 - **Why deferred (UPDATED 2026-05-07 audit):** This is a Rust-only
   dispatcher design concern — TS production has no equivalent because it
   snapshots `[...this._sinks]` AT DELIVERY TIME PER EMIT
-  ([packages/legacy-pure-ts/src/core/node.ts:3583-3617](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/legacy-pure-ts/src/core/node.ts)),
+  ([packages/pure-ts/src/core/node.ts:3583-3617](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/core/node.ts)),
   not once per wave. TS's single-threaded synchronous dispatch makes the
   failure mode literally unreachable. The Rust port batched the snapshot
   to amortize cost across the lock-released drain; the gap is the
@@ -676,7 +676,7 @@ These canonical-spec methods are tracked for parity. Items marked
 
 ### Future napi-rs `last(src, opts?)` adapter must accept `{ defaultValue: T }` shape (Slice C-3 /qa D2)
 
-- **What:** TS legacy `last(source, options?: { defaultValue?: T })` accepts an optional opts object; `Object.hasOwn(options, "defaultValue")` distinguishes "no default" (key absent) from "explicit undefined default" (key present). Rust core splits this into two factories: [`last`](../crates/graphrefly-operators/src/flow.rs) (no default — emits only `Complete` on empty stream) and [`last_with_default`](../crates/graphrefly-operators/src/flow.rs) (real default handle required). The parity-test scenario [`packages/parity-tests/scenarios/operators/flow.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/flow.test.ts) calls `impl.last(src, { defaultValue: 42 })` against `legacyImpl`. When `rustImpl` activates, the napi-rs binding must dispatch `impl.last(src, { defaultValue: V })` to the Rust `last_with_default(src, intern(V))` factory and `impl.last(src)` (no opts) to `last(src)`.
+- **What:** TS legacy `last(source, options?: { defaultValue?: T })` accepts an optional opts object; `Object.hasOwn(options, "defaultValue")` distinguishes "no default" (key absent) from "explicit undefined default" (key present). Rust core splits this into two factories: [`last`](../crates/graphrefly-operators/src/flow.rs) (no default — emits only `Complete` on empty stream) and [`last_with_default`](../crates/graphrefly-operators/src/flow.rs) (real default handle required). The parity-test scenario [`packages/parity-tests/scenarios/operators/flow.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/flow.test.ts) calls `impl.last(src, { defaultValue: 42 })` against `pureTsImpl`. When `rustImpl` activates, the napi-rs binding must dispatch `impl.last(src, { defaultValue: V })` to the Rust `last_with_default(src, intern(V))` factory and `impl.last(src)` (no opts) to `last(src)`.
 - **Why deferred:** parity surface concern for the future binding slice; not a Rust core concern. The Rust dispatch is correct (the two factories cover the two semantic cases); only the JS-binding adapter layer needs to bridge.
 - **Lift point:** when the napi-rs operator binding lands (M3 close-gate residual, alongside the TSFN custom-equals work). The binding's `last(src, opts?)` adapter inspects `opts` and `Object.hasOwn(opts, "defaultValue")`, then dispatches accordingly. The Rust-only edge of `defaultValue: undefined` (TS distinguishes "explicit undefined" from "absent") is acceptably collapsed (Rust has no `undefined`); document the divergence in the binding's adapter.
 - **Source:** Slice C-3 /qa Edge Case Hunter (2026-05-06).
@@ -786,7 +786,7 @@ is acceptable for the M2 close but worth tracking for future slices.
 ## M2 parity-tests fragility (post-/qa, 2026-05-06)
 
 Surfaced during /qa of the B+C+D batch. The six new `scenarios/graph/`
-scenarios pass against `legacyImpl` but rest on assumptions that may not
+scenarios pass against `pureTsImpl` but rest on assumptions that may not
 generalize cleanly when `rustImpl` activates. Tracked rather than fixed
 in-batch because (a) `rustImpl` is still `null` (no observable divergence
 yet), and (b) tightening would require either spec-citation amendments or
@@ -1059,7 +1059,7 @@ The cross-repo audit (2026-05-07) confirmed:
   `false`/Off); all three are canonical. The original Rust v1 choice
   to "canonicalize on resumeAll" was a regression — `Default` is the
   default for every untagged source.
-- TS reference for `Default` mode: `legacy-pure-ts/src/core/node.ts:2556-2558`
+- TS reference for `Default` mode: `pure-ts/src/core/node.ts:2556-2558`
   (`_pendingWave = true` gate) + `node.ts:3103-3106`
   (`_maybeRunFnOnSettlement()` on RESUME).
 
@@ -1109,7 +1109,7 @@ Regression: `item5_default_mode_consolidates_to_one_fn_fire_on_resume` in
 - **Why deferred (UPDATED 2026-05-07 audit):** Cross-repo audit confirmed
   the lift point is **Rust M2 deactivation cleanup**, NOT TS Phase 14.
   The TS `_deactivate` impl
-  ([packages/legacy-pure-ts/src/core/node.ts:2185-2294](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/legacy-pure-ts/src/core/node.ts))
+  ([packages/pure-ts/src/core/node.ts:2185-2294](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/core/node.ts))
   clears all per-dep settled-state on last-sink-detach (calls
   `resetDepRecord(d)` for each dep, clears `_pauseBuffer`, `_replayBuffer`,
   `_pauseLocks`, and `_cached` for compute nodes). TS doesn't refcount
@@ -1501,7 +1501,7 @@ in the same slice (D046) — recorded here for traceability.
   `rustImpl` publishes — the tests were dead until manually
   unskipped.
 - **Fix:** replaced `test.skip(...)` with
-  `test.runIf(impl.name !== "legacy-pure-ts")(...)`. The
+  `test.runIf(impl.name !== "pure-ts")(...)`. The
   assertion now activates for any non-legacy impl (including
   rustImpl once it publishes), so divergences become loud failures
   instead of silent skips.
@@ -1613,7 +1613,7 @@ Phases A (TSFN substrate + worker-thread Core), B (`BenchOperators` napi class +
 
 ### ~~Phase D — three-bench shape (D049) deferred~~ — RESOLVED 2026-05-08 (Slice X1)
 
-Bench harness shipped at `~/src/graphrefly-ts/packages/legacy-pure-ts/src/__bench__/operators-via-tsfn.bench.ts`. Three bench groups: `builtin_fn` (pure-FFI baseline) + `tsfn_identity` (TSFN scheduling) + `tsfn_addone_js` (end-to-end Rust-via-TSFN-into-JS with deref+intern). All three use top-level await for setup (vitest bench mode does NOT run `beforeAll` — convention from `graphrefly.bench.ts:5`) and `await emitInt` for end-to-end measurement (the legacy `ffi-cost.bench.ts` fires-and-forgets emit, which only measures Promise scheduling). Subtraction interpretation: `(2)−(1) = TSFN scheduling cost`; `(3)−(2) = JS compute + 2× sync FFI`; `(3)` is the headline.
+Bench harness shipped at `~/src/graphrefly-ts/packages/pure-ts/src/__bench__/operators-via-tsfn.bench.ts`. Three bench groups: `builtin_fn` (pure-FFI baseline) + `tsfn_identity` (TSFN scheduling) + `tsfn_addone_js` (end-to-end Rust-via-TSFN-into-JS with deref+intern). All three use top-level await for setup (vitest bench mode does NOT run `beforeAll` — convention from `graphrefly.bench.ts:5`) and `await emitInt` for end-to-end measurement (the legacy `ffi-cost.bench.ts` fires-and-forgets emit, which only measures Promise scheduling). Subtraction interpretation: `(2)−(1) = TSFN scheduling cost`; `(3)−(2) = JS compute + 2× sync FFI`; `(3)` is the headline.
 
 Cold-tokio warmup is per-`describe` (each block builds a fresh BenchCore); the first bench runs slightly cold relative to subsequent ones. Acceptable for the substrate-validation scope of Phase D; if the §10 perf-tier work needs tighter numbers, lift to shared-Core warmup.
 
@@ -1629,7 +1629,7 @@ User direction 2026-05-08: "Fix this in this batch because otherwise parity test
 
 **Side-concern landed too:** `bridge_sync` and `bridge_sync_unit` updated to call `tsfn.call_with_return_value(arg, ...)` (plain `T`, not `Ok(arg)`) per napi-rs 3.x's `CalleeHandled=false` impl signature. The `FnOnce(Result<Return>, Env) -> Result<()>` cb signature is identical between the two `CalleeHandled` impls, so JS-throw delivery via `Result<R>` is preserved — `bridge_sync`'s panic-on-throw discipline (line 209-212) still works.
 
-**Empirical validation:** the rustImpl parity arm activated for the first time (`pnpm --filter @graphrefly/native build` produced `graphrefly-native.darwin-arm64.node`; `pnpm --filter @graphrefly/parity-tests test` ran 138 tests). Result: **118 passed, 0 failed, 16 skipped, 4 todo.** All operator scenarios (transform 16, combine 12, flow 22, higher-order 18, subscription 32) pass against rustImpl AND legacyImpl. The 4 originally-failing `g.derived(name, deps, fn)` sites are now `test.runIf(impl.name !== "rust-via-napi")` gated per the F9 carry-forward.
+**Empirical validation:** the rustImpl parity arm activated for the first time (`pnpm --filter @graphrefly/native build` produced `graphrefly-native.darwin-arm64.node`; `pnpm --filter @graphrefly/parity-tests test` ran 138 tests). Result: **118 passed, 0 failed, 16 skipped, 4 todo.** All operator scenarios (transform 16, combine 12, flow 22, higher-order 18, subscription 32) pass against rustImpl AND pureTsImpl. The 4 originally-failing `g.derived(name, deps, fn)` sites are now `test.runIf(impl.name !== "rust-via-napi")` gated per the F9 carry-forward.
 
 ### Closure-builder Arc-cycle (binding-side production parallel of producer-build cycle)
 
@@ -1945,7 +1945,7 @@ JS adapter widened `Impl.Graph` with unified `observe(path?, opts?)` per canonic
   build (`pnpm --filter @graphrefly/native build` from local toolchain).
   Cross-platform publish is downstream of 1.0 ship-readiness.
 - **Lift point:** when 1.0 ship engineering picks up; coordinate with
-  `@graphrefly/legacy-pure-ts` publish cadence + npm credentials in CI.
+  `@graphrefly/pure-ts` publish cadence + npm credentials in CI.
 - **Source:** Phase E close (2026-05-07).
 
 ### Post-1.0 follow-on: BigInt migration for u32-narrowed napi types
@@ -2020,4 +2020,4 @@ Field doc comment in `graph_bindings.rs::BenchGraph` calls out the redundancy + 
 
 ### ~~F17 — `release_callback` set_release_callback overwritable; second install drops the prior TSFN~~ — RESOLVED 2026-05-08 (Slice X3)
 
-Regression test landed at `packages/parity-tests/scenarios/core/release-callback-reinstall.test.ts` (Rust-only — `legacy-pure-ts` doesn't have TSFN-backed release callbacks; this is a binding-implementation regression test, not cross-impl parity). The test installs callback A, registers a state node with a JS-allocated handle (refcount=1), re-installs callback B, then triggers a release by emitting a different handle on the state node. Asserts B receives the release of the first handle AND A receives nothing — confirming the prior TSFN is dropped (and thus deallocated) on re-install. Vitest passes; the underlying Rust impl `*self.binding.release_callback.lock() = Some(Arc::new(tsfn))` is correct by construction.
+Regression test landed at `packages/parity-tests/scenarios/core/release-callback-reinstall.test.ts` (Rust-only — `pure-ts` doesn't have TSFN-backed release callbacks; this is a binding-implementation regression test, not cross-impl parity). The test installs callback A, registers a state node with a JS-allocated handle (refcount=1), re-installs callback B, then triggers a release by emitting a different handle on the state node. Asserts B receives the release of the first handle AND A receives nothing — confirming the prior TSFN is dropped (and thus deallocated) on re-install. Vitest passes; the underlying Rust impl `*self.binding.release_callback.lock() = Some(Arc::new(tsfn))` is correct by construction.

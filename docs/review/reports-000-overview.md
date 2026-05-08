@@ -76,7 +76,7 @@ The detailed traces, simplification deltas, gap audits, parity-test coverage, an
 
 ## What this review did NOT cover
 
-- **napi-rs operator binding parity** (~25 parity scenarios live in `packages/parity-tests/scenarios/operators/` but only run against `legacyImpl`; `rustImpl` activation gates on the deferred binding work). When that lands, those scenarios become this review's evidence layer.
+- **napi-rs operator binding parity** (~25 parity scenarios live in `packages/parity-tests/scenarios/operators/` but only run against `pureTsImpl`; `rustImpl` activation gates on the deferred binding work). When that lands, those scenarios become this review's evidence layer.
 - **pyo3 / wasm bindings** — both stubs only, deferred to M6 / post-M5.
 - **`graphrefly-storage` / `graphrefly-structures`** — both stubs only, blocked behind DS-14 op-log changesets. Their flowchart batches will land alongside their first feature slice.
 - **Bench numbers** — Phase 13.7 v0 bench landed pre-M1 and is reported in [`docs/research/rust-bench-v0-results.md`](../research/rust-bench-v0-results.md). No new bench passes since.
