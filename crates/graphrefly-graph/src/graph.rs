@@ -549,22 +549,65 @@ impl Graph {
     /// qualifies names with `::` path separators.
     #[must_use]
     pub fn edges(&self, recursive: bool) -> Vec<(String, String)> {
-        self.edges_inner("", recursive)
+        // Pre-compute the qualified-names map across the entire mount
+        // tree (when `recursive`) so a child node's cross-graph dep
+        // (e.g., `sub::z` depending on root's `x`) can resolve to the
+        // parent-namespace name `x` instead of falling through to
+        // `sub::_anon_<id>`. Pre-Slice-Y bug: the per-level names_map
+        // only contained the current graph's names, breaking cross-
+        // graph edge tracing under recursive walking.
+        let names_map = self.collect_qualified_names("", recursive);
+        self.edges_inner("", recursive, &names_map)
     }
 
-    fn edges_inner(&self, prefix: &str, recursive: bool) -> Vec<(String, String)> {
-        // Single-pass build: one walk over `inner.names` produces
-        // both the qualified-name list (for emitting edges) and the
-        // id→qualified-name lookup (for resolving deps to names).
+    /// Build an `id → qualified-name` map across this graph and (if
+    /// `recursive`) its mount tree. Cross-mount lookups use the
+    /// nearest registered name (insertion-order semantics via
+    /// `IndexMap`); the same `NodeId` never appears under two different
+    /// graphs in practice (Graph namespace integrity is enforced at
+    /// `add` time).
+    fn collect_qualified_names(
+        &self,
+        prefix: &str,
+        recursive: bool,
+    ) -> IndexMap<NodeId, String> {
+        let inner = self.inner.lock();
+        let mut map: IndexMap<NodeId, String> = inner
+            .names
+            .iter()
+            .map(|(n, id)| (*id, format!("{prefix}{n}")))
+            .collect();
+        let children: Vec<(String, Graph)> = if recursive {
+            inner
+                .children
+                .iter()
+                .map(|(n, g)| (n.clone(), g.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(inner);
+        for (child_name, child_graph) in children {
+            let child_prefix = format!("{prefix}{child_name}::");
+            let child_map = child_graph.collect_qualified_names(&child_prefix, true);
+            for (id, name) in child_map {
+                map.entry(id).or_insert(name);
+            }
+        }
+        map
+    }
+
+    fn edges_inner(
+        &self,
+        prefix: &str,
+        recursive: bool,
+        names_map: &IndexMap<NodeId, String>,
+    ) -> Vec<(String, String)> {
         let inner = self.inner.lock();
         let qualified: Vec<(String, NodeId)> = inner
             .names
             .iter()
             .map(|(n, id)| (format!("{prefix}{n}"), *id))
-            .collect();
-        let names_map: IndexMap<NodeId, String> = qualified
-            .iter()
-            .map(|(name, id)| (*id, name.clone()))
             .collect();
         let children: Vec<(String, Graph)> = if recursive {
             inner
@@ -590,7 +633,7 @@ impl Graph {
         }
         for (child_name, child_graph) in children {
             let child_prefix = format!("{prefix}{child_name}::");
-            result.extend(child_graph.edges_inner(&child_prefix, true));
+            result.extend(child_graph.edges_inner(&child_prefix, true, names_map));
         }
         result
     }

@@ -505,10 +505,15 @@ impl OpRuntime {
     }
 
     /// Create a packer closure that packs N HandleIds into a Tuple TestValue.
-    /// The closure captures the binding for deref/intern.
+    /// The closure captures the binding via [`Weak`] so it doesn't pin the
+    /// binding alive past the runtime's `Drop` — mirrors the production
+    /// producer-build cycle discipline (Slice Y).
     pub fn make_packer(&self) -> graphrefly_operators::combine::PackerFn {
-        let binding = self.binding.clone();
+        let binding_weak: std::sync::Weak<InnerBinding> = Arc::downgrade(&self.binding);
         Box::new(move |handles: &[HandleId]| {
+            let binding = binding_weak
+                .upgrade()
+                .expect("test invariant: packer fired after binding drop");
             let values: Vec<TestValue> = handles.iter().map(|&h| binding.deref(h)).collect();
             binding.intern(TestValue::Tuple(values))
         })

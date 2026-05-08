@@ -35,7 +35,7 @@
 //! blocking pool, awaited re-entries are non-deadlocking.
 
 use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use graphrefly_core::{FnId, HandleId, NodeId};
 use graphrefly_operators::{
@@ -171,8 +171,22 @@ impl HigherOrderBinding for BenchBinding {
 
 /// TSFN type alias — 7 const generics: `T = input`, `Return = output`,
 /// `CallJsBackArgs = T` (pass-through), `ErrorStatus = Status`,
-/// `CalleeHandled = true`, `Weak = false`, `MaxQueueSize = 1`.
-type Tsfn<T, R> = ThreadsafeFunction<T, R, T, Status, true, false, 1>;
+/// `CalleeHandled = false`, `Weak = false`, `MaxQueueSize = 1`.
+///
+/// **`CalleeHandled = false`** (Slice Y, 2026-05-08): napi-rs 3.x with
+/// `callee_handled::<true>()` makes JS receive `(err, value)` Node-style
+/// — even though the typed `Function<u32, u32>` declares the logical
+/// signature as `(u32) -> u32`. With `false`, JS receives `(value)`
+/// directly, matching the typed signature and `makeProjector`-style
+/// adapter shapes (which take `(h: number) => ...`). JS-throw delivery
+/// via `Result<R>` to the result handler is preserved (the
+/// `FnOnce(Result<Return>, Env) -> Result<()>` cb signature is the
+/// same in both `CalleeHandled` impls per napi-rs 3.x source).
+/// Pre-Slice-Y verified empirically: `(h) => h` actually got
+/// `(null, 1)` as args because `callee_handled::<true>()` was the
+/// wire shape; this silently broke the rustImpl parity arm
+/// (makeProjector's `registry.get(h)` looked up `null`).
+type Tsfn<T, R> = ThreadsafeFunction<T, R, T, Status, false, false, 1>;
 
 /// Block the calling tokio blocking-pool thread until the TSFN's JS
 /// callback returns a value of type `R`. JS-callback throws are
@@ -186,8 +200,12 @@ where
     R: FromNapiValue + Send + 'static,
 {
     let (tx, rx) = sync_channel::<Result<R>>(1);
+    // CalleeHandled=false → call_with_return_value takes plain `T`
+    // (no Result wrapping). JS-throw delivery via the cb's `Result<R>`
+    // is preserved — the result handler's signature is identical
+    // between the two CalleeHandled impls in napi-rs 3.x.
     let status = tsfn.call_with_return_value(
-        Ok(arg),
+        arg,
         ThreadsafeFunctionCallMode::Blocking,
         move |result: Result<R>, _env: Env| -> Result<()> {
             // C1 fix (napi 3.x native): JS throw delivered as Err.
@@ -268,7 +286,7 @@ impl BenchOperators {
         project: Function<u32, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
-        let projector_closure = closure_h_to_h(tsfn, Arc::clone(&self.binding));
+        let projector_closure = closure_h_to_h(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let core = self.core.clone();
         let src_id = NodeId::new(u64::from(src));
@@ -317,7 +335,7 @@ impl BenchOperators {
         folder: Function<FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(folder)?;
-        let folder_closure = closure_hh_to_h(tsfn, Arc::clone(&self.binding));
+        let folder_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let core = self.core.clone();
         let src_id = NodeId::new(u64::from(src));
@@ -344,7 +362,7 @@ impl BenchOperators {
         folder: Function<FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(folder)?;
-        let folder_closure = closure_hh_to_h(tsfn, Arc::clone(&self.binding));
+        let folder_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let core = self.core.clone();
         let src_id = NodeId::new(u64::from(src));
@@ -413,7 +431,7 @@ impl BenchOperators {
         packer: Function<FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(packer)?;
-        let packer_closure = closure_hh_to_h(tsfn, Arc::clone(&self.binding));
+        let packer_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let core = self.core.clone();
         let src_id = NodeId::new(u64::from(src));
@@ -441,7 +459,7 @@ impl BenchOperators {
         packer: Function<Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
-        let packer_closure = closure_packer(tsfn, Arc::clone(&self.binding));
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let src_ids: Vec<NodeId> = srcs
             .into_iter()
@@ -473,7 +491,7 @@ impl BenchOperators {
         packer: Function<Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
-        let packer_closure = closure_packer(tsfn, Arc::clone(&self.binding));
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let core = self.core.clone();
         let primary_id = NodeId::new(u64::from(primary));
@@ -651,7 +669,7 @@ impl BenchOperators {
         packer: Function<Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
-        let packer_closure = closure_packer(tsfn, Arc::clone(&self.binding));
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let src_ids: Vec<NodeId> = srcs
             .into_iter()
@@ -833,7 +851,7 @@ fn build_h_to_h_tsfn(callback: Function<u32, u32>) -> Result<Arc<Tsfn<u32, u32>>
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -842,7 +860,7 @@ fn build_h_to_bool_tsfn(callback: Function<u32, bool>) -> Result<Arc<Tsfn<u32, b
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -853,7 +871,7 @@ fn build_hh_to_h_tsfn(
     let tsfn = callback
         .build_threadsafe_function::<FnArgs<(u32, u32)>>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<FnArgs<(u32, u32)>>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -864,7 +882,7 @@ fn build_hh_to_bool_tsfn(
     let tsfn = callback
         .build_threadsafe_function::<FnArgs<(u32, u32)>>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<FnArgs<(u32, u32)>>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -873,7 +891,7 @@ fn build_vec_to_h_tsfn(callback: Function<Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec
     let tsfn = callback
         .build_threadsafe_function::<Vec<u32>>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<Vec<u32>>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -891,12 +909,28 @@ fn build_vec_to_h_tsfn(callback: Function<Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec
 
 fn closure_h_to_h(
     tsfn: Arc<Tsfn<u32, u32>>,
-    binding: Arc<BenchBinding>,
+    binding: Weak<BenchBinding>,
 ) -> Box<dyn Fn(HandleId) -> HandleId + Send + Sync> {
+    // Captures `Weak<BenchBinding>` (Slice Y, 2026-05-08) — closures
+    // stored in `binding.registry.projectors` would otherwise create
+    // the same Arc cycle as producer-builds. Upgrade-on-fire.
+    //
+    // Slice X3 /qa F (2026-05-08): graceful no-op on dangling weak
+    // (was `.expect("...")` which panicked across the napi boundary).
+    // Closure storage lives in BenchBinding's own registry, so dangling
+    // weak should be unreachable except during a partial Drop unwind —
+    // skipping the retain-validate is consistent with the producer-build
+    // factories' `else { return; }` pattern.
     Box::new(move |h: HandleId| -> HandleId {
         let arg = u32::try_from(h.raw()).expect("HandleId exceeds u32");
         let ret: u32 = bridge_sync(&tsfn, arg);
         let h_out = HandleId::new(u64::from(ret));
+        let Some(binding) = binding.upgrade() else {
+            // BenchBinding dropped — Drop-cascade race. Return the raw
+            // out-handle without retain bump; the registry that would
+            // validate is gone anyway.
+            return h_out;
+        };
         if !binding.registry.lock().validate_and_retain(h_out) {
             panic!(
                 "JS callback returned unknown HandleId({}); registry has no value mapping. \
@@ -917,13 +951,18 @@ fn closure_h_to_bool(tsfn: Arc<Tsfn<u32, bool>>) -> Box<dyn Fn(HandleId) -> bool
 
 fn closure_hh_to_h(
     tsfn: Arc<Tsfn<FnArgs<(u32, u32)>, u32>>,
-    binding: Arc<BenchBinding>,
+    binding: Weak<BenchBinding>,
 ) -> Box<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync> {
+    // Weak<BenchBinding> (Slice Y) — see `closure_h_to_h` doc.
+    // Slice X3 /qa F: graceful no-op on dangling weak.
     Box::new(move |a: HandleId, b: HandleId| -> HandleId {
         let a_u32 = u32::try_from(a.raw()).expect("HandleId exceeds u32");
         let b_u32 = u32::try_from(b.raw()).expect("HandleId exceeds u32");
         let ret: u32 = bridge_sync(&tsfn, FnArgs::from((a_u32, b_u32)));
         let h_out = HandleId::new(u64::from(ret));
+        let Some(binding) = binding.upgrade() else {
+            return h_out;
+        };
         if !binding.registry.lock().validate_and_retain(h_out) {
             panic!(
                 "JS callback returned unknown HandleId({}); registry has no value mapping. \
@@ -945,7 +984,9 @@ fn closure_hh_to_bool(
     })
 }
 
-fn closure_packer(tsfn: Arc<Tsfn<Vec<u32>, u32>>, binding: Arc<BenchBinding>) -> PackerFn {
+fn closure_packer(tsfn: Arc<Tsfn<Vec<u32>, u32>>, binding: Weak<BenchBinding>) -> PackerFn {
+    // Weak<BenchBinding> (Slice Y) — see `closure_h_to_h` doc.
+    // Slice X3 /qa F: graceful no-op on dangling weak.
     Box::new(move |handles: &[HandleId]| -> HandleId {
         let arg: Vec<u32> = handles
             .iter()
@@ -953,6 +994,9 @@ fn closure_packer(tsfn: Arc<Tsfn<Vec<u32>, u32>>, binding: Arc<BenchBinding>) ->
             .collect();
         let ret: u32 = bridge_sync(&tsfn, arg);
         let h_out = HandleId::new(u64::from(ret));
+        let Some(binding) = binding.upgrade() else {
+            return h_out;
+        };
         if !binding.registry.lock().validate_and_retain(h_out) {
             panic!(
                 "JS packer callback returned unknown HandleId({}); registry has no value mapping. \

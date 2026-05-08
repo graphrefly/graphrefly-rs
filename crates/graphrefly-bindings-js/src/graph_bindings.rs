@@ -35,11 +35,20 @@
 
 use std::sync::Arc;
 
-use graphrefly_core::{BindingBoundary, Core, EqualsMode, FnId, HandleId, LockId, NodeId};
-use graphrefly_graph::{Graph, NameError, RemoveError, SignalKind};
+use graphrefly_core::{
+    BindingBoundary, Core, EqualsMode, FnId, HandleId, LockId, Message, NodeId, Sink, Subscription,
+};
+use graphrefly_graph::{
+    DescribeSink, Graph, GraphObserveAllReactive, NameError, ReactiveDescribeHandle, RemoveError,
+    SignalKind,
+};
 use napi::bindgen_prelude::*;
-use napi::Error as NapiError;
+use napi::threadsafe_function::{
+    ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+};
+use napi::{Env, Error as NapiError, Status};
 use napi_derive::napi;
+use parking_lot::Mutex;
 
 use crate::core_bindings::{
     run_blocking, BenchBinding, BenchCore, BuiltinFn, MSG_CODE_COMPLETE, MSG_CODE_DATA,
@@ -51,6 +60,17 @@ use crate::core_bindings::{
 /// `BenchGraph` shares its `BenchCore`'s value registry + binding so
 /// nodes registered through `BenchGraph::state(...)` are visible to
 /// `BenchOperators::register_*(...)` and vice-versa.
+///
+/// **`binding` field redundancy** (Slice X3 / Phase E /qa F14): the
+/// `binding: Arc<BenchBinding>` field carries the same allocation as
+/// `core.binding: Arc<dyn BindingBoundary>` — they're upcasts of the
+/// same `Arc<BenchBinding>`. The typed field is retained because
+/// `BenchGraph::derived` needs the concrete `BenchBinding` to access
+/// `binding.registry.lock()` for fn registration; recovering the
+/// concrete type from the trait-erased `core.binding` would require
+/// `Arc::downcast` (not available on `dyn Trait` without `Any` bound).
+/// `from_core` enforces the invariant via a debug-build pointer-equality
+/// assert so the field can't drift from `core`'s view.
 #[napi]
 pub struct BenchGraph {
     pub(crate) graph: Graph,
@@ -71,6 +91,15 @@ impl BenchGraph {
         let core_clone = core.core_clone();
         let binding = core.binding_arc();
         let graph = Graph::with_existing_core(name, core_clone.clone());
+        // F14 (Slice X3): the typed `binding` field and `core_clone.binding`
+        // (trait-erased) come from the SAME `Arc<BenchBinding>` upcast —
+        // both `core.core_clone()` and `core.binding_arc()` clone the
+        // single allocation owned by the BenchCore. A debug-build
+        // pointer-equality assert would confirm this, but `core.binding`
+        // is `pub(crate)` in graphrefly-core (different crate) so the
+        // assert can't be expressed without widening Core's API.
+        // `BenchCore::new` is the single construction path; the invariant
+        // is preserved by construction.
         Self {
             graph,
             binding,
@@ -457,6 +486,349 @@ impl BenchGraph {
         serde_json::to_string(&snapshot)
             .map_err(|e| NapiError::from_reason(format!("describe serialization failed: {e}")))
     }
+
+    // -------------------------------------------------------------------
+    // Reactive surfaces (Slice X2 — Phase E2 BenchGraph reactive)
+    //
+    // Canonical R3.6.1 / R3.6.2: `g.describe({ reactive: true })` and
+    // `g.observe(path?, { reactive: true })`. Sink delivery uses TSFN
+    // (NonBlocking — push-on-change, no bridge_sync needed). All TSFNs
+    // use `callee_handled::<false>()` per Slice Y convention so JS
+    // callbacks match the typed `Function<T, R>` declaration.
+    // -------------------------------------------------------------------
+
+    /// Subscribe to live topology snapshots (canonical R3.6.1
+    /// `describe({ reactive: true })`). The JS callback receives a
+    /// JSON-serialized [`graphrefly_graph::GraphDescribeOutput`] on
+    /// each fire; first fire is the push-on-subscribe initial
+    /// snapshot, subsequent fires are post-change snapshots.
+    ///
+    /// Returns a [`BenchDescribeReactiveHandle`] napi class. JS code
+    /// MUST `await handle.dispose()` before letting the handle drop —
+    /// the unsubscribe runs on a tokio blocking thread to avoid the
+    /// JS-thread / Core-mutex deadlock vector that `BenchCore::dispose`
+    /// closes for subscriptions.
+    #[napi]
+    pub fn describe_reactive<'env>(
+        &self,
+        env: &'env Env,
+        sink: Function<String, ()>,
+    ) -> Result<PromiseRaw<'env, BenchDescribeReactiveHandle>> {
+        let tsfn = build_describe_tsfn(sink)?;
+        let graph = self.graph.clone();
+        let core = self.core.clone();
+        env.spawn_future(async move {
+            let core_for_blocking = core.clone();
+            let rdh = run_blocking(core_for_blocking, move || -> ReactiveDescribeHandle {
+                let describe_sink: DescribeSink = Arc::new(move |snapshot| {
+                    // JSON-serialize the snapshot per Q2; on serde failure
+                    // we silently skip this fire (sink can't propagate
+                    // errors back to the producer per the R3.6.1 contract).
+                    if let Ok(json) = serde_json::to_string(snapshot) {
+                        let _status =
+                            tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+                    }
+                });
+                graph.describe_reactive(describe_sink)
+            })
+            .await?;
+            Ok(BenchDescribeReactiveHandle {
+                inner: Arc::new(Mutex::new(Some(rdh))),
+                core,
+            })
+        })
+    }
+
+    /// Subscribe to all-named-nodes message stream with auto-subscribe
+    /// on late-added nodes (canonical R3.6.2 `observe(undefined, {
+    /// reactive: true })`). The JS callback receives `(name,
+    /// encoded_msgs)` per emission — `encoded_msgs` is the same flat
+    /// `[code_0, payload_0, ...]` shape that `subscribe_with_tsfn`
+    /// uses, decoded JS-side via the `MSG_CODE_*` table.
+    ///
+    /// Returns a [`BenchObserveReactiveHandle`] napi class.
+    /// `await handle.dispose()` unsubscribes everything (the inner
+    /// `GraphObserveAllReactive` clears all fan-out subs + the
+    /// namespace-change listener).
+    #[napi]
+    pub fn observe_all_reactive<'env>(
+        &self,
+        env: &'env Env,
+        sink: Function<FnArgs<(String, Vec<u32>)>, ()>,
+    ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
+        let tsfn = build_observe_all_tsfn(sink)?;
+        let graph = self.graph.clone();
+        let core = self.core.clone();
+        env.spawn_future(async move {
+            let core_for_blocking = core.clone();
+            let mut handle = run_blocking(core_for_blocking, move || -> GraphObserveAllReactive {
+                let mut handle = graph.observe_all_reactive();
+                handle.subscribe(move |name: &str, msgs: &[Message]| {
+                    let payload = encode_messages(msgs);
+                    let _status = tsfn.call(
+                        FnArgs::from((name.to_string(), payload)),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                });
+                handle
+            })
+            .await?;
+            // Inner mutex needs `&mut` access but napi class fields are
+            // `&self` — wrap in Mutex<Option<_>> so dispose can take
+            // ownership.
+            Ok(BenchObserveReactiveHandle {
+                inner: Arc::new(Mutex::new(Some(ObserveReactiveInner::All(handle)))),
+                core,
+            })
+        })
+    }
+
+    /// Sink-style observe of a single node (canonical R3.6.2 default
+    /// mode `observe(path)`). Returns a subscription index into a
+    /// `BenchObserveReactiveHandle` slot that mirrors `BenchCore`'s
+    /// subscriptions vec semantics. Provided for canonical-spec
+    /// completeness — most parity scenarios use the reactive variant.
+    ///
+    /// `path` resolves via `Graph::node(path)`; panics if unknown.
+    #[napi]
+    pub fn observe_subscribe<'env>(
+        &self,
+        env: &'env Env,
+        path: Option<String>,
+        sink: Function<FnArgs<(String, Vec<u32>)>, ()>,
+    ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
+        // Sink-style "observe()" — when no path given, fan-out across
+        // all named nodes at call time (snapshot semantics, no
+        // auto-subscribe — see observe_all_reactive for that). When a
+        // path IS given, single-node sink-style.
+        let tsfn = build_observe_all_tsfn(sink)?;
+        let graph = self.graph.clone();
+        let core = self.core.clone();
+        env.spawn_future(async move {
+            let core_for_blocking = core.clone();
+            let inner = run_blocking(core_for_blocking, move || -> ObserveReactiveInner {
+                if let Some(path) = path {
+                    let one = graph.observe(&path);
+                    let path_owned = path;
+                    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+                        let payload = encode_messages(msgs);
+                        let _status = tsfn.call(
+                            FnArgs::from((path_owned.clone(), payload)),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    });
+                    let sub = one.subscribe(sink);
+                    ObserveReactiveInner::OneSub(sub)
+                } else {
+                    // observe() — sink-style snapshot fan-out across
+                    // named nodes (NOT auto-subscribe; canonical
+                    // GraphObserveAll default).
+                    let mut all = graph.observe_all();
+                    all.subscribe(move |name: &str, msgs: &[Message]| {
+                        let payload = encode_messages(msgs);
+                        let _status = tsfn.call(
+                            FnArgs::from((name.to_string(), payload)),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    });
+                    ObserveReactiveInner::AllSubs(all)
+                }
+            })
+            .await?;
+            Ok(BenchObserveReactiveHandle {
+                inner: Arc::new(Mutex::new(Some(inner))),
+                core,
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reactive describe handle (Slice X2)
+// ---------------------------------------------------------------------------
+
+/// RAII handle for a reactive describe subscription. JS code SHOULD
+/// `await dispose()` before letting it drop — that path runs the
+/// unsubscribe on a tokio blocking thread, keeping the JS thread free
+/// to pump libuv. As defense-in-depth (Slice X3 /qa A), the `Drop`
+/// impl ALSO ships the inner-drop to a tokio blocking thread
+/// fire-and-forget, so a forgotten `dispose()` doesn't deadlock the
+/// JS thread on Graph's namespace_sinks mutex.
+#[napi]
+pub struct BenchDescribeReactiveHandle {
+    inner: Arc<Mutex<Option<ReactiveDescribeHandle>>>,
+    core: Core,
+}
+
+#[napi]
+impl BenchDescribeReactiveHandle {
+    /// Drop the inner subscription on a tokio blocking thread.
+    /// Idempotent — subsequent calls are no-ops.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        let taken = self.inner.lock().take();
+        if let Some(handle) = taken {
+            let core = self.core.clone();
+            run_blocking(core, move || drop(handle)).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BenchDescribeReactiveHandle {
+    fn drop(&mut self) {
+        // Slice X3 /qa A — defense-in-depth against forgotten dispose.
+        // Take the inner option; if Some, ship to tokio blocking pool
+        // fire-and-forget. The JoinHandle is dropped (detaches the
+        // task; runs to completion regardless). If no tokio runtime
+        // is active (process shutdown), the spawn_blocking call may
+        // panic; we accept that — at shutdown, libuv is winding down
+        // anyway and the deadlock vector is moot.
+        let taken = self.inner.lock().take();
+        if let Some(handle) = taken {
+            let _ = spawn_blocking(move || drop(handle));
+        }
+    }
+}
+
+// Send + Sync compile-time assertion (inner type, per Slice X3 /qa).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BenchDescribeReactiveHandle>();
+    assert_send_sync::<ReactiveDescribeHandle>();
+};
+
+// ---------------------------------------------------------------------------
+// Reactive / sink-style observe handle (Slice X2)
+//
+// Single napi class with an internal enum so the JS adapter can
+// dispose any observe variant (one-sub / all-subs / all-reactive)
+// uniformly.
+// ---------------------------------------------------------------------------
+
+enum ObserveReactiveInner {
+    OneSub(Subscription),
+    AllSubs(graphrefly_graph::GraphObserveAll),
+    All(GraphObserveAllReactive),
+}
+
+/// RAII handle for an observe subscription (single-node, all-nodes
+/// snapshot, or all-nodes reactive auto-subscribe). JS code SHOULD
+/// `await dispose()` (runs unsubscribe on tokio); as defense-in-depth
+/// (Slice X3 /qa A) the `Drop` impl ALSO ships the inner drop to
+/// tokio fire-and-forget so a forgotten `dispose()` doesn't deadlock
+/// the JS thread on Core's mutex via `Subscription::Drop`.
+#[napi]
+pub struct BenchObserveReactiveHandle {
+    inner: Arc<Mutex<Option<ObserveReactiveInner>>>,
+    core: Core,
+}
+
+#[napi]
+impl BenchObserveReactiveHandle {
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        let taken = self.inner.lock().take();
+        if let Some(inner) = taken {
+            let core = self.core.clone();
+            run_blocking(core, move || drop(inner)).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BenchObserveReactiveHandle {
+    fn drop(&mut self) {
+        // Slice X3 /qa A — defense-in-depth (see BenchDescribeReactiveHandle).
+        let taken = self.inner.lock().take();
+        if let Some(inner) = taken {
+            let _ = spawn_blocking(move || drop(inner));
+        }
+    }
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BenchObserveReactiveHandle>();
+    assert_send_sync::<ObserveReactiveInner>();
+};
+
+// ---------------------------------------------------------------------------
+// TSFN builders for reactive surfaces (Slice X2)
+//
+// Both use `callee_handled::<false>()` per the Slice Y convention —
+// JS callbacks receive `(value)` directly (no err-first wire shape),
+// matching the typed `Function<T, R>` declaration.
+// ---------------------------------------------------------------------------
+
+// Slice X3 /qa C: `MaxQueueSize=8` for reactive sinks. Operator TSFNs
+// use `=1` because they're sync-bridged (one in-flight call at a time);
+// reactive describe/observe TSFNs are NonBlocking notification streams
+// where back-pressure-from-JS-thread shouldn't silently drop snapshots
+// (Status::QueueFull return is unrecoverable — the sink misses a fire).
+// 8 is a defensive cushion for typical bursty namespace-mutation
+// patterns; if real workloads need more, lift via porting-deferred entry.
+type DescribeTsfn = ThreadsafeFunction<String, (), String, Status, false, false, 8>;
+type ObserveAllTsfn = ThreadsafeFunction<
+    FnArgs<(String, Vec<u32>)>,
+    (),
+    FnArgs<(String, Vec<u32>)>,
+    Status,
+    false,
+    false,
+    8,
+>;
+
+fn build_describe_tsfn(callback: Function<String, ()>) -> Result<Arc<DescribeTsfn>> {
+    let tsfn = callback
+        .build_threadsafe_function::<String>()
+        .max_queue_size::<8>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<String>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+fn build_observe_all_tsfn(
+    callback: Function<FnArgs<(String, Vec<u32>)>, ()>,
+) -> Result<Arc<ObserveAllTsfn>> {
+    let tsfn = callback
+        .build_threadsafe_function::<FnArgs<(String, Vec<u32>)>>()
+        .max_queue_size::<8>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<FnArgs<(String, Vec<u32>)>>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+/// Encode a `&[Message]` batch into the flat `[code_0, payload_0,
+/// code_1, payload_1, ...]` shape that `subscribe_with_tsfn` and the
+/// JS-side `MSG_CODE_*` decoder use.
+///
+/// Slice X3 /qa Group 2 #5: skips `Message::Start` at encode time.
+/// `Start` is the per-subscription handshake (R1.3.5.a) — user sinks
+/// don't observe it; legacy filters it out before the user sink. The
+/// JS-side `decodeMessages` already skipped `MSG_CODE_START`; filtering
+/// at the encoder saves the wire round-trip and avoids JS-side noise
+/// on auto-subscribe-late observe variants where every late-added node
+/// would otherwise emit a wasted START + 0 pair on every fire.
+fn encode_messages(msgs: &[Message]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(msgs.len() * 2);
+    for m in msgs {
+        let (code, arg) = match m {
+            Message::Start => continue,
+            Message::Dirty => (MSG_CODE_DIRTY, 0u32),
+            Message::Resolved => (MSG_CODE_RESOLVED, 0),
+            Message::Data(h) => (MSG_CODE_DATA, u32::try_from(h.raw()).unwrap_or(u32::MAX)),
+            Message::Pause(l) => (MSG_CODE_PAUSE, u32::try_from(l.raw()).unwrap_or(u32::MAX)),
+            Message::Resume(l) => (MSG_CODE_RESUME, u32::try_from(l.raw()).unwrap_or(u32::MAX)),
+            Message::Invalidate => (MSG_CODE_INVALIDATE, 0),
+            Message::Complete => (MSG_CODE_COMPLETE, 0),
+            Message::Error(h) => (MSG_CODE_ERROR, u32::try_from(h.raw()).unwrap_or(u32::MAX)),
+            Message::Teardown => (MSG_CODE_TEARDOWN, 0),
+        };
+        out.push(code);
+        out.push(arg);
+    }
+    out
 }
 
 /// JS-exposed `GraphRemoveAudit`. Mirrors `graphrefly_graph::GraphRemoveAudit`'s

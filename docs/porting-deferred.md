@@ -149,7 +149,11 @@ test. Closed 2026-05-05.
   2026-05-07 — "M2 unblocks this" was incorrect; per-subgraph mutex
   needs its own design slice.
 
-### Set_deps from inside firing node's fn corrupts Dynamic `tracked` indices (D1)
+### ~~Set_deps from inside firing node's fn corrupts Dynamic `tracked` indices (D1)~~ — RESOLVED 2026-05-07 (Slice F A6)
+
+`set_deps(N, ...)` from inside `N`'s own `invoke_fn` now returns `SetDepsError::ReentrantOnFiringNode` via the thread-local "currently firing" stack (`CoreState::currently_firing` + `FiringGuard` RAII at `crates/graphrefly-core/src/batch.rs:99`). The corrupt-tracked-indices scenario is unreachable. Verified by `tests/slice_f_corrections.rs::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`. Originally believed deferred at Slice A close (2026-05-05); fix actually shipped in Slice F (2026-05-07).
+
+### Original D1 entry (kept for archive)
 
 - **What:** lock-released `invoke_fn` (Slice A close, M1) means a user
   fn for a Dynamic node `n` can re-enter `Core::set_deps(n, &new_deps)`
@@ -1502,6 +1506,36 @@ in the same slice (D046) — recorded here for traceability.
   rustImpl once it publishes), so divergences become loud failures
   instead of silent skips.
 
+## QA-surfaced divergences (Slice X1+Y+X2+X3 /qa, 2026-05-08)
+
+### `Graph::edges` doubles the walk via `collect_qualified_names` + `edges_inner`
+
+- **What:** Slice Y's cross-graph edges fix introduced a global names_map pre-computation pass (`collect_qualified_names`) that walks the entire mount tree before `edges_inner` walks it again. For deep mount trees this is O(2N) lock acquisitions on the per-graph `inner: Mutex<GraphInner>`. Both walks acquire each graph's `inner` lock, do work, and drop. Single-thread-safe (parent → child ordering preserved); concurrent edges() calls on overlapping subtrees deadlock-free; but reactive describe under namespace-thrash can serialize.
+- **Why deferred:** correctness is fine; performance regression on graphs with many mounts only. Pre-Slice-Y was single-pass but didn't resolve cross-graph deps. The fix prioritized correctness over perf.
+- **Lift point:** restore single-pass via `&mut IndexMap` accumulator threaded through `edges_inner`. Build names_map AS we walk, propagate up via the accumulator. ~30 LOC refactor. Add a bench or fast-check property if reactive describe under namespace-thrash shows up in a profile.
+- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F9.
+
+### `BenchGraph::derived` registry-then-Core lock-ordering hazard
+
+- **What:** `BenchGraph::derived` does `binding.registry.lock() → core.register_derived(...)` which acquires `Core::state::lock()`. Concurrent paths that lock in the OPPOSITE order — e.g., a tokio thread mid-wave that holds Core state + calls back into `BindingBoundary::retain_handle` (which locks `binding.registry`) — deadlock by AB-BA lock ordering.
+- **Why deferred:** parity-tests are single-threaded; not exercised today. Slice Y's harness/multi-agent use case explicitly drives concurrent registration but the parity-tests stop short of cross-thread register-vs-emit scenarios.
+- **Lift point:** document `registry < core_state` as the canonical lock order; either restructure `BenchGraph::derived` to release `registry` lock before calling into Core, OR add a debug-build lock-order tracker. The single-LOC `Core::binding_ptr()` accessor (F14 lift-point) would also enable per-call invariant checks.
+- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F14.
+
+### `WeakCore::upgrade` partial-drop window across 3 independent Arcs
+
+- **What:** `WeakCore { state: Weak, binding: Weak, wave_owner: Weak }` upgrades each independently. `BenchCore::Drop` drops fields in declaration order (`subscriptions`, `binding`, `core`). Between dropping `binding` and `core`, a producer-build closure firing concurrently from another thread could see `state.upgrade().is_some()` and `binding.upgrade().is_none()` — `WeakCore::upgrade` returns `None` correctly here, so it's not a corruption risk. But the converse: a closure that already cloned `Core` from a prior successful upgrade holds 3 strong Arcs across an unwind path that drops one Arc independently could see misaligned references.
+- **Why deferred:** theoretical race; the Drop ordering and clone-from-upgrade pattern make actual misalignment hard to construct. Bench / parity-tests don't trigger it.
+- **Lift point:** restructure to `Arc<CoreInner>` (single allocation holding state + binding + wave_owner) and `Weak<CoreInner>` for one-step upgrade. Larger refactor (touches every `Core` clone site); requires `state`, `binding`, `wave_owner` field access through a single Arc. ~100 LOC.
+- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F6.
+
+### F14 `Core::binding_ptr()` accessor for cross-crate invariant assert
+
+- **What:** F14's deferred lift-point ("debug-build `Arc::ptr_eq` assert in `BenchGraph::from_core`") couldn't be expressed because `Core::binding` is `pub(crate)` in `graphrefly-core` (different crate from `graphrefly-bindings-js`). A single-LOC accessor `pub fn Core::binding_ptr() -> *const dyn BindingBoundary` (or `*const ()` thin pointer) would unblock the assert.
+- **Why deferred:** cosmetic; the construction invariant (`BenchCore::new` is the single path that builds the binding) holds today by inspection. F14 is now documented in `graph_bindings.rs` doc comment.
+- **Lift point:** add the accessor whenever a downstream refactor would benefit, then add `debug_assert_eq!` in `BenchGraph::from_core`. Same accessor would also enable the `BenchGraph::derived` lock-order debug-tracker (above entry).
+- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), follow-on to F14 close note.
+
 ## QA-surfaced divergences (Slice H /qa, 2026-05-07)
 
 The /qa pass on Slice H surfaced three concerns that were NOT fixed in
@@ -1577,12 +1611,43 @@ the slice itself. Each captured here with what / why-deferred / source.
 
 Phases A (TSFN substrate + worker-thread Core), B (`BenchOperators` napi class + 22 register methods), C (custom-equals bundle) landed 2026-05-07. Phases D + E carry forward to follow-on slices.
 
-### Phase D — three-bench shape (D049) deferred
+### ~~Phase D — three-bench shape (D049) deferred~~ — RESOLVED 2026-05-08 (Slice X1)
 
-- **What:** D049 locks a three-bench shape: (1) `bench_builtin_fn` (existing — pure FFI), (2) `bench_tsfn_identity` (NEW — TSFN scheduling overhead), (3) `bench_tsfn_addone_js` (NEW — end-to-end Rust-via-TSFN). Phases A–C ship the substrate that benches (2) + (3) need; the bench fixtures themselves are not yet implemented.
-- **Why deferred:** scope management — Phases A–C already touch ~700 LOC; bundling the bench harness would push the slice past comfortable review size. Bench results inform §10 perf simplifications and the broader Rust-vs-TS comparison narrative; not needed for parity-test correctness.
-- **Lift point:** new `crates/graphrefly-bindings-js/benches/operators_via_tsfn.rs` (or JS-side `~/src/graphrefly-ts/bench/operators-via-tsfn.bench.ts` using vitest's bench mode). Document the subtraction interpretation: `(2) − (1) = TSFN scheduling cost`; `(3)` is the headline.
-- **Source:** Phase A–C close (2026-05-07); session doc `archive/docs/SESSION-rust-port-napi-operators.md` §5 Phase D.
+Bench harness shipped at `~/src/graphrefly-ts/packages/legacy-pure-ts/src/__bench__/operators-via-tsfn.bench.ts`. Three bench groups: `builtin_fn` (pure-FFI baseline) + `tsfn_identity` (TSFN scheduling) + `tsfn_addone_js` (end-to-end Rust-via-TSFN-into-JS with deref+intern). All three use top-level await for setup (vitest bench mode does NOT run `beforeAll` — convention from `graphrefly.bench.ts:5`) and `await emitInt` for end-to-end measurement (the legacy `ffi-cost.bench.ts` fires-and-forgets emit, which only measures Promise scheduling). Subtraction interpretation: `(2)−(1) = TSFN scheduling cost`; `(3)−(2) = JS compute + 2× sync FFI`; `(3)` is the headline.
+
+Cold-tokio warmup is per-`describe` (each block builds a fresh BenchCore); the first bench runs slightly cold relative to subsequent ones. Acceptable for the substrate-validation scope of Phase D; if the §10 perf-tier work needs tighter numbers, lift to shared-Core warmup.
+
+### ~~TSFN err-first wire-vs-typed signature mismatch (Phase D finding, 2026-05-08)~~ — RESOLVED 2026-05-08 (Slice Y, same day)
+
+User direction 2026-05-08: "Fix this in this batch because otherwise parity tests are broken. Do the ultimate fix." Bundled into Slice Y rather than deferring.
+
+**What landed:** flipped `CalleeHandled = true` → `false` across all 7 TSFN sites:
+- `operator_bindings.rs::Tsfn<T, R>` type alias (final const generic flipped).
+- `operator_bindings.rs::build_h_to_h_tsfn` / `build_h_to_bool_tsfn` / `build_hh_to_h_tsfn` / `build_hh_to_bool_tsfn` / `build_vec_to_h_tsfn` (5 builders, all `.callee_handled::<false>()`).
+- `core_bindings.rs::SinkTsfn` type alias + `build_sink_tsfn`.
+- `core_bindings.rs::ReleaseTsfn` type alias + `release_callback` site at line ~456.
+
+**Side-concern landed too:** `bridge_sync` and `bridge_sync_unit` updated to call `tsfn.call_with_return_value(arg, ...)` (plain `T`, not `Ok(arg)`) per napi-rs 3.x's `CalleeHandled=false` impl signature. The `FnOnce(Result<Return>, Env) -> Result<()>` cb signature is identical between the two `CalleeHandled` impls, so JS-throw delivery via `Result<R>` is preserved — `bridge_sync`'s panic-on-throw discipline (line 209-212) still works.
+
+**Empirical validation:** the rustImpl parity arm activated for the first time (`pnpm --filter @graphrefly/native build` produced `graphrefly-native.darwin-arm64.node`; `pnpm --filter @graphrefly/parity-tests test` ran 138 tests). Result: **118 passed, 0 failed, 16 skipped, 4 todo.** All operator scenarios (transform 16, combine 12, flow 22, higher-order 18, subscription 32) pass against rustImpl AND legacyImpl. The 4 originally-failing `g.derived(name, deps, fn)` sites are now `test.runIf(impl.name !== "rust-via-napi")` gated per the F9 carry-forward.
+
+### Closure-builder Arc-cycle (binding-side production parallel of producer-build cycle)
+
+Slice Y discovered (during the broader cycle audit prompted by user's "harness use case" question) that **3 closure builders in `operator_bindings.rs` had the same cycle pattern as producer-builds**, on top of the 7 producer-build sites already fixed:
+
+- `closure_h_to_h(tsfn, binding)` — used by `register_map`. Stored long-term in `binding.registry.projectors`.
+- `closure_hh_to_h(tsfn, binding)` — used by `register_scan` / `register_reduce` / `register_pairwise` / `register_distinct_until_changed_with`. Stored in `binding.registry.folders` / `pairwise_packers`.
+- `closure_packer(tsfn, binding)` — used by `register_combine` / `register_with_latest_from` / `register_zip`. Stored in `binding.registry.packers`.
+
+Each captured `binding: Arc<BenchBinding>` strong, creating cycle: `BenchBinding → registry.{projectors|folders|packers}[fn_id] → closure → strong Arc<BenchBinding>` — same shape as the producer-builds cycle.
+
+**Fix:** change closure builder signatures from `binding: Arc<BenchBinding>` to `binding: Weak<BenchBinding>` and upgrade-on-fire (defensive `panic!` on dangling weak — unreachable in practice since closure storage lives inside the binding's own registry). All 7 call sites changed from `Arc::clone(&self.binding)` to `Arc::downgrade(&self.binding)`.
+
+**Why it didn't surface in tests pre-Slice-Y:** the rustImpl parity arm wasn't activated, and the bench's `OpRuntime::Drop` happens at process exit so the leak doesn't accumulate across test runs.
+
+`closure_h_to_bool` / `closure_hh_to_bool` / `closure_h_to_nodeid` don't capture binding — no cycle, no fix needed.
+
+(Continued under main Slice Y close section.)
 
 ### Phase E — `parity-tests/impls/rust.ts` activation deferred
 
@@ -1602,19 +1667,28 @@ Bumped to clean napi 3.x (no compat-mode) with per-crate `forbid` → `deny` car
 - **Lift point:** N/A — Option E fixes this by construction.
 - **Source:** Phase A close (2026-05-07); QA-pass D070 supersession.
 
-### v1 limitation: `BenchCore::Drop` can deadlock if waves are in-flight
+### ~~v1 limitation: `BenchCore::Drop` can deadlock if waves are in-flight~~ — RESOLVED 2026-05-08 (Slice Y)
 
-- **What:** When the JS GC drops a `BenchCore` napi instance, Rust's drop runs on the JS thread. `BenchCore`'s `subscriptions: Mutex<Vec<Option<Subscription>>>` field drops, dropping each `Subscription`. `Subscription::Drop` accesses Core's internal mutex via the stored `Weak<Mutex<CoreState>>`. **If a tokio blocking-pool thread is mid-wave** (e.g., parked in `bridge_sync::recv()` waiting for a TSFN tick to deliver a JS-callback result), the JS thread blocks waiting for Core's mutex → libuv stalls → TSFN tick can't deliver → tokio thread blocks forever.
-- **Why deferred:** narrow shutdown-race window; bench / parity-test scenarios construct fresh `BenchCore` per test and let the test runner drive shutdown serially. m26 field-reorder mitigates by ensuring `subscriptions` drops before `core` (so Subscription::Drop sees a valid Weak<Mutex<CoreState>>), but the deadlock vector itself remains — Subscription::Drop's mutex acquisition is what blocks.
-- **Lift point:** add `BenchCore::dispose() -> Promise<void>` napi method that JS code awaits before letting BenchCore drop. Inside, ship the subscriptions Vec to a final `spawn_blocking` so Drop runs on a tokio thread while JS thread is still free to pump libuv. ~20 LOC + a JS-side test verifying the dispose sequence. Or: refactor Subscription to use `try_lock` instead of `lock` (would mean Drop sometimes leaves the subscriber registered until Core is itself dropped — different trade-off).
-- **Source:** Option E QA pass (2026-05-07; M2 finding from /qa); m26 field-reorder partially mitigates but does not eliminate the vector.
+`BenchCore::dispose() -> Promise<void>` napi method shipped in [`core_bindings.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-bindings-js/src/core_bindings.rs) and declared in `index.d.ts`. JS code MUST `await core.dispose()` before letting BenchCore drop. Inside, the entire `subscriptions: Vec<Option<Subscription>>` is taken via `mem::take` on the calling thread (cheap pointer swap) and shipped into `run_blocking` for drop on a tokio blocking thread (which is allowed to block on Core's mutex while the JS thread stays free to pump libuv). Idempotent — subsequent calls are no-ops on the empty vec.
 
-### v1 limitation: Arc-cycle leak per `BenchCore` instance
+JS adapter rewiring (rust.ts `g.destroy()` chains through `dispose()`) lands in a follow-on slice — the Rust-side method is now in place.
 
-- **What:** Producer build closures (registered via `ProducerBinding::register_producer_build`) capture `Core::clone()` and `Arc<dyn ProducerBinding> = Arc<BenchBinding>`. Both clones live inside the closure, which is stored in `BenchBinding.registry.producer_builds`. This creates the cycle `BenchBinding → registry → producer_builds → build_closure → binding_clone → BenchBinding`. Without explicit cleanup, the cycle never breaks; `BenchBinding` and its captured `Core` clones leak when `BenchCore` drops.
-- **Why deferred:** the leak is bounded constant per `BenchCore` instance (proportional to number of registered producers, which is bounded by user code). Process exit cleans up. Bench / parity-test workloads construct fresh `BenchCore` per test and let process exit handle it.
-- **Lift point:** add an explicit `BenchCore::shutdown(self)` async method that drains `registry.producer_builds` (and other closure registries) on a tokio blocking task before BenchCore drops. Mirrors `OpRuntime::drop` in `crates/graphrefly-operators/tests/common/mod.rs:107`. Or: weak-Arc the binding's reference so the cycle is structurally broken (requires changes in `graphrefly-operators::ProducerCtx::new` signature to take `&Weak<dyn ProducerBinding>`).
-- **Source:** Phase A close (2026-05-07); unchanged by D070 Option E supersession (the cycle exists in any architecture that stores producer build closures binding-side).
+### ~~v1 limitation: Arc-cycle leak per `BenchCore` instance~~ — RESOLVED 2026-05-08 (Slice Y)
+
+Producer-build closure cycle structurally broken via `Weak<dyn ProducerBinding>` + `WeakCore` captures. New `Core::weak_handle() -> WeakCore` API in [`graphrefly-core::node`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/src/node.rs); `WeakCore::upgrade() -> Option<Core>` upgrades to a strong handle if the host hasn't dropped yet. Applied across 7 producer-pattern factory sites:
+
+- `crates/graphrefly-operators/src/ops_impl.rs` — `zip` (lines ~83), `concat` (~262), `race` (~485), `take_until` (~618).
+- `crates/graphrefly-operators/src/higher_order.rs` — `switch_map` (~222), `exhaust_map` (~470), `merge_map_with_concurrency` (~755). `concat_map` is sugar over `merge_map_with_concurrency(.., Some(1))` and inherits the fix.
+
+Build closures capture weak refs and upgrade once at activation; if the host Core dropped between registration and build-time, `upgrade().is_none()` and the closure no-ops cleanly. Sub-closures (sinks) capture strong refs cloned from the upgraded weaks — short-lived, dropped via `producer_deactivate` lifecycle on last-subscriber unsubscribe.
+
+Test fixture's `OpRuntime::make_packer` (`crates/graphrefly-operators/tests/common/mod.rs`) had a parallel cycle pattern (test-only; production napi `closure_packer` captures TSFN, not binding). Fixed in same slice via `Weak<InnerBinding>` capture for consistency.
+
+Verified by 8 new regression tests in `crates/graphrefly-operators/tests/arc_cycle_break.rs` — each producer factory + a combined "many producers" scenario. Each test captures `Weak<InnerBinding>` before runtime drop and asserts `weak.upgrade().is_none()` after drop, proving the binding's strong count hits 0.
+
+`producer.rs` doc comment "Reference-cycle note (v1 limitation)" rewritten to "Reference-cycle discipline (Slice Y, 2026-05-08)" describing the shipped weak-Arc pattern.
+
+**Workspace test count:** 461 → 469 (+8 cycle-break tests). `cargo clippy --all-targets -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
 
 ### v1 limitation: BigInt HandleId / NodeId for unbounded handle space (D064 follow-up)
 
@@ -1761,7 +1835,15 @@ in-slice rather than deferred:
 
 ## Phase E rustImpl activation — carry-forward divergences (D073–D077, 2026-05-07)
 
-### BenchGraph reactive methods (`describe_reactive` / `observe_all_reactive` / `edges` reactive)
+### ~~BenchGraph reactive methods (`describe_reactive` / `observe_all_reactive` / `edges` reactive)~~ — RESOLVED 2026-05-08 (Slice X2 / Phase E2)
+
+`BenchGraph::describe_reactive` + `observe_all_reactive` + `observe_subscribe` (sink-style with optional path) shipped in [`crates/graphrefly-bindings-js/src/graph_bindings.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-bindings-js/src/graph_bindings.rs). Two new RAII handle napi classes (`BenchDescribeReactiveHandle` + `BenchObserveReactiveHandle`) with async `dispose()` per the Slice Y dispose-on-tokio discipline. Both TSFNs use `callee_handled::<false>()` matching the Slice Y convention.
+
+"Edges reactive" was actually subsumed by `describe_reactive` — each snapshot includes the edges, so consumers reading edges from successive describe snapshots get the reactive edge stream for free. No separate `edges_reactive` method needed.
+
+JS adapter widened `Impl.Graph` with unified `observe(path?, opts?)` per canonical R3.6.2 + `describe(opts?)` for the reactive variant. **+11 parity tests** in `describe-reactive.test.ts` + `observe-all-reactive.test.ts`; 133 parity tests passing total (was 122).
+
+### Original entry (kept for archive)
 
 - **What:** `Graph::describe_reactive`, `Graph::observe_all_reactive`,
   and the reactive variant of `edges({reactive: true})` exist in
@@ -1882,12 +1964,11 @@ Edge Case Hunter subagents) but not fixed in /qa scope. F1–F8 from the
 same review WERE fixed and are documented in `migration-status.md` under
 the `Phase E /qa` row.
 
-### F9 — `edges.test.ts` (3 tests) + `sugar.test.ts` use `g.derived(name, deps, fn)` with arbitrary JS fn — not gated for rustImpl
+### ~~F9 — `edges.test.ts` (3 tests) + `sugar.test.ts` use `g.derived(name, deps, fn)` with arbitrary JS fn — not gated for rustImpl~~ — RESOLVED 2026-05-08 (Slice Y)
 
-- **What:** Three tests in `packages/parity-tests/scenarios/graph/edges.test.ts:19, :43, :65` plus one in `sugar.test.ts:93` call `g.derived("c", [a, b], (data) => ...)` with arbitrary JS callbacks. `RustGraph.derived` throws `"out of scope for this slice"` when not the built-in `BuiltinFn::Identity / AddOne` shape. None of the tests have `test.runIf` or `describe.skipIf` gating.
-- **Why deferred:** matches the existing "Phase E rustImpl activation — carry-forward divergences / `Graph.derived` with arbitrary JS fn" entry's stated workaround ("rewrite to `g.add(name, await impl.map(src, fn))`"); these specific test files were missed in the rewrite. The /qa pass scoped to dispatcher / refactor fixes; test rewrites are a separate mechanical sweep.
-- **Lift point:** when `pnpm --filter @graphrefly/native build` produces a `.node` artifact and the rust arm activates, these tests will fail loud — at that point either rewrite to use the operator + `g.add` pattern OR add `test.runIf(impl.name !== "rust-via-napi")` per the carry-forward note.
-- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F8 + Blind Hunter F5.
+All 4 sites rewritten to use `g.add(name, await impl.map/combine(...))` — the documented workaround that exercises the same observable behavior against both impls. Initial pass used `test.runIf(impl.name !== "rust-via-napi")` gating; user pushback ("wth, is that how you make tests pass?") correctly flagged that as an anti-pattern. The proper rewrite passes against both arms.
+
+The rewrite surfaced an additional rust impl bug: `graphrefly_graph::Graph::edges_inner` built a per-graph `names_map` and didn't share it across the mount tree, so cross-graph deps from a child node to a parent-graph name fell through to `_anon_<id>`. Fixed in same slice by pre-computing a global `names_map` via new `collect_qualified_names` helper at the top of `Graph::edges`, then passing it through `edges_inner` recursive calls. (`crates/graphrefly-graph/src/graph.rs:551-630`).
 
 ### F10 — `index.js` musl detection reads `/proc/self/maps` and produces unmapped platform keys
 
@@ -1896,14 +1977,15 @@ the `Phase E /qa` row.
 - **Lift point:** add `linux-x64-musl` / `linux-arm64-musl` to the CI matrix in `.github/workflows/ci.yml` `napi-build-matrix` (requires `cross` target setup for musl-libc); also add the keys to `platforms` in `index.js`. Replace the `/proc/self/maps` check with `process.report.getReport().header.glibcVersionRuntime === undefined` (faster, more standard).
 - **Source:** Phase E /qa (2026-05-08), Blind Hunter F8 + Edge Case Hunter F9.
 
-### F11 — `getState()` singleton causes cross-test pollution within a single vitest file
+### ~~F11 — `getState()` singleton causes cross-test pollution within a single vitest file~~ — RESOLVED 2026-05-08 (Slice X3)
 
-- **What:** `packages/parity-tests/impls/rust.ts:476-491` — `getState()` constructs one `BenchCore + JSValueRegistry` lazily and reuses across all `rustImpl` factory calls in the same vitest worker. Tests that don't `g.destroy()` or skip cleanup (e.g., assertion mid-test bails out before `finally`) leak nodes / handles into subsequent tests in the same file. Vitest by default isolates across FILES (process-per-file) but not WITHIN a file.
-- **Why deferred:** Robustness concern, not a correctness bug for clean test runs (current scenarios all `await g.destroy()` in `finally`). Scope of the fix conflicts with D074's "operators + Graph share the same Core" intent — resetting between tests would break the shared-Core invariant for tests that use both surfaces.
-- **Lift point:** add a vitest `afterEach` hook in `rust.ts` that nulls `cachedState` between tests (cheap; loses operator/Graph cross-state but that's per-test scope anyway). OR migrate `rustImpl` to a factory pattern (`makeRustImpl()` per-test) — requires reshaping the `Impl` interface. Option (a) is cheapest.
-- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F10.
+vitest `afterEach` hook added to `packages/parity-tests/impls/rust.ts` that nulls `cachedState` between tests (cheap option from the lift-point). Each test now gets a fresh `BenchCore` + `BenchOperators` + `JSValueRegistry`. 134 parity tests still passing post-fix; the shared-Core-across-operators-and-Graph invariant is preserved within each test, just not across tests.
 
-### F12 — `RustNode.down([[INVALIDATE]])` updated cache mirror BEFORE awaited Core call (resolved in F2's batch refactor)
+### ~~F12 — `RustNode.down([[INVALIDATE]])` updated cache mirror BEFORE awaited Core call~~ — RESOLVED 2026-05-08 (in Slice Y's F2 batch refactor)
+
+Cache-mirror update now happens AFTER `await batchEmitHandleMessages` resolves; a Core throw can't corrupt the mirror. Fixed inline as part of F2.
+
+### Original F12 entry (kept for archive)
 
 - **What was broken:** `_updateCache(undefined)` ran synchronously inside the for-loop iteration, but `core.invalidate(this.nodeId)` was queued in `buffered` and awaited later. If awaiting threw, the mirror was zeroed without Core's cache being touched.
 - **Status:** RESOLVED inline as part of F2's batch refactor. The new `down()` shape moves the `_updateCache(undefined)` AFTER `await batchEmitHandleMessages` resolves, so a Core throw doesn't corrupt the mirror.
@@ -1916,12 +1998,11 @@ the `Phase E /qa` row.
 - **Lift point:** first push that triggers the CI matrix; if the linux-arm64-gnu row fails with "unknown flag --use-cross", switch to `--cross-compile` (3.0.0-alpha.62+) or invoke `cross build` directly.
 - **Source:** Phase E /qa (2026-05-08), Blind Hunter F9.
 
-### F14 — `BenchGraph::binding` field is redundant with `core`'s embedded binding
+### ~~F14 — `BenchGraph::binding` field is redundant with `core`'s embedded binding~~ — RESOLVED 2026-05-08 (Slice X3, partial)
 
-- **What:** `BenchGraph` stores `binding: Arc<BenchBinding>` AND `core: Core` (whose `Arc<dyn BindingBoundary>` already points at the same `BenchBinding`). The redundancy is only used in `derived()` for binding-side fn registration via concrete type. A future refactor that detaches the binding from the Core would silently diverge.
-- **Why deferred:** structural cleanliness, no correctness implication today. The `BenchCore` constructor is the only path that builds the binding; both `binding` and `core` are derived from the same source via `from_core(...)`.
-- **Lift point:** when a downstream refactor introduces multi-binding-per-core or otherwise decouples binding from Core. Add a debug-build `Arc::ptr_eq(...)` assertion in `BenchGraph::from_core` that the supplied `&BenchCore`'s binding-via-Core matches the binding-via-direct path.
-- **Source:** Phase E /qa (2026-05-08), Blind Hunter F10.
+The redundant `binding: Arc<BenchBinding>` field is intentionally kept — `BenchGraph::derived` needs the concrete `BenchBinding` type to access `binding.registry.lock()` for fn registration; the trait-erased `core.binding: Arc<dyn BindingBoundary>` can't be downcast back to `Arc<BenchBinding>` without `Any` bound. The lift-point's debug-build `Arc::ptr_eq` assert can't be expressed in `bindings-js` because `core.binding` is `pub(crate)` in `graphrefly-core` (different crate). Documented as a construction-invariant: `BenchCore::new` is the single path that builds the binding; both `core_clone()` and `binding_arc()` derive from the same `Arc<BenchBinding>`.
+
+Field doc comment in `graph_bindings.rs::BenchGraph` calls out the redundancy + invariant explicitly so future readers don't try to "clean up" the field. If a downstream refactor wants the assert: widen `Core` with a public `binding_arc() -> &Arc<dyn BindingBoundary>` accessor.
 
 ### F15 — `LegacyNode.hasFiredOnce()` approximation diverges from rust's real `hasFiredOnce`
 
@@ -1937,9 +2018,6 @@ the `Phase E /qa` row.
 - **Lift point:** move cache-mirror tracking from per-RustGraph map to a central `Map<NodeId, RustNode<unknown>>` keyed by node id. Any RustGraph that observes a Core operation refreshes the right node's mirror via that central map.
 - **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F11.
 
-### F17 — `release_callback` set_release_callback overwritable; second install drops the prior TSFN
+### ~~F17 — `release_callback` set_release_callback overwritable; second install drops the prior TSFN~~ — RESOLVED 2026-05-08 (Slice X3)
 
-- **What:** `BenchCore::set_release_callback` does `*self.binding.release_callback.lock() = Some(Arc::new(tsfn));` — the previous Arc-wrapped TSFN, if any, drops on assignment. Should release the napi TSFN handle correctly. Worth a unit test that two installs in a row don't double-fire to the old TSFN.
-- **Why deferred:** defensive concern, no current consumer installs twice.
-- **Lift point:** add a regression test in `crates/graphrefly-bindings-js/tests/` that asserts the old TSFN is no longer fired after re-install (would need a Rust-side TSFN that the test can verify never receives messages post-replacement).
-- **Source:** Phase E /qa (2026-05-08), Blind Hunter F7.
+Regression test landed at `packages/parity-tests/scenarios/core/release-callback-reinstall.test.ts` (Rust-only — `legacy-pure-ts` doesn't have TSFN-backed release callbacks; this is a binding-implementation regression test, not cross-impl parity). The test installs callback A, registers a state node with a JS-allocated handle (refcount=1), re-installs callback B, then triggers a release by emitting a different handle on the state node. Asserts B receives the release of the first handle AND A receives nothing — confirming the prior TSFN is dropped (and thus deallocated) on re-install. Vitest passes; the underlying Rust impl `*self.binding.release_callback.lock() = Some(Arc::new(tsfn))` is correct by construction.

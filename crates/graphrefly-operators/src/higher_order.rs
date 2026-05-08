@@ -58,7 +58,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use ahash::AHashMap;
 use graphrefly_core::{Core, FnId, HandleId, Message, NodeId, Sink, Subscription};
@@ -220,12 +220,22 @@ pub fn switch_map(
     project: ProjectFn,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    let core_clone = core.clone();
-    let binding_clone: Arc<dyn HigherOrderBinding> = binding.clone();
-    let producer_binding: Arc<dyn ProducerBinding> = binding.clone();
+    // Weak captures break the producer-build Arc cycle (see
+    // `graphrefly_operators::ops_impl::zip` doc).
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
+    let producer_binding_weak: Weak<dyn ProducerBinding> =
+        Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
+        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
+            core_weak.upgrade(),
+            binding_weak.upgrade(),
+            producer_binding_weak.upgrade(),
+        ) else {
+            return;
+        };
         let state: Arc<Mutex<SwitchState>> = Arc::new(Mutex::new(SwitchState::new()));
 
         let state_for_outer = state.clone();
@@ -456,12 +466,21 @@ pub fn exhaust_map(
     project: ProjectFn,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    let core_clone = core.clone();
-    let binding_clone: Arc<dyn HigherOrderBinding> = binding.clone();
-    let producer_binding: Arc<dyn ProducerBinding> = binding.clone();
+    // Weak captures break the producer-build Arc cycle (see `switch_map` doc).
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
+    let producer_binding_weak: Weak<dyn ProducerBinding> =
+        Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
+        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
+            core_weak.upgrade(),
+            binding_weak.upgrade(),
+            producer_binding_weak.upgrade(),
+        ) else {
+            return;
+        };
         let state: Arc<Mutex<ExhaustState>> = Arc::new(Mutex::new(ExhaustState::new()));
 
         let state_for_outer = state.clone();
@@ -734,12 +753,21 @@ pub fn merge_map_with_concurrency(
     concurrency: Option<u32>,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    let core_clone = core.clone();
-    let binding_clone: Arc<dyn HigherOrderBinding> = binding.clone();
-    let producer_binding: Arc<dyn ProducerBinding> = binding.clone();
+    // Weak captures break the producer-build Arc cycle (see `switch_map` doc).
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
+    let producer_binding_weak: Weak<dyn ProducerBinding> =
+        Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
+        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
+            core_weak.upgrade(),
+            binding_weak.upgrade(),
+            producer_binding_weak.upgrade(),
+        ) else {
+            return;
+        };
         let state: Arc<Mutex<MergeMapState>> = Arc::new(Mutex::new(MergeMapState::new()));
 
         let state_for_outer = state.clone();

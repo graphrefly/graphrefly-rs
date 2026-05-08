@@ -62,6 +62,6 @@ pub use message::{Message, Messages};
 pub use node::{
     Core, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration, OperatorOp, OperatorOpts,
     PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError, SetPausableModeError,
-    Sink, Subscription, TerminalKind, UpError,
+    Sink, Subscription, TerminalKind, UpError, WeakCore,
 };
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};

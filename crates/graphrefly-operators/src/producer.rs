@@ -19,18 +19,28 @@
 //!       upstream sinks unsubscribe.
 //! ```
 //!
-//! # Reference-cycle note (v1 limitation)
+//! # Reference-cycle discipline (Slice Y, 2026-05-08)
 //!
-//! The build closures registered via
-//! [`ProducerBinding::register_producer_build`] capture `Core::clone()`
-//! so sinks can re-enter Core. This creates a strong-Arc cycle: Core →
-//! binding → build-closure → Core. In tests, drop ordering breaks the
-//! cycle — `drop(runtime)` clears the binding's closure storage, which
-//! drops the captured Core refs. In production bindings (napi-rs / pyo3
-//! / wasm-bindgen), the host runtime owns Core's lifetime and ensures
-//! cleanup at shutdown. v2 may switch to `Weak<Core>` upgrade-on-fire
-//! (requires a `Core::weak_handle()` accessor); deferred to evidence
-//! that the cycle causes user-visible leaks.
+//! Build closures registered via
+//! [`ProducerBinding::register_producer_build`] are stored long-term in
+//! the binding's `producer_builds` registry. To avoid the strong-Arc
+//! cycle `BenchBinding → registry → producer_builds[fn_id] → closure →
+//! strong-Arc<dyn ProducerBinding> → BenchBinding`, factory bodies
+//! (`zip` / `concat` / `race` / `take_until` in `ops_impl.rs` plus
+//! `switch_map` / `exhaust_map` / `merge_map` / `concat_map` in
+//! `higher_order.rs`) capture `WeakCore` and
+//! `Weak<dyn ProducerBinding>` (and `Weak<dyn HigherOrderBinding>`
+//! for the higher-order factories). The build closure upgrades both
+//! on each invocation; if the host `Core` was already dropped, upgrade
+//! returns `None` and the build closure no-ops cleanly.
+//!
+//! Sinks spawned by the build closure capture STRONG refs cloned from
+//! the upgraded weaks. Their lifetime is tied to the producer's active
+//! subscription — `producer_deactivate` on last-subscriber unsubscribe
+//! clears `producer_storage[node_id]`, dropping the upstream
+//! `Subscription`s, which drops the sinks, which drops the strong
+//! captures. So the strong-ref window is bounded by producer-active
+//! state, not by the long-lived `producer_builds` registry.
 
 use std::any::Any;
 use std::sync::Arc;

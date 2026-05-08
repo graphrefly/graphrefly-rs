@@ -301,7 +301,7 @@ impl Registry {
 /// Late delivery is benign: handle IDs are never reused (allocator is
 /// monotonic), so prune-after-Core-drop is a `Map.delete` of an
 /// unknown key.
-pub(crate) type ReleaseTsfn = ThreadsafeFunction<u32, (), u32, Status, true, false, 1>;
+pub(crate) type ReleaseTsfn = ThreadsafeFunction<u32, (), u32, Status, false, false, 1>;
 
 pub(crate) struct BenchBinding {
     pub(crate) registry: Mutex<Registry>,
@@ -453,7 +453,9 @@ impl BindingBoundary for BenchBinding {
                 // is full or the TSFN is closed during shutdown, the
                 // JS-side mirror just doesn't prune for this handle
                 // (benign — handle IDs are never reused).
-                let _status = tsfn.call(Ok(h_u32), ThreadsafeFunctionCallMode::NonBlocking);
+                // CalleeHandled=false (Slice Y) — `call(value)` takes
+                // plain `u32`, not `Result<u32>`.
+                let _status = tsfn.call(h_u32, ThreadsafeFunctionCallMode::NonBlocking);
             }
         }
     }
@@ -627,14 +629,16 @@ fn encode_message(m: Message) -> (u32, u32) {
 
 /// TSFN type for sinks. Single arg `Vec<u32>` (flat-encoded batch); JS
 /// callback returns nothing (`()` → undefined). `MaxQueueSize = 1`
-/// per D077 sync-bridge invariant.
-type SinkTsfn = ThreadsafeFunction<Vec<u32>, (), Vec<u32>, Status, true, false, 1>;
+/// per D077 sync-bridge invariant. `CalleeHandled = false` (Slice Y) —
+/// JS receives `(value)` directly, matching the typed
+/// `Function<Vec<u32>, ()>` signature.
+type SinkTsfn = ThreadsafeFunction<Vec<u32>, (), Vec<u32>, Status, false, false, 1>;
 
 fn build_sink_tsfn(callback: Function<Vec<u32>, ()>) -> Result<Arc<SinkTsfn>> {
     let tsfn = callback
         .build_threadsafe_function::<Vec<u32>>()
         .max_queue_size::<1>()
-        .callee_handled::<true>()
+        .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<Vec<u32>>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
@@ -647,8 +651,9 @@ fn build_sink_tsfn(callback: Function<Vec<u32>, ()>) -> Result<Arc<SinkTsfn>> {
 /// Symmetric with `operator_bindings::bridge_sync` but for `()` return.
 fn bridge_sync_unit(tsfn: &Arc<SinkTsfn>, payload: Vec<u32>) {
     let (tx, rx) = sync_channel::<Result<()>>(1);
+    // CalleeHandled=false → plain `T` arg (no Result wrapping).
     let status = tsfn.call_with_return_value(
-        Ok(payload),
+        payload,
         ThreadsafeFunctionCallMode::Blocking,
         move |result: Result<()>, _env: Env| -> Result<()> {
             let _ = tx.send(result);
@@ -1028,7 +1033,7 @@ impl BenchCore {
         let tsfn = callback
             .build_threadsafe_function::<u32>()
             .max_queue_size::<1>()
-            .callee_handled::<true>()
+            .callee_handled::<false>()
             .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
         *self.binding.release_callback.lock() = Some(Arc::new(tsfn));
         Ok(())
@@ -1051,6 +1056,37 @@ impl BenchCore {
         if let Some(sub) = sub {
             let core = self.core.clone();
             run_blocking(core, move || drop(sub)).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain all retained subscriptions on a tokio blocking thread —
+    /// JS code MUST `await core.dispose()` before letting `BenchCore`
+    /// drop. Closes the BenchCore::Drop deadlock vector (Slice Y):
+    /// without `dispose`, GC of the napi instance runs `Drop` on the
+    /// JS thread; each `Subscription::Drop` blocks on `Core`'s mutex;
+    /// if a tokio blocking-pool thread is mid-wave (parked in a TSFN
+    /// bridge waiting for libuv to pump a JS-callback result), the JS
+    /// thread waiting for the mutex stalls libuv → TSFN never
+    /// delivers → tokio thread blocks forever. Calling `dispose` first
+    /// ships the subscription drop work onto a tokio blocking thread
+    /// (which is allowed to block on the mutex while the JS thread
+    /// stays free to pump libuv).
+    ///
+    /// Idempotent: subsequent calls are no-ops once the vec is drained.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        // Take the entire Vec out on the calling thread (cheap — Vec
+        // pointer swap). Ship into spawn_blocking for drop so each
+        // Subscription's Drop runs on a tokio thread that can block
+        // on Core's mutex without stalling libuv.
+        let subs: Vec<Option<Subscription>> = {
+            let mut guard = self.subscriptions.lock();
+            std::mem::take(&mut *guard)
+        };
+        if !subs.is_empty() {
+            let core = self.core.clone();
+            run_blocking(core, move || drop(subs)).await?;
         }
         Ok(())
     }

@@ -1336,6 +1336,40 @@ pub struct Core {
     pub(crate) wave_owner: Arc<ReentrantMutex<()>>,
 }
 
+/// Weak handle to a [`Core`] — does not contribute to strong refcount.
+///
+/// Constructed via [`Core::weak_handle`]; upgraded back to a strong
+/// [`Core`] via [`WeakCore::upgrade`]. Used by long-lived binding-stored
+/// closures (notably `ProducerBuildFn`s registered via
+/// [`graphrefly_operators::ProducerBinding::register_producer_build`])
+/// to break the BenchBinding → registry → closure → strong-Core cycle
+/// that would otherwise leak the entire graph state when a `BenchCore`
+/// drops with active producer registrations.
+///
+/// Upgrade on each invocation; if the host `Core` was already dropped,
+/// `upgrade()` returns `None` and the closure should no-op (the host
+/// is being torn down, no work to do).
+#[derive(Clone)]
+pub struct WeakCore {
+    state: Weak<Mutex<CoreState>>,
+    binding: Weak<dyn BindingBoundary>,
+    wave_owner: Weak<ReentrantMutex<()>>,
+}
+
+impl WeakCore {
+    /// Try to upgrade back to a strong [`Core`]. Returns `None` if the
+    /// host `Core`'s strong count has reached zero (i.e. the host
+    /// `BenchCore` / equivalent owner was dropped).
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Core> {
+        Some(Core {
+            state: self.state.upgrade()?,
+            binding: self.binding.upgrade()?,
+            wave_owner: self.wave_owner.upgrade()?,
+        })
+    }
+}
+
 /// RAII guard that owns an [`OperatorScratch`] until either (a) the
 /// caller `take()`s it for installation, or (b) the guard drops on an
 /// early return / unwind, in which case the scratch's handle retains
@@ -1473,6 +1507,34 @@ impl Core {
     #[must_use]
     pub fn same_dispatcher(&self, other: &Core) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Downgrade to a [`WeakCore`] handle that doesn't contribute to
+    /// strong refcount of the underlying state / binding / wave_owner.
+    ///
+    /// Used by binding-stored long-lived closures (e.g.
+    /// `register_producer_build`-stored `ProducerBuildFn`s) to avoid the
+    /// Arc cycle:
+    ///
+    /// ```text
+    /// BenchBinding → registry → producer_builds[fn_id]
+    ///   → closure → strong Arc<dyn _Binding> → BenchBinding
+    /// ```
+    ///
+    /// Closures hold `WeakCore` and `Weak<dyn _Binding>` instead, then
+    /// upgrade-on-fire (returning early if either weak is dangling —
+    /// indicating the host BenchCore was already dropped). Upgraded
+    /// strong refs live only for the build closure's invocation; sinks
+    /// the build closure spawns close over those upgraded strongs and
+    /// stay alive only while the producer is active (cleared via
+    /// `producer_deactivate` on last-subscriber unsubscribe).
+    #[must_use]
+    pub fn weak_handle(&self) -> WeakCore {
+        WeakCore {
+            state: Arc::downgrade(&self.state),
+            binding: Arc::downgrade(&self.binding),
+            wave_owner: Arc::downgrade(&self.wave_owner),
+        }
     }
 
     /// Configure the Core-global cap on pause replay buffer length. When set,
