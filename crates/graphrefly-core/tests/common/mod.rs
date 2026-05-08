@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
-    Subscription,
+    BindingBoundary, CleanupTrigger, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message,
+    NodeId, Sink, Subscription,
 };
 
 #[derive(Clone, Debug)]
@@ -73,6 +73,30 @@ type DynamicFnImpl =
 type RawFnImpl = Arc<dyn Fn(&[DepBatch]) -> FnResult + Send + Sync>;
 type EqualsImpl = Arc<dyn Fn(&TestValue, &TestValue) -> bool + Send + Sync>;
 
+/// Slice E2: cleanup closure stored binding-side per D055. Each slot is
+/// optional — a fn that returns `{ on_deactivation: Some(_), .. }` only
+/// gets `OnDeactivation` fires; the other triggers are no-ops.
+pub type CleanupClosure = Arc<dyn Fn() + Send + Sync>;
+
+/// Slice E2: per-node cleanup spec held in the binding's `node_ctx` map.
+/// `current_cleanup` is overwritten on each `invoke_fn` return; per D059,
+/// `OnDeactivation` clears it after firing.
+#[derive(Clone, Default)]
+pub struct TestNodeFnCleanup {
+    pub on_rerun: Option<CleanupClosure>,
+    pub on_deactivation: Option<CleanupClosure>,
+    pub on_invalidate: Option<CleanupClosure>,
+}
+
+/// Slice E2: binding-side per-node ctx state per D055. `store` persists
+/// across deactivation by default (R2.4.6); `current_cleanup` follows the
+/// per-trigger lifecycle in the design doc §6.3.
+#[derive(Default)]
+pub struct NodeCtxState {
+    pub store: HashMap<String, TestValue>,
+    pub current_cleanup: Option<TestNodeFnCleanup>,
+}
+
 struct RegistryInner {
     next_handle: u64,
     next_fn_id: u64,
@@ -92,6 +116,24 @@ struct RegistryInner {
 
 pub struct TestBinding {
     inner: Mutex<RegistryInner>,
+    /// Slice E2 (D055): per-node ctx state. Lazily populated on first
+    /// `register_cleanup` for that node. Operator nodes never get an entry
+    /// (operator dispatch routes via `project_each` etc., not `invoke_fn`).
+    node_ctx: Mutex<HashMap<NodeId, NodeCtxState>>,
+    /// Slice E2 recorder: `(NodeId, CleanupTrigger)` in fire order. Tests
+    /// assert against this to verify cleanup hooks fired at the right
+    /// lifecycle moments.
+    cleanup_calls: Mutex<Vec<(NodeId, CleanupTrigger)>>,
+    /// Slice E2 recorder: nodes that received `wipe_ctx`, in fire order.
+    wipe_calls: Mutex<Vec<NodeId>>,
+    /// Slice E2 panic-policy switch: when `true`, `cleanup_for` propagates
+    /// closure panics out of the FFI call (used by D060 drain-don't-short-
+    /// circuit tests). Default `false`: panics are caught binding-side and
+    /// recorded in `cleanup_panics` instead.
+    propagate_cleanup_panics: Mutex<bool>,
+    /// Slice E2 recorder: `(NodeId, CleanupTrigger)` for each cleanup
+    /// closure that panicked while `propagate_cleanup_panics == false`.
+    cleanup_panics: Mutex<Vec<(NodeId, CleanupTrigger)>>,
 }
 
 impl TestBinding {
@@ -109,6 +151,11 @@ impl TestBinding {
                 raw_fns: HashMap::new(),
                 custom_equals: HashMap::new(),
             }),
+            node_ctx: Mutex::new(HashMap::new()),
+            cleanup_calls: Mutex::new(Vec::new()),
+            wipe_calls: Mutex::new(Vec::new()),
+            propagate_cleanup_panics: Mutex::new(false),
+            cleanup_panics: Mutex::new(Vec::new()),
         })
     }
 
@@ -222,6 +269,97 @@ impl TestBinding {
         inner.raw_fns.insert(id, Arc::new(f));
         id
     }
+
+    // -----------------------------------------------------------------
+    // Slice E2 cleanup-hook test infrastructure (per session doc §8 phase 5)
+    // -----------------------------------------------------------------
+
+    /// Imperatively install a cleanup spec for `node_id`. In a real binding
+    /// this would be the data the user fn returns from `invoke_fn`; the
+    /// `TestBinding` lets tests register cleanups directly without
+    /// threading them through fn return values. Overwrites any prior
+    /// `current_cleanup` for the node (mirrors invoke_fn-on-replace).
+    pub fn register_cleanup(&self, node_id: NodeId, spec: TestNodeFnCleanup) {
+        let mut ctx = self.node_ctx.lock().expect("node_ctx lock");
+        let entry = ctx.entry(node_id).or_default();
+        entry.current_cleanup = Some(spec);
+    }
+
+    /// Read a key from `node_id`'s ctx store. Returns `None` if the key
+    /// doesn't exist or the node has no ctx state.
+    pub fn store_get(&self, node_id: NodeId, key: &str) -> Option<TestValue> {
+        self.node_ctx
+            .lock()
+            .expect("node_ctx lock")
+            .get(&node_id)
+            .and_then(|s| s.store.get(key).cloned())
+    }
+
+    /// Write a key into `node_id`'s ctx store. Lazily creates the node's
+    /// `NodeCtxState` entry if absent.
+    pub fn store_set(&self, node_id: NodeId, key: &str, value: TestValue) {
+        self.node_ctx
+            .lock()
+            .expect("node_ctx lock")
+            .entry(node_id)
+            .or_default()
+            .store
+            .insert(key.to_string(), value);
+    }
+
+    /// Whether `node_id` currently has a `NodeCtxState` entry. After
+    /// `wipe_ctx`, this returns `false` (the entry is fully removed).
+    pub fn has_ctx(&self, node_id: NodeId) -> bool {
+        self.node_ctx
+            .lock()
+            .expect("node_ctx lock")
+            .contains_key(&node_id)
+    }
+
+    /// Snapshot of cleanup-trigger fires recorded by `cleanup_for`, in
+    /// fire order. Tests assert against this to verify lifecycle wiring.
+    pub fn cleanup_calls(&self) -> Vec<(NodeId, CleanupTrigger)> {
+        self.cleanup_calls
+            .lock()
+            .expect("cleanup_calls lock")
+            .clone()
+    }
+
+    /// Filter `cleanup_calls()` to a single trigger.
+    pub fn cleanup_calls_for(&self, trigger: CleanupTrigger) -> Vec<NodeId> {
+        self.cleanup_calls()
+            .into_iter()
+            .filter_map(|(n, t)| (t == trigger).then_some(n))
+            .collect()
+    }
+
+    /// Snapshot of wipe-fire targets recorded by `wipe_ctx`, in fire order.
+    pub fn wipe_calls(&self) -> Vec<NodeId> {
+        self.wipe_calls.lock().expect("wipe_calls lock").clone()
+    }
+
+    /// Toggle the panic-propagation policy for `cleanup_for`. When `true`,
+    /// closure panics propagate out of the FFI call (Core's drain catches
+    /// them per D060 to prevent short-circuit). When `false` (default),
+    /// the binding catches panics internally and records them in
+    /// `cleanup_panics` — matches D060's "binding-side panic isolation"
+    /// recommendation for production bindings.
+    pub fn set_propagate_cleanup_panics(&self, on: bool) {
+        *self
+            .propagate_cleanup_panics
+            .lock()
+            .expect("propagate_cleanup_panics lock") = on;
+    }
+
+    /// Snapshot of cleanup closures that panicked while caught binding-side
+    /// (i.e. `propagate_cleanup_panics == false`). Empty when propagation
+    /// is on (panics propagate to Core's drain catch).
+    pub fn cleanup_panics(&self) -> Vec<(NodeId, CleanupTrigger)> {
+        self.cleanup_panics
+            .lock()
+            .expect("cleanup_panics lock")
+            .clone()
+    }
 }
 
 impl BindingBoundary for TestBinding {
@@ -327,6 +465,74 @@ impl BindingBoundary for TestBinding {
     fn retain_handle(&self, handle: HandleId) {
         let mut inner = self.inner.lock().expect("registry lock");
         *inner.refcounts.entry(handle).or_insert(0) += 1;
+    }
+
+    fn cleanup_for(&self, node_id: NodeId, trigger: CleanupTrigger) {
+        // Always record the trigger fire — even if no closure is registered
+        // — so tests can assert "Core called cleanup_for at this lifecycle
+        // moment" independently of whether the binding has user state.
+        self.cleanup_calls
+            .lock()
+            .expect("cleanup_calls lock")
+            .push((node_id, trigger));
+
+        // Resolve the matching closure under the node_ctx lock, CLONE it
+        // out, then DROP the lock before invoking — per the D060 binding-
+        // side discipline (avoid deadlock if user closure re-enters the
+        // binding's high-level API which may re-acquire node_ctx).
+        let closure: Option<CleanupClosure> = {
+            let mut ctx = self.node_ctx.lock().expect("node_ctx lock");
+            let entry = ctx.get_mut(&node_id);
+            entry.and_then(|state| {
+                let cleanup = state.current_cleanup.as_ref()?;
+                let c = match trigger {
+                    CleanupTrigger::OnRerun => cleanup.on_rerun.clone(),
+                    CleanupTrigger::OnDeactivation => cleanup.on_deactivation.clone(),
+                    CleanupTrigger::OnInvalidate => cleanup.on_invalidate.clone(),
+                };
+                // D059: clear current_cleanup after OnDeactivation fires
+                // (one-shot per activation cycle). The next subscribe +
+                // first invoke_fn will re-register a fresh spec.
+                if matches!(trigger, CleanupTrigger::OnDeactivation) {
+                    state.current_cleanup = None;
+                }
+                c
+            })
+        };
+        let Some(closure) = closure else {
+            return;
+        };
+
+        // D060: bindings own panic policy. By default, catch panics
+        // internally (record them so tests can verify the closure ran +
+        // panicked); switch to propagation when a test wants to exercise
+        // Core's drain-don't-short-circuit catch_unwind.
+        let propagate = *self
+            .propagate_cleanup_panics
+            .lock()
+            .expect("propagate_cleanup_panics lock");
+        if propagate {
+            closure();
+        } else {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closure()));
+            if result.is_err() {
+                self.cleanup_panics
+                    .lock()
+                    .expect("cleanup_panics lock")
+                    .push((node_id, trigger));
+            }
+        }
+    }
+
+    fn wipe_ctx(&self, node_id: NodeId) {
+        self.wipe_calls
+            .lock()
+            .expect("wipe_calls lock")
+            .push(node_id);
+        self.node_ctx
+            .lock()
+            .expect("node_ctx lock")
+            .remove(&node_id);
     }
 }
 

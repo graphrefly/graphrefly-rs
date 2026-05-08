@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GraphReFly Rust Port — Review Site</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="logo">⚙</span>
+      <span>GraphReFly Rust Port — Review</span>
+    </div>
+    <div class="topbar-info">
+      <span id="modalCount">0 diagrams open</span>
+      <button id="closeAllModals" title="Close all open diagrams">Close all</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-section">
+        <h3>Reports</h3>
+        <ul id="reportList"></ul>
+      </div>
+      <div class="sidebar-section">
+        <h3>Flowcharts <span class="muted">(canonical)</span></h3>
+        <p class="hint">Click any <code>[F<i>x.y</i>]</code> link in a report to open that diagram in a draggable modal. Multiple modals can stay open at once.</p>
+        <div id="diagramIndex"></div>
+      </div>
+      <div class="sidebar-section">
+        <h3>Tips</h3>
+        <ul class="tips">
+          <li>Modal headers drag the window.</li>
+          <li>Mouse-wheel inside a modal pans/zooms the diagram.</li>
+          <li><kbd>Esc</kbd> closes the focused modal.</li>
+          <li>Drag the bottom-right corner to resize.</li>
+        </ul>
+      </div>
+    </aside>
+
+    <main class="content" id="content">
+      <div id="reportContent" class="markdown-body">
+        <p class="loading">Loading…</p>
+      </div>
+    </main>
+  </div>
+
+  <div id="modalRoot"></div>
+
+  <!-- file:// guard — Chrome blocks fetch() from file:// origins. Show clear instructions
+       instead of letting CORS errors pile up in the console. -->
+  <script>
+    (function () {
+      if (location.protocol !== 'file:') return;
+
+      document.getElementById('reportContent').innerHTML =
+        '<h1 style="margin-top:0">⚠ Open this site through a static server</h1>' +
+        '<p>Browsers block <code>fetch()</code> from <code>file://</code> origins, so this' +
+        ' site can\'t load reports or flowcharts when opened by double-clicking' +
+        ' <code>index.html</code>.</p>' +
+        '<p>From <code>~/src/graphrefly-rs/</code> run one of these (do <em>not</em>' +
+        ' <code>source</code> the shell script with a leading dot — execute it):</p>' +
+        '<pre>bash docs/review/site/serve.sh        # works without the execute bit\n./docs/review/site/serve.sh            # bundled shortcut\npython3 -m http.server 8765 --directory docs\n\n# then open: http://localhost:8765/review/site/</pre>' +
+        '<p>Or via Claude Code: <code>preview_start</code> with the <code>rust-review</code>' +
+        ' launch profile in <code>.claude/launch.json</code>.</p>' +
+        '<p style="color:#94a3b8">Once running over <code>http://</code> this banner goes' +
+        ' away and the site works as designed.</p>';
+      document.getElementById('modalCount').textContent = 'serve via http to use';
+
+      // Stop right here — do NOT load mermaid / app.js, they would only flood the
+      // console with cross-origin fetch errors.
+      throw new Error('file:// origin — see banner');
+    })();
+  </script>
+
+  <!-- libraries (skipped under file:// thanks to the throw above) -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
+  <script src="js/app.js" defer></script>
+</body>
+</html>

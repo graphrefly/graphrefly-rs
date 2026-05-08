@@ -3,51 +3,134 @@
 //! Build profile: only enabled with the `tracing` feature (default), which
 //! pulls in `graphrefly-core`.
 //!
-//! # Design notes
+//! # Design notes — Option E (post-QA refactor 2026-05-07)
 //!
-//! - **Value registry on the Rust side.** For v0 FFI bench, we move the
-//!   value registry into Rust (vs. the binding-side TS `valueRegistry` in
-//!   the prototype). This avoids the Send+Sync conflict between
-//!   napi-rs `JsFunction` (`!Send`) and the Core's `BindingBoundary: Send + Sync`.
-//!   Trade-off: every emit serializes the value (i32 or string) through napi
-//!   into a Rust handle. That's the FFI cost we're measuring.
+//! - **Async napi methods.** Every `#[napi]` method that touches Core is
+//!   `async fn`, returning a JS `Promise` automatically via napi-rs's
+//!   `tokio_rt` integration. Inside, the body uses
+//!   [`napi::tokio_runtime::spawn_blocking`] to run Core's sync wave
+//!   engine on a tokio blocking-pool thread. The JS thread stays free
+//!   to pump libuv during `await`, so TSFN-backed JS callbacks (in
+//!   [`crate::operator_bindings`]) can be delivered without deadlock.
 //!
-//! - **Pre-baked derived fns.** v0 supports a small set of built-in fn types
-//!   (`Identity`, `Add`, `Mul`) registered as Rust closures. Real JS
-//!   callbacks via TSFN come later — they're async (event-loop scheduled),
-//!   which would conflate "true FFI cost" with "TSFN scheduling overhead."
+//! - **Rust core stays sync.** The `tokio::task::spawn_blocking` boundary
+//!   is the ONLY place tokio enters; everything inside the closure (and
+//!   thus all of `graphrefly-core` / `graphrefly-operators` /
+//!   `graphrefly-graph`) runs synchronously. CLAUDE.md invariant 4
+//!   ("no async runtime in Core") preserved.
 //!
-//! - **Subscribe via TSFN.** Subscribe takes a JS callback; we wrap it in
-//!   a `ThreadsafeFunction` so it can be called from any thread. For v0
-//!   bench we only test single-thread; cross-Worker scenarios use `Arc<Core>`.
+//! - **Value registry on the Rust side.** Same as before — primitives
+//!   intern via `Registry`. Switched to `parking_lot::Mutex` (M1 fix:
+//!   no poisoning; matches `producer_storage`'s flavor).
+//!
+//! - **Pre-baked derived fns.** `BuiltinFn` / `BuiltinBatchFn` enums.
+//!   Real JS-callback fns live on `BenchOperators` (TSFN-backed; M3
+//!   napi-rs operator parity).
+//!
+//! - **Thread-local Core for producer dispatch.** [`CURRENT_CORE`] is
+//!   set inside each `spawn_blocking` closure via a RAII guard so
+//!   `BindingBoundary::invoke_fn`'s producer-dispatch branch can build a
+//!   `ProducerCtx` against the calling thread's `Core` clone. Replaces
+//!   the old `worker::WORKER_CORE` thread-local.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::RefCell;
+use std::sync::{Arc, OnceLock};
 
 use graphrefly_core::{
     BindingBoundary, Core, DepBatch, EqualsMode, FnEmission, FnId, FnResult, HandleId, LockId,
     NodeId, Subscription,
 };
+use napi::bindgen_prelude::*;
 use napi::Error as NapiError;
 use napi_derive::napi;
+use parking_lot::Mutex;
 use smallvec::SmallVec;
+
+#[cfg(feature = "operators")]
+use graphrefly_operators::producer::{
+    default_producer_deactivate, ProducerCtx, ProducerNodeState, ProducerStorage,
+};
+
+// ---------------------------------------------------------------------------
+// Thread-local Core (replaces worker::WORKER_CORE)
+//
+// Set inside each `spawn_blocking` closure; cleared by the RAII guard at
+// scope exit. `BindingBoundary::invoke_fn`'s producer-dispatch branch
+// reads it to construct `ProducerCtx::new(node_id, &core, &storage)`
+// without forcing the binding to hold its own `Core` clone (which would
+// create an Arc cycle with `Core.binding`).
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static CURRENT_CORE: RefCell<Option<Core>> = const { RefCell::new(None) };
+}
+
+/// Returns a clone of the current thread's `Core`, if one was installed
+/// via [`CoreThreadGuard::set`]. Returns `None` if called from outside a
+/// `spawn_blocking` closure (e.g., directly from the JS thread).
+#[cfg(feature = "operators")]
+pub(crate) fn current_core() -> Option<Core> {
+    CURRENT_CORE.with(|c| c.borrow().clone())
+}
+
+/// RAII guard for the thread-local `Core`. Sets on construction; clears
+/// on Drop. Use at the top of every `spawn_blocking` closure that runs
+/// Core operations to make `current_core()` valid for the duration of
+/// the closure.
+pub(crate) struct CoreThreadGuard;
+
+impl CoreThreadGuard {
+    #[must_use]
+    pub(crate) fn set(core: Core) -> Self {
+        CURRENT_CORE.with(|c| *c.borrow_mut() = Some(core));
+        Self
+    }
+}
+
+impl Drop for CoreThreadGuard {
+    fn drop(&mut self) {
+        CURRENT_CORE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Static no-op sink shared across all `subscribe_noop` calls (M9 fix
+/// — was per-call `Arc::new(|_| {})` allocation).
+fn noop_sink() -> graphrefly_core::Sink {
+    static NOOP: OnceLock<graphrefly_core::Sink> = OnceLock::new();
+    NOOP.get_or_init(|| Arc::new(|_| {})).clone()
+}
+
+/// Spawn a sync closure on the napi-rs tokio runtime's blocking pool,
+/// installing the thread-local `Core` for the duration. Returns the
+/// closure's result via the awaited JoinHandle.
+///
+/// Centralizes (a) the `CoreThreadGuard` install, (b) the `JoinError`
+/// → `napi::Error` conversion, (c) the `Result<T>` flattening.
+pub(crate) async fn run_blocking<F, R>(core: Core, f: F) -> Result<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    spawn_blocking(move || {
+        let _guard = CoreThreadGuard::set(core);
+        f()
+    })
+    .await
+    .map_err(|e| NapiError::from_reason(format!("worker thread panicked: {e}")))
+}
 
 // ---------------------------------------------------------------------------
 // Value registry — owned by the Rust side for v0 FFI bench.
-// In production, the registry lives in TS to enable WeakMap-based identity
-// dedup. For bench purposes (primitives only), Rust-side intern is simpler
-// and faster.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum BenchValue {
+pub(crate) enum BenchValue {
     Int(i32),
     #[allow(dead_code)] // reserved for v1 string-value benchmarks
     Str(String),
 }
 
 /// User-side emission shape for the FnResult::Batch builtin fn registry.
-/// Distinct from `graphrefly_core::FnEmission` because builtin fns emit
-/// `BenchValue`s; the binding interns them into HandleIds at fire time.
 #[derive(Clone, Debug)]
 enum BenchEmission {
     Data(BenchValue),
@@ -58,17 +141,30 @@ enum BenchEmission {
 type SingleFnImpl = Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync>;
 type BatchFnImpl = Arc<dyn Fn(&[DepBatch], &Registry) -> Vec<BenchEmission> + Send + Sync>;
 
-struct Registry {
+pub(crate) struct Registry {
     next_handle: u64,
     values: ahash::AHashMap<HandleId, BenchValue>,
     primitive_index: ahash::AHashMap<BenchValue, HandleId>,
-    refcounts: ahash::AHashMap<HandleId, u64>,
-    /// Pre-baked single-emission fn implementations (`FnResult::Data`).
-    fns: ahash::AHashMap<FnId, SingleFnImpl>,
-    /// Pre-baked batch fn implementations — fire returns `FnResult::Batch`
-    /// with multiple emissions per wave. Models `actions.down(msgs)`.
-    batch_fns: ahash::AHashMap<FnId, BatchFnImpl>,
-    next_fn_id: u64,
+    pub(crate) refcounts: ahash::AHashMap<HandleId, u64>,
+    pub(crate) fns: ahash::AHashMap<FnId, SingleFnImpl>,
+    pub(crate) batch_fns: ahash::AHashMap<FnId, BatchFnImpl>,
+    pub(crate) next_fn_id: u64,
+    pub(crate) projectors: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> HandleId + Send + Sync>>,
+    pub(crate) predicates: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> bool + Send + Sync>>,
+    pub(crate) folders:
+        ahash::AHashMap<FnId, Arc<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>>,
+    pub(crate) equalses:
+        ahash::AHashMap<FnId, Arc<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>>,
+    pub(crate) pairwise_packers:
+        ahash::AHashMap<FnId, Arc<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>>,
+    pub(crate) packers: ahash::AHashMap<FnId, Arc<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>>,
+    pub(crate) higher_order_projectors:
+        ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> NodeId + Send + Sync>>,
+    /// Producer build closures, looked up by `BenchBinding::invoke_fn`
+    /// when a producer node fires. The closure receives a `ProducerCtx`
+    /// built against the thread-local `current_core()`.
+    #[cfg(feature = "operators")]
+    pub(crate) producer_builds: ahash::AHashMap<FnId, Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>>,
 }
 
 impl Registry {
@@ -81,10 +177,19 @@ impl Registry {
             fns: ahash::AHashMap::new(),
             batch_fns: ahash::AHashMap::new(),
             next_fn_id: 1,
+            projectors: ahash::AHashMap::new(),
+            predicates: ahash::AHashMap::new(),
+            folders: ahash::AHashMap::new(),
+            equalses: ahash::AHashMap::new(),
+            pairwise_packers: ahash::AHashMap::new(),
+            packers: ahash::AHashMap::new(),
+            higher_order_projectors: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            producer_builds: ahash::AHashMap::new(),
         }
     }
 
-    fn intern(&mut self, value: BenchValue) -> HandleId {
+    pub(crate) fn intern(&mut self, value: BenchValue) -> HandleId {
         if let Some(&h) = self.primitive_index.get(&value) {
             *self.refcounts.entry(h).or_insert(0) += 1;
             return h;
@@ -97,8 +202,28 @@ impl Registry {
         h
     }
 
-    fn deref(&self, h: HandleId) -> Option<BenchValue> {
+    pub(crate) fn deref(&self, h: HandleId) -> Option<BenchValue> {
         self.values.get(&h).cloned()
+    }
+
+    /// True if `h` is a known handle (has a value mapping). Used by
+    /// TSFN closures (C2 / H-01 fix — phantom registry entries on
+    /// unknown JS-returned HandleIds).
+    pub(crate) fn contains(&self, h: HandleId) -> bool {
+        self.values.contains_key(&h)
+    }
+
+    /// Validate `h` exists, then bump its refcount. Returns false if
+    /// `h` is unknown — caller should panic with a JS-bug diagnostic.
+    /// Matches `BindingBoundary::retain_handle`'s pattern
+    /// (`.entry(h).or_insert(0) += 1`) for known handles.
+    /// (C2 / H-01 / H-02 fix — single-source-of-truth retain pattern.)
+    pub(crate) fn validate_and_retain(&mut self, h: HandleId) -> bool {
+        if !self.values.contains_key(&h) {
+            return false;
+        }
+        *self.refcounts.entry(h).or_insert(0) += 1;
+        true
     }
 
     fn release(&mut self, h: HandleId) {
@@ -117,35 +242,59 @@ impl Registry {
     }
 }
 
-struct BenchBinding {
-    registry: Mutex<Registry>,
+pub(crate) struct BenchBinding {
+    pub(crate) registry: Mutex<Registry>,
+    /// `ProducerStorage` for `ProducerBinding` impl. Used by zip/concat/
+    /// race/take_until and the higher-order family.
+    #[cfg(feature = "operators")]
+    pub(crate) producer_storage: ProducerStorage,
 }
 
 impl BenchBinding {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Registry::new()),
+            #[cfg(feature = "operators")]
+            producer_storage: Arc::new(Mutex::new(
+                ahash::AHashMap::<NodeId, ProducerNodeState>::new(),
+            )),
         })
     }
 }
 
 impl BindingBoundary for BenchBinding {
-    fn invoke_fn(&self, _: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
-        // Try batch fns first — they receive `&[DepBatch]` directly and may
-        // emit multiple values per fire (FnResult::Batch).
-        //
-        // Single registry lock acquisition across the whole batch-fn fire:
-        // fn lookup + value deref (via &Registry passed to the closure) +
-        // emission intern. Eliminates the prior 3-acquisition TOCTOU window
-        // where another thread could mutate `primitive_index` between phases.
-        // No re-entrancy possible: the closure only reads via `&Registry`
-        // (no `&mut`), and Core never re-enters the binding mid-fire.
+    /// Spec: R5.7 (operator-fn dispatch shape) + R1.3.6.b (multi-emit
+    /// batch via `FnResult::Batch`). Producer dispatch (D031) checked
+    /// FIRST when `feature = "operators"` is on, so producer fn_ids
+    /// don't fall through to the batch_fns / fns lookups.
+    fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        // Producer dispatch (Slice D, D031) — try first since producer
+        // nodes have empty dep_data and the build closure is keyed by
+        // FnId. Only relevant when the operators feature is on.
+        #[cfg(feature = "operators")]
+        {
+            let build = {
+                let reg = self.registry.lock();
+                reg.producer_builds.get(&fn_id).cloned()
+            };
+            if let Some(build) = build {
+                let core = current_core().expect(
+                    "invariant: producer fn fires from inside a `spawn_blocking` closure that \
+                     installed the thread-local Core via CoreThreadGuard — current_core() must be Some",
+                );
+                let ctx = ProducerCtx::new(_node_id, &core, &self.producer_storage);
+                build(ctx);
+                return FnResult::Noop { tracked: None };
+            }
+        }
+
+        // Try batch fns first (single-emission path follows).
         let batch_f = {
-            let reg = self.registry.lock().expect("registry lock");
+            let reg = self.registry.lock();
             reg.batch_fns.get(&fn_id).cloned()
         };
         if let Some(f) = batch_f {
-            let mut reg = self.registry.lock().expect("registry lock");
+            let mut reg = self.registry.lock();
             let emissions = f(dep_data, &reg);
             let converted: SmallVec<[FnEmission; 2]> = emissions
                 .into_iter()
@@ -161,9 +310,8 @@ impl BindingBoundary for BenchBinding {
             };
         }
 
-        // Single-emission path: latest-value-per-dep, returns at most one
-        // FnResult::Data (or FnResult::Noop).
-        let reg = self.registry.lock().expect("registry lock");
+        // Single-emission path.
+        let reg = self.registry.lock();
         let f = reg
             .fns
             .get(&fn_id)
@@ -180,7 +328,7 @@ impl BindingBoundary for BenchBinding {
         drop(reg);
         match f(&dep_values) {
             Some(v) => {
-                let h = self.registry.lock().expect("registry lock").intern(v);
+                let h = self.registry.lock().intern(v);
                 FnResult::Data {
                     handle: h,
                     tracked: None,
@@ -190,89 +338,219 @@ impl BindingBoundary for BenchBinding {
         }
     }
 
-    fn custom_equals(&self, _: FnId, a: HandleId, b: HandleId) -> bool {
-        a == b
+    /// Spec: R5.5 (custom-equals semantics) + R1.3.2.d (per-wave
+    /// equals coalescing — Slice G). Falls back to identity-equals
+    /// (`HandleId u64` compare) when no custom closure is registered;
+    /// otherwise dispatches to the closure stored by
+    /// `OperatorBinding::register_equals` or
+    /// `BenchOperators::register_state_int_with_custom_equals`.
+    fn custom_equals(&self, fn_id: FnId, a: HandleId, b: HandleId) -> bool {
+        let f = {
+            let reg = self.registry.lock();
+            reg.equalses.get(&fn_id).cloned()
+        };
+        match f {
+            Some(closure) => closure(a, b),
+            None => a == b,
+        }
     }
 
+    /// Spec: D016 (handle-protocol cleaving plane — Core sees only
+    /// opaque `HandleId` integers; the binding owns the value
+    /// registry). Each `release_handle` pairs with one `retain_handle`
+    /// or `intern` (which sets refcount=1). Refcount→0 evicts both
+    /// `values[h]` and `primitive_index` mapping for that value.
     fn release_handle(&self, h: HandleId) {
-        self.registry.lock().expect("registry lock").release(h);
+        self.registry.lock().release(h);
     }
 
+    /// Spec: D016 (refcount-bump pairing with release_handle).
+    /// Inserts refcount=1 if `h` was unknown — by design, since this
+    /// is called by Core when it takes ownership of a handle returned
+    /// from `project_each` / `pack_tuple` etc., and the closure
+    /// (D020) pre-bumps for the unknown-handle edge case.
     fn retain_handle(&self, h: HandleId) {
-        let mut reg = self.registry.lock().expect("registry lock");
+        let mut reg = self.registry.lock();
         *reg.refcounts.entry(h).or_insert(0) += 1;
+    }
+
+    // -----------------------------------------------------------------
+    // Operator FFI dispatch (Slice C-1 / C-2 / C-3 + Slice E).
+    // -----------------------------------------------------------------
+
+    /// Spec: R5.7 (transform-operator dispatch) + D016 (closure-
+    /// wrapping discipline — Core invokes a `Fn(HandleId) → HandleId`
+    /// closure stored by `OperatorBinding::register_projector`).
+    /// Caller (Core) takes ownership of the returned handle's retain
+    /// share; the TSFN-wrapped closures bump retain via
+    /// `Registry::validate_and_retain` (C2 / C3 fix).
+    #[cfg(feature = "operators")]
+    fn project_each(&self, fn_id: FnId, inputs: &[HandleId]) -> SmallVec<[HandleId; 1]> {
+        let f = {
+            let reg = self.registry.lock();
+            reg.projectors
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown projector fn_id {fn_id:?}"))
+        };
+        inputs.iter().map(|h| f(*h)).collect()
+    }
+
+    /// Spec: R5.7 (filter / takeWhile / find dispatch) + D016. Returns
+    /// per-input bool. No retain-bump (predicate doesn't return a
+    /// handle).
+    #[cfg(feature = "operators")]
+    fn predicate_each(&self, fn_id: FnId, inputs: &[HandleId]) -> SmallVec<[bool; 4]> {
+        let f = {
+            let reg = self.registry.lock();
+            reg.predicates
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown predicate fn_id {fn_id:?}"))
+        };
+        inputs.iter().map(|h| f(*h)).collect()
+    }
+
+    /// Spec: R5.7 (scan / reduce dispatch) + D016. Folds left-to-right
+    /// with `acc` carrying forward; returns each intermediate handle
+    /// (Scan emits each entry; Reduce uses only the last). Caller owns
+    /// retain shares on returned handles (D016).
+    #[cfg(feature = "operators")]
+    fn fold_each(
+        &self,
+        fn_id: FnId,
+        acc: HandleId,
+        inputs: &[HandleId],
+    ) -> SmallVec<[HandleId; 1]> {
+        let f = {
+            let reg = self.registry.lock();
+            reg.folders
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown folder fn_id {fn_id:?}"))
+        };
+        let mut current_acc = acc;
+        let mut results: SmallVec<[HandleId; 1]> = SmallVec::with_capacity(inputs.len());
+        for h in inputs {
+            current_acc = f(current_acc, *h);
+            results.push(current_acc);
+        }
+        results
+    }
+
+    /// Spec: R5.7 (pairwise dispatch) + D016. Returns the binding-side
+    /// handle for the new tuple value `(prev, current)`. Caller owns
+    /// the returned retain share.
+    #[cfg(feature = "operators")]
+    fn pairwise_pack(&self, fn_id: FnId, prev: HandleId, current: HandleId) -> HandleId {
+        let f = {
+            let reg = self.registry.lock();
+            reg.pairwise_packers
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown pairwise packer fn_id {fn_id:?}"))
+        };
+        f(prev, current)
+    }
+
+    /// Spec: D020 (pre-bumped retain). The closure stored at
+    /// `reg.packers[fn_id]` MUST pre-bump the returned handle's retain
+    /// — the TSFN-derived `closure_packer` does this via
+    /// `validate_and_retain`. Used by `OperatorOp::Combine` /
+    /// `WithLatestFrom` and by `ops_impl::zip`. Caller (Core) does NOT
+    /// call `retain_handle` on the returned handle.
+    #[cfg(feature = "operators")]
+    fn pack_tuple(&self, fn_id: FnId, handles: &[HandleId]) -> HandleId {
+        let f = {
+            let reg = self.registry.lock();
+            reg.packers
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown packer fn_id {fn_id:?}"))
+        };
+        f(handles)
+    }
+
+    /// Spec: D031 / D035 (producer lifecycle — Slice D-substrate).
+    /// Fired by Core when a producer node loses its last subscriber;
+    /// the binding drops the per-node entry from `producer_storage`,
+    /// which transitively drops upstream subscriptions via
+    /// `Subscription::Drop`. Fires lock-released per D045.
+    #[cfg(feature = "operators")]
+    fn producer_deactivate(&self, node_id: NodeId) {
+        default_producer_deactivate(&self.producer_storage, node_id);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pre-baked fn variants (v0 bench scope — no JS callbacks)
+// Pre-baked fn variants (v0 bench scope — no JS callbacks).
 // ---------------------------------------------------------------------------
 
-/// Built-in fn shapes selectable by name. Real JS-callback fns come later.
 #[napi(string_enum)]
 pub enum BuiltinFn {
-    /// `f(x) = x` — passthrough; measures pure dispatch with one fn fire.
     Identity,
-    /// `f(x) = x + 1` (Int only) — measures dispatch + simple computation.
     AddOne,
 }
 
-/// Built-in batch fn shapes — fire returns `FnResult::Batch` with one
-/// emission per dep-batch entry (R1.3.6.b multi-emit).
-///
-/// Demonstrates the `actions.down(msgs)` substrate through the napi
-/// boundary. Real JS-callback batch fns require TSFN and come later.
 #[napi(string_enum)]
 pub enum BuiltinBatchFn {
-    /// For each handle in `dep_data[0].data`, emit `value + 1` as a
-    /// `FnEmission::Data`. Demonstrates K-emit-per-fire coalescing through
-    /// the FFI: a 3-emit batch on the source produces a 3-emission Batch
-    /// result, all delivered in the same wave.
     MapAddOneBatch,
-    /// Emit `value * 10` for each input, then a `FnEmission::Complete` —
-    /// demonstrates terminal-in-batch (R1.3.4.a: terminals stop further
-    /// processing within the same Batch).
     MulTenThenComplete,
 }
 
-/// User-side emission shape for the batch surfaces. The kind discriminator
-/// is a string so JS callers don't depend on enum integer values.
-///
-/// - `kind: "data"` — `value` is the i32 payload
-/// - `kind: "complete"` — `value` ignored
-/// - `kind: "error"` — `value` is the i32 error-code payload
-///
-/// Cleaner than mirroring the Rust `FnEmission` tagged union directly: at
-/// the JS layer one struct shape covers all three variants and TypeScript
-/// consumers can narrow on `kind`.
 #[napi(object)]
 pub struct BatchEmissionJs {
     pub kind: String,
     pub value: Option<i32>,
 }
 
-// Note: a `DepBatchJs` napi struct was considered for inspecting per-dep
-// wave state from JS. Dropped because there's no consumer yet — the M3
-// Slice A regression tests live Rust-side via `register_raw_fn` capture.
-// Re-add if a JS-side parity scenario needs to verify R1.3.6.b shape.
-
 // ---------------------------------------------------------------------------
-// JS-facing API: a single `BenchCore` class with the minimum to bench.
+// JS-facing API: `BenchCore` napi class.
+//
+// Per Option E (post-QA refactor 2026-05-07), every method that touches
+// Core is `async fn`. Inside, `run_blocking` (a `napi::tokio_runtime
+// ::spawn_blocking` wrapper) installs the thread-local `Core` via
+// `CoreThreadGuard` and runs the sync work on tokio's blocking pool.
+// JS sees a Promise; libuv on the JS thread is free to drain TSFN ticks
+// fired by operator callbacks during the wave.
 // ---------------------------------------------------------------------------
 
 #[napi]
 pub struct BenchCore {
-    core: Core,
-    binding: Arc<BenchBinding>,
-    /// Holds noop subscriptions so they stay alive for the bench's lifetime.
-    /// Per §10.12, dropping a `Subscription` deregisters it; the bench needs
-    /// nodes activated for the whole run, so we keep them here.
-    subscriptions: Mutex<Vec<Subscription>>,
+    /// Subscriptions retained for activation lifetimes. `None` slots
+    /// represent unsubscribed entries (we don't compact to keep indices
+    /// stable). Drop happens on whatever tokio thread last touches the
+    /// slot; safe because `parking_lot` is non-poisoning.
+    ///
+    /// **Field-declaration order matters (m26 fix):** Rust drops fields
+    /// in declaration order. `subscriptions` is declared FIRST so each
+    /// `Subscription::Drop` (which accesses Core's internal mutex via
+    /// the Subscription's own `Weak<Mutex<CoreState>>`) runs while
+    /// `core` is still fully alive. Reverse order would deactivate
+    /// Core's CoreState (potentially dropping `Arc<dyn BindingBoundary>`
+    /// and triggering `producer_deactivate` chains) before subscriptions
+    /// drop — fragile if Subscription is later refactored to hold a
+    /// strong Arc.
+    pub(crate) subscriptions: Mutex<Vec<Option<Subscription>>>,
+    pub(crate) binding: Arc<BenchBinding>,
+    pub(crate) core: Core,
+}
+
+impl BenchCore {
+    /// Internal accessor — `BenchOperators::from_core` clones the Core
+    /// + binding so the companion class drives the same instance.
+    pub(crate) fn core_clone(&self) -> Core {
+        self.core.clone()
+    }
+
+    pub(crate) fn binding_arc(&self) -> Arc<BenchBinding> {
+        Arc::clone(&self.binding)
+    }
 }
 
 #[napi]
 impl BenchCore {
-    /// Construct a fresh BenchCore wired to a Rust-side value registry.
+    /// Construct a fresh `BenchCore` wired to a Rust-side value registry.
     #[napi(constructor)]
     #[allow(clippy::new_without_default)]
     #[must_use]
@@ -280,188 +558,246 @@ impl BenchCore {
         let binding = BenchBinding::new();
         let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
         Self {
-            core,
-            binding,
             subscriptions: Mutex::new(Vec::new()),
+            binding,
+            core,
         }
     }
 
-    /// Register a state node with an i32 initial value. Returns the node id
-    /// as a u32 (so JS can pass it back without BigInt overhead).
+    // -----------------------------------------------------------------
+    // Sync registry helpers — pure binding-side ops, no Core wave.
+    // Exposed sync because they don't risk libuv-pump deadlock.
+    // -----------------------------------------------------------------
+
+    /// Intern an i32 value; returns its HandleId. Used by JS-side
+    /// adapters to construct fresh handles for operator callback returns
+    /// (e.g., `register_map(src, x => intern_int(deref_int(x) + 1))`).
     #[napi]
-    pub fn register_state_int(&self, initial: i32) -> u32 {
-        let handle = self
-            .binding
-            .registry
-            .lock()
-            .expect("registry lock")
-            .intern(BenchValue::Int(initial));
-        let id = self
-            .core
-            .register_state(handle, false)
-            .expect("invariant: state registration is structurally infallible");
-        u32::try_from(id.raw()).expect("node id exceeds u32")
+    #[must_use]
+    pub fn intern_int(&self, value: i32) -> u32 {
+        let h = self.binding.registry.lock().intern(BenchValue::Int(value));
+        u32::try_from(h.raw()).expect("handle exceeds u32")
     }
 
-    /// Register a state node with sentinel cache (no initial value).
+    /// Dereference a HandleId to its i32 payload. Returns -1 for
+    /// unknown handles or non-Int values (matches `cache_int`'s
+    /// sentinel convention for the bench surface).
     #[napi]
-    pub fn register_state_sentinel(&self) -> u32 {
-        let id = self
-            .core
-            .register_state(graphrefly_core::NO_HANDLE, false)
-            .expect("invariant: state registration is structurally infallible");
-        u32::try_from(id.raw()).expect("node id exceeds u32")
-    }
-
-    /// Register a derived node with a built-in fn shape. `dep_ids` are the
-    /// node ids returned by `register_state*` / `register_derived*`.
-    #[napi]
-    pub fn register_derived(&self, dep_ids: Vec<u32>, builtin: BuiltinFn) -> u32 {
-        let fn_impl: Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync> = match builtin
-        {
-            BuiltinFn::Identity => Arc::new(|deps: &[BenchValue]| deps.first().cloned()),
-            BuiltinFn::AddOne => Arc::new(|deps: &[BenchValue]| match deps.first() {
-                Some(BenchValue::Int(n)) => Some(BenchValue::Int(n + 1)),
-                _ => None,
-            }),
-        };
-        let mut reg = self.binding.registry.lock().expect("registry lock");
-        let fn_id = FnId::new(reg.next_fn_id);
-        reg.next_fn_id += 1;
-        reg.fns.insert(fn_id, fn_impl);
-        drop(reg);
-        let deps: Vec<NodeId> = dep_ids
-            .into_iter()
-            .map(|id| NodeId::new(u64::from(id)))
-            .collect();
-        let id = self
-            .core
-            .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-            .expect("invariant: caller has validated dep ids before calling register_derived");
-        u32::try_from(id.raw()).expect("node id exceeds u32")
-    }
-
-    /// Subscribe a noop sink to a node — required to activate compute nodes.
-    /// The Subscription is retained inside `BenchCore` so it lives for the
-    /// bench's lifetime (per §10.12 RAII semantics). Returns the index in the
-    /// subscriptions vec for tests that want to release one early via
-    /// [`Self::unsubscribe_index`].
-    #[napi]
-    pub fn subscribe_noop(&self, node_id: u32) -> u32 {
-        let sink: graphrefly_core::Sink = Arc::new(|_| {});
-        let sub = self.core.subscribe(NodeId::new(u64::from(node_id)), sink);
-        let mut subs = self.subscriptions.lock().expect("subscriptions lock");
-        let idx = subs.len();
-        subs.push(sub);
-        u32::try_from(idx).expect("subscription index exceeds u32")
-    }
-
-    /// Emit an i32 value on a state node. Single FFI call per emit.
-    #[napi]
-    pub fn emit_int(&self, node_id: u32, value: i32) {
-        let handle = self
-            .binding
-            .registry
-            .lock()
-            .expect("registry lock")
-            .intern(BenchValue::Int(value));
-        self.core.emit(NodeId::new(u64::from(node_id)), handle);
-    }
-
-    /// Read a state node's current cache as i32. Sentinel returns -1 (sentinel
-    /// distinguishable in tests; for bench we always init non-sentinel).
-    #[napi]
-    pub fn cache_int(&self, node_id: u32) -> i32 {
-        let h = self.core.cache_of(NodeId::new(u64::from(node_id)));
-        if h == graphrefly_core::NO_HANDLE {
-            return -1;
-        }
-        let reg = self.binding.registry.lock().expect("registry lock");
+    #[must_use]
+    pub fn deref_int(&self, handle: u32) -> i32 {
+        let h = HandleId::new(u64::from(handle));
+        let reg = self.binding.registry.lock();
         match reg.deref(h) {
             Some(BenchValue::Int(n)) => n,
             _ => -1,
         }
     }
 
-    /// Tight Rust loop: emit `n` times on a state node, no JS call between.
-    /// Measures Rust dispatcher amortized cost. JS divides elapsed by `n`.
+    // -----------------------------------------------------------------
+    // Async Core-touching methods (Promise-returning; non-deadlocking).
+    // -----------------------------------------------------------------
+
+    /// Register a state node with an i32 initial value.
     #[napi]
-    pub fn rust_emit_loop(&self, node_id: u32, n: u32) {
-        let nid = NodeId::new(u64::from(node_id));
-        let mut reg = self.binding.registry.lock().expect("registry lock");
-        // Pre-intern handles to avoid hashing in the hot loop.
-        let handles: Vec<HandleId> = (0..n)
-            .map(|i| reg.intern(BenchValue::Int(i as i32)))
-            .collect();
-        drop(reg);
-        for h in handles {
-            self.core.emit(nid, h);
+    pub async fn register_state_int(&self, initial: i32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let handle = binding.registry.lock().intern(BenchValue::Int(initial));
+            let id = core
+                .register_state(handle, false)
+                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// Register a state node with sentinel cache (no initial value).
+    #[napi]
+    pub async fn register_state_sentinel(&self) -> Result<u32> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let id = core
+                .register_state(graphrefly_core::NO_HANDLE, false)
+                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// Register a derived node with a built-in fn shape.
+    #[napi]
+    pub async fn register_derived(&self, dep_ids: Vec<u32>, builtin: BuiltinFn) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let fn_impl: Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync> =
+                match builtin {
+                    BuiltinFn::Identity => Arc::new(|deps: &[BenchValue]| deps.first().cloned()),
+                    BuiltinFn::AddOne => Arc::new(|deps: &[BenchValue]| match deps.first() {
+                        Some(BenchValue::Int(n)) => Some(BenchValue::Int(n + 1)),
+                        _ => None,
+                    }),
+                };
+            let mut reg = binding.registry.lock();
+            let fn_id = FnId::new(reg.next_fn_id);
+            reg.next_fn_id += 1;
+            reg.fns.insert(fn_id, fn_impl);
+            drop(reg);
+            let deps: Vec<NodeId> = dep_ids
+                .into_iter()
+                .map(|id| NodeId::new(u64::from(id)))
+                .collect();
+            let id = core
+                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// Subscribe a noop sink. Activation may fire fns (including
+    /// JS-callback operators), so this MUST be async.
+    #[napi]
+    pub async fn subscribe_noop(&self, node_id: u32) -> Result<u32> {
+        let core = self.core.clone();
+        // Subscriptions live on `BenchCore`'s `subscriptions` Mutex; we
+        // can't move that ref into spawn_blocking (it's tied to &self).
+        // Instead, build the Subscription inside the closure, ship it
+        // back, and store on the JS-thread side after the spawn_blocking
+        // returns. Subscription is `Send` so this is fine.
+        //
+        // M9 fix: noop sink is a static `OnceLock<Sink>` shared across
+        // all subscribe_noop calls — was per-call `Arc::new(|_| {})`.
+        let sub = run_blocking(core.clone(), move || -> Subscription {
+            core.subscribe(NodeId::new(u64::from(node_id)), noop_sink())
+        })
+        .await?;
+        let mut subs = self.subscriptions.lock();
+        let idx = subs.len();
+        subs.push(Some(sub));
+        u32::try_from(idx).map_err(|_| NapiError::from_reason("subscription index exceeds u32"))
+    }
+
+    /// Drop the subscription at `idx` (releases activation refcount).
+    /// Async because Subscription's Drop locks Core's mutex; running
+    /// on a tokio blocking thread keeps the JS thread free during any
+    /// terminal-cascade work the unsubscribe triggers.
+    #[napi]
+    pub async fn unsubscribe(&self, idx: u32) -> Result<()> {
+        // Take the Subscription out of the slot on the calling thread,
+        // ship it into spawn_blocking for drop. This way the actual
+        // Drop happens on a tokio blocking thread (which is allowed to
+        // block on Core's mutex).
+        let sub = {
+            let mut subs = self.subscriptions.lock();
+            subs.get_mut(idx as usize).and_then(Option::take)
+        };
+        if let Some(sub) = sub {
+            let core = self.core.clone();
+            run_blocking(core, move || drop(sub)).await?;
         }
+        Ok(())
+    }
+
+    /// Emit an i32 value on a state node.
+    #[napi]
+    pub async fn emit_int(&self, node_id: u32, value: i32) -> Result<()> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let handle = binding.registry.lock().intern(BenchValue::Int(value));
+            core.emit(NodeId::new(u64::from(node_id)), handle);
+        })
+        .await
+    }
+
+    /// Read a state node's current cache as i32.
+    #[napi]
+    pub async fn cache_int(&self, node_id: u32) -> Result<i32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> i32 {
+            let h = core.cache_of(NodeId::new(u64::from(node_id)));
+            if h == graphrefly_core::NO_HANDLE {
+                return -1;
+            }
+            let reg = binding.registry.lock();
+            match reg.deref(h) {
+                Some(BenchValue::Int(n)) => n,
+                _ => -1,
+            }
+        })
+        .await
+    }
+
+    /// Tight loop: emit `n` times on a state node, no JS call between.
+    #[napi]
+    pub async fn rust_emit_loop(&self, node_id: u32, n: u32) -> Result<()> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let nid = NodeId::new(u64::from(node_id));
+            let mut reg = binding.registry.lock();
+            let handles: Vec<HandleId> = (0..n)
+                .map(|i| reg.intern(BenchValue::Int(i as i32)))
+                .collect();
+            drop(reg);
+            for h in handles {
+                core.emit(nid, h);
+            }
+        })
+        .await
     }
 
     // -------------------------------------------------------------------
-    // Slice A close (M1) parity — wave-emitting + lifecycle methods
-    //
-    // Each new public Core method gets a thin wrapper here so JS / TS
-    // tests can drive it. Error surfaces use `napi::Error` for the
-    // standard JS Error shape; structured Rust errors stringify into
-    // the message body.
-    //
-    // LockId is exposed as `u32` to JS (matches NodeId's napi shape).
-    // The Core's u64 LockId space is wider, but tests fit comfortably
-    // in u32. Use `alloc_lock_id` for collision-free allocation.
+    // Slice A close (M1) parity — wave-emitting + lifecycle methods.
     // -------------------------------------------------------------------
 
-    /// Allocate a fresh `LockId` for use with [`Self::pause`] /
-    /// [`Self::resume`]. Core's lock-id space is `u64`; JS gets a `u32`.
-    /// If Core has allocated more than `u32::MAX` lock ids over its
-    /// lifetime, returns an error rather than silently clamping (which
-    /// would alias every subsequent allocation to the same id and cause
-    /// cross-controller pause leak — see the `LockId`-collision note in
-    /// `porting-deferred.md`).
     #[napi]
-    pub fn alloc_lock_id(&self) -> Result<u32, NapiError> {
-        u32::try_from(self.core.alloc_lock_id().raw()).map_err(|_| {
+    pub async fn alloc_lock_id(&self) -> Result<u32> {
+        let core = self.core.clone();
+        let raw = run_blocking(core.clone(), move || core.alloc_lock_id().raw()).await?;
+        u32::try_from(raw).map_err(|_| {
             NapiError::from_reason(
-                "alloc_lock_id exceeded u32 range — Core has allocated more \
-                 than u32::MAX lock ids; bench binding cannot widen without \
-                 BigInt — restart the BenchCore or migrate to BigInt-typed binding",
+                "alloc_lock_id exceeded u32 range — restart BenchCore or migrate to BigInt",
             )
         })
     }
 
-    /// Configure the Core-global pause replay buffer cap. `None`
-    /// (no value) means unbounded; messages buffer indefinitely until
-    /// the lockset clears. Per-node override is not exposed at this
-    /// layer in v1.
     #[napi]
-    pub fn set_pause_buffer_cap(&self, cap: Option<u32>) {
-        self.core.set_pause_buffer_cap(cap.map(|c| c as usize));
+    pub async fn set_pause_buffer_cap(&self, cap: Option<u32>) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.set_pause_buffer_cap(cap.map(|c| c as usize));
+        })
+        .await
     }
 
-    /// Acquire a pause lock. While paused, tier-3 (DATA/RESOLVED) and
-    /// tier-4 (INVALIDATE) outgoing messages buffer in the node's pause
-    /// buffer; other tiers flush immediately.
     #[napi]
-    pub fn pause(&self, node_id: u32, lock_id: u32) -> Result<(), NapiError> {
-        self.core
-            .pause(
+    pub async fn pause(&self, node_id: u32, lock_id: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.pause(
                 NodeId::new(u64::from(node_id)),
                 LockId::new(u64::from(lock_id)),
             )
-            .map_err(|e| NapiError::from_reason(format!("{e}")))
+        })
+        .await?
+        .map_err(|e| NapiError::from_reason(format!("{e}")))
     }
 
-    /// Release a pause lock. Returns the resume report when the final
-    /// lock releases (`replayed` + `dropped` counts); `None` when more
-    /// locks are still held.
     #[napi]
-    pub fn resume(&self, node_id: u32, lock_id: u32) -> Result<Option<ResumeReportJs>, NapiError> {
-        self.core
-            .resume(
+    pub async fn resume(&self, node_id: u32, lock_id: u32) -> Result<Option<ResumeReportJs>> {
+        let core = self.core.clone();
+        let result = run_blocking(core.clone(), move || {
+            core.resume(
                 NodeId::new(u64::from(node_id)),
                 LockId::new(u64::from(lock_id)),
             )
+        })
+        .await?;
+        result
             .map(|opt| {
                 opt.map(|r| ResumeReportJs {
                     replayed: r.replayed,
@@ -471,245 +807,223 @@ impl BenchCore {
             .map_err(|e| NapiError::from_reason(format!("{e}")))
     }
 
-    /// True if the node currently holds at least one pause lock.
     #[napi]
-    pub fn is_paused(&self, node_id: u32) -> bool {
-        self.core.is_paused(NodeId::new(u64::from(node_id)))
+    pub async fn is_paused(&self, node_id: u32) -> Result<bool> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.is_paused(NodeId::new(u64::from(node_id)))
+        })
+        .await
     }
 
-    /// Number of pause locks currently held on the node.
+    /// Number of pause locks currently held. Returns Err on overflow
+    /// instead of saturating silently (M8 fix — matches `alloc_lock_id`).
     #[napi]
-    pub fn pause_lock_count(&self, node_id: u32) -> u32 {
-        u32::try_from(self.core.pause_lock_count(NodeId::new(u64::from(node_id))))
-            .unwrap_or(u32::MAX)
+    pub async fn pause_lock_count(&self, node_id: u32) -> Result<u32> {
+        let core = self.core.clone();
+        let count = run_blocking(core.clone(), move || {
+            core.pause_lock_count(NodeId::new(u64::from(node_id)))
+        })
+        .await?;
+        u32::try_from(count).map_err(|_| NapiError::from_reason("pause_lock_count exceeds u32"))
     }
 
-    /// Test inspector: whether `node_id` currently holds the given `lock_id`.
     #[napi]
-    pub fn holds_pause_lock(&self, node_id: u32, lock_id: u32) -> bool {
-        self.core.holds_pause_lock(
-            NodeId::new(u64::from(node_id)),
-            LockId::new(u64::from(lock_id)),
-        )
+    pub async fn holds_pause_lock(&self, node_id: u32, lock_id: u32) -> Result<bool> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.holds_pause_lock(
+                NodeId::new(u64::from(node_id)),
+                LockId::new(u64::from(lock_id)),
+            )
+        })
+        .await
     }
 
-    /// Clear `node_id`'s cache and cascade `[INVALIDATE]` to dependents.
-    /// No-op if the node was never populated (R1.4 idempotency).
     #[napi]
-    pub fn invalidate(&self, node_id: u32) {
-        self.core.invalidate(NodeId::new(u64::from(node_id)));
+    pub async fn invalidate(&self, node_id: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.invalidate(NodeId::new(u64::from(node_id)));
+        })
+        .await
     }
 
-    /// Emit `[COMPLETE]` (R1.3.4) on `node_id`. After this call the node
-    /// is terminal: subsequent emits are silent no-ops, fn no longer
-    /// fires, and children's `dep_terminals` slots cascade per Lock 2.B.
     #[napi]
-    pub fn complete(&self, node_id: u32) {
-        self.core.complete(NodeId::new(u64::from(node_id)));
+    pub async fn complete(&self, node_id: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.complete(NodeId::new(u64::from(node_id)));
+        })
+        .await
     }
 
-    /// Emit `[ERROR]` on `node_id` with a primitive i32 error payload.
-    /// JS bench-binding limitation: the error is a fresh i32 interned
-    /// here (no JS Error object roundtrip). Real bindings that want
-    /// arbitrary error payloads will surface a separate path.
     #[napi]
-    pub fn error_int(&self, node_id: u32, err_code: i32) {
-        let h = self
-            .binding
-            .registry
-            .lock()
-            .expect("registry lock")
-            .intern(BenchValue::Int(err_code));
-        self.core.error(NodeId::new(u64::from(node_id)), h);
+    pub async fn error_int(&self, node_id: u32, err_code: i32) -> Result<()> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let h = binding.registry.lock().intern(BenchValue::Int(err_code));
+            core.error(NodeId::new(u64::from(node_id)), h);
+        })
+        .await
     }
 
-    /// Tear `node_id` down (R2.6.4). Auto-prepends COMPLETE if not yet
-    /// terminal; cascades through children. Idempotent on duplicate
-    /// delivery via `has_received_teardown`.
     #[napi]
-    pub fn teardown(&self, node_id: u32) {
-        self.core.teardown(NodeId::new(u64::from(node_id)));
+    pub async fn teardown(&self, node_id: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.teardown(NodeId::new(u64::from(node_id)));
+        })
+        .await
     }
 
-    /// Attach `companion` as a meta companion of `parent` (R1.3.9.d).
-    /// Companions tear down before their parent in TEARDOWN ordering.
     #[napi]
-    pub fn add_meta_companion(&self, parent: u32, companion: u32) {
-        self.core.add_meta_companion(
-            NodeId::new(u64::from(parent)),
-            NodeId::new(u64::from(companion)),
-        );
+    pub async fn add_meta_companion(&self, parent: u32, companion: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.add_meta_companion(
+                NodeId::new(u64::from(parent)),
+                NodeId::new(u64::from(companion)),
+            );
+        })
+        .await
     }
 
-    /// Mark `node_id` as resubscribable per R2.2.7. Resubscribable nodes
-    /// reset their terminal-lifecycle state on a fresh subscribe (unless
-    /// they have received TEARDOWN). Configuration call — must be made
-    /// before the node has any active subscribers.
     #[napi]
-    pub fn set_resubscribable(&self, node_id: u32, resubscribable: bool) {
-        self.core
-            .set_resubscribable(NodeId::new(u64::from(node_id)), resubscribable);
+    pub async fn set_resubscribable(&self, node_id: u32, resubscribable: bool) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.set_resubscribable(NodeId::new(u64::from(node_id)), resubscribable);
+        })
+        .await
     }
 
-    /// Coalesce multiple emits into a single wave. Emits inside the
-    /// closure-equivalent — for the napi binding, we expose the simpler
-    /// shape "emit a list of ints in one wave" since closures don't
-    /// cross cleanly over FFI.
-    ///
-    /// On panic in the binding-side, the RAII `BatchGuard` discards
-    /// pending tier-3+ work; subscribers do not observe a half-built
-    /// wave.
     #[napi]
-    pub fn batch_emit_ints(&self, node_id: u32, values: Vec<i32>) {
-        let nid = NodeId::new(u64::from(node_id));
-        let handles: Vec<HandleId> = {
-            let mut reg = self.binding.registry.lock().expect("registry lock");
-            values
+    pub async fn batch_emit_ints(&self, node_id: u32, values: Vec<i32>) -> Result<()> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let nid = NodeId::new(u64::from(node_id));
+            let handles: Vec<HandleId> = {
+                let mut reg = binding.registry.lock();
+                values
+                    .into_iter()
+                    .map(|v| reg.intern(BenchValue::Int(v)))
+                    .collect()
+            };
+            let _guard = core.begin_batch();
+            for h in handles {
+                core.emit(nid, h);
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn set_deps(&self, node_id: u32, new_dep_ids: Vec<u32>) -> Result<()> {
+        let core = self.core.clone();
+        let result = run_blocking(core.clone(), move || {
+            let n = NodeId::new(u64::from(node_id));
+            let new_deps: Vec<NodeId> = new_dep_ids
                 .into_iter()
-                .map(|v| reg.intern(BenchValue::Int(v)))
-                .collect()
-        };
-        // begin_batch returns a BatchGuard that drops at scope end.
-        let _guard = self.core.begin_batch();
-        for h in handles {
-            self.core.emit(nid, h);
-        }
-        // _guard drops here → drain + flush.
+                .map(|id| NodeId::new(u64::from(id)))
+                .collect();
+            core.set_deps(n, &new_deps)
+        })
+        .await?;
+        result.map_err(|e| NapiError::from_reason(format!("{e}")))
     }
 
-    /// Atomically rewire a node's deps. New deps are validated for
-    /// existence and cycle-freedom; terminal-rejection policy applies
-    /// per Phase 13.8 Q1. Returns `Err` with a stringified
-    /// `SetDepsError` describing the rejection.
     #[napi]
-    pub fn set_deps(&self, node_id: u32, new_dep_ids: Vec<u32>) -> Result<(), NapiError> {
-        let n = NodeId::new(u64::from(node_id));
-        let new_deps: Vec<NodeId> = new_dep_ids
-            .into_iter()
-            .map(|id| NodeId::new(u64::from(id)))
-            .collect();
-        self.core
-            .set_deps(n, &new_deps)
-            .map_err(|e| NapiError::from_reason(format!("{e}")))
-    }
-
-    /// Read whether the node has fired its fn at least once (compute) OR
-    /// has had a non-sentinel value (state). Useful as a smoke test for
-    /// the activation drain in the new lock-released drain.
-    #[napi]
-    pub fn has_fired_once(&self, node_id: u32) -> bool {
-        self.core.has_fired_once(NodeId::new(u64::from(node_id)))
+    pub async fn has_fired_once(&self, node_id: u32) -> Result<bool> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.has_fired_once(NodeId::new(u64::from(node_id)))
+        })
+        .await
     }
 
     // -------------------------------------------------------------------
-    // M3 — DepBatch + FnResult::Batch parity surface
-    //
-    // `register_batch_derived` exposes the FnResult::Batch substrate —
-    // a derived node whose fn fire returns multiple emissions (R1.3.6.b
-    // coalescing on the output side). `batch_emit_messages` is the
-    // user-facing batch: a heterogeneous wave of data/complete/error
-    // emissions applied atomically inside a `Core::batch` scope.
+    // M3 — DepBatch + FnResult::Batch parity surface.
     // -------------------------------------------------------------------
 
-    /// Register a derived node whose fn returns `FnResult::Batch` with
-    /// one emission per input batch entry. Demonstrates the M3 Slice B
-    /// `FnResult::Batch` substrate through the napi boundary.
-    ///
-    /// The fn fires once per wave; its output emissions all flow within
-    /// the same wave. `EqualsMode::Identity` is hardcoded because
-    /// `FnResult::Batch` skips equals substitution per R1.3.2.d (multi-
-    /// message waves pass through verbatim) — the equals mode only
-    /// affects single-emission `FnResult::Data` paths, which a batch fn
-    /// doesn't produce.
-    ///
-    /// # Panics
-    ///
-    /// Bench builtins (`MapAddOneBatch`, `MulTenThenComplete`) panic if
-    /// a dep handle resolves to a non-Int value or is missing from the
-    /// registry. These are bench helpers; production batch fns will
-    /// surface domain errors via dedicated channels.
+    /// Register a derived node whose fn returns `FnResult::Batch`.
+    /// R1.3.6.b — multi-emit per fire flows in same wave.
     #[napi]
-    pub fn register_batch_derived(&self, dep_ids: Vec<u32>, builtin: BuiltinBatchFn) -> u32 {
-        let fn_impl: BatchFnImpl = match builtin {
-            BuiltinBatchFn::MapAddOneBatch => Arc::new(|deps: &[DepBatch], reg: &Registry| {
-                let mut emissions = Vec::new();
-                if let Some(d) = deps.first() {
-                    for h in &d.data {
-                        match reg.deref(*h) {
-                            Some(BenchValue::Int(n)) => {
-                                emissions.push(BenchEmission::Data(BenchValue::Int(n + 1)));
+    pub async fn register_batch_derived(
+        &self,
+        dep_ids: Vec<u32>,
+        builtin: BuiltinBatchFn,
+    ) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let fn_impl: BatchFnImpl = match builtin {
+                BuiltinBatchFn::MapAddOneBatch => Arc::new(|deps: &[DepBatch], reg: &Registry| {
+                    let mut emissions = Vec::new();
+                    if let Some(d) = deps.first() {
+                        for h in &d.data {
+                            match reg.deref(*h) {
+                                Some(BenchValue::Int(n)) => {
+                                    emissions.push(BenchEmission::Data(BenchValue::Int(n + 1)));
+                                }
+                                Some(other) => panic!(
+                                    "MapAddOneBatch only supports Int dep values, got {other:?}"
+                                ),
+                                None => panic!("MapAddOneBatch: dep handle {h:?} not in registry"),
                             }
-                            Some(other) => {
-                                panic!("MapAddOneBatch only supports Int dep values, got {other:?}",)
-                            }
-                            None => panic!("MapAddOneBatch: dep handle {h:?} not in registry"),
                         }
                     }
-                }
-                emissions
-            }),
-            BuiltinBatchFn::MulTenThenComplete => Arc::new(|deps: &[DepBatch], reg: &Registry| {
-                let mut emissions = Vec::new();
-                if let Some(d) = deps.first() {
-                    for h in &d.data {
-                        match reg.deref(*h) {
-                            Some(BenchValue::Int(n)) => {
-                                emissions.push(BenchEmission::Data(BenchValue::Int(n * 10)));
+                    emissions
+                }),
+                BuiltinBatchFn::MulTenThenComplete => {
+                    Arc::new(|deps: &[DepBatch], reg: &Registry| {
+                        let mut emissions = Vec::new();
+                        if let Some(d) = deps.first() {
+                            for h in &d.data {
+                                match reg.deref(*h) {
+                                    Some(BenchValue::Int(n)) => {
+                                        emissions
+                                            .push(BenchEmission::Data(BenchValue::Int(n * 10)));
+                                    }
+                                    Some(other) => panic!(
+                                        "MulTenThenComplete only supports Int dep values, got {other:?}"
+                                    ),
+                                    None => panic!(
+                                        "MulTenThenComplete: dep handle {h:?} not in registry"
+                                    ),
+                                }
                             }
-                            Some(other) => panic!(
-                                "MulTenThenComplete only supports Int dep values, got {other:?}",
-                            ),
-                            None => panic!("MulTenThenComplete: dep handle {h:?} not in registry",),
                         }
-                    }
+                        emissions.push(BenchEmission::Complete);
+                        emissions
+                    })
                 }
-                emissions.push(BenchEmission::Complete);
-                emissions
-            }),
-        };
-        let mut reg = self.binding.registry.lock().expect("registry lock");
-        let fn_id = FnId::new(reg.next_fn_id);
-        reg.next_fn_id += 1;
-        reg.batch_fns.insert(fn_id, fn_impl);
-        drop(reg);
-        let deps: Vec<NodeId> = dep_ids
-            .into_iter()
-            .map(|id| NodeId::new(u64::from(id)))
-            .collect();
-        let id = self
-            .core
-            .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-            .expect("invariant: caller has validated dep ids before calling register_derived");
-        u32::try_from(id.raw()).expect("node id exceeds u32")
+            };
+            let mut reg = binding.registry.lock();
+            let fn_id = FnId::new(reg.next_fn_id);
+            reg.next_fn_id += 1;
+            reg.batch_fns.insert(fn_id, fn_impl);
+            drop(reg);
+            let deps: Vec<NodeId> = dep_ids
+                .into_iter()
+                .map(|id| NodeId::new(u64::from(id)))
+                .collect();
+            let id = core
+                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
     }
 
-    /// User-facing batch — apply a sequence of mixed emissions on a state
-    /// node in one wave. Internally uses `Core::batch` to coalesce; each
-    /// emission maps to the underlying source-level call (`emit` /
-    /// `complete` / `error`) inside the batch scope.
-    ///
-    /// This is the "user-facing batch" surface: cleaner than mirroring
-    /// `FnResult::Batch` directly (which is a fn-fire return shape, not a
-    /// caller-driven wave). Heterogeneous waves of mixed emissions are
-    /// expressible without exposing the internal `FnEmission` enum to JS.
-    ///
-    /// # Errors
-    ///
-    /// Returns `napi::Error` (NOT panic) when:
-    /// - Any `kind` is not one of `"data"` / `"complete"` / `"error"`.
-    /// - `kind` is `"data"` or `"error"` and `value` is `None` (R1.2.5
-    ///   intent: payload must be supplied at construction; silent default
-    ///   to `0` would mask user error and produce phantom-zero events
-    ///   indistinguishable from legitimate `0` payloads).
-    ///
-    /// All input is validated up-front BEFORE opening the batch, so a
-    /// malformed `msgs` never produces a partially-applied wave.
     #[napi]
-    pub fn batch_emit_messages(
+    pub async fn batch_emit_messages(
         &self,
         node_id: u32,
         msgs: Vec<BatchEmissionJs>,
-    ) -> Result<(), NapiError> {
+    ) -> Result<()> {
         // Up-front validation — bad input MUST NOT open a batch.
         for (i, m) in msgs.iter().enumerate() {
             match m.kind.as_str() {
@@ -730,37 +1044,30 @@ impl BenchCore {
             }
         }
 
-        let nid = NodeId::new(u64::from(node_id));
-        self.core.batch(|| {
-            for m in msgs {
-                match m.kind.as_str() {
-                    "data" => {
-                        let v = m.value.expect("validated up-front");
-                        let h = self
-                            .binding
-                            .registry
-                            .lock()
-                            .expect("registry lock")
-                            .intern(BenchValue::Int(v));
-                        self.core.emit(nid, h);
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let nid = NodeId::new(u64::from(node_id));
+            core.batch(|| {
+                for m in msgs {
+                    match m.kind.as_str() {
+                        "data" => {
+                            let v = m.value.expect("validated up-front");
+                            let h = binding.registry.lock().intern(BenchValue::Int(v));
+                            core.emit(nid, h);
+                        }
+                        "complete" => core.complete(nid),
+                        "error" => {
+                            let v = m.value.expect("validated up-front");
+                            let h = binding.registry.lock().intern(BenchValue::Int(v));
+                            core.error(nid, h);
+                        }
+                        _ => unreachable!("validated up-front"),
                     }
-                    "complete" => self.core.complete(nid),
-                    "error" => {
-                        let v = m.value.expect("validated up-front");
-                        let h = self
-                            .binding
-                            .registry
-                            .lock()
-                            .expect("registry lock")
-                            .intern(BenchValue::Int(v));
-                        self.core.error(nid, h);
-                    }
-                    _ => unreachable!("validated up-front"),
                 }
-            }
-        });
-
-        Ok(())
+            });
+        })
+        .await
     }
 }
 
@@ -772,13 +1079,8 @@ pub struct ResumeReportJs {
 }
 
 // ---------------------------------------------------------------------------
-// Shared singleton — for cross-Worker bench.
-//
-// Node.js native modules are loaded once per process; static state in Rust
-// is visible from every Worker thread that loads the addon. We expose a
-// single global `BenchCore` that all Workers can call into. Operations on
-// the global serialize through `Core`'s internal `parking_lot::Mutex` —
-// concurrency is a Rust-side concern, transparent to JS callers.
+// Shared singleton — for cross-Worker bench (legacy; kept for back-compat).
+// Each global call routes through the same `BenchCore`'s tokio dispatch.
 // ---------------------------------------------------------------------------
 
 static GLOBAL_CORE: OnceLock<Arc<BenchCore>> = OnceLock::new();
@@ -789,39 +1091,34 @@ fn global() -> Arc<BenchCore> {
         .clone()
 }
 
-/// Register a state node on the process-global shared core. Returns the node id.
 #[napi]
-pub fn global_register_state_int(initial: i32) -> u32 {
-    global().register_state_int(initial)
+pub async fn global_register_state_int(initial: i32) -> Result<u32> {
+    global().register_state_int(initial).await
 }
 
-/// Register a derived (Identity) node on the global core.
 #[napi]
-pub fn global_register_derived_identity(dep_ids: Vec<u32>) -> u32 {
-    global().register_derived(dep_ids, BuiltinFn::Identity)
+pub async fn global_register_derived_identity(dep_ids: Vec<u32>) -> Result<u32> {
+    global()
+        .register_derived(dep_ids, BuiltinFn::Identity)
+        .await
 }
 
-/// Subscribe a noop sink on the global core.
 #[napi]
-pub fn global_subscribe_noop(node_id: u32) -> u32 {
-    global().subscribe_noop(node_id)
+pub async fn global_subscribe_noop(node_id: u32) -> Result<u32> {
+    global().subscribe_noop(node_id).await
 }
 
-/// Emit on the global core. Callable from any Worker; concurrent calls
-/// serialize through the Core's internal Mutex.
 #[napi]
-pub fn global_emit_int(node_id: u32, value: i32) {
-    global().emit_int(node_id, value);
+pub async fn global_emit_int(node_id: u32, value: i32) -> Result<()> {
+    global().emit_int(node_id, value).await
 }
 
-/// Read cache from the global core. Callable from any Worker.
 #[napi]
-pub fn global_cache_int(node_id: u32) -> i32 {
-    global().cache_int(node_id)
+pub async fn global_cache_int(node_id: u32) -> Result<i32> {
+    global().cache_int(node_id).await
 }
 
-/// Tight Rust loop on the global core.
 #[napi]
-pub fn global_rust_emit_loop(node_id: u32, n: u32) {
-    global().rust_emit_loop(node_id, n);
+pub async fn global_rust_emit_loop(node_id: u32, n: u32) -> Result<()> {
+    global().rust_emit_loop(node_id, n).await
 }

@@ -20,15 +20,50 @@ graphrefly-operators  = { workspace = true, optional = true }
 graphrefly-storage    = { workspace = true, optional = true }
 graphrefly-structures = { workspace = true, optional = true }
 
+# Used by `BenchBinding`'s `Mutex<Registry>` (M1 fix — no poisoning,
+# matches `producer_storage`'s flavor). Also required by the
+# `graphrefly-operators::producer::ProducerStorage` typedef when the
+# `operators` feature is on.
+parking_lot           = { workspace = true, optional = true }
+
 # Used to construct `FnResult::Batch` emissions for the batch-fn binding
 # surface. SmallVec inline-2 mirrors the Core's `FnResult::Batch.emissions`
 # shape so building a batch doesn't heap-alloc on the common case.
 smallvec              = { workspace = true }
 
-# napi-rs runtime — the FFI scaffolding to V8.
-# napi9 targets Node.js 12+ ABI (broad compatibility).
-napi        = { version = "2.16", default-features = false, features = ["napi9", "tokio_rt"] }
-napi-derive = { version = "2.16" }
+# napi-rs 3.x runtime — bumped from 2.16 in QA pass D070 follow-up
+# (user directive 2026-05-07: "upgrade to latest").
+#
+# **`compat-mode` carve-out** — napi-derive 3.x's default `type-def`
+# feature pulls in the `ctor` crate for static module registration,
+# whose generated code requires `#[allow(unsafe_code)]` and conflicts
+# with the workspace-wide `#![forbid(unsafe_code)]` rule (CLAUDE.md
+# Rust invariant 1). The `compat-mode` feature on napi-derive disables
+# ctor-based registration in favor of the older module-init pattern,
+# restoring `forbid(unsafe_code)` compatibility. Trade-off: lose the
+# auto-generated TS type-definition file (`index.d.ts`); bench / parity
+# tests don't need it (TS types live in `packages/parity-tests/impls/types.ts`).
+#
+# napi9 targets Node.js 12+ ABI; tokio_rt drives `napi::tokio_runtime
+# ::spawn_blocking` for Option E (D070).
+# napi-rs 3.x runtime — clean migration from 2.16 (D072, user directive
+# 2026-05-07: "no compat mode! no backward compat needed. no legacy
+# behind"). Default features only (no compat-mode); typed
+# `Function<Args, Return>` replaces deprecated `JsFunction`; new TSFN
+# builder pattern replaces `create_threadsafe_function`'s
+# 7-generic-parameter call shape; cb signature
+# `FnOnce(Result<Return>, Env) -> Result<()>` natively delivers
+# JS-callback throws as `Err` (no fatal abort — fixes C1 by design).
+#
+# **`forbid(unsafe_code)` carve-out per-crate** (CLAUDE.md Rust
+# invariant 1 relaxed to `deny(unsafe_code)` ONLY in this crate's
+# `lib.rs`): napi-derive 3.x's `#[napi]` macro emits
+# `#[allow(unsafe_code)]` on generated registration items. `forbid`
+# rejects ALL `allow` overrides; `deny` rejects ad-hoc unsafe but
+# permits explicit macro-generated `allow`s. No hand-written unsafe
+# lives in this crate — every allow site is in macro-generated code.
+napi        = { version = "3", default-features = false, features = ["napi9", "tokio_rt"] }
+napi-derive = { version = "3" }
 
 [build-dependencies]
 napi-build  = { version = "2" }
@@ -39,7 +74,7 @@ default  = ["tracing"]
 
 # `tracing` = lightweight build for the @graphrefly/lite distribution
 # (just dispatch + observe; no graph, no operators, no storage).
-tracing  = ["dep:graphrefly-core", "dep:ahash"]
+tracing  = ["dep:graphrefly-core", "dep:ahash", "dep:parking_lot"]
 
 # `standard` = typical agent harness use; @graphrefly/standard.
 standard = ["tracing", "graph-codec", "operators"]

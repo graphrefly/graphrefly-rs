@@ -75,7 +75,7 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::batch::PendingPerNode;
-use crate::boundary::BindingBoundary;
+use crate::boundary::{BindingBoundary, CleanupTrigger};
 use crate::clock::monotonic_ns;
 use crate::handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 use crate::message::Message;
@@ -467,7 +467,32 @@ impl Drop for Subscription {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let (was_last_sub, is_producer, binding) = {
+        // Slice E2 (D056): when the last subscriber drops, fire the
+        // node's OnDeactivation cleanup hook BEFORE producer_deactivate
+        // (cleanup may release handles the producer subscription owns;
+        // reverse order would let producer_deactivate drop subs that user
+        // cleanup expected to be live). Both calls are lock-released per
+        // D045.
+        //
+        // OnDeactivation gating (D068, QA Q3 fix): fires only when the
+        // node has fired its fn at least once AND has a fn (`fn_id`
+        // populated). State nodes have no fn — they cannot register a
+        // cleanup spec via the production fn-return path (R2.4.5), so
+        // firing `cleanup_for` on them is wasted FFI; the binding's
+        // lookup is guaranteed to find no `current_cleanup`. Skipping
+        // here saves the FFI hop and matches the design-doc wording
+        // ("never-fired state nodes" — state-with-initial-value satisfies
+        // `has_fired_once = true` but still has no fn).
+        //
+        // Slice E2 /qa Q2(b) (D069): if the node is a resubscribable
+        // node that's ALREADY terminal (terminate fired BEFORE this last
+        // sub drop), fire `wipe_ctx` lock-released AFTER OnDeactivation
+        // + producer_deactivate. Mutually exclusive with `terminate_node`'s
+        // queue-wipe site: terminate-with-empty-subs goes through
+        // `pending_wipes`; terminate-with-live-subs routes here when
+        // those subs eventually drop. Either path fires exactly one
+        // wipe per terminal lifecycle.
+        let (was_last_sub, is_producer, has_user_cleanup, fire_wipe, binding) = {
             let mut s = state.lock();
             let Some(rec) = s.nodes.get_mut(&self.node_id) else {
                 return;
@@ -475,18 +500,40 @@ impl Drop for Subscription {
             rec.subscribers.remove(&self.sub_id);
             let last = rec.subscribers.is_empty();
             let producer = rec.is_producer();
-            // Clone the binding Arc out so we can call producer_deactivate
-            // lock-released. Cheap (Arc::clone).
-            let binding = if last && producer {
+            // OnDeactivation gate: must have run a fn at least once
+            // (has_fired_once) AND have a fn registered (fn_id.is_some()).
+            // The fn_id check excludes state nodes whose has_fired_once
+            // tracks initial-value status, not "user fn ran."
+            let user_cleanup = rec.has_fired_once && rec.fn_id.is_some();
+            let fire_wipe = last && rec.resubscribable && rec.terminal.is_some();
+            // Clone the binding Arc out only if at least one hook will
+            // fire. Cheap (Arc::clone) in the common path; skipped on
+            // non-last-sub or never-fired non-producer nodes.
+            let binding = if last && (producer || user_cleanup || fire_wipe) {
                 Some(s.binding.clone())
             } else {
                 None
             };
-            (last, producer, binding)
+            (last, producer, user_cleanup, fire_wipe, binding)
         };
-        if was_last_sub && is_producer {
+        if was_last_sub {
             if let Some(binding) = binding {
-                binding.producer_deactivate(self.node_id);
+                if has_user_cleanup {
+                    binding.cleanup_for(self.node_id, CleanupTrigger::OnDeactivation);
+                }
+                if is_producer {
+                    binding.producer_deactivate(self.node_id);
+                }
+                // D069: eager wipe — fires AFTER OnDeactivation so the
+                // user closure observes pre-wipe `store` (matches the
+                // existing "OnDeactivation runs before wipe on terminal
+                // reset" invariant covered by test 10). Idempotent —
+                // `HashMap::remove` on absent key is a no-op, so even
+                // if the wave already drained `pending_wipes` earlier,
+                // this fire is benign.
+                if fire_wipe {
+                    binding.wipe_ctx(self.node_id);
+                }
             }
         }
     }
@@ -1211,6 +1258,45 @@ pub(crate) struct CoreState {
     /// `commit_emission_verbatim` (Batch path passes through verbatim
     /// per R1.3.3.c).
     pub(crate) tier3_emitted_this_wave: ahash::AHashSet<NodeId>,
+    /// Slice E2 (R1.3.9.b strict reading per D057): per-wave-per-node
+    /// dedup for `OnInvalidate` cleanup hook firing. A node already in
+    /// this set this wave has already had its `OnInvalidate` queued into
+    /// `deferred_cleanup_hooks` and MUST NOT queue again, even if
+    /// `invalidate_inner` re-encounters it (rare: only matters when the
+    /// node re-populates mid-wave via fn-fire and then gets re-invalidated
+    /// in the same wave through a separate path).
+    ///
+    /// Cleared in [`CoreState::clear_wave_state`] alongside the other
+    /// wave-scoped queues.
+    pub(crate) invalidate_hooks_fired_this_wave: ahash::AHashSet<NodeId>,
+    /// Slice E2 (per D060/D061): lock-released drain queue for
+    /// `OnInvalidate` cleanup hooks. Populated under the state lock by
+    /// `Core::invalidate_inner` when a node's cache transitions
+    /// `!= NO_HANDLE → NO_HANDLE`; drained after the lock drops at wave
+    /// boundary by [`crate::batch::Core::fire_deferred_cleanup_hooks`]
+    /// (each call wrapped in `catch_unwind` so a single binding panic
+    /// doesn't short-circuit the drain — last panic re-raises after the
+    /// loop completes per D060).
+    ///
+    /// **Panic-discard semantics (D061):** cleared in
+    /// [`CoreState::clear_wave_state`] without firing — a panic-discarded
+    /// wave drops the queued cleanup hooks silently, mirroring the
+    /// `pending_pause_overflow` precedent (Slice F /qa A3). Bindings using
+    /// `OnInvalidate` for external-resource cleanup MUST idempotent-cleanup
+    /// at process exit or next successful invalidate cycle.
+    pub(crate) deferred_cleanup_hooks: Vec<(NodeId, crate::boundary::CleanupTrigger)>,
+    /// Slice E2 /qa Q2(b) (D069): lock-released drain queue for
+    /// `BindingBoundary::wipe_ctx` calls fired eagerly from
+    /// `Core::terminate_node` when a resubscribable node terminates with
+    /// no live subscribers. Pairs with the `Subscription::Drop` direct-
+    /// fire site (mutually exclusive: subs-empty-at-terminate routes
+    /// here; subs-non-empty-at-terminate fires from Subscription::Drop's
+    /// last-sub-drop path). Drained alongside `deferred_cleanup_hooks`
+    /// at wave boundary; same `catch_unwind` discipline so a single
+    /// binding panic doesn't short-circuit the drain. Same panic-discard
+    /// semantics as `deferred_cleanup_hooks` (silent drop on
+    /// panic-discarded waves).
+    pub(crate) pending_wipes: Vec<NodeId>,
 }
 
 /// The handle-protocol Core dispatcher.
@@ -1344,6 +1430,9 @@ impl Core {
                 currently_firing: Vec::new(),
                 pending_pause_overflow: Vec::new(),
                 tier3_emitted_this_wave: ahash::AHashSet::new(),
+                invalidate_hooks_fired_this_wave: ahash::AHashSet::new(),
+                deferred_cleanup_hooks: Vec::new(),
+                pending_wipes: Vec::new(),
             })),
             binding,
             wave_owner: Arc::new(ReentrantMutex::new(())),
@@ -2038,7 +2127,7 @@ impl Core {
         // `lock_arc()` is `!Send`; same-thread reentrant.
         let _wave_guard = self.wave_owner.lock_arc();
 
-        let (sub_id, tier_slices, needs_activation) = {
+        let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
             let sub_id = s.alloc_sub_id();
 
@@ -2126,9 +2215,21 @@ impl Core {
                 .insert(sub_id, sink.clone());
 
             let needs_activation = first_subscriber && !is_state;
-            (sub_id, tier_slices, needs_activation)
+            (sub_id, tier_slices, needs_activation, needs_reset)
             // state lock drops here
         };
+
+        // Slice E2 (R2.4.6 / D055): on resubscribable terminal reset, fire
+        // `wipe_ctx` LOCK-RELEASED so the binding drops its `NodeCtxState`
+        // entry (clearing both `store` and any residual `current_cleanup`).
+        // The new subscriber's first invoke_fn sees a fresh empty store.
+        // Fires AFTER the state lock drops so the binding's
+        // `node_ctx.lock()` can't deadlock against Core's state lock — and
+        // BEFORE the handshake so the wipe is observable before any
+        // user-visible interaction with the new lifecycle.
+        if did_reset {
+            self.binding.wipe_ctx(node_id);
+        }
 
         // Fire handshake LOCK-RELEASED. Sink may re-enter Core; same-
         // thread re-entry passes through `wave_owner` reentrantly.
@@ -2674,7 +2775,24 @@ impl Core {
             if let TerminalKind::Error(h) = t {
                 self.binding.retain_handle(h);
             }
+            // Slice E2 /qa Q2(b) (D069): if a resubscribable node is
+            // terminating with no live subscribers, queue eager
+            // `wipe_ctx` for the wave's lock-released drain. This is the
+            // mutually-exclusive complement of the `Subscription::Drop`
+            // wipe site: when the LAST sub drops first then terminate
+            // fires, subs are empty here and we queue; when terminate
+            // fires WITH subs still alive, we DON'T queue (subs not
+            // empty), and `Subscription::Drop` will fire wipe directly
+            // when those subs eventually drop. Either way, exactly one
+            // wipe fires per terminal lifecycle.
+            let queue_wipe = {
+                let rec = s.require_node(id);
+                rec.resubscribable && rec.subscribers.is_empty()
+            };
             s.require_node_mut(id).terminal = Some(t);
+            if queue_wipe {
+                s.pending_wipes.push(id);
+            }
             // Drain pending fires for this node — fn won't fire on a
             // terminal node.
             s.pending_fires.remove(&id);
@@ -3028,6 +3146,9 @@ impl Core {
         let mut work: Vec<NodeId> = vec![root];
         while let Some(node_id) = work.pop() {
             // Never-populated / already-invalidated: no-op (R1.4 idempotency).
+            // Per R1.3.9.c never-populated case, OnInvalidate cleanup hook
+            // also does NOT fire — natural fallout of skipping via the
+            // cache==NO_HANDLE guard (we never reach the queue-push below).
             let old_handle = s.require_node(node_id).cache;
             if old_handle == NO_HANDLE {
                 continue;
@@ -3035,6 +3156,18 @@ impl Core {
             // Clear cache + release the handle's slot ownership.
             s.require_node_mut(node_id).cache = NO_HANDLE;
             self.binding.release_handle(old_handle);
+            // Slice E2 (R1.3.9.b strict per D057 + D058 fire-at-cache-clear):
+            // queue OnInvalidate cleanup hook for lock-released drain at
+            // wave-end. The dedup set guarantees at-most-once-per-wave-per-
+            // node firing even if a node re-populates mid-wave (via fn-fire
+            // emit) and gets re-invalidated through a separate path. Pure
+            // cache==NO_HANDLE idempotency (above) catches "still at
+            // sentinel" only; the explicit set is the strict R1.3.9.b
+            // reading.
+            if s.invalidate_hooks_fired_this_wave.insert(node_id) {
+                s.deferred_cleanup_hooks
+                    .push((node_id, CleanupTrigger::OnInvalidate));
+            }
             // Wire emission. Pause-aware via queue_notify.
             self.queue_notify(s, node_id, Message::Invalidate);
             // Cascade: for each child, clear the dep record's prev_data
@@ -3491,8 +3624,20 @@ impl Core {
         // stays wave-scoped and gets cleared at wave end. The setDeps action
         // itself does NOT change the dirty boolean unless all deps are cleared;
         // in that case we settle.
+        // Slice E2 (D067): on a dynamic node that had previously fired its
+        // fn, capture `has_fired_once` BEFORE the reset so we can fire
+        // `OnRerun` cleanup lock-released after `drop(s)` below. Without
+        // this, the next `fire_regular` Phase 1 would capture
+        // `has_fired_once = false`, causing Phase 1.5 to skip OnRerun —
+        // silently dropping the prior activation's cleanup closure when
+        // the next `invoke_fn` overwrites `current_cleanup`. Per spec
+        // R2.4.5, `set_deps` does NOT end the activation cycle
+        // (subscribe→unsubscribe is the cycle boundary), so OnRerun must
+        // fire on every re-fire including post-set_deps.
+        let fire_set_deps_on_rerun;
         {
             let rec = s.require_node_mut(n);
+            fire_set_deps_on_rerun = rec.is_dynamic && rec.has_fired_once;
             rec.dep_records = new_dep_records;
             // Re-derive `tracked` for static derived: all indices.
             // For dynamic: clear `tracked` AND reset `has_fired_once` so the
@@ -3544,6 +3689,17 @@ impl Core {
         // releases. Keeps the lock-discipline split (binding calls outside
         // the state lock) consistent with the rest of the dispatcher.
         drop(s);
+        // Slice E2 (D067): fire OnRerun lock-released for dynamic nodes
+        // that had previously fired. The cleanup closure cleans up
+        // resources tied to the old dep shape before the next fn-fire
+        // (triggered by added-dep push-on-subscribe below) registers a
+        // fresh cleanup spec. Direct fire (NOT via deferred_cleanup_hooks)
+        // because set_deps may NOT enter a wave (no added deps → no
+        // run_wave below) — queueing the hook would orphan it until the
+        // next unrelated wave drains.
+        if fire_set_deps_on_rerun {
+            self.binding.cleanup_for(n, CleanupTrigger::OnRerun);
+        }
         // Fire topology event after lock is dropped.
         self.fire_topology_event(&crate::topology::TopologyEvent::DepsChanged {
             node: n,
@@ -3662,6 +3818,26 @@ impl CoreState {
         self.pending_pause_overflow.clear();
         // Slice G: tier3 emit tracking is wave-scoped.
         self.tier3_emitted_this_wave.clear();
+        // Slice E2 (D057): per-wave-per-node OnInvalidate dedup is
+        // wave-scoped — cleared so the next wave can fire cleanups again.
+        self.invalidate_hooks_fired_this_wave.clear();
+        // Slice E2 INVARIANT (DO NOT CHANGE WITHOUT THINKING):
+        // `deferred_cleanup_hooks` is NOT cleared here. It follows the
+        // `deferred_handle_releases` discipline:
+        //   - SUCCESS path (`BatchGuard::drop` non-panic): drained by
+        //     `Core::drain_deferred` AFTER `clear_wave_state` runs, then
+        //     fired lock-released by `Core::fire_deferred`.
+        //   - PANIC-DISCARD path (`BatchGuard::drop` panic): explicitly
+        //     `std::mem::take`-and-dropped AFTER `clear_wave_state` runs,
+        //     silently per D061.
+        // Clearing it INSIDE `clear_wave_state` would race the success
+        // path: the wave's queued `OnInvalidate` cleanup hooks would be
+        // erased BEFORE `drain_deferred` could take them, dropping every
+        // user cleanup callback on every successful wave.
+        // If a future change moves `deferred_cleanup_hooks` ownership
+        // here, ALSO move the post-`clear_wave_state` take in both
+        // BatchGuard paths to BEFORE the clear call. Until then, leaving
+        // the field untouched here is load-bearing.
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;

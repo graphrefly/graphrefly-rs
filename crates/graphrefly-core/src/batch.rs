@@ -63,6 +63,17 @@ use crate::node::{Core, CoreState, EqualsMode, OperatorOp, Sink, TerminalKind};
 /// content. Drained from `CoreState` and fired lock-released.
 pub(crate) type DeferredJobs = Vec<(Vec<Sink>, Vec<Message>)>;
 
+/// Lock-released drain payload of the wave's BatchGuard:
+/// `(sink_jobs, handle_releases, OnInvalidate cleanup hooks, pending wipe_ctx fires)`.
+/// Returned by [`Core::drain_deferred`], consumed by [`Core::fire_deferred`].
+/// Sliced into a type alias to satisfy `clippy::type_complexity`.
+pub(crate) type WaveDeferred = (
+    DeferredJobs,
+    Vec<HandleId>,
+    Vec<(crate::handle::NodeId, crate::boundary::CleanupTrigger)>,
+    Vec<crate::handle::NodeId>,
+);
+
 /// Per-node wave-end notification queue.
 ///
 /// Subscribers are snapshotted on the FIRST `queue_notify` call for the
@@ -435,7 +446,10 @@ impl Core {
         }
 
         // Phase 1: snapshot inputs — build DepBatch per dep from dep_records.
-        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, bool)> = {
+        // `has_fired_once` is captured here for the Slice E2 OnRerun gate
+        // (Phase 1.5 below): the cleanup hook only fires when the fn has
+        // run at least once already in this activation cycle.
+        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, bool, bool)> = {
             let mut s = self.lock_state();
             s.pending_fires.remove(&node_id);
             let rec = s.require_node(node_id);
@@ -454,13 +468,29 @@ impl Core {
                             involved: dr.involved_this_wave,
                         })
                         .collect();
-                    (fn_id, dep_batches, rec.is_dynamic)
+                    (fn_id, dep_batches, rec.is_dynamic, rec.has_fired_once)
                 })
             }
         };
-        let Some((fn_id, dep_batches, is_dynamic)) = prep else {
+        let Some((fn_id, dep_batches, is_dynamic, has_fired_once)) = prep else {
             return;
         };
+
+        // Phase 1.5 (Slice E2 — R2.4.5 OnRerun, lock-released per D045): if
+        // the fn has fired at least once in this activation cycle, fire its
+        // OnRerun cleanup hook BEFORE the next invoke_fn re-allocates fn-
+        // local resources. First-fire is intentionally skipped — there is
+        // no prior run to clean up. Fires OUTSIDE `FiringGuard` because
+        // cleanup re-entrance is not the A6 reentrancy concern (which
+        // protects against `set_deps(self, ...)` from inside the in-flight
+        // invoke_fn). Operator nodes never reach this path (`fire_regular`
+        // is the fn-id branch of `fire_fn`; operators dispatch via
+        // `fire_operator`), so cleanup hooks correctly only fire for fn-
+        // shaped nodes (state / derived / dynamic / producer).
+        if has_fired_once {
+            self.binding
+                .cleanup_for(node_id, crate::boundary::CleanupTrigger::OnRerun);
+        }
 
         // Phase 2: invoke fn lock-released. A6 reentrancy guard is scoped to
         // the FFI call only — Phase 3's lock-held state mutation is not part
@@ -2000,32 +2030,104 @@ impl Core {
         }
     }
 
-    /// Take the deferred sink-fire jobs and payload-handle releases from
-    /// `CoreState`. Callers pair this with a `drop(state_guard)` and a
-    /// subsequent [`Self::fire_deferred`] to deliver the wave's sinks
-    /// lock-released. Returning a 2-tuple keeps the call sites concise.
-    pub(crate) fn drain_deferred(s: &mut CoreState) -> (DeferredJobs, Vec<HandleId>) {
+    /// Take the deferred sink-fire jobs, payload-handle releases,
+    /// cleanup-hook fire queue, and pending-wipe queue from `CoreState`.
+    /// Callers pair this with a `drop(state_guard)` and a subsequent
+    /// [`Self::fire_deferred`] to deliver the wave's sinks + handle
+    /// releases + Slice E2 OnInvalidate cleanup hooks + Slice E2 /qa
+    /// Q2(b) eager wipe_ctx fires lock-released.
+    pub(crate) fn drain_deferred(s: &mut CoreState) -> WaveDeferred {
         (
             std::mem::take(&mut s.deferred_flush_jobs),
             std::mem::take(&mut s.deferred_handle_releases),
+            std::mem::take(&mut s.deferred_cleanup_hooks),
+            std::mem::take(&mut s.pending_wipes),
         )
     }
 
     /// Fire deferred sink-fire jobs in collected order, then release the
     /// payload handles owed for messages that landed in `pending_notify`
-    /// during the wave. Both phases run lock-released so:
+    /// during the wave, then fire any queued Slice E2 OnInvalidate cleanup
+    /// hooks. All three phases run lock-released so:
     /// - Sinks that call back into Core (emit, pause, etc.) re-acquire the
     ///   state lock cleanly and run their own nested wave.
     /// - The binding's `release_handle` path can't deadlock against a
     ///   binding-side mutex held by Core.
-    pub(crate) fn fire_deferred(&self, jobs: DeferredJobs, releases: Vec<HandleId>) {
+    /// - User cleanup closures (invoked via `BindingBoundary::cleanup_for`)
+    ///   may safely re-enter Core for unrelated nodes.
+    ///
+    /// **Cleanup-drain panic discipline (D060):** each `cleanup_for` call
+    /// is wrapped in `catch_unwind` so a single binding panic doesn't
+    /// short-circuit the per-wave drain. All queued cleanup attempts run;
+    /// if any panicked, the LAST panic re-raises after the loop completes
+    /// (preserving wave-end discipline while still surfacing failures).
+    /// Per D060, Core stays panic-naive about user code — bindings own
+    /// their host-language panic policy inside `cleanup_for`; this
+    /// `catch_unwind` is purely about drain-don't-short-circuit.
+    pub(crate) fn fire_deferred(
+        &self,
+        jobs: DeferredJobs,
+        releases: Vec<HandleId>,
+        cleanup_hooks: Vec<(crate::handle::NodeId, crate::boundary::CleanupTrigger)>,
+        pending_wipes: Vec<crate::handle::NodeId>,
+    ) {
+        // Slice E2 /qa P1 (2026-05-07): wrap each sink-fire in
+        // `catch_unwind` so a panicking sink doesn't unwind out of
+        // `fire_deferred` and drop the queued `releases` +
+        // `cleanup_hooks`. Mirrors Slice F audit fix A7's per-tier
+        // handshake-fire discipline. Without this guard, a sink panic
+        // here would silently leak handle retains AND silently drop
+        // OnInvalidate cleanup hooks. AssertUnwindSafe is safe because
+        // we re-raise the last panic at the end after running every
+        // queued fire — drain ordering is preserved.
+        let mut last_panic: Option<Box<dyn std::any::Any + Send>> = None;
         for (sinks, msgs) in jobs {
             for sink in &sinks {
-                sink(&msgs);
+                let sink = sink.clone();
+                let msgs_ref = &msgs;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    sink(msgs_ref);
+                }));
+                if let Err(payload) = result {
+                    last_panic = Some(payload);
+                }
             }
         }
         for h in releases {
             self.binding.release_handle(h);
+        }
+        // Slice E2 (D060): drain cleanup hooks with per-item panic
+        // isolation so the loop always completes. AssertUnwindSafe is
+        // safe here because we don't rely on logical state being valid
+        // post-panic — the panic propagates anyway after the drain ends.
+        for (node_id, trigger) in cleanup_hooks {
+            let binding = &self.binding;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                binding.cleanup_for(node_id, trigger);
+            }));
+            if let Err(payload) = result {
+                last_panic = Some(payload);
+            }
+        }
+        // Slice E2 /qa Q2(b) (D069): drain eager wipe_ctx queue with the
+        // same per-item panic isolation. Fires AFTER cleanup hooks so a
+        // resubscribable node's OnInvalidate (or any tier-3+ cleanup that
+        // fires in the same wave) sees pre-wipe binding state if it
+        // landed in the same wave as the terminal cascade. Mutually
+        // exclusive with `Subscription::Drop`'s direct-fire site, but
+        // even concurrent fires are idempotent (binding's `wipe_ctx`
+        // calls `HashMap::remove` which is a no-op on absent keys).
+        for node_id in pending_wipes {
+            let binding = &self.binding;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                binding.wipe_ctx(node_id);
+            }));
+            if let Err(payload) = result {
+                last_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = last_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -2194,6 +2296,22 @@ impl Drop for BatchGuard {
                 // deferred_handle_releases, so take it AFTER the clear.
                 s.clear_wave_state();
                 let deferred_releases = std::mem::take(&mut s.deferred_handle_releases);
+                // Slice E2 (D061): panic-discard wave drops queued
+                // OnInvalidate cleanup hooks SILENTLY. Bindings using
+                // OnInvalidate for external-resource cleanup MUST
+                // idempotent-cleanup at process exit / next successful
+                // invalidate. Mirrors A3 `pending_pause_overflow`
+                // panic-discard precedent.
+                let _: Vec<(crate::handle::NodeId, crate::boundary::CleanupTrigger)> =
+                    std::mem::take(&mut s.deferred_cleanup_hooks);
+                // Slice E2 /qa Q2(b) (D069): same panic-discard discipline
+                // for the eager-wipe queue. A panic-discarded wave drops
+                // queued `wipe_ctx` fires silently; the binding-side
+                // `NodeCtxState` entry remains until the next successful
+                // terminate-with-no-subs cycle (or until `Core` drops).
+                // This mirrors D061's external-resource-cleanup gap and
+                // is documented similarly.
+                let _: Vec<crate::handle::NodeId> = std::mem::take(&mut s.pending_wipes);
                 s.in_tick = false;
                 (pending, deferred_releases, restored)
             };
@@ -2217,14 +2335,22 @@ impl Drop for BatchGuard {
         // Successful drain — drain_and_flush manages its own locking.
         self.core.drain_and_flush();
         // Wave cleanup + extract deferred jobs under the lock.
-        let (jobs, releases) = {
+        let (jobs, releases, cleanup_hooks, pending_wipes) = {
             let mut s = self.core.lock_state();
             s.clear_wave_state();
             s.in_tick = false;
             self.core.commit_wave_cache_snapshots(&mut s);
+            // `drain_deferred` takes `deferred_flush_jobs` +
+            // `deferred_handle_releases` (incl. rotation releases pushed
+            // by `clear_wave_state` above) + Slice E2
+            // `deferred_cleanup_hooks` + Slice E2 /qa Q2(b)
+            // `pending_wipes`.
             Core::drain_deferred(&mut s)
         };
-        // Lock dropped — fire deferred sinks + release retains.
-        self.core.fire_deferred(jobs, releases);
+        // Lock dropped — fire deferred sinks + release retains + fire
+        // cleanup hooks (Slice E2 OnInvalidate, D060 catch_unwind drain)
+        // + fire eager wipes (D069).
+        self.core
+            .fire_deferred(jobs, releases, cleanup_hooks, pending_wipes);
     }
 }

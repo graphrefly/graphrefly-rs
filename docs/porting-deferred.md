@@ -251,15 +251,22 @@ transparently. ~50 LOC change, reuses existing `wave_owner`
 infrastructure from Slice A close /qa Q2 — no per-sink
 staging-buffer machinery required. Closed 2026-05-07.
 
-### Deactivation cleanup not yet modeled
+### Deactivation cleanup not yet modeled (cache-clear half)
 
 - **What:** when the last subscriber unsubscribes from a derived/dynamic node,
   TS clears its cache and releases handles. Rust currently no-ops the
-  unsubscribe path's deactivation.
+  unsubscribe path's CACHE-CLEAR side. (As of Slice E2 — 2026-05-07 —
+  the user-facing cleanup-hook side IS modeled: `BindingBoundary::cleanup_for(node, OnDeactivation)` fires lock-released
+  from `Subscription::Drop` when the last sub leaves, gated on
+  `has_fired_once`, before the existing `producer_deactivate` hook per
+  D056. What's still deferred: Core's own cache release + handle
+  drop on deactivation.)
 - **Why deferred:** correct under "always subscribed" lifetimes (which all
   current tests assume). Lands when the graph layer (M2) introduces
   subgraph mount/unmount that makes deactivation observable.
 - **Source:** [node.rs](../crates/graphrefly-core/src/node.rs) inline comment.
+  Cross-ref Slice E2 wiring above for the cleanup-hook layer that already
+  exists in v1.
 
 ### ~~Cascade recursion can stack-overflow on deep chains~~ — RESOLVED in Slice A-bigger
 
@@ -581,12 +588,9 @@ These canonical-spec methods are tracked for parity. Items marked
 
 ## M3 Slice C-1 — operator deferrals
 
-### napi-rs operator binding parity not yet shipped
+### ~~napi-rs operator binding parity not yet shipped~~ — RESOLVED 2026-05-07 (M3 napi-rs operator parity Phase A–C)
 
-- **What:** `BenchCore` ([`crates/graphrefly-bindings-js/src/core_bindings.rs`](../crates/graphrefly-bindings-js/src/core_bindings.rs)) does NOT expose `register_map` / `register_filter` / `register_scan` etc. The Slice C-1 substrate is reachable from JS only via direct `Core::register_operator` + a binding-side `OperatorBinding` impl that doesn't yet exist for napi.
-- **Why deferred:** operator factories take `Box<dyn Fn(HandleId) -> HandleId + Send + Sync>` closures. Wiring JS callbacks across napi requires tsfn (thread-safe function) plumbing — same shape needed for the deferred TSFN-based JS-callback fns / TSFN custom-equals work (see "Slice B — napi-rs binding parity" closing section in `migration-status.md`). Bundling them lets one tsfn refactor cover both paths.
-- **Lift point:** when a JS consumer needs operators OR when TSFN custom-equals lands, expose `register_map(deps, project_fn)` etc. on `BenchCore` (or a richer `BenchOperators` companion class). Wire `parity-tests/impls/rust.ts` to flip non-null at the same time so the existing transform parity scenarios activate against rustImpl.
-- **Source:** Slice C-1 close (2026-05-06).
+`BenchOperators` napi class shipped with 24 operators wired (6 transform + 3 combine + 7 flow + 4 producer-shape + 4 higher-order). `OperatorBinding` / `HigherOrderBinding` / `ProducerBinding` impls on `BenchBinding`. TSFN bridge (`bridge_sync<T, R>`) handles JS-callback sync return via worker-thread Core (D062). See `migration-status.md` row "M3 (napi-rs operator parity)" + session doc `archive/docs/SESSION-rust-port-napi-operators.md`.
 
 ### pyo3 operator binding deferred to M6
 
@@ -1568,6 +1572,63 @@ the slice itself. Each captured here with what / why-deferred / source.
   when binding-side error UX consistency becomes a real consumer
   concern.
 - **Source:** Slice H /qa Blind Hunter F12 (2026-05-07).
+
+## M3 napi-rs operator parity — carry-forward (Phases D + E)
+
+Phases A (TSFN substrate + worker-thread Core), B (`BenchOperators` napi class + 22 register methods), C (custom-equals bundle) landed 2026-05-07. Phases D + E carry forward to follow-on slices.
+
+### Phase D — three-bench shape (D049) deferred
+
+- **What:** D049 locks a three-bench shape: (1) `bench_builtin_fn` (existing — pure FFI), (2) `bench_tsfn_identity` (NEW — TSFN scheduling overhead), (3) `bench_tsfn_addone_js` (NEW — end-to-end Rust-via-TSFN). Phases A–C ship the substrate that benches (2) + (3) need; the bench fixtures themselves are not yet implemented.
+- **Why deferred:** scope management — Phases A–C already touch ~700 LOC; bundling the bench harness would push the slice past comfortable review size. Bench results inform §10 perf simplifications and the broader Rust-vs-TS comparison narrative; not needed for parity-test correctness.
+- **Lift point:** new `crates/graphrefly-bindings-js/benches/operators_via_tsfn.rs` (or JS-side `~/src/graphrefly-ts/bench/operators-via-tsfn.bench.ts` using vitest's bench mode). Document the subtraction interpretation: `(2) − (1) = TSFN scheduling cost`; `(3)` is the headline.
+- **Source:** Phase A–C close (2026-05-07); session doc `archive/docs/SESSION-rust-port-napi-operators.md` §5 Phase D.
+
+### Phase E — `parity-tests/impls/rust.ts` activation deferred
+
+- **What:** D053 locks activate-and-triage rollout for `parity-tests/impls/rust.ts`. The napi binding ships with the operator surface, but the JS-side adapter that wraps `BenchCore` / `BenchOperators` into the high-level `Impl` shape (`impl.node([], { initial, name })`, `impl.map(src, fn)`, `node.subscribe(...)`, `node.down([[DATA, v]])`, etc.) is substantial wrapper code (~200–400 LOC) that hasn't shipped yet.
+- **Why deferred:** the adapter is its own conceptually-independent block of work — it's a JS-side "rebuild the high-level reactive-graph API on top of a u32-NodeId / u32-HandleId interface." Doing it inline would push this slice past the typical close size. Better to land Phases A–C as a clean reviewable unit + activate the parity arm in a follow-on slice scoped specifically to the adapter shape.
+- **Lift point:** follow-on slice "M3 napi-rs operator parity — Phase E (rustImpl activation + triage)". Steps: (1) build the napi binding via napi-cli into a publishable `@graphrefly/native` shape; (2) write `rust.ts` adapter mapping `Impl` methods to `BenchCore` / `BenchOperators`; (3) flip `rustImpl` non-null; (4) run `pnpm --filter @graphrefly/parity-tests test` against both arms; (5) triage Rust-port-only divergences with `test.runIf` markers + porting-deferred entries.
+- **Source:** Phase A–C close (2026-05-07); session doc `archive/docs/SESSION-rust-port-napi-operators.md` §5 Phase E.
+
+### ~~napi-rs 2.x → 3.x bump deferred~~ — RESOLVED 2026-05-07 (D072)
+
+Bumped to clean napi 3.x (no compat-mode) with per-crate `forbid` → `deny` carve-out for `unsafe_code` in `bindings-js/src/lib.rs`. Native 3.x TSFN cb signature `FnOnce(Result<Return>, Env) -> Result<()>` delivers JS-callback throws as `Err` to our cb (no fatal abort) — C1 fixed by design. `Function<Args, Return>` typed callbacks, `Env::spawn_future` returning `PromiseRaw<'env, T>`, builder-pattern TSFN setup. Wrapper helpers from D071 deleted.
+
+### v1 limitation: JS callbacks should `await` (not sync-call) re-entries into `BenchCore` / `BenchOperators`
+
+- **What:** Per D070's Option E architecture, the tokio blocking-pool thread executing the wave is parked inside a TSFN-bridge `mpsc::sync_channel` `recv` while a JS callback (project / predicate / fold / pack / equals / higher-order project) executes on the JS thread. If the JS callback synchronously **awaits** a nested `BenchCore.emit(...)` / `BenchOperators.register_*(...)` call, the nested napi method runs on a DIFFERENT tokio blocking thread (tokio's pool defaults to 512 threads); JS yields to libuv during the await; libuv pumps the original TSFN's result-handler; original tokio thread continues. **No deadlock under await.** The deadlock vector is JS callbacks that try to call BenchCore methods **synchronously without await** — but napi-rs methods return Promises now, so JS can't synchronously call them anyway (calling a Promise-returning function without await just gets a pending Promise, no JS-side wait).
+- **Why deferred:** v1 acceptable. The Option E architecture (D070) makes this a non-issue in practice — Promise-returning napi methods naturally compose with await semantics. Original D062's deadlock concern (sync mpsc on JS thread) is gone.
+- **Lift point:** N/A — Option E fixes this by construction.
+- **Source:** Phase A close (2026-05-07); QA-pass D070 supersession.
+
+### v1 limitation: `BenchCore::Drop` can deadlock if waves are in-flight
+
+- **What:** When the JS GC drops a `BenchCore` napi instance, Rust's drop runs on the JS thread. `BenchCore`'s `subscriptions: Mutex<Vec<Option<Subscription>>>` field drops, dropping each `Subscription`. `Subscription::Drop` accesses Core's internal mutex via the stored `Weak<Mutex<CoreState>>`. **If a tokio blocking-pool thread is mid-wave** (e.g., parked in `bridge_sync::recv()` waiting for a TSFN tick to deliver a JS-callback result), the JS thread blocks waiting for Core's mutex → libuv stalls → TSFN tick can't deliver → tokio thread blocks forever.
+- **Why deferred:** narrow shutdown-race window; bench / parity-test scenarios construct fresh `BenchCore` per test and let the test runner drive shutdown serially. m26 field-reorder mitigates by ensuring `subscriptions` drops before `core` (so Subscription::Drop sees a valid Weak<Mutex<CoreState>>), but the deadlock vector itself remains — Subscription::Drop's mutex acquisition is what blocks.
+- **Lift point:** add `BenchCore::dispose() -> Promise<void>` napi method that JS code awaits before letting BenchCore drop. Inside, ship the subscriptions Vec to a final `spawn_blocking` so Drop runs on a tokio thread while JS thread is still free to pump libuv. ~20 LOC + a JS-side test verifying the dispose sequence. Or: refactor Subscription to use `try_lock` instead of `lock` (would mean Drop sometimes leaves the subscriber registered until Core is itself dropped — different trade-off).
+- **Source:** Option E QA pass (2026-05-07; M2 finding from /qa); m26 field-reorder partially mitigates but does not eliminate the vector.
+
+### v1 limitation: Arc-cycle leak per `BenchCore` instance
+
+- **What:** Producer build closures (registered via `ProducerBinding::register_producer_build`) capture `Core::clone()` and `Arc<dyn ProducerBinding> = Arc<BenchBinding>`. Both clones live inside the closure, which is stored in `BenchBinding.registry.producer_builds`. This creates the cycle `BenchBinding → registry → producer_builds → build_closure → binding_clone → BenchBinding`. Without explicit cleanup, the cycle never breaks; `BenchBinding` and its captured `Core` clones leak when `BenchCore` drops.
+- **Why deferred:** the leak is bounded constant per `BenchCore` instance (proportional to number of registered producers, which is bounded by user code). Process exit cleans up. Bench / parity-test workloads construct fresh `BenchCore` per test and let process exit handle it.
+- **Lift point:** add an explicit `BenchCore::shutdown(self)` async method that drains `registry.producer_builds` (and other closure registries) on a tokio blocking task before BenchCore drops. Mirrors `OpRuntime::drop` in `crates/graphrefly-operators/tests/common/mod.rs:107`. Or: weak-Arc the binding's reference so the cycle is structurally broken (requires changes in `graphrefly-operators::ProducerCtx::new` signature to take `&Weak<dyn ProducerBinding>`).
+- **Source:** Phase A close (2026-05-07); unchanged by D070 Option E supersession (the cycle exists in any architecture that stores producer build closures binding-side).
+
+### v1 limitation: BigInt HandleId / NodeId for unbounded handle space (D064 follow-up)
+
+- **What:** Per D064, the napi binding narrows `HandleId(u64)` and `NodeId(u64)` to `u32` at the FFI boundary (matching existing `BenchCore::register_state_int → u32` convention). Long-running production processes that exhaust the 4-billion-handle space within a single `BenchCore` will overflow at `u32::try_from(...).expect("...")` sites.
+- **Why deferred:** bench / parity-test workloads don't hit this. Production users that do can either (a) restart the BenchCore, or (b) wait for the BigInt migration.
+- **Lift point:** swap `u32` napi types for `napi::JsBigInt` across the BenchCore + BenchOperators surface. Carries per-call BigInt boxing cost. Bench evidence justifies.
+- **Source:** D064 close (2026-05-07).
+
+### v1 limitation: per-fire JS-callback throw isolation (D065 follow-up)
+
+- **What:** Per D065, JS-callback throws panic at the FFI boundary, propagating to the worker thread's wave engine which panic-discards the entire in-flight wave via `clear_wave_state`. Multiple operator callbacks firing in the same wave that throw individually all collapse the wave; there's no per-fire isolation.
+- **Why deferred:** matches D060's cleanup-closure discipline (Core stays panic-naive about user code). Per-fire isolation requires either (a) `catch_unwind` per `project_each` / `predicate_each` / `fold_each` invocation in `BindingBoundary` impl (impacts perf — `UnwindSafe` bounds), or (b) restructuring Core's wave engine to checkpoint per-fire (substantial refactor).
+- **Lift point:** when production workloads surface specific need for per-fire isolation. Until then, the wave-discard granularity is acceptable.
+- **Source:** D065 close (2026-05-07).
 
 ## Audit fixes landed in Slice H /qa (2026-05-07)
 

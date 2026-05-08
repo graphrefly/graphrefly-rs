@@ -65,6 +65,50 @@ impl DepBatch {
     }
 }
 
+/// Lifecycle trigger discriminator for [`BindingBoundary::cleanup_for`].
+///
+/// Slice E2 (R2.4.5 / Lock 4.A / Lock 4.A′) — the named-hook cleanup spec
+/// returned by user fns has three independent slots; Core fires each slot
+/// at its own lifecycle moment via `cleanup_for(node_id, CleanupTrigger)`.
+///
+/// All three triggers fire **lock-released** per Slice E D045 handshake
+/// discipline. The binding is responsible for resolving the trigger to its
+/// stored cleanup closure (typically a `node_id → NodeFnCleanup` map) and
+/// invoking the matching slot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CleanupTrigger {
+    /// **R2.4.5 `onRerun`** — fires before the next fn run within the same
+    /// activation cycle. Core fires this in `fire_regular` between the
+    /// lock-held dep-snapshot phase and the lock-released `invoke_fn` call,
+    /// gated on `has_fired_once == true` (so first-fire never sees an
+    /// `onRerun`). The user closure receives no arguments and is expected
+    /// to release fn-local resources from the previous run before the
+    /// fresh `invoke_fn` allocates new ones.
+    OnRerun,
+    /// **R2.4.5 `onDeactivation`** — fires when subscriber count drops to
+    /// zero. Core fires this from `Subscription::Drop` (alongside the
+    /// existing [`BindingBoundary::producer_deactivate`] call), gated on
+    /// `has_fired_once == true`. Order: cleanup-first (`OnDeactivation`)
+    /// then `producer_deactivate`, because cleanup may release handles the
+    /// producer subscription owns (D056). Per D059, bindings SHOULD clear
+    /// `current_cleanup` on this trigger — the next subscribe + first-fire
+    /// will re-register a fresh closure.
+    OnDeactivation,
+    /// **R2.4.5 `onInvalidate`** — fires when an `[[INVALIDATE]]` arrives at
+    /// the node and clears its cache. Per **R1.3.9.b** strict reading
+    /// (D057): fires **at most once per wave per node**, regardless of
+    /// fan-in shape. Per **R1.3.9.c**: never fires when the node's cache
+    /// is the never-populated sentinel (a node that has not yet emitted
+    /// has nothing to clean up). Per **D058**: fires at cache-clear time,
+    /// not at wire-delivery time — pause buffering doesn't defer the
+    /// hook. **Per D061**: when the wave is panic-discarded mid-flight,
+    /// queued OnInvalidate hooks are dropped silently (the cleanup never
+    /// fires for the panicked wave); see [`BindingBoundary::cleanup_for`]
+    /// rustdoc for the panic-discard guarantee gap and the bindings'
+    /// idempotent-cleanup recommendation.
+    OnInvalidate,
+}
+
 /// A single emission within a [`FnResult::Batch`] — one element of an
 /// `actions.down(msgs)` call. Processed in sequence within the same wave.
 #[derive(Clone, Debug)]
@@ -328,6 +372,106 @@ pub trait BindingBoundary: Send + Sync {
     ) -> Option<HandleId> {
         None
     }
+
+    // -----------------------------------------------------------------
+    // Cleanup-hook lifecycle (Slice E2 — R2.4.5 / R2.4.6 / Lock 4.A / 4.A′
+    // / Lock 6.D). Decisions: D054 (lifecycle-trigger hooks; binding owns
+    // ctx state), D055 (binding-side `Mutex<HashMap<NodeId, NodeCtxState>>`,
+    // wipe only on resubscribable terminal reset), D056 (cleanup-first
+    // before producer_deactivate), D057 (strict per-wave-per-node dedup),
+    // D058 (fire at cache-clear time), D059 (one-shot current_cleanup on
+    // OnDeactivation), D060 (binding-side panic isolation, drain
+    // iterates-don't-short-circuit), D061 (panic-discard wave drops
+    // deferred queue silently). Full design lives in
+    // `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-fn-ctx-cleanup.md`.
+    //
+    // Bindings opt in by overriding `cleanup_for` and `wipe_ctx`. Default
+    // no-ops keep non-cleanup-aware bindings (e.g. minimal test bindings,
+    // bench harnesses) compiling unchanged.
+    // -----------------------------------------------------------------
+
+    /// Fire a registered user-cleanup hook for `node_id` at the lifecycle
+    /// moment indicated by `trigger`.
+    ///
+    /// # Binding-side contract
+    ///
+    /// Per D055, bindings own a `Mutex<HashMap<NodeId, NodeCtxState>>` where
+    /// `NodeCtxState = { store, current_cleanup }`. On each `invoke_fn` the
+    /// binding overwrites `current_cleanup` with whatever cleanup spec the
+    /// user fn returned. When Core later fires `cleanup_for(node, trigger)`,
+    /// the binding's impl looks up `current_cleanup.<trigger_slot>` and
+    /// invokes it if present. Absent slots are no-ops.
+    ///
+    /// **Lock discipline.** Bindings MUST release their `node_ctx` lock
+    /// before invoking the user closure (clone the closure handle out of
+    /// the map, drop the lock, fire). Holding the binding-side lock
+    /// across the user closure deadlocks if the user re-enters the
+    /// binding's high-level API from inside the cleanup.
+    ///
+    /// **Re-entrance into Core (D045 / D060).** Permitted: `release_handle`,
+    /// `Core::up(other_node, Pause/Resume/Invalidate/Teardown)`, `Core::emit`
+    /// for unrelated nodes, `Core::subscribe` / drop a `Subscription`. Not
+    /// permitted (undefined behavior): `Core::emit(self_node, ...)` from
+    /// inside `OnRerun` (creates a fresh emit during the wave's pre-fire
+    /// window); `Core::subscribe(self_node)` from inside `OnDeactivation`
+    /// (self-resubscribe race during deactivation).
+    ///
+    /// **Panic isolation (D060).** Core stays panic-naive about user code
+    /// — bindings SHOULD wrap user-closure invocations in `catch_unwind`
+    /// and surface failures via the host language's idiom (JS exception
+    /// → console.error, Python panic → warning, Rust panic → log + propagate
+    /// per binding policy). Core's deferred-drain for `OnInvalidate` wraps
+    /// each `cleanup_for` call in `catch_unwind` itself to prevent a single
+    /// panic from short-circuiting the per-wave drain (all queued cleanup
+    /// attempts run; the last panic re-raises after the drain completes).
+    /// `OnRerun` and `OnDeactivation` fire inline lock-released — a
+    /// panicking `cleanup_for` propagates out of `fire_regular` Phase 1.5
+    /// or `Subscription::Drop` respectively (Drop guarantees apply: state
+    /// lock already released).
+    ///
+    /// **Panic-discard guarantee gap (D061).** When a wave is panic-discarded
+    /// (an `invoke_fn` panics mid-wave), the queued `OnInvalidate` cleanup
+    /// hooks are dropped silently — the cascade's recorded cache-clears
+    /// never fire their cleanups. External-resource cleanup (file handles,
+    /// network sockets, external transactions) attached to `OnInvalidate`
+    /// MUST be idempotent at process exit / next successful invalidate
+    /// cycle. `OnRerun` panic-discard is moot (panic in `OnRerun` aborts
+    /// the wave's `fire_regular` before it can corrupt state). `OnDeactivation`
+    /// panic-discard is moot (Drop is invoked during stack unwinding;
+    /// double-panic during drop aborts per `std::process::abort` semantics).
+    ///
+    /// **Per-trigger lifecycle.** See [`CleanupTrigger`] for per-variant
+    /// firing rules. After each trigger fires, the binding decides whether
+    /// to clear `current_cleanup`:
+    /// - `OnRerun`: do NOT clear; the next `invoke_fn` will overwrite.
+    /// - `OnInvalidate`: do NOT clear; multiple INVALIDATEs across waves
+    ///   can re-fire the same closure.
+    /// - `OnDeactivation`: clear (D059) — one-shot per activation cycle;
+    ///   `store` persists separately per R2.4.6.
+    ///
+    /// Default no-op so bindings without cleanup-hook support compile
+    /// unchanged.
+    fn cleanup_for(&self, _node_id: NodeId, _trigger: CleanupTrigger) {}
+
+    /// Wipe the binding-side ctx state for `node_id`.
+    ///
+    /// Called by Core ONLY on resubscribable terminal reset, per **R2.4.6**:
+    /// `ctx.store` is "wiped automatically: on resubscribable terminal
+    /// reset (when a `resubscribable: true` node hits `COMPLETE`/`ERROR`
+    /// and is later resubscribed)". Bindings drop their `NodeCtxState`
+    /// entry for `node_id`, releasing both `store` and any residual
+    /// `current_cleanup`.
+    ///
+    /// Default deactivation does NOT trigger wipe — `store` persists
+    /// across deactivation/reactivation cycles by spec design (mirrored
+    /// here to match canonical; current TS impl wipes on deactivation
+    /// per docstring at `node.ts:189-190` and is on the Phase 13.6.B
+    /// migration list per canonical-spec §11 item 3).
+    ///
+    /// Fires lock-released. Re-entrance into Core is permitted; typical
+    /// implementations just call `node_ctx.lock().remove(&node_id)`.
+    /// Default no-op.
+    fn wipe_ctx(&self, _node_id: NodeId) {}
 }
 
 #[cfg(test)]
