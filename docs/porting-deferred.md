@@ -1756,3 +1756,190 @@ in-slice rather than deferred:
   change a bogus id (gets `UnknownNode` as expected), then re-sets the
   known node's mode to `Off` (succeeds, proving no partial state
   mutation happened on the failed call).
+
+---
+
+## Phase E rustImpl activation — carry-forward divergences (D073–D077, 2026-05-07)
+
+### BenchGraph reactive methods (`describe_reactive` / `observe_all_reactive` / `edges` reactive)
+
+- **What:** `Graph::describe_reactive`, `Graph::observe_all_reactive`,
+  and the reactive variant of `edges({reactive: true})` exist in
+  `graphrefly-graph` (Slice F) but are NOT wrapped in `BenchGraph` for
+  this slice. The corresponding parity scenarios under
+  `packages/parity-tests/scenarios/graph/describe-reactive.test.ts`,
+  `observe-all-reactive.test.ts`, and the reactive halves of
+  `edges.test.ts` are `test.skip`'d for both impls.
+- **Why deferred:** wrapping the reactive variants requires (a)
+  exposing `Graph::describe_reactive`'s `ReactiveDescribeHandle` over
+  napi (returns a dispose handle + a Node), (b) wiring Producer-style
+  nodes that emit on graph mutations, (c) a TSFN-backed sink path on
+  the JS adapter side. The static surface (`describeJson`,
+  `edges(recursive)`) ships in this slice; the reactive surface is its
+  own scope.
+- **Lift point:** new follow-on slice "Phase E2 — BenchGraph reactive
+  surface". Steps: (1) extend `BenchGraph` with `describe_reactive`
+  returning a struct holding `(node_id: u32, dispose_fn_id: u64)`; (2)
+  same for `observe_all_reactive` + `edges_reactive`; (3) JS adapter
+  exposes `g.describe({reactive: true})` returning `{ node, dispose
+  }` matching the legacy shape; (4) re-enable the skipped scenarios.
+- **Source:** Phase E close (2026-05-07).
+
+### `Graph.derived(name, deps, fn)` with arbitrary JS fn
+
+- **What:** `BenchGraph::derived` only accepts the built-in `BuiltinFn`
+  enum (`Identity` / `AddOne`). Tests calling `g.derived(name, deps,
+  (data) => [...])` with arbitrary JS callbacks throw with a clear
+  diagnostic from `rust.ts`. The workaround for tests: build the
+  derived node via `BenchOperators` (e.g., `impl.map(src, fn)`) and
+  attach via `g.add(name, node)`.
+- **Why deferred:** wiring TSFN-backed derived fn into BenchGraph's
+  Graph::derived path requires either widening `BenchGraph` with a
+  TSFN-receiving variant OR routing through `Core::register_derived`
+  with binding-side fn registration. Both are non-trivial. Most
+  parity scenarios that use `g.derived` can be rewritten to use
+  `g.add(name, impl.map(src, fn))` shape — that's the pattern the
+  Rust port encourages anyway (operators are first-class; arbitrary
+  derived fns are deemphasized).
+- **Lift point:** Phase E2 follow-on; OR rewrite parity scenarios
+  that currently use `g.derived(name, deps, fn)` to use the operator
+  factory + `g.add` pattern.
+- **Source:** Phase E close (2026-05-07).
+
+### `Graph.mount(name, child)` with pre-built foreign child
+
+- **What:** `BenchGraph::mount_new(name)` creates a child sharing the
+  same Core. Mounting a pre-built foreign child (`g.mount(name,
+  child)`) is rejected with a diagnostic from `rust.ts`.
+- **Why deferred:** cross-Core mount has structural questions
+  (handle-space disjointness across BenchCore instances) that aren't
+  resolved in the Rust port. Single-Core mount via `mount_new` covers
+  the common case and matches the M2 Slice E+ semantics already
+  present in `graphrefly-graph`.
+- **Lift point:** if a parity scenario specifically requires foreign-
+  child mount, address case-by-case. Current scenarios that use
+  `g.mount(name)` (no child) work fine.
+- **Source:** Phase E close (2026-05-07).
+
+### Error-payload identity for non-i32 values
+
+- **What:** `BenchCore::error_int(node, err_code: i32)` is the only
+  error-emit path on the napi binding. Tests that emit ERROR with
+  arbitrary `T` payloads (e.g., `s.error("not found")`) lose payload
+  identity through the rust adapter — the JS-side mirror has the
+  value but the napi binding emits a sentinel `0` error code.
+- **Why deferred:** adding `BenchCore::error_handle(node, handle)`
+  taking a JS-allocated handle is straightforward (~10 LOC mirroring
+  `emit_handle`). Tests that depend on error-payload identity through
+  rustImpl will surface during activation triage.
+- **Lift point:** add `BenchCore::error_handle` napi method when a
+  parity scenario surfaces the gap. The `RustNode.error(value)` impl
+  in `rust.ts` already pre-allocates the handle; only the binding
+  call needs to be widened.
+- **Source:** Phase E close (2026-05-07).
+
+### `RustNode.allocLockId` semantics
+
+- **What:** `RustNode.allocLockId()` calls `BenchCore::alloc_lock_id`
+  which allocates from a high (`1<<32`+) range to avoid collision with
+  user-supplied LockIds (per Slice F A4 fix). Legacy uses a process-
+  local counter starting at 0/1. Tests that compare lock-id values
+  numerically across impls will diverge.
+- **Why deferred:** lock-id values are opaque per spec; tests should
+  not assume specific numeric values. If a parity scenario does
+  numerical comparison, address by widening the test to accept either
+  range OR by aligning the legacy counter starting point.
+- **Lift point:** triage individual scenarios as they surface.
+- **Source:** Phase E close (2026-05-07).
+
+### Cross-platform `.node` artifacts not built / published
+
+- **What:** This slice ships the `@graphrefly/native` package shape,
+  napi-cli config, and `package.json` declaring the per-platform
+  `optionalDependencies` matrix. CI matrix to build artifacts per
+  platform lands separately (Commit 5 of this slice). NPM publish flow
+  is a release-engineering follow-on (D075).
+- **Why deferred:** parity-test activation requires only host-platform
+  build (`pnpm --filter @graphrefly/native build` from local toolchain).
+  Cross-platform publish is downstream of 1.0 ship-readiness.
+- **Lift point:** when 1.0 ship engineering picks up; coordinate with
+  `@graphrefly/legacy-pure-ts` publish cadence + npm credentials in CI.
+- **Source:** Phase E close (2026-05-07).
+
+### Post-1.0 follow-on: BigInt migration for u32-narrowed napi types
+
+- **What:** The napi binding currently narrows `HandleId(u64)`, `NodeId(u64)`, `LockId(u64)`, `FnId(u64)` to `u32` at the FFI boundary (D064 — matches existing `BenchCore::register_state_int → u32` convention). Each method that crosses the boundary does `u32::try_from(raw).expect(...)` or `.map_err(...)`, which silently caps the usable space at 4 billion handles per process.
+- **Why deferred:** Bench / parity-test workloads don't approach 2^32. Phase E /qa F1 surfaced a concrete cost — `alloc_lock_id`'s seed had to drop from `1u64 << 32` to `1u64 << 31` to keep the napi round-trip working, halving the high-range ceiling. The same constraint applies to every other u64 type that crosses napi.
+- **Lift point:** **after the Rust port closes** (post-M5 or post-1.0 — user direction 2026-05-08). At that point, sweep all `u32::try_from` sites in `crates/graphrefly-bindings-js/src/{core_bindings,operator_bindings,graph_bindings}.rs` and migrate to `napi::bindgen_prelude::BigInt` (n-api 9 supports `bigint64_t`). JS adapter coerces BigInt ↔ Number where safe (Number.MAX_SAFE_INTEGER = 2^53 covers most realistic counters); the BigInt → Number conversion is a JS-side concern. Concurrently, lift the `next_lock_id` seed back to `1u64 << 32+` (or higher).
+- **Source:** Phase E /qa F1 close (2026-05-08). User pre-locked the design intent: u32 narrowing is acceptable for now, BigInt sweep happens after the port stabilizes.
+
+---
+
+## Phase E /qa deferred items (2026-05-08)
+
+These were surfaced by the Phase E /qa adversarial review (Blind Hunter +
+Edge Case Hunter subagents) but not fixed in /qa scope. F1–F8 from the
+same review WERE fixed and are documented in `migration-status.md` under
+the `Phase E /qa` row.
+
+### F9 — `edges.test.ts` (3 tests) + `sugar.test.ts` use `g.derived(name, deps, fn)` with arbitrary JS fn — not gated for rustImpl
+
+- **What:** Three tests in `packages/parity-tests/scenarios/graph/edges.test.ts:19, :43, :65` plus one in `sugar.test.ts:93` call `g.derived("c", [a, b], (data) => ...)` with arbitrary JS callbacks. `RustGraph.derived` throws `"out of scope for this slice"` when not the built-in `BuiltinFn::Identity / AddOne` shape. None of the tests have `test.runIf` or `describe.skipIf` gating.
+- **Why deferred:** matches the existing "Phase E rustImpl activation — carry-forward divergences / `Graph.derived` with arbitrary JS fn" entry's stated workaround ("rewrite to `g.add(name, await impl.map(src, fn))`"); these specific test files were missed in the rewrite. The /qa pass scoped to dispatcher / refactor fixes; test rewrites are a separate mechanical sweep.
+- **Lift point:** when `pnpm --filter @graphrefly/native build` produces a `.node` artifact and the rust arm activates, these tests will fail loud — at that point either rewrite to use the operator + `g.add` pattern OR add `test.runIf(impl.name !== "rust-via-napi")` per the carry-forward note.
+- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F8 + Blind Hunter F5.
+
+### F10 — `index.js` musl detection reads `/proc/self/maps` and produces unmapped platform keys
+
+- **What:** `crates/graphrefly-bindings-js/index.js:32-43` reads `/proc/self/maps` (potentially MB on long-running processes) and substring-matches "musl" to detect Alpine. Two issues: (a) `/proc/self/maps` is unbounded (mapped libraries grow with process lifetime); (b) the `platforms` table on lines 21-28 has NO musl entries. On Alpine, `pickPlatformKey()` returns `"linux-x64-musl"` → `platforms[key]` is `undefined` → falls through to `graphrefly-native.linux-x64-musl.node` which doesn't exist → `require('@graphrefly/native-linux-x64-musl')` fails. Final error: confusing "no native artifact found for linux-x64-musl" without explaining musl isn't supported.
+- **Why deferred:** musl support is downstream of the Cross-platform CI matrix (D075) which currently builds gnu / msvc / darwin only. Fixing the loader without adding musl artifacts would make Alpine users marginally better-error'd but still broken. Lift together when Alpine is an explicit target.
+- **Lift point:** add `linux-x64-musl` / `linux-arm64-musl` to the CI matrix in `.github/workflows/ci.yml` `napi-build-matrix` (requires `cross` target setup for musl-libc); also add the keys to `platforms` in `index.js`. Replace the `/proc/self/maps` check with `process.report.getReport().header.glibcVersionRuntime === undefined` (faster, more standard).
+- **Source:** Phase E /qa (2026-05-08), Blind Hunter F8 + Edge Case Hunter F9.
+
+### F11 — `getState()` singleton causes cross-test pollution within a single vitest file
+
+- **What:** `packages/parity-tests/impls/rust.ts:476-491` — `getState()` constructs one `BenchCore + JSValueRegistry` lazily and reuses across all `rustImpl` factory calls in the same vitest worker. Tests that don't `g.destroy()` or skip cleanup (e.g., assertion mid-test bails out before `finally`) leak nodes / handles into subsequent tests in the same file. Vitest by default isolates across FILES (process-per-file) but not WITHIN a file.
+- **Why deferred:** Robustness concern, not a correctness bug for clean test runs (current scenarios all `await g.destroy()` in `finally`). Scope of the fix conflicts with D074's "operators + Graph share the same Core" intent — resetting between tests would break the shared-Core invariant for tests that use both surfaces.
+- **Lift point:** add a vitest `afterEach` hook in `rust.ts` that nulls `cachedState` between tests (cheap; loses operator/Graph cross-state but that's per-test scope anyway). OR migrate `rustImpl` to a factory pattern (`makeRustImpl()` per-test) — requires reshaping the `Impl` interface. Option (a) is cheapest.
+- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F10.
+
+### F12 — `RustNode.down([[INVALIDATE]])` updated cache mirror BEFORE awaited Core call (resolved in F2's batch refactor)
+
+- **What was broken:** `_updateCache(undefined)` ran synchronously inside the for-loop iteration, but `core.invalidate(this.nodeId)` was queued in `buffered` and awaited later. If awaiting threw, the mirror was zeroed without Core's cache being touched.
+- **Status:** RESOLVED inline as part of F2's batch refactor. The new `down()` shape moves the `_updateCache(undefined)` AFTER `await batchEmitHandleMessages` resolves, so a Core throw doesn't corrupt the mirror.
+- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F12. Resolved in F2 fix (same /qa pass).
+
+### F13 — `napi-cli --use-cross` flag verification
+
+- **What:** `.github/workflows/ci.yml:188-194` (the `napi-build-matrix` job) uses `--use-cross` for the `aarch64-unknown-linux-gnu` row to invoke rustup `cross`. napi-rs CLI 3.x is also moving toward `--cross-compile` / `--use-napi-cross` (zigbuild-based). The flag may have been renamed.
+- **Why deferred:** verifiable on first CI run only; can't reproduce locally without setting up GitHub Actions runners. Fast feedback once CI runs.
+- **Lift point:** first push that triggers the CI matrix; if the linux-arm64-gnu row fails with "unknown flag --use-cross", switch to `--cross-compile` (3.0.0-alpha.62+) or invoke `cross build` directly.
+- **Source:** Phase E /qa (2026-05-08), Blind Hunter F9.
+
+### F14 — `BenchGraph::binding` field is redundant with `core`'s embedded binding
+
+- **What:** `BenchGraph` stores `binding: Arc<BenchBinding>` AND `core: Core` (whose `Arc<dyn BindingBoundary>` already points at the same `BenchBinding`). The redundancy is only used in `derived()` for binding-side fn registration via concrete type. A future refactor that detaches the binding from the Core would silently diverge.
+- **Why deferred:** structural cleanliness, no correctness implication today. The `BenchCore` constructor is the only path that builds the binding; both `binding` and `core` are derived from the same source via `from_core(...)`.
+- **Lift point:** when a downstream refactor introduces multi-binding-per-core or otherwise decouples binding from Core. Add a debug-build `Arc::ptr_eq(...)` assertion in `BenchGraph::from_core` that the supplied `&BenchCore`'s binding-via-Core matches the binding-via-direct path.
+- **Source:** Phase E /qa (2026-05-08), Blind Hunter F10.
+
+### F15 — `LegacyNode.hasFiredOnce()` approximation diverges from rust's real `hasFiredOnce`
+
+- **What:** Legacy approximates `hasFiredOnce` as "cache is non-undefined-non-null." Rust's real `has_fired_once` is a separate bookkeeping flag. After `node.invalidate()`, cache is undefined → legacy returns false; rust returns true (it DID fire once historically). Tests that distinguish "fired-and-invalidated" from "never-fired" will diverge.
+- **Why deferred:** parity-only divergence, no current scenario exercises it. The legacy `has_fired_once` semantics aren't part of the public legacy API; expose-and-align is its own slice.
+- **Lift point:** when a parity scenario lands that exercises this distinction, either widen legacy.Node to expose the bookkeeping flag OR gate the test with `runIf`.
+- **Source:** Phase E /qa (2026-05-08), Blind Hunter F12.
+
+### F16 — `RustGraph.set/invalidate(name)` mirror-update only fires when the named node is owned by this RustGraph
+
+- **What:** `RustGraph.set(name, value)` does `this.nodesByName.get(name)?._updateCache(value)`. If the node was added via `add(name, externalNode)` from a different RustGraph (multi-graph composition), `nodesByName` lookup hits but the OTHER graph's `nodesByName` doesn't know about the rename. Cross-graph cache-mirror divergence.
+- **Why deferred:** current parity scenarios don't exercise multi-RustGraph composition. Phase E2 / patterns work will.
+- **Lift point:** move cache-mirror tracking from per-RustGraph map to a central `Map<NodeId, RustNode<unknown>>` keyed by node id. Any RustGraph that observes a Core operation refreshes the right node's mirror via that central map.
+- **Source:** Phase E /qa (2026-05-08), Edge Case Hunter F11.
+
+### F17 — `release_callback` set_release_callback overwritable; second install drops the prior TSFN
+
+- **What:** `BenchCore::set_release_callback` does `*self.binding.release_callback.lock() = Some(Arc::new(tsfn));` — the previous Arc-wrapped TSFN, if any, drops on assignment. Should release the napi TSFN handle correctly. Worth a unit test that two installs in a row don't double-fire to the old TSFN.
+- **Why deferred:** defensive concern, no current consumer installs twice.
+- **Lift point:** add a regression test in `crates/graphrefly-bindings-js/tests/` that asserts the old TSFN is no longer fired after re-install (would need a Rust-side TSFN that the test can verify never receives messages post-replacement).
+- **Source:** Phase E /qa (2026-05-08), Blind Hunter F7.

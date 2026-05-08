@@ -43,9 +43,19 @@ fn a2_zero_cap_rejected() {
 fn a4_alloc_lock_id_starts_above_user_range() {
     let rt = TestRuntime::new();
     let allocated = rt.core.alloc_lock_id();
+    // Phase E /qa F1 (2026-05-08): seed lowered from `1u64 << 32` to
+    // `1u64 << 31` so values round-trip through napi's u32 boundary.
+    // Anti-collision intent (high vs low range) preserved.
     assert!(
-        allocated.raw() >= (1u64 << 32),
-        "alloc_lock_id should start at >= 2^32; got raw={}",
+        allocated.raw() >= (1u64 << 31),
+        "alloc_lock_id should start at >= 2^31; got raw={}",
+        allocated.raw()
+    );
+    // Also verify it's still u32-fitting so the napi binding doesn't
+    // error on the cast.
+    assert!(
+        allocated.raw() <= u64::from(u32::MAX),
+        "alloc_lock_id seed must fit in u32 for napi round-trip; got raw={}",
         allocated.raw()
     );
 }

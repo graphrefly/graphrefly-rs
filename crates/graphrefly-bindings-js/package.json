@@ -1,0 +1,50 @@
+{
+	"name": "@graphrefly/native",
+	"version": "0.0.0",
+	"private": true,
+	"description": "GraphReFly Rust dispatcher exposed to JavaScript via napi-rs. Phase E rustImpl activation slice (D074).",
+	"main": "index.js",
+	"types": "index.d.ts",
+	"files": [
+		"index.js",
+		"index.d.ts",
+		"graphrefly-native.*.node",
+		"npm/**"
+	],
+	"napi": {
+		"binaryName": "graphrefly-native",
+		"targets": [
+			"x86_64-apple-darwin",
+			"aarch64-apple-darwin",
+			"x86_64-unknown-linux-gnu",
+			"aarch64-unknown-linux-gnu",
+			"x86_64-pc-windows-msvc",
+			"aarch64-pc-windows-msvc"
+		]
+	},
+	"scripts": {
+		"artifacts": "napi artifacts",
+		"build": "napi build --platform --release --features standard",
+		"build:debug": "napi build --platform --features standard",
+		"prepublishOnly": "napi prepublish -t npm",
+		"version": "napi version"
+	},
+	"devDependencies": {
+		"@napi-rs/cli": "^3.0.0"
+	},
+	"engines": {
+		"node": ">=14"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/graphrefly/graphrefly-rs"
+	},
+	"keywords": [
+		"graphrefly",
+		"reactive",
+		"dispatcher",
+		"napi-rs"
+	],
+	"comment_for_humans": "Phase E (D074): @graphrefly/native is the napi-rs binding for the Rust GraphReFly dispatcher. The package.json shape mirrors the napi-rs canonical layout (binaryName + per-target sub-packages via optionalDependencies). For this slice, no platform sub-packages are published — the local build via 'pnpm build' produces graphrefly-native.<host>.node directly in this directory, which the workspace consumer (packages/parity-tests in graphrefly-ts) loads via relative file: dep. Cross-platform CI matrix lands in Commit 5 of this slice; npm publish is a separate release-engineering slice."
+}

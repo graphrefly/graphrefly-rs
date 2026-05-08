@@ -34,6 +34,9 @@ mod core_bindings;
 #[cfg(feature = "operators")]
 mod operator_bindings;
 
+#[cfg(feature = "graph-codec")]
+mod graph_bindings;
+
 use napi_derive::napi;
 
 /// Smoke export — verifies napi-rs link works.

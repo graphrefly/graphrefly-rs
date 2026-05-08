@@ -34,14 +34,18 @@
 //!   the old `worker::WORKER_CORE` thread-local.
 
 use std::cell::RefCell;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
 
 use graphrefly_core::{
     BindingBoundary, Core, DepBatch, EqualsMode, FnEmission, FnId, FnResult, HandleId, LockId,
-    NodeId, Subscription,
+    Message, NodeId, Sink, Subscription,
 };
 use napi::bindgen_prelude::*;
-use napi::Error as NapiError;
+use napi::threadsafe_function::{
+    ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+};
+use napi::{Env, Error as NapiError, Status};
 use napi_derive::napi;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
@@ -128,6 +132,14 @@ pub(crate) enum BenchValue {
     Int(i32),
     #[allow(dead_code)] // reserved for v1 string-value benchmarks
     Str(String),
+    /// JS-allocated handle marker (D073). Value lives in the JS-side
+    /// adapter registry; this Rust-side variant is only stored for
+    /// refcount tracking. `release_handle → 0` for one of these fires
+    /// the TSFN registered via `BenchCore::set_release_callback`,
+    /// letting the JS-side mirror prune. NOT inserted into
+    /// `primitive_index` (every JS-allocated handle is a fresh allocation
+    /// — no de-duping by value, since Rust has no value to de-dup on).
+    JsAllocated,
 }
 
 /// User-side emission shape for the FnResult::Batch builtin fn registry.
@@ -202,6 +214,29 @@ impl Registry {
         h
     }
 
+    /// Allocate a fresh `HandleId` for a value that lives JS-side (D073).
+    /// Stores `BenchValue::JsAllocated` as a marker (NOT indexed by value
+    /// — every JS-allocated handle is a fresh allocation since Rust has
+    /// no value to dedup on). Refcount=1 — caller (JS adapter) takes
+    /// ownership of the share, which transfers when the handle is
+    /// passed to `register_state_with_handle` / `emit_handle` / etc.
+    pub(crate) fn alloc_external_handle(&mut self) -> HandleId {
+        let h = HandleId::new(self.next_handle);
+        self.next_handle += 1;
+        self.values.insert(h, BenchValue::JsAllocated);
+        self.refcounts.insert(h, 1);
+        h
+    }
+
+    /// True if `h` was allocated via `alloc_external_handle` (JS-side).
+    /// Currently unused — the JS-prune gate moved into `release` for
+    /// atomicity (Phase E /qa F5). Kept as a predicate for future
+    /// debug / introspection paths.
+    #[allow(dead_code)]
+    pub(crate) fn is_js_allocated(&self, h: HandleId) -> bool {
+        matches!(self.values.get(&h), Some(BenchValue::JsAllocated))
+    }
+
     pub(crate) fn deref(&self, h: HandleId) -> Option<BenchValue> {
         self.values.get(&h).cloned()
     }
@@ -226,12 +261,27 @@ impl Registry {
         true
     }
 
-    fn release(&mut self, h: HandleId) {
+    /// Decrement refcount for `h` and evict if zero. Returns `true` IFF
+    /// (a) the entry was a `JsAllocated` marker AND (b) the post-release
+    /// refcount hit zero (i.e., the entry was just evicted). Caller
+    /// fires the JS-side prune TSFN on `true` (D076).
+    ///
+    /// Phase E /qa F5 (2026-05-08): replaced the prior two-phase
+    /// snapshot-then-release pattern in `BindingBoundary::release_handle`
+    /// (lock-acquire → snapshot → drop lock → lock-acquire → release →
+    /// notify) with an atomic single-acquisition variant. The TOCTOU
+    /// window between the two acquisitions allowed concurrent
+    /// retain/release to flip the JS-prune decision (false-positive
+    /// prune → JS adapter loses live values; false-negative prune →
+    /// JS mirror leaks).
+    fn release(&mut self, h: HandleId) -> bool {
+        let was_js_allocated = matches!(self.values.get(&h), Some(BenchValue::JsAllocated));
         let count = self.refcounts.entry(h).or_insert(0);
         if *count > 0 {
             *count -= 1;
         }
-        if *count == 0 {
+        let evicted = *count == 0;
+        if evicted {
             if let Some(value) = self.values.remove(&h) {
                 if self.primitive_index.get(&value).copied() == Some(h) {
                     self.primitive_index.remove(&value);
@@ -239,11 +289,28 @@ impl Registry {
             }
             self.refcounts.remove(&h);
         }
+        was_js_allocated && evicted
     }
 }
 
+/// TSFN that fires JS-side prune notifications when a JS-allocated
+/// handle's refcount drops to 0 (D076). Single-arg `(handle: u32)`
+/// callback; JS adapter wires this to `Map.delete(handle)`.
+/// **Non-blocking call mode** — `release_handle` may run from inside
+/// Core's wave (state lock held); we MUST NOT block the Core thread.
+/// Late delivery is benign: handle IDs are never reused (allocator is
+/// monotonic), so prune-after-Core-drop is a `Map.delete` of an
+/// unknown key.
+pub(crate) type ReleaseTsfn = ThreadsafeFunction<u32, (), u32, Status, true, false, 1>;
+
 pub(crate) struct BenchBinding {
     pub(crate) registry: Mutex<Registry>,
+    /// JS-side prune callback for JS-allocated handles (D076).
+    /// `None` until the JS adapter calls `BenchCore::set_release_callback`.
+    /// Mutex (not Arc-based swap) because installation is one-shot at
+    /// adapter init; the read path on every `release_handle` clones the
+    /// Arc<Tsfn> out under a quick lock.
+    pub(crate) release_callback: Mutex<Option<Arc<ReleaseTsfn>>>,
     /// `ProducerStorage` for `ProducerBinding` impl. Used by zip/concat/
     /// race/take_until and the higher-order family.
     #[cfg(feature = "operators")]
@@ -254,6 +321,7 @@ impl BenchBinding {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Registry::new()),
+            release_callback: Mutex::new(None),
             #[cfg(feature = "operators")]
             producer_storage: Arc::new(Mutex::new(
                 ahash::AHashMap::<NodeId, ProducerNodeState>::new(),
@@ -360,8 +428,34 @@ impl BindingBoundary for BenchBinding {
     /// registry). Each `release_handle` pairs with one `retain_handle`
     /// or `intern` (which sets refcount=1). Refcount→0 evicts both
     /// `values[h]` and `primitive_index` mapping for that value.
+    ///
+    /// **D076 — JS-side prune notification:** if `h` was allocated via
+    /// `alloc_external_handle` (JsAllocated marker) AND refcount drops
+    /// to 0 in this call AND a release_callback TSFN is installed,
+    /// fire the TSFN non-blocking with the handle ID. JS adapter
+    /// prunes its mirror map. Non-blocking is REQUIRED — this method
+    /// may run from inside Core's wave with state lock held; blocking
+    /// would deadlock the wave.
+    ///
+    /// Phase E /qa F5: snapshot-and-release happens under one
+    /// `registry.lock()` acquisition via `Registry::release`'s `bool`
+    /// return — closes the TOCTOU window where concurrent retain/
+    /// release between two separate acquisitions could flip the
+    /// JS-prune decision.
     fn release_handle(&self, h: HandleId) {
-        self.registry.lock().release(h);
+        let should_notify_js = self.registry.lock().release(h);
+        if should_notify_js {
+            let cb = self.release_callback.lock().clone();
+            if let Some(tsfn) = cb {
+                let h_u32 = u32::try_from(h.raw()).unwrap_or(u32::MAX);
+                // Non-blocking — fire-and-forget. `_status` ignored
+                // because there's no caller to recover; if the queue
+                // is full or the TSFN is closed during shutdown, the
+                // JS-side mirror just doesn't prune for this handle
+                // (benign — handle IDs are never reused).
+                let _status = tsfn.call(Ok(h_u32), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
     }
 
     /// Spec: D016 (refcount-bump pairing with release_handle).
@@ -483,6 +577,120 @@ impl BindingBoundary for BenchBinding {
 }
 
 // ---------------------------------------------------------------------------
+// TSFN-backed sink — JS subscribe API (D077 — async-everywhere parity).
+//
+// The user-side JS sink `(msgs: number[]) => void` receives a flat-encoded
+// message batch: alternating (variantCode, payload) u32 pairs. JS adapter
+// translates variant codes to canonical message-type symbols (DATA /
+// RESOLVED / etc., re-exported from `@graphrefly/legacy-pure-ts` per D066)
+// and dereferences payload handles via the JS-side mirror map (D073).
+//
+// **Sync bridge.** Sinks fire from inside a wave running on a tokio
+// blocking-pool thread. To preserve "all sinks completed before Promise
+// resolves" semantics (so `await impl.subscribe(...)` followed by sync
+// `expect(seen)...` works), the sink uses `bridge_sync_unit`: blocks the
+// tokio thread on a sync_channel until the JS sink callback returns via
+// libuv pump. JS thread MUST be `await`ing the napi method that
+// triggered the wave; otherwise the bridge deadlocks (no libuv pump).
+//
+// **Variant code table** — must match the JS-side decode table in
+// `packages/parity-tests/impls/rust.ts`. Don't reorder without updating
+// both sides.
+// ---------------------------------------------------------------------------
+
+pub(crate) const MSG_CODE_START: u32 = 0;
+pub(crate) const MSG_CODE_DIRTY: u32 = 1;
+pub(crate) const MSG_CODE_RESOLVED: u32 = 2;
+pub(crate) const MSG_CODE_DATA: u32 = 3;
+pub(crate) const MSG_CODE_INVALIDATE: u32 = 4;
+pub(crate) const MSG_CODE_PAUSE: u32 = 5;
+pub(crate) const MSG_CODE_RESUME: u32 = 6;
+pub(crate) const MSG_CODE_COMPLETE: u32 = 7;
+pub(crate) const MSG_CODE_ERROR: u32 = 8;
+pub(crate) const MSG_CODE_TEARDOWN: u32 = 9;
+
+#[inline]
+fn encode_message(m: Message) -> (u32, u32) {
+    match m {
+        Message::Start => (MSG_CODE_START, 0),
+        Message::Dirty => (MSG_CODE_DIRTY, 0),
+        Message::Resolved => (MSG_CODE_RESOLVED, 0),
+        Message::Data(h) => (MSG_CODE_DATA, u32::try_from(h.raw()).unwrap_or(u32::MAX)),
+        Message::Invalidate => (MSG_CODE_INVALIDATE, 0),
+        Message::Pause(l) => (MSG_CODE_PAUSE, u32::try_from(l.raw()).unwrap_or(u32::MAX)),
+        Message::Resume(l) => (MSG_CODE_RESUME, u32::try_from(l.raw()).unwrap_or(u32::MAX)),
+        Message::Complete => (MSG_CODE_COMPLETE, 0),
+        Message::Error(h) => (MSG_CODE_ERROR, u32::try_from(h.raw()).unwrap_or(u32::MAX)),
+        Message::Teardown => (MSG_CODE_TEARDOWN, 0),
+    }
+}
+
+/// TSFN type for sinks. Single arg `Vec<u32>` (flat-encoded batch); JS
+/// callback returns nothing (`()` → undefined). `MaxQueueSize = 1`
+/// per D077 sync-bridge invariant.
+type SinkTsfn = ThreadsafeFunction<Vec<u32>, (), Vec<u32>, Status, true, false, 1>;
+
+fn build_sink_tsfn(callback: Function<Vec<u32>, ()>) -> Result<Arc<SinkTsfn>> {
+    let tsfn = callback
+        .build_threadsafe_function::<Vec<u32>>()
+        .max_queue_size::<1>()
+        .callee_handled::<true>()
+        .build_callback(|ctx: ThreadsafeCallContext<Vec<u32>>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+/// Fire the TSFN with the encoded batch; block the calling tokio
+/// blocking-pool thread until the JS sink callback returns. JS-callback
+/// throws panic on the tokio thread (per D065 wave-discard discipline);
+/// Core's `BatchGuard::drop` panic path discards the wave cleanly.
+///
+/// Symmetric with `operator_bindings::bridge_sync` but for `()` return.
+fn bridge_sync_unit(tsfn: &Arc<SinkTsfn>, payload: Vec<u32>) {
+    let (tx, rx) = sync_channel::<Result<()>>(1);
+    let status = tsfn.call_with_return_value(
+        Ok(payload),
+        ThreadsafeFunctionCallMode::Blocking,
+        move |result: Result<()>, _env: Env| -> Result<()> {
+            let _ = tx.send(result);
+            Ok(())
+        },
+    );
+    if status != Status::Ok {
+        panic!(
+            "TSFN sink call_with_return_value failed with status {status:?} (likely TSFN closed during shutdown). \
+             Wave panic-discarded via Core's BatchGuard drop discipline."
+        );
+    }
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("[graphrefly] JS sink callback threw: {e}");
+            panic!(
+                "JS sink callback threw: {e}. Wave panic-discarded via Core's BatchGuard drop discipline."
+            );
+        }
+        Err(_) => panic!(
+            "TSFN sink result channel closed without delivering. \
+             Wave panic-discarded via Core's BatchGuard drop discipline."
+        ),
+    }
+}
+
+/// Build a `Sink` closure that delivers each message batch to JS via
+/// the TSFN, blocking until JS finishes processing.
+fn build_tsfn_sink(tsfn: Arc<SinkTsfn>) -> Sink {
+    Arc::new(move |msgs: &[Message]| {
+        let mut payload: Vec<u32> = Vec::with_capacity(msgs.len() * 2);
+        for m in msgs {
+            let (code, arg) = encode_message(*m);
+            payload.push(code);
+            payload.push(arg);
+        }
+        bridge_sync_unit(&tsfn, payload);
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Pre-baked fn variants (v0 bench scope — no JS callbacks).
 // ---------------------------------------------------------------------------
 
@@ -522,16 +730,26 @@ pub struct BenchCore {
     /// stable). Drop happens on whatever tokio thread last touches the
     /// slot; safe because `parking_lot` is non-poisoning.
     ///
-    /// **Field-declaration order matters (m26 fix):** Rust drops fields
-    /// in declaration order. `subscriptions` is declared FIRST so each
-    /// `Subscription::Drop` (which accesses Core's internal mutex via
-    /// the Subscription's own `Weak<Mutex<CoreState>>`) runs while
-    /// `core` is still fully alive. Reverse order would deactivate
-    /// Core's CoreState (potentially dropping `Arc<dyn BindingBoundary>`
-    /// and triggering `producer_deactivate` chains) before subscriptions
-    /// drop — fragile if Subscription is later refactored to hold a
-    /// strong Arc.
-    pub(crate) subscriptions: Mutex<Vec<Option<Subscription>>>,
+    /// **Arc-wrapped (D077, Phase E)** — `subscribe_with_tsfn` returns
+    /// a `PromiseRaw` whose `spawn_future` closure outlives `&self`;
+    /// Arc lets the closure capture a clone for storing the
+    /// Subscription after the blocking task resolves.
+    ///
+    /// **Drop-order discipline (Phase E /qa F8 — was m26):** with the
+    /// Arc wrapper, Rust's field-drop order no longer guarantees
+    /// `Subscription::Drop` runs strictly BEFORE `core` — any in-flight
+    /// `subscribe_with_tsfn` future that hasn't been polled to
+    /// completion holds a clone of this Arc, so the Vec can outlive
+    /// `BenchCore::core` if the JS side drops the Promise. This is
+    /// SAFE because `Subscription` holds a `Weak<Mutex<CoreState>>`
+    /// (not a strong `Arc<Core>`) — when the Vec finally drops, each
+    /// `Subscription::Drop` either upgrades the Weak (Core still
+    /// alive) and releases activation, or no-ops (Core gone, state
+    /// already cleaned by the matching binding-side
+    /// `producer_deactivate` cascade). The field declaration stays
+    /// FIRST in struct order so the COMMON case (no in-flight
+    /// futures) drops subscriptions before `core` deterministically.
+    pub(crate) subscriptions: Arc<Mutex<Vec<Option<Subscription>>>>,
     pub(crate) binding: Arc<BenchBinding>,
     pub(crate) core: Core,
 }
@@ -546,6 +764,11 @@ impl BenchCore {
     pub(crate) fn binding_arc(&self) -> Arc<BenchBinding> {
         Arc::clone(&self.binding)
     }
+
+    /// Clone the subscriptions Arc for capture into futures (D077).
+    pub(crate) fn subscriptions_arc(&self) -> Arc<Mutex<Vec<Option<Subscription>>>> {
+        Arc::clone(&self.subscriptions)
+    }
 }
 
 #[napi]
@@ -558,7 +781,7 @@ impl BenchCore {
         let binding = BenchBinding::new();
         let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
         Self {
-            subscriptions: Mutex::new(Vec::new()),
+            subscriptions: Arc::new(Mutex::new(Vec::new())),
             binding,
             core,
         }
@@ -591,6 +814,77 @@ impl BenchCore {
             Some(BenchValue::Int(n)) => n,
             _ => -1,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Handle-passthrough surface (D073 — JS-side value registry).
+    //
+    // The JS adapter (`packages/parity-tests/impls/rust.ts`) holds a
+    // `Map<u32, T>` mirror for arbitrary `T`. Rust binding stays
+    // handle-opaque: it only refcount-tracks the JS-allocated handles
+    // via `BenchValue::JsAllocated` markers. When refcount drops to 0
+    // for a JS-allocated handle, `BenchBinding::release_handle` fires
+    // the TSFN registered via `set_release_callback` so the JS adapter
+    // can prune its mirror (D076).
+    // -----------------------------------------------------------------
+
+    /// Allocate a fresh handle for the JS adapter to associate with a
+    /// JS-side value (D073). Returns the handle ID; refcount=1.
+    /// **Caller responsibility:** the JS adapter MUST register the
+    /// value in its mirror map BEFORE handing the handle to anything
+    /// that may dereference it (operator callbacks, sinks).
+    /// Sync — pure Registry op, no Core wave.
+    #[napi]
+    #[must_use]
+    pub fn alloc_external_handle(&self) -> u32 {
+        let h = self.binding.registry.lock().alloc_external_handle();
+        u32::try_from(h.raw()).expect("handle exceeds u32")
+    }
+
+    /// Register a state node initialized with a JS-allocated handle.
+    /// JS adapter must have called `alloc_external_handle` and stored
+    /// the value in its mirror first. The handle's refcount=1 share is
+    /// consumed by the state node's initial cache slot.
+    #[napi]
+    pub async fn register_state_with_handle(&self, initial_handle: u32) -> Result<u32> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let h = HandleId::new(u64::from(initial_handle));
+            let id = core
+                .register_state(h, false)
+                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// Emit a JS-allocated handle on a node. JS adapter must have
+    /// stored the value in its mirror first. The handle's refcount
+    /// share is consumed by Core's emission path (Core retains the
+    /// handle into the cache slot).
+    #[napi]
+    pub async fn emit_handle(&self, node_id: u32, handle: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.emit(
+                NodeId::new(u64::from(node_id)),
+                HandleId::new(u64::from(handle)),
+            );
+        })
+        .await
+    }
+
+    /// Read a node's current cache as a HandleId. Returns 0
+    /// (NO_HANDLE) for sentinel cache. JS adapter looks up the handle
+    /// in its mirror map.
+    #[napi]
+    pub async fn cache_handle(&self, node_id: u32) -> Result<u32> {
+        let core = self.core.clone();
+        let h = run_blocking(core.clone(), move || {
+            core.cache_of(NodeId::new(u64::from(node_id)))
+        })
+        .await?;
+        u32::try_from(h.raw()).map_err(|_| NapiError::from_reason("handle exceeds u32"))
     }
 
     // -----------------------------------------------------------------
@@ -674,9 +968,70 @@ impl BenchCore {
         })
         .await?;
         let mut subs = self.subscriptions.lock();
-        let idx = subs.len();
+        // Phase E /qa F7 (2026-05-08): validate idx BEFORE push so
+        // overflow drops `sub` (auto-unsubscribes via Drop) instead of
+        // leaking a Subscription into a slot that no JS caller can
+        // address.
+        let idx_u32 = u32::try_from(subs.len())
+            .map_err(|_| NapiError::from_reason("subscription index exceeds u32"))?;
         subs.push(Some(sub));
-        u32::try_from(idx).map_err(|_| NapiError::from_reason("subscription index exceeds u32"))
+        Ok(idx_u32)
+    }
+
+    /// Subscribe with a JS callback sink (D077). The callback receives
+    /// a flat-encoded `Vec<u32>` per message batch — alternating
+    /// `(variantCode, payload)` pairs. JS adapter decodes via the
+    /// `MSG_CODE_*` table (mirrored in `rust.ts`) and dereferences
+    /// payload handles via the JS-side mirror map.
+    ///
+    /// **Sync-bridge semantics:** the returned Promise resolves AFTER
+    /// the subscribe-time handshake fires AND the JS sink callback
+    /// completes (per `bridge_sync_unit` blocking the tokio thread on
+    /// a sync_channel until JS responds via libuv pump). JS code
+    /// MUST `await` this method — synchronous calling deadlocks.
+    ///
+    /// `pub fn` (not `async fn`) because `Function<>` is `!Send`; the
+    /// async work runs inside `env.spawn_future(async move { ... })`.
+    #[napi]
+    pub fn subscribe_with_tsfn<'env>(
+        &self,
+        env: &'env Env,
+        node_id: u32,
+        sink_callback: Function<Vec<u32>, ()>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_sink_tsfn(sink_callback)?;
+        let sink = build_tsfn_sink(tsfn);
+        let core = self.core.clone();
+        let subs = self.subscriptions_arc();
+        env.spawn_future(async move {
+            let core_for_blocking = core.clone();
+            let sub = run_blocking(core, move || -> Subscription {
+                core_for_blocking.subscribe(NodeId::new(u64::from(node_id)), sink)
+            })
+            .await?;
+            let mut s = subs.lock();
+            // Phase E /qa F7: validate-before-push (see subscribe_noop).
+            let idx_u32 = u32::try_from(s.len())
+                .map_err(|_| NapiError::from_reason("subscription index exceeds u32"))?;
+            s.push(Some(sub));
+            Ok(idx_u32)
+        })
+    }
+
+    /// Install the JS-side prune callback (D076). Called once at JS
+    /// adapter construction. Subsequent calls overwrite. The callback
+    /// receives a single `(handle: u32)` and should `Map.delete(handle)`
+    /// in the JS-side mirror. Fired NON-BLOCKING from
+    /// `BindingBoundary::release_handle`.
+    #[napi]
+    pub fn set_release_callback(&self, callback: Function<'_, u32, ()>) -> Result<()> {
+        let tsfn = callback
+            .build_threadsafe_function::<u32>()
+            .max_queue_size::<1>()
+            .callee_handled::<true>()
+            .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
+        *self.binding.release_callback.lock() = Some(Arc::new(tsfn));
+        Ok(())
     }
 
     /// Drop the subscription at `idx` (releases activation refcount).
@@ -1016,6 +1371,88 @@ impl BenchCore {
             u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
         })
         .await?
+    }
+
+    /// Batch-dispatch a handle-encoded message sequence atomically (Phase E
+    /// /qa F2 — D077 "one call = one wave"). The `encoded` argument is a
+    /// flat `[code_0, payload_0, code_1, payload_1, ...]` array using the
+    /// same `MSG_CODE_*` table that `subscribe_with_tsfn` decodes — so
+    /// `RustNode.down(msgs)` can encode once on the JS side and replay
+    /// the whole batch through one Core wave.
+    ///
+    /// Codes accepted:
+    /// - 1 (DIRTY) — Core auto-emits DIRTY before tier-3 emissions; an
+    ///   explicit DIRTY in `encoded` is a no-op (matches legacy semantics).
+    /// - 3 (DATA) — payload is a JS-allocated handle (D073).
+    /// - 4 (INVALIDATE) — no payload.
+    /// - 5 (PAUSE) — payload is a lock id.
+    /// - 6 (RESUME) — payload is a lock id.
+    /// - 7 (COMPLETE) — no payload.
+    /// - 8 (ERROR) — payload is a JS-allocated handle.
+    /// - 9 (TEARDOWN) — no payload.
+    ///
+    /// Codes 0 (Start), 2 (Resolved) are not accepted on the down-path
+    /// (legacy parity — Start is per-subscription, Resolved is generated
+    /// by Core's equals path).
+    #[napi]
+    pub async fn batch_emit_handle_messages(&self, node_id: u32, encoded: Vec<u32>) -> Result<()> {
+        if encoded.len() % 2 != 0 {
+            return Err(NapiError::from_reason(format!(
+                "batch_emit_handle_messages: encoded length must be even (alternating code, payload pairs); got {}",
+                encoded.len()
+            )));
+        }
+        // Up-front validation — bad input MUST NOT open a batch.
+        for chunk in encoded.chunks_exact(2) {
+            let code = chunk[0];
+            match code {
+                MSG_CODE_DIRTY | MSG_CODE_DATA | MSG_CODE_INVALIDATE | MSG_CODE_PAUSE
+                | MSG_CODE_RESUME | MSG_CODE_COMPLETE | MSG_CODE_ERROR | MSG_CODE_TEARDOWN => {}
+                MSG_CODE_START | MSG_CODE_RESOLVED => {
+                    return Err(NapiError::from_reason(format!(
+                        "batch_emit_handle_messages: code {code} (START/RESOLVED) not valid on the down-path",
+                    )));
+                }
+                _ => {
+                    return Err(NapiError::from_reason(format!(
+                        "batch_emit_handle_messages: unknown message code {code}",
+                    )));
+                }
+            }
+        }
+
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            let nid = NodeId::new(u64::from(node_id));
+            core.batch(|| {
+                for chunk in encoded.chunks_exact(2) {
+                    let code = chunk[0];
+                    let payload = chunk[1];
+                    match code {
+                        MSG_CODE_DIRTY => { /* Core auto-emits; no-op */ }
+                        MSG_CODE_DATA => {
+                            core.emit(nid, HandleId::new(u64::from(payload)));
+                        }
+                        MSG_CODE_INVALIDATE => core.invalidate(nid),
+                        MSG_CODE_PAUSE => {
+                            // Ignore PauseError — matches `RustNode.pause` shape;
+                            // explicit pause errors surface via direct napi calls.
+                            let _ = core.pause(nid, LockId::new(u64::from(payload)));
+                        }
+                        MSG_CODE_RESUME => {
+                            let _ = core.resume(nid, LockId::new(u64::from(payload)));
+                        }
+                        MSG_CODE_COMPLETE => core.complete(nid),
+                        MSG_CODE_ERROR => {
+                            core.error(nid, HandleId::new(u64::from(payload)));
+                        }
+                        MSG_CODE_TEARDOWN => core.teardown(nid),
+                        _ => unreachable!("validated up-front"),
+                    }
+                }
+            });
+        })
+        .await
     }
 
     #[napi]

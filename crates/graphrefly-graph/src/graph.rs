@@ -151,6 +151,21 @@ impl Graph {
         }
     }
 
+    /// Construct a fresh root [`Graph`] wrapping an existing [`Core`].
+    /// Used by binding crates (napi-rs, pyo3, wasm) where the same
+    /// `Core` is shared between a `Graph` and direct binding-side
+    /// dispatch (`BenchOperators::register_*`, etc.) so the namespace
+    /// and the operator surface see the same node ids.
+    ///
+    /// Sister method to [`Self::new`]; the difference is that `new`
+    /// constructs a fresh `Core` from a binding, while this one accepts
+    /// a `Core` the caller already owns (typically cloned from
+    /// `BenchCore`).
+    #[must_use]
+    pub fn with_existing_core(name: impl Into<String>, core: Core) -> Self {
+        Self::with_core(name.into(), core, None)
+    }
+
     /// The graph's name as set at construction (or via `mount` / `mount_new`).
     #[must_use]
     pub fn name(&self) -> String {

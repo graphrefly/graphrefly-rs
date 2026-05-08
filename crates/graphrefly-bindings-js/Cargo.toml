@@ -31,6 +31,10 @@ parking_lot           = { workspace = true, optional = true }
 # shape so building a batch doesn't heap-alloc on the common case.
 smallvec              = { workspace = true }
 
+# Used by `BenchGraph::describe_json` to serialize the graphrefly-graph
+# describe snapshot to JSON for JS consumers.
+serde_json            = { workspace = true, optional = true }
+
 # napi-rs 3.x runtime — bumped from 2.16 in QA pass D070 follow-up
 # (user directive 2026-05-07: "upgrade to latest").
 #
@@ -83,7 +87,7 @@ standard = ["tracing", "graph-codec", "operators"]
 full     = ["standard", "storage", "structures"]
 
 # Capability features — composable; usually selected via a profile above.
-graph-codec = ["dep:graphrefly-graph"]
+graph-codec = ["dep:graphrefly-graph", "dep:serde_json"]
 operators   = ["dep:graphrefly-operators"]
 storage     = ["dep:graphrefly-storage"]
 structures  = ["dep:graphrefly-structures"]

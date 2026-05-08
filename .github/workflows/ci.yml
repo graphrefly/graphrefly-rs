@@ -118,6 +118,92 @@ jobs:
         continue-on-error: true
 
   # ---------------------------------------------------------------------
+  # Cross-platform napi build matrix (Phase E rustImpl activation slice,
+  # D075). Builds the `.node` artifact for each target triple and uploads
+  # as a workflow artifact. NOT published to npm — that's a separate
+  # release-engineering slice. Downstream parity-tests in graphrefly-ts
+  # download the host artifact for activation testing.
+  #
+  # Matrix mirrors `crates/graphrefly-bindings-js/package.json`'s
+  # `napi.targets`. linux-arm64 + win-arm64 are emitted but not yet
+  # tested in parity (host runner constraint); when GitHub Actions
+  # offers ARM runners more broadly we'll wire those into parity too.
+  # ---------------------------------------------------------------------
+  napi-build-matrix:
+    name: napi build (${{ matrix.target }})
+    needs: bindings-js
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            artifact: graphrefly-native.darwin-x64.node
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            artifact: graphrefly-native.darwin-arm64.node
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: graphrefly-native.linux-x64-gnu.node
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: graphrefly-native.linux-arm64-gnu.node
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: graphrefly-native.win32-x64-msvc.node
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: "10"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: napi-${{ matrix.target }}
+
+      - name: Install cross (linux-arm64 only)
+        if: matrix.cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Install @napi-rs/cli + workspace deps
+        working-directory: crates/graphrefly-bindings-js
+        run: |
+          pnpm install --no-frozen-lockfile
+
+      - name: Build napi binding (${{ matrix.target }})
+        working-directory: crates/graphrefly-bindings-js
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            pnpm exec napi build --platform --release --target ${{ matrix.target }} --features standard --use-cross
+          else
+            pnpm exec napi build --platform --release --target ${{ matrix.target }} --features standard
+          fi
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}
+          path: crates/graphrefly-bindings-js/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
   # TLA+ model checks — runs the canonical handle-protocol scenarios
   # from `~/src/graphrefly-ts/docs/research/`. The Rust port refines
   # the same wave_protocol invariants; any drift between the Rust

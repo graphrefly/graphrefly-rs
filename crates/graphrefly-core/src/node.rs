@@ -1406,13 +1406,22 @@ impl Core {
             state: Arc::new(Mutex::new(CoreState {
                 next_node_id: 1,
                 next_subscription_id: 1,
-                // A4 (Slice F, 2026-05-07): start `next_lock_id` at `1 << 32`.
-                // User-supplied `LockId::new(N)` constructors stay in the low
-                // u32 range (the napi-rs binding marshals `u32` → `LockId`);
-                // `alloc_lock_id` can no longer collide with them. Lift the
-                // floor higher (e.g. `1 << 63`) only if a u32 caller starts
-                // using lock ids beyond `u32::MAX`.
-                next_lock_id: 1u64 << 32,
+                // A4 (Slice F, 2026-05-07): start `next_lock_id` in the high
+                // half of the u32 range so `alloc_lock_id` can't collide with
+                // user-supplied `LockId::new(N)` constructors (which the
+                // napi-rs binding marshals from `u32` and tests typically use
+                // in the low range, 1..1024). Phase E /qa F1 (2026-05-08):
+                // lowered from `1u64 << 32` to `1u64 << 31` so the value
+                // round-trips through `u32::try_from(...)` at the napi
+                // boundary — the previous seed errored every napi
+                // `alloc_lock_id` call. Anti-collision intent (high range vs
+                // low user range) preserved at half the prior ceiling
+                // (2^31 ≈ 2 billion allocations per Core, ample for parity
+                // tests). Lift the floor when the deferred BigInt-narrowing
+                // migration extends `LockId` to `u64` at the FFI layer
+                // (porting-deferred "BigInt migration for u32-narrowed napi
+                // types" entry).
+                next_lock_id: 1u64 << 31,
                 nodes: HashMap::new(),
                 children: HashMap::new(),
                 pending_fires: HashSet::new(),
