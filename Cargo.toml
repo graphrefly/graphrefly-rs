@@ -14,13 +14,13 @@ default-members = [
 # for wasm.
 
 [workspace.package]
-version      = "0.0.0"                # pre-release; not yet published
+version      = "0.0.1"                # pre-release; not yet published
 edition      = "2021"
 rust-version = "1.95"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/graphrefly/graphrefly-rs"
 homepage     = "https://graphrefly.dev"
-authors      = ["David Chen Allio <clfhhc@gmail.com>"]
+authors      = ["David Chen<clfhhc@gmail.com>"]
 
 # ---------------------------------------------------------------------------
 # Shared dependencies — child crates inherit via `workspace = true` and
@@ -29,11 +29,11 @@ authors      = ["David Chen Allio <clfhhc@gmail.com>"]
 
 [workspace.dependencies]
 # In-workspace crates (path deps; bumped together pre-1.0)
-graphrefly-core       = { path = "crates/graphrefly-core",       version = "0.0.0" }
-graphrefly-graph      = { path = "crates/graphrefly-graph",      version = "0.0.0" }
-graphrefly-operators  = { path = "crates/graphrefly-operators",  version = "0.0.0" }
-graphrefly-storage    = { path = "crates/graphrefly-storage",    version = "0.0.0" }
-graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.0" }
+graphrefly-core       = { path = "crates/graphrefly-core",       version = "0.0.1" }
+graphrefly-graph      = { path = "crates/graphrefly-graph",      version = "0.0.1" }
+graphrefly-operators  = { path = "crates/graphrefly-operators",  version = "0.0.1" }
+graphrefly-storage    = { path = "crates/graphrefly-storage",    version = "0.0.1" }
+graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.1" }
 
 # Concurrency primitives
 # `arc_lock` enables `Arc<ReentrantMutex<()>>::lock_arc()` returning an

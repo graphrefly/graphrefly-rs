@@ -1,6 +1,7 @@
 [package]
 name        = "graphrefly-bindings-py"
 description = "GraphReFly Python bindings via PyO3"
+publish     = false   # Built into graphrefly-py via maturin; not a crates.io artifact (PART 14, session-doc D-bindings).
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

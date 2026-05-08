@@ -1,3 +1,0 @@
-crates/graphrefly-operators/tests/diag.rs - moved to TRASH/diag.rs.removed - diagnostic test for debugging producer storage cleanup; replaced by subscription.rs::producer_storage_cleared_on_deactivation
-crates/graphrefly-operators/tests/diag.rs - moved to TRASH/diag2.rs.removed - second diagnostic test for refcount tracing
-crates/graphrefly-bindings-js/src/worker.rs - moved to TRASH/worker.rs on 2026-05-07 - homemade dispatcher thread superseded by `napi::tokio_runtime::spawn_blocking` (Option E refactor in M3 napi-rs operator parity QA pass). The mpsc-blocking-on-JS-thread design caused TSFN-libuv deadlock; tokio's blocking pool + async fn napi methods is the canonical replacement.

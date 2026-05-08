@@ -1,6 +1,7 @@
 [package]
 name        = "graphrefly-bindings-wasm"
 description = "GraphReFly WebAssembly bindings (browser, Cloudflare Workers, Deno, Bun)"
+publish     = false   # Built into @graphrefly/wasm via wasm-pack; not a crates.io artifact (PART 14, session-doc D-bindings).
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
