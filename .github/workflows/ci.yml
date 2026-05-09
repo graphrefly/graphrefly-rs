@@ -175,9 +175,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            artifact: graphrefly-native.darwin-x64.node
+          # x86_64-apple-darwin dropped 2026-05-09 — Apple stopped selling
+          # Intel Macs in 2023, install base shrinking, and macos-13 runner
+          # pool was queueing for minutes per build. Re-add later if user
+          # demand surfaces (could cross-compile from macos-14 to avoid the
+          # macos-13 deprecated-pool problem).
           - target: aarch64-apple-darwin
             runner: macos-14
             artifact: graphrefly-native.darwin-arm64.node
