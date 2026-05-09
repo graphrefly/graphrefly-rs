@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-bindings-js"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "graphrefly-core",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-bindings-py"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "graphrefly-core",
  "graphrefly-graph",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-bindings-wasm"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "graphrefly-core",
  "graphrefly-graph",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "criterion",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-graph"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "blake3",
  "ciborium",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-operators"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ahash",
  "graphrefly-core",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-storage"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "graphrefly-core",
  "graphrefly-graph",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-structures"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "graphrefly-core",
  "graphrefly-graph",
