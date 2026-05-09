@@ -17,8 +17,14 @@
 semver_check        = true
 # Generate CHANGELOG.md per crate. Default true; explicit for clarity.
 changelog_update    = true
-# Tag format. v{{ version }} matches our existing manual tag style.
-git_tag_name        = "v{{ version }}"
+# Per-package tag template. The workspace has 5 publishable crates that
+# release-plz tags individually. With "v{{ version }}" all 5 try to create
+# the same `v0.0.2` tag — the first succeeds, the rest fail with
+# `422 Reference already exists` and the run aborts before publishing the
+# remaining crates. `{{ package }}-v{{ version }}` gives each crate a unique
+# tag (`graphrefly-core-v0.0.2`, `graphrefly-graph-v0.0.2`, etc.) and also
+# preserves the option to version each crate independently in the future.
+git_tag_name        = "{{ package }}-v{{ version }}"
 
 # Per-crate overrides for the bindings crates: skip cargo publish AND
 # skip the GitHub release. They build into npm/PyPI artifacts via
