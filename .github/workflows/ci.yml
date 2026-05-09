@@ -246,7 +246,11 @@ jobs:
         run: |
           mkdir -p /tmp/tla
           BASE="https://raw.githubusercontent.com/graphrefly/graphrefly-ts/${TLA_REF}/docs/research"
-          for f in handle-protocol.tla handle_protocol_MC.tla handle_protocol_MC.cfg \
+          # Note: handle_protocol.tla uses underscore — TLA+ requires the
+          # filename to match the MODULE name exactly (`MODULE handle_protocol`).
+          # An earlier hyphenated `handle-protocol.tla` filename was renamed
+          # in graphrefly-ts for this reason.
+          for f in handle_protocol.tla handle_protocol_MC.tla handle_protocol_MC.cfg \
                    wave_protocol_rewire.tla wave_protocol_rewire_MC.tla \
                    wave_protocol_rewire_MC.cfg; do
             curl -fL --retry 3 -o "/tmp/tla/$f" "$BASE/$f"

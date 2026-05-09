@@ -1,12 +1,16 @@
 # release-plz workspace config. See https://release-plz.dev/docs/config
 #
 # By default release-plz operates on every workspace member. The bindings
-# crates are marked `publish = false` in their Cargo.toml, so release-plz
-# already excludes them from `cargo publish`. We additionally set
-# `release = false` here to skip the version-bump PR + changelog work
-# entirely for those crates (they don't have a public release cadence —
-# their build outputs ship via napi-rs / wasm-pack / maturin to npm and
-# PyPI).
+# crates are marked `publish = false` in their Cargo.toml. release-plz
+# requires the release-plz config to AGREE with each Cargo.toml's publish
+# setting — if Cargo.toml says publish=false, the release-plz config must
+# also say publish=false (the default is publish=true). Without this match
+# release-plz fails with:
+#   "Package `X` has `publish = false` ... in Cargo.toml, but it has
+#    `publish = true` in the release-plz configuration."
+#
+# We additionally set `release = false` to skip the GitHub release entry
+# (no point cutting a release for a crate we don't publish).
 
 [workspace]
 # Conventional Commits → SemVer bumps. Default; explicit for clarity.
@@ -16,15 +20,20 @@ changelog_update    = true
 # Tag format. v{{ version }} matches our existing manual tag style.
 git_tag_name        = "v{{ version }}"
 
-# Per-crate overrides for the bindings crates (no release / no changelog).
+# Per-crate overrides for the bindings crates: skip cargo publish AND
+# skip the GitHub release. They build into npm/PyPI artifacts via
+# napi-rs / wasm-pack / maturin, not crates.io.
 [[package]]
 name    = "graphrefly-bindings-js"
+publish = false
 release = false
 
 [[package]]
 name    = "graphrefly-bindings-py"
+publish = false
 release = false
 
 [[package]]
 name    = "graphrefly-bindings-wasm"
+publish = false
 release = false

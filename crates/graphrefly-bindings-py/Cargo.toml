@@ -24,7 +24,10 @@ graphrefly-structures = { workspace = true, optional = true }
 # pyo3 — `extension-module` produces a .so/.pyd; `abi3-py39` targets the
 # stable Python ABI from 3.9 onward (one wheel per platform, not per
 # Python minor version).
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+# Pinned >= 0.24.1 to fix RUSTSEC-2025-0020 (PyString::from_object buffer
+# overflow). 0.22 → 0.24 introduced the Bound API as default; the scaffold
+# `#[pyfunction]` shape used here is unaffected.
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
 
 [features]
 default  = ["tracing"]
