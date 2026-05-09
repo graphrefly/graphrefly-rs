@@ -102,6 +102,13 @@ jobs:
   # Open / update a release PR with the next version bumps + changelogs.
   release-plz-pr:
     name: Release-plz PR
+    # Belt-and-suspenders: skip when the head commit is the bot's own
+    # "chore: release" merge commit. release-plz-release should have
+    # already created per-package tags at this commit, so release-plz-pr
+    # would no-op anyway — but this `if` prevents any edge case where the
+    # tag isn't yet visible to release-plz, which would cause a NEW PR to
+    # be opened (the infinite-loop bug).
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: release') }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write       # push to the release PR's branch
