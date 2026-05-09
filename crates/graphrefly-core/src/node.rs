@@ -498,6 +498,11 @@ impl Drop for Subscription {
                 return;
             };
             rec.subscribers.remove(&self.sub_id);
+            // Slice X4 / D2: bump revision so any pending_notify entry for
+            // this node opened earlier in the wave starts a fresh batch on
+            // the next queue_notify, dropping the now-departed sink from
+            // the snapshot.
+            rec.subscribers_revision = rec.subscribers_revision.wrapping_add(1);
             let last = rec.subscribers.is_empty();
             let producer = rec.is_producer();
             // OnDeactivation gate: must have run a fn at least once
@@ -957,6 +962,20 @@ pub(crate) struct NodeRecord {
     pub(crate) cache: HandleId,
     pub(crate) has_fired_once: bool,
     pub(crate) subscribers: HashMap<SubscriptionId, Sink>,
+    /// Monotonic counter bumped on every mutation of [`Self::subscribers`]
+    /// (insert on subscribe, remove on `Subscription::Drop`, remove on
+    /// handshake-panic cleanup). Used by
+    /// [`crate::batch::Core::queue_notify`] to detect mid-wave subscriber-
+    /// set changes and start a fresh `PendingBatch` with an updated sink
+    /// snapshot — closes D2 (Slice X4, 2026-05-08): the late-subscriber
+    /// and multi-emit-per-wave gap where the pre-fix per-node single
+    /// snapshot meant a sub installed between two emits to the same node
+    /// in one wave was invisible to the second emit's flush.
+    ///
+    /// Per-node (not per-Core) so that a subscribe to node A doesn't
+    /// invalidate snapshot reuse for node B's pending batch in the same
+    /// wave.
+    pub(crate) subscribers_revision: u64,
     /// For dynamic nodes: which dep indices fn actually tracks.
     /// For static derived: all indices, populated at construction.
     pub(crate) tracked: HashSet<usize>,
@@ -1334,6 +1353,17 @@ pub struct Core {
     pub(crate) state: Arc<Mutex<CoreState>>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
     pub(crate) wave_owner: Arc<ReentrantMutex<()>>,
+    /// Slice X5 (D3 substrate, 2026-05-08): per-subgraph union-find
+    /// registry. Tracks each registered node's connected-component
+    /// membership (a "subgraph") so cross-thread emits to disjoint
+    /// components can run truly parallel via per-component
+    /// `wave_owner` (Y1 commit-2 wires the wave engine through the
+    /// registry; X5 commit-1 just maintains the union-find state).
+    ///
+    /// Direct port of [`graphrefly-py`'s
+    /// `subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
+    /// design (locked in [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)).
+    pub(crate) registry: Arc<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
 }
 
 /// Weak handle to a [`Core`] — does not contribute to strong refcount.
@@ -1354,6 +1384,7 @@ pub struct WeakCore {
     state: Weak<Mutex<CoreState>>,
     binding: Weak<dyn BindingBoundary>,
     wave_owner: Weak<ReentrantMutex<()>>,
+    registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
 }
 
 impl WeakCore {
@@ -1366,6 +1397,7 @@ impl WeakCore {
             state: self.state.upgrade()?,
             binding: self.binding.upgrade()?,
             wave_owner: self.wave_owner.upgrade()?,
+            registry: self.registry.upgrade()?,
         })
     }
 }
@@ -1479,6 +1511,9 @@ impl Core {
             })),
             binding,
             wave_owner: Arc::new(ReentrantMutex::new(())),
+            registry: Arc::new(parking_lot::Mutex::new(
+                crate::subgraph::SubgraphRegistry::new(),
+            )),
         }
     }
 
@@ -1534,7 +1569,50 @@ impl Core {
             state: Arc::downgrade(&self.state),
             binding: Arc::downgrade(&self.binding),
             wave_owner: Arc::downgrade(&self.wave_owner),
+            registry: Arc::downgrade(&self.registry),
         }
+    }
+
+    /// Number of distinct connected-component partitions tracked by
+    /// the per-subgraph union-find registry (Slice X5 substrate).
+    /// Two threads emitting into nodes with distinct partitions will
+    /// run truly parallel once Y1 wires the wave engine through the
+    /// registry; X5 reports the partition count for inspection
+    /// (acceptance bar + debugging) but the wave engine still uses
+    /// the legacy Core-level `wave_owner`.
+    #[must_use]
+    pub fn partition_count(&self) -> usize {
+        self.registry.lock().component_count()
+    }
+
+    /// Resolve `node`'s partition identity per the per-subgraph
+    /// union-find registry (Slice X5 substrate). Two nodes with the
+    /// same `SubgraphId` are connected via dep edges (transitively)
+    /// and share a partition lock under Y1+; nodes in different
+    /// partitions can run truly parallel.
+    ///
+    /// Returns `None` for unregistered nodes.
+    #[must_use]
+    pub fn partition_of(&self, node: NodeId) -> Option<crate::subgraph::SubgraphId> {
+        self.registry.lock().partition_of(node)
+    }
+
+    /// Test-only inspection: number of `PendingBatch`es queued for
+    /// `node` in the current wave. Used by Slice X4 D2 regression
+    /// tests to pin the "common case = single batch, no SmallVec
+    /// spill" perf invariant.
+    ///
+    /// Returns `None` if no `pending_notify` entry exists for `node`
+    /// (no tier-1+ message has been queued for this node yet in this
+    /// wave). `Some(0)` is unreachable by construction (a vacant
+    /// entry implies no batches; an occupied entry has at least one).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn pending_batch_count(&self, node: NodeId) -> Option<usize> {
+        self.lock_state()
+            .pending_notify
+            .get(&node)
+            .map(|entry| entry.batches.len())
     }
 
     /// Configure the Core-global cap on pause replay buffer length. When set,
@@ -1896,6 +1974,7 @@ impl Core {
             cache: initial,
             has_fired_once: initial != NO_HANDLE,
             subscribers: HashMap::new(),
+            subscribers_revision: 0,
             tracked,
             dirty: false,
             involved_this_wave: false,
@@ -1916,6 +1995,19 @@ impl Core {
             s.children.entry(dep).or_default().insert(id);
         }
         drop(s);
+        // Slice X5 (D3 substrate, 2026-05-08): track partition membership.
+        // Register the new node as its own component, then `union_nodes`
+        // each dep — connectivity-based grouping per Q1=(c-uf split-eager).
+        // Lock-released wrt state so the registry mutex isn't ordered
+        // under the state mutex (avoids constraining future cross-mutex
+        // refactors).
+        {
+            let mut reg = self.registry.lock();
+            reg.ensure_registered(id);
+            for &dep in &deps {
+                reg.union_nodes(id, dep);
+            }
+        }
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
         Ok(id)
     }
@@ -2281,9 +2373,21 @@ impl Core {
             // Install sink BEFORE dropping state lock so any thread that
             // subsequently acquires `wave_owner` (after our scope ends)
             // sees the sink already registered.
-            s.require_node_mut(node_id)
-                .subscribers
-                .insert(sub_id, sink.clone());
+            //
+            // Slice X4 / D2: bump `subscribers_revision` alongside the
+            // insert so a pending_notify entry opened earlier in the same
+            // wave (e.g. inside `batch(|| { emit(s, h1); subscribe(s,
+            // late); emit(s, h2); })`) starts a fresh `PendingBatch` on
+            // its next `queue_notify` push — making the new sink visible
+            // to subsequent emits' flush slices, while the pre-subscribe
+            // batch's snapshot stays frozen so we don't double-deliver
+            // earlier emits via the wave's flush AND the new sub's
+            // handshake replay.
+            {
+                let rec = s.require_node_mut(node_id);
+                rec.subscribers.insert(sub_id, sink.clone());
+                rec.subscribers_revision = rec.subscribers_revision.wrapping_add(1);
+            }
 
             let needs_activation = first_subscriber && !is_state;
             (sub_id, tier_slices, needs_activation, needs_reset)
@@ -2333,6 +2437,13 @@ impl Core {
                     let mut s = self.lock_state();
                     if let Some(rec) = s.nodes.get_mut(&node_id) {
                         rec.subscribers.remove(&sub_id);
+                        // Slice X4 / D2: keep revision-tracked snapshot
+                        // discipline consistent with the install site —
+                        // any pending_notify entry that already absorbed
+                        // the panicking sink under the post-install
+                        // revision should start a fresh batch on its
+                        // next queue_notify push.
+                        rec.subscribers_revision = rec.subscribers_revision.wrapping_add(1);
                     }
                 }
                 std::panic::resume_unwind(panic_payload);
@@ -3755,11 +3866,28 @@ impl Core {
         // (Q2) blocks concurrent waves once we enter `run_wave`, so the
         // re-read sees a coherent post-validation state.
         let added_for_wave: Vec<NodeId> = added.iter().copied().collect();
+        let added_for_registry: Vec<NodeId> = added.iter().copied().collect();
+        let removed_for_registry: Vec<NodeId> = removed.iter().copied().collect();
         // Drop the state lock before run_wave (which acquires its own) and
         // before crossing the binding boundary for the F1 refcount-fix
         // releases. Keeps the lock-discipline split (binding calls outside
         // the state lock) consistent with the rest of the dispatcher.
         drop(s);
+        // Slice X5 (D3 substrate, 2026-05-08): maintain partition
+        // membership across topology change.
+        //   - For each new edge: union the partitions of `n` and `added_dep`.
+        //   - For each removed edge: notify registry (X5 commit-1: no-op;
+        //     Y1 commit-2 will run reachability walk + split if disconnected).
+        // Done lock-released wrt state. Registry mutex is held briefly.
+        {
+            let mut reg = self.registry.lock();
+            for added_dep in &added_for_registry {
+                reg.union_nodes(n, *added_dep);
+            }
+            for removed_dep in &removed_for_registry {
+                reg.on_edge_removed(n, *removed_dep);
+            }
+        }
         // Slice E2 (D067): fire OnRerun lock-released for dynamic nodes
         // that had previously fired. The cleanup closure cleans up
         // resources tied to the old dep shape before the next fn-fire
@@ -4020,9 +4148,10 @@ impl Drop for CoreState {
             }
         }
 
-        // Pending wave retains.
+        // Pending wave retains. Slice X4 / D2: walk all batches' messages
+        // — `iter_messages` flattens the per-node `SmallVec<PendingBatch>`.
         for entry in pending.values() {
-            for msg in &entry.messages {
+            for msg in entry.iter_messages() {
                 if let Some(h) = msg.payload_handle() {
                     self.binding.release_handle(h);
                 }

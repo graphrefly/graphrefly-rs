@@ -78,41 +78,46 @@ tests covering fn re-entrance via emit/pause/resume/invalidate, custom
 equals re-entrance, and a concurrent emit during invoke_fn deadlock
 test. Closed 2026-05-05.
 
-### Late subscriber + multi-emit-per-wave snapshot gap (D2 — Rust-only dispatcher design)
+### ~~Late subscriber + multi-emit-per-wave snapshot gap (D2 — Rust-only dispatcher design)~~ — RESOLVED 2026-05-08 in Slice X4
 
-- **What:** the sinks-snapshot-on-first-touch fix (Slice A close, M1)
-  freezes a node's per-wave subscriber list at the FIRST `queue_notify`
-  push. If a subscriber is installed BETWEEN two emits to the same node
-  in one wave (e.g. inside `batch(|| { emit(s, h1); subscribe(s, late);
-  emit(s, h2); })`), `late` doesn't appear in the entry's snapshot —
-  emit 2's `Dirty + Data(h2)` flushes only to existing subscribers.
-  `late` sees `[Start, Data(h1)]` from its handshake and nothing more
-  this wave; actual cache is `h2` after the wave settles.
-- **Why divergent:** R1.3.5.a (subscriber sees consistent post-handshake
-  view) is silently weakened in this niche scenario. The single-emit-
-  per-wave + late subscribe case (the canonical race the snapshot fix
-  targets) IS correct.
-- **Why deferred (UPDATED 2026-05-07 audit):** This is a Rust-only
-  dispatcher design concern — TS production has no equivalent because it
-  snapshots `[...this._sinks]` AT DELIVERY TIME PER EMIT
-  ([packages/pure-ts/src/core/node.ts:3583-3617](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/core/node.ts)),
-  not once per wave. TS's single-threaded synchronous dispatch makes the
-  failure mode literally unreachable. The Rust port batched the snapshot
-  to amortize cost across the lock-released drain; the gap is the
-  trade-off. **Original "wait for DS-14" framing was a layer mismatch** —
-  DS-14's `BaseChange<T>` per-emit metadata lives in
-  `bundle.mutations` envelopes, not on dispatcher-level
-  `pending_notify` entries. DS-14 will not produce a substrate that
-  resolves this trade-off. Pick one of the three candidate fixes on its
-  merits when M2+ surfaces a real consumer:
-  - **Re-snapshot every push** — fixes correctness, allocates O(emits ×
-    subscribers) per wave.
-  - **Walk pending_notify on subscribe and append new sink** —
-    re-introduces the duplicate-Data bug for the single-emit + late
-    subscribe case (the snapshot fix's original target).
-  - **Per-message subscriber tracking** — most expressive, heaviest.
-- **Source:** Slice A close /qa Edge Case Hunter finding (2026-05-05);
-  reframed 2026-05-07 per cross-repo audit confirming Rust-only nature.
+`PendingPerNode` was reshaped from a single `(sinks, messages)` tuple
+to a `SmallVec<[PendingBatch; 1]>` of subscriber-snapshot epochs.
+`NodeRecord::subscribers_revision: u64` bumps on every mutation of
+`subscribers` (subscribe install, `Subscription::Drop`, handshake-panic
+eviction). `Core::queue_notify` consults the revision: if it matches
+the open batch's `snapshot_revision` (common case, no mid-wave subscribe
+at this node) the message appends to the open batch with no extra
+allocation. If the revision advanced, a fresh `PendingBatch` opens with
+a current sink snapshot — pre-subscribe batches retain their original
+snapshot so earlier emits don't double-deliver via flush AND handshake.
+
+Picked option 1 (re-snapshot every push) over options 2 (walk-and-append,
+re-introduces duplicate-Data) and 3 (per-message tracking, heavier with
+no win). Revision tracking gates the snapshot allocation on actual
+subscriber-set change, keeping the common case allocation-free.
+
+`flush_notifications` iterates batches in arrival order within each
+phase × node loop; per-batch sink snapshots and per-batch message
+filtering are independent. Refcount-release walks (`flush_notifications`,
+`Drop for CoreState`, `BatchGuard::drop` panic-discard) all use the new
+`PendingPerNode::iter_messages` flat-walk helper.
+
+Verified by `crates/graphrefly-core/tests/sink_snapshot.rs` (4 tests):
+multi-emit + late-subscribe (canonical D2), single-emit + late-subscribe
+(preserves original snapshot fix's target), multi-emit + mid-wave
+unsubscribe, multi-emit + no sub change (common case unchanged).
+Cross-impl no-regression case in
+`packages/parity-tests/scenarios/core/sink-snapshot.test.ts` (1 test ×
+2 impls). Closed 2026-05-08.
+
+The canonical D2 case (multi-emit + late-subscribe in one wave) is
+**not** parity-tested cross-impl — the bug is structurally
+unreachable in `pure-ts` (per-emit snapshot at delivery time, not
+per-wave at flush time), and the napi `Impl` interface does not
+expose `batch(closure)` for JS to interleave subscribe between emits
+inside one Rust wave (`parking_lot::ReentrantMutex` thread-affinity
+contract on `BatchGuard` doesn't span `spawn_blocking` boundaries).
+Cargo regression tests are the source of truth for the canonical case.
 
 ### Cross-thread emit blocks until in-flight wave completes (D3 — UPDATED 2026-05-07)
 
@@ -139,9 +144,91 @@ test. Closed 2026-05-05.
   **Real defer condition:** consumer pressure for cross-thread parallel
   waves on the same Core. Until then, the wave-owner mutex is the
   correct shape and not a "v1 limitation" — it's the v1 design.
-  When/if pressure surfaces, scope a dedicated per-subgraph-mutex
-  design slice (substantial refactor: lock-ordering protocol, cross-
-  subgraph wave handoff, deadlock prevention).
+- **Design LOCKED 2026-05-08 (Slice X4 follow-up):**
+  [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
+  in graphrefly-ts. Top-level: Option B (single Core, per-partition
+  state). **Q1 = (c-uf split-eager)** — union-find connectivity-based
+  with reachability walk on edge removal, mirroring graphrefly-py's
+  [`subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
+  but adding split where py is monotonic-merge. Decisions logged at
+  `docs/rust-port-decisions.md` D085 (split-into-design-doc + Option
+  B recommendation), D086 (Q1 lock + union-find + split-eager).
+- **Slice X5 LANDED 2026-05-08: substrate-only intermediate state.**
+  `crates/graphrefly-core/src/subgraph.rs` (new module, ~370 LOC)
+  ships `SubgraphId`, `SubgraphRegistry` (union-find with
+  union-by-rank + path compression + cleanup re-rooting), and
+  `SubgraphLockBox` (per-partition `wave_owner: Arc<ReentrantMutex<()>>`
+  allocated but not yet authoritative). `Core::register` calls
+  `registry.ensure_registered(new_node)` + `union_nodes(new_node, dep)`
+  for each dep; `Core::set_deps` calls `union_nodes(n, added_dep)`
+  for each new edge and `on_edge_removed(n, removed_dep)` (no-op in
+  X5; Y1 split site) for each removed edge. Public `Core::partition_count()`
+  + `Core::partition_of(node)` accessors expose connectivity for
+  bench / inspection. **490 cargo tests pass (was 469 pre-X5; +10
+  subgraph unit tests + 7 integration tests + 4 D2 sink-snapshot from
+  Slice X4); 142 parity tests pass.** `cargo clippy --all-targets
+  -D warnings` clean; `cargo fmt --check` clean for files touched;
+  `#![forbid(unsafe_code)]` preserved.
+- **Y1 carry-forward:** wave engine migration to per-partition
+  `wave_owner`. Every `begin_batch()` / `run_wave()` call site +
+  `Core::subscribe`'s `wave_owner.lock_arc()` + `BatchGuard`'s lock
+  retention need to be reshaped around `lock_for(node)` with
+  retry-validate semantics for held-Arc-vs-current-root divergence
+  on union. Plus split-eager (reachability walk + state migration on
+  edge removal) and `currently_firing` extension to reject mid-wave
+  `set_deps` triggering migration. **Estimated ~2500 LOC**, touches
+  ~80 call sites in `node.rs` + `batch.rs`. Substantial enough to
+  warrant its own dedicated batch — splitting from X5 closes a
+  meaningful intermediate state (substrate green) without risking
+  the 490-cargo-test invariant during a multi-day wave-engine churn.
+- **Y1 entry-condition #1 (Slice X5 /qa P12, 2026-05-08):
+  `Core::register` and `Core::set_deps` register-then-union ordering
+  vs lock acquisition.** The X5 substrate acquires the registry mutex
+  AFTER dropping the state lock at both
+  [`crates/graphrefly-core/src/node.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/src/node.rs)
+  `Core::register` (~line 1976) and `Core::set_deps` (~line 3866).
+  This creates a window where a concurrent thread observes the new
+  node in `s.nodes` / new edges in `s.children`, but the registry
+  hasn't yet unioned the partition. Today benign (`Core::partition_of`
+  is debug/inspection-only); under Y1 the wave engine consumes
+  `lock_for(node)`, and the window means `lock_for` could resolve to
+  a partition that's been topologically unioned in `s.children` but
+  not yet in `registry`. **Y1 must either** (a) move registry mutation
+  back inside the state-lock scope (acceptable — registry mutex is
+  uncontended in X5 substrate), OR (b) document the eventual-consistency
+  window and add lock-validation retry inside `Core::lock_for`.
+  Recommend (a) for simplicity.
+- **Y1 entry-condition #2 (Slice X5 /qa P13, 2026-05-08): mid-wave
+  `set_deps` registry mutation must extend the `currently_firing`
+  thread-local guard.** Q3=(a-strict) per the D3 design lock REJECTS
+  mid-wave migrations. X5 monotonic-merge unions mid-wave silently
+  ([`crates/graphrefly-core/src/node.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/src/node.rs)
+  `set_deps` at ~line 3865) — benign because the registry isn't
+  authoritative yet. Under Y1 the wave engine holds partition A's
+  `wave_owner`, fires `invoke_fn`, and a recursive `Core::set_deps`
+  triggering union into partition B would mutate the lock-acquisition
+  graph mid-wave. The Slice F A6 `currently_firing: Vec<NodeId>`
+  thread-local must be extended: if `union_nodes` (or `split` under
+  split-eager) would migrate any node currently on the firing stack,
+  reject with a `SetDepsError::PartitionMigrationDuringFire` variant
+  (or extend the existing `ReentrantOnFiringNode`).
+- **Y1 entry-condition #3 (Slice X5 /qa noted, 2026-05-08): X4
+  parity-test forcing function for D2 canonical case.** The
+  cross-impl D2 parity scenario at
+  [`packages/parity-tests/scenarios/core/sink-snapshot.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/core/sink-snapshot.test.ts)
+  only covers the no-regression case; the canonical D2 (multi-emit +
+  late-subscribe in one wave) is cargo-only because pure-TS dispatcher
+  snapshots subscribers per delivery and the case is unreachable in
+  pure-TS today. **If the pure-TS dispatcher is ever refactored** to
+  per-wave-at-flush-time snapshotting (mirroring Rust), the parity
+  scenario must be widened to cover the canonical case to lock the
+  cross-impl contract.
+- **Y2 carry-forward:** TLA+ extension of `wave_protocol_rewire`
+  covering partition lock-ordering + cross-partition deadlock-freedom
+  + union/split discipline; multi-thread parallel-emit criterion
+  bench validating sub-linear wall-clock scaling vs serialized;
+  CLAUDE.md Rust invariant 3 wording update from "planned" to current.
+  Mandatory before D3 fully closes per session-doc Q6/Q8 scope items.
 - **Verified by:** `concurrent_emit_blocks_until_in_flight_wave_completes`
   in `tests/lock_released.rs`.
 - **Source:** Slice A close /qa Blind Hunter + Edge Case Hunter findings
@@ -172,31 +259,17 @@ test. Closed 2026-05-05.
   with and verify alignment in phase 3.
 - **Source:** Slice A close /qa Edge Case Hunter finding (2026-05-05).
 
-### Per-tier handshake panic on tier-N leaves sink registered (D4)
+### ~~Per-tier handshake panic on tier-N leaves sink registered (D4)~~ — RESOLVED in Slice F A7 (2026-05-07)
 
-- **What:** the per-tier handshake split (R1.3.5.a alignment, Slice A
-  close) fires `[Start]`, `[Data(v)]`, `[Complete|Error]`, `[Teardown]`
-  as separate sink calls. The sink is installed in `subscribers` BEFORE
-  the handshake fires. If a user sink panics on tier N (e.g.
-  `[Data(v)]`) during handshake, the panic unwinds out of `subscribe()`
-  before the `Subscription` handle is returned. The sink stays
-  registered in `subscribers`; subsequent waves' `flush_notifications`
-  will fire it (its `Arc<dyn Fn>` clone in
-  `pending_notify[node].sinks` is alive).
-- **Why deferred:** still a real concern after Slice E's lock-released
-  handshake rework — the sink installation happens before the
-  handshake fires (so concurrent subsequent emits observe it). A
-  panicking handshake-time sink leaves the sink in `subscribers`
-  without returning a `Subscription`, so the user has no handle to
-  drop. `Drop for CoreState` releases the sink Arc when the last
-  `Core` drops, so it's not a memory leak, but a panicking sink
-  keeps panicking on every subsequent wave's flush.
-- **Lift point:** wrap the lock-released handshake fire in
-  `catch_unwind`; on panic, remove the sink from subscribers and
-  re-raise. Small change (~20 LOC); not blocking.
-- **Source:** Slice A close /qa Blind Hunter finding (2026-05-05);
-  partially superseded by Slice E rework (D045) but the panic-leaves-
-  sink behavior remains.
+The per-tier handshake fire in `Core::subscribe` is wrapped in
+`catch_unwind`. On panic, the orphaned sink is removed from
+`subscribers` (via the already-allocated `sub_id`) before the unwind
+resumes, so subsequent waves' `flush_notifications` cannot re-fire the
+panicking sink. Verified by
+`tests/slice_f_corrections.rs::a7_handshake_panic_removes_sink_and_does_not_re_fire_on_next_wave`.
+Slice F A7 shipped with the catch_unwind 2026-05-07; this entry was
+preserved in the active backlog by oversight and struck through during
+Slice X4 (2026-05-08) as a documentation-only cleanup.
 
 ### `commit_emission` cache-race documentation (D5 — adjunct to P3)
 

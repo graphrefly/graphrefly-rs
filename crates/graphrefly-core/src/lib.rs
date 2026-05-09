@@ -51,6 +51,7 @@ pub mod handle;
 pub mod message;
 pub mod node;
 pub(crate) mod op_state;
+pub mod subgraph;
 pub mod topology;
 
 pub use batch::BatchGuard;
@@ -64,4 +65,5 @@ pub use node::{
     PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError, SetPausableModeError,
     Sink, Subscription, TerminalKind, UpError, WeakCore,
 };
+pub use subgraph::SubgraphId;
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};

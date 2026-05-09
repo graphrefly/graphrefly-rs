@@ -566,11 +566,7 @@ impl Graph {
     /// `IndexMap`); the same `NodeId` never appears under two different
     /// graphs in practice (Graph namespace integrity is enforced at
     /// `add` time).
-    fn collect_qualified_names(
-        &self,
-        prefix: &str,
-        recursive: bool,
-    ) -> IndexMap<NodeId, String> {
+    fn collect_qualified_names(&self, prefix: &str, recursive: bool) -> IndexMap<NodeId, String> {
         let inner = self.inner.lock();
         let mut map: IndexMap<NodeId, String> = inner
             .names

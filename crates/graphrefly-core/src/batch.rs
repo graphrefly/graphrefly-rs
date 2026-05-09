@@ -74,24 +74,58 @@ pub(crate) type WaveDeferred = (
     Vec<crate::handle::NodeId>,
 );
 
-/// Per-node wave-end notification queue.
-///
-/// Subscribers are snapshotted on the FIRST `queue_notify` call for the
-/// node within a wave. Subsequent calls append messages but reuse the
-/// snapshot. This makes late subscribers (installed between fn-fire
-/// iterations now that the state lock is dropped per-iteration) invisible
-/// to messages already queued before they subscribed — they get the
-/// already-fresh post-commit cache via their handshake, but do not
-/// double-receive the wave's `[Dirty, Data]` that would otherwise duplicate
-/// the value.
-///
-/// Bookkeeping: `payload_retains` is the count of `payload_handle()`
-/// retains owed to the binding when this entry's messages release at
-/// flush time. Each push of a payload-bearing message bumps it; flush
-/// drains it via `deferred_handle_releases`.
-pub(crate) struct PendingPerNode {
+/// One subscriber-snapshot epoch within a node's wave-end notification
+/// queue. A `PendingBatch` is opened the first time `queue_notify` runs
+/// for the node in a wave, and a fresh batch is opened whenever the node's
+/// `subscribers_revision` advances mid-wave (a new sink subscribes, an
+/// existing sink unsubscribes, or a handshake-time panic evicts an
+/// orphaned sink). All messages within one batch flush to the same sink
+/// list — the snapshot taken when the batch opened, frozen against
+/// subsequent revision bumps.
+pub(crate) struct PendingBatch {
+    /// `NodeRecord::subscribers_revision` value at the moment this batch
+    /// opened. Used by `queue_notify` to decide append-to-last-batch vs
+    /// open-fresh-batch on every push.
+    pub(crate) snapshot_revision: u64,
     pub(crate) sinks: Vec<Sink>,
     pub(crate) messages: Vec<Message>,
+}
+
+/// Per-node wave-end notification queue, structured as one or more
+/// subscriber-snapshot epochs (`batches`). The common case (no
+/// mid-wave subscribe / unsubscribe at this node) keeps a single
+/// inline batch — `SmallVec<[_; 1]>` keeps that allocation-free.
+///
+/// **Slice X4 / D2 (2026-05-08):** the prior shape was a single
+/// `(sinks, messages)` pair per node — the snapshot froze on first
+/// `queue_notify` and was reused for every subsequent emit to the same
+/// node in the wave. That caused the documented late-subscriber +
+/// multi-emit-per-wave gap (R1.3.5.a divergence): a sub installed
+/// between two emits to the same node was invisible to the second
+/// emit's flush slice. The revision-tracked batch list resolves it —
+/// late subs land in a fresh batch that frozenly carries them, while
+/// pre-subscribe batches retain their original snapshot so the new
+/// sub doesn't double-receive earlier emits via flush AND handshake.
+pub(crate) struct PendingPerNode {
+    pub(crate) batches: SmallVec<[PendingBatch; 1]>,
+}
+
+impl PendingPerNode {
+    /// Iterate every queued message for this node across all batches in
+    /// arrival order. Used by R1.3.3.a invariant assertions and the
+    /// auto-resolve / Slice-G coalescing tier-3-presence checks, which
+    /// reason about wave-content per node, not per batch.
+    pub(crate) fn iter_messages(&self) -> impl Iterator<Item = &Message> + '_ {
+        self.batches.iter().flat_map(|b| b.messages.iter())
+    }
+
+    /// Mutable counterpart for `iter_messages`. Used by
+    /// `rewrite_prior_resolved_to_data` to in-place rewrite Resolved
+    /// entries to Data when a wave detects a multi-emit case after the
+    /// fact.
+    pub(crate) fn iter_messages_mut(&mut self) -> impl Iterator<Item = &mut Message> + '_ {
+        self.batches.iter_mut().flat_map(|b| b.messages.iter_mut())
+    }
 }
 
 /// RAII helper for the A6 reentrancy guard (Slice F, 2026-05-07).
@@ -338,7 +372,7 @@ impl Core {
             let needs_resolve = s
                 .pending_notify
                 .get(&node_id)
-                .is_some_and(|entry| !entry.messages.iter().any(|m| m.tier() >= 3));
+                .is_some_and(|entry| !entry.iter_messages().any(|m| m.tier() >= 3));
             if needs_resolve {
                 self.queue_notify(&mut s, node_id, Message::Resolved);
             }
@@ -548,7 +582,7 @@ impl Core {
                     let already_tier3 = s
                         .pending_notify
                         .get(&node_id)
-                        .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+                        .is_some_and(|entry| entry.iter_messages().any(|m| m.tier() == 3));
                     if already_dirty && !already_tier3 {
                         self.queue_notify(&mut s, node_id, Message::Resolved);
                     }
@@ -563,7 +597,7 @@ impl Core {
                     let already_tier3 = s
                         .pending_notify
                         .get(&node_id)
-                        .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+                        .is_some_and(|entry| entry.iter_messages().any(|m| m.tier() == 3));
                     if already_dirty && !already_tier3 {
                         self.queue_notify(&mut s, node_id, Message::Resolved);
                     }
@@ -796,9 +830,10 @@ impl Core {
             _ => return,
         };
         let mut retains_needed = 0u32;
-        // Pending_notify path.
+        // Pending_notify path. Walk all batches' messages — Slice-G
+        // coalescing reasons about wave-content per node, not per-batch.
         if let Some(entry) = s.pending_notify.get_mut(&node_id) {
-            for msg in &mut entry.messages {
+            for msg in entry.iter_messages_mut() {
                 if matches!(msg, Message::Resolved) {
                     *msg = Message::Data(snapshot);
                     retains_needed += 1;
@@ -1057,7 +1092,7 @@ impl Core {
         let already_tier3 = s
             .pending_notify
             .get(&node_id)
-            .is_some_and(|entry| entry.messages.iter().any(|m| m.tier() == 3));
+            .is_some_and(|entry| entry.iter_messages().any(|m| m.tier() == 3));
         if !already_tier3 {
             self.queue_notify(&mut s, node_id, Message::Resolved);
         }
@@ -1809,16 +1844,18 @@ impl Core {
 
     /// Queue a wave-end message for `node_id`'s subscribers.
     ///
-    /// **Sink-snapshot-on-first-touch:** the per-wave subscriber list is
-    /// snapshotted the first time `queue_notify` is called for each node
-    /// in a wave (via the `Vacant` arm of `pending_notify.entry()`).
-    /// Subsequent calls for the same node append messages but reuse the
-    /// snapshot. This makes late subscribers (installed mid-wave between
-    /// fn-fire iterations now that the state lock drops per-iteration)
-    /// invisible to messages already queued before they subscribed —
-    /// avoiding the duplicate-Data delivery hazard where a late subscriber
-    /// would see `[Start, Data(post)]` from its handshake AND `[Dirty,
-    /// Data(post)]` from the wave's flush.
+    /// **Revision-tracked sink-snapshot batches (Slice X4 / D2,
+    /// 2026-05-08):** each push for a given node either appends the
+    /// message to the open batch (if `NodeRecord::subscribers_revision`
+    /// hasn't advanced since that batch opened — the common case — no
+    /// extra allocation), or opens a fresh batch with a current sink
+    /// snapshot frozen at the new revision. A sub installed mid-wave
+    /// bumps `subscribers_revision`; the next `queue_notify` for the
+    /// same node observes the bump and starts a new batch that includes
+    /// the new sub. Pre-subscribe batches retain their original snapshot,
+    /// so earlier emits flush to their original sink list — the new sub
+    /// does NOT double-receive them via flush AND handshake replay,
+    /// closing the late-subscriber + multi-emit-per-wave R1.3.5.a gap.
     ///
     /// Pause routing decision (R1.3.7.b tier table, §10.2 buffering):
     ///   Tier 3 (DATA / RESOLVED) and Tier 4 (INVALIDATE) buffer while
@@ -1842,10 +1879,13 @@ impl Core {
         #[cfg(debug_assertions)]
         if matches!(msg.tier(), 3) {
             if let Some(entry) = s.pending_notify.get(&node_id) {
-                let has_data = entry.messages.iter().any(|m| matches!(m, Message::Data(_)));
+                // Walk all batches' messages — R1.3.3.a is a per-node
+                // wave-content invariant, not per-batch (the X4 batches
+                // are subscriber-snapshot epochs; the protocol-level
+                // tier-3 invariant spans the whole wave for the node).
+                let has_data = entry.iter_messages().any(|m| matches!(m, Message::Data(_)));
                 let resolved_count = entry
-                    .messages
-                    .iter()
+                    .iter_messages()
                     .filter(|m| matches!(m, Message::Resolved))
                     .count();
                 let incoming_is_data = matches!(msg, Message::Data(_));
@@ -1930,19 +1970,43 @@ impl Core {
         }
 
         // Non-paused queue path: retain payload handle and queue into
-        // pending_notify with a per-wave subscriber snapshot taken at
-        // first touch. Released in `flush_notifications` after sinks fire.
+        // pending_notify. Released in `flush_notifications` after sinks
+        // fire.
         if let Some(h) = msg.payload_handle() {
             self.binding.retain_handle(h);
         }
+        Self::push_into_pending_notify(s, node_id, msg);
+    }
 
-        // Snapshot subscribers on first touch per wave. We need to read
-        // `subscribers` separately from the `pending_notify.entry()` borrow
-        // because both are fields of `CoreState` and split-borrowing
-        // through a method call (`require_node_mut`) defeats the borrow
-        // checker. So precompute the snapshot iff the entry is vacant.
-        let needs_snapshot = !s.pending_notify.contains_key(&node_id);
-        let sinks_snapshot: Vec<Sink> = if needs_snapshot {
+    /// Slice X4 / D2: revision-tracked batch decision for `queue_notify`'s
+    /// non-paused path. Either appends `msg` to the open batch (if
+    /// `subscribers_revision` hasn't advanced since it opened — common
+    /// case, no extra allocation) or opens a fresh batch with a current
+    /// sink snapshot frozen at the new revision.
+    ///
+    /// Borrow discipline: reads `subscribers_revision` and the snapshot
+    /// from `s.nodes` BEFORE calling `s.pending_notify.entry()` to keep
+    /// the two field borrows disjoint (split-borrow through
+    /// `require_node_mut` defeats the borrow checker).
+    ///
+    /// Lock-discipline assumption: this read of `subscribers_revision`
+    /// is safe because both the subscribe install path
+    /// ([`crate::node::Core::subscribe`]) and `queue_notify` hold
+    /// `CoreState`'s mutex when they bump / read the revision —
+    /// concurrent subscribe/unsubscribe cannot interleave. **If
+    /// `Core::subscribe` ever moves the sink-install lock-released
+    /// (mirroring the lock-released drain refactor), the revision read
+    /// here must re-validate post-borrow — otherwise a fresh batch
+    /// could open with a stale snapshot.**
+    fn push_into_pending_notify(s: &mut CoreState, node_id: NodeId, msg: Message) {
+        let current_rev = s.require_node(node_id).subscribers_revision;
+        let needs_new_batch = s.pending_notify.get(&node_id).is_none_or(|entry| {
+            entry
+                .batches
+                .last()
+                .is_none_or(|b| b.snapshot_revision != current_rev)
+        });
+        let sinks_snapshot: Vec<Sink> = if needs_new_batch {
             s.require_node(node_id)
                 .subscribers
                 .values()
@@ -1953,13 +2017,30 @@ impl Core {
         };
         match s.pending_notify.entry(node_id) {
             Entry::Vacant(slot) => {
-                slot.insert(PendingPerNode {
+                let mut batches: SmallVec<[PendingBatch; 1]> = SmallVec::new();
+                batches.push(PendingBatch {
+                    snapshot_revision: current_rev,
                     sinks: sinks_snapshot,
                     messages: vec![msg],
                 });
+                slot.insert(PendingPerNode { batches });
             }
             Entry::Occupied(mut slot) => {
-                slot.get_mut().messages.push(msg);
+                let entry = slot.get_mut();
+                if needs_new_batch {
+                    entry.batches.push(PendingBatch {
+                        snapshot_revision: current_rev,
+                        sinks: sinks_snapshot,
+                        messages: vec![msg],
+                    });
+                } else {
+                    entry
+                        .batches
+                        .last_mut()
+                        .expect("non-empty by construction (entry exists implies batch exists)")
+                        .messages
+                        .push(msg);
+                }
             }
         }
     }
@@ -2000,29 +2081,35 @@ impl Core {
         let pending = std::mem::take(&mut s.pending_notify);
         for &phase_tiers in PHASES {
             for (_node_id, entry) in &pending {
-                let phase_msgs: Vec<Message> = entry
-                    .messages
-                    .iter()
-                    .copied()
-                    .filter(|m| phase_tiers.contains(&m.tier()))
-                    .collect();
-                if phase_msgs.is_empty() {
-                    continue;
+                // Slice X4 / D2: iterate batches in arrival order. Each
+                // batch carries its own sink snapshot frozen at open-time;
+                // a batch's messages flush to ITS sinks only. Within a
+                // single (phase, node), batches stay in arrival order so
+                // emit-order semantics are preserved across batches.
+                for batch in &entry.batches {
+                    if batch.sinks.is_empty() {
+                        continue;
+                    }
+                    let phase_msgs: Vec<Message> = batch
+                        .messages
+                        .iter()
+                        .copied()
+                        .filter(|m| phase_tiers.contains(&m.tier()))
+                        .collect();
+                    if phase_msgs.is_empty() {
+                        continue;
+                    }
+                    let sinks_clone: Vec<Sink> = batch.sinks.iter().map(Arc::clone).collect();
+                    s.deferred_flush_jobs.push((sinks_clone, phase_msgs));
                 }
-                if entry.sinks.is_empty() {
-                    continue;
-                }
-                // Clone the per-node sink snapshot — same Arcs, cheap.
-                let sinks_clone: Vec<Sink> = entry.sinks.iter().map(Arc::clone).collect();
-                s.deferred_flush_jobs.push((sinks_clone, phase_msgs));
             }
         }
         // Refcount release: balance the retain done in `queue_notify` for
-        // every payload-bearing message that landed in pending_notify.
-        // Deferred to post-lock-drop so the binding's release path can't
-        // re-enter Core under our lock.
+        // every payload-bearing message that landed in pending_notify
+        // (across ALL batches per node). Deferred to post-lock-drop so the
+        // binding's release path can't re-enter Core under our lock.
         for entry in pending.values() {
-            for msg in &entry.messages {
+            for msg in entry.iter_messages() {
                 if let Some(h) = msg.payload_handle() {
                     s.deferred_handle_releases.push(h);
                 }
@@ -2318,7 +2405,7 @@ impl Drop for BatchGuard {
             // Lock dropped — release retains lock-released so the binding
             // can't deadlock against an internal binding mutex.
             for entry in pending.values() {
-                for msg in &entry.messages {
+                for msg in entry.iter_messages() {
                     if let Some(h) = msg.payload_handle() {
                         self.core.binding.release_handle(h);
                     }

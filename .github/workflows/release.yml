@@ -1,125 +1,106 @@
-# Publishes graphrefly-* crates to crates.io via Trusted Publishing (OIDC).
+# release-plz: PR-based versioning + crates.io publish with Trusted
+# Publishing (native OIDC, no API token).
 #
-# How this works (no long-lived API tokens needed):
-#   1. Workflow triggered by a `v*` git tag push.
-#   2. `rust-lang/crates-io-auth-action@v1` exchanges this workflow's GitHub
-#      OIDC token for a short-lived (~30min) crates.io publish token.
-#   3. `cargo publish` uses that token via `CARGO_REGISTRY_TOKEN` to publish
-#      each user-facing crate in dependency order, with waits between tiers
-#      so crates.io has time to index a freshly-published crate before its
-#      dependents try to resolve it.
+# How this works (per release-plz docs):
+#   1. On every push to main, two jobs run:
+#      - release-plz-pr:      computes version bumps from conventional
+#                              commits + opens a "release" PR that bumps
+#                              versions + updates CHANGELOGs across the
+#                              workspace. Sits open until you merge.
+#      - release-plz-release: when the release PR is merged, this job
+#                              publishes the bumped crates to crates.io
+#                              in dependency order (release-plz handles
+#                              this internally).
+#   2. release-plz natively supports crates.io trusted publishing —
+#      no `rust-lang/crates-io-auth-action` needed and no
+#      CARGO_REGISTRY_TOKEN secret. Just set `id-token: write` and
+#      release-plz handles the OIDC token exchange (per
+#      https://release-plz.dev/docs/github/quickstart §2).
 #
-# Bindings crates (graphrefly-bindings-{js,py,wasm}) are marked
-# `publish = false` in their Cargo.toml and are NOT published here — they
-# build into npm/PyPI artifacts via separate workflows.
+# Manual prerequisites (one-time):
+#   1. First publish each crate manually to claim the name (already done
+#      via `scripts/reserve-crate-names.sh`).
+#   2. For each user-facing crate (graphrefly-core, -graph, -operators,
+#      -storage, -structures), configure trusted publishing on
+#      https://crates.io/crates/<name>/settings → Trusted Publishing →
+#      Add → GitHub Actions:
+#        - Repository owner:    graphrefly
+#        - Repository name:     graphrefly-rs
+#        - Workflow filename:   release.yml
+#        - Environment (opt):   release
+#   3. GitHub repo: Settings → Actions → General → Workflow permissions:
+#        - "Read and write permissions"
+#        - "Allow GitHub Actions to create and approve pull requests"
+#      (release-plz needs these to open + update the release PR.)
+#   4. (Optional) GitHub Environment "release" with branch + reviewer
+#      protection. The job below references it; remove the
+#      `environment:` line if you don't want this.
 #
-# Prerequisites (one-time, manual):
-#   1. crates.io account exists and has manually published v0.0.1 (or later)
-#      of each of the 5 crates listed in the publish steps below. (Trusted
-#      publishing requires that the crate name already be claimed.)
-#   2. For each crate, on crates.io: Settings → Trusted Publishing → Add →
-#      GitHub Actions:
-#         - Repository owner:    graphrefly
-#         - Repository name:     graphrefly-rs
-#         - Workflow filename:   release.yml
-#         - Environment (opt):   release
-#   3. (Optional but recommended) GitHub repo: Settings → Environments →
-#      Create "release" with branch protection (e.g. only `main`) and
-#      reviewer requirements. The `environment: release` line below picks
-#      this up. Drop the `environment:` line if you don't want this.
-#
-# Release flow (per release):
-#   1. Bump `[workspace.package].version` in `Cargo.toml`.
-#   2. Commit, push to main.
-#   3. `git tag vX.Y.Z && git push --tags`.
-#   4. This workflow runs, publishes all 5 crates at the new version.
+# Bindings crates are excluded — they're marked `publish = false` in
+# their Cargo.toml and release-plz respects that.
 
-name: Release crates.io
+name: Release-plz
 
 on:
   push:
-    tags: ['v*']
-  workflow_dispatch:  # manual re-run from the Actions tab
+    branches: [main]
 
+# Don't trigger on the release-plz bot's own commits to avoid loops.
 permissions:
   contents: read
 
-# Prevent two concurrent release runs from racing on crates.io index.
-concurrency:
-  group: release-crates-io
-  cancel-in-progress: false
-
 jobs:
-  publish:
-    name: Publish to crates.io
+  # Publish unpublished crates when a release PR merges.
+  release-plz-release:
+    name: Release-plz release
     runs-on: ubuntu-latest
-    environment: release  # remove this line if you don't use protected environments
+    environment: release   # remove this line if you don't use protected environments
     permissions:
-      id-token: write  # REQUIRED for OIDC token exchange
-      contents: read
-
+      contents: write       # push tags + create GitHub releases
+      pull-requests: read   # detect the release PR + its commits
+      id-token: write       # REQUIRED for crates.io OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
-
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Match the workspace's rust-toolchain.toml pin.
           toolchain: "1.95"
-
-      # Sanity check before talking to crates.io. CI on main already runs
-      # the full suite, but a release tag can technically be pushed without
-      # main being green — these two steps catch that.
-      - name: Build (locked)
-        run: cargo build --release --locked
-
-      - name: Test (default-members; excludes binding crates by design)
-        run: cargo test --locked
-
-      # Exchange OIDC for short-lived crates.io token. The action sets
-      # `steps.auth.outputs.token` for downstream steps.
-      - name: Get crates.io OIDC token
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      # ---------- Tier 1: foundational, no in-workspace deps. ----------
-      - name: Publish graphrefly-core
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p graphrefly-core
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No CARGO_REGISTRY_TOKEN — release-plz uses OIDC trusted
+          # publishing automatically when `id-token: write` is set.
 
-      # crates.io needs ~30–60s to index a freshly-published crate before
-      # dependents can resolve it. Without this wait, Tier 2 publishes fail
-      # with "no matching package named graphrefly-core found".
-      - name: Wait for crates.io index (Tier 1 → 2)
-        run: sleep 60
-
-      # ---------- Tier 2: depends on -core only. ----------
-      - name: Publish graphrefly-graph
+  # Open / update a release PR with the next version bumps + changelogs.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # push to the release PR's branch
+      pull-requests: write  # create + update the release PR
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p graphrefly-graph
-
-      - name: Publish graphrefly-operators
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p graphrefly-operators
-
-      - name: Wait for crates.io index (Tier 2 → 3)
-        run: sleep 45
-
-      # ---------- Tier 3: depends on -core + -graph. ----------
-      - name: Publish graphrefly-storage
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p graphrefly-storage
-
-      - name: Publish graphrefly-structures
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p graphrefly-structures
-
-      - name: Done
-        run: |
-          echo "Published 5 crates at version $(grep -E '^version' Cargo.toml | head -1 | sed -E 's/.*"(.*)".*/\1/')"
-          echo "Verify at: https://crates.io/users/<your-username>"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

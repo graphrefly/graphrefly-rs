@@ -1,0 +1,30 @@
+# release-plz workspace config. See https://release-plz.dev/docs/config
+#
+# By default release-plz operates on every workspace member. The bindings
+# crates are marked `publish = false` in their Cargo.toml, so release-plz
+# already excludes them from `cargo publish`. We additionally set
+# `release = false` here to skip the version-bump PR + changelog work
+# entirely for those crates (they don't have a public release cadence —
+# their build outputs ship via napi-rs / wasm-pack / maturin to npm and
+# PyPI).
+
+[workspace]
+# Conventional Commits → SemVer bumps. Default; explicit for clarity.
+semver_check        = true
+# Generate CHANGELOG.md per crate. Default true; explicit for clarity.
+changelog_update    = true
+# Tag format. v{{ version }} matches our existing manual tag style.
+git_tag_name        = "v{{ version }}"
+
+# Per-crate overrides for the bindings crates (no release / no changelog).
+[[package]]
+name    = "graphrefly-bindings-js"
+release = false
+
+[[package]]
+name    = "graphrefly-bindings-py"
+release = false
+
+[[package]]
+name    = "graphrefly-bindings-wasm"
+release = false

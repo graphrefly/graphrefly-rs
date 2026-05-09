@@ -525,8 +525,7 @@ impl BenchGraph {
                     // we silently skip this fire (sink can't propagate
                     // errors back to the producer per the R3.6.1 contract).
                     if let Ok(json) = serde_json::to_string(snapshot) {
-                        let _status =
-                            tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+                        let _status = tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
                     }
                 });
                 graph.describe_reactive(describe_sink)
