@@ -28,10 +28,21 @@
 #        - Repository name:     graphrefly-rs
 #        - Workflow filename:   release.yml
 #        - Environment (opt):   release
-#   3. GitHub repo: Settings → Actions → General → Workflow permissions:
-#        - "Read and write permissions"
-#        - "Allow GitHub Actions to create and approve pull requests"
-#      (release-plz needs these to open + update the release PR.)
+#   3. Install the same GitHub App used in graphrefly-ts on this repo, OR
+#      enable Settings → Actions → General → Workflow permissions →
+#      "Allow GitHub Actions to create and approve pull requests".
+#      (Release-plz opens a version-bump PR, which the default
+#      GITHUB_TOKEN can't do under the org's default policy.) The
+#      App-token path below requires:
+#        - Org var:    GRAPHREFLY_WRITE_CONTENT_APP_ID
+#        - Org secret: GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY
+#        - App installed on graphrefly/graphrefly-rs with permissions:
+#          Contents=write, Issues=write, Pull requests=write,
+#          Metadata=read.
+#      If you don't want the App on this repo, replace the
+#      `actions/create-github-app-token@v3` step with a dummy and use
+#      `${{ secrets.GITHUB_TOKEN }}` instead — but you must then enable
+#      the org-level "Allow GitHub Actions to create PRs" toggle.
 #   4. (Optional) GitHub Environment "release" with branch + reviewer
 #      protection. The job below references it; remove the
 #      `environment:` line if you don't want this.
@@ -60,11 +71,21 @@ jobs:
       pull-requests: read   # detect the release PR + its commits
       id-token: write       # REQUIRED for crates.io OIDC trusted publishing
     steps:
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_ID }}
+          private-key: ${{ secrets.GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,7 +95,7 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           # No CARGO_REGISTRY_TOKEN — release-plz uses OIDC trusted
           # publishing automatically when `id-token: write` is set.
 
@@ -89,11 +110,21 @@ jobs:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_ID }}
+          private-key: ${{ secrets.GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -103,4 +134,4 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
