@@ -290,6 +290,173 @@ Cargo regression tests are the source of truth for the canonical case.
   binding-side equivalent) surfaces a load-bearing need for explicit
   node removal. `cleanup_node` remains `#[allow(dead_code)]`-gated
   with an explanatory rustdoc.
+
+  **Phase J (criterion bench, 2026-05-09) — quantified parallelism;
+  earlier "OBSERVABLE" claim retracted as regime-dependent.** New
+  bench [`crates/graphrefly-core/benches/per_subgraph_parallelism.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/benches/per_subgraph_parallelism.rs)
+  runs 5 + 3 scenarios spanning two regimes:
+  - **Tight state-emit (no fn fire):** 2t-disjoint = 7.11 ms vs
+    serial = 5.35 ms (8000 emits) — **0.75× = 33% SLOWER.**
+    4t-disjoint = 14.84 ms vs serial 16K = 10.48 ms — **0.71× =
+    42% SLOWER.** Per-partition `wave_owner` invisible because
+    state mutex is held throughout `commit_emission` +
+    `drain_and_flush` and is Core-global; cross-thread state-mutex
+    contention dominates.
+  - **Fn-fire-heavy (~4µs CPU per fire, lock-released invoke_fn):**
+    2t-disjoint = 1.35 ms vs serial = 1.66 ms (2000 emits) —
+    **1.23× speedup.** 2t-same-partition = 2.66 ms — **1.97×
+    SLOWER than disjoint** (canonical Y1 property: same-partition
+    serializes via partition `wave_owner`; disjoint-partition runs
+    concurrent fn fires lock-released).
+
+  **Implication for Phase E re-scope (Q2 / Q3):** the wave-engine
+  migration is structurally correct; the user-facing parallelism
+  gain is gated on workload mix. To extend the gain to tight-emit
+  workloads, the Q2 cross-partition mutex split (move
+  `pending_pause_overflow` / `pending_auto_resolve` /
+  `wave_cache_snapshots` / `deferred_handle_releases` out of
+  `CoreState`) and Q3 per-partition `tier3_emitted_this_wave`
+  must land — they shrink the state-mutex critical section so
+  cross-thread state acquisition doesn't serialize disjoint-
+  partition emits. **Q2/Q3 is the next concrete step toward
+  wide-spectrum parallelism.** Bench evidence justifies the work
+  but the workload-specific benefit ceiling depends on real
+  consumer mix.
+
+  **Test note:** the existing
+  `concurrent_emit_on_disjoint_partitions_runs_truly_parallel`
+  acceptance test pins a NON-BLOCKING property (thread B's emit
+  returns BEFORE tx.send releases thread A's blocked fn — QA-fix
+  group 2 replaced the earlier 2s timing window with a deterministic
+  atomic event-ordering check). The companion
+  `concurrent_emit_on_same_partition_serializes` similarly uses
+  entry/exit atomic flags instead of timing-window checks. Both
+  pin correctness properties (non-blocking / serialization), not
+  wall-clock-speedup properties — Phase J bench is the
+  speedup-measurement source.
+
+### Producer-pattern cross-partition subscribe deadlock (Phase H+ scope)
+
+- **What:** a Producer-pattern node `P` in partition X executes its
+  fn-fire (lock-released `invoke_fn`). The fn calls
+  `Core::subscribe(source, sink)` where `source ∈ Y` (a different
+  partition — subscribe doesn't add a dep edge, so partitions stay
+  disjoint). `Core::subscribe` calls
+  `partition_wave_owner_lock_arc(source)` — acquiring partition
+  Y's `wave_owner`. The calling thread A now holds X + Y.
+- **Risk:** classic AB/BA deadlock. If thread B is holding Y (via
+  its own `begin_batch_for`) and is waiting on X (legitimate
+  ascending-order acquisition of `{X, Y}` per Q7), then:
+  - thread A holds X + needs Y;
+  - thread B holds Y + needs X;
+  - cycle. Q7's "ascending SubgraphId" only protects when partitions
+    are acquired together upfront via `begin_batch_for`;
+    `subscribe`-from-`invoke_fn` bypasses it (single-partition
+    acquisition mid-fire of another partition).
+- **Why deferred:** the Producer pattern is uncommon in v1 use
+  (mostly higher-order operators that subscribe to upstream
+  sources). The legitimate workaround is to defer the
+  cross-partition subscribe to a post-flush callback (sink-time
+  re-subscribe), which several existing operators already do for
+  unrelated reasons. v1 ships with a documented hazard rather
+  than a structural fix.
+- **Lift:** Phase H acceptance includes a loom-checked TLA+ /
+  loom scenario for cross-partition subscribe-during-fire. The
+  fix when surfaced is structural — either (a) widen the wave's
+  `BatchGuard` to include subscribe-target partitions reachable
+  via the fn's binding-side captures (impossible without
+  prescience); (b) defer the subscribe's actual partition-Y
+  acquisition until post-flush (queue the subscription request,
+  apply at wave end); or (c) document that producer fns
+  subscribing to other partitions are unsafe under cross-thread
+  contention and require the user to schedule the subscribe
+  outside the wave.
+- **Source:** QA-finding #6 (Edge Case Hunter, 2026-05-09) on
+  Slice E + F + Phase J QA pass. Cross-references Q5 scope item
+  in [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
+  — Q5 was scoped for `Subscription::Drop` cross-partition
+  cleanup cascade (lock-released drop with per-upstream-partition
+  acquisition, no deadlock); the symmetric SUBSCRIBE-during-fire
+  case was not explicitly covered.
+
+### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — next batch after D3 closure
+
+- **What:** unified follow-up batch covering session-doc Q2
+  (cross_partition mutex split), Q3 (per-partition
+  `tier3_emitted_this_wave`), and Q-beyond (split `CoreState` into
+  per-partition `SubgraphShard`s holding `nodes` / `children` /
+  `pending_notify` / `pending_fires` / wave bookkeeping). The full
+  shape that realizes wide-spectrum parallelism for tight state-emit
+  loops, not just fn-fire-heavy workloads.
+
+- **Why this is one batch (not three):** Q2 alone trims ~4 fields
+  out of ~15 in the state critical section — bench impact 0–5% in
+  Regime A. Q3 alone is similar (one `AHashSet` reduction). Both
+  are *prerequisite shape* for Q-beyond, which is the actual
+  perf-positive change: per-partition `nodes` / `children` /
+  `pending_notify` / `pending_fires` shards mean two threads on
+  disjoint partitions hold disjoint mutexes (no algorithmic
+  contention) and disjoint memory regions (no L1/L2 cache-line
+  bouncing on the shared atomic). Doing Q2 / Q3 in isolation is
+  busy-work; bundled with Q-beyond they're the natural shape-
+  preparation prefix.
+
+- **Bench evidence (the trigger):**
+  [`crates/graphrefly-core/benches/per_subgraph_parallelism.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/benches/per_subgraph_parallelism.rs)
+  Phase J results (2026-05-09):
+  | Regime | Serial | 2t-disjoint | 2t-same-partition | Notes |
+  |---|---|---|---|---|
+  | Tight state-emit (8K emits) | 5.35 ms | 7.11 ms (0.75×) | 7.37 ms (0.73×) | Per-partition `wave_owner` invisible — `state` mutex (cache-line) is the bottleneck |
+  | Fn-fire-heavy (2K emits) | 1.66 ms | **1.35 ms (1.23×)** | 2.66 ms (0.62×) | `state` released around lock-released `invoke_fn`; **disjoint vs same = 1.97× separation** — Y1 property visible |
+
+  Hypothesis for the post-batch numbers: 2t-disjoint state-emit
+  approaches `serial / 2` (modulo coordination overhead) — i.e.
+  ~1.7–1.9× speedup at 2 threads. 4t-disjoint approaches
+  `serial / 4` on a 4-core machine. Same-partition stays at 1.0× /
+  baseline (correct serialization preserved by per-partition
+  `wave_owner`).
+
+- **Estimated scope:** ~2000–3000 LOC across `node.rs` + `batch.rs`.
+  Touches `CoreState` declaration, `Core::new`, every read/write
+  site (~150+), `BatchGuard`, drain, flush, sink fire,
+  `Drop for CoreState`, `WeakCore`, plus a `cross_partition`
+  mutex for the 4 Q2 fields and per-`SubgraphLockBox`
+  `state: Mutex<SubgraphState>` for Q3. Sequencing within the
+  batch:
+  1. Q3 first — smallest. Add `SubgraphState`, move `tier3`
+     per-partition. Establishes the per-partition-data pattern.
+  2. Q2 — split `cross_partition` mutex out, move 4 wave-scoped
+     fields. Establishes the cross-partition aggregation pattern.
+  3. Q-beyond — split `CoreState` into per-partition `SubgraphShard`s.
+     Reshape every wave-engine site to `shards[partition].lock()`.
+     Cross-partition cascades acquire multiple shards in ascending
+     `SubgraphId` order (same Q7 pattern as `wave_owner`).
+  4. Bench re-run — quantify the win. Update bench expectations.
+
+- **Risks:** breaking the 498-test invariant during a multi-day
+  refactor; cross-partition cascade-shard acquisition has subtle
+  lock-order requirements; `BatchGuard` reshape interacts with the
+  retry-validate loop. Plan to land in sub-slices (Q3, then Q2,
+  then Q-beyond per-site) with cargo test green at each boundary.
+
+- **Path-to-win:**
+  1. **D3 closes first** via Phase H + I + K + L (correctness
+     tests, TLA+ extension, CLAUDE.md update, closing docs +
+     git tag). The current shape ships as v1 with the documented
+     regime-dependent parallelism caveat.
+  2. **This batch is the planned follow-up** (post-1.0 if release
+     happens before; or Slice Z+ within the pre-1.0 sequencer).
+     User direction 2026-05-09: "put that Q2 + Q3 + Q-beyond
+     refactor as the next batch after H/I/K/L."
+  3. **Update CLAUDE.md Rust invariant 3** when this batch lands —
+     the wording "Per-subgraph `parking_lot::ReentrantMutex`
+     (planned)" should lift to "current implementation" only when
+     Regime A also shows true parallelism. Until then, the Phase K
+     update should reflect the partial win.
+
+- **Source:** Phase J bench evidence (2026-05-09). User direction
+  2026-05-09 to bundle Q2 + Q3 + Q-beyond as one follow-up batch
+  rather than landing Q2 / Q3 in isolation.
 - **Y2 carry-forward:** TLA+ extension of `wave_protocol_rewire`
   covering partition lock-ordering + cross-partition deadlock-freedom
   + union/split discipline; multi-thread parallel-emit criterion

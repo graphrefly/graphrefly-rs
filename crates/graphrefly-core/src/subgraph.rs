@@ -162,6 +162,25 @@ pub struct SubgraphRegistry {
     /// `lock_for` calls on its members find the winner's box via
     /// `find`.
     boxes: HashMap<NodeId, Arc<SubgraphLockBox>>,
+    /// Monotonic counter bumped on every operation that changes the
+    /// SET of partitions or any partition's box-identity:
+    /// [`Self::ensure_registered`] (creates a new partition),
+    /// [`Self::union_nodes`] (merges two partitions — actual merge
+    /// only, idempotent calls don't bump), and
+    /// [`Self::split_partition`] (splits a partition into two with a
+    /// fresh box for the orphan side).
+    ///
+    /// Consumed by [`crate::Core::begin_batch`] and
+    /// [`crate::Core::begin_batch_for`] for retry-validate at the
+    /// all-partitions / touched-partitions level (QA-fix #2,
+    /// 2026-05-09): if the epoch changes between snapshot and
+    /// post-acquire re-read, a concurrent registry mutation may
+    /// have added/removed/redirected a partition the batch should
+    /// have held. The batch drops its acquired guards and retries.
+    ///
+    /// Counter is `u64`; wrap-around is unreachable in practice
+    /// (bumping 1B times per second still takes 584 years).
+    epoch: u64,
 }
 
 impl SubgraphRegistry {
@@ -177,7 +196,17 @@ impl SubgraphRegistry {
             rank: HashMap::new(),
             children: HashMap::new(),
             boxes: HashMap::new(),
+            epoch: 0,
         }
+    }
+
+    /// Read the current registry epoch. Used by
+    /// [`crate::Core::begin_batch`] / [`crate::Core::begin_batch_for`]
+    /// for the snapshot-and-acquire retry-validate loop (QA-fix #2,
+    /// 2026-05-09).
+    #[must_use]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Register `node` as the root of a fresh singleton component.
@@ -194,6 +223,9 @@ impl SubgraphRegistry {
         self.rank.insert(node, 0);
         self.children.insert(node, HashSet::new());
         self.boxes.insert(node, SubgraphLockBox::new());
+        // QA-fix #2: new partition exists. Closure-form `Core::begin_batch`
+        // that snapshotted before now must retry to acquire it.
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Find the root of `node`'s component, with path compression.
@@ -290,6 +322,10 @@ impl SubgraphRegistry {
         // Drop the loser's box. Any in-flight readers holding an Arc
         // clone keep it alive; the registry no longer references it.
         self.boxes.remove(&root_b);
+        // QA-fix #2: real merge happened (early-return above handled the
+        // idempotent same-root case). The set of partitions changed;
+        // bump epoch so closure-form / per-seed retry-validate detects.
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Remove `node` from the registry. If `node` was a root, promote
@@ -496,6 +532,11 @@ impl SubgraphRegistry {
         // succeed for keep-side nodes). Fresh box → orphan-side root.
         self.boxes.insert(keep_root, original_box);
         self.boxes.insert(orphan_root, SubgraphLockBox::new());
+
+        // QA-fix #2: split changed the partition set + introduced a
+        // fresh box. Bump epoch so any closure-form / per-seed batch
+        // that snapshotted before the split detects + retries.
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Resolve `node`'s partition lock box. Caller acquires the

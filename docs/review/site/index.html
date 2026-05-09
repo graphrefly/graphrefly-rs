@@ -3,49 +3,93 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>GraphReFly Rust Port — Review Site</title>
+  <title>GraphReFly Rust Port — Review Journal</title>
   <link rel="stylesheet" href="css/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,300..900,0..100,0..1&family=Newsreader:opsz,wght@6..72,400..800&family=IBM+Plex+Sans:wght@400..600&family=JetBrains+Mono:wght@400..600&display=swap"
+    rel="stylesheet"
+  />
 </head>
 <body>
   <header class="topbar">
-    <div class="topbar-title">
-      <span class="logo">⚙</span>
-      <span>GraphReFly Rust Port — Review</span>
+    <div class="topbar-brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="6" cy="9"  r="2.6" fill="currentColor"/>
+          <circle cx="6" cy="23" r="2.6" fill="currentColor"/>
+          <circle cx="26" cy="16" r="2.6" fill="currentColor"/>
+          <line x1="6"  y1="9"  x2="26" y2="16" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="6"  y1="23" x2="26" y2="16" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="6"  y1="9"  x2="6"  y2="23" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2,2"/>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <span class="brand-title">GraphReFly</span>
+        <span class="brand-sub">Rust Port — Review Journal</span>
+      </div>
     </div>
-    <div class="topbar-info">
-      <span id="modalCount">0 diagrams open</span>
-      <button id="closeAllModals" title="Close all open diagrams">Close all</button>
-    </div>
+    <nav class="topbar-actions">
+      <span id="modalCount" class="badge-pill ghost">0 enlarged</span>
+      <button id="closeAllModals" type="button" title="Close all enlarged figures">Close all</button>
+      <a class="repo-link" href="../../../README.md" title="Repository root">↗ repo</a>
+    </nav>
   </header>
 
   <div class="layout">
-    <aside class="sidebar" id="sidebar">
-      <div class="sidebar-section">
-        <h3>Reports</h3>
-        <ul id="reportList"></ul>
-      </div>
-      <div class="sidebar-section">
-        <h3>Flowcharts <span class="muted">(canonical)</span></h3>
-        <p class="hint">Click any <code>[F<i>x.y</i>]</code> link in a report to open that diagram in a draggable modal. Multiple modals can stay open at once.</p>
-        <div id="diagramIndex"></div>
-      </div>
-      <div class="sidebar-section">
-        <h3>Tips</h3>
+    <aside class="sidebar" id="sidebar" aria-label="Reports & flowcharts">
+      <section class="rail-section">
+        <h3 class="rail-heading">Reports</h3>
+        <ul id="reportList" class="rail-list"></ul>
+      </section>
+      <section class="rail-section">
+        <h3 class="rail-heading">Figures <span class="muted">(canonical)</span></h3>
+        <p class="rail-hint">
+          <span class="chip-demo">F<i>x.y</i></span> chips inside any report scroll to or open the matching diagram.
+          Hover for the title.
+        </p>
+        <div id="diagramIndex" class="figure-index"></div>
+      </section>
+      <section class="rail-section">
+        <h3 class="rail-heading">Reading aids</h3>
         <ul class="tips">
-          <li>Modal headers drag the window.</li>
-          <li>Mouse-wheel inside a modal pans/zooms the diagram.</li>
+          <li>Click a <span class="chip-demo">F<i>x.y</i></span> chip to jump in-page; click again to enlarge in a draggable window.</li>
+          <li>Modal headers drag · scroll inside to zoom · drag the corner to resize.</li>
           <li><kbd>Esc</kbd> closes the focused modal.</li>
-          <li>Drag the bottom-right corner to resize.</li>
+          <li>Right rail shows the active report's outline + its figures.</li>
         </ul>
-      </div>
+      </section>
     </aside>
 
     <main class="content" id="content">
-      <div id="reportContent" class="markdown-body">
-        <p class="loading">Loading…</p>
-      </div>
+      <article id="reportContent" class="journal">
+        <p class="loading">Loading the review journal…</p>
+      </article>
     </main>
+
+    <aside class="rightrail" id="rightrail" aria-label="On-page outline">
+      <div class="rightrail-inner">
+        <section class="rail-section">
+          <h3 class="rail-heading">On this page</h3>
+          <nav id="pageOutline" class="page-outline"><p class="muted small">Outline appears once a report is loaded.</p></nav>
+        </section>
+        <section class="rail-section">
+          <h3 class="rail-heading">Figures in this report</h3>
+          <ul id="pageFigures" class="page-figures"><li class="muted small">— none yet —</li></ul>
+        </section>
+        <section class="rail-section legend">
+          <h3 class="rail-heading">Legend</h3>
+          <ul class="legend-list">
+            <li><span class="dot bug"></span> Correctness bug</li>
+            <li><span class="dot warn"></span> Limitation / deferred</li>
+            <li><span class="dot opp"></span> Simplification / win</li>
+            <li><span class="dot note"></span> Note / observation</li>
+          </ul>
+        </section>
+      </div>
+    </aside>
   </div>
 
   <div id="modalRoot"></div>
@@ -70,8 +114,6 @@
         ' away and the site works as designed.</p>';
       document.getElementById('modalCount').textContent = 'serve via http to use';
 
-      // Stop right here — do NOT load mermaid / app.js, they would only flood the
-      // console with cross-origin fetch errors.
       throw new Error('file:// origin — see banner');
     })();
   </script>

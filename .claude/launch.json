@@ -4,8 +4,8 @@
 		{
 			"name": "rust-review",
 			"runtimeExecutable": "python3",
-			"runtimeArgs": ["-m", "http.server", "8765", "--directory", "docs"],
-			"port": 8765
+			"runtimeArgs": ["-m", "http.server", "8769", "--directory", "docs"],
+			"port": 8769
 		}
 	]
 }

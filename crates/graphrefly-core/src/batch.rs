@@ -2279,6 +2279,13 @@ impl Core {
     ///
     /// Like the closure form, nested `begin_batch` calls share the outer
     /// wave (only the outermost guard drains).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry-epoch retry-validate loop exceeds
+    /// [`crate::subgraph::MAX_LOCK_RETRIES`] iterations — pathological
+    /// concurrent `register` / `set_deps` activity racing with
+    /// closure-form batch entry. Unreachable in correct call paths.
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch(&self) -> BatchGuard {
         // Slice Y1 / Phase E (2026-05-08): closure-form batch has no known
@@ -2287,27 +2294,50 @@ impl Core {
         // `wave_owner` in ascending [`SubgraphId`] order via the retry-
         // validate primitive. Same-thread re-entry passes through each
         // ReentrantMutex transparently; cross-thread waves on any of the
-        // touched partitions block until our `_wave_guards` drop.
+        // touched partitions block until our `wave_guards` drop.
+        //
+        // **QA-fix #2 (2026-05-09) — registry epoch retry-validate:** a
+        // concurrent `register` / `set_deps`-driven union/split between
+        // our `all_partitions_lock_boxes()` snapshot and the post-
+        // acquire epoch read changes the partition set. We then retry
+        // the whole acquire with the new snapshot. Without this, a
+        // partition added after our snapshot would not be held by our
+        // batch — breaking the closure-form's "all-partitions
+        // serialization" contract.
         //
         // Trade-off (documented v1 contract): closure-form batch is the
         // serialization point under per-partition parallelism. Per-seed
         // entry points (`Core::subscribe`, [`Self::begin_batch_for`])
         // acquire only the touched partitions and run truly parallel
-        // for disjoint partitions. Closure-form is intentionally slower
-        // — its all-partitions semantic is what makes the closure's
-        // `core.emit(s1, ...); core.emit(s2, ...)` coalesce regardless
-        // of which partitions s1 / s2 live in.
-        let partition_boxes = self.all_partitions_lock_boxes();
-        let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
-        for (sid, _box) in &partition_boxes {
-            // Use the partition's root NodeId as the lock_for retry seed.
-            // SubgraphId.raw() == root NodeId.raw(); the root is always
-            // registered in the X5 / Phase-E substrate (cleanup_node is
-            // gated, Phase G activates).
-            let representative = crate::handle::NodeId::new(sid.raw());
-            wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+        // for disjoint partitions.
+        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
+            let epoch_before = self.registry.lock().epoch();
+            let partition_boxes = self.all_partitions_lock_boxes();
+            let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
+            for (sid, _box) in &partition_boxes {
+                // Use the partition's root NodeId as the lock_for retry
+                // seed. SubgraphId.raw() == root NodeId.raw(); the root
+                // is always registered in the X5 / Phase-E substrate
+                // (cleanup_node is gated, Phase G activates).
+                let representative = crate::handle::NodeId::new(sid.raw());
+                wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+            }
+            // Post-acquire epoch read. If unchanged, our snapshot is
+            // still authoritative — every existing partition was held
+            // throughout. If changed, drop guards and retry.
+            let epoch_after = self.registry.lock().epoch();
+            if epoch_after == epoch_before {
+                return self.begin_batch_with_guards(wave_guards);
+            }
+            // Drop guards lock-released so retries don't accumulate.
+            drop(wave_guards);
+            std::thread::yield_now();
         }
-        self.begin_batch_with_guards(wave_guards)
+        panic!(
+            "Core::begin_batch: exceeded {} retries — pathological concurrent \
+             register/union/split activity racing with closure-form batch entry",
+            crate::subgraph::MAX_LOCK_RETRIES
+        );
     }
 
     /// Begin a batch scoped to the partitions transitively touched from
@@ -2324,16 +2354,47 @@ impl Core {
     /// resume, invalidate, complete, error, teardown,
     /// set_deps push-on-subscribe).
     ///
-    /// Slice Y1 / Phase E (2026-05-08).
+    /// **QA-fix #2 (2026-05-09):** retry-validate the touched-partition
+    /// set against the registry epoch — same protection as
+    /// [`Self::begin_batch`] but scoped to a per-seed touched set
+    /// rather than every partition. Conservative: any registry
+    /// mutation (even on a partition unrelated to seed's touched set)
+    /// triggers a retry. This avoids a precise "did MY touched set
+    /// change?" check at the cost of occasional spurious retries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry-epoch retry-validate loop exceeds
+    /// [`crate::subgraph::MAX_LOCK_RETRIES`] iterations, OR if
+    /// [`Core::partition_wave_owner_lock_arc`] panics on an
+    /// unregistered seed. Both are unreachable in correct call paths
+    /// (P12 invariant guarantees registry membership matches
+    /// `s.nodes`).
+    ///
+    /// Slice Y1 / Phase E (2026-05-08); QA-fix #2 (2026-05-09).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard {
-        let touched = self.compute_touched_partitions(seed);
-        let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
-        for sid in &touched {
-            let representative = crate::handle::NodeId::new(sid.raw());
-            wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
+            let epoch_before = self.registry.lock().epoch();
+            let touched = self.compute_touched_partitions(seed);
+            let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
+            for sid in &touched {
+                let representative = crate::handle::NodeId::new(sid.raw());
+                wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+            }
+            let epoch_after = self.registry.lock().epoch();
+            if epoch_after == epoch_before {
+                return self.begin_batch_with_guards(wave_guards);
+            }
+            drop(wave_guards);
+            std::thread::yield_now();
         }
-        self.begin_batch_with_guards(wave_guards)
+        panic!(
+            "Core::begin_batch_for(seed={seed:?}): exceeded {} retries — \
+             pathological concurrent register/union/split activity racing \
+             with per-seed batch entry",
+            crate::subgraph::MAX_LOCK_RETRIES
+        );
     }
 
     /// Internal helper: claim `in_tick` and assemble a [`BatchGuard`]
@@ -2358,7 +2419,7 @@ impl Core {
         BatchGuard {
             core: self.clone(),
             owns_tick,
-            _wave_guards: wave_guards,
+            wave_guards,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -2391,7 +2452,7 @@ impl Core {
 /// release the wave-owner guards from a different thread than the
 /// one that acquired them, breaking both the thread-local "I own
 /// the wave scope" semantic and `parking_lot::ReentrantMutex`'s
-/// ownership invariant. The `_wave_guards` field is a `SmallVec` of
+/// ownership invariant. The `wave_guards` field is a `SmallVec` of
 /// `!Send` `ArcReentrantMutexGuard<()>`; the `PhantomData<*const ()>`
 /// marker is belt-and-suspenders.
 ///
@@ -2436,7 +2497,7 @@ pub struct BatchGuard {
     /// (and thus `BatchGuard`) is `!Send` at the type level — sending
     /// across threads would violate `parking_lot::ReentrantMutex`'s
     /// thread-ownership invariant.
-    _wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
+    wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
@@ -2522,5 +2583,16 @@ impl Drop for BatchGuard {
         // + fire eager wipes (D069).
         self.core
             .fire_deferred(jobs, releases, cleanup_hooks, pending_wipes);
+        // QA-fix group 2 (2026-05-09): explicitly drop the wave guards
+        // in REVERSE acquisition order. `parking_lot::ReentrantMutex`
+        // doesn't care about release order for same-thread holders, but
+        // a future migration to a non-reentrant lock (or one with a
+        // Drop side-effect tied to ordering) would silently break if we
+        // relied on `SmallVec`'s default forward-iteration drop. The
+        // ascending-acquire / descending-release pattern is the
+        // canonical lock-discipline shape.
+        while let Some(guard) = self.wave_guards.pop() {
+            drop(guard);
+        }
     }
 }

@@ -472,30 +472,46 @@ fn concurrent_emit_on_disjoint_partitions_runs_truly_parallel() {
 
     // Thread B: emits on s_b. Under Y1 / Phase E, this acquires only
     // partition(s_b)'s `wave_owner` — DISJOINT from partition(s_a)'s
-    // held by Thread A. EXPECTED to FINISH PROMPTLY (truly parallel).
+    // held by Thread A. EXPECTED to FINISH BEFORE tx.send (the
+    // unblock for thread A's fn). Atomic flag enables deterministic
+    // event-ordering check (QA-fix group 2 — the earlier 2s timing
+    // window was CI-flaky under thread-spawn contention).
+    let thread_b_done = Arc::new(AtomicU64::new(0));
+    let thread_b_done_for_thread = thread_b_done.clone();
     let core_b = rt.core.clone();
     let s_b_id = s_b.id;
     let binding_b = rt.binding.clone();
     let thread_b = thread::spawn(move || {
         let h = binding_b.intern(TestValue::Int(2));
         core_b.emit(s_b_id, h);
+        thread_b_done_for_thread.store(1, Ordering::SeqCst);
     });
 
-    // Wait up to 2s for Thread B (generous — Thread B's emit is a
-    // single-state-node wave with no fn fire, so it's microseconds in
-    // practice). Under the legacy whole-Core wave_owner, Thread B would
-    // block until tx.send below; under Y1 per-partition, it finishes
-    // before tx.send — that's the parallelism property.
+    // Wait for Thread B's emit to complete. Generous safety bound (10s)
+    // tolerates very slow CI without false-failing parallelism. If the
+    // wave engine regressed to whole-Core serialization, Thread B
+    // would block until tx.send, but tx.send hasn't been called yet —
+    // so a regression manifests as the timeout firing here, not as a
+    // false-positive ordering.
     let parallelism_window_start = std::time::Instant::now();
-    while !thread_b.is_finished() {
+    while thread_b_done.load(Ordering::SeqCst) == 0 {
         assert!(
-            parallelism_window_start.elapsed() < Duration::from_secs(2),
+            parallelism_window_start.elapsed() < Duration::from_secs(10),
             "Thread B's cross-thread emit on a DISJOINT partition should \
-             have finished promptly (truly parallel under per-partition \
+             have finished BEFORE tx.send (truly parallel under per-partition \
              wave_owner). Instead it blocked — Y1 parallelism regression?"
         );
         thread::sleep(Duration::from_millis(5));
     }
+    // Deterministic event-ordering assertion: Thread B's emit completed
+    // BEFORE we release Thread A's fn. Under whole-Core serialization,
+    // this is impossible (Thread B would be blocked in `wave_owner`
+    // acquisition); under per-partition, it's expected.
+    assert_eq!(
+        thread_b_done.load(Ordering::SeqCst),
+        1,
+        "Thread B must have completed its emit before tx.send releases Thread A"
+    );
 
     // Release Thread A's fn — its wave can now drain + finish.
     tx.send(()).expect("send to unblock fn");
@@ -579,21 +595,47 @@ fn concurrent_emit_on_same_partition_serializes() {
         assert!(waited_ms < 5_000, "thread A's fn never entered");
     }
 
+    // Thread B uses entry/exit atomic flags so we can deterministically
+    // distinguish "B started but is blocked" from "B never started"
+    // (QA-fix group 2 — the earlier 100ms sleep + `is_finished()` check
+    // was vacuous on slow CI: if B hadn't been scheduled yet, the
+    // assertion `!is_finished()` would pass for the wrong reason).
+    let thread_b_entered = Arc::new(AtomicU64::new(0));
+    let thread_b_exited = Arc::new(AtomicU64::new(0));
+    let entered_for_b = thread_b_entered.clone();
+    let exited_for_b = thread_b_exited.clone();
     let core_b = rt.core.clone();
     let s_b_id = s_b.id;
     let binding_b = rt.binding.clone();
     let thread_b = thread::spawn(move || {
         let h = binding_b.intern(TestValue::Int(2));
+        entered_for_b.store(1, Ordering::SeqCst);
         core_b.emit(s_b_id, h);
+        exited_for_b.store(1, Ordering::SeqCst);
     });
 
-    // Thread B SHOULD block on partition's wave_owner held by Thread A.
+    // Wait for Thread B to ENTER (so we know it's actually attempting
+    // the emit, not just unscheduled).
+    let mut waited_ms = 0u64;
+    while thread_b_entered.load(Ordering::SeqCst) == 0 {
+        thread::sleep(Duration::from_millis(1));
+        waited_ms += 1;
+        assert!(waited_ms < 5_000, "Thread B never started");
+    }
+
+    // Now that Thread B is in `core.emit(s_b, h)` and Thread A holds
+    // partition(s_a)'s wave_owner (same partition by union via
+    // _d_join), Thread B SHOULD block on the partition's wave_owner.
+    // Give it 100ms wall-clock to be sure the emit attempt has been
+    // made + blocked, then assert exit flag is still 0.
     thread::sleep(Duration::from_millis(100));
-    assert!(
-        !thread_b.is_finished(),
-        "Thread B's cross-thread emit on the SAME partition must block \
-         on the held partition wave_owner; finishing early would break \
-         the same-partition serialization contract"
+    assert_eq!(
+        thread_b_exited.load(Ordering::SeqCst),
+        0,
+        "Thread B entered the emit ({}ms ago) but its emit must block \
+         on the held partition wave_owner; the exit flag set early \
+         would mean same-partition emits raced through.",
+        100
     );
 
     tx.send(()).expect("send to unblock fn");

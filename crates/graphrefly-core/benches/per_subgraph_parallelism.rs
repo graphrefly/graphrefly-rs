@@ -36,7 +36,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use graphrefly_core::{
@@ -101,7 +100,7 @@ fn bench_serial_baseline(c: &mut Criterion) {
     let binding = ParallelBenchBinding::new();
     let core = Core::new(binding.clone());
     let s = core.register_state(HandleId::new(1), false).unwrap();
-    let _sub = core.subscribe(s, noop_sink());
+    std::mem::forget(core.subscribe(s, noop_sink()));
     // Pre-allocate the handle to emit (same handle each iteration —
     // exercises the equals-substitution dedup hot path; no per-emit
     // binding allocation).
@@ -137,8 +136,8 @@ fn bench_parallel_disjoint(c: &mut Criterion) {
     // keeps them in distinct partitions.
     let s_a = core.register_state(HandleId::new(1), false).unwrap();
     let s_b = core.register_state(HandleId::new(2), false).unwrap();
-    let _sub_a = core.subscribe(s_a, noop_sink());
-    let _sub_b = core.subscribe(s_b, noop_sink());
+    std::mem::forget(core.subscribe(s_a, noop_sink()));
+    std::mem::forget(core.subscribe(s_b, noop_sink()));
 
     // Sanity: pin the parallelism premise — disjoint partitions.
     assert_ne!(
@@ -188,7 +187,7 @@ fn bench_parallel_same_partition(c: &mut Criterion) {
     let binding = ParallelBenchBinding::new();
     let core = Core::new(binding.clone());
     let s = core.register_state(HandleId::new(1), false).unwrap();
-    let _sub = core.subscribe(s, noop_sink());
+    std::mem::forget(core.subscribe(s, noop_sink()));
 
     let h = HandleId::new(1);
 
@@ -288,7 +287,7 @@ fn bench_serial_baseline_4n(c: &mut Criterion) {
     let binding = ParallelBenchBinding::new();
     let core = Core::new(binding.clone());
     let s = core.register_state(HandleId::new(1), false).unwrap();
-    let _sub = core.subscribe(s, noop_sink());
+    std::mem::forget(core.subscribe(s, noop_sink()));
     let h = HandleId::new(1);
 
     group.bench_function(
@@ -307,20 +306,36 @@ fn bench_serial_baseline_4n(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 // 6) FN-FIRE regime: each emit triggers a derived's fn fire that does
-//    `WORK_NS` of CPU work. Since `BindingBoundary::invoke_fn` fires
-//    LOCK-RELEASED (Slice A close M1), the state mutex is dropped around
-//    the binding callback — this is where per-partition `wave_owner`
-//    parallelism SHOULD be observable, because cross-thread waves on
-//    disjoint partitions can fire fn concurrently with state lock free.
+//    a fixed-iteration CPU spin (deterministic, no clock syscalls per
+//    loop). Since `BindingBoundary::invoke_fn` fires LOCK-RELEASED
+//    (Slice A close M1), the state mutex is dropped around the binding
+//    callback — this is where per-partition `wave_owner` parallelism
+//    SHOULD be observable, because cross-thread waves on disjoint
+//    partitions can fire fn concurrently with state lock free.
 //
-//    Compare to the cheap state-emit benches above where state mutex
-//    contention dominates and parallelism is invisible.
+//    **CRITICAL — handle freshness (QA-fix #1, 2026-05-09):** every emit
+//    MUST produce a NEW state cache to actually reach the derived's fn.
+//    Emitting the SAME handle twice triggers equals-substitution
+//    (R1.3.2.d) at the state node — the wave converts to RESOLVED and
+//    the derived's `invoke_fn` is NOT re-fired. The earlier
+//    `WorkBinding` impl returned `HandleId::new(1)` on every fire and
+//    the bench emitted `HandleId::new(1)` on every iteration; both
+//    layers dedup'd → only ONE fn fire per `b.iter` despite the loop
+//    iterations claiming N. The resulting numbers measured the
+//    equals-coalesce hot path, not the fn-fire workload — i.e., they
+//    were the same workload as the tight-state-emit benches with extra
+//    cascade overhead. The fix: `binding.fresh()` per emit + per fn
+//    return → cache always changes → DATA cascade fires the fn.
 // ---------------------------------------------------------------------------
 
-/// Spin-loop work per fn fire — simulates a non-trivial dependent
-/// computation (lock-released; doesn't hold state). Tuned so single-
-/// thread total is ~10ms at the M_EMITS_PER_THREAD scale.
-const WORK_NS_PER_FIRE: u64 = 4_000;
+/// Fixed-iteration spin counter approximating ~3–6 µs of CPU work on
+/// modern x86_64 / Apple-silicon. Calibrated coarsely; bench numbers
+/// are relative comparisons across scenarios on the same machine, so
+/// exact wall-clock per fire matters less than cross-bench parity.
+/// Replaces an earlier `Instant::elapsed()`-driven spin (QA finding 9 —
+/// per-iteration `clock_gettime` overhead dominated the spin and added
+/// cross-thread `vDSO` clock-read contention).
+const SPIN_ITERS_PER_FIRE: u32 = 2_000;
 
 struct WorkBinding {
     next_handle: AtomicU64,
@@ -329,23 +344,34 @@ struct WorkBinding {
 impl WorkBinding {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            next_handle: AtomicU64::new(1),
+            // Start at 100 — leaves room for state-init handles (1, 2, …)
+            // without colliding with the per-emit fresh-handle stream.
+            next_handle: AtomicU64::new(100),
         })
+    }
+
+    #[inline]
+    fn fresh(&self) -> HandleId {
+        HandleId::new(self.next_handle.fetch_add(1, Ordering::Relaxed))
     }
 }
 
 impl BindingBoundary for WorkBinding {
     fn invoke_fn(&self, _: NodeId, _: FnId, _dep_data: &[DepBatch]) -> FnResult {
-        // Spin-busy loop for WORK_NS_PER_FIRE nanoseconds. This stands
-        // in for "real" CPU work that a user fn might do — pure-Rust
-        // code that holds no Core lock (lock-released per Slice A).
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_nanos(WORK_NS_PER_FIRE) {
-            std::hint::spin_loop();
+        // Calibrated counted spin — no `Instant::elapsed()` per iteration
+        // (would dominate at sub-µs spin targets and add cross-thread
+        // clock-syscall variance per QA finding 9). `black_box` prevents
+        // the loop being optimized to a no-op.
+        let mut x: u64 = 0;
+        for _ in 0..SPIN_ITERS_PER_FIRE {
+            x = std::hint::black_box(x.wrapping_add(1));
         }
-        // Same-handle return → equals-substitution dedup → RESOLVED tier.
+        let _ = std::hint::black_box(x);
+        // FRESH handle every fire — derived's downstream cache always
+        // changes, so consumer-side equals-coalesce can't suppress the
+        // fn re-fire either.
         FnResult::Data {
-            handle: HandleId::new(1),
+            handle: self.fresh(),
             tracked: None,
         }
     }
@@ -371,15 +397,17 @@ fn bench_fnfire_serial(c: &mut Criterion) {
     let d = core
         .register_derived(&[s], dummy_fn, EqualsMode::Identity, false)
         .unwrap();
-    let _sub = core.subscribe(d, noop_sink());
-    let h = HandleId::new(1);
+    std::mem::forget(core.subscribe(d, noop_sink()));
 
     group.bench_function(
         BenchmarkId::new("fnfire_serial_2N", 2 * M_EMITS_FNFIRE),
         |b| {
             b.iter(|| {
                 for _ in 0..(2 * M_EMITS_FNFIRE) {
-                    core.emit(s, h);
+                    // Fresh handle per emit (QA-fix #1) — state cache
+                    // changes → DATA cascade → derived's `invoke_fn`
+                    // actually runs (the work we're measuring).
+                    core.emit(s, binding.fresh());
                 }
             });
         },
@@ -403,15 +431,13 @@ fn bench_fnfire_parallel_2t_disjoint(c: &mut Criterion) {
     let d_b = core
         .register_derived(&[s_b], dummy_fn, EqualsMode::Identity, false)
         .unwrap();
-    let _sub_a = core.subscribe(d_a, noop_sink());
-    let _sub_b = core.subscribe(d_b, noop_sink());
+    std::mem::forget(core.subscribe(d_a, noop_sink()));
+    std::mem::forget(core.subscribe(d_b, noop_sink()));
     assert_ne!(
         core.partition_of(s_a),
         core.partition_of(s_b),
         "fnfire bench premise: disjoint partitions"
     );
-    let h_a = HandleId::new(1);
-    let h_b = HandleId::new(2);
 
     group.bench_function(
         BenchmarkId::new("fnfire_parallel_2t_disjoint", M_EMITS_FNFIRE),
@@ -419,14 +445,16 @@ fn bench_fnfire_parallel_2t_disjoint(c: &mut Criterion) {
             b.iter(|| {
                 let core_a = core.clone();
                 let core_b = core.clone();
+                let binding_a = binding.clone();
+                let binding_b = binding.clone();
                 let t_a = thread::spawn(move || {
                     for _ in 0..M_EMITS_FNFIRE {
-                        core_a.emit(s_a, h_a);
+                        core_a.emit(s_a, binding_a.fresh());
                     }
                 });
                 let t_b = thread::spawn(move || {
                     for _ in 0..M_EMITS_FNFIRE {
-                        core_b.emit(s_b, h_b);
+                        core_b.emit(s_b, binding_b.fresh());
                     }
                 });
                 t_a.join().unwrap();
@@ -448,8 +476,7 @@ fn bench_fnfire_parallel_2t_same_partition(c: &mut Criterion) {
     let d = core
         .register_derived(&[s], dummy_fn, EqualsMode::Identity, false)
         .unwrap();
-    let _sub = core.subscribe(d, noop_sink());
-    let h = HandleId::new(1);
+    std::mem::forget(core.subscribe(d, noop_sink()));
 
     group.bench_function(
         BenchmarkId::new("fnfire_parallel_2t_same_partition", M_EMITS_FNFIRE),
@@ -457,14 +484,16 @@ fn bench_fnfire_parallel_2t_same_partition(c: &mut Criterion) {
             b.iter(|| {
                 let core_a = core.clone();
                 let core_b = core.clone();
+                let binding_a = binding.clone();
+                let binding_b = binding.clone();
                 let t_a = thread::spawn(move || {
                     for _ in 0..M_EMITS_FNFIRE {
-                        core_a.emit(s, h);
+                        core_a.emit(s, binding_a.fresh());
                     }
                 });
                 let t_b = thread::spawn(move || {
                     for _ in 0..M_EMITS_FNFIRE {
-                        core_b.emit(s, h);
+                        core_b.emit(s, binding_b.fresh());
                     }
                 });
                 t_a.join().unwrap();

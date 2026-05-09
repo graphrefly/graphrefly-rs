@@ -48,7 +48,7 @@ jobs:
   # ---------------------------------------------------------------------
   rust:
     name: Rust ${{ matrix.toolchain }}
-    if: ${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -108,7 +108,7 @@ jobs:
   # ---------------------------------------------------------------------
   deny:
     name: cargo deny (supply-chain audit)
-    if: ${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -124,7 +124,7 @@ jobs:
   # ---------------------------------------------------------------------
   bindings-js:
     name: napi-rs binding (cdylib build + clippy)
-    if: ${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -169,7 +169,7 @@ jobs:
   # ---------------------------------------------------------------------
   napi-build-matrix:
     name: napi build (${{ matrix.target }})
-    if: ${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     needs: bindings-js
     strategy:
       fail-fast: false
@@ -259,7 +259,7 @@ jobs:
   # ---------------------------------------------------------------------
   tlc:
     name: TLA+ model check (wave_protocol scenarios)
-    if: ${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

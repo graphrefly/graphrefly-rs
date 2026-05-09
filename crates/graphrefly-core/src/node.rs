@@ -1644,8 +1644,13 @@ impl Core {
             if still_valid {
                 return guard;
             }
-            // Stale — drop guard and retry.
+            // Stale — drop guard and retry. Yield to give the
+            // contending writer a chance to make forward progress
+            // before re-resolving (QA-fix group 2 — earlier tight-spin
+            // could monopolize a CPU under sustained pathological
+            // union/split activity).
             drop(guard);
+            std::thread::yield_now();
         }
         panic!(
             "partition_wave_owner_lock_arc: exceeded {} retries for seed {:?} \
@@ -1724,28 +1729,45 @@ impl Core {
     }
 }
 
-/// BFS over the undirected dep-edge graph from `start`, optionally
-/// skipping ONE edge in both directions. Returns every reachable
+/// Walk the undirected dep-edge graph from `start`, optionally
+/// skipping ONE edge in both directions, and optionally treating
+/// additional edges as if present. Returns every reachable
 /// [`NodeId`].
+///
+/// Implementation note: uses a stack (`pop()` on a `SmallVec`) — i.e.
+/// DFS traversal order. For pure reachability the order doesn't
+/// matter (the visited set is identical to BFS); the function is
+/// named "walk" rather than "BFS" to avoid implying that traversal
+/// distance is meaningful (QA-fix group 2 — earlier name
+/// `bfs_undirected_dep_graph` was misleading).
 ///
 /// **Edge convention:** the dep edge `parent → child` represents
 /// data flow from `parent` (a dep) to `child` (the consumer). It
 /// appears in `s.children[parent]` as `child`, and in
 /// `s.nodes[child].dep_records` as `parent`. `skip_edge =
 /// Some((parent, child))` skips both forward (`parent → child`) and
-/// backward (`child → parent`) traversals of that edge.
+/// backward (`child → parent`) traversals of that edge. Each
+/// `(p, c)` pair in `extra_edges` is treated as if `c ∈
+/// s.children[p]` and `p ∈ s.nodes[c].dep_records` — used for
+/// "what would connectivity look like if THESE edges were also
+/// present?" lookahead.
 ///
 /// Used by Slice Y1 / Phase F (D3 split-eager, 2026-05-09):
 /// - **P13 widening (pre-removal connectivity):** call with
-///   `skip_edge = Some((removed_parent, removed_child))` to determine
-///   if removing the edge would disconnect the partition.
+///   `skip_edge = Some((removed_parent, removed_child))` AND
+///   `extra_edges = added_edges_in_set_deps_call` so a `set_deps`
+///   that simultaneously removes one edge AND adds another path
+///   isn't falsely flagged as disconnecting (QA-fix #4 2026-05-09 —
+///   without `extra_edges`, the pre-mutation BFS doesn't see the
+///   would-be-added edges and rejects the conservative case).
 /// - **Actual split execution (post-removal):** call with
-///   `skip_edge = None`; the visited set is the keep-side of the
-///   split (the side containing `start`).
-pub(crate) fn bfs_undirected_dep_graph(
+///   `skip_edge = None` and `extra_edges = &[]`; the visited set is
+///   the keep-side of the split (the side containing `start`).
+pub(crate) fn walk_undirected_dep_graph(
     s: &CoreState,
     start: NodeId,
     skip_edge: Option<(NodeId, NodeId)>,
+    extra_edges: &[(NodeId, NodeId)],
 ) -> HashSet<NodeId> {
     let mut visited: HashSet<NodeId> = HashSet::default();
     let mut queue: SmallVec<[NodeId; 32]> = SmallVec::new();
@@ -1768,6 +1790,16 @@ pub(crate) fn bfs_undirected_dep_graph(
                 if !is_skipped && !visited.contains(&d) {
                     queue.push(d);
                 }
+            }
+        }
+        // Virtual extra edges (e.g. would-be-added edges in
+        // pre-mutation BFS).
+        for &(ep, ec) in extra_edges {
+            if cur == ep && !visited.contains(&ec) {
+                queue.push(ec);
+            }
+            if cur == ec && !visited.contains(&ep) {
+                queue.push(ep);
             }
         }
     }
@@ -4042,15 +4074,28 @@ impl Core {
                     }
                 }
                 // Case 2 (split): for each removed dep, simulate undirected
-                // BFS from `removed_dep` skipping the would-be-removed edge
+                // walk from `removed_dep` skipping the would-be-removed edge
                 // (`removed_dep → n`); if `n` is unreachable, removal would
                 // disconnect — split — affecting all nodes in that
                 // partition. Since dep edges are within a single partition
                 // by construction (union-find merges on edge add), every
                 // node currently in the partition is affected.
+                //
+                // QA-fix #4 (2026-05-09): pass `added_edges` as `extra_edges`
+                // so a `set_deps` that simultaneously REMOVES one edge AND
+                // ADDS another path isn't falsely rejected. Without this,
+                // the pre-mutation walk doesn't see the would-be-added
+                // edges and reports disconnect even when the net change
+                // preserves connectivity.
+                let added_edges: Vec<(NodeId, NodeId)> = added.iter().map(|&a| (a, n)).collect();
                 for &removed_dep in &removed {
                     let part_removed = reg.partition_of(removed_dep);
-                    let visited = bfs_undirected_dep_graph(&s, removed_dep, Some((removed_dep, n)));
+                    let visited = walk_undirected_dep_graph(
+                        &s,
+                        removed_dep,
+                        Some((removed_dep, n)),
+                        &added_edges,
+                    );
                     let would_disconnect = !visited.contains(&n);
                     if would_disconnect {
                         if let Some(&(firing, _)) = firing_with_partition
@@ -4210,10 +4255,12 @@ impl Core {
                 reg.union_nodes(n, added_dep);
             }
             for &removed_dep in &removed {
-                // Post-removal BFS — `s.children[removed_dep]` no longer
+                // Post-removal walk — `s.children[removed_dep]` no longer
                 // contains `n`, and `s.nodes[n].dep_records` no longer
-                // contains `removed_dep`. No skip needed.
-                let visited = bfs_undirected_dep_graph(&s, removed_dep, None);
+                // contains `removed_dep`. No skip needed; no extra edges
+                // (added edges are already applied to `s.children` and
+                // `dep_records` by the time we reach this block).
+                let visited = walk_undirected_dep_graph(&s, removed_dep, None, &[]);
                 if visited.contains(&n) {
                     // Still connected via other dep edges — no split.
                     continue;
