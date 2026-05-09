@@ -33,6 +33,10 @@ loom = { workspace = true }
 name    = "dispatcher"
 harness = false
 
+[[bench]]
+name    = "per_subgraph_parallelism"
+harness = false
+
 [features]
 default      = ["std"]
 # `std` is the only supported configuration for now. Kept as a feature so

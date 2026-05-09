@@ -223,6 +223,73 @@ Cargo regression tests are the source of truth for the canonical case.
   per-wave-at-flush-time snapshotting (mirroring Rust), the parity
   scenario must be widened to cover the canonical case to lock the
   cross-impl contract.
+- **Slice Y1+Y2 IN-FLIGHT 2026-05-08 → 2026-05-09 (Phase B-E
+  landed; Phase F-L carry forward).** User chose Option 3 (single
+  all-in-one D3 closure). Decisions D089–D094 logged. **Phase C
+  lifted Y1 entry-condition #1** (registry mutation inside the
+  state-lock scope, option (a) per D090; lock order `state →
+  registry`). **Phase D lifted Y1 entry-condition #2** (new
+  `SetDepsError::PartitionMigrationDuringFire` variant + check, option
+  (b) per D091; Phase F split-eager widens the check). **Phase E
+  delivered the canonical parallelism win**: legacy `Core::wave_owner`
+  removed; wave engine routes through per-partition
+  `partition_wave_owner_lock_arc(seed)` with retry-validate;
+  `BatchGuard::_wave_guards: SmallVec<[WaveOwnerGuard; 4]>` holds
+  acquired-in-ascending-`SubgraphId`-order partition guards;
+  closure-form `Core::batch` acquires every current partition (Q7
+  serialization point); `Core::begin_batch_for(seed)` walks
+  `s.children` + `meta_companions` to compute touched partitions
+  upfront; `Core::run_wave_for(seed, op)` migrated all 7 callers in
+  `node.rs` (subscribe activation, emit, emit_terminal, teardown,
+  invalidate, resume default-mode drain, set_deps push-on-subscribe);
+  legacy `run_wave` removed. The acceptance test
+  `concurrent_emit_blocks_until_in_flight_wave_completes` (asserting
+  whole-Core serialization) was replaced with the inverse
+  `concurrent_emit_on_disjoint_partitions_runs_truly_parallel` (parallel
+  across disjoint partitions) + companion
+  `concurrent_emit_on_same_partition_serializes` (same-partition still
+  serializes). Both pass — the parallelism property is observable.
+  **496 cargo + 142 parity green** (was 491 + 142; +4 P12+P13
+  regressions, +1 net from inversion+companion). **`Core::wave_owner`
+  field, legacy whole-Core ReentrantMutex retired** — `WeakCore`
+  updated, `Core::new` simplified.
+
+  **Phase E re-scope**: original plan included Q2 (cross_partition
+  Mutex split — relocate `pending_pause_overflow` /
+  `pending_auto_resolve` / `wave_cache_snapshots` /
+  `deferred_handle_releases` out of `CoreState`) and Q3 (per-partition
+  `tier3_emitted_this_wave`). Both are independent optimizations —
+  the parallelism win landed without them. Deferred to Phase H or
+  later (subject to bench evidence). Cross-thread waves on disjoint
+  partitions still briefly contend on the single state mutex during
+  pending_notify queueing / clear_wave_state, but no longer on a
+  Core-global wave_owner. Phase J bench will quantify the residual
+  contention.
+
+  **Phase F (2026-05-09) delivered split-eager** per the locked
+  Q1 = (c-uf split-eager) design. New `bfs_undirected_dep_graph`
+  helper in `node.rs` walks `s.children` + `dep_records` from a
+  seed (with optional one-edge skip for the P13 connectivity
+  pre-check). New `SubgraphRegistry::split_partition` method
+  resets every component node to a singleton, re-unions via
+  post-removal dep edges, and assigns the original `Arc<SubgraphLockBox>`
+  to the keep-side root while allocating a fresh box for the
+  orphan-side root. `Core::set_deps`'s registry block now invokes
+  this on each removed dep when the post-removal BFS shows
+  disconnection. P13 widened to reject mid-fire splits via the
+  same BFS with `skip_edge = Some((removed_dep, n))`. **498 cargo
+  tests pass** (+2 net from Phase F's new split-eager scenarios).
+
+  **Phase G (cleanup_node activation) DEFERRED** — requires a
+  NodeRecord removal lifecycle (currently `terminate_node` only
+  marks the node terminal; NodeRecords persist for the life of
+  `CoreState`). No leak vector observed in practice; each
+  terminal-only partition retains a single `Arc<ReentrantMutex<()>>`
+  (negligible overhead) and registry HashMap entries drop together
+  with `CoreState`. Lifts when graph-layer `unmount` (or a
+  binding-side equivalent) surfaces a load-bearing need for explicit
+  node removal. `cleanup_node` remains `#[allow(dead_code)]`-gated
+  with an explanatory rustdoc.
 - **Y2 carry-forward:** TLA+ extension of `wave_protocol_rewire`
   covering partition lock-ordering + cross-partition deadlock-freedom
   + union/split discipline; multi-thread parallel-emit criterion

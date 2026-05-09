@@ -388,24 +388,31 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
 // ---------------------------------------------------------------------------
 
 #[test]
-fn concurrent_emit_blocks_until_in_flight_wave_completes() {
-    // Q2 contract (Slice A close /qa, M1): cross-thread emits BLOCK at
-    // the wave-owner re-entrant mutex until the in-flight wave's drain
-    // + flush + sink-fire completes. This preserves the user-facing
-    // "emit returning means subscribers have observed" contract that
-    // would otherwise be broken by the lock-released drain.
+fn concurrent_emit_on_disjoint_partitions_runs_truly_parallel() {
+    // Slice Y1 / Phase E (D3, 2026-05-08) — INVERTED from the legacy
+    // M1 contract `concurrent_emit_blocks_until_in_flight_wave_completes`.
+    //
+    // The legacy test asserted that cross-thread emits BLOCK at the
+    // Core-global `wave_owner` re-entrant mutex until the in-flight
+    // wave's drain + flush + sink-fire completes. Per session-doc Q4 +
+    // decision D3 / D092, the wave engine now uses per-partition
+    // `wave_owner` mutexes — two threads emitting on DISJOINT partitions
+    // run truly parallel, the canonical Y1 parallelism win.
     //
     // Test shape:
-    //   1. Thread A starts a wave whose fn blocks on `rx.recv()`.
-    //      Thread A holds `wave_owner` for the wave's duration.
-    //   2. Thread B emits on a DIFFERENT state node. It must BLOCK at
-    //      `wave_owner.lock_arc()` since Thread A holds it.
-    //   3. Test thread observes Thread B has not finished after 50ms
-    //      (proving the block).
+    //   1. Thread A starts a wave on `s_a`'s partition (`s_a → _d`)
+    //      whose fn blocks on `rx.recv()`. Thread A holds partition(s_a)'s
+    //      `wave_owner` for the wave's duration.
+    //   2. Thread B emits on `s_b` — a state node in a DISJOINT partition
+    //      (no dep edges connect s_a/s_b, so union-find keeps them apart).
+    //   3. Test thread observes Thread B FINISHES quickly (< 200ms),
+    //      proving the per-partition mutexes don't block Thread B on
+    //      Thread A's held lock.
     //   4. Test thread releases Thread A's fn via `tx.send(())`.
-    //   5. Thread A's wave completes, releasing `wave_owner`.
-    //   6. Thread B's emit unblocks and completes.
-    //   7. Both threads join cleanly.
+    //   5. Thread A's wave completes; both threads join cleanly.
+    //
+    // Same-partition serialization is verified by the companion test
+    // `concurrent_emit_on_same_partition_serializes` below.
     let rt = TestRuntime::new();
     // Sentinel s_a so subscribe_recorder doesn't trigger an activation-
     // time fire that blocks before thread-A even spawns.
@@ -431,8 +438,19 @@ fn concurrent_emit_blocks_until_in_flight_wave_completes() {
 
     let _rec_d = rt.subscribe_recorder(_d);
 
+    // Sanity: partition(s_a) and partition(s_b) are disjoint by construction
+    // (no dep edges between them). The Y1 parallelism premise depends on
+    // this — pin it so a future regression that accidentally unions the
+    // partitions doesn't silently turn this into a same-partition race.
+    let p_a = rt.core.partition_of(s_a.id).expect("registered");
+    let p_b = rt.core.partition_of(s_b.id).expect("registered");
+    assert_ne!(
+        p_a, p_b,
+        "s_a and s_b must start in disjoint partitions for the parallelism win"
+    );
+
     // Thread A: emit on s_a triggers the first fn fire (which blocks on rx).
-    // Thread A holds `wave_owner` for the wave's duration.
+    // Thread A holds `partition(s_a).wave_owner` for the wave's duration.
     let core_a = rt.core.clone();
     let s_a_id = s_a.id;
     let binding_a = rt.binding.clone();
@@ -441,19 +459,20 @@ fn concurrent_emit_blocks_until_in_flight_wave_completes() {
         core_a.emit(s_a_id, h);
     });
 
-    // Wait for thread A's fn to enter (so wave_owner is held).
+    // Wait for thread A's fn to enter (so partition(s_a)'s wave_owner is held).
     let mut waited_ms = 0u64;
     while fn_entered.load(Ordering::SeqCst) == 0 {
         thread::sleep(Duration::from_millis(1));
         waited_ms += 1;
         assert!(
             waited_ms < 5_000,
-            "thread A's fn never entered — emit may have deadlocked at wave_owner"
+            "thread A's fn never entered — emit may have deadlocked"
         );
     }
 
-    // Thread B: emits on s_b. EXPECTED to BLOCK at wave_owner since
-    // Thread A's wave is in flight.
+    // Thread B: emits on s_b. Under Y1 / Phase E, this acquires only
+    // partition(s_b)'s `wave_owner` — DISJOINT from partition(s_a)'s
+    // held by Thread A. EXPECTED to FINISH PROMPTLY (truly parallel).
     let core_b = rt.core.clone();
     let s_b_id = s_b.id;
     let binding_b = rt.binding.clone();
@@ -462,21 +481,26 @@ fn concurrent_emit_blocks_until_in_flight_wave_completes() {
         core_b.emit(s_b_id, h);
     });
 
-    // Verify Thread B is blocked. Give it 100ms of wall-clock to be
-    // sure it had a chance to attempt the emit; if it finished within
-    // that window, the wave-owner mutex isn't doing its job.
-    thread::sleep(Duration::from_millis(100));
-    assert!(
-        !thread_b.is_finished(),
-        "Thread B's cross-thread emit should be blocked on wave_owner \
-         while Thread A's wave is in flight; instead it finished early"
-    );
+    // Wait up to 2s for Thread B (generous — Thread B's emit is a
+    // single-state-node wave with no fn fire, so it's microseconds in
+    // practice). Under the legacy whole-Core wave_owner, Thread B would
+    // block until tx.send below; under Y1 per-partition, it finishes
+    // before tx.send — that's the parallelism property.
+    let parallelism_window_start = std::time::Instant::now();
+    while !thread_b.is_finished() {
+        assert!(
+            parallelism_window_start.elapsed() < Duration::from_secs(2),
+            "Thread B's cross-thread emit on a DISJOINT partition should \
+             have finished promptly (truly parallel under per-partition \
+             wave_owner). Instead it blocked — Y1 parallelism regression?"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 
-    // Release Thread A's fn — its wave will now finish, releasing
-    // wave_owner. Thread B's emit then unblocks.
+    // Release Thread A's fn — its wave can now drain + finish.
     tx.send(()).expect("send to unblock fn");
 
-    // Both threads should now finish.
+    // Both threads should join cleanly.
     let join_with_timeout = |handle: thread::JoinHandle<()>, secs: u64| {
         let start = std::time::Instant::now();
         loop {
@@ -486,6 +510,103 @@ fn concurrent_emit_blocks_until_in_flight_wave_completes() {
             }
             if start.elapsed().as_secs() > secs {
                 panic!("thread did not finish within {secs}s — likely deadlock");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    join_with_timeout(thread_a, 5);
+    join_with_timeout(thread_b, 5);
+}
+
+#[test]
+fn concurrent_emit_on_same_partition_serializes() {
+    // Slice Y1 / Phase E (D3, 2026-05-08) — companion to
+    // `concurrent_emit_on_disjoint_partitions_runs_truly_parallel`.
+    //
+    // Same-partition emits MUST still serialize on the partition's
+    // `wave_owner`. Without this, a wave's lock-released drain could
+    // let a concurrent same-partition emit absorb into the in-flight
+    // wave's `pending_notify` and return before subscribers fire —
+    // breaking the user-facing "emit returning means subscribers have
+    // observed" contract.
+    //
+    // Test shape: same as the disjoint-partition test, but `s_a` and
+    // `s_b` share a partition (`s_b` depends on `s_a` via `_d_join`).
+    // Thread B's emit MUST block on partition's wave_owner until
+    // Thread A's wave completes.
+    let rt = TestRuntime::new();
+    let s_a = rt.state(None);
+    let s_b = rt.state(Some(TestValue::Int(0)));
+    // _d_join unions partition(s_a) and partition(s_b) via dep edges.
+    let _d_join = rt.derived(&[s_a.id, s_b.id], |_deps| Some(TestValue::Int(0)));
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let rx = Arc::new(Mutex::new(Some(rx)));
+    let rx_for_fn = rx.clone();
+    let fn_entered = Arc::new(AtomicU64::new(0));
+    let fn_entered_for_fn = fn_entered.clone();
+
+    let blocking_d = rt.derived(&[s_a.id], move |deps| {
+        fn_entered_for_fn.fetch_add(1, Ordering::SeqCst);
+        let recv = rx_for_fn.lock().unwrap().take();
+        if let Some(rx) = recv {
+            let _ = rx.recv();
+        }
+        Some(deps[0].clone())
+    });
+    let _rec_d = rt.subscribe_recorder(blocking_d);
+
+    // Sanity: s_a and s_b share a partition (unioned via _d_join).
+    let p_a = rt.core.partition_of(s_a.id).expect("registered");
+    let p_b = rt.core.partition_of(s_b.id).expect("registered");
+    assert_eq!(
+        p_a, p_b,
+        "s_a and s_b must share a partition for the serialization assertion"
+    );
+
+    let core_a = rt.core.clone();
+    let s_a_id = s_a.id;
+    let binding_a = rt.binding.clone();
+    let thread_a = thread::spawn(move || {
+        let h = binding_a.intern(TestValue::Int(1));
+        core_a.emit(s_a_id, h);
+    });
+
+    let mut waited_ms = 0u64;
+    while fn_entered.load(Ordering::SeqCst) == 0 {
+        thread::sleep(Duration::from_millis(1));
+        waited_ms += 1;
+        assert!(waited_ms < 5_000, "thread A's fn never entered");
+    }
+
+    let core_b = rt.core.clone();
+    let s_b_id = s_b.id;
+    let binding_b = rt.binding.clone();
+    let thread_b = thread::spawn(move || {
+        let h = binding_b.intern(TestValue::Int(2));
+        core_b.emit(s_b_id, h);
+    });
+
+    // Thread B SHOULD block on partition's wave_owner held by Thread A.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !thread_b.is_finished(),
+        "Thread B's cross-thread emit on the SAME partition must block \
+         on the held partition wave_owner; finishing early would break \
+         the same-partition serialization contract"
+    );
+
+    tx.send(()).expect("send to unblock fn");
+
+    let join_with_timeout = |handle: thread::JoinHandle<()>, secs: u64| {
+        let start = std::time::Instant::now();
+        loop {
+            if handle.is_finished() {
+                handle.join().expect("thread panicked");
+                return;
+            }
+            if start.elapsed().as_secs() > secs {
+                panic!("thread did not finish within {secs}s");
             }
             thread::sleep(Duration::from_millis(5));
         }

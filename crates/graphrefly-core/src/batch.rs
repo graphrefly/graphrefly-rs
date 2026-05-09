@@ -48,7 +48,6 @@
 use std::sync::Arc;
 
 use indexmap::map::Entry;
-use parking_lot::ArcReentrantMutexGuard;
 
 use smallvec::SmallVec;
 
@@ -234,17 +233,30 @@ impl Core {
     /// run a nested wave. Cross-thread emits block at `wave_owner` until
     /// the in-flight wave's drain completes — preserving the user-facing
     /// "emit returning means subscribers have observed" contract.
-    pub(crate) fn run_wave<F>(&self, op: F)
+    /// Wave entry with a known `seed` node. Acquires only the partitions
+    /// transitively touched from `seed` (downstream cascade via
+    /// `s.children` + R1.3.9.d meta-companion cascade) instead of every
+    /// current partition. The canonical Y1 parallelism win for per-seed
+    /// entry points (`Core::emit`, `Core::subscribe`'s activation,
+    /// `Core::pause` / `Core::resume` / `Core::invalidate` / `Core::complete`
+    /// / `Core::error` / `Core::teardown` / `Core::set_deps`'s
+    /// push-on-subscribe).
+    ///
+    /// Two threads with disjoint touched-partition sets run truly
+    /// parallel — they don't block each other on Core-global locks.
+    /// Same-thread re-entry passes through each partition's
+    /// `ReentrantMutex` transparently. Cross-thread emits on the SAME
+    /// partition (or any overlapping touched-partition set) serialize
+    /// per the per-partition `wave_owner` mutex, preserving the
+    /// "emit returning means subscribers have observed" contract.
+    ///
+    /// Slice Y1 / Phase E (2026-05-08).
+    pub(crate) fn run_wave_for<F>(&self, seed: crate::handle::NodeId, op: F)
     where
         F: FnOnce(&Self),
     {
-        // The guard holds wave_owner + claims in_tick. On normal scope
-        // exit it drains + flushes + fires sinks. On panic-during-op it
-        // restores cache snapshots + clears in_tick (panic-discard).
-        let _guard = self.begin_batch();
+        let _guard = self.begin_batch_for(seed);
         op(self);
-        // _guard drops here → drain or panic-discard, depending on whether
-        // op() returned normally.
     }
 
     /// Release retains held by `wave_cache_snapshots` and clear the map.
@@ -2269,13 +2281,72 @@ impl Core {
     /// wave (only the outermost guard drains).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch(&self) -> BatchGuard {
-        // Acquire the wave-owner re-entrant mutex BEFORE the state lock.
-        // Same-thread re-entry passes through (e.g. fn → emit → run_wave →
-        // begin_batch from inside outer wave's invoke_fn); cross-thread
-        // entries block until the in-flight wave's `_wave_guard` drops.
-        // `lock_arc()` is `!Send` — strengthens BatchGuard's `!Send`
-        // guarantee at the type level.
-        let wave_guard = self.wave_owner.lock_arc();
+        // Slice Y1 / Phase E (2026-05-08): closure-form batch has no known
+        // seed; per session-doc Q7 / D092 it MUST serialize against every
+        // currently-existing partition. Acquire each partition's
+        // `wave_owner` in ascending [`SubgraphId`] order via the retry-
+        // validate primitive. Same-thread re-entry passes through each
+        // ReentrantMutex transparently; cross-thread waves on any of the
+        // touched partitions block until our `_wave_guards` drop.
+        //
+        // Trade-off (documented v1 contract): closure-form batch is the
+        // serialization point under per-partition parallelism. Per-seed
+        // entry points (`Core::subscribe`, [`Self::begin_batch_for`])
+        // acquire only the touched partitions and run truly parallel
+        // for disjoint partitions. Closure-form is intentionally slower
+        // — its all-partitions semantic is what makes the closure's
+        // `core.emit(s1, ...); core.emit(s2, ...)` coalesce regardless
+        // of which partitions s1 / s2 live in.
+        let partition_boxes = self.all_partitions_lock_boxes();
+        let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
+        for (sid, _box) in &partition_boxes {
+            // Use the partition's root NodeId as the lock_for retry seed.
+            // SubgraphId.raw() == root NodeId.raw(); the root is always
+            // registered in the X5 / Phase-E substrate (cleanup_node is
+            // gated, Phase G activates).
+            let representative = crate::handle::NodeId::new(sid.raw());
+            wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+        }
+        self.begin_batch_with_guards(wave_guards)
+    }
+
+    /// Begin a batch scoped to the partitions transitively touched from
+    /// `seed`. Walks `s.children` (downstream cascade) + `meta_companions`
+    /// (R1.3.9.d TEARDOWN cascade) starting at `seed`, collects every
+    /// reachable partition, and acquires each in ascending
+    /// [`crate::subgraph::SubgraphId`] order via
+    /// [`Core::partition_wave_owner_lock_arc`].
+    ///
+    /// Two threads with disjoint touched-partition sets run truly
+    /// parallel — the per-partition `wave_owner` mutexes don't block
+    /// each other. This is the canonical Y1 parallelism win for
+    /// per-seed wave-driving entry points (subscribe, emit, pause,
+    /// resume, invalidate, complete, error, teardown,
+    /// set_deps push-on-subscribe).
+    ///
+    /// Slice Y1 / Phase E (2026-05-08).
+    #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
+    pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard {
+        let touched = self.compute_touched_partitions(seed);
+        let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
+        for sid in &touched {
+            let representative = crate::handle::NodeId::new(sid.raw());
+            wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+        }
+        self.begin_batch_with_guards(wave_guards)
+    }
+
+    /// Internal helper: claim `in_tick` and assemble a [`BatchGuard`]
+    /// with the supplied (already-acquired) partition wave-owner guards.
+    /// `wave_guards` MUST be in ascending [`crate::subgraph::SubgraphId`]
+    /// order (the canonical lock-acquisition order) — both
+    /// [`Self::begin_batch`] (all-partitions) and
+    /// [`Self::begin_batch_for`] (touched-partitions) construct the
+    /// vector in that order before calling here.
+    fn begin_batch_with_guards(
+        &self,
+        wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
+    ) -> BatchGuard {
         let owns_tick = {
             let mut s = self.lock_state();
             let was_in = s.in_tick;
@@ -2287,7 +2358,7 @@ impl Core {
         BatchGuard {
             core: self.clone(),
             owns_tick,
-            _wave_guard: wave_guard,
+            _wave_guards: wave_guards,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -2314,14 +2385,22 @@ impl Core {
 /// # Thread safety
 ///
 /// `BatchGuard` is **`!Send`** by design. `begin_batch` claims the
-/// per-`Core` `in_tick` flag AND the per-`Core` `wave_owner` re-entrant
-/// mutex on the calling thread; sending the guard to another thread
-/// and dropping it there would clear `in_tick` and release `wave_owner`
-/// from a different thread than the one that acquired them, breaking
-/// both the thread-local "I own the wave scope" semantic and
-/// `parking_lot::ReentrantMutex`'s ownership invariant. The
-/// `_wave_guard` field is `!Send` (`ArcReentrantMutexGuard<()>`); the
-/// `PhantomData<*const ()>` marker is belt-and-suspenders.
+/// per-`Core` `in_tick` flag AND the per-partition `wave_owner`
+/// re-entrant mutex(es) on the calling thread; sending the guard to
+/// another thread and dropping it there would clear `in_tick` and
+/// release the wave-owner guards from a different thread than the
+/// one that acquired them, breaking both the thread-local "I own
+/// the wave scope" semantic and `parking_lot::ReentrantMutex`'s
+/// ownership invariant. The `_wave_guards` field is a `SmallVec` of
+/// `!Send` `ArcReentrantMutexGuard<()>`; the `PhantomData<*const ()>`
+/// marker is belt-and-suspenders.
+///
+/// Slice Y1 / Phase E (2026-05-08): the field migrated from a single
+/// `ArcReentrantMutexGuard` (legacy Core-global `wave_owner`) to a
+/// `SmallVec` of partition wave-owner guards. Closure-form
+/// `begin_batch` acquires every current partition (serialization
+/// point); `begin_batch_for(seed)` acquires only the transitively-
+/// touched partitions (parallel for disjoint sets).
 ///
 /// ```compile_fail
 /// use graphrefly_core::{BatchGuard, BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, NodeId};
@@ -2344,16 +2423,20 @@ impl Core {
 pub struct BatchGuard {
     core: Core,
     owns_tick: bool,
-    /// Re-entrant mutex guard held for the wave's duration. Drop releases
-    /// `wave_owner`, allowing cross-thread waves blocked at
-    /// `Core::begin_batch` to proceed. Same-thread re-entry (nested
-    /// `begin_batch` from a fn callback) re-acquires this mutex
-    /// transparently.
+    /// Re-entrant mutex guards held for the wave's duration. One entry
+    /// per touched partition's `wave_owner`, in ascending
+    /// [`crate::subgraph::SubgraphId`] order. Drop releases each guard
+    /// (any order — `parking_lot::ReentrantMutex` doesn't care since all
+    /// are held by the same thread). Cross-thread waves on any of the
+    /// held partitions block until our scope ends; cross-thread waves
+    /// on partitions NOT in this vector run truly parallel — the
+    /// canonical Y1 parallelism property.
     ///
-    /// `ArcReentrantMutexGuard<()>` is `!Send`, so `BatchGuard` is `!Send`
-    /// at the type level — sending across threads would violate
-    /// `parking_lot::ReentrantMutex`'s thread-ownership invariant.
-    _wave_guard: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
+    /// Each `ArcReentrantMutexGuard<()>` is `!Send`, so the `SmallVec`
+    /// (and thus `BatchGuard`) is `!Send` at the type level — sending
+    /// across threads would violate `parking_lot::ReentrantMutex`'s
+    /// thread-ownership invariant.
+    _wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 

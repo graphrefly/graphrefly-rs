@@ -70,7 +70,17 @@ use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use indexmap::IndexMap;
-use parking_lot::{Mutex, MutexGuard, ReentrantMutex};
+use parking_lot::{ArcReentrantMutexGuard, Mutex, MutexGuard};
+
+/// Held guard from `parking_lot::ReentrantMutex::lock_arc()` on a
+/// partition's `wave_owner`. `!Send` per `parking_lot::ReentrantMutex`'s
+/// thread-affinity contract — the type-level `!Send` flows into
+/// [`crate::batch::BatchGuard::_wave_guards`] so any attempt to send
+/// the batch guard across threads fails to compile.
+///
+/// Slice Y1 / Phase E (2026-05-08).
+pub(crate) type WaveOwnerGuard =
+    ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -1352,13 +1362,15 @@ pub(crate) struct CoreState {
 pub struct Core {
     pub(crate) state: Arc<Mutex<CoreState>>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    pub(crate) wave_owner: Arc<ReentrantMutex<()>>,
-    /// Slice X5 (D3 substrate, 2026-05-08): per-subgraph union-find
+    /// Slice X5 (D3 substrate, 2026-05-08) + Slice Y1 / Phase E
+    /// (wave-engine migration, 2026-05-08): per-subgraph union-find
     /// registry. Tracks each registered node's connected-component
-    /// membership (a "subgraph") so cross-thread emits to disjoint
-    /// components can run truly parallel via per-component
-    /// `wave_owner` (Y1 commit-2 wires the wave engine through the
-    /// registry; X5 commit-1 just maintains the union-find state).
+    /// membership (a "subgraph"). Each component's root carries an
+    /// `Arc<SubgraphLockBox>` whose `wave_owner: ReentrantMutex<()>`
+    /// is the per-partition wave-serialization lock — acquired by
+    /// [`Self::partition_wave_owner_lock_arc`] under the retry-validate
+    /// loop. Cross-thread emits to disjoint partitions run truly
+    /// parallel; same-thread re-entry passes through reentrantly.
     ///
     /// Direct port of [`graphrefly-py`'s
     /// `subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
@@ -1383,7 +1395,6 @@ pub struct Core {
 pub struct WeakCore {
     state: Weak<Mutex<CoreState>>,
     binding: Weak<dyn BindingBoundary>,
-    wave_owner: Weak<ReentrantMutex<()>>,
     registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
 }
 
@@ -1396,7 +1407,6 @@ impl WeakCore {
         Some(Core {
             state: self.state.upgrade()?,
             binding: self.binding.upgrade()?,
-            wave_owner: self.wave_owner.upgrade()?,
             registry: self.registry.upgrade()?,
         })
     }
@@ -1510,7 +1520,6 @@ impl Core {
                 pending_wipes: Vec::new(),
             })),
             binding,
-            wave_owner: Arc::new(ReentrantMutex::new(())),
             registry: Arc::new(parking_lot::Mutex::new(
                 crate::subgraph::SubgraphRegistry::new(),
             )),
@@ -1568,7 +1577,6 @@ impl Core {
         WeakCore {
             state: Arc::downgrade(&self.state),
             binding: Arc::downgrade(&self.binding),
-            wave_owner: Arc::downgrade(&self.wave_owner),
             registry: Arc::downgrade(&self.registry),
         }
     }
@@ -1597,6 +1605,176 @@ impl Core {
         self.registry.lock().partition_of(node)
     }
 
+    /// Acquire `seed`'s partition `wave_owner` re-entrant mutex with
+    /// retry-validate against concurrent union/split. Mirrors
+    /// graphrefly-py's `subgraph_locks.py::lock_for` retry pattern
+    /// (lines 154–178): a concurrent `union_nodes` may redirect
+    /// `seed`'s partition root between our `lock_for` resolve and
+    /// our `lock_arc` call; if so, the held guard is on a stale
+    /// (but still valid) `SubgraphLockBox` whose `Arc` no longer
+    /// matches the registry's canonical box for `seed`'s current
+    /// root. Release + retry up to [`crate::subgraph::MAX_LOCK_RETRIES`].
+    ///
+    /// Returns the held guard. Caller holds it for the wave's
+    /// duration; drop releases.
+    ///
+    /// **Panics** if `seed` is not registered (caller violation —
+    /// every wave entry takes a `NodeId` already in `s.nodes`, and
+    /// the P12-fixed lock-discipline guarantees registry membership
+    /// is published atomically with state). **Panics** on exceeding
+    /// `MAX_LOCK_RETRIES` — pathological union activity.
+    ///
+    /// Slice Y1 / Phase E (2026-05-08).
+    pub(crate) fn partition_wave_owner_lock_arc(&self, seed: NodeId) -> WaveOwnerGuard {
+        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
+            let lock_box = {
+                let mut reg = self.registry.lock();
+                let (_sid, b) = reg.lock_for(seed).expect(
+                    "partition_wave_owner_lock_arc: seed must be registered \
+                     (P12-fix invariant: registry membership is published \
+                     atomically with `s.nodes`)",
+                );
+                b
+            };
+            let guard = lock_box.wave_owner.lock_arc();
+            // Re-validate post-acquire. If a concurrent `union` redirected
+            // `seed`'s root between our `lock_for` and `lock_arc`, the
+            // registry's current box for `seed` differs from what we hold.
+            let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);
+            if still_valid {
+                return guard;
+            }
+            // Stale — drop guard and retry.
+            drop(guard);
+        }
+        panic!(
+            "partition_wave_owner_lock_arc: exceeded {} retries for seed {:?} \
+             — pathological concurrent union/split activity. Mirrors py \
+             `_MAX_LOCK_RETRIES`.",
+            crate::subgraph::MAX_LOCK_RETRIES,
+            seed
+        );
+    }
+
+    /// BFS from `seed` along `s.children` (downstream consumer cascade
+    /// for DATA / RESOLVED / INVALIDATE / COMPLETE / ERROR / TEARDOWN)
+    /// and `meta_companions` (R1.3.9.d TEARDOWN cascade). Collects
+    /// every partition reachable from `seed`, returning the unique
+    /// `SubgraphId`s sorted ascending — the canonical lock-acquisition
+    /// order per session-doc Q7 / decision D092 that guarantees
+    /// deadlock-freedom across cross-partition waves.
+    ///
+    /// Holds the state lock + registry lock for the BFS duration
+    /// (lock order `state → registry` per the P12-fix invariant).
+    /// Bounded by the cascade graph reachable from `seed`; for typical
+    /// apps the partition count is small (1–3) and the BFS is
+    /// negligible relative to wave drain.
+    ///
+    /// Used by [`Core::begin_batch_for`] to compute the upfront-
+    /// acquired partition set for per-seed waves. Closure-form
+    /// [`Core::batch`] doesn't have a seed and uses
+    /// [`Core::all_partitions_lock_boxes`] instead.
+    ///
+    /// Slice Y1 / Phase E (2026-05-08).
+    pub(crate) fn compute_touched_partitions(
+        &self,
+        seed: NodeId,
+    ) -> SmallVec<[crate::subgraph::SubgraphId; 4]> {
+        let s = self.lock_state();
+        let mut reg = self.registry.lock();
+        let mut partitions: SmallVec<[crate::subgraph::SubgraphId; 4]> = SmallVec::new();
+        let mut visited: HashSet<NodeId> = HashSet::default();
+        let mut stack: SmallVec<[NodeId; 16]> = SmallVec::new();
+        stack.push(seed);
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n) {
+                continue;
+            }
+            if let Some(p) = reg.partition_of(n) {
+                if !partitions.contains(&p) {
+                    partitions.push(p);
+                }
+            }
+            if let Some(children) = s.children.get(&n) {
+                stack.extend(children.iter().copied());
+            }
+            if let Some(rec) = s.nodes.get(&n) {
+                stack.extend(rec.meta_companions.iter().copied());
+            }
+        }
+        partitions.sort_unstable_by_key(|sid| sid.raw());
+        partitions
+    }
+
+    /// Snapshot of every currently-existing partition's lock box, in
+    /// ascending [`crate::subgraph::SubgraphId`] order (canonical
+    /// lock-acquisition order per session-doc Q7 / D092). Used by
+    /// closure-form [`Core::batch`] / [`Core::begin_batch`] which
+    /// don't have a known seed and must serialize against every
+    /// existing partition.
+    ///
+    /// Slice Y1 / Phase E (2026-05-08).
+    pub(crate) fn all_partitions_lock_boxes(
+        &self,
+    ) -> Vec<(
+        crate::subgraph::SubgraphId,
+        Arc<crate::subgraph::SubgraphLockBox>,
+    )> {
+        self.registry.lock().all_partitions()
+    }
+}
+
+/// BFS over the undirected dep-edge graph from `start`, optionally
+/// skipping ONE edge in both directions. Returns every reachable
+/// [`NodeId`].
+///
+/// **Edge convention:** the dep edge `parent → child` represents
+/// data flow from `parent` (a dep) to `child` (the consumer). It
+/// appears in `s.children[parent]` as `child`, and in
+/// `s.nodes[child].dep_records` as `parent`. `skip_edge =
+/// Some((parent, child))` skips both forward (`parent → child`) and
+/// backward (`child → parent`) traversals of that edge.
+///
+/// Used by Slice Y1 / Phase F (D3 split-eager, 2026-05-09):
+/// - **P13 widening (pre-removal connectivity):** call with
+///   `skip_edge = Some((removed_parent, removed_child))` to determine
+///   if removing the edge would disconnect the partition.
+/// - **Actual split execution (post-removal):** call with
+///   `skip_edge = None`; the visited set is the keep-side of the
+///   split (the side containing `start`).
+pub(crate) fn bfs_undirected_dep_graph(
+    s: &CoreState,
+    start: NodeId,
+    skip_edge: Option<(NodeId, NodeId)>,
+) -> HashSet<NodeId> {
+    let mut visited: HashSet<NodeId> = HashSet::default();
+    let mut queue: SmallVec<[NodeId; 32]> = SmallVec::new();
+    queue.push(start);
+    while let Some(cur) = queue.pop() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        if let Some(consumers) = s.children.get(&cur) {
+            for &c in consumers {
+                let is_skipped = skip_edge.is_some_and(|(sp, sc)| cur == sp && c == sc);
+                if !is_skipped && !visited.contains(&c) {
+                    queue.push(c);
+                }
+            }
+        }
+        if let Some(rec) = s.nodes.get(&cur) {
+            for d in rec.dep_records.iter().map(|r| r.node) {
+                let is_skipped = skip_edge.is_some_and(|(sp, sc)| cur == sc && d == sp);
+                if !is_skipped && !visited.contains(&d) {
+                    queue.push(d);
+                }
+            }
+        }
+    }
+    visited
+}
+
+impl Core {
     /// Test-only inspection: number of `PendingBatch`es queued for
     /// `node` in the current wave. Used by Slice X4 D2 regression
     /// tests to pin the "common case = single batch, no SmallVec
@@ -1994,13 +2172,24 @@ impl Core {
         for &dep in &deps {
             s.children.entry(dep).or_default().insert(id);
         }
-        drop(s);
-        // Slice X5 (D3 substrate, 2026-05-08): track partition membership.
-        // Register the new node as its own component, then `union_nodes`
-        // each dep — connectivity-based grouping per Q1=(c-uf split-eager).
-        // Lock-released wrt state so the registry mutex isn't ordered
-        // under the state mutex (avoids constraining future cross-mutex
-        // refactors).
+        // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
+        // membership BEFORE dropping the state lock. Closes the
+        // eventual-consistency window where a concurrent thread observed
+        // the new node in `s.nodes` / new edges in `s.children` but the
+        // registry hadn't unioned the partition yet. Today benign
+        // (`partition_of` is debug-only); under Y1's wave engine
+        // migration `lock_for(node)` consumes registry state on the hot
+        // path, and the window means `lock_for` could resolve to a
+        // partition that's been topologically unioned in `s.children`
+        // but not yet in `registry`.
+        //
+        // **Lock-discipline invariant:** `state lock → registry mutex`
+        // (one-way; never registry → state). Registry mutex is
+        // uncontended in the X5 substrate — the only acquisition sites
+        // are this one + `Core::set_deps` + the read-only accessors
+        // `partition_count`/`partition_of` and (Y1+) `lock_for` — none
+        // of which take the state lock — so the inner critical section
+        // adds negligible latency.
         {
             let mut reg = self.registry.lock();
             reg.ensure_registered(id);
@@ -2008,6 +2197,7 @@ impl Core {
                 reg.union_nodes(id, dep);
             }
         }
+        drop(s);
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
         Ok(id)
     }
@@ -2286,9 +2476,15 @@ impl Core {
         // we drop it, ensuring all our handshake calls land before
         // any concurrent wave's flush observes the sink.
 
-        // Acquire wave_owner first — cross-thread serialization point.
+        // Acquire the partition's `wave_owner` first — cross-thread
+        // serialization point. Per Slice Y1 / Phase E (2026-05-08),
+        // subscribe routes through the per-partition lock instead of
+        // a Core-global one. Subscribe touches only `node_id`'s
+        // partition (activation cascade stays within the partition
+        // because dep edges are unioned). `partition_wave_owner_lock_arc`
+        // does retry-validate against concurrent union/split.
         // `lock_arc()` is `!Send`; same-thread reentrant.
-        let _wave_guard = self.wave_owner.lock_arc();
+        let _wave_guard = self.partition_wave_owner_lock_arc(node_id);
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
@@ -2450,10 +2646,12 @@ impl Core {
             }
         }
 
-        // Run activation if needed. `run_wave` re-acquires `wave_owner`
-        // reentrantly + manages its own state-lock acquisition.
+        // Run activation if needed. `run_wave_for(node_id)` acquires
+        // only the partitions transitively touched from `node_id`
+        // (downstream cascade + meta-companion teardown reach) — same-
+        // partition activation re-enters reentrantly. Slice Y1 / Phase E.
         if needs_activation {
-            self.run_wave(|this| {
+            self.run_wave_for(node_id, |this| {
                 let mut s = this.lock_state();
                 this.activate_derived(&mut s, node_id);
             });
@@ -2753,10 +2951,12 @@ impl Core {
                 return;
             }
         }
-        // Run wave — `run_wave` and `commit_emission` manage their own
-        // locking; binding callbacks (custom_equals, sinks) fire lock-
-        // released.
-        self.run_wave(|this| {
+        // Run wave on `node_id`'s touched partitions. Slice Y1 / Phase E:
+        // emit cascades only via `s.children`, all unioned with `node_id`'s
+        // partition by construction (dep edges = union edges). Common case
+        // is a single-partition acquire — disjoint-partition emits run
+        // truly parallel under per-partition `wave_owner`.
+        self.run_wave_for(node_id, |this| {
             this.commit_emission(node_id, new_handle);
         });
     }
@@ -2930,11 +3130,11 @@ impl Core {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
         }
-        // Wave runs with `run_wave` orchestrating drain. The thunk acquires
-        // its own lock to queue the cascade (terminate_node is a fast
-        // structural walk; no binding callbacks beyond non-re-entrant
-        // retain/release).
-        self.run_wave(|this| {
+        // Wave on `node_id`'s touched partitions (Slice Y1 / Phase E).
+        // COMPLETE / ERROR cascade follows `s.children` (in-partition by
+        // union-find construction). The thunk acquires its own state lock
+        // to queue the cascade.
+        self.run_wave_for(node_id, |this| {
             let mut s = this.lock_state();
             this.terminate_node(&mut s, node_id, terminal);
         });
@@ -3130,7 +3330,12 @@ impl Core {
         }
         let torn_down: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
         let torn_down_for_wave = torn_down.clone();
-        self.run_wave(move |this| {
+        // TEARDOWN cascade follows `s.children` AND `meta_companions`
+        // (R1.3.9.d) — meta-companions can cross partitions. Slice Y1 /
+        // Phase E `compute_touched_partitions(node_id)` (called by
+        // `run_wave_for`) walks both axes so the wave acquires every
+        // partition reachable via the cascade.
+        self.run_wave_for(node_id, move |this| {
             let mut s = this.lock_state();
             let collected = this.teardown_inner(&mut s, node_id);
             torn_down_for_wave.lock().extend(collected);
@@ -3301,7 +3506,9 @@ impl Core {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
         }
-        self.run_wave(|this| {
+        // INVALIDATE cascade follows `s.children` (in-partition by union-
+        // find construction). Slice Y1 / Phase E.
+        self.run_wave_for(node_id, |this| {
             let mut s = this.lock_state();
             this.invalidate_inner(&mut s, node_id);
         });
@@ -3519,11 +3726,12 @@ impl Core {
         }
 
         // Phase 4 (default-mode): drain the consolidated fn-fire scheduled
-        // in Phase 1. `run_wave` re-acquires `wave_owner` reentrantly + runs
-        // the standard drain pipeline; the new fn-fire emerges as a normal
-        // wave's worth of messages to subscribers.
+        // in Phase 1. `run_wave_for(node_id)` acquires the partitions
+        // touched from `node_id` (Slice Y1 / Phase E) and runs the standard
+        // drain pipeline; the new fn-fire emerges as a normal wave's worth
+        // of messages to subscribers.
         if pending_wave_for_default {
-            self.run_wave(|_this| {
+            self.run_wave_for(node_id, |_this| {
                 // The pending_fires entry was pushed in Phase 1 under the
                 // lock. run_wave's drain picks it up.
             });
@@ -3646,6 +3854,45 @@ pub enum SetDepsError {
          Schedule the rewire outside this fire scope."
     )]
     ReentrantOnFiringNode { n: NodeId },
+
+    /// `set_deps(n, ...)` would trigger a partition migration (union or
+    /// split in the per-subgraph union-find registry) that affects the
+    /// partition of a node currently mid-fire on this thread. Distinct
+    /// from [`Self::ReentrantOnFiringNode`]: that variant rejects
+    /// `set_deps(n, ...)` where `n` itself is firing; this variant
+    /// rejects `set_deps(n, ...)` on some OTHER node whose union/split
+    /// shifts a firing node's partition root mid-wave.
+    ///
+    /// Why this matters: Y1's wave engine holds an
+    /// [`Arc<crate::subgraph::SubgraphLockBox>`] for the firing node's
+    /// partition for the wave's duration. A union mid-wave swaps the
+    /// box-identity for one of the two affected partitions; a split
+    /// (Y1+ post-Phase-F) extracts a fresh box for the orphan side.
+    /// Either way the held Arc would diverge from the registry's
+    /// current root for that partition, so the wave would lose
+    /// serialization against the box's true partition mid-flight.
+    ///
+    /// Per [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
+    /// Q3 = (a-strict): mid-wave migration is rejected at edge-mutation
+    /// time. If a real consumer surfaces pressure to support mid-wave
+    /// migration, lift via state-migration logic in a follow-up — but
+    /// the v1 contract is "the partition a wave runs in cannot change
+    /// shape mid-flight."
+    ///
+    /// `n` is the node whose `set_deps` was rejected; `firing` is the
+    /// concretely-identified firing node whose partition would be
+    /// migrated. Workaround: schedule the rewire outside the wave
+    /// (e.g. emit a state-change that triggers `set_deps` from a sink
+    /// callback running post-flush).
+    ///
+    /// Slice Y1 (D3 / D091, 2026-05-08).
+    #[error(
+        "set_deps({n:?}, ...): rejected — would migrate the partition of \
+         currently-firing node {firing:?} mid-wave (union/split during \
+         fire would invalidate the held wave_owner Arc). Schedule the \
+         rewire outside the wave."
+    )]
+    PartitionMigrationDuringFire { n: NodeId, firing: NodeId },
 }
 
 impl Core {
@@ -3740,11 +3987,87 @@ impl Core {
                 return Err(SetDepsError::TerminalDep { n, dep: d });
             }
         }
-        // Idempotent fast-path.
-        if added.is_empty() && current_deps == new_deps_set {
+        // Compute `removed` early (Phase F: needs to be available for P13
+        // split-case widening below). Idempotent fast-path moved below the
+        // P13 check accordingly.
+        let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
+
+        // Slice Y1 (D3 / D091 — P13, 2026-05-08): reject mid-wave set_deps
+        // that would shift a currently-firing node's partition root.
+        // Distinct from `ReentrantOnFiringNode` (same-node case, line above).
+        // Holds the registry lock briefly under the state lock per the
+        // P12-fix lock-discipline invariant `state lock → registry mutex`.
+        //
+        // **Two cases:**
+        // 1. **Union (Phase D)** — adding a cross-partition dep merges two
+        //    components. Both pre-merge components are affected (the
+        //    smaller-rank loser's box is dropped, its members migrate to
+        //    the winner's root).
+        // 2. **Split (Phase F, 2026-05-09)** — removing an edge whose
+        //    removal disconnects the dep graph splits one component into
+        //    two. The pre-split component is affected (every member
+        //    re-unions; the orphan side gets a fresh `SubgraphLockBox`
+        //    while the keep side preserves the original Arc).
+        //
+        // Either case migrates the partition root (and box-identity) for
+        // affected nodes mid-wave; if any node currently firing on this
+        // thread is in an affected partition, the wave's held
+        // `Arc<SubgraphLockBox>` would diverge from the registry's new
+        // canonical box. Q3 = (a-strict) per the D3 design lock rejects
+        // both cases at edge-mutation time.
+        if !s.currently_firing.is_empty() && (!added.is_empty() || !removed.is_empty()) {
+            let mut reg = self.registry.lock();
+            // Snapshot firing nodes' partitions. `partition_of` is mutating
+            // (path compression) but partition IDENTITY is stable across
+            // reads (only `union_nodes` / `split_partition` mutate roots).
+            let firing_with_partition: Vec<(NodeId, crate::subgraph::SubgraphId)> = s
+                .currently_firing
+                .iter()
+                .filter_map(|&f| reg.partition_of(f).map(|p| (f, p)))
+                .collect();
+            if !firing_with_partition.is_empty() {
+                let part_n = reg.partition_of(n);
+                // Case 1 (union): for each added dep, check cross-partition merge.
+                for &added_dep in &added {
+                    let part_added = reg.partition_of(added_dep);
+                    if part_n == part_added {
+                        continue; // same-partition add is a no-op in union-find
+                    }
+                    let affected = [part_n, part_added];
+                    if let Some(&(firing, _)) = firing_with_partition
+                        .iter()
+                        .find(|(_, p)| affected.contains(&Some(*p)))
+                    {
+                        return Err(SetDepsError::PartitionMigrationDuringFire { n, firing });
+                    }
+                }
+                // Case 2 (split): for each removed dep, simulate undirected
+                // BFS from `removed_dep` skipping the would-be-removed edge
+                // (`removed_dep → n`); if `n` is unreachable, removal would
+                // disconnect — split — affecting all nodes in that
+                // partition. Since dep edges are within a single partition
+                // by construction (union-find merges on edge add), every
+                // node currently in the partition is affected.
+                for &removed_dep in &removed {
+                    let part_removed = reg.partition_of(removed_dep);
+                    let visited = bfs_undirected_dep_graph(&s, removed_dep, Some((removed_dep, n)));
+                    let would_disconnect = !visited.contains(&n);
+                    if would_disconnect {
+                        if let Some(&(firing, _)) = firing_with_partition
+                            .iter()
+                            .find(|(_, p)| Some(*p) == part_removed)
+                        {
+                            return Err(SetDepsError::PartitionMigrationDuringFire { n, firing });
+                        }
+                    }
+                }
+            }
+        }
+        // Idempotent fast-path. Now safe to short-circuit since the P13
+        // check above already considered both `added` and `removed`.
+        if added.is_empty() && removed.is_empty() {
             return Ok(());
         }
-        let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
         // Snapshot old deps (ordered) for topology event, before mutation.
         let old_deps_vec: Vec<NodeId> = s.require_node(n).dep_ids_vec();
@@ -3866,28 +4189,74 @@ impl Core {
         // (Q2) blocks concurrent waves once we enter `run_wave`, so the
         // re-read sees a coherent post-validation state.
         let added_for_wave: Vec<NodeId> = added.iter().copied().collect();
-        let added_for_registry: Vec<NodeId> = added.iter().copied().collect();
-        let removed_for_registry: Vec<NodeId> = removed.iter().copied().collect();
+        // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
+        // membership BEFORE dropping the state lock so the registry can
+        // never lag behind topology mutations as observed by concurrent
+        // readers. Lock-order invariant `state lock → registry mutex`
+        // (one-way; never registry → state) — see the matching block in
+        // `Core::register` for the full rationale.
+        //   - For each new edge: union the partitions of `n` and `added_dep`.
+        //   - For each removed edge (Slice Y1 / Phase F, 2026-05-09):
+        //     run undirected-dep-graph BFS from `removed_dep` over the
+        //     POST-removal `s.children` + `dep_records`. If `n` is
+        //     unreachable, the partition has split — gather the affected
+        //     component nodes + intra-component edges, then call
+        //     [`SubgraphRegistry::split_partition`] to migrate the orphan
+        //     side onto a fresh `SubgraphLockBox`. Mid-fire splits would
+        //     have been rejected at the P13 check above (Q3 = (a-strict)).
+        {
+            let mut reg = self.registry.lock();
+            for &added_dep in &added {
+                reg.union_nodes(n, added_dep);
+            }
+            for &removed_dep in &removed {
+                // Post-removal BFS — `s.children[removed_dep]` no longer
+                // contains `n`, and `s.nodes[n].dep_records` no longer
+                // contains `removed_dep`. No skip needed.
+                let visited = bfs_undirected_dep_graph(&s, removed_dep, None);
+                if visited.contains(&n) {
+                    // Still connected via other dep edges — no split.
+                    continue;
+                }
+                // Disconnected. `visited` is the keep-side (containing
+                // `removed_dep`). Identify the original component, the
+                // intra-component dep edges, and split.
+                let original_root = reg.find(removed_dep);
+                // Snapshot keys before iterating — `find` mutates via
+                // path compression; iterating + mutating concurrently
+                // would alias-borrow.
+                let snapshot_keys: Vec<NodeId> = reg.registered_nodes();
+                let component_nodes: Vec<NodeId> = snapshot_keys
+                    .into_iter()
+                    .filter(|&node| reg.find(node) == original_root)
+                    .collect();
+                let component_set: HashSet<NodeId> = component_nodes.iter().copied().collect();
+                // Collect dep edges within the component (post-removal).
+                // Edge convention: `(parent, child)` data-flow direction.
+                let mut edges_in_component: Vec<(NodeId, NodeId)> = Vec::new();
+                for &node in &component_nodes {
+                    if let Some(rec) = s.nodes.get(&node) {
+                        for d in rec.dep_records.iter().map(|r| r.node) {
+                            if component_set.contains(&d) {
+                                edges_in_component.push((d, node));
+                            }
+                        }
+                    }
+                }
+                let keep_side_nodes: Vec<NodeId> = visited.iter().copied().collect();
+                reg.split_partition(&component_nodes, &keep_side_nodes, &edges_in_component);
+                // Marker call kept for symmetry with `union_nodes` — the
+                // registry's `on_edge_removed` is itself a no-op (Phase F
+                // moved the actual work into Core where the dep-graph
+                // view is available).
+                reg.on_edge_removed(n, removed_dep);
+            }
+        }
         // Drop the state lock before run_wave (which acquires its own) and
         // before crossing the binding boundary for the F1 refcount-fix
         // releases. Keeps the lock-discipline split (binding calls outside
         // the state lock) consistent with the rest of the dispatcher.
         drop(s);
-        // Slice X5 (D3 substrate, 2026-05-08): maintain partition
-        // membership across topology change.
-        //   - For each new edge: union the partitions of `n` and `added_dep`.
-        //   - For each removed edge: notify registry (X5 commit-1: no-op;
-        //     Y1 commit-2 will run reachability walk + split if disconnected).
-        // Done lock-released wrt state. Registry mutex is held briefly.
-        {
-            let mut reg = self.registry.lock();
-            for added_dep in &added_for_registry {
-                reg.union_nodes(n, *added_dep);
-            }
-            for removed_dep in &removed_for_registry {
-                reg.on_edge_removed(n, *removed_dep);
-            }
-        }
         // Slice E2 (D067): fire OnRerun lock-released for dynamic nodes
         // that had previously fired. The cleanup closure cleans up
         // resources tied to the old dep shape before the next fn-fire
@@ -3906,11 +4275,16 @@ impl Core {
             new_deps: new_deps_vec.clone(),
         });
         if !added_for_wave.is_empty() {
-            self.run_wave(|this| {
+            // Slice Y1 / Phase E: push-on-subscribe wave runs on `n`'s
+            // touched partitions. Added deps are now unioned with `n`
+            // (Phase C P12 fix moved registry mutation inside the state
+            // lock), so any cascade through them stays in `n`'s partition
+            // set as walked by `compute_touched_partitions`.
+            self.run_wave_for(n, |this| {
                 let mut s = this.lock_state();
                 // Defensive: re-validate `n` still exists and isn't terminal.
                 // A concurrent path could have terminated it between
-                // validation and run_wave's wave_owner acquisition.
+                // validation and run_wave_for's partition-lock acquisition.
                 if !s.nodes.contains_key(&n) || s.require_node(n).terminal.is_some() {
                     return;
                 }

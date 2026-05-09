@@ -110,19 +110,17 @@ impl std::fmt::Display for SubgraphId {
 /// preserved across merges via the [`Arc`] reference (mirrors py's
 /// `_LockBox.lock` redirect on union).
 ///
-/// **Slice X5 commit-1:** the `wave_owner` field is allocated but
-/// not yet used by the wave engine. Y1 / commit-2 migrates
-/// `Core::subscribe` + `Core::begin_batch` to acquire this per-
-/// partition lock instead of the legacy `Core::wave_owner`.
+/// **Slice Y1 (D3 / Phase E, 2026-05-08):** the wave engine acquires
+/// this per-partition lock via [`crate::Core::partition_wave_owner_lock_arc`]
+/// (with retry-validate against concurrent union/split). Closure-form
+/// `Core::batch` acquires every partition's lock in ascending
+/// [`SubgraphId`] order; per-seed entry points (`emit`, `subscribe`,
+/// etc.) acquire only the seed's transitively-touched partitions.
 pub struct SubgraphLockBox {
     /// Per-partition wave ownership. Cross-thread emits to the same
     /// partition serialize here; same-thread re-entry passes through.
     /// Wrapped in `Arc` at the registry level so two roots' boxes
     /// can share the same mutex identity after `union`.
-    ///
-    /// **Slice X5 status:** allocated but unused — Y1 wires the wave
-    /// engine through it.
-    #[allow(dead_code)]
     pub(crate) wave_owner: Arc<ReentrantMutex<()>>,
 }
 
@@ -140,9 +138,8 @@ impl SubgraphLockBox {
 /// `union` activity racing with `lock_for` — pathological in
 /// practice but bounded for safety.
 ///
-/// **Slice X5 status:** unused — Y1 wires the wave engine retry loop
-/// against this cap.
-#[allow(dead_code)]
+/// Consumed by [`crate::Core::partition_wave_owner_lock_arc`] under
+/// the retry-validate loop (Slice Y1 / Phase E, 2026-05-08).
 pub(crate) const MAX_LOCK_RETRIES: u32 = 100;
 
 /// Union-find registry tracking each node's connected-component
@@ -373,16 +370,132 @@ impl SubgraphRegistry {
         // had a box entry.
     }
 
-    /// Hook for an edge removal. Slice X5 commit-1: notes the removal
-    /// but does NOT split (monotonic-merge stepping stone). Y1
-    /// commit-2 adds the reachability walk to detect disconnected
-    /// components and split them into fresh `SubgraphId`s.
+    /// Hook for an edge removal. Slice X5 commit-1: was a no-op
+    /// (monotonic-merge stepping stone). Slice Y1 / Phase F (D3
+    /// split-eager, 2026-05-09): the actual reachability walk +
+    /// split decision lives in `Core::set_deps` (it has access to
+    /// `s.children` and `s.nodes`'s `dep_records` for the undirected
+    /// dep-edge graph). When `Core` detects disconnection it calls
+    /// [`Self::split_partition`] directly. This `on_edge_removed`
+    /// hook remains as a no-op marker — kept for API symmetry with
+    /// [`Self::union_nodes`] and for future use if the registry
+    /// gains its own edge-graph view.
     pub(crate) fn on_edge_removed(&mut self, _from: NodeId, _to: NodeId) {
-        // X5 commit-1: no-op. Monotonic merge — components only grow.
-        // Y1 commit-2 will add:
-        //   if !is_still_connected(from, to, &removed_edges) {
-        //       self.split_component(from, to);
-        //   }
+        // No-op. See `Core::set_deps` Phase F split-eager block which
+        // calls `split_partition` directly when an edge removal causes
+        // disconnection in the undirected dep-edge graph.
+    }
+
+    /// Split an existing component into two, given the keep-side and
+    /// orphan-side membership. Slice Y1 / Phase F (D3 split-eager,
+    /// 2026-05-09).
+    ///
+    /// **Invariants assumed by caller:**
+    /// 1. `component_nodes` lists every node currently in some single
+    ///    component C of this registry.
+    /// 2. `keep_side` ⊆ `component_nodes` is the post-removal
+    ///    connected subset that should retain C's existing
+    ///    [`SubgraphLockBox`] (Arc identity preserved). `keep_side`
+    ///    must be non-empty.
+    /// 3. The orphan side (`component_nodes - keep_side`) must be
+    ///    non-empty. (If it were empty, no split is needed; caller
+    ///    should not invoke this method.)
+    /// 4. `edges_in_component` lists the dep edges (as `(parent,
+    ///    child)` data-flow pairs) currently present in
+    ///    `Core::s.children` / `s.nodes[*].dep_records`,
+    ///    POST-removal of the triggering edge. The edges connect
+    ///    nodes within `component_nodes`. The caller is responsible
+    ///    for filtering to in-component edges.
+    ///
+    /// **Algorithm (mirrors graphrefly-py [`subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
+    /// `_on_split` plus a Rust-idiomatic Arc redirect):**
+    /// 1. Capture the original [`Arc<SubgraphLockBox>`] for the
+    ///    component's pre-split root.
+    /// 2. Reset every component node to a singleton (parent[n] = n,
+    ///    rank = 0, children = ∅).
+    /// 3. Re-union via `edges_in_component` — each edge calls
+    ///    [`Self::union_nodes`], which restores connectivity within
+    ///    each side independently (since `edges_in_component`
+    ///    contains only the post-removal edges, the two sides stay
+    ///    disconnected from each other in the union-find tree).
+    /// 4. Resolve the new keep-side root and orphan-side root.
+    /// 5. Assign the original lock box to the keep-side root (so
+    ///    in-flight waves holding the original `Arc` succeed
+    ///    `lock_for_validate` against the keep-side); allocate a
+    ///    fresh box for the orphan-side root (in-flight waves on
+    ///    the orphan side fail validate, retry with the new box).
+    pub(crate) fn split_partition(
+        &mut self,
+        component_nodes: &[NodeId],
+        keep_side_nodes: &[NodeId],
+        edges_in_component: &[(NodeId, NodeId)],
+    ) {
+        debug_assert!(
+            !component_nodes.is_empty(),
+            "component_nodes must be non-empty"
+        );
+        debug_assert!(
+            !keep_side_nodes.is_empty(),
+            "keep_side_nodes must be non-empty"
+        );
+        // Build a contains-lookup set for the keep side. The caller
+        // passes a slice (avoids cross-crate-internal HashSet flavor
+        // mismatch — `std::collections::HashSet` vs `ahash::AHashSet`).
+        let keep_side: HashSet<NodeId> = keep_side_nodes.iter().copied().collect();
+        debug_assert!(
+            component_nodes.iter().any(|n| !keep_side.contains(n)),
+            "orphan side must be non-empty (no-op caller)"
+        );
+
+        // Step 1: capture original box.
+        let original_root = self.find(component_nodes[0]);
+        let original_box = self
+            .boxes
+            .remove(&original_root)
+            .expect("original_root must have a registered box");
+
+        // Step 2: reset every component node to a singleton.
+        for &n in component_nodes {
+            self.parent.insert(n, n);
+            self.rank.insert(n, 0);
+            self.children.insert(n, HashSet::new());
+        }
+
+        // Step 3: re-union via post-removal edges. Both sides become
+        // internally connected; the two sides remain disconnected from
+        // each other (since the triggering edge was removed and the
+        // caller's BFS verified disconnection).
+        for &(a, b) in edges_in_component {
+            // `union_nodes` is idempotent on already-merged components,
+            // so multiple edges into the same connected subset are fine.
+            // Self-edges shouldn't appear here (Core's cycle detection
+            // rejects them at edge-mutation time) but guard defensively.
+            if a != b {
+                self.union_nodes(a, b);
+            }
+        }
+
+        // Step 4: resolve roots. Pick any keep-side / orphan-side
+        // representative and find its post-re-union root.
+        let keep_repr = keep_side_nodes[0];
+        let keep_root = self.find(keep_repr);
+        let orphan_repr = *component_nodes
+            .iter()
+            .find(|n| !keep_side.contains(n))
+            .expect("non-empty orphan side");
+        let orphan_root = self.find(orphan_repr);
+        debug_assert!(
+            keep_root != orphan_root,
+            "split_partition: keep_root {keep_root:?} and orphan_root {orphan_root:?} \
+             must be distinct after re-union — caller's BFS must have asserted \
+             disconnection"
+        );
+
+        // Step 5: assign boxes. Original box → keep-side root (so
+        // in-flight waves' `lock_for_validate` against the held Arc
+        // succeed for keep-side nodes). Fresh box → orphan-side root.
+        self.boxes.insert(keep_root, original_box);
+        self.boxes.insert(orphan_root, SubgraphLockBox::new());
     }
 
     /// Resolve `node`'s partition lock box. Caller acquires the
@@ -394,8 +507,8 @@ impl SubgraphRegistry {
     /// Returns `None` if `node` is not registered (defensive — should
     /// not happen in correct call paths).
     ///
-    /// **Slice X5 status:** unused — Y1 wires the wave engine through it.
-    #[allow(dead_code)]
+    /// Consumed by [`crate::Core::partition_wave_owner_lock_arc`]
+    /// under the retry-validate loop (Slice Y1 / Phase E, 2026-05-08).
     #[must_use]
     pub(crate) fn lock_for(&mut self, node: NodeId) -> Option<(SubgraphId, Arc<SubgraphLockBox>)> {
         if !self.parent.contains_key(&node) {
@@ -412,9 +525,8 @@ impl SubgraphRegistry {
     /// lock is for the wrong partition and the caller must release +
     /// retry.
     ///
-    /// **Slice X5 status:** unused — Y1 wires the wave engine retry
-    /// loop through it.
-    #[allow(dead_code)]
+    /// Consumed by [`crate::Core::partition_wave_owner_lock_arc`]
+    /// under the retry-validate loop (Slice Y1 / Phase E, 2026-05-08).
     #[must_use]
     pub(crate) fn lock_for_validate(
         &mut self,
@@ -431,11 +543,41 @@ impl SubgraphRegistry {
         }
     }
 
+    /// Snapshot of every currently-existing partition, sorted in
+    /// ascending [`SubgraphId`] order. Returns `(partition_id, lock_box)`
+    /// pairs — the caller acquires `box.wave_owner.lock_arc()` on each
+    /// in ascending order to enter a closure-form batch (which doesn't
+    /// have a known seed and must serialize against ALL partitions per
+    /// session-doc Q7 + decision D092).
+    ///
+    /// Consumed by `Core::all_partitions_lock_boxes` (Slice Y1 /
+    /// Phase E, 2026-05-08).
+    #[must_use]
+    pub(crate) fn all_partitions(&self) -> Vec<(SubgraphId, Arc<SubgraphLockBox>)> {
+        let mut out: Vec<(SubgraphId, Arc<SubgraphLockBox>)> = self
+            .boxes
+            .iter()
+            .map(|(root, box_arc)| (SubgraphId::from_node(*root), Arc::clone(box_arc)))
+            .collect();
+        out.sort_unstable_by_key(|(sid, _)| *sid);
+        out
+    }
+
     /// Number of registered nodes. Useful for debugging + acceptance
     /// tests that verify the registry stays in sync with `Core::nodes`.
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.parent.len()
+    }
+
+    /// Snapshot of every currently-registered node. Used by
+    /// `Core::set_deps`'s split-eager block (Slice Y1 / Phase F,
+    /// 2026-05-09) to enumerate candidate nodes for a component-
+    /// membership filter; iterating + calling `find` would alias-
+    /// borrow `&mut self`, so we snapshot first.
+    #[must_use]
+    pub(crate) fn registered_nodes(&self) -> Vec<NodeId> {
+        self.parent.keys().copied().collect()
     }
 
     /// Number of distinct connected components. Two threads emitting
