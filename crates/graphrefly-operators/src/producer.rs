@@ -148,39 +148,33 @@ impl<'a> ProducerCtx<'a> {
     /// deactivation, the binding drops the storage entry, which drops
     /// the Subscription, which unsubscribes the sink.
     ///
-    /// **Phase H+ option (d) /qa N1(a) (2026-05-09):** the `sink` is
-    /// wrapped in `ProducerSinkGuard` so for the duration of every
-    /// sink invocation, the per-thread `IN_PRODUCER_BUILD` refcount
-    /// is bumped, suppressing the H+ ascending-order check. This
-    /// preserves the existing producer-pattern operator architecture
-    /// against the widened H+ gate. The producer-pattern operators
-    /// (zip, concat, race, take_until, switch_map, exhaust_map,
-    /// concat_map, merge_map) all do cross-partition `Core::subscribe`
-    /// plus `Core::emit` from inside their inner-source sink
-    /// callbacks; the wrapping carve-out lets those continue to work
-    /// while non-producer sink-callback re-entry IS checked by the
-    /// widened gate. Refactoring the operators to defer their
-    /// sink-time inner subscribes and re-emits to wave-end is the
-    /// broader Phase H+ STRICT variant scope (option `b`
-    /// defer-to-post-flush, estimated 1500+ LOC) per
-    /// `docs/porting-deferred.md`.
+    /// **Phase H+ STRICT (D115, 2026-05-10):** uses `try_subscribe`
+    /// to attempt the subscription. On partition order violation, the
+    /// subscribe is deferred to wave-end via
+    /// `DeferredProducerOp::Callback` — the deferred callback runs
+    /// after all partition wave_owners are released (no partitions
+    /// held → safe to acquire any partition).
     pub fn subscribe_to(&self, source: NodeId, sink: Sink) {
-        let wrapped: Sink = std::sync::Arc::new(move |msgs| {
-            // RAII guard so producer_build_exit() runs even if the
-            // sink panics (Drop in Rust runs during unwind).
-            struct ProducerSinkGuard;
-            impl Drop for ProducerSinkGuard {
-                fn drop(&mut self) {
-                    graphrefly_core::producer_build_exit();
-                }
-            }
-            graphrefly_core::producer_build_enter();
-            let _g = ProducerSinkGuard;
-            sink(msgs);
-        });
-        let sub = self.core.subscribe(source, wrapped);
-        let mut states = self.storage.lock();
-        states.entry(self.node_id).or_default().subs.push(sub);
+        let sink_for_defer = sink.clone();
+        if let Ok(sub) = self.core.try_subscribe(source, sink) {
+            self.storage
+                .lock()
+                .entry(self.node_id)
+                .or_default()
+                .subs
+                .push(sub);
+        } else {
+            let core = self.core.clone();
+            let core_for_callback = core.clone();
+            let storage = self.storage.clone();
+            let node_id = self.node_id;
+            core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
+                Box::new(move || {
+                    let sub = core_for_callback.subscribe(source, sink_for_defer);
+                    storage.lock().entry(node_id).or_default().subs.push(sub);
+                }),
+            ));
+        }
     }
 }
 

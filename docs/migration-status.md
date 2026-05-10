@@ -4,6 +4,49 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 ## Current state (2026-05-10)
 
+**Phase H+ STRICT LANDED (2026-05-10, D115): typed-error variant closes the `IN_PRODUCER_BUILD` carve-out. Producer-pattern operators now defer cross-partition operations to wave-end via `*_or_defer` methods instead of bypassing the ascending-order check.**
+
+Key changes:
+1. **`check_and_acquire` returns `Result<(), PartitionOrderViolation>`** — no longer panics for producer paths; returns typed error.
+2. **Per-Core `deferred_producer_ops: Mutex<Vec<DeferredProducerOp>>`** — deferred ops queue drained after wave_guards release in `BatchGuard::drop`. Avoids cross-Core contamination (D114 F1/F2 precedent).
+3. **`try_*` internal + `*_or_defer` public methods** on Core — `emit_or_defer`, `complete_or_defer`, `error_or_defer` handle retain/release discipline internally; `try_subscribe` returns Result for operator-level defer logic.
+4. **`IN_PRODUCER_BUILD` thread-local removed** — the carve-out that suppressed H+ for producer sinks is eliminated. `FiringGuard::is_producer_build` field removed.
+5. **`ProducerCtx::subscribe_to`** uses `try_subscribe` + `DeferredProducerOp::Callback` fallback. `ProducerSinkGuard` wrapper removed.
+6. **All operator sink closures** (`ops_impl.rs` + `higher_order.rs`) migrated to `*_or_defer` variants.
+
+**Test count: 505 cargo + 142 parity, 0 failed, 2 ignored.** +3 new tests (deferred emit, deferred subscribe, ordering preservation). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**Carry-forward (next batches):**
+- **Per-partition `nodes`/`children` shards (Q-beyond sub-slice 4)** — DEFERRED, evidence-gated. No current evidence of state-mutex contention.
+- **(Optional, deferred) Phase G** — `cleanup_node` activation — when NodeRecord removal lifecycle becomes load-bearing.
+
+---
+
+## Current state (2026-05-10 — pre-H+-STRICT, preserved for archive)
+
+**Profile-driven cleanup batch CLOSED (2026-05-10): per-thread partition cache + SmallVec for PendingBatch sinks/messages. Combined −12.6% wall-clock on disjoint fn-fire profile harness (928→811 ns/emit).**
+
+Two optimizations landed:
+1. **Per-thread `PARTITION_CACHE`** in `begin_batch_for` — caches `(core_generation, seed, epoch) → touched_partitions`, skipping the `compute_touched_partitions` BFS + state-lock + registry-lock on repeated same-seed emits (the dominant hot-loop pattern). Invalidated by registry epoch bump. ~30 LOC. **/qa F1 applied:** keyed on monotonic `Core::generation` (global `AtomicU64` counter) instead of `Arc::as_ptr` — eliminates ABA false-hit after Core drop + allocator address reuse.
+2. **`PendingBatch` SmallVec conversion** — `sinks: Vec<Sink>` → `SmallVec<[Sink; 1]>`, `messages: Vec<Message>` → `SmallVec<[Message; 3]>`. Eliminates heap allocation for the common single-subscriber + ≤3-messages-per-node-per-wave pattern. ~10 LOC change, transparent to all consumers.
+3. **Item (1) `mach_absolute_time` investigation** — confirmed zero clock calls on the hot path; the ~2% is from parking_lot's internal adaptive spinning. No code change; closed as "not our code."
+
+**Test count: 502 cargo + 142 parity, 0 failed, 2 ignored.** Unchanged from pre-batch (pure perf optimization, no behavioral change). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**Profile harness (2026-05-10, `profile_disjoint_fn_fire`, 2 threads × 2M emits, SPIN_ITERS=1500):**
+| Metric | Pre-batch | Post-batch | Δ |
+|---|---|---|---|
+| Wall-clock (median of 3) | 3.71 s (928 ns/emit) | 3.25 s (811 ns/emit) | **−12.6%** |
+
+**Carry-forward (next batches):**
+- ~~**Phase H+ STRICT option (d) typed-error variant**~~ — **LANDED 2026-05-10** (D115). Closed the producer-pattern operator carve-out.
+- **Per-partition `nodes`/`children` shards (Q-beyond sub-slice 4)** — DEFERRED, evidence-gated. No current evidence of state-mutex contention.
+- **(Optional, deferred) Phase G** — `cleanup_node` activation — when NodeRecord removal lifecycle becomes load-bearing.
+
+---
+
+## Current state (2026-05-10 — pre-profile-cleanup, preserved for archive)
+
 **Q-beyond CLOSED with bench-driven scope reduction (2026-05-10): wave-scoped state moved to per-thread `WaveState` thread_local; per-partition `nodes`/`children` shards (sub-slice 4) DROPPED based on Phase J bench evidence.**
 
 **The architecture story.** Q-beyond was originally scoped as "split CoreState into per-partition `SubgraphShard`s holding `nodes` / `children` / `pending_notify` / `pending_fires` / wave bookkeeping" (~2000-3000 LOC, ~150+ wave-engine sites — per the porting-deferred entry pre-batch). User pushback ("we have created a lot of locks, I'm not sure if they are hurting more on the performance or gaining more on the parallelism") triggered a first-principles audit + 4-architecture comparison + bench-driven decision (D108). The bench harness `crates/graphrefly-core/benches/lock_strategy.rs` (7 scenarios × 4-6 sync primitives) revealed:

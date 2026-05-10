@@ -478,6 +478,32 @@ fn wave_state_clear_outermost() {
     });
 }
 
+// Profile-driven optimization (2026-05-10): per-thread partition cache for
+// `begin_batch_for`. The common hot-loop pattern is repeated emits to the
+// same seed node (e.g., state node in a tight emit loop). Each emit calls
+// `begin_batch_for(seed)` which calls `compute_touched_partitions(seed)` —
+// a BFS that acquires state + registry locks and allocates a HashSet +
+// SmallVec. Since the topology doesn't change between emits (registry epoch
+// is stable), we cache the BFS result per-thread and skip the BFS on hit.
+//
+// Cache validity: keyed on (core_generation, seed, epoch). Any registry mutation
+// (register/union/split) bumps epoch → invalidates. The post-acquire epoch
+// recheck in `begin_batch_for` catches the (rare) case where a concurrent
+// mutation happens between cache read and lock acquisition.
+struct PartitionCache {
+    /// Monotonic generation from [`crate::node::CORE_GENERATION`]. Avoids
+    /// ABA false-hits that `Arc::as_ptr` would suffer after Core drop +
+    /// allocator address reuse (/qa F1, 2026-05-10).
+    core_generation: u64,
+    seed: NodeId,
+    epoch: u64,
+    partitions: SmallVec<[crate::subgraph::SubgraphId; 4]>,
+}
+
+thread_local! {
+    static PARTITION_CACHE: RefCell<Option<PartitionCache>> = const { RefCell::new(None) };
+}
+
 /// Has `node` emitted a tier-3 (DATA / RESOLVED) message in the current
 /// wave on this thread? See [`TIER3_EMITTED_THIS_WAVE`] for the per-thread
 /// wave-scope rationale.
@@ -534,8 +560,14 @@ pub(crate) struct PendingBatch {
     /// opened. Used by `queue_notify` to decide append-to-last-batch vs
     /// open-fresh-batch on every push.
     pub(crate) snapshot_revision: u64,
-    pub(crate) sinks: Vec<Sink>,
-    pub(crate) messages: Vec<Message>,
+    /// Subscriber snapshot frozen at batch-open time. SmallVec<[_; 1]>
+    /// inlines the common single-subscriber case (avoids heap alloc for
+    /// the dominant 1-sink-per-node pattern in most reactive graphs).
+    pub(crate) sinks: SmallVec<[Sink; 1]>,
+    /// Messages queued to this batch. SmallVec<[_; 3]> inlines the
+    /// common per-node-per-wave message set (DIRTY + DATA + optional
+    /// RESOLVED) without heap allocation.
+    pub(crate) messages: SmallVec<[Message; 3]>,
 }
 
 /// Per-node wave-end notification queue, structured as one or more
@@ -601,147 +633,36 @@ impl PendingPerNode {
 pub(crate) struct FiringGuard {
     core: Core,
     node_id: NodeId,
-    /// Phase H+ option (d) /qa N1(a) widened variant (2026-05-09):
-    /// whether this guard participates in the per-thread
-    /// `IN_PRODUCER_BUILD` accounting. Producer-pattern operator
-    /// activations (`zip` / `concat` / `race` / `take_until` /
-    /// `switch_map` / `exhaust_map` / `concat_map` / `merge_map`
-    /// — all `is_producer()`) DO participate: they SUPPRESS the H+
-    /// check during their build/project closure because those
-    /// closures legitimately subscribe to upstream sources
-    /// cross-partition (operator-internal activation-time setup,
-    /// not user-fn re-entry). Refactoring those operators to defer
-    /// inner subscribes to wave-end is the broader Phase H+ STRICT
-    /// variant scope; the limited variant carves them out via this
-    /// flag. Derived / dynamic / state user-fn fires do NOT
-    /// participate — the H+ check applies to them under the
-    /// "held non-empty AND not in producer build" gate (see
-    /// `crate::node::held_partitions` module docstring).
-    ///
-    /// **INVARIANT:** the value is captured at `FiringGuard::new`
-    /// from `NodeRecord::is_producer()` for the firing node and
-    /// must NEVER be re-derived at `Drop` time. `is_producer` is
-    /// stable for a node's lifetime per the current registration
-    /// API (a node's kind cannot change once registered), but a
-    /// future contributor adding mutability MUST honor this snapshot
-    /// to keep the `producer_build_enter` / `producer_build_exit`
-    /// pair balanced. A debug_assert in Drop verifies the snapshot
-    /// still matches when assertions are enabled.
-    is_producer_build: bool,
 }
 
 impl FiringGuard {
     pub(crate) fn new(core: &Core, node_id: NodeId) -> Self {
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
         // CoreState (cross-thread visible, restoring the D091 P13 check).
-        // Push under the SAME state lock scope as the is_producer read —
-        // this also closes /qa F3 (the panic-window between
-        // with_wave_state push and Self construction is gone; a panic in
-        // `lock_state` itself can't leak the push because no push has
-        // run yet, and the push + is_producer read happen atomically
-        // under the state lock).
-        let is_producer = {
+        // Push under the state lock scope.
+        {
             let mut s = core.lock_state();
             s.currently_firing.push(node_id);
-            s.nodes
-                .get(&node_id)
-                .is_some_and(crate::node::NodeRecord::is_producer)
-        };
-        // Construct Self FIRST (capture the cached `is_producer_build`
-        // snapshot in the struct). Then call `producer_build_enter()`
-        // as a separate step. If a future contributor adds fallible
-        // / panicking code between Self construction and the enter
-        // call, the panic still leaves Self abandoned (no Drop runs
-        // because Self isn't bound to a name yet) and the
-        // `producer_build_enter` call hasn't been made — so no
-        // imbalance. This is the panic-safe ordering per /qa A4.
-        //
-        // **Cleanup-on-panic path:** a panic AFTER Self is constructed
-        // and bound to a named guard runs `Drop for FiringGuard`, which
-        // pops `currently_firing` under the state lock. A panic between
-        // the `lock_state` block above and Self construction would leak
-        // the push; in practice `lock_state` is parking_lot
-        // (no-panic-on-unpoisoned) and `core.clone()` is infallible, so
-        // the panic-window is empty for current code. The defensive
-        // clear in `CoreState::clear_wave_state` (called from
-        // BatchGuard::drop wave-end) catches any hypothetical leak.
-        let guard = Self {
+        }
+        Self {
             core: core.clone(),
             node_id,
-            is_producer_build: is_producer,
-        };
-        if is_producer {
-            crate::node::producer_build_enter();
         }
-        guard
     }
 }
 
 impl Drop for FiringGuard {
     fn drop(&mut self) {
-        // INVARIANT (debug-asserted): `is_producer_build` must match
-        // the node's current `is_producer()` at Drop time. If a future
-        // refactor introduces post-construction node-kind mutation,
-        // this fails loudly under debug builds — the
-        // `producer_build_enter` / `producer_build_exit` pair would
-        // otherwise become unbalanced. Per /qa A5.
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
-        // CoreState. Pop under the SAME state lock scope as the debug
-        // invariant check, atomic with the construction-side push.
+        // CoreState. Pop under state lock.
         {
             let mut s = self.core.lock_state();
-            #[cfg(debug_assertions)]
-            {
-                // INVARIANT: `is_producer_build` must match the node's
-                // current `is_producer()` at Drop time. If a future
-                // refactor introduces post-construction node-kind
-                // mutation, this fails loudly under debug builds — the
-                // `producer_build_enter` / `producer_build_exit` pair
-                // would otherwise become unbalanced. Per /qa A5.
-                let now_producer = s
-                    .nodes
-                    .get(&self.node_id)
-                    .is_some_and(crate::node::NodeRecord::is_producer);
-                // Allow node-removed-mid-fire (now `is_some_and(...)` is
-                // false) — that's a benign asymmetry. Real concern: a
-                // node that was non-producer at construction is now
-                // reported as producer (or vice versa for an existing
-                // node).
-                if s.nodes.contains_key(&self.node_id) {
-                    debug_assert_eq!(
-                        self.is_producer_build,
-                        now_producer,
-                        "FiringGuard invariant violation: node {:?} was {} at \
-                         construction but is {} at Drop. The is_producer flag \
-                         must be stable for a node's lifetime; see FiringGuard \
-                         struct docstring.",
-                        self.node_id,
-                        if self.is_producer_build {
-                            "is_producer=true"
-                        } else {
-                            "is_producer=false"
-                        },
-                        if now_producer {
-                            "is_producer=true"
-                        } else {
-                            "is_producer=false"
-                        },
-                    );
-                }
-            }
             // Pop the right-most matching node_id (membership semantics —
             // not strict LIFO). If absent, an external rebalance already
             // popped — silent no-op (panic-in-Drop is poison).
             if let Some(pos) = s.currently_firing.iter().rposition(|n| *n == self.node_id) {
                 s.currently_firing.swap_remove(pos);
             }
-        }
-        // Phase H+ pair: decrement IN_PRODUCER_BUILD IFF we incremented
-        // in `new`. Done outside the WaveState borrow so the next
-        // wave-state access (potentially on a re-entry hot path) can
-        // proceed without our cell access on its critical section.
-        if self.is_producer_build {
-            crate::node::producer_build_exit();
         }
     }
 }
@@ -827,6 +748,23 @@ impl Core {
     {
         let _guard = self.begin_batch_for(seed);
         op(self);
+    }
+
+    /// Fallible wave entry. Returns `Err` if partition acquire violates
+    /// ascending order (Phase H+ STRICT, D115). Used by `try_emit` /
+    /// `try_complete` / `try_error`; the public `run_wave_for` calls
+    /// `begin_batch_for` which panics on violation.
+    pub(crate) fn try_run_wave_for<F>(
+        &self,
+        seed: crate::handle::NodeId,
+        op: F,
+    ) -> Result<(), crate::node::PartitionOrderViolation>
+    where
+        F: FnOnce(&Self),
+    {
+        let _guard = self.try_begin_batch_for(seed)?;
+        op(self);
+        Ok(())
     }
 
     /// Drain retains held by `wave_cache_snapshots` and return them so
@@ -2735,14 +2673,14 @@ impl Core {
                     .is_none_or(|b| b.snapshot_revision != current_rev)
             })
         });
-        let sinks_snapshot: Vec<Sink> = if needs_new_batch {
+        let sinks_snapshot: SmallVec<[Sink; 1]> = if needs_new_batch {
             s.require_node(node_id)
                 .subscribers
                 .values()
                 .cloned()
                 .collect()
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         with_wave_state(|ws| match ws.pending_notify.entry(node_id) {
             Entry::Vacant(slot) => {
@@ -2750,7 +2688,7 @@ impl Core {
                 batches.push(PendingBatch {
                     snapshot_revision: current_rev,
                     sinks: sinks_snapshot,
-                    messages: vec![msg],
+                    messages: smallvec::smallvec![msg],
                 });
                 slot.insert(PendingPerNode { batches });
             }
@@ -2760,7 +2698,7 @@ impl Core {
                     entry.batches.push(PendingBatch {
                         snapshot_revision: current_rev,
                         sinks: sinks_snapshot,
-                        messages: vec![msg],
+                        messages: smallvec::smallvec![msg],
                     });
                 } else {
                     entry
@@ -3023,10 +2961,33 @@ impl Core {
     /// flow (e.g. async-state-machine code paths, or splitting setup and
     /// drain across helper functions).
     ///
-    /// ```ignore
+    /// ```
+    /// use graphrefly_core::{Core, BindingBoundary, NodeRegistration, NodeOpts,
+    ///     HandleId, NodeId, FnId, FnResult, DepBatch};
+    /// use std::sync::Arc;
+    ///
+    /// struct Stub;
+    /// impl BindingBoundary for Stub {
+    ///     fn invoke_fn(&self, _: NodeId, _: FnId, _: &[DepBatch]) -> FnResult {
+    ///         FnResult::Noop { tracked: None }
+    ///     }
+    ///     fn custom_equals(&self, _: FnId, _: HandleId, _: HandleId) -> bool { false }
+    ///     fn release_handle(&self, _: HandleId) {}
+    /// }
+    ///
+    /// let core = Core::new(Arc::new(Stub) as Arc<dyn BindingBoundary>);
+    /// let state_a = core.register(NodeRegistration {
+    ///     deps: vec![], fn_or_op: None,
+    ///     opts: NodeOpts { initial: HandleId::new(1), ..Default::default() },
+    /// }).unwrap();
+    /// let state_b = core.register(NodeRegistration {
+    ///     deps: vec![], fn_or_op: None,
+    ///     opts: NodeOpts { initial: HandleId::new(2), ..Default::default() },
+    /// }).unwrap();
+    ///
     /// let g = core.begin_batch();
-    /// core.emit(state_a, h1);
-    /// core.emit(state_b, h2);
+    /// core.emit(state_a, HandleId::new(10));
+    /// core.emit(state_b, HandleId::new(20));
     /// drop(g); // wave drains here
     /// ```
     ///
@@ -3073,7 +3034,10 @@ impl Core {
                 // is always registered in the X5 / Phase-E substrate
                 // (cleanup_node is gated, Phase G activates).
                 let representative = crate::handle::NodeId::new(sid.raw());
-                wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+                wave_guards.push(
+                    self.partition_wave_owner_lock_arc(representative)
+                        .unwrap_or_else(|e| panic!("{e}")),
+                );
             }
             // Post-acquire epoch read. If unchanged, our snapshot is
             // still authoritative — every existing partition was held
@@ -3127,18 +3091,79 @@ impl Core {
     /// Slice Y1 / Phase E (2026-05-08); QA-fix #2 (2026-05-09).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard {
+        match self.try_begin_batch_for(seed) {
+            Ok(guard) => guard,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible variant of `begin_batch_for`. Returns `Err` if any
+    /// partition acquire violates ascending order (Phase H+ STRICT,
+    /// D115). Used by `try_run_wave_for`; the public `begin_batch_for`
+    /// calls this and unwraps.
+    pub(crate) fn try_begin_batch_for(
+        &self,
+        seed: crate::handle::NodeId,
+    ) -> Result<BatchGuard, crate::node::PartitionOrderViolation> {
+        let core_generation = self.generation;
         for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
             let epoch_before = self.registry.lock().epoch();
-            let touched = self.compute_touched_partitions(seed);
+            // Fast-path: per-thread partition cache. On repeated emits to
+            // the same seed (the dominant hot-loop pattern), skip the BFS
+            // in compute_touched_partitions — it acquires state + registry
+            // locks and allocates a HashSet + SmallVec per call. The cache
+            // is valid as long as the registry epoch hasn't changed (no
+            // register/union/split since the cache was populated).
+            let touched = PARTITION_CACHE
+                .with(|cell| {
+                    let cache = cell.borrow();
+                    if let Some(ref c) = *cache {
+                        if c.core_generation == core_generation
+                            && c.seed == seed
+                            && c.epoch == epoch_before
+                        {
+                            return Some(c.partitions.clone());
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| {
+                    let result = self.compute_touched_partitions(seed);
+                    PARTITION_CACHE.with(|cell| {
+                        *cell.borrow_mut() = Some(PartitionCache {
+                            core_generation,
+                            seed,
+                            epoch: epoch_before,
+                            partitions: result.clone(),
+                        });
+                    });
+                    result
+                });
             let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
+            let mut partition_err = None;
             for sid in &touched {
                 let representative = crate::handle::NodeId::new(sid.raw());
-                wave_guards.push(self.partition_wave_owner_lock_arc(representative));
+                match self.partition_wave_owner_lock_arc(representative) {
+                    Ok(guard) => wave_guards.push(guard),
+                    Err(e) => {
+                        partition_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            // Drop wave_guards on error — release any already-acquired partitions.
+            if let Some(e) = partition_err {
+                drop(wave_guards);
+                return Err(e);
             }
             let epoch_after = self.registry.lock().epoch();
             if epoch_after == epoch_before {
-                return self.begin_batch_with_guards(wave_guards);
+                return Ok(self.begin_batch_with_guards(wave_guards));
             }
+            // Epoch changed — invalidate cache and retry.
+            PARTITION_CACHE.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
             drop(wave_guards);
             std::thread::yield_now();
         }
@@ -3366,6 +3391,21 @@ impl Drop for BatchGuard {
             // thread-local outlives the BatchGuard otherwise — cargo's
             // thread reuse across tests would propagate stale entries.
             tier3_clear();
+            // Phase H+ STRICT (D115): discard deferred producer ops on
+            // panic. Release handle retains without firing.
+            {
+                let mut ops = self.core.deferred_producer_ops.lock();
+                let discarded = std::mem::take(&mut *ops);
+                for op in discarded {
+                    match op {
+                        crate::node::DeferredProducerOp::Emit { handle, .. }
+                        | crate::node::DeferredProducerOp::Error { handle, .. } => {
+                            self.core.binding.release_handle(handle);
+                        }
+                        _ => {} // Complete has no handle; Callback drops naturally
+                    }
+                }
+            }
             return;
         }
         // Successful drain — drain_and_flush manages its own locking.
@@ -3432,5 +3472,14 @@ impl Drop for BatchGuard {
         while let Some(guard) = self.wave_guards.pop() {
             drop(guard);
         }
+        // Phase H+ STRICT (D115): drain deferred producer ops now that
+        // THIS BatchGuard's wave_guards are released. However, if an
+        // outer scope still holds partitions (e.g., try_subscribe's
+        // _wave_guard), draining here would re-enter Core::subscribe /
+        // emit while those partitions are still in held_partitions,
+        // triggering the ascending-order check. In that case, leave the
+        // ops in the queue — the outermost BatchGuard (whose drop runs
+        // with no outer partitions held) will drain them.
+        self.core.drain_deferred_producer_ops();
     }
 }

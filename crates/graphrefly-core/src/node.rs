@@ -67,6 +67,7 @@
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -119,10 +120,9 @@ impl Drop for WaveOwnerGuard {
     }
 }
 
-/// Phase H+ option (d) limited variant — thread-local infrastructure
-/// for cross-partition acquire-during-fire / cross-partition
-/// acquire-during-wave deadlock detection (extended /qa N1(a)
-/// 2026-05-09 to cover sink callbacks + any nested in-wave acquire).
+/// Phase H+ STRICT variant — thread-local infrastructure for
+/// cross-partition acquire-during-fire / cross-partition
+/// acquire-during-wave deadlock detection (D115, 2026-05-10).
 ///
 /// **Protocol invariant enforced:** whenever this thread already
 /// holds at least one partition wave_owner (HELD non-empty), every
@@ -138,32 +138,15 @@ impl Drop for WaveOwnerGuard {
 /// attempts X (X > Y, ascending-OK from B's POV). A's acquire on Y
 /// blocks behind B; B's acquire on X blocks behind A. Cycle.
 ///
-/// **Single carve-out — producer build/project closures:** producer-
-/// pattern operator activation (`zip` / `concat` / `race` /
-/// `take_until` / `switch_map` / `exhaust_map` / `concat_map` /
-/// `merge_map`) runs build closures inside `BindingBoundary::invoke_fn`
-/// that legitimately subscribe to upstream sources cross-partition.
-/// Refactoring those operators to defer their inner subscribes to
-/// wave-end is the broader "Phase H+ STRICT variant" carry-forward
-/// (see `docs/porting-deferred.md`). For the limited variant, the
-/// thread-local [`IN_PRODUCER_BUILD`] refcount is incremented when a
-/// producer node enters its FiringGuard scope and the H+ check is
-/// suppressed for the duration. All other call paths (derived /
-/// dynamic user fns, sink callbacks, subscribe handshakes, drop
-/// cleanup) DO see the check.
-///
-/// **What this widening (/qa N1(a) 2026-05-09) catches that the
-/// original `fire_depth > 0` gate did NOT:**
-/// - Sink callbacks fired by `flush_notifications` lock-released
-///   AFTER drain — the outer wave's wave_owner is still held but
-///   no FiringGuard is on the stack. A sink that calls
-///   `core.subscribe(node_in_lower_partition, sink)` would have
-///   bypassed the original gate; now caught.
-/// - Subscribe-handshake-time cross-partition operations (similar
-///   shape — the handshake fires lock-released).
-/// - Any future re-entry path that doesn't go through `FiringGuard`
-///   (e.g., `Subscription::Drop` cleanup paths, R3.7-style graph
-///   destroy cascades).
+/// **No producer carve-out:** the prior limited variant suppressed
+/// the check during producer build/sink closures via an
+/// `IN_PRODUCER_BUILD` refcount. The STRICT variant (D115) removes
+/// this carve-out entirely. Instead, `check_and_acquire` returns a
+/// typed `Result<(), PartitionOrderViolation>` error, and callers
+/// that would violate ascending order (producer-pattern operator
+/// sinks) defer the operation to wave-end via the per-Core
+/// `deferred_producer_ops` queue. The defer-and-retry approach
+/// preserves deadlock-freedom without suppressing the check.
 mod held_partitions {
     use crate::subgraph::SubgraphId;
     use smallvec::SmallVec;
@@ -195,79 +178,15 @@ mod held_partitions {
         ///
         /// Bookkeeping is unconditional — every acquire bumps the
         /// refcount, every release decrements. The CHECK gate
-        /// (`!held.is_empty() && !in_producer_build()`) is what
+        /// (`!held.is_empty() && !already_held`) is what
         /// distinguishes "first-time acquire on a fresh thread"
         /// (allowed, held empty) from "nested acquire while we
         /// already hold something" (must be ascending).
         static HELD: RefCell<SmallVec<[(SubgraphId, u32); HELD_INLINE]>>
             = const { RefCell::new(SmallVec::new_const()) };
-
-        /// Per-thread "we're inside a producer build/project closure"
-        /// refcount. Producer-pattern operator activation increments
-        /// this on `FiringGuard::new`; their build closures call
-        /// cross-partition `Core::subscribe` legitimately during
-        /// activation (operator-internal setup, not user-fn re-entry).
-        /// The H+ check is suppressed while this counter is non-zero.
-        ///
-        /// Tracked as a refcount (not a bool) because nested producer
-        /// activations are theoretically possible (e.g., a producer
-        /// whose build closure subscribes to ANOTHER producer that
-        /// also activates) and must balance correctly. The increment
-        /// uses `checked_add(1)` so an unbounded recursion (a real
-        /// bug — protocol cascades are bounded by
-        /// `MAX_BATCH_DRAIN_ITERATIONS`) panics instead of silently
-        /// saturating and disabling the check.
-        ///
-        /// /qa N1(a) (2026-05-09): replaced the original `FIRE_DEPTH`
-        /// thread-local. The previous design gated the H+ check on
-        /// fire_depth > 0; this restricted coverage to the
-        /// FiringGuard-wrapped invoke_fn scope. The new design
-        /// inverts: gate on `held non-empty AND !in_producer_build`.
-        /// Catches sink-callback / handshake / drop-cleanup paths
-        /// the previous gate missed.
-        static IN_PRODUCER_BUILD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
-    /// Increment the producer-build refcount. Called from
-    /// `FiringGuard::new` ONLY for `is_producer()` nodes, AND from
-    /// `ProducerCtx::subscribe_to`'s wrapped sink (so producer-
-    /// internal sink callbacks also suppress the H+ check).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the per-thread refcount would overflow `u32::MAX`.
-    /// This indicates an unbounded recursion through producer build /
-    /// sink dispatch — a real bug. Safer to surface than to silently
-    /// saturate and disable the check or produce inverted Drop
-    /// semantics. The protocol's `MAX_BATCH_DRAIN_ITERATIONS` cap
-    /// makes this overflow unreachable in practice.
-    pub fn producer_build_enter() {
-        IN_PRODUCER_BUILD.with(|c| {
-            let next = c.get().checked_add(1).expect(
-                "in_producer_build refcount overflow — unbounded \
-                 producer-build re-entrance. Should be bounded by the \
-                 protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
-            );
-            c.set(next);
-        });
-    }
-
-    /// Decrement the producer-build refcount. Called from
-    /// `FiringGuard::drop` ONLY for guards that incremented in `new`,
-    /// AND from `ProducerSinkGuard::drop` in the producer-sink
-    /// wrapper. Saturates on underflow (would indicate Drop without
-    /// matching `new` — recovery via no-op is safer than panicking
-    /// in Drop).
-    pub fn producer_build_exit() {
-        IN_PRODUCER_BUILD.with(|c| c.set(c.get().saturating_sub(1)));
-    }
-
-    /// Currently inside a producer build/project closure on this thread?
-    fn in_producer_build() -> bool {
-        IN_PRODUCER_BUILD.with(|c| c.get() > 0)
-    }
-
-    /// Phase H+ check + bookkeeping. Called BEFORE acquiring the
+    /// Phase H+ STRICT check + bookkeeping. Called BEFORE acquiring the
     /// partition's parking_lot::ReentrantMutex.
     ///
     /// Panics with a clear diagnostic if:
@@ -289,64 +208,26 @@ mod held_partitions {
     /// rule in `Core::begin_batch_for`). This thread-local check
     /// adds the layer that prevents a same-thread descending acquire
     /// from creating the FIRST half of a cross-thread cycle.
-    pub(crate) fn check_and_acquire(sid: SubgraphId) {
+    pub(crate) fn check_and_acquire(sid: SubgraphId) -> Result<(), super::PartitionOrderViolation> {
         HELD.with(|h| {
             let mut held = h.borrow_mut();
-            // Gate: held non-empty (we're nested) AND not in producer
-            // build/sink (the v1 carve-out for operator activation +
-            // producer-internal sink callbacks). First-time acquires
+            // Gate: held non-empty (we're nested). First-time acquires
             // on a fresh thread (held empty) skip the check — there's
             // nothing to compare against.
             let already_held = held.iter().any(|(s, _)| *s == sid);
-            if !held.is_empty() && !in_producer_build() && !already_held {
+            if !held.is_empty() && !already_held {
                 // Linear-scan max over the inline storage (typical N ≤ 4).
                 // Branch-predictable and cache-local; no allocation.
                 if let Some(max_held) = held.iter().map(|(s, _)| *s).max() {
                     if sid <= max_held {
-                        // Drop the borrow before panicking so unwind
-                        // doesn't see a still-borrowed RefCell.
+                        // Drop the borrow before returning Err so
+                        // the caller doesn't see a still-borrowed RefCell.
                         let new_id = sid;
                         drop(held);
-                        panic!(
-                            "Phase H+ ascending-order violation: thread tried \
-                             to acquire partition {new_id:?} while already \
-                             holding partition {max_held:?}. \
-                             The same-thread cross-partition lock-acquisition \
-                             protocol requires every NEW partition acquired \
-                             while ANY partition is already held to have id \
-                             strictly greater than every already-held \
-                             partition; otherwise two threads doing \
-                             reciprocal acquires can form an AB/BA deadlock.\n\
-                             \n\
-                             Note: this check is per-thread. A cross-thread \
-                             AB/BA cycle between threads each obeying \
-                             ascending order at the per-thread level is \
-                             prevented at a different layer — the \
-                             `compute_touched_partitions` upfront-acquire-\
-                             all-ascending rule in `Core::begin_batch_for`.\n\
-                             \n\
-                             Common triggers (see docs/porting-deferred.md \
-                             'Cross-partition acquire-during-fire deadlock'):\n\
-                             - A user fn (derived / dynamic) that calls \
-                             `Core::emit` / `complete` / `error` / `teardown` \
-                             / `invalidate` mid-fire on a node in a partition \
-                             with a smaller id than the firing node's.\n\
-                             - A sink callback that calls `Core::subscribe` \
-                             on a node in a smaller-id partition while the \
-                             outer wave's wave_owner is still held.\n\
-                             - A subscribe handshake (or Drop cleanup) that \
-                             re-enters Core on a smaller-id partition.\n\
-                             \n\
-                             Fix: schedule the cross-partition operation \
-                             OUTSIDE the wave (e.g., via a deferred queue \
-                             applied at wave end) so the acquire happens at \
-                             top-level rather than nested under a held \
-                             partition; OR declare the cross-partition \
-                             reachability upfront via `add_meta_companion` \
-                             so the wave acquires both partitions ascending \
-                             at top-level and the inner re-entry becomes a \
-                             re-entrant acquire on a held partition."
-                        );
+                        return Err(super::PartitionOrderViolation {
+                            attempted: new_id,
+                            max_held,
+                        });
                     }
                 }
             }
@@ -362,7 +243,8 @@ mod held_partitions {
             } else {
                 held.push((sid, 1));
             }
-        });
+            Ok(())
+        })
     }
 
     /// Decrement the refcount for `sid`; remove the entry if it
@@ -423,6 +305,14 @@ mod held_partitions {
         })
     }
 
+    /// Returns `true` if this thread currently holds any partition
+    /// wave_owner. Used by `BatchGuard::drop` to skip the deferred-ops
+    /// drain when we're still nested inside an outer wave_guard scope
+    /// (Phase H+ STRICT, D115).
+    pub(crate) fn any_held() -> bool {
+        HELD.with(|h| !h.borrow().is_empty())
+    }
+
     /// Test-only: read the current thread's held-partitions snapshot.
     /// Used by post-panic regression assertions to verify the
     /// thread-local stays clean even when the H+ check unwinds the
@@ -443,33 +333,14 @@ mod held_partitions {
         v.sort_unstable_by_key(|(s, _)| *s);
         v
     }
-
-    /// Test-only: read the current thread's producer-build refcount.
-    /// Companion to [`held_snapshot_for_tests`] for verifying the
-    /// thread-local stays clean post-panic.
-    #[cfg(any(test, debug_assertions))]
-    #[must_use]
-    pub fn in_producer_build_for_tests() -> u32 {
-        IN_PRODUCER_BUILD.with(std::cell::Cell::get)
-    }
 }
-
-/// `pub` re-exports for the `graphrefly-operators` crate to wrap
-/// producer-internal sinks with the same `IN_PRODUCER_BUILD` flag
-/// the FiringGuard uses (per /qa N1(a) — operator sinks are
-/// operator-internal and SUPPRESS the H+ check, mirroring the
-/// activation-time carve-out). Not part of the v1 stable user API
-/// surface; intended for in-workspace consumers only. Phase H+
-/// STRICT variant (the producer-architecture refactor) will
-/// eliminate the need for this carve-out.
-pub use held_partitions::{producer_build_enter, producer_build_exit};
 
 /// Test-only re-exports for integration tests under
 /// `crates/graphrefly-core/tests/`. Gated `#[cfg(any(test, debug_assertions))]`
 /// so they don't leak into release builds. Public visibility is
 /// required because integration tests live outside the crate.
 #[cfg(any(test, debug_assertions))]
-pub use held_partitions::{held_snapshot_for_tests, in_producer_build_for_tests};
+pub use held_partitions::held_snapshot_for_tests;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -1184,6 +1055,46 @@ pub(crate) struct PendingPauseOverflow {
     pub(crate) lock_held_ns: u64,
 }
 
+/// Error returned when a same-thread partition acquire violates
+/// ascending order. Phase H+ STRICT variant (D115).
+///
+/// The ascending-order protocol prevents AB/BA deadlocks between
+/// threads. When this error surfaces, the caller should defer the
+/// operation to wave-end (when no partitions are held) and retry.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "Phase H+ ascending-order violation: attempted partition {attempted:?} \
+     while already holding partition {max_held:?} — defer to wave-end"
+)]
+pub struct PartitionOrderViolation {
+    /// The partition the caller tried to acquire.
+    pub attempted: crate::subgraph::SubgraphId,
+    /// The highest-id partition currently held by this thread.
+    pub max_held: crate::subgraph::SubgraphId,
+}
+
+/// A producer-pattern operation deferred because it would have
+/// violated the ascending partition-order protocol (Phase H+ STRICT,
+/// D115). Drained by `BatchGuard::drop` after wave_guards are
+/// released (no partitions held → safe to acquire any partition).
+///
+/// Variants with `HandleId` fields hold a binding-side retain taken
+/// at defer time. The drain path releases this retain after the
+/// operation fires; the panic-discard path releases it without firing.
+pub enum DeferredProducerOp {
+    /// Deferred `Core::emit`. Retain held on `handle`.
+    Emit { node_id: NodeId, handle: HandleId },
+    /// Deferred `Core::complete`. No handle.
+    Complete { node_id: NodeId },
+    /// Deferred `Core::error`. Retain held on `handle`.
+    Error { node_id: NodeId, handle: HandleId },
+    /// Generic deferred callback (e.g., deferred subscribe from
+    /// producer build closure). The closure captures everything it
+    /// needs; `graphrefly-core` doesn't depend on operator-specific
+    /// types. The closure is responsible for its own retain discipline.
+    Callback(Box<dyn FnOnce() + Send>),
+}
+
 /// Errors returnable by [`Core::pause`] and [`Core::resume`].
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum PauseError {
@@ -1735,10 +1646,21 @@ pub(crate) struct CoreState {
 /// emits absorb into the in-flight wave's `pending_notify` and return
 /// before subscribers fire — breaking the user-facing happens-after
 /// contract that `emit` returning means subscribers have observed.
+/// Monotonic generation counter for `Core` instances. Used by the
+/// per-thread `PARTITION_CACHE` in `batch.rs` to distinguish Core
+/// instances without relying on `Arc::as_ptr` (which can be reused by
+/// the allocator after a Core is dropped — ABA hazard). One atomic
+/// increment per `Core::new`; negligible cost.
+static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub struct Core {
     pub(crate) state: Arc<Mutex<CoreState>>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
+    /// Deferred producer-pattern operations. Per-Core (not per-thread)
+    /// to avoid the cross-Core contamination discovered in D114 F1/F2.
+    /// Drained after wave_guards release in `BatchGuard::drop`.
+    pub(crate) deferred_producer_ops: Arc<parking_lot::Mutex<Vec<DeferredProducerOp>>>,
     /// Slice X5 (D3 substrate, 2026-05-08) + Slice Y1 / Phase E
     /// (wave-engine migration, 2026-05-08): per-subgraph union-find
     /// registry. Tracks each registered node's connected-component
@@ -1753,6 +1675,10 @@ pub struct Core {
     /// `subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
     /// design (locked in [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)).
     pub(crate) registry: Arc<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
+    /// Unique generation ID for this Core instance. Assigned from
+    /// [`CORE_GENERATION`] at construction. Used by `PARTITION_CACHE`
+    /// to avoid ABA false-hits after Core drop + allocator reuse.
+    pub(crate) generation: u64,
 }
 
 /// Weak handle to a [`Core`] — does not contribute to strong refcount.
@@ -1772,7 +1698,9 @@ pub struct Core {
 pub struct WeakCore {
     state: Weak<Mutex<CoreState>>,
     binding: Weak<dyn BindingBoundary>,
+    deferred_producer_ops: Weak<parking_lot::Mutex<Vec<DeferredProducerOp>>>,
     registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
+    generation: u64,
 }
 
 impl WeakCore {
@@ -1784,7 +1712,9 @@ impl WeakCore {
         Some(Core {
             state: self.state.upgrade()?,
             binding: self.binding.upgrade()?,
+            deferred_producer_ops: self.deferred_producer_ops.upgrade()?,
             registry: self.registry.upgrade()?,
+            generation: self.generation,
         })
     }
 }
@@ -1895,9 +1825,11 @@ impl Core {
                 next_topology_id: 1,
             })),
             binding,
+            deferred_producer_ops: Arc::new(parking_lot::Mutex::new(Vec::new())),
             registry: Arc::new(parking_lot::Mutex::new(
                 crate::subgraph::SubgraphRegistry::new(),
             )),
+            generation: CORE_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -1952,7 +1884,9 @@ impl Core {
         WeakCore {
             state: Arc::downgrade(&self.state),
             binding: Arc::downgrade(&self.binding),
+            deferred_producer_ops: Arc::downgrade(&self.deferred_producer_ops),
             registry: Arc::downgrade(&self.registry),
+            generation: self.generation,
         }
     }
 
@@ -1978,6 +1912,73 @@ impl Core {
     #[must_use]
     pub fn partition_of(&self, node: NodeId) -> Option<crate::subgraph::SubgraphId> {
         self.registry.lock().partition_of(node)
+    }
+
+    /// Push a deferred producer operation. Called by operator sinks
+    /// when a Core method returns `PartitionOrderViolation`.
+    ///
+    /// For `Emit` and `Error` variants, the caller MUST retain the
+    /// handle before pushing (the drain releases it after firing).
+    /// `Complete` and `Callback` variants have no handle to retain.
+    pub fn push_deferred_producer_op(&self, op: DeferredProducerOp) {
+        self.deferred_producer_ops.lock().push(op);
+    }
+
+    /// Drain deferred producer ops when no partitions are held on
+    /// the current thread. Each op may itself produce new deferred
+    /// ops (e.g., a deferred subscribe activates a producer whose
+    /// build defers further subscribes), so drain in a loop until
+    /// the queue is empty.
+    ///
+    /// Called from `try_subscribe` after its `wave_guard` drops,
+    /// and from `BatchGuard::drop` after releasing all wave_guards.
+    /// Skips silently if partitions are still held (nested context).
+    /// Maximum number of drain iterations before panicking with a
+    /// diagnostic. Prevents unbounded loops from buggy callbacks that
+    /// keep pushing more deferred ops indefinitely.
+    const MAX_DEFERRED_DRAIN_ITERATIONS: u32 = 1000;
+
+    pub(crate) fn drain_deferred_producer_ops(&self) {
+        if held_partitions::any_held() {
+            return;
+        }
+        let mut iterations = 0u32;
+        loop {
+            let deferred_ops: Vec<DeferredProducerOp> = {
+                let mut ops = self.deferred_producer_ops.lock();
+                if ops.is_empty() {
+                    break;
+                }
+                std::mem::take(&mut *ops)
+            };
+            iterations += 1;
+            assert!(
+                iterations <= Self::MAX_DEFERRED_DRAIN_ITERATIONS,
+                "drain_deferred_producer_ops exceeded {} iterations — \
+                 a deferred callback is likely pushing unbounded ops. \
+                 Iteration {iterations}, batch size {}.",
+                Self::MAX_DEFERRED_DRAIN_ITERATIONS,
+                deferred_ops.len(),
+            );
+            for op in deferred_ops {
+                match op {
+                    DeferredProducerOp::Emit { node_id, handle } => {
+                        self.emit(node_id, handle);
+                        self.binding.release_handle(handle);
+                    }
+                    DeferredProducerOp::Complete { node_id } => {
+                        self.complete(node_id);
+                    }
+                    DeferredProducerOp::Error { node_id, handle } => {
+                        self.error(node_id, handle);
+                        self.binding.release_handle(handle);
+                    }
+                    DeferredProducerOp::Callback(f) => {
+                        f();
+                    }
+                }
+            }
+        }
     }
 
     // Q3 (2026-05-09) introduced `Core::partition_box_of(node)` to
@@ -2010,7 +2011,10 @@ impl Core {
     /// `MAX_LOCK_RETRIES` — pathological union activity.
     ///
     /// Slice Y1 / Phase E (2026-05-08).
-    pub(crate) fn partition_wave_owner_lock_arc(&self, seed: NodeId) -> WaveOwnerGuard {
+    pub(crate) fn partition_wave_owner_lock_arc(
+        &self,
+        seed: NodeId,
+    ) -> Result<WaveOwnerGuard, PartitionOrderViolation> {
         /// Scope-guard for the H+ thread-local refcount entry. Released on
         /// Drop unless `into_consumed()` is called (the success path).
         /// Ensures balance even on panic between `check_and_acquire` and
@@ -2052,7 +2056,7 @@ impl Core {
             // retry-validate failure (Drop fires), retry-exhaustion panic
             // (Drop fires before unwind), or a panic in `lock_arc()` /
             // `lock_for_validate()` (Drop fires during unwind).
-            held_partitions::check_and_acquire(sid);
+            held_partitions::check_and_acquire(sid)?;
             let acquire_guard = AcquireGuard {
                 sid,
                 consumed: false,
@@ -2069,7 +2073,7 @@ impl Core {
                 // `SubgraphLockBox::state` to a per-thread thread-local,
                 // so the guard no longer carries the box reference.
                 drop(lock_box);
-                return WaveOwnerGuard { sid, inner };
+                return Ok(WaveOwnerGuard { sid, inner });
             }
             // Stale — drop the parking_lot guard. The AcquireGuard's
             // Drop releases the held_partitions refcount automatically.
@@ -2915,8 +2919,27 @@ impl Core {
     /// Activation (R2.2.3 step 5): if this is the first subscriber and the
     /// node is a derived/dynamic compute, recursively activate deps so their
     /// cached handles fill our `dep_handles`.
+    /// # Panics
+    ///
+    /// Panics if subscribing would violate the Phase H+ ascending
+    /// partition-order invariant (typed [`PartitionOrderViolation`]).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription {
+        match self.try_subscribe(node_id, sink) {
+            Ok(sub) => sub,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible subscribe. Returns `Err` on partition order violation
+    /// (Phase H+ STRICT, D115). Used by `subscribe` (unwraps) and
+    /// producer-pattern operator sinks (defers on Err).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn try_subscribe(
+        &self,
+        node_id: NodeId,
+        sink: Sink,
+    ) -> Result<Subscription, PartitionOrderViolation> {
         // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
         //
         // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
@@ -2950,7 +2973,7 @@ impl Core {
         // because dep edges are unioned). `partition_wave_owner_lock_arc`
         // does retry-validate against concurrent union/split.
         // `lock_arc()` is `!Send`; same-thread reentrant.
-        let _wave_guard = self.partition_wave_owner_lock_arc(node_id);
+        let wave_guard = self.partition_wave_owner_lock_arc(node_id)?;
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
@@ -3123,12 +3146,22 @@ impl Core {
             });
         }
 
-        Subscription {
+        // Phase H+ STRICT (D115): drop the wave_guard BEFORE draining
+        // deferred producer ops. The deferred ops may need to subscribe
+        // to sources in lower-numbered partitions — if wave_guard is
+        // still held, the ascending-order check would reject them.
+        drop(wave_guard);
+
+        // Drain deferred producer ops now that no partitions are held
+        // on this thread. The drain is a loop because each deferred op
+        // may itself produce new deferred ops.
+        self.drain_deferred_producer_ops();
+
+        Ok(Subscription {
             state: Arc::downgrade(&self.state),
             node_id,
             sub_id,
-        }
-        // _wave_guard drops here, releasing wave_owner.
+        })
     }
 
     /// Mark `node_id` as resubscribable per R2.2.7. Resubscribable nodes
@@ -3393,6 +3426,20 @@ impl Core {
     /// Panics if `node_id` is not a state node, or if `new_handle` is
     /// [`NO_HANDLE`] (per R1.2.4, sentinel is not a valid DATA payload).
     pub fn emit(&self, node_id: NodeId, new_handle: HandleId) {
+        match self.try_emit(node_id, new_handle) {
+            Ok(()) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible emit. Returns `Err` on partition order violation
+    /// (Phase H+ STRICT, D115). The public `emit` calls this and
+    /// unwraps; `emit_or_defer` calls this and defers on Err.
+    pub(crate) fn try_emit(
+        &self,
+        node_id: NodeId,
+        new_handle: HandleId,
+    ) -> Result<(), PartitionOrderViolation> {
         assert!(
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
@@ -3421,7 +3468,7 @@ impl Core {
                 // cache. Released lock-released so the binding can't
                 // deadlock against an internal binding mutex.
                 self.binding.release_handle(new_handle);
-                return;
+                return Ok(());
             }
         }
         // Run wave on `node_id`'s touched partitions. Slice Y1 / Phase E:
@@ -3429,9 +3476,23 @@ impl Core {
         // partition by construction (dep edges = union edges). Common case
         // is a single-partition acquire — disjoint-partition emits run
         // truly parallel under per-partition `wave_owner`.
-        self.run_wave_for(node_id, |this| {
+        self.try_run_wave_for(node_id, |this| {
             this.commit_emission(node_id, new_handle);
-        });
+        })?;
+        Ok(())
+    }
+
+    /// Emit or defer to wave-end on partition order violation.
+    /// For producer-pattern operator sinks. Retains `handle` on defer;
+    /// the drain releases it after firing (or on discard).
+    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
+        if self.try_emit(node_id, new_handle).is_err() {
+            self.binding.retain_handle(new_handle);
+            self.push_deferred_producer_op(DeferredProducerOp::Emit {
+                node_id,
+                handle: new_handle,
+            });
+        }
     }
 
     /// Read a node's current cache. Returns [`NO_HANDLE`] if sentinel.
@@ -3571,7 +3632,26 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn complete(&self, node_id: NodeId) {
-        self.emit_terminal(node_id, TerminalKind::Complete);
+        match self.try_complete(node_id) {
+            Ok(()) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible complete. Returns `Err` on partition order violation.
+    pub(crate) fn try_complete(&self, node_id: NodeId) -> Result<(), PartitionOrderViolation> {
+        self.try_emit_terminal(node_id, TerminalKind::Complete)
+    }
+
+    /// Complete or defer to wave-end on partition order violation.
+    /// For producer-pattern operator sinks.
+    pub fn complete_or_defer(&self, node_id: NodeId) {
+        match self.try_complete(node_id) {
+            Ok(()) => {}
+            Err(_) => {
+                self.push_deferred_producer_op(DeferredProducerOp::Complete { node_id });
+            }
+        }
     }
 
     /// Emit `[ERROR, error_handle]` (R1.3.4) on `node_id`. `error_handle`
@@ -3584,11 +3664,23 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown or `error_handle == NO_HANDLE`.
     pub fn error(&self, node_id: NodeId, error_handle: HandleId) {
+        match self.try_error(node_id, error_handle) {
+            Ok(()) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible error. Returns `Err` on partition order violation.
+    pub(crate) fn try_error(
+        &self,
+        node_id: NodeId,
+        error_handle: HandleId,
+    ) -> Result<(), PartitionOrderViolation> {
         assert!(
             error_handle != NO_HANDLE,
             "NO_HANDLE is not a valid ERROR payload (R1.2.5)"
         );
-        self.emit_terminal(node_id, TerminalKind::Error(error_handle));
+        self.try_emit_terminal(node_id, TerminalKind::Error(error_handle))?;
         // The caller's intern share for `error_handle` is NOT transferred
         // to any slot — `terminate_node` takes its OWN retain for every
         // populated `terminal` and `dep_terminals` slot. Release the
@@ -3596,9 +3688,27 @@ impl Core {
         // release on terminal). Without this, every `error()` call leaks
         // one binding-side handle ref. Slice A-bigger /qa item D fix.
         self.binding.release_handle(error_handle);
+        Ok(())
     }
 
-    fn emit_terminal(&self, node_id: NodeId, terminal: TerminalKind) {
+    /// Error or defer to wave-end on partition order violation.
+    /// For producer-pattern operator sinks. Retains `handle` on defer;
+    /// the drain releases it after firing (or on discard).
+    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
+        if self.try_error(node_id, error_handle).is_err() {
+            self.binding.retain_handle(error_handle);
+            self.push_deferred_producer_op(DeferredProducerOp::Error {
+                node_id,
+                handle: error_handle,
+            });
+        }
+    }
+
+    fn try_emit_terminal(
+        &self,
+        node_id: NodeId,
+        terminal: TerminalKind,
+    ) -> Result<(), PartitionOrderViolation> {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -3607,10 +3717,10 @@ impl Core {
         // COMPLETE / ERROR cascade follows `s.children` (in-partition by
         // union-find construction). The thunk acquires its own state lock
         // to queue the cascade.
-        self.run_wave_for(node_id, |this| {
+        self.try_run_wave_for(node_id, |this| {
             let mut s = this.lock_state();
             this.terminate_node(&mut s, node_id, terminal);
-        });
+        })
     }
 
     /// Set the node's terminal slot, queue the wire message, and cascade to
@@ -3807,6 +3917,29 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn teardown(&self, node_id: NodeId) {
+        match self.try_teardown(node_id) {
+            Ok(()) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Teardown or defer to wave-end on partition order violation.
+    /// For producer-pattern operator sinks.
+    pub fn teardown_or_defer(&self, node_id: NodeId) {
+        match self.try_teardown(node_id) {
+            Ok(()) => {}
+            Err(_) => {
+                self.push_deferred_producer_op(DeferredProducerOp::Callback(Box::new({
+                    let core = self.clone();
+                    move || {
+                        core.teardown(node_id);
+                    }
+                })));
+            }
+        }
+    }
+
+    fn try_teardown(&self, node_id: NodeId) -> Result<(), PartitionOrderViolation> {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -3818,11 +3951,11 @@ impl Core {
         // Phase E `compute_touched_partitions(node_id)` (called by
         // `run_wave_for`) walks both axes so the wave acquires every
         // partition reachable via the cascade.
-        self.run_wave_for(node_id, move |this| {
+        self.try_run_wave_for(node_id, move |this| {
             let mut s = this.lock_state();
             let collected = this.teardown_inner(&mut s, node_id);
             torn_down_for_wave.lock().extend(collected);
-        });
+        })?;
         // Fire NodeTornDown for every cascaded id (root + metas +
         // downstream consumers that auto-cascaded). Outside the state
         // lock, matching fire_topology_event discipline.
@@ -3830,6 +3963,7 @@ impl Core {
         for id in ids {
             self.fire_topology_event(&crate::topology::TopologyEvent::NodeTornDown(id));
         }
+        Ok(())
     }
 
     /// Iterative teardown walk (Slice A-bigger, M1-close).
@@ -3995,6 +4129,31 @@ impl Core {
             let mut s = this.lock_state();
             this.invalidate_inner(&mut s, node_id);
         });
+    }
+
+    /// Invalidate or defer to wave-end on partition order violation.
+    /// For producer-pattern operator sinks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_id` is not registered in this Core.
+    pub fn invalidate_or_defer(&self, node_id: NodeId) {
+        {
+            let s = self.lock_state();
+            assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
+        }
+        let result = self.try_run_wave_for(node_id, |this| {
+            let mut s = this.lock_state();
+            this.invalidate_inner(&mut s, node_id);
+        });
+        if result.is_err() {
+            self.push_deferred_producer_op(DeferredProducerOp::Callback(Box::new({
+                let core = self.clone();
+                move || {
+                    core.invalidate(node_id);
+                }
+            })));
+        }
     }
 
     /// Iterative invalidate cascade (Slice A-bigger, M1-close).

@@ -175,11 +175,11 @@ fn build_inner_sink(
         }
         for action in actions {
             match action {
-                Action::Emit(h) => core.emit(producer_id, h),
+                Action::Emit(h) => core.emit_or_defer(producer_id, h),
                 Action::Complete => on_inner_complete(),
                 Action::Error(h) => on_inner_error(h),
-                Action::Invalidate => core.invalidate(producer_id),
-                Action::Teardown => core.teardown(producer_id),
+                Action::Invalidate => core.invalidate_or_defer(producer_id),
+                Action::Teardown => core.teardown_or_defer(producer_id),
             }
         }
     })
@@ -353,30 +353,42 @@ pub fn switch_map(
                     on_complete,
                     on_error,
                 );
-                let inner_sub = core_for_outer.subscribe(inner_node, inner_sink);
-
-                // Install (or drop, if terminated mid-project / inner
-                // already completed and on_complete cleared the slot).
-                // Prior slot is empty (we cleared above). If the inner
-                // already self-completed during the handshake,
-                // on_complete left `inner_sub: None`. Either way,
-                // `replace` returns None and we install. Defensively
-                // preserve any unexpected leftover for lock-released drop.
-                let to_drop = {
-                    let mut s = state_for_outer.lock().unwrap();
-                    if s.terminated {
-                        Some(inner_sub)
-                    } else {
-                        s.inner_sub.replace(inner_sub)
-                    }
-                };
-                drop(to_drop);
+                // Phase H+ STRICT: try_subscribe + defer for inner source.
+                let inner_sink_for_defer = inner_sink.clone();
+                if let Ok(inner_sub) = core_for_outer.try_subscribe(inner_node, inner_sink) {
+                    let to_drop = {
+                        let mut s = state_for_outer.lock().unwrap();
+                        if s.terminated {
+                            Some(inner_sub)
+                        } else {
+                            s.inner_sub.replace(inner_sub)
+                        }
+                    };
+                    drop(to_drop);
+                } else {
+                    let core_cb = core_for_outer.clone();
+                    let state_cb = state_for_outer.clone();
+                    core_for_outer.push_deferred_producer_op(
+                        graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
+                            let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                            let to_drop = {
+                                let mut s = state_cb.lock().unwrap();
+                                if s.terminated {
+                                    Some(inner_sub)
+                                } else {
+                                    s.inner_sub.replace(inner_sub)
+                                }
+                            };
+                            drop(to_drop);
+                        })),
+                    );
+                }
             }
 
             if plan.self_complete {
-                core_for_outer.complete(producer_id);
+                core_for_outer.complete_or_defer(producer_id);
             } else if let Some(h) = plan.self_error {
-                core_for_outer.error(producer_id, h);
+                core_for_outer.error_or_defer(producer_id, h);
             }
         });
 
@@ -409,7 +421,7 @@ fn make_switch_on_complete(
         }
         drop(prev_inner);
         if should_complete {
-            core.complete(producer_id);
+            core.complete_or_defer(producer_id);
         }
     })
 }
@@ -430,7 +442,7 @@ fn make_switch_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        core.error(producer_id, h);
+        core.error_or_defer(producer_id, h);
     })
 }
 
@@ -581,22 +593,42 @@ pub fn exhaust_map(
                 // either way; in the synchronous-completion path,
                 // `inner_sub` was None so our just-subscribed (and
                 // already-dead) sub is dropped on the next iteration.
-                let inner_sub = core_for_outer.subscribe(inner_node, inner_sink);
-                let to_drop = {
-                    let mut s = state_for_outer.lock().unwrap();
-                    if s.terminated {
-                        Some(inner_sub)
-                    } else {
-                        s.inner_sub.replace(inner_sub)
-                    }
-                };
-                drop(to_drop);
+                // Phase H+ STRICT: try_subscribe + defer for inner source.
+                let inner_sink_for_defer = inner_sink.clone();
+                if let Ok(inner_sub) = core_for_outer.try_subscribe(inner_node, inner_sink) {
+                    let to_drop = {
+                        let mut s = state_for_outer.lock().unwrap();
+                        if s.terminated {
+                            Some(inner_sub)
+                        } else {
+                            s.inner_sub.replace(inner_sub)
+                        }
+                    };
+                    drop(to_drop);
+                } else {
+                    let core_cb = core_for_outer.clone();
+                    let state_cb = state_for_outer.clone();
+                    core_for_outer.push_deferred_producer_op(
+                        graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
+                            let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                            let to_drop = {
+                                let mut s = state_cb.lock().unwrap();
+                                if s.terminated {
+                                    Some(inner_sub)
+                                } else {
+                                    s.inner_sub.replace(inner_sub)
+                                }
+                            };
+                            drop(to_drop);
+                        })),
+                    );
+                }
             }
 
             if plan.self_complete {
-                core_for_outer.complete(producer_id);
+                core_for_outer.complete_or_defer(producer_id);
             } else if let Some(h) = plan.self_error {
-                core_for_outer.error(producer_id, h);
+                core_for_outer.error_or_defer(producer_id, h);
             }
         });
 
@@ -629,7 +661,7 @@ fn make_exhaust_on_complete(
         }
         drop(prev_inner);
         if should_complete {
-            core.complete(producer_id);
+            core.complete_or_defer(producer_id);
         }
     })
 }
@@ -650,7 +682,7 @@ fn make_exhaust_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        core.error(producer_id, h);
+        core.error_or_defer(producer_id, h);
     })
 }
 
@@ -825,11 +857,11 @@ pub fn merge_map_with_concurrency(
             }
 
             if let Some(h) = error_action {
-                core_for_outer.error(producer_id, h);
+                core_for_outer.error_or_defer(producer_id, h);
                 return;
             }
             if self_complete_now {
-                core_for_outer.complete(producer_id);
+                core_for_outer.complete_or_defer(producer_id);
                 return;
             }
 
@@ -906,7 +938,7 @@ fn drain_merge_buffer(
 
         if should_self_complete {
             MERGE_DRAIN_ACTIVE.with(|f| f.set(false));
-            core.complete(producer_id);
+            core.complete_or_defer(producer_id);
             return;
         }
 
@@ -938,21 +970,41 @@ fn drain_merge_buffer(
             on_complete,
             on_error,
         );
-        let inner_sub = core.subscribe(inner_node, inner_sink);
-
-        // Decide whether to install the sub: if `on_complete` fired
-        // synchronously inside `subscribe` (pre-completed inner), it
-        // already removed `inner_id` from `pending_inner_ids`.
-        let to_drop = {
-            let mut s = state.lock().unwrap();
-            if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
-                Some(inner_sub)
-            } else {
-                s.inner_subs.insert(inner_id, inner_sub);
-                None
-            }
-        };
-        drop(to_drop);
+        // Phase H+ STRICT: try_subscribe + defer for inner source.
+        let inner_sink_for_defer = inner_sink.clone();
+        if let Ok(inner_sub) = core.try_subscribe(inner_node, inner_sink) {
+            // Decide whether to install the sub: if `on_complete` fired
+            // synchronously inside `subscribe` (pre-completed inner), it
+            // already removed `inner_id` from `pending_inner_ids`.
+            let to_drop = {
+                let mut s = state.lock().unwrap();
+                if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
+                    Some(inner_sub)
+                } else {
+                    s.inner_subs.insert(inner_id, inner_sub);
+                    None
+                }
+            };
+            drop(to_drop);
+        } else {
+            let core_cb = core.clone();
+            let state_cb = state.clone();
+            core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
+                Box::new(move || {
+                    let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                    let to_drop = {
+                        let mut s = state_cb.lock().unwrap();
+                        if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
+                            Some(inner_sub)
+                        } else {
+                            s.inner_subs.insert(inner_id, inner_sub);
+                            None
+                        }
+                    };
+                    drop(to_drop);
+                }),
+            ));
+        }
 
         // Loop continues — pops next from buffer or returns.
     }
@@ -1032,7 +1084,7 @@ fn make_merge_on_error(
         for h_b in buffered_to_release {
             binding.release_handle(h_b);
         }
-        core.error(producer_id, h);
+        core.error_or_defer(producer_id, h);
     })
 }
 

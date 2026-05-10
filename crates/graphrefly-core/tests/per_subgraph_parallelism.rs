@@ -440,6 +440,216 @@ mod std_thread_tests {
         assert_ne!(cache_b2, graphrefly_core::HandleId::new(0));
     }
 
+    // =================================================================
+    // Phase H+ STRICT deferred-producer-op regression tests (D115)
+    // =================================================================
+    //
+    // These tests pin the defer-and-succeed behavior that replaced the
+    // `IN_PRODUCER_BUILD` carve-out. Producer-pattern operators that
+    // hit a partition-order violation now defer to wave-end instead of
+    // bypassing the check.
+
+    #[test]
+    fn producer_cross_partition_emit_defers_and_succeeds() {
+        // A producer-pattern node subscribes to `a` (higher-id partition)
+        // and on receiving DATA, calls `emit_or_defer` on `b` (lower-id
+        // partition). Under Phase H+ STRICT this defers (not panics) and
+        // eventually delivers the emission to downstream subscribers of b.
+        let rt = TestRuntime::new();
+        let s_b = rt.state(Some(TestValue::Int(0)));
+        let s_a = rt.state(None);
+
+        // Confirm partition ordering: s_a's derived will have a HIGHER
+        // partition id than s_b's standalone partition (s_b was registered
+        // first → lower id).
+        let p_b = rt.core.partition_of(s_b.id).expect("registered");
+        let p_a = rt.core.partition_of(s_a.id).expect("registered");
+        assert!(
+            p_a.raw() > p_b.raw(),
+            "fixture invariant: partition(s_a) must be > partition(s_b) \
+             for the cross-partition emit to trigger descending-order deferral. \
+             Got p_a={p_a:?}, p_b={p_b:?}"
+        );
+
+        // The "producer sink" pattern: a derived node that, during its fn
+        // callback (holding partition(s_a)), calls emit_or_defer on s_b
+        // (lower partition). This simulates what a producer-pattern operator
+        // sink does when it forwards data.
+        let core_for_fn = rt.core.clone();
+        let binding_for_fn = rt.binding.clone();
+        let s_b_id = s_b.id;
+        let d_producer = rt.derived(&[s_a.id], move |deps| {
+            if let TestValue::Int(n) = deps[0] {
+                let h = binding_for_fn.intern(TestValue::Int(n * 100));
+                // This would have panicked pre-D115 (or been suppressed
+                // by the IN_PRODUCER_BUILD carve-out). Now it defers.
+                core_for_fn.emit_or_defer(s_b_id, h);
+            }
+            Some(deps[0].clone())
+        });
+
+        // Subscribe to both the producer-derived and to s_b to observe
+        // the deferred emission landing.
+        let rec_d: Recorder = rt.subscribe_recorder(d_producer);
+        let rec_b: Recorder = rt.subscribe_recorder(s_b.id);
+
+        // Emit on s_a → fires d_producer's fn → emit_or_defer on s_b
+        // → deferred → drains at wave-end → s_b gets the value.
+        let h = rt.binding.intern(TestValue::Int(7));
+        rt.core.emit(s_a.id, h);
+
+        // d_producer should have received the value from s_a.
+        let d_data = rec_d.data_values();
+        assert!(
+            d_data.contains(&TestValue::Int(7)),
+            "d_producer should see s_a's emission; got: {d_data:?}"
+        );
+
+        // s_b should have received the deferred emission (7 * 100 = 700).
+        let b_data = rec_b.data_values();
+        assert!(
+            b_data.contains(&TestValue::Int(700)),
+            "s_b should receive the deferred emission (700); got: {b_data:?}"
+        );
+    }
+
+    #[test]
+    fn producer_cross_partition_subscribe_defers_and_succeeds() {
+        // A producer whose build closure (simulated via a derived fn)
+        // pushes a DeferredProducerOp::Callback that subscribes to a
+        // source in a LOWER-id partition than the producer's own. The
+        // subscription is deferred to wave-end and succeeds.
+        let rt = TestRuntime::new();
+        let s_low = rt.state(Some(TestValue::Int(42)));
+        let s_trigger = rt.state(None);
+
+        let p_low = rt.core.partition_of(s_low.id).expect("registered");
+        let p_trigger = rt.core.partition_of(s_trigger.id).expect("registered");
+        assert!(
+            p_trigger.raw() > p_low.raw(),
+            "fixture invariant: partition(s_trigger) > partition(s_low). \
+             Got p_trigger={p_trigger:?}, p_low={p_low:?}"
+        );
+
+        // We'll use a shared recorder that the deferred subscribe
+        // wires up. Once the deferred subscribe fires, data from s_low
+        // should reach this recorder.
+        let deferred_events: Arc<Mutex<Vec<TestValue>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_for_sub = deferred_events.clone();
+        let binding_for_sub = rt.binding.clone();
+
+        // The "producer build" pattern: a derived node that, during its fn,
+        // pushes a DeferredProducerOp::Callback to subscribe to s_low.
+        let core_for_fn = rt.core.clone();
+        let s_low_id = s_low.id;
+        let d_build = rt.derived(&[s_trigger.id], move |deps| {
+            if let TestValue::Int(_n) = deps[0] {
+                let events_c = events_for_sub.clone();
+                let binding_c = binding_for_sub.clone();
+                let core_c = core_for_fn.clone();
+                let sink: graphrefly_core::Sink =
+                    Arc::new(move |msgs: &[graphrefly_core::Message]| {
+                        for msg in msgs {
+                            if let graphrefly_core::Message::Data(h) = msg {
+                                let v = binding_c.deref(*h);
+                                events_c.lock().unwrap().push(v);
+                            }
+                        }
+                    });
+                // Push a deferred callback that subscribes to s_low.
+                // During this fn, partition(s_trigger) is held — subscribing
+                // to s_low (lower partition) would violate ascending order.
+                // The Callback variant runs at wave-end when no partitions
+                // are held.
+                let core_for_cb = core_c.clone();
+                core_c.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
+                    Box::new(move || {
+                        let sub = core_for_cb.subscribe(s_low_id, sink);
+                        // Keep the subscription alive without dropping it —
+                        // ManuallyDrop prevents unsubscribe while avoiding
+                        // the unsound `mem::forget` pattern.
+                        let _ = std::mem::ManuallyDrop::new(sub);
+                    }),
+                ));
+            }
+            Some(deps[0].clone())
+        });
+
+        let _rec_d: Recorder = rt.subscribe_recorder(d_build);
+
+        // Trigger the build: emit on s_trigger fires d_build's fn
+        // which pushes the deferred subscribe callback.
+        let h = rt.binding.intern(TestValue::Int(1));
+        rt.core.emit(s_trigger.id, h);
+
+        // After the wave drains, the deferred callback ran and
+        // subscribed to s_low. s_low has cache = 42, so the handshake
+        // should have delivered Data(42) to our deferred_events.
+        let events = deferred_events.lock().unwrap();
+        assert!(
+            events.contains(&TestValue::Int(42)),
+            "deferred subscribe should receive s_low's cached value (42); \
+             got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_emit_ordering_preserved() {
+        // A producer-pattern node defers multiple emissions in sequence
+        // (h1, h2, h3). All three must be delivered in FIFO order when
+        // the deferred queue drains.
+        let rt = TestRuntime::new();
+        let s_target = rt.state(Some(TestValue::Int(0)));
+        let s_source = rt.state(None);
+
+        let p_target = rt.core.partition_of(s_target.id).expect("registered");
+        let p_source = rt.core.partition_of(s_source.id).expect("registered");
+        assert!(
+            p_source.raw() > p_target.raw(),
+            "fixture invariant: partition(s_source) > partition(s_target). \
+             Got p_source={p_source:?}, p_target={p_target:?}"
+        );
+
+        let core_for_fn = rt.core.clone();
+        let binding_for_fn = rt.binding.clone();
+        let s_target_id = s_target.id;
+        let d_multi = rt.derived(&[s_source.id], move |deps| {
+            if let TestValue::Int(_n) = deps[0] {
+                // Defer 3 emissions in sequence on s_target (lower partition).
+                for i in 1..=3i64 {
+                    let h = binding_for_fn.intern(TestValue::Int(i * 10));
+                    core_for_fn.emit_or_defer(s_target_id, h);
+                }
+            }
+            Some(deps[0].clone())
+        });
+
+        let _rec_d: Recorder = rt.subscribe_recorder(d_multi);
+        let rec_target: Recorder = rt.subscribe_recorder(s_target.id);
+
+        // Trigger: emit on s_source fires d_multi's fn which defers 3
+        // emissions on s_target.
+        let h = rt.binding.intern(TestValue::Int(1));
+        rt.core.emit(s_source.id, h);
+
+        // All three deferred emissions should have landed on s_target
+        // in order: 10, 20, 30.
+        let target_data = rec_target.data_values();
+        // Filter out the initial cache push (0) from subscribe handshake.
+        let deferred_values: Vec<i64> = target_data
+            .iter()
+            .filter_map(|v| match v {
+                TestValue::Int(n) if *n > 0 => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deferred_values,
+            vec![10, 20, 30],
+            "deferred emissions must arrive in FIFO order; got: {deferred_values:?}"
+        );
+    }
+
     #[test]
     fn user_fn_cross_partition_emit_during_fire_panics_with_h_plus_diagnostic() {
         // Phase H+ option (d) /qa N1(a) widened variant —
@@ -468,14 +678,12 @@ mod std_thread_tests {
         // upfront and the inner emit is re-entrant (no panic).
         //
         // **POST-PANIC ASSERTIONS (per /qa A3/A10):** verify the H+
-        // thread-locals (`HELD`, `IN_PRODUCER_BUILD`) are CLEAN after
-        // the panic unwinds. Cargo's default test runner reuses
-        // threads — a leak in either thread-local would corrupt
-        // subsequent tests on the same thread (spurious H+ panics, or
-        // false-negative skipped checks). The scope-guard pattern in
-        // `partition_wave_owner_lock_arc` (per /qa A1) is what makes
-        // this safe; this assertion is the regression test for that
-        // guard.
+        // thread-local `HELD` is CLEAN after the panic unwinds. Cargo's
+        // default test runner reuses threads — a leak would corrupt
+        // subsequent tests on the same thread (spurious H+ panics).
+        // The scope-guard pattern in `partition_wave_owner_lock_arc`
+        // (per /qa A1) is what makes this safe; this assertion is the
+        // regression test for that guard.
         //
         // **NOTE**: this test asserts the impl REJECTS the unsafe
         // pattern. If the broader fix lands (option (b) defer-acquire-
@@ -573,12 +781,249 @@ mod std_thread_tests {
              must release the refcount on every exit path including \
              panic unwinds; a non-empty held set here means a leak."
         );
-        let in_pb = graphrefly_core::in_producer_build_for_tests();
-        assert_eq!(
-            in_pb, 0,
-            "Phase H+ thread-local `IN_PRODUCER_BUILD` is dirty \
-             post-panic: refcount={in_pb}. `FiringGuard::Drop` must \
-             pair every `producer_build_enter()` with a `producer_build_exit()`."
+    }
+
+    // -------------------------------------------------------------------
+    // Finding 10 (HIGH): panic-path handle discard
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn panic_in_derived_discards_deferred_handles_without_leaking() {
+        // A derived fn defers an emit via `emit_or_defer`, then panics.
+        // BatchGuard::drop's panic-discard path must release the deferred
+        // handle (not fire it) and leave the held_partitions thread-local
+        // clean.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = TestRuntime::new();
+            let s_target = rt.state(Some(TestValue::Int(0)));
+            let s_trigger = rt.state(None);
+
+            let p_target = rt.core.partition_of(s_target.id).expect("registered");
+            let p_trigger = rt.core.partition_of(s_trigger.id).expect("registered");
+            assert!(
+                p_trigger.raw() > p_target.raw(),
+                "fixture invariant: partition(s_trigger) > partition(s_target). \
+                 Got p_trigger={p_trigger:?}, p_target={p_target:?}"
+            );
+
+            let core_for_fn = rt.core.clone();
+            let binding_for_fn = rt.binding.clone();
+            let s_target_id = s_target.id;
+            let _d = rt.derived(&[s_trigger.id], move |deps| {
+                if let TestValue::Int(_n) = deps[0] {
+                    // Defer an emit on s_target (lower partition).
+                    let h = binding_for_fn.intern(TestValue::Int(999));
+                    core_for_fn.emit_or_defer(s_target_id, h);
+                    // Now panic — the deferred emit handle must be released
+                    // without firing during BatchGuard's panic-discard.
+                    panic!("intentional panic for discard test");
+                }
+                Some(deps[0].clone())
+            });
+
+            let _rec = rt.subscribe_recorder(_d);
+
+            // Trigger: this will fire d's fn which defers then panics.
+            let h = rt.binding.intern(TestValue::Int(1));
+            rt.core.emit(s_trigger.id, h);
+        }));
+
+        // The panic from the derived fn should propagate.
+        assert!(
+            result.is_err(),
+            "expected panic from derived fn, but closure completed normally"
+        );
+
+        // Post-panic: held_partitions must be clean (no leaked partition
+        // refcounts). Cargo reuses threads — a leak would corrupt the
+        // next test on this thread.
+        let held = graphrefly_core::held_snapshot_for_tests();
+        assert!(
+            held.is_empty(),
+            "held_partitions dirty after panic-discard: {held:?}"
+        );
+
+        // The deferred handle (value 999) was released without firing.
+        // s_target's cache should still be the initial value (0), not 999.
+        // We can't inspect s_target after catch_unwind (rt was dropped
+        // inside), so the held_partitions check + no-panic on this thread
+        // is the primary assertion. The handle release is exercised by
+        // BatchGuard::drop's explicit release_handle loop on discarded ops.
+    }
+
+    // -------------------------------------------------------------------
+    // Finding 11 (MEDIUM): nested/chained deferred ops
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn chained_deferred_ops_drain_multi_iteration() {
+        // When processing one deferred op queues another, the drain loop
+        // must iterate more than once to process all of them. This test
+        // sets up a chain: deferred callback A pushes deferred emit B.
+        let rt = TestRuntime::new();
+        let s_target = rt.state(Some(TestValue::Int(0)));
+        let s_trigger = rt.state(None);
+
+        let p_target = rt.core.partition_of(s_target.id).expect("registered");
+        let p_trigger = rt.core.partition_of(s_trigger.id).expect("registered");
+        assert!(
+            p_trigger.raw() > p_target.raw(),
+            "fixture invariant: partition(s_trigger) > partition(s_target)"
+        );
+
+        let core_for_fn = rt.core.clone();
+        let binding_for_fn = rt.binding.clone();
+        let s_target_id = s_target.id;
+        let d = rt.derived(&[s_trigger.id], move |deps| {
+            if let TestValue::Int(_n) = deps[0] {
+                // Push a Callback that itself pushes a deferred Emit.
+                // This exercises the multi-iteration drain loop.
+                let core_cb = core_for_fn.clone();
+                let binding_cb = binding_for_fn.clone();
+                core_for_fn.push_deferred_producer_op(
+                    graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
+                        // This callback runs during drain iteration 1.
+                        // It pushes a new deferred emit — which must be
+                        // picked up in drain iteration 2.
+                        let h = binding_cb.intern(TestValue::Int(777));
+                        core_cb.emit_or_defer(s_target_id, h);
+                    })),
+                );
+            }
+            Some(deps[0].clone())
+        });
+
+        let _rec_d = rt.subscribe_recorder(d);
+        let rec_target = rt.subscribe_recorder(s_target.id);
+
+        // Trigger the chain.
+        let h = rt.binding.intern(TestValue::Int(1));
+        rt.core.emit(s_trigger.id, h);
+
+        // The chained deferred emit (777) should have landed on s_target.
+        let target_data = rec_target.data_values();
+        assert!(
+            target_data.contains(&TestValue::Int(777)),
+            "chained deferred op (emit 777 from callback) should drain; \
+             got target data: {target_data:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Finding 12 (MEDIUM): drain from try_subscribe path
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn subscribe_triggered_drain_of_deferred_ops() {
+        // The try_subscribe path has its own drain call site (after
+        // dropping wave_guard). This test exercises it by having a
+        // derived node whose subscribe-time activation pushes a deferred
+        // op, which is then drained by the subscribe path (not batch).
+        let rt = TestRuntime::new();
+        let s_low = rt.state(Some(TestValue::Int(100)));
+        let s_trigger = rt.state(Some(TestValue::Int(0)));
+
+        let p_low = rt.core.partition_of(s_low.id).expect("registered");
+        let p_trigger = rt.core.partition_of(s_trigger.id).expect("registered");
+        assert!(
+            p_trigger.raw() > p_low.raw(),
+            "fixture invariant: partition(s_trigger) > partition(s_low)"
+        );
+
+        let core_for_fn = rt.core.clone();
+        let binding_for_fn = rt.binding.clone();
+        let s_low_id = s_low.id;
+        // d depends on s_trigger. When d activates (via subscribe), it
+        // fires its fn which pushes a deferred emit on s_low.
+        let d = rt.derived(&[s_trigger.id], move |deps| {
+            if let TestValue::Int(n) = deps[0] {
+                // Defer an emit on s_low (lower partition).
+                let h = binding_for_fn.intern(TestValue::Int(n + 500));
+                core_for_fn.emit_or_defer(s_low_id, h);
+            }
+            Some(deps[0].clone())
+        });
+
+        let rec_low = rt.subscribe_recorder(s_low.id);
+
+        // Subscribe to d — this is the subscribe path (not batch).
+        // d's fn fires during subscribe activation, pushes a deferred
+        // emit on s_low. The subscribe path's drain_deferred_producer_ops
+        // should fire it.
+        let _rec_d = rt.subscribe_recorder(d);
+
+        // The deferred emit (0 + 500 = 500) should have landed on s_low.
+        let low_data = rec_low.data_values();
+        assert!(
+            low_data.contains(&TestValue::Int(500)),
+            "subscribe-path drain should fire deferred emit (500); \
+             got s_low data: {low_data:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Finding 13 (LOW): mixed deferred op types FIFO order
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mixed_deferred_op_types_preserve_fifo_order() {
+        // Verifies FIFO ordering across mixed deferred op types:
+        // emit, then complete. The emit must land before the complete.
+        let rt = TestRuntime::new();
+        let s_target = rt.state(Some(TestValue::Int(0)));
+        let s_trigger = rt.state(None);
+
+        let p_target = rt.core.partition_of(s_target.id).expect("registered");
+        let p_trigger = rt.core.partition_of(s_trigger.id).expect("registered");
+        assert!(
+            p_trigger.raw() > p_target.raw(),
+            "fixture invariant: partition(s_trigger) > partition(s_target)"
+        );
+
+        let core_for_fn = rt.core.clone();
+        let binding_for_fn = rt.binding.clone();
+        let s_target_id = s_target.id;
+        let d = rt.derived(&[s_trigger.id], move |deps| {
+            if let TestValue::Int(_n) = deps[0] {
+                // Defer an emit followed by a complete on s_target.
+                // FIFO order: emit must fire before complete.
+                let h = binding_for_fn.intern(TestValue::Int(42));
+                core_for_fn.emit_or_defer(s_target_id, h);
+                core_for_fn.complete_or_defer(s_target_id);
+            }
+            Some(deps[0].clone())
+        });
+
+        let _rec_d = rt.subscribe_recorder(d);
+        let rec_target = rt.subscribe_recorder(s_target.id);
+
+        // Trigger: fires d's fn which defers emit + complete on s_target.
+        let h = rt.binding.intern(TestValue::Int(1));
+        rt.core.emit(s_trigger.id, h);
+
+        // Verify: s_target received Data(42) THEN Complete, in that order.
+        let events = rec_target.snapshot();
+        let data_idx = events
+            .iter()
+            .position(|e| matches!(e, super::common::RecordedEvent::Data(TestValue::Int(42))));
+        let complete_idx = events
+            .iter()
+            .position(|e| matches!(e, super::common::RecordedEvent::Complete));
+
+        assert!(
+            data_idx.is_some(),
+            "s_target should receive Data(42) from deferred emit; events: {events:?}"
+        );
+        assert!(
+            complete_idx.is_some(),
+            "s_target should receive Complete from deferred complete; events: {events:?}"
+        );
+        assert!(
+            data_idx.unwrap() < complete_idx.unwrap(),
+            "FIFO order violation: Data(42) at index {:?} should precede \
+             Complete at index {:?}; events: {events:?}",
+            data_idx,
+            complete_idx
         );
     }
 }

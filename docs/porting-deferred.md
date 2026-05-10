@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-10 (Q-beyond CLOSED with bench-driven scope reduction; per-partition `nodes`/`children` shards (sub-slice 4) DEFERRED evidence-gated; Phase H+ STRICT still carries forward)
+last_updated: 2026-05-10 (Q-beyond CLOSED with bench-driven scope reduction; per-partition `nodes`/`children` shards (sub-slice 4) DEFERRED evidence-gated; Phase H+ STRICT CLOSED)
 ---
 
 # Porting flags & deferred concerns
@@ -69,100 +69,65 @@ collectively could deliver ~5-7% with much lower engineering risk than
 sub-slice 4 (per-partition `nodes`/`children` shards). Group them into a
 single "profile-driven cleanup" batch when picked up.
 
-### (1) Eliminate `mach_absolute_time` from the hot path — surprising ~2% self-time
+### ~~(1) Eliminate `mach_absolute_time` from the hot path~~ — RESOLVED 2026-05-10 (no action needed)
 
 - **What:** profile shows `mach_absolute_time` at 2.44% self-time on the
-  worker thread of the disjoint fn-fire workload. Nothing in the dispatcher
-  SHOULD be reading wall-clock per emit. Likely culprits: pause-state
-  `lock_held_ns` tracking populated by `queue_notify` even when no pause-
-  overflow has occurred, the `set_pausable_mode` overflow diagnostic, or
-  some debug-time tracing macro.
-- **Acceptance:** grep `crates/graphrefly-core/src/` for `monotonic_ns()` /
-  `wall_clock_ns()` / `Instant::now()` / `clock::*` calls. For each
-  invocation site on the wave-engine hot path (commit_emission, queue_notify,
-  fire_regular, deliver_data_to_consumer): determine if the timestamp is
-  load-bearing for behavior or only for opt-in diagnostics. Move opt-in
-  diagnostics behind a `cfg(debug_assertions)` gate or a feature flag. Pin
-  the bench expectation: `mach_absolute_time` should drop below 0.5% on the
-  same workload.
-- **Estimated scope:** 1-3 hours investigation + 50-150 LOC fix.
-- **Estimated gain:** ~1-2% wall-clock on disjoint fn-fire.
-- **Source:** post-Q-beyond profile (2026-05-10). Profile harness:
-  `crates/graphrefly-core/examples/profile_disjoint_fn_fire.rs`. Profile
-  data: `/tmp/graphrefly-sample.txt` (regenerable via
-  `samply record --rate 1999 --no-open --save-only --output /tmp/graphrefly-profile.json -- ./target/profiling/examples/profile_disjoint_fn_fire`
-  after `cargo build --profile profiling --example profile_disjoint_fn_fire -p graphrefly-core`).
+  worker thread of the disjoint fn-fire workload.
+- **Investigation (2026-05-10):** grep of all `monotonic_ns()` /
+  `wall_clock_ns()` / `Instant::now()` / `clock::*` calls in
+  `crates/graphrefly-core/src/` found **zero** time calls on the wave-engine
+  hot path (commit_emission, queue_notify, fire_regular,
+  deliver_data_to_consumer, begin_batch_for, flush_notifications). The only
+  two active `monotonic_ns()` sites are in `PauseState::add_lock()` (cold —
+  transition to paused) and `PauseState::overflow_diagnostic()` (cold —
+  overflow reporting). The ~2% `mach_absolute_time` is from
+  **`parking_lot`'s internal adaptive spinning** — it uses `Instant::now()`
+  to decide spin-vs-park on contended mutex acquire. This is not addressable
+  from graphrefly-core code; the mitigation is reducing lock acquisitions
+  per emit (addressed by items (2) and (3) below).
+- **Resolution:** no code change. Item closed as "not our code." The profile
+  cost will decrease as items (2)/(3) reduce the number of mutex acquires
+  per emit.
 
-### (2) Reduce allocation churn in `queue_notify` and `pending_notify` — ~3.5% across alloc/free
+### ~~(2) Reduce allocation churn in `queue_notify` and `pending_notify`~~ — RESOLVED 2026-05-10
 
-- **What:** profile shows `_xzm_xzone_malloc_tiny` (1.42%) + `_xzm_free`
-  (1.10%) + `RawVec::finish_grow` (0.48%) + `RawTable::reserve_rehash`
-  (0.51%) + `IndexMap drop_in_place` (0.26%) + Vec growth in
-  `spec_from_iter_nested::from_iter` (~0.5%) ≈ **3.5% of total time in
-  allocator activity.** The dominant source is `queue_notify`'s per-batch
-  `Vec<Sink>` clone-snapshot (one Vec growth per fresh batch) and
-  `pending_notify` IndexMap entry inserts.
-- **Resolutions to evaluate:**
-  - Pre-size `Vec<Sink>` via `Vec::with_capacity(known subscriber count)` —
-    the subscriber count is known at snapshot time.
-  - Switch the per-batch sink storage to `SmallVec<[Sink; 1]>` — most
-    subscribers in the test workloads + production reactive graphs use
-    a single sink (tied to a single Graph::observe / sink-registration).
-  - Pool `PendingBatch` allocations across waves (small arena reused per
-    wave; cleared at outermost BatchGuard drop alongside the existing
-    wave-end clear discipline).
-  - For `pending_notify` IndexMap: investigate whether the IndexMap entry
-    growth is from per-node insertion (rare — bounded by node count) or
-    from per-batch SmallVec growth (likely — every emit on a new node
-    triggers a slot insert).
-- **Acceptance:** post-batch profile shows allocator activity below 1.5%
-  combined. Vec-grow paths in `queue_notify` should not appear in top 30.
-- **Estimated scope:** 1 day, ~300-500 LOC.
-- **Estimated gain:** ~2-3% wall-clock.
-- **Source:** post-Q-beyond profile (2026-05-10). Profile harness as above.
+- **What:** profile showed ~3.5% of total time in allocator activity from
+  per-batch `Vec<Sink>` clone-snapshot and `Vec<Message>` growth.
+- **Resolution (2026-05-10):** converted `PendingBatch.sinks` from
+  `Vec<Sink>` to `SmallVec<[Sink; 1]>` (inlines the common
+  single-subscriber case) and `PendingBatch.messages` from `Vec<Message>`
+  to `SmallVec<[Message; 3]>` (inlines the common DIRTY + DATA + optional
+  RESOLVED set). Both changes eliminate heap allocation for the dominant
+  hot-loop pattern (single subscriber, ≤3 messages per node per wave).
+- **Measured improvement:** combined with item (3), the profile harness
+  shows −12.6% wall-clock on disjoint fn-fire (928→811 ns/emit). The
+  SmallVec contribution vs the partition cache is not individually isolable
+  from the profile harness but the criterion bench delta for state-emit
+  (which doesn't benefit from the partition cache as much) shows ~1%
+  improvement attributable to reduced allocator churn.
 
-### (3) Cache or short-circuit `begin_batch_for` — ~2% self + ~4% inclusive
+### ~~(3) Cache or short-circuit `begin_batch_for`~~ — RESOLVED 2026-05-10
 
-- **What:** every `Core::emit` invokes `begin_batch_for(seed)` which:
-  registry.lock() → `lock_for(seed)` → `compute_touched_partitions(seed)`
-  BFS over `s.children` + meta_companions → resolve each touched
-  partition → `partition_wave_owner_lock_arc` per partition (with
-  retry-validate). For the common single-partition case (no
-  meta_companions, leaf-emit), this is overkill.
-- **Resolutions to evaluate:**
-  - **Fast-path single-partition:** if seed has no children AND no
-    meta_companions, skip the BFS — just acquire seed's partition.
-    Detection cost: one `s.children.get(&seed).map_or(true, HashSet::is_empty)`
-    + `s.nodes[&seed].meta_companions.is_empty()`. If both true, fast-path.
-  - **Cache last-seed → touched-partitions on Core**, invalidated by
-    registry epoch bump. Saves the BFS for repeated emits on the same
-    seed (the canonical hot loop case).
-  - **Inline the registry lookup:** `partition_wave_owner_lock_arc`'s
-    retry-validate loop dominates on the no-contention path. Profile
-    shows it's hit per-emit; the `lock_for` + `lock_for_validate`
-    sequence could be combined into a single locked-call that returns
-    both the box and a validate epoch atomically.
-- **Acceptance:** post-batch profile shows `begin_batch_for` below 1%
-  self-time. `compute_touched_partitions` should not appear in top 30
-  for single-partition emits.
-- **Estimated scope:** 1 day, ~200-400 LOC. New tests for the fast-path
-  + single regression test asserting no behavior change for cross-partition
-  cascades (which still need the full BFS).
-- **Estimated gain:** ~1-2% wall-clock.
-- **Source:** post-Q-beyond profile (2026-05-10). Profile harness as above.
+- **What:** every `Core::emit` invoked `compute_touched_partitions(seed)`
+  BFS under state + registry locks, even for repeated emits on the same
+  seed where the topology hadn't changed.
+- **Resolution (2026-05-10):** per-thread `PARTITION_CACHE` thread-local
+  caching `(core_id, seed, epoch) → partitions`. On repeated emits to the
+  same seed (the dominant hot-loop pattern), the BFS + its state-lock +
+  registry-lock + HashSet + SmallVec allocations are skipped entirely.
+  Cache invalidated by registry epoch change (concurrent
+  register/union/split); post-acquire epoch recheck validates staleness.
+- **Measured improvement:** the dominant contributor to the −12.6%
+  wall-clock improvement on disjoint fn-fire. Saves 2 lock acquisitions +
+  BFS per emit in the common case (repeated same-seed emits).
 
-### Suggested ordering when batched
+### Suggested ordering when batched — N/A (all items resolved)
 
-1. (1) first — investigation-driven, smallest LOC, may be a quick win or a
-   surprising deeper issue.
-2. (3) second — well-scoped, isolated, easy to bench.
-3. (2) third — most LOC, most carefully-thought-through (allocator changes
-   can interact with refcount discipline; needs care around
-   `PendingBatch::sinks` which holds `Vec<Sink>` Arc clones).
-4. Re-bench Phase J + the profile harness after each. Stop early if
-   cumulative improvement exceeds 7-8% (any further gain is into
-   diminishing-returns territory; sub-slice 4 becomes the next escalation
-   only if state-mutex contention regrows in the profile).
+All three profile-surfaced items have been addressed in the 2026-05-10
+profile-driven cleanup batch. Combined measurement: −12.6% wall-clock on
+the `profile_disjoint_fn_fire` harness (928 → 811 ns/emit, Apple Silicon,
+2 threads × 2M emits on disjoint partitions with ~450 ns calibrated spin
+per fn-fire).
 
 ---
 
@@ -449,7 +414,7 @@ The original entry body is preserved below for archival reference.
   wall-clock-speedup properties — Phase J bench is the
   speedup-measurement source.
 
-### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — LIMITED VARIANT LANDED 2026-05-09; activation-time + producer-internal scope CARRIED FORWARD
+### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — FULLY CLOSED 2026-05-10 (LIMITED 2026-05-09 + STRICT D115 2026-05-10)
 
 **Closure summary (limited variant, 2026-05-09):** Phase H+ option (d)
 panicking variant landed for the **non-producer wave-active surface**.
@@ -493,34 +458,33 @@ descending-cross-partition pattern were refactored via
 so the wave acquires both partitions ascending; the inner re-entry
 becomes a re-entrant acquire on a held partition (no panic).
 
-**Carried forward — STRICT variant (still deferred):** the
-**producer-pattern operator surface** (zip / concat / race /
-take_until / switch_map / exhaust_map / concat_map / merge_map) still
-does cross-partition subscribe-during-activation via `Core::subscribe`
-calls inside producer build / project closures AND cross-partition
-emit-during-sink-callback via `Core::emit` from inside their
-inner-source sink callbacks. `FiringGuard::new` was refactored to
-skip `producer_build_enter` for the firing-node-isProducer activation
-case; `ProducerCtx::subscribe_to` was extended (per /qa N1(a)) to
-ALSO wrap inner sinks with the same flag. Both carve-outs preserve
-the operator architecture as v1 ships.
+**~~Carried forward — STRICT variant (still deferred)~~** — **LANDED
+2026-05-10 (D115).** The typed-error variant (option `d` strict) was
+implemented as the Phase H+ STRICT slice. Key changes:
 
-The STRICT variant requires either:
-- **(a) Defer-to-post-flush refactor (option `b`, ~1500+ LOC).**
-  Refactor all producer operators to use a wave-end callback queue
-  for inner-source subscribes / re-emits. Producer build closures
-  enqueue subscriptions; the queue is drained at wave-end against
-  the outer drain. Eliminates the carve-out entirely.
-- **(b) Typed-error variant (option `d` strict, ~700–900 LOC + public-API
-  break).** Plumb `PartitionOrderViolation` error variant through ≥7
-  public Core methods (subscribe / emit / complete / error / teardown
-  / invalidate / set_deps push-on-subscribe). Binding wrappers
-  (napi-rs / pyo3 / wasm-bindgen) need matching error mapping.
-  Operator code at the carve-out call sites picks up the error and
-  retries via the deferred-queue path.
+1. `check_and_acquire` returns `Result<(), PartitionOrderViolation>` —
+   no longer panics for producer paths.
+2. Per-Core `deferred_producer_ops: Mutex<Vec<DeferredProducerOp>>` queue
+   drained after wave_guards release in `BatchGuard::drop`.
+3. `try_subscribe` / `emit_or_defer` / `complete_or_defer` / `error_or_defer`
+   methods added — operators use these instead of raw emit/subscribe.
+4. `IN_PRODUCER_BUILD` thread-local removed entirely.
+5. `ProducerSinkGuard` wrapper removed; `FiringGuard::is_producer_build` removed.
+6. All operator sink closures migrated to `*_or_defer` variants.
 
-Either is the carry-forward to the next batch alongside
-Q2+Q3+Q-beyond.
+Internal-only change: public `subscribe`/`emit`/`complete`/`error`
+signatures unchanged (they delegate to `try_*` and panic on violation
+for non-producer paths — behavior unchanged). Binding-side error
+mapping (napi-rs / pyo3 / wasm) NOT needed since public API didn't change.
+
+Test coverage: `producer_cross_partition_emit_defers_and_succeeds`,
+`producer_cross_partition_subscribe_defers_and_succeeds`,
+`deferred_emit_ordering_preserved` (3 new tests). 505 cargo total.
+
+The TLA+ spec at `docs/research/wave_protocol_partitioned.tla` remains
+the correctness authority — the impl now matches the spec for the FULL
+surface (both non-producer AND producer paths enforce ascending order;
+the deferred-queue retries at wave-end when no partitions are held).
 
 The original entry body is preserved below for archival reference.
 

@@ -61,24 +61,18 @@ pub use clock::{monotonic_ns, wall_clock_ns};
 pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
 pub use message::{Message, Messages};
 pub use node::{
-    Core, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration, OperatorOp, OperatorOpts,
-    PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError, SetPausableModeError,
-    Sink, Subscription, TerminalKind, UpError, WeakCore,
+    Core, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration,
+    OperatorOp, OperatorOpts, PartitionOrderViolation, PausableMode, PauseError, RegisterError,
+    ResumeReport, SetDepsError, SetPausableModeError, Sink, Subscription, TerminalKind, UpError,
+    WeakCore,
 };
 pub use subgraph::SubgraphId;
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};
 
-/// Phase H+ /qa N1(a) (2026-05-09): in-workspace re-exports for the
-/// `graphrefly-operators` crate. `ProducerCtx::subscribe_to` wraps
-/// producer-internal sinks with these to suppress the H+ check
-/// during sink callbacks (mirroring the FiringGuard activation-time
-/// carve-out). Not part of the v1 stable user API.
-pub use node::{producer_build_enter, producer_build_exit};
-
-/// Phase H+ /qa A3 (2026-05-09): test-only thread-local accessors
-/// for verifying the H+ check's bookkeeping stays clean across
-/// panic unwinds. Re-exported `pub` (gated by
+/// Phase H+ STRICT (D115): test-only thread-local accessors for
+/// verifying the H+ check's bookkeeping stays clean across panic
+/// unwinds. Re-exported `pub` (gated by
 /// `cfg(any(test, debug_assertions))`) so integration tests under
 /// `tests/` can call them. Not part of the v1 stable API.
 #[cfg(any(test, debug_assertions))]
-pub use node::{held_snapshot_for_tests, in_producer_build_for_tests};
+pub use node::held_snapshot_for_tests;

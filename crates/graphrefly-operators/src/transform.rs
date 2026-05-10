@@ -69,9 +69,13 @@ impl From<OperatorRegistration> for NodeId {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use graphrefly_operators::map;
-/// let mapped = map(&core, &binding, source, |h: HandleId| { /* deref + transform */ });
+/// ```no_run
+/// # use graphrefly_core::{Core, HandleId, NodeId};
+/// # use graphrefly_operators::{map, OperatorBinding};
+/// # use std::sync::Arc;
+/// # fn example(core: &Core, binding: &Arc<dyn OperatorBinding>, source: NodeId) {
+/// let mapped = map(core, binding, source, |h: HandleId| h);
+/// # }
 /// ```
 pub fn map<F>(
     core: &Core,
