@@ -153,26 +153,126 @@ impl PendingPerNode {
 pub(crate) struct FiringGuard {
     core: Core,
     node_id: NodeId,
+    /// Phase H+ option (d) /qa N1(a) widened variant (2026-05-09):
+    /// whether this guard participates in the per-thread
+    /// `IN_PRODUCER_BUILD` accounting. Producer-pattern operator
+    /// activations (`zip` / `concat` / `race` / `take_until` /
+    /// `switch_map` / `exhaust_map` / `concat_map` / `merge_map`
+    /// — all `is_producer()`) DO participate: they SUPPRESS the H+
+    /// check during their build/project closure because those
+    /// closures legitimately subscribe to upstream sources
+    /// cross-partition (operator-internal activation-time setup,
+    /// not user-fn re-entry). Refactoring those operators to defer
+    /// inner subscribes to wave-end is the broader Phase H+ STRICT
+    /// variant scope; the limited variant carves them out via this
+    /// flag. Derived / dynamic / state user-fn fires do NOT
+    /// participate — the H+ check applies to them under the
+    /// "held non-empty AND not in producer build" gate (see
+    /// `crate::node::held_partitions` module docstring).
+    ///
+    /// **INVARIANT:** the value is captured at `FiringGuard::new`
+    /// from `NodeRecord::is_producer()` for the firing node and
+    /// must NEVER be re-derived at `Drop` time. `is_producer` is
+    /// stable for a node's lifetime per the current registration
+    /// API (a node's kind cannot change once registered), but a
+    /// future contributor adding mutability MUST honor this snapshot
+    /// to keep the `producer_build_enter` / `producer_build_exit`
+    /// pair balanced. A debug_assert in Drop verifies the snapshot
+    /// still matches when assertions are enabled.
+    is_producer_build: bool,
 }
 
 impl FiringGuard {
     pub(crate) fn new(core: &Core, node_id: NodeId) -> Self {
-        core.lock_state().currently_firing.push(node_id);
-        Self {
+        // Detect node kind under the same lock used to push
+        // currently_firing. Producer-pattern nodes (build/project
+        // closures) suppress the H+ check; everything else
+        // (state / derived / dynamic / operators) is subject to it.
+        let is_producer = {
+            let mut s = core.lock_state();
+            s.currently_firing.push(node_id);
+            s.nodes
+                .get(&node_id)
+                .is_some_and(crate::node::NodeRecord::is_producer)
+        };
+        // Construct Self FIRST (capture the cached `is_producer_build`
+        // snapshot in the struct). Then call `producer_build_enter()`
+        // as a separate step. If a future contributor adds fallible
+        // / panicking code between Self construction and the enter
+        // call, the panic still leaves Self abandoned (no Drop runs
+        // because Self isn't bound to a name yet) and the
+        // `producer_build_enter` call hasn't been made — so no
+        // imbalance. This is the panic-safe ordering per /qa A4.
+        let guard = Self {
             core: core.clone(),
             node_id,
+            is_producer_build: is_producer,
+        };
+        if is_producer {
+            crate::node::producer_build_enter();
         }
+        guard
     }
 }
 
 impl Drop for FiringGuard {
     fn drop(&mut self) {
+        // INVARIANT (debug-asserted): `is_producer_build` must match
+        // the node's current `is_producer()` at Drop time. If a future
+        // refactor introduces post-construction node-kind mutation,
+        // this fails loudly under debug builds — the
+        // `producer_build_enter` / `producer_build_exit` pair would
+        // otherwise become unbalanced. Per /qa A5.
+        #[cfg(debug_assertions)]
+        {
+            let s = self.core.lock_state();
+            let now_producer = s
+                .nodes
+                .get(&self.node_id)
+                .is_some_and(crate::node::NodeRecord::is_producer);
+            // Allow node-removed-mid-fire (now `is_some_and(...)` is
+            // false) — that's a benign asymmetry (the producer flag
+            // was true at construction; node removed before drop).
+            // Real concern: a node that was non-producer at
+            // construction is now reported as producer (or vice versa
+            // for an existing node).
+            if s.nodes.contains_key(&self.node_id) {
+                debug_assert_eq!(
+                    self.is_producer_build,
+                    now_producer,
+                    "FiringGuard invariant violation: node {:?} was {} at \
+                     construction but is {} at Drop. The is_producer flag \
+                     must be stable for a node's lifetime; see FiringGuard \
+                     struct docstring.",
+                    self.node_id,
+                    if self.is_producer_build {
+                        "is_producer=true"
+                    } else {
+                        "is_producer=false"
+                    },
+                    if now_producer {
+                        "is_producer=true"
+                    } else {
+                        "is_producer=false"
+                    },
+                );
+            }
+            drop(s);
+        }
         let mut s = self.core.lock_state();
         if let Some(pos) = s.currently_firing.iter().rposition(|n| *n == self.node_id) {
             s.currently_firing.swap_remove(pos);
         }
         // else: already popped by an external rebalance — silent no-op
         // for Drop discipline (panic-in-Drop is poison).
+        drop(s);
+        // Phase H+ pair: decrement IN_PRODUCER_BUILD IFF we incremented
+        // in `new`. Done lock-released so the next thread waiting on
+        // the state lock can proceed without our cell access on its
+        // hot path.
+        if self.is_producer_build {
+            crate::node::producer_build_exit();
+        }
     }
 }
 

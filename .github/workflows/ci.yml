@@ -306,10 +306,13 @@ jobs:
               -o "$out" "$url"
             test -s "$out"
           }
-          # From graphrefly-ts (handle-protocol refinement + rewire harness).
+          # From graphrefly-ts (handle-protocol refinement + rewire harness
+          # + Phase I partitioned-protocol harness).
           for f in handle_protocol.tla handle_protocol_MC.tla handle_protocol_MC.cfg \
                    wave_protocol_rewire.tla wave_protocol_rewire_MC.tla \
-                   wave_protocol_rewire_MC.cfg; do
+                   wave_protocol_rewire_MC.cfg \
+                   wave_protocol_partitioned.tla wave_protocol_partitioned_MC.tla \
+                   wave_protocol_partitioned_MC.cfg; do
             fetch "$BASE_TS/$f" "/tmp/tla/$f"
           done
           # From graphrefly (spec repo) — base modules that the above EXTEND.
@@ -344,3 +347,20 @@ jobs:
           grep -q "Model checking completed" rewire.log
           ! grep -q "is violated" rewire.log
           ! grep -qi "^error:" rewire.log
+
+      - name: TLC — wave_protocol_partitioned_MC (Phase I — D3 closure)
+        # Per-partition wave_owner protocol verification (Slice Y1+Y2,
+        # 2026-05-09). Encodes Q6 invariants from
+        # `archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md`:
+        # cross-partition deadlock-freedom, ascending-`SubgraphId`
+        # acquisition ordering, `Subscription::Drop` cleanup cascade,
+        # union/split discipline, mid-wave reentrancy rejection.
+        working-directory: /tmp/tla
+        shell: bash -euo pipefail {0}
+        run: |
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
+            -tool -workers auto -config wave_protocol_partitioned_MC.cfg wave_protocol_partitioned_MC.tla \
+            | tee partitioned.log
+          grep -q "Model checking completed" partitioned.log
+          ! grep -q "is violated" partitioned.log
+          ! grep -qi "^error:" partitioned.log

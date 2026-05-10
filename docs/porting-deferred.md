@@ -119,7 +119,13 @@ inside one Rust wave (`parking_lot::ReentrantMutex` thread-affinity
 contract on `BatchGuard` doesn't span `spawn_blocking` boundaries).
 Cargo regression tests are the source of truth for the canonical case.
 
-### Cross-thread emit blocks until in-flight wave completes (D3 — UPDATED 2026-05-07)
+### ~~Cross-thread emit blocks until in-flight wave completes (D3)~~ — RESOLVED 2026-05-09 in Slice Y1+Y2 (Phases B–L)
+
+**Closure summary (2026-05-09):** the per-partition `wave_owner` substrate landed in Phase E, split-eager partition splitting in Phase F, criterion-bench validation in Phase J, comprehensive cross-partition tests in Phase H, TLA+ verification of all 5 Q6 invariants in Phase I (`docs/research/wave_protocol_partitioned.tla` + `_MC` — 133,611 states explored, 0 invariant violations), CLAUDE.md invariant 3 wording lifted to current state in Phase K, and this strikethrough lands in Phase L. **Result:** disjoint-partition fn-fire-heavy waves see 1.82× speedup at 2 threads (2.16× separation vs same-partition) per the Phase J calibrated bench. **Caveat:** tight-emit Regime A still serializes on the Core-global state mutex — wide-spectrum parallelism awaits the "Per-partition state-shard refactor (Q2 + Q3 + Q-beyond)" entry below. Decisions D089–D099 logged in `docs/rust-port-decisions.md`. Closing migration-status section: `Slice Y1+Y2 CLOSED (2026-05-08 → 2026-05-09)`.
+
+The original entry body is preserved below for archival reference.
+
+### Cross-thread emit blocks until in-flight wave completes (D3 — original entry, UPDATED 2026-05-07, RESOLVED 2026-05-09)
 
 - **What:** with the wave-owner re-entrant mutex (Slice A close /qa,
   M1), cross-thread `Core::emit` calls block at
@@ -335,49 +341,262 @@ Cargo regression tests are the source of truth for the canonical case.
   wall-clock-speedup properties — Phase J bench is the
   speedup-measurement source.
 
-### Producer-pattern cross-partition subscribe deadlock (Phase H+ scope)
+### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — LIMITED VARIANT LANDED 2026-05-09; activation-time + producer-internal scope CARRIED FORWARD
 
-- **What:** a Producer-pattern node `P` in partition X executes its
-  fn-fire (lock-released `invoke_fn`). The fn calls
-  `Core::subscribe(source, sink)` where `source ∈ Y` (a different
-  partition — subscribe doesn't add a dep edge, so partitions stay
-  disjoint). `Core::subscribe` calls
-  `partition_wave_owner_lock_arc(source)` — acquiring partition
-  Y's `wave_owner`. The calling thread A now holds X + Y.
-- **Risk:** classic AB/BA deadlock. If thread B is holding Y (via
-  its own `begin_batch_for`) and is waiting on X (legitimate
-  ascending-order acquisition of `{X, Y}` per Q7), then:
-  - thread A holds X + needs Y;
-  - thread B holds Y + needs X;
-  - cycle. Q7's "ascending SubgraphId" only protects when partitions
-    are acquired together upfront via `begin_batch_for`;
-    `subscribe`-from-`invoke_fn` bypasses it (single-partition
-    acquisition mid-fire of another partition).
-- **Why deferred:** the Producer pattern is uncommon in v1 use
-  (mostly higher-order operators that subscribe to upstream
-  sources). The legitimate workaround is to defer the
-  cross-partition subscribe to a post-flush callback (sink-time
-  re-subscribe), which several existing operators already do for
-  unrelated reasons. v1 ships with a documented hazard rather
-  than a structural fix.
-- **Lift:** Phase H acceptance includes a loom-checked TLA+ /
-  loom scenario for cross-partition subscribe-during-fire. The
-  fix when surfaced is structural — either (a) widen the wave's
-  `BatchGuard` to include subscribe-target partitions reachable
-  via the fn's binding-side captures (impossible without
-  prescience); (b) defer the subscribe's actual partition-Y
-  acquisition until post-flush (queue the subscription request,
-  apply at wave end); or (c) document that producer fns
-  subscribing to other partitions are unsafe under cross-thread
-  contention and require the user to schedule the subscribe
-  outside the wave.
+**Closure summary (limited variant, 2026-05-09):** Phase H+ option (d)
+panicking variant landed for the **non-producer wave-active surface**.
+The check fires when `held_partitions` is non-empty (this thread is
+inside an active wave that's already acquired ≥1 partition) AND
+`in_producer_build == 0` (we're not inside a producer-pattern operator's
+build/project closure or sink callback) AND the new partition id is
+`<= max-already-held`. Caught surfaces include:
+
+- **User-fn fire** — derived / dynamic / state `invoke_fn` re-entering
+  Core on a smaller-id partition mid-fire.
+- **Sink callbacks** — non-producer sinks (test recorders, application
+  observers) re-entering Core on a smaller-id partition while an outer
+  wave's wave_owner is held (closed by /qa N1(a) widening).
+- **Subscribe handshake / Subscription::Drop cleanup** — same shape:
+  any nested re-entry path goes through the same gate.
+
+Verified by `crates/graphrefly-core/tests/per_subgraph_parallelism.rs::user_fn_cross_partition_emit_during_fire_panics_with_h_plus_diagnostic`.
+The TLA+ spec at `docs/research/wave_protocol_partitioned.tla`
+verifies the safe protocol clean (207,305 states at MaxOps=7); the
+impl now matches the spec for the non-producer surface (modulo the
+producer-pattern carry-forward below).
+
+**Producer-pattern operator carve-out (intentional):** `ProducerCtx::subscribe_to`
+in `graphrefly-operators::producer` wraps every producer-internal
+sink with a `ProducerSinkGuard` that bumps `IN_PRODUCER_BUILD` for
+the duration of the sink call. This preserves the existing
+producer-pattern operator architecture (`zip` / `concat` / `race` /
+`take_until` / `switch_map` / `exhaust_map` / `concat_map` /
+`merge_map` all do cross-partition `Core::subscribe` + `Core::emit`
+from inside their inner-source sink callbacks) against the widened
+H+ gate. Refactoring the operators to defer their sink-time inner
+subscribes to wave-end is the broader Phase H+ STRICT variant scope
+(option `b` defer-to-post-flush, ~1500+ LOC) — see "STRICT variant"
+section below.
+
+Verified by `crates/graphrefly-core/tests/per_subgraph_parallelism.rs::user_fn_cross_partition_emit_during_fire_panics_with_h_plus_diagnostic`.
+The 3 existing `lock_released.rs` tests that exercised the
+descending-cross-partition pattern were refactored via
+`add_meta_companion` to declare cross-partition reachability upfront
+so the wave acquires both partitions ascending; the inner re-entry
+becomes a re-entrant acquire on a held partition (no panic).
+
+**Carried forward — STRICT variant (still deferred):** the
+**producer-pattern operator surface** (zip / concat / race /
+take_until / switch_map / exhaust_map / concat_map / merge_map) still
+does cross-partition subscribe-during-activation via `Core::subscribe`
+calls inside producer build / project closures AND cross-partition
+emit-during-sink-callback via `Core::emit` from inside their
+inner-source sink callbacks. `FiringGuard::new` was refactored to
+skip `producer_build_enter` for the firing-node-isProducer activation
+case; `ProducerCtx::subscribe_to` was extended (per /qa N1(a)) to
+ALSO wrap inner sinks with the same flag. Both carve-outs preserve
+the operator architecture as v1 ships.
+
+The STRICT variant requires either:
+- **(a) Defer-to-post-flush refactor (option `b`, ~1500+ LOC).**
+  Refactor all producer operators to use a wave-end callback queue
+  for inner-source subscribes / re-emits. Producer build closures
+  enqueue subscriptions; the queue is drained at wave-end against
+  the outer drain. Eliminates the carve-out entirely.
+- **(b) Typed-error variant (option `d` strict, ~700–900 LOC + public-API
+  break).** Plumb `PartitionOrderViolation` error variant through ≥7
+  public Core methods (subscribe / emit / complete / error / teardown
+  / invalidate / set_deps push-on-subscribe). Binding wrappers
+  (napi-rs / pyo3 / wasm-bindgen) need matching error mapping.
+  Operator code at the carve-out call sites picks up the error and
+  retries via the deferred-queue path.
+
+Either is the carry-forward to the next batch alongside
+Q2+Q3+Q-beyond.
+
+The original entry body is preserved below for archival reference.
+
+### Cross-partition acquire-during-fire deadlock (Phase H+) — original entry, bundled into next batch (2026-05-09; LIMITED VARIANT landed same day)
+
+- **What (generalized framing):** a thread holding partition `H`
+  (max-id `m`) initiates a NEW partition acquire (via any path that
+  eventually calls `partition_wave_owner_lock_arc`) targeting a
+  partition `r` with `r < m`. Q7 ascending-order is enforced WITHIN
+  a single `compute_touched_partitions`-driven batch acquire, but
+  NOT ACROSS successive `begin_batch_for` calls on the same thread.
+  The lower-id-after-higher-id acquire breaks ascending order
+  globally for that thread; under cross-thread contention, AB/BA
+  deadlock can form.
+- **Concrete trigger surfaces (each is a manifestation of the same
+  protocol gap):**
+  1. **Producer-pattern subscribe-during-fire (the original framing).**
+     A Producer-pattern node `P` in partition X executes its fn-fire
+     (lock-released `invoke_fn`). The fn calls `Core::subscribe(source, sink)`
+     where `source ∈ Y`. Subscribe acquires Y's `wave_owner` even
+     though X is already held; if `Y < X`, ascending order is broken.
+  2. **Lifecycle re-entry on a different partition mid-fire.** From
+     inside `invoke_fn` on a node in X, the user fn re-enters
+     `Core::complete` / `Core::error` / `Core::teardown` /
+     `Core::invalidate` on a node in Y. Each goes through
+     `run_wave_for(node)` → `begin_batch_for(node)` →
+     `partition_wave_owner_lock_arc`. Same protocol gap.
+  3. **`Subscription::Drop` from inside a fire** (Q5 scope item in
+     the session-doc) when the cleanup walks upstream into a partition
+     `< max-already-held`. Q5 acknowledged drop-cascade ascending-
+     acquisition; the gap appears when the drop happens INSIDE another
+     wave's fire (not just standalone drop).
+- **Risk:** classic AB/BA deadlock. Thread A holds X, attempts to
+  acquire Y (where Y < X). Concurrently thread B holds Y, attempts
+  to acquire X (legitimate batch acquire `{X, Y}` ascending). Cycle:
+  A waits on Y (held by B); B waits on X (held by A).
+- **Why deferred:** the Producer-pattern surface is uncommon in v1
+  use (mostly higher-order operators that subscribe to upstream
+  sources, and those tend to defer the subscribe to sink-time for
+  unrelated reasons). Lifecycle-during-fire is rare and already
+  flagged as a re-entrance hazard. The fix is structural and shouldn't
+  block D3 closure. v1 ships with a documented hazard rather than a
+  structural fix.
+- **TLA+ status (Phase I, 2026-05-09):**
+  [`docs/research/wave_protocol_partitioned.tla`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/research/wave_protocol_partitioned.tla)
+  REQUIRES the protective ascending-order guard on every acquire
+  (encoded as `\A r \in newTargets : \A h \in threadHolds[t] : r > h`
+  on `BeginBatchFor`, `BeginPending`, and
+  `BeginSubscriptionDropCleanup`) for `NoWaitForCycle` to verify.
+  When the guard is removed, the model checker produces the AB/BA
+  counterexample within 5 actions. **The verified spec describes
+  the SAFE protocol; the impl ships with the documented gap.**
+- **Lift options:** the fix when surfaced is structural — either
+  (a) widen the outer wave's `BatchGuard` to include all partitions
+  the fn might re-enter (impossible without prescience over user
+  binding closures); (b) defer the inner acquire to a post-flush
+  callback queue (apply nested `subscribe` / `complete` / `error` /
+  `teardown` at wave end against the outer drain); (c) document
+  that re-entering Core on a DIFFERENT partition from inside fire
+  is unsafe under cross-thread contention and require the user to
+  schedule the operation outside the wave; or (d) detect the
+  ascending-order violation at acquire time and reject with a
+  typed error (caller chooses sequencing). Option (b) is the
+  cleanest user-facing surface but adds wave-end queue machinery;
+  option (d) is the smallest-blast-radius fix and matches the
+  Q3=(a-strict) rejection precedent.
+- **LOC re-estimate (post-/qa, 2026-05-09):** the original "~200–500
+  LOC" estimate was scope-light. Realistic sizing per option:
+  - **Option (d) panicking variant (~300 LOC):** thread-local
+    `held_partitions: SmallVec<[SubgraphId; 4]>` (mirrors
+    `currently_firing`), check at every `partition_wave_owner_lock_arc`
+    site comparing new id against max held, panic on violation,
+    drop-side bookkeeping. No public-API change. Smallest
+    blast radius; UX trade-off is that the violation surfaces as a
+    panic rather than a typed error.
+  - **Option (d) typed-error variant (~700–900 LOC + public API
+    break):** same thread-local + check, but every public `Core`
+    method that may eventually call `partition_wave_owner_lock_arc`
+    grows a `PartitionOrderViolation` error variant
+    (subscribe / emit / complete / error / teardown / invalidate /
+    set_deps push-on-subscribe — ≥7 public methods, each with
+    binding-side and graph-layer call sites that need the new
+    error plumbed through). Public API break — all binding wrappers
+    (napi-rs / pyo3 / wasm-bindgen) need matching error mapping.
+  - **Option (b) defer-to-post-flush (~1500+ LOC):** wave-end
+    callback queue infrastructure shares machinery with parts of
+    Q-beyond's per-partition state-shard work; sequence H+ option (b)
+    AFTER Q-beyond if this option is chosen.
+  - **Option (c) document-only (~50 LOC):** rustdoc warnings on
+    every public method that calls `partition_wave_owner_lock_arc`
+    + a `Subscription::Drop` panic-on-mid-fire-cross-partition
+    debug-only check. Does NOT fix the hazard, just makes it
+    discoverable. Lowest cost, lowest safety.
+  - **Recommended path:** option (d) panicking variant first
+    (~300 LOC, gives concrete safety property at low cost); raise
+    to typed-error variant if user feedback requests it. Sequence
+    independently of Q2+Q3+Q-beyond — H+ panicking option (d) is
+    orthogonal to the state-shard layout and can land before or
+    after.
+- **Acceptance for the lift:** the `producer_subscribe_to_other_partition_during_fire_deadlock_hazard`
+  test in [`crates/graphrefly-core/tests/per_subgraph_parallelism.rs`](https://github.com/graphrefly/graphrefly-rs/blob/main/crates/graphrefly-core/tests/per_subgraph_parallelism.rs)
+  un-`#[ignore]`d with the body matching the chosen fix (b/c/d).
+  Plus loom-checked tests for each of the three trigger surfaces
+  above (subscribe / lifecycle re-entry / drop-during-fire).
 - **Source:** QA-finding #6 (Edge Case Hunter, 2026-05-09) on
-  Slice E + F + Phase J QA pass. Cross-references Q5 scope item
-  in [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
-  — Q5 was scoped for `Subscription::Drop` cross-partition
-  cleanup cascade (lock-released drop with per-upstream-partition
-  acquisition, no deadlock); the symmetric SUBSCRIBE-during-fire
-  case was not explicitly covered.
+  Slice E + F + Phase J QA pass. Generalized framing 2026-05-09 from
+  the Phase I TLA+ counterexample, which showed the deadlock arises
+  from same-thread successive-acquire ordering, not specifically
+  from the Producer pattern. Cross-references Q5 scope item in
+  [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
+  — Q5 covered standalone `Subscription::Drop` (lock-released
+  drop with per-upstream-partition acquisition, no deadlock); the
+  generalized "any acquire-during-fire on a different partition"
+  hazard was not explicitly covered.
+
+### Phase I TLA+ modeling gaps (D1–D5, surfaced 2026-05-09 /qa)
+
+The Phase I TLA+ harness (`docs/research/wave_protocol_partitioned*` in
+graphrefly-ts) verifies the safe-protocol cross-partition lock-acquisition
+properties under bounded model-checking. The /qa pass surfaced five
+modeling gaps that are NOT bugs in the spec or impl, but documented
+limitations of the abstraction. Each is a candidate for follow-up
+spec enrichment if a future investigation needs the missing coverage.
+
+- **D1 — `three_disjoint_partitions_emit_returns_concurrently_while_one_blocked`
+  doesn't pin "T2 and T3 hold their wave_owners simultaneously".** The
+  test verifies the negative property (T2/T3 don't block on T1's held
+  P_1 wave_owner) but does NOT pin the positive ("T2 and T3 can
+  hold their respective wave_owners at the same instant"). To pin
+  simultaneous-hold would require a multi-channel orchestration test
+  (~50+ LOC) where each thread signals "I'm inside the held window"
+  and the test verifies overlap. **Source:** Blind Hunter #4. **Why
+  deferred:** the test's primary property (per-partition lock
+  acquisition isn't blocked by held disjoint-partition lock) is
+  what the slice claims; simultaneous-hold is a stronger property
+  not strictly necessary for D3 closure.
+
+- **D2 — TLA+ `Union` / `Split` guard "no thread holds either
+  partition" is more restrictive than the real impl.** The real
+  `Core::set_deps` (`crates/graphrefly-core/src/node.rs:3954+`) only
+  rejects when a CURRENTLY-FIRING node would migrate; it does NOT
+  check whether some thread holds the partition's wave_owner. The
+  spec abstracts the retry-validate loop in `partition_wave_owner_lock_arc`
+  (registry-epoch-bump retry on lost race) by requiring no holds at
+  all when Union/Split fires. **Source:** Edge Case Hunter #6 + Blind
+  Hunter #7. **Lift:** add a separate `UnionDuringHeld` /
+  `SplitDuringHeld` action in the spec that triggers retry-validate
+  (epoch bump → drop guards → retry until epoch matches). Estimated
+  ~80 LOC of TLA+. Worth doing if a future bug in the retry-validate
+  path needs coverage.
+
+- **D3 — `ReleaseAll` precondition `currentlyFiring[t] = {}` doesn't
+  model panic-discard release.** `BatchGuard::drop` on a panicked
+  wave (`crates/graphrefly-core/src/batch.rs:2509`) discards
+  pending_fires and clears `in_tick` WITHOUT draining; the firing
+  stack may or may not be empty depending on where the panic
+  happened. Spec's `ReleaseAll` cannot fire when `currentlyFiring[t] # {}`,
+  so panic-discard mid-fire is not exercised. **Source:** Edge Case
+  Hunter #10. **Lift:** add `ReleasePanic(t)` action that releases
+  guards + clears `currentlyFiring[t]` atomically (modeling
+  panic-discard collapses all stack frames). ~30 LOC TLA+. Verify
+  `MidFireMigrationRejected` still holds across this action — if
+  not, the panic path needs a hard look.
+
+- **D4 — `BeginBatchFor` atomic-acquire abstraction doesn't model
+  partial-acquire-then-park.** The real `partition_wave_owner_lock_arc`
+  loop acquires partitions one-by-one in a sequence; if mid-loop
+  another thread mutates topology, the epoch-bump triggers retry. The
+  spec abstracts this as one atomic action. Edge cases under topology
+  churn during acquire (e.g., A acquires X, then between A's
+  `compute_touched_partitions` of X+Y and A's actual `lock_arc(Y)`,
+  B has unioned X-Y → A's snapshot is stale) are NOT directly
+  modeled. **Source:** Blind Hunter #8 + Edge Case Hunter (analysis
+  block). **Lift:** would require splitting `BeginBatchFor` into a
+  state-machine of partial-acquire steps; substantial ~150 LOC of
+  TLA+. Defer unless a real bug surfaces.
+
+- **D5 — `TouchedFrom` CHOOSE-based fixed-point produces opaque
+  counterexample traces.** Mathematically correct (least-set fixed
+  point) but if a future bug surfaces, the trace shows CHOOSE
+  selecting an opaque set. **Source:** Edge Case Hunter #8. **Lift:**
+  replace with recursive bounded-fuel operator (~30 LOC TLA+); only
+  prioritize if a future bug investigation actually needs to read
+  MC traces.
 
 ### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — next batch after D3 closure
 
@@ -440,19 +659,29 @@ Cargo regression tests are the source of truth for the canonical case.
   then Q-beyond per-site) with cargo test green at each boundary.
 
 - **Path-to-win:**
-  1. **D3 closes first** via Phase H + I + K + L (correctness
-     tests, TLA+ extension, CLAUDE.md update, closing docs +
-     git tag). The current shape ships as v1 with the documented
-     regime-dependent parallelism caveat.
-  2. **This batch is the planned follow-up** (post-1.0 if release
-     happens before; or Slice Z+ within the pre-1.0 sequencer).
-     User direction 2026-05-09: "put that Q2 + Q3 + Q-beyond
-     refactor as the next batch after H/I/K/L."
+  1. **D3 closed 2026-05-09** via Phase H + I + K + L (correctness
+     tests, TLA+ extension, CLAUDE.md update, closing docs).
+     v1 shipped with the documented regime-dependent parallelism
+     caveat.
+  2. **This batch + Phase H+ are the planned next-batch follow-up**
+     (post-1.0 if release happens before; or Slice Z+ within the
+     pre-1.0 sequencer). User direction 2026-05-09: "put that
+     Q2 + Q3 + Q-beyond refactor as the next batch after H/I/K/L";
+     amended same-day to ALSO bundle Phase H+ (cross-partition
+     acquire-during-fire deadlock fix — see entry above) into the
+     same next batch. The two are independent slices that can be
+     sequenced either way: H+ option (d) (detect-and-reject) is
+     small (~200–500 LOC) and orthogonal to the state-shard layout;
+     H+ option (b) (defer-acquire-to-post-flush) shares wave-end
+     queue machinery with parts of Q-beyond — pick the order based
+     on which H+ option is chosen.
   3. **Update CLAUDE.md Rust invariant 3** when this batch lands —
-     the wording "Per-subgraph `parking_lot::ReentrantMutex`
-     (planned)" should lift to "current implementation" only when
-     Regime A also shows true parallelism. Until then, the Phase K
-     update should reflect the partial win.
+     the current wording (post-Phase-K) acknowledges the
+     regime-dependent partial win; lift to "wide-spectrum" only
+     when Regime A also shows true parallelism (Q-beyond) AND the
+     Phase H+ ascending-order gap closes (so the safe protocol
+     verified by `wave_protocol_partitioned` matches what the
+     impl enforces).
 
 - **Source:** Phase J bench evidence (2026-05-09). User direction
   2026-05-09 to bundle Q2 + Q3 + Q-beyond as one follow-up batch

@@ -1,0 +1,262 @@
+{"id":"R1.1.1","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":36,"anchor":"../implementation-plan-13.6-canonical-spec.md#L36"}
+{"id":"R1.1.2","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":44,"anchor":"../implementation-plan-13.6-canonical-spec.md#L44"}
+{"id":"R1.2.1","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":58,"anchor":"../implementation-plan-13.6-canonical-spec.md#L58"}
+{"id":"R1.2.2","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":74,"anchor":"../implementation-plan-13.6-canonical-spec.md#L74"}
+{"id":"R1.2.3","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":76,"anchor":"../implementation-plan-13.6-canonical-spec.md#L76"}
+{"id":"R1.2.4","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":82,"anchor":"../implementation-plan-13.6-canonical-spec.md#L82"}
+{"id":"R1.2.5","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":88,"anchor":"../implementation-plan-13.6-canonical-spec.md#L88"}
+{"id":"R1.2.6","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":90,"anchor":"../implementation-plan-13.6-canonical-spec.md#L90"}
+{"id":"R1.3.1.a","title":"Two-phase push (DIRTY before DATA/RESOLVED) \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":96,"anchor":"../implementation-plan-13.6-canonical-spec.md#L96"}
+{"id":"R1.3.1.b","title":"Two-phase push (DIRTY before DATA/RESOLVED) \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":100,"anchor":"../implementation-plan-13.6-canonical-spec.md#L100"}
+{"id":"R1.3.1.c","title":"Two-phase push (DIRTY before DATA/RESOLVED) \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":102,"anchor":"../implementation-plan-13.6-canonical-spec.md#L102"}
+{"id":"R1.3.2","title":"Equals substitution and cache discipline","section":"1. Message Protocol","first_seen_line":407,"anchor":"../implementation-plan-13.6-canonical-spec.md#L407"}
+{"id":"R1.3.2.a","title":"Equals substitution and cache discipline \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":106,"anchor":"../implementation-plan-13.6-canonical-spec.md#L106"}
+{"id":"R1.3.2.b","title":"Equals substitution and cache discipline \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":108,"anchor":"../implementation-plan-13.6-canonical-spec.md#L108"}
+{"id":"R1.3.2.c","title":"Equals substitution and cache discipline \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":118,"anchor":"../implementation-plan-13.6-canonical-spec.md#L118"}
+{"id":"R1.3.2.d","title":"Equals substitution and cache discipline \u2014 sub-rule d","section":"1. Message Protocol","first_seen_line":123,"anchor":"../implementation-plan-13.6-canonical-spec.md#L123"}
+{"id":"R1.3.3","title":"Wave-content invariants","section":"1. Message Protocol","first_seen_line":211,"anchor":"../implementation-plan-13.6-canonical-spec.md#L211"}
+{"id":"R1.3.3.a","title":"Wave-content invariants \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":135,"anchor":"../implementation-plan-13.6-canonical-spec.md#L135"}
+{"id":"R1.3.3.b","title":"Wave-content invariants \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":7,"anchor":"../implementation-plan-13.6-canonical-spec.md#L7"}
+{"id":"R1.3.3.c","title":"Wave-content invariants \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":144,"anchor":"../implementation-plan-13.6-canonical-spec.md#L144"}
+{"id":"R1.3.3.d","title":"Wave-content invariants \u2014 sub-rule d","section":"1. Message Protocol","first_seen_line":146,"anchor":"../implementation-plan-13.6-canonical-spec.md#L146"}
+{"id":"R1.3.3.e","title":"Wave-content invariants \u2014 sub-rule e","section":"1. Message Protocol","first_seen_line":148,"anchor":"../implementation-plan-13.6-canonical-spec.md#L148"}
+{"id":"R1.3.3.f","title":"Wave-content invariants \u2014 sub-rule f","section":"1. Message Protocol","first_seen_line":86,"anchor":"../implementation-plan-13.6-canonical-spec.md#L86"}
+{"id":"R1.3.3.g","title":"Wave-content invariants \u2014 sub-rule g","section":"1. Message Protocol","first_seen_line":157,"anchor":"../implementation-plan-13.6-canonical-spec.md#L157"}
+{"id":"R1.3.4","title":"Terminal lifecycle","section":"1. Message Protocol","first_seen_line":699,"anchor":"../implementation-plan-13.6-canonical-spec.md#L699"}
+{"id":"R1.3.4.a","title":"Terminal lifecycle \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":161,"anchor":"../implementation-plan-13.6-canonical-spec.md#L161"}
+{"id":"R1.3.4.b","title":"Terminal lifecycle \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":163,"anchor":"../implementation-plan-13.6-canonical-spec.md#L163"}
+{"id":"R1.3.4.c","title":"Terminal lifecycle \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":165,"anchor":"../implementation-plan-13.6-canonical-spec.md#L165"}
+{"id":"R1.3.5.a","title":"START ordering \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":169,"anchor":"../implementation-plan-13.6-canonical-spec.md#L169"}
+{"id":"R1.3.6","title":"Batch semantics","section":"1. Message Protocol","first_seen_line":985,"anchor":"../implementation-plan-13.6-canonical-spec.md#L985"}
+{"id":"R1.3.6.a","title":"Batch semantics \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":173,"anchor":"../implementation-plan-13.6-canonical-spec.md#L173"}
+{"id":"R1.3.6.b","title":"Batch semantics \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":175,"anchor":"../implementation-plan-13.6-canonical-spec.md#L175"}
+{"id":"R1.3.6.c","title":"Batch semantics \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":181,"anchor":"../implementation-plan-13.6-canonical-spec.md#L181"}
+{"id":"R1.3.7","title":"Signal tier table","section":"1. Message Protocol","first_seen_line":476,"anchor":"../implementation-plan-13.6-canonical-spec.md#L476"}
+{"id":"R1.3.7.a","title":"Signal tier table \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":185,"anchor":"../implementation-plan-13.6-canonical-spec.md#L185"}
+{"id":"R1.3.7.b","title":"Signal tier table \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":197,"anchor":"../implementation-plan-13.6-canonical-spec.md#L197"}
+{"id":"R1.3.7.c","title":"Signal tier table \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":199,"anchor":"../implementation-plan-13.6-canonical-spec.md#L199"}
+{"id":"R1.3.8","title":"PAUSE/RESUME semantics","section":"1. Message Protocol","first_seen_line":504,"anchor":"../implementation-plan-13.6-canonical-spec.md#L504"}
+{"id":"R1.3.8.a","title":"PAUSE/RESUME semantics \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":203,"anchor":"../implementation-plan-13.6-canonical-spec.md#L203"}
+{"id":"R1.3.8.b","title":"PAUSE/RESUME semantics \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":205,"anchor":"../implementation-plan-13.6-canonical-spec.md#L205"}
+{"id":"R1.3.8.c","title":"PAUSE/RESUME semantics \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":209,"anchor":"../implementation-plan-13.6-canonical-spec.md#L209"}
+{"id":"R1.3.8.d","title":"PAUSE/RESUME semantics \u2014 sub-rule d","section":"1. Message Protocol","first_seen_line":211,"anchor":"../implementation-plan-13.6-canonical-spec.md#L211"}
+{"id":"R1.3.8.e","title":"PAUSE/RESUME semantics \u2014 sub-rule e","section":"1. Message Protocol","first_seen_line":217,"anchor":"../implementation-plan-13.6-canonical-spec.md#L217"}
+{"id":"R1.3.8.f","title":"PAUSE/RESUME semantics \u2014 sub-rule f","section":"1. Message Protocol","first_seen_line":219,"anchor":"../implementation-plan-13.6-canonical-spec.md#L219"}
+{"id":"R1.3.9.a","title":"Cleanup and INVALIDATE \u2014 sub-rule a","section":"1. Message Protocol","first_seen_line":223,"anchor":"../implementation-plan-13.6-canonical-spec.md#L223"}
+{"id":"R1.3.9.b","title":"Cleanup and INVALIDATE \u2014 sub-rule b","section":"1. Message Protocol","first_seen_line":227,"anchor":"../implementation-plan-13.6-canonical-spec.md#L227"}
+{"id":"R1.3.9.c","title":"Cleanup and INVALIDATE \u2014 sub-rule c","section":"1. Message Protocol","first_seen_line":229,"anchor":"../implementation-plan-13.6-canonical-spec.md#L229"}
+{"id":"R1.3.9.d","title":"Cleanup and INVALIDATE \u2014 sub-rule d","section":"1. Message Protocol","first_seen_line":233,"anchor":"../implementation-plan-13.6-canonical-spec.md#L233"}
+{"id":"R1.4.1","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":237,"anchor":"../implementation-plan-13.6-canonical-spec.md#L237"}
+{"id":"R1.4.2","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":244,"anchor":"../implementation-plan-13.6-canonical-spec.md#L244"}
+{"id":"R1.4.3","title":"(undocumented)","section":"1. Message Protocol","first_seen_line":248,"anchor":"../implementation-plan-13.6-canonical-spec.md#L248"}
+{"id":"R2.1.1","title":"(undocumented)","section":"2. Node","first_seen_line":258,"anchor":"../implementation-plan-13.6-canonical-spec.md#L258"}
+{"id":"R2.1.2","title":"(undocumented)","section":"2. Node","first_seen_line":264,"anchor":"../implementation-plan-13.6-canonical-spec.md#L264"}
+{"id":"R2.1.3","title":"(undocumented)","section":"2. Node","first_seen_line":277,"anchor":"../implementation-plan-13.6-canonical-spec.md#L277"}
+{"id":"R2.2.1","title":"(undocumented)","section":"2. Node","first_seen_line":281,"anchor":"../implementation-plan-13.6-canonical-spec.md#L281"}
+{"id":"R2.2.2","title":"(undocumented)","section":"2. Node","first_seen_line":296,"anchor":"../implementation-plan-13.6-canonical-spec.md#L296"}
+{"id":"R2.2.3","title":"(undocumented)","section":"2. Node","first_seen_line":310,"anchor":"../implementation-plan-13.6-canonical-spec.md#L310"}
+{"id":"R2.2.4","title":"(undocumented)","section":"2. Node","first_seen_line":329,"anchor":"../implementation-plan-13.6-canonical-spec.md#L329"}
+{"id":"R2.2.5","title":"(undocumented)","section":"2. Node","first_seen_line":338,"anchor":"../implementation-plan-13.6-canonical-spec.md#L338"}
+{"id":"R2.2.6","title":"(undocumented)","section":"2. Node","first_seen_line":340,"anchor":"../implementation-plan-13.6-canonical-spec.md#L340"}
+{"id":"R2.2.7","title":"(undocumented)","section":"2. Node","first_seen_line":342,"anchor":"../implementation-plan-13.6-canonical-spec.md#L342"}
+{"id":"R2.2.8","title":"(undocumented)","section":"2. Node","first_seen_line":344,"anchor":"../implementation-plan-13.6-canonical-spec.md#L344"}
+{"id":"R2.3.1","title":"(undocumented)","section":"2. Node","first_seen_line":355,"anchor":"../implementation-plan-13.6-canonical-spec.md#L355"}
+{"id":"R2.3.2","title":"(undocumented)","section":"2. Node","first_seen_line":367,"anchor":"../implementation-plan-13.6-canonical-spec.md#L367"}
+{"id":"R2.3.3","title":"(undocumented)","section":"2. Node","first_seen_line":382,"anchor":"../implementation-plan-13.6-canonical-spec.md#L382"}
+{"id":"R2.4.1","title":"(undocumented)","section":"2. Node","first_seen_line":390,"anchor":"../implementation-plan-13.6-canonical-spec.md#L390"}
+{"id":"R2.4.2","title":"(undocumented)","section":"2. Node","first_seen_line":397,"anchor":"../implementation-plan-13.6-canonical-spec.md#L397"}
+{"id":"R2.4.3","title":"(undocumented)","section":"2. Node","first_seen_line":404,"anchor":"../implementation-plan-13.6-canonical-spec.md#L404"}
+{"id":"R2.4.4","title":"(undocumented)","section":"2. Node","first_seen_line":410,"anchor":"../implementation-plan-13.6-canonical-spec.md#L410"}
+{"id":"R2.4.5","title":"(undocumented)","section":"2. Node","first_seen_line":416,"anchor":"../implementation-plan-13.6-canonical-spec.md#L416"}
+{"id":"R2.4.6","title":"(undocumented)","section":"2. Node","first_seen_line":414,"anchor":"../implementation-plan-13.6-canonical-spec.md#L414"}
+{"id":"R2.4.7","title":"(undocumented)","section":"2. Node","first_seen_line":466,"anchor":"../implementation-plan-13.6-canonical-spec.md#L466"}
+{"id":"R2.5.1","title":"(undocumented)","section":"2. Node","first_seen_line":494,"anchor":"../implementation-plan-13.6-canonical-spec.md#L494"}
+{"id":"R2.5.2","title":"(undocumented)","section":"2. Node","first_seen_line":513,"anchor":"../implementation-plan-13.6-canonical-spec.md#L513"}
+{"id":"R2.5.3","title":"(undocumented)","section":"2. Node","first_seen_line":519,"anchor":"../implementation-plan-13.6-canonical-spec.md#L519"}
+{"id":"R2.5.4","title":"(undocumented)","section":"2. Node","first_seen_line":521,"anchor":"../implementation-plan-13.6-canonical-spec.md#L521"}
+{"id":"R2.6.1","title":"(undocumented)","section":"2. Node","first_seen_line":527,"anchor":"../implementation-plan-13.6-canonical-spec.md#L527"}
+{"id":"R2.6.2","title":"(undocumented)","section":"2. Node","first_seen_line":529,"anchor":"../implementation-plan-13.6-canonical-spec.md#L529"}
+{"id":"R2.6.3","title":"(undocumented)","section":"2. Node","first_seen_line":537,"anchor":"../implementation-plan-13.6-canonical-spec.md#L537"}
+{"id":"R2.6.4","title":"(undocumented)","section":"2. Node","first_seen_line":539,"anchor":"../implementation-plan-13.6-canonical-spec.md#L539"}
+{"id":"R2.6.5","title":"(undocumented)","section":"2. Node","first_seen_line":547,"anchor":"../implementation-plan-13.6-canonical-spec.md#L547"}
+{"id":"R2.6.6","title":"(undocumented)","section":"2. Node","first_seen_line":551,"anchor":"../implementation-plan-13.6-canonical-spec.md#L551"}
+{"id":"R2.6.7","title":"(undocumented)","section":"2. Node","first_seen_line":562,"anchor":"../implementation-plan-13.6-canonical-spec.md#L562"}
+{"id":"R2.7.1","title":"(undocumented)","section":"2. Node","first_seen_line":584,"anchor":"../implementation-plan-13.6-canonical-spec.md#L584"}
+{"id":"R2.7.2","title":"(undocumented)","section":"2. Node","first_seen_line":601,"anchor":"../implementation-plan-13.6-canonical-spec.md#L601"}
+{"id":"R2.7.3","title":"(undocumented)","section":"2. Node","first_seen_line":603,"anchor":"../implementation-plan-13.6-canonical-spec.md#L603"}
+{"id":"R2.7.4","title":"(undocumented)","section":"2. Node","first_seen_line":610,"anchor":"../implementation-plan-13.6-canonical-spec.md#L610"}
+{"id":"R2.7.5","title":"(undocumented)","section":"2. Node","first_seen_line":621,"anchor":"../implementation-plan-13.6-canonical-spec.md#L621"}
+{"id":"R2.7.6","title":"(undocumented)","section":"2. Node","first_seen_line":623,"anchor":"../implementation-plan-13.6-canonical-spec.md#L623"}
+{"id":"R2.8","title":"(undocumented)","section":"2. Node","first_seen_line":1247,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1247"}
+{"id":"R2.8.1","title":"(undocumented)","section":"2. Node","first_seen_line":632,"anchor":"../implementation-plan-13.6-canonical-spec.md#L632"}
+{"id":"R2.8.2","title":"(undocumented)","section":"2. Node","first_seen_line":642,"anchor":"../implementation-plan-13.6-canonical-spec.md#L642"}
+{"id":"R2.8.3","title":"(undocumented)","section":"2. Node","first_seen_line":644,"anchor":"../implementation-plan-13.6-canonical-spec.md#L644"}
+{"id":"R2.8.4","title":"(undocumented)","section":"2. Node","first_seen_line":655,"anchor":"../implementation-plan-13.6-canonical-spec.md#L655"}
+{"id":"R2.8.5","title":"(undocumented)","section":"2. Node","first_seen_line":657,"anchor":"../implementation-plan-13.6-canonical-spec.md#L657"}
+{"id":"R2.9.b","title":"(undocumented)","section":"2. Node","first_seen_line":671,"anchor":"../implementation-plan-13.6-canonical-spec.md#L671"}
+{"id":"R2.9.c","title":"(undocumented)","section":"2. Node","first_seen_line":734,"anchor":"../implementation-plan-13.6-canonical-spec.md#L734"}
+{"id":"R2.4a","title":"(undocumented)","section":"2. Node","first_seen_line":1950,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1950"}
+{"id":"R2.4a.1","title":"(undocumented)","section":"2. Node","first_seen_line":476,"anchor":"../implementation-plan-13.6-canonical-spec.md#L476"}
+{"id":"R2.4a.2","title":"(undocumented)","section":"2. Node","first_seen_line":486,"anchor":"../implementation-plan-13.6-canonical-spec.md#L486"}
+{"id":"R2.4a.3","title":"(undocumented)","section":"2. Node","first_seen_line":488,"anchor":"../implementation-plan-13.6-canonical-spec.md#L488"}
+{"id":"R2.4a.4","title":"(undocumented)","section":"2. Node","first_seen_line":490,"anchor":"../implementation-plan-13.6-canonical-spec.md#L490"}
+{"id":"R3.1.1","title":"(undocumented)","section":"3. Graph","first_seen_line":751,"anchor":"../implementation-plan-13.6-canonical-spec.md#L751"}
+{"id":"R3.1.2","title":"(undocumented)","section":"3. Graph","first_seen_line":753,"anchor":"../implementation-plan-13.6-canonical-spec.md#L753"}
+{"id":"R3.2.1","title":"(undocumented)","section":"3. Graph","first_seen_line":757,"anchor":"../implementation-plan-13.6-canonical-spec.md#L757"}
+{"id":"R3.2.2","title":"(undocumented)","section":"3. Graph","first_seen_line":772,"anchor":"../implementation-plan-13.6-canonical-spec.md#L772"}
+{"id":"R3.2.3","title":"(undocumented)","section":"3. Graph","first_seen_line":774,"anchor":"../implementation-plan-13.6-canonical-spec.md#L774"}
+{"id":"R3.2.4","title":"(undocumented)","section":"3. Graph","first_seen_line":776,"anchor":"../implementation-plan-13.6-canonical-spec.md#L776"}
+{"id":"R3.3","title":"(undocumented)","section":"3. Graph","first_seen_line":1914,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1914"}
+{"id":"R3.3.1","title":"(undocumented)","section":"3. Graph","first_seen_line":780,"anchor":"../implementation-plan-13.6-canonical-spec.md#L780"}
+{"id":"R3.3.1.1","title":"(undocumented)","section":"3. Graph","first_seen_line":782,"anchor":"../implementation-plan-13.6-canonical-spec.md#L782"}
+{"id":"R3.3.2","title":"(undocumented)","section":"3. Graph","first_seen_line":801,"anchor":"../implementation-plan-13.6-canonical-spec.md#L801"}
+{"id":"R3.3.3","title":"(undocumented)","section":"3. Graph","first_seen_line":803,"anchor":"../implementation-plan-13.6-canonical-spec.md#L803"}
+{"id":"R3.4.1","title":"(undocumented)","section":"3. Graph","first_seen_line":807,"anchor":"../implementation-plan-13.6-canonical-spec.md#L807"}
+{"id":"R3.4.2","title":"(undocumented)","section":"3. Graph","first_seen_line":815,"anchor":"../implementation-plan-13.6-canonical-spec.md#L815"}
+{"id":"R3.4.3","title":"(undocumented)","section":"3. Graph","first_seen_line":819,"anchor":"../implementation-plan-13.6-canonical-spec.md#L819"}
+{"id":"R3.5.1","title":"(undocumented)","section":"3. Graph","first_seen_line":823,"anchor":"../implementation-plan-13.6-canonical-spec.md#L823"}
+{"id":"R3.5.2","title":"(undocumented)","section":"3. Graph","first_seen_line":831,"anchor":"../implementation-plan-13.6-canonical-spec.md#L831"}
+{"id":"R3.6.1","title":"(undocumented)","section":"3. Graph","first_seen_line":840,"anchor":"../implementation-plan-13.6-canonical-spec.md#L840"}
+{"id":"R3.6.2","title":"(undocumented)","section":"3. Graph","first_seen_line":918,"anchor":"../implementation-plan-13.6-canonical-spec.md#L918"}
+{"id":"R3.6.3","title":"(undocumented)","section":"3. Graph","first_seen_line":969,"anchor":"../implementation-plan-13.6-canonical-spec.md#L969"}
+{"id":"R3.7.1","title":"(undocumented)","section":"3. Graph","first_seen_line":973,"anchor":"../implementation-plan-13.6-canonical-spec.md#L973"}
+{"id":"R3.7.2","title":"(undocumented)","section":"3. Graph","first_seen_line":816,"anchor":"../implementation-plan-13.6-canonical-spec.md#L816"}
+{"id":"R3.7.3","title":"(undocumented)","section":"3. Graph","first_seen_line":983,"anchor":"../implementation-plan-13.6-canonical-spec.md#L983"}
+{"id":"R3.7.4","title":"(undocumented)","section":"3. Graph","first_seen_line":985,"anchor":"../implementation-plan-13.6-canonical-spec.md#L985"}
+{"id":"R3.8","title":"(undocumented)","section":"3. Graph","first_seen_line":1805,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1805"}
+{"id":"R3.9","title":"(undocumented)","section":"3. Graph","first_seen_line":605,"anchor":"../implementation-plan-13.6-canonical-spec.md#L605"}
+{"id":"R3.9.1","title":"(undocumented)","section":"3. Graph","first_seen_line":1009,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1009"}
+{"id":"R3.9.a","title":"graph.state<T>(name, initial?, opts?)","section":"3. Graph","first_seen_line":1011,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1011"}
+{"id":"R3.9.b","title":"graph.derived<T>(name, deps, fn, opts?)","section":"3. Graph","first_seen_line":1031,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1031"}
+{"id":"R3.9.c","title":"graph.effect(name, deps, fn, opts?)","section":"3. Graph","first_seen_line":1058,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1058"}
+{"id":"R3.9.d","title":"graph.producer<T>(name, setupFn, opts?)","section":"3. Graph","first_seen_line":1086,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1086"}
+{"id":"R4.2","title":"(undocumented)","section":"4. Utilities","first_seen_line":1230,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1230"}
+{"id":"R4.2.1","title":"(undocumented)","section":"4. Utilities","first_seen_line":1139,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1139"}
+{"id":"R4.2.2","title":"(undocumented)","section":"4. Utilities","first_seen_line":1141,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1141"}
+{"id":"R4.2.3","title":"(undocumented)","section":"4. Utilities","first_seen_line":1148,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1148"}
+{"id":"R4.2.4","title":"(undocumented)","section":"4. Utilities","first_seen_line":1152,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1152"}
+{"id":"R4.3","title":"(undocumented)","section":"4. Utilities","first_seen_line":1953,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1953"}
+{"id":"R4.3.1","title":"(undocumented)","section":"4. Utilities","first_seen_line":1160,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1160"}
+{"id":"R4.3.2","title":"(undocumented)","section":"4. Utilities","first_seen_line":1168,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1168"}
+{"id":"R4.3.3","title":"(undocumented)","section":"4. Utilities","first_seen_line":1170,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1170"}
+{"id":"R4.3.4","title":"(undocumented)","section":"4. Utilities","first_seen_line":1172,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1172"}
+{"id":"R4.3.5","title":"(undocumented)","section":"4. Utilities","first_seen_line":1182,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1182"}
+{"id":"R4.4.1","title":"(undocumented)","section":"4. Utilities","first_seen_line":1186,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1186"}
+{"id":"R4.4.2","title":"(undocumented)","section":"4. Utilities","first_seen_line":1195,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1195"}
+{"id":"R4.4.3","title":"(undocumented)","section":"4. Utilities","first_seen_line":1197,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1197"}
+{"id":"R4.4.4","title":"(undocumented)","section":"4. Utilities","first_seen_line":1201,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1201"}
+{"id":"R5.1","title":"(undocumented)","section":"5. Design Principles","first_seen_line":16,"anchor":"../implementation-plan-13.6-canonical-spec.md#L16"}
+{"id":"R5.2","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1211,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1211"}
+{"id":"R5.3","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1213,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1213"}
+{"id":"R5.4","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1215,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1215"}
+{"id":"R5.5","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1217,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1217"}
+{"id":"R5.6","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1219,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1219"}
+{"id":"R5.7","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1221,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1221"}
+{"id":"R5.8","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1223,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1223"}
+{"id":"R5.9","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1225,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1225"}
+{"id":"R5.10","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1229,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1229"}
+{"id":"R5.11","title":"(undocumented)","section":"5. Design Principles","first_seen_line":1234,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1234"}
+{"id":"R5.12","title":"(undocumented)","section":"5. Design Principles","first_seen_line":16,"anchor":"../implementation-plan-13.6-canonical-spec.md#L16"}
+{"id":"R6.1","title":"(undocumented)","section":"6. Implementation Guidance","first_seen_line":1699,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1699"}
+{"id":"R6.3","title":"(undocumented)","section":"6. Implementation Guidance","first_seen_line":671,"anchor":"../implementation-plan-13.6-canonical-spec.md#L671"}
+{"id":"R6.3.1","title":"(undocumented)","section":"6. Implementation Guidance","first_seen_line":1275,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1275"}
+{"id":"R6.3.2","title":"(undocumented)","section":"6. Implementation Guidance","first_seen_line":1279,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1279"}
+{"id":"R7.1.1","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1292,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1292"}
+{"id":"R7.1.2","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1300,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1300"}
+{"id":"R7.1.3","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1302,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1302"}
+{"id":"R7.2","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":509,"anchor":"../implementation-plan-13.6-canonical-spec.md#L509"}
+{"id":"R7.2.1","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1310,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1310"}
+{"id":"R7.2.2","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1320,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1320"}
+{"id":"R7.2.3","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1324,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1324"}
+{"id":"R7.2.4","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1326,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1326"}
+{"id":"R7.3.1","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1333,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1333"}
+{"id":"R7.3.2","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1337,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1337"}
+{"id":"R7.4.1","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1343,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1343"}
+{"id":"R7.4.2","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1348,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1348"}
+{"id":"R7.5.1","title":"(undocumented)","section":"7. Node Versioning (Progressive, Optional)","first_seen_line":1352,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1352"}
+{"id":"R8.1.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1364,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1364"}
+{"id":"R8.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1386,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1386"}
+{"id":"R8.2.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1388,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1388"}
+{"id":"R8.2.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1400,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1400"}
+{"id":"R8.2.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1408,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1408"}
+{"id":"R8.2.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1410,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1410"}
+{"id":"R8.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1412,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1412"}
+{"id":"R8.3.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1414,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1414"}
+{"id":"R8.3.1.a","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1416,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1416"}
+{"id":"R8.3.1.b","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1418,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1418"}
+{"id":"R8.3.1.c","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1420,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1420"}
+{"id":"R8.3.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1422,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1422"}
+{"id":"R8.3.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1424,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1424"}
+{"id":"R8.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1426,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1426"}
+{"id":"R8.4.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1428,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1428"}
+{"id":"R8.4.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1438,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1438"}
+{"id":"R8.4.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1444,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1444"}
+{"id":"R8.4.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1446,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1446"}
+{"id":"R8.4.5","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1448,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1448"}
+{"id":"R8.5","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1450,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1450"}
+{"id":"R8.5.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1452,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1452"}
+{"id":"R8.5.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1470,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1470"}
+{"id":"R8.5.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1478,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1478"}
+{"id":"R8.5.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1480,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1480"}
+{"id":"R8.5.5","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1482,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1482"}
+{"id":"R8.6","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1484,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1484"}
+{"id":"R8.6.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1486,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1486"}
+{"id":"R8.6.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1494,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1494"}
+{"id":"R8.6.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1514,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1514"}
+{"id":"R8.6.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1526,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1526"}
+{"id":"R8.6.5","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1530,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1530"}
+{"id":"R8.6.6","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1537,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1537"}
+{"id":"R8.6.7","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1549,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1549"}
+{"id":"R8.6.8","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1564,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1564"}
+{"id":"R8.6.9","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1568,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1568"}
+{"id":"R8.7","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1572,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1572"}
+{"id":"R8.7.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1574,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1574"}
+{"id":"R8.7.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1580,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1580"}
+{"id":"R8.7.3","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1585,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1585"}
+{"id":"R8.7.4","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1594,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1594"}
+{"id":"R8.7.5","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1596,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1596"}
+{"id":"R8.7.6","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1598,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1598"}
+{"id":"R8.8","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1600,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1600"}
+{"id":"R8.9.1","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1647,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1647"}
+{"id":"R8.9.2","title":"(undocumented)","section":"8. Patterns Layer","first_seen_line":1657,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1657"}
+{"id":"R9.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1676,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1676"}
+{"id":"R9.1.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1678,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1678"}
+{"id":"R9.1.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1699,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1699"}
+{"id":"R9.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1701,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1701"}
+{"id":"R9.2.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1703,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1703"}
+{"id":"R9.2.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1716,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1716"}
+{"id":"R9.2.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1718,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1718"}
+{"id":"R9.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1720,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1720"}
+{"id":"R9.3.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1722,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1722"}
+{"id":"R9.3.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1734,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1734"}
+{"id":"R9.3.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1747,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1747"}
+{"id":"R9.3.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1763,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1763"}
+{"id":"R9.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1777,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1777"}
+{"id":"R9.4.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1779,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1779"}
+{"id":"R9.4.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1790,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1790"}
+{"id":"R9.4.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1805,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1805"}
+{"id":"R9.5","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1812,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1812"}
+{"id":"R9.5.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1814,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1814"}
+{"id":"R9.5.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1820,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1820"}
+{"id":"R9.5.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1830,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1830"}
+{"id":"R9.5.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1832,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1832"}
+{"id":"R9.5.5","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1834,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1834"}
+{"id":"R9.6.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1838,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1838"}
+{"id":"R9.6.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1844,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1844"}
+{"id":"R9.6.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1850,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1850"}
+{"id":"R9.6.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1852,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1852"}
+{"id":"R9.6.5","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1854,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1854"}
+{"id":"R9.7","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1859,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1859"}
+{"id":"R9.7.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1861,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1861"}
+{"id":"R9.7.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1872,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1872"}
+{"id":"R9.7.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1874,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1874"}
+{"id":"R9.7.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1876,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1876"}
+{"id":"R9.7.5","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1888,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1888"}
+{"id":"R9.8","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1894,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1894"}
+{"id":"R9.8.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1896,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1896"}
+{"id":"R9.8.2","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1908,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1908"}
+{"id":"R9.8.3","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1912,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1912"}
+{"id":"R9.8.4","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1914,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1914"}
+{"id":"R9.9","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":2074,"anchor":"../implementation-plan-13.6-canonical-spec.md#L2074"}
+{"id":"R9.9.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1920,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1920"}
+{"id":"R9.10.1","title":"(undocumented)","section":"9. Storage & Persistence","first_seen_line":1924,"anchor":"../implementation-plan-13.6-canonical-spec.md#L1924"}

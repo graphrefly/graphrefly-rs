@@ -74,13 +74,326 @@ use parking_lot::{ArcReentrantMutexGuard, Mutex, MutexGuard};
 
 /// Held guard from `parking_lot::ReentrantMutex::lock_arc()` on a
 /// partition's `wave_owner`. `!Send` per `parking_lot::ReentrantMutex`'s
-/// thread-affinity contract — the type-level `!Send` flows into
+/// thread-affinity contract (the inner guard is `!Send`; the wrapper
+/// inherits) — the type-level `!Send` flows into
 /// [`crate::batch::BatchGuard::_wave_guards`] so any attempt to send
 /// the batch guard across threads fails to compile.
 ///
-/// Slice Y1 / Phase E (2026-05-08).
-pub(crate) type WaveOwnerGuard =
-    ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>;
+/// **Phase H+ option (d) limited variant (2026-05-09):** the guard's
+/// [`Drop`] also pops `sid` from the [`held_partitions`] thread-local
+/// so the ascending-order check on the next acquire sees the correct
+/// "currently held" set. Re-entrant acquires (same thread, same
+/// partition) increment a refcount in the thread-local; final drop
+/// removes the entry.
+///
+/// Slice Y1 / Phase E (2026-05-08); Phase H+ wrapper (2026-05-09).
+pub(crate) struct WaveOwnerGuard {
+    /// The actual parking_lot guard holding the partition wave_owner.
+    /// Drop order: the wrapper's Drop runs FIRST (pops `held_partitions`),
+    /// then `inner` drops automatically (releases the parking_lot lock).
+    /// Field-declaration order matters in Rust: the wrapper drops top-
+    /// down by default, so `inner` is listed AFTER `sid` so the wrapper's
+    /// custom Drop runs on the whole struct first, releasing the
+    /// thread-local entry under our control before the inner guard
+    /// hits parking_lot's release path.
+    sid: crate::subgraph::SubgraphId,
+    /// `#[allow(dead_code)]`: the inner guard is held to keep the
+    /// parking_lot::ReentrantMutex acquired for the wave's duration;
+    /// it's never read, only its `Drop` matters.
+    #[allow(dead_code)]
+    inner: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
+}
+
+impl Drop for WaveOwnerGuard {
+    fn drop(&mut self) {
+        held_partitions::release(self.sid);
+        // `inner` drops automatically after this — releases the
+        // parking_lot::ReentrantMutex (decrementing parking_lot's
+        // own internal re-entry counter; only the FINAL release
+        // unparks waiters).
+    }
+}
+
+/// Phase H+ option (d) limited variant — thread-local infrastructure
+/// for cross-partition acquire-during-fire / cross-partition
+/// acquire-during-wave deadlock detection (extended /qa N1(a)
+/// 2026-05-09 to cover sink callbacks + any nested in-wave acquire).
+///
+/// **Protocol invariant enforced:** whenever this thread already
+/// holds at least one partition wave_owner (HELD non-empty), every
+/// NEW partition this thread tries to acquire must have an id
+/// strictly greater than every partition currently held. Re-entrant
+/// acquires (same thread, same partition that's already held) bypass
+/// the check (they're fine — `parking_lot::ReentrantMutex` allows
+/// same-thread re-entry transparently).
+///
+/// Without this check, two threads each doing nested cross-partition
+/// acquires within an active wave could form an AB/BA cycle: thread A
+/// holds X, attempts Y (Y < X); concurrently thread B holds Y,
+/// attempts X (X > Y, ascending-OK from B's POV). A's acquire on Y
+/// blocks behind B; B's acquire on X blocks behind A. Cycle.
+///
+/// **Single carve-out — producer build/project closures:** producer-
+/// pattern operator activation (`zip` / `concat` / `race` /
+/// `take_until` / `switch_map` / `exhaust_map` / `concat_map` /
+/// `merge_map`) runs build closures inside `BindingBoundary::invoke_fn`
+/// that legitimately subscribe to upstream sources cross-partition.
+/// Refactoring those operators to defer their inner subscribes to
+/// wave-end is the broader "Phase H+ STRICT variant" carry-forward
+/// (see `docs/porting-deferred.md`). For the limited variant, the
+/// thread-local [`IN_PRODUCER_BUILD`] refcount is incremented when a
+/// producer node enters its FiringGuard scope and the H+ check is
+/// suppressed for the duration. All other call paths (derived /
+/// dynamic user fns, sink callbacks, subscribe handshakes, drop
+/// cleanup) DO see the check.
+///
+/// **What this widening (/qa N1(a) 2026-05-09) catches that the
+/// original `fire_depth > 0` gate did NOT:**
+/// - Sink callbacks fired by `flush_notifications` lock-released
+///   AFTER drain — the outer wave's wave_owner is still held but
+///   no FiringGuard is on the stack. A sink that calls
+///   `core.subscribe(node_in_lower_partition, sink)` would have
+///   bypassed the original gate; now caught.
+/// - Subscribe-handshake-time cross-partition operations (similar
+///   shape — the handshake fires lock-released).
+/// - Any future re-entry path that doesn't go through `FiringGuard`
+///   (e.g., `Subscription::Drop` cleanup paths, R3.7-style graph
+///   destroy cascades).
+mod held_partitions {
+    use crate::subgraph::SubgraphId;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        /// Currently-held partitions on this thread, keyed by
+        /// `SubgraphId`. The value is a re-entry refcount (mirrors
+        /// parking_lot::ReentrantMutex's internal counter — needed
+        /// because we can't query parking_lot's count). `BTreeMap`
+        /// gives ordered iteration so `iter().next_back()` is the
+        /// max-held in O(log n).
+        ///
+        /// Bookkeeping is unconditional — every acquire bumps the
+        /// refcount, every release decrements. The CHECK gate
+        /// (`!held.is_empty() && !in_producer_build()`) is what
+        /// distinguishes "first-time acquire on a fresh thread"
+        /// (allowed, held empty) from "nested acquire while we
+        /// already hold something" (must be ascending).
+        static HELD: RefCell<BTreeMap<SubgraphId, u32>> = const { RefCell::new(BTreeMap::new()) };
+
+        /// Per-thread "we're inside a producer build/project closure"
+        /// refcount. Producer-pattern operator activation increments
+        /// this on `FiringGuard::new`; their build closures call
+        /// cross-partition `Core::subscribe` legitimately during
+        /// activation (operator-internal setup, not user-fn re-entry).
+        /// The H+ check is suppressed while this counter is non-zero.
+        ///
+        /// Tracked as a refcount (not a bool) because nested producer
+        /// activations are theoretically possible (e.g., a producer
+        /// whose build closure subscribes to ANOTHER producer that
+        /// also activates) and must balance correctly. The increment
+        /// uses `checked_add(1)` so an unbounded recursion (a real
+        /// bug — protocol cascades are bounded by
+        /// `MAX_BATCH_DRAIN_ITERATIONS`) panics instead of silently
+        /// saturating and disabling the check.
+        ///
+        /// /qa N1(a) (2026-05-09): replaced the original `FIRE_DEPTH`
+        /// thread-local. The previous design gated the H+ check on
+        /// fire_depth > 0; this restricted coverage to the
+        /// FiringGuard-wrapped invoke_fn scope. The new design
+        /// inverts: gate on `held non-empty AND !in_producer_build`.
+        /// Catches sink-callback / handshake / drop-cleanup paths
+        /// the previous gate missed.
+        static IN_PRODUCER_BUILD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Increment the producer-build refcount. Called from
+    /// `FiringGuard::new` ONLY for `is_producer()` nodes, AND from
+    /// `ProducerCtx::subscribe_to`'s wrapped sink (so producer-
+    /// internal sink callbacks also suppress the H+ check).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the per-thread refcount would overflow `u32::MAX`.
+    /// This indicates an unbounded recursion through producer build /
+    /// sink dispatch — a real bug. Safer to surface than to silently
+    /// saturate and disable the check or produce inverted Drop
+    /// semantics. The protocol's `MAX_BATCH_DRAIN_ITERATIONS` cap
+    /// makes this overflow unreachable in practice.
+    pub fn producer_build_enter() {
+        IN_PRODUCER_BUILD.with(|c| {
+            let next = c.get().checked_add(1).expect(
+                "in_producer_build refcount overflow — unbounded \
+                 producer-build re-entrance. Should be bounded by the \
+                 protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
+            );
+            c.set(next);
+        });
+    }
+
+    /// Decrement the producer-build refcount. Called from
+    /// `FiringGuard::drop` ONLY for guards that incremented in `new`,
+    /// AND from `ProducerSinkGuard::drop` in the producer-sink
+    /// wrapper. Saturates on underflow (would indicate Drop without
+    /// matching `new` — recovery via no-op is safer than panicking
+    /// in Drop).
+    pub fn producer_build_exit() {
+        IN_PRODUCER_BUILD.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+
+    /// Currently inside a producer build/project closure on this thread?
+    fn in_producer_build() -> bool {
+        IN_PRODUCER_BUILD.with(|c| c.get() > 0)
+    }
+
+    /// Phase H+ check + bookkeeping. Called BEFORE acquiring the
+    /// partition's parking_lot::ReentrantMutex.
+    ///
+    /// Panics with a clear diagnostic if:
+    /// - HELD is non-empty (this thread already holds ≥1 partition),
+    /// - AND we're NOT inside a producer build closure,
+    /// - AND `sid` is NOT already held by this thread,
+    /// - AND `sid <= max(currently held)`.
+    ///
+    /// Otherwise: increments the refcount for `sid` (creating the
+    /// entry if needed) and returns. The caller MUST pair every
+    /// call with a [`release`] when the guard drops.
+    ///
+    /// **Important note on cross-thread vs same-thread:** this check
+    /// is a SAME-THREAD invariant — it catches a thread acquiring
+    /// out of order from itself. Cross-thread AB/BA cycles between
+    /// threads with disjoint same-thread acquisition orders are
+    /// prevented at a different layer (the
+    /// `compute_touched_partitions` upfront-acquire-all-ascending
+    /// rule in `Core::begin_batch_for`). This thread-local check
+    /// adds the layer that prevents a same-thread descending acquire
+    /// from creating the FIRST half of a cross-thread cycle.
+    pub(crate) fn check_and_acquire(sid: SubgraphId) {
+        HELD.with(|h| {
+            let mut held = h.borrow_mut();
+            // Gate: held non-empty (we're nested) AND not in producer
+            // build/sink (the v1 carve-out for operator activation +
+            // producer-internal sink callbacks). First-time acquires
+            // on a fresh thread (held empty) skip the check — there's
+            // nothing to compare against.
+            if !held.is_empty() && !in_producer_build() && !held.contains_key(&sid) {
+                if let Some((&max_held, _)) = held.iter().next_back() {
+                    if sid <= max_held {
+                        // Drop the borrow before panicking so unwind
+                        // doesn't see a still-borrowed RefCell.
+                        let new_id = sid;
+                        drop(held);
+                        panic!(
+                            "Phase H+ ascending-order violation: thread tried \
+                             to acquire partition {new_id:?} while already \
+                             holding partition {max_held:?}. \
+                             The same-thread cross-partition lock-acquisition \
+                             protocol requires every NEW partition acquired \
+                             while ANY partition is already held to have id \
+                             strictly greater than every already-held \
+                             partition; otherwise two threads doing \
+                             reciprocal acquires can form an AB/BA deadlock.\n\
+                             \n\
+                             Note: this check is per-thread. A cross-thread \
+                             AB/BA cycle between threads each obeying \
+                             ascending order at the per-thread level is \
+                             prevented at a different layer — the \
+                             `compute_touched_partitions` upfront-acquire-\
+                             all-ascending rule in `Core::begin_batch_for`.\n\
+                             \n\
+                             Common triggers (see docs/porting-deferred.md \
+                             'Cross-partition acquire-during-fire deadlock'):\n\
+                             - A user fn (derived / dynamic) that calls \
+                             `Core::emit` / `complete` / `error` / `teardown` \
+                             / `invalidate` mid-fire on a node in a partition \
+                             with a smaller id than the firing node's.\n\
+                             - A sink callback that calls `Core::subscribe` \
+                             on a node in a smaller-id partition while the \
+                             outer wave's wave_owner is still held.\n\
+                             - A subscribe handshake (or Drop cleanup) that \
+                             re-enters Core on a smaller-id partition.\n\
+                             \n\
+                             Fix: schedule the cross-partition operation \
+                             OUTSIDE the wave (e.g., via a deferred queue \
+                             applied at wave end) so the acquire happens at \
+                             top-level rather than nested under a held \
+                             partition; OR declare the cross-partition \
+                             reachability upfront via `add_meta_companion` \
+                             so the wave acquires both partitions ascending \
+                             at top-level and the inner re-entry becomes a \
+                             re-entrant acquire on a held partition."
+                        );
+                    }
+                }
+            }
+            // Bookkeeping: increment refcount. `checked_add(1)` so
+            // overflow surfaces (would indicate an unbounded
+            // re-entrance — a real bug).
+            let entry = held.entry(sid).or_insert(0);
+            *entry = entry.checked_add(1).expect(
+                "held_partitions refcount overflow — unbounded \
+                 same-partition re-entrance. Should be bounded by the \
+                 protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
+            );
+        });
+    }
+
+    /// Decrement the refcount for `sid`; remove the entry if it
+    /// hits zero. Called from [`super::WaveOwnerGuard::drop`] AND
+    /// from the retry / panic paths in
+    /// [`super::Core::partition_wave_owner_lock_arc`] to ensure the
+    /// refcount stays balanced under all unwind / retry / exhaust
+    /// paths.
+    pub(crate) fn release(sid: SubgraphId) {
+        HELD.with(|h| {
+            let mut held = h.borrow_mut();
+            if let Some(count) = held.get_mut(&sid) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    held.remove(&sid);
+                }
+            }
+        });
+    }
+
+    /// Test-only: read the current thread's held-partitions snapshot.
+    /// Used by post-panic regression assertions to verify the
+    /// thread-local stays clean even when the H+ check unwinds the
+    /// stack (so cargo's thread-reuse doesn't propagate corrupted
+    /// state to subsequent tests). `pub` (gated by
+    /// `cfg(any(test, debug_assertions))`) so integration tests
+    /// outside the crate can read it.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn held_snapshot_for_tests() -> Vec<(SubgraphId, u32)> {
+        HELD.with(|h| h.borrow().iter().map(|(s, c)| (*s, *c)).collect())
+    }
+
+    /// Test-only: read the current thread's producer-build refcount.
+    /// Companion to [`held_snapshot_for_tests`] for verifying the
+    /// thread-local stays clean post-panic.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn in_producer_build_for_tests() -> u32 {
+        IN_PRODUCER_BUILD.with(std::cell::Cell::get)
+    }
+}
+
+/// `pub` re-exports for the `graphrefly-operators` crate to wrap
+/// producer-internal sinks with the same `IN_PRODUCER_BUILD` flag
+/// the FiringGuard uses (per /qa N1(a) — operator sinks are
+/// operator-internal and SUPPRESS the H+ check, mirroring the
+/// activation-time carve-out). Not part of the v1 stable user API
+/// surface; intended for in-workspace consumers only. Phase H+
+/// STRICT variant (the producer-architecture refactor) will
+/// eliminate the need for this carve-out.
+pub use held_partitions::{producer_build_enter, producer_build_exit};
+
+/// Test-only re-exports for integration tests under
+/// `crates/graphrefly-core/tests/`. Gated `#[cfg(any(test, debug_assertions))]`
+/// so they don't leak into release builds. Public visibility is
+/// required because integration tests live outside the crate.
+#[cfg(any(test, debug_assertions))]
+pub use held_partitions::{held_snapshot_for_tests, in_producer_build_for_tests};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -1626,30 +1939,69 @@ impl Core {
     ///
     /// Slice Y1 / Phase E (2026-05-08).
     pub(crate) fn partition_wave_owner_lock_arc(&self, seed: NodeId) -> WaveOwnerGuard {
+        /// Scope-guard for the H+ thread-local refcount entry. Released on
+        /// Drop unless `into_consumed()` is called (the success path).
+        /// Ensures balance even on panic between `check_and_acquire` and
+        /// successful `WaveOwnerGuard` construction (`lock_arc()` /
+        /// `lock_for_validate()` could in principle panic; defensive).
+        struct AcquireGuard {
+            sid: crate::subgraph::SubgraphId,
+            consumed: bool,
+        }
+        impl AcquireGuard {
+            fn into_consumed(mut self) {
+                self.consumed = true;
+            }
+        }
+        impl Drop for AcquireGuard {
+            fn drop(&mut self) {
+                if !self.consumed {
+                    held_partitions::release(self.sid);
+                }
+            }
+        }
+
         for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
-            let lock_box = {
+            let (sid, lock_box) = {
                 let mut reg = self.registry.lock();
-                let (_sid, b) = reg.lock_for(seed).expect(
+                reg.lock_for(seed).expect(
                     "partition_wave_owner_lock_arc: seed must be registered \
                      (P12-fix invariant: registry membership is published \
                      atomically with `s.nodes`)",
-                );
-                b
+                )
             };
-            let guard = lock_box.wave_owner.lock_arc();
+            // Phase H+ option (d) /qa N1(a) widened variant: BEFORE
+            // acquiring the parking_lot lock, check ascending-order if
+            // this thread already holds at least one partition AND we're
+            // not in a producer build closure. Panics on violation.
+            // Also increments the thread-local refcount for `sid`. The
+            // `AcquireGuard` ensures the refcount is released on EVERY
+            // exit path — successful return (via `into_consumed()`),
+            // retry-validate failure (Drop fires), retry-exhaustion panic
+            // (Drop fires before unwind), or a panic in `lock_arc()` /
+            // `lock_for_validate()` (Drop fires during unwind).
+            held_partitions::check_and_acquire(sid);
+            let acquire_guard = AcquireGuard {
+                sid,
+                consumed: false,
+            };
+            let inner = lock_box.wave_owner.lock_arc();
             // Re-validate post-acquire. If a concurrent `union` redirected
             // `seed`'s root between our `lock_for` and `lock_arc`, the
             // registry's current box for `seed` differs from what we hold.
             let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);
             if still_valid {
-                return guard;
+                acquire_guard.into_consumed();
+                return WaveOwnerGuard { sid, inner };
             }
-            // Stale — drop guard and retry. Yield to give the
-            // contending writer a chance to make forward progress
-            // before re-resolving (QA-fix group 2 — earlier tight-spin
-            // could monopolize a CPU under sustained pathological
-            // union/split activity).
-            drop(guard);
+            // Stale — drop the parking_lot guard. The AcquireGuard's
+            // Drop releases the held_partitions refcount automatically.
+            // Yield to give the contending writer a chance to make
+            // forward progress before re-resolving (QA-fix group 2 —
+            // earlier tight-spin could monopolize a CPU under sustained
+            // pathological union/split activity).
+            drop(inner);
+            drop(acquire_guard);
             std::thread::yield_now();
         }
         panic!(

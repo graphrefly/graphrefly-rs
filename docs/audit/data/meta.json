@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-05-09T21:13:12Z",
+  "repo_root": "/Users/davidchenallio/src/graphrefly-rs",
+  "spec_path": "/Users/davidchenallio/src/graphrefly-ts/docs/implementation-plan-13.6-canonical-spec.md",
+  "totals": {
+    "crates": 8,
+    "src_files": 32,
+    "test_files": 42,
+    "src_loc": 17025,
+    "test_loc": 14809,
+    "items": 974,
+    "items_unsafe": 0,
+    "tests": 465,
+    "active_tests": 465,
+    "ignored_tests": 0,
+    "tests_with_rules": 38,
+    "rules": 262,
+    "rules_cited_in_src": 16,
+    "rules_with_tests": 26,
+    "topology_edges": 11,
+    "lock_acquisitions": 433,
+    "lock_constructions": 151,
+    "flowcharts": 52,
+    "flowcharts_with_rules": 20
+  },
+  "crates": [
+    "graphrefly-bindings-js",
+    "graphrefly-bindings-py",
+    "graphrefly-bindings-wasm",
+    "graphrefly-core",
+    "graphrefly-graph",
+    "graphrefly-operators",
+    "graphrefly-storage",
+    "graphrefly-structures"
+  ]
+}

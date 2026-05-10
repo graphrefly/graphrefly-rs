@@ -38,6 +38,14 @@ fn fn_can_reenter_core_emit_during_invoke_fn_runs_nested_wave() {
     // A derived's fn calls `Core::emit(other_state, ...)` mid-fire. The
     // nested emit should run a nested wave (in_tick re-entrance) and
     // queue downstream work; the outer drain picks it up.
+    //
+    // **Phase H+ topology requirement (2026-05-09):** the cross-partition
+    // emit during fire must obey ascending-order acquisition (Phase H+
+    // option (d) limited variant). To satisfy that, declare s_side as a
+    // meta-companion of s_in so the wave's `compute_touched_partitions`
+    // acquires {partition(s_in), partition(s_side)} ascending UPFRONT;
+    // the inner emit on s_side then becomes a re-entrant acquire (already
+    // held by this thread) rather than a fresh descending acquire.
     let rt = TestRuntime::new();
     let s_in = rt.state(Some(TestValue::Int(0)));
     let s_side = rt.state(Some(TestValue::Int(0)));
@@ -51,11 +59,41 @@ fn fn_can_reenter_core_emit_during_invoke_fn_runs_nested_wave() {
     let d = rt.derived(&[s_in.id], move |deps| {
         if let TestValue::Int(n) = deps[0] {
             // Re-enter Core::emit lock-released. Should NOT deadlock.
-            let h = binding.intern(TestValue::Int(n * 10));
-            core.emit(s_side_id, h);
+            //
+            // Phase H+ /qa N1(a) (2026-05-09): gate on `n > 0` so the
+            // cross-partition emit fires from a TOP-LEVEL wave entry
+            // (`s_in.set(7)` below) rather than from d's activation-
+            // time fire. Activation goes through `Core::subscribe`'s
+            // direct `partition_wave_owner_lock_arc` (NOT `begin_batch_for`),
+            // which doesn't walk meta_companions; the cross-partition
+            // acquire would then be descending and panic. Top-level
+            // `s_in.set(...)` does go through `begin_batch_for(s_in)`
+            // which walks `s_in`'s meta_companions and acquires
+            // `{partition(s_in), partition(s_side)}` ascending upfront,
+            // so the inner emit is re-entrant on a held partition.
+            if n > 0 {
+                let h = binding.intern(TestValue::Int(n * 10));
+                core.emit(s_side_id, h);
+            }
         }
         Some(deps[0].clone())
     });
+    // Phase H+ topology requirement: declare s_side as a meta-companion
+    // of s_in so the top-level `s_in.set(...)` wave below acquires
+    // {partition(s_in), partition(s_side)} ascending upfront via
+    // `compute_touched_partitions(s_in)`. Inner emit on s_side is
+    // then a re-entrant acquire on a partition already held by the
+    // wave, not a fresh descending acquire from inside fn-fire.
+    //
+    // /qa A7 (2026-05-09): note that `add_meta_companion` ALSO
+    // induces R1.3.9.d TEARDOWN cascade — when `s_in` is torn down,
+    // `s_side` will receive a Teardown event. This test samples its
+    // assertions BEFORE `rt` drops, so the cascade doesn't affect
+    // observable behavior. Future variants that inspect state AFTER
+    // an explicit teardown must account for the cascaded Teardown
+    // on s_side's recorder (filter or assert).
+    let _ = d; // silence unused-binding warning if present
+    rt.core.add_meta_companion(s_in.id, s_side_id);
 
     let rec_d = rt.subscribe_recorder(d);
     let rec_side = rt.subscribe_recorder(s_side.id);
@@ -114,9 +152,28 @@ fn fn_can_reenter_core_invalidate_during_invoke_fn() {
 
     let core = rt.core.clone();
     let _d = rt.derived(&[s_in.id], move |deps| {
-        core.invalidate(s_other_id);
+        // Phase H+ /qa N1(a) (2026-05-09): gate on `n != 0` so the
+        // cross-partition invalidate fires from a TOP-LEVEL wave
+        // entry (`s_in.set(1)` below), not from d's activation-time
+        // fire. Same rationale as
+        // `fn_can_reenter_core_emit_during_invoke_fn_runs_nested_wave`
+        // above — subscribe-time activation goes through
+        // `partition_wave_owner_lock_arc` directly, bypassing the
+        // meta-companion walk in `compute_touched_partitions`.
+        if let TestValue::Int(n) = deps[0] {
+            if n != 0 {
+                core.invalidate(s_other_id);
+            }
+        }
         Some(deps[0].clone())
     });
+    // Phase H+ topology requirement: every wave entering d's fire
+    // must touch s_other's partition upfront. The top-level
+    // `s_in.set(...)` below drives begin_batch_for(s_in) which walks
+    // s_in's meta_companions to s_other, acquires both partitions
+    // ascending, then d's fire's inner invalidate on s_other is
+    // re-entrant on a held partition.
+    rt.core.add_meta_companion(s_in.id, s_other_id);
 
     let _rec_d = rt.subscribe_recorder(_d);
 
@@ -317,6 +374,11 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
     let late_sink_holder: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(Some(late_sink)));
     let late_sink_for_fn = late_sink_holder.clone();
     let trigger = rt.state(Some(TestValue::Int(0)));
+    // Phase H+ topology requirement: declare s as a meta-companion of
+    // trigger so the wave entered via trigger.set acquires both
+    // partitions ascending UPFRONT; the nested emit + subscribe on s
+    // are re-entrant acquires on a held partition.
+    rt.core.add_meta_companion(trigger.id, s_id);
 
     let _d = rt.derived(&[trigger.id], move |deps| {
         if let TestValue::Int(n) = deps[0] {
