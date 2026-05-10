@@ -2,7 +2,7 @@
 	"version": "0.0.1",
 	"configurations": [
 		{
-			"name": "rust-review",
+			"name": "rust-audit",
 			"runtimeExecutable": "python3",
 			"runtimeArgs": ["-m", "http.server", "8769", "--directory", "docs"],
 			"port": 8769

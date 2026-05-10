@@ -21,3 +21,23 @@ rust = "1.95"
 # Disable cargo's default incremental compilation in CI for smaller artifacts.
 # Local dev uses CARGO_INCREMENTAL=1 (cargo's default).
 # CARGO_INCREMENTAL = "0"
+
+# ─── tasks ──────────────────────────────────────────────────────────
+# Run with `mise run <name>` from anywhere inside the repo.
+
+[tasks.audit-serve]
+description = "Serve the rust-audit dashboard at http://localhost:8769/audit/site/"
+run = "python3 -m http.server 8769 --directory docs"
+
+[tasks.audit-extract]
+description = "Re-run the JSONL extractor (items, rules, tests, topology, locks, flowcharts)"
+run = "python3 docs/audit/extract.py"
+
+[tasks.audit-cite-suggest]
+description = "Generate auto-cite suggestions for tests that look spec-rule-shaped"
+run = "python3 docs/audit/auto_cite.py"
+
+[tasks.audit]
+description = "Re-extract all data, then serve the dashboard"
+depends = ["audit-extract"]
+run = "python3 -m http.server 8769 --directory docs"

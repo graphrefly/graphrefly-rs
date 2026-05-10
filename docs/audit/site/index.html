@@ -36,6 +36,7 @@
       <button type="button" class="tab" data-view="matrix"       aria-selected="false">Spec ⇄ Impl</button>
       <button type="button" class="tab" data-view="architecture" aria-selected="false">Architecture</button>
       <button type="button" class="tab" data-view="flowcharts"   aria-selected="false">Flowcharts</button>
+      <button type="button" class="tab" data-view="reviews"      aria-selected="false">Reviews</button>
     </nav>
     <div class="topbar-meta">
       <span class="generated" id="generatedAt">—</span>
@@ -284,6 +285,27 @@
         <div class="flow-stage" id="flowStage">
           <p class="empty" id="flowEmpty">Select a flowchart from the sidebar.</p>
         </div>
+      </div>
+    </section>
+
+    <section class="view view-reviews hidden" data-view="reviews">
+      <div class="view-header">
+        <h2>Reviews</h2>
+        <p class="view-sub">
+          One row per <code>/rust-review</code> session. Each row carries the
+          slice, premise, behavioral traces, simplification delta, opened
+          findings, and verdict — all structured fields, all queryable. Click a
+          card to expand its embedded traces and deltas.
+        </p>
+        <div class="view-controls">
+          <input id="reviewSearch" type="search" placeholder="Search slice, scope, premise…" />
+          <span class="flex-spacer"></span>
+          <button type="button" id="reviewExpandAll">Expand all</button>
+          <button type="button" id="reviewCollapseAll">Collapse all</button>
+        </div>
+      </div>
+      <div class="view-body">
+        <div id="reviewList" class="reviews-list"></div>
       </div>
     </section>
 

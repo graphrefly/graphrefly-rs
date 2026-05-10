@@ -762,6 +762,17 @@ def main():
     write_jsonl(OUT_DIR / "locks.jsonl", locks)
     write_jsonl(OUT_DIR / "flowcharts.jsonl", flowcharts)
 
+    # Reviews and findings are author-edited (not regenerated). Count them
+    # for the heartbeat — DO NOT overwrite either file.
+    reviews_path = OUT_DIR / "reviews.jsonl"
+    findings_path = OUT_DIR / "findings.jsonl"
+    review_count = 0
+    if reviews_path.is_file():
+        review_count = sum(1 for ln in reviews_path.read_text().splitlines() if ln.strip())
+    finding_count = 0
+    if findings_path.is_file():
+        finding_count = sum(1 for ln in findings_path.read_text().splitlines() if ln.strip())
+
     # Heartbeat metadata for the SPA's top strip
     files = [i for i in items if i["kind"] == "file"]
     code_files = [i for i in files if i["role"] == "src"]
@@ -792,6 +803,8 @@ def main():
             "lock_constructions": sum(1 for l in locks if l["op"] == "new"),
             "flowcharts": len(flowcharts),
             "flowcharts_with_rules": sum(1 for f in flowcharts if f["rules_cited"]),
+            "reviews": review_count,
+            "findings": finding_count,
         },
         "crates": crates,
     }
@@ -803,6 +816,7 @@ def main():
     print(f"Wrote {OUT_DIR/'topology.jsonl'}: {len(topology)} edges")
     print(f"Wrote {OUT_DIR/'locks.jsonl'}: {len(locks)} lock sites")
     print(f"Wrote {OUT_DIR/'flowcharts.jsonl'}: {len(flowcharts)} diagrams ({sum(1 for f in flowcharts if f['rules_cited'])} cite ≥1 rule)")
+    print(f"  ({review_count} reviews + {finding_count} findings preserved — those files are author-edited, not regenerated)")
     print(f"Wrote {OUT_DIR/'meta.json'}")
 
 

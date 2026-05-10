@@ -20,6 +20,7 @@ const DATA = {
   topology: [],
   locks: [],
   flowcharts: [],
+  reviews: [],
   meta: null,
 };
 
@@ -39,7 +40,7 @@ async function loadJsonl(url) {
 }
 
 async function loadAll() {
-  const [items, rules, findings, tests, topology, locks, flowcharts, metaResp] = await Promise.all([
+  const [items, rules, findings, tests, topology, locks, flowcharts, reviews, metaResp] = await Promise.all([
     loadJsonl("../data/items.jsonl"),
     loadJsonl("../data/rules.jsonl"),
     loadJsonl("../data/findings.jsonl").catch(() => []),
@@ -47,6 +48,7 @@ async function loadAll() {
     loadJsonl("../data/topology.jsonl").catch(() => []),
     loadJsonl("../data/locks.jsonl").catch(() => []),
     loadJsonl("../data/flowcharts.jsonl").catch(() => []),
+    loadJsonl("../data/reviews.jsonl").catch(() => []),
     fetch("../data/meta.json").then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
   DATA.items = items;
@@ -58,6 +60,7 @@ async function loadAll() {
   DATA.topology = topology;
   DATA.locks = locks;
   DATA.flowcharts = flowcharts;
+  DATA.reviews = reviews;
   DATA.meta = metaResp;
 }
 
@@ -73,6 +76,7 @@ function setView(view) {
   if (view === "matrix" && !DATA._matrixBuilt) renderMatrix();
   if (view === "architecture" && !DATA._archBuilt) renderArchitecture();
   if (view === "flowcharts" && !DATA._flowBuilt) renderFlowcharts();
+  if (view === "reviews" && !DATA._reviewsBuilt) renderReviews();
   history.replaceState(null, "", `#${view}`);
 }
 
@@ -117,6 +121,7 @@ function renderHeartbeat() {
     { label: "Limits / gaps", value: byKind("limit") + byKind("complete-gap"), sub: "deferred + missing coverage", tone: "warn" },
     { label: "Opportunities", value: byKind("opp"), sub: "simplification + perf", tone: "opp" },
     { label: "Flowcharts", value: DATA.flowcharts.length, sub: `${DATA.flowcharts.filter(f => (f.rules_cited || []).length).length} cite ≥1 rule`, tone: "note" },
+    { label: "Reviews", value: DATA.reviews.length, sub: DATA.reviews.length ? `latest ${(DATA.reviews.reduce((a,b) => (a.review_date || "") > (b.review_date || "") ? a : b).review_date) || "—"}` : "no /rust-review runs yet", tone: "note" },
   ];
   const ul = document.getElementById("kpis");
   ul.innerHTML = kpis.map(k => `
@@ -1567,6 +1572,190 @@ async function selectFlowchart(id) {
   }
 }
 
+// ─── view 6: reviews (timeline of /rust-review sessions) ────────────
+const REVIEWS_STATE = {
+  search: "",
+  expanded: new Set(),  // review ids that are open
+};
+
+function bindReviewsControls() {
+  document.getElementById("reviewSearch").addEventListener("input", (e) => {
+    REVIEWS_STATE.search = e.target.value.trim().toLowerCase();
+    renderReviews();
+  });
+  document.getElementById("reviewExpandAll").addEventListener("click", () => {
+    REVIEWS_STATE.expanded = new Set(DATA.reviews.map(r => r.id));
+    renderReviews();
+  });
+  document.getElementById("reviewCollapseAll").addEventListener("click", () => {
+    REVIEWS_STATE.expanded.clear();
+    renderReviews();
+  });
+}
+
+function renderReviews() {
+  DATA._reviewsBuilt = true;
+  const list = document.getElementById("reviewList");
+  if (DATA.reviews.length === 0) {
+    list.innerHTML = `<p class="empty">No reviews yet. Run <code>/rust-review</code> to append the first row.</p>`;
+    return;
+  }
+  // Sort by review_date desc, then by id
+  const sorted = DATA.reviews.slice().sort((a, b) => {
+    const da = a.review_date || "", db = b.review_date || "";
+    if (da !== db) return db.localeCompare(da);
+    return (a.id || "").localeCompare(b.id || "");
+  });
+  // Filter
+  const q = REVIEWS_STATE.search;
+  const filtered = q
+    ? sorted.filter(r => `${r.slice} ${r.scope} ${r.premise} ${r.id}`.toLowerCase().includes(q))
+    : sorted;
+
+  list.innerHTML = filtered.map(r => reviewCardHtml(r)).join("");
+
+  list.querySelectorAll(".review-card-header").forEach(h => {
+    h.addEventListener("click", () => {
+      const id = h.dataset.id;
+      if (REVIEWS_STATE.expanded.has(id)) REVIEWS_STATE.expanded.delete(id);
+      else REVIEWS_STATE.expanded.add(id);
+      renderReviews();
+    });
+  });
+  list.querySelectorAll(".review-finding-link").forEach(a => {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setView("findings");
+      requestAnimationFrame(() => openFindingDetail(a.dataset.findingId));
+    });
+  });
+  list.querySelectorAll(".review-rule-chip").forEach(chip => {
+    chip.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      jumpToMatrixRule(chip.dataset.rule);
+    });
+  });
+  list.querySelectorAll(".review-flow-chip").forEach(chip => {
+    chip.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      FLOW_STATE.selectedId = chip.dataset.fcId;
+      setView("flowcharts");
+    });
+  });
+}
+
+function reviewCardHtml(r) {
+  const expanded = REVIEWS_STATE.expanded.has(r.id);
+  const verdictTone = (r.assessment?.spec_fidelity || "").toLowerCase();
+  const toneClass = verdictTone.startsWith("very high") || verdictTone.startsWith("high")
+    ? "opp"
+    : verdictTone.startsWith("med") ? "warn"
+    : verdictTone === "low" ? "bug"
+    : "note";
+  const findingsCount = (r.findings_opened || []).length;
+  const tracesCount = (r.traces || []).length;
+  const deltasCount = (r.deltas || []).length;
+
+  return `
+    <article class="review-card${expanded ? " expanded" : ""}" data-id="${esc(r.id)}">
+      <header class="review-card-header" data-id="${esc(r.id)}">
+        <span class="review-card-toggle">${expanded ? "▾" : "▸"}</span>
+        <div class="review-card-headline">
+          <div class="review-card-title">
+            <span class="review-card-date">${esc(r.review_date || "—")}</span>
+            <span class="review-card-slice">${esc(r.slice || "—")}</span>
+          </div>
+          ${r.scope ? `<div class="review-card-scope">${esc(r.scope)}</div>` : ""}
+        </div>
+        <span class="review-card-stats">
+          <span class="review-stat" title="behavioral traces">${tracesCount} trace${tracesCount === 1 ? "" : "s"}</span>
+          <span class="review-stat" title="simplification delta rows">${deltasCount} delta${deltasCount === 1 ? "" : "s"}</span>
+          <span class="review-stat" title="findings opened">${findingsCount} finding${findingsCount === 1 ? "" : "s"}</span>
+          <span class="review-stat tests">${r.tests_before ?? "?"} → ${r.tests_after ?? "?"}</span>
+          <span class="kpi-pill ${toneClass}">${esc(r.assessment?.spec_fidelity || "—")}</span>
+        </span>
+      </header>
+      ${expanded ? reviewCardBody(r) : ""}
+    </article>
+  `;
+}
+
+function reviewCardBody(r) {
+  const traces = (r.traces || []).map(t => `
+    <details class="review-trace">
+      <summary>
+        <span class="rule-chip">${esc(t.id)}</span>
+        <span class="review-trace-title">${esc(t.title)}</span>
+        ${(t.rules || []).map(rule => `<span class="rule-chip clickable review-rule-chip" data-rule="${esc(rule)}">${esc(rule)}</span>`).join("")}
+        ${(t.diagrams || []).map(fid => `<span class="rule-chip review-flow-chip clickable" data-fc-id="${esc(fid)}" title="Open flowchart F${esc(fid)}">📊 F${esc(fid)}</span>`).join("")}
+      </summary>
+      <table class="review-trace-table">
+        <thead><tr><th>#</th><th>Event</th><th>Internal state change</th><th>Observable output</th></tr></thead>
+        <tbody>${(t.steps || []).map(s => `
+          <tr>
+            <td class="num">${esc(s.step)}</td>
+            <td><code>${esc(s.event)}</code></td>
+            <td>${esc(s.internal)}</td>
+            <td>${esc(s.output)}</td>
+          </tr>
+        `).join("")}</tbody>
+      </table>
+      ${t.commentary ? `<p class="review-trace-commentary">${esc(t.commentary)}</p>` : ""}
+    </details>
+  `).join("");
+
+  const deltas = (r.deltas || []).length ? `
+    <h4>Simplification delta</h4>
+    <table class="review-delta-table">
+      <thead><tr><th>#</th><th>TS pattern</th><th>Rust replacement</th><th>Simpler?</th><th>Notes</th></tr></thead>
+      <tbody>${r.deltas.map(d => `
+        <tr class="delta-${esc(d.simpler || "same")}">
+          <td class="num">${esc(d.n)}</td>
+          <td>${esc(d.ts_pattern)}</td>
+          <td>${esc(d.rust_replacement)}</td>
+          <td><span class="delta-tag delta-${esc(d.simpler || "same")}">${esc(d.simpler || "same")}</span></td>
+          <td>${esc(d.notes || "")}${d.diagram ? ` <span class="rule-chip review-flow-chip clickable" data-fc-id="${esc(d.diagram)}">📊 F${esc(d.diagram)}</span>` : ""}</td>
+        </tr>
+      `).join("")}</tbody>
+    </table>
+  ` : "";
+
+  const findingsLinks = (r.findings_opened || []).length ? `
+    <h4>Findings opened in this review</h4>
+    <div class="review-findings-row">
+      ${r.findings_opened.map(fid => {
+        const f = DATA.findings.find(x => x.id === fid);
+        const label = f ? `${fid} — ${f.title}` : fid;
+        const kind = f?.kind || "note";
+        return `<a class="review-finding-link kind-pill" data-finding-id="${esc(fid)}" data-kind="${esc(kind)}" title="${esc(label)}">${esc(fid)}: ${esc(f?.title || fid)}</a>`;
+      }).join("")}
+    </div>
+  ` : "";
+
+  const verdict = r.assessment ? `
+    <h4>Verdict</h4>
+    <dl class="review-verdict">
+      ${r.assessment.spec_fidelity ? `<dt>Spec fidelity</dt><dd>${esc(r.assessment.spec_fidelity)}</dd>` : ""}
+      ${r.assessment.over_engineering ? `<dt>Over-engineering</dt><dd>${esc(r.assessment.over_engineering)}</dd>` : ""}
+      ${r.assessment.correctness_holes ? `<dt>Correctness holes</dt><dd>${esc(r.assessment.correctness_holes)}</dd>` : ""}
+      ${r.assessment.halt ? `<dt>HALT</dt><dd>${esc(r.assessment.halt)}</dd>` : ""}
+      ${r.assessment.summary ? `<dt>Summary</dt><dd>${esc(r.assessment.summary)}</dd>` : ""}
+    </dl>
+  ` : "";
+
+  return `
+    <div class="review-card-body">
+      ${r.premise ? `<p class="review-premise">${esc(r.premise)}</p>` : ""}
+      ${traces ? `<h4>Behavioral traces</h4><div class="review-traces">${traces}</div>` : ""}
+      ${deltas}
+      ${findingsLinks}
+      ${verdict}
+      ${r.source ? `<p class="muted small" style="margin-top:14px;">Source: <code>${esc(r.source)}</code></p>` : ""}
+    </div>
+  `;
+}
+
 // ─── cross-view linking ───────────────────────────────────────────
 // Jump from any file reference (in findings, locks, sidecar, etc.) to
 // the Repo Map with that file selected and the parent crate auto-zoomed.
@@ -1649,6 +1838,7 @@ async function boot() {
   bindMatrixControls();
   bindArchControls();
   bindFlowControls();
+  bindReviewsControls();
 
   document.querySelectorAll(".tab").forEach(t => {
     t.addEventListener("click", () => setView(t.dataset.view));

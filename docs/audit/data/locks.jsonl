@@ -57,32 +57,33 @@
 {"crate":"graphrefly-bindings-js","file":"crates/graphrefly-bindings-js/src/operator_bindings.rs","line":934,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if !binding.registry.lock().validate_and_retain(h_out) {","role":"src"}
 {"crate":"graphrefly-bindings-js","file":"crates/graphrefly-bindings-js/src/operator_bindings.rs","line":966,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if !binding.registry.lock().validate_and_retain(h_out) {","role":"src"}
 {"crate":"graphrefly-bindings-js","file":"crates/graphrefly-bindings-js/src/operator_bindings.rs","line":1000,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if !binding.registry.lock().validate_and_retain(h_out) {","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2314,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_before = self.registry.lock().epoch();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2328,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_after = self.registry.lock().epoch();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2378,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_before = self.registry.lock().epoch();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2385,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_after = self.registry.lock().epoch();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2414,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_before = self.registry.lock().epoch();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2428,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_after = self.registry.lock().epoch();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2478,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_before = self.registry.lock().epoch();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/batch.rs","line":2485,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let epoch_after = self.registry.lock().epoch();","role":"src"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/src/boundary.rs","line":472,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"/// implementations just call `node_ctx.lock().remove(&node_id)`.","role":"src"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/src/lib.rs","line":40,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"// since the state lives in CoreState behind self.state.lock()). The lint","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":506,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = state.lock();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1482,"op":"new","lock_type":"Mutex","snippet":"state: Arc::new(Mutex::new(CoreState {","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1523,"op":"new","lock_type":"parking_lot::Mutex","snippet":"registry: Arc::new(parking_lot::Mutex::new(","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1540,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.state.lock()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1593,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().component_count()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1605,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().partition_of(node)","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1631,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1643,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1689,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1728,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().all_partitions()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2226,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2630,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"// `node_ctx.lock()` can't deadlock against Core's state lock \u2014 and","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3363,"op":"new","lock_type":"Mutex","snippet":"let torn_down: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3373,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"torn_down_for_wave.lock().extend(collected);","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3378,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let ids = std::mem::take(&mut *torn_down.lock());","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3778,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3788,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3798,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4051,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4253,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":198,"op":"new","lock_type":"RefCell","snippet":"= const { RefCell::new(SmallVec::new_const()) };","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":846,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = state.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1822,"op":"new","lock_type":"Mutex","snippet":"state: Arc::new(Mutex::new(CoreState {","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1863,"op":"new","lock_type":"parking_lot::Mutex","snippet":"registry: Arc::new(parking_lot::Mutex::new(","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1880,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.state.lock()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1933,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().component_count()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1945,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().partition_of(node)","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":1993,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2019,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2068,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2107,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.registry.lock().all_partitions()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":2605,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3009,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"// `node_ctx.lock()` can't deadlock against Core's state lock \u2014 and","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3742,"op":"new","lock_type":"Mutex","snippet":"let torn_down: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3752,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"torn_down_for_wave.lock().extend(collected);","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":3757,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let ids = std::mem::take(&mut *torn_down.lock());","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4157,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4167,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4177,"op":"lock","lock_type":"Mutex/parking_lot","snippet":".lock()","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4430,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/src/node.rs","line":4632,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut reg = self.registry.lock();","role":"src"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/src/topology.rs","line":48,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = state.lock();","role":"src"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/src/topology.rs","line":102,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let s = self.state.lock();","role":"src"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/batch.rs","line":57,"op":"new","lock_type":"Mutex","snippet":"inner: Arc::new(Mutex::new(Vec::new())),","role":"tests"}
@@ -195,25 +196,25 @@
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_discipline.rs","line":242,"op":"new","lock_type":"Mutex","snippet":"let stop = Arc::new(Mutex::new(false));","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_discipline.rs","line":249,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"while !*stop_emit.lock().unwrap() && counter <= 1000 {","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_discipline.rs","line":266,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*stop.lock().unwrap() = true;","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":308,"op":"new","lock_type":"Mutex","snippet":"let late_recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":311,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*late_recorder.lock().unwrap() = Some(late_rec);","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":317,"op":"new","lock_type":"Mutex","snippet":"let late_sink_holder: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(Some(late_sink)));","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":332,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if let Some(sink) = late_sink_for_fn.lock().unwrap().take() {","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":334,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if let Some(rec) = late_recorder_for_fn.lock().unwrap().as_ref() {","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":368,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let late = late_recorder.lock().unwrap();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":423,"op":"new","lock_type":"Mutex","snippet":"let rx = Arc::new(Mutex::new(Some(rx)));","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":432,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":560,"op":"new","lock_type":"Mutex","snippet":"let rx = Arc::new(Mutex::new(Some(rx)));","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":567,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":713,"op":"new","lock_type":"Mutex","snippet":"core_slot: Mutex::new(None),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":714,"op":"new","lock_type":"Mutex","snippet":"probe_node: Mutex::new(None),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":724,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.core_slot.lock().unwrap().as_ref(),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":725,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*self.probe_node.lock().unwrap(),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":751,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*binding.core_slot.lock().unwrap() = Some(core.clone());","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":756,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*binding.probe_node.lock().unwrap() = Some(probe_id);","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":768,"op":"new","lock_type":"Mutex","snippet":"let rec_events: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":771,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"rec_events_for_sink.lock().unwrap().extend_from_slice(msgs);","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":776,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let events = rec_events.lock().unwrap();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":365,"op":"new","lock_type":"Mutex","snippet":"let late_recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":368,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*late_recorder.lock().unwrap() = Some(late_rec);","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":374,"op":"new","lock_type":"Mutex","snippet":"let late_sink_holder: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(Some(late_sink)));","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":394,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if let Some(sink) = late_sink_for_fn.lock().unwrap().take() {","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":396,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"if let Some(rec) = late_recorder_for_fn.lock().unwrap().as_ref() {","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":430,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let late = late_recorder.lock().unwrap();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":485,"op":"new","lock_type":"Mutex","snippet":"let rx = Arc::new(Mutex::new(Some(rx)));","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":494,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":622,"op":"new","lock_type":"Mutex","snippet":"let rx = Arc::new(Mutex::new(Some(rx)));","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":629,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":775,"op":"new","lock_type":"Mutex","snippet":"core_slot: Mutex::new(None),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":776,"op":"new","lock_type":"Mutex","snippet":"probe_node: Mutex::new(None),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":786,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"self.core_slot.lock().unwrap().as_ref(),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":787,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*self.probe_node.lock().unwrap(),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":813,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*binding.core_slot.lock().unwrap() = Some(core.clone());","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":818,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"*binding.probe_node.lock().unwrap() = Some(probe_id);","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":830,"op":"new","lock_type":"Mutex","snippet":"let rec_events: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":833,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"rec_events_for_sink.lock().unwrap().extend_from_slice(msgs);","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/lock_released.rs","line":838,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let events = rec_events.lock().unwrap();","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/loom_subscription.rs","line":61,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = self.state.lock().unwrap();","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/loom_subscription.rs","line":74,"op":"new","lock_type":"Mutex","snippet":"let registry = Arc::new(Mutex::new(SubRegistry {","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/loom_subscription.rs","line":113,"op":"new","lock_type":"Mutex","snippet":"let registry = Arc::new(Mutex::new(SubRegistry {","role":"tests"}
@@ -231,12 +232,12 @@
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":145,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":239,"op":"new","lock_type":"Mutex","snippet":"let rx = Arc::new(Mutex::new(Some(rx)));","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":246,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let recv = rx_for_fn.lock().unwrap().take();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":564,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let g_low = low.guard.lock().unwrap();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":565,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let g_high = high.guard.lock().unwrap();","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":597,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":601,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":663,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
-{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":667,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":658,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let g_low = low.guard.lock().unwrap();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":659,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let g_high = high.guard.lock().unwrap();","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":691,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":695,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":757,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
+{"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/per_subgraph_parallelism.rs","line":761,"op":"new","lock_type":"Mutex","snippet":"guard: Mutex::new(()),","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/producer.rs","line":47,"op":"new","lock_type":"Mutex","snippet":"inner: Mutex::new(ProducerInner {","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/producer.rs","line":61,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut inner = self.inner.lock().unwrap();","role":"tests"}
 {"crate":"graphrefly-core","file":"crates/graphrefly-core/tests/producer.rs","line":70,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut inner = self.inner.lock().unwrap();","role":"tests"}
@@ -514,8 +515,8 @@
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/ops_impl.rs","line":626,"op":"new","lock_type":"Mutex","snippet":"let state: Arc<Mutex<TakeUntilState>> = Arc::new(Mutex::new(TakeUntilState::new()));","role":"src"}
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/ops_impl.rs","line":640,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = state_for_source.lock().unwrap();","role":"src"}
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/ops_impl.rs","line":695,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut s = state_for_notifier.lock().unwrap();","role":"src"}
-{"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/producer.rs","line":152,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut states = self.storage.lock();","role":"src"}
-{"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/producer.rs","line":162,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut states = storage.lock();","role":"src"}
+{"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/producer.rs","line":182,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut states = self.storage.lock();","role":"src"}
+{"crate":"graphrefly-operators","file":"crates/graphrefly-operators/src/producer.rs","line":192,"op":"lock","lock_type":"Mutex/parking_lot","snippet":"let mut states = storage.lock();","role":"src"}
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/tests/common/mod.rs","line":132,"op":"new","lock_type":"Mutex","snippet":"state: Mutex::new(RegistryState {","role":"tests"}
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/tests/common/mod.rs","line":147,"op":"new","lock_type":"parking_lot::Mutex","snippet":"producer_storage: Arc::new(parking_lot::Mutex::new(ahash::AHashMap::new())),","role":"tests"}
 {"crate":"graphrefly-operators","file":"crates/graphrefly-operators/tests/common/mod.rs","line":148,"op":"new","lock_type":"Mutex","snippet":"core_ref: Mutex::new(None),","role":"tests"}

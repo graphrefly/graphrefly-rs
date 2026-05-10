@@ -42,7 +42,7 @@ parking_lot = { version = "0.12", default-features = false, features = ["arc_loc
 ahash       = { version = "0.8" }
 
 # Small-collection primitives
-smallvec    = { version = "1.13", features = ["union"] }
+smallvec    = { version = "1.13", features = ["union", "const_new"] }
 indexmap    = { version = "2.6" }
 
 # Errors / logging
