@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.3...graphrefly-core-v0.0.4) - 2026-05-10
+
+### Added
+
+- phase E F
+
+### Fixed
+
+- slice Q
+- slice H i J K
+
+### Other
+
+- release v0.0.3
+
 ## [0.0.3](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.2...graphrefly-core-v0.0.3) - 2026-05-09
 
 ### Fixed
