@@ -80,15 +80,14 @@ use parking_lot::{ArcReentrantMutexGuard, Mutex, MutexGuard};
 /// the batch guard across threads fails to compile.
 ///
 /// **Phase H+ option (d) limited variant (2026-05-09):** the guard's
-/// [`Drop`] also pops `sid` from the [`held_partitions`] thread-local
-/// so the ascending-order check on the next acquire sees the correct
+/// [`Drop`] pops `sid` from the [`held_partitions`] thread-local so
+/// the ascending-order check on the next acquire sees the correct
 /// "currently held" set. Re-entrant acquires (same thread, same
 /// partition) increment a refcount in the thread-local; final drop
 /// removes the entry.
 ///
 /// Slice Y1 / Phase E (2026-05-08); Phase H+ wrapper (2026-05-09).
 pub(crate) struct WaveOwnerGuard {
-    /// The actual parking_lot guard holding the partition wave_owner.
     /// Drop order: the wrapper's Drop runs FIRST (pops `held_partitions`),
     /// then `inner` drops automatically (releases the parking_lot lock).
     /// Field-declaration order matters in Rust: the wrapper drops top-
@@ -106,7 +105,13 @@ pub(crate) struct WaveOwnerGuard {
 
 impl Drop for WaveOwnerGuard {
     fn drop(&mut self) {
-        held_partitions::release(self.sid);
+        // `held_partitions::release` returns `bool was_outermost`. The
+        // outermost-release signal is consumed by [`crate::batch::BatchGuard::drop`]
+        // for the per-thread `TIER3_EMITTED_THIS_WAVE` clear (D1 patch,
+        // 2026-05-09 — Slice G coalescing tracker is keyed by thread,
+        // not by partition, so the clear lives on `BatchGuard` not here).
+        // We discard the bool — no per-guard cleanup remains.
+        let _ = held_partitions::release(self.sid);
         // `inner` drops automatically after this — releases the
         // parking_lot::ReentrantMutex (decrementing parking_lot's
         // own internal re-entry counter; only the FINAL release
@@ -161,16 +166,32 @@ impl Drop for WaveOwnerGuard {
 ///   destroy cascades).
 mod held_partitions {
     use crate::subgraph::SubgraphId;
+    use smallvec::SmallVec;
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+
+    /// Inline-storage capacity for the per-thread held-partitions set.
+    /// 4 mirrors the same inline limit used elsewhere in the codebase
+    /// (`compute_touched_partitions` returns `SmallVec<[SubgraphId; 4]>`,
+    /// `BatchGuard::_wave_guards` is `SmallVec<[WaveOwnerGuard; 4]>`).
+    /// In the typical wave a single thread holds 1–3 partitions; spillover
+    /// to the heap costs allocation but is correct.
+    const HELD_INLINE: usize = 4;
 
     thread_local! {
-        /// Currently-held partitions on this thread, keyed by
-        /// `SubgraphId`. The value is a re-entry refcount (mirrors
-        /// parking_lot::ReentrantMutex's internal counter — needed
-        /// because we can't query parking_lot's count). `BTreeMap`
-        /// gives ordered iteration so `iter().next_back()` is the
-        /// max-held in O(log n).
+        /// Currently-held partitions on this thread, as `(SubgraphId, refcount)`
+        /// pairs in arbitrary order. The refcount mirrors
+        /// `parking_lot::ReentrantMutex`'s internal counter (we can't query
+        /// parking_lot's directly).
+        ///
+        /// `SmallVec<[_; HELD_INLINE]>` over `BTreeMap<_, _>`: under the
+        /// expected workload (≤4 partitions held simultaneously per wave) the
+        /// inline-storage SmallVec keeps the entire set in stack memory with
+        /// no allocation, no Box-per-node, and contiguous cache layout. Linear
+        /// scans are branch-predictable and faster than BTreeMap's logn
+        /// pointer-chasing for tiny N. Phase J post-widening bench
+        /// (`migration-status.md` 2026-05-09) reported 14–25% overhead vs the
+        /// pre-widening baseline, attributed in part to BTreeMap allocation
+        /// costs on the hot path. This swap recovers part of that overhead.
         ///
         /// Bookkeeping is unconditional — every acquire bumps the
         /// refcount, every release decrements. The CHECK gate
@@ -178,7 +199,8 @@ mod held_partitions {
         /// distinguishes "first-time acquire on a fresh thread"
         /// (allowed, held empty) from "nested acquire while we
         /// already hold something" (must be ascending).
-        static HELD: RefCell<BTreeMap<SubgraphId, u32>> = const { RefCell::new(BTreeMap::new()) };
+        static HELD: RefCell<SmallVec<[(SubgraphId, u32); HELD_INLINE]>>
+            = const { RefCell::new(SmallVec::new_const()) };
 
         /// Per-thread "we're inside a producer build/project closure"
         /// refcount. Producer-pattern operator activation increments
@@ -275,8 +297,11 @@ mod held_partitions {
             // producer-internal sink callbacks). First-time acquires
             // on a fresh thread (held empty) skip the check — there's
             // nothing to compare against.
-            if !held.is_empty() && !in_producer_build() && !held.contains_key(&sid) {
-                if let Some((&max_held, _)) = held.iter().next_back() {
+            let already_held = held.iter().any(|(s, _)| *s == sid);
+            if !held.is_empty() && !in_producer_build() && !already_held {
+                // Linear-scan max over the inline storage (typical N ≤ 4).
+                // Branch-predictable and cache-local; no allocation.
+                if let Some(max_held) = held.iter().map(|(s, _)| *s).max() {
                     if sid <= max_held {
                         // Drop the borrow before panicking so unwind
                         // doesn't see a still-borrowed RefCell.
@@ -327,13 +352,16 @@ mod held_partitions {
             }
             // Bookkeeping: increment refcount. `checked_add(1)` so
             // overflow surfaces (would indicate an unbounded
-            // re-entrance — a real bug).
-            let entry = held.entry(sid).or_insert(0);
-            *entry = entry.checked_add(1).expect(
-                "held_partitions refcount overflow — unbounded \
-                 same-partition re-entrance. Should be bounded by the \
-                 protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
-            );
+            // re-entrance — a real bug). Linear find-or-push.
+            if let Some((_, count)) = held.iter_mut().find(|(s, _)| *s == sid) {
+                *count = count.checked_add(1).expect(
+                    "held_partitions refcount overflow — unbounded \
+                     same-partition re-entrance. Should be bounded by the \
+                     protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
+                );
+            } else {
+                held.push((sid, 1));
+            }
         });
     }
 
@@ -343,16 +371,56 @@ mod held_partitions {
     /// [`super::Core::partition_wave_owner_lock_arc`] to ensure the
     /// refcount stays balanced under all unwind / retry / exhaust
     /// paths.
-    pub(crate) fn release(sid: SubgraphId) {
+    ///
+    /// Returns `true` iff this release brought the partition's
+    /// refcount on this thread to zero — i.e. this was the OUTERMOST
+    /// guard for `sid` on this thread. [`super::WaveOwnerGuard::drop`]
+    /// uses this signal to clear per-partition wave state (Q3) on
+    /// outermost release only; inner re-entrant guard drops must NOT
+    /// clear (a containing wave is still active and still holds
+    /// in-flight wave state). The `partition_wave_owner_lock_arc`
+    /// retry / panic paths ignore the return value because the
+    /// partition state hadn't been touched yet on those paths
+    /// (clearing would be a no-op anyway).
+    pub(crate) fn release(sid: SubgraphId) -> bool {
         HELD.with(|h| {
             let mut held = h.borrow_mut();
-            if let Some(count) = held.get_mut(&sid) {
+            if let Some(idx) = held.iter().position(|(s, _)| *s == sid) {
+                let count = &mut held[idx].1;
+                // /qa A3 fix (2026-05-09): debug_assert the refcount is
+                // non-zero before decrement. A `release(sid)` on an
+                // entry with `count == 0` indicates a bookkeeping bug
+                // (a release without a matching `check_and_acquire`,
+                // or a logic error in caller), but the legacy
+                // saturating_sub silently returned `was_outermost=true`
+                // and removed the entry — masking the bug. Surface
+                // in dev/test builds; release builds preserve the
+                // saturating behavior.
+                debug_assert!(
+                    *count > 0,
+                    "held_partitions::release({sid:?}): refcount underflow — \
+                     release without matching check_and_acquire (caller bug)"
+                );
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    held.remove(&sid);
+                    // `swap_remove` is O(1) and order-irrelevant: the
+                    // CHECK gate computes max via linear scan and does
+                    // not depend on iteration order.
+                    held.swap_remove(idx);
+                    return true;
                 }
+            } else {
+                // /qa A3 fix (2026-05-09): same intent — release on a
+                // sid that's not in HELD is a bookkeeping bug. Surface
+                // in dev/test builds.
+                debug_assert!(
+                    false,
+                    "held_partitions::release({sid:?}): sid not in HELD — \
+                     double-drop or stray release (caller bug)"
+                );
             }
-        });
+            false
+        })
     }
 
     /// Test-only: read the current thread's held-partitions snapshot.
@@ -365,7 +433,15 @@ mod held_partitions {
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn held_snapshot_for_tests() -> Vec<(SubgraphId, u32)> {
-        HELD.with(|h| h.borrow().iter().map(|(s, c)| (*s, *c)).collect())
+        // /qa A2 fix (2026-05-09): sort by SubgraphId so the snapshot
+        // returns ascending order — matches the BTreeMap-iteration
+        // contract that pre-/qa SmallVec swap consumers might rely on.
+        // Test consumers currently only assert `is_empty()`, but the
+        // ordered shape is the safer default for future tests that
+        // assert specific entries.
+        let mut v: Vec<(SubgraphId, u32)> = HELD.with(|h| h.borrow().to_vec());
+        v.sort_unstable_by_key(|(s, _)| *s);
+        v
     }
 
     /// Test-only: read the current thread's producer-build refcount.
@@ -1469,10 +1545,161 @@ impl NodeRecord {
     }
 }
 
+/// Wave-scoped cross-partition aggregation state — fields populated as
+/// a wave executes that aggregate work across every partition the wave
+/// touched, drained / cleared at wave-end. Lives behind a separate
+/// [`parking_lot::Mutex`] from [`CoreState`].
+///
+/// **Q2 (next batch — post-D3-closure, 2026-05-09):** moved out of
+/// `CoreState`'s critical section into a sibling mutex. Q2 alone is
+/// pattern-prep for Q-beyond — the bench impact in isolation is 0–5% in
+/// Regime A (the four fields are ~4 of ~15 fields in the wave-engine
+/// critical section). The structural value is establishing the "Core
+/// has multiple Core-level mutexes" pattern with explicit
+/// lock-discipline rules:
+///
+/// - **Lock order (acquire-direction rules; constrains the order ONLY
+///   WHEN both are acquired simultaneously):**
+///   - `state → registry` (P12 invariant — pre-existing).
+///   - `state → cross_partition` (Q2, 2026-05-09).
+///   - `registry → cross_partition` is permitted (no path uses both
+///     simultaneously today; reserved for forward compatibility).
+///   - The forbidden direction is `cross_partition → state`: any
+///     thread holding `cross_partition` must NOT then attempt to
+///     acquire `state`, since some thread doing the canonical
+///     `state → cross_partition` order would deadlock against it.
+///   - `partition_state` (the per-`SubgraphLockBox::state` mutex) was
+///     introduced under Q3 v1 then reverted by the D1 patch; it no
+///     longer exists in this lock chain.
+/// - **Acquire alone:** sites that ONLY touch the four fields (no state
+///   access in the same critical section) MAY acquire `cross_partition`
+///   without state. The lock-order rule only constrains the RELATIVE
+///   order when both are acquired.
+/// - **Wave-end clear:** [`Self::clear_wave_state`] zeroes
+///   `pending_auto_resolve` and `pending_pause_overflow`. The other two
+///   fields (`wave_cache_snapshots` and `deferred_handle_releases`)
+///   follow the explicit drain-and-release-lock-released discipline in
+///   the BatchGuard success/panic paths — see `Drop for BatchGuard` for
+///   the canonical drain order.
+///
+/// Q-beyond will continue the shape decomposition with per-partition
+/// `SubgraphShard`s holding most of `CoreState`'s fields per-partition;
+/// the four fields here aggregate ACROSS partitions in a wave and stay
+/// shared.
+pub(crate) struct CrossPartitionState {
+    /// Payload-handle releases owed for messages that landed in
+    /// `pending_notify` during this wave (one per `payload_handle()`).
+    /// `run_wave` releases these after sinks fire and the lock is dropped,
+    /// balancing the retain done in `queue_notify`.
+    pub(crate) deferred_handle_releases: Vec<HandleId>,
+    /// Pre-wave cache snapshots used to restore state if the wave aborts
+    /// mid-flight (e.g., a `Core::batch` closure panics). Each entry is
+    /// `(node_id → old_cache_handle)` — the handle the node held BEFORE
+    /// the wave started writing to it. The snapshotted handle holds a
+    /// retain (taken when the snapshot was inserted) so it stays alive
+    /// for restoration. On wave success, snapshots are dropped and their
+    /// retains released. On wave abort (`BatchGuard::drop` panic-discard
+    /// path), each cache slot is restored from the snapshot — the slot's
+    /// current handle is released, and the snapshot's retain transfers
+    /// to the cache slot. Only populated for in-flight waves; empty
+    /// between waves.
+    pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
+    /// Nodes that need an auto-Resolved at wave end if they don't receive
+    /// a tier-3+ message from their own commit_emission. Populated by
+    /// the RESOLVED child propagation in `commit_emission` (which queues
+    /// Dirty but defers Resolved to avoid double-settlement). Drained by
+    /// the auto-resolve sweep in `drain_and_flush`. Cleared by
+    /// `clear_wave_state`.
+    pub(crate) pending_auto_resolve: ahash::AHashSet<NodeId>,
+    /// R1.3.8.c pause-overflow ERROR synthesis queue (Slice F, A3 —
+    /// 2026-05-07). Recorded by [`Core::queue_notify`] when the pause
+    /// buffer first overflows in a cycle; drained at wave-end after the
+    /// lock-released call to
+    /// [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
+    ///
+    /// One entry per (node × pause-cycle); subsequent overflows in the
+    /// same cycle don't re-queue (gated by `PauseState::overflow_reported`).
+    pub(crate) pending_pause_overflow: Vec<PendingPauseOverflow>,
+    /// Binding-boundary handle for `Drop`-time refcount balancing.
+    /// Mirrors [`CoreState::binding`] — both structs hold their own
+    /// strong ref so each can independently release retained handles
+    /// from its drop path. The Arc clone is cheap; the binding object
+    /// itself is shared.
+    binding: Arc<dyn BindingBoundary>,
+}
+
+impl CrossPartitionState {
+    /// Construct an empty `CrossPartitionState`. **Caller invariant
+    /// (load-bearing):** `binding` MUST be the same `Arc<dyn BindingBoundary>`
+    /// instance that's also stored in [`CoreState::binding`] and
+    /// [`Core::binding`] for the same `Core`. The three strong refs
+    /// share refcount accounting for handle retain/release pairings;
+    /// passing a DIFFERENT binding here would split the refcount
+    /// state and produce use-after-free / double-release on
+    /// `release_handle` paths. Only `Core::new` constructs this — keep
+    /// it that way unless a future change moves construction
+    /// elsewhere with the same invariant preserved.
+    ///
+    /// /qa A8 doc-fix (2026-05-09).
+    fn new(binding: Arc<dyn BindingBoundary>) -> Self {
+        Self {
+            deferred_handle_releases: Vec::new(),
+            wave_cache_snapshots: HashMap::new(),
+            pending_auto_resolve: ahash::AHashSet::new(),
+            pending_pause_overflow: Vec::new(),
+            binding,
+        }
+    }
+
+    /// Wave-end clear. Mirrors the four field clears that previously
+    /// lived in [`CoreState::clear_wave_state`]. `pending_auto_resolve`
+    /// and `pending_pause_overflow` are zeroed; `wave_cache_snapshots`
+    /// and `deferred_handle_releases` are NOT cleared here — they
+    /// follow the success/panic paths' explicit drain discipline (see
+    /// [`Drop`] for panic-time cleanup).
+    pub(crate) fn clear_wave_state(&mut self) {
+        self.pending_auto_resolve.clear();
+        // A3 (Slice F, 2026-05-07): pending_pause_overflow is normally
+        // drained by drain_and_flush via the synthesis loop. If a wave is
+        // panic-discarded BEFORE the synthesis runs, we drop the queued
+        // entries silently — the binding never sees ERROR for that
+        // overflow event, but the pause buffer's `dropped` count is
+        // unchanged so callers can still detect via ResumeReport.
+        self.pending_pause_overflow.clear();
+    }
+}
+
+impl Drop for CrossPartitionState {
+    fn drop(&mut self) {
+        // Mirrors the cross_partition cleanup that previously lived in
+        // [`Drop for CoreState`] (Q2, 2026-05-09 — fields moved here).
+        // Defensive: at process-exit time the wave engine has typically
+        // drained these to empty, but a panicked-mid-wave Core could
+        // leave retains in either field.
+        let snapshots = std::mem::take(&mut self.wave_cache_snapshots);
+        for (_, h) in snapshots {
+            self.binding.release_handle(h);
+        }
+        let releases = std::mem::take(&mut self.deferred_handle_releases);
+        for h in releases {
+            self.binding.release_handle(h);
+        }
+        // pending_auto_resolve / pending_pause_overflow hold no retains.
+    }
+}
+
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
 ///
-/// v1 single-mutex; per-subgraph `ReentrantMutex` parallelism is a later
-/// optimization (CLAUDE.md Rust invariant 3).
+/// Q2 (2026-05-09) split four wave-scoped cross-partition aggregation
+/// fields out into [`CrossPartitionState`] under its own
+/// `parking_lot::Mutex` on [`Core`]. The D1 patch (2026-05-09) moved
+/// Slice G's `tier3_emitted_this_wave` set out to a per-thread
+/// thread-local in `crate::batch` (was briefly per-partition under Q3
+/// v1; that placement was vulnerable to mid-wave cross-thread
+/// `set_deps` partition splits — see `docs/porting-deferred.md`
+/// "Per-partition state-shard refactor" closing summary). Q-beyond
+/// will continue the shape decomposition by sharding most of the
+/// remaining fields per-partition.
 pub(crate) struct CoreState {
     pub(crate) next_node_id: u64,
     pub(crate) next_subscription_id: u64,
@@ -1523,11 +1750,8 @@ pub(crate) struct CoreState {
     /// `run_wave` then drops the lock and fires the jobs. Each tuple is
     /// `(sinks_for_one_node_one_phase, phase_messages)`. Empty between waves.
     pub(crate) deferred_flush_jobs: crate::batch::DeferredJobs,
-    /// Payload-handle releases owed for messages that landed in
-    /// `pending_notify` during this wave (one per `payload_handle()`).
-    /// `run_wave` releases these after sinks fire and the lock is dropped,
-    /// balancing the retain done in `queue_notify`.
-    pub(crate) deferred_handle_releases: Vec<HandleId>,
+    // Q2 (2026-05-09): `deferred_handle_releases` moved to
+    // [`CrossPartitionState::deferred_handle_releases`].
     /// Binding-boundary handle for `Drop`-time refcount balancing.
     /// `Core` also holds a clone of this Arc; storing it here lets
     /// `Drop for CoreState` walk every retained slot and release the
@@ -1535,25 +1759,10 @@ pub(crate) struct CoreState {
     /// `cache` / `terminal` / `dep_terminals` Error / pause-buffer payload
     /// handle refs leak in the binding registry until process exit.
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    /// Pre-wave cache snapshots used to restore state if the wave aborts
-    /// mid-flight (e.g., a `Core::batch` closure panics). Each entry is
-    /// `(node_id → old_cache_handle)` — the handle the node held BEFORE
-    /// the wave started writing to it. The snapshotted handle holds a
-    /// retain (taken when the snapshot was inserted) so it stays alive
-    /// for restoration. On wave success, snapshots are dropped and their
-    /// retains released. On wave abort (`BatchGuard::drop` panic-discard
-    /// path), each cache slot is restored from the snapshot — the slot's
-    /// current handle is released, and the snapshot's retain transfers
-    /// to the cache slot. Only populated for in-flight waves; empty
-    /// between waves.
-    pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
-    /// Nodes that need an auto-Resolved at wave end if they don't receive
-    /// a tier-3+ message from their own commit_emission. Populated by
-    /// the RESOLVED child propagation in `commit_emission` (which queues
-    /// Dirty but defers Resolved to avoid double-settlement). Drained by
-    /// the auto-resolve sweep in `drain_and_flush`. Cleared by
-    /// `clear_wave_state`.
-    pub(crate) pending_auto_resolve: ahash::AHashSet<NodeId>,
+    // Q2 (2026-05-09): `wave_cache_snapshots` moved to
+    // [`CrossPartitionState::wave_cache_snapshots`].
+    // Q2 (2026-05-09): `pending_auto_resolve` moved to
+    // [`CrossPartitionState::pending_auto_resolve`].
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
@@ -1574,32 +1783,17 @@ pub(crate) struct CoreState {
     /// higher-order operators) and linear scan is faster than hash for that
     /// size.
     pub(crate) currently_firing: Vec<NodeId>,
-    /// R1.3.8.c pause-overflow ERROR synthesis queue (Slice F, A3 —
-    /// 2026-05-07). Recorded by [`Core::queue_notify`] when the pause
-    /// buffer first overflows in a cycle; drained at wave-end after the
-    /// lock-released call to
-    /// [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
-    ///
-    /// One entry per (node × pause-cycle); subsequent overflows in the
-    /// same cycle don't re-queue (gated by `PauseState::overflow_reported`).
-    pub(crate) pending_pause_overflow: Vec<PendingPauseOverflow>,
-    /// Slice G (R1.3.2.d / R1.3.3.a — 2026-05-07): nodes that have emitted
-    /// at least one tier-3 message (Data or Resolved) in the CURRENT wave.
-    /// Wave-scoped (cleared in `clear_wave_state`). Used by
-    /// [`crate::batch::Core::commit_emission`] to detect "this is a
-    /// subsequent emit at this node in the same wave" — when set,
-    /// equals substitution is skipped (would produce a R1.3.3.a-violating
-    /// mixed wave) and any prior Resolved entries in pending_notify or
-    /// the pause buffer are rewritten to Data using the wave-start cache
-    /// snapshot.
-    ///
-    /// Distinct from `pending_pause_overflow` (per-pause-cycle, not
-    /// per-wave) and `wave_cache_snapshots` (per-wave snapshot, but only
-    /// populated on Data path pre-Slice-G). Populated by both Data and
-    /// Resolved branches of `commit_emission`; NOT populated by
-    /// `commit_emission_verbatim` (Batch path passes through verbatim
-    /// per R1.3.3.c).
-    pub(crate) tier3_emitted_this_wave: ahash::AHashSet<NodeId>,
+    // Q2 (2026-05-09): `pending_pause_overflow` moved to
+    // [`CrossPartitionState::pending_pause_overflow`].
+    // Slice G (R1.3.2.d / R1.3.3.a — 2026-05-07): tier3-emitted-this-wave
+    // tracker MOVED to a per-thread thread-local in `crate::batch`
+    // (D1 patch, 2026-05-09 — was briefly per-partition under Q3 v1
+    // 2026-05-09 morning). Wave-scope = thread; per-thread placement
+    // is robust to mid-wave cross-thread `set_deps` partition splits
+    // because thread B's split doesn't touch thread A's thread-local.
+    // See [`crate::batch::TIER3_EMITTED_THIS_WAVE`] for the per-thread
+    // wave-scope rationale and lifecycle (cleared at outermost
+    // [`crate::batch::BatchGuard`] drop, both success + panic).
     /// Slice E2 (R1.3.9.b strict reading per D057): per-wave-per-node
     /// dedup for `OnInvalidate` cleanup hook firing. A node already in
     /// this set this wave has already had its `OnInvalidate` queued into
@@ -1674,6 +1868,12 @@ pub(crate) struct CoreState {
 #[derive(Clone)]
 pub struct Core {
     pub(crate) state: Arc<Mutex<CoreState>>,
+    /// Q2 (2026-05-09): wave-scoped cross-partition aggregation state
+    /// behind a sibling `parking_lot::Mutex` (separate from `state`).
+    /// Lock-discipline: `state → cross_partition` (acquire state first
+    /// when both are needed). See [`CrossPartitionState`] for the
+    /// per-field rationale.
+    pub(crate) cross_partition: Arc<parking_lot::Mutex<CrossPartitionState>>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
     /// Slice X5 (D3 substrate, 2026-05-08) + Slice Y1 / Phase E
     /// (wave-engine migration, 2026-05-08): per-subgraph union-find
@@ -1707,6 +1907,7 @@ pub struct Core {
 #[derive(Clone)]
 pub struct WeakCore {
     state: Weak<Mutex<CoreState>>,
+    cross_partition: Weak<parking_lot::Mutex<CrossPartitionState>>,
     binding: Weak<dyn BindingBoundary>,
     registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
 }
@@ -1719,6 +1920,7 @@ impl WeakCore {
     pub fn upgrade(&self) -> Option<Core> {
         Some(Core {
             state: self.state.upgrade()?,
+            cross_partition: self.cross_partition.upgrade()?,
             binding: self.binding.upgrade()?,
             registry: self.registry.upgrade()?,
         })
@@ -1819,19 +2021,17 @@ impl Core {
                 pause_buffer_cap: None,
                 max_batch_drain_iterations: 10_000,
                 deferred_flush_jobs: Vec::new(),
-                deferred_handle_releases: Vec::new(),
                 binding: binding.clone(),
-                wave_cache_snapshots: HashMap::new(),
-                pending_auto_resolve: ahash::AHashSet::new(),
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
                 currently_firing: Vec::new(),
-                pending_pause_overflow: Vec::new(),
-                tier3_emitted_this_wave: ahash::AHashSet::new(),
                 invalidate_hooks_fired_this_wave: ahash::AHashSet::new(),
                 deferred_cleanup_hooks: Vec::new(),
                 pending_wipes: Vec::new(),
             })),
+            cross_partition: Arc::new(parking_lot::Mutex::new(CrossPartitionState::new(
+                binding.clone(),
+            ))),
             binding,
             registry: Arc::new(parking_lot::Mutex::new(
                 crate::subgraph::SubgraphRegistry::new(),
@@ -1851,6 +2051,24 @@ impl Core {
     /// longer needed.
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock()
+    }
+
+    /// Acquire the cross-partition aggregation lock (Q2, 2026-05-09).
+    ///
+    /// **Lock-discipline:** if both `state` and `cross_partition` are
+    /// needed in the same critical section, ALWAYS acquire `state`
+    /// FIRST. Acquiring `cross_partition` then `state` is forbidden —
+    /// any thread doing the canonical `state → cross_partition` order
+    /// would deadlock against it. The compiler can't enforce this; the
+    /// rule is preserved by code-review and the consistent shape
+    /// `let mut s = self.lock_state(); let mut cps = self.lock_cross_partition();`.
+    ///
+    /// Sites that touch ONLY the four cross-partition fields (no state
+    /// access in the same critical section) MAY acquire
+    /// `cross_partition` standalone — the lock-order rule only
+    /// constrains the relative order WHEN both are needed.
+    pub(crate) fn lock_cross_partition(&self) -> parking_lot::MutexGuard<'_, CrossPartitionState> {
+        self.cross_partition.lock()
     }
 
     /// Whether `self` and `other` point to the same dispatcher state.
@@ -1889,6 +2107,7 @@ impl Core {
     pub fn weak_handle(&self) -> WeakCore {
         WeakCore {
             state: Arc::downgrade(&self.state),
+            cross_partition: Arc::downgrade(&self.cross_partition),
             binding: Arc::downgrade(&self.binding),
             registry: Arc::downgrade(&self.registry),
         }
@@ -1917,6 +2136,16 @@ impl Core {
     pub fn partition_of(&self, node: NodeId) -> Option<crate::subgraph::SubgraphId> {
         self.registry.lock().partition_of(node)
     }
+
+    // Q3 (2026-05-09) introduced `Core::partition_box_of(node)` to
+    // resolve a partition's `Arc<SubgraphLockBox>` for per-partition
+    // state access. The D1 patch (2026-05-09) moved Slice G's
+    // `tier3_emitted_this_wave` set off `SubgraphLockBox::state` to a
+    // per-thread thread-local in `crate::batch`, eliminating
+    // `partition_box_of`'s only callers (`commit_emission` /
+    // `commit_emission_verbatim`). The helper is REMOVED rather than
+    // kept dead — Q-beyond will resurrect a similar shape when the
+    // CoreState shard layout actually needs per-partition lookups.
 
     /// Acquire `seed`'s partition `wave_owner` re-entrant mutex with
     /// retry-validate against concurrent union/split. Mirrors
@@ -1992,6 +2221,11 @@ impl Core {
             let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);
             if still_valid {
                 acquire_guard.into_consumed();
+                // `lock_box` is unused after this point — the D1 patch
+                // moved Slice G tier3 tracking off the per-partition
+                // `SubgraphLockBox::state` to a per-thread thread-local,
+                // so the guard no longer carries the box reference.
+                drop(lock_box);
                 return WaveOwnerGuard { sid, inner };
             }
             // Stale — drop the parking_lot guard. The AcquireGuard's
@@ -3965,11 +4199,18 @@ impl Core {
                         let dr = &s.require_node(child_id).dep_records[idx];
                         (dr.prev_data, dr.data_batch.clone())
                     };
-                    if old_prev != NO_HANDLE {
-                        s.deferred_handle_releases.push(old_prev);
-                    }
-                    for h in batch_hs {
-                        s.deferred_handle_releases.push(h);
+                    {
+                        // Q2 (2026-05-09): deferred_handle_releases moved
+                        // to CrossPartitionState. Lock-discipline: state
+                        // is held, so acquiring cross_partition next
+                        // satisfies `state → cross_partition`.
+                        let mut cps = self.cross_partition.lock();
+                        if old_prev != NO_HANDLE {
+                            cps.deferred_handle_releases.push(old_prev);
+                        }
+                        for h in batch_hs {
+                            cps.deferred_handle_releases.push(h);
+                        }
                     }
                     let dr = &mut s.require_node_mut(child_id).dep_records[idx];
                     dr.prev_data = NO_HANDLE;
@@ -4771,25 +5012,22 @@ impl CoreState {
     ///
     /// Handle releases are pushed to `deferred_handle_releases` for
     /// post-lock-drop release by the caller.
-    pub(crate) fn clear_wave_state(&mut self) {
-        self.pending_auto_resolve.clear();
+    pub(crate) fn clear_wave_state(&mut self, cps: &mut CrossPartitionState) {
+        // Q2 (2026-05-09): `pending_auto_resolve` + `pending_pause_overflow`
+        // clears moved to [`CrossPartitionState::clear_wave_state`]. The
+        // per-NodeRecord rotation below ALSO pushes batch-handle and
+        // prev_data releases into `cps.deferred_handle_releases` (was
+        // `s.deferred_handle_releases` pre-Q2). Caller passes the
+        // `cps` guard already-acquired in lock-discipline order
+        // (`state → cross_partition`).
         // A6 (Slice F, 2026-05-07): currently_firing is push/pop balanced
         // by FiringGuard's RAII (including on panic). It should already be
         // empty here, but defensively clear in case a future code path
         // forgets the guard.
         self.currently_firing.clear();
-        // A3 (Slice F, 2026-05-07): pending_pause_overflow is normally
-        // drained by drain_and_flush via the synthesis loop. If a wave is
-        // panic-discarded BEFORE the synthesis runs (e.g. invoke_fn panics
-        // before a paused-overflow has a chance to synthesize), we drop the
-        // queued entries silently — the binding never sees ERROR for that
-        // overflow event, but the pause buffer's `dropped` count is
-        // unchanged so callers can still detect via ResumeReport. Re-firing
-        // the synthesis on the next wave would be confusing (the overflow
-        // event is logically scoped to the panicked wave).
-        self.pending_pause_overflow.clear();
-        // Slice G: tier3 emit tracking is wave-scoped.
-        self.tier3_emitted_this_wave.clear();
+        // Slice G tier3 emit tracking moved to per-partition state (Q3,
+        // 2026-05-09); cleared by [`super::WaveOwnerGuard::drop`] on
+        // outermost release for each partition the wave touched.
         // Slice E2 (D057): per-wave-per-node OnInvalidate dedup is
         // wave-scoped — cleared so the next wave can fire cleanups again.
         self.invalidate_hooks_fired_this_wave.clear();
@@ -4819,12 +5057,12 @@ impl CoreState {
                     // Release all batch entries EXCEPT the last — the last
                     // entry's retain transfers to prev_data.
                     for &h in &dr.data_batch[..batch_len - 1] {
-                        self.deferred_handle_releases.push(h);
+                        cps.deferred_handle_releases.push(h);
                     }
                     // Release the OLD prev_data (its retain was from the
                     // previous wave's rotation or from initial delivery).
                     if dr.prev_data != NO_HANDLE {
-                        self.deferred_handle_releases.push(dr.prev_data);
+                        cps.deferred_handle_releases.push(dr.prev_data);
                     }
                     // Rotate: last batch entry becomes new prev_data.
                     // Its retain carries over — no extra retain needed.
@@ -4865,13 +5103,15 @@ impl CoreState {
 impl Drop for CoreState {
     fn drop(&mut self) {
         // Drain pending in-flight retains too, so a panic mid-wave doesn't
-        // strand the queue_notify retains in `deferred_handle_releases`.
+        // strand the queue_notify retains.
         let pending = std::mem::take(&mut self.pending_notify);
-        let deferred_releases = std::mem::take(&mut self.deferred_handle_releases);
         // `deferred_flush_jobs` carries `Vec<Sink>` clones — those Arcs
         // drop naturally when this CoreState drops; no handles to release
         // there.
         let _ = std::mem::take(&mut self.deferred_flush_jobs);
+        // Q2 (2026-05-09): `deferred_handle_releases` and
+        // `wave_cache_snapshots` releases moved to
+        // [`Drop for CrossPartitionState`].
 
         // Per-node retained handles:
         //   - `cache` (1 retain per non-NO_HANDLE state cache or
@@ -4930,15 +5170,11 @@ impl Drop for CoreState {
                 }
             }
         }
-        for h in deferred_releases {
-            self.binding.release_handle(h);
-        }
-        // Wave-cache snapshot retains (defensive — should normally be
-        // empty by the time Core drops, but a panicked-mid-wave Core
-        // could leave them populated).
-        let snapshots = std::mem::take(&mut self.wave_cache_snapshots);
-        for (_, h) in snapshots {
-            self.binding.release_handle(h);
-        }
+        // Q2 (2026-05-09): `deferred_handle_releases` +
+        // `wave_cache_snapshots` retain-release moved to
+        // [`Drop for CrossPartitionState`] (sibling Mutex on `Core`).
+        // Both Arc<Mutex<_>>s drop together when the last `Core` clone
+        // drops, so the binding-side share gets released in either
+        // ordering.
     }
 }

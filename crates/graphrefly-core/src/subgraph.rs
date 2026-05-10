@@ -104,6 +104,22 @@ impl std::fmt::Display for SubgraphId {
     }
 }
 
+// Q3 (2026-05-09) introduced `SubgraphState { tier3_emitted_this_wave }`
+// + a `state: parking_lot::Mutex<SubgraphState>` field on
+// `SubgraphLockBox`. The D1 patch (2026-05-09) reverted this placement
+// after QA surfaced a mid-wave cross-thread `set_deps` partition-split
+// hazard: thread B's split could move a node X from the wave's
+// partition to a fresh orphan-side partition with empty
+// `tier3_emitted_this_wave`, and thread A's subsequent emit at X would
+// then mis-detect "first emit" and violate R1.3.3.a coalescing. Slice G
+// tier3 tracking now lives in a per-thread thread-local in
+// `crate::batch::TIER3_EMITTED_THIS_WAVE` — robust to cross-thread
+// splits because thread B's split doesn't touch thread A's
+// thread-local at all. The `SubgraphState` struct is GONE for now;
+// Q-beyond will reintroduce a per-partition state placement when the
+// CoreState shard layout actually needs it (with a different field
+// shape that's robust to mid-wave splits).
+
 /// Per-component lock box. Holds the partition's `wave_owner`
 /// re-entrant mutex. On `union`, the box of the smaller-rank root is
 /// replaced by the larger-rank root's box — the lock identity is

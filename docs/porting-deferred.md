@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-07 (Slice H — register + set_pausable_mode typed-error promotion)
+last_updated: 2026-05-09 (Q3 + Q2 + BTreeMap → SmallVec swap landed; Q-beyond + Phase H+ STRICT carry forward)
 ---
 
 # Porting flags & deferred concerns
@@ -598,9 +598,77 @@ spec enrichment if a future investigation needs the missing coverage.
   prioritize if a future bug investigation actually needs to read
   MC traces.
 
-### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — next batch after D3 closure
+### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — Q2 + Slice G tier3 placement (D1 patch) + BTreeMap swap LANDED 2026-05-09; Q-beyond CARRIED FORWARD
 
-- **What:** unified follow-up batch covering session-doc Q2
+**Closure summary (Q3 v1 → D1 patch + Q2, 2026-05-09):** Q3 v1 placed
+`tier3_emitted_this_wave` per-partition on `SubgraphLockBox::state:
+parking_lot::Mutex<SubgraphState>`. The QA pass surfaced D1 (mid-wave
+cross-thread `set_deps` partition-split desync → potential R1.3.3.a
+violation when X migrates from a held partition to a fresh orphan-side
+box mid-wave with empty `tier3_emitted_this_wave`). User picked D1 (b)
+trace+fix; the trace confirmed the gap is reachable via thread B's
+set_deps when thread A is mid-wave but between fn fires
+(`currently_firing.is_empty()` → P13 short-circuits). **D1 fix landed
+the same day:** moved Slice G tier3 tracking to a per-thread
+`thread_local! { static TIER3_EMITTED_THIS_WAVE: RefCell<AHashSet<NodeId>> }`
+in `crate::batch`. Wave scope = thread (cross-thread emits BLOCK on
+the partition wave_owner so they always land in the OTHER thread's
+wave context with the OTHER thread's thread-local). Cleared at the
+outermost `BatchGuard` drop on both success + panic-discard paths,
+plus a defensive wave-start clear at outermost owning entry against
+cargo's thread-reuse propagating stale entries from a panicked-mid-wave
+prior test. Q3 v1 substrate fully removed (`SubgraphState` struct +
+`state` field on `SubgraphLockBox` + `WaveOwnerGuard.box_` field +
+`Core::partition_box_of` helper). Q2 (cross_partition mutex split —
+`Core::cross_partition: Arc<parking_lot::Mutex<CrossPartitionState>>`
+holding the 4 wave-aggregation fields previously in CoreState) and the
+BTreeMap → SmallVec swap on `held_partitions::HELD` landed alongside.
+~700 LOC across `node.rs` / `batch.rs` / `subgraph.rs` / `Cargo.toml`.
+**502 cargo tests + 142 parity green; 0 failed; 2 ignored** post-/qa.
+clippy + fmt clean. `#![forbid(unsafe_code)]` preserved. See
+[`migration-status.md`](migration-status.md) "Current state (2026-05-09)"
+for the per-sub-slice + per-/qa-finding breakdown.
+
+**Phase J bench post-Q3+Q2 (criterion, 2026-05-09):** ~25% regression
+on fn-fire-disjoint (5.41 ms vs 4.32 ms pre-Q2/Q3); 21% regression on
+fn-fire-same-partition; ~10-15% on Regime A. Disjoint-vs-same
+separation 2.11× (was 2.18× — parallelism property preserved). The
+regression matches the porting-deferred entry's framing: Q2/Q3 in
+isolation are pattern-prep with bench cost; Q-beyond is the
+perf-positive change. The pbox-cache optimization in `commit_emission`
+recovered ~7% of the fn-fire regression (registry-mutex acquire
+amortized to once per emission); further wins are gated on Q-beyond.
+
+**What carries forward — Q-beyond:**
+
+- **What:** split `CoreState` into per-partition
+  `SubgraphShard`s holding `nodes` / `children` / `pending_notify` /
+  `pending_fires` / wave bookkeeping. Reshape every wave-engine site
+  to `shards[partition].lock()`. Cross-partition cascades acquire
+  multiple shards in ascending `SubgraphId` order (same Q7 pattern as
+  `wave_owner`). The shape that realizes wide-spectrum parallelism for
+  tight state-emit loops (not just fn-fire-heavy workloads), and
+  recovers + exceeds the Q3+Q2 bench regression by removing the global
+  state mutex bottleneck entirely.
+- **Estimated scope:** ~2000–3000 LOC across `node.rs` + `batch.rs`.
+  Touches every read/write site (~150+), `BatchGuard`, drain, flush,
+  sink fire, `Drop for CoreState`, `WeakCore`. The Q3+Q2
+  prerequisites are now in place: per-partition state pattern via
+  `SubgraphLockBox::state`, cross-partition aggregation pattern via
+  `Core::cross_partition`. Q-beyond extends both.
+- **Plan:** land in per-field sub-slices (move one CoreState field
+  per-partition at a time) with cargo test green at each boundary.
+  Per-partition shards likely take the form
+  `SubgraphLockBox::shard: parking_lot::Mutex<SubgraphShard>` (sibling
+  to `state` and `wave_owner`). Lock-discipline:
+  `state-residual → cross_partition → shard[i] → ... → partition_state`.
+
+**Original entry preserved below for the bench-evidence baseline,
+sequencing rationale, and risks discussion.**
+
+---
+
+- **What (original framing):** unified follow-up batch covering session-doc Q2
   (cross_partition mutex split), Q3 (per-partition
   `tier3_emitted_this_wave`), and Q-beyond (split `CoreState` into
   per-partition `SubgraphShard`s holding `nodes` / `children` /
