@@ -101,6 +101,81 @@ fn full_removal_to_empty_deps() {
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
 }
 
+/// B3 (D117, 2026-05-10): `set_deps(N, &[])` mid-wave when N has a queued
+/// DIRTY without a paired settle must not leave subscribers observing an
+/// unpaired DIRTY (R1.3.1.b violation). The fix pushes N to
+/// `pending_auto_resolve` so the wave-end sweep emits a paired Resolved.
+///
+/// Scenario: an upstream RESOLVED emit (same-value path) cascades into a
+/// downstream child via the per-child Dirty-then-pending-auto-resolve
+/// propagation in `commit_emission` (Slice F /qa A7). A `set_deps(child, &[])`
+/// during the same batch must not break that pairing — every wave-end DIRTY
+/// must be matched by a tier-3+ message in the same wave per R1.3.1.b.
+#[test]
+fn set_deps_full_removal_mid_wave_pairs_dirty_with_resolved() {
+    use common::RecordedEvent;
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let calls = Arc::new(std::sync::Mutex::new(0u32));
+    let calls_inner = calls.clone();
+    let c = rt.derived(&[a.id], move |deps| {
+        *calls_inner.lock().unwrap() += 1;
+        match &deps[0] {
+            TestValue::Int(n) => Some(TestValue::Int(*n)),
+            _ => panic!("type"),
+        }
+    });
+    let rec = rt.subscribe_recorder(c);
+    let pre = rec.snapshot().len();
+
+    // Drive a same-value RESOLVED emit on A inside a batch, then full-remove
+    // C's deps before the wave drains. A's RESOLVED propagation queues
+    // Dirty for C and adds C to pending_auto_resolve; the wave-end sweep
+    // must still emit a Resolved for C even after deps are cleared.
+    {
+        let _bg = rt.core.begin_batch();
+        // Same value as cache → equals substitution → RESOLVED on A.
+        a.set(TestValue::Int(10));
+        // Mid-wave full-removal of C's deps.
+        rt.core.set_deps(c, &[]).expect("rewire to empty ok");
+    } // BatchGuard drop drains the wave.
+
+    // Every Dirty in C's post-pre-recorder events must be paired with a
+    // tier-3+ message (Resolved / Data / Complete / Error) before the next
+    // Dirty (per R1.3.1.b two-phase push).
+    let snapshot = rec.snapshot();
+    let mut dirty_paired = true;
+    let mut last_dirty_unpaired = false;
+    for ev in &snapshot[pre..] {
+        match ev {
+            RecordedEvent::Dirty => {
+                if last_dirty_unpaired {
+                    dirty_paired = false;
+                    break;
+                }
+                last_dirty_unpaired = true;
+            }
+            RecordedEvent::Data(_)
+            | RecordedEvent::Resolved
+            | RecordedEvent::Complete
+            | RecordedEvent::Error(_) => {
+                last_dirty_unpaired = false;
+            }
+            _ => {}
+        }
+    }
+    if last_dirty_unpaired {
+        dirty_paired = false;
+    }
+    assert!(
+        dirty_paired,
+        "R1.3.1.b violation: unpaired DIRTY in subscriber events: {snapshot:?}"
+    );
+    // Cache preserved (compute node, ROM/RAM rule R2.2.7/R2.2.8 applies on
+    // deactivation only — cache stays here because the node is still subscribed).
+    assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
+}
+
 #[test]
 fn idempotent_no_change() {
     let rt = TestRuntime::new();

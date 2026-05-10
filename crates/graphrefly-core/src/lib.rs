@@ -63,8 +63,8 @@ pub use message::{Message, Messages};
 pub use node::{
     Core, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration,
     OperatorOp, OperatorOpts, PartitionOrderViolation, PausableMode, PauseError, RegisterError,
-    ResumeReport, SetDepsError, SetPausableModeError, Sink, Subscription, TerminalKind, UpError,
-    WeakCore,
+    ResumeReport, SetDepsError, SetPausableModeError, Sink, SubscribeError, Subscription,
+    TerminalKind, UpError, WeakCore,
 };
 pub use subgraph::SubgraphId;
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};

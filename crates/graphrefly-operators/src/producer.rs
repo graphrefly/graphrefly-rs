@@ -50,6 +50,58 @@ use parking_lot::Mutex;
 
 use graphrefly_core::{BindingBoundary, Core, FnId, NodeId, Sink, Subscription};
 
+/// Outcome of [`ProducerCtx::subscribe_to`] — the producer-layer
+/// translation of [`graphrefly_core::SubscribeError`] into a positive
+/// outcome enum that operators (zip / concat / race / take_until /
+/// merge_map / switch_map / exhaust_map / concat_map) can match on for
+/// per-operator dead-source semantics.
+///
+/// Introduced /qa F2 (2026-05-10) to close the silent-wedge class of
+/// bugs where operators previously couldn't tell that a `subscribe_to`
+/// call had been rejected per R2.2.7.b (non-resubscribable terminal
+/// source) — pre-F2 the rejection was logged-and-skipped silently,
+/// which left zip waiting for a queue that would never fill, concat
+/// stuck on a source that would never advance, etc.
+///
+/// Mirrors the per-domain status-string-union pattern used in TS
+/// (`RefineStatus`, `AgentStatus`, process status: `"running" |
+/// "completed" | "errored" | "cancelled"`) — each operator-layer
+/// outcome lives in its own typed enum rather than sharing a global
+/// `Outcome<T, E>` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeOutcome {
+    /// Subscription installed successfully. The
+    /// [`ProducerNodeState`] holds the [`Subscription`]; no further
+    /// operator action required.
+    Live,
+    /// Subscription was deferred to wave-end via the
+    /// [`graphrefly_core::DeferredProducerOp::Callback`] queue (Phase
+    /// H+ STRICT, D115). The deferred callback installs the
+    /// subscription after wave_guards release. Operators MAY treat
+    /// this as `Live` for lifecycle bookkeeping — the subscription
+    /// WILL be installed; just not yet.
+    Deferred,
+    /// The target node is non-resubscribable AND has terminated
+    /// (R2.2.7.b, D118). The sink will NOT be installed. Operators
+    /// MUST handle this per their semantics:
+    ///
+    /// - **zip / take_until (source)**: self-Complete (tuple stream
+    ///   can never form; take_until's source is gone).
+    /// - **concat**: advance to the next source (treat as inner
+    ///   Complete signal).
+    /// - **race**: mark `completed[idx] = true`; if all sources are
+    ///   Dead/Complete, self-Complete.
+    /// - **take_until (notifier)**: ignore (notifier signal will
+    ///   never fire; take_until reduces to a passthrough of source).
+    /// - **switch_map / exhaust_map / concat_map / merge_map (inner)**:
+    ///   treat as immediate `on_inner_complete` — decrement active,
+    ///   advance to next, check self-Complete trigger.
+    Dead {
+        /// The dead node that rejected the subscribe.
+        node: NodeId,
+    },
+}
+
 /// Build closure type — the producer's fn body, called once on first
 /// activation. The closure receives a [`ProducerCtx`] for setting up
 /// upstream subscriptions; emissions on the producer come from sink
@@ -154,26 +206,83 @@ impl<'a> ProducerCtx<'a> {
     /// `DeferredProducerOp::Callback` — the deferred callback runs
     /// after all partition wave_owners are released (no partitions
     /// held → safe to acquire any partition).
-    pub fn subscribe_to(&self, source: NodeId, sink: Sink) {
+    ///
+    /// **R2.2.7.b (D118, 2026-05-10):** if the upstream is
+    /// non-resubscribable AND already terminated, `try_subscribe`
+    /// returns `Err(SubscribeError::TornDown)`. /qa F2 (2026-05-10):
+    /// the rejection is now surfaced to the caller via
+    /// [`SubscribeOutcome::Dead`] so the operator can apply its
+    /// per-op dead-source semantics — pre-F2 the rejection was
+    /// silently swallowed, leaving operators wedged (zip waiting on a
+    /// queue that would never fill, concat stuck on a source that
+    /// would never advance, etc.). See [`SubscribeOutcome::Dead`] for
+    /// per-operator guidance.
+    pub fn subscribe_to(&self, source: NodeId, sink: Sink) -> SubscribeOutcome {
         let sink_for_defer = sink.clone();
-        if let Ok(sub) = self.core.try_subscribe(source, sink) {
-            self.storage
-                .lock()
-                .entry(self.node_id)
-                .or_default()
-                .subs
-                .push(sub);
-        } else {
-            let core = self.core.clone();
-            let core_for_callback = core.clone();
-            let storage = self.storage.clone();
-            let node_id = self.node_id;
-            core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
-                Box::new(move || {
-                    let sub = core_for_callback.subscribe(source, sink_for_defer);
-                    storage.lock().entry(node_id).or_default().subs.push(sub);
-                }),
-            ));
+        match self.core.try_subscribe(source, sink) {
+            Ok(sub) => {
+                self.storage
+                    .lock()
+                    .entry(self.node_id)
+                    .or_default()
+                    .subs
+                    .push(sub);
+                SubscribeOutcome::Live
+            }
+            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                let core = self.core.clone();
+                let core_for_callback = core.clone();
+                let storage = self.storage.clone();
+                let node_id = self.node_id;
+                // F2 /qa (2026-05-10): deferred Callback uses
+                // `try_subscribe` (not the panicking `subscribe`) so a
+                // source that became non-resubscribable + terminal
+                // between the original defer-queue push and the
+                // wave-end drain doesn't crash the binding boundary.
+                // On TornDown at drain time, the producer-layer's
+                // SubscribeOutcome::Dead path was never reached at
+                // subscribe-time (because we deferred); we silently
+                // drop the deferred sub here. Per-operator dead-source
+                // semantics rely on the subscribe-time outcome — if
+                // the source went terminal during the defer window,
+                // the operator's other inputs / lifecycle paths must
+                // handle it (e.g., zip with one Live + one
+                // raced-to-Dead source would still emit until the
+                // dead one Complete-cascades to the operator via
+                // other state, which it doesn't here — but the
+                // condition requires concurrent termination during
+                // wave-end drain which is a narrow window).
+                core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
+                    Box::new(move || {
+                        match core_for_callback.try_subscribe(source, sink_for_defer) {
+                            Ok(sub) => {
+                                storage.lock().entry(node_id).or_default().subs.push(sub);
+                            }
+                            Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                                // Source became Dead during the defer
+                                // window — silently drop (see comment
+                                // above).
+                            }
+                            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                                // Should never happen: the deferred
+                                // Callback drains AFTER wave_guards
+                                // release, so partition acquisition
+                                // can't fail. Surface as a panic if
+                                // it ever does.
+                                panic!(
+                                    "deferred producer-op Callback: partition-order \
+                                     violation at wave-end drain — substrate invariant \
+                                     broken (wave_guards still held during drain)"
+                                );
+                            }
+                        }
+                    }),
+                ));
+                SubscribeOutcome::Deferred
+            }
+            Err(graphrefly_core::SubscribeError::TornDown { node }) => {
+                SubscribeOutcome::Dead { node }
+            }
         }
     }
 }

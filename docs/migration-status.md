@@ -2,7 +2,68 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-10)
+## Current state (2026-05-10 — /qa pass applied to B + A batch)
+
+**/qa pass on the B + A semantics-cleanup batch surfaced 15 actionable findings; all patches landed 2026-05-10. Cross-impl close spanning Rust core/operators + TS substrate + canonical spec.**
+
+**/qa fixes (D123-D128):**
+- **F1 (D123):** Phase G re-checks `subscribers.is_empty()` inside its state-lock acquire and skips if non-empty — closes a use-after-release race where a user `cleanup_for(OnDeactivation)` hook re-subscribed during the lock-released window, leaving the new subscriber's handshake-delivered handle being released by Phase G before the wave's flush.
+- **F8 (D124):** Phase G now releases `op_scratch` for non-resubscribable nodes (gated; resubscribable's `reset_for_fresh_lifecycle` keeps the seed-aliasing-acc Slice C-3 /qa P1 invariant intact). Closes D028 partially for the non-resubscribable case.
+- **F6 (D125):** B3 predicate walks `pending_notify` counting unpaired DIRTYs instead of `any tier>=3`. Tier-4 INVALIDATE is not a settle; multi-emit waves like `[DIRTY, RESOLVED, DIRTY]` now correctly trigger auto-resolve.
+- **F2 (D126):** new `producer::SubscribeOutcome { Live, Deferred, Dead }` substrate (cross-impl outcome enum mirroring TS's per-domain status-string-union pattern). Per-operator Dead handlers added in zip / concat / race / take_until (ops_impl.rs) + switch_map / exhaust_map / merge_map (higher_order.rs synthesizes inner-Complete via cloned `on_complete_for_dead`). Producer.rs's deferred Callback uses `try_subscribe` (not panicking `subscribe`) so source termination during the defer window doesn't crash the binding.
+- **F3 (D127):** TS substrate landed — new `TornDownError` class (in `packages/pure-ts/src/core/subscribe-error.ts`) + `isTornDownError` + `SubscribeOutcome` type + `trySubscribeOrDead` helper. `Node.subscribe` throws `TornDownError` (was generic Error). The 25-site TS operator audit (buffer / take / control / combine / time / higher-order) is deferred to a focused follow-up batch.
+- **F5 / F7 / F10 / F11 (D128):** dead handshake branches removed from `try_subscribe` post-D118; TS error message routed through the typed class (drops loose `(status=...)` substring for canonical parity); test regex tightened; race-window regression test added; spec §1 TEARDOWN table row updated in both `~/src/graphrefly/GRAPHREFLY-SPEC.md` and `~/src/graphrefly-ts/docs/implementation-plan-13.6-canonical-spec.md` to remove "Permanent cleanup" contradiction with R2.2.7.a.
+
+**Test count post-/qa: 520 cargo + 142 parity + 3008 pure-ts, 0 failed, 0 ignored.**
+- +3 new Phase G tests (`phase_g_preserves_terminal_slot_for_non_resubscribable_rejection`, `phase_g_skips_cache_clear_when_cleanup_hook_re_subscribes`, `r2_2_7_b_rejects_subscribe_between_complete_and_teardown_cascade`) in `crates/graphrefly-core/tests/phase_g_cleanup_node.rs`.
+
+`cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `pnpm run lint` (biome) clean. `#![forbid(unsafe_code)]` preserved.
+
+**Carry-forward (next batches):**
+- **TS operator audit (F3 follow-up)** — 25-site mechanical migration: wrap each `source.subscribe(...)` call in `extra/operators/{buffer,take,control,combine,time,higher-order}.ts` with `trySubscribeOrDead` + per-op dead-source handling. Substrate is in place (`@graphrefly/graphrefly` exports `TornDownError`, `isTornDownError`, `SubscribeOutcome`, `trySubscribeOrDead`); operators that need Dead-source resilience use the helper.
+- **F2 end-to-end Dead-path tests** — verifying the immediate-Dead path on producer-pattern operators requires partition-coherent test setups (sources must be in already-acquired partitions). Documented in `crates/graphrefly-operators/tests/subscription.rs`. Unit coverage via `SubscribeError::TornDown` tests in `tests/resubscribable.rs`.
+- **Per-partition `nodes`/`children` shards (Q-beyond sub-slice 4)** — DEFERRED, evidence-gated. No current evidence of state-mutex contention.
+
+Decisions D123-D128 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
+## Current state (2026-05-10 — B + A sub-slices CLOSED, semantics-cleanup batch; pre-/qa, preserved for archive)
+
+**Subscribe-after-terminal semantics cleanup (B sub-slice) + Phase G cleanup_node activation (A sub-slice) LANDED 2026-05-10. Cross-impl change spanning canonical spec + Rust + TS.**
+
+**Behavioral changes (D116–D122):**
+
+1. **Canonical spec R2.2.7.a + R2.2.7.b (D118)** — added subscribe-after-terminal clauses to both `~/src/graphrefly-ts/docs/implementation-plan-13.6-canonical-spec.md` (Rust port authority) and `~/src/graphrefly/GRAPHREFLY-SPEC.md` (TS+PY authority). Cleans up the conflation of `resubscribable` with TEARDOWN handling: late `subscribe()` to resubscribable + terminal node resets to fresh lifecycle (regardless of TEARDOWN state); late `subscribe()` to non-resubscribable + terminal node is rejected. R2.6.4 / Lock 6.F note clarified — TEARDOWN is the cleanup signal of the prior activation cycle, not permanent destruction.
+
+2. **`Core::set_deps(N, &[])` mid-wave full-removal (B3, D117)** — when N has unpaired DIRTY in `pending_notify`, push N to `pending_auto_resolve` so the wave-end sweep emits a paired Resolved. Closes R1.3.1.b two-phase-push violation for the empty-deps mid-wave case.
+
+3. **`SubscribeError` enum + `Core::try_subscribe` widened (B4, D118)** — new error variants `TornDown { node }` (R2.2.7.b rejection) and `PartitionOrderViolation(_)` (Phase H+ STRICT). Public `subscribe` panics; producer.rs + higher_order.rs operator callers match on variant — defer for partition order, skip source for TornDown. `reset_for_fresh_lifecycle`'s `!has_received_teardown` guard removed (D118 R2.2.7.a).
+
+4. **Phase G — Core cache-clear on deactivation (A, D119/D120/D121)** — `Subscription::Drop` last-sub branch extended with Core-internal cache-clear, mirroring TS `_deactivate` (`packages/pure-ts/src/core/node.ts:2185-2297`). Order: user `cleanup_for(OnDeactivation)` → `producer_deactivate` → `wipe_ctx` → **NEW Core cache-clear**. Releases per-dep `prev_data` + `data_batch` retains + `dep_terminals[i]` Error retains (D121 — closes the long-standing "non-resubscribable terminal Error handles leak via diamond cascade" porting-deferred entry); clears pause/replay buffers; releases compute `cached` (R2.2.7/R2.2.8 ROM rule per D119: state preserved, compute cleared); resets `has_fired_once` / `dirty` / `involved_this_wave` / `tracked` (dynamic). Keeps per-node `terminal` slot intact (D121 — preserved for late-subscriber R2.2.7.a/b).
+
+**Stale porting-deferred entries struck through (doc cleanup, D116/D122):** "Pause-buffer overflow does not synthesize ERROR" (already done in Slice F A3, 2026-05-07); "alloc_lock_id can collide with user-supplied LockId::new(N)" (already done via Slice F A4 high-range reservation, 2026-05-07); "take_until(source, notifier) not yet ported" (already done in Slice D / M3 producer-pattern slice — `crates/graphrefly-operators/src/ops_impl.rs:610` + 4 tests).
+
+**Test count: 517 cargo + 142 parity + 3008 pure-ts, 0 failed, 0 ignored.**
+- +6 new Phase G tests in `crates/graphrefly-core/tests/phase_g_cleanup_node.rs`.
+- +1 B3 test in `crates/graphrefly-core/tests/setdeps.rs::set_deps_full_removal_mid_wave_pairs_dirty_with_resolved`.
+- +5 B4 rejection / reset-after-teardown tests in `crates/graphrefly-core/tests/resubscribable.rs`.
+- −3 stale handshake-tier-split-for-terminated tests removed from `crates/graphrefly-core/tests/lock_released.rs` (replaced with explanatory comment block; coverage moved to the rejection tests).
+- −4 stale "replay terminal" + "TEARDOWN-blocks-reset" tests rewritten in `crates/graphrefly-core/tests/resubscribable.rs`.
+- 1 TS test updated (`packages/pure-ts/src/__tests__/extra/session1-foundation.test.ts`) — re-subscribe to non-resubscribable terminal now expects `R2.2.7.b` throw.
+- 1 operator refcount test updated (`crates/graphrefly-operators/tests/flow.rs::last_releases_buffered_latest_on_lifecycle_reset`) — expected refcount 4 instead of 5 (Phase G clears compute `cached` on deactivation per R2.2.8).
+
+`cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `pnpm run lint` (biome) clean. `#![forbid(unsafe_code)]` preserved.
+
+**Carry-forward (next batches):**
+- **Per-partition `nodes`/`children` shards (Q-beyond sub-slice 4)** — DEFERRED, evidence-gated. No current evidence of state-mutex contention.
+- **(Optional, deferred) Phase G operator-scratch reset on every deactivation** — currently `op_scratch` only resets on resubscribable terminal cycle via `reset_for_fresh_lifecycle`; non-resubscribable / non-terminal deactivate-reactivate cycles don't reset operator state. Tracked in [`porting-deferred.md` "Flow operator counters reset only on resubscribable terminal cycle"](porting-deferred.md). Lift point: extend Phase G to also call `OperatorScratch::release_handles` + reinstall fresh scratch on deactivation.
+
+Decisions D116–D122 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
+## Current state (2026-05-10 — pre-B+A semantics-cleanup, preserved for archive)
 
 **Phase H+ STRICT LANDED (2026-05-10, D115): typed-error variant closes the `IN_PRODUCER_BUILD` carve-out. Producer-pattern operators now defer cross-partition operations to wave-end via `*_or_defer` methods instead of bypassing the ascending-order check.**
 

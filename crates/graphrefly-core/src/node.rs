@@ -780,14 +780,11 @@ impl Drop for Subscription {
             // tracks initial-value status, not "user fn ran."
             let user_cleanup = rec.has_fired_once && rec.fn_id.is_some();
             let fire_wipe = last && rec.resubscribable && rec.terminal.is_some();
-            // Clone the binding Arc out only if at least one hook will
-            // fire. Cheap (Arc::clone) in the common path; skipped on
-            // non-last-sub or never-fired non-producer nodes.
-            let binding = if last && (producer || user_cleanup || fire_wipe) {
-                Some(s.binding.clone())
-            } else {
-                None
-            };
+            // Phase G (D119/D120/D121, 2026-05-10): always clone the
+            // binding when last sub leaves so we can run the Core
+            // cache-clear after the existing hooks. The Arc::clone is
+            // cheap and dwarfed by the cost of the hooks themselves.
+            let binding = if last { Some(s.binding.clone()) } else { None };
             (last, producer, user_cleanup, fire_wipe, binding)
         };
         if was_last_sub {
@@ -807,6 +804,167 @@ impl Drop for Subscription {
                 // this fire is benign.
                 if fire_wipe {
                     binding.wipe_ctx(self.node_id);
+                }
+
+                // Phase G (D118/D119/D120/D121, 2026-05-10) — Core
+                // cache-clear on deactivation, mirroring TS `_deactivate`
+                // (`pure-ts/src/core/node.ts:2185-2297`):
+                //
+                //   1. user `cleanup_for(OnDeactivation)`  ← above
+                //   2. `producer_deactivate`                ← above
+                //   3. `wipe_ctx` (resubscribable+terminal) ← above
+                //   4. **NEW: Core cache-clear**            ← here
+                //
+                // Releases per-dep `prev_data` + `data_batch` retains +
+                // `dep_terminals` Error retains (the latter closes the
+                // long-standing "Non-resubscribable terminal Error
+                // handles leak via diamond cascade" porting-deferred
+                // entry — D121). Clears pause/replay buffers. Releases
+                // `cached` for compute nodes (R2.2.7 / R2.2.8 ROM:
+                // state nodes preserve cache; compute nodes clear).
+                // Keeps the per-node `terminal` slot intact (D121:
+                // producer-side terminal stays for late-subscriber
+                // R2.2.7.a reset or R2.2.7.b rejection).
+                //
+                // Lock-released release discipline: collect handles
+                // under the lock, drop the lock, fire `release_handle`
+                // outside (mirrors `Core::resume` Phase 2 + the
+                // existing F1 `set_deps` removed-handles release at
+                // node.rs:5003).
+                //
+                // Re-entrance safety (F1 / D123, /qa 2026-05-10): if the
+                // user `cleanup_for` / `producer_deactivate` / `wipe_ctx`
+                // hook re-subscribed via some path, `subscribers` is now
+                // non-empty. **Skip Phase G entirely in that case** —
+                // the new subscriber's handshake delivered the live
+                // `cache` handle to its sink and is holding a refcount
+                // share through `pending_notify`; clearing cache here
+                // would race with the new subscriber's wave and cause
+                // a use-after-release in bindings that reap registry
+                // slots at refcount-zero.
+                //
+                // Why this diverges from TS `_deactivate` (which clears
+                // unconditionally): TS runs the cleanup hook + cache
+                // clear as ONE sync block under the (implicit) JS
+                // single-thread mutex; there's no released-lock window
+                // for a re-subscribe to install a sub before the
+                // cache-clear runs. Rust's lock-released hook discipline
+                // (D045) opens that window, so the re-check is
+                // necessary to preserve refcount soundness.
+                //
+                // Re-acquire state lock atomically with the recheck so
+                // a concurrent thread cannot install a sub between the
+                // emptiness check and the cache mutation.
+                // F8 (/qa 2026-05-10): also take `op_scratch` so its
+                // retains release lock-released after the state-lock
+                // scope. Pre-F8 Phase G only released per-edge handles
+                // + the compute `cache`, leaving operator-internal
+                // retains (Last.latest, Scan.acc, Reduce.acc, etc.)
+                // in-place. For non-resubscribable nodes that never
+                // re-subscribe, this was a permanent leak —
+                // asymmetric with the per-edge cleanup. F8 closes that
+                // by taking the scratch alongside per-edge handles
+                // and calling `release_handles` lock-released.
+                let (to_release, scratch_to_release): (
+                    Vec<HandleId>,
+                    Option<Box<dyn crate::op_state::OperatorScratch>>,
+                ) = {
+                    let mut s = state.lock();
+                    if let Some(rec) = s.nodes.get_mut(&self.node_id) {
+                        // F1 re-entrance check.
+                        if !rec.subscribers.is_empty() {
+                            // A user hook re-subscribed during the
+                            // lock-released window; the new lifecycle
+                            // owns this node now. Phase G is a no-op.
+                            return;
+                        }
+                        let mut handles: Vec<HandleId> = Vec::new();
+                        // Per-dep state. Empty for state nodes.
+                        for dr in &mut rec.dep_records {
+                            if dr.prev_data != NO_HANDLE {
+                                handles.push(dr.prev_data);
+                                dr.prev_data = NO_HANDLE;
+                            }
+                            for h in dr.data_batch.drain(..) {
+                                handles.push(h);
+                            }
+                            // D121: per-edge terminal-Error retain
+                            // released here. Closes the cascade leak.
+                            // The producer's own `rec.terminal` slot
+                            // stays intact (preserved below).
+                            if let Some(TerminalKind::Error(h)) = dr.terminal {
+                                handles.push(h);
+                            }
+                            dr.terminal = None;
+                            dr.dirty = false;
+                            dr.involved_this_wave = false;
+                        }
+                        // Pause buffer DATA / replay buffer.
+                        if let PauseState::Paused { ref mut buffer, .. } = rec.pause_state {
+                            for msg in buffer.drain(..) {
+                                if let Some(h) = msg.payload_handle() {
+                                    handles.push(h);
+                                }
+                            }
+                        }
+                        for h in rec.replay_buffer.drain(..) {
+                            handles.push(h);
+                        }
+                        // Pause locks drained → node back to Active.
+                        rec.pause_state = PauseState::Active;
+                        // R2.2.7 / R2.2.8 ROM: state nodes preserve
+                        // cache; compute (fn or op) nodes clear.
+                        // D119: state nodes keep `cached` because the
+                        // value is intrinsic and non-volatile;
+                        // resubscribe sees the same value.
+                        let is_compute = rec.fn_id.is_some() || rec.op.is_some();
+                        if is_compute && rec.cache != NO_HANDLE {
+                            handles.push(rec.cache);
+                            rec.cache = NO_HANDLE;
+                        }
+                        // Reset wave + lifecycle state so reactivation
+                        // begins fresh. `terminal` STAYS (D121).
+                        rec.has_fired_once = false;
+                        rec.dirty = false;
+                        rec.involved_this_wave = false;
+                        if rec.is_dynamic {
+                            rec.tracked.clear();
+                        }
+                        // F8 (/qa 2026-05-10): take op_scratch ONLY for
+                        // non-resubscribable nodes. Resubscribable nodes
+                        // need op_scratch to survive deactivation so
+                        // `reset_for_fresh_lifecycle` on the next subscribe
+                        // can run the "new-retain-first-then-old-release-
+                        // second" Slice C-3 /qa P1 ordering — releasing
+                        // the seed share here would collapse the registry
+                        // slot before reset can take a fresh retain
+                        // (verified by `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry`).
+                        // For non-resubscribable nodes there is no future
+                        // reset path, so eager release is safe and closes
+                        // the operator-state leak D028 partially flagged.
+                        let scratch = if rec.resubscribable {
+                            None
+                        } else {
+                            std::mem::take(&mut rec.op_scratch)
+                        };
+                        (handles, scratch)
+                    } else {
+                        // Node destroyed between lock-released hooks
+                        // and this re-acquire (terminate cascade or
+                        // graph removal) — nothing to clear.
+                        (Vec::new(), None)
+                    }
+                };
+                // Release handles lock-released. Binding may re-enter
+                // Core during `release_handle` (final-Drop callbacks
+                // are user code).
+                for h in to_release {
+                    binding.release_handle(h);
+                }
+                // F8: release operator-scratch handles lock-released
+                // (mirrors `ScratchReleaseGuard::drop` ordering).
+                if let Some(mut scratch) = scratch_to_release {
+                    scratch.release_handles(&*binding);
                 }
             }
         }
@@ -1071,6 +1229,39 @@ pub struct PartitionOrderViolation {
     pub attempted: crate::subgraph::SubgraphId,
     /// The highest-id partition currently held by this thread.
     pub max_held: crate::subgraph::SubgraphId,
+}
+
+/// Errors returnable by [`Core::try_subscribe`].
+///
+/// `Core::subscribe` (the panic-on-error variant) panics on either
+/// case; `try_subscribe` returns these so operators (zip / concat /
+/// race / take_until / merge / switch_map / etc.) can match on the
+/// variant — defer for [`Self::PartitionOrderViolation`], skip the
+/// source for [`Self::TornDown`].
+///
+/// Per canonical spec R2.2.7.a / R2.2.7.b (D118, 2026-05-10).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum SubscribeError {
+    /// Phase H+ STRICT (D115): partition acquisition would violate the
+    /// ascending-order protocol. Caller should defer the subscribe to
+    /// wave-end via the producer-pattern deferred-op queue.
+    #[error(transparent)]
+    PartitionOrderViolation(#[from] PartitionOrderViolation),
+
+    /// R2.2.7.b (D118, 2026-05-10): the node is non-resubscribable AND
+    /// has terminated (`[COMPLETE]` or `[ERROR, h]` was delivered).
+    /// The stream is permanently over; subscribe is rejected.
+    /// Resubscribable terminal nodes do NOT surface this error — they
+    /// reset to a fresh lifecycle on subscribe per R2.2.7.a, regardless
+    /// of TEARDOWN state.
+    #[error(
+        "subscribe({node:?}): node is non-resubscribable and has terminated; \
+         the stream is permanently over (R2.2.7.b)"
+    )]
+    TornDown {
+        /// The non-resubscribable terminal node that rejected the subscribe.
+        node: NodeId,
+    },
 }
 
 /// A producer-pattern operation deferred because it would have
@@ -2905,24 +3096,33 @@ impl Core {
     /// state:
     /// - Sentinel cache + live (non-terminal): `[START]`
     /// - Cached + live: `[START, DATA(handle)]`
-    /// - Cached + terminated (non-resubscribable): `[START, DATA(handle), <terminal>]`
-    /// - Sentinel + terminated (non-resubscribable): `[START, <terminal>]`
     ///
-    /// Resubscribable terminal lifecycle (R2.2.7 / R2.5.3): if the node was
-    /// marked resubscribable via [`Self::set_resubscribable`] AND has
-    /// terminated, the subscribe call first **resets** the node — clears
-    /// `terminal`, `has_fired_once`, `has_received_teardown`, all
-    /// `dep_handles` to `NO_HANDLE`, all `dep_terminals` to `None`, and
-    /// drains the pause lockset. The new subscriber then receives a fresh
-    /// `[START]` (cache may survive for state nodes; sentinel for compute).
+    /// Subscribe-after-terminal semantics (canonical R2.2.7.a / R2.2.7.b,
+    /// D118 2026-05-10):
+    /// - **Resubscribable + terminal** (any TEARDOWN state): the subscribe
+    ///   call first **resets** the node — clears `terminal`,
+    ///   `has_fired_once`, `has_received_teardown`, all `dep_handles` to
+    ///   `NO_HANDLE`, all `dep_terminals` to `None`, drains the pause
+    ///   lockset, clears the replay buffer. The new subscriber receives a
+    ///   fresh `[START]` (cache survives for state nodes per R2.2.8;
+    ///   sentinel for compute). The `wipe_ctx` cleanup hook fires
+    ///   lock-released so binding-side `ctx.store` starts fresh.
+    /// - **Non-resubscribable + terminal** (any TEARDOWN state): the
+    ///   subscribe is rejected — `try_subscribe` returns
+    ///   [`SubscribeError::TornDown`]; this method (the panic-on-error
+    ///   variant) panics with the diagnostic.
     ///
     /// Activation (R2.2.3 step 5): if this is the first subscriber and the
     /// node is a derived/dynamic compute, recursively activate deps so their
     /// cached handles fill our `dep_handles`.
+    ///
     /// # Panics
     ///
-    /// Panics if subscribing would violate the Phase H+ ascending
-    /// partition-order invariant (typed [`PartitionOrderViolation`]).
+    /// Panics if:
+    /// - Subscribing would violate the Phase H+ ascending partition-order
+    ///   invariant ([`SubscribeError::PartitionOrderViolation`]).
+    /// - The node is non-resubscribable AND has terminated
+    ///   ([`SubscribeError::TornDown`], R2.2.7.b).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription {
         match self.try_subscribe(node_id, sink) {
@@ -2931,15 +3131,18 @@ impl Core {
         }
     }
 
-    /// Fallible subscribe. Returns `Err` on partition order violation
-    /// (Phase H+ STRICT, D115). Used by `subscribe` (unwraps) and
-    /// producer-pattern operator sinks (defers on Err).
+    /// Fallible subscribe. Returns `Err` on:
+    /// - Partition order violation (Phase H+ STRICT, D115) — caller defers.
+    /// - Non-resubscribable terminal node (R2.2.7.b, D118) — caller skips.
+    ///
+    /// Used by `subscribe` (unwraps both errors as panics) and producer-
+    /// pattern operator sinks (match on variant).
     #[allow(clippy::needless_pass_by_value)]
     pub fn try_subscribe(
         &self,
         node_id: NodeId,
         sink: Sink,
-    ) -> Result<Subscription, PartitionOrderViolation> {
+    ) -> Result<Subscription, SubscribeError> {
         // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
         //
         // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
@@ -2977,35 +3180,72 @@ impl Core {
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
+
+            // R2.2.7.b (D118, 2026-05-10): non-resubscribable + terminal →
+            // reject. The stream is permanently over; subscribe gets a
+            // clean error rather than a confusing replay of past events.
+            // Operators (zip / concat / race / ...) match on the variant
+            // and skip the source. Drop the wave_owner before returning so
+            // a concurrent waiter can proceed.
+            //
+            // The `has_received_teardown` flag is irrelevant here —
+            // `terminal.is_some()` alone gates rejection. The auto-TEARDOWN
+            // cascade in R2.6.4 / Lock 6.F means torn_down lags terminal
+            // by at most one wave anyway; a brief mid-wave window where
+            // `terminal.is_some() && !torn_down` is reachable but the
+            // rejection decision doesn't depend on which side of that
+            // window we're in.
+            let should_reject = {
+                let rec = s.require_node(node_id);
+                !rec.resubscribable && rec.terminal.is_some()
+            };
+            if should_reject {
+                drop(s);
+                drop(wave_guard);
+                return Err(SubscribeError::TornDown { node: node_id });
+            }
+
             let sub_id = s.alloc_sub_id();
 
-            // Resubscribable reset: terminal + flagged → clear lifecycle
-            // state so the incoming subscriber starts fresh. F3 audit
-            // guard: a node that has received TEARDOWN (R2.6.4) is
-            // permanently destroyed at this layer; resurrecting it via a
-            // late subscribe is a category error. COMPLETE/ERROR is
-            // recoverable for resubscribable nodes; TEARDOWN is not. The
-            // handshake will still replay the terminal in the non-reset
-            // branch so the late subscriber sees a clean
-            // `[START, ?DATA, COMPLETE|ERROR, TEARDOWN]` stream.
+            // R2.2.7.a (D118, 2026-05-10): resubscribable + terminal → reset
+            // to fresh lifecycle, regardless of TEARDOWN state. The prior
+            // `!has_received_teardown` guard (Slice A+B F3) conflated
+            // "TEARDOWN is the cleanup signal of the previous activation
+            // cycle" with "permanent destruction" — corrected per the
+            // canonical-spec amendment. `reset_for_fresh_lifecycle` clears
+            // `has_received_teardown` along with `terminal`,
+            // `has_fired_once`, dep_records sentinels, pause lockset, and
+            // replay buffer. `wipe_ctx` fires lock-released after the
+            // state lock drops so the binding's `ctx.store` starts fresh.
             let needs_reset = {
                 let rec = s.require_node(node_id);
-                rec.resubscribable && rec.terminal.is_some() && !rec.has_received_teardown
+                rec.resubscribable && rec.terminal.is_some()
             };
             if needs_reset {
                 self.reset_for_fresh_lifecycle(&mut s, node_id);
             }
 
             // Snapshot handshake state under lock.
-            let (cache, is_state, first_subscriber, terminal, torn_down) = {
+            //
+            // F5 (/qa 2026-05-10): post-D118 R2.2.7.a/b, the snapshot
+            // ALWAYS sees a non-terminal node here — `should_reject`
+            // already rejected non-resubscribable terminal above, and
+            // `needs_reset` cleared resubscribable terminal back to
+            // `terminal = None` / `has_received_teardown = false`.
+            // The pre-D118 terminal-replay + teardown-replay branches
+            // were dead code in this post-D118 sequence and are
+            // removed.
+            let (cache, is_state, first_subscriber) = {
                 let rec = s.require_node(node_id);
-                (
-                    rec.cache,
-                    rec.is_state(),
-                    rec.subscribers.is_empty(),
-                    rec.terminal,
-                    rec.has_received_teardown,
-                )
+                debug_assert!(
+                    rec.terminal.is_none(),
+                    "R2.2.7.a/b invariant: post-reject/reset, terminal must be None"
+                );
+                debug_assert!(
+                    !rec.has_received_teardown,
+                    "R2.2.7.a invariant: reset clears has_received_teardown"
+                );
+                (rec.cache, rec.is_state(), rec.subscribers.is_empty())
             };
 
             // Build per-tier handshake slices. Each non-empty slice is
@@ -3044,15 +3284,6 @@ impl Core {
             };
             for h in &replay_handles {
                 tier_slices.push(vec![Message::Data(*h)]);
-            }
-            if let Some(t) = terminal {
-                tier_slices.push(vec![match t {
-                    TerminalKind::Complete => Message::Complete,
-                    TerminalKind::Error(h) => Message::Error(h),
-                }]);
-            }
-            if torn_down {
-                tier_slices.push(vec![Message::Teardown]);
             }
 
             // Install sink BEFORE dropping state lock so any thread that
@@ -4944,6 +5175,52 @@ impl Core {
                 // view is available).
                 reg.on_edge_removed(n, removed_dep);
             }
+        }
+        // B3 (D117, 2026-05-10): when set_deps clears ALL deps mid-wave AND
+        // n has a tier-1 (DIRTY) message already queued this wave with no
+        // settle yet, push n to `pending_auto_resolve` so the drain-end
+        // sweep emits a paired Resolved. Without this, subscribers observe
+        // an unpaired DIRTY, violating R1.3.1.b two-phase push pairing.
+        //
+        // Outside any active wave the per-thread `pending_notify` is empty
+        // (cleared at wave-end), so the predicate short-circuits and the
+        // insert is a no-op. Inside a wave, the `pending_auto_resolve`
+        // sweep at `drain_and_flush` end re-checks pending_notify and
+        // routes through `queue_notify` (which handles paused-children
+        // pause-buffer placement automatically).
+        if new_deps_vec.is_empty() {
+            // F6 (/qa 2026-05-10): walk pending_notify in arrival order
+            // counting unpaired DIRTYs. Tier 4 INVALIDATE is NOT a
+            // settle for two-phase pairing — it clears cache but does
+            // not pair with a DIRTY. Pairs are DIRTY ↔ DATA / RESOLVED
+            // (tier 3 value-class) or DIRTY ↔ COMPLETE / ERROR (tier 5
+            // terminal). Multi-emit waves like `[DIRTY, RESOLVED, DIRTY]`
+            // leave one trailing unpaired DIRTY that needs auto-Resolved.
+            crate::batch::with_wave_state(|ws| {
+                let needs_auto_resolve = ws.pending_notify.get(&n).is_some_and(|entry| {
+                    let mut unpaired: i32 = 0;
+                    for m in entry.iter_messages() {
+                        match m {
+                            crate::message::Message::Dirty => unpaired += 1,
+                            crate::message::Message::Data(_)
+                            | crate::message::Message::Resolved
+                            | crate::message::Message::Complete
+                            | crate::message::Message::Error(_)
+                                if unpaired > 0 =>
+                            {
+                                unpaired -= 1;
+                            }
+                            // INVALIDATE / PAUSE / RESUME / TEARDOWN /
+                            // START — not settles for two-phase pairing.
+                            _ => {}
+                        }
+                    }
+                    unpaired > 0
+                });
+                if needs_auto_resolve {
+                    ws.pending_auto_resolve.insert(n);
+                }
+            });
         }
         // Drop the state lock before run_wave (which acquires its own) and
         // before crossing the binding boundary for the F1 refcount-fix

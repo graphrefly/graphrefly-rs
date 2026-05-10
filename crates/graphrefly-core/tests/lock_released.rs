@@ -261,75 +261,17 @@ fn handshake_tier_split_cached_state_two_calls() {
     );
 }
 
-#[test]
-fn handshake_tier_split_terminated_state_three_calls() {
-    // Cached state that has terminated (non-resubscribable). Handshake
-    // should be `[Start]`, `[Data(cached)]`, `[Complete]` — three calls.
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(7)));
-    rt.core.complete(s.id);
-
-    let rec = rt.subscribe_recorder(s.id);
-
-    assert_eq!(
-        rec.call_count(),
-        3,
-        "cached + complete handshake = 3 sink calls"
-    );
-    assert_eq!(rec.call_boundaries(), vec![1, 1, 1]);
-    assert_eq!(
-        rec.snapshot(),
-        vec![
-            RecordedEvent::Start,
-            RecordedEvent::Data(TestValue::Int(7)),
-            RecordedEvent::Complete,
-        ]
-    );
-}
-
-#[test]
-fn handshake_tier_split_torndown_node_four_calls() {
-    // Torn-down cached state: `[Start]`, `[Data]`, `[Complete]`,
-    // `[Teardown]` — four calls.
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(5)));
-    rt.core.teardown(s.id);
-
-    let rec = rt.subscribe_recorder(s.id);
-
-    assert_eq!(rec.call_count(), 4, "torn-down handshake = 4 sink calls");
-    assert_eq!(rec.call_boundaries(), vec![1, 1, 1, 1]);
-    assert_eq!(
-        rec.snapshot(),
-        vec![
-            RecordedEvent::Start,
-            RecordedEvent::Data(TestValue::Int(5)),
-            RecordedEvent::Complete,
-            RecordedEvent::Teardown,
-        ]
-    );
-}
-
-#[test]
-fn handshake_tier_split_error_terminated_three_calls() {
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(1)));
-    let err_h = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(s.id, err_h);
-
-    let rec = rt.subscribe_recorder(s.id);
-
-    assert_eq!(rec.call_count(), 3);
-    assert_eq!(rec.call_boundaries(), vec![1, 1, 1]);
-    assert_eq!(
-        rec.snapshot(),
-        vec![
-            RecordedEvent::Start,
-            RecordedEvent::Data(TestValue::Int(1)),
-            RecordedEvent::Error(TestValue::Str("boom".into())),
-        ]
-    );
-}
+// Note: pre-D118, three additional handshake-tier-split tests covered the
+// `[Start, Data, Complete]` / `[Start, Data, Complete, Teardown]` / `[Start,
+// Data, Error]` replay shape on non-resubscribable terminal nodes. With
+// canonical R2.2.7.b (D118, 2026-05-10), subscribe to a non-resubscribable
+// terminal node is REJECTED rather than replayed. The handshake-tier-split
+// guarantee (R1.3.5.a) is now exercised on:
+//   - `handshake_tier_split_sentinel_state_one_call` — `[Start]` (1 call)
+//   - `handshake_tier_split_cached_state_two_calls` — `[Start, Data]` (2 calls)
+//   - replay-buffer scenarios in `replay_buffer.rs` — `[Start, Data, Data, ...]`
+// The rejection paths (replacing the deleted three tests) live in
+// `tests/resubscribable.rs::subscribe_to_non_resubscribable_*_panics` (D118).
 
 // ---------------------------------------------------------------------------
 // Late-subscriber-during-wave: sink-snapshot-on-first-touch race fix

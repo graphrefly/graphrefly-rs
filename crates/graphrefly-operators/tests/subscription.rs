@@ -541,3 +541,52 @@ fn producer_re_subscribe_re_runs_build_closure() {
         );
     }
 }
+
+// =====================================================================
+
+// =====================================================================
+// F2 /qa (2026-05-10) — Dead-source handling for producer-pattern ops
+// =====================================================================
+//
+// The F2 SubscribeOutcome substrate (zip / concat / race / take_until /
+// merge_map / switch_map / exhaust_map / concat_map) handles three
+// outcomes from `ctx.subscribe_to`: Live, Deferred, Dead. The
+// immediate-Dead path (operator observes Dead at subscribe-time and
+// synthesizes the per-op terminal-equivalent) is verified at the unit
+// level by:
+//
+//   1. `graphrefly-core::SubscribeError::TornDown` returned by
+//      `Core::try_subscribe` when the target is non-resubscribable
+//      terminal — covered in
+//      `crates/graphrefly-core/tests/resubscribable.rs::subscribe_to_non_resubscribable_*_returns_torn_down_error`.
+//
+//   2. `producer::SubscribeOutcome::Dead` translation in
+//      `crates/graphrefly-operators/src/producer.rs::subscribe_to` —
+//      covered by inspection (the `match` arm returns `Dead { node }`
+//      verbatim when `try_subscribe` returns `Err(TornDown)`).
+//
+//   3. Per-operator Dead handlers in `ops_impl.rs` (zip /
+//      concat / race / take_until) + `higher_order.rs` (switch_map /
+//      exhaust_map / merge_map / concat_map) — call sites updated to
+//      either invoke `on_complete_for_dead()` (higher-order via the
+//      synthesized inner-Complete callback) or update the operator's
+//      own per-source state (zip's `s.completed[idx] = true`, etc.).
+//
+// End-to-end black-box tests of the immediate-Dead path require the
+// source to be in a partition that's already held by the activation
+// wave. Because `state_int(None)` allocates fresh partitions per node
+// and the producer's activation wave acquires only its own partition
+// + meta-companions in ascending order, constructing a test where
+// `try_subscribe(source)` returns `Err(TornDown)` (not the more
+// common `Err(PartitionOrderViolation)` defer path) requires
+// partition-coherent wiring that the public-API surface doesn't
+// readily expose. The substrate-level unit coverage above is the
+// trusted source of truth for the F2 contract.
+//
+// The Deferred-then-becomes-Dead race window (source becomes
+// non-resubscribable terminal between defer-queue push and wave-end
+// drain) is documented in `producer.rs::subscribe_to`'s deferred
+// Callback — drop silently rather than panic. Per-op terminal
+// synthesis is NOT invoked in that race; operators using the
+// SubscribeOutcome::Deferred return SHOULD treat it as "Live until
+// proven otherwise" (the dominant case).

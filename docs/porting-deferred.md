@@ -994,22 +994,27 @@ transparently. ~50 LOC change, reuses existing `wave_owner`
 infrastructure from Slice A close /qa Q2 — no per-sink
 staging-buffer machinery required. Closed 2026-05-07.
 
-### Deactivation cleanup not yet modeled (cache-clear half)
+### ~~Deactivation cleanup not yet modeled (cache-clear half)~~ — RESOLVED 2026-05-10 (D119/D120/D121, A sub-slice / Phase G cleanup_node)
 
-- **What:** when the last subscriber unsubscribes from a derived/dynamic node,
-  TS clears its cache and releases handles. Rust currently no-ops the
-  unsubscribe path's CACHE-CLEAR side. (As of Slice E2 — 2026-05-07 —
-  the user-facing cleanup-hook side IS modeled: `BindingBoundary::cleanup_for(node, OnDeactivation)` fires lock-released
-  from `Subscription::Drop` when the last sub leaves, gated on
-  `has_fired_once`, before the existing `producer_deactivate` hook per
-  D056. What's still deferred: Core's own cache release + handle
-  drop on deactivation.)
-- **Why deferred:** correct under "always subscribed" lifetimes (which all
-  current tests assume). Lands when the graph layer (M2) introduces
-  subgraph mount/unmount that makes deactivation observable.
-- **Source:** [node.rs](../crates/graphrefly-core/src/node.rs) inline comment.
-  Cross-ref Slice E2 wiring above for the cleanup-hook layer that already
-  exists in v1.
+Phase G (`Subscription::Drop` last-sub branch — `crates/graphrefly-core/src/node.rs`)
+implements the cache-clear half of deactivation, mirroring TS `_deactivate`
+(`packages/pure-ts/src/core/node.ts:2185-2297`):
+
+1. (existing) user `cleanup_for(OnDeactivation)`
+2. (existing) `producer_deactivate`
+3. (existing) `wipe_ctx` (resubscribable + terminal)
+4. **NEW Phase G:** Core cache-clear — releases compute `cached`
+   (R2.2.7 / R2.2.8 ROM rule: state preserved, compute cleared per D119),
+   per-dep `prev_data` + `data_batch` retains, per-dep `dep_terminals[i]`
+   Error retains (D121 — closes the per-cascade-destination leak), pause
+   buffer DATA, replay buffer; resets `has_fired_once`, `dirty`,
+   `involved_this_wave`, `tracked` (dynamic). Drains pause lockset.
+   Keeps per-node `terminal` slot intact (D121).
+
+Lock-released release discipline: handles collected under state lock,
+released after lock drop (mirrors `Core::resume` Phase 2). Re-entrance
+into Core during `release_handle` is permitted. Verified by
+`crates/graphrefly-core/tests/phase_g_cleanup_node.rs` (6 tests).
 
 ### ~~Cascade recursion can stack-overflow on deep chains~~ — RESOLVED in Slice A-bigger
 
@@ -1394,11 +1399,9 @@ These canonical-spec methods are tracked for parity. Items marked
 - **Lift point:** when deactivation cleanup lands, call `OperatorScratch::release_handles` + reinstall fresh scratch on deactivation (mirrors `reset_for_fresh_lifecycle` shape — the substrate is already in place via the trait's `release_handles` method).
 - **Source:** Slice C-3 close (2026-05-06); D028.
 
-### `take_until(source, notifier)` not yet ported
+### ~~`take_until(source, notifier)` not yet ported~~ — RESOLVED (Slice D / M3 producer-pattern slice); doc strike-through 2026-05-10 (B sub-slice cleanup batch)
 
-- **What:** TS `take.ts` exports `takeUntil(source, notifier, opts?)` — forwards `source` until `notifier` matches `predicate`, then `Complete`. Implementation uses the producer pattern (manual subscribe to two sources). Not in the Slice C-3 scope.
-- **Why deferred:** the Core-dispatch `OperatorOp` family (Take/Skip/TakeWhile/Last) handles single-dep / count / predicate gates cleanly. `takeUntil` is fundamentally a 2-dep subscription-managed operator (D020 category B) — different infrastructure. Lands with the future subscription-managed slice that also covers `zip` / `concat` / `race` / `switchMap` / `mergeMap` / `concatMap`.
-- **Source:** Slice C-3 close (2026-05-06); D024 scope decision.
+`take_until` shipped in `crates/graphrefly-operators/src/ops_impl.rs:610` as a producer-pattern operator — subscribes to both `source` and `notifier`, forwards source DATA until notifier emits any DATA, then completes. Uses the H+ STRICT defer-to-wave-end machinery (`emit_or_defer` / `complete_or_defer` / `error_or_defer`). 4 cargo tests in `crates/graphrefly-operators/tests/subscription.rs:389+` (`take_until_forwards_source_until_notifier_emits`, `take_until_does_not_forward_notifier_value`, `take_until_source_complete_propagates`, `take_until_source_error_propagates`). The original deferred entry was preserved in the active backlog by oversight; doc strike-through landed during the 2026-05-10 B sub-slice cleanup batch (D122).
 
 ### Operator describe doesn't surface flow-variant discriminant
 
@@ -1751,34 +1754,13 @@ These are deliberate simplifications relative to the TS production
 dispatcher (`~/src/graphrefly-ts/src/core/node.ts`). Each is a known
 divergence; M1-close hardening or M2 work may revisit.
 
-### Pause-buffer overflow does not synthesize ERROR (TS Lock 6.A divergence)
+### ~~Pause-buffer overflow does not synthesize ERROR (TS Lock 6.A divergence)~~ — RESOLVED 2026-05-07 (Slice F A3); doc strike-through 2026-05-10 (B sub-slice cleanup batch)
 
-- **What:** When the per-node pause replay buffer hits the Core-global
-  `pause_buffer_cap`, the oldest message is dropped and `dropped` increments.
-  TS Lock 6.A also synthesizes a `Message::Error` carrying overflow detail
-  (cap value, dropped count, lock-held duration in ms). The Rust port
-  reports overflow only via `ResumeReport.dropped`.
-- **Why divergent:** simpler v1 surface; callers are expected to inspect
-  `ResumeReport.dropped > 0` themselves. The reserved
-  `PauseState::Paused.started_at_ns` field is `#[allow(dead_code)]` for
-  future use when ERROR synthesis lands.
-- **Source:** Edge Case Hunter QA finding, 2026-05-05; TS reference at
-  `~/src/graphrefly-ts/src/core/node.ts:3193-3225`.
+The canonical fix landed in Slice F A3 (2026-05-07). `BindingBoundary::synthesize_pause_overflow_error(node_id, dropped_count, configured_max, lock_held_duration_ms) -> Option<HandleId>` is the binding-side hook. `Core::drain_and_flush` invokes the synth at wave-end (`crates/graphrefly-core/src/batch.rs:856`), routes the returned handle through `Core::error` to terminate the node and cascade. Default impl returns `None` (silent drop + `ResumeReport.dropped` fallback). Tests in `crates/graphrefly-core/tests/slice_f_corrections.rs::a3_pause_overflow_synthesizes_error_once_per_cycle` and `a3_overflow_silently_dropped_when_binding_returns_none`. The original deferred entry was preserved in the active backlog by oversight; doc strike-through landed during the 2026-05-10 B sub-slice cleanup batch (D122).
 
-### `alloc_lock_id` can collide with user-supplied `LockId::new(N)`
+### ~~`alloc_lock_id` can collide with user-supplied `LockId::new(N)`~~ — RESOLVED 2026-05-07 (Slice F A4); doc strike-through 2026-05-10 (B sub-slice cleanup batch)
 
-- **What:** [`Core::alloc_lock_id`](../crates/graphrefly-rs/crates/graphrefly-core/src/node.rs)
-  uses a sequential `next_lock_id` starting at 1. Users who construct
-  `LockId::new(N)` directly (the `pub` constructor exposes any `u64`) can
-  collide with later alloc-allocated ids, causing
-  cross-controller pause leak: caller A's `resume(node, lock_a)` would
-  drain caller B's pause if both happened to use the same `LockId`.
-- **Why deferred:** TS uses opaque `Symbol()` for guaranteed uniqueness;
-  Rust's `LockId` is a u64 newtype. Production fix: either reserve a high
-  range for `alloc_lock_id` (start at e.g. `u64::MAX / 2`) or make
-  `LockId::new` `pub(crate)` and force users through `alloc_lock_id`. v1
-  recommendation: pick one allocation scheme per consumer.
-- **Source:** Edge Case Hunter QA finding, 2026-05-05.
+Resolved via option (b) of the lift options — high-range reservation. `next_lock_id` initialized at `1u64 << 31` (`crates/graphrefly-core/src/node.rs:1807`); `LockId` ranges documented at `crates/graphrefly-core/src/handle.rs:118-133`: `[0, 1<<32)` user range, `[1<<32, u64::MAX]` dispatcher range. User-supplied ids (typical max u32::MAX from JS marshalling) cannot collide with dispatcher allocations. The original deferred entry was preserved in the active backlog by oversight; doc strike-through landed during the 2026-05-10 B sub-slice cleanup batch (D116).
 
 ### ~~Cross-wave DIRTY-then-DATA under PAUSE (was "DIRTY-without-DATA across pause-resume")~~ — RESOLVED 2026-05-07 in Slice F audit follow-on
 
@@ -1808,18 +1790,16 @@ suppression branch + `Core::resume` Phase-4 consolidated fn-fire schedule.
 Regression: `item5_default_mode_consolidates_to_one_fn_fire_on_resume` in
 `tests/slice_f_corrections.rs`. Closed 2026-05-07.
 
-### `set_deps` mid-wave full-removal leaves stuck DIRTY without RESOLVED
+### ~~`set_deps` mid-wave full-removal leaves stuck DIRTY without RESOLVED~~ — RESOLVED 2026-05-10 (D117, B sub-slice)
 
-- **What:** If `set_deps(N, &[])` is called while N is in dirty state (a
-  prior dep delivered DATA and queued DIRTY this wave), the rewire removes
-  all deps. The wave engine has nothing to fire (no fn deps) and no auto-
-  RESOLVED is queued. Subscribers see DIRTY without a paired settle.
-- **Why deferred:** complex semantics — auto-RESOLVED on wave-end after
-  full removal would compete with downstream-cascade conventions. The
-  inline comment at `set_deps` already acknowledges the gap. Real fix
-  bundles with the M2 graph-layer "structural change → wave settle"
-  protocol.
-- **Source:** Edge Case Hunter QA finding, 2026-05-05.
+When `set_deps(N, &[])` is called mid-wave AND `pending_notify[N]` contains
+a tier-1 (DIRTY) message with no settle yet, `Core::set_deps` now pushes
+`N` to `pending_auto_resolve` (the existing wave-end auto-resolve sweep
+mechanism). The drain-end sweep at `crates/graphrefly-core/src/batch.rs:923+`
+re-checks pending_notify and queues a paired Resolved via `queue_notify`
+(handles paused-children pause-buffer routing automatically). Verified by
+`crates/graphrefly-core/tests/setdeps.rs::set_deps_full_removal_mid_wave_pairs_dirty_with_resolved`.
+Closes R1.3.1.b two-phase-push pairing for the empty-deps mid-wave case.
 
 ### `pending_notify` IndexMap insertion-order: meta companion ordering breaks for **mid-wave** teardown
 
@@ -1837,30 +1817,19 @@ Regression: `item5_default_mode_consolidates_to_one_fn_fire_on_resume` in
   tier-6) or a separate teardown queue.
 - **Source:** Blind Hunter QA finding, 2026-05-05.
 
-### Non-resubscribable terminal Error handles leak via diamond cascade
+### ~~Non-resubscribable terminal Error handles leak via diamond cascade~~ — RESOLVED 2026-05-10 (D121, A sub-slice / Phase G cleanup_node)
 
-- **What:** When a node terminates with `Error(h)`, every per-node
-  `terminal` slot AND every consumer's `dep_terminals[idx]` slot retains
-  `h` (refcount bump). For non-resubscribable nodes, those retains are
-  never released (the resubscribable reset path is the only release site
-  for these slots). Each terminal node leaks one retain per cascade
-  destination.
-- **Why deferred (UPDATED 2026-05-07 audit):** Cross-repo audit confirmed
-  the lift point is **Rust M2 deactivation cleanup**, NOT TS Phase 14.
-  The TS `_deactivate` impl
-  ([packages/pure-ts/src/core/node.ts:2185-2294](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/core/node.ts))
-  clears all per-dep settled-state on last-sink-detach (calls
-  `resetDepRecord(d)` for each dep, clears `_pauseBuffer`, `_replayBuffer`,
-  `_pauseLocks`, and `_cached` for compute nodes). TS doesn't refcount
-  handles, so the "leak per cascade destination" shape is structurally
-  different — but the *discipline* is exactly what Rust needs to mirror:
-  release per-dep `Handle` refs in `dep_terminals[idx]` + own `terminal`
-  slot when deactivation lands. **No TS Phase 14 dep.** Cross-link to
-  the "Deactivation cleanup not yet modeled" entry — both lift together
-  at the M2 deactivation work.
-- **Source:** Migration-status.md "Carried forward" section reinforced by
-  Blind Hunter QA finding, 2026-05-05; cross-repo audit 2026-05-07
-  confirmed Rust-M2 dependency (not TS).
+Phase G (`Subscription::Drop` last-sub branch — `crates/graphrefly-core/src/node.rs`)
+releases per-dep `dep_terminals[i]` Error retains on consumer deactivation
+(D121). The leak was per-cascade-destination — each consumer node retained
+one share of the upstream's error handle in its own `dep_terminals[i]`
+slot. Phase G walks `rec.dep_records` releasing those retains alongside
+`prev_data` + `data_batch` retains. The producer's own `rec.terminal` slot
+is preserved (D121: needed for late-subscriber R2.2.7.a reset or R2.2.7.b
+rejection per D118). Verified by
+`crates/graphrefly-core/tests/phase_g_cleanup_node.rs::phase_g_releases_dep_terminal_error_handles_on_deactivation`.
+Closes the cross-repo audit note about the discipline mirroring TS
+`_deactivate` (per-dep settled-state release).
 
 ## Open questions from SESSION-rust-port-architecture.md Part 6
 
@@ -1894,11 +1863,58 @@ Surfaced during the TS rewire impl + integration gap-finding. Inherited by
 the Rust port — to re-validate when `set_deps` carries the full M1 feature
 set (PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR/TEARDOWN).
 
-- **Late-subscriber-to-terminal-node-delivers-nothing universal foot-gun.**
-  When a node has emitted COMPLETE and a new subscriber arrives, the
-  push-on-subscribe path must decide whether to replay the terminator.
-  Resubscribable nodes already get a clean handshake (Slice A+B); the
-  non-resubscribable case is the foot-gun.
+- ~~**Late-subscriber-to-terminal-node-delivers-nothing universal foot-gun.**~~
+  RESOLVED 2026-05-10 (D118, B sub-slice) — canonical-spec amendment
+  R2.2.7.a + R2.2.7.b in [`docs/implementation-plan-13.6-canonical-spec.md`](../docs/implementation-plan-13.6-canonical-spec.md)
+  (and `~/src/graphrefly/GRAPHREFLY-SPEC.md` mirror) cleanly splits the
+  policy by `resubscribable` flag, replacing the prior "replay terminal
+  history as courtesy" with explicit semantics:
+  - **Resubscribable + terminal** (any TEARDOWN state) → reset to fresh
+    lifecycle on subscribe (R2.2.7.a). Drops the prior F3 audit guard
+    (`!has_received_teardown`).
+  - **Non-resubscribable + terminal** → reject — `Core::try_subscribe`
+    returns `Err(SubscribeError::TornDown { node })`; public `subscribe`
+    panics (R2.2.7.b).
+  Operators (zip / concat / race / take_until / merge / switch_map / etc.)
+  match on the `SubscribeError` variant and skip dead upstream sources.
+  Verified by `crates/graphrefly-core/tests/resubscribable.rs` (5 new
+  tests covering rejection × 4 + reset-after-teardown + reset-after-any-
+  terminal). TS mirrored at `packages/pure-ts/src/core/node.ts:1281+`
+  (3008/3008 tests pass + 142 parity tests pass).
+- **TS operator audit for R2.2.7.b rejection handling (D127, /qa F3 carry-forward).**
+  The TS substrate landed 2026-05-10 (`TornDownError` class + `isTornDownError` +
+  `SubscribeOutcome` type + `trySubscribeOrDead` helper exported from
+  `@graphrefly/graphrefly`). `Node.subscribe` now throws `TornDownError`
+  when subscribing to a non-resubscribable terminal node. ~25 TS operator
+  subscribe sites in `packages/pure-ts/src/extra/operators/{buffer,take,
+  control,combine,time,higher-order}.ts` still call raw `source.subscribe(...)`
+  unwrapped — these will throw uncaught from inside their `onSubscribe`
+  closures when given a dead upstream, propagating to the consumer's
+  `.subscribe(operatorNode)`. **Lift:** audit each call site and migrate
+  to `trySubscribeOrDead(source, sink)` with per-op Dead handling (zip
+  self-completes, concat advances, race marks completed, take_until
+  self-completes, switch_map / exhaust_map / merge_map invoke
+  on-inner-complete). Mirror the Rust per-op fixes in
+  `crates/graphrefly-operators/src/{producer,ops_impl,higher_order}.rs`.
+  Scope: ~25 sites + per-op test additions. Source: /qa F3 (2026-05-10).
+
+- **F2 immediate-Dead end-to-end operator tests (D126, /qa carry-forward).**
+  The Rust `SubscribeOutcome::Dead` substrate + per-op Dead handlers
+  landed 2026-05-10. End-to-end black-box verification (operator self-
+  completes on Dead source at activation) requires partition-coherent
+  test setup — sources must be in partitions already-acquired by the
+  activation wave. Public-API surface doesn't readily expose this:
+  `state_int` allocates fresh partitions per node, and the producer's
+  activation wave acquires only its own partition + meta-companions
+  in ascending order. Existing meta-companion test workarounds hit
+  Phase H+ STRICT defer instead of the immediate-Dead path. Substrate-
+  level unit coverage via `SubscribeError::TornDown` in
+  `crates/graphrefly-core/tests/resubscribable.rs` is the trusted
+  source of truth for the F2 contract. **Lift:** add a test-runtime
+  helper to construct partition-coherent operator scenarios, OR
+  exercise the Dead path through napi-bindings end-to-end. Source:
+  /qa F2 (2026-05-10).
+
 - **Mid-fn rewire re-entrancy hazard.** TS impl rejects synchronous re-entry
   via `_inDepMutation`. Rust impl currently only rejects via the cycle check;
   needs explicit re-entrancy guard once `set_deps` is callable from inside an

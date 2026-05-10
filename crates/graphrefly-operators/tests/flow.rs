@@ -458,32 +458,42 @@ fn last_releases_buffered_latest_on_lifecycle_reset() {
     // consumes that retain into Last.cache. Refcount becomes 5.
     assert_eq!(rec1.data_values(), vec![TestValue::Int(5)]);
     drop(rec1);
-    // After drop(rec1): rec1's Subscription drops, its sink is
-    // removed from n's subscribers. Refcount unchanged (no shares
-    // to release on subscriber removal for non-producer compute nodes).
+    // After drop(rec1): rec1's Subscription drops. Phase G (D119,
+    // 2026-05-10) fires Core cache-clear on the last-sub-leaves
+    // transition. For compute nodes (R2.2.7 / R2.2.8 ROM rule, D119),
+    // `cache` is released and per-dep `prev_data` is released:
+    //   - Last.cache released: 5 → 4
+    //   - prev_data released:  4 → 3
+    //   - LastState.latest stays in op_scratch (Phase G touches
+    //     NodeRecord state only, not operator scratch)
+    // Refcount after drop(rec1): 3 (diag + source.cache + LastState.latest).
 
-    // Re-subscribing triggers reset_for_fresh_lifecycle AND re-activation
-    // (because subscribers count went 1→0→1, _rec2 is a "first
-    // subscriber" again):
+    // Re-subscribing triggers reset_for_fresh_lifecycle (resubscribable
+    // + terminal — note D118 R2.2.7.a now allows reset regardless of
+    // TEARDOWN state) AND re-activation (subscribers count went 1→0→1,
+    // _rec2 is a "first subscriber" again):
     //   - Phase 2 makes a fresh LastState (latest=NO_HANDLE,
     //     default=NO_HANDLE) — no retain on `5`.
-    //   - Phase 3 releases old LastState.latest's share (5 → 4).
-    //   - Phase 5 releases the old prev_data share (4 → 3).
+    //   - Phase 3 releases old LastState.latest's share (3 → 2).
+    //   - Phase 5 prev_data release: skipped (Phase G already cleared).
     //   - Then activation re-walks source dep, deliver_data_to_consumer
     //     retains source.cache for the new dep_records[0].data_batch
-    //     (3 → 4). fire_op_last runs, updates LastState.latest with
-    //     a fresh retain (4 → 5). Wave-end rotates data_batch into
-    //     prev_data (no net retain change). `Last.cache` is NOT reset
-    //     and stays at `5`.
-    // Final: 1 (diag) + 1 (source.cache) + 1 (Last.cache) +
-    //        1 (re-activated prev_data) + 1 (re-activated LastState.latest)
-    //        = 5.
+    //     (2 → 3). Wave-end rotates data_batch into prev_data (no net
+    //     retain change). fire_op_last buffers source.cache into the
+    //     new LastState.latest (+1 retain: 3 → 4). `Last.cache` stays
+    //     at NO_HANDLE because the source is already terminal — no new
+    //     Data is emitted to fill it.
+    // Final: 1 (diag) + 1 (source.cache) + 1 (re-activated prev_data) +
+    //        1 (re-activated LastState.latest) = 4.
     let _rec2 = rt.subscribe_recorder(n);
     assert_eq!(
         rt.binding.refcount_of(observed_handle),
-        5,
-        "after reset + re-activation: old shares released by reset, \
-         then re-activation re-retains via source.cache + new LastState.latest"
+        4,
+        "after Phase G cache-clear + reset + re-activation: Last.cache \
+         released by Phase G; prev_data + LastState.latest replaced by \
+         re-activation's fresh retains. (Pre-D119 expected 5 because \
+         Last.cache survived; D119 clears compute cache on deactivation \
+         per R2.2.7 / R2.2.8 ROM rule.)"
     );
 }
 

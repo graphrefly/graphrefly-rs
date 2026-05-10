@@ -206,7 +206,38 @@ pub fn zip(
                     }
                 }
             });
-            ctx.subscribe_to(source, sink);
+            // F2 /qa: on Dead, synthesize the per-source Complete in
+            // zip's state machine — `s.completed[idx] = true` and (if
+            // queue is empty, which it always is at activation since
+            // DATA hasn't yet flowed) self-Complete the producer.
+            // Pre-F2 a Dead source left zip waiting on a queue that
+            // would never fill → silent wedge.
+            let outcome = ctx.subscribe_to(source, sink);
+            if matches!(outcome, crate::producer::SubscribeOutcome::Dead { .. }) {
+                let core_dead = core_for_build.clone();
+                let binding_dead = binding_clone.clone();
+                let mut should_complete = false;
+                let mut to_release: SmallVec<[HandleId; 8]> = SmallVec::new();
+                {
+                    let mut s = state.lock().unwrap();
+                    if !s.terminated {
+                        s.completed[idx] = true;
+                        if s.queues[idx].is_empty() {
+                            s.terminated = true;
+                            for q in &mut s.queues {
+                                to_release.extend(q.drain(..));
+                            }
+                            should_complete = true;
+                        }
+                    }
+                }
+                for h in to_release {
+                    binding_dead.release_handle(h);
+                }
+                if should_complete {
+                    core_dead.complete_or_defer(producer_id);
+                }
+            }
         }
     });
 
@@ -347,7 +378,19 @@ pub fn concat(
                 }
             }
         });
-        ctx.subscribe_to(second, second_sink);
+        // F2 /qa: Dead `second` is observed via `second_completed` flag.
+        // First-Complete drains pending and self-Completes if second
+        // already completed; same logic handles Dead second.
+        let second_outcome = ctx.subscribe_to(second, second_sink);
+        if matches!(
+            second_outcome,
+            crate::producer::SubscribeOutcome::Dead { .. }
+        ) {
+            let mut s = state.lock().unwrap();
+            s.second_completed = true;
+            // No additional action — the first-Complete path or first-Dead
+            // path below will trigger producer-Complete.
+        }
 
         let state_for_first = state.clone();
         let core_for_first = core_clone.clone();
@@ -439,7 +482,38 @@ pub fn concat(
                 }
             }
         });
-        ctx.subscribe_to(first, first_sink);
+        // F2 /qa: Dead `first` triggers the phase transition immediately
+        // (treat as first-Complete). If `second` is also dead (or already
+        // completed in phase 0), self-Complete; else continue forwarding
+        // pending+future from second.
+        let first_outcome = ctx.subscribe_to(first, first_sink);
+        if matches!(
+            first_outcome,
+            crate::producer::SubscribeOutcome::Dead { .. }
+        ) {
+            let core_first_dead = core_clone.clone();
+            let mut should_complete = false;
+            let mut pending_to_emit: Vec<HandleId> = Vec::new();
+            {
+                let mut s = state.lock().unwrap();
+                if !s.terminated && s.phase == 0 {
+                    s.phase = 1;
+                    // Drain pending second-DATA buffered during phase 0.
+                    pending_to_emit.extend(s.pending.drain(..));
+                    // If second already completed (or was Dead), self-Complete.
+                    if s.second_completed && !s.terminated {
+                        s.terminated = true;
+                        should_complete = true;
+                    }
+                }
+            }
+            for h in pending_to_emit {
+                core_first_dead.emit_or_defer(producer_id, h);
+            }
+            if should_complete {
+                core_first_dead.complete_or_defer(producer_id);
+            }
+        }
     });
 
     let fn_id = binding.register_producer_build(build);
@@ -575,7 +649,28 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
                     }
                 }
             });
-            ctx.subscribe_to(source, sink);
+            // F2 /qa: on Dead, treat as `completed[idx] = true`. If
+            // all sources are now completed without a winner, self-
+            // Complete (matches the P4 "all completed no winner"
+            // branch in the per-source sink above).
+            let outcome = ctx.subscribe_to(source, sink);
+            if matches!(outcome, crate::producer::SubscribeOutcome::Dead { .. }) {
+                let core_dead = core_clone.clone();
+                let mut should_complete = false;
+                {
+                    let mut s = state.lock().unwrap();
+                    if !s.terminated && s.winner.is_none() {
+                        s.completed[idx] = true;
+                        if s.completed.iter().all(|&c| c) {
+                            s.terminated = true;
+                            should_complete = true;
+                        }
+                    }
+                }
+                if should_complete {
+                    core_dead.complete_or_defer(producer_id);
+                }
+            }
         }
     });
 
@@ -679,7 +774,27 @@ pub fn take_until(
                 }
             }
         });
-        ctx.subscribe_to(source, source_sink);
+        // F2 /qa: Dead `source` → self-Complete (source is permanently
+        // over, so take_until has nothing to forward and the producer
+        // is finished).
+        let source_outcome = ctx.subscribe_to(source, source_sink);
+        if matches!(
+            source_outcome,
+            crate::producer::SubscribeOutcome::Dead { .. }
+        ) {
+            let core_dead = core_clone.clone();
+            let mut should_complete = false;
+            {
+                let mut s = state.lock().unwrap();
+                if !s.terminated {
+                    s.terminated = true;
+                    should_complete = true;
+                }
+            }
+            if should_complete {
+                core_dead.complete_or_defer(producer_id);
+            }
+        }
 
         // Notifier sink: any DATA → terminate; ERROR → cascade.
         let state_for_notifier = state.clone();
@@ -734,7 +849,12 @@ pub fn take_until(
                 }
             }
         });
-        ctx.subscribe_to(notifier, notifier_sink);
+        // F2 /qa: Dead `notifier` → ignore. Notifier signal can never
+        // fire, so take_until reduces to a passthrough of source. The
+        // source's own Complete/Error will terminate the producer
+        // normally; if source is also Dead, the source-Dead branch
+        // above already self-Completed.
+        let _ = ctx.subscribe_to(notifier, notifier_sink);
     });
 
     let fn_id = binding.register_producer_build(build);

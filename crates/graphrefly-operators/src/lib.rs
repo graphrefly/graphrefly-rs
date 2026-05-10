@@ -73,7 +73,7 @@ pub use higher_order::{
 pub use ops_impl::{concat, race, take_until, zip};
 pub use producer::{
     default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
-    ProducerStorage,
+    ProducerStorage, SubscribeOutcome,
 };
 pub use transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan, OperatorRegistration,

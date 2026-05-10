@@ -346,6 +346,13 @@ pub fn switch_map(
                     core_for_outer.clone(),
                     producer_id,
                 );
+                // F2 /qa (2026-05-10): clone `on_complete` so the Dead
+                // branch can invoke it as an immediate "inner completed
+                // before any emit" signal — closes the bug where a
+                // batched `[outer.Data, outer.Complete]` projected to a
+                // dead inner wedged the producer (source_done=true,
+                // inner_sub=None, no future trigger).
+                let on_complete_for_dead = on_complete.clone();
                 let inner_sink = build_inner_sink(
                     core_for_outer.clone(),
                     producer_binding_for_outer.clone(),
@@ -354,34 +361,48 @@ pub fn switch_map(
                     on_error,
                 );
                 // Phase H+ STRICT: try_subscribe + defer for inner source.
+                // F2 /qa: TornDown synthesizes inner-Complete via
+                // on_complete (so the operator's self-Complete trigger
+                // can fire).
                 let inner_sink_for_defer = inner_sink.clone();
-                if let Ok(inner_sub) = core_for_outer.try_subscribe(inner_node, inner_sink) {
-                    let to_drop = {
-                        let mut s = state_for_outer.lock().unwrap();
-                        if s.terminated {
-                            Some(inner_sub)
-                        } else {
-                            s.inner_sub.replace(inner_sub)
-                        }
-                    };
-                    drop(to_drop);
-                } else {
-                    let core_cb = core_for_outer.clone();
-                    let state_cb = state_for_outer.clone();
-                    core_for_outer.push_deferred_producer_op(
-                        graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
-                            let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                            let to_drop = {
-                                let mut s = state_cb.lock().unwrap();
-                                if s.terminated {
-                                    Some(inner_sub)
-                                } else {
-                                    s.inner_sub.replace(inner_sub)
-                                }
-                            };
-                            drop(to_drop);
-                        })),
-                    );
+                match core_for_outer.try_subscribe(inner_node, inner_sink) {
+                    Ok(inner_sub) => {
+                        let to_drop = {
+                            let mut s = state_for_outer.lock().unwrap();
+                            if s.terminated {
+                                Some(inner_sub)
+                            } else {
+                                s.inner_sub.replace(inner_sub)
+                            }
+                        };
+                        drop(to_drop);
+                    }
+                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                        let core_cb = core_for_outer.clone();
+                        let state_cb = state_for_outer.clone();
+                        core_for_outer.push_deferred_producer_op(
+                            graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
+                                let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                                let to_drop = {
+                                    let mut s = state_cb.lock().unwrap();
+                                    if s.terminated {
+                                        Some(inner_sub)
+                                    } else {
+                                        s.inner_sub.replace(inner_sub)
+                                    }
+                                };
+                                drop(to_drop);
+                            })),
+                        );
+                    }
+                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                        // R2.2.7.b: inner is dead. Synthesize
+                        // inner-Complete so switch's state machine
+                        // clears inner_sub and checks the self-Complete
+                        // trigger (closes the [Data,Complete] batched
+                        // wedge bug).
+                        on_complete_for_dead();
+                    }
                 }
             }
 
@@ -581,6 +602,8 @@ pub fn exhaust_map(
                     core_for_outer.clone(),
                     producer_id,
                 );
+                // F2 /qa: clone for TornDown synthesis (mirrors switch_map).
+                let on_complete_for_dead = on_complete.clone();
                 let inner_sink = build_inner_sink(
                     core_for_outer.clone(),
                     producer_binding_for_outer.clone(),
@@ -594,34 +617,49 @@ pub fn exhaust_map(
                 // `inner_sub` was None so our just-subscribed (and
                 // already-dead) sub is dropped on the next iteration.
                 // Phase H+ STRICT: try_subscribe + defer for inner source.
+                // R2.2.7.b: TornDown means the inner source is non-resubscribable
+                // and terminal — skip silently.
                 let inner_sink_for_defer = inner_sink.clone();
-                if let Ok(inner_sub) = core_for_outer.try_subscribe(inner_node, inner_sink) {
-                    let to_drop = {
-                        let mut s = state_for_outer.lock().unwrap();
-                        if s.terminated {
-                            Some(inner_sub)
-                        } else {
-                            s.inner_sub.replace(inner_sub)
-                        }
-                    };
-                    drop(to_drop);
-                } else {
-                    let core_cb = core_for_outer.clone();
-                    let state_cb = state_for_outer.clone();
-                    core_for_outer.push_deferred_producer_op(
-                        graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
-                            let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                            let to_drop = {
-                                let mut s = state_cb.lock().unwrap();
-                                if s.terminated {
-                                    Some(inner_sub)
-                                } else {
-                                    s.inner_sub.replace(inner_sub)
-                                }
-                            };
-                            drop(to_drop);
-                        })),
-                    );
+                match core_for_outer.try_subscribe(inner_node, inner_sink) {
+                    Ok(inner_sub) => {
+                        let to_drop = {
+                            let mut s = state_for_outer.lock().unwrap();
+                            if s.terminated {
+                                Some(inner_sub)
+                            } else {
+                                s.inner_sub.replace(inner_sub)
+                            }
+                        };
+                        drop(to_drop);
+                    }
+                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                        let core_cb = core_for_outer.clone();
+                        let state_cb = state_for_outer.clone();
+                        core_for_outer.push_deferred_producer_op(
+                            graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
+                                let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                                let to_drop = {
+                                    let mut s = state_cb.lock().unwrap();
+                                    if s.terminated {
+                                        Some(inner_sub)
+                                    } else {
+                                        s.inner_sub.replace(inner_sub)
+                                    }
+                                };
+                                drop(to_drop);
+                            })),
+                        );
+                    }
+                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                        // R2.2.7.b / F2 /qa: synthesize inner-Complete
+                        // so exhaust's `s.inner_sub` clears and the
+                        // next outer DATA can re-project (previously
+                        // the TornDown branch was a silent no-op which
+                        // could leave outer spawning more dead
+                        // projections indefinitely without ever
+                        // advancing the state machine).
+                        on_complete_for_dead();
+                    }
                 }
             }
 
@@ -963,6 +1001,11 @@ fn drain_merge_buffer(
         );
         let on_error =
             make_merge_on_error(state.clone(), core.clone(), binding.clone(), producer_id);
+        // F2 /qa: clone on_complete so the TornDown branch can
+        // synthesize inner-Complete (closes the merge_map `s.active`
+        // leak that left the producer never self-completing when a
+        // projected inner was dead).
+        let on_complete_for_dead = on_complete.clone();
         let inner_sink = build_inner_sink(
             core.clone(),
             producer_binding.clone(),
@@ -971,39 +1014,56 @@ fn drain_merge_buffer(
             on_error,
         );
         // Phase H+ STRICT: try_subscribe + defer for inner source.
+        // R2.2.7.b: TornDown means the inner source is non-resubscribable
+        // and terminal — skip silently and remove from pending so the
+        // overall lifecycle isn't wedged waiting on a dead inner.
         let inner_sink_for_defer = inner_sink.clone();
-        if let Ok(inner_sub) = core.try_subscribe(inner_node, inner_sink) {
-            // Decide whether to install the sub: if `on_complete` fired
-            // synchronously inside `subscribe` (pre-completed inner), it
-            // already removed `inner_id` from `pending_inner_ids`.
-            let to_drop = {
-                let mut s = state.lock().unwrap();
-                if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
-                    Some(inner_sub)
-                } else {
-                    s.inner_subs.insert(inner_id, inner_sub);
-                    None
-                }
-            };
-            drop(to_drop);
-        } else {
-            let core_cb = core.clone();
-            let state_cb = state.clone();
-            core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
-                Box::new(move || {
-                    let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                    let to_drop = {
-                        let mut s = state_cb.lock().unwrap();
-                        if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
-                            Some(inner_sub)
-                        } else {
-                            s.inner_subs.insert(inner_id, inner_sub);
-                            None
-                        }
-                    };
-                    drop(to_drop);
-                }),
-            ));
+        match core.try_subscribe(inner_node, inner_sink) {
+            Ok(inner_sub) => {
+                // Decide whether to install the sub: if `on_complete` fired
+                // synchronously inside `subscribe` (pre-completed inner), it
+                // already removed `inner_id` from `pending_inner_ids`.
+                let to_drop = {
+                    let mut s = state.lock().unwrap();
+                    if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
+                        Some(inner_sub)
+                    } else {
+                        s.inner_subs.insert(inner_id, inner_sub);
+                        None
+                    }
+                };
+                drop(to_drop);
+            }
+            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                let core_cb = core.clone();
+                let state_cb = state.clone();
+                core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
+                    Box::new(move || {
+                        let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
+                        let to_drop = {
+                            let mut s = state_cb.lock().unwrap();
+                            if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
+                                Some(inner_sub)
+                            } else {
+                                s.inner_subs.insert(inner_id, inner_sub);
+                                None
+                            }
+                        };
+                        drop(to_drop);
+                    }),
+                ));
+            }
+            Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                // R2.2.7.b / F2 /qa: synthesize inner-Complete. This
+                // delegates to `make_merge_on_complete`'s state-machine
+                // which decrements `s.active`, removes inner_id from
+                // pending, and checks the self-Complete trigger
+                // (source_done && active == 0 && buffer.empty()) —
+                // closing the wedge bug where a Dead inner left
+                // `s.active` permanently inflated and merge_map
+                // never self-completed even after source completed.
+                on_complete_for_dead();
+            }
         }
 
         // Loop continues — pops next from buffer or returns.
