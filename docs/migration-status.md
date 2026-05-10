@@ -2,7 +2,68 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-09)
+## Current state (2026-05-10)
+
+**Q-beyond CLOSED with bench-driven scope reduction (2026-05-10): wave-scoped state moved to per-thread `WaveState` thread_local; per-partition `nodes`/`children` shards (sub-slice 4) DROPPED based on Phase J bench evidence.**
+
+**The architecture story.** Q-beyond was originally scoped as "split CoreState into per-partition `SubgraphShard`s holding `nodes` / `children` / `pending_notify` / `pending_fires` / wave bookkeeping" (~2000-3000 LOC, ~150+ wave-engine sites — per the porting-deferred entry pre-batch). User pushback ("we have created a lot of locks, I'm not sure if they are hurting more on the performance or gaining more on the parallelism") triggered a first-principles audit + 4-architecture comparison + bench-driven decision (D108). The bench harness `crates/graphrefly-core/benches/lock_strategy.rs` (7 scenarios × 4-6 sync primitives) revealed:
+
+- **Uncontended same-thread mutex acquire is ~14 ns/op — IDENTICAL to thread_local borrow.** The "mutex hop is slow" intuition was wrong. parking_lot's adaptive spinning + cache-hot path makes uncontended acquire effectively free.
+- **The real cost is cross-thread cache-line bouncing on the lock state itself.** S3 (2 threads, disjoint keys): shared mutex 35.9 ns/op vs per-partition mutex / thread_local 13.0-13.4 ns/op — 2.7× slower purely from cache-line bounce on the lock.
+- **Per-partition Mutex matches thread_local for disjoint workloads.** 13.0 vs 13.4 ns/op — both eliminate cross-thread bouncing.
+- **DashMap loses single-thread by 1.5-2×** (S5: 16.7 vs 9.2 ns/op). RwLock is consistently bad for read-heavy multi-thread (82% slower than Mutex). crossbeam-channel (Tokio-style) is 2× slower than mutex single-thread.
+
+**The architecture decision (D108):** hybrid — per-thread `WaveState` thread_local for wave-scoped state + per-partition `wave_owner` ReentrantMutex for cross-thread serialization (unchanged). NO DashMap, NO RwLock, NO Tokio scheduler. NO per-partition `nodes`/`children` shards (the latter was sub-slice 4, dropped by D110 after sub-slices 1-3 hit the perf goal alone).
+
+**12 wave-scoped fields migrated CoreState → WaveState** across 3 sub-slices, all cargo-green at sub-slice boundary:
+
+**Sub-slice 1 (2026-05-09): 4 fields ex-CrossPartitionState** — `deferred_handle_releases`, `wave_cache_snapshots`, `pending_auto_resolve`, `pending_pause_overflow`. Eliminated `Core::cross_partition` field, `WeakCore::cross_partition`, `lock_cross_partition()` method, `CrossPartitionState` struct + its `Drop` impl. Established the `WAVE_STATE: thread_local RefCell<WaveState>` infrastructure + `with_wave_state(|ws| ...)` helper + `wave_state_clear_outermost()` defensive wave-start clear (mirrors tier3 D1-patch pattern).
+
+**Sub-slice 2 (2026-05-10): pending_fires + pending_notify** — these are the high-traffic wave-scoped fields. ~10 access sites for `pending_fires` (drain, pick, deliver_data_to_consumer, register, set_deps, terminate_node, etc.); ~9 for `pending_notify` (queue_notify, push_into_pending_notify, flush_notifications, panic-discard, dev-mode invariant assertions). Critical lifecycle nuance: `pending_fires` NOT cleared in `wave_state_clear_outermost` because `Core::resume` stages entries OUTSIDE any in-tick wave then calls `run_wave_for(node_id)` to drain — the start-clear would erase the staged entry. Documented inline at both call sites.
+
+**Sub-slice 3 (2026-05-10): 6 remaining wave-scoped fields** — `currently_firing` (D1 reentrancy guard stack used by FiringGuard RAII), `in_tick` (wave-active flag), `deferred_flush_jobs` (sink-fire queue), `deferred_cleanup_hooks` (Slice E2 OnInvalidate queue), `pending_wipes` (Slice E2 /qa Q2(b) eager wipe queue), `invalidate_hooks_fired_this_wave` (Slice E2 D057 dedup). FiringGuard push/pop migrated to `with_wave_state(|ws| ws.currently_firing.push/pop(...))`. P13's `set_deps` reentrancy check snapshots `currently_firing` into a local Vec via `with_wave_state` BEFORE acquiring registry mutex (avoids holding WaveState borrow across registry acquire). `commit_emission` / `commit_emission_verbatim` fuse `s.in_tick` read with `wave_cache_snapshots.entry(...)` into a single `with_wave_state` block. `flush_notifications` collects sink-fire jobs into a local Vec then appends via single `with_wave_state` end-of-function (avoids holding WaveState borrow across the per-phase loop).
+
+**Sub-slice 4 (2026-05-10): DROPPED per D110.** Originally scoped as `nodes` + `children` per-partition `SubgraphShard` on `SubgraphLockBox` + `set_deps` wave_owner-acquire-on-split for the migration race. Subagent that started sub-slice 4 surfaced a structural blocker (`compute_touched_partitions` walks `s.children` to know which partitions to lock — chicken-and-egg with sharded children) AND the Phase J bench against the prior baseline showed sub-slices 1-3 ALONE delivered the perf goal: 2t-disjoint state-emit −17.9%, 2t-same-partition state-emit −26.8%, fn-fire serial −20.9%, fn-fire 2t-disjoint −4.7%, fn-fire 2t-same −16.8%. The original Q-beyond hypothesis ("per-partition shards needed for Regime A wide-spectrum parallelism") was contradicted by data. D110 dropped sub-slice 4; the 3000-5000 LOC structural refactor would chase a marginal additional gain not justified by current workloads. Carried forward to porting-deferred.md as evidence-gated (lifts when a real workload surfaces state-mutex contention on `nodes`/`children` reads — currently no evidence).
+
+**Sub-slice 5 (this section): bench formalization + close docs.** Phase J bench harness + new `lock_strategy.rs` microbench harness + D110-D112 decision logs + this migration-status update + porting-deferred.md update + CLAUDE.md invariant 3 wording lift to current state.
+
+**Test count: 502 cargo + 142 parity, 0 failed, 2 ignored.** Same as pre-batch (the migration is pure structural — all 502 tests already covered the post-batch behavior). `cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**/qa pass applied (2026-05-10).** Adversarial review (Blind Hunter + Edge Case Hunter, parallel) on the Q-beyond batch close (sub-slices 1-3 + dropped sub-slice 4 + bench/profile harnesses + closing docs) surfaced 2 architectural regressions and 7 minor cleanups. Both regressions were sub-slice-3 fields placed on per-thread `WaveState` thread_local where the placement broke load-bearing cross-Core / cross-thread invariants. Decisions D113 (sub-slice 4 second defer) and D114 (/qa F1+F2 reverts + F4-F10 auto-fixes) logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+- **F1 (silent corruption regression):** `in_tick` per-thread broke cross-Core same-thread BatchGuard isolation (Core-A's BatchGuard sets `ws.in_tick=true` → Core-B's `begin_batch` sees nested → Core-B's writes drained by Core-A's binding). **REVERTED to `CoreState::in_tick`** (per-Core, cross-thread visible via state mutex). The 11 truly-wave-scoped fields stay per-thread.
+- **F2 (P13 cross-thread bypass regression):** `currently_firing` per-thread silently bypassed the cross-thread P13 partition-migration check (D091). Pre-sub-slice-3 the shared `s.currently_firing` was visible cross-thread; per-thread placement made Thread B's `set_deps` read its own empty stack. **REVERTED to `CoreState::currently_firing`**. `FiringGuard::new` push merges into the existing state-lock scope (atomic with `is_producer` read). Implicitly resolves /qa F3 (panic-window between WaveState push and Self construction — gone because push happens atomically under state lock).
+- **F4-F10 auto-fixes:** debug_asserts in `wave_state_clear_outermost` for retain-holding-fields-empty invariant; bench S2 BenchmarkId relabel (`3_separate_mutexes` → `3_separate_mutexes_5_acquires_per_iter`); profile harness docstring fix (was 20× off vs constants); `flush_notifications` `let _ = s` shim cleanup; bulk-rewrite stale `Q2 → CrossPartitionState` comments in node.rs to the post-Sub-slice-1 WaveState targets; bench S8 docstring caveats (Variant B' under-counts state contention; Variant A under-counts WaveState borrow — symmetric, defer-decision robust).
+
+**Architectural lesson recorded (D114):** wave-scoped fields on per-thread `WaveState` thread_local are correct for fields accessed ONLY by the wave-owner thread under `wave_owner` discipline (`pending_fires`, `pending_notify`, `wave_cache_snapshots`, `pending_auto_resolve`, `pending_pause_overflow`, `deferred_handle_releases`, `deferred_flush_jobs`, `deferred_cleanup_hooks`, `pending_wipes`, `invalidate_hooks_fired_this_wave` — cross-thread access is structurally impossible because cross-thread emits BLOCK on partition wave_owner). Fields with cross-Core or cross-thread read requirements (`in_tick`, `currently_firing`) MUST stay on shared `CoreState` — the thread_local optimization doesn't apply when the access pattern crosses the thread boundary by design.
+
+**Final post-/qa state: 502 cargo + 142 parity, 0 failed, 2 ignored.** clippy + fmt clean. `#![forbid(unsafe_code)]` preserved.
+
+**Phase J bench post-Q-beyond (criterion, 2026-05-10) vs the prior Q3+Q2 baseline:**
+| Regime | Prior baseline | Post sub-slices 1-3 | Δ |
+|---|---|---|---|
+| Tight state-emit serial 4N (16K emits) | 13.7 ms | **11.6 ms** | **−15.5%** |
+| Tight state-emit 2t-disjoint (4K each) | 10.7 ms | **8.8 ms** | **−17.9%** |
+| Tight state-emit 2t-same-partition (4K each) | 11.0 ms | **8.0 ms** | **−26.8%** |
+| Tight state-emit 4t-disjoint (4K each) | 25.0 ms | 24.3 ms | ±0% (noise) |
+| Fn-fire serial (2K emits + ~4µs spin) | 10.0 ms | **7.9 ms** | **−20.9%** |
+| Fn-fire 2t-disjoint (1K each) | 5.4 ms | **5.2 ms** | **−4.7%** |
+| Fn-fire 2t-same-partition (1K each) | 11.4 ms | **9.5 ms** | **−16.8%** |
+
+**Disjoint-vs-same separation (fn-fire):** 1.84× post-batch (was 2.11× pre-batch). The parallelism property is preserved; the ratio compresses because BOTH regimes got faster and the "same-partition" case improved disproportionately (per-thread WaveState removes mutex-contention-on-state-mutex even for cross-thread same-partition emits, which now sequentialize on wave_owner alone with each thread's own WaveState).
+
+**Architectural lessons recorded (D111):** Three independent precedents converge on per-thread for wave-scoped state — graphrefly-py's `_batch_tls`, Tokio's per-worker local queues, this Rust port's D1 patch (per-thread tier3). The pattern works because cross-thread access to wave-scoped state is structurally impossible (cross-thread emits block on partition wave_owner; the wave runs on ONE thread once unblocked). Per-partition shards are the right shape ONLY for state genuinely shared across threads AND only when reads cross partitions concurrently AND the workload mix justifies the shard split overhead. Future maintainers: resist the urge to "shard everything" without bench evidence. The `lock_strategy.rs` bench is the canonical comparison harness for any future shard-vs-thread-local-vs-DashMap question.
+
+**Carry-forward (next batches):**
+- **Per-partition `nodes`/`children` shards (Q-beyond sub-slice 4)** — DEFERRED, evidence-gated. Lifts when a real workload surfaces state-mutex contention on `nodes`/`children` reads. Currently no evidence; bench shows post-Q-beyond state mutex is not a bottleneck.
+- **Phase H+ STRICT option (d) typed-error variant** — UNCHANGED carry-forward from prior batch (~700-900 LOC + operator refactor + binding-side error mapping). Closes the producer-pattern operator carve-out for Phase H+ ascending-order check. Not blocked by Q-beyond close.
+- **(Optional, deferred)** Phase G — `cleanup_node` activation — when NodeRecord removal lifecycle becomes load-bearing.
+
+Decisions D108–D112 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
+## Current state (2026-05-09 — pre-Q-beyond, preserved for archive)
 
 **Q3 + Q2 + BTreeMap → SmallVec swap CLOSED + /qa pass applied (2026-05-09): per-partition state-shard refactor.** Q3 (Slice G `tier3_emitted_this_wave` placement) landed first as per-partition state on `SubgraphLockBox::state`; the QA pass surfaced D1 (mid-wave cross-thread `set_deps` partition-split desyncs the per-partition tier3 set → potential R1.3.3.a violation) and the user-approved D1 (b) trace + fix moved tier3 to a per-thread thread-local in `crate::batch::TIER3_EMITTED_THIS_WAVE`. Q2 (cross_partition mutex split for 4 wave-aggregation fields) and the BTreeMap → SmallVec swap on the `held_partitions::HELD` thread-local landed alongside. Establishes the cross-partition aggregation pattern that Q-beyond will extend. Q-beyond (~2000-3000 LOC, ~150+ sites) and Phase H+ STRICT option (d) typed-error variant (~700-900 LOC + operator refactor) CARRY FORWARD as their own focused batches per the porting-deferred entry's "multi-day per-site sub-slices" framing. Decisions D100–D102 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md); D1 trace + fix logged as the QA-pass closing addendum below.
 

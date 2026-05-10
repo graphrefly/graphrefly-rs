@@ -18,8 +18,11 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]
-proptest    = { workspace = true }
-criterion   = { workspace = true }
+proptest          = { workspace = true }
+criterion         = { workspace = true }
+# Bench-only: lock-strategy microbench (see benches/lock_strategy.rs).
+dashmap           = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 # loom is a concurrency model checker that permutes thread interleavings.
 # Used only when compiling with `--cfg loom`. Tests that depend on loom
@@ -35,6 +38,10 @@ harness = false
 
 [[bench]]
 name    = "per_subgraph_parallelism"
+harness = false
+
+[[bench]]
+name    = "lock_strategy"
 harness = false
 
 [features]

@@ -76,6 +76,11 @@ redb                  = { version = "2"    }
 proptest              = { version = "1"    }
 criterion             = { version = "0.5"  }
 loom                  = { version = "0.7"  }
+# Bench-only — used for the lock-strategy microbench (compares parking_lot
+# Mutex / RwLock / dashmap / thread_local / crossbeam MPSC under realistic
+# dispatcher access patterns). Not used by the core dispatcher itself.
+dashmap               = { version = "6"    }
+crossbeam-channel     = { version = "0.5"  }
 
 # ---------------------------------------------------------------------------
 # Build profiles
@@ -95,3 +100,14 @@ opt-level = "z"
 # Our own crates stay opt-level=0 for fast incremental compiles.
 [profile.dev.package."*"]
 opt-level = 1
+
+# Profiling profile: release-optimized but keeps debug symbols + frame
+# pointers so samply / Instruments can produce readable backtraces.
+# Build with: `cargo build --profile profiling --example profile_*`
+# Profile with: `samply record -- ./target/profiling/examples/profile_*`
+[profile.profiling]
+inherits      = "release"
+debug         = true       # full debuginfo for symbols
+strip         = "none"
+lto           = false      # disable LTO so call frames stay intact
+codegen-units = 1

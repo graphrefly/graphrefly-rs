@@ -46,7 +46,8 @@
 //! - **Wave-end sink fires** drop the state lock first. A subscriber's sink
 //!   that calls back into `Core::emit` / `pause` / `resume` / `invalidate` /
 //!   `complete` / `error` / `teardown` re-acquires the lock cleanly and runs
-//!   a nested wave (`s.in_tick` is cleared before the deferred-fire phase).
+//!   a nested wave (`WaveState::in_tick` is cleared before the
+//!   deferred-fire phase).
 //! - **`BindingBoundary::invoke_fn`** fires lock-released. The wave engine
 //!   acquires + drops the state lock per fn-fire iteration around the
 //!   `invoke_fn` callback. User fns may re-enter `Core::emit` / `pause` /
@@ -69,7 +70,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use indexmap::IndexMap;
 use parking_lot::{ArcReentrantMutexGuard, Mutex, MutexGuard};
 
 /// Held guard from `parking_lot::ReentrantMutex::lock_arc()` on a
@@ -473,7 +473,6 @@ pub use held_partitions::{held_snapshot_for_tests, in_producer_build_for_tests};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::batch::PendingPerNode;
 use crate::boundary::{BindingBoundary, CleanupTrigger};
 use crate::clock::monotonic_ns;
 use crate::handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
@@ -1545,159 +1544,43 @@ impl NodeRecord {
     }
 }
 
-/// Wave-scoped cross-partition aggregation state — fields populated as
-/// a wave executes that aggregate work across every partition the wave
-/// touched, drained / cleared at wave-end. Lives behind a separate
-/// [`parking_lot::Mutex`] from [`CoreState`].
-///
-/// **Q2 (next batch — post-D3-closure, 2026-05-09):** moved out of
-/// `CoreState`'s critical section into a sibling mutex. Q2 alone is
-/// pattern-prep for Q-beyond — the bench impact in isolation is 0–5% in
-/// Regime A (the four fields are ~4 of ~15 fields in the wave-engine
-/// critical section). The structural value is establishing the "Core
-/// has multiple Core-level mutexes" pattern with explicit
-/// lock-discipline rules:
-///
-/// - **Lock order (acquire-direction rules; constrains the order ONLY
-///   WHEN both are acquired simultaneously):**
-///   - `state → registry` (P12 invariant — pre-existing).
-///   - `state → cross_partition` (Q2, 2026-05-09).
-///   - `registry → cross_partition` is permitted (no path uses both
-///     simultaneously today; reserved for forward compatibility).
-///   - The forbidden direction is `cross_partition → state`: any
-///     thread holding `cross_partition` must NOT then attempt to
-///     acquire `state`, since some thread doing the canonical
-///     `state → cross_partition` order would deadlock against it.
-///   - `partition_state` (the per-`SubgraphLockBox::state` mutex) was
-///     introduced under Q3 v1 then reverted by the D1 patch; it no
-///     longer exists in this lock chain.
-/// - **Acquire alone:** sites that ONLY touch the four fields (no state
-///   access in the same critical section) MAY acquire `cross_partition`
-///   without state. The lock-order rule only constrains the RELATIVE
-///   order when both are acquired.
-/// - **Wave-end clear:** [`Self::clear_wave_state`] zeroes
-///   `pending_auto_resolve` and `pending_pause_overflow`. The other two
-///   fields (`wave_cache_snapshots` and `deferred_handle_releases`)
-///   follow the explicit drain-and-release-lock-released discipline in
-///   the BatchGuard success/panic paths — see `Drop for BatchGuard` for
-///   the canonical drain order.
-///
-/// Q-beyond will continue the shape decomposition with per-partition
-/// `SubgraphShard`s holding most of `CoreState`'s fields per-partition;
-/// the four fields here aggregate ACROSS partitions in a wave and stay
-/// shared.
-pub(crate) struct CrossPartitionState {
-    /// Payload-handle releases owed for messages that landed in
-    /// `pending_notify` during this wave (one per `payload_handle()`).
-    /// `run_wave` releases these after sinks fire and the lock is dropped,
-    /// balancing the retain done in `queue_notify`.
-    pub(crate) deferred_handle_releases: Vec<HandleId>,
-    /// Pre-wave cache snapshots used to restore state if the wave aborts
-    /// mid-flight (e.g., a `Core::batch` closure panics). Each entry is
-    /// `(node_id → old_cache_handle)` — the handle the node held BEFORE
-    /// the wave started writing to it. The snapshotted handle holds a
-    /// retain (taken when the snapshot was inserted) so it stays alive
-    /// for restoration. On wave success, snapshots are dropped and their
-    /// retains released. On wave abort (`BatchGuard::drop` panic-discard
-    /// path), each cache slot is restored from the snapshot — the slot's
-    /// current handle is released, and the snapshot's retain transfers
-    /// to the cache slot. Only populated for in-flight waves; empty
-    /// between waves.
-    pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
-    /// Nodes that need an auto-Resolved at wave end if they don't receive
-    /// a tier-3+ message from their own commit_emission. Populated by
-    /// the RESOLVED child propagation in `commit_emission` (which queues
-    /// Dirty but defers Resolved to avoid double-settlement). Drained by
-    /// the auto-resolve sweep in `drain_and_flush`. Cleared by
-    /// `clear_wave_state`.
-    pub(crate) pending_auto_resolve: ahash::AHashSet<NodeId>,
-    /// R1.3.8.c pause-overflow ERROR synthesis queue (Slice F, A3 —
-    /// 2026-05-07). Recorded by [`Core::queue_notify`] when the pause
-    /// buffer first overflows in a cycle; drained at wave-end after the
-    /// lock-released call to
-    /// [`crate::boundary::BindingBoundary::synthesize_pause_overflow_error`].
-    ///
-    /// One entry per (node × pause-cycle); subsequent overflows in the
-    /// same cycle don't re-queue (gated by `PauseState::overflow_reported`).
-    pub(crate) pending_pause_overflow: Vec<PendingPauseOverflow>,
-    /// Binding-boundary handle for `Drop`-time refcount balancing.
-    /// Mirrors [`CoreState::binding`] — both structs hold their own
-    /// strong ref so each can independently release retained handles
-    /// from its drop path. The Arc clone is cheap; the binding object
-    /// itself is shared.
-    binding: Arc<dyn BindingBoundary>,
-}
-
-impl CrossPartitionState {
-    /// Construct an empty `CrossPartitionState`. **Caller invariant
-    /// (load-bearing):** `binding` MUST be the same `Arc<dyn BindingBoundary>`
-    /// instance that's also stored in [`CoreState::binding`] and
-    /// [`Core::binding`] for the same `Core`. The three strong refs
-    /// share refcount accounting for handle retain/release pairings;
-    /// passing a DIFFERENT binding here would split the refcount
-    /// state and produce use-after-free / double-release on
-    /// `release_handle` paths. Only `Core::new` constructs this — keep
-    /// it that way unless a future change moves construction
-    /// elsewhere with the same invariant preserved.
-    ///
-    /// /qa A8 doc-fix (2026-05-09).
-    fn new(binding: Arc<dyn BindingBoundary>) -> Self {
-        Self {
-            deferred_handle_releases: Vec::new(),
-            wave_cache_snapshots: HashMap::new(),
-            pending_auto_resolve: ahash::AHashSet::new(),
-            pending_pause_overflow: Vec::new(),
-            binding,
-        }
-    }
-
-    /// Wave-end clear. Mirrors the four field clears that previously
-    /// lived in [`CoreState::clear_wave_state`]. `pending_auto_resolve`
-    /// and `pending_pause_overflow` are zeroed; `wave_cache_snapshots`
-    /// and `deferred_handle_releases` are NOT cleared here — they
-    /// follow the success/panic paths' explicit drain discipline (see
-    /// [`Drop`] for panic-time cleanup).
-    pub(crate) fn clear_wave_state(&mut self) {
-        self.pending_auto_resolve.clear();
-        // A3 (Slice F, 2026-05-07): pending_pause_overflow is normally
-        // drained by drain_and_flush via the synthesis loop. If a wave is
-        // panic-discarded BEFORE the synthesis runs, we drop the queued
-        // entries silently — the binding never sees ERROR for that
-        // overflow event, but the pause buffer's `dropped` count is
-        // unchanged so callers can still detect via ResumeReport.
-        self.pending_pause_overflow.clear();
-    }
-}
-
-impl Drop for CrossPartitionState {
-    fn drop(&mut self) {
-        // Mirrors the cross_partition cleanup that previously lived in
-        // [`Drop for CoreState`] (Q2, 2026-05-09 — fields moved here).
-        // Defensive: at process-exit time the wave engine has typically
-        // drained these to empty, but a panicked-mid-wave Core could
-        // leave retains in either field.
-        let snapshots = std::mem::take(&mut self.wave_cache_snapshots);
-        for (_, h) in snapshots {
-            self.binding.release_handle(h);
-        }
-        let releases = std::mem::take(&mut self.deferred_handle_releases);
-        for h in releases {
-            self.binding.release_handle(h);
-        }
-        // pending_auto_resolve / pending_pause_overflow hold no retains.
-    }
-}
+// Q-beyond Sub-slice 1 (D108, 2026-05-09): `CrossPartitionState` removed.
+//
+// The four wave-scoped fields previously held under
+// `Core::cross_partition: Arc<parking_lot::Mutex<CrossPartitionState>>`
+// (Q2, 2026-05-09) moved to a per-thread `WaveState` thread_local in
+// [`crate::batch`]. The bench-driven rationale is documented at
+// [`crate::batch::WaveState`]: cross-thread cache-line bouncing on the
+// `cross_partition` mutex was the dominant cost in Phase J's regression,
+// not single-thread mutex hop count. Per-thread placement eliminates the
+// bounce point entirely.
+//
+// **Refcount discipline preserved.** `wave_cache_snapshots` and
+// `deferred_handle_releases` still hold binding-side handle retains;
+// outermost `BatchGuard::drop` drains them via `Core::binding` on both
+// success and panic paths (the binding ref the prior
+// `CrossPartitionState` held for its `Drop` impl is no longer needed —
+// `BatchGuard` already holds a `Core` clone with the binding).
 
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
 ///
-/// Q2 (2026-05-09) split four wave-scoped cross-partition aggregation
-/// fields out into [`CrossPartitionState`] under its own
-/// `parking_lot::Mutex` on [`Core`]. The D1 patch (2026-05-09) moved
-/// Slice G's `tier3_emitted_this_wave` set out to a per-thread
-/// thread-local in `crate::batch` (was briefly per-partition under Q3
-/// v1; that placement was vulnerable to mid-wave cross-thread
-/// `set_deps` partition splits — see `docs/porting-deferred.md`
-/// "Per-partition state-shard refactor" closing summary). Q-beyond
+/// **Architecture history.** Q2 (2026-05-09) split four wave-scoped
+/// cross-partition aggregation fields out into a separate
+/// `parking_lot::Mutex<CrossPartitionState>` on [`Core`]. Q-beyond
+/// Sub-slice 1 (D108, 2026-05-09) eliminated `CrossPartitionState`
+/// entirely — its four fields moved to per-thread `WaveState`
+/// thread_local in `crate::batch`. Sub-slice 2 + 3 moved 8 more
+/// wave-scoped fields the same way. /qa F1+F2 (2026-05-10) reverted
+/// `in_tick` and `currently_firing` BACK to CoreState (per-Core,
+/// cross-thread visible — load-bearing for cross-Core same-thread
+/// isolation and cross-thread P13 set_deps check respectively).
+///
+/// The D1 patch (2026-05-09) moved Slice G's `tier3_emitted_this_wave`
+/// set to a per-thread thread-local in `crate::batch` (was briefly
+/// per-partition under Q3 v1; that placement was vulnerable to mid-wave
+/// cross-thread `set_deps` partition splits — see
+/// `docs/porting-deferred.md` "Per-partition state-shard refactor"
+/// closing summary). Q-beyond
 /// will continue the shape decomposition by sharding most of the
 /// remaining fields per-partition.
 pub(crate) struct CoreState {
@@ -1707,24 +1590,19 @@ pub(crate) struct CoreState {
     pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     /// Inverted adjacency: `parent → children`. Updated on registration.
     pub(crate) children: HashMap<NodeId, HashSet<NodeId>>,
-    /// Nodes whose fn we owe a fire to — drained by [`Core::run_wave`].
-    pub(crate) pending_fires: HashSet<NodeId>,
-    /// Per-node outgoing message buffer; flushed at wave end. Insertion-
-    /// ordered so flush order is deterministic — load-bearing for
-    /// R1.3.9.d meta-TEARDOWN ordering: when a parent and its meta
-    /// companion both have queued messages in the same wave, the meta
-    /// (queued first via `teardown_inner`'s recursion order) flushes
-    /// first.
-    ///
-    /// Each entry carries the per-wave subscriber snapshot taken at first
-    /// touch (Slice A close, M1: lock-released drain). Late subscribers
-    /// installed mid-wave between fn-fire iterations don't appear in
-    /// already-snapshotted entries; this is the load-bearing fix that
-    /// prevents duplicate-Data delivery when a handshake delivers the
-    /// post-commit cache and the wave's flush would otherwise also fire
-    /// to the same sink.
-    pub(crate) pending_notify: IndexMap<NodeId, PendingPerNode>,
-    pub(crate) in_tick: bool,
+    // Q-beyond Sub-slice 2 (D108, 2026-05-09): `pending_fires` and
+    // `pending_notify` moved to per-thread
+    // [`crate::batch::WaveState`]. Both fields are wave-scoped — emit
+    // populates them on the same thread that drains them at wave end.
+    // Cross-thread emits block on partition `wave_owner` and land in
+    // the OTHER thread's wave context, so the per-thread placement is
+    // safe by construction.
+    //
+    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `in_tick`,
+    // `currently_firing`, `deferred_flush_jobs`, `deferred_cleanup_hooks`,
+    // `pending_wipes`, and `invalidate_hooks_fired_this_wave` likewise
+    // moved to [`crate::batch::WaveState`]. Same wave-scoped per-thread
+    // rationale.
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -1745,13 +1623,49 @@ pub(crate) struct CoreState {
     /// cannot transitively reach the new node). The drain bound is the
     /// safety net for runtime cycles that bypass both static checks.
     pub(crate) max_batch_drain_iterations: u32,
-    /// Deferred sink-fire jobs collected by `flush_notifications`. The wave
-    /// engine populates this under the state lock during the flush phase;
-    /// `run_wave` then drops the lock and fires the jobs. Each tuple is
-    /// `(sinks_for_one_node_one_phase, phase_messages)`. Empty between waves.
-    pub(crate) deferred_flush_jobs: crate::batch::DeferredJobs,
-    // Q2 (2026-05-09): `deferred_handle_releases` moved to
-    // [`CrossPartitionState::deferred_handle_releases`].
+    /// Wave-active flag — true between outermost `BatchGuard` entry and
+    /// the matching outermost drop. Per-Core (cross-thread visible) so
+    /// cross-Core same-thread BatchGuard nesting is correctly isolated:
+    /// Core-A's `in_tick=true` does NOT cause Core-B's `begin_batch` to
+    /// see itself as nested.
+    ///
+    /// /qa F1 reverted (2026-05-10): briefly placed on per-thread
+    /// `WaveState` in Sub-slice 3, then moved BACK to `CoreState` after
+    /// /qa F1 surfaced the cross-Core same-thread isolation regression
+    /// (a thread holding a live BatchGuard on Core-A and starting a wave
+    /// on Core-B would observe `ws.in_tick=true` set by Core-A → Core-B
+    /// becomes non-owning → Core-B's writes drained by Core-A's binding
+    /// → silent corruption). The other 11 wave-scoped fields stay on
+    /// per-thread `WaveState` because they're accessed only by the
+    /// wave-owner thread under `wave_owner` discipline.
+    pub(crate) in_tick: bool,
+    /// A6 reentrancy guard stack (Slice F, 2026-05-07): the stack of
+    /// NodeIds whose fn is currently being invoked. Pushed at the top of
+    /// `fire_fn` (just before the lock-released `invoke_fn` call) and
+    /// popped on return / unwind via the [`crate::batch::FiringGuard`]
+    /// RAII helper. [`Core::set_deps`] consults this set and rejects
+    /// with [`SetDepsError::ReentrantOnFiringNode`] if `n` is currently
+    /// firing — preventing the D1 `tracked` index corruption. Read by
+    /// the P13 partition-migration check (D091) to reject mid-fire
+    /// `set_deps` that would migrate a firing node's partition.
+    ///
+    /// **Per-Core (cross-thread visible).** /qa F2 reverted (2026-05-10):
+    /// briefly placed on per-thread `WaveState` in Sub-slice 3, then
+    /// moved BACK to `CoreState` after /qa F2 surfaced the cross-thread
+    /// P13 bypass (per-thread placement made Thread B's `set_deps` read
+    /// its own empty stack → P13 silently bypassed for cross-thread
+    /// `set_deps` calls during Thread A's lock-released `invoke_fn`).
+    /// Cross-thread visibility on shared `CoreState` is the load-bearing
+    /// property the D091 check requires.
+    ///
+    /// Membership semantics (NOT strict LIFO): consumed via
+    /// `contains(&n)` membership test. `FiringGuard::drop` pops the
+    /// right-most matching `node_id` via `rposition` + `swap_remove`;
+    /// physical order of remaining entries may not match construction
+    /// order, but membership is preserved.
+    pub(crate) currently_firing: Vec<NodeId>,
+    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `deferred_flush_jobs`
+    // moved to [`crate::batch::WaveState`].
     /// Binding-boundary handle for `Drop`-time refcount balancing.
     /// `Core` also holds a clone of this Arc; storing it here lets
     /// `Drop for CoreState` walk every retained slot and release the
@@ -1759,32 +1673,21 @@ pub(crate) struct CoreState {
     /// `cache` / `terminal` / `dep_terminals` Error / pause-buffer payload
     /// handle refs leak in the binding registry until process exit.
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    // Q2 (2026-05-09): `wave_cache_snapshots` moved to
-    // [`CrossPartitionState::wave_cache_snapshots`].
-    // Q2 (2026-05-09): `pending_auto_resolve` moved to
-    // [`CrossPartitionState::pending_auto_resolve`].
+    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `wave_cache_snapshots`
+    // moved to [`crate::batch::WaveState::wave_cache_snapshots`].
+    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `pending_auto_resolve`
+    // moved to [`crate::batch::WaveState::pending_auto_resolve`].
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
-    /// A6 reentrancy guard (Slice F, 2026-05-07): the stack of NodeIds whose
-    /// fn is currently being invoked on the wave-owner thread. Pushed at the
-    /// top of `fire_fn` (just before the lock-released `invoke_fn` call) and
-    /// popped on return / unwind via the [`crate::batch::FiringGuard`] RAII
-    /// helper. [`Core::set_deps`] consults this set and rejects with
-    /// [`SetDepsError::ReentrantOnFiringNode`] if `n` is currently firing —
-    /// preventing the D1 `tracked` index corruption (see
-    /// `porting-deferred.md` "Set_deps from inside firing node's fn corrupts
-    /// Dynamic `tracked` indices").
-    ///
-    /// Stack rather than set so nested fn re-entrance (Producer subscribing
-    /// to a fn that itself fires another fn) tracks every concurrently-firing
-    /// node on the wave-owner. `Vec` rather than `HashSet` because the
-    /// expected depth is small (typically 1, occasionally 2–3 with
-    /// higher-order operators) and linear scan is faster than hash for that
-    /// size.
-    pub(crate) currently_firing: Vec<NodeId>,
-    // Q2 (2026-05-09): `pending_pause_overflow` moved to
-    // [`CrossPartitionState::pending_pause_overflow`].
+    // /qa F2 reverted (2026-05-10): `currently_firing` field is declared
+    // EARLIER in this struct (above `pause_buffer_cap`). Sub-slice 3
+    // briefly moved it to `crate::batch::WaveState::currently_firing` on
+    // the per-thread thread_local, but per-thread placement silently
+    // bypassed the cross-thread P13 partition-migration check. /qa F2
+    // (2026-05-10) moved it BACK to CoreState (cross-thread visible).
+    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `pending_pause_overflow`
+    // moved to [`crate::batch::WaveState::pending_pause_overflow`].
     // Slice G (R1.3.2.d / R1.3.3.a — 2026-05-07): tier3-emitted-this-wave
     // tracker MOVED to a per-thread thread-local in `crate::batch`
     // (D1 patch, 2026-05-09 — was briefly per-partition under Q3 v1
@@ -1794,45 +1697,12 @@ pub(crate) struct CoreState {
     // See [`crate::batch::TIER3_EMITTED_THIS_WAVE`] for the per-thread
     // wave-scope rationale and lifecycle (cleared at outermost
     // [`crate::batch::BatchGuard`] drop, both success + panic).
-    /// Slice E2 (R1.3.9.b strict reading per D057): per-wave-per-node
-    /// dedup for `OnInvalidate` cleanup hook firing. A node already in
-    /// this set this wave has already had its `OnInvalidate` queued into
-    /// `deferred_cleanup_hooks` and MUST NOT queue again, even if
-    /// `invalidate_inner` re-encounters it (rare: only matters when the
-    /// node re-populates mid-wave via fn-fire and then gets re-invalidated
-    /// in the same wave through a separate path).
-    ///
-    /// Cleared in [`CoreState::clear_wave_state`] alongside the other
-    /// wave-scoped queues.
-    pub(crate) invalidate_hooks_fired_this_wave: ahash::AHashSet<NodeId>,
-    /// Slice E2 (per D060/D061): lock-released drain queue for
-    /// `OnInvalidate` cleanup hooks. Populated under the state lock by
-    /// `Core::invalidate_inner` when a node's cache transitions
-    /// `!= NO_HANDLE → NO_HANDLE`; drained after the lock drops at wave
-    /// boundary by [`crate::batch::Core::fire_deferred_cleanup_hooks`]
-    /// (each call wrapped in `catch_unwind` so a single binding panic
-    /// doesn't short-circuit the drain — last panic re-raises after the
-    /// loop completes per D060).
-    ///
-    /// **Panic-discard semantics (D061):** cleared in
-    /// [`CoreState::clear_wave_state`] without firing — a panic-discarded
-    /// wave drops the queued cleanup hooks silently, mirroring the
-    /// `pending_pause_overflow` precedent (Slice F /qa A3). Bindings using
-    /// `OnInvalidate` for external-resource cleanup MUST idempotent-cleanup
-    /// at process exit or next successful invalidate cycle.
-    pub(crate) deferred_cleanup_hooks: Vec<(NodeId, crate::boundary::CleanupTrigger)>,
-    /// Slice E2 /qa Q2(b) (D069): lock-released drain queue for
-    /// `BindingBoundary::wipe_ctx` calls fired eagerly from
-    /// `Core::terminate_node` when a resubscribable node terminates with
-    /// no live subscribers. Pairs with the `Subscription::Drop` direct-
-    /// fire site (mutually exclusive: subs-empty-at-terminate routes
-    /// here; subs-non-empty-at-terminate fires from Subscription::Drop's
-    /// last-sub-drop path). Drained alongside `deferred_cleanup_hooks`
-    /// at wave boundary; same `catch_unwind` discipline so a single
-    /// binding panic doesn't short-circuit the drain. Same panic-discard
-    /// semantics as `deferred_cleanup_hooks` (silent drop on
-    /// panic-discarded waves).
-    pub(crate) pending_wipes: Vec<NodeId>,
+    //
+    // Q-beyond Sub-slice 3 (D108, 2026-05-09):
+    // `invalidate_hooks_fired_this_wave`, `deferred_cleanup_hooks`,
+    // and `pending_wipes` moved to [`crate::batch::WaveState`].
+    // Wave-scoped per-thread; same rationale as the other Sub-slice 3
+    // migrations.
 }
 
 /// The handle-protocol Core dispatcher.
@@ -1868,12 +1738,6 @@ pub(crate) struct CoreState {
 #[derive(Clone)]
 pub struct Core {
     pub(crate) state: Arc<Mutex<CoreState>>,
-    /// Q2 (2026-05-09): wave-scoped cross-partition aggregation state
-    /// behind a sibling `parking_lot::Mutex` (separate from `state`).
-    /// Lock-discipline: `state → cross_partition` (acquire state first
-    /// when both are needed). See [`CrossPartitionState`] for the
-    /// per-field rationale.
-    pub(crate) cross_partition: Arc<parking_lot::Mutex<CrossPartitionState>>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
     /// Slice X5 (D3 substrate, 2026-05-08) + Slice Y1 / Phase E
     /// (wave-engine migration, 2026-05-08): per-subgraph union-find
@@ -1907,7 +1771,6 @@ pub struct Core {
 #[derive(Clone)]
 pub struct WeakCore {
     state: Weak<Mutex<CoreState>>,
-    cross_partition: Weak<parking_lot::Mutex<CrossPartitionState>>,
     binding: Weak<dyn BindingBoundary>,
     registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
 }
@@ -1920,7 +1783,6 @@ impl WeakCore {
     pub fn upgrade(&self) -> Option<Core> {
         Some(Core {
             state: self.state.upgrade()?,
-            cross_partition: self.cross_partition.upgrade()?,
             binding: self.binding.upgrade()?,
             registry: self.registry.upgrade()?,
         })
@@ -2015,23 +1877,23 @@ impl Core {
                 next_lock_id: 1u64 << 31,
                 nodes: HashMap::new(),
                 children: HashMap::new(),
-                pending_fires: HashSet::new(),
-                pending_notify: IndexMap::new(),
+                // Q-beyond Sub-slice 2 + 3 (D108, 2026-05-09): pending_fires,
+                // pending_notify, deferred_flush_jobs,
+                // deferred_cleanup_hooks, pending_wipes, and
+                // invalidate_hooks_fired_this_wave all live on per-thread
+                // [`crate::batch::WaveState`].
+                // /qa F1+F2 reverted (2026-05-10): in_tick + currently_firing
+                // stay on CoreState (per-Core, cross-thread visible) for
+                // cross-Core same-thread isolation (F1) and cross-thread
+                // P13 set_deps check (F2).
                 in_tick: false,
+                currently_firing: Vec::new(),
                 pause_buffer_cap: None,
                 max_batch_drain_iterations: 10_000,
-                deferred_flush_jobs: Vec::new(),
                 binding: binding.clone(),
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
-                currently_firing: Vec::new(),
-                invalidate_hooks_fired_this_wave: ahash::AHashSet::new(),
-                deferred_cleanup_hooks: Vec::new(),
-                pending_wipes: Vec::new(),
             })),
-            cross_partition: Arc::new(parking_lot::Mutex::new(CrossPartitionState::new(
-                binding.clone(),
-            ))),
             binding,
             registry: Arc::new(parking_lot::Mutex::new(
                 crate::subgraph::SubgraphRegistry::new(),
@@ -2051,24 +1913,6 @@ impl Core {
     /// longer needed.
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock()
-    }
-
-    /// Acquire the cross-partition aggregation lock (Q2, 2026-05-09).
-    ///
-    /// **Lock-discipline:** if both `state` and `cross_partition` are
-    /// needed in the same critical section, ALWAYS acquire `state`
-    /// FIRST. Acquiring `cross_partition` then `state` is forbidden —
-    /// any thread doing the canonical `state → cross_partition` order
-    /// would deadlock against it. The compiler can't enforce this; the
-    /// rule is preserved by code-review and the consistent shape
-    /// `let mut s = self.lock_state(); let mut cps = self.lock_cross_partition();`.
-    ///
-    /// Sites that touch ONLY the four cross-partition fields (no state
-    /// access in the same critical section) MAY acquire
-    /// `cross_partition` standalone — the lock-order rule only
-    /// constrains the relative order WHEN both are needed.
-    pub(crate) fn lock_cross_partition(&self) -> parking_lot::MutexGuard<'_, CrossPartitionState> {
-        self.cross_partition.lock()
     }
 
     /// Whether `self` and `other` point to the same dispatcher state.
@@ -2107,7 +1951,6 @@ impl Core {
     pub fn weak_handle(&self) -> WeakCore {
         WeakCore {
             state: Arc::downgrade(&self.state),
-            cross_partition: Arc::downgrade(&self.cross_partition),
             binding: Arc::downgrade(&self.binding),
             registry: Arc::downgrade(&self.registry),
         }
@@ -2405,10 +2248,15 @@ impl Core {
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn pending_batch_count(&self, node: NodeId) -> Option<usize> {
-        self.lock_state()
-            .pending_notify
-            .get(&node)
-            .map(|entry| entry.batches.len())
+        // Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_notify lives
+        // on per-thread `WaveState`. Test callers run on the same
+        // thread that ran the wave, so the per-thread placement is
+        // observable here.
+        crate::batch::with_wave_state(|ws| {
+            ws.pending_notify
+                .get(&node)
+                .map(|entry| entry.batches.len())
+        })
     }
 
     /// Configure the Core-global cap on pause replay buffer length. When set,
@@ -3504,13 +3352,20 @@ impl Core {
         // Producer nodes (no deps + has fn — Slice D, D031) have no deps
         // to walk; queue them directly into `pending_fires` so the wave
         // engine fires their fn once on activation.
+        //
+        // Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_fires lives on
+        // per-thread WaveState. State lock + thread_local borrow are
+        // independent; deliver_data_to_consumer also writes pending_fires
+        // via WaveState (no nested with_wave_state borrows here).
         for &id in &order {
             let (dep_ids, is_producer) = {
                 let rec = s.require_node(id);
                 (rec.dep_ids_vec(), rec.is_producer())
             };
             if is_producer {
-                s.pending_fires.insert(id);
+                crate::batch::with_wave_state(|ws| {
+                    ws.pending_fires.insert(id);
+                });
                 continue;
             }
             for (i, dep_id) in dep_ids.iter().copied().enumerate() {
@@ -3790,12 +3645,18 @@ impl Core {
                 rec.resubscribable && rec.subscribers.is_empty()
             };
             s.require_node_mut(id).terminal = Some(t);
-            if queue_wipe {
-                s.pending_wipes.push(id);
-            }
-            // Drain pending fires for this node — fn won't fire on a
-            // terminal node.
-            s.pending_fires.remove(&id);
+            // Q-beyond Sub-slice 2 + 3 (D108, 2026-05-09): pending_fires
+            // and pending_wipes both live on per-thread WaveState. Single
+            // borrow handles the queue-wipe push and the pending_fires
+            // remove.
+            crate::batch::with_wave_state(|ws| {
+                if queue_wipe {
+                    ws.pending_wipes.push(id);
+                }
+                // Drain pending fires for this node — fn won't fire on a
+                // terminal node.
+                ws.pending_fires.remove(&id);
+            });
             // R1.3.8.b / Slice F (A3, 2026-05-07): if this node was paused
             // when terminating (the canonical case is the R1.3.8.c overflow
             // ERROR synthesis path), drain the pause buffer and release
@@ -3887,7 +3748,11 @@ impl Core {
                         work.push((child_id, t_child));
                     }
                     ChildAction::QueueFire => {
-                        s.pending_fires.insert(child_id);
+                        // Q-beyond Sub-slice 2 (D108, 2026-05-09):
+                        // pending_fires lives on per-thread WaveState.
+                        crate::batch::with_wave_state(|ws| {
+                            ws.pending_fires.insert(child_id);
+                        });
                     }
                 }
             }
@@ -4171,10 +4036,17 @@ impl Core {
             // cache==NO_HANDLE idempotency (above) catches "still at
             // sentinel" only; the explicit set is the strict R1.3.9.b
             // reading.
-            if s.invalidate_hooks_fired_this_wave.insert(node_id) {
-                s.deferred_cleanup_hooks
-                    .push((node_id, CleanupTrigger::OnInvalidate));
-            }
+            // Q-beyond Sub-slice 3 (D108, 2026-05-09):
+            // `invalidate_hooks_fired_this_wave` and
+            // `deferred_cleanup_hooks` both live on per-thread WaveState.
+            // Single borrow handles the dedup-insert and (on first
+            // insertion) the cleanup-hook push.
+            crate::batch::with_wave_state(|ws| {
+                if ws.invalidate_hooks_fired_this_wave.insert(node_id) {
+                    ws.deferred_cleanup_hooks
+                        .push((node_id, CleanupTrigger::OnInvalidate));
+                }
+            });
             // Wire emission. Pause-aware via queue_notify.
             self.queue_notify(s, node_id, Message::Invalidate);
             // Cascade: for each child, clear the dep record's prev_data
@@ -4200,17 +4072,18 @@ impl Core {
                         (dr.prev_data, dr.data_batch.clone())
                     };
                     {
-                        // Q2 (2026-05-09): deferred_handle_releases moved
-                        // to CrossPartitionState. Lock-discipline: state
-                        // is held, so acquiring cross_partition next
-                        // satisfies `state → cross_partition`.
-                        let mut cps = self.cross_partition.lock();
-                        if old_prev != NO_HANDLE {
-                            cps.deferred_handle_releases.push(old_prev);
-                        }
-                        for h in batch_hs {
-                            cps.deferred_handle_releases.push(h);
-                        }
+                        // Q-beyond Sub-slice 1 (D108, 2026-05-09):
+                        // deferred_handle_releases moved to per-thread
+                        // WaveState thread_local. State lock held; the
+                        // thread_local borrow is independent.
+                        crate::batch::with_wave_state(|ws| {
+                            if old_prev != NO_HANDLE {
+                                ws.deferred_handle_releases.push(old_prev);
+                            }
+                            for h in batch_hs {
+                                ws.deferred_handle_releases.push(h);
+                            }
+                        });
                     }
                     let dr = &mut s.require_node_mut(child_id).dep_records[idx];
                     dr.prev_data = NO_HANDLE;
@@ -4326,8 +4199,13 @@ impl Core {
             // the wave engine consolidates the pause-window dep deliveries
             // into one fn execution. State nodes don't fire fn (no
             // `pending_fires` membership has effect for them).
+            //
+            // Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_fires lives
+            // on per-thread WaveState.
             if pending_wave && was_default_mode {
-                s.pending_fires.insert(node_id);
+                crate::batch::with_wave_state(|ws| {
+                    ws.pending_fires.insert(node_id);
+                });
             }
             (sinks, messages, dropped, pending_wave && was_default_mode)
         };
@@ -4571,6 +4449,14 @@ impl Core {
         // against post-rewire ordering. Same-thread re-entry is the only
         // path that matters — cross-thread emits already block on
         // `wave_owner` per the M1 design.
+        // /qa F2 reverted (2026-05-10): currently_firing lives on
+        // CoreState (per-Core, cross-thread visible). The D1 reentrance
+        // check requires the same-thread visibility (a fn re-entering
+        // set_deps on its own firing node), and the P13 cross-thread
+        // check requires cross-thread visibility (Thread B's set_deps
+        // observing Thread A's firing pushes during A's lock-released
+        // invoke_fn). Per-Core placement on shared CoreState delivers
+        // both. Read under the already-held state lock.
         if s.currently_firing.contains(&n) {
             return Err(SetDepsError::ReentrantOnFiringNode { n });
         }
@@ -4640,16 +4526,24 @@ impl Core {
         // `Arc<SubgraphLockBox>` would diverge from the registry's new
         // canonical box. Q3 = (a-strict) per the D3 design lock rejects
         // both cases at edge-mutation time.
-        if !s.currently_firing.is_empty() && (!added.is_empty() || !removed.is_empty()) {
+        // /qa F2 reverted (2026-05-10): currently_firing lives on
+        // CoreState (cross-thread visible — load-bearing for this P13
+        // partition-migration check, which detects cross-thread set_deps
+        // calls during another thread's lock-released invoke_fn).
+        // Snapshot under the already-held state lock so the registry
+        // mutex acquire below doesn't need to also hold the snapshot
+        // borrow.
+        let currently_firing_snapshot: Vec<NodeId> = s.currently_firing.clone();
+        if !currently_firing_snapshot.is_empty() && (!added.is_empty() || !removed.is_empty()) {
             let mut reg = self.registry.lock();
             // Snapshot firing nodes' partitions. `partition_of` is mutating
             // (path compression) but partition IDENTITY is stable across
             // reads (only `union_nodes` / `split_partition` mutate roots).
-            let firing_with_partition: Vec<(NodeId, crate::subgraph::SubgraphId)> = s
-                .currently_firing
-                .iter()
-                .filter_map(|&f| reg.partition_of(f).map(|p| (f, p)))
-                .collect();
+            let firing_with_partition: Vec<(NodeId, crate::subgraph::SubgraphId)> =
+                currently_firing_snapshot
+                    .iter()
+                    .filter_map(|&f| reg.partition_of(f).map(|p| (f, p)))
+                    .collect();
             if !firing_with_partition.is_empty() {
                 let part_n = reg.partition_of(n);
                 // Case 1 (union): for each added dep, check cross-partition merge.
@@ -5012,42 +4906,34 @@ impl CoreState {
     ///
     /// Handle releases are pushed to `deferred_handle_releases` for
     /// post-lock-drop release by the caller.
-    pub(crate) fn clear_wave_state(&mut self, cps: &mut CrossPartitionState) {
-        // Q2 (2026-05-09): `pending_auto_resolve` + `pending_pause_overflow`
-        // clears moved to [`CrossPartitionState::clear_wave_state`]. The
-        // per-NodeRecord rotation below ALSO pushes batch-handle and
-        // prev_data releases into `cps.deferred_handle_releases` (was
-        // `s.deferred_handle_releases` pre-Q2). Caller passes the
-        // `cps` guard already-acquired in lock-discipline order
-        // (`state → cross_partition`).
-        // A6 (Slice F, 2026-05-07): currently_firing is push/pop balanced
-        // by FiringGuard's RAII (including on panic). It should already be
-        // empty here, but defensively clear in case a future code path
-        // forgets the guard.
+    pub(crate) fn clear_wave_state(&mut self, ws: &mut crate::batch::WaveState) {
+        // Q-beyond Sub-slice 1 (D108, 2026-05-09): `pending_auto_resolve`
+        // + `pending_pause_overflow` clears moved to
+        // [`crate::batch::WaveState::clear_wave_state`]. The per-NodeRecord
+        // rotation below pushes batch-handle and prev_data releases into
+        // `ws.deferred_handle_releases` (was `cps.deferred_handle_releases`
+        // pre-sub-slice-1, was `s.deferred_handle_releases` pre-Q2). Caller
+        // borrows the WaveState thread_local; no lock-discipline rule
+        // applies (state lock + thread_local borrow are independent).
+        //
+        // Q-beyond Sub-slice 3 (D108, 2026-05-09):
+        // `invalidate_hooks_fired_this_wave` clear moved to
+        // [`crate::batch::WaveState::clear_wave_state`]. The
+        // `deferred_cleanup_hooks` invariant (NOT cleared here, drained
+        // explicitly on success/panic paths) likewise moves with the
+        // field.
+        //
+        // /qa F2 reverted (2026-05-10): `currently_firing` stays on
+        // CoreState (per-Core, cross-thread visible — load-bearing for
+        // P13). Defensive clear here mirrors the pre-sub-slice-3 safety
+        // net (`FiringGuard`'s RAII push/pop is balanced even on panic;
+        // a future code path that bypasses the guard would otherwise
+        // leak a stale entry into the next wave).
         self.currently_firing.clear();
+        //
         // Slice G tier3 emit tracking moved to per-partition state (Q3,
         // 2026-05-09); cleared by [`super::WaveOwnerGuard::drop`] on
         // outermost release for each partition the wave touched.
-        // Slice E2 (D057): per-wave-per-node OnInvalidate dedup is
-        // wave-scoped — cleared so the next wave can fire cleanups again.
-        self.invalidate_hooks_fired_this_wave.clear();
-        // Slice E2 INVARIANT (DO NOT CHANGE WITHOUT THINKING):
-        // `deferred_cleanup_hooks` is NOT cleared here. It follows the
-        // `deferred_handle_releases` discipline:
-        //   - SUCCESS path (`BatchGuard::drop` non-panic): drained by
-        //     `Core::drain_deferred` AFTER `clear_wave_state` runs, then
-        //     fired lock-released by `Core::fire_deferred`.
-        //   - PANIC-DISCARD path (`BatchGuard::drop` panic): explicitly
-        //     `std::mem::take`-and-dropped AFTER `clear_wave_state` runs,
-        //     silently per D061.
-        // Clearing it INSIDE `clear_wave_state` would race the success
-        // path: the wave's queued `OnInvalidate` cleanup hooks would be
-        // erased BEFORE `drain_deferred` could take them, dropping every
-        // user cleanup callback on every successful wave.
-        // If a future change moves `deferred_cleanup_hooks` ownership
-        // here, ALSO move the post-`clear_wave_state` take in both
-        // BatchGuard paths to BEFORE the clear call. Until then, leaving
-        // the field untouched here is load-bearing.
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;
@@ -5057,12 +4943,12 @@ impl CoreState {
                     // Release all batch entries EXCEPT the last — the last
                     // entry's retain transfers to prev_data.
                     for &h in &dr.data_batch[..batch_len - 1] {
-                        cps.deferred_handle_releases.push(h);
+                        ws.deferred_handle_releases.push(h);
                     }
                     // Release the OLD prev_data (its retain was from the
                     // previous wave's rotation or from initial delivery).
                     if dr.prev_data != NO_HANDLE {
-                        cps.deferred_handle_releases.push(dr.prev_data);
+                        ws.deferred_handle_releases.push(dr.prev_data);
                     }
                     // Rotate: last batch entry becomes new prev_data.
                     // Its retain carries over — no extra retain needed.
@@ -5102,16 +4988,31 @@ impl CoreState {
 /// have been a problem in normal operation.
 impl Drop for CoreState {
     fn drop(&mut self) {
-        // Drain pending in-flight retains too, so a panic mid-wave doesn't
-        // strand the queue_notify retains.
-        let pending = std::mem::take(&mut self.pending_notify);
-        // `deferred_flush_jobs` carries `Vec<Sink>` clones — those Arcs
-        // drop naturally when this CoreState drops; no handles to release
-        // there.
-        let _ = std::mem::take(&mut self.deferred_flush_jobs);
-        // Q2 (2026-05-09): `deferred_handle_releases` and
-        // `wave_cache_snapshots` releases moved to
-        // [`Drop for CrossPartitionState`].
+        // Q-beyond Sub-slice 3 (D108, 2026-05-09): `deferred_flush_jobs`
+        // moved to [`crate::batch::WaveState`]. The `Vec<Sink>` clones
+        // drop naturally with the per-thread WaveState's lifetime; no
+        // CoreState-side cleanup needed.
+        // Q-beyond Sub-slice 1 (D108, 2026-05-09): `deferred_handle_releases`
+        // and `wave_cache_snapshots` moved to per-thread WaveState
+        // thread_local. By outermost-BatchGuard-drop discipline both fields
+        // are empty by the time CoreState drops (BatchGuard owns a Core
+        // clone, so Core can't drop while a BatchGuard is in flight). Any
+        // thread that ran a wave on this Core drained on its own outermost
+        // BatchGuard; cross-Core thread_local sharing is fine because each
+        // wave drains its own retains.
+        //
+        // Q-beyond Sub-slice 2 (D108, 2026-05-09): `pending_fires` and
+        // `pending_notify` likewise moved to per-thread WaveState. The
+        // pre-Sub-slice-2 `pending_notify` walk here (drain + release each
+        // payload_handle) is no longer reachable from `Drop for CoreState`:
+        // by invariant, no wave is in flight when CoreState drops (BatchGuard
+        // holds a Core clone), so the originating thread's WaveState
+        // pending_notify is empty by then. Other threads' WaveStates are
+        // unreachable from CoreState::drop anyway — they're per-thread
+        // thread_locals scoped to whichever thread ran the wave. The
+        // outermost `BatchGuard::drop` is the canonical drain point on both
+        // success and panic paths; Drop for CoreState relies on that
+        // discipline holding rather than re-implementing it.
 
         // Per-node retained handles:
         //   - `cache` (1 retain per non-NO_HANDLE state cache or
@@ -5161,20 +5062,10 @@ impl Drop for CoreState {
             }
         }
 
-        // Pending wave retains. Slice X4 / D2: walk all batches' messages
-        // — `iter_messages` flattens the per-node `SmallVec<PendingBatch>`.
-        for entry in pending.values() {
-            for msg in entry.iter_messages() {
-                if let Some(h) = msg.payload_handle() {
-                    self.binding.release_handle(h);
-                }
-            }
-        }
-        // Q2 (2026-05-09): `deferred_handle_releases` +
-        // `wave_cache_snapshots` retain-release moved to
-        // [`Drop for CrossPartitionState`] (sibling Mutex on `Core`).
-        // Both Arc<Mutex<_>>s drop together when the last `Core` clone
-        // drops, so the binding-side share gets released in either
-        // ordering.
+        // Q-beyond Sub-slice 1 + 2 (D108, 2026-05-09): WaveState's
+        // retain-holding fields (`wave_cache_snapshots`,
+        // `deferred_handle_releases`, `pending_notify`) are drained by
+        // outermost BatchGuard::drop (success + panic paths). See
+        // comment above for the invariant.
     }
 }

@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-09 (Q3 + Q2 + BTreeMap → SmallVec swap landed; Q-beyond + Phase H+ STRICT carry forward)
+last_updated: 2026-05-10 (Q-beyond CLOSED with bench-driven scope reduction; per-partition `nodes`/`children` shards (sub-slice 4) DEFERRED evidence-gated; Phase H+ STRICT still carries forward)
 ---
 
 # Porting flags & deferred concerns
@@ -55,6 +55,114 @@ Add a per-item entry only if a bench surfaces the cost.
 (2026-05-05). Collapsed into a single bucket 2026-05-07 (Slice F doc cleanup)
 per user direction — individual entries were prior-art noise relative to "do
 not pre-optimize."
+
+---
+
+## Profile-surfaced optimizations (2026-05-10) — candidates for a future cleanup batch
+
+User direction (2026-05-10): "I'm sure there are some optimization items in
+the deferred we can pick them up later in a batch." The three items below were
+surfaced by the post-Q-beyond profile (`samply` + macOS `sample` on
+`crates/graphrefly-core/examples/profile_disjoint_fn_fire.rs`, 4M emits across
+2 disjoint partitions). They're individually small wins (1-3% each) but
+collectively could deliver ~5-7% with much lower engineering risk than
+sub-slice 4 (per-partition `nodes`/`children` shards). Group them into a
+single "profile-driven cleanup" batch when picked up.
+
+### (1) Eliminate `mach_absolute_time` from the hot path — surprising ~2% self-time
+
+- **What:** profile shows `mach_absolute_time` at 2.44% self-time on the
+  worker thread of the disjoint fn-fire workload. Nothing in the dispatcher
+  SHOULD be reading wall-clock per emit. Likely culprits: pause-state
+  `lock_held_ns` tracking populated by `queue_notify` even when no pause-
+  overflow has occurred, the `set_pausable_mode` overflow diagnostic, or
+  some debug-time tracing macro.
+- **Acceptance:** grep `crates/graphrefly-core/src/` for `monotonic_ns()` /
+  `wall_clock_ns()` / `Instant::now()` / `clock::*` calls. For each
+  invocation site on the wave-engine hot path (commit_emission, queue_notify,
+  fire_regular, deliver_data_to_consumer): determine if the timestamp is
+  load-bearing for behavior or only for opt-in diagnostics. Move opt-in
+  diagnostics behind a `cfg(debug_assertions)` gate or a feature flag. Pin
+  the bench expectation: `mach_absolute_time` should drop below 0.5% on the
+  same workload.
+- **Estimated scope:** 1-3 hours investigation + 50-150 LOC fix.
+- **Estimated gain:** ~1-2% wall-clock on disjoint fn-fire.
+- **Source:** post-Q-beyond profile (2026-05-10). Profile harness:
+  `crates/graphrefly-core/examples/profile_disjoint_fn_fire.rs`. Profile
+  data: `/tmp/graphrefly-sample.txt` (regenerable via
+  `samply record --rate 1999 --no-open --save-only --output /tmp/graphrefly-profile.json -- ./target/profiling/examples/profile_disjoint_fn_fire`
+  after `cargo build --profile profiling --example profile_disjoint_fn_fire -p graphrefly-core`).
+
+### (2) Reduce allocation churn in `queue_notify` and `pending_notify` — ~3.5% across alloc/free
+
+- **What:** profile shows `_xzm_xzone_malloc_tiny` (1.42%) + `_xzm_free`
+  (1.10%) + `RawVec::finish_grow` (0.48%) + `RawTable::reserve_rehash`
+  (0.51%) + `IndexMap drop_in_place` (0.26%) + Vec growth in
+  `spec_from_iter_nested::from_iter` (~0.5%) ≈ **3.5% of total time in
+  allocator activity.** The dominant source is `queue_notify`'s per-batch
+  `Vec<Sink>` clone-snapshot (one Vec growth per fresh batch) and
+  `pending_notify` IndexMap entry inserts.
+- **Resolutions to evaluate:**
+  - Pre-size `Vec<Sink>` via `Vec::with_capacity(known subscriber count)` —
+    the subscriber count is known at snapshot time.
+  - Switch the per-batch sink storage to `SmallVec<[Sink; 1]>` — most
+    subscribers in the test workloads + production reactive graphs use
+    a single sink (tied to a single Graph::observe / sink-registration).
+  - Pool `PendingBatch` allocations across waves (small arena reused per
+    wave; cleared at outermost BatchGuard drop alongside the existing
+    wave-end clear discipline).
+  - For `pending_notify` IndexMap: investigate whether the IndexMap entry
+    growth is from per-node insertion (rare — bounded by node count) or
+    from per-batch SmallVec growth (likely — every emit on a new node
+    triggers a slot insert).
+- **Acceptance:** post-batch profile shows allocator activity below 1.5%
+  combined. Vec-grow paths in `queue_notify` should not appear in top 30.
+- **Estimated scope:** 1 day, ~300-500 LOC.
+- **Estimated gain:** ~2-3% wall-clock.
+- **Source:** post-Q-beyond profile (2026-05-10). Profile harness as above.
+
+### (3) Cache or short-circuit `begin_batch_for` — ~2% self + ~4% inclusive
+
+- **What:** every `Core::emit` invokes `begin_batch_for(seed)` which:
+  registry.lock() → `lock_for(seed)` → `compute_touched_partitions(seed)`
+  BFS over `s.children` + meta_companions → resolve each touched
+  partition → `partition_wave_owner_lock_arc` per partition (with
+  retry-validate). For the common single-partition case (no
+  meta_companions, leaf-emit), this is overkill.
+- **Resolutions to evaluate:**
+  - **Fast-path single-partition:** if seed has no children AND no
+    meta_companions, skip the BFS — just acquire seed's partition.
+    Detection cost: one `s.children.get(&seed).map_or(true, HashSet::is_empty)`
+    + `s.nodes[&seed].meta_companions.is_empty()`. If both true, fast-path.
+  - **Cache last-seed → touched-partitions on Core**, invalidated by
+    registry epoch bump. Saves the BFS for repeated emits on the same
+    seed (the canonical hot loop case).
+  - **Inline the registry lookup:** `partition_wave_owner_lock_arc`'s
+    retry-validate loop dominates on the no-contention path. Profile
+    shows it's hit per-emit; the `lock_for` + `lock_for_validate`
+    sequence could be combined into a single locked-call that returns
+    both the box and a validate epoch atomically.
+- **Acceptance:** post-batch profile shows `begin_batch_for` below 1%
+  self-time. `compute_touched_partitions` should not appear in top 30
+  for single-partition emits.
+- **Estimated scope:** 1 day, ~200-400 LOC. New tests for the fast-path
+  + single regression test asserting no behavior change for cross-partition
+  cascades (which still need the full BFS).
+- **Estimated gain:** ~1-2% wall-clock.
+- **Source:** post-Q-beyond profile (2026-05-10). Profile harness as above.
+
+### Suggested ordering when batched
+
+1. (1) first — investigation-driven, smallest LOC, may be a quick win or a
+   surprising deeper issue.
+2. (3) second — well-scoped, isolated, easy to bench.
+3. (2) third — most LOC, most carefully-thought-through (allocator changes
+   can interact with refcount discipline; needs care around
+   `PendingBatch::sinks` which holds `Vec<Sink>` Arc clones).
+4. Re-bench Phase J + the profile harness after each. Stop early if
+   cumulative improvement exceeds 7-8% (any further gain is into
+   diminishing-returns territory; sub-slice 4 becomes the next escalation
+   only if state-mutex contention regrows in the profile).
 
 ---
 
@@ -598,7 +706,70 @@ spec enrichment if a future investigation needs the missing coverage.
   prioritize if a future bug investigation actually needs to read
   MC traces.
 
-### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — Q2 + Slice G tier3 placement (D1 patch) + BTreeMap swap LANDED 2026-05-09; Q-beyond CARRIED FORWARD
+### ~~Per-partition state-shard refactor (Q2 + Q3 + Q-beyond)~~ — Q-beyond CLOSED 2026-05-10 with bench-driven scope reduction; per-partition `nodes`/`children` shards (sub-slice 4) DEFERRED evidence-gated
+
+**Closure summary (Q-beyond, 2026-05-10):** the original Q-beyond plan was "split CoreState into per-partition `SubgraphShard`s for everything." User pushback ("we have created a lot of locks, I'm not sure if they are hurting more on the performance or gaining more on the parallelism") triggered a first-principles audit + bench-driven decision (D108). The bench harness `crates/graphrefly-core/benches/lock_strategy.rs` (7 scenarios × 4-6 sync primitives) revealed: (a) uncontended same-thread mutex acquire is identical to thread_local borrow (~14 ns/op — parking_lot's adaptive spin makes the "mutex hop is slow" intuition wrong); (b) the real cost is cross-thread cache-line bouncing on the lock state (S3: shared mutex 35.9 ns/op vs per-partition mutex / thread_local 13.0-13.4 ns/op); (c) DashMap loses single-thread by 1.5-2× (S5); (d) RwLock is 82% slower than Mutex for read-heavy 2-thread (S5); (e) crossbeam-channel (Tokio-style) is 2× slower than mutex single-thread (S6).
+
+**Architecture decision (D108):** hybrid — per-thread `WaveState` thread_local for wave-scoped state + per-partition `wave_owner` ReentrantMutex for cross-thread serialization (unchanged). NO DashMap, NO RwLock, NO Tokio. NO per-partition `nodes`/`children` shards (sub-slice 4 dropped — see below).
+
+**12 wave-scoped fields migrated CoreState → per-thread WaveState** across sub-slices 1-3 (2026-05-09 → 2026-05-10):
+- Sub-slice 1: `deferred_handle_releases`, `wave_cache_snapshots`, `pending_auto_resolve`, `pending_pause_overflow` (the 4 ex-CrossPartitionState fields). `Core::cross_partition`, `WeakCore::cross_partition`, `lock_cross_partition()`, `CrossPartitionState` struct ALL eliminated.
+- Sub-slice 2: `pending_fires`, `pending_notify`.
+- Sub-slice 3: `currently_firing`, `in_tick`, `deferred_flush_jobs`, `deferred_cleanup_hooks`, `pending_wipes`, `invalidate_hooks_fired_this_wave`.
+
+**Sub-slice 4 (per-partition `nodes`/`children` shards) DROPPED per D110.** Subagent that started sub-slice 4 surfaced a structural blocker (`compute_touched_partitions` walks `s.children` to know which partitions to lock — chicken-and-egg with sharded children) AND the Phase J bench against the prior baseline showed sub-slices 1-3 alone delivered the perf goal. See "Per-partition `nodes`/`children` shards (Q-beyond Sub-slice 4) — DEFERRED evidence-gated" entry below for the carry-forward.
+
+**Phase J bench post-Q-beyond (2026-05-10) vs prior Q3+Q2 baseline:** 2t-disjoint state-emit −17.9%, 2t-same-partition state-emit −26.8%, serial 4N −15.5%, fn-fire serial −20.9%, fn-fire 2t-disjoint −4.7%, fn-fire 2t-same −16.8%. **The Q3+Q2 regression was fully recovered + exceeded by the per-thread architecture alone.** Disjoint-vs-same separation 1.84× (was 2.11× — parallelism property preserved; ratio compresses because both regimes got faster).
+
+**502 cargo + 142 parity green; 0 failed; 2 ignored.** clippy + fmt clean. `#![forbid(unsafe_code)]` preserved. Decisions D108–D112 logged in `docs/rust-port-decisions.md`. Closing migration-status section: "Current state (2026-05-10)".
+
+**Original Q-beyond entry preserved below for the architecture audit trail.**
+
+---
+
+### Per-partition `nodes`/`children` shards (Q-beyond Sub-slice 4) — DEFERRED evidence-gated 2026-05-10
+
+- **What:** split `CoreState`'s `nodes: HashMap<NodeId, NodeRecord>` and `children: HashMap<NodeId, HashSet<NodeId>>` per-partition onto `SubgraphLockBox.shard: parking_lot::Mutex<SubgraphShard>`. Cross-partition cascades acquire multiple shards in ascending `SubgraphId` order (Q7 pattern). `set_deps` split path acquires `wave_owner` of the affected partition before mutating to serialize against in-flight cross-thread waves on that partition (graphrefly-py-style serialization; same-thread re-entry passes through).
+
+- **Why deferred:** TWO closure events. (i) D110 (2026-05-10) initially dropped sub-slice 4 because Phase J bench post-sub-slices-1-3 showed the wave-scoped migration alone delivered the perf goal (state-emit 2t-disjoint −17.9%, fn-fire serial −20.9%, etc. vs prior Q3+Q2 baseline). (ii) D113 (2026-05-10) re-explored sub-slice 4 with a more rigorous bench (S8 in `crates/graphrefly-core/benches/lock_strategy.rs`) and DEFERRED for the second time after HONEST bench data + engineering-blocker analysis. Combined evidence: sub-slice 4 would deliver ~9% additional gain on disjoint fn-fire IF the engineering risks are managed cleanly, but the engineering complexity is genuinely high.
+
+- **HONEST bench reframe (D113, 2026-05-10):** the original S8 Variant B comparison was misleading — Variant B eliminated the state mutex entirely (only shard.lock acquired), but a structural-only sub-slice 4 keeps state.lock() because state still holds children, ID counters, topology_sinks, config. The `2t_disjoint_HONEST_state_plus_shard` variant added 2026-05-10 holds BOTH state.lock() AND shard.lock() per access (faithful to a structural migration) and shows **2.50 ms vs current 2.74 ms = ~9% improvement** (not the 19% the misleading variant suggested). Real dispatcher gain is likely smaller still — the bench abstracts away other sources of state mutex contention (`s.children` walks, queue_notify, deliver_data_to_consumer, etc.). Realistic estimate: 4-9% on disjoint fn-fire workloads.
+
+- **Engineering blockers identified by subagent analysis (2026-05-10):**
+  1. **Re-entrancy hazard.** parking_lot::Mutex is non-reentrant. Cascade-style code (`terminate_node`, `set_deps`, `invalidate`, `fire_op_*`) has patterns that hold parent NodeRecord borrow across child access. Post-migration, parent and child are SAME partition (union-find) → SAME shard → deadlock. Each cascade site needs careful audit + restructure (drop borrow before re-acquire, or use multi-shard helper).
+  2. **`clear_wave_state` per-wave shard walks.** Today walks `self.nodes.values_mut()` once. Post-migration: lock every touched shard, walk. Per-wave overhead grows with partition count. Resolvable by narrowing to BatchGuard's touched-sids set (add `BatchGuard::touched_sids()` accessor).
+  3. **`walk_undirected_dep_graph` is a free function on `&CoreState`.** Used in `set_deps` for P13 widening + post-removal split detection. Reads `s.nodes[cur].dep_records`. Post-migration: each visited node requires a shard lock for dep_records read. Resolvable but cascades signature changes.
+  4. **`set_deps` split-migration is correctness-tricky.** Orphan-side NodeRecords must move shards atomically with `split_partition`. Wave_owner-acquire-on-split (graphrefly-py-style) is the right fix but is a behavior change vs today (set_deps was non-blocking against cross-thread waves) and needs at least one new test exercising mid-wave cross-thread set_deps with concurrent emit.
+
+- **Lift trigger (D113-tightened):** evidence-gated. Re-engage IF AND ONLY IF:
+  - A profiling trace on a realistic disjoint-partition workload identifies `parking_lot::Mutex::lock` on `Core::state` as a top-3 contributor (>20% of dispatcher time), OR
+  - A user / parity-test report of measurable wall-clock degradation traceable to state-mutex contention on `nodes` reads, OR
+  - A criterion bench scenario where state-emit Regime A shows poor scaling at N≥4 threads on disjoint partitions where ≥80% of dispatcher time is in `parking_lot::Mutex::lock`.
+
+  The goal of tightening: prevent re-engaging based on speculative bench data alone (the sub-slice-4 exploration was triggered by a misleading bench projection; evidence-gated lift trigger prevents that recurring).
+
+- **Resolutions for the structural blocker** (when work resumes):
+  - **`compute_touched_partitions` recursion:** RESOLVED by minimum-viable scope — keep `children` on CoreState (don't migrate it to shards). `compute_touched_partitions` walks `s.children` from CoreState (no shard lookup needed).
+  - **`terminate_node` cross-partition cascade:** pre-compute touched partitions via `compute_touched_partitions` (already done by BatchGuard upfront), then acquire all touched shards in ascending sid order via `with_shards_for(&[node_ids], |shards| ...)` helper. Same-partition parent+child accessed via the same `MutexGuard<SubgraphShard>` (no re-entry).
+  - **`set_deps` split-migration race:** `partition_wave_owner_lock_arc(removed_dep)` before `split_partition`; same-thread re-entry passes through, cross-thread blocks until the wave drains.
+  - **`clear_wave_state`:** add `BatchGuard::touched_sids() -> &[SubgraphId]` accessor; iterate only touched partitions.
+
+- **Estimated scope (D113-revised):** ~2000-3000 LOC across `node.rs` + `batch.rs` + `subgraph.rs`. Lower than D110's original ~3000-5000 estimate because minimum-viable scope (nodes-only, leave children) sidesteps several blockers. ~100+ access sites for `nodes` + ~40 indirect via `require_node`/`require_node_mut` + lock-discipline restructuring at every callsite + new SubgraphShard struct + helpers + split-migration race fix + new tests for the behavior change.
+
+- **Suggested approach (when work resumes):** option A from the agent's pre-halt report — multi-commit staging:
+  1. Add `SubgraphShard` substrate (just `nodes` field; not children), helpers (`with_node`, `with_node_mut`, `with_shards_for`), `BatchGuard::touched_sids` accessor.
+  2. Migrate `Core::register` to insert into the partition's shard.
+  3. Migrate read-mostly sites first (`require_node`, lookups in `subscribe`, etc.), drop the `s.nodes` reads that were temporary mirrors.
+  4. Migrate write sites (cascade walks, fire_regular Phase 3, etc.) — this is where re-entrancy hazards bite; audit each cascade site individually.
+  5. Wire the set_deps wave_owner-acquire-on-split fix + add the new test.
+  6. Update `Drop for CoreState` to walk shards.
+  7. Bench: confirm ≥5% improvement on `fnfire_parallel_2t_disjoint` per `crates/graphrefly-core/benches/per_subgraph_parallelism.rs`. If <5%, REVERT — the engineering risk doesn't justify the gain.
+
+- **Source:** Q-beyond batch close (2026-05-10) D110 first drop; D113 (2026-05-10) re-exploration + HONEST bench + final defer. Subagent transcripts in conversation history surfaced the structural blocker analysis.
+
+---
+
+### Per-partition state-shard refactor (Q2 + Q3 + Q-beyond) — Q2 + Slice G tier3 placement (D1 patch) + BTreeMap swap LANDED 2026-05-09; Q-beyond fully CLOSED 2026-05-10 (original entry below preserved for archive)
 
 **Closure summary (Q3 v1 → D1 patch + Q2, 2026-05-09):** Q3 v1 placed
 `tier3_emitted_this_wave` per-partition on `SubgraphLockBox::state:
