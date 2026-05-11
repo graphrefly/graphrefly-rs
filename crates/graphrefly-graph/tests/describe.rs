@@ -4,7 +4,7 @@ mod common;
 
 use common::binding;
 use graphrefly_core::{EqualsMode, FnId, HandleId};
-use graphrefly_graph::{Graph, NodeStatus, NodeTypeStr};
+use graphrefly_graph::{DescribeValue, Graph, NodeStatus, NodeTypeStr};
 
 #[test]
 fn empty_graph_describes_as_empty() {
@@ -35,7 +35,7 @@ fn state_node_status_settled_when_initial_present() {
     let d = g.describe();
     let n = d.nodes.get("retry_limit").unwrap();
     assert_eq!(n.status, NodeStatus::Settled);
-    assert_eq!(n.value, Some(HandleId::new(3)));
+    assert_eq!(n.value, Some(DescribeValue::Handle(HandleId::new(3))));
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn derived_node_status_settled_after_dep_fires() {
     let d = g.describe();
     let nd = d.nodes.get("d").unwrap();
     assert_eq!(nd.status, NodeStatus::Settled);
-    assert_eq!(nd.value, Some(HandleId::new(7))); // identity passthrough
+    assert_eq!(nd.value, Some(DescribeValue::Handle(HandleId::new(7)))); // identity passthrough
     assert_eq!(nd.deps, vec!["a"]);
 }
 
@@ -179,4 +179,146 @@ fn describe_node_order_matches_namespace_insertion_order() {
     let d = g.describe();
     let names: Vec<&str> = d.nodes.keys().map(String::as_str).collect();
     assert_eq!(names, vec!["z", "a", "m"]);
+}
+
+// ---------------------------------------------------------------------------
+// F sub-slice (2026-05-10) — describe_with_debug + DebugBindingBoundary
+// ---------------------------------------------------------------------------
+
+mod debug_render {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use graphrefly_core::{BindingBoundary, FnResult, HandleId};
+    use graphrefly_graph::{DebugBindingBoundary, DescribeValue, Graph};
+    use parking_lot::Mutex;
+
+    /// Minimal binding that renders handles via a HashMap<HandleId, T>.
+    struct DebugBinding {
+        values: Mutex<HashMap<HandleId, serde_json::Value>>,
+    }
+
+    impl DebugBinding {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                values: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn register(&self, h: HandleId, v: serde_json::Value) {
+            self.values.lock().insert(h, v);
+        }
+    }
+
+    impl BindingBoundary for DebugBinding {
+        fn invoke_fn(
+            &self,
+            _node_id: graphrefly_core::NodeId,
+            _fn_id: graphrefly_core::FnId,
+            dep_data: &[graphrefly_core::DepBatch],
+        ) -> FnResult {
+            let h = dep_data
+                .first()
+                .map_or(HandleId::new(0), graphrefly_core::DepBatch::latest);
+            FnResult::Data {
+                handle: h,
+                tracked: None,
+            }
+        }
+        fn custom_equals(&self, _f: graphrefly_core::FnId, a: HandleId, b: HandleId) -> bool {
+            a == b
+        }
+        fn release_handle(&self, _h: HandleId) {}
+    }
+
+    impl DebugBindingBoundary for DebugBinding {
+        fn handle_to_debug(&self, handle: HandleId) -> serde_json::Value {
+            self.values
+                .lock()
+                .get(&handle)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    #[test]
+    fn describe_with_debug_renders_value_via_binding() {
+        // describe_with_debug surfaces `value: <T>` shapes (whatever
+        // the binding's `handle_to_debug` returns) instead of raw
+        // `value: <u64>`. Default `describe()` still surfaces raw
+        // handle u64.
+        let binding = DebugBinding::new();
+        let h42 = HandleId::new(42);
+        binding.register(h42, serde_json::json!(3));
+        let g = Graph::new("system", binding.clone() as Arc<dyn BindingBoundary>);
+        g.state("retry_limit", Some(h42)).unwrap();
+
+        // Default describe: raw handle view.
+        let default = g.describe();
+        assert_eq!(
+            default.nodes.get("retry_limit").unwrap().value,
+            Some(DescribeValue::Handle(h42))
+        );
+        let default_json = serde_json::to_string(&default).unwrap();
+        assert!(
+            default_json.contains("\"value\":42"),
+            "default describe() emits raw u64 handle. JSON: {default_json}"
+        );
+
+        // describe_with_debug: rendered view via DebugBindingBoundary.
+        let rendered = g.describe_with_debug(binding.as_ref());
+        assert_eq!(
+            rendered.nodes.get("retry_limit").unwrap().value,
+            Some(DescribeValue::Rendered(serde_json::json!(3)))
+        );
+        let rendered_json = serde_json::to_string(&rendered).unwrap();
+        assert!(
+            rendered_json.contains("\"value\":3"),
+            "describe_with_debug emits binding-rendered value. JSON: {rendered_json}"
+        );
+    }
+
+    #[test]
+    fn describe_with_debug_preserves_null_for_sentinel_cache() {
+        // Sentinel (no-initial state) → value: null in both modes.
+        let binding = DebugBinding::new();
+        let g = Graph::new("system", binding.clone() as Arc<dyn BindingBoundary>);
+        g.state("knob", None).unwrap();
+
+        let rendered = g.describe_with_debug(binding.as_ref());
+        assert!(rendered.nodes.get("knob").unwrap().value.is_none());
+        let json = serde_json::to_string(&rendered).unwrap();
+        assert!(
+            json.contains("\"value\":null"),
+            "sentinel cache → value:null. JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn describe_with_debug_supports_complex_json_shapes() {
+        // Bindings can return arbitrary JSON shapes (objects, arrays,
+        // strings, etc.) — the trait's return type is
+        // `serde_json::Value`, no constraint.
+        let binding = DebugBinding::new();
+        let h1 = HandleId::new(1);
+        binding.register(
+            h1,
+            serde_json::json!({ "kind": "tuple", "items": [1, 2, 3] }),
+        );
+        let g = Graph::new("system", binding.clone() as Arc<dyn BindingBoundary>);
+        g.state("payload", Some(h1)).unwrap();
+
+        let rendered = g.describe_with_debug(binding.as_ref());
+        // Compare via the DescribeValue::Rendered branch directly —
+        // string comparison would be brittle to serde_json's
+        // alphabetic key ordering.
+        let v = rendered.nodes.get("payload").unwrap().value.clone();
+        assert_eq!(
+            v,
+            Some(DescribeValue::Rendered(
+                serde_json::json!({ "kind": "tuple", "items": [1, 2, 3] })
+            )),
+            "complex shape round-trips through describe_with_debug"
+        );
+    }
 }

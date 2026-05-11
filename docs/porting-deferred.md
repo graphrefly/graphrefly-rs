@@ -133,6 +133,32 @@ per fn-fire).
 
 ## v1 dispatcher limitations (intentional, with planned lift points)
 
+### `release_handles` / `release_handle` called lock-held during `reset_for_fresh_lifecycle` (Phase 3 + 3b + 5) — established pattern, expanded by D-α
+
+- **What:** `Core::reset_for_fresh_lifecycle` takes a `&mut CoreState` parameter (caller holds the state mutex). All three release passes — Phase 3 (`old_scratch.release_handles`), the new Phase 3b D-α queue drain, and Phase 5 (`for h in handles_to_release { binding.release_handle(h) }`) — run with the state lock held. Same applies to `Drop for CoreState`'s D-α queue drain. Pre-D-α the same shape existed for Phase 3 + Phase 5 (single old scratch + bounded wave-state vec); D-α expands the surface by adding a queue that can hold N scratches accumulated across non-terminal deactivate cycles (typically O(few) in practice; degenerate workloads could push higher per the `pending_scratch_release` growth-bound note on `CoreState`).
+- **Why this is safe at v1:** the `BindingBoundary::release_handle` (and `OperatorScratch::release_handles`) trait contract documents the leaf-operation invariant — implementations MUST NOT re-enter Core during refcount calls. Production bindings (napi-rs, pyo3, wasm-bindgen) honor this. The lock-held pattern is consistent across Phase 3 / 3b / 5 / Drop, so D-α doesn't change the contract — just stretches the existing surface.
+- **Why divergent from the broader Phase G pattern:** Phase G (in `Subscription::Drop`) releases handles lock-RELEASED (gather under lock, drop lock, then call release). That's the more conservative shape. `reset_for_fresh_lifecycle` runs lock-HELD by structural necessity — the caller already holds the lock (it's mid-subscribe handshake), and the function can't relinquish it without breaking the broader subscribe state-machine.
+- **Lift point:** widen the `BindingBoundary` trait's `release_handle` rustdoc to make the leaf-operation requirement a HARD contract (currently it reads more like an implementation hint). Add a `release_handle_lock_held: bool` capability flag if a future binding genuinely needs Core re-entrance during refcount paths. Until then, defer.
+- **Source:** /qa F2 / M1 (2026-05-10 A/B/D/E/F batch review). Pre-existing for Phase 3/5; expanded for Phase 3b + Drop drain via D-α.
+
+### `signal_invalidate` uses unbounded recursion (stack overflow risk on deep mount trees)
+
+- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs) `collect_signal_invalidate_ids` recurses into `child.collect_signal_invalidate_ids(out)` for each mounted child. Each Rust stack frame is significantly heavier than a TS closure frame; a mount tree of several thousand levels would overflow the default thread stack.
+- **Why acceptable at v1:** mount trees in practice are ≤4 levels deep (the canonical pattern is `system / module / submodule / leaf`). Deeper trees indicate either accidental nesting or an adversarial construction; either way, the gather pass is on a setup/teardown-time path (not hot), so a panic on stack overflow is loud and recoverable.
+- **Lift point:** convert recursion to iteration using an explicit `Vec<Graph>` worklist. Pop a graph, lock briefly, push children to the worklist, push own ids to `out`. Mirrors the destroy() cascade pattern at `graph.rs:874`.
+- **Source:** /qa Blind Hunter Major (2026-05-10 A/B/D/E/F batch review).
+
+### `DescribeValue::Rendered(Value::Null)` is JSON-indistinguishable from `Option::None` (sentinel cache)
+
+- **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs) `NodeDescribe.value: Option<DescribeValue>` serializes:
+  - `None` (sentinel cache, `NO_HANDLE`) → `"value":null`
+  - `Some(DescribeValue::Handle(h))` → `"value":<u64>`
+  - `Some(DescribeValue::Rendered(Value::Null))` (binding rendered as JSON null) → `"value":null`
+- A JSON consumer reading the serialized describe output cannot tell "node has no cache" from "node has cache but binding rendered as null".
+- **Why acceptable at v1:** `serde_json::Value::Null` is a legitimate rendering target (for nullable user values); the ambiguity is on the JSON side, not the API side. Rust callers comparing `DescribeValue::Rendered(Value::Null)` vs `None` via `PartialEq` get the correct distinction.
+- **Lift point:** either (a) add a top-level `value_mode: "handle" | "rendered"` field on `GraphDescribeOutput` so consumers know which interpretation applies; OR (b) document that bindings should return a non-Null discriminator (e.g. `{"opaque": true}`) for handles that resolve to null user values; OR (c) tag the serialized form (e.g. `{"value": {"rendered": null}}`) — would break JSON shape parity with TS canonical.
+- **Source:** /qa m1/m28 (2026-05-10 A/B/D/E/F batch review).
+
 ### ~~Fn re-entrance via `BindingBoundary::invoke_fn` and `custom_equals` still forbidden~~ — RESOLVED in Slice A close
 
 `Core::fire_fn` and `Core::commit_emission` were rewritten as
@@ -1101,21 +1127,17 @@ clean. `#![forbid(unsafe_code)]` preserved.
 
 ## M2 Slice E+ — read-side introspection + composition divergences
 
-### `describe()` `value` field surfaces raw `HandleId`, not user-rendered `T`
+### ~~`describe()` `value` field surfaces raw `HandleId`, not user-rendered `T`~~ — RESOLVED by D131 (F sub-slice, 2026-05-10)
 
-- **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs)
-  `NodeDescribe.value: Option<HandleId>`. Canonical TS surfaces `value: T`
-  directly — the binding-side registry resolves `HandleId → T` before
-  serialization.
-- **Why divergent:** Core operates on opaque `HandleId` integers per the
-  handle-protocol cleaving plane. Producing `T` would require a Core-side
-  binding callback, which conflicts with the cleaving-plane invariant.
-- **Lift point:** binding crates (`graphrefly-bindings-js`, `-py`) provide
-  a thin wrapper (e.g. `describe_with_values`) that walks the handle-id
-  output and substitutes the registered user value before serializing for
-  end-user JSON consumption.
-- **Source:** Slice E+ (2026-05-05); documented in `describe.rs` module
-  docs and §11 Implementation Deltas.
+- **Resolution (D131, A/B/D/E/F batch):** new optional `DebugBindingBoundary`
+  extension trait in `crates/graphrefly-graph/src/debug.rs` (kept OUT of
+  `graphrefly-core` to preserve serde-free dep footprint). `NodeDescribe.value`
+  refactored to `Option<DescribeValue>` enum with `Handle(HandleId)` (raw,
+  default for `Graph::describe()`) and `Rendered(serde_json::Value)` variants
+  (binding-projected, from `Graph::describe_with_debug(debug)`). Serialized
+  uniformly without an enum tag — consumers see either a number or whatever
+  JSON shape the binding emits. Bindings impl `BindingBoundary` always and
+  `DebugBindingBoundary` opt-in. 3 tests in `crates/graphrefly-graph/tests/describe.rs::debug_render`.
 
 ### ~~`observe_all()` snapshot-at-subscribe-time semantics~~ — RESOLVED in Slice F
 
@@ -1127,23 +1149,27 @@ a deadlock where the topology sink closure's `Arc<inner>` could be the
 last reference and try to drop `Subscription`s under `CoreState` lock.
 Closed 2026-05-06.
 
-### `signal_invalidate` does not snapshot the namespace under a single lock
+### ~~`signal_invalidate` does not snapshot the namespace under a single lock~~ — TIGHTENED by D130 (E sub-slice, 2026-05-10)
 
-- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
-  `Graph::signal_invalidate` collects own-graph node ids + child Graphs
-  under one `inner.lock()`, then drops the lock and walks them.
-  Concurrent `add` / `mount_new` / `unmount` calls during the walk are
-  visible (new nodes added after the snapshot are NOT invalidated;
-  unmounted children may already be detached when the recursive call
-  hits them).
-- **Why divergent:** holding the namespace lock across the recursive
-  invalidation walk would serialize all graph mutations against
-  invalidate cascades — fine in practice (signal_invalidate is
-  typically setup/teardown-time, not on the hot path), but the
-  acquisition-order rule is "Graph → Core only", and the Core
-  invalidate cascade re-enters the Graph layer would deadlock against
-  a Graph-held lock. Snapshotting first preserves the rule.
-- **Source:** Slice E+ (2026-05-05).
+- **Resolution (D130, A/B/D/E/F batch):** `signal_invalidate` refactored to
+  two-phase tree-wide gather. Phase 1 walks the entire mount tree under
+  per-graph locks (each subgraph locked briefly to extract names + meta
+  filter + children, then released), accumulating a flat `Vec<NodeId>`.
+  Phase 2 runs `Core::invalidate` on the flat list — no Graph locks held
+  during the Core cascade (preserves Slice F /qa D2 lock-ordering rule).
+  DFS pre-order; destroyed subgraphs skipped via existing
+  `inner.destroyed` short-circuit. Concurrent `add` / `mount_new` /
+  `unmount` mid-walk only affect NOT-YET-snapshotted subgraphs — the
+  invariant the original behavior aimed for is now structural rather
+  than per-subgraph.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` —
+  `signal_invalidate` + new `collect_signal_invalidate_ids` recursive
+  helper.
+- **Tests:** 3 in `crates/graphrefly-graph/tests/mount.rs` —
+  `signal_invalidate_traverses_deep_mount_tree`,
+  `signal_invalidate_skips_destroyed_subtree`,
+  `signal_invalidate_gather_does_not_hold_graph_lock_during_core_call`.
+- **Source:** Slice E+ (2026-05-05); tightened by D130 (A/B/D/E/F batch, 2026-05-10).
 
 ### Anonymous Core nodes surface as `_anon_<NodeId>` strings in describe deps
 
@@ -1392,12 +1418,17 @@ These canonical-spec methods are tracked for parity. Items marked
 
 ## M3 Slice C-3 — flow operator deferrals
 
-### Flow operator counters reset only on resubscribable terminal cycle (D028)
+### ~~Flow operator counters reset only on resubscribable terminal cycle (D028)~~ — FULLY CLOSED by D129 (D-α, 2026-05-10)
 
-- **What:** TS legacy `take.ts` resets `taken` / `skipped` / `done` / `latest` on every deactivation (when last subscriber leaves) per Lock 6.D. Rust v1's [`crates/graphrefly-core/src/op_state.rs`](../crates/graphrefly-core/src/op_state.rs) state structs only reset via `reset_for_fresh_lifecycle` — the resubscribable terminal lifecycle reset path. Non-resubscribable nodes whose subscribers go to zero and then come back DON'T reset their flow-operator state.
-- **Why divergent:** matches the broader "Deactivation cleanup not yet modeled" deferral. Rust v1 only models the terminal-resubscribable lifecycle reset; full deactivation/reactivation cleanup awaits M2-graph mount/unmount work that surfaces deactivation as observable.
-- **Lift point:** when deactivation cleanup lands, call `OperatorScratch::release_handles` + reinstall fresh scratch on deactivation (mirrors `reset_for_fresh_lifecycle` shape — the substrate is already in place via the trait's `release_handles` method).
-- **Source:** Slice C-3 close (2026-05-06); D028.
+- **Resolution (D129, A/B/D/E/F batch):** Phase G on resubscribable + has-op now builds a FRESH scratch via `Core::make_op_scratch_with_binding` (lock-held — `binding.retain_handle` is a leaf op), installs it on `rec.op_scratch`, and pushes the OLD scratch to `CoreState::pending_scratch_release` for deferred release. The queue drains on the next `reset_for_fresh_lifecycle` Phase 3b (AFTER its Phase 2 fresh retain — preserves Slice C-3 /qa P1 seed-aliasing-acc invariant) or on `Drop for CoreState` (catch-all). All three rows of the original status matrix now correct:
+  | Path | Status |
+  |---|---|
+  | Non-resubscribable + deactivate | released by Phase G ✓ (D124) |
+  | Resubscribable + terminal + late-subscribe → reset | `reset_for_fresh_lifecycle` releases ✓ |
+  | Resubscribable + non-terminal deactivate → reactivate | fresh scratch installed by Phase G; old shares deferred to queue ✓ (D129) |
+- **Where it landed:** `crates/graphrefly-core/src/node.rs` — `Subscription::Drop` Phase G branch (lines ~858–1010) + `reset_for_fresh_lifecycle` Phase 3b (line ~3540) + `Drop for CoreState` D-α drain (lines ~5499+). Static `Core::make_op_scratch_with_binding(binding, op)` enables the Phase G call site (which has only `&dyn BindingBoundary`, not `&Core`).
+- **Tests:** 5 in `crates/graphrefly-operators/tests/phase_g_op_scratch.rs` — `take_resubscribable_non_terminal_deactivate_resets_counter`, `scan_resubscribable_non_terminal_deactivate_resets_acc_to_seed`, `phase_g_resubscribable_seed_aliasing_acc_does_not_collapse_registry`, `pending_scratch_release_drains_on_core_drop`, `pending_scratch_release_drains_on_reset_for_fresh_lifecycle`.
+- **Source:** Slice C-3 close (2026-05-06); D028. Partial close via /qa F8 (D124, 2026-05-10 — non-resubscribable case). Full close via D129 (A/B/D/E/F batch, 2026-05-10 — resubscribable case via defer queue).
 
 ### ~~`take_until(source, notifier)` not yet ported~~ — RESOLVED (Slice D / M3 producer-pattern slice); doc strike-through 2026-05-10 (B sub-slice cleanup batch)
 
@@ -1881,39 +1912,30 @@ set (PAUSE/RESUME, INVALIDATE, COMPLETE/ERROR/TEARDOWN).
   tests covering rejection × 4 + reset-after-teardown + reset-after-any-
   terminal). TS mirrored at `packages/pure-ts/src/core/node.ts:1281+`
   (3008/3008 tests pass + 142 parity tests pass).
-- **TS operator audit for R2.2.7.b rejection handling (D127, /qa F3 carry-forward).**
-  The TS substrate landed 2026-05-10 (`TornDownError` class + `isTornDownError` +
-  `SubscribeOutcome` type + `trySubscribeOrDead` helper exported from
-  `@graphrefly/graphrefly`). `Node.subscribe` now throws `TornDownError`
-  when subscribing to a non-resubscribable terminal node. ~25 TS operator
-  subscribe sites in `packages/pure-ts/src/extra/operators/{buffer,take,
-  control,combine,time,higher-order}.ts` still call raw `source.subscribe(...)`
-  unwrapped — these will throw uncaught from inside their `onSubscribe`
-  closures when given a dead upstream, propagating to the consumer's
-  `.subscribe(operatorNode)`. **Lift:** audit each call site and migrate
-  to `trySubscribeOrDead(source, sink)` with per-op Dead handling (zip
-  self-completes, concat advances, race marks completed, take_until
-  self-completes, switch_map / exhaust_map / merge_map invoke
-  on-inner-complete). Mirror the Rust per-op fixes in
-  `crates/graphrefly-operators/src/{producer,ops_impl,higher_order}.rs`.
-  Scope: ~25 sites + per-op test additions. Source: /qa F3 (2026-05-10).
+- **TS operator audit for R2.2.7.b rejection handling (D127, /qa F3 carry-forward)** — PARTIALLY RESOLVED by D133 (A sub-slice, 2026-05-10) for `extra/operators/*`; `extra/sources/*` and patterns-layer sites remain unaudited.
+  - **Resolved scope (D133, 2026-05-10):** new `subscribeOr(source, sink, onDead)` helper added to
+    `packages/pure-ts/src/core/subscribe-error.ts` (also exported via `@graphrefly/graphrefly`).
+    25 sites migrated across `packages/pure-ts/src/extra/operators/{buffer,take,control,combine,time,higher-order}.ts`.
+    Per-op Dead semantics match Rust impl: buffer / time-window-style →
+    flush + self-COMPLETE; takeUntil source → self-COMPLETE; takeUntil
+    notifier → no-op; merge / concat / zip / race → per-source-Dead
+    handling; higher-order inner → `on_inner_complete` via `forwardInner`.
+    All 3008 pure-ts tests pass post-migration.
+  - **Remaining scope (carry-forward):** `packages/pure-ts/src/extra/sources/{settled.ts, async.ts}` contains ~8 raw `source.subscribe(...)` calls in `firstWhere` / `firstValueFrom` / `subscribeAndAwaitDone` / async-iter conversion paths that still throw uncaught `TornDownError` on dead upstreams. Patterns-layer `compat/*` and `patterns/**/*.ts` not yet swept either. Lift: wrap each call site with `trySubscribeOrDead` or the new `subscribeOr` helper + per-op Dead-handling matching its consumer contract (e.g. `firstValueFrom(dead)` should reject the promise with `TornDownError`, not bubble it).
+  - **Source:** /qa F3 (2026-05-10); partially resolved by D133 (operators only). Full close awaits consumer pressure on sources/patterns paths.
 
-- **F2 immediate-Dead end-to-end operator tests (D126, /qa carry-forward).**
-  The Rust `SubscribeOutcome::Dead` substrate + per-op Dead handlers
-  landed 2026-05-10. End-to-end black-box verification (operator self-
-  completes on Dead source at activation) requires partition-coherent
-  test setup — sources must be in partitions already-acquired by the
-  activation wave. Public-API surface doesn't readily expose this:
-  `state_int` allocates fresh partitions per node, and the producer's
-  activation wave acquires only its own partition + meta-companions
-  in ascending order. Existing meta-companion test workarounds hit
-  Phase H+ STRICT defer instead of the immediate-Dead path. Substrate-
-  level unit coverage via `SubscribeError::TornDown` in
-  `crates/graphrefly-core/tests/resubscribable.rs` is the trusted
-  source of truth for the F2 contract. **Lift:** add a test-runtime
-  helper to construct partition-coherent operator scenarios, OR
-  exercise the Dead path through napi-bindings end-to-end. Source:
-  /qa F2 (2026-05-10).
+- **~~F2 immediate-Dead end-to-end operator tests (D126, /qa carry-forward)~~** — RESOLVED by D132 (B sub-slice, 2026-05-10).
+  New `OpRuntime::with_all_partitions_held(f)` helper in
+  `crates/graphrefly-operators/tests/common/mod.rs` wraps `f` in a
+  `core.batch()` scope (which acquires every existing partition's
+  `wave_owner` in ascending `SubgraphId` order via the retry-validate
+  loop). Producer-pattern operator factories called inside the helper
+  see partition-coherent state — `try_subscribe(dead_source)` returns
+  `SubscribeError::TornDown` synchronously (not deferred), surfacing
+  as `SubscribeOutcome::Dead` to per-op handlers. 8 e2e tests in
+  `crates/graphrefly-operators/tests/dead_source_e2e.rs` covering
+  zip / concat / race / take_until per-op Dead-source semantics.
+  Source: /qa F2 (2026-05-10); resolved 2026-05-10 A/B/D/E/F batch.
 
 - **Mid-fn rewire re-entrancy hazard.** TS impl rejects synchronous re-entry
   via `_inDepMutation`. Rust impl currently only rejects via the cycle check;

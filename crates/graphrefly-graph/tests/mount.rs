@@ -251,3 +251,135 @@ fn signal_invalidate_on_destroyed_graph_is_noop() {
     g.signal_invalidate(); // must not panic, no-op
     assert!(g.is_destroyed());
 }
+
+// ---------------------------------------------------------------------------
+// E sub-slice (2026-05-10) — tree-wide gather-then-invalidate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signal_invalidate_traverses_deep_mount_tree() {
+    // Three-level mount tree: root → child → grandchild. Tree-wide
+    // gather pass collects ids from all three levels under per-graph
+    // locks (each lock held briefly); invalidation runs lock-released
+    // afterward on the flat list.
+    let root = Graph::new("root", binding());
+    let child = root.mount_new("child").unwrap();
+    let grandchild = child.mount_new("grandchild").unwrap();
+
+    let r_node = root.state("r", Some(HandleId::new(1))).unwrap();
+    let c_node = child.state("c", Some(HandleId::new(2))).unwrap();
+    let g_node = grandchild.state("g", Some(HandleId::new(3))).unwrap();
+
+    root.signal_invalidate();
+
+    assert_eq!(
+        root.cache_of(r_node),
+        graphrefly_core::NO_HANDLE,
+        "root level invalidated"
+    );
+    assert_eq!(
+        child.cache_of(c_node),
+        graphrefly_core::NO_HANDLE,
+        "child level invalidated"
+    );
+    assert_eq!(
+        grandchild.cache_of(g_node),
+        graphrefly_core::NO_HANDLE,
+        "grandchild level invalidated"
+    );
+}
+
+#[test]
+fn signal_invalidate_skips_destroyed_subtree() {
+    // A child graph destroyed BEFORE signal_invalidate must be skipped
+    // by the gather pass (the destroyed-check short-circuits inside
+    // each subgraph's snapshot). The parent's own nodes still get
+    // invalidated.
+    let root = Graph::new("root", binding());
+    let child = root.mount_new("child").unwrap();
+    let r_node = root.state("r", Some(HandleId::new(1))).unwrap();
+    let c_node = child.state("c", Some(HandleId::new(2))).unwrap();
+
+    child.destroy();
+    // /qa m6 (2026-05-10): tighten the test — verify the destroyed
+    // child is still in the parent's mount tree (so the gather pass
+    // actually exercises the `inner.destroyed` short-circuit at line
+    // 864). If a future Graph refactor removes destroyed children
+    // from the parent's `children` map, this assertion catches the
+    // shift and forces a test rewrite to match the new semantics.
+    assert_eq!(
+        root.child_names(),
+        vec!["child"],
+        "destroyed child still listed in parent's mount tree (proves \
+         the destroyed-skip path is exercised, not the no-child path)"
+    );
+    assert!(
+        child.is_destroyed(),
+        "child marked destroyed (gather should short-circuit)"
+    );
+
+    // /qa m25 (2026-05-10): pre-invalidate snapshot of c_node's cache.
+    // For STATE nodes, R2.2.8 ROM preserves cache across destroy's
+    // TEARDOWN cascade (cache is intrinsic, not derived). The
+    // destroyed-skip path means signal_invalidate must NOT touch
+    // c_node — we verify by asserting cache is unchanged afterward.
+    let c_cache_pre = child.cache_of(c_node);
+    assert_eq!(
+        c_cache_pre,
+        HandleId::new(2),
+        "state node cache preserved through destroy (R2.2.8 ROM)"
+    );
+
+    // After child.destroy(): child's namespace is cleared, but the
+    // gather pass still walks into the child entry and short-circuits
+    // on the destroyed flag. root.r should still wipe.
+    root.signal_invalidate();
+    assert_eq!(
+        root.cache_of(r_node),
+        graphrefly_core::NO_HANDLE,
+        "parent invalidate ran even though child subtree was destroyed"
+    );
+    // /qa m25: signal_invalidate must NOT touch c_node (gather pass
+    // short-circuited on destroyed flag). c_node's cache stays at the
+    // same value as before signal_invalidate.
+    assert_eq!(
+        child.cache_of(c_node),
+        c_cache_pre,
+        "destroyed child's node cache untouched by signal_invalidate \
+         (gather short-circuited on destroyed flag)"
+    );
+}
+
+#[test]
+fn signal_invalidate_gather_does_not_hold_graph_lock_during_core_call() {
+    // Regression-style: the two-phase split (gather then invalidate)
+    // means no Graph lock is held while Core::invalidate fires. We
+    // verify by attaching a sink that, on receiving INVALIDATE,
+    // re-enters the Graph layer (calls `Graph::name_of`) — this would
+    // deadlock if signal_invalidate held the Graph::inner lock across
+    // the Core call.
+    use graphrefly_core::Message;
+    let g = Graph::new("system", binding());
+    let s = g.state("named", Some(HandleId::new(1))).unwrap();
+    let g_for_sink = g.clone();
+    let observed_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let observed_for_sink = observed_name.clone();
+    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if matches!(m, Message::Invalidate) {
+                // Re-enter Graph layer mid-cascade. Pre-fix this would
+                // deadlock against the held inner lock; post-fix it
+                // resolves cleanly.
+                *observed_for_sink.lock().unwrap() = g_for_sink.name_of(s);
+            }
+        }
+    });
+    let _sub = g.subscribe(s, sink);
+    g.signal_invalidate();
+    assert_eq!(
+        observed_name.lock().unwrap().as_deref(),
+        Some("named"),
+        "sink observed INVALIDATE and re-entered Graph layer successfully \
+         (no Graph lock held during Core cascade — E sub-slice invariant)"
+    );
+}

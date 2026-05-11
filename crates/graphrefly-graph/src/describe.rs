@@ -4,16 +4,29 @@
 //! / mermaid / d2 / stage-log / explain / reachable variants are
 //! deferred (subsequent slices).
 //!
-//! # Value rendering divergence (TS spec)
+//! # Value rendering — raw vs. binding-rendered (F sub-slice, 2026-05-10)
 //!
-//! Canonical TS surfaces `value: T` directly. The Rust port surfaces
-//! `value: Option<HandleId>` — Core operates on opaque `HandleId`
-//! integers, and the binding-side registry is the only place
-//! `HandleId → T` resolution happens. Bindings (`graphrefly-bindings-js`,
-//! `graphrefly-bindings-py`) provide a thin wrapper that swaps each
-//! handle for the registered value before serializing for end-user
-//! consumption. Documented divergence per §11 Implementation Deltas
-//! (handle-protocol cleaving plane).
+//! Canonical TS surfaces `value: T` directly. The Rust port preserves
+//! the handle-protocol cleaving plane (Core operates on opaque
+//! `HandleId` integers; binding-side owns `HandleId → T`) by surfacing
+//! `value: DescribeValue`:
+//!
+//! - `DescribeValue::Handle(HandleId)` — raw u64 view, used by
+//!   `Graph::describe()` (the default). Suitable for parity tests
+//!   that compare against TS by mapping handles through the binding
+//!   manually, and for debug contexts that don't have a debug
+//!   binding wired up.
+//! - `DescribeValue::Rendered(serde_json::Value)` — binding-rendered
+//!   view, used by `Graph::describe_with_debug(debug)`. The caller
+//!   passes a [`DebugBindingBoundary`] impl that knows how to
+//!   project each registered value into a JSON form. This is the
+//!   "developer-friendly" surface — looks just like TS's `value: T`
+//!   in the serialized JSON because the rendering happens at the
+//!   binding boundary, off the Core hot path.
+//!
+//! Each value field serializes uniformly: as a u64 number for
+//! `Handle`, or as the binding's chosen JSON shape for `Rendered`.
+//! `None` (sentinel cache) serializes as `null` in both modes.
 
 use std::sync::{Arc, Weak};
 
@@ -22,6 +35,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 
+use crate::debug::DebugBindingBoundary;
 use crate::graph::{Graph, GraphInner};
 
 /// Top-level `describe()` output (canonical Appendix B JSON schema).
@@ -52,11 +66,17 @@ pub struct NodeDescribe {
     pub r#type: NodeTypeStr,
     /// Lifecycle status (canonical Appendix B enum).
     pub status: NodeStatus,
-    /// Raw handle of the node's current cache. `None` when the cache
-    /// is sentinel (`NO_HANDLE`). Bindings render to `T` before
-    /// surfacing to end users.
-    #[serde(serialize_with = "ser_opt_handle")]
-    pub value: Option<HandleId>,
+    /// Current cache value (F sub-slice, 2026-05-10). `None` when
+    /// the cache is sentinel (`NO_HANDLE`). Otherwise:
+    ///
+    /// - `DescribeValue::Handle(HandleId)` — raw u64 (from
+    ///   [`Graph::describe`]).
+    /// - `DescribeValue::Rendered(serde_json::Value)` — binding-
+    ///   rendered (from [`Graph::describe_with_debug`]).
+    ///
+    /// Serialization is uniform: the inner u64 or JSON value
+    /// appears directly in the output (no enum tag).
+    pub value: Option<DescribeValue>,
     /// Dep names in declaration order. Unnamed deps surface as
     /// `_anon_<NodeId>` to keep the output lossless without
     /// elevating Core-only nodes into the namespace.
@@ -69,6 +89,35 @@ pub struct NodeDescribe {
     /// `skip_serializing_if` when None to keep current outputs slim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
+}
+
+/// Per-node cache value in `describe` output. Surfaced as `value:
+/// <u64>` when produced by [`Graph::describe`] (raw handle view), or
+/// as `value: <T>` when produced by
+/// [`Graph::describe_with_debug`] (binding-rendered view). Serialized
+/// uniformly without an enum tag — consumers see either a number
+/// or whatever JSON shape the binding emits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DescribeValue {
+    /// Raw handle view. Default for [`Graph::describe`]. The
+    /// serialized JSON is a `Number` (the u64 raw view of the
+    /// handle).
+    Handle(HandleId),
+    /// Binding-rendered view. Produced by
+    /// [`Graph::describe_with_debug`] via the supplied
+    /// [`DebugBindingBoundary`]. The serialized JSON is whatever
+    /// shape the binding's `handle_to_debug` returned (string,
+    /// number, object — fully under binding control).
+    Rendered(serde_json::Value),
+}
+
+impl Serialize for DescribeValue {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DescribeValue::Handle(h) => ser.serialize_u64(h.raw()),
+            DescribeValue::Rendered(v) => v.serialize(ser),
+        }
+    }
 }
 
 /// Edge between two named nodes (or a named node and an anonymous
@@ -122,8 +171,36 @@ pub enum NodeStatus {
 impl Graph {
     /// Snapshot the graph's topology + lifecycle state. JSON form only
     /// in this slice (see module docs).
+    ///
+    /// `value` fields serialize as raw u64 handles. Pass a
+    /// [`DebugBindingBoundary`] to
+    /// [`Self::describe_with_debug`](Self::describe_with_debug)
+    /// instead if you want `value: T`-shaped output.
     #[must_use]
     pub fn describe(&self) -> GraphDescribeOutput {
+        self.describe_inner(None)
+    }
+
+    /// Variant of [`Self::describe`] that renders each node's
+    /// `value` via the supplied [`DebugBindingBoundary`].
+    ///
+    /// Useful when consuming `describe()` output to display values
+    /// to humans (e.g., debugging UIs, log scrapers) — the JSON
+    /// surfaces the binding's `T` shape rather than opaque u64
+    /// handles.
+    ///
+    /// The trait is intentionally outside
+    /// [`graphrefly_core::BindingBoundary`] so the hot-path FFI
+    /// surface stays narrow. Bindings opt in by implementing both.
+    /// Pre-1.0: bindings that don't ship `DebugBindingBoundary`
+    /// simply force callers to use raw [`Self::describe`] (no
+    /// fallback). See [`crate::debug`] for the trait's contract.
+    #[must_use]
+    pub fn describe_with_debug(&self, debug: &dyn DebugBindingBoundary) -> GraphDescribeOutput {
+        self.describe_inner(Some(debug))
+    }
+
+    fn describe_inner(&self, debug: Option<&dyn DebugBindingBoundary>) -> GraphDescribeOutput {
         let inner = self.inner.lock();
         let graph_name = inner.name.clone();
         let local_names: IndexMap<NodeId, String> = inner
@@ -163,16 +240,24 @@ impl Graph {
                 });
             }
 
+            // F sub-slice (2026-05-10): pick raw vs binding-rendered
+            // value. Sentinel cache (NO_HANDLE) → None regardless of
+            // mode. Real handle: route through debug binding when
+            // supplied, else surface raw.
+            let value = if cache == NO_HANDLE {
+                None
+            } else if let Some(debug) = debug {
+                Some(DescribeValue::Rendered(debug.handle_to_debug(cache)))
+            } else {
+                Some(DescribeValue::Handle(cache))
+            };
+
             nodes.insert(
                 name.clone(),
                 NodeDescribe {
                     r#type: type_str_of(kind),
                     status: status_of(kind, cache, terminal, dirty, fired),
-                    value: if cache == NO_HANDLE {
-                        None
-                    } else {
-                        Some(cache)
-                    },
+                    value,
                     deps: dep_names,
                     meta: None,
                 },
@@ -185,18 +270,6 @@ impl Graph {
             edges,
             subgraphs,
         }
-    }
-}
-
-/// Serialize `Option<HandleId>` as `null` or its raw u64.
-///
-/// Takes `&Option<T>` not `Option<&T>` because `serde`'s
-/// `serialize_with` API mandates the former signature.
-#[allow(clippy::ref_option)]
-fn ser_opt_handle<S: Serializer>(value: &Option<HandleId>, ser: S) -> Result<S::Ok, S::Error> {
-    match value {
-        Some(h) => ser.serialize_some(&h.raw()),
-        None => ser.serialize_none(),
     }
 }
 

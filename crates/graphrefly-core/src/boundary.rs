@@ -220,19 +220,62 @@ pub trait BindingBoundary: Send + Sync {
     /// Implementing this as a no-op is safe during prototyping; it matters
     /// for memory pressure under sustained load. The TS prototype's
     /// `bindings.ts` uses this to drive a `Map<HandleId, { value, refcount }>`.
+    ///
+    /// # Leaf-operation contract (/qa F2/M1, 2026-05-10) — HARD requirement
+    ///
+    /// Implementations MUST NOT re-enter Core from `release_handle`. The
+    /// Core's lock-held release paths (`Drop for CoreState`,
+    /// `Core::reset_for_fresh_lifecycle` Phase 3 / 3b / 5,
+    /// `OperatorScratch::release_handles` callers) invoke
+    /// `release_handle` while the state mutex is held; re-entering Core
+    /// (via `emit` / `subscribe` / `register` / nested `release_handle`
+    /// on a different handle that triggers a final-Drop hook into Core,
+    /// etc.) deadlocks against that lock.
+    ///
+    /// "Re-entry into Core" here means: calling any method on the same
+    /// `Core` instance (or any `Core` that shares state via `Arc::clone`
+    /// of the inner state mutex). Independent Cores are fine.
+    ///
+    /// Safe operations inside `release_handle`:
+    /// - Pure value-registry bookkeeping (decrement refcount, drop the
+    ///   underlying `T` when count reaches zero).
+    /// - Logging / metrics that don't re-enter Core.
+    /// - Calling other binding methods that themselves honor the
+    ///   leaf-op contract (e.g., a binding-internal mutex).
+    ///
+    /// Forbidden operations inside `release_handle`:
+    /// - Any `Core::emit` / `subscribe` / `register*` / `complete` /
+    ///   `error` / `teardown` / `invalidate` / `pause` / `resume` /
+    ///   `set_deps` / `batch` / `begin_batch`.
+    /// - Recursive `BindingBoundary::release_handle` on this binding
+    ///   that fans into Core via a binding-side final-Drop.
+    ///
+    /// Bindings that need lifecycle hooks on value-drop should buffer
+    /// the events and process them asynchronously (e.g., next tick on
+    /// the host runtime) so the Core lock is released before
+    /// re-entrance.
     fn release_handle(&self, handle: HandleId);
 
     /// Increment the refcount on `handle`. Called when the Core takes an
     /// additional reference to an existing handle that the binding side
-    /// already interned — currently used by the pause buffer (a buffered
+    /// already interned — used by the pause buffer (a buffered
     /// `Data(H)` outlives the cache slot that originally interned `H`, so
     /// the buffer needs its own refcount share to keep `H` alive across
-    /// later cache replacements).
+    /// later cache replacements), the operator-scratch pipeline (Scan/Reduce
+    /// seed retain, Last default retain), and Phase G's D-α fresh-scratch
+    /// install.
     ///
     /// Default: no-op. Bindings that don't track refcounts (e.g., trivial
     /// always-alive registries) can leave the default. Bindings that do
     /// (TS `bindings.ts`, the test runtime, the napi-rs bench harness) must
     /// override to bump the per-handle refcount.
+    ///
+    /// # Leaf-operation contract — HARD requirement
+    ///
+    /// Same leaf-op contract as [`Self::release_handle`]: implementations
+    /// MUST NOT re-enter Core from `retain_handle`. Core call sites
+    /// (notably `make_op_scratch_with_binding` called from Phase G's
+    /// lock-held window) assume the retain is a pure refcount bump.
     fn retain_handle(&self, _handle: HandleId) {}
 
     // -----------------------------------------------------------------

@@ -43,14 +43,16 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
+mod debug;
 mod describe;
 mod graph;
 mod mount;
 mod observe;
 
+pub use debug::DebugBindingBoundary;
 pub use describe::{
-    DescribeSink, EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus, NodeTypeStr,
-    ReactiveDescribeHandle,
+    DescribeSink, DescribeValue, EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus,
+    NodeTypeStr, ReactiveDescribeHandle,
 };
 pub use graph::{Graph, NameError, RemoveError, SignalKind};
 pub use mount::{GraphRemoveAudit, MountError};

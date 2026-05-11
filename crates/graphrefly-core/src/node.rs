@@ -720,6 +720,7 @@ impl Subscription {
 }
 
 impl Drop for Subscription {
+    #[allow(clippy::too_many_lines)] // Phase G is one continuous lifecycle hook chain (user cleanup → producer_deactivate → wipe_ctx → Core cache-clear); splitting it would obscure the ordering invariant.
     fn drop(&mut self) {
         // Silent no-op if Core is gone. This keeps Drop infallible (no panics
         // from a dropped subscription racing a dropped Core) and avoids
@@ -865,6 +866,21 @@ impl Drop for Subscription {
                 // asymmetric with the per-edge cleanup. F8 closes that
                 // by taking the scratch alongside per-edge handles
                 // and calling `release_handles` lock-released.
+                //
+                // D-α (D028 full close, 2026-05-10): for resubscribable
+                // operator nodes, take the OLD scratch AND build a
+                // FRESH scratch via `make_op_scratch` (lock-held, but
+                // `binding.retain_handle` is a leaf operation per
+                // op_state.rs:69-80 docs), install the fresh scratch
+                // on `rec.op_scratch`, and push the old scratch to
+                // `pending_scratch_release` for deferred release. The
+                // queue drains on the next `reset_for_fresh_lifecycle`
+                // (after Phase 2 takes fresh retains — preserves the
+                // C-3 /qa P1 seed-aliasing-acc invariant) or on
+                // `Drop for CoreState`. The fresh install gives
+                // re-activation correct counter / acc state (Take.taken
+                // back to 0, Scan.acc back to seed, etc.) matching TS
+                // Lock 6.D ("resets on every deactivation").
                 let (to_release, scratch_to_release): (
                     Vec<HandleId>,
                     Option<Box<dyn crate::op_state::OperatorScratch>>,
@@ -930,22 +946,49 @@ impl Drop for Subscription {
                         if rec.is_dynamic {
                             rec.tracked.clear();
                         }
-                        // F8 (/qa 2026-05-10): take op_scratch ONLY for
-                        // non-resubscribable nodes. Resubscribable nodes
-                        // need op_scratch to survive deactivation so
-                        // `reset_for_fresh_lifecycle` on the next subscribe
-                        // can run the "new-retain-first-then-old-release-
-                        // second" Slice C-3 /qa P1 ordering — releasing
-                        // the seed share here would collapse the registry
-                        // slot before reset can take a fresh retain
-                        // (verified by `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry`).
-                        // For non-resubscribable nodes there is no future
-                        // reset path, so eager release is safe and closes
-                        // the operator-state leak D028 partially flagged.
-                        let scratch = if rec.resubscribable {
+                        // F8 + D-α: op_scratch handling forks by
+                        // `resubscribable`. Non-resubscribable: eager
+                        // release (F8 path — there's no future reset
+                        // so the leak ends here). Resubscribable +
+                        // has-op: take old AND install fresh; defer
+                        // old release to the queue.
+                        let scratch = if !rec.resubscribable {
+                            std::mem::take(&mut rec.op_scratch)
+                        } else if let Some(op) = rec.op {
+                            // Slice C-3 /qa P1 (retain-before-release):
+                            // build fresh scratch FIRST (this calls
+                            // `binding.retain_handle` for any seed /
+                            // default the op carries), THEN swap. The
+                            // old scratch's release is deferred to the
+                            // `pending_scratch_release` queue (drained
+                            // on next reset_for_fresh_lifecycle or
+                            // Drop for CoreState).
+                            //
+                            // make_op_scratch is fallible only for
+                            // OperatorSeedSentinel; the OperatorOp
+                            // stored on NodeRecord passed validation
+                            // at registration time, so the unwrap
+                            // here is structurally guaranteed (mirrors
+                            // reset_for_fresh_lifecycle).
+                            //
+                            // Uses the binding-explicit static variant
+                            // because we have only `&dyn BindingBoundary`
+                            // here (Subscription::Drop holds no Core).
+                            let new_scratch = Core::make_op_scratch_with_binding(&*binding, op)
+                                .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
+                            let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
+                            if let Some(old_box) = old {
+                                s.pending_scratch_release.push(old_box);
+                            }
+                            // The "scratch_to_release" for lock-released
+                            // release stays None here — the resubscribable
+                            // case routes through the queue.
                             None
                         } else {
-                            std::mem::take(&mut rec.op_scratch)
+                            // Resubscribable but no op (e.g. derived
+                            // compute / dynamic / state). Nothing to
+                            // do for op_scratch.
+                            None
                         };
                         (handles, scratch)
                     } else {
@@ -1782,6 +1825,44 @@ pub(crate) struct CoreState {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
+    /// D-α (D028 full close, 2026-05-10): per-Core defer queue for old
+    /// operator-scratch boxes pushed by Phase G on resubscribable nodes.
+    /// Phase G builds a fresh scratch via [`Core::make_op_scratch`] and
+    /// installs it on the node's `op_scratch` slot (so re-activation
+    /// sees fresh counters / a fresh seed-share); the OLD scratch's
+    /// handle retains are deferred to one of two drain points to
+    /// preserve the Slice C-3 /qa P1 retain-before-release invariant
+    /// (the C-3 test
+    /// `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry`
+    /// fails if the old `acc` share is released before the fresh seed
+    /// share is taken — when `acc == seed` interns to the same registry
+    /// slot, eager release drops the slot to zero before the fresh
+    /// retain bumps it back up).
+    ///
+    /// Drain points:
+    /// 1. [`Core::reset_for_fresh_lifecycle`] — after Phase 2 takes
+    ///    fresh retains on the new seed/default, the queue drain
+    ///    releases queued boxes whose handles may have aliased.
+    /// 2. [`Drop for CoreState`] — catch-all on Core shutdown.
+    ///
+    /// Note that the queue lives on `CoreState` (not on `Core`) so
+    /// `Drop for CoreState` has access to both the binding and the
+    /// queue under the single state lock — no separate mutex needed.
+    ///
+    /// **Growth bound (/qa m17, 2026-05-10):** size is bounded by the
+    /// number of non-terminal deactivate-reactivate cycles since the
+    /// last terminal-then-resubscribe reset on any resubscribable +
+    /// has-op node in this Core. Each entry is a `Box<dyn OperatorScratch>`
+    /// holding O(1) handles (Scan/Reduce/Last: 1 handle; Take/Skip/
+    /// TakeWhile/DistinctUntilChanged/Pairwise: 0 or 1 handle). Typical
+    /// workloads: O(few KB). Degenerate workloads (long-lived Cores
+    /// with frequent deactivate-reactivate cycles and no terminal
+    /// resets) should call `core.complete()` / `core.error()` on the
+    /// op node periodically to trigger queue drain via
+    /// `reset_for_fresh_lifecycle`. The release happens unconditionally
+    /// on Core drop, so this is not a leak — just a deferred-release
+    /// growth concern under unusual workloads.
+    pub(crate) pending_scratch_release: Vec<Box<dyn crate::op_state::OperatorScratch>>,
     // /qa F2 reverted (2026-05-10): `currently_firing` field is declared
     // EARLIER in this struct (above `pause_buffer_cap`). Sub-slice 3
     // briefly moved it to `crate::batch::WaveState::currently_firing` on
@@ -2014,6 +2095,7 @@ impl Core {
                 binding: binding.clone(),
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
+                pending_scratch_release: Vec::new(),
             })),
             binding,
             deferred_producer_ops: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2974,8 +3056,10 @@ impl Core {
 
     /// Build a fresh [`OperatorScratch`](crate::op_state::OperatorScratch)
     /// box for an operator variant, taking any required handle retains.
-    /// Shared between `register_operator` (initial install) and
-    /// `reset_for_fresh_lifecycle` (resubscribable cycle re-install).
+    /// Shared between `register_operator` (initial install),
+    /// `reset_for_fresh_lifecycle` (resubscribable terminal-cycle
+    /// re-install), and Phase G of `Subscription::Drop` (D-α
+    /// resubscribable + non-terminal deactivate re-install).
     ///
     /// # Errors
     ///
@@ -2986,6 +3070,18 @@ impl Core {
     /// `Err` leaves no handles dangling.
     fn make_op_scratch(
         &self,
+        op: OperatorOp,
+    ) -> Result<Option<Box<dyn crate::op_state::OperatorScratch>>, RegisterError> {
+        Self::make_op_scratch_with_binding(&*self.binding, op)
+    }
+
+    /// Associated-function variant of [`Self::make_op_scratch`] that
+    /// takes the binding explicitly. Used by call sites that have a
+    /// `&dyn BindingBoundary` but not a `&Core` (notably
+    /// [`Subscription::Drop`]'s Phase G, which holds only a
+    /// `Weak<Mutex<CoreState>>` and operates on `s.binding`).
+    pub(crate) fn make_op_scratch_with_binding(
+        binding: &dyn BindingBoundary,
         op: OperatorOp,
     ) -> Result<Option<Box<dyn crate::op_state::OperatorScratch>>, RegisterError> {
         use crate::op_state::{
@@ -3009,7 +3105,7 @@ impl Core {
                     return Err(RegisterError::OperatorSeedSentinel);
                 }
                 let state = Box::new(ScanState { acc: seed });
-                self.binding.retain_handle(seed);
+                binding.retain_handle(seed);
                 Ok(Some(state))
             }
             OperatorOp::Reduce { seed, .. } => {
@@ -3017,7 +3113,7 @@ impl Core {
                     return Err(RegisterError::OperatorSeedSentinel);
                 }
                 let state = Box::new(ReduceState { acc: seed });
-                self.binding.retain_handle(seed);
+                binding.retain_handle(seed);
                 Ok(Some(state))
             }
             OperatorOp::DistinctUntilChanged { .. } => Ok(Some(Box::new(DistinctState::default()))),
@@ -3031,7 +3127,7 @@ impl Core {
                     default,
                 });
                 if default != NO_HANDLE {
-                    self.binding.retain_handle(default);
+                    binding.retain_handle(default);
                 }
                 Ok(Some(state))
             }
@@ -3535,6 +3631,22 @@ impl Core {
             scratch.release_handles(&*self.binding);
         }
         drop(old_scratch);
+
+        // Phase 3b (D-α, D028 full close, 2026-05-10): drain the
+        // per-Core `pending_scratch_release` queue populated by Phase G
+        // on prior resubscribable + non-terminal deactivate cycles.
+        // Queued boxes' shares may alias the seed/default we just
+        // retained in Phase 2 (e.g., when scan's `acc` interns to the
+        // same registry slot as `seed`). Releasing AFTER Phase 2's
+        // floor keeps the registry slot at refcount ≥1 throughout —
+        // mirrors the Phase 2/3 retain-before-release ordering. Safe
+        // even when the queue is empty (no prior deactivations
+        // happened).
+        let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
+            std::mem::take(&mut s.pending_scratch_release);
+        for mut scratch in queued {
+            scratch.release_handles(&*self.binding);
+        }
 
         // Phase 4: install the fresh scratch.
         {
@@ -5496,6 +5608,23 @@ impl Drop for CoreState {
             if let Some(scratch) = rec.op_scratch.as_mut() {
                 scratch.release_handles(&*self.binding);
             }
+        }
+
+        // D-α (D028 full close, 2026-05-10): drain the
+        // `pending_scratch_release` queue (Phase G of
+        // `Subscription::Drop` pushes old operator-scratch boxes here
+        // on resubscribable + non-terminal deactivate). Catch-all for
+        // Core shutdown — anything still queued never made it through
+        // a `reset_for_fresh_lifecycle` drain. Release happens BEFORE
+        // the queue's `Vec<Box<dyn OperatorScratch>>` drops, because
+        // each box's `Drop` impl is a plain `mem::drop` of the state
+        // struct fields (HandleIds are raw u64s; the boxes don't
+        // re-enter the binding on drop). Without this explicit drain
+        // the binding-side refcount is left bumped on Core shutdown.
+        let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
+            std::mem::take(&mut self.pending_scratch_release);
+        for mut scratch in queued {
+            scratch.release_handles(&*self.binding);
         }
 
         // Q-beyond Sub-slice 1 + 2 (D108, 2026-05-09): WaveState's

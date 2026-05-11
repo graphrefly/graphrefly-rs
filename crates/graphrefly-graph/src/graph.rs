@@ -822,8 +822,43 @@ impl Graph {
     /// `Core::invalidate(meta_id)` still wipes a meta's cache — the
     /// filter applies only to this graph-layer broadcast.
     ///
+    /// **Two-phase tree-wide gather (E sub-slice, 2026-05-10).** Phase 1
+    /// recursively walks the mount tree under per-graph locks (each
+    /// child locked briefly to extract its names + meta filter + children
+    /// snapshot, then released), accumulating a flat list of `NodeId`s to
+    /// invalidate. Phase 2 runs `Core::invalidate` on the flat list —
+    /// no Graph locks held during the cascade. The split:
+    ///
+    /// - Tightens the snapshot to **whole-mount-tree** scope: an `add`
+    ///   to a subtree-root graph AFTER its snapshot completes won't
+    ///   cause a parent-graph invalidate to fire on the new node, but
+    ///   it also won't sneak into an interleaved invalidate cascade
+    ///   either. Mid-walk topology mutations are visible only to
+    ///   not-yet-snapshotted subgraphs.
+    /// - Preserves the lock-acquisition rule (R3.7.2 / Slice F /qa D2):
+    ///   `Graph::inner` is dropped BEFORE any `Core::invalidate` call.
+    ///   Core's invalidate cascade re-entering the Graph layer (for
+    ///   describe-reactive notifications, etc.) cannot deadlock against
+    ///   a Graph-held lock.
+    /// - Makes invalidate ordering deterministic: DFS pre-order (parent
+    ///   before children) across the entire mount tree.
+    ///
     /// Idempotent on a destroyed graph (no-op).
     pub fn signal_invalidate(&self) {
+        let mut to_invalidate: Vec<NodeId> = Vec::new();
+        self.collect_signal_invalidate_ids(&mut to_invalidate);
+        for id in to_invalidate {
+            self.core.invalidate(id);
+        }
+    }
+
+    /// Recursive gather pass for [`Self::signal_invalidate`]. Pushes
+    /// every named node id (modulo meta-companion filter) across this
+    /// graph and its mount subtree into `out`, in DFS pre-order.
+    ///
+    /// Each subgraph is locked briefly and independently — no nested
+    /// locks. Skips destroyed subgraphs (idempotent).
+    fn collect_signal_invalidate_ids(&self, out: &mut Vec<NodeId>) {
         let (own_ids, meta_set, child_clones) = {
             let inner = self.inner.lock();
             if inner.destroyed {
@@ -848,10 +883,10 @@ impl Graph {
             if meta_set.contains(&id) {
                 continue;
             }
-            self.core.invalidate(id);
+            out.push(id);
         }
         for child in child_clones {
-            child.signal_invalidate();
+            child.collect_signal_invalidate_ids(out);
         }
     }
 

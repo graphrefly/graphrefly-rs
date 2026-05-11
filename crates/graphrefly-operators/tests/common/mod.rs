@@ -525,6 +525,54 @@ impl OpRuntime {
         let packer = self.make_packer();
         self.op_binding.register_packer(packer)
     }
+
+    /// B sub-slice (2026-05-10): execute `f` inside a `core.batch()`
+    /// scope that pre-acquires every CURRENTLY-EXISTING partition's
+    /// wave_owner. Sources registered BEFORE the helper call are
+    /// pre-held; subscribing to them yields `SubscribeOutcome::Dead`
+    /// SYNCHRONOUSLY when terminal + non-resubscribable (vs the
+    /// `SubscribeOutcome::Deferred` path under Phase H+ STRICT).
+    ///
+    /// This unblocks F2 end-to-end Dead-path tests: pre-D-α the
+    /// existing test workarounds (using meta-companion partitions)
+    /// hit the Phase H+ Deferred path instead of the immediate-Dead
+    /// path, so per-op Dead handlers couldn't be exercised end-to-end.
+    ///
+    /// Why holding all partitions works: `try_subscribe(source)`
+    /// inside the producer's activation wave acquires `source`'s
+    /// partition lock. Because the outer `batch()` already holds it
+    /// (via the parking_lot::ReentrantMutex), same-thread re-acquire
+    /// is free; the Phase H+ ascending-order check passes because all
+    /// partitions are already held by this thread. The subscribe
+    /// path then sees the source's `resubscribable=false +
+    /// terminal=Some(...)` state and returns
+    /// `SubscribeError::TornDown`, which `ProducerCtx::subscribe_to`
+    /// surfaces as `SubscribeOutcome::Dead`.
+    ///
+    /// **Scope caveats (/qa m10/m24, 2026-05-10):**
+    /// 1. **New partitions created INSIDE the closure are NOT
+    ///    pre-held.** When the closure calls `zip(...)` or another
+    ///    factory that registers a producer-shape node, that node's
+    ///    own partition is created mid-closure. The producer's
+    ///    activation wave acquires it independently. This still
+    ///    works for the Dead path because the activation wave's
+    ///    `try_subscribe(source)` only needs SOURCE's partition held
+    ///    (which it is, via the outer batch's pre-acquire), not the
+    ///    producer's own partition.
+    /// 2. **Cross-Core scenarios are out of scope.** `core.batch()`
+    ///    acquires only THIS Core's partitions. A source on a
+    ///    different Core (cross-Core mount) is not held by this
+    ///    helper.
+    /// 3. **Retry-validate panic possibility.** `core.begin_batch()`
+    ///    uses a bounded retry-validate loop and panics with
+    ///    `"exceeded {MAX_LOCK_RETRIES} retries"` on pathological
+    ///    concurrent `register` / `set_deps` activity. Test workloads
+    ///    that interleave registration with this helper may surface
+    ///    this; the panic is informative.
+    pub fn with_all_partitions_held<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        let _g = self.core.begin_batch();
+        f(self)
+    }
 }
 
 impl Drop for OpRuntime {
