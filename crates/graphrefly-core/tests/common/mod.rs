@@ -524,6 +524,37 @@ impl BindingBoundary for TestBinding {
         }
     }
 
+    fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.values.get(&handle).map(|v| match v {
+            TestValue::Int(n) => serde_json::Value::Number((*n).into()),
+            TestValue::Str(s) => serde_json::Value::String(s.clone()),
+            TestValue::Null => serde_json::Value::Null,
+            TestValue::Object(obj) => {
+                serde_json::json!({ "label": obj.label, "x": obj.x })
+            }
+        })
+    }
+
+    fn deserialize_value(&self, value: serde_json::Value) -> HandleId {
+        let test_value = match &value {
+            serde_json::Value::Number(n) => TestValue::Int(n.as_i64().expect("integer value")),
+            serde_json::Value::String(s) => TestValue::Str(s.clone()),
+            serde_json::Value::Null => TestValue::Null,
+            serde_json::Value::Object(map) => {
+                let label = map
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let x = map.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                TestValue::Object(std::sync::Arc::new(TestObject { label, x }))
+            }
+            _ => panic!("unsupported JSON value for deserialization: {value:?}"),
+        };
+        self.intern(test_value)
+    }
+
     fn wipe_ctx(&self, node_id: NodeId) {
         self.wipe_calls
             .lock()

@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-10 (Q-beyond CLOSED with bench-driven scope reduction; per-partition `nodes`/`children` shards (sub-slice 4) DEFERRED evidence-gated; Phase H+ STRICT CLOSED)
+last_updated: 2026-05-11 (M4.F parity tests landed; no new deferred items)
 ---
 
 # Porting flags & deferred concerns
@@ -148,12 +148,9 @@ per fn-fire).
 - **Lift point:** convert recursion to iteration using an explicit `Vec<Graph>` worklist. Pop a graph, lock briefly, push children to the worklist, push own ids to `out`. Mirrors the destroy() cascade pattern at `graph.rs:874`.
 - **Source:** /qa Blind Hunter Major (2026-05-10 A/B/D/E/F batch review).
 
-### M4.B `flush()` pending data loss on encode / write failure (lift @ M4.D redb)
+### ~~M4.B `flush()` pending data loss on encode / write failure~~ — RESOLVED 2026-05-11 (D165)
 
-- **What:** [crates/graphrefly-storage/src/memory.rs](../crates/graphrefly-storage/src/memory.rs) `SnapshotStorage::flush`, `KvStorage::flush`, and `AppendLogStorage::flush` all take pending state via `std::mem::take` BEFORE invoking the fallible `codec.encode` / `backend.write` operations. If encode fails or write fails partway through, the pending state is already gone and there's no retry path — data is lost.
-- **Why acceptable at v1:** TS impl has the same pattern (`pending = undefined; codec.encode(slot.snapshot)` — TS loses pending on async backend rejection). M4.B intentionally matches TS behavior. The retry-safe variant (clone pending, commit only on success) adds buffer-copy overhead on every flush; the canonical fix lives in M4.D where redb's `Database::begin_write` ACID transaction naturally provides all-or-nothing semantics.
-- **Lift point (M4.D):** redb-backed `RedbStorage` wraps the tier's flush in a `WriteTransaction` so a mid-flush error rolls back the transaction; the tier-level pending state can then be restored from the rolled-back transaction state (or the tier holds a clone for the transaction's lifetime). When this lands, the in-memory / file backends inherit the pattern.
-- **Source:** /qa F1 (D138-followup, 2026-05-10). Cross-language parity preserved with TS — TS-side has the same gap and the same lift path (TS-side waits for the Rust port's M4.E `attach_storage` redb integration to inform the retry-safe shape).
+All three tier `flush()` impls restructured to restore pending state on encode/write failure. `SnapshotStorage::try_flush` returns `Err((T, StorageError))` — caller restores T to `pending`. KV and AppendLog flush loops restore remaining unprocessed entries on any mid-loop error. Two regression tests in `tests/redb_backend.rs` (`f1_snapshot_flush_failure_preserves_pending`, `f1_kv_flush_failure_preserves_pending`) verify the restore path using a `FailWrite` stub backend. Additionally, redb's per-write ACID transactions (D163) provide backend-level durability — a committed write is durable regardless of what happens to the tier's in-process state.
 
 ### M4.B `compact_every` modulo semantics — single-add equivalent to TS, batch saves use boundary-crossing
 
@@ -162,26 +159,21 @@ per fn-fire).
 - **Cross-language coordination:** Rust fix at `crates/graphrefly-storage/src/memory.rs` (all three `*Tier` impls); TS fix at `packages/pure-ts/src/extra/storage/tiers.ts` (all three factories). Both impls verified test-green post-fix.
 - **Source:** /qa F2 (D138-followup, 2026-05-10).
 
-### M4.B `AppendLogStorage::flush` concurrent-write race (lift @ M4.D redb)
+### ~~M4.B `AppendLogStorage::flush` concurrent-write race (lift @ M4.D redb)~~ — RESOLVED 2026-05-11 (D163)
 
-- **What:** [crates/graphrefly-storage/src/memory.rs](../crates/graphrefly-storage/src/memory.rs) `AppendLogStorage::flush` releases the tier mutex after `mem::take` of the pending buckets, then does read-merge-write per bucket without any cross-tier lock. Two concurrent `flush()` calls on the SAME tier (or two tiers writing the same backend key) can both read baseline=N entries, merge their own bucket, and write — last writer wins, loser's appends dropped.
-- **Why acceptable at v1:** TS impl uses a Promise-chain (`flushChain`) to serialize flushes against async backends; Rust sync backends don't auto-serialize. A per-tier `flush_lock: Mutex<()>` would close this but is redundant with redb's transactional semantics.
-- **Lift point (M4.D):** redb's `Database::begin_write` serializes concurrent writes by definition. M4.D `RedbStorage::flush` will hold a write transaction for the duration; multi-tier writes to the same key serialize through the transaction. Memory / file backends can inherit either via the same per-tier mutex pattern OR by being marked single-threaded-only in their rustdoc.
-- **Source:** /qa F3 (2026-05-10). Cross-references the TS `flushChain` precedent at `packages/pure-ts/src/extra/storage/tiers.ts:467-471`.
+redb per-write ACID transactions (D163) serialize concurrent writers by MVCC design — `Database::begin_write` blocks until the previous write transaction commits. Two concurrent `flush()` calls on the same tier or on tiers sharing a backend are serialized at the database level; no per-tier `flush_lock` needed. Memory and file backends remain single-writer-documented (their rustdoc already notes "not thread-safe for concurrent writes"). The structural race is closed for the production backend (redb); non-production backends carry explicit documentation.
 
-### M4.B Snapshot `last_saved_key` is process-local — cross-restart `load()` with custom `key_of` (lift @ M4.E manifest)
+### ~~M4.B Snapshot `last_saved_key` is process-local — cross-restart `load()` with custom `key_of` (lift @ M4.E manifest)~~ — STRUCTURALLY CLOSED 2026-05-11 (D174)
 
 - **What:** [crates/graphrefly-storage/src/memory.rs](../crates/graphrefly-storage/src/memory.rs) `SnapshotStorage::last_saved_key` tracks the most recent backend key written. On a fresh process attaching a tier to an existing backend, this field is `None`, so `load()` falls back to `self.name`. If the prior run wrote under a `key_of`-derived key that differs from `tier.name`, `load()` returns `None` even though a baseline exists.
-- **Why acceptable at v1:** TS impl has the same gap (`_lastSavedKey` is closure-local; lost across processes). TS's default `key_of` peeks into the snapshot's `name` field (see "M4.B Snapshot `key_of` default divergence" below) which masks the issue in common cases, but the underlying problem is the same: no manifest persistence at the tier layer.
-- **Lift point (M4.E):** Graph-side `attach_storage` writes a manifest entry (`<graph.name>/manifest` → `{ snapshot_key, last_frame_seq, ... }`) on every commit; on restore, manifest is consulted first to derive the snapshot key. Tier-level `last_saved_key` becomes a cache; manifest is the source of truth.
-- **Source:** /qa F4 (2026-05-10).
+- **Status (M4.E2 close):** D174 structurally closes this. `attach_snapshot_storage` derives the snapshot key deterministically from `graph.name` via `key_of` — no manifest needed. `restore_snapshot` uses the same `key_of` derivation. The tier-level `last_saved_key` gap is masked by the graph-level deterministic keying.
+- **Source:** /qa F4 (2026-05-10); closed D174 / M4.E2 (2026-05-11).
 
-### M4.B Snapshot `key_of` default doesn't peek into `T::name` field — cross-impl divergence
+### ~~M4.B Snapshot `key_of` default doesn't peek into `T::name` field — cross-impl divergence~~ — STRUCTURALLY CLOSED 2026-05-11 (D174)
 
 - **What:** TS `snapshotStorage` default `key_of` at `packages/pure-ts/src/extra/storage/tiers.ts:346-348` is `(v) => (v as { name?: string }).name ?? opts.name ?? backend.name ?? "snapshot"` — it inspects the snapshot for a `name` field. Rust `snapshot_storage` default at `crates/graphrefly-storage/src/memory.rs:111-115` always uses `tier.name`. Cross-impl: a Rust writer using default `key_of` and `Snap { name: "alpha", value: 1 }` writes under `tier.name`; a TS writer with the same snapshot writes under `"alpha"`. WAL files written by one impl can't be loaded by the other.
-- **Why acceptable at v1:** the TS "peek into T" pattern relies on TypeScript's structural type erasure (any object with a `name` field works); Rust would need either a `HasName` trait + blanket-impl or runtime serde-Value reflection. Both add complexity for a heuristic. Explicit `key_of` is cleaner and forces the user to think about keying.
-- **Lift point:** M4.E `Graph::attach_storage` passes a `key_of` derived from `graph.name` (the canonical pattern) when attaching the default snapshot tier. Users with custom T shapes pass their own `key_of` explicitly. The cross-impl `key_of` divergence then disappears at the attach boundary.
-- **Source:** /qa F8 (2026-05-10).
+- **Status (M4.E2 close):** D174 structurally closes this at the graph-integration layer. `attach_snapshot_storage` always passes `key_of = |snap| snap.name` (derived from `graph.name`), so both impls converge at the attach boundary. The tier-level default `key_of` divergence remains but is irrelevant when using the graph-level API.
+- **Source:** /qa F8 (2026-05-10); closed D174 / M4.E2 (2026-05-11).
 
 ### Cross-language `format_version` field missing from `WALFrame<T>` — spec §d gap
 
@@ -190,13 +182,49 @@ per fn-fire).
 - **Lift point (M4.E or cross-language batch):** add `pub format_version: u32` to `WALFrame<T>` (both impls); include in canonical-JSON body for checksum; bump parity fixtures. Cross-references TS-side `docs/optimizations.md` entry.
 - **Source:** /qa F7 (2026-05-10). Cross-language scope — tracked in TS `docs/optimizations.md` under "Active work items".
 
-### M4.B tier-level setTimeout-equivalent debounce (lift @ M4.E)
+### M4.B tier-level setTimeout-equivalent debounce (lift @ reactive timer port)
 
 - **What:** [crates/graphrefly-storage/src/tier.rs](../crates/graphrefly-storage/src/tier.rs) `BaseStorageTier::debounce_ms` surfaces the configured debounce window. **The tier itself does NOT drive a timer.** `save()` always buffers; `flush()` always commits; `compact_every` triggers immediate flush on Nth write (sync counter). `debounce_ms > 0` is currently a no-op at the tier level — buffered writes sit until something else (Graph wave-close, explicit `flush()`, `compact()` call, `compact_every` trigger) drains them.
-- **Why acceptable at v1:** the M4.B sub-slice is sync-only (D143); a tier-level timer would require either `tokio::time::sleep` (forces graphrefly-storage into tokio) or a per-tier OS thread (CLAUDE.md "no polling"; threading overhead per tier doesn't compose for many-tier scenarios). At M4.E, Graph already needs reactive timer sources (`from_timer` / `from_cron`); concentrating timer ownership there is structurally cleaner than tier-level setTimeout.
-- **Lift point (M4.E):** when `Graph::attach_storage` lands, it reads each attached tier's `debounce_ms` and schedules a `from_timer(debounce_ms).map(|_| tier.flush())` reactive subgraph at attach time. Tier-level API doesn't change — only the wiring at attach.
+- **Status (M4.E2 update):** `attach_snapshot_storage` landed in M4.E2 (2026-05-11) with sync-through only (D171). The `debounce_ms` field on `AttachOptions` exists but is documented as having no effect until reactive timer sources (`from_timer` / `from_cron`) are ported to Rust. Sync-through flush occurs on every tier-3+ message.
+- **Why acceptable at v1:** a tier-level timer would require either `tokio::time::sleep` (forces graphrefly-storage into tokio) or a per-tier OS thread (CLAUDE.md "no polling"; threading overhead per tier doesn't compose for many-tier scenarios). Reactive timer sources concentrate timer ownership at the graph layer — structurally cleaner.
+- **Lift point:** when `from_timer` / `from_cron` are ported to Rust (M5 or earlier if needed), `attach_snapshot_storage` reads each attached tier's `debounce_ms` and schedules a `from_timer(debounce_ms).map(|_| tier.flush())` reactive subgraph at attach time. Tier-level API doesn't change — only the wiring at attach.
 - **Until then:** users who care about debounced flush must call `tier.flush()` explicitly. The `compact_every` knob is a partial substitute (write-count-based, not time-based).
-- **Source:** D144 / M4.B slice 2026-05-10. Documented inline at `tier.rs` module-doc.
+- **Source:** D144 / M4.B slice 2026-05-10; updated D171 / M4.E2 slice 2026-05-11.
+
+### M4.C `FileBackend` case-insensitive-filesystem key collision
+
+- **What:** [crates/graphrefly-storage/src/file.rs](../crates/graphrefly-storage/src/file.rs) `encode_key_to_filename` preserves ASCII alphanumeric case (`Foo` encodes to `Foo`, `foo` to `foo`). On case-insensitive filesystems (default macOS HFS+ / APFS, default Windows NTFS) the files `Foo.bin` and `foo.bin` collide — last `write` wins, the second `read` returns the wrong value, `list` reports only one entry. Cross-impl parity is preserved (TS `fileBackend` has the same behavior).
+- **Why acceptable at v1:** graphrefly-internal keys (tier names, `<graph>/wal/<seq>` paths) are case-consistent by construction — there's no internal pattern that produces case-divergent siblings. Adversarial user-supplied keys with case-only differences are a deliberate footgun on any filesystem; the inherent constraint is unavoidable without a filesystem-portability adapter.
+- **Lift point:** at M4.E `Graph::attach_storage` or a focused follow-on slice, either (a) document the constraint loudly and trust the user; (b) detect the filesystem case-sensitivity at attach time (`File::create_new("Probe-X.bin")` + `File::open("probe-x.bin")` — collision indicates case-insensitive) and reject case-divergent keys with a clear diagnostic; (c) lowercase-fold all keys before encoding (lossy — breaks round-trip for users who genuinely want distinct casings). (a) and (b) are both viable; (c) is not acceptable pre-1.0.
+- **Source:** M4.C slice 2026-05-10. Documented inline at `file.rs` `FileBackend` struct doc.
+
+### M4.E1 `from_snapshot` auto-hydration doesn't handle cross-subgraph deps
+
+- **What:** `Graph::from_snapshot` auto-hydration mode resolves deps by name within the same graph's `created` map. If a node in the snapshot depends on a node in a mounted subgraph (cross-mount dep), the dep name won't be found in the local `created` map, and the node will be reported as `UnresolvableDeps`. The TS impl has the same limitation — `from_snapshot` only resolves local deps.
+- **Why acceptable at v1:** cross-mount deps are rare in practice (most deps are local to the graph they're declared in). The builder mode of `from_snapshot` handles cross-mount deps naturally because the user wires topology explicitly. Auto-hydration mode is primarily for state-heavy graphs with simple topologies.
+- **Lift point:** when cross-mount dep resolution is needed, extend the `created` map to include subgraph nodes with qualified names (e.g. `"subgraph.nodeName"`), or pass a pre-populated dep resolver that can look up nodes across the mount tree.
+- **Source:** D168 / M4.E1 slice 2026-05-11.
+
+### M4.E2 ownership lifecycle replay in `apply_wal_frame` (mount/unmount)
+
+- **What:** `apply_wal_frame` in `graph_integration.rs` handles `WalTag::SpecAdd` (graph.add) and `WalTag::SpecRemove` (graph.remove) for state nodes. It does NOT handle ownership lifecycle frames (mount/unmount subgraphs) because the WAL tag vocabulary doesn't include mount/unmount variants yet. Subgraph added/removed entries in `GraphSnapshotDiff` are computed by `diff_snapshots` but not decomposed to WAL frames by `decompose_diff_to_frames`.
+- **Why acceptable at v1:** subgraph mount/unmount is a topology change that's best handled at the `from_snapshot` / `restore` level (which already supports recursive subgraphs). WAL-level replay of mount/unmount would require new `WalTag` variants and careful ordering (mount parent before children). Current restore path handles subgraph topology via baseline snapshot restore.
+- **Lift point:** when the WAL tag vocabulary is extended to include mount/unmount lifecycle events, add corresponding arms to `apply_wal_frame` and `decompose_diff_to_frames`.
+- **Source:** D172 / M4.E2 slice 2026-05-11.
+
+### M4.E2 `attach_snapshot_storage` TEARDOWN tier excluded from persistence
+
+- **What:** The `observe_all_reactive` subscription in `attach_snapshot_storage` filters to tiers 3–5 (`(3..6).contains(&t)`). Tier 6 (TEARDOWN) is excluded. This means a node's teardown event is NOT persisted to the WAL. On restore, torn-down nodes will appear as their last pre-teardown state (COMPLETE or ERROR).
+- **Why acceptable at v1:** TEARDOWN is a terminal lifecycle event that triggers cleanup. Restoring a graph to a pre-teardown state is generally the desired behavior — teardown cleanup actions are not idempotent and should not be replayed. The TS implementation has the same behavior.
+- **Lift point:** if a use case arises where teardown state needs to persist (e.g., audit log), add tier 6 to the filter and a corresponding `WalTag::Teardown` variant.
+- **Source:** M4.E2 slice 2026-05-11.
+
+### M4.E1 snapshot torn-read caveat (concurrent mutation)
+
+- **What:** `Graph::snapshot()` takes state-at-call-time. If nodes are being mutated concurrently (from another thread or re-entrant wave), the snapshot may capture a mix of pre- and post-mutation values. The inner lock protects the namespace walk, but individual `core.cache_of` / `core.is_terminal` calls after the lock drop can observe mid-wave state.
+- **Why acceptable at v1:** TS impl has the same semantics — `snapshot()` is a synchronous point-in-time capture. The doc comment explicitly notes: "use `Graph::batch` or `Graph::signal(Pause)` for consistency if needed." No user has requested snapshot-level isolation.
+- **Lift point:** if needed, `snapshot()` could acquire the Core lock for the entire walk (snapshot under lock), or use a copy-on-write epoch to freeze state for the duration of serialization. Both add complexity for a scenario that hasn't been reported.
+- **Source:** D167 / M4.E1 slice 2026-05-11.
 
 ### M4.A canonical-JSON parity caveats (WAL checksum)
 

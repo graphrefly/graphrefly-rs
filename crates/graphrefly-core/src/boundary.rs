@@ -496,6 +496,39 @@ pub trait BindingBoundary: Send + Sync {
     /// unchanged.
     fn cleanup_for(&self, _node_id: NodeId, _trigger: CleanupTrigger) {}
 
+    // -----------------------------------------------------------------
+    // Snapshot serialization (M4.E1 — D166). The Core operates on
+    // opaque HandleId integers; snapshot persistence needs to cross
+    // the cleaving plane to serialize/deserialize user values as JSON.
+    // Default impls return None / panic so bindings without snapshot
+    // support compile unchanged.
+    // -----------------------------------------------------------------
+
+    /// Serialize a handle's value to JSON for snapshot persistence.
+    /// Returns `None` if the handle is unknown or unresolvable.
+    ///
+    /// Called by `Graph::snapshot()` for each node's cache handle.
+    /// The binding dereferences `handle` to its underlying `T` and
+    /// produces a `serde_json::Value` that will survive serialization
+    /// round-trips (i.e., JSON-safe: no functions, no circular refs).
+    ///
+    /// Default returns `None` — bindings that don't support snapshots
+    /// get `value: null` in the snapshot output.
+    fn serialize_handle(&self, _handle: HandleId) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Deserialize a JSON value back into a handle for snapshot restore.
+    /// The binding interns the value and returns its `HandleId`.
+    ///
+    /// Called by `Graph::restore()` / `Graph::from_snapshot()` for each
+    /// node's serialized value.
+    ///
+    /// Default panics — bindings that restore snapshots MUST override.
+    fn deserialize_value(&self, _value: serde_json::Value) -> HandleId {
+        unimplemented!("deserialize_value: this binding does not support snapshot restore (D166)")
+    }
+
     /// Wipe the binding-side ctx state for `node_id`.
     ///
     /// Called by Core ONLY on resubscribable terminal reset, per **R2.4.6**:

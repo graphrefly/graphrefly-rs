@@ -2722,6 +2722,16 @@ impl Core {
         id
     }
 
+    /// Access the binding boundary for this Core.
+    ///
+    /// Used by `graphrefly-graph` for snapshot serialization (M4.E1 / D166):
+    /// `Graph::snapshot()` calls `binding.serialize_handle(cache)` to
+    /// project each node's cached value into portable JSON.
+    #[must_use]
+    pub fn binding_ptr(&self) -> &Arc<dyn BindingBoundary> {
+        &self.binding
+    }
+
     // -------------------------------------------------------------------
     // Registration — unified `register()` (D030, Slice D)
     //

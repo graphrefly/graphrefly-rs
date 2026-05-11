@@ -33,6 +33,10 @@ parking_lot      = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 
+[dev-dependencies]
+indexmap.workspace = true
+tempfile = "3"
+
 [features]
 default = ["memory", "file", "redb-store"]
 memory     = []

@@ -48,6 +48,7 @@ mod describe;
 mod graph;
 mod mount;
 mod observe;
+mod snapshot;
 
 pub use debug::DebugBindingBoundary;
 pub use describe::{
@@ -57,3 +58,7 @@ pub use describe::{
 pub use graph::{Graph, NameError, RemoveError, SignalKind};
 pub use mount::{GraphRemoveAudit, MountError};
 pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne};
+pub use snapshot::{
+    GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus, SnapshotBuilder,
+    SnapshotError,
+};

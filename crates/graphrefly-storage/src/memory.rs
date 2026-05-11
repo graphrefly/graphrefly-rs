@@ -145,19 +145,24 @@ where
     T: Send + Sync + 'static,
     C: Codec<T>,
 {
-    fn flush_now_locked(
+    /// Encode + write a snapshot to the backend, updating `last_saved_key` on
+    /// success. Returns `Err((snapshot, error))` on failure so the caller can
+    /// restore the snapshot to the pending slot (D165 — F1 fix).
+    fn try_flush(
         backend: &B,
         codec: &C,
         key_of: &KeyOfFn<T>,
         last_saved_key: &Mutex<Option<String>>,
-        slot: Option<T>,
-    ) -> Result<(), StorageError> {
-        let Some(snapshot) = slot else {
-            return Ok(());
-        };
+        snapshot: T,
+    ) -> Result<(), (T, StorageError)> {
         let key = key_of(&snapshot);
-        let bytes = codec.encode(&snapshot)?;
-        backend.write(&key, &bytes)?;
+        let bytes = match codec.encode(&snapshot) {
+            Ok(b) => b,
+            Err(e) => return Err((snapshot, e.into())),
+        };
+        if let Err(e) = backend.write(&key, &bytes) {
+            return Err((snapshot, e));
+        }
         *last_saved_key.lock() = Some(key);
         Ok(())
     }
@@ -179,15 +184,27 @@ where
         self.compact_every
     }
 
+    // D165 — F1 fix: take pending, attempt encode+write, restore on failure.
+    // Pre-fix: `mem::take` before encode lost pending on encode/write error.
     fn flush(&self) -> Result<(), StorageError> {
         let slot = self.pending.lock().take();
-        Self::flush_now_locked(
+        let Some(snapshot) = slot else {
+            return Ok(());
+        };
+        match Self::try_flush(
             &*self.backend,
             &self.codec,
             &self.key_of,
             &self.last_saved_key,
-            slot,
-        )
+            snapshot,
+        ) {
+            Ok(()) => Ok(()),
+            Err((snapshot, err)) => {
+                // Restore pending so the caller can retry.
+                *self.pending.lock() = Some(snapshot);
+                Err(err)
+            }
+        }
     }
 
     fn rollback(&self) -> Result<(), StorageError> {
@@ -245,13 +262,17 @@ where
             }
         };
         if let Some(snap) = captured {
-            Self::flush_now_locked(
+            // D165 — F1 fix: restore pending on encode/write failure.
+            if let Err((snap, err)) = Self::try_flush(
                 &self.backend,
                 &self.codec,
                 &self.key_of,
                 &self.last_saved_key,
-                Some(snap),
-            )?;
+                snap,
+            ) {
+                *self.pending.lock() = Some(snap);
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -381,22 +402,50 @@ where
         self.compact_every
     }
 
+    // D165 — F1 fix: take pending, attempt per-bucket encode+write, restore
+    // unprocessed buckets on failure so the caller can retry.
     fn flush(&self) -> Result<(), StorageError> {
-        let buckets = std::mem::take(&mut *self.pending.lock());
-        for (key, bucket) in buckets {
-            if bucket.is_empty() {
-                continue;
-            }
-            // Read existing, merge, write back. Matches TS semantics —
-            // each bucket key holds the cumulative array.
-            let existing = self.backend.read(&key)?;
+        let mut buckets = std::mem::take(&mut *self.pending.lock());
+        let keys: Vec<String> = buckets.keys().cloned().collect();
+        for key in keys {
+            let bucket = match buckets.remove(&key) {
+                Some(b) if !b.is_empty() => b,
+                _ => continue,
+            };
+            // Read existing, merge, write back.
+            let existing = match self.backend.read(&key) {
+                Ok(e) => e,
+                Err(e) => {
+                    buckets.insert(key, bucket);
+                    *self.pending.lock() = buckets;
+                    return Err(e);
+                }
+            };
             let mut merged = match existing {
-                Some(bytes) if !bytes.is_empty() => self.codec.decode(&bytes)?,
+                Some(bytes) if !bytes.is_empty() => match self.codec.decode(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        buckets.insert(key, bucket);
+                        *self.pending.lock() = buckets;
+                        return Err(e.into());
+                    }
+                },
                 _ => Vec::new(),
             };
+            let bucket_backup = bucket.clone();
             merged.extend(bucket);
-            let encoded = self.codec.encode(&merged)?;
-            self.backend.write(&key, &encoded)?;
+            let encoded = match self.codec.encode(&merged) {
+                Ok(b) => b,
+                Err(e) => {
+                    buckets.insert(key, bucket_backup);
+                    *self.pending.lock() = buckets;
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self.backend.write(&key, &encoded) {
+                *self.pending.lock() = buckets;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -575,11 +624,28 @@ where
         self.compact_every
     }
 
+    // D165 — F1 fix: take pending, attempt per-entry encode+write, restore
+    // unprocessed entries on failure so the caller can retry.
     fn flush(&self) -> Result<(), StorageError> {
-        let entries = std::mem::take(&mut *self.pending.lock());
-        for (key, value) in entries {
-            let bytes = self.codec.encode(&value)?;
-            self.backend.write(&key, &bytes)?;
+        let mut entries = std::mem::take(&mut *self.pending.lock());
+        let keys: Vec<String> = entries.keys().cloned().collect();
+        for key in keys {
+            let Some(value) = entries.remove(&key) else {
+                continue;
+            };
+            let bytes = match self.codec.encode(&value) {
+                Ok(b) => b,
+                Err(e) => {
+                    entries.insert(key, value);
+                    *self.pending.lock() = entries;
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self.backend.write(&key, &bytes) {
+                entries.insert(key, value);
+                *self.pending.lock() = entries;
+                return Err(e);
+            }
         }
         Ok(())
     }

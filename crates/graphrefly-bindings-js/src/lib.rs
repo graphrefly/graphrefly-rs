@@ -37,6 +37,16 @@ mod operator_bindings;
 #[cfg(feature = "graph-codec")]
 mod graph_bindings;
 
+#[cfg(feature = "storage")]
+#[allow(
+    unreachable_pub,                     // napi-rs #[napi] items are pub for JS, not Rust-visible.
+    clippy::needless_pass_by_value,      // napi-rs requires String not &str at the FFI boundary.
+    clippy::wildcard_imports,            // napi::bindgen_prelude::* glob pattern.
+    clippy::cast_possible_truncation,    // WAL_FRAME_SEQ_PAD usize→u32 is bounded.
+    clippy::let_underscore_future,       // fire-and-forget spawn_blocking in Drop.
+)]
+mod storage_bindings;
+
 use napi_derive::napi;
 
 /// Smoke export — verifies napi-rs link works.

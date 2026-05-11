@@ -14,6 +14,7 @@
 //! `packages/pure-ts/src/extra/storage/wal.ts:194-251`; variant names align
 //! with the TS string discriminants for parity-test diffability.
 
+use serde::Serialize;
 use thiserror::Error;
 
 use graphrefly_structures::Lifecycle;
@@ -106,7 +107,7 @@ pub enum RestoreError {
 }
 
 /// Per-lifecycle phase telemetry within a [`RestoreResult`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PhaseStat {
     pub lifecycle: Lifecycle,
     pub frames: u64,
@@ -115,7 +116,7 @@ pub struct PhaseStat {
 /// Telemetry returned by a successful `restore_snapshot({ mode: "diff" })`
 /// call. Every field is observable so tests + dry-run audit paths can pin
 /// replay invariants (CLAUDE.md dry-run equivalence rule).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RestoreResult {
     /// Total frames applied across all phases.
     pub replayed_frames: u64,
