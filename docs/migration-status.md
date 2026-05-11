@@ -2,6 +2,138 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
+## Current state (2026-05-10 — /qa pass applied to M4.A + M4.B batch)
+
+**/qa adversarial review (Blind Hunter + Edge Case Hunter, parallel) on the combined M4.A + M4.B diff surfaced 72 raw findings. Triage applied 11 patches (A1–A4, A10, A11, plus 5 new test groups A5–A8 + A13); 6 architectural findings deferred to porting-deferred with explicit lift points; cross-language fix (F2) applied symmetrically to TS-side `tiers.ts`.** Decisions D150–D157 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**Patches applied:**
+
+- **F2 cross-impl (D150)** — `compact_every` trigger logic changed from strict modulo (`count % N == 0`) to boundary-crossing (`prev / N != new / N`) in all 3 tier impls of both Rust (`memory.rs`) and TS (`packages/pure-ts/src/extra/storage/tiers.ts` — `snapshotStorage` / `appendLogStorage` / `kvStorage`). Pre-fix, an `append_entries(&[5_items])` with `compact_every=3` jumped count 0→5 and `5 % 3 != 0` skipped the flush trigger entirely. Boundary-crossing fires one flush per boundary crossed. Single-save callers see identical behavior.
+
+- **A1 (D151)** — Snapshot compact-trigger race fix. `memory.rs:206-240`: pending lock now held across the count update + trigger decision + capture, so the snapshot that triggers a compact cadence is THE snapshot that gets persisted. Pre-fix, between releasing `pending.lock()` and calling `flush()`, another thread could overwrite pending — the wrong snapshot would persist.
+
+- **A2 (D152)** — `KvStorage::delete` error-path ordering swap. `memory.rs:617-622`: backend.delete fires FIRST; pending stays intact on failure so the caller can retry. Pre-fix had pending cleared before backend.delete, meaning a backend.delete failure left the backend with stale data + pending empty — silent data divergence visible only on next `load(key)`.
+
+- **A3 (D153)** — `impl From<ChecksumError> for StorageError` added in `error.rs`. Routes `ChecksumError::CanonicalJsonFailed(serde_json::Error)` through `StorageError::Codec(CodecError::Encode(...))`. M4.E call sites can now use `?` for checksum failures.
+
+- **A4 (D154)** — Reject `compact_every: Some(0)` at construction in all 3 factories (`snapshot_storage` / `kv_storage` / `append_log_storage`). Pre-1.0 footgun guard — panics with clear diagnostic ("use `None` to disable; `Some(n)` requires n >= 1"). 3 `#[should_panic]` tests added.
+
+- **A10 (D155)** — `preserve_order_feature_is_not_enabled` canary test in `wal.rs::tests`. Asserts `serde_json::Map<String, Value>` iterates in alphabetical-key order (BTreeMap-backed default). If any workspace consumer enables `serde_json/preserve_order` via Cargo feature unification, the canonical-JSON sort invariant breaks silently and this test fails loud with a `cargo tree -e features | grep preserve_order` diagnostic.
+
+- **A11 (D156)** — Removed unnecessary `prefix_owned = prefix.to_string()` clone in `PrefixIter::new` (`tier.rs:206-213`). `keys.retain(|k| k.starts_with(prefix))` works directly on `&str`. Saves one `String` allocation per `list_by_prefix_bytes` call.
+
+- **A5+A6+A7+A8+A13 (D157)** — Test surface widening:
+  - **A5:** parity fixtures for `Lifecycle::Spec` and `Lifecycle::Ownership` (only `Data` was covered). SHA-256 hex pinned via `printf '<canonical>' | shasum -a 256` for each.
+  - **A6:** parity fixture for `BaseChange { seq: Some(0) }` (only `seq: None` was covered). Distinct SHA proves the canonical body differs from `seq: None`.
+  - **A7:** `WalTag` deserialization rejects null / integer / array / object / boolean tokens (only rejects-wrong-string was covered).
+  - **A8:** filter+compact_every interaction tests for SnapshotStorage and KvStorage — verify filter-rejected save does NOT bump compact_every count.
+  - **A13:** `WALFrame<()>` and `WALFrame<serde_json::Value>` round-trip tests.
+  - Plus 2 boundary-crossing batch tests: `append_log_compact_every_triggers_when_batch_jumps_boundary` and `kv_compact_every_triggers_when_save_jumps_multiple_boundaries` proving the F2 fix.
+
+**New defer entries in `porting-deferred.md`:**
+- **F1 — `flush()` pending data loss on encode / write failure** (lift @ M4.D redb transactions).
+- **F2 — `compact_every` boundary-crossing semantics** (closed by the patch — entry documents the cross-impl coordination).
+- **F3 — `AppendLogStorage::flush` concurrent-write race** (lift @ M4.D redb).
+- **F4 — Snapshot `last_saved_key` cross-restart with custom `key_of`** (lift @ M4.E manifest persistence).
+- **F7 — `format_version` field missing from `WALFrame<T>`** (cross-language; lift @ M4.E or focused spec-conformance batch). Also tracked in TS-side `docs/optimizations.md` "Active work items".
+- **F8 — Snapshot `key_of` default doesn't peek into `T::name`** (Rust convention divergence; lift @ M4.E `attach_storage` explicit `key_of`).
+
+**Test count post-/qa: 607 cargo + 142 parity + 3008 pure-ts, 0 failed, 0 ignored.**
+- Rust: 607 (was 592 pre-/qa). +15 net: 5 wal lib-tests (Spec/Ownership/seq+0/WalTag-rejection ×2 + preserve_order canary) + 4 tier-integration test groups (filter+compact ×2, boundary-crossing batch ×2, panic-on-zero ×3, delete-error-path) + 2 WAL `()` / `Value` sanity tests + 1 fmt-driven re-organization.
+- TS pure-ts: 3008 (unchanged — F2 fix is behavior-preserving for single-save callers, batch-save APIs are an upcoming surface).
+- TS parity: 142 (unchanged).
+
+`cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `pnpm run lint` clean. `pnpm run build` clean. `#![forbid(unsafe_code)]` preserved at both new crate roots (`graphrefly-storage`, `graphrefly-structures`).
+
+**Carry-forward (M4 sub-slices):**
+- **M4.C** — file backend with `tempfile`-based atomic-rename crash-safety.
+- **M4.D** — redb backend; ACID transactions structurally close F1 (pending retry-safety) + F3 (concurrent flush race).
+- **M4.E** — Graph integration; closes F4 (manifest persistence), F8 (explicit `key_of` from Graph context), and the M4.B debounce-timer carry. Also natural breakpoint for F7 (`format_version` field) addition.
+- **M4.F** — parity tests; rustImpl arm activates with `@graphrefly/native` publish.
+
+Decisions D150–D157 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
+## Current state (2026-05-10 — M4.B tier abstraction landed; pre-/qa, preserved for archive)
+
+**M4.B LANDED 2026-05-10: tier abstraction + memory backend + 3 concrete tier factories. Second sub-slice of M4.** Decisions D143–D149 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**Behavioral additions:**
+
+1. **`graphrefly-storage::backend` module (D143).** `StorageBackend` trait — sync bytes-level kv I/O (`read` / `write` / `delete` / `list` / `flush`). Default `list` returns `BackendNoListSupport` (lazy-throw semantics from TS). New `MemoryBackend` struct (`parking_lot::Mutex<HashMap<String, Vec<u8>>>`) + `memory_backend() -> Arc<MemoryBackend>` factory. **All sync** — no async fn, no `Future` return types; tokio-backed networking backends would wrap their async surface via `tokio::Handle::block_on` at the adapter layer.
+
+2. **`graphrefly-storage::codec` module (D148).** `Codec<T>` trait with `name` / `version` / `encode` / `decode`. New `JsonCodec` zero-sized struct implementing `Codec<T>` for all `T: Serialize + DeserializeOwned + Send + Sync`. Encode routes through the M4.A canonical-JSON path (`serde_json::to_value` → BTreeMap-backed `Map` → `to_vec`) — snapshot files byte-identical to TS `jsonCodec`. New `CodecError` enum (`Encode(String)` / `Decode(String)`) wired into `StorageError::Codec(#[from] CodecError)`.
+
+3. **`graphrefly-storage::tier` module (Q5 lock).** Four traits:
+   - `BaseStorageTier` — dyn-safe surface (`name`, `debounce_ms`, `compact_every`, `flush`, `rollback`, `list_by_prefix_bytes -> ListByPrefixIter<'a>`, `compact`). New `ListByPrefixIter<'a>` type alias for `Box<dyn Iterator<Item = Result<(String, Vec<u8>), StorageError>> + 'a>`.
+   - `SnapshotStorageTier<T>: BaseStorageTier` — `save(snapshot)` / `load() -> Option<T>`.
+   - `AppendLogStorageTier<T>: BaseStorageTier` — `append_entries(&[T])` / `load_entries(key_filter)`.
+   - `KvStorageTier<T>: BaseStorageTier` — `save(key, value)` / `load(key)` / `delete(key)` / `list(prefix)`.
+   - All four traits dyn-safe (compile-time `assert_dyn` test pins this).
+   - Internal `PrefixIter<B>` adapter wraps a `&dyn StorageBackend` with lex-ASC ordering + lazy decode + lazy-throw on `BackendNoListSupport`.
+
+4. **`graphrefly-storage::memory` module (D147 + D148).** Three concrete generic structs:
+   - `SnapshotStorage<B, T, C = JsonCodec>` → `SnapshotStorageTier<T>`
+   - `AppendLogStorage<B, T, C = JsonCodec>` → `AppendLogStorageTier<T>`
+   - `KvStorage<B, T, C = JsonCodec>` → `KvStorageTier<T>`
+   - Each holds `Arc<B>` (D147 — multi-tier-share-one-backend supported; the paired `{ snapshot, wal }` shape from DS-14-storage §a) + `C` codec + cadence knobs + `parking_lot::Mutex`-buffered pending state.
+   - Factories: `snapshot_storage(backend, opts)` / `append_log_storage(backend, opts)` / `kv_storage(backend, opts)` for arbitrary backends; `memory_snapshot(opts)` / `memory_append_log(opts)` / `memory_kv(opts)` convenience over a fresh `Arc<MemoryBackend>`.
+   - Optional closures (`filter`, `key_of`) boxed as `Box<dyn Fn(...) + Send + Sync>` (D149 — matches TS optional-callback shape).
+
+5. **`debounce_ms` semantics at M4.B (D144).** The accessor surfaces the value; **the tier itself does NOT drive a timer.** `save()` always buffers; `flush()` always commits. `compact_every` does trigger immediate flush on Nth write (sync counter). Graph-layer attach reads `debounce_ms` and schedules time-driven `flush()` via its own reactive timer source at M4.E. Documented inline at `tier.rs` module doc.
+
+**Test count post-batch: 592 cargo + 142 parity + 3008 pure-ts, 0 failed, 0 ignored.**
+- +36 new Rust tests over M4.A baseline (8 in `backend.rs`, 4 in `codec.rs`, 3 in `tier.rs`, 21 in new `tests/tier.rs` integration suite covering snapshot round-trip + filter + key_of + compact_every + rollback + KV CRUD + AppendLog + multi-tier-share-one-backend + dyn-safe `list_by_prefix_bytes` enumeration).
+- Pre-batch baseline 556 cargo (from M4.A close).
+
+`cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**Carry-forward (M4 sub-slices):**
+- **M4.C — file backend** — `file_backend(root)` factory with atomic-rename crash-safety via `tempfile`. Bytes-level only; no graph integration.
+- **M4.D — redb backend** — `redb_storage(path)` factory with ACID `Database::begin_write` per `flush()` + Q8 default `truncate_on_compact: true` for Rust impl.
+- **M4.E — Graph integration** — `Graph::attach_storage` + `restore_snapshot mode:"diff"` replay path with Q2 partial-restore + Q3 torn-write + Q7 INVALIDATE persistence. **Brings tier-level debounce timers via Graph's reactive timer source** (D144 lift point).
+- **M4.F — parity tests** — `packages/parity-tests/scenarios/storage-wal/` scenarios; rustImpl activates when `@graphrefly/native` exposes storage surface.
+- **Tier-level setTimeout-equivalent debounce** — deferred to M4.E (Graph-layer timer integration). See `porting-deferred.md` new entry.
+
+Decisions D143–D149 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
+## Current state (2026-05-10 — M4.A WAL substrate landed)
+
+**M4.A LANDED 2026-05-10: WAL frame substrate + storage errors. First sub-slice of M4 (`graphrefly-storage` crate).** Decisions D138–D142 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**Behavioral additions:**
+
+1. **`graphrefly-structures::changeset` module (D140).** New `BaseChange<T>` envelope + `Lifecycle { Spec, Data, Ownership }` + `Version { Counter(u64), Cid(String) }` (D139 — `#[serde(untagged)]` for wire-parity with TS's `number | string` union). Lives in `graphrefly-structures` so M5 reactive-structure ports inherit the envelope without re-homing; storage / bridge / future structures all consume the same type. Codec footprint gated behind the existing `serde-support` feature (default-on). `Option<u64>` seq field with `skip_serializing_if = "Option::is_none"` so `None` doesn't bloat the wire.
+
+2. **`graphrefly-storage::wal` module (DS-14-storage Q1+Q5).** `WALFrame<T>` struct with 7 fields per spec §a — `t` (`WalTag` singleton enforcing `"c"` discriminator on parse), `lifecycle`, `path`, `change: BaseChange<T>`, `frame_seq: u64`, `frame_t_ns: u64`, `checksum: String` (D141 — 64-char lowercase hex). `wal_frame_checksum` / `verify_wal_frame_checksum` compute SHA-256 over canonical JSON of the frame body (sans `checksum` itself) via the [D138 route](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md) — `serde_json::to_value` → BTreeMap-backed Map → `to_string` produces sorted-key JSON that matches TS `stableJsonString` byte-for-byte on the WAL schema. `wal_frame_key(prefix, seq)` zero-pads `frame_seq` to 20 digits so lex-ASC string sort = numeric ASC. `WAL_KEY_SEGMENT` / `WAL_FRAME_SEQ_PAD` / `graph_wal_prefix` / `REPLAY_ORDER` consts exported for downstream consumption.
+
+3. **`graphrefly-storage::error` module (DS-14-storage Q3+Q9).** `StorageError` (`BackendNoListSupport` / `CodecMismatch` / `BackendError { source }`) — tier-level preconditions surfaced by `BaseStorageTier` ops (M4.B+). `RestoreError` (`PhaseFailed { lifecycle, frame_seq, message }` / `TornWriteMidStream` / `BaselineMissing` / `CodecMismatch` / `WalTierRequired`) — replay-time failures from `Graph::restore_snapshot({ mode: "diff" })` (M4.E). `RestoreResult { replayed_frames, skipped_frames, final_seq, phases: Vec<PhaseStat> }` — telemetry returned on success (inspection-as-test-harness shape per CLAUDE.md dry-run rule).
+
+4. **Workspace deps updates.** Added `hex = "0.4"` to `[workspace.dependencies]` (sole new external dep; `serde`, `serde_json`, `sha2` were already declared). `graphrefly-storage/Cargo.toml` adds `graphrefly-structures`, `serde`, `serde_json`, `sha2`, `hex`. `graphrefly-structures/Cargo.toml` adds `serde_json` as a dev-dep for codec round-trip tests. Both crates get `#![forbid(unsafe_code)]` at lib.rs.
+
+**Test count post-batch: 556 cargo + 142 parity + 3008 pure-ts, 0 failed, 0 ignored.**
+- +17 net Rust tests (16 in `graphrefly-storage` lib unit tests covering frame-key invariants, checksum round-trip + tamper detection × 3 fields + 64-char-hex shape + `WalTag` parse + canonical sort sanity + parity-fixture; 3 in `graphrefly-structures` covering Lifecycle lowercase + Version untagged + BaseChange seq-skip; net change accounts for the 2 scaffold tests replaced).
+- Pre-batch baseline 539 cargo (from `/qa A/B/D/E/F batch`).
+
+`cargo clippy --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved across BOTH crate roots.
+
+**Parity-fixture lock (D138).** `wal::tests::checksum_parity_fixture_minimal_frame` asserts that a hand-canonicalized JSON body (deliberately minimal — single `u64` payload, all-zero counters) hashes to a specific SHA-256 hex string. The expected canonical bytes are inline in the test; the expected SHA-256 was generated via `printf '<canonical>' | shasum -a 256`. Any future drift in the Rust canonical-JSON algorithm fails this test loud. TS-side parity assertion (running TS `walFrameChecksum` on the same input + asserting equal output) lives in the M4.F parity-tests slice.
+
+**Carry-forward (M4 sub-slices, D142):**
+- **M4.B — tier abstraction + memory backend.** `BaseStorageTier` trait (flush / rollback / `list_by_prefix: Box<dyn Stream<...>>` / compact), `SnapshotStorageTier<T>` / `AppendLogStorageTier<T>` super-traits, `Codec<T>` trait + `json_codec()` factory, `StorageBackend` trait, `memory_backend()` + `snapshot_storage(backend, opts)` factories. Tokio enters at this sub-slice (for futures::Stream).
+- **M4.C — file backend.** `file_backend(root)` factory with atomic-rename crash-safety via the `tempfile` workspace dep.
+- **M4.D — redb backend.** `redb_storage(path)` factory with ACID `Database::begin_write` per `flush()` + truncate-on-compact default-on (DS-14-storage Q8 lock for Rust M4).
+- **M4.E — Graph integration.** `Graph::attach_storage` writes WAL frames per data-lifecycle message; `Graph::restore_snapshot({ mode: "diff" })` replay path with per-lifecycle `batch()` rollback (Q2) + Q3 torn-write handling + INVALIDATE persistence (Q7).
+- **M4.F — parity tests.** `packages/parity-tests/scenarios/storage-wal/` scenarios — rustImpl arm activates when `@graphrefly/native` exposes the storage surface.
+- **Canonical-JSON parity caveats** (M4.A `wal.rs` module-doc) — UTF-16-vs-UTF-8 sort divergence on non-BMP keys; float subnormal divergence. Lift point: real consumer with non-ASCII identifiers / float user-data.
+
+Decisions D138–D142 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+---
+
 ## Current state (2026-05-10 — /qa pass applied to A/B/D/E/F batch)
 
 **/qa pass on the five-item polish batch surfaced 49 raw findings; triage applied 8 patches (F1 critical + F3/F4/F5 major + doc/test polish) and added 3 new defer entries.** Decisions D134–D137 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
@@ -551,7 +683,7 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | **M3 (napi-rs operator parity — Phase E rustImpl activation)** | `graphrefly-bindings-js` + `graphrefly-graph` + `graphrefly-ts/packages/parity-tests` | ✅ landed 2026-05-07 (Commits 1a–6) | Phase E rustImpl activation slice (D073–D077). **Rust binding additions (Commit 1):** (1a) `BenchValue::JsAllocated` marker variant + 4 handle-passthrough napi methods on `BenchCore` (`alloc_external_handle` sync + `register_state_with_handle` / `emit_handle` / `cache_handle` async). (1b) TSFN-backed sink delivery via `subscribe_with_tsfn` + `bridge_sync_unit` (sink fires complete BEFORE Promise resolves — preserves `await subscribe(cb)` followed by sync `expect` semantics); `BenchBinding::release_handle` fires JS-side TSFN callback non-blocking when JsAllocated handle's refcount drops to 0 (D076 — JS adapter prunes mirror map). (1c) New `BenchGraph` napi class wrapping `graphrefly_graph::Graph` (Slice E+/F surface). New `Graph::with_existing_core` public constructor in `graphrefly-graph` so BenchGraph shares its BenchCore's Core. **Build infrastructure (Commit 2):** `crates/graphrefly-bindings-js/package.json` declares `@graphrefly/native` workspace package + napi-cli config + `optionalDependencies`-shape (per-platform sub-packages reserved for cross-platform publish flow). Hand-written `index.js` loader + `index.d.ts` type declarations. Workspace consumer wiring via `link:../../../graphrefly-rs/crates/graphrefly-bindings-js` in `packages/parity-tests/package.json`. **JS adapter (Commit 3):** `Impl` interface widened to async-everywhere per D077 (every dispatcher-touching method returns `Promise`); `pureTsImpl` wraps sync legacy API in `Promise.resolve()`; `rustImpl` is a 470-LOC adapter exposing `RustNode<T>` + `RustGraph` + 24 operator wrappers. Per-Impl `JSValueRegistry` Map<u32, T> + per-Core release-callback installation. ~30 parity-test scenario files converted to async tests via bulk perl transforms (test fns become `async`, dispatcher-touching calls get `await`). **Triage (Commit 4):** carry-forward divergences logged in `porting-deferred.md` "Phase E rustImpl activation — carry-forward divergences" section: BenchGraph reactive methods (describe_reactive / observe_all_reactive / edges reactive) deferred; `Graph.derived(name, deps, fn)` with arbitrary JS fn deferred (workaround: build via operators + g.add); cross-Core mount rejected; error-payload identity for non-i32 lossy. **CI (Commit 5):** `.github/workflows/ci.yml` adds `napi-build-matrix` job per D075 — builds `.node` artifacts for darwin-x64 / darwin-arm64 / linux-x64-gnu / linux-arm64-gnu (via cross) / win32-x64-msvc; uploads as workflow artifacts. NPM publish flow stays separate (release-engineering follow-on). **Decision log:** D073 (JS-side value registry, not Rust polymorphic widen), D074 (bundle Graph in this slice), D075 (CI matrix builds artifacts; no npm publish), D076 (release_handle TSFN callback for JS-side prune), D077 (parity tests migrate to async; Impl interface Promise-returning). **460 tests pass (cargo) + 60 parity tests pass + 7 skipped + 2 todo (vitest, legacy arm).** rust arm activates when `pnpm --filter @graphrefly/native build` runs; until then rustImpl is null and registry filters. `cargo clippy --all-targets -D warnings` clean (default-members); `cargo fmt --check` clean; `#![forbid(unsafe_code)]` preserved (per-crate `deny` carve-out for bindings-js still in place per D072). Session doc: [`SESSION-rust-port-napi-operators.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-napi-operators.md). |
 | **M3 (napi-rs operator parity — Phases A–C)** | `graphrefly-bindings-js` | ✅ landed 2026-05-07 (Phases A–C of 6, post-/qa-followup-followup) | Phases A (TSFN substrate via `napi::tokio_runtime::spawn_blocking` per **D070 Option E**), B (`BenchOperators` napi class + 22 register methods + `OperatorBinding` / `HigherOrderBinding` / `ProducerBinding` impls on `BenchBinding`), C (custom-equals bundle). 24 operators wired (6 transform + 3 combine + 7 flow + 4 producer-shape + 4 higher-order). Producer dispatch via thread-local `CURRENT_CORE` + RAII `CoreThreadGuard`. **Rust core stays sync** — tokio enters only at `spawn_blocking`; CLAUDE.md invariant 4 preserved. **napi 3.x clean migration (D072)** — bumped from 2.16 with NO compat-mode per user directive ("no compat mode! no backward compat needed. no legacy behind"). Per-crate `forbid(unsafe_code)` → `deny(unsafe_code)` carve-out for napi-derive's macro-generated `allow`s (CLAUDE.md Rust invariant 1 relaxed only for this crate). API migration: `JsFunction` → `Function<Args, Return>` typed; `JsObject` → `PromiseRaw<'env, T>`; `create_threadsafe_function` → builder pattern (`build_threadsafe_function::<T>().max_queue_size::<1>().callee_handled::<true>().build_callback(...)`); `ErrorStrategy` enum → const-bool generic; `execute_tokio_future` → `Env::spawn_future`. **C1 fixed by design** — 3.x TSFN cb signature `FnOnce(Result<Return>, Env) -> Result<()>` delivers JS-throws as `Err` (no fatal abort); D071's Rust-built JS wrapper helpers deleted. Two-arg callbacks use `FnArgs<(u32, u32)>` (3.x convention). **/qa fixes:** C2 (`Registry::validate_and_retain` panics on phantom HandleIds), C3 (retain bumps via single-source-of-truth pattern), m26 (`BenchCore` field-drop reorder: `subscriptions, binding, core`), H-08 (NodeId(0) panic), M9 (static `noop_sink` via `OnceLock`), `parking_lot::Mutex<Registry>` (no poisoning). **Phases D (bench harness) + E (parity-tests `rustImpl` activation) carry forward** to follow-on slices. Workspace tests pass. Decision log: D049–D053 + D062–D066 + D070 + D072 (D062/D063 superseded by D070; D071 superseded by D072). Session doc: [`SESSION-rust-port-napi-operators.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-napi-operators.md). |
 | **Post-M5 (Slice E5 — Node Versioning §7)** | `graphrefly-core` + `graphrefly-storage` | ⏸ blocked | §7 R7.x — Node versioning bundle (`graph.tagFactory`, `setVersioning(level)`, V0/V1/V2 progression). Bundles with DS-14 op-log counter shape; STRONG DEFER per Phase 14 guardrail. |
-| **M4** | `graphrefly-storage` | 🟢 ready (flipped 2026-05-10) | DS-14-storage substrate landed TS-side 2026-05-08 per `graphrefly-ts/docs/implementation-plan.md` Phase 14.6 (`WALFrame<T>` + `BaseStorageTier::list_by_prefix` traits + 9Q walk Q1–Q9 locked). Rust scope: `graphrefly-storage` crate with redb-backed tier dispatch, WAL frame ciborium serialization, recovery boundary (Q3), partial-restore phase rollback via Core `batch()`. See [SESSION-DS-14-storage-wal-replay.md](../../graphrefly-ts/archive/docs/SESSION-DS-14-storage-wal-replay.md) PART 7. |
+| **M4** | `graphrefly-storage` | 🚧 in progress — M4.A + M4.B landed 2026-05-10 | DS-14-storage substrate landed TS-side 2026-05-08 per `graphrefly-ts/docs/implementation-plan.md` Phase 14.6 (`WALFrame<T>` + `BaseStorageTier::list_by_prefix` traits + 9Q walk Q1–Q9 locked). Rust scope: `graphrefly-storage` crate with redb-backed tier dispatch, WAL frame ciborium serialization, recovery boundary (Q3), partial-restore phase rollback via Core `batch()`. See [SESSION-DS-14-storage-wal-replay.md](../../graphrefly-ts/archive/docs/SESSION-DS-14-storage-wal-replay.md) PART 7. **Sub-slice plan (D142):** M4.A ✅ WAL frame substrate + storage errors (2026-05-10); M4.B ✅ tier traits + memory backend (2026-05-10); M4.C file backend; M4.D redb backend; M4.E Graph integration; M4.F parity tests. |
 | M5 | `graphrefly-structures` | ⏸ blocked | After M2 + DS-14 (op-log changesets) — STRONG DEFER per Phase 14 guardrail |
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
 | any | `graphrefly-bindings-wasm` | ⏸ blocked | Lands alongside napi-rs progression |

@@ -10,12 +10,25 @@ homepage.workspace     = true
 authors.workspace      = true
 
 [dependencies]
-graphrefly-core  = { workspace = true }
-graphrefly-graph = { workspace = true }   # for Codec types
+graphrefly-core       = { workspace = true }
+graphrefly-graph      = { workspace = true }   # for Codec types
+graphrefly-structures = { workspace = true }   # BaseChange<T> envelope
 
 # Persistence backends — each gated behind its own feature
 redb             = { workspace = true, optional = true }
 tempfile         = { version = "3", optional = true }   # atomic-rename helpers for FileStorage
+
+# WAL frame substrate (M4.A — DS-14-storage Q1 lock)
+# `serde_json` route gives canonical (sorted-key) JSON via `to_value` → BTreeMap
+# → `to_string`, matching the TS `stableJsonString` algorithm byte-for-byte on
+# the WAL frame schema (ASCII keys, integer numerics, no floats).
+serde            = { workspace = true, features = ["derive"] }
+serde_json       = { workspace = true }
+sha2             = { workspace = true }
+hex              = { workspace = true }
+
+# Concurrency (M4.B — tier-level pending buffers)
+parking_lot      = { workspace = true }
 
 thiserror        = { workspace = true }
 tracing          = { workspace = true }

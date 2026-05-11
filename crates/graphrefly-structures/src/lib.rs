@@ -32,9 +32,8 @@
 #![warn(rust_2018_idioms, unreachable_pub)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
+#![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_compiles() {}
-}
+pub mod changeset;
+
+pub use changeset::{BaseChange, Lifecycle, Version};

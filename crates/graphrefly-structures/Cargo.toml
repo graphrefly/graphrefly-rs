@@ -30,6 +30,9 @@ tracing          = { workspace = true }
 # Optional serde for snapshot-codec interop
 serde            = { workspace = true, features = ["derive"], optional = true }
 
+[dev-dependencies]
+serde_json       = { workspace = true }
+
 [features]
 default = ["serde-support"]
 serde-support = ["dep:serde"]
