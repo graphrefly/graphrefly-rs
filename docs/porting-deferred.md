@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-11 (M5.A reactive data structures landed; 6 deferred items)
+last_updated: 2026-05-11 (Slice T temporal operators landed; M4+M5 formally closed)
 ---
 
 # Porting flags & deferred concerns
@@ -185,11 +185,11 @@ redb per-write ACID transactions (D163) serialize concurrent writers by MVCC des
 ### M4.B tier-level setTimeout-equivalent debounce (lift @ reactive timer port)
 
 - **What:** [crates/graphrefly-storage/src/tier.rs](../crates/graphrefly-storage/src/tier.rs) `BaseStorageTier::debounce_ms` surfaces the configured debounce window. **The tier itself does NOT drive a timer.** `save()` always buffers; `flush()` always commits; `compact_every` triggers immediate flush on Nth write (sync counter). `debounce_ms > 0` is currently a no-op at the tier level — buffered writes sit until something else (Graph wave-close, explicit `flush()`, `compact()` call, `compact_every` trigger) drains them.
-- **Status (M4.E2 update):** `attach_snapshot_storage` landed in M4.E2 (2026-05-11) with sync-through only (D171). The `debounce_ms` field on `AttachOptions` exists but is documented as having no effect until reactive timer sources (`from_timer` / `from_cron`) are ported to Rust. Sync-through flush occurs on every tier-3+ message.
-- **Why acceptable at v1:** a tier-level timer would require either `tokio::time::sleep` (forces graphrefly-storage into tokio) or a per-tier OS thread (CLAUDE.md "no polling"; threading overhead per tier doesn't compose for many-tier scenarios). Reactive timer sources concentrate timer ownership at the graph layer — structurally cleaner.
-- **Lift point:** when `from_timer` / `from_cron` are ported to Rust (M5 or earlier if needed), `attach_snapshot_storage` reads each attached tier's `debounce_ms` and schedules a `from_timer(debounce_ms).map(|_| tier.flush())` reactive subgraph at attach time. Tier-level API doesn't change — only the wiring at attach.
+- **Status (Slice T update, 2026-05-11):** Timer substrate + temporal operators (including `interval`) landed in Slice T (2026-05-11). The `debounce_ms` lift point is now **unblocked** — `graphrefly-operators::temporal::debounce` and `interval` are available. `attach_snapshot_storage` still uses sync-through only (D171). Wiring `debounce_ms` into a reactive timer subgraph at attach time is now a straightforward follow-on.
+- **Why still deferred:** the wiring requires `from_timer` (graph-layer source) which builds on the `interval` operator but adds graph-level sugar. The tier-level API doesn't change — only the attach-time wiring. Low risk, medium effort (~50 LOC at the graph integration layer).
+- **Lift point:** wire `attach_snapshot_storage` to read each tier's `debounce_ms` and create a `debounce(observe_node, ms)` → `map(|_| tier.flush())` reactive subgraph. Alternatively, use `interval(ms)` as a periodic flush trigger (simpler but less responsive than debounce). Tier-level API doesn't change.
 - **Until then:** users who care about debounced flush must call `tier.flush()` explicitly. The `compact_every` knob is a partial substitute (write-count-based, not time-based).
-- **Source:** D144 / M4.B slice 2026-05-10; updated D171 / M4.E2 slice 2026-05-11.
+- **Source:** D144 / M4.B slice 2026-05-10; updated D171 / M4.E2 slice 2026-05-11; Slice T timer port 2026-05-11.
 
 ### M4.C `FileBackend` case-insensitive-filesystem key collision
 

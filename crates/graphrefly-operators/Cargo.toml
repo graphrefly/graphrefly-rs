@@ -11,14 +11,16 @@ authors.workspace      = true
 
 [dependencies]
 ahash           = { workspace = true }
-graphrefly-core = { workspace = true }
+graphrefly-core = { workspace = true, features = ["tokio"] }
 parking_lot     = { workspace = true }
 smallvec        = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
+tokio           = { workspace = true, features = ["time", "sync", "rt", "macros"] }
 
 [dev-dependencies]
 proptest        = { workspace = true }
+tokio           = { workspace = true, features = ["time", "sync", "rt", "macros", "rt-multi-thread", "test-util"] }
 
 [features]
 default     = []

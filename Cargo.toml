@@ -67,6 +67,9 @@ hex                   = { version = "0.4"  }
 # Compression — DagCborZstdCodec
 zstd                  = { version = "0.13" }
 
+# Async runtime — timer substrate (feature-gated in core, always-on in storage/bindings)
+tokio                 = { version = "1", default-features = false }
+
 # Persistent collections — Phase 14 op-log substrate
 imbl                  = { version = "3"    }
 

@@ -52,6 +52,8 @@ pub mod message;
 pub mod node;
 pub(crate) mod op_state;
 pub mod subgraph;
+#[cfg(feature = "tokio")]
+pub mod timer;
 pub mod topology;
 
 pub use batch::BatchGuard;

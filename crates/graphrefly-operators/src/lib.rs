@@ -26,7 +26,8 @@
 //! - [`combine`] — combine, merge, withLatestFrom (✅ Slice C-2)
 //! - [`flow`] — take, skip, takeWhile, last + first/find/element_at
 //!   sugar (✅ Slice C-3)
-//! - `temporal` — throttle, debounce, sample
+//! - [`temporal`] — sample, debounce, throttle, delay, audit, interval
+//!   (✅ Slice T)
 //! - `switching` — switchMap, mergeMap, concatMap
 //! - `gating` — valve, gate, budgetGate, policyGate
 //! - `resilience` — retry, circuitBreaker, timeout, fallback,
@@ -58,6 +59,7 @@ pub mod flow;
 pub mod higher_order;
 pub mod ops_impl;
 pub mod producer;
+pub mod temporal;
 pub mod transform;
 
 pub use binding::OperatorBinding;
@@ -75,6 +77,7 @@ pub use producer::{
     default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
     ProducerStorage, SubscribeOutcome,
 };
+pub use temporal::{audit, debounce, delay, interval, sample, throttle};
 pub use transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan, OperatorRegistration,
 };

@@ -17,10 +17,12 @@ indexmap    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 serde_json  = { workspace = true }
+tokio       = { workspace = true, features = ["time", "sync", "rt", "macros"], optional = true }
 
 [dev-dependencies]
 proptest          = { workspace = true }
 criterion         = { workspace = true }
+tokio             = { workspace = true, features = ["time", "sync", "rt", "macros", "rt-multi-thread", "test-util"] }
 # Bench-only: lock-strategy microbench (see benches/lock_strategy.rs).
 dashmap           = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -46,10 +48,14 @@ name    = "lock_strategy"
 harness = false
 
 [features]
-default      = ["std"]
+default      = ["std", "tokio"]
 # `std` is the only supported configuration for now. Kept as a feature so
 # `no_std` (alloc-only) remains a future option without breaking the API.
 std          = []
+# Timer substrate — spawns tokio tasks for schedule/cancel/fire lifecycle.
+# Gated because Core stays fully synchronous; tokio enters only at the
+# timer boundary layer. Operators, storage, and bindings enable this.
+tokio        = ["dep:tokio"]
 # Concurrency permutation testing via loom. Enable in CI for the per-subgraph
 # RLock + dispatch tests.
 loom-checked = []
