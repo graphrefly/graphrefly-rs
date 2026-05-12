@@ -1,39 +1,51 @@
-//! `GraphReFly` reactive data structures.
+//! `GraphReFly` reactive data structures (M5.A — D177/D178/D179).
 //!
-//! `reactiveMap`, `reactiveList`, `reactiveLog`, `reactiveIndex` —
-//! built on `imbl` persistent immutable collections so that Phase 14
-//! op-log changesets get O(log n) snapshot-and-revert naturally:
+//! Four reactive structures backed by pluggable backends, integrated at
+//! the Core level (no Graph dependency required):
 //!
-//!   - Each emit is a function `State -> State` returning a new
-//!     persistent collection.
-//!   - Rollback = use the prior `Arc<State>`. Glitch-free by
-//!     construction.
-//!   - Diff = pointer compare on `Arc::ptr_eq` is O(1); structural
-//!     diff via `imbl::HashMap::diff` is O(log n).
+//! - [`ReactiveLog`] — append-only log with optional ring-buffer cap
+//! - [`ReactiveList`] — ordered list with positional insert/pop
+//! - [`ReactiveMap`] — key-value map with set/delete operations
+//! - [`ReactiveIndex`] — sorted index with primary key lookup + secondary sort
+//!
+//! Each structure owns a Core state `NodeId` and emits DIRTY→DATA snapshots
+//! on every mutation. Optional `mutation_log` companions record typed
+//! `BaseChange<XxxChange<T>>` deltas for op-log changesets (Phase 14).
+//!
+//! Default backends use `Vec<T>` / `HashMap<K, V>`. `imbl`-backed persistent
+//! backends are deferred until bench evidence justifies (D178).
 //!
 //! CRDT-backed variants (yrs / automerge / loro / diamond-types) are
-//! post-1.0 work, gated behind feature flags. The Rust ecosystem's
-//! CRDT libraries are the canonical implementations — yjs JS users
-//! increasingly run yrs under WASM.
-//!
-//! # Status
-//!
-//! Scaffold. Implementation lands during Milestone 5 of the Rust port,
-//! together with the user-facing Phase 14 op-log changeset API.
-//!
-//! # Module layout (planned)
-//!
-//! - `map` — reactiveMap (`imbl::HashMap-backed`)
-//! - `list` — reactiveList (`imbl::Vector-backed`)
-//! - `log` — reactiveLog (append-only op-log)
-//! - `index` — reactiveIndex (composite index over a reactiveMap)
-//! - `changeset` — Phase 14 op-log delta protocol
+//! post-1.0 work, gated behind feature flags.
 
 #![warn(rust_2018_idioms, unreachable_pub)]
 #![warn(clippy::pedantic)]
-#![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
+#![allow(
+    clippy::module_name_repetitions,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::type_complexity,
+    clippy::doc_markdown
+)]
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod changeset;
+pub mod reactive;
 
-pub use changeset::{BaseChange, Lifecycle, Version};
+// Re-export core types for ergonomic access.
+pub use backend::{
+    HashMapBackend, IndexBackend, IndexRow, ListBackend, LogBackend, MapBackend, VecIndexBackend,
+    VecListBackend, VecLogBackend,
+};
+pub use changeset::{
+    BaseChange, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
+};
+pub use reactive::{
+    IndexOutOfBounds, InternFn, ReactiveIndex, ReactiveIndexOptions, ReactiveList,
+    ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions,
+};

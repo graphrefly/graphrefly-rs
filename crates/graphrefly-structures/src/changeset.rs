@@ -78,6 +78,77 @@ pub struct BaseChange<T> {
     pub change: T,
 }
 
+// ---------------------------------------------------------------------------
+// Per-structure change payload enums (M5.A — D179)
+// ---------------------------------------------------------------------------
+
+/// Delta payload for [`crate::ReactiveLog`] mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde-support",
+    serde(tag = "kind", rename_all = "camelCase")
+)]
+pub enum LogChange<T> {
+    Append { value: T },
+    AppendMany { values: Vec<T> },
+    Clear { count: usize },
+    TrimHead { n: usize },
+}
+
+/// Delta payload for [`crate::ReactiveList`] mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde-support",
+    serde(tag = "kind", rename_all = "camelCase")
+)]
+pub enum ListChange<T> {
+    Append { value: T },
+    AppendMany { values: Vec<T> },
+    Insert { index: usize, value: T },
+    InsertMany { index: usize, values: Vec<T> },
+    Pop { index: i64, value: T },
+    Clear { count: usize },
+}
+
+/// Delta payload for [`crate::ReactiveMap`] mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde-support",
+    serde(tag = "kind", rename_all = "camelCase")
+)]
+pub enum MapChange<K, V> {
+    Set { key: K, value: V },
+    Delete { key: K },
+    Clear { count: usize },
+}
+
+/// Delta payload for [`crate::ReactiveIndex`] mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde-support",
+    serde(tag = "kind", rename_all = "camelCase")
+)]
+pub enum IndexChange<K, V> {
+    Upsert {
+        primary: K,
+        secondary: String,
+        value: V,
+    },
+    Delete {
+        primary: K,
+    },
+    DeleteMany {
+        primaries: Vec<K>,
+    },
+    Clear {
+        count: usize,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

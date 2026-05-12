@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-11 (M4.F parity tests landed; no new deferred items)
+last_updated: 2026-05-11 (M5.A reactive data structures landed; 6 deferred items)
 ---
 
 # Porting flags & deferred concerns
@@ -2885,3 +2885,49 @@ Field doc comment in `graph_bindings.rs::BenchGraph` calls out the redundancy + 
 ### ~~F17 — `release_callback` set_release_callback overwritable; second install drops the prior TSFN~~ — RESOLVED 2026-05-08 (Slice X3)
 
 Regression test landed at `packages/parity-tests/scenarios/core/release-callback-reinstall.test.ts` (Rust-only — `pure-ts` doesn't have TSFN-backed release callbacks; this is a binding-implementation regression test, not cross-impl parity). The test installs callback A, registers a state node with a JS-allocated handle (refcount=1), re-installs callback B, then triggers a release by emitting a different handle on the state node. Asserts B receives the release of the first handle AND A receives nothing — confirming the prior TSFN is dropped (and thus deallocated) on re-install. Vitest passes; the underlying Rust impl `*self.binding.release_callback.lock() = Some(Arc::new(tsfn))` is correct by construction.
+
+---
+
+## M5 — Reactive data structures
+
+### F18 — ReactiveLog views (tail/slice/fromCursor), scan, attach, attachStorage
+
+- **What:** TS `reactiveLog` has `view()` (memoized derived views: tail, slice, fromCursor), `scan()` (O(1) incremental aggregate), `attach()` (upstream subscription), `attachStorage()` (persistence wiring). Rust M5.A has none of these.
+- **Why deferred:** Base CRUD operations and Core-level integration were the priority for M5.A. Views/scan require derived node composition patterns; attach/attachStorage require subscription wiring and storage tier interop.
+- **Lift point:** M5.B — after base structures are validated in real usage patterns.
+- **Source:** M5.A scope decision D179.
+
+### F19 — ReactiveMap TTL, LRU, retention policies
+
+- **What:** TS `reactiveMap` supports `defaultTtl` (per-entry expiry), `maxSize` (LRU eviction), and `retention` (score-based eviction). Rust M5.A has none of these.
+- **Why deferred:** TTL requires a timer mechanism (no async in Core — needs reactive timer source or binding-side hook). LRU requires access-order tracking. Neither is needed for base functionality.
+- **Lift point:** M5.B or when a real workload requires time-based eviction.
+- **Source:** M5.A scope decision D179.
+
+### F20 — ReactiveIndex custom equals for upsert idempotency
+
+- **What:** TS `reactiveIndex.upsert()` takes optional `opts.equals` to suppress re-emission when value hasn't changed. Rust M5.A always emits on upsert.
+- **Why deferred:** Custom equals requires BindingBoundary crossing (values are opaque handles). Base index functionality works without idempotent upserts.
+- **Lift point:** M5.B — when idempotent upsert is needed for performance.
+- **Source:** M5.A scope decision D179.
+
+### F21 — imbl-backed persistent backends
+
+- **What:** Cargo.toml depends on `imbl` but default backends use `Vec`/`HashMap`. Persistent immutable collections give O(log n) snapshot-and-revert for op-log changesets.
+- **Why deferred:** Vec/HashMap defaults are simpler and faster for small-to-medium collections. No current workload benefits from persistent-collection semantics. Backend trait abstraction means imbl can slot in later without API changes.
+- **Lift point:** When bench evidence shows snapshot/revert cost justifies the overhead, or when Phase 14 op-log changesets require structural persistence.
+- **Source:** D178 decision.
+
+### F22 — Versioning integration (V0/V1 content-addressed versions)
+
+- **What:** TS structures support `versioning` option (V0 counter, V1 CID). Rust M5.A uses monotonic counter only via `Version::Counter(u64)`.
+- **Why deferred:** CID versioning requires content-addressing infrastructure (blake3/sha2 hashing of snapshots). Counter versioning covers all current use cases.
+- **Lift point:** When Phase 14 op-log changesets or cross-replica sync need content-addressed versions.
+- **Source:** M5.A scope decision D179.
+
+### F23 — Graph-level sugar wrappers for reactive structures
+
+- **What:** TS structures can be composed into Graph via `graph.state()` or standalone. Rust M5.A structures are Core-level only. Graph-level wrappers (`graph.reactive_log(name, opts)` etc.) not implemented.
+- **Why deferred:** Core-level is more fundamental. Graph wrappers are thin convenience (register structure's node_id with Graph's namespace). Can be added without changing structure internals.
+- **Lift point:** When Graph-level composition patterns are needed (M2 follow-up or M5.B).
+- **Source:** D177 decision.

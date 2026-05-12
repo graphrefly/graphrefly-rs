@@ -2,6 +2,44 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
+## Current state (2026-05-11 — M5.A reactive data structures base operations landed)
+
+**M5.A LANDED 2026-05-11: All 4 reactive data structures — ReactiveLog, ReactiveList, ReactiveMap, ReactiveIndex — with Core-level integration, pluggable backend traits, change envelope types, and mutation log companions.** Decisions D177–D179 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**Behavioral additions:**
+
+1. **Core-level integration (D177).** Structures take `WeakCore` + user-supplied `InternFn<S>` at construction. Each structure registers a state `NodeId` with Core and emits DIRTY→DATA snapshots on every mutation via `Core::emit()`. No Graph dependency — structures are standalone building blocks.
+
+2. **Backend traits (D178).** Pluggable storage via `LogBackend<T>`, `ListBackend<T>`, `MapBackend<K,V>`, `IndexBackend<K,V>`. Default implementations use `Vec<T>` / `HashMap<K,V>`. `imbl`-backed persistent backends deferred until bench evidence justifies.
+
+3. **Per-structure change envelope types.** `LogChange<T>` (Append/AppendMany/Clear/TrimHead), `ListChange<T>` (Append/AppendMany/Insert/InsertMany/Pop/Clear), `MapChange<K,V>` (Set/Delete/Clear), `IndexChange<K,V>` (Upsert/Delete/DeleteMany/Clear). All derive `Serialize`/`Deserialize` under `serde-support` feature with `#[serde(tag = "kind", rename_all = "camelCase")]` for wire parity with TS.
+
+4. **Optional mutation log companions.** When `mutation_log: true`, each structure records `BaseChange<XxxChange<T>>` deltas to an internal `Vec` (accessible via `mutation_log_snapshot()`). Version counter is monotonically increasing per structure instance.
+
+5. **ReactiveLog<T>.** Append-only log with optional ring-buffer cap (`max_size`). Operations: `append`, `append_many`, `clear`, `trim_head`, `at` (negative index), `size`, `to_vec`.
+
+6. **ReactiveList<T>.** Ordered list with positional operations. Operations: `append`, `append_many`, `insert`, `insert_many`, `pop` (negative index), `clear`, `at`, `size`, `to_vec`.
+
+7. **ReactiveMap<K, V>.** Key-value map. Operations: `set`, `set_many`, `get`, `has`, `delete`, `delete_many`, `clear`, `size`, `to_vec`.
+
+8. **ReactiveIndex<K, V>.** Sorted index by (secondary, primary) with O(1) primary lookup. Operations: `upsert`, `upsert_many`, `get`, `has`, `delete`, `delete_many`, `clear`, `size`, `to_ordered`, `to_primary_map`. `IndexRow<K, V>` type for ordered output.
+
+**Test count post-batch: 745 cargo + 170 parity + 3008 pure-ts, 0 failed, 3 ignored.**
+- +31 net Rust tests over M4.F baseline (28 integration tests in `tests/reactive_structures.rs` + 3 existing changeset unit tests).
+- Pre-batch baseline 714 cargo (from M4.F close).
+
+`cargo clippy -p graphrefly-structures --all-targets` clean. `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**Deferred to M5.B:**
+- ReactiveLog views (tail, slice, fromCursor), scan, attach, attachStorage
+- ReactiveMap TTL, LRU, retention policies
+- ReactiveIndex custom equals for upsert idempotency
+- imbl-backed persistent backends
+- Versioning integration (V0/V1 content-addressed versions)
+- Graph-level sugar wrappers
+
+---
+
 ## Current state (2026-05-11 — M4.F storage parity tests landed)
 
 **M4.F LANDED 2026-05-11: Cross-impl storage parity tests — Tier 1 (core ops), Tier 2 (WAL utilities), Tier 3 (graph integration). Pure-TS arm green; rust arm gated on `@graphrefly/native` storage feature build.** Decisions D175–D176 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).

@@ -716,6 +716,7 @@ dependencies = [
  "graphrefly-core",
  "graphrefly-graph",
  "imbl",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",

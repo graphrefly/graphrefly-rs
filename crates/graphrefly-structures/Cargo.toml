@@ -19,6 +19,7 @@ graphrefly-graph = { workspace = true }   # snapshot / codec interop
 # only consumer doesn't pay its compile cost.
 imbl             = { workspace = true }
 
+parking_lot      = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 
