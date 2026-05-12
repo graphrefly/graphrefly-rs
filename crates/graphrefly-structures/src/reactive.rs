@@ -10,20 +10,23 @@
 //! the structure during message delivery. The `EmitHandle` lives outside the
 //! inner `Mutex` and uses `AtomicU64` for thread-safe version counting.
 
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use graphrefly_core::{wall_clock_ns, Core, HandleId, NodeId, WeakCore};
+use graphrefly_core::{
+    monotonic_ns, wall_clock_ns, Core, HandleId, Message, NodeId, Subscription, WeakCore,
+};
 
 use crate::backend::{
     HashMapBackend, IndexBackend, IndexRow, ListBackend, LogBackend, MapBackend, VecIndexBackend,
     VecListBackend, VecLogBackend,
 };
 use crate::changeset::{
-    BaseChange, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
+    BaseChange, DeleteReason, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ impl std::error::Error for IndexOutOfBounds {}
 /// Optionally records `BaseChange<LogChange<T>>` deltas to a companion
 /// mutation log.
 pub struct ReactiveLog<T: Clone + Send + Sync + 'static> {
-    inner: Mutex<LogInner<T>>,
+    inner: Arc<Mutex<LogInner<T>>>,
     emitter: EmitHandle<Vec<T>>,
     /// The Core state node backing this structure.
     pub node_id: NodeId,
@@ -155,7 +158,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             structure_name: opts.name,
         };
         Self {
-            inner: Mutex::new(inner),
+            inner: Arc::new(Mutex::new(inner)),
             emitter: EmitHandle {
                 core: core.weak_handle(),
                 node_id,
@@ -252,6 +255,348 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     #[must_use]
     pub fn mutation_log_snapshot(&self) -> Option<Vec<BaseChange<LogChange<T>>>> {
         self.inner.lock().mutation_log.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReactiveLog — views, scan, attach, attachStorage (M5.B)
+// ---------------------------------------------------------------------------
+
+/// View specification for [`ReactiveLog::view`].
+pub enum ViewSpec {
+    /// Last `n` entries.
+    Tail { n: usize },
+    /// Range `[start..stop)`. `stop` defaults to log length.
+    Slice { start: usize, stop: Option<usize> },
+    /// Entries from cursor position onward. The cursor node provides a `usize`
+    /// position via `read_cursor(handle) -> usize`.
+    FromCursor {
+        cursor_node: NodeId,
+        read_cursor: Arc<dyn Fn(HandleId) -> usize + Send + Sync>,
+    },
+}
+
+/// Handle to a log view. Dropping disposes the view subscription.
+pub struct LogView {
+    /// The state node backing this view. Subscribe to receive view snapshots.
+    pub node_id: NodeId,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Handle to a log scan. Dropping disposes the scan subscription.
+pub struct ScanHandle {
+    /// The state node backing this scan. Subscribe to receive accumulator snapshots.
+    pub node_id: NodeId,
+    _subscription: Subscription,
+}
+
+/// Trait for append-log storage sinks used by [`ReactiveLog::attach_storage`].
+///
+/// Implementors receive batches of entries and optionally support pre-loading.
+/// Methods return `Result` — errors are swallowed by `attach_storage` (matches
+/// TS try/catch semantics) so a failing tier doesn't break the reactive graph.
+pub trait AppendLogSink<T>: Send + Sync {
+    /// Append entries to persistent storage.
+    fn append_entries(&self, entries: &[T])
+        -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Load previously stored entries (for pre-loading on startup).
+    /// Returns an empty vec if no entries are stored.
+    fn load_entries(&self) -> Result<Vec<T>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Handle to an attach-storage subscription. Dropping disposes the subscription.
+pub struct AttachStorageHandle {
+    _subscription: Subscription,
+}
+
+impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
+    /// Create a reactive view of this log. Returns a [`LogView`] whose
+    /// `node_id` emits `Vec<T>` snapshots on every log mutation.
+    ///
+    /// `intern` converts the view `Vec<T>` into a `HandleId` for Core emission.
+    #[allow(clippy::too_many_lines)]
+    pub fn view(&self, spec: ViewSpec, intern: InternFn<Vec<T>>) -> LogView {
+        let core = self.emitter.core.upgrade().expect("Core dropped");
+        let view_node = core
+            .register_state(HandleId::new(0), false)
+            .expect("register_state for LogView");
+        let view_emitter = Arc::new(EmitHandle {
+            core: self.emitter.core.clone(),
+            node_id: view_node,
+            intern,
+            version: AtomicU64::new(0),
+        });
+
+        let inner = Arc::clone(&self.inner);
+        let mut subscriptions = Vec::new();
+
+        match spec {
+            ViewSpec::Tail { n } => {
+                let inner_c = Arc::clone(&inner);
+                let emitter_c = Arc::clone(&view_emitter);
+                let sub = core.subscribe(
+                    self.node_id,
+                    Arc::new(move |msgs| {
+                        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                            let guard = inner_c.lock();
+                            let data = guard.backend.to_vec();
+                            let start = data.len().saturating_sub(n);
+                            let view = data[start..].to_vec();
+                            drop(guard);
+                            emitter_c.emit(view);
+                        }
+                    }),
+                );
+                subscriptions.push(sub);
+            }
+            ViewSpec::Slice { start, stop } => {
+                let inner_c = Arc::clone(&inner);
+                let emitter_c = Arc::clone(&view_emitter);
+                let sub = core.subscribe(
+                    self.node_id,
+                    Arc::new(move |msgs| {
+                        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                            let guard = inner_c.lock();
+                            let data = guard.backend.to_vec();
+                            let end = stop.unwrap_or(data.len()).min(data.len());
+                            let s = start.min(end);
+                            let view = data[s..end].to_vec();
+                            drop(guard);
+                            emitter_c.emit(view);
+                        }
+                    }),
+                );
+                subscriptions.push(sub);
+            }
+            ViewSpec::FromCursor {
+                cursor_node,
+                read_cursor,
+            } => {
+                let cursor_pos = Arc::new(Mutex::new(0usize));
+
+                // Cursor subscription: update position and recompute.
+                let cursor_pos_c = Arc::clone(&cursor_pos);
+                let inner_c = Arc::clone(&inner);
+                let emitter_c = Arc::clone(&view_emitter);
+                let read_cursor_c = Arc::clone(&read_cursor);
+                let sub_cursor = core.subscribe(
+                    cursor_node,
+                    Arc::new(move |msgs| {
+                        for m in msgs {
+                            if let Message::Data(h) = m {
+                                let pos = read_cursor_c(*h);
+                                *cursor_pos_c.lock() = pos;
+                                let guard = inner_c.lock();
+                                let data = guard.backend.to_vec();
+                                let s = pos.min(data.len());
+                                let view = data[s..].to_vec();
+                                drop(guard);
+                                emitter_c.emit(view);
+                            }
+                        }
+                    }),
+                );
+                subscriptions.push(sub_cursor);
+
+                // Log subscription: recompute with current cursor.
+                let cursor_pos_c2 = Arc::clone(&cursor_pos);
+                let inner_c2 = Arc::clone(&inner);
+                let emitter_c2 = view_emitter;
+                let sub_log = core.subscribe(
+                    self.node_id,
+                    Arc::new(move |msgs| {
+                        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                            let pos = *cursor_pos_c2.lock();
+                            let guard = inner_c2.lock();
+                            let data = guard.backend.to_vec();
+                            let s = pos.min(data.len());
+                            let view = data[s..].to_vec();
+                            drop(guard);
+                            emitter_c2.emit(view);
+                        }
+                    }),
+                );
+                subscriptions.push(sub_log);
+            }
+        }
+
+        LogView {
+            node_id: view_node,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Incremental running aggregate over the log.
+    ///
+    /// Returns a [`ScanHandle`] whose `node_id` emits the current accumulator
+    /// on every log mutation. Appends are O(1) (only new entries processed);
+    /// `trimHead`/`clear` trigger a full rescan.
+    pub fn scan<TAcc: Clone + Send + Sync + 'static>(
+        &self,
+        initial: TAcc,
+        step: Arc<dyn Fn(&TAcc, &T) -> TAcc + Send + Sync>,
+        intern: InternFn<TAcc>,
+    ) -> ScanHandle {
+        struct ScanState<T, TAcc> {
+            acc: TAcc,
+            processed: usize,
+            initial: TAcc,
+            step: Arc<dyn Fn(&TAcc, &T) -> TAcc + Send + Sync>,
+        }
+
+        let core = self.emitter.core.upgrade().expect("Core dropped");
+        let scan_node = core
+            .register_state(HandleId::new(0), false)
+            .expect("register_state for Scan");
+
+        let state = Arc::new(Mutex::new(ScanState {
+            acc: initial.clone(),
+            processed: 0,
+            initial,
+            step,
+        }));
+        let inner = Arc::clone(&self.inner);
+        let scan_emitter = Arc::new(EmitHandle {
+            core: self.emitter.core.clone(),
+            node_id: scan_node,
+            intern,
+            version: AtomicU64::new(0),
+        });
+
+        let sub = core.subscribe(
+            self.node_id,
+            Arc::new(move |msgs| {
+                if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                    let mut ss = state.lock();
+                    let guard = inner.lock();
+                    let data = guard.backend.to_vec();
+                    drop(guard);
+
+                    if data.len() < ss.processed {
+                        // Length decreased (clear/trim) — full rescan.
+                        ss.acc = ss.initial.clone();
+                        ss.processed = 0;
+                    }
+                    for item in &data[ss.processed..] {
+                        ss.acc = (ss.step)(&ss.acc, item);
+                    }
+                    ss.processed = data.len();
+                    let acc = ss.acc.clone();
+                    drop(ss);
+                    scan_emitter.emit(acc);
+                }
+            }),
+        );
+
+        ScanHandle {
+            node_id: scan_node,
+            _subscription: sub,
+        }
+    }
+
+    /// Subscribe to an upstream node and append every DATA value into this log.
+    ///
+    /// `read_value` converts the upstream `HandleId` to a `T` for appending.
+    /// Returns a `Subscription` — dropping it stops the attachment.
+    pub fn attach(
+        &self,
+        upstream: NodeId,
+        read_value: Arc<dyn Fn(HandleId) -> T + Send + Sync>,
+    ) -> Subscription {
+        let core = self.emitter.core.upgrade().expect("Core dropped");
+        let inner = Arc::clone(&self.inner);
+        let weak_core = self.emitter.core.clone();
+        let node_id = self.node_id;
+        let intern = Arc::clone(&self.emitter.intern);
+
+        core.subscribe(
+            upstream,
+            Arc::new(move |msgs| {
+                for m in msgs {
+                    if let Message::Data(h) = m {
+                        let value = read_value(*h);
+                        let snapshot = {
+                            let mut guard = inner.lock();
+                            guard.backend.append(value);
+                            guard.backend.to_vec()
+                        };
+                        let handle = (intern)(snapshot);
+                        if let Some(c) = weak_core.upgrade() {
+                            c.emit(node_id, handle);
+                        }
+                    }
+                }
+            }),
+        )
+    }
+
+    /// Wire append-log storage sinks to this log.
+    ///
+    /// If `preload` is true, attempts `load_entries()` on the first sink that
+    /// returns data and appends to this log before subscribing. After
+    /// subscription, deltas are forwarded to ALL sinks. On trim/clear, the
+    /// full snapshot is re-shipped. Sink errors are swallowed (logged via
+    /// `eprintln!`) so a failing tier doesn't break the reactive graph.
+    pub fn attach_storage(
+        &self,
+        sinks: Vec<Arc<dyn AppendLogSink<T>>>,
+        preload: bool,
+    ) -> AttachStorageHandle {
+        if sinks.is_empty() {
+            let core = self.emitter.core.upgrade().expect("Core dropped");
+            let sub = core.subscribe(self.node_id, Arc::new(|_| {}));
+            return AttachStorageHandle { _subscription: sub };
+        }
+
+        if preload {
+            for sink in &sinks {
+                if let Ok(entries) = sink.load_entries() {
+                    if !entries.is_empty() {
+                        self.append_many(entries);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let current_size = self.size();
+        // All sinks start delivered at current_size (post-preload snapshot).
+        // The subscriber only sees future emissions, so no double-write.
+        let delivered: Vec<Arc<Mutex<usize>>> = sinks
+            .iter()
+            .map(|_| Arc::new(Mutex::new(current_size)))
+            .collect();
+
+        let core = self.emitter.core.upgrade().expect("Core dropped");
+        let inner = Arc::clone(&self.inner);
+        let sinks_arc = sinks;
+        let delivered_arc = delivered;
+
+        let sub = core.subscribe(
+            self.node_id,
+            Arc::new(move |msgs| {
+                if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                    let guard = inner.lock();
+                    let data = guard.backend.to_vec();
+                    drop(guard);
+
+                    for (i, sink) in sinks_arc.iter().enumerate() {
+                        let mut del = delivered_arc[i].lock();
+                        let result = match data.len().cmp(&*del) {
+                            std::cmp::Ordering::Greater => sink.append_entries(&data[*del..]),
+                            std::cmp::Ordering::Less => sink.append_entries(&data),
+                            std::cmp::Ordering::Equal => continue,
+                        };
+                        match result {
+                            Ok(()) => *del = data.len(),
+                            Err(e) => eprintln!("attach_storage sink[{i}] error: {e}"),
+                        }
+                    }
+                }
+            }),
+        );
+
+        AttachStorageHandle { _subscription: sub }
     }
 }
 
@@ -497,6 +842,26 @@ where
     pub node_id: NodeId,
 }
 
+/// Score-based retention policy for [`ReactiveMap`].
+///
+/// After every mutation, entries are scored and those below `archive_threshold`
+/// (or exceeding `max_size` by ascending score) are archived (deleted).
+/// Mutually exclusive with top-level `max_size` (LRU).
+pub struct RetentionPolicy<K, V>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Score function — higher is kept.
+    pub score: Arc<dyn Fn(&K, &V) -> f64 + Send + Sync>,
+    /// Entries scoring below this threshold are archived.
+    pub archive_threshold: Option<f64>,
+    /// Maximum number of live entries. Lowest-scored entries archived first.
+    pub max_size: Option<usize>,
+    /// Called for each archived entry.
+    pub on_archive: Option<Arc<dyn Fn(&K, &V, f64) + Send + Sync>>,
+}
+
 struct MapInner<K, V>
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
@@ -505,6 +870,16 @@ where
     backend: Box<dyn MapBackend<K, V>>,
     mutation_log: Option<Vec<BaseChange<MapChange<K, V>>>>,
     structure_name: String,
+    /// Per-key expiry timestamps (monotonic ns). Present only when TTL is enabled.
+    ttl_expiry: HashMap<K, u64>,
+    /// Default TTL in nanoseconds. None = no TTL.
+    default_ttl_ns: Option<u64>,
+    /// LRU access order (most recently used at end). Present only when LRU is enabled.
+    lru_order: Vec<K>,
+    /// Maximum entries for LRU eviction. None = no LRU cap.
+    lru_max_size: Option<usize>,
+    /// Score-based retention policy.
+    retention: Option<RetentionPolicy<K, V>>,
 }
 
 impl<K, V> MapInner<K, V>
@@ -524,6 +899,125 @@ where
             });
         }
     }
+
+    /// Prune expired keys. Returns deleted (key, previous_value) pairs.
+    fn prune_expired_inner(&mut self) -> Vec<(K, V)> {
+        if self.ttl_expiry.is_empty() {
+            return vec![];
+        }
+        let now = monotonic_ns();
+        let expired_keys: Vec<K> = self
+            .ttl_expiry
+            .iter()
+            .filter(|(_, &exp)| now >= exp)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut expired = Vec::new();
+        for k in expired_keys {
+            if let Some(prev) = self.backend.get(&k) {
+                self.backend.delete(&k);
+                self.ttl_expiry.remove(&k);
+                self.lru_remove(&k);
+                expired.push((k, prev));
+            }
+        }
+        expired
+    }
+
+    /// Apply retention policy. Returns archived keys with scores.
+    fn apply_retention_inner(&mut self) -> Vec<(K, V, f64)> {
+        // Extract retention config values to avoid borrow conflict.
+        let (score_fn, archive_threshold, max_size) = match &self.retention {
+            Some(r) => (Arc::clone(&r.score), r.archive_threshold, r.max_size),
+            None => return vec![],
+        };
+        let entries = self.backend.to_vec();
+        if entries.is_empty() {
+            return vec![];
+        }
+        let mut scored: Vec<(K, V, f64)> = entries
+            .into_iter()
+            .map(|(k, v)| {
+                let s = (score_fn)(&k, &v);
+                (k, v, s)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.2.total_cmp(&b.2));
+
+        let mut archived = Vec::new();
+        if let Some(threshold) = archive_threshold {
+            while let Some(entry) = scored.first() {
+                if entry.2 < threshold {
+                    let (k, v, s) = scored.remove(0);
+                    self.backend.delete(&k);
+                    self.ttl_expiry.remove(&k);
+                    self.lru_remove(&k);
+                    archived.push((k, v, s));
+                } else {
+                    break;
+                }
+            }
+        }
+        if let Some(max) = max_size {
+            while scored.len() > max {
+                let (k, v, s) = scored.remove(0);
+                self.backend.delete(&k);
+                self.ttl_expiry.remove(&k);
+                self.lru_remove(&k);
+                archived.push((k, v, s));
+            }
+        }
+        archived
+    }
+
+    /// Touch key in LRU order (move to end). Does NOT emit.
+    fn lru_touch(&mut self, key: &K) {
+        if self.lru_max_size.is_none() {
+            return;
+        }
+        if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+            self.lru_order.remove(pos);
+            self.lru_order.push(key.clone());
+        }
+    }
+
+    /// Remove key from LRU order.
+    fn lru_remove(&mut self, key: &K) {
+        if self.lru_max_size.is_none() {
+            return;
+        }
+        if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+            self.lru_order.remove(pos);
+        }
+    }
+
+    /// Evict LRU entries exceeding max_size. Returns evicted (key, previous_value) pairs.
+    fn lru_evict(&mut self) -> Vec<(K, V)> {
+        let Some(max) = self.lru_max_size else {
+            return vec![];
+        };
+        let mut evicted = Vec::new();
+        while self.backend.size() > max && !self.lru_order.is_empty() {
+            let victim = self.lru_order.remove(0);
+            if let Some(prev) = self.backend.get(&victim) {
+                self.backend.delete(&victim);
+                self.ttl_expiry.remove(&victim);
+                evicted.push((victim, prev));
+            }
+        }
+        evicted
+    }
+
+    /// Record TTL for a key. Per-call `ttl` (seconds) overrides `default_ttl_ns`.
+    fn set_ttl_with(&mut self, key: &K, ttl: Option<f64>) {
+        let ttl_ns = match ttl {
+            Some(secs) => Some((secs * 1_000_000_000.0) as u64),
+            None => self.default_ttl_ns,
+        };
+        if let Some(ns) = ttl_ns {
+            self.ttl_expiry.insert(key.clone(), monotonic_ns() + ns);
+        }
+    }
 }
 
 /// Options for constructing a [`ReactiveMap`].
@@ -535,6 +1029,13 @@ where
     pub name: String,
     pub backend: Option<Box<dyn MapBackend<K, V>>>,
     pub mutation_log: bool,
+    /// Default TTL in seconds. Applied to all `set`/`set_many` calls.
+    /// Must be > 0 if set.
+    pub default_ttl: Option<f64>,
+    /// LRU cap. Mutually exclusive with `retention`.
+    pub max_size: Option<usize>,
+    /// Score-based retention policy. Mutually exclusive with `max_size`.
+    pub retention: Option<RetentionPolicy<K, V>>,
 }
 
 impl<K, V> Default for ReactiveMapOptions<K, V>
@@ -547,17 +1048,56 @@ where
             name: "reactiveMap".into(),
             backend: None,
             mutation_log: false,
+            default_ttl: None,
+            max_size: None,
+            retention: None,
         }
     }
 }
+
+/// Configuration validation error for [`ReactiveMap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapConfigError(pub String);
+
+impl std::fmt::Display for MapConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MapConfigError {}
 
 impl<K, V> ReactiveMap<K, V>
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    #[must_use]
-    pub fn new(core: &Core, intern: InternFn<Vec<(K, V)>>, opts: ReactiveMapOptions<K, V>) -> Self {
+    /// Create a new reactive map.
+    ///
+    /// # Errors
+    /// Returns `MapConfigError` if both `max_size` (LRU) and `retention` are set.
+    pub fn new(
+        core: &Core,
+        intern: InternFn<Vec<(K, V)>>,
+        opts: ReactiveMapOptions<K, V>,
+    ) -> Result<Self, MapConfigError> {
+        if opts.max_size.is_some() && opts.retention.is_some() {
+            return Err(MapConfigError(
+                "max_size (LRU) and retention are mutually exclusive".into(),
+            ));
+        }
+        if let Some(ref r) = opts.retention {
+            if r.archive_threshold.is_none() && r.max_size.is_none() {
+                return Err(MapConfigError(
+                    "retention requires at least one of archive_threshold or max_size".into(),
+                ));
+            }
+        }
+        if let Some(ttl) = opts.default_ttl {
+            if ttl <= 0.0 {
+                return Err(MapConfigError("default_ttl must be > 0".into()));
+            }
+        }
         let node_id = core
             .register_state(HandleId::new(0), false)
             .expect("register_state for ReactiveMap");
@@ -569,12 +1109,18 @@ where
         } else {
             None
         };
+        let default_ttl_ns = opts.default_ttl.map(|secs| (secs * 1_000_000_000.0) as u64);
         let inner = MapInner {
             backend,
             mutation_log,
             structure_name: opts.name,
+            ttl_expiry: HashMap::new(),
+            default_ttl_ns,
+            lru_order: Vec::new(),
+            lru_max_size: opts.max_size,
+            retention: opts.retention,
         };
-        Self {
+        Ok(Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
                 core: core.weak_handle(),
@@ -583,7 +1129,7 @@ where
                 version: AtomicU64::new(0),
             },
             node_id,
-        }
+        })
     }
 
     #[must_use]
@@ -591,38 +1137,201 @@ where
         self.inner.lock().backend.size()
     }
 
-    #[must_use]
+    /// Check if key exists. Expired keys are pruned (observable side-effect).
+    /// LRU touch: live key is marked as most-recently-used (no emission).
     pub fn has(&self, key: &K) -> bool {
-        self.inner.lock().backend.has(key)
+        let (has, expired) = {
+            let mut inner = self.inner.lock();
+            let mut target_expired = false;
+            // Check TTL expiry first.
+            if inner.default_ttl_ns.is_some() {
+                if let Some(&exp) = inner.ttl_expiry.get(key) {
+                    if monotonic_ns() >= exp {
+                        target_expired = true;
+                    }
+                }
+            }
+            // Prune all expired keys (including the target if expired).
+            let mut expired = inner.prune_expired_inner();
+            if target_expired && !expired.iter().any(|(k, _)| k == key) {
+                // Target was expired but prune_expired_inner didn't catch it
+                // (race with monotonic_ns). Delete it explicitly.
+                if let Some(prev) = inner.backend.get(key) {
+                    inner.backend.delete(key);
+                    inner.ttl_expiry.remove(key);
+                    inner.lru_remove(key);
+                    expired.push((key.clone(), prev));
+                }
+            }
+            let has = if target_expired {
+                false
+            } else {
+                let h = inner.backend.has(key);
+                if h {
+                    inner.lru_touch(key);
+                }
+                h
+            };
+            (has, expired)
+        };
+        if !expired.is_empty() {
+            let snapshot = self.inner.lock().backend.to_vec();
+            let version = self.emitter.emit(snapshot);
+            let mut inner = self.inner.lock();
+            for (k, prev) in expired {
+                inner.record(
+                    MapChange::Delete {
+                        key: k,
+                        previous: prev,
+                        reason: DeleteReason::Expired,
+                    },
+                    version.clone(),
+                );
+            }
+        }
+        has
     }
 
-    #[must_use]
+    /// Get value by key. Expired keys return `None` (observable side-effect).
+    /// LRU touch: live key is marked as most-recently-used (no emission).
     pub fn get(&self, key: &K) -> Option<V> {
-        self.inner.lock().backend.get(key)
+        let (value, expired) = {
+            let mut inner = self.inner.lock();
+            let mut target_expired = false;
+            if inner.default_ttl_ns.is_some() {
+                if let Some(&exp) = inner.ttl_expiry.get(key) {
+                    if monotonic_ns() >= exp {
+                        target_expired = true;
+                    }
+                }
+            }
+            // Prune all expired keys (including the target if expired).
+            let mut expired = inner.prune_expired_inner();
+            if target_expired && !expired.iter().any(|(k, _)| k == key) {
+                // Target was expired but prune_expired_inner didn't catch it.
+                if let Some(prev) = inner.backend.get(key) {
+                    inner.backend.delete(key);
+                    inner.ttl_expiry.remove(key);
+                    inner.lru_remove(key);
+                    expired.push((key.clone(), prev));
+                }
+            }
+            let value = if target_expired {
+                None
+            } else {
+                let v = inner.backend.get(key);
+                if v.is_some() {
+                    inner.lru_touch(key);
+                }
+                v
+            };
+            (value, expired)
+        };
+        if !expired.is_empty() {
+            let snapshot = self.inner.lock().backend.to_vec();
+            let version = self.emitter.emit(snapshot);
+            let mut inner = self.inner.lock();
+            for (k, prev) in expired {
+                inner.record(
+                    MapChange::Delete {
+                        key: k,
+                        previous: prev,
+                        reason: DeleteReason::Expired,
+                    },
+                    version.clone(),
+                );
+            }
+        }
+        value
     }
 
     pub fn set(&self, key: K, value: V) {
-        let (snapshot, change) = {
+        self.set_with_ttl(key, value, None);
+    }
+
+    /// Set a key with an optional per-call TTL override (seconds).
+    ///
+    /// # Panics
+    /// Panics if `ttl` is `Some` with a non-positive or non-finite value.
+    pub fn set_with_ttl(&self, key: K, value: V, ttl: Option<f64>) {
+        if let Some(t) = ttl {
+            assert!(
+                t > 0.0 && t.is_finite(),
+                "per-call ttl must be positive and finite"
+            );
+        }
+        let (snapshot, change, eviction_changes) = {
             let mut inner = self.inner.lock();
+            let expired = inner.prune_expired_inner();
             let change = inner.mutation_log.is_some().then(|| MapChange::Set {
                 key: key.clone(),
                 value: value.clone(),
             });
+            inner.set_ttl_with(&key, ttl);
+            inner.lru_remove(&key);
+            if inner.lru_max_size.is_some() {
+                inner.lru_order.push(key.clone());
+            }
             inner.backend.set(key, value);
-            (inner.backend.to_vec(), change)
+            let evicted = inner.lru_evict();
+            let archived = inner.apply_retention_inner();
+            let mut eviction_changes: Vec<(K, V, DeleteReason)> = Vec::new();
+            for (k, prev) in expired {
+                eviction_changes.push((k, prev, DeleteReason::Expired));
+            }
+            for (k, prev) in evicted {
+                eviction_changes.push((k, prev, DeleteReason::LruEvict));
+            }
+            for (k, v, s) in &archived {
+                if let Some(on_archive) =
+                    &inner.retention.as_ref().and_then(|r| r.on_archive.clone())
+                {
+                    on_archive(k, v, *s);
+                }
+                eviction_changes.push((k.clone(), v.clone(), DeleteReason::Archived));
+            }
+            (inner.backend.to_vec(), change, eviction_changes)
         };
         let version = self.emitter.emit(snapshot);
-        if let Some(change) = change {
-            self.inner.lock().record(change, version);
+        if change.is_some() || !eviction_changes.is_empty() {
+            let mut inner = self.inner.lock();
+            if let Some(change) = change {
+                inner.record(change, version.clone());
+            }
+            for (k, prev, reason) in eviction_changes {
+                inner.record(
+                    MapChange::Delete {
+                        key: k,
+                        previous: prev,
+                        reason,
+                    },
+                    version.clone(),
+                );
+            }
         }
     }
 
     pub fn set_many(&self, entries: Vec<(K, V)>) {
+        self.set_many_with_ttl(entries, None);
+    }
+
+    /// Batch set with optional per-call TTL override (seconds).
+    ///
+    /// # Panics
+    /// Panics if `ttl` is `Some` with a non-positive or non-finite value.
+    pub fn set_many_with_ttl(&self, entries: Vec<(K, V)>, ttl: Option<f64>) {
+        if let Some(t) = ttl {
+            assert!(
+                t > 0.0 && t.is_finite(),
+                "per-call ttl must be positive and finite"
+            );
+        }
         if entries.is_empty() {
             return;
         }
-        let (snapshot, changes) = {
+        let (snapshot, changes, eviction_changes) = {
             let mut inner = self.inner.lock();
+            let expired = inner.prune_expired_inner();
             let changes: Option<Vec<MapChange<K, V>>> = inner.mutation_log.is_some().then(|| {
                 entries
                     .iter()
@@ -632,55 +1341,107 @@ where
                     })
                     .collect()
             });
+            for (k, _) in &entries {
+                inner.set_ttl_with(k, ttl);
+                inner.lru_remove(k);
+                if inner.lru_max_size.is_some() {
+                    inner.lru_order.push(k.clone());
+                }
+            }
             inner.backend.set_many(entries);
-            (inner.backend.to_vec(), changes)
+            let evicted = inner.lru_evict();
+            let archived = inner.apply_retention_inner();
+            let mut eviction_changes: Vec<(K, V, DeleteReason)> = Vec::new();
+            for (k, prev) in expired {
+                eviction_changes.push((k, prev, DeleteReason::Expired));
+            }
+            for (k, prev) in evicted {
+                eviction_changes.push((k, prev, DeleteReason::LruEvict));
+            }
+            for (k, v, s) in &archived {
+                if let Some(on_archive) =
+                    &inner.retention.as_ref().and_then(|r| r.on_archive.clone())
+                {
+                    on_archive(k, v, *s);
+                }
+                eviction_changes.push((k.clone(), v.clone(), DeleteReason::Archived));
+            }
+            (inner.backend.to_vec(), changes, eviction_changes)
         };
         let version = self.emitter.emit(snapshot);
-        if let Some(changes) = changes {
+        if changes.is_some() || !eviction_changes.is_empty() {
             let mut inner = self.inner.lock();
-            for change in changes {
-                inner.record(change, version.clone());
+            if let Some(changes) = changes {
+                for change in changes {
+                    inner.record(change, version.clone());
+                }
+            }
+            for (k, prev, reason) in eviction_changes {
+                inner.record(
+                    MapChange::Delete {
+                        key: k,
+                        previous: prev,
+                        reason,
+                    },
+                    version.clone(),
+                );
             }
         }
     }
 
     pub fn delete(&self, key: &K) {
-        let snapshot = {
+        let (snapshot, previous) = {
             let mut inner = self.inner.lock();
+            let previous = inner.backend.get(key);
             if !inner.backend.delete(key) {
                 return;
             }
-            inner.backend.to_vec()
+            inner.ttl_expiry.remove(key);
+            inner.lru_remove(key);
+            (inner.backend.to_vec(), previous)
         };
         let version = self.emitter.emit(snapshot);
-        self.inner
-            .lock()
-            .record(MapChange::Delete { key: key.clone() }, version);
+        if let Some(prev) = previous {
+            self.inner.lock().record(
+                MapChange::Delete {
+                    key: key.clone(),
+                    previous: prev,
+                    reason: DeleteReason::Explicit,
+                },
+                version,
+            );
+        }
     }
 
     pub fn delete_many(&self, keys: &[K]) {
         let (snapshot, actually_deleted) = {
             let mut inner = self.inner.lock();
-            // Pre-filter to keys that actually exist (P4 fix).
-            let actually_deleted: Vec<K> = if inner.mutation_log.is_some() {
-                keys.iter()
-                    .filter(|k| inner.backend.has(k))
-                    .cloned()
-                    .collect()
-            } else {
-                vec![]
-            };
+            let actually_deleted: Vec<(K, V)> = keys
+                .iter()
+                .filter_map(|k| inner.backend.get(k).map(|v| (k.clone(), v)))
+                .collect();
             let removed = inner.backend.delete_many(keys);
             if removed == 0 {
                 return;
+            }
+            for k in keys {
+                inner.ttl_expiry.remove(k);
+                inner.lru_remove(k);
             }
             (inner.backend.to_vec(), actually_deleted)
         };
         let version = self.emitter.emit(snapshot);
         if !actually_deleted.is_empty() {
             let mut inner = self.inner.lock();
-            for k in actually_deleted {
-                inner.record(MapChange::Delete { key: k }, version.clone());
+            for (k, prev) in actually_deleted {
+                inner.record(
+                    MapChange::Delete {
+                        key: k,
+                        previous: prev,
+                        reason: DeleteReason::Explicit,
+                    },
+                    version.clone(),
+                );
             }
         }
     }
@@ -692,12 +1453,40 @@ where
             if count == 0 {
                 return;
             }
+            inner.ttl_expiry.clear();
+            inner.lru_order.clear();
             (inner.backend.to_vec(), count)
         };
         let version = self.emitter.emit(snapshot);
         self.inner
             .lock()
             .record(MapChange::Clear { count }, version);
+    }
+
+    /// Explicitly prune all expired keys. Returns the number of keys removed.
+    pub fn prune_expired(&self) -> usize {
+        let expired = {
+            let mut inner = self.inner.lock();
+            inner.prune_expired_inner()
+        };
+        if expired.is_empty() {
+            return 0;
+        }
+        let count = expired.len();
+        let snapshot = self.inner.lock().backend.to_vec();
+        let version = self.emitter.emit(snapshot);
+        let mut inner = self.inner.lock();
+        for (k, prev) in expired {
+            inner.record(
+                MapChange::Delete {
+                    key: k,
+                    previous: prev,
+                    reason: DeleteReason::Expired,
+                },
+                version.clone(),
+            );
+        }
+        count
     }
 
     #[must_use]
@@ -728,6 +1517,9 @@ where
     pub node_id: NodeId,
 }
 
+/// User-supplied equality function for upsert idempotency.
+pub type IndexEqualsFn<K, V> = Arc<dyn Fn(&IndexRow<K, V>, &IndexRow<K, V>) -> bool + Send + Sync>;
+
 struct IndexInner<K, V>
 where
     K: Clone + Eq + Hash + Send + Sync + ToString + 'static,
@@ -736,6 +1528,11 @@ where
     backend: Box<dyn IndexBackend<K, V>>,
     mutation_log: Option<Vec<BaseChange<IndexChange<K, V>>>>,
     structure_name: String,
+    /// Factory-level equals for upsert idempotency. When set, `upsert` on an
+    /// existing key compares the existing row with the proposed row; if
+    /// `equals(existing, proposed)` returns `true`, the upsert is a no-op
+    /// (no version bump, no emission).
+    equals: Option<IndexEqualsFn<K, V>>,
 }
 
 impl<K, V> IndexInner<K, V>
@@ -757,6 +1554,26 @@ where
     }
 }
 
+/// Per-call upsert options for [`ReactiveIndex::upsert`].
+pub struct UpsertOptions<K, V>
+where
+    K: Clone + Eq + Hash + Send + Sync + ToString + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Per-call equals override. Takes precedence over the factory-level equals.
+    pub equals: Option<IndexEqualsFn<K, V>>,
+}
+
+impl<K, V> Default for UpsertOptions<K, V>
+where
+    K: Clone + Eq + Hash + Send + Sync + ToString + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self { equals: None }
+    }
+}
+
 /// Options for constructing a [`ReactiveIndex`].
 pub struct ReactiveIndexOptions<K, V>
 where
@@ -766,6 +1583,8 @@ where
     pub name: String,
     pub backend: Option<Box<dyn IndexBackend<K, V>>>,
     pub mutation_log: bool,
+    /// Factory-level equals for upsert idempotency.
+    pub equals: Option<IndexEqualsFn<K, V>>,
 }
 
 impl<K, V> Default for ReactiveIndexOptions<K, V>
@@ -778,6 +1597,7 @@ where
             name: "reactiveIndex".into(),
             backend: None,
             mutation_log: false,
+            equals: None,
         }
     }
 }
@@ -808,6 +1628,7 @@ where
             backend,
             mutation_log,
             structure_name: opts.name,
+            equals: opts.equals,
         };
         Self {
             inner: Mutex::new(inner),
@@ -836,10 +1657,39 @@ where
         self.inner.lock().backend.get(primary)
     }
 
-    /// Insert or update a row. Returns `true` if inserted (new primary key).
+    /// Insert or update a row. Returns `true` if inserted (new primary key),
+    /// `false` if updated or skipped by equals idempotency.
     pub fn upsert(&self, primary: K, secondary: String, value: V) -> bool {
+        self.upsert_with(primary, secondary, value, &UpsertOptions::default())
+    }
+
+    /// Insert or update a row with per-call options.
+    ///
+    /// If `opts.equals` (or the factory-level equals) returns `true` for the
+    /// existing row vs the proposed row, the upsert is a no-op (no emission).
+    pub fn upsert_with(
+        &self,
+        primary: K,
+        secondary: String,
+        value: V,
+        opts: &UpsertOptions<K, V>,
+    ) -> bool {
         let (is_new, snapshot, change) = {
             let mut inner = self.inner.lock();
+            // Check equals idempotency: per-call overrides factory-level.
+            let eq_fn = opts.equals.as_ref().or(inner.equals.as_ref());
+            if let Some(eq) = eq_fn {
+                if let Some(existing_row) = inner.backend.get_row(&primary) {
+                    let proposed = IndexRow {
+                        primary: primary.clone(),
+                        secondary: secondary.clone(),
+                        value: value.clone(),
+                    };
+                    if eq(&existing_row, &proposed) {
+                        return false;
+                    }
+                }
+            }
             let change = inner.mutation_log.is_some().then(|| IndexChange::Upsert {
                 primary: primary.clone(),
                 secondary: secondary.clone(),
@@ -855,14 +1705,39 @@ where
         is_new
     }
 
+    /// Batch upsert. Rows matching the factory-level equals are skipped.
+    /// If ALL rows are skipped, no emission occurs.
     pub fn upsert_many(&self, rows: Vec<(K, String, V)>) {
         if rows.is_empty() {
             return;
         }
         let (snapshot, changes) = {
             let mut inner = self.inner.lock();
+            // Filter rows through equals idempotency.
+            let effective_rows: Vec<(K, String, V)> = if let Some(eq) = &inner.equals {
+                rows.into_iter()
+                    .filter(|(pk, sec, val)| {
+                        if let Some(existing) = inner.backend.get_row(pk) {
+                            let proposed = IndexRow {
+                                primary: pk.clone(),
+                                secondary: sec.clone(),
+                                value: val.clone(),
+                            };
+                            !eq(&existing, &proposed)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            } else {
+                rows
+            };
+            if effective_rows.is_empty() {
+                return;
+            }
             let changes: Option<Vec<IndexChange<K, V>>> = inner.mutation_log.is_some().then(|| {
-                rows.iter()
+                effective_rows
+                    .iter()
                     .map(|(k, s, v)| IndexChange::Upsert {
                         primary: k.clone(),
                         secondary: s.clone(),
@@ -870,7 +1745,7 @@ where
                     })
                     .collect()
             });
-            inner.backend.upsert_many(rows);
+            inner.backend.upsert_many(effective_rows);
             (inner.backend.to_ordered(), changes)
         };
         let version = self.emitter.emit(snapshot);

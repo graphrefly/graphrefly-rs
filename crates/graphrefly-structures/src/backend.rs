@@ -287,6 +287,8 @@ pub trait IndexBackend<K: Clone + Eq + Hash, V: Clone>: Send + Sync {
     fn size(&self) -> usize;
     fn has(&self, primary: &K) -> bool;
     fn get(&self, primary: &K) -> Option<V>;
+    /// Get the full row (primary + secondary + value) by primary key.
+    fn get_row(&self, primary: &K) -> Option<IndexRow<K, V>>;
     /// Returns `true` if inserted (new key), `false` if updated.
     fn upsert(&mut self, primary: K, secondary: String, value: V) -> bool;
     fn upsert_many(&mut self, rows: Vec<(K, String, V)>) -> usize;
@@ -338,6 +340,16 @@ impl<K: Clone + Eq + Hash + Send + Sync + ToString, V: Clone + Send + Sync> Inde
 
     fn get(&self, primary: &K) -> Option<V> {
         self.primary_map.get(primary).cloned()
+    }
+
+    fn get_row(&self, primary: &K) -> Option<IndexRow<K, V>> {
+        let value = self.primary_map.get(primary)?;
+        let secondary = self.secondary_map.get(primary)?;
+        Some(IndexRow {
+            primary: primary.clone(),
+            secondary: secondary.clone(),
+            value: value.clone(),
+        })
     }
 
     fn upsert(&mut self, primary: K, secondary: String, value: V) -> bool {

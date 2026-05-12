@@ -112,6 +112,17 @@ pub enum ListChange<T> {
     Clear { count: usize },
 }
 
+/// Reason a map key was deleted — tracked in mutation log for audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde-support", serde(rename_all = "camelCase"))]
+pub enum DeleteReason {
+    Explicit,
+    Expired,
+    LruEvict,
+    Archived,
+}
+
 /// Delta payload for [`crate::ReactiveMap`] mutations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde-support", derive(Serialize, Deserialize))]
@@ -120,9 +131,18 @@ pub enum ListChange<T> {
     serde(tag = "kind", rename_all = "camelCase")
 )]
 pub enum MapChange<K, V> {
-    Set { key: K, value: V },
-    Delete { key: K },
-    Clear { count: usize },
+    Set {
+        key: K,
+        value: V,
+    },
+    Delete {
+        key: K,
+        previous: V,
+        reason: DeleteReason,
+    },
+    Clear {
+        count: usize,
+    },
 }
 
 /// Delta payload for [`crate::ReactiveIndex`] mutations.

@@ -2,6 +2,71 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
+## Current state (2026-05-11 — M5.B /qa fixes landed)
+
+**M5.B LANDED 2026-05-11 + parity review fixes + /qa fixes applied same-day.** Decisions D180–D185 + D186 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**/qa fixes (applied after adversarial review):**
+
+1. **F1 — `has()`/`get()` early-return emission bug (Rust fix).** When TTL-expired target key was found, both methods deleted from backend and returned early — skipping emission and mutation log recording. Subscribers and audit log never learned about the deletion. Fixed: expired target now flows through the normal `expired` collection and emission path.
+
+2. **F2 — Per-call TTL validation (Rust fix).** `set_with_ttl` / `set_many_with_ttl` accepted arbitrary `f64` TTL values. Negative or NaN values cast to 0, causing instant expiry and silent data loss. Fixed: panics on non-positive or non-finite per-call TTL.
+
+3. **F3 — TS `reason` field made required (TS fix).** `MapChangePayload.reason` was `reason?:` (optional) while Rust `DeleteReason` is required. All TS call sites already provided a reason. Fixed: removed the `?` for cross-language parity.
+
+4. **F4 — NaN-safe retention sort (Rust fix).** `apply_retention_inner` used `partial_cmp().unwrap_or(Equal)` which made NaN-scored entries nondeterministic. Fixed: uses `total_cmp()` which places NaN below -Infinity, ensuring NaN entries are always archived first.
+
+---
+
+**M5.B features (initial landing):** ReactiveLog views/scan/attach/attachStorage, ReactiveMap TTL/LRU/retention policies, ReactiveIndex custom equals for upsert idempotency, mutation log `DeleteReason` discriminant.
+
+**Parity review fixes (applied to BOTH TS and Rust):**
+
+1. **Retention validation (Rust fix).** `ReactiveMap::new` now rejects `RetentionPolicy` with neither `archive_threshold` nor `max_size` set — matches TS validation.
+
+2. **`IndexBackend::get_row` (both).** New O(1) `get_row(primary) -> Option<IndexRow>` method on the backend trait. Replaces the O(n) `to_ordered().iter().find()` scan used in equals checks. Added to both TS `NativeIndexBackend` and Rust `VecIndexBackend`.
+
+3. **`MapChange::Delete` carries `previous: V` (Rust fix).** Mutation log now captures the deleted value for all deletion reasons (explicit, expired, LRU evict, archived) — matches TS semantics.
+
+4. **Per-call TTL on `set`/`set_many` (Rust fix).** New `set_with_ttl(key, value, ttl)` and `set_many_with_ttl(entries, ttl)` methods. Per-call TTL (seconds, `Option<f64>`) overrides factory `default_ttl` — matches TS `opts?.ttl` pattern.
+
+5. **Archival reason `"archived"` (TS fix + Rust already correct).** TS `MapChangePayload` reason union widened to include `"archived"`. Retention archival now emits `reason: "archived"` instead of the misleading `"lru-evict"`. Rust already had the dedicated `DeleteReason::Archived` variant.
+
+6. **Mutation log records only effective upsert rows (TS fix + Rust already correct).** TS `upsertMany` wrapper now pre-filters idempotent rows through the equals predicate before logging — only rows that cause state change are recorded. Matches Rust behavior. Previous TS behavior logged ALL input rows regardless of equals skip.
+
+7. **Multi-tier `attach_storage` with error resilience (Rust fix).** `attach_storage` now takes `Vec<Arc<dyn AppendLogSink<T>>>` with per-sink delivery tracking. Preload attempts sinks in order (first with data wins). `AppendLogSink` methods now return `Result` — errors are swallowed with `eprintln!` diagnostic so a failing tier doesn't break the reactive graph. Matches TS multi-tier + try/catch semantics.
+
+**Behavioral additions (from initial M5.B landing):**
+
+1. **ReactiveLog views (A).** `ViewSpec` enum (Tail/Slice/FromCursor) with reactive `LogView` that re-emits `Vec<T>` snapshots on every log mutation. `FromCursor` variant takes a cursor `NodeId` + `read_cursor` callback for dual-dependency reactivity.
+
+2. **ReactiveLog scan (A).** Incremental running aggregate via `scan(initial, step, intern)`. Appends are O(1); `trimHead`/`clear` trigger full rescan.
+
+3. **ReactiveLog attach/attachStorage (A).** `attach(upstream, read_value)` subscribes to an upstream `NodeId` and appends every DATA value. **Ascending-order constraint (D182):** upstream must be registered before the log.
+
+4. **ReactiveMap TTL (B).** `default_ttl` + per-call TTL. Lazy pruning on `get`/`has`. `prune_expired()` for explicit batch cleanup.
+
+5. **ReactiveMap LRU (B).** `max_size` eviction cap. Mutually exclusive with retention — validated at construction.
+
+6. **ReactiveMap retention (B).** `RetentionPolicy` with `score`, `archive_threshold`, `max_size`, `on_archive`. Requires at least one trigger — validated at construction.
+
+7. **ReactiveIndex custom equals (C).** Factory-level + per-call override. `get_row` O(1) lookup for equals comparison.
+
+8. **DeleteReason audit discriminant.** `MapChange::Delete` carries `previous: V` + `reason: DeleteReason` (Explicit/Expired/LruEvict/Archived).
+
+**API changes (breaking):** `ReactiveMap::new` returns `Result<Self, MapConfigError>`. `MapChange::Delete` now carries `previous: V` + `reason: DeleteReason`. `AppendLogSink` methods return `Result`. `attach_storage` takes `Vec<Arc<dyn AppendLogSink<T>>>`.
+
+**Test count: 52 Rust integration tests, 3009 TS pure-ts tests.** `cargo clippy` clean. `cargo fmt --check` clean. `biome check` clean. `#![forbid(unsafe_code)]` preserved.
+
+**View memoization: intentionally not ported.** TS caches views in LRU maps because `view()` returns a shared `Node<T[]>` and callers may call it repeatedly. Rust's `view()` returns an owned `LogView` — the caller holds it directly, so memoization would add complexity with no benefit.
+
+**Deferred to M5.C+:**
+- imbl-backed persistent backends (bench evidence required)
+- Versioning integration (V0/V1 content-addressed versions)
+- Graph-level sugar wrappers
+
+---
+
 ## Current state (2026-05-11 — M5.A reactive data structures base operations landed)
 
 **M5.A LANDED 2026-05-11: All 4 reactive data structures — ReactiveLog, ReactiveList, ReactiveMap, ReactiveIndex — with Core-level integration, pluggable backend traits, change envelope types, and mutation log companions.** Decisions D177–D179 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
@@ -880,7 +945,7 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | **M3 (napi-rs operator parity — Phases A–C)** | `graphrefly-bindings-js` | ✅ landed 2026-05-07 (Phases A–C of 6, post-/qa-followup-followup) | Phases A (TSFN substrate via `napi::tokio_runtime::spawn_blocking` per **D070 Option E**), B (`BenchOperators` napi class + 22 register methods + `OperatorBinding` / `HigherOrderBinding` / `ProducerBinding` impls on `BenchBinding`), C (custom-equals bundle). 24 operators wired (6 transform + 3 combine + 7 flow + 4 producer-shape + 4 higher-order). Producer dispatch via thread-local `CURRENT_CORE` + RAII `CoreThreadGuard`. **Rust core stays sync** — tokio enters only at `spawn_blocking`; CLAUDE.md invariant 4 preserved. **napi 3.x clean migration (D072)** — bumped from 2.16 with NO compat-mode per user directive ("no compat mode! no backward compat needed. no legacy behind"). Per-crate `forbid(unsafe_code)` → `deny(unsafe_code)` carve-out for napi-derive's macro-generated `allow`s (CLAUDE.md Rust invariant 1 relaxed only for this crate). API migration: `JsFunction` → `Function<Args, Return>` typed; `JsObject` → `PromiseRaw<'env, T>`; `create_threadsafe_function` → builder pattern (`build_threadsafe_function::<T>().max_queue_size::<1>().callee_handled::<true>().build_callback(...)`); `ErrorStrategy` enum → const-bool generic; `execute_tokio_future` → `Env::spawn_future`. **C1 fixed by design** — 3.x TSFN cb signature `FnOnce(Result<Return>, Env) -> Result<()>` delivers JS-throws as `Err` (no fatal abort); D071's Rust-built JS wrapper helpers deleted. Two-arg callbacks use `FnArgs<(u32, u32)>` (3.x convention). **/qa fixes:** C2 (`Registry::validate_and_retain` panics on phantom HandleIds), C3 (retain bumps via single-source-of-truth pattern), m26 (`BenchCore` field-drop reorder: `subscriptions, binding, core`), H-08 (NodeId(0) panic), M9 (static `noop_sink` via `OnceLock`), `parking_lot::Mutex<Registry>` (no poisoning). **Phases D (bench harness) + E (parity-tests `rustImpl` activation) carry forward** to follow-on slices. Workspace tests pass. Decision log: D049–D053 + D062–D066 + D070 + D072 (D062/D063 superseded by D070; D071 superseded by D072). Session doc: [`SESSION-rust-port-napi-operators.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-napi-operators.md). |
 | **Post-M5 (Slice E5 — Node Versioning §7)** | `graphrefly-core` + `graphrefly-storage` | ⏸ blocked | §7 R7.x — Node versioning bundle (`graph.tagFactory`, `setVersioning(level)`, V0/V1/V2 progression). Bundles with DS-14 op-log counter shape; STRONG DEFER per Phase 14 guardrail. |
 | **M4** | `graphrefly-storage` | 🚧 in progress — M4.A + M4.B + M4.C + M4.D landed | DS-14-storage substrate landed TS-side 2026-05-08 per `graphrefly-ts/docs/implementation-plan.md` Phase 14.6 (`WALFrame<T>` + `BaseStorageTier::list_by_prefix` traits + 9Q walk Q1–Q9 locked). Rust scope: `graphrefly-storage` crate with redb-backed tier dispatch, WAL frame ciborium serialization, recovery boundary (Q3), partial-restore phase rollback via Core `batch()`. See [SESSION-DS-14-storage-wal-replay.md](../../graphrefly-ts/archive/docs/SESSION-DS-14-storage-wal-replay.md) PART 7. **Sub-slice plan (D142):** M4.A ✅ WAL frame substrate + storage errors (2026-05-10); M4.B ✅ tier traits + memory backend (2026-05-10); M4.C ✅ file backend (2026-05-10); M4.D ✅ redb backend + F1/F3 close (2026-05-11); M4.E Graph integration; M4.F parity tests. |
-| M5 | `graphrefly-structures` | ⏸ blocked | After M2 + DS-14 (op-log changesets) — STRONG DEFER per Phase 14 guardrail |
+| M5 | `graphrefly-structures` | 🚧 in progress — M5.A + M5.B landed | DS-14 landed TS-side; M5 unblocked. M5.A ✅ base operations (2026-05-11); M5.B ✅ views/scan/attach, TTL/LRU/retention, custom equals (2026-05-11). Deferred: imbl backends, versioning integration, graph-level sugar. |
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
 | any | `graphrefly-bindings-wasm` | ⏸ blocked | Lands alongside napi-rs progression |
 

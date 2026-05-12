@@ -12,9 +12,9 @@ mod common;
 
 use common::StructuresRuntime;
 use graphrefly_structures::{
-    IndexChange, ListChange, LogChange, MapChange, ReactiveIndex, ReactiveIndexOptions,
-    ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap,
-    ReactiveMapOptions,
+    AppendLogSink, DeleteReason, IndexChange, IndexEqualsFn, ListChange, LogChange, MapChange,
+    ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions, ReactiveLog,
+    ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, RetentionPolicy, UpsertOptions, ViewSpec,
 };
 
 // ===========================================================================
@@ -284,7 +284,8 @@ fn map_set_and_get() {
         &rt.core,
         rt.intern_pairs_fn(),
         ReactiveMapOptions::default(),
-    );
+    )
+    .unwrap();
     let rec = rt.subscribe_recorder(map.node_id);
 
     map.set("a".into(), 1);
@@ -306,7 +307,8 @@ fn map_set_many() {
         &rt.core,
         rt.intern_pairs_fn(),
         ReactiveMapOptions::default(),
-    );
+    )
+    .unwrap();
     let rec = rt.subscribe_recorder(map.node_id);
 
     map.set_many(vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]);
@@ -322,7 +324,8 @@ fn map_delete() {
         &rt.core,
         rt.intern_pairs_fn(),
         ReactiveMapOptions::default(),
-    );
+    )
+    .unwrap();
 
     map.set_many(vec![("a".into(), 1), ("b".into(), 2)]);
     map.delete(&"a".into());
@@ -339,7 +342,8 @@ fn map_delete_nonexistent_no_emit() {
         &rt.core,
         rt.intern_pairs_fn(),
         ReactiveMapOptions::default(),
-    );
+    )
+    .unwrap();
     let rec = rt.subscribe_recorder(map.node_id);
 
     map.delete(&"x".into());
@@ -354,7 +358,8 @@ fn map_clear() {
         &rt.core,
         rt.intern_pairs_fn(),
         ReactiveMapOptions::default(),
-    );
+    )
+    .unwrap();
 
     map.set_many(vec![("a".into(), 1), ("b".into(), 2)]);
     map.clear();
@@ -372,7 +377,8 @@ fn map_mutation_log() {
             mutation_log: true,
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
 
     map.set("x".into(), 42);
     map.delete(&"x".into());
@@ -382,7 +388,7 @@ fn map_mutation_log() {
     assert!(
         matches!(&entries[0].change, MapChange::Set { key, value } if key == "x" && *value == 42)
     );
-    assert!(matches!(&entries[1].change, MapChange::Delete { key } if key == "x"));
+    assert!(matches!(&entries[1].change, MapChange::Delete { key, .. } if key == "x"));
 }
 
 #[test]
@@ -395,7 +401,8 @@ fn map_delete_many_only_logs_existing_keys() {
             mutation_log: true,
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
 
     map.set_many(vec![("a".into(), 1), ("b".into(), 2)]);
     map.delete_many(&["a".into(), "nonexistent".into(), "b".into()]);
@@ -667,4 +674,565 @@ fn subscriber_can_read_during_emission() {
         2,
         "subscriber received both DATA messages"
     );
+}
+
+// ===========================================================================
+// M5.B: ReactiveLog views (A)
+// ===========================================================================
+
+#[test]
+fn log_view_tail() {
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+    let view = log.view(ViewSpec::Tail { n: 2 }, rt.intern_vec_fn());
+    let rec = rt.subscribe_recorder(view.node_id);
+
+    log.append(1);
+    log.append(2);
+    log.append(3);
+
+    // After 3 appends, tail(2) should show [2, 3].
+    let vals = rec.data_values();
+    let last = vals.last().unwrap();
+    let nums: Vec<i64> = last
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![2, 3]);
+}
+
+#[test]
+fn log_view_slice() {
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+    let view = log.view(
+        ViewSpec::Slice {
+            start: 1,
+            stop: Some(3),
+        },
+        rt.intern_vec_fn(),
+    );
+    let rec = rt.subscribe_recorder(view.node_id);
+
+    log.append_many(vec![10, 20, 30, 40]);
+
+    let vals = rec.data_values();
+    let last = vals.last().unwrap();
+    let nums: Vec<i64> = last
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![20, 30]);
+}
+
+#[test]
+fn log_view_from_cursor() {
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    // Create a cursor state node.
+    let cursor_node = rt
+        .core
+        .register_state(graphrefly_core::HandleId::new(0), false)
+        .unwrap();
+
+    let binding = rt.binding.clone();
+    let read_cursor: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> usize + Send + Sync> =
+        std::sync::Arc::new(move |h| {
+            let v = binding.deref(h);
+            v.as_u64().unwrap() as usize
+        });
+
+    let view = log.view(
+        ViewSpec::FromCursor {
+            cursor_node,
+            read_cursor,
+        },
+        rt.intern_vec_fn(),
+    );
+    let rec = rt.subscribe_recorder(view.node_id);
+
+    log.append_many(vec![10, 20, 30, 40, 50]);
+
+    // Move cursor to position 2.
+    let h = rt.binding.intern(serde_json::json!(2));
+    rt.core.emit(cursor_node, h);
+
+    let vals = rec.data_values();
+    let last = vals.last().unwrap();
+    let nums: Vec<i64> = last
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![30, 40, 50]);
+}
+
+// ===========================================================================
+// M5.B: ReactiveLog scan (A)
+// ===========================================================================
+
+#[test]
+fn log_scan_incremental() {
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let intern_sum: graphrefly_structures::InternFn<i64> = {
+        let b = rt.binding.clone();
+        std::sync::Arc::new(move |sum: i64| b.intern(serde_json::json!(sum)))
+    };
+
+    let scan = log.scan(
+        0i64,
+        std::sync::Arc::new(|acc: &i64, item: &i64| acc + item),
+        intern_sum,
+    );
+    let rec = rt.subscribe_recorder(scan.node_id);
+
+    log.append(10);
+    log.append(20);
+    log.append(30);
+
+    let vals = rec.data_values();
+    let sums: Vec<i64> = vals.iter().map(|v| v.as_i64().unwrap()).collect();
+    assert_eq!(sums, vec![10, 30, 60]);
+}
+
+#[test]
+fn log_scan_rescan_on_clear() {
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let intern_sum: graphrefly_structures::InternFn<i64> = {
+        let b = rt.binding.clone();
+        std::sync::Arc::new(move |sum: i64| b.intern(serde_json::json!(sum)))
+    };
+
+    let scan = log.scan(
+        0i64,
+        std::sync::Arc::new(|acc: &i64, item: &i64| acc + item),
+        intern_sum,
+    );
+    let rec = rt.subscribe_recorder(scan.node_id);
+
+    log.append_many(vec![10, 20]);
+    log.clear();
+    log.append(5);
+
+    let vals = rec.data_values();
+    let sums: Vec<i64> = vals.iter().map(|v| v.as_i64().unwrap()).collect();
+    // After append_many(10, 20): sum = 30
+    // After clear: sum = 0 (rescan empty)
+    // After append(5): sum = 5
+    assert_eq!(sums, vec![30, 0, 5]);
+}
+
+// ===========================================================================
+// M5.B: ReactiveLog attach (A)
+// ===========================================================================
+
+#[test]
+fn log_attach_upstream() {
+    let rt = StructuresRuntime::new();
+
+    // Create upstream BEFORE the log so it has a lower SubgraphId —
+    // Core's ascending-order invariant requires that subscribers emit
+    // to nodes with higher SubgraphIds than the source.
+    let upstream = rt
+        .core
+        .register_state(graphrefly_core::HandleId::new(0), false)
+        .unwrap();
+
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let binding = rt.binding.clone();
+    let read_value: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> i64 + Send + Sync> =
+        std::sync::Arc::new(move |h| binding.deref(h).as_i64().unwrap());
+
+    let _sub = log.attach(upstream, read_value);
+
+    // Emit values to upstream — they should appear in the log.
+    let h1 = rt.binding.intern(serde_json::json!(100));
+    rt.core.emit(upstream, h1);
+    let h2 = rt.binding.intern(serde_json::json!(200));
+    rt.core.emit(upstream, h2);
+
+    assert_eq!(log.to_vec(), vec![100, 200]);
+}
+
+// ===========================================================================
+// M5.B: ReactiveLog attachStorage (A)
+// ===========================================================================
+
+#[test]
+fn log_attach_storage_preload_and_delta() {
+    use std::sync::{Arc, Mutex};
+
+    struct TestSink {
+        stored: Mutex<Vec<i64>>,
+    }
+    impl AppendLogSink<i64> for TestSink {
+        fn append_entries(
+            &self,
+            entries: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.stored.lock().unwrap().extend_from_slice(entries);
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+    }
+
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    // Pre-seed the sink.
+    let sink = Arc::new(TestSink {
+        stored: Mutex::new(vec![1, 2]),
+    });
+
+    let _handle = log.attach_storage(vec![sink.clone()], true);
+
+    // Pre-loaded entries should be in the log.
+    assert_eq!(log.to_vec(), vec![1, 2]);
+
+    // New appends go to sink as deltas.
+    log.append(3);
+    // Subscriber was registered AFTER preload, so it only sees post-preload
+    // emissions. append(3) produces delta [3]. Sink: [1,2] + [3] = [1,2,3].
+    assert_eq!(*sink.stored.lock().unwrap(), vec![1, 2, 3]);
+}
+
+// ===========================================================================
+// M5.B: ReactiveMap TTL (B)
+// ===========================================================================
+
+#[test]
+fn map_ttl_expired_key_returns_none() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            default_ttl: Some(0.000_000_001), // 1 nanosecond — expires immediately.
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("a".into(), 42);
+    // After 1ns, the key should be expired.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    assert_eq!(map.get(&"a".into()), None);
+}
+
+#[test]
+fn map_ttl_mutation_log_records_expired() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            default_ttl: Some(0.000_000_001),
+            mutation_log: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("x".into(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    map.prune_expired();
+
+    let entries = map.mutation_log_snapshot().unwrap();
+    let expired: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.change,
+                MapChange::Delete {
+                    reason: DeleteReason::Expired,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(!expired.is_empty(), "should log expired deletion");
+}
+
+// ===========================================================================
+// M5.B: ReactiveMap LRU (B)
+// ===========================================================================
+
+#[test]
+fn map_lru_evicts_oldest() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            max_size: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("a".into(), 1);
+    map.set("b".into(), 2);
+    map.set("c".into(), 3); // Should evict "a".
+
+    assert_eq!(map.size(), 2);
+    assert_eq!(map.get(&"a".into()), None);
+    assert_eq!(map.get(&"b".into()), Some(2));
+    assert_eq!(map.get(&"c".into()), Some(3));
+}
+
+#[test]
+fn map_lru_touch_on_get_prevents_eviction() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            max_size: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("a".into(), 1);
+    map.set("b".into(), 2);
+    // Touch "a" so it becomes most-recently-used.
+    let _ = map.get(&"a".into());
+    // Insert "c" — should evict "b" (now LRU), not "a".
+    map.set("c".into(), 3);
+
+    assert_eq!(map.size(), 2);
+    assert_eq!(map.get(&"a".into()), Some(1));
+    assert_eq!(map.get(&"b".into()), None);
+    assert_eq!(map.get(&"c".into()), Some(3));
+}
+
+#[test]
+fn map_lru_mutation_log_records_eviction() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            max_size: Some(1),
+            mutation_log: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("a".into(), 1);
+    map.set("b".into(), 2); // Evicts "a".
+
+    let entries = map.mutation_log_snapshot().unwrap();
+    let evictions: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.change,
+                MapChange::Delete {
+                    reason: DeleteReason::LruEvict,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(evictions.len(), 1, "should log LRU eviction of 'a'");
+}
+
+// ===========================================================================
+// M5.B: ReactiveMap retention (B)
+// ===========================================================================
+
+#[test]
+fn map_retention_archives_below_threshold() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            retention: Some(RetentionPolicy {
+                score: std::sync::Arc::new(|_k, v| *v as f64),
+                archive_threshold: Some(10.0),
+                max_size: None,
+                on_archive: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set_many(vec![("low".into(), 5), ("high".into(), 20)]);
+
+    assert_eq!(map.size(), 1);
+    assert_eq!(map.get(&"low".into()), None);
+    assert_eq!(map.get(&"high".into()), Some(20));
+}
+
+#[test]
+fn map_retention_max_size_keeps_highest_scored() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            retention: Some(RetentionPolicy {
+                score: std::sync::Arc::new(|_k, v| *v as f64),
+                archive_threshold: None,
+                max_size: Some(2),
+                on_archive: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set_many(vec![("c".into(), 30), ("a".into(), 10), ("b".into(), 20)]);
+
+    assert_eq!(map.size(), 2);
+    // Lowest scored (a=10) should be archived.
+    assert_eq!(map.get(&"a".into()), None);
+}
+
+#[test]
+fn map_lru_and_retention_mutually_exclusive() {
+    let rt = StructuresRuntime::new();
+    let result = ReactiveMap::<String, i64>::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            max_size: Some(2),
+            retention: Some(RetentionPolicy {
+                score: std::sync::Arc::new(|_k, v| *v as f64),
+                archive_threshold: None,
+                max_size: None,
+                on_archive: None,
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(result.is_err());
+}
+
+// ===========================================================================
+// M5.B: ReactiveIndex custom equals (C)
+// ===========================================================================
+
+#[test]
+fn index_custom_equals_skips_identical_upsert() {
+    let rt = StructuresRuntime::new();
+    let eq: IndexEqualsFn<String, i64> =
+        std::sync::Arc::new(|a, b| a.secondary == b.secondary && a.value == b.value);
+    let index = ReactiveIndex::new(
+        &rt.core,
+        rt.intern_index_fn(),
+        ReactiveIndexOptions {
+            equals: Some(eq),
+            ..Default::default()
+        },
+    );
+    let rec = rt.subscribe_recorder(index.node_id);
+
+    index.upsert("a".into(), "1".into(), 10);
+    // Same values — should be idempotent (no emission).
+    let was_new = index.upsert("a".into(), "1".into(), 10);
+    assert!(!was_new);
+
+    // Different value — should emit.
+    index.upsert("a".into(), "2".into(), 99);
+
+    assert_eq!(rec.data_count(), 2); // First upsert + third upsert, NOT the idempotent one.
+}
+
+#[test]
+fn index_per_call_equals_override() {
+    let rt = StructuresRuntime::new();
+    let index = ReactiveIndex::new(
+        &rt.core,
+        rt.intern_index_fn(),
+        ReactiveIndexOptions::default(),
+    );
+    let rec = rt.subscribe_recorder(index.node_id);
+
+    index.upsert("a".into(), "1".into(), 10);
+    // Per-call equals that always considers rows identical.
+    let always_equal: IndexEqualsFn<String, i64> = std::sync::Arc::new(|_a, _b| true);
+    let was_new = index.upsert_with(
+        "a".into(),
+        "2".into(),
+        99,
+        &UpsertOptions {
+            equals: Some(always_equal),
+        },
+    );
+    assert!(!was_new);
+    assert_eq!(rec.data_count(), 1); // Only the first upsert emitted.
+}
+
+#[test]
+fn index_upsert_many_respects_factory_equals() {
+    let rt = StructuresRuntime::new();
+    let eq: IndexEqualsFn<String, i64> =
+        std::sync::Arc::new(|a, b| a.secondary == b.secondary && a.value == b.value);
+    let index = ReactiveIndex::new(
+        &rt.core,
+        rt.intern_index_fn(),
+        ReactiveIndexOptions {
+            equals: Some(eq),
+            ..Default::default()
+        },
+    );
+    let rec = rt.subscribe_recorder(index.node_id);
+
+    index.upsert("a".into(), "1".into(), 10);
+    // Batch: "a" is identical (skip), "b" is new (accept).
+    index.upsert_many(vec![
+        ("a".into(), "1".into(), 10), // skip
+        ("b".into(), "2".into(), 20), // new
+    ]);
+
+    assert_eq!(index.size(), 2);
+    assert_eq!(rec.data_count(), 2); // First upsert + batch (with only "b").
+}
+
+// ===========================================================================
+// M5.B: DeleteReason on mutation log
+// ===========================================================================
+
+#[test]
+fn map_delete_reason_explicit() {
+    let rt = StructuresRuntime::new();
+    let map: ReactiveMap<String, i64> = ReactiveMap::new(
+        &rt.core,
+        rt.intern_pairs_fn(),
+        ReactiveMapOptions {
+            mutation_log: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    map.set("x".into(), 1);
+    map.delete(&"x".into());
+
+    let entries = map.mutation_log_snapshot().unwrap();
+    assert!(matches!(
+        &entries[1].change,
+        MapChange::Delete {
+            reason: DeleteReason::Explicit,
+            ..
+        }
+    ));
 }

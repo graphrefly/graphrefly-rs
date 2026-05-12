@@ -43,9 +43,11 @@ pub use backend::{
     VecListBackend, VecLogBackend,
 };
 pub use changeset::{
-    BaseChange, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
+    BaseChange, DeleteReason, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
 };
 pub use reactive::{
-    IndexOutOfBounds, InternFn, ReactiveIndex, ReactiveIndexOptions, ReactiveList,
-    ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions,
+    AppendLogSink, AttachStorageHandle, IndexEqualsFn, IndexOutOfBounds, InternFn, LogView,
+    MapConfigError, ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions,
+    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, RetentionPolicy, ScanHandle,
+    UpsertOptions, ViewSpec,
 };
