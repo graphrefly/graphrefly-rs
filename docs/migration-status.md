@@ -2,7 +2,64 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-12 — Slice T /qa fixes applied)
+## Current state (2026-05-12 — Slice U: control + buffer + §10 perf)
+
+**Slice U LANDED 2026-05-12.** Control operators, buffer operators, temporal operator extensions, §10 performance optimizations, and Core OperatorOp infrastructure for future operator dispatch.
+
+**§10 performance optimizations (Core):**
+
+1. **`topo_rank` field on `NodeRecord`.** Topological depth (1 + max dep rank) computed at registration, recomputed on `set_deps`. Used by `pick_next_fire` for O(|pending_fires|) glitch-free scheduling instead of O(V) transitive BFS.
+2. **`received_mask` field on `NodeRecord`.** Per-dep bitmask (up to 64 deps) tracking DATA delivery. `has_sentinel_deps()` becomes a single integer compare for ≤64 deps (O(1) vs O(deps) scan). Cleared on invalidation, deactivation, and lifecycle reset.
+3. **`pick_next_fire` rewrite.** From O(N·V) `transitive_upstream_settled` BFS to O(N) `topo_rank` min-scan. `transitive_upstream_settled` removed entirely.
+
+**Control operators (producer-based, `graphrefly-operators::control`):**
+
+1. **`tap(source, fn_id)`** — Side-effect passthrough. Forwards DATA/COMPLETE/ERROR unchanged, calls `invoke_tap_fn` on each DATA.
+2. **`tap_observer(source, data_fn?, error_fn?, complete_fn?)`** — Lifecycle-aware observer with optional per-event callbacks.
+3. **`on_first_data(source, fn_id)`** — One-shot side-effect on first DATA only.
+4. **`rescue(source, fn_id)`** — Error recovery. On ERROR, calls `invoke_rescue_fn`; `Ok(h)` emits recovered DATA, `Err(())` forwards original ERROR.
+5. **`valve(source, control, gate_fn_id, cancel?)`** — Boolean-gated passthrough with optional `CancellationToken` abort on close transition.
+6. **`settle(source, quiet_waves, max_waves?)`** — Wave-count convergence detector. Self-completes after `quiet_waves` consecutive no-DATA waves.
+7. **`repeat(source, count)`** — Sequential resubscribe loop with self-referential sink for resubscription.
+
+**Buffer operators (producer-based, `graphrefly-operators::buffer`):**
+
+1. **`buffer(source, notifier, pack_fn_id)`** — Notifier-triggered flush of accumulated DATA handles.
+2. **`buffer_count(source, count, pack_fn_id)`** — Fixed-size buffer with automatic flush at `count`.
+3. **`window(source, notifier)`** — Notifier-triggered sub-node splitting via `intern_node`.
+4. **`window_count(source, count)`** — Count-based sub-node splitting.
+
+**Temporal operator extensions (added to `graphrefly-operators::temporal`):**
+
+1. **`timeout(source, ms)`** — Idle watchdog; emits ERROR if no DATA within `ms`.
+2. **`buffer_time(source, ms, pack_fn_id)`** — Time-windowed buffer flush every `ms`.
+3. **`window_time(source, ms)`** — Time-windowed sub-node splitting.
+
+**Core OperatorOp infrastructure (for future Core-dispatch path):**
+
+- Added `OperatorOp::Tap`, `TapFirst`, `Valve`, `Settle` variants with `fire_op_*` implementations.
+- Added `TapFirstState`, `SettleState` to `op_state.rs`.
+- `Valve` skips auto-cascade (handles source terminal explicitly, ignores control terminal).
+- These variants enable a future migration from producer-based to Core-dispatch for these operators.
+
+**BindingBoundary extensions:**
+
+- `intern_node(NodeId) -> HandleId` — for window operators to emit sub-node identities.
+- `invoke_tap_fn(FnId, HandleId)` — side-effect tap on DATA.
+- `invoke_tap_error_fn(FnId, HandleId)` — side-effect tap on ERROR.
+- `invoke_tap_complete_fn(FnId)` — side-effect tap on COMPLETE.
+- `invoke_rescue_fn(FnId, HandleId) -> Result<HandleId, ()>` — error recovery.
+
+**OperatorBinding extensions:**
+
+- `register_tap(Fn(HandleId))` — register side-effect callback.
+- `register_rescue(Fn(HandleId) -> Result<HandleId, ()>)` — register recovery callback.
+
+**Test count: 499 cargo tests pass** (core + operators). +33 net from Slice U (20 control + 13 buffer). `cargo clippy -p graphrefly-core -p graphrefly-operators` clean. `#![forbid(unsafe_code)]` preserved.
+
+---
+
+## Previous state (2026-05-12 — Slice T /qa fixes applied)
 
 **Slice T LANDED 2026-05-11 + /qa fixes applied 2026-05-12.** Timer substrate in `graphrefly-core` + 6 temporal operators in `graphrefly-operators` (sample, debounce, throttle, delay, audit, interval). Feature-gated tokio timer substrate (`#[cfg(feature = "tokio")]`) with `TimerCmd` enum, `TimerTaskHandle` with RAII shutdown, `spawn_timer_task()` factory. Per-operator async tasks communicate via `TemporalCmd` commands over `mpsc::unbounded_channel` — each operator spawns its own tokio task that owns all pending state exclusively (avoids double-ownership between operator state and timer substrate). `TemporalTaskGuard` RAII wrapper (channel-close-first + abort-fallback) stored in `ProducerNodeState::op_state` for clean handle release on producer deactivation.
 

@@ -12,6 +12,12 @@
 //!   the latest value. Timer does NOT restart on subsequent DATA within
 //!   the window.
 //! - [`interval`] — source that emits a monotonic counter every `period_ms`.
+//! - [`timeout`] — errors if no DATA arrives within `ms` after subscribe or
+//!   after the previous DATA.
+//! - [`buffer_time`] — collects upstream DATA into a buffer and flushes as
+//!   a packed tuple every `ms` milliseconds.
+//! - [`window_time`] — rotates inner sub-nodes every `ms` milliseconds;
+//!   upstream DATA is forwarded to the current window node.
 //!
 //! # Architecture
 //!
@@ -36,7 +42,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use graphrefly_core::{BindingBoundary, Core, HandleId, NodeId, Sink, WeakCore};
+use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink, WeakCore};
 use smallvec::SmallVec;
 
 use crate::producer::{ProducerBinding, ProducerBuildFn, ProducerCtx, SubscribeOutcome};
@@ -995,5 +1001,535 @@ async fn sleep_until_or_forever(deadline: Option<tokio::time::Instant>) {
 fn release_opt(opt: &mut Option<HandleId>, binding: &dyn BindingBoundary) {
     if let Some(h) = opt.take() {
         binding.release_handle(h);
+    }
+}
+
+// =========================================================================
+// timeout(source, ms, error_handle)
+// =========================================================================
+
+/// Errors if no upstream DATA arrives within `ms` milliseconds after
+/// subscribe or after the previous DATA. Each DATA resets the timer.
+///
+/// On timeout: retains `error_handle` and emits ERROR with it.
+/// On upstream COMPLETE: cancels timer, forwards complete.
+/// On upstream ERROR: cancels timer, forwards error.
+#[must_use]
+pub fn timeout(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    source: NodeId,
+    ms: u64,
+    error_handle: HandleId,
+) -> NodeId {
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
+    let duration = Duration::from_millis(ms);
+
+    let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
+        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
+            return;
+        };
+        let pid = ctx.node_id();
+        let bb: Arc<dyn BindingBoundary> = binding_s.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx_sink = tx.clone();
+        let tx_dead = tx.clone();
+        let task = tokio::spawn(timeout_task(
+            rx,
+            core_s.weak_handle(),
+            pid,
+            bb.clone(),
+            duration,
+            error_handle,
+        ));
+
+        {
+            let mut storage = binding_s.producer_storage().lock();
+            let entry = storage.entry(pid).or_default();
+            entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
+        }
+
+        let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
+        let source_sink: Sink = Arc::new(move |msgs| {
+            for m in msgs {
+                match m.tier() {
+                    3 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(TemporalCmd::Value(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(TemporalCmd::Error(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        } else {
+                            let _ = tx_sink.send(TemporalCmd::Complete);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let outcome = ctx.subscribe_to(source, source_sink);
+        if matches!(outcome, SubscribeOutcome::Dead { .. }) {
+            let _ = tx_dead.send(TemporalCmd::Complete);
+        }
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+        .expect("timeout: register_producer failed")
+}
+
+async fn timeout_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
+    core: WeakCore,
+    pid: NodeId,
+    binding: Arc<dyn BindingBoundary>,
+    duration: Duration,
+    error_handle: HandleId,
+) {
+    // The timer starts immediately on subscribe — if no DATA arrives
+    // within `duration`, we fire the timeout error.
+    loop {
+        tokio::select! {
+            biased;
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(TemporalCmd::Value(h)) => {
+                        // DATA arrived — forward it and reset the timer
+                        // (the next loop iteration restarts the sleep).
+                        if let Some(c) = core.upgrade() {
+                            c.emit_or_defer(pid, h);
+                        } else {
+                            binding.release_handle(h);
+                            return;
+                        }
+                        // Continue loop → resets the sleep timer.
+                    }
+                    Some(TemporalCmd::Complete) => {
+                        if let Some(c) = core.upgrade() {
+                            c.complete_or_defer(pid);
+                        }
+                        return;
+                    }
+                    Some(TemporalCmd::Error(err_h)) => {
+                        if let Some(c) = core.upgrade() {
+                            c.error_or_defer(pid, err_h);
+                        } else {
+                            binding.release_handle(err_h);
+                        }
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            () = tokio::time::sleep(duration) => {
+                // Timeout fired — emit error.
+                if let Some(c) = core.upgrade() {
+                    binding.retain_handle(error_handle);
+                    c.error_or_defer(pid, error_handle);
+                }
+                return;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// buffer_time(source, ms, pack_fn_id)
+// =========================================================================
+
+/// Command sent from the `buffer_time` sink to its async task.
+enum BufferTimeCmd {
+    /// New DATA handle from upstream. Already retained by the sink.
+    Value(HandleId),
+    /// Upstream COMPLETE.
+    Complete,
+    /// Upstream ERROR. Handle already retained.
+    Error(HandleId),
+}
+
+/// Collects upstream DATA handles into a buffer and flushes them as a
+/// packed tuple every `ms` milliseconds.
+///
+/// - On interval tick: packs buffered handles via
+///   `binding.pack_tuple(pack_fn_id, &buf)`, emits the result, releases
+///   individual handles, clears buffer.
+/// - On upstream COMPLETE: flushes remaining buffer, then completes.
+/// - On upstream ERROR: releases buffered handles, forwards error.
+#[must_use]
+pub fn buffer_time(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    source: NodeId,
+    ms: u64,
+    pack_fn_id: FnId,
+) -> NodeId {
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
+    let period = Duration::from_millis(ms);
+
+    let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
+        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
+            return;
+        };
+        let pid = ctx.node_id();
+        let bb: Arc<dyn BindingBoundary> = binding_s.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx_sink = tx.clone();
+        let tx_dead = tx.clone();
+        let task = tokio::spawn(buffer_time_task(
+            rx,
+            core_s.weak_handle(),
+            pid,
+            bb.clone(),
+            period,
+            pack_fn_id,
+        ));
+
+        {
+            let mut storage = binding_s.producer_storage().lock();
+            let entry = storage.entry(pid).or_default();
+            entry.op_state = Some(Box::new(BufferTimeTaskGuard { _tx: tx, task }));
+        }
+
+        let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
+        let source_sink: Sink = Arc::new(move |msgs| {
+            for m in msgs {
+                match m.tier() {
+                    3 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(BufferTimeCmd::Value(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(BufferTimeCmd::Error(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        } else {
+                            let _ = tx_sink.send(BufferTimeCmd::Complete);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let outcome = ctx.subscribe_to(source, source_sink);
+        if matches!(outcome, SubscribeOutcome::Dead { .. }) {
+            let _ = tx_dead.send(BufferTimeCmd::Complete);
+        }
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+        .expect("buffer_time: register_producer failed")
+}
+
+/// RAII guard for `buffer_time` task — same pattern as [`TemporalTaskGuard`]
+/// but with `BufferTimeCmd` channel.
+struct BufferTimeTaskGuard {
+    _tx: tokio::sync::mpsc::UnboundedSender<BufferTimeCmd>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BufferTimeTaskGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn buffer_time_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<BufferTimeCmd>,
+    core: WeakCore,
+    pid: NodeId,
+    binding: Arc<dyn BindingBoundary>,
+    period: Duration,
+    pack_fn_id: FnId,
+) {
+    let mut buf: Vec<HandleId> = Vec::new();
+    let mut ticker = tokio::time::interval(period);
+    ticker.tick().await; // First tick is immediate — skip it.
+
+    loop {
+        tokio::select! {
+            biased;
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(BufferTimeCmd::Value(h)) => {
+                        buf.push(h);
+                    }
+                    Some(BufferTimeCmd::Complete) => {
+                        // Flush remaining buffer then complete.
+                        if !buf.is_empty() {
+                            if let Some(c) = core.upgrade() {
+                                let packed = binding.pack_tuple(pack_fn_id, &buf);
+                                c.emit_or_defer(pid, packed);
+                            }
+                            for h in buf.drain(..) {
+                                binding.release_handle(h);
+                            }
+                        }
+                        if let Some(c) = core.upgrade() {
+                            c.complete_or_defer(pid);
+                        }
+                        return;
+                    }
+                    Some(BufferTimeCmd::Error(err_h)) => {
+                        for h in buf.drain(..) {
+                            binding.release_handle(h);
+                        }
+                        if let Some(c) = core.upgrade() {
+                            c.error_or_defer(pid, err_h);
+                        } else {
+                            binding.release_handle(err_h);
+                        }
+                        return;
+                    }
+                    None => {
+                        // Channel closed — deactivated. Release buffered.
+                        for h in buf.drain(..) {
+                            binding.release_handle(h);
+                        }
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if !buf.is_empty() {
+                    if let Some(c) = core.upgrade() {
+                        let packed = binding.pack_tuple(pack_fn_id, &buf);
+                        c.emit_or_defer(pid, packed);
+                        for h in buf.drain(..) {
+                            binding.release_handle(h);
+                        }
+                    } else {
+                        for h in buf.drain(..) {
+                            binding.release_handle(h);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// window_time(source, ms)
+// =========================================================================
+
+/// Command sent from the `window_time` sink to its async task.
+enum WindowTimeCmd {
+    /// New DATA handle from upstream. Already retained by the sink.
+    Value(HandleId),
+    /// Upstream COMPLETE.
+    Complete,
+    /// Upstream ERROR. Handle already retained.
+    Error(HandleId),
+}
+
+/// Rotates sub-node windows every `ms` milliseconds.
+///
+/// Creates a new inner state node each interval tick. Upstream DATA is
+/// forwarded to the current inner window node. On tick, the current
+/// window is completed, a new inner node is created, and its identity
+/// is emitted as a DATA handle (via `binding.intern_node`).
+///
+/// - On upstream COMPLETE: completes current window, then completes self.
+/// - On upstream ERROR: errors current window, then errors self.
+#[must_use]
+pub fn window_time(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    source: NodeId,
+    ms: u64,
+) -> NodeId {
+    let core_weak = core.weak_handle();
+    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
+    let period = Duration::from_millis(ms);
+
+    let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
+        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
+            return;
+        };
+        let pid = ctx.node_id();
+        let bb: Arc<dyn BindingBoundary> = binding_s.clone();
+
+        // Pre-register a reusable no-op FnId for creating inner window
+        // nodes. The async task reuses this FnId for every window rotation
+        // so it only needs Core (via WeakCore), not ProducerBinding.
+        let noop_fn_id = binding_s.register_producer_build(Box::new(|_ctx: ProducerCtx<'_>| {
+            // Inner window nodes are passive — all emissions are driven by
+            // the parent window_time task via emit_or_defer / complete_or_defer.
+        }));
+
+        // Create the first inner window node and emit its handle.
+        let first_inner = core_s
+            .register_producer(noop_fn_id)
+            .expect("window_time inner: register_producer failed");
+        let first_handle = bb.intern_node(first_inner);
+        core_s.emit_or_defer(pid, first_handle);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx_sink = tx.clone();
+        let tx_dead = tx.clone();
+        let task = tokio::spawn(window_time_task(
+            rx,
+            core_s.weak_handle(),
+            pid,
+            first_inner,
+            bb.clone(),
+            period,
+            noop_fn_id,
+        ));
+
+        {
+            let mut storage = binding_s.producer_storage().lock();
+            let entry = storage.entry(pid).or_default();
+            entry.op_state = Some(Box::new(WindowTimeTaskGuard { _tx: tx, task }));
+        }
+
+        let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
+        let source_sink: Sink = Arc::new(move |msgs| {
+            for m in msgs {
+                match m.tier() {
+                    3 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(WindowTimeCmd::Value(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_sink.retain_handle(h);
+                            if tx_sink.send(WindowTimeCmd::Error(h)).is_err() {
+                                bb_sink.release_handle(h);
+                            }
+                        } else {
+                            let _ = tx_sink.send(WindowTimeCmd::Complete);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let outcome = ctx.subscribe_to(source, source_sink);
+        if matches!(outcome, SubscribeOutcome::Dead { .. }) {
+            let _ = tx_dead.send(WindowTimeCmd::Complete);
+        }
+    });
+
+    let fn_id = binding.register_producer_build(build);
+    core.register_producer(fn_id)
+        .expect("window_time: register_producer failed")
+}
+
+/// RAII guard for `window_time` task.
+struct WindowTimeTaskGuard {
+    _tx: tokio::sync::mpsc::UnboundedSender<WindowTimeCmd>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WindowTimeTaskGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn window_time_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WindowTimeCmd>,
+    core: WeakCore,
+    pid: NodeId,
+    initial_inner: NodeId,
+    binding: Arc<dyn BindingBoundary>,
+    period: Duration,
+    noop_fn_id: FnId,
+) {
+    let mut current_inner = initial_inner;
+    let mut ticker = tokio::time::interval(period);
+    ticker.tick().await; // First tick is immediate — skip it.
+
+    loop {
+        tokio::select! {
+            biased;
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(WindowTimeCmd::Value(h)) => {
+                        // Forward DATA to current inner window.
+                        if let Some(c) = core.upgrade() {
+                            c.emit_or_defer(current_inner, h);
+                        } else {
+                            binding.release_handle(h);
+                            return;
+                        }
+                    }
+                    Some(WindowTimeCmd::Complete) => {
+                        // Complete current inner window, then complete self.
+                        if let Some(c) = core.upgrade() {
+                            c.complete_or_defer(current_inner);
+                            c.complete_or_defer(pid);
+                        }
+                        return;
+                    }
+                    Some(WindowTimeCmd::Error(err_h)) => {
+                        // Error current inner window, then error self.
+                        if let Some(c) = core.upgrade() {
+                            binding.retain_handle(err_h);
+                            c.error_or_defer(current_inner, err_h);
+                            // err_h already retained once by sink + once above;
+                            // the inner node consumes one retain, self consumes the other.
+                            c.error_or_defer(pid, err_h);
+                        } else {
+                            binding.release_handle(err_h);
+                        }
+                        return;
+                    }
+                    None => {
+                        // Channel closed — deactivated.
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                // Window rotation: complete current, create new, emit handle.
+                if let Some(c) = core.upgrade() {
+                    c.complete_or_defer(current_inner);
+
+                    // Create a new inner window node using the pre-registered
+                    // noop FnId. Each inner node is a passive producer whose
+                    // emissions are driven externally by this task.
+                    if let Ok(new_inner) = c.register_producer(noop_fn_id) {
+                        current_inner = new_inner;
+                        let h = binding.intern_node(new_inner);
+                        c.emit_or_defer(pid, h);
+                    } else {
+                        // Registration failed — complete self and exit.
+                        c.complete_or_defer(pid);
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
     }
 }

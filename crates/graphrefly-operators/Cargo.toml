@@ -17,6 +17,7 @@ smallvec        = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
 tokio           = { workspace = true, features = ["time", "sync", "rt", "macros"] }
+tokio-util      = { workspace = true }
 
 [dev-dependencies]
 proptest        = { workspace = true }

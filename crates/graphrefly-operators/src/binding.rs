@@ -87,4 +87,26 @@ pub trait OperatorBinding: BindingBoundary {
     /// passed to [`graphrefly_core::OperatorOp::Combine`] or
     /// [`graphrefly_core::OperatorOp::WithLatestFrom`].
     fn register_packer(&self, f: super::combine::PackerFn) -> FnId;
+
+    /// Register a side-effect callback: `Fn(T)` wrapped into
+    /// `Fn(HandleId)`. Used by [`super::control::tap`] and
+    /// [`super::control::on_first_data`]. The returned [`FnId`] is passed
+    /// to [`graphrefly_core::OperatorOp::Tap`] or
+    /// [`graphrefly_core::OperatorOp::TapFirst`]. The binding invokes
+    /// the stored closure from
+    /// [`BindingBoundary::invoke_tap_fn`](graphrefly_core::BindingBoundary::invoke_tap_fn).
+    fn register_tap(&self, _f: Box<dyn Fn(HandleId) + Send + Sync>) -> FnId {
+        unimplemented!("register_tap: this binding does not support control operators")
+    }
+
+    /// Register an error-recovery callback: `Fn(HandleId) -> HandleId`.
+    /// Used by [`super::control::rescue`]. The binding invokes the stored
+    /// closure from
+    /// [`BindingBoundary::invoke_rescue_fn`](graphrefly_core::BindingBoundary::invoke_rescue_fn).
+    fn register_rescue(
+        &self,
+        _f: Box<dyn Fn(HandleId) -> Result<HandleId, ()> + Send + Sync>,
+    ) -> FnId {
+        unimplemented!("register_rescue: this binding does not support control operators")
+    }
 }

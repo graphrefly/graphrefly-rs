@@ -340,6 +340,17 @@ pub trait BindingBoundary: Send + Sync {
         unimplemented!("pack_tuple: this binding does not support combinator operators (D020)")
     }
 
+    /// Intern a [`NodeId`] as a value handle. Used by windowing operators
+    /// (`window`, `window_count`) to emit inner sub-node identities as
+    /// DATA payloads. The binding side stores the node id as a value in
+    /// its value registry and returns the corresponding [`HandleId`].
+    /// The returned handle has a pre-bumped retain (caller takes ownership).
+    ///
+    /// Default panics — bindings that ship window operators MUST override.
+    fn intern_node(&self, _node_id: NodeId) -> HandleId {
+        unimplemented!("intern_node: this binding does not support window operators")
+    }
+
     // -----------------------------------------------------------------
     // Producer lifecycle (Slice D, D031, D035). Producers are nodes
     // with no deps + a fn — fn fires once on first subscribe and may
@@ -527,6 +538,45 @@ pub trait BindingBoundary: Send + Sync {
     /// Default panics — bindings that restore snapshots MUST override.
     fn deserialize_value(&self, _value: serde_json::Value) -> HandleId {
         unimplemented!("deserialize_value: this binding does not support snapshot restore (D166)")
+    }
+
+    // -----------------------------------------------------------------
+    // Control-operator FFI surface (tap, rescue). Side-effect and
+    // error-recovery callbacks invoked by control operators in
+    // `graphrefly-operators::control`. Default impls panic so bindings
+    // that don't ship control operators compile unchanged.
+    // -----------------------------------------------------------------
+
+    /// Side-effect tap: invoke a user callback with a DATA handle for
+    /// observation purposes. The callback must NOT produce a return
+    /// value or modify the handle's refcount — it is purely for
+    /// side-effects (logging, metrics, debugging).
+    ///
+    /// Called by `tap` and `on_first_data` operators on each (or first)
+    /// DATA emission.
+    fn invoke_tap_fn(&self, _fn_id: FnId, _handle: HandleId) {
+        unimplemented!("invoke_tap_fn: this binding does not support control operators")
+    }
+
+    /// Side-effect tap on ERROR: invoke a user callback with the error
+    /// handle. Purely for observation — must not modify refcounts.
+    fn invoke_tap_error_fn(&self, _fn_id: FnId, _handle: HandleId) {
+        unimplemented!("invoke_tap_error_fn: this binding does not support control operators")
+    }
+
+    /// Side-effect tap on COMPLETE: invoke a user callback.
+    fn invoke_tap_complete_fn(&self, _fn_id: FnId) {
+        unimplemented!("invoke_tap_complete_fn: this binding does not support control operators")
+    }
+
+    /// Error recovery: invoke a user callback with the error handle.
+    /// Returns `Ok(recovered_handle)` if recovery succeeded (the
+    /// binding interns the recovered value and returns its handle with
+    /// a pre-bumped retain). Returns `Err(())` if recovery failed and
+    /// the original error should propagate.
+    #[allow(clippy::result_unit_err)]
+    fn invoke_rescue_fn(&self, _fn_id: FnId, _handle: HandleId) -> Result<HandleId, ()> {
+        unimplemented!("invoke_rescue_fn: this binding does not support control operators")
     }
 
     /// Wipe the binding-side ctx state for `node_id`.

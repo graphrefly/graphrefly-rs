@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-11 (Slice T temporal operators landed; M4+M5 formally closed)
+last_updated: 2026-05-12 (Slice U control+buffer+§10 perf landed)
 ---
 
 # Porting flags & deferred concerns
@@ -42,19 +42,24 @@ The following items are kept deferred as a single bucket. **Do not pick them
 up without a criterion bench reproducer that makes them pay for themselves.**
 Add a per-item entry only if a bench surfaces the cost.
 
-| § | What | Current shape | Optimization |
-|---|---|---|---|
-| 10.3 | Diamond resolution bookkeeping | `pending_fires: HashSet<NodeId>` + per-node `involved_this_wave` | `WaveTracker { settled: u64, all_deps_mask: u64 }` bitmask (O(1) is_complete vs O(n)). Pays only on fan-in beyond ~32 deps. |
-| 10.4 | Per-dep indexing | position-based `deps.iter().position(...)` per child propagation | Stable `slot_index` per DepRecord; restructures `tracked: HashSet<usize>` + wave-mask bookkeeping. |
-| 10.5 | Wave-end notification buffer | `pending_notify: IndexMap<NodeId, Vec<Message>>` (alloc per active node) | Single `BatchFrame { pending: Vec<(NodeId, ...)> }` arena per wave. |
-| 10.6 | Sink iteration | `subscribers: HashMap<SubId, Sink>`, flush iterates under lock | Epoch iteration / snapshot-spread (TS pattern). Rust avoids snapshot cost because sink re-entrance discipline differs (see "Late subscriber + multi-emit-per-wave snapshot gap" below for the related correctness gap). |
-| 10.13 | First-run gate scan | `dep_records.iter().any(|r| r.prev_data == NO_HANDLE && r.data_batch.is_empty())` | `received_mask: u64` + `all_deps_mask` bitmask. Largely redundant — wave engine only re-adds nodes to `pending_fires` after real DATA delivery. |
-| —    | `pick_next_fire` transitive upstream walk | O(N·V) BFS per pick (correctness fix from Slice C-1.5, was O(n²) immediate-only and incorrect for >1-hop diamonds) | Per-node `unresolved_dep_count` counter (decrement on settle, fire on zero) — O(1) per pick. |
+| § | What | Current shape | Optimization | Status |
+|---|---|---|---|---|
+| 10.3 | Diamond resolution bookkeeping | `pending_fires: HashSet<NodeId>` + per-node `involved_this_wave` | `WaveTracker { settled: u64, all_deps_mask: u64 }` bitmask (O(1) is_complete vs O(n)). Pays only on fan-in beyond ~32 deps. | deferred |
+| 10.4 | Per-dep indexing | position-based `deps.iter().position(...)` per child propagation | Stable `slot_index` per DepRecord; restructures `tracked: HashSet<usize>` + wave-mask bookkeeping. | dropped — `dep_node_to_index` HashMap is O(1) per lookup, good enough |
+| 10.5 | Wave-end notification buffer | `pending_notify: IndexMap<NodeId, Vec<Message>>` (alloc per active node) | Single `BatchFrame { pending: Vec<(NodeId, ...)> }` arena per wave. | deferred |
+| 10.6 | Sink iteration | `subscribers: HashMap<SubId, Sink>`, flush iterates under lock | Epoch iteration / snapshot-spread (TS pattern). Rust avoids snapshot cost because sink re-entrance discipline differs (see "Late subscriber + multi-emit-per-wave snapshot gap" below for the related correctness gap). | deferred |
+| ~~10.13~~ | ~~First-run gate scan~~ | ~~`dep_records.iter().any(...)`~~ | ~~`received_mask: u64` + `all_deps_mask` bitmask~~ | **RESOLVED** — Slice U (2026-05-12). `received_mask: u64` field on `NodeRecord`; `has_sentinel_deps()` is O(1) bitmask compare. Bit set by `deliver_data_to_consumer`, cleared on deactivation/invalidation/resubscribable reset. |
+| ~~—~~ | ~~`pick_next_fire` transitive upstream walk~~ | ~~O(N·V) BFS per pick~~ | ~~Per-node `unresolved_dep_count` counter~~ | **RESOLVED** — Slice U (2026-05-12). `topo_rank: u32` field on `NodeRecord`; `pick_next_fire` uses O(N) min-scan by `topo_rank` (computed at `set_deps` time via BFS from roots). Eliminates per-pick BFS entirely. |
 
 **Source:** Slice A+B audit (2026-05-05); pick_next_fire entry from Slice C-1.5
 (2026-05-05). Collapsed into a single bucket 2026-05-07 (Slice F doc cleanup)
 per user direction — individual entries were prior-art noise relative to "do
-not pre-optimize."
+not pre-optimize." §10.13 and pick_next_fire resolved in Slice U (2026-05-12).
+
+### Slice U known limitations (2026-05-12)
+
+- **`topo_rank` not propagated to consumers on `set_deps`.** When a node's deps change via `set_deps`, its own `topo_rank` is recomputed, but downstream consumers' ranks are not cascaded. Correct re-ranking would require a transitive walk of all reachable consumers. Acceptable for v1: `set_deps` is an experimental Phase 13.8 API, rarely called in practice, and the worst case is a temporarily suboptimal pick order (one extra no-op fire that settles on the next wave). Fix if `set_deps` becomes hot-path.
+- **`valve` CancellationToken vs TS AbortController parity.** TS valve accepts an `AbortController` which valve can both observe (abort signal from outside) and trigger (valve closes → abort). Rust `CancellationToken` only supports the trigger direction (valve close → cancel). The observe direction (external cancel → close valve) would require spawning a tokio task to select on the token, which adds async machinery for an edge case. Deferred until a concrete use case surfaces.
 
 ---
 
@@ -1466,11 +1471,13 @@ These canonical-spec methods are tracked for parity. Items marked
 - **Lift point:** when a future operator opts in, add a `commit_emission` (with-substitution) path to its `fire_op_*` helper.
 - **Source:** Slice C-1 close (2026-05-06).
 
-### `fire_operator` first-run gate uses linear-scan `has_sentinel_deps()`
+### ~~`fire_operator` first-run gate uses linear-scan `has_sentinel_deps()`~~ — RESOLVED in Slice U
 
-- **What:** `fire_operator`'s pre-fire skip check calls `rec.has_sentinel_deps()` (O(n_deps) linear scan). For transform operators (single-dep, R5.7), this is O(1) in practice. But for future multi-dep operators (combine, withLatestFrom), it's O(n_deps) per fire.
-- **Why deferred:** mirrors the §10.13 deferred concern for `fire_regular`; the `received_mask: u64` bitmask refactor would land alongside that work. Bench-driven re-look.
-- **Source:** Slice C-1 close (2026-05-06).
+`has_sentinel_deps()` now uses the `received_mask: u64` bitmask (O(1) compare
+against `full_mask`), resolving both this entry and §10.13 simultaneously.
+Landed 2026-05-12 as part of the Slice U §10 perf batch.
+
+- **Source:** Slice C-1 close (2026-05-06); resolved Slice U (2026-05-12).
 
 ### Operator describe doesn't surface per-operator discriminant
 

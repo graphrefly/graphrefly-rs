@@ -82,6 +82,10 @@ type FolderBox = Box<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>;
 type EqualsBox = Box<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>;
 type PairwiseBox = Box<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>;
 type PackerBox = Box<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>;
+type TapBox = Box<dyn Fn(HandleId) + Send + Sync>;
+type TapErrorBox = Box<dyn Fn(HandleId) + Send + Sync>;
+type TapCompleteBox = Box<dyn Fn() + Send + Sync>;
+type RescueBox = Box<dyn Fn(HandleId) -> Result<HandleId, ()> + Send + Sync>;
 
 type ProjectorFn = Arc<dyn Fn(HandleId) -> HandleId + Send + Sync>;
 type PredicateFn = Arc<dyn Fn(HandleId) -> bool + Send + Sync>;
@@ -89,6 +93,10 @@ type FolderFn = Arc<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>;
 type EqualsFn = Arc<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>;
 type PairwiseFn = Arc<dyn Fn(HandleId, HandleId) -> HandleId + Send + Sync>;
 type PackerFn = Arc<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>;
+type TapFn = Arc<dyn Fn(HandleId) + Send + Sync>;
+type TapErrorFn = Arc<dyn Fn(HandleId) + Send + Sync>;
+type TapCompleteFn = Arc<dyn Fn() + Send + Sync>;
+type RescueFn = Arc<dyn Fn(HandleId) -> Result<HandleId, ()> + Send + Sync>;
 
 type ProducerBuildArc = Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
 
@@ -120,6 +128,10 @@ struct RegistryState {
     pairwises: HashMap<FnId, PairwiseFn>,
     packers: HashMap<FnId, PackerFn>,
     projects: HashMap<FnId, ProjectArc>,
+    taps: HashMap<FnId, TapFn>,
+    tap_errors: HashMap<FnId, TapErrorFn>,
+    tap_completes: HashMap<FnId, TapCompleteFn>,
+    rescues: HashMap<FnId, RescueFn>,
     /// Producer build closures, keyed by FnId allocated at register
     /// time. Looked up by `invoke_fn` when a producer node fires.
     producer_builds: HashMap<FnId, ProducerBuildArc>,
@@ -141,6 +153,10 @@ impl InnerBinding {
                 pairwises: HashMap::new(),
                 packers: HashMap::new(),
                 projects: HashMap::new(),
+                taps: HashMap::new(),
+                tap_errors: HashMap::new(),
+                tap_completes: HashMap::new(),
+                rescues: HashMap::new(),
                 producer_builds: HashMap::new(),
                 next_fn_id: 1,
             }),
@@ -211,6 +227,34 @@ impl InnerBinding {
     fn alloc_fn_id(&self, s: &mut RegistryState) -> FnId {
         let id = FnId::new(s.next_fn_id);
         s.next_fn_id += 1;
+        id
+    }
+
+    pub fn register_tap(&self, f: TapBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.taps.insert(id, Arc::from(f));
+        id
+    }
+
+    pub fn register_tap_error(&self, f: TapErrorBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.tap_errors.insert(id, Arc::from(f));
+        id
+    }
+
+    pub fn register_tap_complete(&self, f: TapCompleteBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.tap_completes.insert(id, Arc::from(f));
+        id
+    }
+
+    pub fn register_rescue(&self, f: RescueBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.rescues.insert(id, Arc::from(f));
         id
     }
 }
@@ -352,6 +396,56 @@ impl BindingBoundary for InnerBinding {
             .cloned()
             .expect("packer not registered");
         f(handles)
+    }
+
+    fn invoke_tap_fn(&self, fn_id: FnId, handle: HandleId) {
+        let f: TapFn = self
+            .state
+            .lock()
+            .taps
+            .get(&fn_id)
+            .cloned()
+            .expect("tap fn not registered");
+        f(handle);
+    }
+
+    fn invoke_tap_error_fn(&self, fn_id: FnId, handle: HandleId) {
+        let f: TapErrorFn = self
+            .state
+            .lock()
+            .tap_errors
+            .get(&fn_id)
+            .cloned()
+            .expect("tap_error fn not registered");
+        f(handle);
+    }
+
+    fn invoke_tap_complete_fn(&self, fn_id: FnId) {
+        let f: TapCompleteFn = self
+            .state
+            .lock()
+            .tap_completes
+            .get(&fn_id)
+            .cloned()
+            .expect("tap_complete fn not registered");
+        f();
+    }
+
+    fn invoke_rescue_fn(&self, fn_id: FnId, handle: HandleId) -> Result<HandleId, ()> {
+        let f: RescueFn = self
+            .state
+            .lock()
+            .rescues
+            .get(&fn_id)
+            .cloned()
+            .expect("rescue fn not registered");
+        f(handle)
+    }
+
+    fn intern_node(&self, node_id: NodeId) -> HandleId {
+        // Intern the NodeId as a TestValue::Int(raw_id) for simplicity.
+        let raw = node_id.raw();
+        self.intern(TestValue::Int(raw as i64))
     }
 
     fn producer_deactivate(&self, node_id: NodeId) {

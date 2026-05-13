@@ -56,7 +56,7 @@ use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 use crate::boundary::{DepBatch, FnEmission, FnResult};
-use crate::handle::{HandleId, NodeId, NO_HANDLE};
+use crate::handle::{FnId, HandleId, NodeId, NO_HANDLE};
 use crate::message::Message;
 use crate::node::{Core, CoreState, EqualsMode, OperatorOp, Sink, TerminalKind};
 
@@ -943,60 +943,21 @@ impl Core {
         self.flush_notifications(&mut s);
     }
 
-    /// Pick a node whose **transitive** upstream is fully settled.
+    /// Pick the pending node with the lowest topological rank.
     ///
-    /// A node `id` is ready to fire iff none of its transitive ancestors
-    /// (via the `deps` chain) is currently in `pending_fires`. Diamond
-    /// glitch prevention requires transitive (not immediate-only) reasoning
-    /// — for graph `A → {B, C, E}; D = combine(B, C); F = combine(D, E)`,
-    /// a wave that fires `E` first adds `F` to `pending_fires` before `D`
-    /// is added. An immediate-only readiness check would mistakenly pick
-    /// `F` because neither `D` nor `E` are in `pending_fires` at that
-    /// moment, firing `F` against the stale activation-time `D` cache and
-    /// again later when `D` actually settles. Transitive upstream walk
-    /// catches `B`/`C` pending and correctly defers `F`.
+    /// Nodes with lower `topo_rank` have no transitive upstream in
+    /// `pending_fires` (by construction — `topo_rank = 1 + max dep rank`).
+    /// This is O(|pending_fires|) instead of the prior O(N·V) BFS.
+    /// §10 perf optimization (D047, Slice U).
     ///
-    /// Cost: O(V) per candidate; worst case O(N·V) per pick. The existing
-    /// porting-deferred entry on `pick_next_fire` perf flagged this as a
-    /// future per-node `unresolved_dep_count` refactor.
-    /// Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_fires lives on
-    /// per-thread WaveState. Caller passes `&WaveState` alongside
+    /// Q-beyond Sub-slice 2 (D108, 2026-05-09): `pending_fires` lives on
+    /// per-thread `WaveState`. Caller passes `&WaveState` alongside
     /// `&CoreState` so the borrow scopes stay disjoint and visible.
     fn pick_next_fire(s: &CoreState, ws: &WaveState) -> Option<NodeId> {
-        for &id in &ws.pending_fires {
-            if Self::transitive_upstream_settled(s, ws, id) {
-                return Some(id);
-            }
-        }
-        // Cycle / no eligible candidate (every node has an upstream pending,
-        // possibly via a cycle path): pick any so the drain guard advances.
-        // The drain-iteration cap will catch genuine cycles.
-        ws.pending_fires.iter().copied().next()
-    }
-
-    fn transitive_upstream_settled(s: &CoreState, ws: &WaveState, node_id: NodeId) -> bool {
-        let rec = s.require_node(node_id);
-        if rec.dep_count() == 0 {
-            return true;
-        }
-        let mut visited: ahash::AHashSet<NodeId> = ahash::AHashSet::new();
-        let mut stack: Vec<NodeId> = rec.dep_ids_vec();
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            if ws.pending_fires.contains(&id) {
-                return false;
-            }
-            if let Some(r) = s.nodes.get(&id) {
-                for dep_id in r.dep_ids() {
-                    if !visited.contains(&dep_id) {
-                        stack.push(dep_id);
-                    }
-                }
-            }
-        }
-        true
+        ws.pending_fires
+            .iter()
+            .copied()
+            .min_by_key(|&id| s.nodes.get(&id).map_or(0, |r| r.topo_rank))
     }
 
     /// Wave drain entry point. Dispatches via `rec.op` to either the
@@ -1692,6 +1653,13 @@ impl Core {
             // `make_op_scratch` path; once registered, the live default
             // is read from `LastState::default` inside `fire_op_last`.
             OperatorOp::Last { .. } => self.fire_op_last(node_id),
+            OperatorOp::Tap { fn_id } => self.fire_op_tap(node_id, fn_id),
+            OperatorOp::TapFirst { fn_id } => self.fire_op_tap_first(node_id, fn_id),
+            OperatorOp::Valve => self.fire_op_valve(node_id),
+            OperatorOp::Settle {
+                quiet_waves,
+                max_waves,
+            } => self.fire_op_settle(node_id, quiet_waves, max_waves),
         }
     }
 
@@ -2422,6 +2390,195 @@ impl Core {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Slice U: control operators — fire_op impls
+    // -----------------------------------------------------------------
+
+    /// Tap — side-effect passthrough. Invoke tap fn on each DATA, then
+    /// emit each input handle unchanged (zero allocation).
+    fn fire_op_tap(&self, node_id: NodeId, fn_id: FnId) {
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            if terminal.is_none() {
+                self.settle_dirty_resolved(node_id);
+            }
+        } else {
+            for &h in &inputs {
+                self.binding.invoke_tap_fn(fn_id, h);
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+            }
+        }
+        // Terminal forwarding.
+        match terminal {
+            None => {}
+            Some(TerminalKind::Complete) => {
+                self.binding.invoke_tap_complete_fn(fn_id);
+                self.complete(node_id);
+            }
+            Some(TerminalKind::Error(h)) => {
+                self.binding.invoke_tap_error_fn(fn_id, h);
+                self.binding.retain_handle(h);
+                self.error(node_id, h);
+            }
+        }
+    }
+
+    /// TapFirst — one-shot side-effect on first DATA. After the first
+    /// qualifying DATA, acts as pure passthrough.
+    fn fire_op_tap_first(&self, node_id: NodeId, fn_id: FnId) {
+        use crate::op_state::TapFirstState;
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+        if inputs.is_empty() {
+            if terminal.is_none() {
+                self.settle_dirty_resolved(node_id);
+            }
+        } else {
+            let fired = {
+                let s = self.lock_state();
+                scratch_ref::<TapFirstState>(&s, node_id).fired
+            };
+            for &h in &inputs {
+                if !fired {
+                    self.binding.invoke_tap_fn(fn_id, h);
+                    let mut s = self.lock_state();
+                    scratch_mut::<TapFirstState>(&mut s, node_id).fired = true;
+                }
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+            }
+        }
+        if let Some(TerminalKind::Complete) = terminal {
+            self.complete(node_id);
+        } else if let Some(TerminalKind::Error(h)) = terminal {
+            self.binding.retain_handle(h);
+            self.error(node_id, h);
+        }
+    }
+
+    /// Valve — conditional forward. dep[0]=source, dep[1]=control.
+    /// When control is truthy, forwards source DATA; else RESOLVED.
+    fn fire_op_valve(&self, node_id: NodeId) {
+        // Snapshot both deps.
+        let (src_inputs, src_terminal, ctrl_latest) = {
+            let s = self.lock_state();
+            let rec = s.require_node(node_id);
+            debug_assert!(rec.dep_records.len() == 2, "valve must have exactly 2 deps");
+            let dr0 = &rec.dep_records[0];
+            let dr1 = &rec.dep_records[1];
+            let src_inputs: Vec<HandleId> = dr0.data_batch.iter().copied().collect();
+            let src_term = dr0.terminal;
+            // Latest control: last of this wave's batch, or prev_data.
+            let ctrl = dr1.data_batch.last().copied().unwrap_or(dr1.prev_data);
+            (src_inputs, src_term, ctrl)
+        };
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+
+        // Source terminal forwarding (D3).
+        if let Some(TerminalKind::Complete) = src_terminal {
+            self.complete(node_id);
+            return;
+        }
+        if let Some(TerminalKind::Error(h)) = src_terminal {
+            self.binding.retain_handle(h);
+            self.error(node_id, h);
+            return;
+        }
+
+        // Gate: NO_HANDLE means "gate closed" (control never sent DATA);
+        // any real handle means "gate open". Proper value-level truthiness
+        // would require BindingBoundary::is_truthy (deferred — D048).
+        let gate_open = ctrl_latest != crate::handle::NO_HANDLE;
+
+        if !gate_open {
+            self.settle_dirty_resolved(node_id);
+            return;
+        }
+
+        if src_inputs.is_empty() {
+            // Control opened but no source DATA this wave. Re-emit
+            // prev source value if available.
+            let prev_src = {
+                let s = self.lock_state();
+                s.require_node(node_id).dep_records[0].prev_data
+            };
+            if prev_src == crate::handle::NO_HANDLE {
+                self.settle_dirty_resolved(node_id);
+            } else {
+                self.binding.retain_handle(prev_src);
+                self.commit_emission_verbatim(node_id, prev_src);
+            }
+        } else {
+            for &h in &src_inputs {
+                self.binding.retain_handle(h);
+                self.commit_emission_verbatim(node_id, h);
+            }
+        }
+    }
+
+    /// Settle — convergence detector. Forwards DATA, counts quiet waves,
+    /// self-completes when converged.
+    fn fire_op_settle(&self, node_id: NodeId, quiet_waves: u32, max_waves: Option<u32>) {
+        use crate::op_state::SettleState;
+        let (inputs, terminal) = self.snapshot_op_dep0(node_id);
+        {
+            let mut s = self.lock_state();
+            s.require_node_mut(node_id).has_fired_once = true;
+        }
+
+        // Terminal forwarding.
+        if let Some(TerminalKind::Complete) = terminal {
+            self.complete(node_id);
+            return;
+        }
+        if let Some(TerminalKind::Error(h)) = terminal {
+            self.binding.retain_handle(h);
+            self.error(node_id, h);
+            return;
+        }
+
+        let saw_data = !inputs.is_empty();
+
+        // Forward all DATA.
+        for &h in &inputs {
+            self.binding.retain_handle(h);
+            self.commit_emission_verbatim(node_id, h);
+        }
+
+        // Update counters.
+        let should_complete = {
+            let mut s = self.lock_state();
+            let scratch = scratch_mut::<SettleState>(&mut s, node_id);
+            scratch.wave_count += 1;
+            if saw_data {
+                scratch.has_value = true;
+                scratch.quiet_count = 0;
+            } else {
+                scratch.quiet_count += 1;
+            }
+            let settled = scratch.has_value && scratch.quiet_count >= quiet_waves;
+            let exhausted = max_waves.is_some_and(|max| scratch.wave_count >= max);
+            settled || exhausted
+        };
+
+        if should_complete {
+            self.complete(node_id);
+        } else if !saw_data {
+            self.settle_dirty_resolved(node_id);
+        }
+    }
+
     pub(crate) fn deliver_data_to_consumer(
         &self,
         s: &mut CoreState,
@@ -2452,6 +2609,11 @@ impl Core {
             consumer.dep_records[dep_idx].data_batch.push(handle);
             consumer.dep_records[dep_idx].involved_this_wave = true;
             consumer.involved_this_wave = true;
+            // §10.13 perf (D047): set received_mask bit on first DATA
+            // delivery for this dep.
+            if dep_idx < 64 {
+                consumer.received_mask |= 1u64 << dep_idx;
+            }
             is_dynamic = consumer.is_dynamic;
             is_state = consumer.is_state();
             tracked_or_first_fire = !consumer.has_fired_once || consumer.tracked.contains(&dep_idx);

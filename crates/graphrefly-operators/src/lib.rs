@@ -26,7 +26,8 @@
 //! - [`combine`] — combine, merge, withLatestFrom (✅ Slice C-2)
 //! - [`flow`] — take, skip, takeWhile, last + first/find/element_at
 //!   sugar (✅ Slice C-3)
-//! - [`temporal`] — sample, debounce, throttle, delay, audit, interval
+//! - [`temporal`] — sample, debounce, throttle, delay, audit, interval,
+//!   timeout, buffer_time, window_time
 //!   (✅ Slice T)
 //! - `switching` — switchMap, mergeMap, concatMap
 //! - `gating` — valve, gate, budgetGate, policyGate
@@ -53,7 +54,9 @@
 )]
 
 pub mod binding;
+pub mod buffer;
 pub mod combine;
+pub mod control;
 pub mod error;
 pub mod flow;
 pub mod higher_order;
@@ -63,7 +66,9 @@ pub mod temporal;
 pub mod transform;
 
 pub use binding::OperatorBinding;
+pub use buffer::{buffer, buffer_count, window, window_count};
 pub use combine::{combine as combine_latest, merge, with_latest_from, MergeRegistration};
+pub use control::{on_first_data, repeat, rescue, settle, tap, tap_observer, valve};
 pub use error::OperatorFactoryError;
 pub use flow::{
     element_at, find, first, last, last_with_default, skip, take, take_while, FlowRegistration,
@@ -77,7 +82,9 @@ pub use producer::{
     default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
     ProducerStorage, SubscribeOutcome,
 };
-pub use temporal::{audit, debounce, delay, interval, sample, throttle};
+pub use temporal::{
+    audit, buffer_time, debounce, delay, interval, sample, throttle, timeout, window_time,
+};
 pub use transform::{
     distinct_until_changed, filter, map, pairwise, reduce, scan, OperatorRegistration,
 };

@@ -319,6 +319,51 @@ impl OperatorScratch for LastState {
     }
 }
 
+// ---- Slice U: control operators ----
+
+/// TapFirst one-shot flag. Once `fired` is `true`, subsequent fires skip
+/// the `invoke_tap_fn` call.
+#[derive(Debug, Default)]
+pub(crate) struct TapFirstState {
+    pub(crate) fired: bool,
+}
+
+impl OperatorScratch for TapFirstState {
+    fn release_handles(&mut self, _binding: &dyn BindingBoundary) {
+        self.fired = false;
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Settle convergence-detector state. Tracks the quiet-wave counter,
+/// total wave count, and the last emitted handle (for value-equality
+/// dedup when the binding provides an equals fn, deferred to v2).
+#[derive(Debug, Default)]
+pub(crate) struct SettleState {
+    pub(crate) quiet_count: u32,
+    pub(crate) wave_count: u32,
+    pub(crate) has_value: bool,
+}
+
+impl OperatorScratch for SettleState {
+    fn release_handles(&mut self, _binding: &dyn BindingBoundary) {
+        self.quiet_count = 0;
+        self.wave_count = 0;
+        self.has_value = false;
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
 // =====================================================================
 // Send + Sync compile-time asserts (Slice C-3 /qa P9)
 // =====================================================================
@@ -342,6 +387,8 @@ const _: fn() = || {
     assert_send_sync::<SkipState>();
     assert_send_sync::<TakeWhileState>();
     assert_send_sync::<LastState>();
+    assert_send_sync::<TapFirstState>();
+    assert_send_sync::<SettleState>();
     // Trait-object-level check (defensive).
     assert_send_sync::<Box<dyn OperatorScratch>>();
 };

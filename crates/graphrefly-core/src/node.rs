@@ -413,7 +413,9 @@ impl NodeKind {
     pub(crate) fn skips_auto_cascade(self) -> bool {
         matches!(
             self,
-            NodeKind::Operator(OperatorOp::Reduce { .. } | OperatorOp::Last { .. })
+            NodeKind::Operator(
+                OperatorOp::Reduce { .. } | OperatorOp::Last { .. } | OperatorOp::Valve
+            )
         )
     }
 }
@@ -517,6 +519,39 @@ pub enum OperatorOp {
     /// Opts out of Lock 2.B auto-cascade so it can intercept upstream
     /// COMPLETE.
     Last { default: HandleId },
+
+    // ----- Slice U: control operators (D047) -----
+    /// `tap(source, fn)` — side-effect passthrough. Calls
+    /// `BindingBoundary::invoke_tap_fn(fn_id, handle)` on each input DATA,
+    /// then emits the input handle unchanged. Zero-transform: output
+    /// handles are the inputs verbatim (no equals substitution, no
+    /// allocation).
+    Tap { fn_id: FnId },
+
+    /// `tapFirst(source, fn)` — one-shot side-effect on first DATA. Same
+    /// as [`Tap`](Self::Tap) but fires `invoke_tap_fn` only once; after
+    /// the first fire, subsequent DATA passes through without a callback.
+    /// State: [`TapFirstState`](super::op_state::TapFirstState) tracks
+    /// `fired: bool`.
+    TapFirst { fn_id: FnId },
+
+    /// `valve(source, control)` — conditional forward. 2-dep: dep[0] is
+    /// source, dep[1] is boolean control. When the latest control value
+    /// is truthy (non-zero handle), forwards source DATA; when falsy,
+    /// settles with RESOLVED. Partial mode so it fires on control-alone
+    /// before source has delivered. Does NOT auto-complete on control
+    /// terminal (`completeWhenDepsComplete: false` equivalent).
+    Valve,
+
+    /// `settle(source, quietWaves, maxWaves)` — convergence detector.
+    /// Forwards each upstream DATA, counts consecutive no-change waves,
+    /// and self-completes when `quiet_count >= quiet_waves` (or
+    /// `wave_count >= max_waves` if set). State:
+    /// [`SettleState`](super::op_state::SettleState).
+    Settle {
+        quiet_waves: u32,
+        max_waves: Option<u32>,
+    },
 }
 
 /// Registration options for [`Core::register_operator`].
@@ -943,6 +978,9 @@ impl Drop for Subscription {
                         rec.has_fired_once = false;
                         rec.dirty = false;
                         rec.involved_this_wave = false;
+                        // §10.13 perf (D047): reset received_mask — all deps back
+                        // to sentinel on resubscribe.
+                        rec.received_mask = 0;
                         if rec.is_dynamic {
                             rec.tracked.clear();
                         }
@@ -1575,6 +1613,17 @@ pub(crate) struct NodeRecord {
     /// State/Derived/Dynamic nodes the field is settable but the gated
     /// path remains the typical caller default.
     pub(crate) partial: bool,
+    /// Topological rank — 1 + max dep rank. Nodes with no deps have rank 0.
+    /// Used by `pick_next_fire` for O(|pending_fires|) scheduling instead
+    /// of O(V) transitive BFS. Computed at registration; recomputed on
+    /// `set_deps` for the modified node (consumer propagation deferred —
+    /// see `porting-deferred.md`). §10 perf optimization (D047, Slice U).
+    pub(crate) topo_rank: u32,
+    /// Bitmask for first-run gate — bit i set when dep i delivers first
+    /// DATA. `has_sentinel_deps()` becomes a single integer compare for
+    /// ≤64 deps. Falls back to `iter().any()` when `dep_count > 64`.
+    /// Reset on resubscribe. §10.13 perf optimization (D047, Slice U).
+    pub(crate) received_mask: u64,
     /// Generic per-operator scratch slot (Slice C-3, D026). Replaces
     /// the typed `operator_state: HandleId` field used by Slices C-1 / C-2.
     /// `None` for non-operator kinds and operators with no cross-wave
@@ -1665,17 +1714,23 @@ impl NodeRecord {
         self.dep_ids().collect()
     }
 
-    /// Number of deps.
-    pub(crate) fn dep_count(&self) -> usize {
-        self.dep_records.len()
-    }
-
     /// True if any dep is in sentinel state (never emitted DATA and no
     /// data this wave). Replaces the old `dep_handles.contains(&NO_HANDLE)`.
     pub(crate) fn has_sentinel_deps(&self) -> bool {
-        self.dep_records
-            .iter()
-            .any(|r| r.prev_data == NO_HANDLE && r.data_batch.is_empty())
+        let n = self.dep_records.len();
+        if n == 0 {
+            return false;
+        }
+        if n <= 64 {
+            // O(1): check if all bits [0..n) are set.
+            let full_mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+            self.received_mask != full_mask
+        } else {
+            // Fallback for >64 deps (extremely rare).
+            self.dep_records
+                .iter()
+                .any(|r| r.prev_data == NO_HANDLE && r.data_batch.is_empty())
+        }
     }
 
     /// Find the index of a dep by NodeId.
@@ -2792,6 +2847,7 @@ impl Core {
     /// discipline that covers both early-return AND unwind paths.
     /// `Last { default }` retains its `default` handle on the same
     /// release path.
+    #[allow(clippy::too_many_lines)]
     pub fn register(&self, reg: NodeRegistration) -> Result<NodeId, RegisterError> {
         let NodeRegistration {
             deps,
@@ -2896,6 +2952,17 @@ impl Core {
 
         let dep_records: Vec<DepRecord> = deps.iter().map(|&d| DepRecord::new(d)).collect();
 
+        // §10 perf (D047): compute topo_rank = 1 + max(dep ranks).
+        let topo_rank = if deps.is_empty() {
+            0
+        } else {
+            deps.iter()
+                .filter_map(|&d| s.nodes.get(&d).map(|r| r.topo_rank))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+
         let rec = NodeRecord {
             dep_records,
             fn_id,
@@ -2918,6 +2985,8 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
+            topo_rank,
+            received_mask: 0,
             op_scratch: installed_scratch,
         };
         s.nodes.insert(id, rec);
@@ -3141,11 +3210,19 @@ impl Core {
                 }
                 Ok(Some(state))
             }
+            OperatorOp::TapFirst { .. } => {
+                Ok(Some(Box::new(crate::op_state::TapFirstState::default())))
+            }
+            OperatorOp::Settle { .. } => {
+                Ok(Some(Box::new(crate::op_state::SettleState::default())))
+            }
             OperatorOp::Map { .. }
             | OperatorOp::Filter { .. }
             | OperatorOp::Combine { .. }
             | OperatorOp::WithLatestFrom { .. }
-            | OperatorOp::Merge => Ok(None),
+            | OperatorOp::Merge
+            | OperatorOp::Tap { .. }
+            | OperatorOp::Valve => Ok(None),
         }
     }
 
@@ -3593,6 +3670,9 @@ impl Core {
             rec.pause_state = PauseState::Active;
             rec.involved_this_wave = false;
             rec.dirty = false;
+            // §10.13 perf (D047): reset received_mask — fresh lifecycle
+            // means all deps are sentinel again.
+            rec.received_mask = 0;
             // P7 (Slice A close /qa): Dynamic nodes clear `tracked` so
             // the post-reset first fire repopulates from the fn's
             // returned tracked-deps set.
@@ -4597,9 +4677,14 @@ impl Core {
                             }
                         });
                     }
-                    let dr = &mut s.require_node_mut(child_id).dep_records[idx];
-                    dr.prev_data = NO_HANDLE;
-                    dr.data_batch.clear();
+                    let child_rec = s.require_node_mut(child_id);
+                    child_rec.dep_records[idx].prev_data = NO_HANDLE;
+                    child_rec.dep_records[idx].data_batch.clear();
+                    // §10.13 perf (D047): clear received_mask bit so
+                    // has_sentinel_deps() re-closes the first-run gate.
+                    if idx < 64 {
+                        child_rec.received_mask &= !(1u64 << idx);
+                    }
                     work.push(child_id);
                 }
             }
@@ -5183,11 +5268,32 @@ impl Core {
         // R2.4.5, `set_deps` does NOT end the activation cycle
         // (subscribe→unsubscribe is the cycle boundary), so OnRerun must
         // fire on every re-fire including post-set_deps.
+        // §10 perf (D047): compute new topo_rank before the mutable
+        // borrow on rec, since we need to read other nodes' depths.
+        let new_topo_rank = if new_deps_vec.is_empty() {
+            0
+        } else {
+            new_deps_vec
+                .iter()
+                .filter(|&&d| d != n)
+                .filter_map(|&d| s.nodes.get(&d).map(|r| r.topo_rank))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
         let fire_set_deps_on_rerun;
         {
             let rec = s.require_node_mut(n);
             fire_set_deps_on_rerun = rec.is_dynamic && rec.has_fired_once;
             rec.dep_records = new_dep_records;
+            rec.topo_rank = new_topo_rank;
+            // §10.13 perf (D047): recompute received_mask from new dep_records.
+            rec.received_mask = 0;
+            for (i, dr) in rec.dep_records.iter().enumerate() {
+                if i < 64 && (dr.prev_data != NO_HANDLE || !dr.data_batch.is_empty()) {
+                    rec.received_mask |= 1u64 << i;
+                }
+            }
             // Re-derive `tracked` for static derived: all indices.
             // For dynamic: clear `tracked` AND reset `has_fired_once` so the
             // next dep delivery satisfies the first-fire branch in
