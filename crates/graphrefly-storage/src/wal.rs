@@ -84,6 +84,15 @@ pub struct WALFrame<T> {
     /// the wire format JSON-codec-friendly. M4.A parity-fixture asserts
     /// byte-equivalence against the TS impl.
     pub checksum: String,
+    /// Codec version tag. All M4.A frames are implicitly version 1
+    /// (JSON codec). Defaults to `1` for backward-compatible deserialization
+    /// of frames written before this field was added.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+}
+
+fn default_format_version() -> u32 {
+    1
 }
 
 /// Singleton-string discriminator for the bridge wire-format tag. Always
@@ -228,6 +237,7 @@ mod tests {
             frame_seq: 17,
             frame_t_ns: 1_700_000_001_000,
             checksum: String::new(),
+            format_version: 1,
         }
     }
 
@@ -390,6 +400,7 @@ mod tests {
             frame_seq: 0,
             frame_t_ns: 0,
             checksum: String::new(),
+            format_version: 1,
         };
         let computed = wal_frame_checksum(&frame).unwrap();
 
@@ -437,6 +448,7 @@ mod tests {
             frame_seq: 0,
             frame_t_ns: 0,
             checksum: String::new(),
+            format_version: 1,
         };
         let expected_sha = "7e857f0862bd429d7d144980a2580da732e0d4b420a03d73d63462368f896c3b";
         assert_eq!(wal_frame_checksum(&frame).unwrap(), expected_sha);
@@ -460,6 +472,7 @@ mod tests {
             frame_seq: 0,
             frame_t_ns: 0,
             checksum: String::new(),
+            format_version: 1,
         };
         let expected_sha = "901d3d70d38d954864243bdee5a88cb6d204e5e9823598606d38c10e604c3af4";
         assert_eq!(wal_frame_checksum(&frame).unwrap(), expected_sha);
@@ -486,6 +499,7 @@ mod tests {
             frame_seq: 0,
             frame_t_ns: 0,
             checksum: String::new(),
+            format_version: 1,
         };
         let expected_sha = "da42bdfa3eff9dbb7ffc60b04c7478cbe7cbb7015ba48963b4ea4661f678c387";
         assert_eq!(wal_frame_checksum(&frame).unwrap(), expected_sha);
@@ -522,6 +536,7 @@ mod tests {
             frame_seq: 0,
             frame_t_ns: 0,
             checksum: String::new(),
+            format_version: 1,
         };
         let mut f = frame.clone();
         f.checksum = wal_frame_checksum(&frame).unwrap();
@@ -547,10 +562,63 @@ mod tests {
             frame_seq: 17,
             frame_t_ns: 200,
             checksum: String::new(),
+            format_version: 1,
         };
         let mut f = frame.clone();
         f.checksum = wal_frame_checksum(&frame).unwrap();
         assert!(verify_wal_frame_checksum(&f).unwrap());
+    }
+
+    /// /qa F5 (2026-05-12): backward-compatible deserialization of
+    /// pre-`format_version` frames. Old frames serialized WITHOUT the
+    /// `format_version` field must deserialize successfully with
+    /// `format_version` defaulting to `1`.
+    #[test]
+    fn format_version_defaults_on_old_frame_json() {
+        // JSON from a pre-format_version frame (no `format_version` key).
+        let old_json = r#"{
+            "t": "c",
+            "lifecycle": "data",
+            "path": "p",
+            "change": {
+                "structure": "s",
+                "version": 0,
+                "t_ns": 0,
+                "lifecycle": "data",
+                "change": 0
+            },
+            "frame_seq": 0,
+            "frame_t_ns": 0,
+            "checksum": ""
+        }"#;
+        let frame: WALFrame<u64> = serde_json::from_str(old_json).unwrap();
+        assert_eq!(frame.format_version, 1, "missing format_version must default to 1");
+    }
+
+    /// /qa F5 (2026-05-12): new frames with explicit `format_version`
+    /// round-trip correctly.
+    #[test]
+    fn format_version_round_trips() {
+        let frame = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: 0u64,
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 2,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let deser: WALFrame<u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.format_version, 2);
     }
 
     /// /qa A10 (2026-05-10): canary detecting `serde_json/preserve_order`

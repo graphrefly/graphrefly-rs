@@ -291,6 +291,7 @@ pub fn decompose_diff_to_frames(
             frame_seq: seq,
             frame_t_ns: timestamp_ns,
             checksum: String::new(),
+            format_version: 1,
         };
         frame.checksum = wal_frame_checksum(&frame)?;
         frames.push(frame);

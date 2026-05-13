@@ -2,7 +2,36 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-12 — Slice U: control + buffer + §10 perf)
+## Current state (2026-05-12 — Slice 3e/3f: cold sources + deferred cleanup)
+
+**Slice 3e/3f LANDED 2026-05-12.** Cold synchronous sources ported to `graphrefly-operators::source`, deferred cleanup items resolved.
+
+**Cold synchronous sources (`graphrefly-operators::source`):**
+
+1. **`from_iter(core, binding, handles)`** — Emit each `HandleId` as DATA in order, then COMPLETE. Empty vec behaves like `empty`. Uses producer pattern with `Weak` captures.
+2. **`of(core, binding, handles)`** — Convenience alias for `from_iter`.
+3. **`empty(core, binding)`** — COMPLETE immediately with no DATA.
+4. **`never(core, binding)`** — No-op build closure; stays active until last subscriber drops.
+5. **`throw_error(core, binding, error_handle)`** — Emit ERROR immediately with pre-interned error handle.
+
+All factories follow the standard producer pattern: `register_producer_build` + `core.register_producer(fn_id)`. Build closures fire once on first activation (first subscriber) and emit synchronously. Deactivation auto-cleans via `producer_deactivate`.
+
+**Deferred cleanup items resolved:**
+
+1. **`signal_invalidate` iterative worklist** — `Graph::collect_signal_invalidate_ids` converted from recursive to iterative using explicit `Vec<Graph>` worklist. Prevents stack overflow on deep mount trees.
+2. **`format_version` field on `WALFrame<T>`** — Added `pub format_version: u32` with `#[serde(default = "default_format_version")]` (defaults to `1`). Backward-compatible with existing M4.A frames. Excluded from checksum computation (metadata, not content).
+
+**Decisions recorded:**
+
+- Async sources (`fromPromise`, `defer`, `fromAsyncIter`) are **binding-layer only** — input types are language-specific (JS Promise, Python coroutine, Rust Future). Core sees only `HandleId`.
+- Render functions (`graphSpecToMermaid` etc.) are **binding-layer only** — data/render separation already done in TS (Tier 2.1 A2).
+- `share`/`replay`/`cached` are **redundant** — every GraphReFly node already has multicast, replay buffer (`NodeOpts::replay_buffer`), and cache (`cached: HandleId` with push-on-subscribe).
+
+**Test count: 829 cargo tests pass** (up from 499). +330 net (includes Slice U control/buffer + this slice's 10 source tests). `cargo clippy` clean on new code. `#![forbid(unsafe_code)]` preserved.
+
+---
+
+## Previous state (2026-05-12 — Slice U: control + buffer + §10 perf)
 
 **Slice U LANDED 2026-05-12.** Control operators, buffer operators, temporal operator extensions, §10 performance optimizations, and Core OperatorOp infrastructure for future operator dispatch.
 

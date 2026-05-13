@@ -62,6 +62,7 @@ pub mod flow;
 pub mod higher_order;
 pub mod ops_impl;
 pub mod producer;
+pub mod source;
 pub mod temporal;
 pub mod transform;
 
@@ -78,6 +79,7 @@ pub use higher_order::{
     ProjectFn,
 };
 pub use ops_impl::{concat, race, take_until, zip};
+pub use source::{empty, from_iter, never, of, throw_error};
 pub use producer::{
     default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
     ProducerStorage, SubscribeOutcome,

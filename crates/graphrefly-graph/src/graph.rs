@@ -852,41 +852,46 @@ impl Graph {
         }
     }
 
-    /// Recursive gather pass for [`Self::signal_invalidate`]. Pushes
+    /// Iterative gather pass for [`Self::signal_invalidate`]. Pushes
     /// every named node id (modulo meta-companion filter) across this
-    /// graph and its mount subtree into `out`, in DFS pre-order.
+    /// graph and its mount subtree into `out`.
     ///
-    /// Each subgraph is locked briefly and independently — no nested
-    /// locks. Skips destroyed subgraphs (idempotent).
+    /// Uses an explicit `Vec<Graph>` worklist instead of recursion to
+    /// avoid stack overflow on deep mount trees (porting-deferred.md
+    /// lift point). Each subgraph is locked briefly and independently
+    /// — no nested locks. Skips destroyed subgraphs (idempotent).
+    /// Order is unspecified (invalidate is order-independent).
     fn collect_signal_invalidate_ids(&self, out: &mut Vec<NodeId>) {
-        let (own_ids, meta_set, child_clones) = {
-            let inner = self.inner.lock();
-            if inner.destroyed {
-                return;
-            }
-            // Build the set of ids that are meta-companions of any other
-            // named node in this graph. Names that point at a meta of
-            // some named parent get filtered.
-            let mut meta_set: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-            for &parent_id in inner.names.values() {
-                for child_id in self.core.meta_companions_of(parent_id) {
-                    meta_set.insert(child_id);
+        let mut worklist: Vec<Graph> = vec![self.clone()];
+        while let Some(graph) = worklist.pop() {
+            let (own_ids, meta_set, child_clones) = {
+                let inner = graph.inner.lock();
+                if inner.destroyed {
+                    continue;
                 }
+                // Build the set of ids that are meta-companions of any other
+                // named node in this graph. Names that point at a meta of
+                // some named parent get filtered.
+                let mut meta_set: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                for &parent_id in inner.names.values() {
+                    for child_id in graph.core.meta_companions_of(parent_id) {
+                        meta_set.insert(child_id);
+                    }
+                }
+                (
+                    inner.names.values().copied().collect::<Vec<_>>(),
+                    meta_set,
+                    inner.children.values().cloned().collect::<Vec<_>>(),
+                )
+            };
+            for id in own_ids {
+                if meta_set.contains(&id) {
+                    continue;
+                }
+                out.push(id);
             }
-            (
-                inner.names.values().copied().collect::<Vec<_>>(),
-                meta_set,
-                inner.children.values().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for id in own_ids {
-            if meta_set.contains(&id) {
-                continue;
-            }
-            out.push(id);
-        }
-        for child in child_clones {
-            child.collect_signal_invalidate_ids(out);
+            worklist.extend(child_clones);
         }
     }
 

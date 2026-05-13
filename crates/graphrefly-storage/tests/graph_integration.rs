@@ -558,6 +558,7 @@ fn restore_torn_tail_skipped() {
         frame_seq: 1,
         frame_t_ns: 2000,
         checksum: "bad".to_owned(),
+        format_version: 1,
     };
     wal_tier
         .save(
@@ -622,6 +623,7 @@ fn restore_torn_mid_aborts() {
         frame_seq: 1,
         frame_t_ns: 2000,
         checksum: "corrupt".to_owned(),
+        format_version: 1,
     };
     wal_tier
         .save(
@@ -768,6 +770,7 @@ fn restore_custom_torn_policy_skip_all() {
             frame_seq: seq,
             frame_t_ns: 2000,
             checksum: "bad".to_owned(),
+            format_version: 1,
         };
         wal_tier
             .save(

@@ -146,11 +146,10 @@ per fn-fire).
 - **Lift point:** widen the `BindingBoundary` trait's `release_handle` rustdoc to make the leaf-operation requirement a HARD contract (currently it reads more like an implementation hint). Add a `release_handle_lock_held: bool` capability flag if a future binding genuinely needs Core re-entrance during refcount paths. Until then, defer.
 - **Source:** /qa F2 / M1 (2026-05-10 A/B/D/E/F batch review). Pre-existing for Phase 3/5; expanded for Phase 3b + Drop drain via D-α.
 
-### `signal_invalidate` uses unbounded recursion (stack overflow risk on deep mount trees)
+### ~~`signal_invalidate` uses unbounded recursion (stack overflow risk on deep mount trees)~~ — RESOLVED 2026-05-12 (Slice 3e/3f)
 
-- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs) `collect_signal_invalidate_ids` recurses into `child.collect_signal_invalidate_ids(out)` for each mounted child. Each Rust stack frame is significantly heavier than a TS closure frame; a mount tree of several thousand levels would overflow the default thread stack.
-- **Why acceptable at v1:** mount trees in practice are ≤4 levels deep (the canonical pattern is `system / module / submodule / leaf`). Deeper trees indicate either accidental nesting or an adversarial construction; either way, the gather pass is on a setup/teardown-time path (not hot), so a panic on stack overflow is loud and recoverable.
-- **Lift point:** convert recursion to iteration using an explicit `Vec<Graph>` worklist. Pop a graph, lock briefly, push children to the worklist, push own ids to `out`. Mirrors the destroy() cascade pattern at `graph.rs:874`.
+- **Resolution:** `collect_signal_invalidate_ids` converted from recursive to iterative using an explicit `Vec<Graph>` worklist. Pop a graph, lock briefly, push children to worklist, push own ids to `out`. Mirrors the `destroy()` cascade pattern.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `collect_signal_invalidate_ids`.
 - **Source:** /qa Blind Hunter Major (2026-05-10 A/B/D/E/F batch review).
 
 ### ~~M4.B `flush()` pending data loss on encode / write failure~~ — RESOLVED 2026-05-11 (D165)
@@ -180,11 +179,10 @@ redb per-write ACID transactions (D163) serialize concurrent writers by MVCC des
 - **Status (M4.E2 close):** D174 structurally closes this at the graph-integration layer. `attach_snapshot_storage` always passes `key_of = |snap| snap.name` (derived from `graph.name`), so both impls converge at the attach boundary. The tier-level default `key_of` divergence remains but is irrelevant when using the graph-level API.
 - **Source:** /qa F8 (2026-05-10); closed D174 / M4.E2 (2026-05-11).
 
-### Cross-language `format_version` field missing from `WALFrame<T>` — spec §d gap
+### ~~Cross-language `format_version` field missing from `WALFrame<T>` — spec §d gap~~ — RESOLVED (Rust) 2026-05-12 (Slice 3e/3f)
 
-- **What:** Canonical spec at `GRAPHREFLY-SPEC.md:1234` mandates: "`format_version` extends from `GraphCheckpointRecord` to `WALFrame` per-tier; codec migration via baseline rewrite." Neither TS `wal.ts:52-77` nor Rust `wal.rs:67-87` carry this field. Without it, codec migration can't surface `RestoreError::CodecMismatch { expected, found }` with the actual `found` codec version.
-- **Why acceptable at v1:** the field can be added schema-compatibly later (new field with a `serde(default)` for backward read of old frames). All M4.A frames will be implicitly `format_version: 1` JSON-codec by inspection. No active codec-migration scenarios in v1 — `DagCborCodec` lands post-1.0.
-- **Lift point (M4.E or cross-language batch):** add `pub format_version: u32` to `WALFrame<T>` (both impls); include in canonical-JSON body for checksum; bump parity fixtures. Cross-references TS-side `docs/optimizations.md` entry.
+- **Resolution (Rust side):** Added `pub format_version: u32` to `WALFrame<T>` with `#[serde(default = "default_format_version")]` (defaults to `1`). Backward-compatible with existing M4.A frames. Excluded from `ChecksumBody` (metadata, not content) — parity fixtures unchanged.
+- **TS side:** still missing. When adding to TS, the field MUST also be excluded from the checksum body (`canonicalFrameBody` at `wal.ts:141`) — otherwise cross-language parity breaks. Track in TS `docs/optimizations.md`.
 - **Source:** /qa F7 (2026-05-10). Cross-language scope — tracked in TS `docs/optimizations.md` under "Active work items".
 
 ### M4.B tier-level setTimeout-equivalent debounce (lift @ reactive timer port)
