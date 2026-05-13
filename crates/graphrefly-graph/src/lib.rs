@@ -55,7 +55,7 @@ pub use describe::{
     DescribeSink, DescribeValue, EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus,
     NodeTypeStr, ReactiveDescribeHandle,
 };
-pub use graph::{Graph, NameError, RemoveError, SignalKind};
+pub use graph::{Graph, NameError, PathError, RemoveError, SignalKind};
 pub use mount::{GraphRemoveAudit, MountError};
 pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne};
 pub use snapshot::{

@@ -40,13 +40,15 @@ use std::sync::{Arc, Weak};
 use graphrefly_core::{FnId, HandleId, NodeId};
 use graphrefly_operators::{
     binding::OperatorBinding,
+    buffer,
     combine::{self, PackerFn},
+    control,
     error::OperatorFactoryError,
     flow,
     higher_order::{self, HigherOrderBinding, ProjectFn},
     ops_impl,
     producer::{ProducerBinding, ProducerBuildFn, ProducerStorage},
-    transform,
+    source, temporal, transform,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -835,6 +837,466 @@ impl BenchOperators {
             .await?
         })
     }
+
+    // -----------------------------------------------------------------
+    // Control operators (Slice U napi parity)
+    // -----------------------------------------------------------------
+
+    /// `tap(src, fn)` — side-effect on each DATA. JS callback: `(handle: u32) => void`.
+    #[napi]
+    pub fn register_tap<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        callback: Function<u32, ()>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_h_to_unit_tsfn(callback)?;
+        let tap_closure = closure_h_to_unit(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let fn_id = {
+                    let mut reg = binding.registry.lock();
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.tap_fns.insert(fn_id, Arc::from(tap_closure));
+                    fn_id
+                };
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = control::tap(&core, &producer_binding, src_id, fn_id);
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `tap_observer(src, data_fn?, error_fn?, complete_fn?)` — lifecycle-aware taps.
+    #[napi]
+    pub fn register_tap_observer<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        data_callback: Option<Function<u32, ()>>,
+        error_callback: Option<Function<u32, ()>>,
+        complete_callback: Option<Function<'env, (), ()>>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let data_tsfn = data_callback.map(build_h_to_unit_tsfn).transpose()?;
+        let error_tsfn = error_callback.map(build_h_to_unit_tsfn).transpose()?;
+        let complete_tsfn = complete_callback.map(build_unit_to_unit_tsfn).transpose()?;
+
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let mut reg = binding.registry.lock();
+                let data_fn_id = data_tsfn.map(|tsfn| {
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.tap_fns
+                        .insert(fn_id, Arc::from(closure_h_to_unit(tsfn)));
+                    fn_id
+                });
+                let error_fn_id = error_tsfn.map(|tsfn| {
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.tap_error_fns
+                        .insert(fn_id, Arc::from(closure_h_to_unit(tsfn)));
+                    fn_id
+                });
+                let complete_fn_id = complete_tsfn.map(|tsfn| {
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.tap_complete_fns
+                        .insert(fn_id, Arc::from(closure_unit(tsfn)));
+                    fn_id
+                });
+                drop(reg);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = control::tap_observer(
+                    &core,
+                    &producer_binding,
+                    src_id,
+                    data_fn_id,
+                    error_fn_id,
+                    complete_fn_id,
+                );
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `on_first_data(src, fn)` — one-shot side-effect on first DATA.
+    #[napi]
+    pub fn register_on_first_data<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        callback: Function<u32, ()>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_h_to_unit_tsfn(callback)?;
+        let tap_closure = closure_h_to_unit(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let fn_id = {
+                    let mut reg = binding.registry.lock();
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.tap_fns.insert(fn_id, Arc::from(tap_closure));
+                    fn_id
+                };
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = control::on_first_data(&core, &producer_binding, src_id, fn_id);
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `rescue(src, fn)` — error recovery. JS callback: `(handle: u32) => number | -1`.
+    /// Returns a handle for the recovered value, or -1 to propagate the original error.
+    #[napi]
+    pub fn register_rescue<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        callback: Function<u32, i32>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_h_to_i32_tsfn(callback)?;
+        let rescue_closure = closure_rescue(tsfn, Arc::downgrade(&self.binding));
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let fn_id = {
+                    let mut reg = binding.registry.lock();
+                    let fn_id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.rescue_fns.insert(fn_id, Arc::from(rescue_closure));
+                    fn_id
+                };
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = control::rescue(&core, &producer_binding, src_id, fn_id);
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `valve(src, control, gate_fn)` — boolean-gated passthrough.
+    /// JS gate callback: `(handle: u32) => boolean`.
+    #[napi]
+    pub fn register_valve<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        control_node: u32,
+        gate: Function<u32, bool>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_h_to_bool_tsfn(gate)?;
+        let predicate_closure = closure_h_to_bool(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        let control_id = NodeId::new(u64::from(control_node));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let op_binding: Arc<dyn OperatorBinding> =
+                    Arc::clone(&binding) as Arc<dyn OperatorBinding>;
+                let gate_fn_id = op_binding.register_predicate(predicate_closure);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = control::valve(
+                    &core,
+                    &producer_binding,
+                    src_id,
+                    control_id,
+                    gate_fn_id,
+                    None, // no CancellationToken in parity surface
+                );
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `settle(src, quiet_waves, max_waves?)` — convergence detector.
+    #[napi]
+    #[must_use]
+    pub async fn register_settle(
+        &self,
+        src: u32,
+        quiet_waves: u32,
+        max_waves: Option<u32>,
+    ) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = control::settle(&core, &producer_binding, src_id, quiet_waves, max_waves);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `repeat(src, count)` — sequential resubscribe loop.
+    #[napi]
+    #[must_use]
+    pub async fn register_repeat(&self, src: u32, count: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = control::repeat(&core, &producer_binding, src_id, count);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    // -----------------------------------------------------------------
+    // Buffer operators (Slice U napi parity)
+    // -----------------------------------------------------------------
+
+    /// `buffer(src, notifier, packer)` — notifier-triggered flush.
+    #[napi]
+    pub fn register_buffer<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        notifier: u32,
+        packer: Function<Vec<u32>, u32>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_vec_to_h_tsfn(packer)?;
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        let notifier_id = NodeId::new(u64::from(notifier));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let op_binding: Arc<dyn OperatorBinding> =
+                    Arc::clone(&binding) as Arc<dyn OperatorBinding>;
+                let pack_fn_id = op_binding.register_packer(packer_closure);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node =
+                    buffer::buffer(&core, &producer_binding, src_id, notifier_id, pack_fn_id);
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `buffer_count(src, count, packer)` — fixed-size buffer.
+    #[napi]
+    pub fn register_buffer_count<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        count: u32,
+        packer: Function<Vec<u32>, u32>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_vec_to_h_tsfn(packer)?;
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let op_binding: Arc<dyn OperatorBinding> =
+                    Arc::clone(&binding) as Arc<dyn OperatorBinding>;
+                let pack_fn_id = op_binding.register_packer(packer_closure);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = buffer::buffer_count(
+                    &core,
+                    &producer_binding,
+                    src_id,
+                    count as usize,
+                    pack_fn_id,
+                );
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `window(src, notifier)` — notifier-triggered sub-node splitting.
+    #[napi]
+    #[must_use]
+    pub async fn register_window(&self, src: u32, notifier: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        let notifier_id = NodeId::new(u64::from(notifier));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = buffer::window(&core, &producer_binding, src_id, notifier_id);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `window_count(src, count)` — count-based sub-node splitting.
+    #[napi]
+    #[must_use]
+    pub async fn register_window_count(&self, src: u32, count: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = buffer::window_count(&core, &producer_binding, src_id, count as usize);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    // -----------------------------------------------------------------
+    // Temporal operator extensions (Slice U napi parity)
+    // -----------------------------------------------------------------
+
+    /// `timeout(src, ms, error_handle)` — idle watchdog.
+    #[napi]
+    #[must_use]
+    pub async fn register_timeout(&self, src: u32, ms: u32, error_handle: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        let error_h = HandleId::new(u64::from(error_handle));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = temporal::timeout(&core, &producer_binding, src_id, u64::from(ms), error_h);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `buffer_time(src, ms, packer)` — time-windowed buffer flush.
+    #[napi]
+    pub fn register_buffer_time<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        ms: u32,
+        packer: Function<Vec<u32>, u32>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_vec_to_h_tsfn(packer)?;
+        let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let op_binding: Arc<dyn OperatorBinding> =
+                    Arc::clone(&binding) as Arc<dyn OperatorBinding>;
+                let pack_fn_id = op_binding.register_packer(packer_closure);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = temporal::buffer_time(
+                    &core,
+                    &producer_binding,
+                    src_id,
+                    u64::from(ms),
+                    pack_fn_id,
+                );
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
+    }
+
+    /// `window_time(src, ms)` — time-windowed sub-node splitting.
+    #[napi]
+    #[must_use]
+    pub async fn register_window_time(&self, src: u32, ms: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = temporal::window_time(&core, &producer_binding, src_id, u64::from(ms));
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    // -----------------------------------------------------------------
+    // Cold sources (Slice 3e/3f napi parity)
+    // -----------------------------------------------------------------
+
+    /// `from_iter(handles)` — emit each handle as DATA, then COMPLETE.
+    #[napi]
+    #[must_use]
+    pub async fn register_from_iter(&self, handles: Vec<u32>) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let handle_ids: Vec<HandleId> = handles
+                .into_iter()
+                .map(|h| HandleId::new(u64::from(h)))
+                .collect();
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = source::from_iter(&core, &producer_binding, handle_ids);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `of(handles)` — convenience alias for `from_iter`.
+    #[napi]
+    #[must_use]
+    pub async fn register_of(&self, handles: Vec<u32>) -> Result<u32> {
+        self.register_from_iter(handles).await
+    }
+
+    /// `empty()` — COMPLETE immediately.
+    #[napi]
+    #[must_use]
+    pub async fn register_empty(&self) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = source::empty(&core, &producer_binding);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `never()` — no-op, stays active.
+    #[napi]
+    #[must_use]
+    pub async fn register_never(&self) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = source::never(&core, &producer_binding);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
+
+    /// `throw_error(error_handle)` — emit ERROR immediately.
+    #[napi]
+    #[must_use]
+    pub async fn register_throw_error(&self, error_handle: u32) -> Result<u32> {
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let error_h = HandleId::new(u64::from(error_handle));
+        run_blocking(core.clone(), move || -> Result<u32> {
+            let producer_binding: Arc<dyn ProducerBinding> = binding;
+            let node = source::throw_error(&core, &producer_binding, error_h);
+            u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+        })
+        .await?
+    }
 }
 
 // =====================================================================
@@ -893,6 +1355,35 @@ fn build_vec_to_h_tsfn(callback: Function<Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec
         .max_queue_size::<1>()
         .callee_handled::<false>()
         .build_callback(|ctx: ThreadsafeCallContext<Vec<u32>>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+// Slice U napi parity — tap/rescue callback shapes.
+
+fn build_h_to_unit_tsfn(callback: Function<u32, ()>) -> Result<Arc<Tsfn<u32, ()>>> {
+    let tsfn = callback
+        .build_threadsafe_function::<u32>()
+        .max_queue_size::<1>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+fn build_unit_to_unit_tsfn(callback: Function<(), ()>) -> Result<Arc<Tsfn<(), ()>>> {
+    let tsfn = callback
+        .build_threadsafe_function::<()>()
+        .max_queue_size::<1>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<()>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
+fn build_h_to_i32_tsfn(callback: Function<u32, i32>) -> Result<Arc<Tsfn<u32, i32>>> {
+    let tsfn = callback
+        .build_threadsafe_function::<u32>()
+        .max_queue_size::<1>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<u32>| Ok(ctx.value))?;
     Ok(Arc::new(tsfn))
 }
 
@@ -1005,6 +1496,50 @@ fn closure_packer(tsfn: Arc<Tsfn<Vec<u32>, u32>>, binding: Weak<BenchBinding>) -
             );
         }
         h_out
+    })
+}
+
+// Slice U napi parity — tap/rescue closure builders.
+
+/// Tap side-effect: HandleId → (). No return value, no retain bump.
+fn closure_h_to_unit(tsfn: Arc<Tsfn<u32, ()>>) -> Box<dyn Fn(HandleId) + Send + Sync> {
+    Box::new(move |h: HandleId| {
+        let arg = u32::try_from(h.raw()).expect("HandleId exceeds u32");
+        bridge_sync::<u32, ()>(&tsfn, arg);
+    })
+}
+
+/// Complete tap side-effect: () → (). No args, no return.
+fn closure_unit(tsfn: Arc<Tsfn<(), ()>>) -> Box<dyn Fn() + Send + Sync> {
+    Box::new(move || {
+        bridge_sync::<(), ()>(&tsfn, ());
+    })
+}
+
+/// Rescue closure: HandleId → Result<HandleId, ()>. JS callback returns
+/// -1 for "recovery failed" (propagate original error), or a handle ID
+/// for the recovered value (with retain-bump via validate_and_retain).
+fn closure_rescue(
+    tsfn: Arc<Tsfn<u32, i32>>,
+    binding: Weak<BenchBinding>,
+) -> Box<dyn Fn(HandleId) -> std::result::Result<HandleId, ()> + Send + Sync> {
+    Box::new(move |h: HandleId| -> std::result::Result<HandleId, ()> {
+        let arg = u32::try_from(h.raw()).expect("HandleId exceeds u32");
+        let ret: i32 = bridge_sync(&tsfn, arg);
+        if ret < 0 {
+            return Err(());
+        }
+        let h_out = HandleId::new(u64::from(ret as u32));
+        let Some(binding) = binding.upgrade() else {
+            return Ok(h_out);
+        };
+        if !binding.registry.lock().validate_and_retain(h_out) {
+            panic!(
+                "rescue JS callback returned unknown HandleId({}); registry has no value mapping.",
+                h_out.raw()
+            );
+        }
+        Ok(h_out)
     })
 }
 

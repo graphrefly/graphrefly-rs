@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-12 (Slice U control+buffer+§10 perf landed)
+last_updated: 2026-05-12 (Slice U-napi: control+buffer+§10 perf + structures napi + Graph sugar)
 ---
 
 # Porting flags & deferred concerns
@@ -60,6 +60,8 @@ not pre-optimize." §10.13 and pick_next_fire resolved in Slice U (2026-05-12).
 
 - **`topo_rank` not propagated to consumers on `set_deps`.** When a node's deps change via `set_deps`, its own `topo_rank` is recomputed, but downstream consumers' ranks are not cascaded. Correct re-ranking would require a transitive walk of all reachable consumers. Acceptable for v1: `set_deps` is an experimental Phase 13.8 API, rarely called in practice, and the worst case is a temporarily suboptimal pick order (one extra no-op fire that settles on the next wave). Fix if `set_deps` becomes hot-path.
 - **`valve` CancellationToken vs TS AbortController parity.** TS valve accepts an `AbortController` which valve can both observe (abort signal from outside) and trigger (valve closes → abort). Rust `CancellationToken` only supports the trigger direction (valve close → cancel). The observe direction (external cancel → close valve) would require spawning a tokio task to select on the token, which adds async machinery for an edge case. Deferred until a concrete use case surfaces.
+- **Structure napi packer drops ReactiveIndex secondary keys.** `make_index_intern_fn` in `structures_bindings.rs` flattens `IndexRow<HandleId, HandleId>` to `[primary, value, ...]` — the `secondary: String` field is dropped because it's an internal sort key not surfaced in the TS public API. If a future TS consumer needs secondary key access, the packer callback shape needs widening.
+- **Structure napi `maxSize`/`defaultTtl` on Map are scaffolded but untested.** `BenchReactiveMap::create` accepts optional `max_size` and `default_ttl_ms` parameters, mapping to `ReactiveMapOptions`. The underlying Rust structures ship TTL/LRU as deferred (F19), so these params are passed through but have no effect at the Rust layer yet.
 
 ---
 
@@ -1279,36 +1281,17 @@ Closed 2026-05-06.
   to bring an anonymous node into the namespace.
 - **Source:** Slice E+ (2026-05-05); per Q3 lock.
 
-### `try_resolve` does not support `..::sibling::node` cross-subgraph paths (R3.5.2)
+### ~~`try_resolve` does not support `..::sibling::node` cross-subgraph paths (R3.5.2)~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
-  `try_resolve` only supports root-relative descent. Canonical R3.5.2:
-  *"Cross-subgraph references use relative paths from the shared
-  parent."* The `..::sibling::node` form requires walking up via
-  `inner.parent.upgrade()` per `..` segment.
-- **Why deferred:** non-trivial path-parser change with edge cases
-  (multiple `..`, traversal past the root, `..` after a name segment).
-  Not blocking M2 — sibling resolution from inside a child graph is a
-  Phase 4+ pattern need (harnessLoop sibling wiring), not yet in
-  scope.
-- **Workaround:** resolve from the shared parent: pass the parent
-  `Graph` clone to fns that need cross-subgraph reach, or use
-  `Graph::node` from the parent.
-- **Source:** Slice E+ /qa Edge Case Hunter F3 (2026-05-05).
+- **Resolution:** `try_resolve_checked` now supports `..` segments for parent traversal. `"..::sibling::node"` walks up to the parent graph via `inner.parent.upgrade()`, then recurses with the remaining path. Multiple `..` segments chain. `PathError::NoParent` is returned if `..` is used on a root graph. Recursive implementation handles all edge cases including mixed `..` and name segments.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `try_resolve_checked` method.
+- **Source:** Slice E+ /qa Edge Case Hunter F3 (2026-05-05); resolved Slice V3 (2026-05-13).
 
-### `try_resolve` returns `None` silently for malformed paths
+### ~~`try_resolve` returns `None` silently for malformed paths~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** Empty paths (`""`), leading separator (`"::foo"`),
-  trailing separator (`"foo::"`), and double-separator (`"a::::b"`)
-  all silently resolve to `None` rather than reporting a malformed
-  path. Caller cannot distinguish "absent" from "syntactically
-  invalid."
-- **Why deferred:** changing the return type to `Result<Option<NodeId>,
-  PathError>` is a public-API break for narrow benefit; in v1, all
-  paths are constructed by graph code (sugar constructors validate at
-  registration). Document the behavior explicitly.
-- **Source:** Slice E+ /qa Blind Hunter + Edge Case Hunter F9
-  (2026-05-05).
+- **Resolution:** New `Graph::try_resolve_checked` returns `Result<Option<NodeId>, PathError>` with typed errors: `PathError::Empty`, `PathError::NoParent`, `PathError::ChildNotFound(String)`, `PathError::Destroyed`. Also supports `..` parent traversal (R3.5.2). `try_resolve` now delegates to `try_resolve_checked().ok().flatten()` preserving backward compat. `PathError` is publicly exported from `graphrefly_graph`.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `try_resolve_checked`, `PathError` enum. `crates/graphrefly-graph/src/lib.rs` — re-export.
+- **Source:** Slice E+ /qa Blind Hunter + Edge Case Hunter F9 (2026-05-05); resolved Slice V3 (2026-05-13).
 
 ### `audit_of` recursive node/mount counts are racy under concurrent mutation
 
@@ -1375,33 +1358,17 @@ Closed 2026-05-06.
   the wave.
 - **Source:** Slice E+ /qa Edge Case Hunter F6 (2026-05-05).
 
-### `_anon_<id>` deps could collide with a user-named node `_anon_<id>`
+### ~~`_anon_<id>` deps could collide with a user-named node `_anon_<id>`~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** `describe()` surfaces unnamed Core deps as
-  `_anon_<NodeId.raw()>` strings in `nodes[].deps` and `edges`.
-  A user who names a node `_anon_5` AND has an anonymous Core
-  node with `NodeId::raw() == 5` produces an ambiguous output —
-  two distinct nodes share the same dep label.
-- **Why deferred:** low-probability collision (raw NodeIds are not
-  stable across builds). Format ambiguity is the issue, not
-  correctness. Fix lifts when the `_anon_<id>` convention is
-  replaced with a structured shape (e.g., a separate
-  `anonymous: HashMap<u64, NodeDescribe>` map alongside the named
-  `nodes` map).
-- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+- **Resolution:** `Graph::validate_name` now rejects names starting with `_anon_` via `NameError::ReservedPrefix`. `Graph::is_valid_name` also checks the prefix. The `_anon_<id>` format is reserved for anonymous-node describe output; user-named nodes cannot collide.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `validate_name`, `is_valid_name`, `NameError::ReservedPrefix`. Mount layer `From<NameError> for MountError` updated to map `ReservedPrefix` → `InvalidName`.
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05); resolved Slice V3 (2026-05-13).
 
-### `ancestors()` cycle insurance
+### ~~`ancestors()` cycle insurance~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
-  `ancestors` walks Weak parent pointers without a visited-set
-  check. If a future regression lets `mount` accept a cycle (e.g.,
-  through internal `with_core` escape hatches), `ancestors` would
-  loop forever.
-- **Why deferred:** current API surface prevents cycles
-  (`mount.AlreadyMounted` rejects double-parent). `with_core` is
-  `pub(crate)` only. Belt-and-braces cycle guard is cheap; defer
-  until a cycle slips past mount validation.
-- **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
+- **Resolution:** `ancestors()` now uses a `HashSet<usize>` visited set keyed by `Arc::as_ptr` address. If a cycle is encountered (future regression in mount validation), the walk breaks instead of looping forever.
+- **Where it landed:** `crates/graphrefly-graph/src/mount.rs` — `ancestors` function.
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05); resolved Slice V3 (2026-05-13).
 
 ### Port-coverage gaps in canonical §3 Graph surface
 
@@ -1477,12 +1444,11 @@ Landed 2026-05-12 as part of the Slice U §10 perf batch.
 
 - **Source:** Slice C-1 close (2026-05-06); resolved Slice U (2026-05-12).
 
-### Operator describe doesn't surface per-operator discriminant
+### ~~Operator describe doesn't surface per-operator discriminant~~ — RESOLVED 2026-05-13 (Slice V5)
 
-- **What:** `Graph::describe()` reports operator nodes as `type: "operator"` but doesn't include the `OperatorOp` discriminant (Map vs Filter vs Scan etc.) or the registered `FnId` references. Consumers see "this is an operator" but not "this is a map".
-- **Why deferred:** belongs with the canonical describe extension that surfaces operator catalog metadata (Phase 4+ pattern). v1 acceptable — the namespace + edges are sufficient for current consumers.
-- **Lift point:** add an `operator: { kind: "map" | "filter" | ... }` field to `NodeDescribe` when the operator catalog substrate lands.
-- **Source:** Slice C-1 close (2026-05-06).
+- **Resolution:** `NodeDescribe` gains `operator_kind: Option<String>` (serialized as `"operator"` in JSON, omitted for non-operator nodes). The `operator_op_name` helper maps each `OperatorOp` variant to its camelCase name (`"map"`, `"filter"`, `"scan"`, `"reduce"`, `"distinctUntilChanged"`, `"pairwise"`, `"combine"`, `"withLatestFrom"`, `"merge"`, `"take"`, `"skip"`, `"takeWhile"`, `"last"`, `"tap"`, `"tapFirst"`, `"valve"`, `"settle"`).
+- **Where it landed:** `crates/graphrefly-graph/src/describe.rs` — `NodeDescribe.operator_kind` field + `operator_op_name` function.
+- **Source:** Slice C-1 close (2026-05-06); resolved Slice V5 (2026-05-13).
 
 ## M3 Slice C-2 — combinator operator deferrals
 
@@ -1526,11 +1492,10 @@ Landed 2026-05-12 as part of the Slice U §10 perf batch.
 
 `take_until` shipped in `crates/graphrefly-operators/src/ops_impl.rs:610` as a producer-pattern operator — subscribes to both `source` and `notifier`, forwards source DATA until notifier emits any DATA, then completes. Uses the H+ STRICT defer-to-wave-end machinery (`emit_or_defer` / `complete_or_defer` / `error_or_defer`). 4 cargo tests in `crates/graphrefly-operators/tests/subscription.rs:389+` (`take_until_forwards_source_until_notifier_emits`, `take_until_does_not_forward_notifier_value`, `take_until_source_complete_propagates`, `take_until_source_error_propagates`). The original deferred entry was preserved in the active backlog by oversight; doc strike-through landed during the 2026-05-10 B sub-slice cleanup batch (D122).
 
-### Operator describe doesn't surface flow-variant discriminant
+### ~~Operator describe doesn't surface flow-variant discriminant~~ — RESOLVED 2026-05-13 (Slice V5)
 
-- **What:** Same as the existing Slice C-1 deferral ("Operator describe doesn't surface per-operator discriminant"). `Graph::describe()` reports the new `Take` / `Skip` / `TakeWhile` / `Last` variants as `type: "operator"` without indicating which flow op they are. Consumers see "this is an operator" but not "this is a take(3)".
-- **Why deferred:** belongs with the canonical describe extension that surfaces operator catalog metadata (Phase 4+ pattern). v1 acceptable.
-- **Source:** Slice C-3 close (2026-05-06); inherits from Slice C-1 deferral.
+- **Resolution:** Inherited from Slice C-1 resolution. All flow-variant `OperatorOp` discriminants (`Take`, `Skip`, `TakeWhile`, `Last`) now surface in `NodeDescribe.operator_kind` as `"take"`, `"skip"`, `"takeWhile"`, `"last"` respectively.
+- **Source:** Slice C-3 close (2026-05-06); resolved Slice V5 (2026-05-13).
 
 ### `predicate_each` length-mismatch silently truncates `take_while` in release builds (Slice C-3 /qa D1)
 
@@ -1574,79 +1539,29 @@ is acceptable for the M2 close but worth tracking for future slices.
   shared-Core mount tree.
 - **Source:** Slice F /qa Blind Hunter + Edge Case Hunter (2026-05-06).
 
-### D2 — `GraphObserveAllReactive::subscribed` HashSet grows unboundedly
+### ~~D2 — `GraphObserveAllReactive::subscribed` HashSet grows unboundedly~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** [crates/graphrefly-graph/src/observe.rs](../crates/graphrefly-graph/src/observe.rs)
-  `ObserveAllReactiveInner::subscribed` records every `NodeId` ever
-  subscribed; it is never pruned for torn-down nodes. For long-running
-  graphs with high node turnover, memory grows linearly with total
-  nodes ever created (not currently live).
-- **Why deferred:** v1 acceptable for short-lived graphs (the typical
-  reactive-observe lifecycle is a UI session, not a server-uptime
-  span). Pruning requires a `Core::subscribe_topology` listener for
-  `NodeTornDown` events to remove ids from `subscribed` — adds a
-  second subscription per reactive observer.
-- **Lift point:** when M3+ surfaces a long-running consumer that
-  exhibits the leak under bench, wire a topology subscription that
-  prunes `subscribed` on `NodeTornDown(id)`.
-- **Source:** Slice F /qa Blind Hunter (2026-05-06).
+- **Resolution:** `GraphObserveAllReactive::subscribe` now wires a `Core::subscribe_topology` listener that prunes `subscribed` and `subs` on `TopologyEvent::NodeTornDown(id)`. The `_topo_sub: Option<TopologySubscription>` field keeps the listener alive; dropping the handle unsubscribes both namespace and topology listeners.
+- **Where it landed:** `crates/graphrefly-graph/src/observe.rs` — `GraphObserveAllReactive` struct + `subscribe` method.
+- **Source:** Slice F /qa Blind Hunter (2026-05-06); resolved Slice V3 (2026-05-13).
 
-### D3 — `signal()` `SignalKind` enum narrower than canonical's open `Messages`
+### ~~D3 — `signal()` `SignalKind` enum narrower than canonical's open `Messages`~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
-  `SignalKind` is closed at `Invalidate / Pause(LockId) / Resume(LockId)`.
-  Canonical R3.7.1's `signal(messages: Messages, opts?)` is open-ended;
-  `[[ERROR, h]]` and `[[COMPLETE]]` graph-wide broadcasts are
-  representable in TS but rejected at the type level in Rust.
-- **Why divergent:** v1 narrow surface. Adding `SignalKind::Complete` /
-  `SignalKind::Error(HandleId)` requires deciding meta-filter semantics
-  for terminal broadcast (R3.7.2 explicit only for INVALIDATE — see
-  D4). Pre-1.0; closed enum is easier to extend than to retract later.
-- **Lift point:** if a consumer needs graph-wide COMPLETE/ERROR
-  (e.g., shutting a whole subgraph terminally without TEARDOWN
-  cascade), extend the enum and decide R3.7.2's coverage scope.
-- **Source:** Slice F /qa Edge Case Hunter F6 (2026-05-06).
+- **Resolution:** `SignalKind` extended with `Complete` and `Error(HandleId)` variants. `signal_complete` and `signal_error` implementations added with meta-companion filtering (same as `signal_invalidate`, per D4 resolution).
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `SignalKind` enum + `signal_complete` / `signal_error` methods.
+- **Source:** Slice F /qa Edge Case Hunter F6 (2026-05-06); resolved Slice V3 (2026-05-13).
 
-### D4 — `signal(Pause/Resume)` does not filter meta companions
+### ~~D4 — `signal(Pause/Resume)` does not filter meta companions~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** Canonical R3.7.2 explicitly requires meta filtering for
-  `INVALIDATE` (meta children's auto-derived caches must not be wiped).
-  The spec is silent on PAUSE/RESUME meta filtering. Rust's
-  `signal_pause` / `signal_resume` pause/resume every named node
-  including any meta companions; `signal_invalidate` does filter
-  metas.
-- **Why deferred:** spec ambiguity. Symmetry argument suggests metas
-  should NOT be paused independently of their parent (their lifecycle
-  is bound to the parent's), but no canonical rule explicitly
-  requires it. TS impl behavior should be checked; if TS skips meta
-  on PAUSE/RESUME and Rust doesn't, that's a parity gap.
-- **Lift point:** raise an issue against `~/src/graphrefly` to
-  extend R3.7.2 to cover PAUSE/RESUME explicitly, OR verify against
-  TS production behavior and align.
-- **Source:** Slice F /qa Edge Case Hunter F7 (2026-05-06).
+- **Resolution:** `signal_pause`, `signal_resume`, `signal_complete`, and `signal_error` now all use `collect_signal_ids_with_meta_filter()` — the same iterative worklist + meta-companion HashSet filtering as `collect_signal_invalidate_ids`. Meta companions are excluded from all four signal broadcasts, matching the symmetry argument.
+- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — new `collect_signal_ids_with_meta_filter` helper; `signal_pause`, `signal_resume`, `signal_complete`, `signal_error` refactored to use it.
+- **Source:** Slice F /qa Edge Case Hunter F7 (2026-05-06); resolved Slice V3 (2026-05-13).
 
-### D5 — `describe_reactive` does not fire on `set_deps` topology changes
+### ~~D5 — `describe_reactive` does not fire on `set_deps` topology changes~~ — RESOLVED 2026-05-13 (Slice V3)
 
-- **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs)
-  `describe_reactive` subscribes to Graph-level namespace-change sinks
-  (fired from `add` / `remove` / `mount` / `unmount` / `destroy`).
-  Core's `DepsChanged` topology event from `set_deps` does NOT trigger
-  the namespace sink — but `describe()` output's edges DO change when
-  deps change (edges are derived from `core.deps_of`). The reactive
-  describe stream is therefore incomplete: it tracks namespace
-  mutations but misses dep mutations even though dep mutations affect
-  the describe payload.
-- **Why divergent:** layering decision per D006 in the decision log.
-  Core topology events are Core-internal; Graph-level reactivity
-  tracks Graph-level mutations. Composing a unified stream requires
-  either (a) Graph subscribes to Core topology and forwards
-  `DepsChanged` as a namespace-change, (b) the user composes both
-  subscriptions manually with dedup. The describe rustdoc explicitly
-  documents the workaround.
-- **Lift point:** when consumers actually need it, internalize the
-  composition by having `describe_reactive` ALSO subscribe to Core's
-  `subscribe_topology` and dedup against the namespace fire.
-- **Source:** Slice F /qa Edge Case Hunter F10 (2026-05-06).
+- **Resolution:** `describe_reactive` now also subscribes to `Core::subscribe_topology` and fires a fresh `describe()` snapshot on `TopologyEvent::DepsChanged`. The topology subscription is held in `ReactiveDescribeHandle._topo_sub` and cleaned up on drop (dropped BEFORE unsubscribing namespace sink to avoid deadlock).
+- **Where it landed:** `crates/graphrefly-graph/src/describe.rs` — `ReactiveDescribeHandle` struct + `describe_reactive` method.
+- **Source:** Slice F /qa Edge Case Hunter F10 (2026-05-06); resolved Slice V3 (2026-05-13).
 
 ## M2 parity-tests fragility (post-/qa, 2026-05-06)
 
@@ -1749,6 +1664,13 @@ When @graphrefly/native publishes and rustImpl activates, those skips
 become divergence assertions that fail loud.
 
 Closed 2026-05-06.
+
+### Slice U-napi parity widening (2026-05-12) — pure-ts passing, rustImpl deferred
+
+- **What:** `Impl` interface widened with 13 new methods: `tap`, `tapObserver`, `onFirstData`, `rescue`, `valve`, `settle`, `repeat`, `buffer`, `bufferCount`, `fromIter`, `of`, `empty`, `throwError`. Three new scenario files: `control.test.ts` (7 scenarios), `buffer.test.ts` (2 scenarios), `sources.test.ts` (4 scenarios). All 13 pass against `pureTsImpl`. The `rustImpl` arm stubs are in place but fail (expected — native module not rebuilt with Slice U operators).
+- **Why deferred (rustImpl):** Native module rebuild is a separate step gated by napi-build CI. The pure-ts scenarios validate spec semantics; rustImpl activation validates FFI parity.
+- **Lift point:** Next napi rebuild (pre-M6). When `@graphrefly/native` publishes, all 13 scenarios should pass against both impls.
+- **Source:** Slice U-napi S5 (2026-05-12).
 
 ---
 
@@ -2930,9 +2852,22 @@ Regression test landed at `packages/parity-tests/scenarios/core/release-callback
 - **Lift point:** When Phase 14 op-log changesets or cross-replica sync need content-addressed versions.
 - **Source:** M5.A scope decision D179.
 
-### F23 — Graph-level sugar wrappers for reactive structures
+### F23 — Graph-level sugar wrappers for reactive structures — TS SHIPPED 2026-05-12; Rust still deferred
 
-- **What:** TS structures can be composed into Graph via `graph.state()` or standalone. Rust M5.A structures are Core-level only. Graph-level wrappers (`graph.reactive_log(name, opts)` etc.) not implemented.
-- **Why deferred:** Core-level is more fundamental. Graph wrappers are thin convenience (register structure's node_id with Graph's namespace). Can be added without changing structure internals.
+- **What:** TS `Graph` now ships `graph.log(name, opts?)`, `graph.list(name, opts?)`, `graph.map(name, opts?)`, `graph.index(name, opts?)` sugar methods that create a structure bundle, register its primary backing node, AND auto-register companion nodes under sub-paths (`name/byPrimary` for index, `name/mutationLog` when `mutationLog` option is set). Rust M5.A structures remain Core-level only — Graph-level wrappers (`graph.reactive_log(name, opts)` etc.) not yet implemented.
+- **Why deferred (Rust):** Core-level is more fundamental. Graph wrappers are thin convenience (register structure's node_id with Graph's namespace). Can be added without changing structure internals.
 - **Lift point:** When Graph-level composition patterns are needed (M2 follow-up or M5.B).
-- **Source:** D177 decision.
+- **Source:** D177 decision; TS-side shipped in Slice U-napi S3 (2026-05-12).
+
+### F24 — napi-rs structures binding: rust.ts adapter + parity tests
+
+- **What:** `structures_bindings.rs` ships 4 napi classes (`BenchReactiveLog`, `BenchReactiveList`, `BenchReactiveMap`, `BenchReactiveIndex`) with sync factories, TSFN-bridged packer callbacks, and all mutation methods. However, the `rust.ts` parity adapter (mapping napi classes → `Impl` interface methods) is not yet written, and parity test scenarios for structure operations don't exist yet.
+- **Why deferred:** The napi binding module compiles and is feature-gated behind `structures`. Activating parity tests requires: (1) rebuilding the native module with `--features structures`, (2) writing the `rust.ts` adapter that maps structure napi classes to the `Impl` interface, (3) writing parity test scenarios exercising CRUD + snapshot operations on each structure.
+- **Lift point:** Next napi rebuild batch (pre-M6), or when structures parity is gated for release.
+- **Source:** Slice U-napi S4 (2026-05-12).
+
+### F25 — HandleId Display impl added for ReactiveIndex K bound
+
+- **What:** `HandleId` gained `impl Display` (`HandleId(N)` format) in `graphrefly-core/src/handle.rs` to satisfy `ReactiveIndex<K,V>` requiring `K: ToString`. Previously only `Debug` was derived.
+- **Why noted:** Not a deferral — this is a resolved concern. The Display output is a debug-quality string (`HandleId(42)`), not a user-facing representation. If a future surface needs human-readable handle rendering, the Display impl may need revisiting.
+- **Source:** Slice U-napi S4, discovered while compiling structures_bindings.rs (2026-05-12).

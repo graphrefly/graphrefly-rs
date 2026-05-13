@@ -30,7 +30,10 @@
 
 use std::sync::{Arc, Weak};
 
-use graphrefly_core::{Core, HandleId, NodeId, NodeKind, TerminalKind, NO_HANDLE};
+use graphrefly_core::{
+    Core, HandleId, NodeId, NodeKind, OperatorOp, TerminalKind, TopologyEvent,
+    TopologySubscription, NO_HANDLE,
+};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
@@ -81,6 +84,12 @@ pub struct NodeDescribe {
     /// `_anon_<NodeId>` to keep the output lossless without
     /// elevating Core-only nodes into the namespace.
     pub deps: Vec<String>,
+    /// Operator discriminant (e.g. `"map"`, `"filter"`, `"combine"`).
+    /// `None` for non-operator nodes. Slice V5: surfaces the
+    /// `OperatorOp` variant name so consumers can distinguish
+    /// operator kinds (was previously just `type: "operator"`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "operator")]
+    pub operator_kind: Option<String>,
     /// Free-form metadata per canonical Appendix B (e.g. `{
     /// "description": "...", "type": "integer", "range": [1, 10] }`).
     /// Always `None` in this slice — the metadata-storage primitive
@@ -252,6 +261,10 @@ impl Graph {
                 Some(DescribeValue::Handle(cache))
             };
 
+            let operator_kind = match kind {
+                NodeKind::Operator(op) => Some(operator_op_name(op)),
+                _ => None,
+            };
             nodes.insert(
                 name.clone(),
                 NodeDescribe {
@@ -259,6 +272,7 @@ impl Graph {
                     status: status_of(kind, cache, terminal, dirty, fired),
                     value,
                     deps: dep_names,
+                    operator_kind,
                     meta: None,
                 },
             );
@@ -281,6 +295,31 @@ fn type_str_of(kind: NodeKind) -> NodeTypeStr {
         NodeKind::Dynamic => NodeTypeStr::Dynamic,
         NodeKind::Operator(_) => NodeTypeStr::Operator,
     }
+}
+
+/// Slice V5: surfaces the `OperatorOp` variant name as a lowercase
+/// string for the `operator` field in `NodeDescribe`.
+fn operator_op_name(op: OperatorOp) -> String {
+    match op {
+        OperatorOp::Map { .. } => "map",
+        OperatorOp::Filter { .. } => "filter",
+        OperatorOp::Scan { .. } => "scan",
+        OperatorOp::Reduce { .. } => "reduce",
+        OperatorOp::DistinctUntilChanged { .. } => "distinctUntilChanged",
+        OperatorOp::Pairwise { .. } => "pairwise",
+        OperatorOp::Combine { .. } => "combine",
+        OperatorOp::WithLatestFrom { .. } => "withLatestFrom",
+        OperatorOp::Merge => "merge",
+        OperatorOp::Take { .. } => "take",
+        OperatorOp::Skip { .. } => "skip",
+        OperatorOp::TakeWhile { .. } => "takeWhile",
+        OperatorOp::Last { .. } => "last",
+        OperatorOp::Tap { .. } => "tap",
+        OperatorOp::TapFirst { .. } => "tapFirst",
+        OperatorOp::Valve => "valve",
+        OperatorOp::Settle { .. } => "settle",
+    }
+    .to_owned()
 }
 
 /// Canonical-spec §3.6.1 status mapping.
@@ -366,10 +405,18 @@ pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
 pub struct ReactiveDescribeHandle {
     graph: Graph,
     ns_sink_id: u64,
+    /// Slice V3 D5: Core topology subscription for `DepsChanged` events.
+    /// When deps change (via `set_deps`), edges in describe output change
+    /// even though the namespace hasn't changed. Dropping this field
+    /// automatically unsubscribes from Core topology events.
+    topo_sub: Option<TopologySubscription>,
 }
 
 impl Drop for ReactiveDescribeHandle {
     fn drop(&mut self) {
+        // Drop topology sub BEFORE unsubscribing namespace sink to avoid
+        // potential deadlock if the topology sink fires during unsubscribe.
+        self.topo_sub.take();
         self.graph.unsubscribe_namespace_change(self.ns_sink_id);
     }
 }
@@ -412,9 +459,9 @@ impl Graph {
         // because the sink's Weak ref does not keep `inner` alive.
         let weak_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.inner);
         let core: Core = self.core.clone();
+        let sink_for_ns = sink.clone();
         let ns_sink = Arc::new(move || {
             let Some(arc_inner) = weak_inner.upgrade() else {
-                // Graph dropped; silent no-op.
                 return;
             };
             let graph = Graph {
@@ -422,12 +469,35 @@ impl Graph {
                 inner: arc_inner,
             };
             let snapshot = graph.describe();
-            sink(&snapshot);
+            sink_for_ns(&snapshot);
         });
         let ns_sink_id = self.subscribe_namespace_change(ns_sink);
+
+        // Slice V3 D5: subscribe to Core topology events so that
+        // `set_deps` changes (which alter edges without touching the
+        // namespace) also trigger a describe update.
+        let weak_inner_topo: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.inner);
+        let core_topo: Core = self.core.clone();
+        let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
+            Arc::new(move |event: &TopologyEvent| {
+                if matches!(event, TopologyEvent::DepsChanged { .. }) {
+                    let Some(arc_inner) = weak_inner_topo.upgrade() else {
+                        return;
+                    };
+                    let graph = Graph {
+                        core: core_topo.clone(),
+                        inner: arc_inner,
+                    };
+                    let snapshot = graph.describe();
+                    sink(&snapshot);
+                }
+            });
+        let topo_sub = self.core.subscribe_topology(topo_sink);
+
         ReactiveDescribeHandle {
             graph: self.clone(),
             ns_sink_id,
+            topo_sub: Some(topo_sub),
         }
     }
 }

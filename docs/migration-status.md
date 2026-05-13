@@ -2,7 +2,82 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-12 — Slice 3e/3f: cold sources + deferred cleanup)
+## Current state (2026-05-13 — Slice V1–V7: deferred item sweep)
+
+**Deferred item sweep LANDED 2026-05-13.** Systematic close of open deferred items across M1–M5. QA pass applied 2026-05-13 (F1 refcount fix).
+
+**Slice V1 — §10 perf optimizations:**
+- `involved_mask: u64` field on `NodeRecord` for O(1) diamond bitmask (§10.3). Bitmask set in `deliver_data_to_consumer`, read in `fire_regular` to compute `DepBatch.involved` without per-dep iteration for ≤64 deps. Reset paths: `clear_wave_state`, deactivation, `reset_for_fresh_lifecycle`, `set_deps`.
+- §10.5 (wave-end buffer) and §10.6 (sink iteration) resolved by existing `SmallVec` optimizations — no code change needed.
+
+**Slice V2 — Core fixes:**
+- 4 `debug_assert!` promoted to `assert!` for binding contract violations: `predicate_each` length checks (Filter + TakeWhile), `fold_each` length checks (Scan + Reduce).
+
+**Slice V3 — Graph fixes (7 items resolved):**
+- `_anon_<id>` collision: `NameError::ReservedPrefix` rejects names starting with `_anon_`.
+- `try_resolve_checked`: typed `PathError` enum + `..` parent traversal (R3.5.2).
+- `SignalKind` extended: `Complete` + `Error(HandleId)` variants (D3).
+- Signal meta filtering: `signal_pause`/`resume`/`complete`/`error` now filter meta companions via shared `collect_signal_ids_with_meta_filter` helper (D4).
+- `describe_reactive` topology: subscribes to `Core::subscribe_topology` for `DepsChanged` events (D5).
+- `ancestors()` cycle insurance: visited-set guard.
+- `GraphObserveAllReactive` pruning: topology subscription removes torn-down nodes from `subscribed` + `subs` (D2).
+- **F1 /qa fix:** `signal_error` pre-retains handle N−1 times before broadcasting to N nodes. Each `Core::error` call releases one caller share; without the pre-retain, refcount underflows when terminal slots are cleaned up.
+
+**Slice V5 — Operator describe discriminant:**
+- `NodeDescribe.operator_kind: Option<String>` field surfaces `OperatorOp` variant name (`"map"`, `"filter"`, etc.) in describe output. Omitted for non-operator nodes.
+
+**Slices V4/V6/V7 — assessed, no code changes:**
+- V4 (storage): tier debounce requires tokio runtime dep (architecture decision); rest acceptable.
+- V6 (M5 features): F18–F20 already shipped; F21 (imbl) / F22 (CID) blocked by prerequisites.
+- V7 (napi): BigInt IDs / throw isolation / F24 rust.ts require native rebuild + CI changes.
+
+---
+
+## Previous state (2026-05-12 — Slice U-napi: napi binding parity + structures)
+
+**Slice U-napi LANDED 2026-05-12.** Full napi-rs JS binding parity for control, buffer, and cold-source operators. Reactive structures napi bindings (`structures_bindings.rs`) created for all four structure types. TS-side Graph sugar added for structures.
+
+**napi binding parity (operator_bindings.rs):**
+
+S1–S2 added 19 new `register_*` napi methods across 4 operator categories:
+- **Control (7):** `register_tap`, `register_tap_observer`, `register_on_first_data`, `register_rescue`, `register_valve`, `register_settle`, `register_repeat`
+- **Buffer (4):** `register_buffer`, `register_buffer_count`, `register_window`, `register_window_count`
+- **Temporal (3):** `register_timeout`, `register_buffer_time`, `register_window_time`
+- **Sources (5):** `register_from_iter`, `register_of`, `register_empty`, `register_never`, `register_throw_error`
+
+Plus 3 new TSFN builders (`build_h_to_unit_tsfn`, `build_unit_to_unit_tsfn`, `build_h_to_i32_tsfn`) and 3 closure builders. Core `BindingBoundary` extended with `invoke_tap_fn`, `invoke_tap_error_fn`, `invoke_tap_complete_fn`, `invoke_rescue_fn`, `intern_node`. `error_handle` method added to `BenchCore`.
+
+**Reactive structures napi bindings (structures_bindings.rs — NEW):**
+
+New module `structures_bindings` gated behind `#[cfg(feature = "structures")]`:
+- `BenchReactiveLog` — append, append_many, clear, at, trim_head, node_id, size
+- `BenchReactiveList` — append, append_many, insert, pop, clear, at, node_id, size
+- `BenchReactiveMap` — set, get, has, delete, clear, node_id, size
+- `BenchReactiveIndex` — upsert, get, has, delete, clear, node_id, size
+
+Each class takes a JS packer callback at construction time, converted to `InternFn<Vec<HandleId>>` via TSFN bridge. Sync factory methods (`create`) — lightweight Core mutex operations. `HandleId` now implements `Display` (needed for `ReactiveIndex<K,V>` where `K: ToString`).
+
+**Parity test surface (packages/parity-tests):**
+
+- `Impl` interface widened with 13 new methods (control × 7, buffer × 2, sources × 4)
+- `pure-ts.ts` impl arm fully implemented — all 13 methods pass
+- `rust.ts` impl arm fully implemented — awaiting native module rebuild
+- 3 new scenario files: `control.test.ts` (7 tests), `buffer.test.ts` (2 tests), `sources.test.ts` (4 tests)
+- All 13 pure-ts tests pass; 13 rust-via-napi tests expected to pass after native rebuild
+
+**TS-side Graph sugar for structures (graph.ts):**
+
+4 new methods on `Graph` class (auto-register companion nodes under sub-paths):
+- `graph.log<T>(name, opts?)` → `ReactiveLogBundle<T>` (registers `entries` node)
+- `graph.list<T>(name, opts?)` → `ReactiveListBundle<T>` (registers `items` + optional `name/mutationLog`)
+- `graph.map<K,V>(name, opts?)` → `ReactiveMapBundle<K,V>` (registers `entries` + optional `name/mutationLog`)
+- `graph.index<K,V>(name, opts?)` → `ReactiveIndexBundle<K,V>` (registers `ordered` + `name/byPrimary` + optional `name/mutationLog`)
+
+Build and all 3011 pure-ts tests pass.
+
+---
+
+## Previous state (2026-05-12 — Slice 3e/3f: cold sources + deferred cleanup)
 
 **Slice 3e/3f LANDED 2026-05-12.** Cold synchronous sources ported to `graphrefly-operators::source`, deferred cleanup items resolved.
 

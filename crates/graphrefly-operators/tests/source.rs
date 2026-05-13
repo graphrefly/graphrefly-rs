@@ -64,10 +64,7 @@ fn from_iter_empty_vec_behaves_like_empty() {
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
-    assert_eq!(
-        events,
-        vec![RecordedEvent::Start, RecordedEvent::Complete]
-    );
+    assert_eq!(events, vec![RecordedEvent::Start, RecordedEvent::Complete]);
 }
 
 // =====================================================================
@@ -82,10 +79,7 @@ fn empty_completes_immediately() {
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
-    assert_eq!(
-        events,
-        vec![RecordedEvent::Start, RecordedEvent::Complete]
-    );
+    assert_eq!(events, vec![RecordedEvent::Start, RecordedEvent::Complete]);
 }
 
 // =====================================================================
@@ -194,8 +188,5 @@ fn empty_into_take_completes_with_no_data() {
     let rec = rt.subscribe_recorder(take_reg.node);
 
     let events = rec.events();
-    assert_eq!(
-        events,
-        vec![RecordedEvent::Start, RecordedEvent::Complete]
-    );
+    assert_eq!(events, vec![RecordedEvent::Start, RecordedEvent::Complete]);
 }

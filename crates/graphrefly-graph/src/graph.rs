@@ -35,6 +35,30 @@ pub enum SignalKind {
     Pause(LockId),
     /// Resume every named node with the given lock.
     Resume(LockId),
+    /// Mark every named node as terminal with `COMPLETE`.
+    /// Slice V3: extends `SignalKind` per D3 in porting-deferred.md.
+    Complete,
+    /// Mark every named node as terminal with `ERROR` carrying the given handle.
+    /// Slice V3: extends `SignalKind` per D3 in porting-deferred.md.
+    Error(HandleId),
+}
+
+/// Path resolution errors returned by [`Graph::try_resolve_checked`].
+/// Slice V3: introduces typed path errors per porting-deferred.md.
+#[derive(Debug, thiserror::Error)]
+pub enum PathError {
+    /// Path is empty.
+    #[error("Path is empty")]
+    Empty,
+    /// A `..` segment was used but the graph has no parent.
+    #[error("Path segment `..` used on root graph (no parent)")]
+    NoParent,
+    /// A segment named a child graph that doesn't exist.
+    #[error("Path segment `{0}` does not match any child graph")]
+    ChildNotFound(String),
+    /// The graph has been destroyed.
+    #[error("Graph has been destroyed")]
+    Destroyed,
 }
 
 /// Errors from name registration.
@@ -44,6 +68,8 @@ pub enum NameError {
     Collision(String),
     #[error("Graph: name `{0}` may not contain the `::` path separator")]
     InvalidName(String),
+    #[error("Graph: name `{0}` uses the reserved `_anon_` prefix (collides with anonymous node describe format)")]
+    ReservedPrefix(String),
     #[error("Graph: graph has been destroyed; further registration refused")]
     Destroyed,
 }
@@ -180,10 +206,13 @@ impl Graph {
         &self.core
     }
 
-    /// Whether `name` is a legal local node/subgraph name (no `::`).
+    /// Whether `name` is a legal local node/subgraph name.
+    /// Rejects names containing `::` (path separator) and names
+    /// starting with `_anon_` (reserved for anonymous-node describe
+    /// format, Slice V3 collision fix).
     #[must_use]
     pub fn is_valid_name(name: &str) -> bool {
-        !name.contains(PATH_SEP)
+        !name.contains(PATH_SEP) && !name.starts_with("_anon_")
     }
 
     /// Subscribe to namespace changes (add, remove, mount, unmount,
@@ -219,6 +248,8 @@ impl Graph {
     fn validate_name(name: &str) -> Result<(), NameError> {
         if name.contains(PATH_SEP) {
             Err(NameError::InvalidName(name.to_owned()))
+        } else if name.starts_with("_anon_") {
+            Err(NameError::ReservedPrefix(name.to_owned()))
         } else {
             Ok(())
         }
@@ -267,23 +298,65 @@ impl Graph {
             .unwrap_or_else(|| panic!("Graph::node: no node at path `{path}`"))
     }
 
-    /// Non-panicking variant of [`Self::node`].
+    /// Non-panicking variant of [`Self::node`]. Returns `None` for any
+    /// resolution failure. For typed error reporting, use
+    /// [`Self::try_resolve_checked`].
     #[must_use]
     pub fn try_resolve(&self, path: &str) -> Option<NodeId> {
-        let mut segments = path.split(PATH_SEP);
-        let first = segments.next()?;
+        self.try_resolve_checked(path).ok().flatten()
+    }
+
+    /// Path resolution with typed errors. Returns:
+    /// - `Ok(Some(id))` — path resolved to a node.
+    /// - `Ok(None)` — path segments resolved but the final name wasn't found.
+    /// - `Err(PathError)` — structural path error (empty, no parent for `..`,
+    ///   child graph not found, destroyed).
+    ///
+    /// Supports `..` segments for parent traversal (R3.5.2):
+    /// `"..::sibling::node"` walks up to parent, then down into `sibling`.
+    ///
+    /// Slice V3: adds typed errors + `..` cross-subgraph paths.
+    pub fn try_resolve_checked(&self, path: &str) -> Result<Option<NodeId>, PathError> {
+        if path.is_empty() {
+            return Err(PathError::Empty);
+        }
         let inner = self.inner.lock();
-        if let Some(rest) = path
-            .strip_prefix(first)
-            .and_then(|r| r.strip_prefix(PATH_SEP))
-        {
-            // first segment is a child graph name; recurse into it.
-            let child = inner.children.get(first)?.clone();
+        if inner.destroyed {
+            return Err(PathError::Destroyed);
+        }
+
+        let segments: Vec<&str> = path.split(PATH_SEP).collect();
+        let first = segments[0];
+
+        if first == ".." {
+            // Parent traversal.
+            let parent_weak = inner.parent.as_ref().ok_or(PathError::NoParent)?;
+            let parent_inner = parent_weak.upgrade().ok_or(PathError::NoParent)?;
+            // Reconstruct parent Graph from the Arc<Mutex<GraphInner>>.
+            let parent = Graph {
+                core: self.core.clone(),
+                inner: parent_inner,
+            };
             drop(inner);
-            child.try_resolve(rest)
+            if segments.len() == 1 {
+                // `..` alone — nonsensical (parent is a graph, not a node).
+                return Ok(None);
+            }
+            let rest = segments[1..].join(PATH_SEP);
+            parent.try_resolve_checked(&rest)
+        } else if segments.len() > 1 {
+            // Multi-segment: first is a child graph name.
+            let child = inner
+                .children
+                .get(first)
+                .cloned()
+                .ok_or_else(|| PathError::ChildNotFound(first.to_string()))?;
+            drop(inner);
+            let rest = segments[1..].join(PATH_SEP);
+            child.try_resolve_checked(&rest)
         } else {
-            // single segment — local lookup.
-            inner.names.get(first).copied()
+            // Single segment — local lookup.
+            Ok(inner.names.get(first).copied())
         }
     }
 
@@ -762,50 +835,92 @@ impl Graph {
             SignalKind::Invalidate => self.signal_invalidate(),
             SignalKind::Pause(lock_id) => self.signal_pause(lock_id),
             SignalKind::Resume(lock_id) => self.signal_resume(lock_id),
+            SignalKind::Complete => self.signal_complete(),
+            SignalKind::Error(h) => self.signal_error(h),
         }
     }
 
-    fn signal_pause(&self, lock_id: LockId) {
-        let (own_ids, child_clones) = {
-            let inner = self.inner.lock();
-            if inner.destroyed {
-                return;
+    /// Two-phase tree-wide gather for `signal_pause` / `signal_resume` /
+    /// `signal_complete` / `signal_error`. Same iterative worklist pattern
+    /// as `collect_signal_invalidate_ids` but with meta-companion
+    /// filtering added per D4 (Slice V3). Returns the flat list of
+    /// `NodeId`s to signal.
+    fn collect_signal_ids_with_meta_filter(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        let mut worklist: Vec<Graph> = vec![self.clone()];
+        while let Some(graph) = worklist.pop() {
+            let (own_ids, meta_set, child_clones) = {
+                let inner = graph.inner.lock();
+                if inner.destroyed {
+                    continue;
+                }
+                let mut meta_set: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                for &parent_id in inner.names.values() {
+                    for child_id in graph.core.meta_companions_of(parent_id) {
+                        meta_set.insert(child_id);
+                    }
+                }
+                (
+                    inner.names.values().copied().collect::<Vec<_>>(),
+                    meta_set,
+                    inner.children.values().cloned().collect::<Vec<_>>(),
+                )
+            };
+            for id in own_ids {
+                if meta_set.contains(&id) {
+                    continue;
+                }
+                out.push(id);
             }
-            (
-                inner.names.values().copied().collect::<Vec<_>>(),
-                inner.children.values().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for id in own_ids {
-            // Ignore UnknownNode from concurrent removal between the
-            // namespace snapshot above and this pause call. (Multi-pauser
-            // pause is idempotent on duplicate locks; the only failure
-            // mode reachable here is a teardown race.)
-            let _ = self.core.pause(id, lock_id);
+            worklist.extend(child_clones);
         }
-        for child in child_clones {
-            child.signal_pause(lock_id);
+        out
+    }
+
+    fn signal_pause(&self, lock_id: LockId) {
+        // Slice V3 D4: filter meta companions, same as signal_invalidate.
+        let ids = self.collect_signal_ids_with_meta_filter();
+        for id in ids {
+            let _ = self.core.pause(id, lock_id);
         }
     }
 
     fn signal_resume(&self, lock_id: LockId) {
-        let (own_ids, child_clones) = {
-            let inner = self.inner.lock();
-            if inner.destroyed {
-                return;
-            }
-            (
-                inner.names.values().copied().collect::<Vec<_>>(),
-                inner.children.values().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for id in own_ids {
-            // Ignore UnknownNode from concurrent removal between
-            // namespace snapshot and this resume call.
+        // Slice V3 D4: filter meta companions, same as signal_invalidate.
+        let ids = self.collect_signal_ids_with_meta_filter();
+        for id in ids {
             let _ = self.core.resume(id, lock_id);
         }
-        for child in child_clones {
-            child.signal_resume(lock_id);
+    }
+
+    /// Broadcast `[COMPLETE]` to every named node in this graph plus
+    /// recursively into mounted children (meta-filtered per D4).
+    /// Idempotent on destroyed graph.
+    /// Slice V3: extends `SignalKind` per D3 in porting-deferred.md.
+    fn signal_complete(&self) {
+        let ids = self.collect_signal_ids_with_meta_filter();
+        for id in ids {
+            self.core.complete(id);
+        }
+    }
+
+    /// Broadcast `[ERROR, handle]` to every named node in this graph plus
+    /// recursively into mounted children (meta-filtered per D4). Each
+    /// `Core::error` call consumes one caller refcount share (via
+    /// `try_error`'s unconditional `release_handle`), so we pre-retain
+    /// N−1 additional shares before the loop. Idempotent on destroyed
+    /// graph.
+    /// Slice V3: extends `SignalKind` per D3 in porting-deferred.md.
+    fn signal_error(&self, error_handle: HandleId) {
+        let ids = self.collect_signal_ids_with_meta_filter();
+        // F1 /qa fix: each core.error() releases one caller share.
+        // Pre-retain (N-1) so the handle survives all N releases.
+        for _ in 1..ids.len() {
+            self.core.binding_ptr().retain_handle(error_handle);
+        }
+        for id in ids {
+            self.core.error(id, error_handle);
         }
     }
 

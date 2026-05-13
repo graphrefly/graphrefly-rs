@@ -45,7 +45,7 @@ impl From<NameError> for MountError {
     fn from(err: NameError) -> Self {
         match err {
             NameError::Collision(n) => Self::NodeNameCollision(n),
-            NameError::InvalidName(n) => Self::InvalidName(n),
+            NameError::InvalidName(n) | NameError::ReservedPrefix(n) => Self::InvalidName(n),
             NameError::Destroyed => Self::Destroyed,
         }
     }
@@ -151,6 +151,12 @@ pub(crate) fn ancestors(graph: &Graph, include_self: bool) -> Vec<Graph> {
     // from the `Arc<Mutex<GraphInner>>` — but `Graph` also needs a
     // `Core`. Because mount is shared-Core only, walking up never
     // changes the Core; reuse `graph.core.clone()`.
+    //
+    // Slice V3: visited-set cycle insurance per porting-deferred.md.
+    // Mount validation prevents cycles, but this belt-and-braces check
+    // guards against future bugs in mount/unmount.
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(Arc::as_ptr(&graph.inner) as usize);
     let mut cursor: Option<Arc<parking_lot::Mutex<GraphInner>>> = graph
         .inner
         .lock()
@@ -158,6 +164,10 @@ pub(crate) fn ancestors(graph: &Graph, include_self: bool) -> Vec<Graph> {
         .as_ref()
         .and_then(std::sync::Weak::upgrade);
     while let Some(inner) = cursor {
+        let ptr = Arc::as_ptr(&inner) as usize;
+        if !visited.insert(ptr) {
+            break; // Cycle detected — break rather than infinite-loop.
+        }
         let next_parent = inner
             .lock()
             .parent

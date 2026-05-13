@@ -1024,13 +1024,22 @@ impl Core {
                 None
             } else {
                 rec.fn_id.map(|fn_id| {
+                    let use_mask = rec.dep_records.len() <= 64;
+                    let mask = rec.involved_mask;
                     let dep_batches: Vec<DepBatch> = rec
                         .dep_records
                         .iter()
-                        .map(|dr| DepBatch {
+                        .enumerate()
+                        .map(|(i, dr)| DepBatch {
                             data: dr.data_batch.clone(),
                             prev_data: dr.prev_data,
-                            involved: dr.involved_this_wave,
+                            // §10.3 perf (Slice V1): derive from bitmask
+                            // for ≤64 deps; fall back to per-dep field.
+                            involved: if use_mask {
+                                (mask >> i) & 1 != 0
+                            } else {
+                                dr.involved_this_wave
+                            },
                         })
                         .collect();
                     (fn_id, dep_batches, rec.is_dynamic, rec.has_fired_once)
@@ -1743,7 +1752,9 @@ impl Core {
         }
         // Phase 2: predicate per input.
         let pass = self.binding.predicate_each(fn_id, &inputs);
-        debug_assert!(
+        // Slice V2: promoted from debug_assert! — binding contract violation
+        // should fail loud in release builds too.
+        assert!(
             pass.len() == inputs.len(),
             "predicate_each returned {} bools for {} inputs",
             pass.len(),
@@ -1784,7 +1795,8 @@ impl Core {
         // Phase 2: fold each input through. Returns N new handles, each
         // with a fresh retain.
         let new_states = self.binding.fold_each(fn_id, acc, &inputs);
-        debug_assert!(
+        // Slice V2: promoted from debug_assert! — binding contract violation.
+        assert!(
             new_states.len() == inputs.len(),
             "fold_each returned {} accs for {} inputs",
             new_states.len(),
@@ -1836,7 +1848,8 @@ impl Core {
         } else {
             self.binding.fold_each(fn_id, acc, &inputs)
         };
-        debug_assert!(
+        // Slice V2: promoted from debug_assert! — binding contract violation.
+        assert!(
             new_states.len() == inputs.len(),
             "fold_each returned {} accs for {} inputs",
             new_states.len(),
@@ -2276,7 +2289,9 @@ impl Core {
         }
         // Phase 2: predicate per input.
         let pass = self.binding.predicate_each(fn_id, &inputs);
-        debug_assert!(
+        // Slice V2: promoted from debug_assert! — binding contract violation
+        // should fail loud in release builds too.
+        assert!(
             pass.len() == inputs.len(),
             "predicate_each returned {} bools for {} inputs",
             pass.len(),
@@ -2613,6 +2628,9 @@ impl Core {
             // delivery for this dep.
             if dep_idx < 64 {
                 consumer.received_mask |= 1u64 << dep_idx;
+                // §10.3 perf (Slice V1): set involved_mask bit for
+                // O(1) per-dep involvement query during fire.
+                consumer.involved_mask |= 1u64 << dep_idx;
             }
             is_dynamic = consumer.is_dynamic;
             is_state = consumer.is_state();

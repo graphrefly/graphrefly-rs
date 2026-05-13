@@ -79,11 +79,11 @@ pub use higher_order::{
     ProjectFn,
 };
 pub use ops_impl::{concat, race, take_until, zip};
-pub use source::{empty, from_iter, never, of, throw_error};
 pub use producer::{
     default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
     ProducerStorage, SubscribeOutcome,
 };
+pub use source::{empty, from_iter, never, of, throw_error};
 pub use temporal::{
     audit, buffer_time, debounce, delay, interval, sample, throttle, timeout, window_time,
 };

@@ -49,9 +49,7 @@ pub fn from_iter(
     let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) =
-            (core_weak.upgrade(), binding_weak.upgrade())
-        else {
+        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
             return;
         };
         let pid = ctx.node_id();
@@ -77,11 +75,7 @@ pub fn from_iter(
 /// Emit each handle as DATA in order, then COMPLETE. Convenience
 /// wrapper over [`from_iter`].
 #[must_use]
-pub fn of(
-    core: &Core,
-    binding: &Arc<dyn ProducerBinding>,
-    handles: Vec<HandleId>,
-) -> NodeId {
+pub fn of(core: &Core, binding: &Arc<dyn ProducerBinding>, handles: Vec<HandleId>) -> NodeId {
     from_iter(core, binding, handles)
 }
 
@@ -131,9 +125,7 @@ pub fn throw_error(
     let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) =
-            (core_weak.upgrade(), binding_weak.upgrade())
-        else {
+        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
             return;
         };
         // Retain for the emission — Core takes ownership.

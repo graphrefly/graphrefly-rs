@@ -177,6 +177,18 @@ pub(crate) struct Registry {
     /// built against the thread-local `current_core()`.
     #[cfg(feature = "operators")]
     pub(crate) producer_builds: ahash::AHashMap<FnId, Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>>,
+    // Control operator closure registries (Slice U napi parity).
+    #[cfg(feature = "operators")]
+    pub(crate) tap_fns: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) + Send + Sync>>,
+    #[cfg(feature = "operators")]
+    pub(crate) tap_error_fns: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) + Send + Sync>>,
+    #[cfg(feature = "operators")]
+    pub(crate) tap_complete_fns: ahash::AHashMap<FnId, Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "operators")]
+    pub(crate) rescue_fns: ahash::AHashMap<
+        FnId,
+        Arc<dyn Fn(HandleId) -> std::result::Result<HandleId, ()> + Send + Sync>,
+    >,
 }
 
 impl Registry {
@@ -198,6 +210,14 @@ impl Registry {
             higher_order_projectors: ahash::AHashMap::new(),
             #[cfg(feature = "operators")]
             producer_builds: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            tap_fns: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            tap_error_fns: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            tap_complete_fns: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            rescue_fns: ahash::AHashMap::new(),
         }
     }
 
@@ -575,6 +595,73 @@ impl BindingBoundary for BenchBinding {
     #[cfg(feature = "operators")]
     fn producer_deactivate(&self, node_id: NodeId) {
         default_producer_deactivate(&self.producer_storage, node_id);
+    }
+
+    // -----------------------------------------------------------------
+    // Control operator FFI dispatch (Slice U napi parity).
+    // -----------------------------------------------------------------
+
+    /// Side-effect tap on DATA: call the registered closure for fn_id.
+    #[cfg(feature = "operators")]
+    fn invoke_tap_fn(&self, fn_id: FnId, handle: HandleId) {
+        let f = {
+            let reg = self.registry.lock();
+            reg.tap_fns
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown tap fn_id {fn_id:?}"))
+        };
+        f(handle);
+    }
+
+    /// Side-effect tap on ERROR.
+    #[cfg(feature = "operators")]
+    fn invoke_tap_error_fn(&self, fn_id: FnId, handle: HandleId) {
+        let f = {
+            let reg = self.registry.lock();
+            reg.tap_error_fns
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown tap_error fn_id {fn_id:?}"))
+        };
+        f(handle);
+    }
+
+    /// Side-effect tap on COMPLETE.
+    #[cfg(feature = "operators")]
+    fn invoke_tap_complete_fn(&self, fn_id: FnId) {
+        let f = {
+            let reg = self.registry.lock();
+            reg.tap_complete_fns
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown tap_complete fn_id {fn_id:?}"))
+        };
+        f();
+    }
+
+    /// Error recovery: call the registered rescue closure. Returns
+    /// `Ok(recovered_handle)` on success, `Err(())` if recovery failed.
+    #[cfg(feature = "operators")]
+    fn invoke_rescue_fn(&self, fn_id: FnId, handle: HandleId) -> std::result::Result<HandleId, ()> {
+        let f = {
+            let reg = self.registry.lock();
+            reg.rescue_fns
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown rescue fn_id {fn_id:?}"))
+        };
+        f(handle)
+    }
+
+    /// Window operators: map a NodeId to a HandleId. Allocates a fresh
+    /// handle whose value is the raw NodeId as i32. JS adapter retrieves
+    /// it via `deref_int(handle)` to get the inner window's NodeId.
+    #[cfg(feature = "operators")]
+    fn intern_node(&self, node_id: NodeId) -> HandleId {
+        let mut reg = self.registry.lock();
+        let raw = u32::try_from(node_id.raw()).expect("NodeId exceeds u32") as i32;
+        reg.intern(BenchValue::Int(raw))
     }
 }
 
@@ -1245,6 +1332,22 @@ impl BenchCore {
         let core = self.core.clone();
         run_blocking(core.clone(), move || {
             core.complete(NodeId::new(u64::from(node_id)));
+        })
+        .await
+    }
+
+    /// Emit ERROR with a JS-allocated handle (D076 parity — non-i32 error
+    /// payloads). JS adapter must have called `alloc_external_handle` and
+    /// stored the value first. The handle's refcount share is consumed by
+    /// Core's error path.
+    #[napi]
+    pub async fn error_handle(&self, node_id: u32, handle: u32) -> Result<()> {
+        let core = self.core.clone();
+        run_blocking(core.clone(), move || {
+            core.error(
+                NodeId::new(u64::from(node_id)),
+                HandleId::new(u64::from(handle)),
+            );
         })
         .await
     }

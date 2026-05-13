@@ -47,6 +47,15 @@ mod graph_bindings;
 )]
 mod storage_bindings;
 
+#[cfg(feature = "structures")]
+#[allow(
+    unreachable_pub,
+    clippy::needless_pass_by_value,
+    clippy::wildcard_imports,
+    clippy::cast_possible_truncation
+)]
+mod structures_bindings;
+
 use napi_derive::napi;
 
 /// Smoke export — verifies napi-rs link works.

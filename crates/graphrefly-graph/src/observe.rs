@@ -10,7 +10,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 
-use graphrefly_core::{Core, LockId, Message, NodeId, PauseError, Sink, Subscription};
+use graphrefly_core::{
+    Core, LockId, Message, NodeId, PauseError, Sink, Subscription, TopologyEvent,
+    TopologySubscription,
+};
 use parking_lot::Mutex;
 
 use crate::graph::{Graph, GraphInner};
@@ -181,6 +184,10 @@ pub struct GraphObserveAllReactive {
     /// `Weak<Mutex<GraphInner>>`); the closure's captured Arcs are
     /// not the last refs because `inner` is still owned by `Self`.
     ns_sink_id: Option<u64>,
+    /// Slice V3: Core topology subscription for pruning torn-down nodes
+    /// from `inner.subscribed` + `inner.subs`. Prevents unbounded
+    /// accumulation on long-running graphs (D2 in porting-deferred.md).
+    topo_sub: Option<TopologySubscription>,
     inner: Arc<Mutex<ObserveAllReactiveInner>>,
 }
 
@@ -205,6 +212,7 @@ impl GraphObserveAllReactive {
         Self {
             graph,
             ns_sink_id: None,
+            topo_sub: None,
             inner: Arc::new(Mutex::new(ObserveAllReactiveInner {
                 subscribed: HashSet::new(),
                 subs: Vec::new(),
@@ -289,6 +297,24 @@ impl GraphObserveAllReactive {
             }
         });
         self.ns_sink_id = Some(self.graph.subscribe_namespace_change(ns_sink));
+
+        // Slice V3: subscribe to Core topology events to prune torn-down
+        // nodes from subscribed + subs. Prevents unbounded accumulation
+        // on long-running graphs (D2 in porting-deferred.md).
+        let inner_for_topo = self.inner.clone();
+        let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
+            Arc::new(move |event: &TopologyEvent| {
+                if let TopologyEvent::NodeTornDown(id) = event {
+                    let mut state = inner_for_topo.lock();
+                    if state.subscribed.remove(id) {
+                        // Drop the Subscription for this node. The
+                        // Subscription's Drop will unsubscribe the sink
+                        // from Core.
+                        state.subs.retain(|sub| sub.node_id() != *id);
+                    }
+                }
+            });
+        self.topo_sub = Some(self.graph.core.subscribe_topology(topo_sink));
 
         // Now take the initial snapshot. Any node added between
         // listener-install and snapshot will be picked up by the

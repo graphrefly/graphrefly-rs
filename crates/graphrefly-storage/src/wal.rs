@@ -592,7 +592,10 @@ mod tests {
             "checksum": ""
         }"#;
         let frame: WALFrame<u64> = serde_json::from_str(old_json).unwrap();
-        assert_eq!(frame.format_version, 1, "missing format_version must default to 1");
+        assert_eq!(
+            frame.format_version, 1,
+            "missing format_version must default to 1"
+        );
     }
 
     /// /qa F5 (2026-05-12): new frames with explicit `format_version`

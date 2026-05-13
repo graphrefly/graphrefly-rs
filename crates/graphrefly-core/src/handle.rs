@@ -74,6 +74,12 @@ impl HandleId {
     }
 }
 
+impl std::fmt::Display for HandleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HandleId({})", self.0)
+    }
+}
+
 /// Sentinel "no handle" — distinct from any valid handle (which start at 1).
 ///
 /// Mirrors `core.ts:57` `NO_HANDLE = 0`. Used for:

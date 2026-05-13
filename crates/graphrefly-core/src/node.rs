@@ -981,6 +981,8 @@ impl Drop for Subscription {
                         // §10.13 perf (D047): reset received_mask — all deps back
                         // to sentinel on resubscribe.
                         rec.received_mask = 0;
+                        // §10.3 perf (Slice V1): reset involved_mask.
+                        rec.involved_mask = 0;
                         if rec.is_dynamic {
                             rec.tracked.clear();
                         }
@@ -1624,6 +1626,14 @@ pub(crate) struct NodeRecord {
     /// ≤64 deps. Falls back to `iter().any()` when `dep_count > 64`.
     /// Reset on resubscribe. §10.13 perf optimization (D047, Slice U).
     pub(crate) received_mask: u64,
+    /// §10.3 diamond resolution bitmask — bit i set when dep i is
+    /// involved in the current wave (DATA delivered). Mirrors
+    /// `received_mask` pattern. Cleared to 0 at wave end instead of
+    /// iterating all deps. For ≤64 deps, `DepBatch::involved` can be
+    /// derived via `(involved_mask >> dep_idx) & 1 != 0`. For >64 deps,
+    /// falls back to per-dep `DepRecord::involved_this_wave` field.
+    /// §10.3 perf optimization (Slice V1).
+    pub(crate) involved_mask: u64,
     /// Generic per-operator scratch slot (Slice C-3, D026). Replaces
     /// the typed `operator_state: HandleId` field used by Slices C-1 / C-2.
     /// `None` for non-operator kinds and operators with no cross-wave
@@ -2987,6 +2997,7 @@ impl Core {
             partial,
             topo_rank,
             received_mask: 0,
+            involved_mask: 0,
             op_scratch: installed_scratch,
         };
         s.nodes.insert(id, rec);
@@ -3673,6 +3684,8 @@ impl Core {
             // §10.13 perf (D047): reset received_mask — fresh lifecycle
             // means all deps are sentinel again.
             rec.received_mask = 0;
+            // §10.3 perf (Slice V1): reset involved_mask.
+            rec.involved_mask = 0;
             // P7 (Slice A close /qa): Dynamic nodes clear `tracked` so
             // the post-reset first fire repopulates from the fn's
             // returned tracked-deps set.
@@ -5288,10 +5301,17 @@ impl Core {
             rec.dep_records = new_dep_records;
             rec.topo_rank = new_topo_rank;
             // §10.13 perf (D047): recompute received_mask from new dep_records.
+            // §10.3 perf (Slice V1): recompute involved_mask alongside.
             rec.received_mask = 0;
+            rec.involved_mask = 0;
             for (i, dr) in rec.dep_records.iter().enumerate() {
-                if i < 64 && (dr.prev_data != NO_HANDLE || !dr.data_batch.is_empty()) {
-                    rec.received_mask |= 1u64 << i;
+                if i < 64 {
+                    if dr.prev_data != NO_HANDLE || !dr.data_batch.is_empty() {
+                        rec.received_mask |= 1u64 << i;
+                    }
+                    if dr.involved_this_wave {
+                        rec.involved_mask |= 1u64 << i;
+                    }
                 }
             }
             // Re-derive `tracked` for static derived: all indices.
@@ -5601,6 +5621,8 @@ impl CoreState {
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;
+            // §10.3 perf (Slice V1): clear involved_mask in one op.
+            rec.involved_mask = 0;
             for dr in &mut rec.dep_records {
                 let batch_len = dr.data_batch.len();
                 if batch_len > 0 {
