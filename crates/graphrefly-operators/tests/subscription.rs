@@ -21,7 +21,7 @@ fn zip_pairs_data_from_two_sources() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
@@ -47,7 +47,7 @@ fn zip_buffers_until_all_sources_have_data() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     // Three emits on s1 before s2 emits — should buffer.
@@ -71,7 +71,7 @@ fn zip_completes_when_one_source_completes_with_empty_queue() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
@@ -90,7 +90,7 @@ fn zip_with_three_sources() {
     let s2 = rt.state_int(None);
     let s3 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2, s3], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2, s3], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
@@ -112,7 +112,7 @@ fn zip_propagates_error_from_any_source() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
@@ -297,7 +297,7 @@ fn race_winner_emits_subsequent_data() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]);
+    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1); // s1 wins
@@ -316,7 +316,7 @@ fn race_loser_data_is_silently_ignored() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let s3 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2, s3]);
+    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2, s3]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s2, 50); // s2 wins
@@ -335,7 +335,7 @@ fn race_winner_complete_terminates_producer() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]);
+    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1);
@@ -354,7 +354,7 @@ fn race_loser_complete_does_not_terminate() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]);
+    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1); // s1 wins
@@ -374,7 +374,7 @@ fn race_pre_winner_error_cascades() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]);
+    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     let err = rt.intern(TestValue::Str("err".into()));
@@ -472,7 +472,7 @@ fn producer_storage_cleared_on_deactivation() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
 
     {
         let _rec = rt.subscribe_recorder(z);
@@ -498,7 +498,7 @@ fn producer_re_subscribe_re_runs_build_closure() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
 
     // First activation cycle.
     {

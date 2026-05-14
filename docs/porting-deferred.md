@@ -61,7 +61,7 @@ not pre-optimize." §10.13 and pick_next_fire resolved in Slice U (2026-05-12).
 - **`topo_rank` not propagated to consumers on `set_deps`.** When a node's deps change via `set_deps`, its own `topo_rank` is recomputed, but downstream consumers' ranks are not cascaded. Correct re-ranking would require a transitive walk of all reachable consumers. Acceptable for v1: `set_deps` is an experimental Phase 13.8 API, rarely called in practice, and the worst case is a temporarily suboptimal pick order (one extra no-op fire that settles on the next wave). Fix if `set_deps` becomes hot-path.
 - **`valve` CancellationToken vs TS AbortController parity.** TS valve accepts an `AbortController` which valve can both observe (abort signal from outside) and trigger (valve closes → abort). Rust `CancellationToken` only supports the trigger direction (valve close → cancel). The observe direction (external cancel → close valve) would require spawning a tokio task to select on the token, which adds async machinery for an edge case. Deferred until a concrete use case surfaces.
 - **Structure napi packer drops ReactiveIndex secondary keys.** `make_index_intern_fn` in `structures_bindings.rs` flattens `IndexRow<HandleId, HandleId>` to `[primary, value, ...]` — the `secondary: String` field is dropped because it's an internal sort key not surfaced in the TS public API. If a future TS consumer needs secondary key access, the packer callback shape needs widening.
-- **Structure napi `maxSize`/`defaultTtl` on Map are scaffolded but untested.** `BenchReactiveMap::create` accepts optional `max_size` and `default_ttl_ms` parameters, mapping to `ReactiveMapOptions`. The underlying Rust structures ship TTL/LRU as deferred (F19), so these params are passed through but have no effect at the Rust layer yet.
+- ~~**Structure napi `maxSize`/`defaultTtl` on Map are scaffolded but untested.**~~ **RESOLVED 2026-05-11 (M5.B) — confirmed 2026-05-13 (Slice W).** TTL/LRU now wired through `ReactiveMapOptions` to the Rust layer (`reactive.rs::default_ttl_ns`, `lru_max_size`, `prune_expired_inner`). Per-call `set_with_ttl` accepted via napi. **Parity-test coverage gap:** only `maxSize` is exercised by `scenarios/structures/reactive-map.test.ts` (line 101); TTL scenario is queued as a follow-up (see migration-status Slice W "Follow-ups queued for next slice"). See F19 entry below for full status.
 
 ---
 
@@ -2817,26 +2817,26 @@ Regression test landed at `packages/parity-tests/scenarios/core/release-callback
 
 ## M5 — Reactive data structures
 
-### F18 — ReactiveLog views (tail/slice/fromCursor), scan, attach, attachStorage
+### F18 — ReactiveLog views (tail/slice/fromCursor), scan, attach, attachStorage — Rust LANDED M5.B (2026-05-11); napi bindings still deferred
 
-- **What:** TS `reactiveLog` has `view()` (memoized derived views: tail, slice, fromCursor), `scan()` (O(1) incremental aggregate), `attach()` (upstream subscription), `attachStorage()` (persistence wiring). Rust M5.A has none of these.
-- **Why deferred:** Base CRUD operations and Core-level integration were the priority for M5.A. Views/scan require derived node composition patterns; attach/attachStorage require subscription wiring and storage tier interop.
-- **Lift point:** M5.B — after base structures are validated in real usage patterns.
-- **Source:** M5.A scope decision D179.
+- **What (Rust core layer):** Rust `reactive.rs` now ships `ViewSpec` (Tail/Slice/FromCursor) + `LogView`, incremental `scan()`, `attach()`, and multi-tier `attach_storage()` per Slice M5.B (2026-05-11). Tests in `tests/reactive_structures.rs`.
+- **What (still deferred — napi):** `structures_bindings.rs::BenchReactiveLog` napi class only exposes `append` / `append_many` / `clear` / `at` / `trim_head` / `size` / `node_id`. Methods `view` / `scan` / `attach` / `attach_storage` are not bound for JS consumption.
+- **Why deferred (napi):** Views/scan/attach require TSFN bridging for cursor-read and step-aggregator callbacks; attach_storage needs the multi-tier `AppendLogSink` abstraction surfaced through napi. Substantial wire-up work; no consumer pressure surfaced yet from the JS-side parity tests (Slice W parity gate clear).
+- **Lift point:** When a JS-side use case requires reactive log views / streaming aggregates over the napi binding, or as part of the next napi-feature-widening slice.
+- **Source:** M5.A scope decision D179 (core), Slice W 2026-05-13 scoping (napi).
 
-### F19 — ReactiveMap TTL, LRU, retention policies
+### ~~F19 — ReactiveMap TTL, LRU, retention policies~~ — RESOLVED M5.B (2026-05-11); Slice W (2026-05-13) confirmed napi-pass-through
 
-- **What:** TS `reactiveMap` supports `defaultTtl` (per-entry expiry), `maxSize` (LRU eviction), and `retention` (score-based eviction). Rust M5.A has none of these.
-- **Why deferred:** TTL requires a timer mechanism (no async in Core — needs reactive timer source or binding-side hook). LRU requires access-order tracking. Neither is needed for base functionality.
-- **Lift point:** M5.B or when a real workload requires time-based eviction.
-- **Source:** M5.A scope decision D179.
+- **What:** Rust `reactive.rs` ships `default_ttl_ns` + per-call TTL (`set_with_ttl`), `lru_max_size`, and `RetentionPolicy` (score-based with `archive_threshold` + `max_size`). `prune_expired_inner` for batch cleanup. napi `BenchReactiveMap::create` accepts `default_ttl: Option<f64>` + `max_size: Option<u32>`; `set` accepts per-call `ttl: Option<f64>`. All wired through `ReactiveMapOptions` to the Rust layer (`reactive.rs:1011-1015` reads `default_ttl`; `reactive.rs:880` `lru_max_size`; `reactive.rs:904` `prune_expired_inner`).
+- **Source:** Slice M5.B landing (2026-05-11), confirmed-no-action in Slice W 2026-05-13 audit.
 
-### F20 — ReactiveIndex custom equals for upsert idempotency
+### F20 — ReactiveIndex custom equals for upsert idempotency — Rust LANDED M5.B (2026-05-11); range query napi still deferred
 
-- **What:** TS `reactiveIndex.upsert()` takes optional `opts.equals` to suppress re-emission when value hasn't changed. Rust M5.A always emits on upsert.
-- **Why deferred:** Custom equals requires BindingBoundary crossing (values are opaque handles). Base index functionality works without idempotent upserts.
-- **Lift point:** M5.B — when idempotent upsert is needed for performance.
-- **Source:** M5.A scope decision D179.
+- **What (Rust core layer):** ReactiveIndex custom equals shipped in Slice M5.B 2026-05-11. Factory-level + per-call override; `get_row(primary)` O(1) lookup for equals comparison.
+- **What (still deferred — napi range queries):** `structures_bindings.rs::BenchReactiveIndex` exposes `upsert` / `get` / `has` / `delete` / `clear` / `node_id` / `size`. Range-query methods (`rangeByPrimary(start, end)`, ordered iteration with bounds) are not bound for JS consumption.
+- **Why deferred (napi):** Range queries require composite-key marshalling through napi (start/end pairs, optional cursor support). No JS-side consumer pressure yet.
+- **Lift point:** When a JS-side use case requires reactive ordered range scans over the napi binding.
+- **Source:** M5.A scope decision D179 (core), Slice W 2026-05-13 scoping (napi).
 
 ### F21 — imbl-backed persistent backends
 

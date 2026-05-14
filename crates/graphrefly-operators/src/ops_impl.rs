@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use graphrefly_core::{Core, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
 
+use super::error::OperatorFactoryError;
 use super::producer::{ProducerBinding, ProducerCtx};
 
 // =====================================================================
@@ -73,13 +74,22 @@ impl ZipState {
 /// queue share after `pack_tuple` returns. The returned tuple handle
 /// has a pre-bumped retain (binding convention per D020 doc on
 /// [`BindingBoundary::pack_tuple`]).
-#[must_use]
+/// # Errors
+///
+/// Returns [`OperatorFactoryError::EmptySources`] when `sources` is empty
+/// (R5.7.x — zip requires ≥1 source; vacuous-tuple semantics rejected).
 pub fn zip(
     core: &Core,
     binding: &Arc<dyn ProducerBinding>,
     sources: Vec<NodeId>,
     pack_fn_id: graphrefly_core::FnId,
-) -> NodeId {
+) -> Result<NodeId, OperatorFactoryError> {
+    // R5.7.x — zip requires ≥1 source. Mirrors `combine::combine` (which
+    // raises the same factory-shape invariant) so all bindings can route
+    // through `operator_factory_error_to_napi` / equivalent.
+    if sources.is_empty() {
+        return Err(OperatorFactoryError::EmptySources);
+    }
     let n = sources.len();
     // Weak-Arc captures break the BenchBinding → registry → producer_builds
     // → closure → strong-Arc<dyn ProducerBinding> cycle that would otherwise
@@ -96,13 +106,7 @@ pub fn zip(
             // Host Core / binding already dropped — no-op.
             return;
         };
-        if n == 0 {
-            // Empty zip emits an empty tuple immediately, then completes.
-            let tuple_h = binding_clone.pack_tuple(pack_fn_id, &[]);
-            core_for_build.emit(producer_id, tuple_h);
-            core_for_build.complete(producer_id);
-            return;
-        }
+        // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
         let state: Arc<Mutex<ZipState>> = Arc::new(Mutex::new(ZipState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
@@ -242,8 +246,9 @@ pub fn zip(
     });
 
     let fn_id = binding.register_producer_build(build);
-    core.register_producer(fn_id)
-        .expect("invariant: register_producer has no deps; no error variants reachable")
+    Ok(core
+        .register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable"))
 }
 
 // =====================================================================
@@ -552,8 +557,19 @@ impl RaceState {
 ///
 /// Empty source list completes immediately. Single source is
 /// identity-passthrough.
-#[must_use]
-pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId>) -> NodeId {
+/// # Errors
+///
+/// Returns [`OperatorFactoryError::EmptySources`] when `sources` is empty
+/// (R5.7.x — race requires ≥1 source; no-winner-possible rejected).
+pub fn race(
+    core: &Core,
+    binding: &Arc<dyn ProducerBinding>,
+    sources: Vec<NodeId>,
+) -> Result<NodeId, OperatorFactoryError> {
+    // R5.7.x — race requires ≥1 source. Mirrors `combine::combine`.
+    if sources.is_empty() {
+        return Err(OperatorFactoryError::EmptySources);
+    }
     let n = sources.len();
     // Weak captures break the producer-build Arc cycle (see `zip` doc).
     let core_weak = core.weak_handle();
@@ -565,10 +581,7 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
         else {
             return;
         };
-        if n == 0 {
-            core_clone.complete(producer_id);
-            return;
-        }
+        // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
         let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
@@ -675,8 +688,9 @@ pub fn race(core: &Core, binding: &Arc<dyn ProducerBinding>, sources: Vec<NodeId
     });
 
     let fn_id = binding.register_producer_build(build);
-    core.register_producer(fn_id)
-        .expect("invariant: register_producer has no deps; no error variants reachable")
+    Ok(core
+        .register_producer(fn_id)
+        .expect("invariant: register_producer has no deps; no error variants reachable"))
 }
 
 // =====================================================================

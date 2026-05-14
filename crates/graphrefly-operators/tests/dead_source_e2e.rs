@@ -48,7 +48,7 @@ fn zip_self_completes_immediately_when_one_source_is_dead() {
     // Activation must happen with all partitions held so Dead fires
     // synchronously (not deferred).
     let rec = rt.with_all_partitions_held(|rt| {
-        let z = zip(&rt.core, &rt.producer_binding, vec![live, dead], pack_fn);
+        let z = zip(&rt.core, &rt.producer_binding, vec![live, dead], pack_fn).unwrap();
         rt.subscribe_recorder(z)
     });
 
@@ -81,7 +81,7 @@ fn zip_self_completes_when_all_sources_are_dead() {
 
     let pack_fn = rt.register_tuple_packer();
     let rec = rt.with_all_partitions_held(|rt| {
-        let z = zip(&rt.core, &rt.producer_binding, vec![a, b], pack_fn);
+        let z = zip(&rt.core, &rt.producer_binding, vec![a, b], pack_fn).unwrap();
         rt.subscribe_recorder(z)
     });
 
@@ -154,7 +154,7 @@ fn race_all_dead_sources_self_completes() {
     rt.core.complete(b);
 
     let rec = rt.with_all_partitions_held(|rt| {
-        let r = race(&rt.core, &rt.producer_binding, vec![a, b]);
+        let r = race(&rt.core, &rt.producer_binding, vec![a, b]).unwrap();
         rt.subscribe_recorder(r)
     });
 
@@ -175,7 +175,7 @@ fn race_one_dead_one_live_continues_with_live() {
     rt.core.complete(dead);
 
     let rec = rt.with_all_partitions_held(|rt| {
-        let r = race(&rt.core, &rt.producer_binding, vec![dead, live]);
+        let r = race(&rt.core, &rt.producer_binding, vec![dead, live]).unwrap();
         rt.subscribe_recorder(r)
     });
 

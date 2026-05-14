@@ -684,7 +684,11 @@ impl BenchOperators {
                     Arc::clone(&binding) as Arc<dyn OperatorBinding>;
                 let pack_fn_id = op_binding.register_packer(packer_closure);
                 let producer_binding: Arc<dyn ProducerBinding> = binding;
-                let node = ops_impl::zip(&core, &producer_binding, src_ids, pack_fn_id);
+                // R5.7.x — `ops_impl::zip` returns
+                // `Err(OperatorFactoryError::EmptySources)` when sources is
+                // empty. Translate to NapiError via the shared converter.
+                let node = ops_impl::zip(&core, &producer_binding, src_ids, pack_fn_id)
+                    .map_err(operator_factory_error_to_napi)?;
                 u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
             })
             .await?
@@ -715,7 +719,11 @@ impl BenchOperators {
             .collect();
         run_blocking(core.clone(), move || -> Result<u32> {
             let producer_binding: Arc<dyn ProducerBinding> = binding;
-            let node = ops_impl::race(&core, &producer_binding, src_ids);
+            // R5.7.x — `ops_impl::race` returns
+            // `Err(OperatorFactoryError::EmptySources)` when sources is
+            // empty. Translate to NapiError via the shared converter.
+            let node = ops_impl::race(&core, &producer_binding, src_ids)
+                .map_err(operator_factory_error_to_napi)?;
             u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
         })
         .await?

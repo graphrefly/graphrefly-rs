@@ -73,7 +73,7 @@ fn zip_no_leak_after_runtime_drop() {
         let s1 = rt.state_int(None);
         let s2 = rt.state_int(None);
         let pack_fn = rt.register_tuple_packer();
-        let _ = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn);
+        let _ = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     });
 }
 
@@ -91,7 +91,7 @@ fn race_no_leak_after_runtime_drop() {
     assert_binding_drops_after(|rt| {
         let s1 = rt.state_int(None);
         let s2 = rt.state_int(None);
-        let _ = race(&rt.core, &rt.producer_binding, vec![s1, s2]);
+        let _ = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
     });
 }
 
@@ -147,9 +147,9 @@ fn many_producers_no_leak_after_runtime_drop() {
         let a = rt.state_int(None);
         let b = rt.state_int(None);
         let pack_fn = rt.register_tuple_packer();
-        let _ = zip(&rt.core, &rt.producer_binding, vec![a, b], pack_fn);
+        let _ = zip(&rt.core, &rt.producer_binding, vec![a, b], pack_fn).unwrap();
         let _ = concat(&rt.core, &rt.producer_binding, a, b);
-        let _ = race(&rt.core, &rt.producer_binding, vec![a, b]);
+        let _ = race(&rt.core, &rt.producer_binding, vec![a, b]).unwrap();
         let _ = take_until(&rt.core, &rt.producer_binding, a, b);
         let _ = switch_map(
             &rt.core,

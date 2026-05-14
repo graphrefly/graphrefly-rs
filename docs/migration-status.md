@@ -2,7 +2,61 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-13 — Slice V1–V7: deferred item sweep)
+## Current state (2026-05-13 — Slice W: cross-impl parity closure)
+
+**Slice W LANDED 2026-05-13.** Closes 6 cross-impl parity divergences flagged in Slice V1-V7 sweep + memory entry `project_next_porting_batch.md`. Decisions D187–D191 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+**Q1/Q2 (D187) — `zip([])` / `race([])` throw at construction:**
+- Canonical spec Appendix E pinned: vacuous-tuple / no-winner-possible rejected at construction.
+- Rust: `ops_impl::zip` / `ops_impl::race` `assert!` at top; napi `register_zip` / `register_race` pre-reject `Vec::is_empty()` with `NapiError`.
+- TS pure-ts: `combine.ts::zip` / `combine.ts::race` throw `Error` at top of factory.
+- Parity tests: 2 new assertions (was 2 `test.todo`).
+
+**Q3 (D188) — concat phase-zero self-complete confirmed in pure-ts (no code change):**
+- Pure-ts `combine.ts::concat` already mirrors Rust port D041 fix via `secondCompleted` flag. Test gate was stale — removed `runIf(impl.name !== "pure-ts")`.
+
+**Q4 (D189) — race all-complete-no-winner confirmed in pure-ts (no code change):**
+- Pure-ts `combine.ts::race` already mirrors Rust port D-ops P4 via `completedCount` counter. Test gate was stale — removed `runIf(impl.name !== "pure-ts")`.
+
+**Q5 (D190) — pure-ts `observe(undefined, { reactive: true })` auto-subscribes late-added nodes:**
+- Pure-ts `_observeReactive` installs topology emitter directly into `_topologyEmitters`. On `node-added`, calls `this.observe(event.name, obsOpts)` and pumps `ObserveResult.onEvent` through the same accumulator. Mounts deferred (no consumer pressure).
+- Dropped redundant `_topology == null` guard from `_emitTopology` so direct emitter registration is honored before lazy topology-companion instantiation.
+- Parity test: `test.runIf(impl.name === "rust-via-napi")` → cross-impl `test`.
+
+**Q6 (D191) — pure-ts `graph.remove()` clears namespace AFTER TEARDOWN cascade:**
+- Reordered `remove()` local-node branch: fire `[[TEARDOWN]]` first, then delete from `_nodes` + `_nodeToName`. Cross-graph ownership stamp (`GRAPH_OWNER`) still released BEFORE TEARDOWN (preserves same-tick re-registration on another Graph).
+- Parity test: `test.skip` → cross-impl `test` for "namespace remains resolvable from inside the TEARDOWN sink (R3.7.3 ordering)".
+
+**Verified-no-action items from queued batch:**
+- **Tier-3 restore parity** — `tier-3-restore.test.ts` rust arm passes 4/4 in current build (8 total). Memo "replayedFrames=0" was stale; likely resolved in Slice V's WAL frame format work.
+- **F19 ReactiveMap TTL/LRU effect at Rust layer** — already wired through `ReactiveMapOptions` → `ReactiveMap::new`; `prune_expired_inner`, `default_ttl_ns`, `lru_max_size` all live in `reactive.rs`.
+
+**Deferred to future slice (recorded in `porting-deferred.md`):**
+- M4 storage `debounce_ms` wiring into reactive timer subgraph (D171) — needs tokio runtime integration in storage path.
+- M5 `ReactiveLog::view` / `scan` / `attach` / `attachStorage` napi bindings — needs TSFN bridging for callbacks.
+- M5 `ReactiveIndex` range query napi bindings.
+
+These are feature gaps (not deferred-item bugs) — scoped out of Slice W since the slice's charter was closing the deferred-item registry, not new feature work.
+
+**Test count: 3011 pure-ts + 289 parity (1 skipped TSFN-only) + 829 cargo cores + 21 operators.** `pnpm test` clean. `cargo test -p graphrefly-operators` clean. `pnpm run lint:fix` applied (formatting only). `cargo fmt` exempt due to pre-existing graphrefly-bindings-js feature-flag drift (independent of Slice W). `#![forbid(unsafe_code)]` preserved.
+
+**Slice W /qa pass (2026-05-13) — 5 fixes applied** (full decision in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md) D192):
+
+1. **F1 — pure-ts `_observeReactive` lateHandle leak + duplicate-subscribe + race window.** `lateHandles[]/lateOffs[]` arrays → `Map<string, {handle, off}>` keyed by name. Topology handler now dedupes (re-add of same name no-ops), handles `removed` events (disposes+deletes the matching entry to prevent accumulation in long-lived dynamic graphs), and the cleanup closure detaches the topology handler FIRST so no new entries land during disposal.
+2. **F2 — `Graph._emitTopology` re-entrant Set iteration.** Snapshotted `[...this._topologyEmitters]` before iterating so handler mutations during iteration don't visit the freshly-added handler in the same loop.
+3. **F3 — `Graph.remove()` registry inconsistency on TEARDOWN throw.** Wrapped TEARDOWN fire in `try { ... } finally { _nodes.delete(); _nodeToName.delete(); }` so a throwing TEARDOWN sink still leaves the registry consistent.
+4. **F4 — Rust `ops_impl::zip` / `race` panic on user-facing path.** Replaced `assert!` with `Result<NodeId, OperatorFactoryError>` returning `OperatorFactoryError::EmptySources`. Mirrors `combine::combine` precedent. napi binding translates via shared `operator_factory_error_to_napi`. Test callers in `tests/{subscription, arc_cycle_break, dead_source_e2e}.rs` updated to `.unwrap()`. Future bindings (pyo3, wasm) get a typed error instead of a panic across FFI. Per `CLAUDE.md` invariant #5.
+5. **F5 — `Graph.add()` JSDoc clarification.** Added explicit caveat that same-graph re-register-under-new-name from inside a TEARDOWN sink is unsupported (do it after `remove()` returns).
+
+Post-/qa test counts: pure-ts 3011, parity 289 + 1 skipped, cargo operators 184 (all `test result: ok`), `cargo clippy -p graphrefly-operators --all-targets -- -D warnings` clean.
+
+**Follow-ups queued for next slice** (low priority, not bug fixes):
+- ReactiveMap TTL parity scenario (only `maxSize` is exercised by `scenarios/structures/reactive-map.test.ts`).
+- Late-add derived-node parity scenario for `observe({ reactive: true })` (covers a path the existing scenario doesn't exercise).
+
+---
+
+## Previous state (2026-05-13 — Slice V1–V7: deferred item sweep)
 
 **Deferred item sweep LANDED 2026-05-13.** Systematic close of open deferred items across M1–M5. QA pass applied 2026-05-13 (F1 refcount fix).
 
@@ -1150,13 +1204,24 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
 | any | `graphrefly-bindings-wasm` | ⏸ blocked | Lands alongside napi-rs progression |
 
-## Next batch candidates (queued 2026-05-08)
+## Next batch candidates (queued 2026-05-13, post-Slice-W)
 
-When the next `/porting-to-rs next batch` invocation runs, these are the pre-queued v1 dispatcher / dispatcher-design concerns to consider lifting. Each is documented in [`porting-deferred.md`](porting-deferred.md) at the linked anchor; user pre-queued them rather than letting them indefinitely defer. Pick based on consumer pressure / bench evidence at the time of the next run.
+When the next `/porting-to-rs next batch` invocation runs, these are the pre-queued items to consider lifting. Pick a coherent subset based on consumer pressure / bench evidence; each is documented in [`porting-deferred.md`](porting-deferred.md). User memory entry `project_next_porting_batch.md` carries the same list.
 
+**napi widening (M5 feature gaps — Rust core layer already shipped):**
+- **F18 — ReactiveLog napi: `view` / `scan` / `attach` / `attach_storage`** ([`porting-deferred.md` §F18](porting-deferred.md)) — Core layer landed in Slice M5.B 2026-05-11; napi class only exposes append/clear/at/trim_head. Needs TSFN bridging for cursor-read callbacks + step-aggregator + multi-tier `AppendLogSink` surface.
+- **F20 — ReactiveIndex napi: range queries (`rangeByPrimary(start, end)`)** ([`porting-deferred.md` §F20](porting-deferred.md)) — Core layer M5.B has custom equals + `get_row`; napi binding lacks ordered range scans.
+- **F24 — Structures parity tests + rust.ts adapter** ([`porting-deferred.md` §F24](porting-deferred.md)) — `structures_bindings.rs` ships 4 napi classes feature-gated behind `structures`; activating parity needs `--features structures` rebuild + adapter + scenarios.
+
+**M4 storage reactive-timer wiring (substrate ready):**
+- **D171 — `debounce_ms` wiring at `attach_snapshot_storage`** ([`porting-deferred.md` §"M4.B tier-level setTimeout-equivalent debounce"](porting-deferred.md)) — Unblocked since Slice T tokio timer port (2026-05-11). ~50 LOC: wire `debounce(observe_node, ms) → map(|_| tier.flush())` reactive subgraph at attach time. Tier-level API unchanged.
+
+**v1 dispatcher / design concerns (pre-2026-05-08 queue):**
 - **D2 — Late subscriber + multi-emit-per-wave snapshot gap** ([`porting-deferred.md` §"Late subscriber + multi-emit-per-wave snapshot gap"](porting-deferred.md)) — Rust-only dispatcher design trade-off. Three candidate fixes documented; pick on merits when M2+ surfaces a real consumer.
 - **D3 — Cross-thread emit blocks until in-flight wave completes** ([`porting-deferred.md` §"Cross-thread emit blocks until in-flight wave completes"](porting-deferred.md)) — by-design wave-owner mutex; lift = per-subgraph mutex granularity (substantial refactor with lock-ordering protocol + cross-subgraph wave handoff + deadlock prevention).
 - **D4 — Per-tier handshake panic on tier-N leaves sink registered** ([`porting-deferred.md` §"Per-tier handshake panic on tier-N leaves sink registered"](porting-deferred.md)) — partially superseded by Slice E rework; remaining behavior: panicking handshake-time sink stays in `subscribers` without returning a `Subscription`. Lift = `catch_unwind` around lock-released handshake fire (~20 LOC).
+
+**Suggested grouping for next slice:** napi widening (F18 + F20 + F24) makes a coherent feature batch (~600-1000 LOC, single rebuild). D171 fits as a small companion (~50 LOC). v1-dispatcher items each merit their own slice.
 
 ## Phase 13.7 bench study — re-decision gate
 
