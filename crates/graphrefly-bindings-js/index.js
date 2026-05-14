@@ -576,11 +576,30 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.BenchCheckpointSnapshotTier = nativeBinding.BenchCheckpointSnapshotTier
 module.exports.BenchCore = nativeBinding.BenchCore
 module.exports.BenchDescribeReactiveHandle = nativeBinding.BenchDescribeReactiveHandle
 module.exports.BenchGraph = nativeBinding.BenchGraph
+module.exports.BenchMemoryBackend = nativeBinding.BenchMemoryBackend
 module.exports.BenchObserveReactiveHandle = nativeBinding.BenchObserveReactiveHandle
 module.exports.BenchOperators = nativeBinding.BenchOperators
+module.exports.BenchReactiveIndex = nativeBinding.BenchReactiveIndex
+module.exports.BenchReactiveList = nativeBinding.BenchReactiveList
+module.exports.BenchReactiveLog = nativeBinding.BenchReactiveLog
+module.exports.BenchReactiveMap = nativeBinding.BenchReactiveMap
+module.exports.BenchStorageHandle = nativeBinding.BenchStorageHandle
+module.exports.BenchValueAppendLogTier = nativeBinding.BenchValueAppendLogTier
+module.exports.BenchValueKvTier = nativeBinding.BenchValueKvTier
+module.exports.BenchValueSnapshotTier = nativeBinding.BenchValueSnapshotTier
+module.exports.BenchWalKvTier = nativeBinding.BenchWalKvTier
+module.exports.BENCH_WAL_FRAME_SEQ_PAD = nativeBinding.BENCH_WAL_FRAME_SEQ_PAD
+module.exports.benchAttachSnapshotStorage = nativeBinding.benchAttachSnapshotStorage
+module.exports.benchGraphSnapshot = nativeBinding.benchGraphSnapshot
+module.exports.benchReplayOrder = nativeBinding.benchReplayOrder
+module.exports.benchRestoreSnapshot = nativeBinding.benchRestoreSnapshot
+module.exports.benchVerifyWalFrameChecksum = nativeBinding.benchVerifyWalFrameChecksum
+module.exports.benchWalFrameChecksum = nativeBinding.benchWalFrameChecksum
+module.exports.benchWalFrameKey = nativeBinding.benchWalFrameKey
 module.exports.BuiltinBatchFn = nativeBinding.BuiltinBatchFn
 module.exports.BuiltinFn = nativeBinding.BuiltinFn
 module.exports.globalCacheInt = nativeBinding.globalCacheInt

@@ -663,6 +663,48 @@ impl BindingBoundary for BenchBinding {
         let raw = u32::try_from(node_id.raw()).expect("NodeId exceeds u32") as i32;
         reg.intern(BenchValue::Int(raw))
     }
+
+    /// Serialize a handle to JSON for snapshot/WAL persistence (M4.F).
+    ///
+    /// For `BenchValue::Int` handles, serialize the actual integer value.
+    /// For `JsAllocated` handles, serialize the raw handle ID — the
+    /// actual value lives in JS and is opaque to Rust. This gives the
+    /// diff engine a stable identity to detect value changes (different
+    /// handles → different serialized values), even though the
+    /// round-tripped value won't be the original JS value.
+    fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
+        let reg = self.registry.lock();
+        match reg.deref(handle) {
+            Some(BenchValue::Int(n)) => Some(serde_json::Value::Number(
+                serde_json::Number::from(n),
+            )),
+            Some(BenchValue::Str(s)) => Some(serde_json::Value::String(s)),
+            Some(BenchValue::JsAllocated) => {
+                // Use raw handle ID as a stable identity for diff detection.
+                Some(serde_json::Value::Number(
+                    serde_json::Number::from(handle.raw()),
+                ))
+            }
+            None => None,
+        }
+    }
+
+    /// Deserialize a JSON value back into a handle for snapshot restore.
+    /// Interns the value as a `BenchValue` and returns the handle.
+    fn deserialize_value(&self, value: serde_json::Value) -> HandleId {
+        let mut reg = self.registry.lock();
+        match &value {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    reg.intern(BenchValue::Int(i as i32))
+                } else {
+                    reg.alloc_external_handle()
+                }
+            }
+            serde_json::Value::String(s) => reg.intern(BenchValue::Str(s.clone())),
+            _ => reg.alloc_external_handle(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

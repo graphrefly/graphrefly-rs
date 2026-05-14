@@ -83,6 +83,7 @@ pub struct WALFrame<T> {
     /// encoded as a 64-char lowercase hex string. Hex (vs raw bytes) keeps
     /// the wire format JSON-codec-friendly. M4.A parity-fixture asserts
     /// byte-equivalence against the TS impl.
+    #[serde(default)]
     pub checksum: String,
     /// Codec version tag. All M4.A frames are implicitly version 1
     /// (JSON codec). Defaults to `1` for backward-compatible deserialization
