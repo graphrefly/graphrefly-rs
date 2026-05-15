@@ -167,7 +167,8 @@ echo "===> Assembling per-platform npm/ sub-packages ..."
 # create-npm-dirs writes npm/<target>/package.json (name/os/cpu/version);
 # artifacts moves each .node into its matching dir.
 pnpm exec napi create-npm-dirs >/dev/null 2>&1 || true
-pnpm exec napi artifacts --dir artifacts
+# napi 3.6.2: the flag is --output-dir (alias -d), not --dir.
+pnpm exec napi artifacts --output-dir artifacts
 
 # Scoped packages default to RESTRICTED on first publish. Force public on
 # every generated sub-package manifest (belt-and-suspenders with the

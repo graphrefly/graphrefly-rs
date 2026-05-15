@@ -135,14 +135,17 @@ jobs:
       - name: Move artifacts into npm sub-packages
         # `napi artifacts` distributes the downloaded .node files into
         # the per-target npm/<target>/ dirs that `napi prepublish`
-        # publishes.
-        run: pnpm exec napi artifacts --dir artifacts
+        # publishes. napi 3.6.2 flag is --output-dir (not --dir).
+        run: pnpm exec napi artifacts --output-dir artifacts
       # No NODE_AUTH_TOKEN: with `id-token: write` + npm >= 11.5.1 and a
       # trusted publisher configured for each package (one-time bootstrap
       # via scripts/first-publish-native.sh), npm authenticates via OIDC
       # and auto-attaches provenance. `napi prepublish` shells out to
       # `npm publish` per sub-package, so OIDC applies there too.
       - name: Publish per-platform packages (OIDC)
-        run: pnpm exec napi prepublish -t npm --skip-gh-release
+        # napi 3.6.2 has no --skip-gh-release; GitHub releases are
+        # opt-in via --gh-release (default off), and `contents: read`
+        # couldn't create one anyway. `-t npm` = --tag-style npm.
+        run: pnpm exec napi prepublish -t npm
       - name: Publish umbrella @graphrefly/native (OIDC)
         run: npm publish --access public --provenance

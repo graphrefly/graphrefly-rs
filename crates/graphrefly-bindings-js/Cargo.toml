@@ -80,7 +80,11 @@ default  = ["tracing"]
 
 # `tracing` = lightweight build for the @graphrefly/lite distribution
 # (just dispatch + observe; no graph, no operators, no storage).
-tracing  = ["dep:graphrefly-core", "dep:ahash", "dep:parking_lot"]
+# serde_json is required unconditionally by core_bindings.rs's
+# BindingBoundary::serialize_handle/deserialize_value (diff-engine
+# value identity), which is compiled in every profile — so the base
+# `tracing` feature must pull it, not just storage/graph-codec.
+tracing  = ["dep:graphrefly-core", "dep:ahash", "dep:parking_lot", "dep:serde_json"]
 
 # `standard` = typical agent harness use; @graphrefly/standard.
 standard = ["tracing", "graph-codec", "operators"]
