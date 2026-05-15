@@ -1,21 +1,37 @@
-# @graphrefly/native — npm publish (D203 native-ship, Slice 3).
+# @graphrefly/native — npm publish (D203 native-ship; OIDC trusted
+# publishing, NO NPM_TOKEN — D206).
 #
 # Separate from release.yml (which is crates.io / release-plz only —
-# bindings crates are `publish = false` there). This workflow cross-
+# bindings crates are `publish = false` there, and napi-rs needs a Rust
+# cross-compile matrix changesets can't do). This workflow cross-
 # compiles the napi-rs `.node` for every configured target, publishes
 # one per-platform npm package per target, then publishes the umbrella
 # `@graphrefly/native` package whose optionalDependencies resolve the
 # right binary at install time (canonical napi-rs layout).
 #
-# TRIGGER: push a tag matching `native-v*` (e.g. `native-v0.1.0`).
-# Tag creation is a deliberate human action — this workflow never runs
-# on a normal push to main, so merging Slice 3 cannot publish anything.
+# AUTH: npm OIDC trusted publishing (same model as release.yml in
+# graphrefly-ts) — no long-lived NPM_TOKEN. Requires npm >= 11.5.1 +
+# Node >= 22 + `id-token: write`. npm mints short-lived creds via the
+# GitHub OIDC token and auto-attaches provenance.
 #
-# One-time prerequisites:
-#   - Repo/org secret `NPM_TOKEN` — an npm automation token with publish
-#     rights to the `@graphrefly` scope.
-#   - The `@graphrefly` npm org must exist and the token's user be a
-#     member with publish permission.
+# TRIGGER: push a tag matching `native-v*` (e.g. `native-v0.0.1`).
+# Tag creation is a deliberate human action — this workflow never runs
+# on a normal push to main.
+#
+# ONE-TIME BOOTSTRAP (chicken-and-egg): OIDC trusted publishing requires
+# each package to ALREADY EXIST on npm with a trusted publisher
+# configured — you cannot configure a trusted publisher for a package
+# that has never been published. So the FIRST publish of all 6 packages
+# (umbrella `@graphrefly/native` + the 5 per-platform sub-packages) must
+# be done once from a local machine using your interactive `npm login`
+# (NOT a CI token):
+#   1. Run  scripts/first-publish-native.sh   (cross-builds all 5
+#      targets locally and publishes all 6 packages via your npm login).
+#   2. For EACH of the 6 packages, on npmjs.com →
+#      Package → Settings → Trusted Publisher → GitHub Actions:
+#        org=graphrefly  repo=graphrefly-rs  workflow=native-npm-publish.yml
+#   3. From then on, every `native-v*` tag publishes via OIDC here —
+#      no token, ever.
 #
 # Tag → version: the workflow publishes whatever `version` is in
 # crates/graphrefly-bindings-js/package.json. Bump that (via
@@ -30,6 +46,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # REQUIRED for npm OIDC trusted publishing
 
 defaults:
   run:
@@ -81,12 +98,20 @@ jobs:
     name: publish to npm
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for trusted publishing
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24   # >= 22 required for npm OIDC trusted publishing
           registry-url: "https://registry.npmjs.org"
+      # OIDC trusted publishing needs npm >= 11.5.1. Node 24 ships a
+      # recent npm, but pin-forward explicitly so a runner-image npm
+      # downgrade can't silently break OIDC.
+      - name: Ensure npm >= 11.5.1
+        run: npm install -g npm@latest && npm --version
       - name: Install pnpm
         uses: pnpm/action-setup@v4
       - name: Install deps
@@ -100,11 +125,12 @@ jobs:
         # the per-target npm/<target>/ dirs that `napi prepublish`
         # publishes.
         run: pnpm exec napi artifacts --dir artifacts
-      - name: Publish per-platform packages
+      # No NODE_AUTH_TOKEN: with `id-token: write` + npm >= 11.5.1 and a
+      # trusted publisher configured for each package (one-time bootstrap
+      # via scripts/first-publish-native.sh), npm authenticates via OIDC
+      # and auto-attaches provenance. `napi prepublish` shells out to
+      # `npm publish` per sub-package, so OIDC applies there too.
+      - name: Publish per-platform packages (OIDC)
         run: pnpm exec napi prepublish -t npm --skip-gh-release
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish umbrella @graphrefly/native
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish umbrella @graphrefly/native (OIDC)
+        run: npm publish --access public --provenance
