@@ -123,13 +123,17 @@ rm -rf artifacts && mkdir -p artifacts
 
 for t in "${TARGETS[@]}"; do
   echo "===> Building $t ..."
-  extra=()
+  # No bash array here: macOS ships bash 3.2, where `"${arr[@]}"` on an
+  # empty array under `set -u` errors "unbound variable". Branch the
+  # full command instead. linux-gnu uses napi's bundled cross-toolchain;
+  # windows-msvc auto-detects cargo-xwin on a non-Windows host; darwin
+  # builds natively.
   case "$t" in
-    *-unknown-linux-gnu)  extra=(--use-napi-cross) ;;   # napi bundled cross-toolchain
-    *-pc-windows-msvc)    extra=() ;;                    # napi auto-detects cargo-xwin on non-Windows host
-    aarch64-apple-darwin) extra=() ;;                    # native on Apple Silicon
+    *-unknown-linux-gnu)
+      pnpm exec napi build --platform --release --features full --target "$t" --use-napi-cross ;;
+    *)
+      pnpm exec napi build --platform --release --features full --target "$t" ;;
   esac
-  pnpm exec napi build --platform --release --features full --target "$t" "${extra[@]}"
   # Collect the produced binary for the artifacts → npm/<target>/ step.
   mv graphrefly-native.*.node artifacts/ 2>/dev/null || \
     fail "no .node produced for $t (check the cross toolchain for this target)."
