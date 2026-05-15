@@ -50,9 +50,12 @@
 #
 # PREREQS (the script hard-checks these and fails fast with hints):
 #   rustup, cargo, Node >= 22, npm >= 11.5.1, @napi-rs/cli (devDep),
-#   `npm whoami` (logged in), cargo-xwin (Windows cross), and the 5
-#   rustup targets. Linux cross uses napi's bundled cross-toolchain
-#   (first run downloads it — network required).
+#   `npm whoami` (logged in), and the 5 rustup targets (auto-added).
+#   On a non-Linux host: zig + cargo-zigbuild (linux-gnu cross) and
+#   cargo-xwin + LLVM (windows-msvc cross). One-time installs:
+#     brew install zig llvm
+#     cargo install --locked cargo-zigbuild cargo-xwin
+#   cargo-xwin auto-downloads the Windows CRT/SDK on first build.
 
 set -euo pipefail
 
@@ -99,6 +102,16 @@ fi
 
 ( cd "$PKG_DIR" && pnpm exec napi --version >/dev/null 2>&1 ) || fail "@napi-rs/cli not resolvable. Run: pnpm install --frozen-lockfile (in repo root)."
 
+# Linux cross from a non-Linux host needs zig (`@napi-rs/cross-toolchain`
+# ships Linux-host ELF gcc binaries that cannot exec on macOS — exit 126
+# "cannot execute binary file"). `napi build --zig` uses zig as the
+# cross C/linker toolchain and handles blake3's C/ASM cleanly.
+HOST_OS="$(uname -s)"
+if [[ "$HOST_OS" != "Linux" ]]; then
+  command -v zig >/dev/null 2>&1 || fail "zig not found (needed to cross-compile the linux-gnu targets from $HOST_OS). Install: brew install zig"
+  command -v cargo-zigbuild >/dev/null 2>&1 || fail "cargo-zigbuild not found (napi --zig uses it). Install: cargo install --locked cargo-zigbuild"
+fi
+
 command -v cargo-xwin >/dev/null 2>&1 || fail "cargo-xwin not found (needed to cross-compile the windows-msvc targets from a non-Windows host). Install: cargo install --locked cargo-xwin  (also: brew install llvm)."
 
 echo "     adding rustup targets ..."
@@ -125,12 +138,18 @@ for t in "${TARGETS[@]}"; do
   echo "===> Building $t ..."
   # No bash array here: macOS ships bash 3.2, where `"${arr[@]}"` on an
   # empty array under `set -u` errors "unbound variable". Branch the
-  # full command instead. linux-gnu uses napi's bundled cross-toolchain;
-  # windows-msvc auto-detects cargo-xwin on a non-Windows host; darwin
-  # builds natively.
+  # full command instead. linux-gnu cross-compiles with zig (the napi
+  # bundled cross-toolchain is Linux-host-only and cannot exec on
+  # macOS); windows-msvc auto-detects cargo-xwin on a non-Windows host;
+  # darwin builds natively. On a Linux host, drop --zig (native cross
+  # toolchains / napi-cross work there).
   case "$t" in
     *-unknown-linux-gnu)
-      pnpm exec napi build --platform --release --features full --target "$t" --use-napi-cross ;;
+      if [[ "$HOST_OS" == "Linux" ]]; then
+        pnpm exec napi build --platform --release --features full --target "$t"
+      else
+        pnpm exec napi build --platform --release --features full --target "$t" --zig
+      fi ;;
     *)
       pnpm exec napi build --platform --release --features full --target "$t" ;;
   esac
