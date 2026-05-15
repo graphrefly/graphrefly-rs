@@ -1,7 +1,7 @@
 {
 	"name": "@graphrefly/native",
 	"version": "0.1.0",
-	"description": "GraphReFly Rust substrate (napi-rs). Install-time substrate provider for @graphrefly/graphrefly (peer alternative to @graphrefly/pure-ts).",
+	"description": "GraphReFly Rust substrate (napi-rs bindings). NOT YET a drop-in substrate provider for @graphrefly/graphrefly: the napi surface is async-only (Core on a tokio blocking pool; sync calls deadlock — D070/D077) while @graphrefly/graphrefly consumes pure-ts's sync API. The install-time overrides drop-in (Q28/D198) is design-pending vs deferred D080 (async-everywhere public API). Today this package is consumed only by the parity-test harness.",
 	"main": "index.js",
 	"types": "index.d.ts",
 	"files": [
