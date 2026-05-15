@@ -102,17 +102,24 @@ fi
 
 ( cd "$PKG_DIR" && pnpm exec napi --version >/dev/null 2>&1 ) || fail "@napi-rs/cli not resolvable. Run: pnpm install --frozen-lockfile (in repo root)."
 
-# Linux cross from a non-Linux host needs zig (`@napi-rs/cross-toolchain`
-# ships Linux-host ELF gcc binaries that cannot exec on macOS — exit 126
-# "cannot execute binary file"). `napi build --zig` uses zig as the
-# cross C/linker toolchain and handles blake3's C/ASM cleanly.
+# The host's own Rust target builds natively; every other target uses
+# napi `--cross-compile` (cargo-zigbuild for linux-gnu, cargo-xwin for
+# windows-msvc). @napi-rs/cross-toolchain (--use-napi-cross) is NOT
+# usable here: it ships Linux-host ELF gcc that cannot exec on macOS
+# (exit 126 "cannot execute binary file" → blake3 build fails).
 HOST_OS="$(uname -s)"
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+[[ -n "$HOST_TARGET" ]] || fail "could not determine host rust target from 'rustc -vV'."
+echo "     host target: $HOST_TARGET"
+
+# zig/cargo-zigbuild are what napi's --cross-compile uses for the
+# linux-gnu targets; only needed when the host isn't itself linux-gnu.
 if [[ "$HOST_OS" != "Linux" ]]; then
-  command -v zig >/dev/null 2>&1 || fail "zig not found (needed to cross-compile the linux-gnu targets from $HOST_OS). Install: brew install zig"
-  command -v cargo-zigbuild >/dev/null 2>&1 || fail "cargo-zigbuild not found (napi --zig uses it). Install: cargo install --locked cargo-zigbuild"
+  command -v zig >/dev/null 2>&1 || fail "zig not found (napi --cross-compile uses cargo-zigbuild for the linux-gnu targets). Install: brew install zig"
+  command -v cargo-zigbuild >/dev/null 2>&1 || fail "cargo-zigbuild not found (napi --cross-compile uses it for linux-gnu). Install: cargo install --locked cargo-zigbuild"
 fi
 
-command -v cargo-xwin >/dev/null 2>&1 || fail "cargo-xwin not found (needed to cross-compile the windows-msvc targets from a non-Windows host). Install: cargo install --locked cargo-xwin  (also: brew install llvm)."
+command -v cargo-xwin >/dev/null 2>&1 || fail "cargo-xwin not found (napi --cross-compile uses it for the windows-msvc targets). Install: cargo install --locked cargo-xwin  (also: brew install llvm)."
 
 echo "     adding rustup targets ..."
 for t in "${TARGETS[@]}"; do rustup target add "$t" >/dev/null 2>&1 || true; done
@@ -138,20 +145,17 @@ for t in "${TARGETS[@]}"; do
   echo "===> Building $t ..."
   # No bash array here: macOS ships bash 3.2, where `"${arr[@]}"` on an
   # empty array under `set -u` errors "unbound variable". Branch the
-  # full command instead. linux-gnu cross-compiles with zig (the napi
-  # bundled cross-toolchain is Linux-host-only and cannot exec on
-  # macOS); windows-msvc auto-detects cargo-xwin on a non-Windows host;
-  # darwin builds natively. On a Linux host, drop --zig (native cross
-  # toolchains / napi-cross work there).
+  # full command instead. The host's own target (aarch64-apple-darwin
+  # on the documented macOS bootstrap machine) builds natively;
+  # everything else uses napi's `--cross-compile` (`-x`), which (per
+  # `napi build --help`) uses `cargo-zigbuild` for the linux-gnu
+  # targets and `cargo-xwin` for the windows-msvc targets. (napi 3.6.2
+  # has no `--zig`; `--use-napi-cross` is Linux-host-only.)
   case "$t" in
-    *-unknown-linux-gnu)
-      if [[ "$HOST_OS" == "Linux" ]]; then
-        pnpm exec napi build --platform --release --features full --target "$t"
-      else
-        pnpm exec napi build --platform --release --features full --target "$t" --zig
-      fi ;;
-    *)
+    "$HOST_TARGET")
       pnpm exec napi build --platform --release --features full --target "$t" ;;
+    *)
+      pnpm exec napi build --platform --release --features full --target "$t" --cross-compile ;;
   esac
   # Collect the produced binary for the artifacts → npm/<target>/ step.
   mv graphrefly-native.*.node artifacts/ 2>/dev/null || \
