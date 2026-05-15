@@ -86,6 +86,75 @@ These are the spec-level invariants every implementation honors. Canonical text 
 6. **DIRTY before DATA/RESOLVED in the same wave.** Wave engine must enforce.
 7. **`actions.up` rejects tier-3/4.** Make this a compile error via separate `UpMessage` / `DownMessage` enums.
 
+## Layering predicate — substrate vs presentation (locked 2026-05-14, D193)
+
+**The single rule** that decides whether a new TS/PY symbol belongs in `graphrefly-rs` (substrate) or stays binding-side (presentation):
+
+> **Substrate** = the symbol manages state, dispatch, mutation, or persistence — i.e., the mechanism. Port to Rust.
+> **Presentation** = the symbol composes substrate into domain shapes (graph-level sugar, observability surfaces, user-facing factories, runtime-idiomatic glue). Stay binding-side.
+>
+> **Hot-path tie-breaker:** when (a) is ambiguous, ask "does this execute on every emission / per-wave?" Yes → substrate; one-shot/wiring-only/audit-only → presentation.
+> **Cross-language sharability cross-check:** if JS and PY both need the same shape with the same semantics, that's evidence for substrate; language-idiomatic shapes (Promise, async iter, NestJS, Pythonic context manager, decorators) are evidence for presentation.
+
+Source: `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-layer-boundary.md` Unit 1 (Q9.1 = C, user-locked 2026-05-14).
+
+**Three-package install-time model** (locked 2026-05-14, D198):
+
+```
+@graphrefly/graphrefly  ← presentation only (patterns + binding-only extras + compat)
+       │  peerDependency: pick ONE substrate provider
+       ▼
+@graphrefly/pure-ts   OR   @graphrefly/native
+  (TS substrate)            (Rust substrate via napi)
+```
+
+Both substrate packages MUST satisfy the same `packages/parity-tests/impls/types.ts` `Impl` interface. `@graphrefly/wasm` and the facade-with-fallback are explicitly **canceled** in favor of this model (supersedes Phase 13 Deferred 1).
+
+### Rust crate ↔ TS folder mapping
+
+| Rust crate | TS folder (in `@graphrefly/pure-ts`) | Substrate? |
+|---|---|---|
+| `graphrefly-core` | `core/` | substrate (always) |
+| `graphrefly-graph` | `graph/` | substrate (always) |
+| `graphrefly-operators` | `extra/operators/` + `extra/composition/stratify` | substrate |
+| `graphrefly-storage` | `extra/storage/` (Node tiers only) | substrate (Node-only path) |
+| `graphrefly-structures` | `extra/data-structures/` | substrate |
+| `graphrefly-bindings-js` | (consumed by `@graphrefly/native`) | binding glue |
+| `graphrefly-bindings-py` | (consumed by `graphrefly-py`) | binding glue |
+| `graphrefly-bindings-wasm` | (consumed by `@graphrefly/wasm`, deferred) | binding glue |
+
+### `extra/` row classification (locked 2026-05-14, D197)
+
+Each `extra/<row>/` sub-folder either ports (substrate) or stays binding-side (presentation). New `extra/` subfolders MUST be classified at introduction:
+
+| `extra/` sub-folder | Classification | Rust home | Notes |
+|---|---|---|---|
+| `operators/` | substrate | `graphrefly-operators` | Already ported (Slice C-1, C-2, U). |
+| `data-structures/` | substrate | `graphrefly-structures` | Already ported (M5.A/M5.B). |
+| `storage/` (Node tiers) | substrate | `graphrefly-storage` | Already ported (M4). |
+| `composition/stratify` | substrate | `graphrefly-operators::stratify` | ✅ Landed 2026-05-14 (D199, Layer-boundary slice). `stratify_branch` operator (~370 LOC incl. two-dep DIRTY gating per N1, `Drop` impl, `cache_of` pre-seed per N2) + `BindingBoundary::invoke_stratify_classifier_fn` + `OperatorBinding::register_stratify_classifier` + napi `register_stratify_branch`. |
+| `composition/{verifiable, distill, pubsub, backpressure, externalProducer}` | presentation | — | Composable from `derived` + `filter` + `state`; stay binding-side. |
+| `mutation/{lightMutation, wrapMutation, createAuditLog, tryIncrementBounded}` | presentation | — | Decorators over `reactiveLog` (already substrate); HOF in TS, context-manager in PY. |
+| `sources/sync` (`of`, `empty`, `fromIter`, `never`, `throwError`) | substrate | `graphrefly-operators::source` | Already ported (Slice 3e/3f). |
+| `sources/event/fromTimer` | substrate | `graphrefly-operators::interval` | Already ported (Slice T) — surface binding-side as `fromTimer`. |
+| `sources/event/fromCron` | substrate (timer) + presentation (parser) | `graphrefly-operators::interval` | Cron parser stays binding-side; consumes Rust `interval` for the timer. |
+| `sources/event/{fromEvent, fromRaf}` | presentation | — | DOM/runtime APIs are binding-language idiomatic. |
+| `io/{http, ws, sse, webhook, reactiveSink}` | presentation | — | Network IO uses language-idiomatic libs per binding. |
+| `data-structures` Graph sugar (`graph.log/list/map/index`) | presentation | — | Ergonomic facade over substrate; stays binding-side (confirmed Slice U-napi S3). |
+
+**Anti-pattern caught in honest review (2026-05-14):** A TS surface that looks like substrate may actually be a thin **decorator** over already-existing substrate. If true, classify as presentation. Example: `mutation/createAuditLog` looked like substrate; the audit log itself IS `reactiveLog` (already substrate), and the decorator is presentation.
+
+### napi widening policy — consumer-pressure-driven, parity-test gated (locked 2026-05-14, D196)
+
+A Rust-core surface gets a napi binding when EITHER:
+
+1. A non-pattern consumer materializes (concrete JS user reaches for it), OR
+2. A parity scenario in `packages/parity-tests/scenarios/<layer>/` exercises it cross-impl.
+
+Presentation symbols (per the table above) **never** enter `Impl` (`packages/parity-tests/impls/types.ts`) and never bind to napi. Substrate symbols not yet exercised by a parity scenario STAY deferred — recorded in `docs/porting-deferred.md`. "Parity scenarios are the consumer pressure signal" — the scenario is itself the receipt that justifies the binding work.
+
+Source: `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-layer-boundary.md` Unit 4 (Q9.1 = B, user-locked 2026-05-14).
+
 ## Rust-specific invariants
 
 Beyond the cross-language spec:

@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-12 (Slice U-napi: control+buffer+§10 perf + structures napi + Graph sugar)
+last_updated: 2026-05-14 (Layer-boundary slice: F24 + D171 + stratify + parity scenarios)
 ---
 
 # Porting flags & deferred concerns
@@ -187,14 +187,12 @@ redb per-write ACID transactions (D163) serialize concurrent writers by MVCC des
 - **TS side:** still missing. When adding to TS, the field MUST also be excluded from the checksum body (`canonicalFrameBody` at `wal.ts:141`) — otherwise cross-language parity breaks. Track in TS `docs/optimizations.md`.
 - **Source:** /qa F7 (2026-05-10). Cross-language scope — tracked in TS `docs/optimizations.md` under "Active work items".
 
-### M4.B tier-level setTimeout-equivalent debounce (lift @ reactive timer port)
+### ~~M4.B tier-level setTimeout-equivalent debounce~~ — RESOLVED 2026-05-14 (Layer-boundary slice, D171)
 
-- **What:** [crates/graphrefly-storage/src/tier.rs](../crates/graphrefly-storage/src/tier.rs) `BaseStorageTier::debounce_ms` surfaces the configured debounce window. **The tier itself does NOT drive a timer.** `save()` always buffers; `flush()` always commits; `compact_every` triggers immediate flush on Nth write (sync counter). `debounce_ms > 0` is currently a no-op at the tier level — buffered writes sit until something else (Graph wave-close, explicit `flush()`, `compact()` call, `compact_every` trigger) drains them.
-- **Status (Slice T update, 2026-05-11):** Timer substrate + temporal operators (including `interval`) landed in Slice T (2026-05-11). The `debounce_ms` lift point is now **unblocked** — `graphrefly-operators::temporal::debounce` and `interval` are available. `attach_snapshot_storage` still uses sync-through only (D171). Wiring `debounce_ms` into a reactive timer subgraph at attach time is now a straightforward follow-on.
-- **Why still deferred:** the wiring requires `from_timer` (graph-layer source) which builds on the `interval` operator but adds graph-level sugar. The tier-level API doesn't change — only the attach-time wiring. Low risk, medium effort (~50 LOC at the graph integration layer).
-- **Lift point:** wire `attach_snapshot_storage` to read each tier's `debounce_ms` and create a `debounce(observe_node, ms)` → `map(|_| tier.flush())` reactive subgraph. Alternatively, use `interval(ms)` as a periodic flush trigger (simpler but less responsive than debounce). Tier-level API doesn't change.
-- **Until then:** users who care about debounced flush must call `tier.flush()` explicitly. The `compact_every` knob is a partial substitute (write-count-based, not time-based).
-- **Source:** D144 / M4.B slice 2026-05-10; updated D171 / M4.E2 slice 2026-05-11; Slice T timer port 2026-05-11.
+- **What landed:** [`attach_snapshot_storage`](../crates/graphrefly-storage/src/graph_integration.rs) now respects each tier's `debounce_ms`. The observe sink writes via `tier.save()` (which buffers per the `BaseStorageTier` contract) but skips inline `tier.flush()` when `debounce_ms > 0`. Callers drain via new `StorageHandle::flush_all() -> Result<(), StorageError>`.
+- **Why this shape (Option B over the originally-deferred Option A "reactive subgraph"):** keeps `graphrefly-storage` sync + binding-agnostic per the canonical no-async-in-storage invariant. The reactive-timer wiring belongs in the layer that already owns the timer primitive (`graphrefly_operators::temporal::interval`, shipped in Slice T). Binding callers wire `interval(debounce_ms) → handle.flush_all()` themselves; the storage crate gains no new dependency on operators.
+- **API delta:** `StorageHandle::flush_all()` added (returns the first error encountered, if any; successful tiers still flush). The `debounce_ms > 0` warn-log in `attach_snapshot_storage` removed (no longer relevant). Test added: `attach_respects_snapshot_debounce_ms_buffering` in `tests/graph_integration.rs`.
+- **Decision provenance:** D171 was originally deferred in M4.E2 (2026-05-11). Lifted in Layer-boundary code-slice 2026-05-14 alongside the F24 + stratify + scenario-authoring bundle. The Option-A reactive-subgraph approach is documented but not adopted — Option B has lower coupling and the same user-visible behavior.
 
 ### M4.C `FileBackend` case-insensitive-filesystem key collision
 
@@ -2859,12 +2857,11 @@ Regression test landed at `packages/parity-tests/scenarios/core/release-callback
 - **Lift point:** When Graph-level composition patterns are needed (M2 follow-up or M5.B).
 - **Source:** D177 decision; TS-side shipped in Slice U-napi S3 (2026-05-12).
 
-### F24 — napi-rs structures binding: rust.ts adapter + parity tests
+### ~~F24 — napi-rs structures binding: rust.ts adapter + parity tests~~ — RESOLVED 2026-05-14 (Layer-boundary slice)
 
-- **What:** `structures_bindings.rs` ships 4 napi classes (`BenchReactiveLog`, `BenchReactiveList`, `BenchReactiveMap`, `BenchReactiveIndex`) with sync factories, TSFN-bridged packer callbacks, and all mutation methods. However, the `rust.ts` parity adapter (mapping napi classes → `Impl` interface methods) is not yet written, and parity test scenarios for structure operations don't exist yet.
-- **Why deferred:** The napi binding module compiles and is feature-gated behind `structures`. Activating parity tests requires: (1) rebuilding the native module with `--features structures`, (2) writing the `rust.ts` adapter that maps structure napi classes to the `Impl` interface, (3) writing parity test scenarios exercising CRUD + snapshot operations on each structure.
-- **Lift point:** Next napi rebuild batch (pre-M6), or when structures parity is gated for release.
-- **Source:** Slice U-napi S4 (2026-05-12).
+- **What landed:** `pnpm --filter @graphrefly/native build` produced the host `.node` binary with `--features full` (includes `structures`). The `rust.ts` adapter already had `buildRustStructures()` ready behind a `typeof n.BenchReactiveLog?.create === "function"` feature-detect; the rebuild made the classes available at runtime, so `hasStructures()` returns `true` on the rust arm and the existing 26 scenarios (`scenarios/structures/{reactive-log,reactive-list,reactive-map,reactive-index}.test.ts`) flipped from pure-ts-only to cross-impl.
+- **Test counts (post-rebuild):** 52 structures parity scenarios pass (26 × 2 arms). All other parity tests still pass: pure-ts 3011/3011; parity 315/316 + 1 skipped.
+- **Source:** Slice U-napi S4 (2026-05-12, original deferral); Layer-boundary code-slice (2026-05-14, resolution).
 
 ### F25 — HandleId Display impl added for ReactiveIndex K bound
 

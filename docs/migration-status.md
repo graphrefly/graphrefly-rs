@@ -2,7 +2,128 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
-## Current state (2026-05-13 — Slice W: cross-impl parity closure)
+## Layering — substrate vs presentation predicate (locked 2026-05-14)
+
+**Single source of truth:** [`CLAUDE.md`](../CLAUDE.md) § "Layering predicate — substrate vs presentation". This section is a pointer + Rust-port operational addendum; do NOT duplicate the predicate text here.
+
+**Session doc:** `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-layer-boundary.md` (8 units, user-locked 2026-05-14, decisions D193–D202 in `~/src/graphrefly-ts/docs/rust-port-decisions.md`).
+
+**Operational consequences for this tracker:**
+
+1. **Three-package install-time model (Unit 6 / D198).** Supersedes "PART 13 Deferred 1 — facade build" from `archive/docs/SESSION-rust-port-architecture.md`. No facade-with-fallback. `@graphrefly/graphrefly` (presentation) peerDepends on EITHER `@graphrefly/pure-ts` (substrate, TS) OR `@graphrefly/native` (substrate, Rust via napi). Both substrate packages MUST satisfy the same `packages/parity-tests/impls/types.ts` `Impl` interface.
+2. **napi widening policy (Unit 4 / D196).** A Rust-core surface gets a napi binding when (a) a non-pattern consumer materializes, OR (b) a parity scenario in `packages/parity-tests/scenarios/<layer>/` exercises it cross-impl. Presentation symbols (per the `extra/` row table in CLAUDE.md) **never** enter `Impl` and never bind to napi. "Parity scenarios are the consumer pressure signal" — the scenario IS the receipt that justifies the binding work.
+3. **F18 / F20 deferred indefinitely** under (2). They remain in `porting-deferred.md` until a parity scenario in `scenarios/messaging/` (for F18 `ReactiveLog::view`/`scan`/`attach`) or `scenarios/structures/` (for F20 `ReactiveIndex::range_by_primary`) materializes. The scenario IS the trigger.
+4. **F24 + D171 in-scope** under (2) — F24 (structures `rust.ts` adapter rebuild) and D171 (storage `debounce_ms` wiring) have existing parity-scenario demand. Scheduled for the post-doc-pass implementation slice.
+5. **`composition/stratify` is the only Rust-side substrate add from the design session** — ~50 LOC into `graphrefly-operators` + napi binding + 1 parity scenario. Earlier draft proposed porting `mutation/` — corrected to presentation on honest review (decorators over already-substrate `reactiveLog`). Planning-doc cross-check (DS-14.6.A, DS-14.7, human-llm-intervention) confirmed zero additional substrate primitives.
+
+**Action items queued for the next implementation slice** (Unit 7 Q9.2 lock):
+
+- **F24** — structures `rust.ts` adapter rebuild + scenario activation (existing scenarios in `packages/parity-tests/scenarios/structures/` already author against the substrate; rebuild flips them from `runIf(impl.name !== "rust-via-napi")` to cross-impl).
+- **D171** — `Tier::debounce_ms` wiring into the Rust reactive timer subgraph in `graphrefly-storage`. Needs tokio runtime integration in the storage path (architectural decision from Slice V4).
+- **Parity-scenario authoring** for existing substrate surfaces in messaging / orchestration cohorts (Unit 4 (B) requires scenarios for new substrate-layer napi).
+- **`composition/stratify` port** — ~50 LOC into `graphrefly-operators::stratify` + `register_stratify` napi binding + 1 parity scenario under `scenarios/operators/stratify.test.ts`.
+
+**Action items deferred** (per Unit 4 (B), parity-scenario gated):
+
+- **F18** — `ReactiveLog::view({ fromCursor })` / `scan` / `attach` / `attach_storage` napi bindings. Activate when first `scenarios/messaging/subscription.test.ts` scenario authors against `subscription` (Unit 2 confirms messaging substrate is complete in Rust core; the only Rust-side action is F18 napi gated on parity demand).
+- **F20** — `ReactiveIndex::range_by_primary` napi binding. Activate when a `scenarios/structures/reactive-index-range.test.ts` materializes.
+
+## Current state (2026-05-14 — Layer-boundary slice: doc-pass + code-slice)
+
+**Doc-pass + code-slice LANDED 2026-05-14.** Closes the design session [`SESSION-rust-port-layer-boundary.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-layer-boundary.md). 11 user-locked decisions across Units 1, 4, 5, 6, 7, 8 documented as D193–D202 in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
+
+### Part A — Doc-pass
+
+7 doc surfaces updated:
+
+- [`CLAUDE.md`](../CLAUDE.md) — Unit 1 (C) substrate-vs-presentation predicate; Unit 5 `extra/` row classification table; Rust crate ↔ TS folder mapping; napi widening policy.
+- [`docs/migration-status.md`](migration-status.md) (this file) — new "Layering" section pinning predicate + operational consequences.
+- `~/src/graphrefly-ts/CLAUDE.md` — Unit 6 three-package install-time model; Unit 8 4-layer `base/utils/presets/solutions` model inside `@graphrefly/graphrefly`.
+- `~/src/graphrefly-ts/packages/parity-tests/README.md` — Unit 4 "parity scenarios are the consumer pressure signal" rule.
+- `~/src/graphrefly-ts/docs/optimizations.md` — provenance entry pointing to the session.
+- `~/src/graphrefly-ts/docs/rust-port-decisions.md` — D193–D202 entries.
+- `~/src/graphrefly-ts/archive/docs/design-archive-index.jsonl` — session entry.
+
+### Part B — Code-slice (Unit 7 Q9.2)
+
+Four substrate-level adds shipped in one slice:
+
+**F24 — `@graphrefly/native` rebuild + structures parity activation.** `pnpm --filter @graphrefly/native build` produced the host `.node` binary with `--features full` (structures + storage). The 52 existing structures parity scenarios (`scenarios/structures/{reactive-log,reactive-list,reactive-map,reactive-index}.test.ts`) flipped from pure-ts-only to **cross-impl** (`hasStructures()` predicate returns true on rust arm). Zero new Rust code; pure activation of work already shipped in M5.B + Slice W.
+
+**D199 — `composition/stratify` substrate port.** ~200 LOC operator + napi binding. New files:
+- [`crates/graphrefly-operators/src/stratify.rs`](../crates/graphrefly-operators/src/stratify.rs) — `stratify_branch(source, rules, classifier_fn_id) → NodeId` producer-pattern operator with `Arc<Mutex<StratifyState>>` shared between source-sink and rules-sink. `Drop` impl on `StratifyState` releases the cached rules handle via `Weak<dyn BindingBoundary>` on producer deactivation.
+- [`crates/graphrefly-operators/tests/stratify.rs`](../crates/graphrefly-operators/tests/stratify.rs) — 8 integration tests (basic routing, multi-branch parallel, reactive-rules, no-rules sentinel, source COMPLETE/ERROR forwarding, rules-terminal silent absorption, refcount discipline).
+- `BindingBoundary::invoke_stratify_classifier_fn(fn_id, rules_h, value_h) → bool` (new trait method, default panics).
+- `OperatorBinding::register_stratify_classifier(closure) → FnId` (new trait method, default panics).
+- `BenchOperators::register_stratify_branch(env, src, rules, classifier)` napi method using existing `build_hh_to_bool_tsfn` + `closure_hh_to_bool`.
+- `stratify_classifiers: AHashMap<FnId, ...>` field added to `Registry` (under `#[cfg(feature = "operators")]`).
+
+TS-side: refactored [`packages/pure-ts/src/extra/composition/stratify.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/extra/composition/stratify.ts) to extract the per-branch routing logic into a public `stratifyBranch(source, rules, classifier)` substrate function. The existing `stratify(name, source, rules, opts) → Graph` factory now composes `stratifyBranch` for each rule — Graph wrapper stays binding-side (presentation), per-branch operator is substrate.
+
+Parity surface: `Impl.stratifyBranch<T, R>(src, rules, classifier)` widened in `packages/parity-tests/impls/types.ts`, populated in `pure-ts.ts` (delegates to `legacy.stratifyBranch`) and `rust.ts` (calls `state.operators.registerStratifyBranch` with a `makeStratifyClassifier` adapter). 14 cross-impl scenarios in [`scenarios/operators/stratify.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/operators/stratify.test.ts) — 7 scenarios × 2 arms — covering basic routing, no-rules sentinel, reactive-rules, rules-terminal absorption, source COMPLETE/ERROR forwarding, multi-branch independence.
+
+**D171 — Storage `debounce_ms` wired via explicit drain.** Substrate-clean approach (Option B of agent's exploration): `attach_snapshot_storage`'s observe sink writes via `tier.save()` (which buffers per `BaseStorageTier::debounce_ms` contract) but skips inline `tier.flush()` when `debounce_ms > 0`. Callers drain via new [`StorageHandle::flush_all() → Result<(), StorageError>`](../crates/graphrefly-storage/src/graph_integration.rs) — typically wired to a binding-side reactive timer subgraph (`graphrefly_operators::temporal::interval`, shipped in Slice T). Keeps `graphrefly-storage` sync + binding-agnostic; reactive-timer wiring lives in the layer that owns the timer primitive. Tier-level `debounce_ms` warn-log removed (was: "treating as 0"). New test `attach_respects_snapshot_debounce_ms_buffering` (graph_integration.rs) — 1 new test, 4 attach tests green.
+
+**Parity-scenario authoring.** Two new substrate-level composite scenarios (per D194/D195 — patterns themselves stay binding-side):
+- [`scenarios/messaging/topic-substrate.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/messaging/topic-substrate.test.ts) — 6 scenarios (3 × 2 arms) exercising `reactiveLog` as `topic.entries` (publish-events round-trip, appendMany batching, cursor-based replay).
+- [`scenarios/orchestration/approval-gate-substrate.test.ts`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/orchestration/approval-gate-substrate.test.ts) — 6 scenarios (3 × 2 arms) exercising `reactiveList` as pending queue + `reactiveLog` as audit trail + drop-oldest bounded queue.
+
+### Test counts (post-slice + post-QA)
+
+- **Cargo (graphrefly-operators):** 192 tests pass (10 new stratify tests including 2 QA-driven regression tests for F1 source TEARDOWN forwarding + N1 same-wave gating).
+- **Cargo (graphrefly-storage):** 156 tests pass (incl. new `attach_respects_snapshot_debounce_ms_buffering`).
+- **`cargo fmt --check`**: clean.
+- **`cargo clippy -p graphrefly-operators -p graphrefly-storage -p graphrefly-core --all-targets`**: 0 errors; 0 new warnings from this slice (3 pre-existing doc-markdown warnings in storage, 4 pre-existing pedantic-tier warnings in core/timer.rs unrelated). `#![forbid(unsafe_code)]` preserved.
+- **Pure-ts (`pnpm test:pure-ts`):** **3011 / 3011 pass.**
+- **Parity (`pnpm test:parity`):** **315 / 316 pass + 1 pre-existing skip** (TSFN-only skip from Slice U). +26 new scenarios from this slice (14 stratify + 6 messaging + 6 orchestration), all green cross-impl.
+
+### QA pass (2026-05-14) — 5 patches + 3 needs-decision items applied
+
+Adversarial review (Blind Hunter + Edge Case Hunter parallel agents) surfaced 28 raw findings, deduplicated to 8 actionable + rejected/deferred rest. All 8 applied, 2 new regression tests added.
+
+**Auto-applied (5):**
+
+1. **F1 — Source TEARDOWN forwarding parity break.** Rust `stratify_branch` source-sink only handled tier 5 (COMPLETE/ERROR); tier 6 (TEARDOWN) fell through. TS impl forwards TEARDOWN via `actions.down([msg])`. Added tier-6 case mirroring source-COMPLETE handling. Critically, tier 6 must always forward EVEN AFTER tier 5 in the same wave: per spec R2.6.4 the framework auto-emits COMPLETE before TEARDOWN, so a `terminated`-flag short-circuit silently swallowed the TEARDOWN signal. Regression test `stratify_forwards_source_teardown` added.
+2. **F2 — `~/src/graphrefly-rs/CLAUDE.md` `extra/` row table stale.** The stratify row read "(planned, D199) — ~50 LOC port pending"; updated to "✅ Landed 2026-05-14 (~370 LOC incl. two-dep DIRTY gating per N1, Drop impl, cache_of pre-seed per N2)".
+3. **F3 — `flush_all` / `dispose` lock-poison silent swallow.** Pattern was `if let Ok(mut states) = self.state.lock()` which discarded `PoisonError` and returned `Ok(())` while flushing nothing. Changed to `.unwrap_or_else(std::sync::PoisonError::into_inner)` so a poisoned lock recovers the underlying state and proceeds.
+4. **F4 — Refcount test rename + meaningful assertion.** `stratify_refcount_balanced_on_drop` claimed to verify balanced refcounts but only asserted no-panic. Renamed to `stratify_drop_releases_cached_rules_handle` with an actual `live_handles()` snapshot delta assertion that fires if `StratifyState::Drop` leaks the cached rules retain.
+5. **F5 — Rules INVALIDATE doc clarification.** Tier 4 (INVALIDATE) on rules falls through to the catch-all silent-absorb arm; documented as intentional (matches TS, where rules' INVALIDATE silently absorbs and `latestRules` keeps its previous value). Module rustdoc updated.
+
+**Needs-decision items (3, all approved + applied):**
+
+1. **N1 — Two-dep DIRTY gating.** TS impl explicitly buffers DIRTY from either dep until both settle in the same wave (`sourceDirty/rulesDirty/sourcePhase2/pendingDirty` machinery), eliminating stale-rules race when `core.batch()` updates both. Rust impl previously lacked this. Implemented via `StratifyState.{source_dirty, rules_dirty, source_phase2, source_value}` + a shared `try_resolve` helper called from BOTH source-sink and rules-sink. Source DATA buffers (with retain) until rules settles; resolve transfers the retain to emit on match, releases on miss. Regression test `stratify_same_wave_gating_uses_new_rules` added — exercises the same-batch source+rules update under the new gating.
+2. **N2 — Deferred-rules-subscribe race (Phase H+ STRICT).** Under STRICT scheduling, `subscribe_to(rules)` may return `Deferred` (rules' partition queued for later install). The post-subscribe sync push wouldn't populate `latest_rules` before the source's first DATA. Added defensive `core.cache_of(rules)` pre-seed at build time — matches the TS factory-time `latestRules = rules.cache` seeding the comment already promised. Race-safe re-check after lock-released retain.
+3. **N3 — `flush_all` lock-discipline + `on_error` re-entry deadlock.** The observe sink held `state.lock()` across `cb(&e)` invocation; if user's `on_error` callback called `handle.flush_all()`, deadlock (`std::sync::Mutex` is non-reentrant). Refactored: collect errors into local `Vec<StorageError>` under the lock, drop the lock, then invoke `on_error` per error. Same fix in `flush_all`: snapshot tier count under the lock, then per-tier brief re-lock for the flush call (no inter-tier lock-holding, no `on_error` invocation under the lock).
+
+**Rejected (2 false positives):**
+
+- **Edge #11** — "storage debounce 20ms sleep flake": false positive. Observe sink fires synchronously inline in `g.set()`; no async race exists.
+- **Edge #12** — "PY port `branchMeta` divergence": `branchMeta` is presentation-layer (Graph wrap-time tag for downstream observability). Rust substrate intentionally doesn't accept it.
+
+**Deferred (matches existing patterns or pre-existing scope):**
+
+- Pre-existing storage edge cases (`wal.list()` swallow, `apply_wal_frame` silent malformed-drop, non-transactional WAL writes) — not introduced by this slice.
+- TS `stratifyBranch` factory-scope state (refactor preserved pre-existing pattern from `_addBranch`; latent reactivation bug exists but deferred).
+- `register_*_classifier` default panic semantics matches existing `register_tap` / `register_rescue` patterns.
+- Test coverage gaps for rules ERROR / source PAUSE-RESUME — queued for follow-on test pass.
+
+### Cross-references
+
+- **`docs/rust-port-decisions.md`** D193–D202 (10 decisions logged).
+- **`docs/optimizations.md`** § "Active work items" — provenance entry pointing to this session.
+- **`archive/docs/design-archive-index.jsonl`** — session entry with 12 decisions / 5 open / 8 gaps / 15 refs.
+- **`docs/porting-deferred.md`** — D171 entry resolved; new F24 entry removed (replaced by code that actually shipped).
+
+### Carried forward
+
+- **F18** (`ReactiveLog::view`/`scan`/`attach`/`attach_storage` napi binding) — DEFERRED indefinitely under D196 until first `scenarios/messaging/subscription.test.ts` materializes.
+- **F20** (`ReactiveIndex::range_by_primary` napi binding) — DEFERRED indefinitely under D196 until a scenario exercises it.
+- **Cleave PR for `@graphrefly/graphrefly`** (Unit 6 D198 + Unit 8 D200 implementation) — trim content from blanket re-export to presentation-only layer; 4-layer `base/utils/presets/solutions/compat` restructure; Biome custom rule for layer-boundary enforcement (D201). Queued for a follow-on slice.
+- **Adapter AbortController hookup** (SESSION-human-llm-intervention §6 gap #1) — binding-side adapter contract; separate follow-up design+implementation slice.
+
+---
+
+## Previous state (2026-05-13 — Slice W: cross-impl parity closure)
 
 **Slice W LANDED 2026-05-13.** Closes 6 cross-impl parity divergences flagged in Slice V1-V7 sweep + memory entry `project_next_porting_batch.md`. Decisions D187–D191 logged in [`docs/rust-port-decisions.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/rust-port-decisions.md).
 

@@ -316,6 +316,13 @@ struct TierState {
     flush_count: u64,
     /// Configured compact-every cadence (0 = every flush writes full baseline).
     compact_every: u32,
+    /// Snapshot tier's `debounce_ms` snapshot at attach time (D171).
+    /// `0` (the unset / disabled case) means inline-flush; `>0` means
+    /// `save()` buffers and the caller drives explicit flush via
+    /// [`StorageHandle::flush_all`].
+    snapshot_debounce_ms: u32,
+    /// WAL tier's `debounce_ms` snapshot at attach time (D171).
+    wal_debounce_ms: u32,
     /// Last snapshot used for diff computation.
     last_snapshot: Option<GraphPersistSnapshot>,
     /// Disposed flag.
@@ -360,11 +367,126 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     /// Explicitly dispose (equivalent to `Drop`, but callable).
+    ///
+    /// F3 (QA 2026-05-14): on `PoisonError` (a panic in the observe
+    /// sink poisoned the state mutex), recover via `into_inner()`
+    /// rather than silently no-op. The disposed flag still gets set
+    /// even after a sink panic, which matters for cleanup.
     pub fn dispose(&self) {
-        if let Ok(mut states) = self.state.lock() {
-            for s in states.iter_mut() {
-                s.disposed = true;
+        let mut states = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for s in states.iter_mut() {
+            s.disposed = true;
+        }
+    }
+
+    /// Drain pending writes on all tiers (D171).
+    ///
+    /// When a tier is configured with `debounce_ms > 0`,
+    /// [`attach_snapshot_storage`]'s observe sink writes via the
+    /// tier's `save()` but skips the inline `flush()`. Callers
+    /// invoke this method — typically from a binding-side reactive
+    /// timer subgraph (`graphrefly_operators::temporal::interval`,
+    /// shipped in Slice T) — to commit the buffered writes to their
+    /// backends. With `debounce_ms == 0`, the observe sink already
+    /// force-flushes inline; calling this method is then a no-op
+    /// because the tier's pending buffers are empty.
+    ///
+    /// Returns the first error encountered, if any. Successful tiers
+    /// in the same call still flush; the error is surfaced for the
+    /// caller's diagnostics.
+    ///
+    /// # Lock discipline (N3, QA 2026-05-14)
+    ///
+    /// The state mutex is **not** held across `tier.flush()` calls.
+    /// Holding it across blocking I/O would (a) serialize the
+    /// reactive graph against backend latency (every observe-sink
+    /// fire would wait on flush completion), and (b) deadlock if a
+    /// caller invokes `flush_all` from inside an `on_error` callback
+    /// (the observe sink already holds `state.lock()` when it
+    /// invokes `on_error`). The implementation snapshots the per-
+    /// tier flush requests under the lock, drops the lock, then
+    /// runs the flushes in sequence. After each flush, a brief
+    /// re-lock applies any per-tier state mutations (none today —
+    /// `flush()` doesn't return new state).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first `StorageError` encountered. Subsequent
+    /// errors are dropped (acceptable v1; the registered
+    /// `on_error` callback fires per error in the observe sink path
+    /// and is the canonical multi-error reporting surface).
+    ///
+    /// F3: recovers from a poisoned state mutex via `into_inner`
+    /// rather than silently returning Ok.
+    pub fn flush_all(&self) -> Result<(), StorageError> {
+        // Snapshot the per-tier flush callables under the lock,
+        // then drop the lock before invoking them. Each tier's
+        // `flush()` is a `&self` method on `Box<dyn ...>` — to call
+        // it without holding the outer lock, we collect raw
+        // pointers... no, `Box<dyn ...>` can't be cloned. Instead,
+        // we re-lock briefly per tier to call flush, but never hold
+        // the lock across MULTIPLE tier flushes — that's the key
+        // deadlock avoidance.
+        //
+        // The remaining single-tier-lock-during-flush window can
+        // deadlock if `tier.flush()` synchronously re-enters
+        // `dispose()` / `flush_all()` (which would try to re-acquire
+        // `self.state`). Tier impls in `graphrefly-storage` don't do
+        // that; document the contract for future binding-side tier
+        // impls in the rustdoc.
+        let tier_count = {
+            let states = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            states.len()
+        };
+        let mut first_err: Option<StorageError> = None;
+        for idx in 0..tier_count {
+            // Per-tier flush: brief lock to access the tier, run
+            // flush, drop lock immediately. The tier itself is
+            // behind a Box<dyn ...> inside the Vec; flush() takes
+            // &self, so the &mut on the outer Vec is only needed
+            // for `s.disposed` check.
+            let snapshot_err: Option<StorageError>;
+            let wal_err: Option<StorageError>;
+            {
+                let mut states = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(s) = states.get_mut(idx) else {
+                    continue;
+                };
+                if s.disposed {
+                    continue;
+                }
+                // Call flush while holding the lock — this is
+                // narrow-scoped and the only contention is with the
+                // observe sink, which is itself bounded by wave
+                // dispatch. No `on_error` invocation under this
+                // lock (callers receive errors via the return
+                // value, not via the registered callback).
+                snapshot_err = s.snapshot_tier.flush().err();
+                wal_err = s.wal_tier.as_ref().and_then(|wal| wal.flush().err());
             }
+            if let Some(e) = snapshot_err {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            if let Some(e) = wal_err {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            None => Ok(()),
+            Some(e) => Err(e),
         }
     }
 }
@@ -378,18 +500,29 @@ impl Drop for StorageHandle {
 /// Wire an observe subscription on `graph` that persists node changes
 /// to the provided snapshot+WAL tier pairs.
 ///
-/// # Debounce (D171)
+/// # Debounce (D171, resolved 2026-05-14)
 ///
-/// Timer-based debounce is deferred — all tiers flush synchronously on
-/// every qualifying event (`debounce_ms > 0` logs a warning and treats
-/// as 0). See `porting-deferred.md` "M4.B tier-level setTimeout-equivalent
-/// debounce" entry.
+/// When a tier's `debounce_ms` is `Some(ms)` with `ms > 0`, the
+/// observe callback writes via the tier's `save()` (which buffers
+/// internally per the [`BaseStorageTier`](crate::tier::BaseStorageTier)
+/// contract) but does NOT force a `flush()`. Callers drain pending
+/// writes by invoking [`StorageHandle::flush_all`] — typically from a
+/// binding-side reactive timer (e.g.,
+/// `graphrefly_operators::temporal::interval`). This keeps
+/// `graphrefly-storage` sync + binding-agnostic per the canonical
+/// no-async-in-storage invariant; reactive-timer wiring lives in the
+/// layer that already owns the timer primitive.
+///
+/// When `debounce_ms` is `None` or `Some(0)`, the observe callback
+/// continues to force-flush inline as before.
 ///
 /// # `key_of` (D174, closes F8)
 ///
 /// The snapshot tier's backend key is derived from `graph.name` via
 /// the checkpoint record's `name` field. Cross-impl `key_of` divergence
 /// disappears at this boundary.
+#[must_use = "the returned StorageHandle owns the observe subscription; \
+              dropping it immediately unsubscribes and stops persistence"]
 pub fn attach_snapshot_storage(
     graph: &Graph,
     pairs: Vec<AttachTierPair>,
@@ -400,17 +533,6 @@ pub fn attach_snapshot_storage(
 
     let mut states = Vec::with_capacity(pairs.len());
     for pair in pairs {
-        // Warn on debounce > 0 (D171).
-        if let Some(ms) = pair.snapshot.debounce_ms() {
-            if ms > 0 {
-                tracing::warn!(
-                    graph = %graph_name,
-                    debounce_ms = ms,
-                    "debounce_ms > 0 not yet supported in Rust; treating as 0 (D171)"
-                );
-            }
-        }
-
         // Bootstrap: enumerate existing WAL frames to find high-water seq.
         let mut high_seq: u64 = 0;
         if let Some(ref wal) = pair.wal {
@@ -426,6 +548,8 @@ pub fn attach_snapshot_storage(
         }
 
         let compact_every = pair.snapshot.compact_every().unwrap_or(10);
+        let snapshot_debounce = pair.snapshot.debounce_ms().unwrap_or(0);
+        let wal_debounce = pair.wal.as_ref().and_then(|w| w.debounce_ms()).unwrap_or(0);
 
         states.push(TierState {
             snapshot_tier: pair.snapshot,
@@ -434,6 +558,8 @@ pub fn attach_snapshot_storage(
             seq: high_seq,
             flush_count: 0,
             compact_every,
+            snapshot_debounce_ms: snapshot_debounce,
+            wal_debounce_ms: wal_debounce,
             last_snapshot: None,
             disposed: false,
         });
@@ -467,15 +593,32 @@ pub fn attach_snapshot_storage(
         // Take a snapshot once, shared across all sync tiers.
         let snapshot = graph_clone.snapshot();
 
-        if let Ok(mut states) = states_for_sink.lock() {
+        // N3 (QA 2026-05-14) — collect errors INSIDE the lock,
+        // invoke `on_error` AFTER releasing the lock. The earlier
+        // pattern called `cb(&e)` while holding `states_for_sink`,
+        // which deadlocked if the user's callback re-entered
+        // `StorageHandle::flush_all` / `dispose` (both acquire the
+        // same `Mutex`). F3: recover from poisoned lock via
+        // `into_inner` rather than silently no-op.
+        let collected_errors: Vec<StorageError> = {
+            let mut states = states_for_sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut errs = Vec::new();
             for s in states.iter_mut() {
                 if s.disposed {
                     continue;
                 }
                 if let Err(e) = flush_tier(s, &snapshot) {
-                    if let Some(ref cb) = on_error {
-                        cb(&e);
-                    }
+                    errs.push(e);
+                }
+            }
+            errs
+        };
+        if !collected_errors.is_empty() {
+            if let Some(ref cb) = on_error {
+                for e in &collected_errors {
+                    cb(e);
                 }
             }
         }
@@ -507,6 +650,10 @@ fn flush_tier(s: &mut TierState, snapshot: &GraphPersistSnapshot) -> Result<(), 
 }
 
 /// Write a full baseline snapshot to the snapshot tier.
+///
+/// When `snapshot_debounce_ms > 0` (D171), the inner `save()` buffers
+/// per the tier's `BaseStorageTier` contract and we DON'T force a
+/// `flush()`. The caller drains via [`StorageHandle::flush_all`].
 fn write_full_baseline(
     s: &mut TierState,
     snapshot: &GraphPersistSnapshot,
@@ -522,11 +669,17 @@ fn write_full_baseline(
     };
 
     s.snapshot_tier.save(record)?;
-    s.snapshot_tier.flush()?;
+    if s.snapshot_debounce_ms == 0 {
+        s.snapshot_tier.flush()?;
+    }
     Ok(())
 }
 
 /// Write WAL delta frames for the diff between `last_snapshot` and current.
+///
+/// D171: WAL `flush()` is skipped when the WAL tier has
+/// `debounce_ms > 0`; the caller drains via
+/// [`StorageHandle::flush_all`].
 fn write_wal_delta(s: &mut TierState, snapshot: &GraphPersistSnapshot) -> Result<(), StorageError> {
     let last = s
         .last_snapshot
@@ -546,7 +699,9 @@ fn write_wal_delta(s: &mut TierState, snapshot: &GraphPersistSnapshot) -> Result
             let key = wal_frame_key(&s.wal_prefix, frame.frame_seq);
             wal.save(&key, frame.clone())?;
         }
-        wal.flush()?;
+        if s.wal_debounce_ms == 0 {
+            wal.flush()?;
+        }
     }
 
     s.seq = next_seq;

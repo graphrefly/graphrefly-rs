@@ -63,6 +63,7 @@ pub mod higher_order;
 pub mod ops_impl;
 pub mod producer;
 pub mod source;
+pub mod stratify;
 pub mod temporal;
 pub mod transform;
 
@@ -84,6 +85,7 @@ pub use producer::{
     ProducerStorage, SubscribeOutcome,
 };
 pub use source::{empty, from_iter, never, of, throw_error};
+pub use stratify::stratify_branch;
 pub use temporal::{
     audit, buffer_time, debounce, delay, interval, sample, throttle, timeout, window_time,
 };

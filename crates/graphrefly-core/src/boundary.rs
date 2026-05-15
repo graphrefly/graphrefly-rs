@@ -579,6 +579,29 @@ pub trait BindingBoundary: Send + Sync {
         unimplemented!("invoke_rescue_fn: this binding does not support control operators")
     }
 
+    /// Stratify classifier — invoke a user predicate with BOTH the
+    /// latest rules handle AND the current value handle. Returns
+    /// `true` if the value belongs to this branch.
+    ///
+    /// Called by `graphrefly_operators::stratify_branch` on each
+    /// source DATA. The binding-side closure (registered via
+    /// `OperatorBinding::register_stratify_classifier`) typically
+    /// dereferences both handles, looks up its branch's rule by name
+    /// inside the rules array, and runs the rule's `classify(value)`.
+    /// Returning `false` for "rule not found" or "classifier threw"
+    /// matches TS stratify semantics.
+    ///
+    /// Default panics — bindings that ship the stratify operator MUST
+    /// override.
+    fn invoke_stratify_classifier_fn(
+        &self,
+        _fn_id: FnId,
+        _rules_handle: HandleId,
+        _value_handle: HandleId,
+    ) -> bool {
+        unimplemented!("invoke_stratify_classifier_fn: this binding does not support the stratify operator (D199)")
+    }
+
     /// Wipe the binding-side ctx state for `node_id`.
     ///
     /// Called by Core ONLY on resubscribable terminal reset, per **R2.4.6**:

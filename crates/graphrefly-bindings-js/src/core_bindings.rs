@@ -189,6 +189,11 @@ pub(crate) struct Registry {
         FnId,
         Arc<dyn Fn(HandleId) -> std::result::Result<HandleId, ()> + Send + Sync>,
     >,
+    /// Stratify classifier closures (D199). Closure shape:
+    /// `Fn(rules_handle, value_handle) -> bool`.
+    #[cfg(feature = "operators")]
+    pub(crate) stratify_classifiers:
+        ahash::AHashMap<FnId, Arc<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>>,
 }
 
 impl Registry {
@@ -218,6 +223,8 @@ impl Registry {
             tap_complete_fns: ahash::AHashMap::new(),
             #[cfg(feature = "operators")]
             rescue_fns: ahash::AHashMap::new(),
+            #[cfg(feature = "operators")]
+            stratify_classifiers: ahash::AHashMap::new(),
         }
     }
 
@@ -654,6 +661,26 @@ impl BindingBoundary for BenchBinding {
         f(handle)
     }
 
+    /// Stratify classifier: call the registered closure with the
+    /// latest rules handle + current value handle. Returns `true` if
+    /// the value belongs to the closure's branch (D199).
+    #[cfg(feature = "operators")]
+    fn invoke_stratify_classifier_fn(
+        &self,
+        fn_id: FnId,
+        rules_handle: HandleId,
+        value_handle: HandleId,
+    ) -> bool {
+        let f = {
+            let reg = self.registry.lock();
+            reg.stratify_classifiers
+                .get(&fn_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("unknown stratify classifier fn_id {fn_id:?}"))
+        };
+        f(rules_handle, value_handle)
+    }
+
     /// Window operators: map a NodeId to a HandleId. Allocates a fresh
     /// handle whose value is the raw NodeId as i32. JS adapter retrieves
     /// it via `deref_int(handle)` to get the inner window's NodeId.
@@ -675,15 +702,15 @@ impl BindingBoundary for BenchBinding {
     fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
         let reg = self.registry.lock();
         match reg.deref(handle) {
-            Some(BenchValue::Int(n)) => Some(serde_json::Value::Number(
-                serde_json::Number::from(n),
-            )),
+            Some(BenchValue::Int(n)) => {
+                Some(serde_json::Value::Number(serde_json::Number::from(n)))
+            }
             Some(BenchValue::Str(s)) => Some(serde_json::Value::String(s)),
             Some(BenchValue::JsAllocated) => {
                 // Use raw handle ID as a stable identity for diff detection.
-                Some(serde_json::Value::Number(
-                    serde_json::Number::from(handle.raw()),
-                ))
+                Some(serde_json::Value::Number(serde_json::Number::from(
+                    handle.raw(),
+                )))
             }
             None => None,
         }

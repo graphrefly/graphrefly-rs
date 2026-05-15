@@ -359,6 +359,63 @@ fn attach_wal_delta_after_baseline() {
     assert!(!wal_keys.is_empty(), "WAL frames should exist after delta");
 }
 
+/// D171: when the snapshot tier is configured with `debounce_ms > 0`,
+/// `attach_snapshot_storage`'s observe sink writes via `save()` (which
+/// buffers internally) but does NOT call `flush()`. The caller drains
+/// buffered writes via `StorageHandle::flush_all()`.
+#[test]
+fn attach_respects_snapshot_debounce_ms_buffering() {
+    let (g, b) = make_graph("debounce-test");
+    let h1 = b.intern(Value::from(10));
+    g.state("counter", Some(h1)).unwrap();
+
+    let backend = memory_backend();
+    let snap_tier = snapshot_storage::<_, GraphCheckpointRecord, _>(
+        backend.clone(),
+        SnapshotStorageOptions {
+            name: Some("debounce-test".to_owned()),
+            debounce_ms: Some(1000),
+            ..Default::default()
+        },
+    );
+    let snap_box: Box<dyn SnapshotStorageTier<GraphCheckpointRecord>> = Box::new(snap_tier);
+
+    let handle = attach_snapshot_storage(
+        &g,
+        vec![AttachTierPair {
+            snapshot: snap_box,
+            wal: None,
+        }],
+        AttachOptions::default(),
+    );
+
+    // Emit a value — observe fires and tier.save() buffers. tier.flush()
+    // is suppressed under debounce_ms > 0, so the backend stays empty.
+    let h2 = b.intern(Value::from(20));
+    g.set("counter", h2);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let stored = backend.read("debounce-test").unwrap();
+    assert!(
+        stored.is_none() || stored.as_ref().is_some_and(std::vec::Vec::is_empty),
+        "with debounce_ms > 0, observe-driven save() must NOT force-flush; \
+         backend should be empty until flush_all() is called (got {stored:?})",
+    );
+
+    // Drain via StorageHandle::flush_all() — backend now has the buffered snapshot.
+    handle
+        .flush_all()
+        .expect("flush_all should commit pending writes");
+
+    let stored = backend.read("debounce-test").unwrap();
+    assert!(
+        stored.is_some(),
+        "after flush_all, the buffered snapshot must be written"
+    );
+    let record: GraphCheckpointRecord = serde_json::from_slice(&stored.unwrap()).unwrap();
+    assert_eq!(record.name, "debounce-test");
+}
+
 #[test]
 fn attach_dispose_stops_persistence() {
     let (g, b) = make_graph("dispose");

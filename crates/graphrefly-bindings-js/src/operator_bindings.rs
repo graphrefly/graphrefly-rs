@@ -48,7 +48,7 @@ use graphrefly_operators::{
     higher_order::{self, HigherOrderBinding, ProjectFn},
     ops_impl,
     producer::{ProducerBinding, ProducerBuildFn, ProducerStorage},
-    source, temporal, transform,
+    source, stratify, temporal, transform,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -115,6 +115,17 @@ impl OperatorBinding for BenchBinding {
         let fn_id = FnId::new(reg.next_fn_id);
         reg.next_fn_id += 1;
         reg.packers.insert(fn_id, Arc::from(f));
+        fn_id
+    }
+
+    fn register_stratify_classifier(
+        &self,
+        f: Box<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>,
+    ) -> FnId {
+        let mut reg = self.registry.lock();
+        let fn_id = FnId::new(reg.next_fn_id);
+        reg.next_fn_id += 1;
+        reg.stratify_classifiers.insert(fn_id, Arc::from(f));
         fn_id
     }
 }
@@ -1304,6 +1315,48 @@ impl BenchOperators {
             u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
         })
         .await?
+    }
+
+    // -----------------------------------------------------------------
+    // Stratify (D199 — Unit 5 Q9.2 of SESSION-rust-port-layer-boundary)
+    // -----------------------------------------------------------------
+
+    /// `stratify_branch(src, rules, classifier)` — single classifier-
+    /// routing branch. JS classifier callback:
+    /// `(rules_handle: u32, value_handle: u32) => boolean`. The TS
+    /// `stratify(name, source, rules, opts) -> Graph` factory composes
+    /// N instances of this one per rule.
+    #[napi]
+    pub fn register_stratify_branch<'env>(
+        &self,
+        env: &'env Env,
+        src: u32,
+        rules_node: u32,
+        classifier: Function<FnArgs<(u32, u32)>, bool>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_hh_to_bool_tsfn(classifier)?;
+        let classifier_closure = closure_hh_to_bool(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let core = self.core.clone();
+        let src_id = NodeId::new(u64::from(src));
+        let rules_id = NodeId::new(u64::from(rules_node));
+        env.spawn_future(async move {
+            run_blocking(core.clone(), move || -> Result<u32> {
+                let op_binding: Arc<dyn OperatorBinding> =
+                    Arc::clone(&binding) as Arc<dyn OperatorBinding>;
+                let classifier_fn_id = op_binding.register_stratify_classifier(classifier_closure);
+                let producer_binding: Arc<dyn ProducerBinding> = binding;
+                let node = stratify::stratify_branch(
+                    &core,
+                    &producer_binding,
+                    src_id,
+                    rules_id,
+                    classifier_fn_id,
+                );
+                u32::try_from(node.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
+        })
     }
 }
 

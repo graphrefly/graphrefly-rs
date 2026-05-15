@@ -86,6 +86,7 @@ type TapBox = Box<dyn Fn(HandleId) + Send + Sync>;
 type TapErrorBox = Box<dyn Fn(HandleId) + Send + Sync>;
 type TapCompleteBox = Box<dyn Fn() + Send + Sync>;
 type RescueBox = Box<dyn Fn(HandleId) -> Result<HandleId, ()> + Send + Sync>;
+type StratifyClassifierBox = Box<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>;
 
 type ProjectorFn = Arc<dyn Fn(HandleId) -> HandleId + Send + Sync>;
 type PredicateFn = Arc<dyn Fn(HandleId) -> bool + Send + Sync>;
@@ -97,6 +98,7 @@ type TapFn = Arc<dyn Fn(HandleId) + Send + Sync>;
 type TapErrorFn = Arc<dyn Fn(HandleId) + Send + Sync>;
 type TapCompleteFn = Arc<dyn Fn() + Send + Sync>;
 type RescueFn = Arc<dyn Fn(HandleId) -> Result<HandleId, ()> + Send + Sync>;
+type StratifyClassifierFn = Arc<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>;
 
 type ProducerBuildArc = Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
 
@@ -132,6 +134,7 @@ struct RegistryState {
     tap_errors: HashMap<FnId, TapErrorFn>,
     tap_completes: HashMap<FnId, TapCompleteFn>,
     rescues: HashMap<FnId, RescueFn>,
+    stratify_classifiers: HashMap<FnId, StratifyClassifierFn>,
     /// Producer build closures, keyed by FnId allocated at register
     /// time. Looked up by `invoke_fn` when a producer node fires.
     producer_builds: HashMap<FnId, ProducerBuildArc>,
@@ -157,6 +160,7 @@ impl InnerBinding {
                 tap_errors: HashMap::new(),
                 tap_completes: HashMap::new(),
                 rescues: HashMap::new(),
+                stratify_classifiers: HashMap::new(),
                 producer_builds: HashMap::new(),
                 next_fn_id: 1,
             }),
@@ -255,6 +259,13 @@ impl InnerBinding {
         let mut s = self.state.lock();
         let id = self.alloc_fn_id(&mut s);
         s.rescues.insert(id, Arc::from(f));
+        id
+    }
+
+    pub fn register_stratify_classifier(&self, f: StratifyClassifierBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.stratify_classifiers.insert(id, Arc::from(f));
         id
     }
 }
@@ -442,6 +453,23 @@ impl BindingBoundary for InnerBinding {
         f(handle)
     }
 
+    fn invoke_stratify_classifier_fn(
+        &self,
+        fn_id: FnId,
+        rules_handle: HandleId,
+        value_handle: HandleId,
+    ) -> bool {
+        let f: StratifyClassifierFn = self
+            .state
+            .lock()
+            .stratify_classifiers
+            .get(&fn_id)
+            .cloned()
+            .expect("stratify classifier not registered");
+        // Lock dropped — closure may re-enter the binding to deref handles.
+        f(rules_handle, value_handle)
+    }
+
     fn intern_node(&self, node_id: NodeId) -> HandleId {
         // Intern the NodeId as a TestValue::Int(raw_id) for simplicity.
         let raw = node_id.raw();
@@ -508,6 +536,13 @@ impl OperatorBinding for InnerBinding {
         let mut s = self.state.lock();
         let id = self.alloc_fn_id(&mut s);
         s.packers.insert(id, Arc::from(f));
+        id
+    }
+
+    fn register_stratify_classifier(&self, f: StratifyClassifierBox) -> FnId {
+        let mut s = self.state.lock();
+        let id = self.alloc_fn_id(&mut s);
+        s.stratify_classifiers.insert(id, Arc::from(f));
         id
     }
 }

@@ -446,6 +446,14 @@ export declare class BenchOperators {
   registerNever(): Promise<number>
   /** `throw_error(error_handle)` — emit ERROR immediately. */
   registerThrowError(errorHandle: number): Promise<number>
+  /**
+   * `stratify_branch(src, rules, classifier)` — single classifier-
+   * routing branch. JS classifier callback:
+   * `(rules_handle: u32, value_handle: u32) => boolean`. The TS
+   * `stratify(name, source, rules, opts) -> Graph` factory composes
+   * N instances of this one per rule.
+   */
+  registerStratifyBranch(src: number, rulesNode: number, classifier: (arg0: number, arg1: number) => boolean): Promise<number>
 }
 
 export declare class BenchReactiveIndex {

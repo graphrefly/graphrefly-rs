@@ -109,4 +109,19 @@ pub trait OperatorBinding: BindingBoundary {
     ) -> FnId {
         unimplemented!("register_rescue: this binding does not support control operators")
     }
+
+    /// Register a stratify classifier: `Fn(rules: HandleId, value:
+    /// HandleId) -> bool`. Used by
+    /// [`super::stratify::stratify_branch`] (D199). The binding-side
+    /// closure typically captures the branch name and looks up the
+    /// matching rule inside the rules array before running the rule's
+    /// `classify(value)` predicate. The binding invokes the stored
+    /// closure from
+    /// [`BindingBoundary::invoke_stratify_classifier_fn`](graphrefly_core::BindingBoundary::invoke_stratify_classifier_fn).
+    fn register_stratify_classifier(
+        &self,
+        _f: Box<dyn Fn(HandleId, HandleId) -> bool + Send + Sync>,
+    ) -> FnId {
+        unimplemented!("register_stratify_classifier: this binding does not support the stratify operator (D199)")
+    }
 }
