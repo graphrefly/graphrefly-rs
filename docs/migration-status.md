@@ -23,10 +23,19 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 - **Parity-scenario authoring** for existing substrate surfaces in messaging / orchestration cohorts (Unit 4 (B) requires scenarios for new substrate-layer napi).
 - **`composition/stratify` port** — ~50 LOC into `graphrefly-operators::stratify` + `register_stratify` napi binding + 1 parity scenario under `scenarios/operators/stratify.test.ts`.
 
-**Action items deferred** (per Unit 4 (B), parity-scenario gated):
+### NEXT BATCH — Ship `@graphrefly/native` (milestone-driven; D203, user-locked 2026-05-15)
 
-- **F18** — `ReactiveLog::view({ fromCursor })` / `scan` / `attach` / `attach_storage` napi bindings. Activate when first `scenarios/messaging/subscription.test.ts` scenario authors against `subscription` (Unit 2 confirms messaging substrate is complete in Rust core; the only Rust-side action is F18 napi gated on parity demand).
-- **F20** — `ReactiveIndex::range_by_primary` napi binding. Activate when a `scenarios/structures/reactive-index-range.test.ts` materializes.
+**D196's consumer-pressure / parity-scenario gate is EXEMPTED for the native-publish milestone (D203).** Rationale: D196 structurally guarantees `@graphrefly/native` never reaches parity — the gate's trigger is "a parity scenario needs the binding," but nobody authors those scenarios because native doesn't ship, because the bindings aren't built (chicken-and-egg). Shipping native is now an explicit user goal (a downstream repo wants the native package and is being forced onto `@graphrefly/pure-ts`). The next `/porting-to-rs` batch is the native-ship slice, scheduled regardless of consumer-pressure demand:
+
+1. **napi binding parity for newer public methods** — `pause` / `resume` / `invalidate` / `complete` / `error` / `teardown` / `add_meta_companion` / `set_resubscribable` (flagged "small follow-up, not blocking M1 close" but never built).
+2. **F18** — `ReactiveLog::view({ fromCursor })` / `scan` / `attach` / `attach_storage` napi bindings. Rust core logic complete (Unit 2); only the napi binding is unbuilt. Author `scenarios/messaging/subscription.test.ts` AS PART OF this slice (the scenario is now an output of the slice, not a precondition for it).
+3. **F20** — `ReactiveIndex::range_by_primary` napi binding + `scenarios/structures/reactive-index-range.test.ts` authored in-slice.
+4. **TS wrapper layer** — the `@graphrefly/native` public surface that re-exposes the full `packages/parity-tests/impls/types.ts` `Impl` API on top of the `Bench*` napi classes. Includes the binding-layer TS shims that are NOT Rust (async-trio `fromPromise`/`fromAsyncIter`/`fromAny`, `fromTimer` surfacing, etc.) — thin TS over the napi core, ~1 file per binding-layer symbol.
+5. **CI publish matrix** — `napi build --platform --release` for all 5 configured targets (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`), per-platform `npm/<target>/` sub-packages, `napi prepublish`, GitHub Actions release workflow.
+6. **Flip publishability** — `crates/graphrefly-bindings-js/package.json`: drop `"private": true`, bump `"version"` from `0.0.0` to a real release, wire into the workspace publish flow.
+7. **Full `rustImpl` parity arm green** — `packages/parity-tests/impls/rust.ts` populated against the published surface; flip remaining `runIf(impl.name !== "rust-via-napi")` scenarios to cross-impl; CI gate added.
+
+M6 (Python / pyo3) remains separate and post-1.0.
 
 ## Current state (2026-05-14 — Layer-boundary slice: doc-pass + code-slice)
 

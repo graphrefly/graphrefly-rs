@@ -153,7 +153,9 @@ A Rust-core surface gets a napi binding when EITHER:
 
 Presentation symbols (per the table above) **never** enter `Impl` (`packages/parity-tests/impls/types.ts`) and never bind to napi. Substrate symbols not yet exercised by a parity scenario STAY deferred — recorded in `docs/porting-deferred.md`. "Parity scenarios are the consumer pressure signal" — the scenario is itself the receipt that justifies the binding work.
 
-Source: `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-layer-boundary.md` Unit 4 (Q9.1 = B, user-locked 2026-05-14).
+**EXEMPTION — native-publish milestone (D203, user-locked 2026-05-15).** D196 governs *incremental* one-off widening; it is carved out for the bounded `@graphrefly/native` publish milestone. That milestone (napi parity for newer methods, F18, F20, the TS wrapper layer, the publish matrix, full `rustImpl` parity arm) is scheduled as the **next `/porting-to-rs` batch regardless of consumer-pressure demand** — the gating parity scenarios are authored *as outputs of* the slice, not preconditions. See `docs/migration-status.md` § "NEXT BATCH — Ship `@graphrefly/native`". Rationale: D196's trigger is unreachable for the native-publish milestone (no scenario → no binding → no publish → no consumer → no scenario); the exemption breaks the self-perpetuating deferral while keeping D196 intact for everything outside the milestone.
+
+Source: `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-layer-boundary.md` Unit 4 (Q9.1 = B, user-locked 2026-05-14); D203 exemption user-locked 2026-05-15.
 
 ## Rust-specific invariants
 
