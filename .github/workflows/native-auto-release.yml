@@ -1,0 +1,161 @@
+# @graphrefly/native — Conventional-Commit auto-release (Option B, D206).
+#
+# Closes the DX gap: you don't hand-craft `native-v*` tags. On merge to
+# main, this inspects the Conventional-Commit subjects of the commits
+# just landed that touched `crates/graphrefly-bindings-js/`, bumps the
+# version, commits it, and pushes the `native-v<next>` tag — which fires
+# `native-npm-publish.yml` (the napi cross-compile matrix + OIDC publish).
+#
+# WHY a tag-push and not `changeset publish` / release-plz: neither can
+# cross-compile Rust to 5 platforms or assemble the napi per-platform
+# sub-packages (see native-npm-publish.yml header). This workflow only
+# does the *versioning + trigger*; the matrix workflow does the publish.
+#
+# BUMP RULES (0.x preview phase — single editable `case` below):
+#   - breaking (`<type>!:` subject, or `BREAKING CHANGE:` in body) → MINOR  (0.0.1 → 0.1.0)
+#   - feat                                                          → PATCH  (0.0.1 → 0.0.2)
+#   - fix | perf | refactor | revert                                → PATCH
+#   - only chore/docs/test/ci/build/style (or no bindings commits)  → NO RELEASE (no-op)
+#   Post-1.0 you'll likely want feat→MINOR; change the `case` then.
+#
+# PREREQUISITES (one-time):
+#   - The same GitHub App graphrefly-ts/release.yml uses, installed on
+#     graphrefly-rs with Contents: write. Org var/secret:
+#       var:    GRAPHREFLY_WRITE_CONTENT_APP_ID
+#       secret: GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY
+#     The App token is REQUIRED: a tag pushed with the default
+#     GITHUB_TOKEN does NOT trigger native-npm-publish.yml (GitHub
+#     suppresses workflow runs from GITHUB_TOKEN-pushed refs). Same
+#     reason graphrefly-ts/release.yml uses an App token.
+#   - If `main` is branch-protected, allow this App to push to it
+#     (it pushes the one-line version-bump commit + the tag).
+#
+# LOOP SAFETY: the bump commit (`chore(native-release): …`) is pushed to
+# main, which re-triggers this workflow — the job `if:` short-circuits
+# on that commit-message prefix. The tag push triggers
+# native-npm-publish.yml (tags-only; no such guard there) — correct.
+
+name: native-auto-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/graphrefly-bindings-js/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-auto-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: version + tag
+    # Break the loop: skip our own version-bump commit.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(native-release):') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_ID }}
+          private-key: ${{ secrets.GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Configure Git committer (GitHub App)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          user_id=$(gh api "users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)
+          git config user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
+          git config user.email "${user_id}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install deps (napi cli for `napi version`)
+        working-directory: crates/graphrefly-bindings-js
+        run: pnpm install --frozen-lockfile
+
+      - name: Decide bump from Conventional Commits
+        id: bump
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Range = exactly what this push to main landed. Fall back to
+          # the parent commit if `before` is unusable (branch create /
+          # all-zeros / force-push).
+          range_base="$BEFORE"
+          if [ -z "$range_base" ] || [ "$range_base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$range_base^{commit}" 2>/dev/null; then
+            range_base="${SHA}~1"
+          fi
+          mapfile -t hashes < <(git log "${range_base}..${SHA}" --no-merges --format=%H -- crates/graphrefly-bindings-js/ || true)
+          if [ "${#hashes[@]}" -eq 0 ]; then
+            echo "No bindings commits in this push — no release."
+            echo "level=none" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          level="none"
+          for h in "${hashes[@]}"; do
+            subj="$(git show -s --format=%s "$h")"
+            body="$(git show -s --format=%b "$h")"
+            # breaking: `type!:` / `type(scope)!:`, or `BREAKING CHANGE` in body
+            if printf '%s' "$subj" | grep -Eq '^[a-z]+(\([^)]*\))?!:' \
+               || printf '%s' "$body" | grep -q 'BREAKING CHANGE'; then
+              level="minor"; break
+            fi
+            if printf '%s' "$subj" | grep -Eq '^(feat|fix|perf|refactor|revert)(\([^)]*\))?:'; then
+              [ "$level" = "none" ] && level="patch"
+            fi
+          done
+          echo "Resolved bump level: $level"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version, commit, tag, push
+        if: ${{ steps.bump.outputs.level != 'none' }}
+        working-directory: crates/graphrefly-bindings-js
+        env:
+          LEVEL: ${{ steps.bump.outputs.level }}
+        run: |
+          set -euo pipefail
+          cur="$(node -p "require('./package.json').version")"
+          IFS=. read -r MA MI PA <<< "$cur"
+          case "$LEVEL" in
+            minor) MI=$((MI+1)); PA=0 ;;
+            patch) PA=$((PA+1)) ;;
+            *) echo "unexpected level '$LEVEL'"; exit 1 ;;
+          esac
+          next="${MA}.${MI}.${PA}"
+          echo "::notice::@graphrefly/native ${cur} → ${next} (${LEVEL})"
+          if npm view "@graphrefly/native@${next}" version >/dev/null 2>&1; then
+            echo "::error::@graphrefly/native@${next} already on npm (immutable). Aborting."; exit 1
+          fi
+          npm pkg set "version=${next}"
+          # Sync the per-platform sub-package versions + the umbrella's
+          # optionalDependencies pins to the new version.
+          pnpm exec napi version
+          cd "$GITHUB_WORKSPACE"
+          git add crates/graphrefly-bindings-js/package.json
+          git commit -m "chore(native-release): v${next}"
+          git tag "native-v${next}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "native-v${next}"
+          echo "::notice::Pushed native-v${next} → native-npm-publish.yml will build + publish via OIDC."

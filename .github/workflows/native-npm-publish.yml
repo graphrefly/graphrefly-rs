@@ -15,8 +15,10 @@
 # GitHub OIDC token and auto-attaches provenance.
 #
 # TRIGGER: push a tag matching `native-v*` (e.g. `native-v0.0.1`).
-# Tag creation is a deliberate human action — this workflow never runs
-# on a normal push to main.
+# Normally the tag is created automatically by native-auto-release.yml
+# from Conventional Commits on merge to main (Option B, D206); a human
+# may also push a `native-v*` tag manually. This workflow never runs on
+# a normal push to main — only on the tag.
 #
 # ONE-TIME BOOTSTRAP (chicken-and-egg): OIDC trusted publishing requires
 # each package to ALREADY EXIST on npm with a trusted publisher
