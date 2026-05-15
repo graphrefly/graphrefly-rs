@@ -144,9 +144,13 @@ pub(crate) enum BenchValue {
 
 /// User-side emission shape for the FnResult::Batch builtin fn registry.
 #[derive(Clone, Debug)]
-enum BenchEmission {
+pub(crate) enum BenchEmission {
     Data(BenchValue),
     Complete,
+    // Error channel of the emission ADT (mirrors `FnEmission::Error`).
+    // Matched in the registry dispatch; not yet produced by any bench
+    // scenario builtin.
+    #[allow(dead_code)]
     Error(BenchValue),
 }
 
@@ -268,12 +272,6 @@ impl Registry {
         self.values.get(&h).cloned()
     }
 
-    /// True if `h` is a known handle (has a value mapping). Used by
-    /// TSFN closures (C2 / H-01 fix — phantom registry entries on
-    /// unknown JS-returned HandleIds).
-    pub(crate) fn contains(&self, h: HandleId) -> bool {
-        self.values.contains_key(&h)
-    }
 
     /// Validate `h` exists, then bump its refcount. Returns false if
     /// `h` is unknown — caller should panic with a JS-bug diagnostic.
@@ -787,10 +785,10 @@ fn encode_message(m: Message) -> (u32, u32) {
 /// callback returns nothing (`()` → undefined). `MaxQueueSize = 1`
 /// per D077 sync-bridge invariant. `CalleeHandled = false` (Slice Y) —
 /// JS receives `(value)` directly, matching the typed
-/// `Function<Vec<u32>, ()>` signature.
+/// `Function<'_, Vec<u32>, ()>` signature.
 type SinkTsfn = ThreadsafeFunction<Vec<u32>, (), Vec<u32>, Status, false, false, 1>;
 
-fn build_sink_tsfn(callback: Function<Vec<u32>, ()>) -> Result<Arc<SinkTsfn>> {
+fn build_sink_tsfn(callback: Function<'_, Vec<u32>, ()>) -> Result<Arc<SinkTsfn>> {
     let tsfn = callback
         .build_threadsafe_function::<Vec<u32>>()
         .max_queue_size::<1>()
@@ -1151,14 +1149,14 @@ impl BenchCore {
     /// a sync_channel until JS responds via libuv pump). JS code
     /// MUST `await` this method — synchronous calling deadlocks.
     ///
-    /// `pub fn` (not `async fn`) because `Function<>` is `!Send`; the
+    /// `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
     /// async work runs inside `env.spawn_future(async move { ... })`.
     #[napi]
     pub fn subscribe_with_tsfn<'env>(
         &self,
         env: &'env Env,
         node_id: u32,
-        sink_callback: Function<Vec<u32>, ()>,
+        sink_callback: Function<'_, Vec<u32>, ()>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_sink_tsfn(sink_callback)?;
         let sink = build_tsfn_sink(tsfn);

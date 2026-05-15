@@ -188,7 +188,7 @@ impl HigherOrderBinding for BenchBinding {
 ///
 /// **`CalleeHandled = false`** (Slice Y, 2026-05-08): napi-rs 3.x with
 /// `callee_handled::<true>()` makes JS receive `(err, value)` Node-style
-/// — even though the typed `Function<u32, u32>` declares the logical
+/// — even though the typed `Function<'_, u32, u32>` declares the logical
 /// signature as `(u32) -> u32`. With `false`, JS receives `(value)`
 /// directly, matching the typed signature and `makeProjector`-style
 /// adapter shapes (which take `(h: number) => ...`). JS-throw delivery
@@ -253,13 +253,13 @@ where
 // `BenchOperators` napi class
 //
 // **`async fn` vs `pub fn` shape (H-13 doc note):** napi methods that
-// take a `Function<Args, Return>` parameter are `pub fn ...
+// take a `Function<'_, Args, Return>` parameter are `pub fn ...
 // -> Result<PromiseRaw<'_, u32>>` and use `env.spawn_future(async move
-// { ... })` to return a Promise. Reason: `Function<Args, Return>` is
+// { ... })` to return a Promise. Reason: `Function<'_, Args, Return>` is
 // `!Send` (lifetime tied to env), so an `async fn` whose parameter
 // list includes one produces a `!Send` future, which napi-rs's
 // auto-Promise-wrap rejects (it requires `Future: Send`). Methods
-// without `Function<>` (e.g., `register_take` taking just a
+// without `Function<'_, >` (e.g., `register_take` taking just a
 // `count: u32`) stay as `async fn`. From JS, both shapes return
 // Promises and are equivalent under `await`.
 // =====================================================================
@@ -296,7 +296,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        project: Function<u32, u32>,
+        project: Function<'_, u32, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
         let projector_closure = closure_h_to_h(tsfn, Arc::downgrade(&self.binding));
@@ -320,7 +320,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        predicate: Function<u32, bool>,
+        predicate: Function<'_, u32, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_bool_tsfn(predicate)?;
         let predicate_closure = closure_h_to_bool(tsfn);
@@ -345,7 +345,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         seed: u32,
-        folder: Function<FnArgs<(u32, u32)>, u32>,
+        folder: Function<'_, FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(folder)?;
         let folder_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
@@ -372,7 +372,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         seed: u32,
-        folder: Function<FnArgs<(u32, u32)>, u32>,
+        folder: Function<'_, FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(folder)?;
         let folder_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
@@ -416,7 +416,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        equals: Function<FnArgs<(u32, u32)>, bool>,
+        equals: Function<'_, FnArgs<(u32, u32)>, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_bool_tsfn(equals)?;
         let equals_closure = closure_hh_to_bool(tsfn);
@@ -441,7 +441,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        packer: Function<FnArgs<(u32, u32)>, u32>,
+        packer: Function<'_, FnArgs<(u32, u32)>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_h_tsfn(packer)?;
         let packer_closure = closure_hh_to_h(tsfn, Arc::downgrade(&self.binding));
@@ -469,7 +469,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         srcs: Vec<u32>,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -501,7 +501,7 @@ impl BenchOperators {
         env: &'env Env,
         primary: u32,
         secondary: u32,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -576,7 +576,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        predicate: Function<u32, bool>,
+        predicate: Function<'_, u32, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_bool_tsfn(predicate)?;
         let predicate_closure = closure_h_to_bool(tsfn);
@@ -640,7 +640,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        predicate: Function<u32, bool>,
+        predicate: Function<'_, u32, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_bool_tsfn(predicate)?;
         let predicate_closure = closure_h_to_bool(tsfn);
@@ -679,7 +679,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         srcs: Vec<u32>,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -763,7 +763,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         outer: u32,
-        project: Function<u32, u32>,
+        project: Function<'_, u32, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
         let project_closure = closure_h_to_nodeid(tsfn);
@@ -786,7 +786,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         outer: u32,
-        project: Function<u32, u32>,
+        project: Function<'_, u32, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
         let project_closure = closure_h_to_nodeid(tsfn);
@@ -809,7 +809,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         outer: u32,
-        project: Function<u32, u32>,
+        project: Function<'_, u32, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
         let project_closure = closure_h_to_nodeid(tsfn);
@@ -833,7 +833,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         outer: u32,
-        project: Function<u32, u32>,
+        project: Function<'_, u32, u32>,
         concurrency: Option<u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_h_tsfn(project)?;
@@ -867,7 +867,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        callback: Function<u32, ()>,
+        callback: Function<'_, u32, ()>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_unit_tsfn(callback)?;
         let tap_closure = closure_h_to_unit(tsfn);
@@ -897,8 +897,8 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        data_callback: Option<Function<u32, ()>>,
-        error_callback: Option<Function<u32, ()>>,
+        data_callback: Option<Function<'_, u32, ()>>,
+        error_callback: Option<Function<'_, u32, ()>>,
         complete_callback: Option<Function<'env, (), ()>>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let data_tsfn = data_callback.map(build_h_to_unit_tsfn).transpose()?;
@@ -954,7 +954,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        callback: Function<u32, ()>,
+        callback: Function<'_, u32, ()>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_unit_tsfn(callback)?;
         let tap_closure = closure_h_to_unit(tsfn);
@@ -985,7 +985,7 @@ impl BenchOperators {
         &self,
         env: &'env Env,
         src: u32,
-        callback: Function<u32, i32>,
+        callback: Function<'_, u32, i32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_i32_tsfn(callback)?;
         let rescue_closure = closure_rescue(tsfn, Arc::downgrade(&self.binding));
@@ -1017,7 +1017,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         control_node: u32,
-        gate: Function<u32, bool>,
+        gate: Function<'_, u32, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_h_to_bool_tsfn(gate)?;
         let predicate_closure = closure_h_to_bool(tsfn);
@@ -1091,7 +1091,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         notifier: u32,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -1120,7 +1120,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         count: u32,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -1204,7 +1204,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         ms: u32,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_to_h_tsfn(packer)?;
         let packer_closure = closure_packer(tsfn, Arc::downgrade(&self.binding));
@@ -1332,7 +1332,7 @@ impl BenchOperators {
         env: &'env Env,
         src: u32,
         rules_node: u32,
-        classifier: Function<FnArgs<(u32, u32)>, bool>,
+        classifier: Function<'_, FnArgs<(u32, u32)>, bool>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_hh_to_bool_tsfn(classifier)?;
         let classifier_closure = closure_hh_to_bool(tsfn);
@@ -1363,14 +1363,14 @@ impl BenchOperators {
 // =====================================================================
 // TSFN builder helpers (napi 3.x builder pattern)
 //
-// Each `build_*_tsfn` consumes a `Function<Args, Return>` and returns
+// Each `build_*_tsfn` consumes a `Function<'_, Args, Return>` and returns
 // an `Arc<Tsfn<T, R>>` with `max_queue_size = 1`, `callee_handled =
 // true`. The `build_callback` closure converts the input T to the
 // JsValuesTuple that JS sees (identity for u32 / Vec<u32>; tuple-pack
 // for FnArgs<(u32, u32)>).
 // =====================================================================
 
-fn build_h_to_h_tsfn(callback: Function<u32, u32>) -> Result<Arc<Tsfn<u32, u32>>> {
+fn build_h_to_h_tsfn(callback: Function<'_, u32, u32>) -> Result<Arc<Tsfn<u32, u32>>> {
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()
@@ -1379,7 +1379,7 @@ fn build_h_to_h_tsfn(callback: Function<u32, u32>) -> Result<Arc<Tsfn<u32, u32>>
     Ok(Arc::new(tsfn))
 }
 
-fn build_h_to_bool_tsfn(callback: Function<u32, bool>) -> Result<Arc<Tsfn<u32, bool>>> {
+fn build_h_to_bool_tsfn(callback: Function<'_, u32, bool>) -> Result<Arc<Tsfn<u32, bool>>> {
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()
@@ -1389,7 +1389,7 @@ fn build_h_to_bool_tsfn(callback: Function<u32, bool>) -> Result<Arc<Tsfn<u32, b
 }
 
 fn build_hh_to_h_tsfn(
-    callback: Function<FnArgs<(u32, u32)>, u32>,
+    callback: Function<'_, FnArgs<(u32, u32)>, u32>,
 ) -> Result<Arc<Tsfn<FnArgs<(u32, u32)>, u32>>> {
     let tsfn = callback
         .build_threadsafe_function::<FnArgs<(u32, u32)>>()
@@ -1400,7 +1400,7 @@ fn build_hh_to_h_tsfn(
 }
 
 fn build_hh_to_bool_tsfn(
-    callback: Function<FnArgs<(u32, u32)>, bool>,
+    callback: Function<'_, FnArgs<(u32, u32)>, bool>,
 ) -> Result<Arc<Tsfn<FnArgs<(u32, u32)>, bool>>> {
     let tsfn = callback
         .build_threadsafe_function::<FnArgs<(u32, u32)>>()
@@ -1410,7 +1410,7 @@ fn build_hh_to_bool_tsfn(
     Ok(Arc::new(tsfn))
 }
 
-fn build_vec_to_h_tsfn(callback: Function<Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec<u32>, u32>>> {
+fn build_vec_to_h_tsfn(callback: Function<'_, Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec<u32>, u32>>> {
     let tsfn = callback
         .build_threadsafe_function::<Vec<u32>>()
         .max_queue_size::<1>()
@@ -1421,7 +1421,7 @@ fn build_vec_to_h_tsfn(callback: Function<Vec<u32>, u32>) -> Result<Arc<Tsfn<Vec
 
 // Slice U napi parity — tap/rescue callback shapes.
 
-fn build_h_to_unit_tsfn(callback: Function<u32, ()>) -> Result<Arc<Tsfn<u32, ()>>> {
+fn build_h_to_unit_tsfn(callback: Function<'_, u32, ()>) -> Result<Arc<Tsfn<u32, ()>>> {
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()
@@ -1430,7 +1430,7 @@ fn build_h_to_unit_tsfn(callback: Function<u32, ()>) -> Result<Arc<Tsfn<u32, ()>
     Ok(Arc::new(tsfn))
 }
 
-fn build_unit_to_unit_tsfn(callback: Function<(), ()>) -> Result<Arc<Tsfn<(), ()>>> {
+fn build_unit_to_unit_tsfn(callback: Function<'_, (), ()>) -> Result<Arc<Tsfn<(), ()>>> {
     let tsfn = callback
         .build_threadsafe_function::<()>()
         .max_queue_size::<1>()
@@ -1439,7 +1439,7 @@ fn build_unit_to_unit_tsfn(callback: Function<(), ()>) -> Result<Arc<Tsfn<(), ()
     Ok(Arc::new(tsfn))
 }
 
-fn build_h_to_i32_tsfn(callback: Function<u32, i32>) -> Result<Arc<Tsfn<u32, i32>>> {
+fn build_h_to_i32_tsfn(callback: Function<'_, u32, i32>) -> Result<Arc<Tsfn<u32, i32>>> {
     let tsfn = callback
         .build_threadsafe_function::<u32>()
         .max_queue_size::<1>()

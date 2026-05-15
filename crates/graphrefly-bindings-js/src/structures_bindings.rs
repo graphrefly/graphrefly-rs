@@ -38,7 +38,7 @@ use crate::core_bindings::{run_blocking, BenchBinding, BenchCore};
 type Tsfn<T, R> = ThreadsafeFunction<T, R, T, Status, false, false, 1>;
 type PackTsfn = Arc<Tsfn<Vec<u32>, u32>>;
 
-fn build_pack_tsfn(callback: Function<Vec<u32>, u32>) -> Result<PackTsfn> {
+fn build_pack_tsfn(callback: Function<'_, Vec<u32>, u32>) -> Result<PackTsfn> {
     let tsfn = callback
         .build_threadsafe_function::<Vec<u32>>()
         .max_queue_size::<1>()
@@ -192,7 +192,7 @@ impl BenchReactiveLog {
     #[napi(factory)]
     pub fn create(
         core: &BenchCore,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
         max_size: Option<u32>,
     ) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
@@ -303,7 +303,7 @@ impl BenchReactiveLog {
     pub fn view_tail<'env>(
         &self,
         env: &'env Env,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
         n: u32,
     ) -> Result<PromiseRaw<'env, BenchLogView>> {
         let tsfn = build_pack_tsfn(packer)?;
@@ -316,7 +316,7 @@ impl BenchReactiveLog {
     pub fn view_slice<'env>(
         &self,
         env: &'env Env,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
         start: u32,
         stop: Option<u32>,
     ) -> Result<PromiseRaw<'env, BenchLogView>> {
@@ -339,9 +339,9 @@ impl BenchReactiveLog {
     pub fn view_from_cursor<'env>(
         &self,
         env: &'env Env,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
         cursor_node_id: u32,
-        read_cursor: Function<Vec<u32>, u32>,
+        read_cursor: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, BenchLogView>> {
         let tsfn = build_pack_tsfn(packer)?;
         let cursor_tsfn = build_pack_tsfn(read_cursor)?;
@@ -386,7 +386,7 @@ impl BenchReactiveLog {
         &self,
         env: &'env Env,
         seed: u32,
-        folder: Function<Vec<u32>, u32>,
+        folder: Function<'_, Vec<u32>, u32>,
     ) -> Result<PromiseRaw<'env, BenchScanHandle>> {
         let folder_tsfn = build_pack_tsfn(folder)?;
         let step = Arc::new(move |acc: &HandleId, value: &HandleId| -> HandleId {
@@ -496,7 +496,7 @@ pub struct BenchReactiveList {
 #[napi]
 impl BenchReactiveList {
     #[napi(factory)]
-    pub fn create(core: &BenchCore, packer: Function<Vec<u32>, u32>) -> Result<Self> {
+    pub fn create(core: &BenchCore, packer: Function<'_, Vec<u32>, u32>) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
         let c = core.core_clone();
         let binding_weak = Arc::downgrade(&core.binding_arc());
@@ -613,7 +613,7 @@ impl BenchReactiveMap {
     #[napi(factory)]
     pub fn create(
         core: &BenchCore,
-        packer: Function<Vec<u32>, u32>,
+        packer: Function<'_, Vec<u32>, u32>,
         max_size: Option<u32>,
         default_ttl: Option<f64>,
     ) -> Result<Self> {
@@ -718,7 +718,7 @@ pub struct BenchReactiveIndex {
 #[napi]
 impl BenchReactiveIndex {
     #[napi(factory)]
-    pub fn create(core: &BenchCore, packer: Function<Vec<u32>, u32>) -> Result<Self> {
+    pub fn create(core: &BenchCore, packer: Function<'_, Vec<u32>, u32>) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
         let c = core.core_clone();
         let binding_weak = Arc::downgrade(&core.binding_arc());

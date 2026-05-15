@@ -348,7 +348,7 @@ mod tests {
         let _sub = core.subscribe(
             node,
             Arc::new(move |msgs| {
-                for m in msgs.iter() {
+                for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);
                     }
@@ -419,7 +419,7 @@ mod tests {
         let _sub = core.subscribe(
             node,
             Arc::new(move |msgs| {
-                for m in msgs.iter() {
+                for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);
                     }
@@ -479,7 +479,7 @@ mod tests {
         task.sender()
             .send(TimerCmd::Schedule {
                 tag: 0,
-                delay: Duration::from_millis(1000),
+                delay: Duration::from_secs(1),
                 handle: h1,
             })
             .unwrap();
@@ -509,7 +509,7 @@ mod tests {
         let _sub = core.subscribe(
             node,
             Arc::new(move |msgs| {
-                for m in msgs.iter() {
+                for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);
                     }

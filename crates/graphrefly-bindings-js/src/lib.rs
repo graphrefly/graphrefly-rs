@@ -29,6 +29,7 @@
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
 #[cfg(feature = "tracing")]
+#[allow(unreachable_pub)] // napi-rs #[napi] items are pub for JS, not Rust-visible.
 mod core_bindings;
 
 #[cfg(feature = "operators")]

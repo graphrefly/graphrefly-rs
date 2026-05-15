@@ -107,16 +107,6 @@ impl BenchGraph {
         }
     }
 
-    /// Construct a child BenchGraph wrapping an existing Graph (used
-    /// by `mount_new` to expose mounted children to JS).
-    pub(crate) fn from_graph(parent: &BenchGraph, child: Graph) -> Self {
-        Self {
-            graph: child,
-            binding: Arc::clone(&parent.binding),
-            core: parent.core.clone(),
-        }
-    }
-
     // -------------------------------------------------------------------
     // Namespace introspection (sync — no Core wave).
     // -------------------------------------------------------------------
@@ -494,7 +484,7 @@ impl BenchGraph {
     // `g.observe(path?, { reactive: true })`. Sink delivery uses TSFN
     // (NonBlocking — push-on-change, no bridge_sync needed). All TSFNs
     // use `callee_handled::<false>()` per Slice Y convention so JS
-    // callbacks match the typed `Function<T, R>` declaration.
+    // callbacks match the typed `Function<'_, T, R>` declaration.
     // -------------------------------------------------------------------
 
     /// Subscribe to live topology snapshots (canonical R3.6.1
@@ -512,7 +502,7 @@ impl BenchGraph {
     pub fn describe_reactive<'env>(
         &self,
         env: &'env Env,
-        sink: Function<String, ()>,
+        sink: Function<'_, String, ()>,
     ) -> Result<PromiseRaw<'env, BenchDescribeReactiveHandle>> {
         let tsfn = build_describe_tsfn(sink)?;
         let graph = self.graph.clone();
@@ -553,14 +543,14 @@ impl BenchGraph {
     pub fn observe_all_reactive<'env>(
         &self,
         env: &'env Env,
-        sink: Function<FnArgs<(String, Vec<u32>)>, ()>,
+        sink: Function<'_, FnArgs<(String, Vec<u32>)>, ()>,
     ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
         let tsfn = build_observe_all_tsfn(sink)?;
         let graph = self.graph.clone();
         let core = self.core.clone();
         env.spawn_future(async move {
             let core_for_blocking = core.clone();
-            let mut handle = run_blocking(core_for_blocking, move || -> GraphObserveAllReactive {
+            let handle = run_blocking(core_for_blocking, move || -> GraphObserveAllReactive {
                 let mut handle = graph.observe_all_reactive();
                 handle.subscribe(move |name: &str, msgs: &[Message]| {
                     let payload = encode_messages(msgs);
@@ -594,7 +584,7 @@ impl BenchGraph {
         &self,
         env: &'env Env,
         path: Option<String>,
-        sink: Function<FnArgs<(String, Vec<u32>)>, ()>,
+        sink: Function<'_, FnArgs<(String, Vec<u32>)>, ()>,
     ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
         // Sink-style "observe()" — when no path given, fan-out across
         // all named nodes at call time (snapshot semantics, no
@@ -705,6 +695,10 @@ const _: fn() = || {
 // uniformly.
 // ---------------------------------------------------------------------------
 
+// Variants are never read — they are RAII guards held purely for their
+// `Drop` side-effect (keeps the underlying observe subscription alive
+// until `dispose()` / `Drop` ships the inner drop to tokio).
+#[allow(dead_code)]
 enum ObserveReactiveInner {
     OneSub(Subscription),
     AllSubs(graphrefly_graph::GraphObserveAll),
@@ -757,7 +751,7 @@ const _: fn() = || {
 //
 // Both use `callee_handled::<false>()` per the Slice Y convention —
 // JS callbacks receive `(value)` directly (no err-first wire shape),
-// matching the typed `Function<T, R>` declaration.
+// matching the typed `Function<'_, T, R>` declaration.
 // ---------------------------------------------------------------------------
 
 // Slice X3 /qa C: `MaxQueueSize=8` for reactive sinks. Operator TSFNs
@@ -778,7 +772,7 @@ type ObserveAllTsfn = ThreadsafeFunction<
     8,
 >;
 
-fn build_describe_tsfn(callback: Function<String, ()>) -> Result<Arc<DescribeTsfn>> {
+fn build_describe_tsfn(callback: Function<'_, String, ()>) -> Result<Arc<DescribeTsfn>> {
     let tsfn = callback
         .build_threadsafe_function::<String>()
         .max_queue_size::<8>()
@@ -788,7 +782,7 @@ fn build_describe_tsfn(callback: Function<String, ()>) -> Result<Arc<DescribeTsf
 }
 
 fn build_observe_all_tsfn(
-    callback: Function<FnArgs<(String, Vec<u32>)>, ()>,
+    callback: Function<'_, FnArgs<(String, Vec<u32>)>, ()>,
 ) -> Result<Arc<ObserveAllTsfn>> {
     let tsfn = callback
         .build_threadsafe_function::<FnArgs<(String, Vec<u32>)>>()
