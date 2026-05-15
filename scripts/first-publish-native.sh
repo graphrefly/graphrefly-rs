@@ -179,8 +179,24 @@ for d in npm/*/; do
 done
 
 # ── Publish ────────────────────────────────────────────────────────────────
-PUB=(npm publish --access public)
+# --ignore-scripts: the umbrella's npm publish must NOT run an
+# `napi prepublish` lifecycle hook (it would non-interactively
+# re-publish the sub-packages and 2FA-block with EOTP). prepublishOnly
+# was removed from package.json; --ignore-scripts is belt-and-braces.
+PUB=(npm publish --access public --ignore-scripts)
 [[ -n "$DRY_RUN" ]] && PUB+=(--dry-run)
+
+# Resumable: npm versions are immutable, so a re-run after a partial
+# publish must SKIP any package already on npm at this version rather
+# than hard-fail. (dry-run still exercises the publish path.)
+publish_pkg() {
+  local name="$1"
+  if [[ -z "$DRY_RUN" ]] && npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+    echo "  -> ${name}@${VERSION} already on npm — skipping"
+    return 0
+  fi
+  "${PUB[@]}"
+}
 
 echo ""
 echo "===> Publishing 5 per-platform sub-packages ..."
@@ -188,12 +204,12 @@ for d in npm/*/; do
   [[ -f "$d/package.json" ]] || continue
   name="$(node -p "require('./$d/package.json').name")"
   echo "  -> $name@$VERSION"
-  ( cd "$d" && "${PUB[@]}" )
+  ( cd "$d" && publish_pkg "$name" )
 done
 
 echo ""
 echo "===> Publishing umbrella @graphrefly/native@$VERSION ..."
-"${PUB[@]}"
+publish_pkg "@graphrefly/native"
 
 # ── Done ───────────────────────────────────────────────────────────────────
 echo ""

@@ -148,4 +148,9 @@ jobs:
         # couldn't create one anyway. `-t npm` = --tag-style npm.
         run: pnpm exec napi prepublish -t npm
       - name: Publish umbrella @graphrefly/native (OIDC)
-        run: npm publish --access public --provenance
+        # --ignore-scripts: the per-platform sub-packages are published
+        # by the explicit `napi prepublish` step above; the umbrella
+        # publish must not re-trigger napi prepublish (package.json no
+        # longer has a prepublishOnly hook — this is belt-and-braces so
+        # a future hook can't cause a double-publish recursion).
+        run: npm publish --access public --provenance --ignore-scripts
