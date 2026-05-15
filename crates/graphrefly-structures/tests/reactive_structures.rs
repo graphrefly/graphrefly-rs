@@ -509,6 +509,38 @@ fn index_clear() {
     assert_eq!(index.to_ordered().len(), 0);
 }
 
+// D205: range_by_primary — [start, end) inclusive-start/exclusive-end,
+// ascending primary order, independent of the secondary sort axis.
+#[test]
+fn index_range_by_primary_d205() {
+    let rt = StructuresRuntime::new();
+    let index: ReactiveIndex<i64, i64> = ReactiveIndex::new(
+        &rt.core,
+        rt.intern_index_fn(),
+        ReactiveIndexOptions::default(),
+    );
+
+    // Insert out of primary order; the secondary string is the structure's
+    // sort axis, but range_by_primary must order by PRIMARY ascending.
+    index.upsert(30, "z".into(), 300);
+    index.upsert(10, "a".into(), 100);
+    index.upsert(20, "m".into(), 200);
+    index.upsert(40, "b".into(), 400);
+
+    // [10, 40): inclusive start, exclusive end → 10,20,30 ascending.
+    assert_eq!(index.range_by_primary(&10, &40), vec![100, 200, 300]);
+    // Exclusive upper bound excludes 40; single match.
+    assert_eq!(index.range_by_primary(&20, &30), vec![200]);
+    // start == end → empty.
+    assert_eq!(index.range_by_primary(&20, &20), Vec::<i64>::new());
+    // start > end → empty.
+    assert_eq!(index.range_by_primary(&40, &10), Vec::<i64>::new());
+    // Gap with no matches → empty.
+    assert_eq!(index.range_by_primary(&11, &19), Vec::<i64>::new());
+    // Wide span covers everything, still ascending by primary.
+    assert_eq!(index.range_by_primary(&0, &1000), vec![100, 200, 300, 400]);
+}
+
 #[test]
 fn index_upsert_many() {
     let rt = StructuresRuntime::new();

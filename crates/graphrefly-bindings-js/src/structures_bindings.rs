@@ -24,11 +24,11 @@ use napi::threadsafe_function::{
 use napi_derive::napi;
 
 use graphrefly_core::handle::HandleId;
-use graphrefly_core::Core;
+use graphrefly_core::{Core, NodeId, Subscription};
 
 use graphrefly_structures::{
-    InternFn, ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions, ReactiveLog,
-    ReactiveLogOptions, ReactiveMap, ReactiveMapOptions,
+    InternFn, LogView, ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions,
+    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, ScanHandle, ViewSpec,
 };
 
 use crate::core_bindings::{run_blocking, BenchBinding, BenchCore};
@@ -92,6 +92,23 @@ fn make_intern_fn(
             }
         }
         h_out
+    })
+}
+
+/// Identity intern for `scan` (TAcc = HandleId). The JS folder already
+/// returns a registry-allocated handle; this validates + retains it so the
+/// scan-node emission keeps it alive (mirrors `make_intern_fn`'s retain).
+fn make_identity_intern_fn(binding: std::sync::Weak<BenchBinding>) -> InternFn<HandleId> {
+    Arc::new(move |acc: HandleId| -> HandleId {
+        if let Some(b) = binding.upgrade() {
+            if !b.registry.lock().validate_and_retain(acc) {
+                panic!(
+                    "scan folder returned unknown HandleId({}); registry has no value mapping.",
+                    acc.raw()
+                );
+            }
+        }
+        acc
     })
 }
 
@@ -165,6 +182,7 @@ pub struct BenchReactiveLog {
     inner: Arc<parking_lot::Mutex<ReactiveLog<HandleId>>>,
     core: Core,
     node_id_raw: u32,
+    binding_weak: std::sync::Weak<BenchBinding>,
 }
 
 #[napi]
@@ -180,7 +198,7 @@ impl BenchReactiveLog {
         let tsfn = build_pack_tsfn(packer)?;
         let c = core.core_clone();
         let binding_weak = Arc::downgrade(&core.binding_arc());
-        let intern = make_intern_fn(tsfn, binding_weak);
+        let intern = make_intern_fn(tsfn, binding_weak.clone());
         let opts = ReactiveLogOptions {
             max_size: max_size.map(|n| n as usize),
             ..Default::default()
@@ -192,6 +210,7 @@ impl BenchReactiveLog {
             inner: Arc::new(parking_lot::Mutex::new(log)),
             core: c,
             node_id_raw,
+            binding_weak,
         })
     }
 
@@ -261,6 +280,207 @@ impl BenchReactiveLog {
             Ok(())
         })
         .await?
+    }
+
+    // ── F18: view / scan / attach ──────────────────────────────────────
+    //
+    // These register a node + `core.subscribe`, and Rust `Core::subscribe`
+    // fires the push-on-subscribe handshake sink SYNCHRONOUSLY. For a
+    // view/scan that sink calls the snapshot `intern`, which `bridge_sync`s
+    // back to a JS packer TSFN. So the subscribe MUST run off the libuv
+    // thread (via `run_blocking` on the tokio blocking pool, like `append`)
+    // — otherwise the napi thread blocks on a TSFN it must itself pump =
+    // deadlock. TSFN construction (`Function` is not `Send`) stays on the
+    // napi thread, before the `run_blocking` boundary.
+
+    /// `view({ tail: n })` — last `n` entries. `packer` mirrors `create`'s
+    /// snapshot packer: `(handles: u32[]) → u32`. Sync method + spawned
+    /// Promise: `Function` is `!Send` and lifetime-bound to `env`, so it
+    /// can't cross an `.await`; the TSFN is built sync (napi thread), the
+    /// blocking subscribe runs off-thread (`env.spawn_future` →
+    /// `run_blocking`). Mirrors `OperatorBindings::register_map`.
+    #[napi]
+    pub fn view_tail<'env>(
+        &self,
+        env: &'env Env,
+        packer: Function<Vec<u32>, u32>,
+        n: u32,
+    ) -> Result<PromiseRaw<'env, BenchLogView>> {
+        let tsfn = build_pack_tsfn(packer)?;
+        self.spawn_view(env, tsfn, ViewSpec::Tail { n: n as usize })
+    }
+
+    /// `view({ slice: [start, stop] })` — `[start..stop)`; `stop` defaults
+    /// to log length when `None`.
+    #[napi]
+    pub fn view_slice<'env>(
+        &self,
+        env: &'env Env,
+        packer: Function<Vec<u32>, u32>,
+        start: u32,
+        stop: Option<u32>,
+    ) -> Result<PromiseRaw<'env, BenchLogView>> {
+        let tsfn = build_pack_tsfn(packer)?;
+        self.spawn_view(
+            env,
+            tsfn,
+            ViewSpec::Slice {
+                start: start as usize,
+                stop: stop.map(|s| s as usize),
+            },
+        )
+    }
+
+    /// `view({ fromCursor })` — entries from a cursor node's position
+    /// onward. `read_cursor` is a JS callback `(cursorHandle: u32[1]) →
+    /// u32` returning the cursor position; it fires inside Core waves on
+    /// the blocking pool, so its `bridge_sync` is safe.
+    #[napi]
+    pub fn view_from_cursor<'env>(
+        &self,
+        env: &'env Env,
+        packer: Function<Vec<u32>, u32>,
+        cursor_node_id: u32,
+        read_cursor: Function<Vec<u32>, u32>,
+    ) -> Result<PromiseRaw<'env, BenchLogView>> {
+        let tsfn = build_pack_tsfn(packer)?;
+        let cursor_tsfn = build_pack_tsfn(read_cursor)?;
+        let read = Arc::new(move |h: HandleId| -> usize {
+            let arg = vec![u32::try_from(h.raw()).expect("HandleId exceeds u32")];
+            bridge_sync(&cursor_tsfn, arg) as usize
+        });
+        self.spawn_view(
+            env,
+            tsfn,
+            ViewSpec::FromCursor {
+                cursor_node: NodeId::new(u64::from(cursor_node_id)),
+                read_cursor: read,
+            },
+        )
+    }
+
+    fn spawn_view<'env>(
+        &self,
+        env: &'env Env,
+        tsfn: PackTsfn,
+        spec: ViewSpec,
+    ) -> Result<PromiseRaw<'env, BenchLogView>> {
+        let intern = make_intern_fn(tsfn, self.binding_weak.clone());
+        let inner = Arc::clone(&self.inner);
+        let core = self.core.clone();
+        env.spawn_future(async move {
+            let view = run_blocking(core, move || inner.lock().view(spec, intern)).await?;
+            let node_id_raw = u32::try_from(view.node_id.raw())
+                .map_err(|_| Error::from_reason("view node id exceeds u32"))?;
+            Ok(BenchLogView {
+                _view: view,
+                node_id_raw,
+            })
+        })
+    }
+
+    /// `scan(seed, folder)` — running aggregate. `seed` is a handle; the
+    /// JS `folder` is `([acc, value]: u32[2]) → u32` (accumulator handle).
+    #[napi]
+    pub fn scan<'env>(
+        &self,
+        env: &'env Env,
+        seed: u32,
+        folder: Function<Vec<u32>, u32>,
+    ) -> Result<PromiseRaw<'env, BenchScanHandle>> {
+        let folder_tsfn = build_pack_tsfn(folder)?;
+        let step = Arc::new(move |acc: &HandleId, value: &HandleId| -> HandleId {
+            let arg = vec![
+                u32::try_from(acc.raw()).expect("HandleId exceeds u32"),
+                u32::try_from(value.raw()).expect("HandleId exceeds u32"),
+            ];
+            HandleId::new(u64::from(bridge_sync(&folder_tsfn, arg)))
+        });
+        let intern = make_identity_intern_fn(self.binding_weak.clone());
+        let seed_h = HandleId::new(u64::from(seed));
+        let inner = Arc::clone(&self.inner);
+        let core = self.core.clone();
+        env.spawn_future(async move {
+            let scan = run_blocking(core, move || inner.lock().scan(seed_h, step, intern)).await?;
+            let node_id_raw = u32::try_from(scan.node_id.raw())
+                .map_err(|_| Error::from_reason("scan node id exceeds u32"))?;
+            Ok(BenchScanHandle {
+                _scan: scan,
+                node_id_raw,
+            })
+        })
+    }
+
+    /// `attach(upstream)` — append every upstream DATA handle into this
+    /// log. Handle-opaque: `read_value` retains so `at()` can't read a
+    /// wave-released slot (release-on-trim is a known bounded leak — see
+    /// porting-deferred.md, parallels the terminal-slot retain note).
+    #[napi]
+    pub async fn attach(&self, upstream_node_id: u32) -> Result<BenchLogSubscription> {
+        let binding = self.binding_weak.clone();
+        let read_value = Arc::new(move |h: HandleId| -> HandleId {
+            if let Some(b) = binding.upgrade() {
+                b.registry.lock().validate_and_retain(h);
+            }
+            h
+        });
+        let inner = Arc::clone(&self.inner);
+        let core = self.core.clone();
+        let sub = run_blocking(core, move || {
+            inner
+                .lock()
+                .attach(NodeId::new(u64::from(upstream_node_id)), read_value)
+        })
+        .await?;
+        Ok(BenchLogSubscription { sub: Some(sub) })
+    }
+}
+
+/// RAII handle for `ReactiveLog::view`. Dropping disposes the view's
+/// subscriptions. JS subscribes to `node_id` via `BenchCore.subscribeWithTsfn`.
+#[napi]
+pub struct BenchLogView {
+    _view: LogView,
+    node_id_raw: u32,
+}
+
+#[napi]
+impl BenchLogView {
+    #[napi(getter)]
+    pub fn node_id(&self) -> u32 {
+        self.node_id_raw
+    }
+}
+
+/// RAII handle for `ReactiveLog::scan`. Dropping disposes the scan
+/// subscription. JS subscribes to `node_id` for accumulator snapshots.
+#[napi]
+pub struct BenchScanHandle {
+    _scan: ScanHandle,
+    node_id_raw: u32,
+}
+
+#[napi]
+impl BenchScanHandle {
+    #[napi(getter)]
+    pub fn node_id(&self) -> u32 {
+        self.node_id_raw
+    }
+}
+
+/// RAII handle for `ReactiveLog::attach`. `dispose()` stops the attachment
+/// deterministically; dropping the object does the same (RAII fallback for
+/// the non-deterministic-GC case).
+#[napi]
+pub struct BenchLogSubscription {
+    sub: Option<Subscription>,
+}
+
+#[napi]
+impl BenchLogSubscription {
+    #[napi]
+    pub fn dispose(&mut self) {
+        self.sub = None;
     }
 }
 
@@ -487,6 +707,12 @@ pub struct BenchReactiveIndex {
     inner: Arc<parking_lot::Mutex<ReactiveIndex<HandleId, HandleId>>>,
     core: Core,
     node_id_raw: u32,
+    /// F20/D205: numeric-primary → value-handle mirror. The core
+    /// `ReactiveIndex::range_by_primary` is `K: Ord`-correct and covered by
+    /// the `index_range_by_primary_d205` cargo test; the parity arm ranges
+    /// over a user-meaningful `i64` key (never opaque `HandleId` order) per
+    /// D205. `BTreeMap` range iteration is naturally ascending.
+    keyed: Arc<parking_lot::Mutex<std::collections::BTreeMap<i64, u32>>>,
 }
 
 #[napi]
@@ -505,6 +731,7 @@ impl BenchReactiveIndex {
             inner: Arc::new(parking_lot::Mutex::new(index)),
             core: c,
             node_id_raw,
+            keyed: Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
@@ -534,21 +761,35 @@ impl BenchReactiveIndex {
             .unwrap_or(0)
     }
 
-    /// `secondary` is a sort-key string (not a handle).
+    /// `secondary` is a sort-key string (not a handle). `numeric_key`
+    /// (F20/D205, optional trailing arg) records this row in the numeric
+    /// range mirror so `range_by_primary` can query by user key.
     #[napi]
-    pub async fn upsert(&self, primary: u32, secondary: String, value: u32) -> Result<bool> {
+    pub async fn upsert(
+        &self,
+        primary: u32,
+        secondary: String,
+        value: u32,
+        numeric_key: Option<i64>,
+    ) -> Result<bool> {
         let inner = Arc::clone(&self.inner);
         let core = self.core.clone();
         let p = HandleId::new(u64::from(primary));
         let v = HandleId::new(u64::from(value));
+        if let Some(nk) = numeric_key {
+            self.keyed.lock().insert(nk, value);
+        }
         run_blocking(core, move || Ok(inner.lock().upsert(p, secondary, v))).await?
     }
 
     #[napi]
-    pub async fn delete(&self, primary: u32) -> Result<()> {
+    pub async fn delete(&self, primary: u32, numeric_key: Option<i64>) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let core = self.core.clone();
         let k = HandleId::new(u64::from(primary));
+        if let Some(nk) = numeric_key {
+            self.keyed.lock().remove(&nk);
+        }
         run_blocking(core, move || {
             inner.lock().delete(&k);
             Ok(())
@@ -556,10 +797,25 @@ impl BenchReactiveIndex {
         .await?
     }
 
+    /// F20/D205: values whose numeric primary sorts within `[start, end)`
+    /// (inclusive start, exclusive end), ascending by primary key.
+    #[napi]
+    pub fn range_by_primary(&self, start: i64, end: i64) -> Vec<u32> {
+        if start >= end {
+            return Vec::new();
+        }
+        self.keyed
+            .lock()
+            .range(start..end)
+            .map(|(_, &v)| v)
+            .collect()
+    }
+
     #[napi]
     pub async fn clear(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let core = self.core.clone();
+        self.keyed.lock().clear();
         run_blocking(core, move || {
             inner.lock().clear();
             Ok(())

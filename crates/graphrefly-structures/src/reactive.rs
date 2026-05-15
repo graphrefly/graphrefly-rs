@@ -1829,6 +1829,27 @@ where
         self.inner.lock().backend.to_primary_map()
     }
 
+    /// Values of all rows whose **primary key** sorts within `[start, end)`
+    /// (inclusive start, exclusive end), in **ascending primary-key order**
+    /// (D205). `start >= end` or no matches → empty vec. The `K: Ord` bound
+    /// is method-scoped so it does not constrain `ReactiveIndex<K, V>` itself.
+    #[must_use]
+    pub fn range_by_primary(&self, start: &K, end: &K) -> Vec<V>
+    where
+        K: Ord,
+    {
+        let mut rows: Vec<(K, V)> = self
+            .inner
+            .lock()
+            .backend
+            .to_primary_map()
+            .into_iter()
+            .filter(|(k, _)| k >= start && k < end)
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.into_iter().map(|(_, v)| v).collect()
+    }
+
     #[must_use]
     pub fn mutation_log_snapshot(&self) -> Option<Vec<BaseChange<IndexChange<K, V>>>> {
         self.inner.lock().mutation_log.clone()

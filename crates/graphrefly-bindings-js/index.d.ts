@@ -333,6 +333,23 @@ export declare class BenchGraph {
   observeSubscribe(path: string | undefined | null, sink: (arg0: string, arg1: Array<number>) => void): Promise<BenchObserveReactiveHandle>
 }
 
+/**
+ * RAII handle for `ReactiveLog::attach`. `dispose()` stops the attachment
+ * deterministically; dropping the object does the same (RAII fallback for
+ * the non-deterministic-GC case).
+ */
+export declare class BenchLogSubscription {
+  dispose(): void
+}
+
+/**
+ * RAII handle for `ReactiveLog::view`. Dropping disposes the view's
+ * subscriptions. JS subscribes to `node_id` via `BenchCore.subscribeWithTsfn`.
+ */
+export declare class BenchLogView {
+  get nodeId(): number
+}
+
 /** In-memory storage backend shared across tiers. */
 export declare class BenchMemoryBackend {
   constructor()
@@ -462,9 +479,18 @@ export declare class BenchReactiveIndex {
   get size(): number
   has(primary: number): boolean
   get(primary: number): number
-  /** `secondary` is a sort-key string (not a handle). */
-  upsert(primary: number, secondary: string, value: number): Promise<boolean>
-  delete(primary: number): Promise<void>
+  /**
+   * `secondary` is a sort-key string (not a handle). `numeric_key`
+   * (F20/D205, optional trailing arg) records this row in the numeric
+   * range mirror so `range_by_primary` can query by user key.
+   */
+  upsert(primary: number, secondary: string, value: number, numericKey?: number | undefined | null): Promise<boolean>
+  delete(primary: number, numericKey?: number | undefined | null): Promise<void>
+  /**
+   * F20/D205: values whose numeric primary sorts within `[start, end)`
+   * (inclusive start, exclusive end), ascending by primary key.
+   */
+  rangeByPrimary(start: number, end: number): Array<number>
   clear(): Promise<void>
 }
 
@@ -493,6 +519,39 @@ export declare class BenchReactiveLog {
   clear(): Promise<void>
   at(index: number): number
   trimHead(n: number): Promise<void>
+  /**
+   * `view({ tail: n })` — last `n` entries. `packer` mirrors `create`'s
+   * snapshot packer: `(handles: u32[]) → u32`. Sync method + spawned
+   * Promise: `Function` is `!Send` and lifetime-bound to `env`, so it
+   * can't cross an `.await`; the TSFN is built sync (napi thread), the
+   * blocking subscribe runs off-thread (`env.spawn_future` →
+   * `run_blocking`). Mirrors `OperatorBindings::register_map`.
+   */
+  viewTail(packer: (arg: Array<number>) => number, n: number): Promise<BenchLogView>
+  /**
+   * `view({ slice: [start, stop] })` — `[start..stop)`; `stop` defaults
+   * to log length when `None`.
+   */
+  viewSlice(packer: (arg: Array<number>) => number, start: number, stop?: number | undefined | null): Promise<BenchLogView>
+  /**
+   * `view({ fromCursor })` — entries from a cursor node's position
+   * onward. `read_cursor` is a JS callback `(cursorHandle: u32[1]) →
+   * u32` returning the cursor position; it fires inside Core waves on
+   * the blocking pool, so its `bridge_sync` is safe.
+   */
+  viewFromCursor(packer: (arg: Array<number>) => number, cursorNodeId: number, readCursor: (arg: Array<number>) => number): Promise<BenchLogView>
+  /**
+   * `scan(seed, folder)` — running aggregate. `seed` is a handle; the
+   * JS `folder` is `([acc, value]: u32[2]) → u32` (accumulator handle).
+   */
+  scan(seed: number, folder: (arg: Array<number>) => number): Promise<BenchScanHandle>
+  /**
+   * `attach(upstream)` — append every upstream DATA handle into this
+   * log. Handle-opaque: `read_value` retains so `at()` can't read a
+   * wave-released slot (release-on-trim is a known bounded leak — see
+   * porting-deferred.md, parallels the terminal-slot retain note).
+   */
+  attach(upstreamNodeId: number): Promise<BenchLogSubscription>
 }
 
 export declare class BenchReactiveMap {
@@ -504,6 +563,14 @@ export declare class BenchReactiveMap {
   set(key: number, value: number, ttl?: number | undefined | null): Promise<void>
   delete(key: number): Promise<void>
   clear(): Promise<void>
+}
+
+/**
+ * RAII handle for `ReactiveLog::scan`. Dropping disposes the scan
+ * subscription. JS subscribes to `node_id` for accumulator snapshots.
+ */
+export declare class BenchScanHandle {
+  get nodeId(): number
 }
 
 export declare class BenchStorageHandle {

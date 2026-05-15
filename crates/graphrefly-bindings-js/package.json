@@ -1,8 +1,7 @@
 {
 	"name": "@graphrefly/native",
-	"version": "0.0.0",
-	"private": true,
-	"description": "GraphReFly Rust dispatcher exposed to JavaScript via napi-rs. Phase E rustImpl activation slice (D074).",
+	"version": "0.1.0",
+	"description": "GraphReFly Rust substrate (napi-rs). Install-time substrate provider for @graphrefly/graphrefly (peer alternative to @graphrefly/pure-ts).",
 	"main": "index.js",
 	"types": "index.d.ts",
 	"files": [

@@ -1,0 +1,110 @@
+# @graphrefly/native — npm publish (D203 native-ship, Slice 3).
+#
+# Separate from release.yml (which is crates.io / release-plz only —
+# bindings crates are `publish = false` there). This workflow cross-
+# compiles the napi-rs `.node` for every configured target, publishes
+# one per-platform npm package per target, then publishes the umbrella
+# `@graphrefly/native` package whose optionalDependencies resolve the
+# right binary at install time (canonical napi-rs layout).
+#
+# TRIGGER: push a tag matching `native-v*` (e.g. `native-v0.1.0`).
+# Tag creation is a deliberate human action — this workflow never runs
+# on a normal push to main, so merging Slice 3 cannot publish anything.
+#
+# One-time prerequisites:
+#   - Repo/org secret `NPM_TOKEN` — an npm automation token with publish
+#     rights to the `@graphrefly` scope.
+#   - The `@graphrefly` npm org must exist and the token's user be a
+#     member with publish permission.
+#
+# Tag → version: the workflow publishes whatever `version` is in
+# crates/graphrefly-bindings-js/package.json. Bump that (via
+# `napi version` or by hand) in the same commit you tag.
+
+name: native-npm-publish
+
+on:
+  push:
+    tags:
+      - "native-v*"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: crates/graphrefly-bindings-js
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            host: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            host: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            host: windows-latest
+          - target: aarch64-pc-windows-msvc
+            host: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Build ${{ matrix.target }}
+        # napi 3.x emits the per-target binary + the npm/<target>/
+        # sub-package. `--features full` keeps structures + storage.
+        run: pnpm exec napi build --platform --release --features full --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/graphrefly-bindings-js/graphrefly-native.*.node
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/graphrefly-bindings-js/artifacts
+      - name: Move artifacts into npm sub-packages
+        # `napi artifacts` distributes the downloaded .node files into
+        # the per-target npm/<target>/ dirs that `napi prepublish`
+        # publishes.
+        run: pnpm exec napi artifacts --dir artifacts
+      - name: Publish per-platform packages
+        run: pnpm exec napi prepublish -t npm --skip-gh-release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish umbrella @graphrefly/native
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
