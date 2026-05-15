@@ -272,7 +272,6 @@ impl Registry {
         self.values.get(&h).cloned()
     }
 
-
     /// Validate `h` exists, then bump its refcount. Returns false if
     /// `h` is unknown — caller should panic with a JS-bug diagnostic.
     /// Matches `BindingBoundary::retain_handle`'s pattern
