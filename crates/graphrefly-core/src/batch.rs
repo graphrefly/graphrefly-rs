@@ -171,10 +171,10 @@ thread_local! {
 // and needs no shared-state lock. (`currently_firing` deliberately stays
 // on `CoreState`; see `node.rs`.)
 //
-// Stale slots: the owning `BatchGuard::drop` releases the generation via
-// an RAII guard that fires on EVERY exit path — normal return, the
-// panic-discard branch, AND an unwind through `drain_and_flush()`. So a
-// slot can only be left interned if `Drop` itself never runs:
+// Stale slots: the owning `BatchGuard::drop` releases the generation on
+// every exit path — normal return, the closure-body-panic branch, AND
+// the drain-phase-panic `catch_unwind` arm (before `resume_unwind`). So
+// a slot can only be left interned if `Drop` itself never runs:
 // `std::mem::forget(guard)` or a process abort without unwinding — both
 // out of contract (`BatchGuard` is `#[must_use]` + `!Send`). Such a
 // leaked key is inert: generations are never reused, so it can never
@@ -3430,14 +3430,16 @@ impl Core {
         IN_TICK_OWNED.with(|s| s.borrow_mut().insert(self.generation))
     }
 
-    /// Release wave ownership for this (Core, thread). Invoked solely by
-    /// the owning [`BatchGuard::drop`]'s `_release_ownership` RAII guard,
-    /// which is constructed only after the `!owns_tick` early-return — so
-    /// a nested guard never releases — and drops last on EVERY exit path
-    /// (normal return, panic-discard `return`, or an unwind through
-    /// `drain_and_flush()`). Released exactly once per (Core, thread,
-    /// wave). Idempotent regardless (`AHashSet::remove` of an absent key
-    /// is a no-op).
+    /// Release wave ownership for this (Core, thread). Called by the
+    /// owning [`BatchGuard::drop`] only — after the `!owns_tick`
+    /// early-return, so a nested guard never releases — explicitly at
+    /// each of the three exit points, always AFTER the wave drain +
+    /// WaveState cleanup and BEFORE `fire_deferred` (so a re-entrant sink
+    /// emit runs as a fresh owning wave): (1) the closure-body-panic
+    /// branch, (2) the drain-phase-panic `catch_unwind` arm (before
+    /// `resume_unwind`), (3) the success path's locked cleanup block.
+    /// Released exactly once per (Core, thread, wave); idempotent
+    /// regardless (`AHashSet::remove` of an absent key is a no-op).
     fn clear_in_tick(&self) {
         IN_TICK_OWNED.with(|s| {
             s.borrow_mut().remove(&self.generation);
@@ -3579,17 +3581,20 @@ impl BatchGuard {
     /// (a fn/sink panic that escaped the inner per-call `catch_unwind`
     /// isolation while drop was NOT already unwinding). /qa D047.
     ///
-    /// Does NOT release `in_tick` — that is `_release_ownership`'s job
-    /// (its `Drop` fires on every exit path including `resume_unwind`).
+    /// Does NOT release `in_tick` — each `BatchGuard::drop` exit path
+    /// calls `clear_in_tick()` explicitly, after this cleanup and before
+    /// `fire_deferred` (so a re-entrant sink emit runs as a fresh owning
+    /// wave).
     fn discard_wave_cleanup(&self) {
         let (pending, deferred_releases, restored_releases) = {
             let mut s = self.core.lock_state();
             // WaveState borrowed alongside state for panic-discard
             // cleanup. The WaveState borrow is per-thread, independent of
             // state. `in_tick` is per-(Core, thread) (`IN_TICK_OWNED`),
-            // released separately by `_release_ownership`; this method
-            // only drains/cleans the per-thread WaveState retain-fields.
-            let result = with_wave_state(|ws| {
+            // released separately by the explicit `clear_in_tick` on each
+            // exit path; this method only drains/cleans the per-thread
+            // WaveState retain-fields.
+            with_wave_state(|ws| {
                 let pending = std::mem::take(&mut ws.pending_notify);
                 let _: DeferredJobs = std::mem::take(&mut ws.deferred_flush_jobs);
                 ws.pending_fires.clear();
@@ -3617,8 +3622,7 @@ impl BatchGuard {
                 // is documented similarly.
                 let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
                 (pending, deferred_releases, restored)
-            });
-            result
+            })
         };
         // Lock dropped — release retains lock-released so the binding
         // can't deadlock against an internal binding mutex.
@@ -3666,48 +3670,44 @@ impl Drop for BatchGuard {
             // (below) is the single clear site.
             return;
         }
-        // Release per-(Core, thread) wave ownership on EVERY exit path of
-        // the owning guard — normal return, the panic-discard branch's
-        // `return`, AND an unwind through `drain_and_flush()` (a fn/sink
-        // panic in the drain phase that escapes the inner `catch_unwind`
-        // isolation). Declared first ⇒ dropped last (after all wave work
-        // and any nested re-entry has completed), exactly once. /qa
-        // hardening (D047): the prior explicit post-drain clear was
-        // skipped if `drain_and_flush()` unwound — pre-existing window
-        // (old `s.in_tick = false` had the identical placement), closed
-        // here so a panicked drain can't leave this (Core, thread)
-        // permanently non-owning.
-        struct ReleaseOwnership<'a>(&'a Core);
-        impl Drop for ReleaseOwnership<'_> {
-            fn drop(&mut self) {
-                self.0.clear_in_tick();
-            }
-        }
-        let _release_ownership = ReleaseOwnership(&self.core);
+        // Wave-ownership (`in_tick`) release discipline. `clear_in_tick`
+        // must run AFTER the wave's drain + WaveState cleanup but BEFORE
+        // `fire_deferred` (sinks), on every exit path:
+        //
+        // - **Before `fire_deferred` (load-bearing):** a sink re-entering
+        //   `Core::emit` / `complete` from a flush callback must run as a
+        //   fresh OWNING wave (so its own emissions drain + deliver). If
+        //   `in_tick` were still owned during `fire_deferred`, that
+        //   re-entrant emit would be a non-owning no-op and its data
+        //   silently lost (regression caught by
+        //   `lock_discipline::sink_can_reenter_core_via_emit`). This is
+        //   why each path clears explicitly at the right point — NOT via
+        //   an end-of-`drop` RAII guard (which would clear *after*
+        //   `fire_deferred`).
+        // - **/qa hardening (D047):** a fn/sink panic in the drain phase
+        //   can escape the per-call `catch_unwind` isolation (e.g. a
+        //   derived fn panicking when fired). Drop is NOT already
+        //   unwinding, so it would otherwise skip BOTH the WaveState
+        //   drain (→ next owning wave trips `wave_state_clear_outermost`)
+        //   AND the `in_tick` clear (pre-D047 the explicit clear had this
+        //   same window). Catching the drain panic, running the shared
+        //   discard cleanup + `clear_in_tick`, then `resume_unwind` gives
+        //   a drain-phase panic the identical atomicity as a
+        //   closure-body panic.
         if std::thread::panicking() {
-            // The wave's *closure body* panicked — drop runs during that
-            // unwind. Discard pending wave work (don't fire sinks during
-            // unwind — a sink panic mid-unwind aborts the process),
-            // release queued retains, restore caches. `_release_ownership`
-            // clears in_tick as the frame finishes unwinding.
+            // Closure-body panic — drop runs during that unwind. Discard
+            // pending wave work (don't fire sinks mid-unwind — a sink
+            // panic then aborts the process), release queued retains,
+            // restore caches, then release ownership.
             self.discard_wave_cleanup();
+            self.core.clear_in_tick();
             return;
         }
-        // Successful drain — drain_and_flush manages its own locking.
-        //
-        // /qa hardening (D047): a fn/sink panic in the drain phase can
-        // escape the per-call `catch_unwind` isolation (e.g. a derived fn
-        // panicking when fired here). Drop is NOT already unwinding, so
-        // such a panic would otherwise skip BOTH the WaveState drain
-        // (leaking retains / leaving `pending_notify` dirty → the next
-        // owning wave trips `wave_state_clear_outermost`) AND — pre-D047
-        // — `in_tick`. Give it the SAME atomicity as a closure-body
-        // panic: catch, run the shared discard cleanup, then resume the
-        // unwind (`_release_ownership` releases in_tick as drop unwinds).
         if let Err(payload) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.core.drain_and_flush()))
         {
             self.discard_wave_cleanup();
+            self.core.clear_in_tick();
             std::panic::resume_unwind(payload);
         }
         // Wave cleanup + extract deferred jobs under the lock.
@@ -3734,8 +3734,14 @@ impl Drop for BatchGuard {
                 let (jobs, releases, hooks, wipes) = Core::drain_deferred(&mut s, ws);
                 (jobs, releases, hooks, wipes, snapshot_releases)
             });
-            // Ownership released by `_release_ownership` (RAII) at end of
-            // drop — fires even if `drain_and_flush()` above unwound.
+            // Release wave ownership now — AFTER drain + WaveState
+            // cleanup, BEFORE `fire_deferred` below. Load-bearing: a sink
+            // re-entering Core from a flush callback must observe
+            // `in_tick` clear so its emit runs as a fresh owning wave.
+            // (Mirrors the placement of the pre-D047 `s.in_tick = false`;
+            // the drain-phase-panic window that placement had is closed
+            // by the `catch_unwind` above.)
+            self.core.clear_in_tick();
             result
         };
         // Lock dropped — fire deferred sinks + release retains + fire

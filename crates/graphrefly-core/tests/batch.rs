@@ -1077,9 +1077,7 @@ fn cross_core_same_thread_batchguard_isolation() {
     rt_b.core.emit(s_b.id, h);
 
     assert!(
-        rec_b
-            .data_values()
-            .contains(&TestValue::Int(7)),
+        rec_b.data_values().contains(&TestValue::Int(7)),
         "Core-B's wave must drain despite a live Core-A BatchGuard on the \
          same thread (cross-Core isolation / qa F1); got {:?}",
         rec_b.data_values()
@@ -1105,10 +1103,12 @@ fn cross_core_same_thread_batchguard_isolation() {
 /// (Core, thread) can run a normal owning wave afterwards.
 ///
 /// Pre-fix this window was uncovered: the explicit post-drain
-/// `clear_in_tick` was skipped when `drain_and_flush()` unwound (the old
-/// `s.in_tick = false` had the identical placement) — leaving the
-/// (Core, thread) permanently non-owning. The `_release_ownership` RAII
-/// guard now fires on this unwind too. (Companion to
+/// `clear_in_tick` (and the WaveState drain) was skipped when
+/// `drain_and_flush()` unwound (the old `s.in_tick = false` had the
+/// identical placement) — leaving the (Core, thread) permanently
+/// non-owning AND `pending_notify` dirty. The `catch_unwind` around
+/// `drain_and_flush()` now runs the shared discard cleanup +
+/// `clear_in_tick` before `resume_unwind`. (Companion to
 /// `batch_panic_discards_pending_wave`, which covers the *closure-body*
 /// panic → panic-discard branch.)
 #[test]
@@ -1129,8 +1129,9 @@ fn panic_in_drain_phase_releases_wave_ownership_for_next_wave() {
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let h = binding.intern(TestValue::Int(999));
         // emit closure returns normally → owning BatchGuard::drop runs
-        // drain_and_flush() → fires `d` → panics → unwinds drop's
-        // SUCCESS path (the window `_release_ownership` now covers).
+        // drain_and_flush() → fires `d` → panics → caught by the
+        // success-path `catch_unwind`, which discards + clears ownership
+        // then resumes the unwind.
         core.emit(sid, h);
     }));
     assert!(
@@ -1138,10 +1139,10 @@ fn panic_in_drain_phase_releases_wave_ownership_for_next_wave() {
         "fn panic during the drain phase must propagate out of emit"
     );
 
-    // If ownership leaked (pre-RAII-fix), this same (Core, thread) would
-    // see in_tick=true → next wave non-owning → no drain (and the
-    // `wave_state_clear_outermost` assert would trip). With the RAII
-    // releaser, ownership was cleared on the unwind → normal wave.
+    // If ownership/WaveState leaked (pre-fix), this same (Core, thread)
+    // would see in_tick=true → next wave non-owning → no drain, or trip
+    // `wave_state_clear_outermost` on dirty WaveState. With the
+    // catch_unwind discard, both are cleaned → normal wave.
     s.set(TestValue::Int(7));
     assert!(
         rec.data_values().contains(&TestValue::Int(7)),
