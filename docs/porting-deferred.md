@@ -2937,3 +2937,64 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **What:** `HandleId` gained `impl Display` (`HandleId(N)` format) in `graphrefly-core/src/handle.rs` to satisfy `ReactiveIndex<K,V>` requiring `K: ToString`. Previously only `Debug` was derived.
 - **Why noted:** Not a deferral — this is a resolved concern. The Display output is a debug-quality string (`HandleId(42)`), not a user-facing representation. If a future surface needs human-readable handle rendering, the Display impl may need revisiting.
 - **Source:** Slice U-napi S4, discovered while compiling structures_bindings.rs (2026-05-12).
+
+### §7-A — `commit_emission` single-pass collapse — DEFERRED (evidence-based; flagged for user ratification)
+
+- **What:** §7 item (1) bundles, alongside the union-find deletion, collapsing `commit_emission`'s defensive multi-phase re-lock (Phase-1 snapshot / Phase-3 re-lock / terminal re-checks) into a single pass. This slice (D208–D211) shipped the union-find deletion + lock-free `None` floor + `SerializationGroupId` contract but **did not** collapse `commit_emission`.
+- **Why deferred:** `SESSION-rust-port-perf-value-investigation.md` §5b *measured* the lock-cycle collapse at **~0% single-thread benefit** (contended-only ~10%); the ~7.6× win is the union-find/machinery deletion (§4b/§4c), not the re-lock collapse. The collapse is also the single riskiest behavioral change in §7 (terminal/equals/DIRTY ordering under the multi-phase structure). Deferring it materially de-risked an already-maximal slice while still delivering §7's measured perf lever and the ~83 ns floor.
+- **Status:** This is a deviation from the literal "one batch, both" wording of the user-locked §7. The AskUserQuestion to confirm failed (stream closed) so it was taken on the strength of §5b's own measurement and **flagged for explicit user ratification**. If the user wants it in-batch, it is a focused follow-on against the now-simplified (group-serialized) wave engine.
+- **Lift point:** Bench evidence that the contended-regime ~10% matters for a real workload, OR user direction to complete §7 literally.
+- **Source:** §7 item (1); §5b measurement; D209; this slice.
+
+### §7-B — Cross-component dynamic re-entry into an unheld serialization group
+
+- **What:** §7's wave acquisition collects the touched-group set via a bounded cascade walk (children + meta) from the seed and acquires it sorted upfront. A fn that, mid-fire, re-enters Core (`emit`/`complete`/…) on a node in a **different** component whose group was *not* in the seed's cascade will acquire that group's `ReentrantMutex` nested (not pre-sorted with the held set).
+- **Why acceptable in v1:** §7 deletes the old union-find defer machinery and does not specify a replacement for this case; the strict all-`None`/all-`Some` component-consistency invariant + static groups + the sorted upfront acquire cover the common topology-reachable cascade. Recorded honestly rather than re-inventing machinery §7 says to delete.
+- **Severity (QA F5, 2026-05-16 — strengthened from the original "missed serialization" wording):** the failure mode is **deadlock potential**, not merely a missed-serialization window. A fn holding group `G_hi` (in the seed cascade) that re-enters Core and emits into a *disjoint-component* node whose group `G_lo < G_hi` performs a **descending mid-wave acquisition**; concurrently another thread holding `G_lo` and re-entrantly acquiring `G_hi` forms a classic ABBA cycle. This is exactly what the deleted `held_partitions::check_and_acquire` ascending-order check + `PartitionOrderViolation` defer-to-wave-end existed to prevent. Reachability is still bounded: it requires cross-*component* (disjoint dep-graph) re-entrant emit under multi-thread grouped load — the producer-pattern common case keeps the target cascade-reachable (group already held → `ReentrantMutex` pass-through). But the consequence if hit is a hang, not just a torn update.
+- **Lift point:** If a real consumer hits cross-component dynamic re-entry under multi-thread grouped load, add a minimal "acquire-or-defer-to-wave-end if it would descend" guard (a much smaller mechanism than the deleted union-find defer). Until then, prefer keeping co-emitting nodes in one component (so the target group is in the seed cascade and pre-acquired sorted).
+- **Source:** §7 wave-acquisition spec; this slice.
+
+### §7-C — Vestigial union-find surface retained for downstream zero-churn (cleanup follow-on)
+
+- **What:** To honor D211 (keep `graphrefly-graph`/`-operators`/`-storage`/`-structures` + napi compiling with zero churn), these now-dead symbols were kept as **vestigial, never-constructed** surface: `PartitionOrderViolation` (fields → `u64`, never produced), `SubscribeError::PartitionOrderViolation`, `SetDepsError::PartitionMigrationDuringFire`, `DeferredProducerOp` (+ `push_deferred_producer_op`, now immediate-exec), the `*_or_defer` methods (now thin aliases to the non-deferred ops), `Core::drain_deferred_producer_ops` (empty inline no-op). The `graphrefly-operators` `Err(SubscribeError::PartitionOrderViolation(_))` defer arms are now dead (never taken).
+- **Why deferred:** Removing them requires editing the matching `Err(_)` arms + call sites across `graphrefly-operators` (`producer.rs`, `higher_order.rs`) — a pure downstream-churn refactor disjoint from the Core rewrite. Pre-1.0, no compat constraint; it's a cleanup, not a correctness issue.
+- **Lift point:** A standalone `graphrefly-operators` cleanup slice (delete the dead defer arms + the vestigial Core symbols together).
+- **Source:** D211; this slice.
+
+### §7-D — Throwaway perf-investigation scaffolding removed
+
+- **What:** The inert `bench_naive` / `bench_state_collapse` Cargo features + their `#[cfg(feature = ...)]` code blocks in `node.rs`/`batch.rs` (and the matching `cfg_attr`s) referenced the very union-find/lock-cycle machinery this slice deletes; the dead `cfg(bench_naive)` paths were stripped as part of the rewrite. `benches/minimal_handle_core.rs` + `examples/profile_disjoint_state_emit.rs` remain (they are the floor-measurement harness and stay useful as the §7 floor regression bench). The `bench_naive`/`bench_state_collapse` feature entries in `Cargo.toml` are now unused and should be removed in the docs/cleanup pass.
+- **Source:** `project_next_porting_batch.md` (throwaway artifacts, revert-before-release); §7 implementation.
+
+### §7-E — `GroupLockRegistry` never prunes (unbounded growth over a long-lived churning Core)
+
+- **What:** `groups::GroupLockRegistry::lock_arc` is get-or-create and the map only grows; no teardown path prunes a `SerializationGroupId` whose nodes were all unmounted/destroyed. A long-lived `Core<LockedCell>` that churns through many distinct group ids leaks one `Arc<ReentrantMutex<()>>` + HashMap entry per id permanently, and closure-form `begin_batch` (`acquire_all_group_guards` → `all_groups_sorted`) acquires every *ever-touched* group lock, so its cost grows monotonically.
+- **Why deferred (QA F6, 2026-05-16):** groups are user-declared, static, and typically few + long-lived (the §7 model is "a handful of serialization domains," not per-node ids). The leak is bounded by *distinct group-id count over process lifetime*, not by node/wave count — negligible for the intended usage. Pruning needs a refcount of live nodes per group (or a sweep on unmount), which is extra machinery with no current consumer pressure.
+- **Lift point:** When a consumer creates unboundedly-many distinct groups, add per-group live-node refcounting (decrement on unmount/destroy; drop the registry entry at zero) or a periodic sweep keyed off `partition_of` membership.
+- **Source:** QA review (Blind Hunter §7 pass); this slice.
+
+### §7-F — `*_or_defer` family carries `where C: Send + Sync` → unavailable on `Core<SingleThreadCell>`
+
+- **What:** The vestigial `emit_or_defer`/`complete_or_defer`/… aliases (§7-C) retained a `where C: Send + Sync` bound. `SingleThreadCell` is `!Send + !Sync`, so producer-pattern operators (`stratify`/`control` and anything routing through `*_or_defer`) are not callable on the §7 floor substrate. Not a current break — `graphrefly-operators` is monomorphic over the default `Core<LockedCell>`, so the workspace compiles and all 825 tests pass.
+- **Why deferred (QA F7, 2026-05-16):** "operators on `Core<SingleThreadCell>`" is a future milestone (the floor today is the bench/regression harness + leaf substrate use, not the operator layer). Removing the bound requires the §7-C cleanup slice to also re-check that the immediate-exec `*_or_defer` bodies don't themselves need `Send + Sync` (they shouldn't post-rewrite — no closure is queued/sent anymore).
+- **Lift point:** Fold into the §7-C `graphrefly-operators` cleanup slice: drop the dead defer arms, drop the `Send + Sync` bound, make the operator layer generic over `C: StateCell`, add a `Core<SingleThreadCell>` + operators smoke test.
+- **Source:** QA review (Blind Hunter §7 pass); this slice.
+
+## Deferred infra — consolidate the 27 graphrefly-core integration-test binaries (D215)
+
+- **What:** Each `crates/graphrefly-core/tests/*.rs` is compiled+linked as a
+  separate test binary (27 of them). `cargo test` link cost scales with that
+  count. Consolidating into one harness (`tests/integration/main.rs` +
+  `#[path]`/`mod` includes, deduping the per-file `mod common;`) is the
+  biggest compile/link-time win.
+- **Why deferred (D215, 2026-05-16):** It mass-edits the same `tests/*.rs`
+  files an active parallel session has uncommitted add/delete changes on
+  (`serialization_groups.rs`, `group_parallelism.rs`, deleted
+  `per_subgraph_parallelism.rs`/`subgraph_registry.rs`). Landing it now is a
+  guaranteed merge collision. With nextest in place the run-phase
+  parallelism is already solved (cross-binary global pool), so the residual
+  value is compile-time only — not worth the conflict.
+- **Lift point:** After the §7 serialization-group slice lands and the test
+  file set is stable, do the consolidation as its own slice. Verify under an
+  isolated `CARGO_TARGET_DIR` via `scripts/dev-test.sh`.
+- **Source:** D215 test-loop speedup (this slice).

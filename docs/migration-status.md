@@ -38,6 +38,8 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 > **✅ Item 8 / native-substrate-contract — RESOLVED 2026-05-15 as D206 (Option A + Option C committed follow-on).** The advertised install-time `overrides` drop-in (Q28 = option (c) / D198) is non-functional (napi async-only — Core on tokio blocking pool, sync calls deadlock per D070/D077 — vs `@graphrefly/graphrefly`'s sync pure-ts API) and is **deferred pending D080**. Locked: (Q-S1) `@graphrefly/native` publishes as an honest **async preview `0.0.1`** + parity arm; `@graphrefly/pure-ts` stays the sole working sync substrate for `@graphrefly/graphrefly`; the D080 async-everywhere presentation rebase (Option B) deferred until consumer pressure. **Option C** (hand-written ergonomic async `@graphrefly/native` public surface over `Bench*`, NOT a pure-ts sync drop-in) is a **committed follow-on `/porting-to-rs` slice** — it also closes N1 item-8's real native-side obligation *as an async surface*. (Q-S2) the B decision re-opens on memo:Re premium-backend native swap blocking (post-M5/DS-14.7-napi) or a D196 consumer. (Q-S4) D203 publish proceeds reframed; publish-prep landed (`@graphrefly/native` `0.0.1` + `publishConfig.access=public` + honest description). **Auth = npm OIDC trusted publishing, NO NPM_TOKEN** (user requirement; matches graphrefly-ts `release.yml`). One-time bootstrap: `scripts/first-publish-native.sh` (local `npm login`, cross-builds 5 targets, publishes all 6 packages) → per-package trusted-publisher config → thereafter `native-v*` tags publish token-free via OIDC. Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md` D206 + `archive/docs/SESSION-DS-native-substrate-contract.md` (RESOLVED + Option C slice plan). N1 item-8's TS-side (Impl-contract pin) already landed; native-side = the Option C slice.
 
+> **⏳ Storage-parity follow-up — `appendLogStorage`/WAL `flush()` durability contract (handed off from graphrefly-ts cross-track-ledger §2, 2026-05-16).** A TS-side memo:Re P0 was fixed in `~/src/graphrefly-ts/packages/pure-ts/src/extra/storage/tiers.ts`: the no-`debounceMs` `appendLogStorage` tier scheduled a microtask-chained `doFlush` per `appendEntries` wave, and `flush()` early-returned (`pending` empty) **before the in-flight chain drained** → only the first wave was durable (silent data loss; `appendMany`'s single wave masked it). Fix: `flushNow()` returns the outstanding `flushChain` when `pending` is empty so `flush()` awaits the full chain. **Native obligation (verify, no scenario gate needed — this is a correctness contract, not a surface widening):** the Rust `@graphrefly/native` storage path (`graphrefly-storage` `appendLogStorage`/WAL flush + `StorageHandle::flush_all` + tier shutdown / `destroyAsync` drain) must guarantee `flush()` resolves **only after all buffered/in-flight writes commit** (durability-on-resolve). The TS bug was a JS chained-microtask artifact specific to the no-debounce auto-flush path; confirm the Rust impl has no analogous "flush returns before queued writes land" gap (N3's `flush_all` lock-discipline work is adjacent but distinct). **Two more semantics surfaced by the graphrefly-ts /qa pass that the Rust parity arm must mirror (not just durability):** (a) **error-surfacing** — post-fix TS `flush()` *rejects* if a prior in-flight write failed (was: silently resolved); make the same reject-vs-swallow decision and test the **rejection** path, not only the happy path; (b) **debounced-flush driver (F9, now FIXED in TS)** — the `appendLogStorage` *tier* still has NO internal timer, but `attachStorage` now drives each debounced tier's `flush()` from a **reactive timer source** (`fromTimer(d,{period:d})`) plus a final drain on detach/teardown. The Rust reactive-log `attach_storage` must mirror this: drive debounced-tier flush from the **Rust reactive timer source** (NOT an internal tier timer, NOT a raw OS timer in the reactive layer) + drain on teardown; (c) **`rollback()` strong semantic (now FIXED in TS)** — a `rollbackEpoch` generation token: `rollback()` bumps it + clears pending; `do_flush` captures the epoch at schedule time and skips if it advanced, so in-flight chained writes scheduled pre-rollback are discarded (best-effort; an already-started backend write can't be un-sent). Mirror the epoch/abort, not just a pending-clear. Cross-ref: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §2 + `optimizations.md` memo:Re P0. Not blocking; fold into the M4/M5 storage parity pass or a `scenarios/storage-wal/` durability+reject+rollback scenario.
+
 M6 (Python / pyo3) remains separate and post-1.0.
 
 ### D047 in_tick re-keying — LANDED 2026-05-15 (CI `cargo test --all-targets` fix)
@@ -2297,6 +2299,127 @@ When a milestone closes:
 2. Add a `## Mn — closed YYYY-MM-DD` section below documenting what landed, what was deferred, and how the milestone's deliverables map back to the migration plan.
 3. Cross-reference any spec amendments (issues filed against `graphrefly/graphrefly`) and any TS-side changes (PRs against `graphrefly-ts`).
 4. Tag a release: `git tag -a vM<n>.0.0 -m "Mn complete"` and bump `[workspace.package].version` in the workspace `Cargo.toml`.
+
+## Concurrency-model rewrite — §7 single-threaded substrate + `SerializationGroupId` — landed 2026-05-16
+
+Post-M5 re-architecture of the M1 dispatcher's concurrency model.
+Source: `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-perf-value-investigation.md` §7
+(user-locked 2026-05-16); decisions D208–D212 in `~/src/graphrefly-ts/docs/rust-port-decisions.md`.
+
+**Motivation (measured, §4b/§4c/§5b):** the production dispatcher paid a
+~7.6–9.5× concurrency-machinery tax over a lean single-threaded Rust core;
+a lean Rust core is 1.1–3.2× *faster* than the pure-ts prototype. The tax
+was the locks-everywhere + D3 union-find partitioning, not Rust.
+
+**Landed:**
+
+- **`StateCell` seam (D208 Option A):** `Core<C: StateCell = LockedCell>`
+  generic over interior mutability. `SingleThreadCell` (`RefCell`, `!Sync`,
+  the §7 lock-free floor — `Core::<SingleThreadCell>::new_with_cell`) vs
+  `LockedCell` (`parking_lot::Mutex`, `Send + Sync`, the default exported
+  `Core` — keeps `graphrefly-graph`/`-operators`/`-storage`/`-structures`
+  + napi compiling unchanged). Zero `unsafe`. `WeakCore`/`Subscription`/
+  `FiringGuard`/`BatchGuard`/`TopologySubscription` generic-ized; the
+  pure-refactor checkpoint was verified behavior-preserving (graphrefly-core
+  330/0 + workspace clean) before the destructive phase.
+- **Union-find DELETED:** `subgraph.rs` (→ `TRASH/`), `SubgraphRegistry`
+  (`find`/path-compression/`union_nodes`/`split_partition`/`ensure_registered`/
+  `on_edge_removed`/epoch), `Core.registry`, `held_partitions`,
+  `partition_wave_owner_lock_arc`, `PARTITION_CACHE`, `MAX_LOCK_RETRIES`,
+  the begin_batch epoch retry-validate loops, the set_deps P13
+  partition-migration check + split/union blocks, `deferred_producer_ops`
+  queue + `drain_deferred_producer_ops`. `SubgraphId` removed.
+- **`SerializationGroupId` model (D210 amended):** `crates/.../groups.rs`
+  `GroupLockRegistry` (get-or-create `SerializationGroupId → Arc<ReentrantMutex<()>>`).
+  `NodeRecord.serialization_group: Option<…>` (via `NodeOpts` + new
+  `Core::set_serialization_group`). `begin_batch` acquires all groups
+  sorted; `begin_batch_for(seed)` walks children+meta, collects distinct
+  touched groups, acquires sorted upfront (deadlock-free; all-`None`
+  cascade → zero locks = the floor). **Strict invariant** (all-`None` or
+  all-`Some` per dep-connected component) enforced at register / set_deps /
+  set_serialization_group only — `RegisterError::GroupInconsistent`,
+  `SetDepsError::GroupInconsistent`, `SetGroupError`. `LockId` /
+  pause-locks (R1.2.6/R2.6) untouched — D210 amended after surfacing the
+  conflation (they are orthogonal axes).
+- **Tests:** `subgraph_registry.rs` + `per_subgraph_parallelism.rs` (tested
+  deleted union-find semantics) → `TRASH/tests/`; replaced by
+  `tests/serialization_groups.rs` (floor / group assignment / strict
+  all-None|all-Some rejection at every mutation point /
+  `Core<SingleThreadCell>` functional) and `tests/group_parallelism.rs`
+  (same-group serialization no-deadlock / disjoint-group no cross-group
+  deadlock). All other test files compiled unchanged.
+
+**Deferred (recorded in `porting-deferred.md` §7-A..D):**
+
+- **§7-A — `commit_emission` single-pass collapse: DEFERRED, flagged for
+  user ratification.** §5b measured the lock-cycle collapse at ~0%
+  single-thread benefit (contended-only ~10%); it is §7's riskiest
+  behavioral change for ~0 of its measured perf lever. Only deviation
+  from the literal "one batch, both" §7 wording; the confirming
+  AskUserQuestion failed mid-call (stream closed) so it was taken on
+  §5b's own evidence and is flagged for explicit ratify/reverse (D212).
+- **§7-B** cross-component dynamic re-entry into an unheld group (faithful
+  v1 limitation; §7 deletes the old defer and specifies no replacement).
+- **§7-C** vestigial union-find surface (`PartitionOrderViolation`,
+  `DeferredProducerOp`, `SubscribeError::PartitionOrderViolation`,
+  `SetDepsError::PartitionMigrationDuringFire`, `*_or_defer` aliases,
+  empty `drain_deferred_producer_ops`) retained for downstream zero-churn
+  (D211) — removal is a standalone `graphrefly-operators` cleanup slice.
+- **§7-D** throwaway `bench_naive`/`bench_state_collapse` scaffolding
+  removed; `minimal_handle_core` bench retained as the floor regression
+  harness.
+
+**Supersedes:** D3 (`SESSION-rust-port-d3-per-subgraph-parallelism.md`,
+banner-flagged) + decisions D085/D086 (D212).
+
+### /qa adversarial pass — landed 2026-05-16 (D213/D214)
+
+Two parallel review subagents (Blind Hunter + Edge Case Hunter)
+**converged** on a critical regression the green suite missed (because
+the slice deleted `per_subgraph_parallelism.rs` + gutted
+`lock_released.rs`'s concurrent tests). Fixes applied + user-approved:
+
+- **F1 (CRITICAL, D213) — fixed.** Deleting union-find removed the
+  per-partition `wave_owner` that serialized waves per component even
+  for an unannotated graph; an all-`None` `Core<LockedCell>` (the
+  `Send+Sync` default every downstream + napi uses, D211) acquired ZERO
+  wave locks → cross-thread `WAVE_STATE`/`TIER3`/`IN_TICK_OWNED`
+  corruption. Fix: `StateCell::SERIALIZE_WAVES` assoc-const +
+  `Core::global_wave: Arc<ReentrantMutex<()>>` acquired only on
+  `LockedCell` when the touched-group set is empty. Floor (`SingleThreadCell`)
+  branch dead-code-eliminates → §7 ~83 ns untouched; `LockedCell` pays
+  ~1 uncontended ReentrantMutex/wave (~1–3%, bench noise). Regression
+  test: `group_parallelism.rs::all_none_default_core_cross_thread_cascade_integrity`.
+- **F2 + point-3 (MAJOR, D214) — fixed.** Meta-companion edges bypassed
+  the strict invariant (`add_meta_companion` did no group check;
+  `walk_undirected_dep_graph` ignored meta while the wave cascade walks
+  it). Unified to ONE deps+children+meta relation
+  (`component_is_group_consistent`) reused by register / add_meta_companion
+  (panics on mix) / set_deps-soundness-basis / set_serialization_group.
+  `set_serialization_group` redefined **component-wide** = the
+  retroactive-regroup primitive (per-node could never legally
+  all-`None`→all-`Some`). `SetGroupError::ComponentInconsistent` now
+  unreachable (retained, doc-noted).
+- **F3 (minor) — fixed.** Added the canonical no-dep `assert_not_impl_any`
+  compile guard that `Core<SingleThreadCell>` is `!Send + !Sync`
+  (Blind Hunter's unsoundness claim was *wrong* — `Arc<RefCell<…>>` is
+  auto `!Send` since `Arc<T>: Send` needs `T: Sync`; the gap was only a
+  missing regression test).
+- **F4 — fixed.** Cross-thread cascade-integrity + meta-consistency +
+  component-wide-regroup tests added (the coverage whose deletion let F1
+  slip).
+- **F5/F6/F7 → deferred & documented** in `porting-deferred.md`: §7-B
+  strengthened (cross-component dynamic re-entry is **deadlock
+  potential**, not just missed-serialization); new §7-E
+  (`GroupLockRegistry` unbounded growth) + §7-F (`*_or_defer`
+  `Send+Sync` cliff on the floor). F8 within §7-C's acknowledged scope.
+
+**Post-/qa test status:** `graphrefly-core` **310 passed, 0 failed**
+(was 307 pre-/qa; +3 net: new F1/F2/F3-anchored tests minus the
+reworked single-node-reject test). Default-members **workspace 828
+passed, 0 failed** (was 825). `cargo clippy -p graphrefly-core
+--all-targets` clean; `cargo fmt --check` clean; `#![forbid(unsafe_code)]`
+preserved across all 6 crate roots; zero new `unsafe`.
 
 ## Post-1.0 backlog
 

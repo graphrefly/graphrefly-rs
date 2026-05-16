@@ -1,0 +1,41 @@
+# cargo-nextest configuration for the GraphReFly Rust port.
+#
+# Why nextest: `cargo test` runs each of the ~27 graphrefly-core integration
+# test binaries one-at-a-time, only parallelising the `#[test]` fns *within*
+# a binary. nextest builds every binary, then runs ALL tests across ALL
+# binaries in a single global thread pool — true cross-binary parallelism.
+#
+# The `slow-timeout` here is deliberate: a deadlocked cross-thread test
+# (e.g. the §7 serialization-group concurrency tests) previously hung a
+# `cargo test` run for ~1h45m, holding the cargo build-directory lock and
+# blocking every other session behind it. nextest now kills any test that
+# overruns instead of hanging the whole suite (and the machine).
+
+[profile.default]
+# Run as many tests concurrently as logical CPUs. Override per-run with
+# `--test-threads N` or `NEXTEST_TEST_THREADS`.
+test-threads = "num-cpus"
+
+# A correct unit/integration test in this suite finishes in well under a
+# second. If one runs 60s it is almost certainly deadlocked or busy-waiting
+# (spec §5: no polling / no busy-wait). Warn at 60s, then KILL after 3
+# overruns (3 min) so a hang can never wedge the suite again.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Local dev: stop on first failure for a fast feedback loop.
+fail-fast = true
+retries = 0
+
+# Surface the slowest tests so regressions in test runtime are visible.
+status-level = "pass"
+final-status-level = "slow"
+
+[profile.ci]
+# CI wants the full failure picture, not first-failure.
+fail-fast = false
+retries = { backoff = "fixed", count = 2, delay = "1s" }
+slow-timeout = { period = "60s", terminate-after = 4 }
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

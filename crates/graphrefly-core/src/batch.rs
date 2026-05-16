@@ -534,31 +534,13 @@ fn wave_state_clear_outermost() {
     });
 }
 
-// Profile-driven optimization (2026-05-10): per-thread partition cache for
-// `begin_batch_for`. The common hot-loop pattern is repeated emits to the
-// same seed node (e.g., state node in a tight emit loop). Each emit calls
-// `begin_batch_for(seed)` which calls `compute_touched_partitions(seed)` —
-// a BFS that acquires state + registry locks and allocates a HashSet +
-// SmallVec. Since the topology doesn't change between emits (registry epoch
-// is stable), we cache the BFS result per-thread and skip the BFS on hit.
-//
-// Cache validity: keyed on (core_generation, seed, epoch). Any registry mutation
-// (register/union/split) bumps epoch → invalidates. The post-acquire epoch
-// recheck in `begin_batch_for` catches the (rare) case where a concurrent
-// mutation happens between cache read and lock acquisition.
-struct PartitionCache {
-    /// Monotonic generation from [`crate::node::CORE_GENERATION`]. Avoids
-    /// ABA false-hits that `Arc::as_ptr` would suffer after Core drop +
-    /// allocator address reuse (/qa F1, 2026-05-10).
-    core_generation: u64,
-    seed: NodeId,
-    epoch: u64,
-    partitions: SmallVec<[crate::subgraph::SubgraphId; 4]>,
-}
-
-thread_local! {
-    static PARTITION_CACHE: RefCell<Option<PartitionCache>> = const { RefCell::new(None) };
-}
+// §7 (D208–D211): the per-thread `PARTITION_CACHE` is DELETED. It existed
+// to amortize the union-find `compute_touched_partitions` BFS + registry
+// epoch round-trips across repeated same-seed emits. With static
+// user-declared serialization groups there is no epoch and the
+// touched-group walk resolves group `Arc`s under a single uncontended
+// `group_locks` lock (and is entirely skipped for the all-`None` floor),
+// so the cache (and its ABA-avoidance generation keying) is unnecessary.
 
 /// Has `node` emitted a tier-3 (DATA / RESOLVED) message in the current
 /// wave on this thread? See [`TIER3_EMITTED_THIS_WAVE`] for the per-thread
@@ -686,13 +668,13 @@ impl PendingPerNode {
 /// but membership is preserved. If a future call site needs strict LIFO
 /// (e.g. "pop the most recently fired node"), switch to `pop()` + assert
 /// the popped value equals `self.node_id`. (QA A6, 2026-05-07)
-pub(crate) struct FiringGuard {
-    core: Core,
+pub(crate) struct FiringGuard<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    core: Core<C>,
     node_id: NodeId,
 }
 
-impl FiringGuard {
-    pub(crate) fn new(core: &Core, node_id: NodeId) -> Self {
+impl<C: crate::state_cell::StateCell> FiringGuard<C> {
+    pub(crate) fn new(core: &Core<C>, node_id: NodeId) -> Self {
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
         // CoreState (cross-thread visible, restoring the D091 P13 check).
         // Push under the state lock scope.
@@ -707,7 +689,7 @@ impl FiringGuard {
     }
 }
 
-impl Drop for FiringGuard {
+impl<C: crate::state_cell::StateCell> Drop for FiringGuard<C> {
     fn drop(&mut self) {
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
         // CoreState. Pop under state lock.
@@ -749,7 +731,7 @@ fn scratch_mut<T: crate::op_state::OperatorScratch>(s: &mut CoreState, node_id: 
         .expect("op_scratch type mismatch")
 }
 
-impl Core {
+impl<C: crate::state_cell::StateCell> Core<C> {
     // -------------------------------------------------------------------
     // Wave entry + drain
     // -------------------------------------------------------------------
@@ -1293,6 +1275,10 @@ impl Core {
         let snapshot = {
             let s = self.lock_state();
             let rec = s.require_node(node_id);
+            // (§7-D: the throwaway `bench_state_collapse` relocated
+            // is_state/producer assert was removed — the normal-path
+            // validation in `Core::emit` is retained; the
+            // commit_emission single-pass collapse is deferred, §7-A.)
             if rec.terminal.is_some() {
                 drop(s);
                 self.binding.release_handle(new_handle);
@@ -3230,67 +3216,18 @@ impl Core {
     /// Like the closure form, nested `begin_batch` calls share the outer
     /// wave (only the outermost guard drains).
     ///
-    /// # Panics
-    ///
-    /// Panics if the registry-epoch retry-validate loop exceeds
-    /// [`crate::subgraph::MAX_LOCK_RETRIES`] iterations — pathological
-    /// concurrent `register` / `set_deps` activity racing with
-    /// closure-form batch entry. Unreachable in correct call paths.
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-    pub fn begin_batch(&self) -> BatchGuard {
-        // Slice Y1 / Phase E (2026-05-08): closure-form batch has no known
-        // seed; per session-doc Q7 / D092 it MUST serialize against every
-        // currently-existing partition. Acquire each partition's
-        // `wave_owner` in ascending [`SubgraphId`] order via the retry-
-        // validate primitive. Same-thread re-entry passes through each
-        // ReentrantMutex transparently; cross-thread waves on any of the
-        // touched partitions block until our `wave_guards` drop.
-        //
-        // **QA-fix #2 (2026-05-09) — registry epoch retry-validate:** a
-        // concurrent `register` / `set_deps`-driven union/split between
-        // our `all_partitions_lock_boxes()` snapshot and the post-
-        // acquire epoch read changes the partition set. We then retry
-        // the whole acquire with the new snapshot. Without this, a
-        // partition added after our snapshot would not be held by our
-        // batch — breaking the closure-form's "all-partitions
-        // serialization" contract.
-        //
-        // Trade-off (documented v1 contract): closure-form batch is the
-        // serialization point under per-partition parallelism. Per-seed
-        // entry points (`Core::subscribe`, [`Self::begin_batch_for`])
-        // acquire only the touched partitions and run truly parallel
-        // for disjoint partitions.
-        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
-            let epoch_before = self.registry.lock().epoch();
-            let partition_boxes = self.all_partitions_lock_boxes();
-            let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
-            for (sid, _box) in &partition_boxes {
-                // Use the partition's root NodeId as the lock_for retry
-                // seed. SubgraphId.raw() == root NodeId.raw(); the root
-                // is always registered in the X5 / Phase-E substrate
-                // (cleanup_node is gated, Phase G activates).
-                let representative = crate::handle::NodeId::new(sid.raw());
-                wave_guards.push(
-                    self.partition_wave_owner_lock_arc(representative)
-                        .unwrap_or_else(|e| panic!("{e}")),
-                );
-            }
-            // Post-acquire epoch read. If unchanged, our snapshot is
-            // still authoritative — every existing partition was held
-            // throughout. If changed, drop guards and retry.
-            let epoch_after = self.registry.lock().epoch();
-            if epoch_after == epoch_before {
-                return self.begin_batch_with_guards(wave_guards);
-            }
-            // Drop guards lock-released so retries don't accumulate.
-            drop(wave_guards);
-            std::thread::yield_now();
-        }
-        panic!(
-            "Core::begin_batch: exceeded {} retries — pathological concurrent \
-             register/union/split activity racing with closure-form batch entry",
-            crate::subgraph::MAX_LOCK_RETRIES
-        );
+    pub fn begin_batch(&self) -> BatchGuard<C> {
+        // §7 (D208–D211): closure-form batch has no known seed, so it
+        // serializes against **every** serialization group. Acquire each
+        // group's wave-lock in ascending `SerializationGroupId` order
+        // (deadlock-free; same-thread re-entry passes through each
+        // `ReentrantMutex`). Groups are static + user-declared, so the
+        // union-find epoch retry-validate loop is GONE — one pass, no
+        // retries. For an all-`None` graph this acquires nothing (the
+        // single-threaded floor).
+        let wave_guards = self.acquire_all_group_guards();
+        self.begin_batch_with_guards(wave_guards)
     }
 
     /// Begin a batch scoped to the partitions transitively touched from
@@ -3326,89 +3263,27 @@ impl Core {
     ///
     /// Slice Y1 / Phase E (2026-05-08); QA-fix #2 (2026-05-09).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-    pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard {
+    pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<C> {
         match self.try_begin_batch_for(seed) {
             Ok(guard) => guard,
             Err(e) => panic!("{e}"),
         }
     }
 
-    /// Fallible variant of `begin_batch_for`. Returns `Err` if any
-    /// partition acquire violates ascending order (Phase H+ STRICT,
-    /// D115). Used by `try_run_wave_for`; the public `begin_batch_for`
-    /// calls this and unwraps.
+    /// §7: now-infallible variant of [`Self::begin_batch_for`]. The
+    /// `Result` is retained so existing callers (`try_run_wave_for`,
+    /// the `?`-using wave entry points) compile unchanged (D211); it is
+    /// **always `Ok`** — serialization groups are static + user-declared
+    /// and the touched-group set is acquired sorted upfront, so there is
+    /// no `PartitionOrderViolation` and no epoch retry. For an
+    /// all-`None` cascade this acquires nothing (single-threaded floor).
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn try_begin_batch_for(
         &self,
         seed: crate::handle::NodeId,
-    ) -> Result<BatchGuard, crate::node::PartitionOrderViolation> {
-        let core_generation = self.generation;
-        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
-            let epoch_before = self.registry.lock().epoch();
-            // Fast-path: per-thread partition cache. On repeated emits to
-            // the same seed (the dominant hot-loop pattern), skip the BFS
-            // in compute_touched_partitions — it acquires state + registry
-            // locks and allocates a HashSet + SmallVec per call. The cache
-            // is valid as long as the registry epoch hasn't changed (no
-            // register/union/split since the cache was populated).
-            let touched = PARTITION_CACHE
-                .with(|cell| {
-                    let cache = cell.borrow();
-                    if let Some(ref c) = *cache {
-                        if c.core_generation == core_generation
-                            && c.seed == seed
-                            && c.epoch == epoch_before
-                        {
-                            return Some(c.partitions.clone());
-                        }
-                    }
-                    None
-                })
-                .unwrap_or_else(|| {
-                    let result = self.compute_touched_partitions(seed);
-                    PARTITION_CACHE.with(|cell| {
-                        *cell.borrow_mut() = Some(PartitionCache {
-                            core_generation,
-                            seed,
-                            epoch: epoch_before,
-                            partitions: result.clone(),
-                        });
-                    });
-                    result
-                });
-            let mut wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]> = SmallVec::new();
-            let mut partition_err = None;
-            for sid in &touched {
-                let representative = crate::handle::NodeId::new(sid.raw());
-                match self.partition_wave_owner_lock_arc(representative) {
-                    Ok(guard) => wave_guards.push(guard),
-                    Err(e) => {
-                        partition_err = Some(e);
-                        break;
-                    }
-                }
-            }
-            // Drop wave_guards on error — release any already-acquired partitions.
-            if let Some(e) = partition_err {
-                drop(wave_guards);
-                return Err(e);
-            }
-            let epoch_after = self.registry.lock().epoch();
-            if epoch_after == epoch_before {
-                return Ok(self.begin_batch_with_guards(wave_guards));
-            }
-            // Epoch changed — invalidate cache and retry.
-            PARTITION_CACHE.with(|cell| {
-                *cell.borrow_mut() = None;
-            });
-            drop(wave_guards);
-            std::thread::yield_now();
-        }
-        panic!(
-            "Core::begin_batch_for(seed={seed:?}): exceeded {} retries — \
-             pathological concurrent register/union/split activity racing \
-             with per-seed batch entry",
-            crate::subgraph::MAX_LOCK_RETRIES
-        );
+    ) -> Result<BatchGuard<C>, crate::node::PartitionOrderViolation> {
+        let wave_guards = self.acquire_touched_group_guards(seed);
+        Ok(self.begin_batch_with_guards(wave_guards))
     }
 
     /// Is this thread currently inside an owning wave on this Core?
@@ -3456,7 +3331,7 @@ impl Core {
     fn begin_batch_with_guards(
         &self,
         wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
-    ) -> BatchGuard {
+    ) -> BatchGuard<C> {
         // Claim wave ownership for this (Core, thread). Keyed per-(Core,
         // thread) in the `IN_TICK_OWNED` thread_local (see its doc for
         // the cross-Core / disjoint-partition / nested-re-entry rationale)
@@ -3547,8 +3422,8 @@ impl Core {
 /// requires_send(guard); // <- compile_fail: BatchGuard is !Send.
 /// ```
 #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-pub struct BatchGuard {
-    core: Core,
+pub struct BatchGuard<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    core: Core<C>,
     owns_tick: bool,
     /// Re-entrant mutex guards held for the wave's duration. One entry
     /// per touched partition's `wave_owner`, in ascending
@@ -3567,7 +3442,7 @@ pub struct BatchGuard {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
-impl BatchGuard {
+impl<C: crate::state_cell::StateCell> BatchGuard<C> {
     /// Panic-discard cleanup for the owning guard: drop pending wave
     /// work, release queued payload + handle retains lock-released,
     /// restore pre-wave cache snapshots, clear per-thread `WaveState` +
@@ -3644,25 +3519,15 @@ impl BatchGuard {
         // thread-local outlives the BatchGuard otherwise — cargo's
         // thread reuse across tests would propagate stale entries.
         tier3_clear();
-        // Phase H+ STRICT (D115): discard deferred producer ops on
-        // panic. Release handle retains without firing.
-        {
-            let mut ops = self.core.deferred_producer_ops.lock();
-            let discarded = std::mem::take(&mut *ops);
-            for op in discarded {
-                match op {
-                    crate::node::DeferredProducerOp::Emit { handle, .. }
-                    | crate::node::DeferredProducerOp::Error { handle, .. } => {
-                        self.core.binding.release_handle(handle);
-                    }
-                    _ => {} // Complete has no handle; Callback drops naturally
-                }
-            }
-        }
+        // §7 (D208–D211): the panic-path "discard deferred producer
+        // ops" block is DELETED. There is no `deferred_producer_ops`
+        // queue — producer ops execute immediately
+        // (`Core::push_deferred_producer_op`), so on a panic-discard
+        // there is nothing queued to release/drop.
     }
 }
 
-impl Drop for BatchGuard {
+impl<C: crate::state_cell::StateCell> Drop for BatchGuard<C> {
     fn drop(&mut self) {
         if !self.owns_tick {
             // Nested / non-owning guard: never claimed ownership, so it
@@ -3725,13 +3590,13 @@ impl Drop for BatchGuard {
                 // /qa A1 (2026-05-09) discipline preserved: drain snapshot
                 // retains under lock, release lock-released below to avoid
                 // binding re-entrance under held mutex / borrow.
-                let snapshot_releases = Core::drain_wave_cache_snapshots(ws);
+                let snapshot_releases = Core::<C>::drain_wave_cache_snapshots(ws);
                 // `drain_deferred` takes `deferred_flush_jobs` +
                 // `deferred_handle_releases` (incl. rotation releases pushed
                 // by `clear_wave_state` above) + Slice E2
                 // `deferred_cleanup_hooks` + Slice E2 /qa Q2(b)
                 // `pending_wipes` — all from WaveState post-Sub-slice-3.
-                let (jobs, releases, hooks, wipes) = Core::drain_deferred(&mut s, ws);
+                let (jobs, releases, hooks, wipes) = Core::<C>::drain_deferred(&mut s, ws);
                 (jobs, releases, hooks, wipes, snapshot_releases)
             });
             // Release wave ownership now — AFTER drain + WaveState

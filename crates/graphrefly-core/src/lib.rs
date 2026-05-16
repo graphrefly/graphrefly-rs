@@ -47,12 +47,13 @@
 mod batch;
 pub mod boundary;
 pub mod clock;
+pub(crate) mod groups;
 pub mod handle;
 pub mod hash;
 pub mod message;
 pub mod node;
 pub(crate) mod op_state;
-pub mod subgraph;
+pub mod state_cell;
 #[cfg(feature = "tokio")]
 pub mod timer;
 pub mod topology;
@@ -61,22 +62,14 @@ pub use batch::BatchGuard;
 
 pub use boundary::{BindingBoundary, CleanupTrigger, DepBatch, FnEmission, FnResult};
 pub use clock::{monotonic_ns, wall_clock_ns};
-pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
+pub use handle::{FnId, HandleId, LockId, NodeId, SerializationGroupId, NO_HANDLE};
 pub use hash::sha256_hex;
 pub use message::{Message, Messages};
 pub use node::{
     Core, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration,
-    OperatorOp, OperatorOpts, PartitionOrderViolation, PausableMode, PauseError, RegisterError,
-    ResumeReport, SetDepsError, SetPausableModeError, Sink, SubscribeError, Subscription,
-    TerminalKind, UpError, WeakCore,
+    OperatorOp, OperatorOpts, PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError,
+    SetGroupError, SetPausableModeError, Sink, SubscribeError, Subscription, TerminalKind, UpError,
+    WeakCore,
 };
-pub use subgraph::SubgraphId;
+pub use state_cell::{LockedCell, SingleThreadCell, StateCell};
 pub use topology::{TopologyEvent, TopologySink, TopologySubscription};
-
-/// Phase H+ STRICT (D115): test-only thread-local accessors for
-/// verifying the H+ check's bookkeeping stays clean across panic
-/// unwinds. Re-exported `pub` (gated by
-/// `cfg(any(test, debug_assertions))`) so integration tests under
-/// `tests/` can call them. Not part of the v1 stable API.
-#[cfg(any(test, debug_assertions))]
-pub use node::held_snapshot_for_tests;

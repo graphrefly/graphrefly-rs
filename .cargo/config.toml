@@ -1,0 +1,18 @@
+# GraphReFly Rust port — cargo config.
+#
+# Intentionally minimal. No alternative linker is overridden here: mold /
+# lld / sccache are NOT installed on the canonical dev machine, and a
+# `[target.*] linker`/`rustflags = -fuse-ld=...` pointing at an absent
+# linker breaks every build. Add a linker override ONLY together with an
+# installed-linker check in scripts/dev-test.sh.
+
+[alias]
+# `cargo t`  — the everyday parallel test loop (cross-binary via nextest).
+# `cargo tc` — the same under the CI profile (no fail-fast, retries).
+t = "nextest run"
+tc = "nextest run --profile ci"
+
+[build]
+# Default for the dev profile already, but pinned so a stray
+# CARGO_INCREMENTAL=0 in the environment doesn't silently slow rebuilds.
+incremental = true

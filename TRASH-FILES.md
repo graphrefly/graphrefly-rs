@@ -1,1 +1,4 @@
 .claude/proto_ab.sh - moved to TRASH/ - throwaway A/B perf orchestration script (in_tick slice); no longer needed
+crates/graphrefly-core/src/subgraph.rs - moved to TRASH/ - D3 union-find subsystem deleted per §7 single-threaded-substrate rewrite (D208-D211); replaced by crates/graphrefly-core/src/groups.rs (SerializationGroupId lock registry)
+crates/graphrefly-core/tests/subgraph_registry.rs - moved to TRASH/tests/ - tested deleted D3 union-find connected-component semantics (partition_count==#components, union/split-eager, P12/P13 PartitionMigrationDuringFire); replaced by tests/serialization_groups.rs (§7 group model)
+crates/graphrefly-core/tests/per_subgraph_parallelism.rs - moved to TRASH/tests/ - tested deleted union-find per-partition wave_owner parallelism; replaced by tests/group_parallelism.rs (§7 disjoint-group parallel / same-group serialized / single-thread floor)

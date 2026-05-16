@@ -51,6 +51,13 @@ harness = false
 name    = "lock_strategy"
 harness = false
 
+# §7 floor regression harness (D208–D211) — a lean single-threaded
+# handle-core mirror; the canonical comparison point for the
+# `Core<SingleThreadCell>` ~83 ns target. Retained post-§7.
+[[bench]]
+name    = "minimal_handle_core"
+harness = false
+
 [features]
 default      = ["std", "tokio"]
 # `std` is the only supported configuration for now. Kept as a feature so
@@ -63,6 +70,10 @@ tokio        = ["dep:tokio"]
 # Concurrency permutation testing via loom. Enable in CI for the per-subgraph
 # RLock + dispatch tests.
 loom-checked = []
+# (§7/D208–D211: the throwaway `bench_naive` / `bench_state_collapse`
+# perf-investigation features were removed — they isolated the
+# union-find / lock-cycle machinery this slice deletes; see
+# `docs/porting-deferred.md` §7-D.)
 
 [lints.rust]
 # Loom is enabled via `RUSTFLAGS="--cfg loom"`, not a Cargo feature.

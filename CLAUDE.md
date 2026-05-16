@@ -33,8 +33,25 @@ eval "$(mise env)"                  # or just exec a shell that sources mise
 
 # Build / test / lint
 cargo check --workspace             # fast type-check, all crates
-cargo test --workspace              # all tests across crates
-cargo test -p graphrefly-core       # one crate
+
+# Test loop — PREFER nextest. `cargo test` runs the ~27 graphrefly-core
+# integration-test binaries one-at-a-time (only parallelising within a
+# binary); nextest runs ALL tests across ALL binaries in one global thread
+# pool, and its slow-timeout (.config/nextest.toml) KILLS a deadlocked
+# test after 3min instead of wedging the suite + the cargo build lock.
+scripts/dev-test.sh                 # ALL default-members tests, isolated
+scripts/dev-test.sh -p graphrefly-core            # one crate
+scripts/dev-test.sh -p graphrefly-core <filter>   # filtered
+cargo t                             # = `cargo nextest run` (shared target)
+cargo tc                            # = nextest run --profile ci
+cargo test --workspace              # legacy fallback (slow, binary-by-binary)
+cargo test -p graphrefly-core       # one crate (legacy)
+
+# ⚠ Parallel sessions: `cargo test`/`cargo t` share `target/` and its
+# build lock — a second run BLOCKS behind the first (and is wedged forever
+# if the first deadlocks). Use `scripts/dev-test.sh`: it sets a
+# per-worktree CARGO_TARGET_DIR so concurrent sessions never share a lock.
+
 cargo clippy --workspace --all-targets   # pedantic-tier lints
 cargo fmt --all                     # rustfmt
 cargo deny check                    # supply-chain audit (after `cargo install cargo-deny`)

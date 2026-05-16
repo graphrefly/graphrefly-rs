@@ -33,16 +33,16 @@ pub type TopologySink = Arc<dyn Fn(&TopologyEvent) + Send + Sync>;
 
 /// RAII handle for a topology subscription. Dropping it unregisters the sink.
 #[must_use = "TopologySubscription holds the subscription; dropping it unregisters the sink"]
-pub struct TopologySubscription {
+pub struct TopologySubscription<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
     /// Index into `CoreState.topology_sinks`. We use a generational
     /// approach: each subscription gets a unique id; unsubscribe
     /// marks the slot as `None`.
     id: u64,
-    /// Weak ref to `CoreState` — silent no-op if Core is dropped first.
-    state: std::sync::Weak<parking_lot::Mutex<super::node::CoreState>>,
+    /// Weak ref to the state cell — silent no-op if Core is dropped first.
+    state: std::sync::Weak<C>,
 }
 
-impl Drop for TopologySubscription {
+impl<C: crate::state_cell::StateCell> Drop for TopologySubscription<C> {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
             let mut s = state.lock();
@@ -57,7 +57,7 @@ const _: fn() = || {
     assert_send_sync::<TopologySubscription>();
 };
 
-impl super::node::Core {
+impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// Subscribe to topology changes. The sink fires synchronously
     /// from the registration / teardown / `set_deps` call site, under
     /// no Core lock (the state lock is dropped before firing). Sinks
@@ -83,7 +83,7 @@ impl super::node::Core {
     /// - `DepsChanged { ... }` fires only when `set_deps` actually
     ///   rewires deps. The idempotent fast-path (deps unchanged as a
     ///   set) returns without firing.
-    pub fn subscribe_topology(&self, sink: TopologySink) -> TopologySubscription {
+    pub fn subscribe_topology(&self, sink: TopologySink) -> TopologySubscription<C> {
         let mut s = self.lock_state();
         let id = s.next_topology_id;
         s.next_topology_id += 1;

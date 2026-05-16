@@ -146,6 +146,7 @@ impl SubgraphLockBox {
             wave_owner: Arc::new(ReentrantMutex::new(())),
         })
     }
+
 }
 
 /// Default cap for [`SubgraphRegistry::lock_for`]'s root-validation
@@ -305,7 +306,17 @@ impl SubgraphRegistry {
     /// On merge, the loser's [`SubgraphLockBox`] entry is removed
     /// from `boxes`. Future `lock_for` calls on the loser's members
     /// resolve to the winner's root → winner's box.
+    #[cfg_attr(feature = "bench_naive", allow(unreachable_code))]
     pub(crate) fn union_nodes(&mut self, a: NodeId, b: NodeId) {
+        // THROWAWAY (`bench_naive`): no merging — every node stays a
+        // singleton partition; the single global naive_box serializes
+        // all waves so partition identity is irrelevant.
+        #[cfg(feature = "bench_naive")]
+        {
+            let _ = (a, b);
+            return;
+        }
+        #[cfg(not(feature = "bench_naive"))]
         debug_assert!(
             self.parent.contains_key(&a) && self.parent.contains_key(&b),
             "union_nodes: both nodes must be registered first"

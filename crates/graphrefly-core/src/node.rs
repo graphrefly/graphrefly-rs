@@ -72,276 +72,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use parking_lot::{ArcReentrantMutexGuard, Mutex, MutexGuard};
+use parking_lot::{ArcReentrantMutexGuard, Mutex};
 
 /// Held guard from `parking_lot::ReentrantMutex::lock_arc()` on a
-/// partition's `wave_owner`. `!Send` per `parking_lot::ReentrantMutex`'s
-/// thread-affinity contract (the inner guard is `!Send`; the wrapper
-/// inherits) — the type-level `!Send` flows into
-/// [`crate::batch::BatchGuard::_wave_guards`] so any attempt to send
-/// the batch guard across threads fails to compile.
+/// **serialization group's** wave-lock (§7; D208–D211, 2026-05-16 —
+/// replaces the deleted union-find per-partition `wave_owner`).
 ///
-/// **Phase H+ option (d) limited variant (2026-05-09):** the guard's
-/// [`Drop`] pops `sid` from the [`held_partitions`] thread-local so
-/// the ascending-order check on the next acquire sees the correct
-/// "currently held" set. Re-entrant acquires (same thread, same
-/// partition) increment a refcount in the thread-local; final drop
-/// removes the entry.
+/// `!Send` per `parking_lot::ReentrantMutex`'s thread-affinity contract
+/// (the inner guard is `!Send`; the wrapper inherits) — the type-level
+/// `!Send` flows into [`crate::batch::BatchGuard::wave_guards`] so any
+/// attempt to send the batch guard across threads fails to compile.
 ///
-/// Slice Y1 / Phase E (2026-05-08); Phase H+ wrapper (2026-05-09).
+/// Deadlock-freedom no longer needs a thread-local ascending-order
+/// check: groups are user-declared and static, and the wave engine
+/// acquires the entire touched-group set sorted by
+/// [`crate::handle::SerializationGroupId`] **upfront** at wave entry
+/// (`begin_batch` / `begin_batch_for`). Same-thread re-entry into an
+/// already-held group passes through `parking_lot::ReentrantMutex`
+/// transparently. There is therefore no per-guard bookkeeping — the
+/// only thing that matters is the inner guard's `Drop` releasing the
+/// mutex at wave end. (Deleted: `held_partitions` thread-local,
+/// `PartitionOrderViolation`, the retry-validate loop.)
 pub(crate) struct WaveOwnerGuard {
-    /// Drop order: the wrapper's Drop runs FIRST (pops `held_partitions`),
-    /// then `inner` drops automatically (releases the parking_lot lock).
-    /// Field-declaration order matters in Rust: the wrapper drops top-
-    /// down by default, so `inner` is listed AFTER `sid` so the wrapper's
-    /// custom Drop runs on the whole struct first, releasing the
-    /// thread-local entry under our control before the inner guard
-    /// hits parking_lot's release path.
-    sid: crate::subgraph::SubgraphId,
-    /// `#[allow(dead_code)]`: the inner guard is held to keep the
-    /// parking_lot::ReentrantMutex acquired for the wave's duration;
-    /// it's never read, only its `Drop` matters.
+    /// `#[allow(dead_code)]`: the inner guard is held purely to keep the
+    /// group's `parking_lot::ReentrantMutex` acquired for the wave's
+    /// duration; it is never read — only its `Drop` (mutex release at
+    /// wave end) matters. No custom `Drop` on the wrapper: there is no
+    /// thread-local bookkeeping to unwind (groups are static + acquired
+    /// sorted upfront), so plain field-drop is correct and sufficient.
     #[allow(dead_code)]
     inner: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
 }
 
-impl Drop for WaveOwnerGuard {
-    fn drop(&mut self) {
-        // `held_partitions::release` returns `bool was_outermost`. The
-        // outermost-release signal is consumed by [`crate::batch::BatchGuard::drop`]
-        // for the per-thread `TIER3_EMITTED_THIS_WAVE` clear (D1 patch,
-        // 2026-05-09 — Slice G coalescing tracker is keyed by thread,
-        // not by partition, so the clear lives on `BatchGuard` not here).
-        // We discard the bool — no per-guard cleanup remains.
-        let _ = held_partitions::release(self.sid);
-        // `inner` drops automatically after this — releases the
-        // parking_lot::ReentrantMutex (decrementing parking_lot's
-        // own internal re-entry counter; only the FINAL release
-        // unparks waiters).
+impl WaveOwnerGuard {
+    /// Wrap an acquired group wave-lock guard.
+    pub(crate) fn new(
+        inner: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
+    ) -> Self {
+        Self { inner }
     }
 }
-
-/// Phase H+ STRICT variant — thread-local infrastructure for
-/// cross-partition acquire-during-fire / cross-partition
-/// acquire-during-wave deadlock detection (D115, 2026-05-10).
-///
-/// **Protocol invariant enforced:** whenever this thread already
-/// holds at least one partition wave_owner (HELD non-empty), every
-/// NEW partition this thread tries to acquire must have an id
-/// strictly greater than every partition currently held. Re-entrant
-/// acquires (same thread, same partition that's already held) bypass
-/// the check (they're fine — `parking_lot::ReentrantMutex` allows
-/// same-thread re-entry transparently).
-///
-/// Without this check, two threads each doing nested cross-partition
-/// acquires within an active wave could form an AB/BA cycle: thread A
-/// holds X, attempts Y (Y < X); concurrently thread B holds Y,
-/// attempts X (X > Y, ascending-OK from B's POV). A's acquire on Y
-/// blocks behind B; B's acquire on X blocks behind A. Cycle.
-///
-/// **No producer carve-out:** the prior limited variant suppressed
-/// the check during producer build/sink closures via an
-/// `IN_PRODUCER_BUILD` refcount. The STRICT variant (D115) removes
-/// this carve-out entirely. Instead, `check_and_acquire` returns a
-/// typed `Result<(), PartitionOrderViolation>` error, and callers
-/// that would violate ascending order (producer-pattern operator
-/// sinks) defer the operation to wave-end via the per-Core
-/// `deferred_producer_ops` queue. The defer-and-retry approach
-/// preserves deadlock-freedom without suppressing the check.
-mod held_partitions {
-    use crate::subgraph::SubgraphId;
-    use smallvec::SmallVec;
-    use std::cell::RefCell;
-
-    /// Inline-storage capacity for the per-thread held-partitions set.
-    /// 4 mirrors the same inline limit used elsewhere in the codebase
-    /// (`compute_touched_partitions` returns `SmallVec<[SubgraphId; 4]>`,
-    /// `BatchGuard::_wave_guards` is `SmallVec<[WaveOwnerGuard; 4]>`).
-    /// In the typical wave a single thread holds 1–3 partitions; spillover
-    /// to the heap costs allocation but is correct.
-    const HELD_INLINE: usize = 4;
-
-    thread_local! {
-        /// Currently-held partitions on this thread, as `(SubgraphId, refcount)`
-        /// pairs in arbitrary order. The refcount mirrors
-        /// `parking_lot::ReentrantMutex`'s internal counter (we can't query
-        /// parking_lot's directly).
-        ///
-        /// `SmallVec<[_; HELD_INLINE]>` over `BTreeMap<_, _>`: under the
-        /// expected workload (≤4 partitions held simultaneously per wave) the
-        /// inline-storage SmallVec keeps the entire set in stack memory with
-        /// no allocation, no Box-per-node, and contiguous cache layout. Linear
-        /// scans are branch-predictable and faster than BTreeMap's logn
-        /// pointer-chasing for tiny N. Phase J post-widening bench
-        /// (`migration-status.md` 2026-05-09) reported 14–25% overhead vs the
-        /// pre-widening baseline, attributed in part to BTreeMap allocation
-        /// costs on the hot path. This swap recovers part of that overhead.
-        ///
-        /// Bookkeeping is unconditional — every acquire bumps the
-        /// refcount, every release decrements. The CHECK gate
-        /// (`!held.is_empty() && !already_held`) is what
-        /// distinguishes "first-time acquire on a fresh thread"
-        /// (allowed, held empty) from "nested acquire while we
-        /// already hold something" (must be ascending).
-        static HELD: RefCell<SmallVec<[(SubgraphId, u32); HELD_INLINE]>>
-            = const { RefCell::new(SmallVec::new_const()) };
-    }
-
-    /// Phase H+ STRICT check + bookkeeping. Called BEFORE acquiring the
-    /// partition's parking_lot::ReentrantMutex.
-    ///
-    /// Panics with a clear diagnostic if:
-    /// - HELD is non-empty (this thread already holds ≥1 partition),
-    /// - AND we're NOT inside a producer build closure,
-    /// - AND `sid` is NOT already held by this thread,
-    /// - AND `sid <= max(currently held)`.
-    ///
-    /// Otherwise: increments the refcount for `sid` (creating the
-    /// entry if needed) and returns. The caller MUST pair every
-    /// call with a [`release`] when the guard drops.
-    ///
-    /// **Important note on cross-thread vs same-thread:** this check
-    /// is a SAME-THREAD invariant — it catches a thread acquiring
-    /// out of order from itself. Cross-thread AB/BA cycles between
-    /// threads with disjoint same-thread acquisition orders are
-    /// prevented at a different layer (the
-    /// `compute_touched_partitions` upfront-acquire-all-ascending
-    /// rule in `Core::begin_batch_for`). This thread-local check
-    /// adds the layer that prevents a same-thread descending acquire
-    /// from creating the FIRST half of a cross-thread cycle.
-    pub(crate) fn check_and_acquire(sid: SubgraphId) -> Result<(), super::PartitionOrderViolation> {
-        HELD.with(|h| {
-            let mut held = h.borrow_mut();
-            // Gate: held non-empty (we're nested). First-time acquires
-            // on a fresh thread (held empty) skip the check — there's
-            // nothing to compare against.
-            let already_held = held.iter().any(|(s, _)| *s == sid);
-            if !held.is_empty() && !already_held {
-                // Linear-scan max over the inline storage (typical N ≤ 4).
-                // Branch-predictable and cache-local; no allocation.
-                if let Some(max_held) = held.iter().map(|(s, _)| *s).max() {
-                    if sid <= max_held {
-                        // Drop the borrow before returning Err so
-                        // the caller doesn't see a still-borrowed RefCell.
-                        let new_id = sid;
-                        drop(held);
-                        return Err(super::PartitionOrderViolation {
-                            attempted: new_id,
-                            max_held,
-                        });
-                    }
-                }
-            }
-            // Bookkeeping: increment refcount. `checked_add(1)` so
-            // overflow surfaces (would indicate an unbounded
-            // re-entrance — a real bug). Linear find-or-push.
-            if let Some((_, count)) = held.iter_mut().find(|(s, _)| *s == sid) {
-                *count = count.checked_add(1).expect(
-                    "held_partitions refcount overflow — unbounded \
-                     same-partition re-entrance. Should be bounded by the \
-                     protocol's MAX_BATCH_DRAIN_ITERATIONS cap.",
-                );
-            } else {
-                held.push((sid, 1));
-            }
-            Ok(())
-        })
-    }
-
-    /// Decrement the refcount for `sid`; remove the entry if it
-    /// hits zero. Called from [`super::WaveOwnerGuard::drop`] AND
-    /// from the retry / panic paths in
-    /// [`super::Core::partition_wave_owner_lock_arc`] to ensure the
-    /// refcount stays balanced under all unwind / retry / exhaust
-    /// paths.
-    ///
-    /// Returns `true` iff this release brought the partition's
-    /// refcount on this thread to zero — i.e. this was the OUTERMOST
-    /// guard for `sid` on this thread. [`super::WaveOwnerGuard::drop`]
-    /// uses this signal to clear per-partition wave state (Q3) on
-    /// outermost release only; inner re-entrant guard drops must NOT
-    /// clear (a containing wave is still active and still holds
-    /// in-flight wave state). The `partition_wave_owner_lock_arc`
-    /// retry / panic paths ignore the return value because the
-    /// partition state hadn't been touched yet on those paths
-    /// (clearing would be a no-op anyway).
-    pub(crate) fn release(sid: SubgraphId) -> bool {
-        HELD.with(|h| {
-            let mut held = h.borrow_mut();
-            if let Some(idx) = held.iter().position(|(s, _)| *s == sid) {
-                let count = &mut held[idx].1;
-                // /qa A3 fix (2026-05-09): debug_assert the refcount is
-                // non-zero before decrement. A `release(sid)` on an
-                // entry with `count == 0` indicates a bookkeeping bug
-                // (a release without a matching `check_and_acquire`,
-                // or a logic error in caller), but the legacy
-                // saturating_sub silently returned `was_outermost=true`
-                // and removed the entry — masking the bug. Surface
-                // in dev/test builds; release builds preserve the
-                // saturating behavior.
-                debug_assert!(
-                    *count > 0,
-                    "held_partitions::release({sid:?}): refcount underflow — \
-                     release without matching check_and_acquire (caller bug)"
-                );
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    // `swap_remove` is O(1) and order-irrelevant: the
-                    // CHECK gate computes max via linear scan and does
-                    // not depend on iteration order.
-                    held.swap_remove(idx);
-                    return true;
-                }
-            } else {
-                // /qa A3 fix (2026-05-09): same intent — release on a
-                // sid that's not in HELD is a bookkeeping bug. Surface
-                // in dev/test builds.
-                debug_assert!(
-                    false,
-                    "held_partitions::release({sid:?}): sid not in HELD — \
-                     double-drop or stray release (caller bug)"
-                );
-            }
-            false
-        })
-    }
-
-    /// Returns `true` if this thread currently holds any partition
-    /// wave_owner. Used by `BatchGuard::drop` to skip the deferred-ops
-    /// drain when we're still nested inside an outer wave_guard scope
-    /// (Phase H+ STRICT, D115).
-    pub(crate) fn any_held() -> bool {
-        HELD.with(|h| !h.borrow().is_empty())
-    }
-
-    /// Test-only: read the current thread's held-partitions snapshot.
-    /// Used by post-panic regression assertions to verify the
-    /// thread-local stays clean even when the H+ check unwinds the
-    /// stack (so cargo's thread-reuse doesn't propagate corrupted
-    /// state to subsequent tests). `pub` (gated by
-    /// `cfg(any(test, debug_assertions))`) so integration tests
-    /// outside the crate can read it.
-    #[cfg(any(test, debug_assertions))]
-    #[must_use]
-    pub fn held_snapshot_for_tests() -> Vec<(SubgraphId, u32)> {
-        // /qa A2 fix (2026-05-09): sort by SubgraphId so the snapshot
-        // returns ascending order — matches the BTreeMap-iteration
-        // contract that pre-/qa SmallVec swap consumers might rely on.
-        // Test consumers currently only assert `is_empty()`, but the
-        // ordered shape is the safer default for future tests that
-        // assert specific entries.
-        let mut v: Vec<(SubgraphId, u32)> = HELD.with(|h| h.borrow().to_vec());
-        v.sort_unstable_by_key(|(s, _)| *s);
-        v
-    }
-}
-
-/// Test-only re-exports for integration tests under
-/// `crates/graphrefly-core/tests/`. Gated `#[cfg(any(test, debug_assertions))]`
-/// so they don't leak into release builds. Public visibility is
-/// required because integration tests live outside the crate.
-#[cfg(any(test, debug_assertions))]
-pub use held_partitions::held_snapshot_for_tests;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -653,6 +423,12 @@ pub struct NodeOpts {
     /// terminal slice). Only DATA is buffered; RESOLVED entries are NOT
     /// (R2.6.5 explicit "DATA only").
     pub replay_buffer: Option<usize>,
+    /// §7 concurrency serialization group (D208–D211). `None` (default)
+    /// = single-threaded lock-free path. `Some(g)` registers the node
+    /// into serialization group `g`. Subject to the strict
+    /// dep-component-consistency check in [`Core::register`] (all deps'
+    /// component must be all-`None` or all-`Some`).
+    pub serialization_group: Option<crate::handle::SerializationGroupId>,
 }
 
 impl Default for NodeOpts {
@@ -664,6 +440,7 @@ impl Default for NodeOpts {
             is_dynamic: false,
             pausable: PausableMode::Default,
             replay_buffer: None,
+            serialization_group: None,
         }
     }
 }
@@ -741,13 +518,13 @@ pub(crate) struct SubscriptionId(u64);
 /// it should subscribe multiple times (each producing a fresh handle) or
 /// wrap the single `Subscription` in `Arc<Mutex<Option<Subscription>>>`.
 #[must_use = "dropping a Subscription unsubscribes its sink immediately"]
-pub struct Subscription {
-    state: Weak<Mutex<CoreState>>,
+pub struct Subscription<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    state: Weak<C>,
     node_id: NodeId,
     sub_id: SubscriptionId,
 }
 
-impl Subscription {
+impl<C: crate::state_cell::StateCell> Subscription<C> {
     /// The node this subscription is attached to.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
@@ -755,7 +532,7 @@ impl Subscription {
     }
 }
 
-impl Drop for Subscription {
+impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
     #[allow(clippy::too_many_lines)] // Phase G is one continuous lifecycle hook chain (user cleanup → producer_deactivate → wipe_ctx → Core cache-clear); splitting it would obscure the ordering invariant.
     fn drop(&mut self) {
         // Silent no-op if Core is gone. This keeps Drop infallible (no panics
@@ -1015,7 +792,7 @@ impl Drop for Subscription {
                             // Uses the binding-explicit static variant
                             // because we have only `&dyn BindingBoundary`
                             // here (Subscription::Drop holds no Core).
-                            let new_scratch = Core::make_op_scratch_with_binding(&*binding, op)
+                            let new_scratch = Core::<C>::make_op_scratch_with_binding(&*binding, op)
                                 .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
                             let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
                             if let Some(old_box) = old {
@@ -1303,16 +1080,23 @@ pub(crate) struct PendingPauseOverflow {
 /// The ascending-order protocol prevents AB/BA deadlocks between
 /// threads. When this error surfaces, the caller should defer the
 /// operation to wave-end (when no partitions are held) and retry.
+/// **Vestigial (§7, D208–D211, 2026-05-16).** The union-find ascending-
+/// order acquisition discipline that this represented is deleted:
+/// serialization groups are user-declared + static and the wave engine
+/// acquires the whole touched-group set sorted **upfront**, so there is
+/// no incremental mid-wave acquisition that could violate ordering.
+/// This type is **never constructed** post-§7. It is retained only so
+/// `SubscribeError::PartitionOrderViolation` and the `Err(_)` match arms
+/// in `graphrefly-operators` compile unchanged (D211 minimal-churn);
+/// removing the type + those arms is a tracked downstream-churn
+/// follow-on (`porting-deferred.md`).
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
-#[error(
-    "Phase H+ ascending-order violation: attempted partition {attempted:?} \
-     while already holding partition {max_held:?} — defer to wave-end"
-)]
+#[error("vestigial PartitionOrderViolation (never constructed post-§7)")]
 pub struct PartitionOrderViolation {
-    /// The partition the caller tried to acquire.
-    pub attempted: crate::subgraph::SubgraphId,
-    /// The highest-id partition currently held by this thread.
-    pub max_held: crate::subgraph::SubgraphId,
+    /// Vestigial. Unused; retained for struct-shape stability only.
+    pub attempted: u64,
+    /// Vestigial. Unused; retained for struct-shape stability only.
+    pub max_held: u64,
 }
 
 /// Errors returnable by [`Core::try_subscribe`].
@@ -1447,6 +1231,19 @@ pub enum RegisterError {
     /// emit on its first fire.
     #[error("register: operator seed must be a real handle (R2.5.3); got NO_HANDLE")]
     OperatorSeedSentinel,
+
+    /// §7 strict serialization-group consistency (D208–D211): the new
+    /// node's dep-connected component would be **mixed** — some members
+    /// carry a [`crate::handle::SerializationGroupId`] and some are
+    /// `None`. A component MUST be uniformly all-`None` (single-threaded
+    /// floor) or all-`Some` (grouped). Assign the node/its deps a group
+    /// (or none) consistently before registering. Checked at
+    /// topology-mutation time only; never on the hot path.
+    #[error(
+        "register: serialization-group inconsistency — node's dep component \
+         mixes grouped and ungrouped nodes (must be uniformly all-None or all-Some)"
+    )]
+    GroupInconsistent,
 }
 
 /// Errors returnable by [`Core::set_pausable_mode`].
@@ -1655,6 +1452,15 @@ pub(crate) struct NodeRecord {
     /// Per-fire helpers retain the new value before releasing the old;
     /// `release_handles` releases the current shares at end-of-life.
     pub(crate) op_scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
+    /// §7 concurrency serialization group (D208–D211, 2026-05-16).
+    /// `None` = single-threaded lock-free path (the floor). `Some(g)` =
+    /// this node serializes with every other node carrying `g` through
+    /// one wave-lock. Static + user-declared; set at [`Core::register`]
+    /// (via [`NodeOpts`]) or [`Core::set_serialization_group`]. The
+    /// strict dep-component-consistency invariant (all-`None` or
+    /// all-`Some`) is enforced at those topology-mutation points only,
+    /// never on the hot path.
+    pub(crate) serialization_group: Option<crate::handle::SerializationGroupId>,
 }
 
 impl NodeRecord {
@@ -1798,7 +1604,11 @@ impl NodeRecord {
 /// closing summary). Q-beyond
 /// will continue the shape decomposition by sharding most of the
 /// remaining fields per-partition.
-pub(crate) struct CoreState {
+// `pub` (not `pub(crate)`): appears in the public `StateCell` trait surface
+// (`Core<C: StateCell>` is public and `SingleThreadCell`/`LockedCell` are
+// exported). The struct *name* is public but every field stays `pub(crate)`,
+// so it is an opaque token outside the crate — no internal state is reachable.
+pub struct CoreState {
     pub(crate) next_node_id: u64,
     pub(crate) next_subscription_id: u64,
     pub(crate) next_lock_id: u64,
@@ -1986,32 +1796,50 @@ pub(crate) struct CoreState {
 /// increment per `Core::new`; negligible cost.
 static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone)]
-pub struct Core {
-    pub(crate) state: Arc<Mutex<CoreState>>,
+pub struct Core<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    pub(crate) state: Arc<C>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    /// Deferred producer-pattern operations. Per-Core (not per-thread)
-    /// to avoid the cross-Core contamination discovered in D114 F1/F2.
-    /// Drained after wave_guards release in `BatchGuard::drop`.
-    pub(crate) deferred_producer_ops: Arc<parking_lot::Mutex<Vec<DeferredProducerOp>>>,
-    /// Slice X5 (D3 substrate, 2026-05-08) + Slice Y1 / Phase E
-    /// (wave-engine migration, 2026-05-08): per-subgraph union-find
-    /// registry. Tracks each registered node's connected-component
-    /// membership (a "subgraph"). Each component's root carries an
-    /// `Arc<SubgraphLockBox>` whose `wave_owner: ReentrantMutex<()>`
-    /// is the per-partition wave-serialization lock — acquired by
-    /// [`Self::partition_wave_owner_lock_arc`] under the retry-validate
-    /// loop. Cross-thread emits to disjoint partitions run truly
-    /// parallel; same-thread re-entry passes through reentrantly.
-    ///
-    /// Direct port of [`graphrefly-py`'s
-    /// `subgraph_locks.py`](https://github.com/graphrefly/graphrefly-py/blob/main/src/graphrefly/core/subgraph_locks.py)
-    /// design (locked in [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)).
-    pub(crate) registry: Arc<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
+    /// §7 serialization-group wave-lock registry (D208–D211, 2026-05-16).
+    /// Replaces the deleted D3 union-find `SubgraphRegistry`. Maps each
+    /// touched [`crate::handle::SerializationGroupId`] to its
+    /// `Arc<ReentrantMutex<()>>`; the wave engine acquires the
+    /// touched-group set sorted upfront. **Empty for an all-`None`
+    /// graph** — the single-threaded floor never locks it.
+    pub(crate) group_locks: Arc<parking_lot::Mutex<crate::groups::GroupLockRegistry>>,
+    /// Core-global wave serialization lock (QA F1, 2026-05-16). Acquired
+    /// **only** on the `LockedCell` substrate (`C::SERIALIZE_WAVES`) and
+    /// **only** when a wave's transitively-touched `SerializationGroupId`
+    /// set is empty (an all-`None` cascade). Restores the pre-rewrite
+    /// "every wave serializes per Core" cross-thread safety floor that the
+    /// deleted union-find per-partition `wave_owner` used to provide —
+    /// without it, two threads driving an unannotated `Core<LockedCell>`
+    /// would interleave waves with no protection for the per-thread
+    /// `WAVE_STATE` / `TIER3_EMITTED_THIS_WAVE` / `IN_TICK_OWNED`
+    /// invariants. `ReentrantMutex` so same-thread re-entrant waves pass
+    /// through (mirrors the group-lock contract). On `SingleThreadCell`
+    /// the `C::SERIALIZE_WAVES` branch dead-code-eliminates → the §7
+    /// ~83 ns floor is untouched.
+    pub(crate) global_wave: Arc<parking_lot::ReentrantMutex<()>>,
     /// Unique generation ID for this Core instance. Assigned from
-    /// [`CORE_GENERATION`] at construction. Used by `PARTITION_CACHE`
-    /// to avoid ABA false-hits after Core drop + allocator reuse.
+    /// [`CORE_GENERATION`] at construction. Keys the per-(Core, thread)
+    /// `crate::batch::IN_TICK_OWNED` re-entrance slot (kept — re-entrance
+    /// transparency survives the §7 rewrite; only the union-find
+    /// `PARTITION_CACHE` consumer was deleted).
     pub(crate) generation: u64,
+}
+
+// Manual `Clone` (not `#[derive]`): a derived `Clone` would impose a spurious
+// `C: Clone` bound on the cell. The cell is shared via `Arc`, never cloned.
+impl<C: crate::state_cell::StateCell> Clone for Core<C> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            binding: Arc::clone(&self.binding),
+            group_locks: Arc::clone(&self.group_locks),
+            global_wave: Arc::clone(&self.global_wave),
+            generation: self.generation,
+        }
+    }
 }
 
 /// Weak handle to a [`Core`] — does not contribute to strong refcount.
@@ -2027,26 +1855,39 @@ pub struct Core {
 /// Upgrade on each invocation; if the host `Core` was already dropped,
 /// `upgrade()` returns `None` and the closure should no-op (the host
 /// is being torn down, no work to do).
-#[derive(Clone)]
-pub struct WeakCore {
-    state: Weak<Mutex<CoreState>>,
+pub struct WeakCore<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    state: Weak<C>,
     binding: Weak<dyn BindingBoundary>,
-    deferred_producer_ops: Weak<parking_lot::Mutex<Vec<DeferredProducerOp>>>,
-    registry: Weak<parking_lot::Mutex<crate::subgraph::SubgraphRegistry>>,
+    group_locks: Weak<parking_lot::Mutex<crate::groups::GroupLockRegistry>>,
+    global_wave: Weak<parking_lot::ReentrantMutex<()>>,
     generation: u64,
 }
 
-impl WeakCore {
+// Manual `Clone` (not `#[derive]`): a derived `Clone` would impose a spurious
+// `C: Clone` bound. The cell `C` is never cloned — only the `Weak`s are.
+impl<C: crate::state_cell::StateCell> Clone for WeakCore<C> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            binding: self.binding.clone(),
+            group_locks: self.group_locks.clone(),
+            global_wave: self.global_wave.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+impl<C: crate::state_cell::StateCell> WeakCore<C> {
     /// Try to upgrade back to a strong [`Core`]. Returns `None` if the
     /// host `Core`'s strong count has reached zero (i.e. the host
     /// `BenchCore` / equivalent owner was dropped).
     #[must_use]
-    pub fn upgrade(&self) -> Option<Core> {
+    pub fn upgrade(&self) -> Option<Core<C>> {
         Some(Core {
             state: self.state.upgrade()?,
             binding: self.binding.upgrade()?,
-            deferred_producer_ops: self.deferred_producer_ops.upgrade()?,
-            registry: self.registry.upgrade()?,
+            group_locks: self.group_locks.upgrade()?,
+            global_wave: self.global_wave.upgrade()?,
             generation: self.generation,
         })
     }
@@ -2113,13 +1954,29 @@ impl Drop for ScratchReleaseGuard<'_> {
     }
 }
 
-impl Core {
-    /// Construct a fresh Core wired to the given binding. Pause buffer cap
-    /// defaults to unbounded; set via [`Self::set_pause_buffer_cap`].
+impl Core<crate::state_cell::LockedCell> {
+    /// Construct a fresh Core on the default cross-thread-capable
+    /// [`LockedCell`](crate::state_cell::LockedCell) cell.
+    ///
+    /// This is the inherent constructor on the *defaulted* `Core` type, so
+    /// existing call sites (`Core::new(binding)`) resolve unambiguously
+    /// without a turbofish — the generic [`Core::new_with_cell`] would be
+    /// ambiguous over `C` at a bare `Core::new` call. The single-threaded
+    /// floor path uses `Core::<SingleThreadCell>::new_with_cell(binding)`.
     #[must_use]
     pub fn new(binding: Arc<dyn BindingBoundary>) -> Self {
+        Self::new_with_cell(binding)
+    }
+}
+
+impl<C: crate::state_cell::StateCell> Core<C> {
+    /// Construct a fresh Core wired to the given binding on cell `C`. Pause
+    /// buffer cap defaults to unbounded; set via
+    /// [`Self::set_pause_buffer_cap`].
+    #[must_use]
+    pub fn new_with_cell(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(CoreState {
+            state: Arc::new(C::from_state(CoreState {
                 next_node_id: 1,
                 next_subscription_id: 1,
                 // A4 (Slice F, 2026-05-07): start `next_lock_id` in the high
@@ -2158,10 +2015,10 @@ impl Core {
                 pending_scratch_release: Vec::new(),
             })),
             binding,
-            deferred_producer_ops: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            registry: Arc::new(parking_lot::Mutex::new(
-                crate::subgraph::SubgraphRegistry::new(),
+            group_locks: Arc::new(parking_lot::Mutex::new(
+                crate::groups::GroupLockRegistry::new(),
             )),
+            global_wave: Arc::new(parking_lot::ReentrantMutex::new(())),
             generation: CORE_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -2176,7 +2033,7 @@ impl Core {
     /// outer subscribe completes, preserving R1.3.5.a happens-after
     /// ordering. The previous `IN_HANDSHAKE_FIRE` panic-diagnostic is no
     /// longer needed.
-    pub(crate) fn lock_state(&self) -> MutexGuard<'_, CoreState> {
+    pub(crate) fn lock_state(&self) -> <C as crate::state_cell::StateCell>::Guard<'_> {
         self.state.lock()
     }
 
@@ -2189,7 +2046,7 @@ impl Core {
     /// Used by `graphrefly-graph`'s `mount` to enforce the "shared-Core
     /// only" v1 invariant — cross-Core mount is post-M6.
     #[must_use]
-    pub fn same_dispatcher(&self, other: &Core) -> bool {
+    pub fn same_dispatcher(&self, other: &Core<C>) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
@@ -2213,247 +2070,107 @@ impl Core {
     /// stay alive only while the producer is active (cleared via
     /// `producer_deactivate` on last-subscriber unsubscribe).
     #[must_use]
-    pub fn weak_handle(&self) -> WeakCore {
+    pub fn weak_handle(&self) -> WeakCore<C> {
         WeakCore {
             state: Arc::downgrade(&self.state),
             binding: Arc::downgrade(&self.binding),
-            deferred_producer_ops: Arc::downgrade(&self.deferred_producer_ops),
-            registry: Arc::downgrade(&self.registry),
+            group_locks: Arc::downgrade(&self.group_locks),
+            global_wave: Arc::downgrade(&self.global_wave),
             generation: self.generation,
         }
     }
 
-    /// Number of distinct connected-component partitions tracked by
-    /// the per-subgraph union-find registry (Slice X5 substrate).
-    /// Two threads emitting into nodes with distinct partitions will
-    /// run truly parallel once Y1 wires the wave engine through the
-    /// registry; X5 reports the partition count for inspection
-    /// (acceptance bar + debugging) but the wave engine still uses
-    /// the legacy Core-level `wave_owner`.
+    /// Number of distinct serialization groups touched so far (§7 group
+    /// registry). Inspection / acceptance-bar only. An all-`None` graph
+    /// reports `0` (the single-threaded floor never touches the
+    /// registry).
     #[must_use]
     pub fn partition_count(&self) -> usize {
-        self.registry.lock().component_count()
+        self.group_locks.lock().group_count()
     }
 
-    /// Resolve `node`'s partition identity per the per-subgraph
-    /// union-find registry (Slice X5 substrate). Two nodes with the
-    /// same `SubgraphId` are connected via dep edges (transitively)
-    /// and share a partition lock under Y1+; nodes in different
-    /// partitions can run truly parallel.
-    ///
-    /// Returns `None` for unregistered nodes.
+    /// Resolve `node`'s serialization group (§7). Two nodes with the
+    /// same [`crate::handle::SerializationGroupId`] serialize through
+    /// one wave-lock; `None` nodes run on the single-threaded
+    /// lock-free path. Returns `None` for unregistered nodes **and**
+    /// for registered nodes with no group assigned (the two are
+    /// distinguished via [`Self::kind_of`] if needed).
     #[must_use]
-    pub fn partition_of(&self, node: NodeId) -> Option<crate::subgraph::SubgraphId> {
-        self.registry.lock().partition_of(node)
+    pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
+        self.lock_state()
+            .nodes
+            .get(&node)
+            .and_then(|r| r.serialization_group)
     }
 
-    /// Push a deferred producer operation. Called by operator sinks
-    /// when a Core method returns `PartitionOrderViolation`.
+    /// Execute a producer-pattern op. §7: the union-find ascending-order
+    /// constraint that motivated *deferring* these is deleted (groups
+    /// are static + acquired sorted upfront, so there is no
+    /// `PartitionOrderViolation` to dodge). The op therefore runs
+    /// **immediately** — re-entrant execution on the wave's thread
+    /// passes through the group `ReentrantMutex` transparently and is
+    /// absorbed by the in-flight wave drain (`IN_TICK_OWNED`), exactly
+    /// as the deferred drain used to run it at wave-end. The
+    /// `deferred_producer_ops` queue + `drain_deferred_producer_ops`
+    /// are deleted; this shim is retained so `graphrefly-operators`
+    /// compiles unchanged (D211 minimal-churn).
     ///
-    /// For `Emit` and `Error` variants, the caller MUST retain the
-    /// handle before pushing (the drain releases it after firing).
-    /// `Complete` and `Callback` variants have no handle to retain.
+    /// For `Emit`/`Error` the caller retained the handle before
+    /// pushing (mirroring the old drain contract); we release it after
+    /// firing so refcount discipline is unchanged.
     pub fn push_deferred_producer_op(&self, op: DeferredProducerOp) {
-        self.deferred_producer_ops.lock().push(op);
-    }
-
-    /// Drain deferred producer ops when no partitions are held on
-    /// the current thread. Each op may itself produce new deferred
-    /// ops (e.g., a deferred subscribe activates a producer whose
-    /// build defers further subscribes), so drain in a loop until
-    /// the queue is empty.
-    ///
-    /// Called from `try_subscribe` after its `wave_guard` drops,
-    /// and from `BatchGuard::drop` after releasing all wave_guards.
-    /// Skips silently if partitions are still held (nested context).
-    /// Maximum number of drain iterations before panicking with a
-    /// diagnostic. Prevents unbounded loops from buggy callbacks that
-    /// keep pushing more deferred ops indefinitely.
-    const MAX_DEFERRED_DRAIN_ITERATIONS: u32 = 1000;
-
-    pub(crate) fn drain_deferred_producer_ops(&self) {
-        if held_partitions::any_held() {
-            return;
-        }
-        let mut iterations = 0u32;
-        loop {
-            let deferred_ops: Vec<DeferredProducerOp> = {
-                let mut ops = self.deferred_producer_ops.lock();
-                if ops.is_empty() {
-                    break;
-                }
-                std::mem::take(&mut *ops)
-            };
-            iterations += 1;
-            assert!(
-                iterations <= Self::MAX_DEFERRED_DRAIN_ITERATIONS,
-                "drain_deferred_producer_ops exceeded {} iterations — \
-                 a deferred callback is likely pushing unbounded ops. \
-                 Iteration {iterations}, batch size {}.",
-                Self::MAX_DEFERRED_DRAIN_ITERATIONS,
-                deferred_ops.len(),
-            );
-            for op in deferred_ops {
-                match op {
-                    DeferredProducerOp::Emit { node_id, handle } => {
-                        self.emit(node_id, handle);
-                        self.binding.release_handle(handle);
-                    }
-                    DeferredProducerOp::Complete { node_id } => {
-                        self.complete(node_id);
-                    }
-                    DeferredProducerOp::Error { node_id, handle } => {
-                        self.error(node_id, handle);
-                        self.binding.release_handle(handle);
-                    }
-                    DeferredProducerOp::Callback(f) => {
-                        f();
-                    }
-                }
+        match op {
+            DeferredProducerOp::Emit { node_id, handle } => {
+                self.emit(node_id, handle);
+                self.binding.release_handle(handle);
+            }
+            DeferredProducerOp::Complete { node_id } => {
+                self.complete(node_id);
+            }
+            DeferredProducerOp::Error { node_id, handle } => {
+                self.error(node_id, handle);
+                self.binding.release_handle(handle);
+            }
+            DeferredProducerOp::Callback(f) => {
+                f();
             }
         }
     }
 
-    // Q3 (2026-05-09) introduced `Core::partition_box_of(node)` to
-    // resolve a partition's `Arc<SubgraphLockBox>` for per-partition
-    // state access. The D1 patch (2026-05-09) moved Slice G's
-    // `tier3_emitted_this_wave` set off `SubgraphLockBox::state` to a
-    // per-thread thread-local in `crate::batch`, eliminating
-    // `partition_box_of`'s only callers (`commit_emission` /
-    // `commit_emission_verbatim`). The helper is REMOVED rather than
-    // kept dead — Q-beyond will resurrect a similar shape when the
-    // CoreState shard layout actually needs per-partition lookups.
+    /// §7: `drain_deferred_producer_ops` is **deleted** — there is no
+    /// `deferred_producer_ops` queue (the union-find ascending-order
+    /// constraint that required deferral is gone). Producer ops execute
+    /// immediately via [`Self::push_deferred_producer_op`]. The former
+    /// `BatchGuard::drop` / `try_subscribe` drain call sites become
+    /// no-ops. Kept as an empty inline fn so those call sites compile
+    /// unchanged (D211 minimal-churn); the optimizer elides it.
+    #[inline]
+    pub(crate) fn drain_deferred_producer_ops(&self) {}
 
-    /// Acquire `seed`'s partition `wave_owner` re-entrant mutex with
-    /// retry-validate against concurrent union/split. Mirrors
-    /// graphrefly-py's `subgraph_locks.py::lock_for` retry pattern
-    /// (lines 154–178): a concurrent `union_nodes` may redirect
-    /// `seed`'s partition root between our `lock_for` resolve and
-    /// our `lock_arc` call; if so, the held guard is on a stale
-    /// (but still valid) `SubgraphLockBox` whose `Arc` no longer
-    /// matches the registry's canonical box for `seed`'s current
-    /// root. Release + retry up to [`crate::subgraph::MAX_LOCK_RETRIES`].
+    /// §7 wave-acquisition: the set of group wave-locks transitively
+    /// touched from `seed`, ascending by [`crate::handle::SerializationGroupId`]
+    /// (deadlock-free acquisition order — replaces the union-find
+    /// ascending-`SubgraphId` discipline). Walks `s.children`
+    /// (downstream cascade) + `meta_companions` (R1.3.9.d TEARDOWN
+    /// cascade) from `seed`, collecting each visited node's
+    /// `serialization_group`.
     ///
-    /// Returns the held guard. Caller holds it for the wave's
-    /// duration; drop releases.
-    ///
-    /// **Panics** if `seed` is not registered (caller violation —
-    /// every wave entry takes a `NodeId` already in `s.nodes`, and
-    /// the P12-fixed lock-discipline guarantees registry membership
-    /// is published atomically with state). **Panics** on exceeding
-    /// `MAX_LOCK_RETRIES` — pathological union activity.
-    ///
-    /// Slice Y1 / Phase E (2026-05-08).
-    pub(crate) fn partition_wave_owner_lock_arc(
+    /// **All-`None` fast path:** if no reachable node carries a group,
+    /// returns empty and the caller acquires nothing — the §7
+    /// single-threaded floor. Groups are user-declared + static, so
+    /// there is no registry epoch / retry-validate: a single
+    /// `group_locks` lock resolves every touched group's `Arc`.
+    pub(crate) fn compute_touched_groups(
         &self,
         seed: NodeId,
-    ) -> Result<WaveOwnerGuard, PartitionOrderViolation> {
-        /// Scope-guard for the H+ thread-local refcount entry. Released on
-        /// Drop unless `into_consumed()` is called (the success path).
-        /// Ensures balance even on panic between `check_and_acquire` and
-        /// successful `WaveOwnerGuard` construction (`lock_arc()` /
-        /// `lock_for_validate()` could in principle panic; defensive).
-        struct AcquireGuard {
-            sid: crate::subgraph::SubgraphId,
-            consumed: bool,
-        }
-        impl AcquireGuard {
-            fn into_consumed(mut self) {
-                self.consumed = true;
-            }
-        }
-        impl Drop for AcquireGuard {
-            fn drop(&mut self) {
-                if !self.consumed {
-                    held_partitions::release(self.sid);
-                }
-            }
-        }
-
-        for _ in 0..crate::subgraph::MAX_LOCK_RETRIES {
-            let (sid, lock_box) = {
-                let mut reg = self.registry.lock();
-                reg.lock_for(seed).expect(
-                    "partition_wave_owner_lock_arc: seed must be registered \
-                     (P12-fix invariant: registry membership is published \
-                     atomically with `s.nodes`)",
-                )
-            };
-            // Phase H+ option (d) /qa N1(a) widened variant: BEFORE
-            // acquiring the parking_lot lock, check ascending-order if
-            // this thread already holds at least one partition AND we're
-            // not in a producer build closure. Panics on violation.
-            // Also increments the thread-local refcount for `sid`. The
-            // `AcquireGuard` ensures the refcount is released on EVERY
-            // exit path — successful return (via `into_consumed()`),
-            // retry-validate failure (Drop fires), retry-exhaustion panic
-            // (Drop fires before unwind), or a panic in `lock_arc()` /
-            // `lock_for_validate()` (Drop fires during unwind).
-            held_partitions::check_and_acquire(sid)?;
-            let acquire_guard = AcquireGuard {
-                sid,
-                consumed: false,
-            };
-            let inner = lock_box.wave_owner.lock_arc();
-            // Re-validate post-acquire. If a concurrent `union` redirected
-            // `seed`'s root between our `lock_for` and `lock_arc`, the
-            // registry's current box for `seed` differs from what we hold.
-            let still_valid = self.registry.lock().lock_for_validate(seed, &lock_box);
-            if still_valid {
-                acquire_guard.into_consumed();
-                // `lock_box` is unused after this point — the D1 patch
-                // moved Slice G tier3 tracking off the per-partition
-                // `SubgraphLockBox::state` to a per-thread thread-local,
-                // so the guard no longer carries the box reference.
-                drop(lock_box);
-                return Ok(WaveOwnerGuard { sid, inner });
-            }
-            // Stale — drop the parking_lot guard. The AcquireGuard's
-            // Drop releases the held_partitions refcount automatically.
-            // Yield to give the contending writer a chance to make
-            // forward progress before re-resolving (QA-fix group 2 —
-            // earlier tight-spin could monopolize a CPU under sustained
-            // pathological union/split activity).
-            drop(inner);
-            drop(acquire_guard);
-            std::thread::yield_now();
-        }
-        panic!(
-            "partition_wave_owner_lock_arc: exceeded {} retries for seed {:?} \
-             — pathological concurrent union/split activity. Mirrors py \
-             `_MAX_LOCK_RETRIES`.",
-            crate::subgraph::MAX_LOCK_RETRIES,
-            seed
-        );
-    }
-
-    /// BFS from `seed` along `s.children` (downstream consumer cascade
-    /// for DATA / RESOLVED / INVALIDATE / COMPLETE / ERROR / TEARDOWN)
-    /// and `meta_companions` (R1.3.9.d TEARDOWN cascade). Collects
-    /// every partition reachable from `seed`, returning the unique
-    /// `SubgraphId`s sorted ascending — the canonical lock-acquisition
-    /// order per session-doc Q7 / decision D092 that guarantees
-    /// deadlock-freedom across cross-partition waves.
-    ///
-    /// Holds the state lock + registry lock for the BFS duration
-    /// (lock order `state → registry` per the P12-fix invariant).
-    /// Bounded by the cascade graph reachable from `seed`; for typical
-    /// apps the partition count is small (1–3) and the BFS is
-    /// negligible relative to wave drain.
-    ///
-    /// Used by [`Core::begin_batch_for`] to compute the upfront-
-    /// acquired partition set for per-seed waves. Closure-form
-    /// [`Core::batch`] doesn't have a seed and uses
-    /// [`Core::all_partitions_lock_boxes`] instead.
-    ///
-    /// Slice Y1 / Phase E (2026-05-08).
-    pub(crate) fn compute_touched_partitions(
-        &self,
-        seed: NodeId,
-    ) -> SmallVec<[crate::subgraph::SubgraphId; 4]> {
+    ) -> SmallVec<
+        [(
+            crate::handle::SerializationGroupId,
+            Arc<parking_lot::ReentrantMutex<()>>,
+        ); 4],
+    > {
         let s = self.lock_state();
-        let mut reg = self.registry.lock();
-        let mut partitions: SmallVec<[crate::subgraph::SubgraphId; 4]> = SmallVec::new();
+        let mut groups: SmallVec<[crate::handle::SerializationGroupId; 4]> = SmallVec::new();
         let mut visited: HashSet<NodeId> = HashSet::default();
         let mut stack: SmallVec<[NodeId; 16]> = SmallVec::new();
         stack.push(seed);
@@ -2461,37 +2178,92 @@ impl Core {
             if !visited.insert(n) {
                 continue;
             }
-            if let Some(p) = reg.partition_of(n) {
-                if !partitions.contains(&p) {
-                    partitions.push(p);
+            if let Some(rec) = s.nodes.get(&n) {
+                if let Some(g) = rec.serialization_group {
+                    if !groups.contains(&g) {
+                        groups.push(g);
+                    }
                 }
+                stack.extend(rec.meta_companions.iter().copied());
             }
             if let Some(children) = s.children.get(&n) {
                 stack.extend(children.iter().copied());
             }
-            if let Some(rec) = s.nodes.get(&n) {
-                stack.extend(rec.meta_companions.iter().copied());
-            }
         }
-        partitions.sort_unstable_by_key(|sid| sid.raw());
-        partitions
+        drop(s);
+        if groups.is_empty() {
+            return SmallVec::new();
+        }
+        groups.sort_unstable_by_key(|g| g.raw());
+        let mut reg = self.group_locks.lock();
+        groups.into_iter().map(|g| (g, reg.lock_arc(g))).collect()
     }
 
-    /// Snapshot of every currently-existing partition's lock box, in
-    /// ascending [`crate::subgraph::SubgraphId`] order (canonical
-    /// lock-acquisition order per session-doc Q7 / D092). Used by
-    /// closure-form [`Core::batch`] / [`Core::begin_batch`] which
-    /// don't have a known seed and must serialize against every
-    /// existing partition.
-    ///
-    /// Slice Y1 / Phase E (2026-05-08).
-    pub(crate) fn all_partitions_lock_boxes(
+    /// Every known group's wave-lock, ascending by id. Backs
+    /// closure-form [`Core::begin_batch`] (no seed → serialize against
+    /// every group). Empty for an all-`None` graph.
+    pub(crate) fn all_groups_sorted(
         &self,
     ) -> Vec<(
-        crate::subgraph::SubgraphId,
-        Arc<crate::subgraph::SubgraphLockBox>,
+        crate::handle::SerializationGroupId,
+        Arc<parking_lot::ReentrantMutex<()>>,
     )> {
-        self.registry.lock().all_partitions()
+        self.group_locks.lock().all_sorted()
+    }
+
+    /// Acquire — in ascending [`crate::handle::SerializationGroupId`]
+    /// order — every group wave-lock transitively touched from `seed`.
+    /// Held for the wave's duration (returned guards live in
+    /// [`crate::batch::BatchGuard::wave_guards`]). **Empty** for an
+    /// all-`None` cascade — the §7 single-threaded floor acquires
+    /// nothing. Same-thread re-entry into a held group passes through
+    /// the `ReentrantMutex` transparently; deadlock-free because the
+    /// set is acquired sorted upfront and groups never migrate.
+    pub(crate) fn acquire_touched_group_guards(
+        &self,
+        seed: NodeId,
+    ) -> SmallVec<[WaveOwnerGuard; 4]> {
+        let guards: SmallVec<[WaveOwnerGuard; 4]> = self
+            .compute_touched_groups(seed)
+            .into_iter()
+            .map(|(_g, m)| WaveOwnerGuard::new(m.lock_arc()))
+            .collect();
+        self.with_global_wave_fallback(guards)
+    }
+
+    /// Acquire every known group's wave-lock, ascending. Backs
+    /// closure-form [`Core::begin_batch`] (no seed → serialize against
+    /// every group). Empty for an all-`None` graph.
+    pub(crate) fn acquire_all_group_guards(&self) -> SmallVec<[WaveOwnerGuard; 4]> {
+        let guards: SmallVec<[WaveOwnerGuard; 4]> = self
+            .all_groups_sorted()
+            .into_iter()
+            .map(|(_g, m)| WaveOwnerGuard::new(m.lock_arc()))
+            .collect();
+        self.with_global_wave_fallback(guards)
+    }
+
+    /// QA F1: when no `SerializationGroupId` is touched (an all-`None`
+    /// cascade) **and** the substrate serializes waves
+    /// ([`crate::state_cell::StateCell::SERIALIZE_WAVES`] — `true` only
+    /// for `LockedCell`), acquire the Core-global wave `ReentrantMutex`
+    /// so two threads driving an unannotated `Core<LockedCell>` cannot
+    /// interleave waves (which would corrupt the per-thread `WAVE_STATE`
+    /// / `TIER3_EMITTED_THIS_WAVE` / `IN_TICK_OWNED` invariants — the
+    /// pre-rewrite union-find `wave_owner` provided this and its deletion
+    /// removed it). On `SingleThreadCell` the const branch
+    /// dead-code-eliminates → the §7 ~83 ns floor takes zero locks. When
+    /// groups *are* touched, their disjoint locks already serialize the
+    /// wave (parallelism preserved), so the global lock is skipped.
+    #[inline]
+    fn with_global_wave_fallback(
+        &self,
+        mut guards: SmallVec<[WaveOwnerGuard; 4]>,
+    ) -> SmallVec<[WaveOwnerGuard; 4]> {
+        if C::SERIALIZE_WAVES && guards.is_empty() {
+            guards.push(WaveOwnerGuard::new(self.global_wave.lock_arc()));
+        }
+        guards
     }
 }
 
@@ -2535,6 +2307,20 @@ pub(crate) fn walk_undirected_dep_graph(
     skip_edge: Option<(NodeId, NodeId)>,
     extra_edges: &[(NodeId, NodeId)],
 ) -> HashSet<NodeId> {
+    // QA F2 / point-3 (2026-05-16): the component is defined over deps
+    // **+ children + meta** — ONE unified connectivity relation, reused
+    // by register / set_deps / add_meta_companion / set_serialization_group
+    // so the strict all-`None`|all-`Some` invariant and the wave cascade
+    // agree on what "the component" is. Meta edges are directional
+    // (`parent.meta_companions ∋ companion`); for undirected reachability
+    // we traverse them both ways. Reverse-meta needs a scan, built once
+    // here (declare-time only — never the hot path, per the §7 invariant).
+    let mut meta_parents: HashMap<NodeId, SmallVec<[NodeId; 2]>> = HashMap::default();
+    for (&p, rec) in &s.nodes {
+        for &comp in &rec.meta_companions {
+            meta_parents.entry(comp).or_default().push(p);
+        }
+    }
     let mut visited: HashSet<NodeId> = HashSet::default();
     let mut queue: SmallVec<[NodeId; 32]> = SmallVec::new();
     queue.push(start);
@@ -2557,6 +2343,20 @@ pub(crate) fn walk_undirected_dep_graph(
                     queue.push(d);
                 }
             }
+            // Forward meta: cur → its companions.
+            for &comp in &rec.meta_companions {
+                if !visited.contains(&comp) {
+                    queue.push(comp);
+                }
+            }
+        }
+        // Reverse meta: any parent that lists cur as a companion.
+        if let Some(parents) = meta_parents.get(&cur) {
+            for &p in parents {
+                if !visited.contains(&p) {
+                    queue.push(p);
+                }
+            }
         }
         // Virtual extra edges (e.g. would-be-added edges in
         // pre-mutation BFS).
@@ -2572,7 +2372,37 @@ pub(crate) fn walk_undirected_dep_graph(
     visited
 }
 
-impl Core {
+/// The ONE strict-consistency guard (QA F2 / point-3, 2026-05-16): is
+/// `node`'s full dep+children+meta component uniformly all-`None` or
+/// all-`Some`? Reused by `register`, `set_deps`, `add_meta_companion`
+/// and `set_serialization_group` so every topology-mutation entry point
+/// enforces the §7 invariant against the *same* component definition
+/// (closing the prior hole where register/set_deps used a deps-only
+/// inductive shortcut that meta edges could bypass). Declare-time only —
+/// the walk never runs on the hot path.
+#[must_use]
+pub(crate) fn component_is_group_consistent(s: &CoreState, node: NodeId) -> bool {
+    let component = walk_undirected_dep_graph(s, node, None, &[]);
+    let mut saw_some = false;
+    let mut saw_none = false;
+    for m in component {
+        if s.nodes
+            .get(&m)
+            .and_then(|r| r.serialization_group)
+            .is_some()
+        {
+            saw_some = true;
+        } else {
+            saw_none = true;
+        }
+        if saw_some && saw_none {
+            return false;
+        }
+    }
+    true
+}
+
+impl<C: crate::state_cell::StateCell> Core<C> {
     /// Test-only inspection: number of `PendingBatch`es queued for
     /// `node` in the current wave. Used by Slice X4 D2 regression
     /// tests to pin the "common case = single batch, no SmallVec
@@ -2866,6 +2696,7 @@ impl Core {
             is_dynamic,
             pausable,
             replay_buffer,
+            serialization_group,
         } = opts;
 
         // Derive the field shape from fn_or_op + deps.
@@ -2994,6 +2825,7 @@ impl Core {
             received_mask: 0,
             involved_mask: 0,
             op_scratch: installed_scratch,
+            serialization_group,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -3018,12 +2850,23 @@ impl Core {
         // `partition_count`/`partition_of` and (Y1+) `lock_for` — none
         // of which take the state lock — so the inner critical section
         // adds negligible latency.
-        {
-            let mut reg = self.registry.lock();
-            reg.ensure_registered(id);
+        // §7 strict serialization-group consistency (D208–D211; QA F2 /
+        // point-3 unified the guard 2026-05-16). The node is already
+        // inserted with its deps wired into `s.children` / `dep_records`,
+        // so the merged component is fully walkable: the ONE guard
+        // (`component_is_group_consistent`, deps + children + meta) decides
+        // it. Topology-mutation time only — never the hot path.
+        if !component_is_group_consistent(&s, id) {
+            // Roll back the partial insert before returning.
+            s.nodes.remove(&id);
+            s.children.remove(&id);
             for &dep in &deps {
-                reg.union_nodes(id, dep);
+                if let Some(c) = s.children.get_mut(&dep) {
+                    c.remove(&id);
+                }
             }
+            drop(s);
+            return Err(RegisterError::GroupInconsistent);
         }
         drop(s);
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
@@ -3313,7 +3156,7 @@ impl Core {
     /// - The node is non-resubscribable AND has terminated
     ///   ([`SubscribeError::TornDown`], R2.2.7.b).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
-    pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription {
+    pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription<C> {
         match self.try_subscribe(node_id, sink) {
             Ok(sub) => sub,
             Err(e) => panic!("{e}"),
@@ -3331,7 +3174,7 @@ impl Core {
         &self,
         node_id: NodeId,
         sink: Sink,
-    ) -> Result<Subscription, SubscribeError> {
+    ) -> Result<Subscription<C>, SubscribeError> {
         // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
         //
         // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
@@ -3363,9 +3206,13 @@ impl Core {
         // a Core-global one. Subscribe touches only `node_id`'s
         // partition (activation cascade stays within the partition
         // because dep edges are unioned). `partition_wave_owner_lock_arc`
-        // does retry-validate against concurrent union/split.
-        // `lock_arc()` is `!Send`; same-thread reentrant.
-        let wave_guard = self.partition_wave_owner_lock_arc(node_id)?;
+        // §7 (D208–D211): acquire every serialization group transitively
+        // touched from `node_id`, sorted ascending, held for the
+        // subscribe wave. Empty (zero locks) for an all-`None` cascade —
+        // the single-threaded floor. Same-thread re-entry passes through
+        // each group's `ReentrantMutex`. Infallible: groups are static +
+        // acquired sorted upfront, so there is no order violation.
+        let wave_guards = self.acquire_touched_group_guards(node_id);
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
@@ -3390,7 +3237,7 @@ impl Core {
             };
             if should_reject {
                 drop(s);
-                drop(wave_guard);
+                drop(wave_guards);
                 return Err(SubscribeError::TornDown { node: node_id });
             }
 
@@ -3566,11 +3413,10 @@ impl Core {
             });
         }
 
-        // Phase H+ STRICT (D115): drop the wave_guard BEFORE draining
-        // deferred producer ops. The deferred ops may need to subscribe
-        // to sources in lower-numbered partitions — if wave_guard is
-        // still held, the ascending-order check would reject them.
-        drop(wave_guard);
+        // §7: drop the group wave-locks before the (now-immediate)
+        // producer-op execution below. Symmetry with the old
+        // drop-before-drain ordering; harmless if empty.
+        drop(wave_guards);
 
         // Drain deferred producer ops now that no partitions are held
         // on this thread. The drain is a loop because each deferred op
@@ -3894,6 +3740,12 @@ impl Core {
         // registered (sink fires → re-enter Core → emit on self).
         // Derived / Dynamic / Operator nodes emit via their fn return
         // value through fire_fn / fire_operator, NOT via emit().
+        //
+        // §7-A (deferred): this standalone validation lock is redundant
+        // with commit_emission Phase 1 and collapsing it is part of §7
+        // item (1); §5b measured ~0% single-thread benefit so the
+        // collapse is deferred (porting-deferred.md §7-A, flagged for
+        // ratification). The normal-path validation is retained here.
         {
             let s = self.lock_state();
             let rec = s.require_node(node_id);
@@ -3926,7 +3778,10 @@ impl Core {
     /// Emit or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks. Retains `handle` on defer;
     /// the drain releases it after firing (or on discard).
-    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
+    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId)
+    where
+        C: Send + Sync,
+    {
         if self.try_emit(node_id, new_handle).is_err() {
             self.binding.retain_handle(new_handle);
             self.push_deferred_producer_op(DeferredProducerOp::Emit {
@@ -4052,7 +3907,7 @@ impl Core {
 // COMPLETE / ERROR — terminal lifecycle + auto-cascade gating
 // -----------------------------------------------------------------------
 
-impl Core {
+impl<C: crate::state_cell::StateCell> Core<C> {
     /// Emit `[COMPLETE]` (R1.3.4) on `node_id`, marking it terminal. After
     /// this call:
     ///
@@ -4086,7 +3941,10 @@ impl Core {
 
     /// Complete or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks.
-    pub fn complete_or_defer(&self, node_id: NodeId) {
+    pub fn complete_or_defer(&self, node_id: NodeId)
+    where
+        C: Send + Sync,
+    {
         match self.try_complete(node_id) {
             Ok(()) => {}
             Err(_) => {
@@ -4135,7 +3993,10 @@ impl Core {
     /// Error or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks. Retains `handle` on defer;
     /// the drain releases it after firing (or on discard).
-    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
+    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId)
+    where
+        C: Send + Sync,
+    {
         if self.try_error(node_id, error_handle).is_err() {
             self.binding.retain_handle(error_handle);
             self.push_deferred_producer_op(DeferredProducerOp::Error {
@@ -4337,7 +4198,7 @@ fn pick_cascade_terminal(dep_records: &[DepRecord]) -> TerminalKind {
 // TEARDOWN — destruction, with auto-COMPLETE prepend (R2.6.4 / Lock 6.F)
 // -----------------------------------------------------------------------
 
-impl Core {
+impl<C: crate::state_cell::StateCell> Core<C> {
     /// Tear `node_id` down. Per R2.6.4 / Lock 6.F:
     ///
     /// - **Auto-prepend COMPLETE.** If the node has not yet emitted a
@@ -4366,7 +4227,10 @@ impl Core {
 
     /// Teardown or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks.
-    pub fn teardown_or_defer(&self, node_id: NodeId) {
+    pub fn teardown_or_defer(&self, node_id: NodeId)
+    where
+        C: Send + Sync,
+    {
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(_) => {
@@ -4507,7 +4371,15 @@ impl Core {
     /// # Panics
     ///
     /// Panics if either node id is unknown, or if `parent == companion`
-    /// (a node cannot be its own meta companion — would loop on TEARDOWN).
+    /// (a node cannot be its own meta companion — would loop on TEARDOWN),
+    /// or if attaching `companion` would make `parent`'s dep+children+meta
+    /// component **group-inconsistent** (mix `None` and `Some` —
+    /// §7 strict invariant; QA F2 / point-3, 2026-05-16). The meta edge is
+    /// a component-joining edge just like a dep edge, so it is guarded by
+    /// the same ONE `component_is_group_consistent` check the deleted
+    /// deps-only inductive shortcut used to bypass. Panic (not `Result`)
+    /// matches this API's existing assert-based contract style; a
+    /// differently-grouped companion is a wiring error, like a cycle.
     pub fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
         assert!(parent != companion, "node cannot be its own meta companion");
         let mut s = self.lock_state();
@@ -4517,8 +4389,23 @@ impl Core {
             "unknown companion {companion:?}"
         );
         let metas = &mut s.require_node_mut(parent).meta_companions;
-        if !metas.contains(&companion) {
-            metas.push(companion);
+        if metas.contains(&companion) {
+            return;
+        }
+        metas.push(companion);
+        if !component_is_group_consistent(&s, parent) {
+            // Roll back the meta edge before failing — keep the graph in
+            // the pre-call consistent state.
+            let metas = &mut s.require_node_mut(parent).meta_companions;
+            if let Some(pos) = metas.iter().position(|&c| c == companion) {
+                metas.swap_remove(pos);
+            }
+            panic!(
+                "add_meta_companion({parent:?}, {companion:?}): would make \
+                 the component mix grouped and ungrouped nodes \
+                 (§7 strict invariant — must be uniformly all-None or \
+                 all-Some; reassign the component via set_serialization_group)"
+            );
         }
     }
 }
@@ -4527,7 +4414,7 @@ impl Core {
 // INVALIDATE — cache clear + downstream cascade
 // -----------------------------------------------------------------------
 
-impl Core {
+impl<C: crate::state_cell::StateCell> Core<C> {
     /// Clear `node_id`'s cache and cascade `[INVALIDATE]` to downstream
     /// dependents per canonical spec §1.4.
     ///
@@ -4578,7 +4465,10 @@ impl Core {
     /// # Panics
     ///
     /// Panics if `node_id` is not registered in this Core.
-    pub fn invalidate_or_defer(&self, node_id: NodeId) {
+    pub fn invalidate_or_defer(&self, node_id: NodeId)
+    where
+        C: Send + Sync,
+    {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -4718,7 +4608,7 @@ pub struct ResumeReport {
     pub dropped: u32,
 }
 
-impl Core {
+impl<C: crate::state_cell::StateCell> Core<C> {
     /// Acquire a pause lock on `node_id`. The first lock transitions the
     /// node from `Active` to `Paused`; further locks add to the lockset.
     /// While paused, tier-3 (DATA/RESOLVED) and tier-4 (INVALIDATE) outgoing
@@ -4994,16 +4884,90 @@ pub enum SetDepsError {
     /// callback running post-flush).
     ///
     /// Slice Y1 (D3 / D091, 2026-05-08).
-    #[error(
-        "set_deps({n:?}, ...): rejected — would migrate the partition of \
-         currently-firing node {firing:?} mid-wave (union/split during \
-         fire would invalidate the held wave_owner Arc). Schedule the \
-         rewire outside the wave."
-    )]
+    /// **Vestigial (§7, D208–D211).** Serialization groups are static
+    /// and user-declared, so `set_deps` never migrates a node's group;
+    /// this is never returned post-§7. Retained only so downstream
+    /// `Err(_)` match arms compile unchanged (D211); removal is a
+    /// tracked downstream-churn follow-on.
+    #[error("vestigial PartitionMigrationDuringFire (never returned post-§7)")]
     PartitionMigrationDuringFire { n: NodeId, firing: NodeId },
+
+    /// §7 strict serialization-group consistency (D208–D211): the
+    /// rewired dep set would make node `n`'s component **mixed**
+    /// (grouped + ungrouped members). A component must be uniformly
+    /// all-`None` or all-`Some`. Checked at topology-mutation time only.
+    #[error(
+        "set_deps({n:?}, ...): serialization-group inconsistency — the new \
+         dep set mixes grouped and ungrouped nodes in n's component \
+         (must be uniformly all-None or all-Some)"
+    )]
+    GroupInconsistent { n: NodeId },
 }
 
-impl Core {
+/// Errors returnable by [`Core::set_serialization_group`] (§7, D208–D211).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum SetGroupError {
+    /// The node id is not registered.
+    #[error("set_serialization_group: unknown node {0:?}")]
+    UnknownNode(NodeId),
+
+    /// **Unreachable since QA point-3 (2026-05-16):**
+    /// [`Core::set_serialization_group`] now assigns the group to the
+    /// node's *entire* dep+children+meta component atomically, so the
+    /// result is consistent by construction. Retained (pre-1.0, no
+    /// removal churn) for the impossible-by-construction arm and any
+    /// future per-node variant. Was: "assigning would make the component
+    /// mix grouped and ungrouped nodes."
+    #[error(
+        "set_serialization_group({node:?}): component-mixed (unreachable since \
+         point-3 component-wide assignment; report as a bug if observed)"
+    )]
+    ComponentInconsistent { node: NodeId },
+}
+
+impl<C: crate::state_cell::StateCell> Core<C> {
+    /// §7 (D208–D211; QA point-3 made it component-wide, 2026-05-16):
+    /// assign (or clear, with `None`) the [`crate::handle::SerializationGroupId`]
+    /// for `node`'s **entire** dep+children+meta component.
+    ///
+    /// This is the **retroactive regrouping** primitive: because
+    /// `set_deps` / mount / unmount can merge previously-separate
+    /// components, and the strict invariant forbids a mixed component, a
+    /// *per-node* setter could never legally transition an all-`None`
+    /// component to all-`Some` (every intermediate single-node state
+    /// would be mixed → rejected — a chicken-and-egg). Assigning the
+    /// whole component in one atomic call removes that: the result is
+    /// uniformly `group` by construction, so the invariant always holds
+    /// and [`SetGroupError::ComponentInconsistent`] is unreachable.
+    ///
+    /// The component is the ONE unified relation (deps + children + meta)
+    /// — the same one `register` / `set_deps` / `add_meta_companion`
+    /// enforce, so regrouping after a topology change is coherent. The
+    /// walk runs at this topology-mutation call only — never the hot path.
+    ///
+    /// Groups are static: this does not re-fire any node or move an
+    /// in-flight wave; it only changes which wave-lock future waves
+    /// touching the component will acquire.
+    pub fn set_serialization_group(
+        &self,
+        node: NodeId,
+        group: Option<crate::handle::SerializationGroupId>,
+    ) -> Result<(), SetGroupError> {
+        let mut s = self.lock_state();
+        if !s.nodes.contains_key(&node) {
+            return Err(SetGroupError::UnknownNode(node));
+        }
+        // Assign `group` to every member of the unified (deps + children
+        // + meta) component — consistent by construction.
+        let component = walk_undirected_dep_graph(&s, node, None, &[]);
+        for m in component {
+            if let Some(rec) = s.nodes.get_mut(&m) {
+                rec.serialization_group = group;
+            }
+        }
+        Ok(())
+    }
+
     /// Atomic dep mutation — change a node's upstream deps without TEARDOWN
     /// cascading and without losing cache.
     ///
@@ -5108,96 +5072,42 @@ impl Core {
         // P13 check accordingly.
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
-        // Slice Y1 (D3 / D091 — P13, 2026-05-08): reject mid-wave set_deps
-        // that would shift a currently-firing node's partition root.
-        // Distinct from `ReentrantOnFiringNode` (same-node case, line above).
-        // Holds the registry lock briefly under the state lock per the
-        // P12-fix lock-discipline invariant `state lock → registry mutex`.
-        //
-        // **Two cases:**
-        // 1. **Union (Phase D)** — adding a cross-partition dep merges two
-        //    components. Both pre-merge components are affected (the
-        //    smaller-rank loser's box is dropped, its members migrate to
-        //    the winner's root).
-        // 2. **Split (Phase F, 2026-05-09)** — removing an edge whose
-        //    removal disconnects the dep graph splits one component into
-        //    two. The pre-split component is affected (every member
-        //    re-unions; the orphan side gets a fresh `SubgraphLockBox`
-        //    while the keep side preserves the original Arc).
-        //
-        // Either case migrates the partition root (and box-identity) for
-        // affected nodes mid-wave; if any node currently firing on this
-        // thread is in an affected partition, the wave's held
-        // `Arc<SubgraphLockBox>` would diverge from the registry's new
-        // canonical box. Q3 = (a-strict) per the D3 design lock rejects
-        // both cases at edge-mutation time.
-        // /qa F2 reverted (2026-05-10): currently_firing lives on
-        // CoreState (cross-thread visible — load-bearing for this P13
-        // partition-migration check, which detects cross-thread set_deps
-        // calls during another thread's lock-released invoke_fn).
-        // Snapshot under the already-held state lock so the registry
-        // mutex acquire below doesn't need to also hold the snapshot
-        // borrow.
-        let currently_firing_snapshot: Vec<NodeId> = s.currently_firing.clone();
-        if !currently_firing_snapshot.is_empty() && (!added.is_empty() || !removed.is_empty()) {
-            let mut reg = self.registry.lock();
-            // Snapshot firing nodes' partitions. `partition_of` is mutating
-            // (path compression) but partition IDENTITY is stable across
-            // reads (only `union_nodes` / `split_partition` mutate roots).
-            let firing_with_partition: Vec<(NodeId, crate::subgraph::SubgraphId)> =
-                currently_firing_snapshot
-                    .iter()
-                    .filter_map(|&f| reg.partition_of(f).map(|p| (f, p)))
-                    .collect();
-            if !firing_with_partition.is_empty() {
-                let part_n = reg.partition_of(n);
-                // Case 1 (union): for each added dep, check cross-partition merge.
-                for &added_dep in &added {
-                    let part_added = reg.partition_of(added_dep);
-                    if part_n == part_added {
-                        continue; // same-partition add is a no-op in union-find
-                    }
-                    let affected = [part_n, part_added];
-                    if let Some(&(firing, _)) = firing_with_partition
-                        .iter()
-                        .find(|(_, p)| affected.contains(&Some(*p)))
-                    {
-                        return Err(SetDepsError::PartitionMigrationDuringFire { n, firing });
-                    }
+        // §7 strict serialization-group consistency (D208–D211; QA F2 /
+        // point-3, 2026-05-16). Replaces the deleted union-find P13
+        // partition-migration rejection. Groups are static + user-declared,
+        // so set_deps can NEVER migrate a node's group; the only concern is
+        // that the rewired adjacency merges `n` with deps of a different
+        // consistency class. The mutation is applied LATER in this atomic
+        // (TLA+-verified) transaction, so the unified
+        // `component_is_group_consistent` walk would see stale adjacency
+        // here; instead the inductive endpoint check `{n} ∪ new_deps` is
+        // used. **Soundness:** every component is internally consistent —
+        // including its meta edges — because `register` /
+        // `add_meta_companion` / `set_serialization_group` ALL now enforce
+        // the unified deps+children+meta guard. Merging internally-consistent
+        // components is consistent iff their representative values agree,
+        // i.e. `{n} ∪ new_deps` is not mixed. Topology-mutation time only.
+        {
+            let node_some = s
+                .nodes
+                .get(&n)
+                .and_then(|r| r.serialization_group)
+                .is_some();
+            let mut saw_some = node_some;
+            let mut saw_none = !node_some;
+            for &dep in &new_deps_set {
+                if s.nodes
+                    .get(&dep)
+                    .and_then(|r| r.serialization_group)
+                    .is_some()
+                {
+                    saw_some = true;
+                } else {
+                    saw_none = true;
                 }
-                // Case 2 (split): for each removed dep, simulate undirected
-                // walk from `removed_dep` skipping the would-be-removed edge
-                // (`removed_dep → n`); if `n` is unreachable, removal would
-                // disconnect — split — affecting all nodes in that
-                // partition. Since dep edges are within a single partition
-                // by construction (union-find merges on edge add), every
-                // node currently in the partition is affected.
-                //
-                // QA-fix #4 (2026-05-09): pass `added_edges` as `extra_edges`
-                // so a `set_deps` that simultaneously REMOVES one edge AND
-                // ADDS another path isn't falsely rejected. Without this,
-                // the pre-mutation walk doesn't see the would-be-added
-                // edges and reports disconnect even when the net change
-                // preserves connectivity.
-                let added_edges: Vec<(NodeId, NodeId)> = added.iter().map(|&a| (a, n)).collect();
-                for &removed_dep in &removed {
-                    let part_removed = reg.partition_of(removed_dep);
-                    let visited = walk_undirected_dep_graph(
-                        &s,
-                        removed_dep,
-                        Some((removed_dep, n)),
-                        &added_edges,
-                    );
-                    let would_disconnect = !visited.contains(&n);
-                    if would_disconnect {
-                        if let Some(&(firing, _)) = firing_with_partition
-                            .iter()
-                            .find(|(_, p)| Some(*p) == part_removed)
-                        {
-                            return Err(SetDepsError::PartitionMigrationDuringFire { n, firing });
-                        }
-                    }
-                }
+            }
+            if saw_some && saw_none {
+                return Err(SetDepsError::GroupInconsistent { n });
             }
         }
         // Idempotent fast-path. Now safe to short-circuit since the P13
@@ -5354,71 +5264,13 @@ impl Core {
         // (Q2) blocks concurrent waves once we enter `run_wave`, so the
         // re-read sees a coherent post-validation state.
         let added_for_wave: Vec<NodeId> = added.iter().copied().collect();
-        // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
-        // membership BEFORE dropping the state lock so the registry can
-        // never lag behind topology mutations as observed by concurrent
-        // readers. Lock-order invariant `state lock → registry mutex`
-        // (one-way; never registry → state) — see the matching block in
-        // `Core::register` for the full rationale.
-        //   - For each new edge: union the partitions of `n` and `added_dep`.
-        //   - For each removed edge (Slice Y1 / Phase F, 2026-05-09):
-        //     run undirected-dep-graph BFS from `removed_dep` over the
-        //     POST-removal `s.children` + `dep_records`. If `n` is
-        //     unreachable, the partition has split — gather the affected
-        //     component nodes + intra-component edges, then call
-        //     [`SubgraphRegistry::split_partition`] to migrate the orphan
-        //     side onto a fresh `SubgraphLockBox`. Mid-fire splits would
-        //     have been rejected at the P13 check above (Q3 = (a-strict)).
-        {
-            let mut reg = self.registry.lock();
-            for &added_dep in &added {
-                reg.union_nodes(n, added_dep);
-            }
-            for &removed_dep in &removed {
-                // Post-removal walk — `s.children[removed_dep]` no longer
-                // contains `n`, and `s.nodes[n].dep_records` no longer
-                // contains `removed_dep`. No skip needed; no extra edges
-                // (added edges are already applied to `s.children` and
-                // `dep_records` by the time we reach this block).
-                let visited = walk_undirected_dep_graph(&s, removed_dep, None, &[]);
-                if visited.contains(&n) {
-                    // Still connected via other dep edges — no split.
-                    continue;
-                }
-                // Disconnected. `visited` is the keep-side (containing
-                // `removed_dep`). Identify the original component, the
-                // intra-component dep edges, and split.
-                let original_root = reg.find(removed_dep);
-                // Snapshot keys before iterating — `find` mutates via
-                // path compression; iterating + mutating concurrently
-                // would alias-borrow.
-                let snapshot_keys: Vec<NodeId> = reg.registered_nodes();
-                let component_nodes: Vec<NodeId> = snapshot_keys
-                    .into_iter()
-                    .filter(|&node| reg.find(node) == original_root)
-                    .collect();
-                let component_set: HashSet<NodeId> = component_nodes.iter().copied().collect();
-                // Collect dep edges within the component (post-removal).
-                // Edge convention: `(parent, child)` data-flow direction.
-                let mut edges_in_component: Vec<(NodeId, NodeId)> = Vec::new();
-                for &node in &component_nodes {
-                    if let Some(rec) = s.nodes.get(&node) {
-                        for d in rec.dep_records.iter().map(|r| r.node) {
-                            if component_set.contains(&d) {
-                                edges_in_component.push((d, node));
-                            }
-                        }
-                    }
-                }
-                let keep_side_nodes: Vec<NodeId> = visited.iter().copied().collect();
-                reg.split_partition(&component_nodes, &keep_side_nodes, &edges_in_component);
-                // Marker call kept for symmetry with `union_nodes` — the
-                // registry's `on_edge_removed` is itself a no-op (Phase F
-                // moved the actual work into Core where the dep-graph
-                // view is available).
-                reg.on_edge_removed(n, removed_dep);
-            }
-        }
+        // §7 (D208–D211): the union-find union/split-eager block that
+        // lived here is DELETED. Serialization groups are static +
+        // user-declared and do NOT migrate with topology, so adding /
+        // removing dep edges never recomputes any node's group. The
+        // group-consistency invariant for the new adjacency was already
+        // enforced above (the strict check that replaced the P13 block).
+        // No registry mutation on the set_deps path.
         // B3 (D117, 2026-05-10): when set_deps clears ALL deps mid-wave AND
         // n has a tier-1 (DIRTY) message already queued this wave with no
         // settle yet, push n to `pending_auto_resolve` so the drain-end

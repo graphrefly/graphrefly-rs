@@ -152,6 +152,56 @@ impl LockId {
     }
 }
 
+/// Identifier for a **concurrency serialization group** (§7 single-threaded
+/// substrate + `Option<LockId>` contract, user-locked 2026-05-16).
+///
+/// Orthogonal to [`LockId`] (which is the spec-mandated *pause-lock*
+/// identifier, R1.2.6 / R2.6 — see D210 amendment). A node carries
+/// `serialization_group: Option<SerializationGroupId>`:
+///
+/// - `None` (default) — the node runs on the single-threaded, lock-free
+///   path. When *every* node in a `Core` is `None`, the wave engine's
+///   group-collect + ordered-acquire step has nothing to do and
+///   monomorphizes out (the §7 ~83 ns floor).
+/// - `Some(g)` — the node belongs to serialization group `g`. All nodes
+///   sharing `g` serialize through one `Arc<ReentrantMutex<()>>` held for
+///   the lifetime of any wave that touches them. Distinct groups whose
+///   touched-sets are disjoint run truly parallel; overlapping touched-sets
+///   serialize. Acquisition is in ascending `SerializationGroupId` order
+///   (deadlock-free under any interleaving).
+///
+/// **Strict consistency invariant (user-locked):** a node's dep-connected
+/// component MUST be lock-consistent — either every member is `None`, or
+/// every member carries a group. Mixed components are rejected at
+/// `register` / `set_serialization_group` time (topology-mutation time
+/// only, never the hot path). See [`crate::Core::set_serialization_group`].
+///
+/// Replaces the deleted D3 union-find per-subgraph partitioning
+/// (`SESSION-rust-port-d3-per-subgraph-parallelism.md`, D085/D086 — flagged
+/// SUPERSEDED). User-declared and *static*: groups do not migrate with
+/// topology, so none of the union-find recompute/validate machinery
+/// (registry lock, `find`/path-compression, epoch, `PARTITION_CACHE`,
+/// retry-validate) is needed.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
+pub struct SerializationGroupId(u64);
+
+impl SerializationGroupId {
+    /// Wrap a raw `u64` as a serialization-group id. Group ids are
+    /// user-assigned and carry no allocation-range convention (unlike
+    /// [`LockId`]) — two nodes are co-serialized iff they were given the
+    /// same value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Unwrap to the underlying `u64` (for ordered acquisition + map keys).
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
