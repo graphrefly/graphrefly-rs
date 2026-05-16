@@ -1711,6 +1711,95 @@ impl BenchCore {
         })
         .await
     }
+
+    // -------------------------------------------------------------------
+    // Option C (D206/D207) — N1 substrate-infra surface for the
+    // hand-written async `@graphrefly/native` public wrapper.
+    // -------------------------------------------------------------------
+
+    /// Single-node describe projection (N1 `describeNode`).
+    ///
+    /// **D207 (locked 2026-05-15): REUSE the existing snapshot /
+    /// describe-projection path — no new `graphrefly-core` public
+    /// method.** This composes Core's existing *read-side inspection
+    /// helpers* (`kind_of` / `deps_of` / `cache_of` / `has_fired_once`
+    /// / `is_terminal`) — the very accessors that back
+    /// `Graph::describe` (`graphrefly-graph::describe::describe_inner`)
+    /// — into the per-node JSON slice the `Impl.describeNode(node)`
+    /// contract expects. Mirrors the pure-ts reference arm
+    /// (`pure-ts.ts` `describeNode → legacy.describeNode(node.inner)`),
+    /// which returns the same `{ type, status, deps, value? }` shape.
+    ///
+    /// Sync — pure read accessors, single state-lock acquire each, no
+    /// wave entry, no binding callbacks. Returns a JSON string the
+    /// JS wrapper parses (same marshaling convention as
+    /// `BenchGraph::describe_json`). Dep ids surface as raw `NodeId`
+    /// u64s (the namespace lives at the Graph layer; an unattached
+    /// node has no names — the JS wrapper renders them as
+    /// `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
+    #[napi]
+    #[must_use]
+    pub fn describe_node(&self, node_id: u32) -> String {
+        let nid = NodeId::new(u64::from(node_id));
+        let kind = self.core.kind_of(nid);
+        let Some(kind) = kind else {
+            // Unknown node — absence over panic (mirrors the Core
+            // read-side "Option/empty for unknown ids" discipline).
+            return "null".to_string();
+        };
+        let type_str = match kind {
+            graphrefly_core::NodeKind::State => "state",
+            graphrefly_core::NodeKind::Producer => "producer",
+            graphrefly_core::NodeKind::Derived => "derived",
+            graphrefly_core::NodeKind::Dynamic => "dynamic",
+            graphrefly_core::NodeKind::Operator(_) => "operator",
+        };
+        let status = match self.core.is_terminal(nid) {
+            Some(graphrefly_core::TerminalKind::Complete) => "complete",
+            Some(graphrefly_core::TerminalKind::Error(_)) => "error",
+            None => {
+                if self.core.has_fired_once(nid) {
+                    "active"
+                } else {
+                    "sentinel"
+                }
+            }
+        };
+        let deps: Vec<u64> = self.core.deps_of(nid).iter().map(|d| d.raw()).collect();
+        let cache = self.core.cache_of(nid);
+        let cache_raw = if cache == graphrefly_core::NO_HANDLE {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::from(cache.raw())
+        };
+        let projection = serde_json::json!({
+            "type": type_str,
+            "status": status,
+            "deps": deps,
+            "valueHandle": cache_raw,
+            "sentinel": cache == graphrefly_core::NO_HANDLE,
+        });
+        projection.to_string()
+    }
+
+    /// Hex SHA-256 (N1 `sha256Hex`).
+    ///
+    /// Hashing is **synchronous in `graphrefly-core`**
+    /// ([`graphrefly_core::sha256_hex`]) — there is nothing async about
+    /// SHA-256, and Core forbids a tokio runtime (CLAUDE.md invariant 4
+    /// / D070 / D077). Async-everywhere is a *binding-contract* shape
+    /// (`Impl.sha256Hex` is `Promise<string>`), so the async wrapping
+    /// lives only here at the napi boundary. We still route through
+    /// `run_blocking` so the (cheap) hash never runs on the libuv
+    /// thread, consistent with every other async napi method.
+    #[napi]
+    pub async fn sha256_hex(&self, input: Uint8Array) -> Result<String> {
+        let core = self.core.clone();
+        run_blocking(core, move || -> String {
+            graphrefly_core::sha256_hex(input.as_ref())
+        })
+        .await
+    }
 }
 
 /// JS-exposed mirror of [`graphrefly_core::ResumeReport`].

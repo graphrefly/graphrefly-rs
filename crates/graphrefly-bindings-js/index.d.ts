@@ -79,7 +79,7 @@ export declare class BenchCore {
    * a sync_channel until JS responds via libuv pump). JS code
    * MUST `await` this method — synchronous calling deadlocks.
    *
-   * `pub fn` (not `async fn`) because `Function<>` is `!Send`; the
+   * `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
    * async work runs inside `env.spawn_future(async move { ... })`.
    */
   subscribeWithTsfn(nodeId: number, sinkCallback: (arg: Array<number>) => void): Promise<number>
@@ -178,6 +178,42 @@ export declare class BenchCore {
    */
   batchEmitHandleMessages(nodeId: number, encoded: Array<number>): Promise<void>
   batchEmitMessages(nodeId: number, msgs: Array<BatchEmissionJs>): Promise<void>
+  /**
+   * Single-node describe projection (N1 `describeNode`).
+   *
+   * **D207 (locked 2026-05-15): REUSE the existing snapshot /
+   * describe-projection path — no new `graphrefly-core` public
+   * method.** This composes Core's existing *read-side inspection
+   * helpers* (`kind_of` / `deps_of` / `cache_of` / `has_fired_once`
+   * / `is_terminal`) — the very accessors that back
+   * `Graph::describe` (`graphrefly-graph::describe::describe_inner`)
+   * — into the per-node JSON slice the `Impl.describeNode(node)`
+   * contract expects. Mirrors the pure-ts reference arm
+   * (`pure-ts.ts` `describeNode → legacy.describeNode(node.inner)`),
+   * which returns the same `{ type, status, deps, value? }` shape.
+   *
+   * Sync — pure read accessors, single state-lock acquire each, no
+   * wave entry, no binding callbacks. Returns a JSON string the
+   * JS wrapper parses (same marshaling convention as
+   * `BenchGraph::describe_json`). Dep ids surface as raw `NodeId`
+   * u64s (the namespace lives at the Graph layer; an unattached
+   * node has no names — the JS wrapper renders them as
+   * `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
+   */
+  describeNode(nodeId: number): string
+  /**
+   * Hex SHA-256 (N1 `sha256Hex`).
+   *
+   * Hashing is **synchronous in `graphrefly-core`**
+   * ([`graphrefly_core::sha256_hex`]) — there is nothing async about
+   * SHA-256, and Core forbids a tokio runtime (CLAUDE.md invariant 4
+   * / D070 / D077). Async-everywhere is a *binding-contract* shape
+   * (`Impl.sha256Hex` is `Promise<string>`), so the async wrapping
+   * lives only here at the napi boundary. We still route through
+   * `run_blocking` so the (cheap) hash never runs on the libuv
+   * thread, consistent with every other async napi method.
+   */
+  sha256Hex(input: Uint8Array): Promise<string>
 }
 
 /**

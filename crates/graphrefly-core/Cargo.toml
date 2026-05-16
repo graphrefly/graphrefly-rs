@@ -17,6 +17,10 @@ indexmap    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 serde_json  = { workspace = true }
+# Sync SHA-256 for the `hash` module (no tokio — Core stays synchronous;
+# the async-everywhere wrapping is applied only at the napi boundary).
+sha2        = { workspace = true }
+hex         = { workspace = true }
 tokio       = { workspace = true, features = ["time", "sync", "rt", "macros"], optional = true }
 
 [dev-dependencies]

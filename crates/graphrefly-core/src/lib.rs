@@ -48,6 +48,7 @@ mod batch;
 pub mod boundary;
 pub mod clock;
 pub mod handle;
+pub mod hash;
 pub mod message;
 pub mod node;
 pub(crate) mod op_state;
@@ -61,6 +62,7 @@ pub use batch::BatchGuard;
 pub use boundary::{BindingBoundary, CleanupTrigger, DepBatch, FnEmission, FnResult};
 pub use clock::{monotonic_ns, wall_clock_ns};
 pub use handle::{FnId, HandleId, LockId, NodeId, NO_HANDLE};
+pub use hash::sha256_hex;
 pub use message::{Message, Messages};
 pub use node::{
     Core, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration,
