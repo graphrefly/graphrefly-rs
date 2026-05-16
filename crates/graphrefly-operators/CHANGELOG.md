@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-operators-v0.0.5...graphrefly-operators-v0.0.6) - 2026-05-16
+
+### Added
+
+- clean up M1-M3
+- clean up slice G
+
+### Fixed
+
+- more porting
+- clean up
+- clean up
+- more operators
+- more operators
+- clean up
+- H+
+
 ## [0.0.4](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-operators-v0.0.3...graphrefly-operators-v0.0.4) - 2026-05-10
 
 ### Fixed

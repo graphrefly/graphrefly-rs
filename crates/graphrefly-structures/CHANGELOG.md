@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-structures-v0.0.5...graphrefly-structures-v0.0.6) - 2026-05-16
+
+### Added
+
+- M4 - 1
+
+### Fixed
+
+- abort and changeset
+- m5 part 2
+- m4
+
 ## [0.0.3](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-structures-v0.0.2...graphrefly-structures-v0.0.3) - 2026-05-09
 
 ### Other
