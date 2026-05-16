@@ -551,12 +551,35 @@ The original entry body is preserved below for archival reference.
   before being relied on. The per-subgraph-parallelism value proposition
   in the disjoint regime is materially weaker than this section claims**
   (flagged for spec-owner re-validation; not silently rewritten).
-  Follow-up C (cheap-correct-drain fast-path for trivial disjoint waves)
-  targets recovering the avoidable fraction; the fn-fire drain cost is
-  largely irreducible. `wave_protocol_partitioned_MC` is unaffected
-  (`in_tick` is a Rust drain-gate not in the TLA+ model; the modeled
-  per-partition `wave_owner` relation is unchanged). See
-  `docs/rust-port-decisions.md` D047.
+  **Follow-up C — CLOSED as investigated (2026-05-15), no code change.**
+  A cheap-correct-drain fast-path is **not viable**: (1) every disjoint
+  bench subscribes a sink, so `pending_notify`-drain + `fire_deferred`
+  delivery is *mandatory correctness work* (the exact work the bug
+  skipped) — an "all-empty ⇒ skip" predicate never fires on the benched
+  workload; (2) `commit_emission` takes a wave-cache rollback snapshot
+  whenever `in_tick && cache != NO_HANDLE` (≈ every real state emit), so
+  the predicate is unreachable even with no subscribers; (3) the residual
+  cost is the **Core-global `lock_state()`** in the post-drain block
+  (`clear_wave_state` touches `CoreState`; `drain_deferred` needs
+  `&mut s`) — under N-thread disjoint contention that single mutex per
+  emit is the bottleneck, i.e. the **already-deferred Q2/Q3 per-partition
+  state-shard refactor is the only real recovery lever, NOT a drain
+  fast-path**. The fn-fire disjoint cost is irreducible (fn fires must
+  drain). `wave_protocol_partitioned_MC` is unaffected (`in_tick` is a
+  Rust drain-gate not in the TLA+ model; the modeled per-partition
+  `wave_owner` relation is unchanged).
+
+  **Open strategic question (escalated, NOT decided here):** the Phase J
+  disjoint-parallel speedup was substantially a bug artifact, so the
+  Rust port's *parallelism* selling point in this regime is weak/absent
+  until Q2/Q3. This says nothing about correct-Rust-vs-`pure-ts`
+  throughput/memory/FFI — **that cross-impl comparison is UNMEASURED**
+  (the `packages/parity-tests` `rustImpl` arm only activates once
+  `@graphrefly/native` publishes). Before the Rust port's performance
+  value proposition is relied on, a proper **correct-Rust vs
+  `@graphrefly/pure-ts`** benchmark is required; the "4×" figure is
+  correct-vs-buggy *intra-Rust*, not Rust-vs-TS, and must not be read as
+  the cross-impl gap. See `docs/rust-port-decisions.md` D047.
 
 ### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — FULLY CLOSED 2026-05-10 (LIMITED 2026-05-09 + STRICT D115 2026-05-10)
 

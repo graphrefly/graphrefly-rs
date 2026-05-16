@@ -91,9 +91,19 @@ jobs:
           version: 10.33.0
       - name: Install deps
         run: pnpm install --frozen-lockfile
+      - name: Install aarch64 cross toolchain
+        # aarch64-unknown-linux-gnu cross-compiles on the x86_64
+        # ubuntu-latest runner. blake3's cc-rs build script needs a C
+        # cross compiler for its NEON backend (blake3_neon); the runner
+        # has none by default → ToolNotFound. Only this matrix leg.
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Build ${{ matrix.target }}
         # napi 3.x emits the per-target binary + the npm/<target>/
         # sub-package. `--features full` keeps structures + storage.
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: pnpm exec napi build --platform --release --features full --target ${{ matrix.target }}
       - name: Upload artifact
         uses: actions/upload-artifact@v4
