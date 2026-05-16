@@ -171,11 +171,16 @@ thread_local! {
 // and needs no shared-state lock. (`currently_firing` deliberately stays
 // on `CoreState`; see `node.rs`.)
 //
-// Stale slots: a `Core` that drops while a thread still has its
-// generation interned (only reachable if a drop was bypassed) leaves an
-// inert key — generations are never reused, so it can never false-match a
-// future Core. Bounded by the number of distinct Cores a thread ever
-// enters a wave on; not an unbounded leak in practice.
+// Stale slots: the owning `BatchGuard::drop` releases the generation via
+// an RAII guard that fires on EVERY exit path — normal return, the
+// panic-discard branch, AND an unwind through `drain_and_flush()`. So a
+// slot can only be left interned if `Drop` itself never runs:
+// `std::mem::forget(guard)` or a process abort without unwinding — both
+// out of contract (`BatchGuard` is `#[must_use]` + `!Send`). Such a
+// leaked key is inert: generations are never reused, so it can never
+// false-match a future Core (no correctness impact), and the leak is
+// bounded by the number of distinct Cores a thread ever forgets a guard
+// on — not an unbounded leak under any normal or panic-recovery path.
 //
 // History: this flag lived briefly per-thread (Q-beyond sub-slice 3),
 // was reverted to Core-global (/qa F1+F2), and is now keyed per-(Core,
@@ -3409,6 +3414,9 @@ impl Core {
     /// Is this thread currently inside an owning wave on this Core?
     /// Per-(Core, thread) — see [`IN_TICK_OWNED`]. Read on the wave-owner
     /// thread (e.g. by `commit_emission` to decide cache-snapshot taking).
+    /// `#[must_use]`: a discarded result silently loses the
+    /// ownership/nesting decision (a classic predicate-misuse bug).
+    #[must_use]
     fn in_tick(&self) -> bool {
         IN_TICK_OWNED.with(|s| s.borrow().contains(&self.generation))
     }
@@ -3422,11 +3430,14 @@ impl Core {
         IN_TICK_OWNED.with(|s| s.borrow_mut().insert(self.generation))
     }
 
-    /// Release wave ownership for this (Core, thread). Called only by the
-    /// outermost (owning) [`BatchGuard::drop`], on both the success and
-    /// panic-discard paths (drop early-returns when `!owns_tick`, so a
-    /// nested guard never reaches here — ownership is released exactly
-    /// once per (Core, thread, wave)).
+    /// Release wave ownership for this (Core, thread). Invoked solely by
+    /// the owning [`BatchGuard::drop`]'s `_release_ownership` RAII guard,
+    /// which is constructed only after the `!owns_tick` early-return — so
+    /// a nested guard never releases — and drops last on EVERY exit path
+    /// (normal return, panic-discard `return`, or an unwind through
+    /// `drain_and_flush()`). Released exactly once per (Core, thread,
+    /// wave). Idempotent regardless (`AHashSet::remove` of an absent key
+    /// is a no-op).
     fn clear_in_tick(&self) {
         IN_TICK_OWNED.with(|s| {
             s.borrow_mut().remove(&self.generation);
@@ -3554,6 +3565,99 @@ pub struct BatchGuard {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
+impl BatchGuard {
+    /// Panic-discard cleanup for the owning guard: drop pending wave
+    /// work, release queued payload + handle retains lock-released,
+    /// restore pre-wave cache snapshots, clear per-thread `WaveState` +
+    /// the Slice-G tier3 tracker, and discard deferred producer ops.
+    ///
+    /// Shared by BOTH panic origins so a drain-phase fn/sink panic gets
+    /// the identical `BatchGuard` atomicity guarantee as a closure-body
+    /// panic: (1) the `std::thread::panicking()` branch (panic propagated
+    /// from the wave's *closure body* — drop runs during that unwind),
+    /// and (2) the success-path `catch_unwind` around `drain_and_flush()`
+    /// (a fn/sink panic that escaped the inner per-call `catch_unwind`
+    /// isolation while drop was NOT already unwinding). /qa D047.
+    ///
+    /// Does NOT release `in_tick` — that is `_release_ownership`'s job
+    /// (its `Drop` fires on every exit path including `resume_unwind`).
+    fn discard_wave_cleanup(&self) {
+        let (pending, deferred_releases, restored_releases) = {
+            let mut s = self.core.lock_state();
+            // WaveState borrowed alongside state for panic-discard
+            // cleanup. The WaveState borrow is per-thread, independent of
+            // state. `in_tick` is per-(Core, thread) (`IN_TICK_OWNED`),
+            // released separately by `_release_ownership`; this method
+            // only drains/cleans the per-thread WaveState retain-fields.
+            let result = with_wave_state(|ws| {
+                let pending = std::mem::take(&mut ws.pending_notify);
+                let _: DeferredJobs = std::mem::take(&mut ws.deferred_flush_jobs);
+                ws.pending_fires.clear();
+                let restored = self.core.restore_wave_cache_snapshots(&mut s, ws);
+                // clear_wave_state pushes batch-handle releases into
+                // ws.deferred_handle_releases, so take ws's queue AFTER
+                // the clear.
+                s.clear_wave_state(ws);
+                ws.clear_wave_state();
+                let deferred_releases = std::mem::take(&mut ws.deferred_handle_releases);
+                // Slice E2 (D061): panic-discard wave drops queued
+                // OnInvalidate cleanup hooks SILENTLY. Bindings using
+                // OnInvalidate for external-resource cleanup MUST
+                // idempotent-cleanup at process exit / next successful
+                // invalidate. Mirrors A3 `pending_pause_overflow`
+                // panic-discard precedent.
+                let _: Vec<(crate::handle::NodeId, crate::boundary::CleanupTrigger)> =
+                    std::mem::take(&mut ws.deferred_cleanup_hooks);
+                // Slice E2 /qa Q2(b) (D069): same panic-discard discipline
+                // for the eager-wipe queue. A panic-discarded wave drops
+                // queued `wipe_ctx` fires silently; the binding-side
+                // `NodeCtxState` entry remains until the next successful
+                // terminate-with-no-subs cycle (or until `Core` drops).
+                // This mirrors D061's external-resource-cleanup gap and
+                // is documented similarly.
+                let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
+                (pending, deferred_releases, restored)
+            });
+            result
+        };
+        // Lock dropped — release retains lock-released so the binding
+        // can't deadlock against an internal binding mutex.
+        for entry in pending.values() {
+            for msg in entry.iter_messages() {
+                if let Some(h) = msg.payload_handle() {
+                    self.core.binding.release_handle(h);
+                }
+            }
+        }
+        for h in deferred_releases {
+            self.core.binding.release_handle(h);
+        }
+        for h in restored_releases {
+            self.core.binding.release_handle(h);
+        }
+        // D1 patch (2026-05-09): clear the per-thread Slice G tier3
+        // tracker on outermost wave-end (panic-discard path). The
+        // thread-local outlives the BatchGuard otherwise — cargo's
+        // thread reuse across tests would propagate stale entries.
+        tier3_clear();
+        // Phase H+ STRICT (D115): discard deferred producer ops on
+        // panic. Release handle retains without firing.
+        {
+            let mut ops = self.core.deferred_producer_ops.lock();
+            let discarded = std::mem::take(&mut *ops);
+            for op in discarded {
+                match op {
+                    crate::node::DeferredProducerOp::Emit { handle, .. }
+                    | crate::node::DeferredProducerOp::Error { handle, .. } => {
+                        self.core.binding.release_handle(handle);
+                    }
+                    _ => {} // Complete has no handle; Callback drops naturally
+                }
+            }
+        }
+    }
+}
+
 impl Drop for BatchGuard {
     fn drop(&mut self) {
         if !self.owns_tick {
@@ -3581,100 +3685,31 @@ impl Drop for BatchGuard {
         }
         let _release_ownership = ReleaseOwnership(&self.core);
         if std::thread::panicking() {
-            // Discard pending wave work to avoid firing sinks during
-            // unwind (sink panic during unwind would abort the process).
-            //
-            // Refcount discipline: pending_notify entries (or any
-            // already-collected deferred_handle_releases from a partial
-            // drain) hold a queue_notify-time retain on every payload
-            // handle. Release them here so the discard doesn't leak.
-            //
-            // Wave-cache snapshots restore pre-panic cache values so the
-            // atomicity guarantee covers state, not just observability.
-            let (pending, deferred_releases, restored_releases) = {
-                let mut s = self.core.lock_state();
-                // Q-beyond Sub-slice 1 + 2 + 3 (D108, 2026-05-09):
-                // WaveState borrowed alongside state for panic-discard
-                // cleanup. The WaveState borrow is per-thread,
-                // independent of state. Sub-slice 2 moved pending_fires
-                // + pending_notify out of CoreState into WaveState;
-                // sub-slice 3 moved deferred_flush_jobs + deferred_cleanup_hooks
-                // + pending_wipes + invalidate_hooks_fired_this_wave;
-                // /qa F1+F2 (2026-05-10) reverted in_tick + currently_firing
-                // back to CoreState (cross-Core / cross-thread visibility
-                // required) — those clear paths are in CoreState::clear_wave_state.
-                let result = with_wave_state(|ws| {
-                    let pending = std::mem::take(&mut ws.pending_notify);
-                    let _: DeferredJobs = std::mem::take(&mut ws.deferred_flush_jobs);
-                    ws.pending_fires.clear();
-                    let restored = self.core.restore_wave_cache_snapshots(&mut s, ws);
-                    // clear_wave_state pushes batch-handle releases into
-                    // ws.deferred_handle_releases, so take ws's queue AFTER
-                    // the clear.
-                    s.clear_wave_state(ws);
-                    ws.clear_wave_state();
-                    let deferred_releases = std::mem::take(&mut ws.deferred_handle_releases);
-                    // Slice E2 (D061): panic-discard wave drops queued
-                    // OnInvalidate cleanup hooks SILENTLY. Bindings using
-                    // OnInvalidate for external-resource cleanup MUST
-                    // idempotent-cleanup at process exit / next successful
-                    // invalidate. Mirrors A3 `pending_pause_overflow`
-                    // panic-discard precedent.
-                    let _: Vec<(crate::handle::NodeId, crate::boundary::CleanupTrigger)> =
-                        std::mem::take(&mut ws.deferred_cleanup_hooks);
-                    // Slice E2 /qa Q2(b) (D069): same panic-discard discipline
-                    // for the eager-wipe queue. A panic-discarded wave drops
-                    // queued `wipe_ctx` fires silently; the binding-side
-                    // `NodeCtxState` entry remains until the next successful
-                    // terminate-with-no-subs cycle (or until `Core` drops).
-                    // This mirrors D061's external-resource-cleanup gap and
-                    // is documented similarly.
-                    let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
-                    (pending, deferred_releases, restored)
-                });
-                // Ownership released by `_release_ownership` (RAII) at
-                // end of drop — covers this panic-discard `return` too.
-                result
-            };
-            // Lock dropped — release retains lock-released so the binding
-            // can't deadlock against an internal binding mutex.
-            for entry in pending.values() {
-                for msg in entry.iter_messages() {
-                    if let Some(h) = msg.payload_handle() {
-                        self.core.binding.release_handle(h);
-                    }
-                }
-            }
-            for h in deferred_releases {
-                self.core.binding.release_handle(h);
-            }
-            for h in restored_releases {
-                self.core.binding.release_handle(h);
-            }
-            // D1 patch (2026-05-09): clear the per-thread Slice G tier3
-            // tracker on outermost wave-end (panic-discard path). The
-            // thread-local outlives the BatchGuard otherwise — cargo's
-            // thread reuse across tests would propagate stale entries.
-            tier3_clear();
-            // Phase H+ STRICT (D115): discard deferred producer ops on
-            // panic. Release handle retains without firing.
-            {
-                let mut ops = self.core.deferred_producer_ops.lock();
-                let discarded = std::mem::take(&mut *ops);
-                for op in discarded {
-                    match op {
-                        crate::node::DeferredProducerOp::Emit { handle, .. }
-                        | crate::node::DeferredProducerOp::Error { handle, .. } => {
-                            self.core.binding.release_handle(handle);
-                        }
-                        _ => {} // Complete has no handle; Callback drops naturally
-                    }
-                }
-            }
+            // The wave's *closure body* panicked — drop runs during that
+            // unwind. Discard pending wave work (don't fire sinks during
+            // unwind — a sink panic mid-unwind aborts the process),
+            // release queued retains, restore caches. `_release_ownership`
+            // clears in_tick as the frame finishes unwinding.
+            self.discard_wave_cleanup();
             return;
         }
         // Successful drain — drain_and_flush manages its own locking.
-        self.core.drain_and_flush();
+        //
+        // /qa hardening (D047): a fn/sink panic in the drain phase can
+        // escape the per-call `catch_unwind` isolation (e.g. a derived fn
+        // panicking when fired here). Drop is NOT already unwinding, so
+        // such a panic would otherwise skip BOTH the WaveState drain
+        // (leaking retains / leaving `pending_notify` dirty → the next
+        // owning wave trips `wave_state_clear_outermost`) AND — pre-D047
+        // — `in_tick`. Give it the SAME atomicity as a closure-body
+        // panic: catch, run the shared discard cleanup, then resume the
+        // unwind (`_release_ownership` releases in_tick as drop unwinds).
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.core.drain_and_flush()))
+        {
+            self.discard_wave_cleanup();
+            std::panic::resume_unwind(payload);
+        }
         // Wave cleanup + extract deferred jobs under the lock.
         let (jobs, releases, cleanup_hooks, pending_wipes, snapshot_releases) = {
             let mut s = self.core.lock_state();

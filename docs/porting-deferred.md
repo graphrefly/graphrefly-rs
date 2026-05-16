@@ -553,7 +553,10 @@ The original entry body is preserved below for archival reference.
   (flagged for spec-owner re-validation; not silently rewritten).
   Follow-up C (cheap-correct-drain fast-path for trivial disjoint waves)
   targets recovering the avoidable fraction; the fn-fire drain cost is
-  largely irreducible. See `docs/rust-port-decisions.md` D047.
+  largely irreducible. `wave_protocol_partitioned_MC` is unaffected
+  (`in_tick` is a Rust drain-gate not in the TLA+ model; the modeled
+  per-partition `wave_owner` relation is unchanged). See
+  `docs/rust-port-decisions.md` D047.
 
 ### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — FULLY CLOSED 2026-05-10 (LIMITED 2026-05-09 + STRICT D115 2026-05-10)
 
