@@ -40,6 +40,10 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 M6 (Python / pyo3) remains separate and post-1.0.
 
+### D047 in_tick re-keying — LANDED 2026-05-15 (CI `cargo test --all-targets` fix)
+
+`in_tick` (wave ownership / drain gate) re-keyed Core-global → per-(Core, thread) `crate::batch::IN_TICK_OWNED` — fixes a disjoint-partition drain-skip bug (thread B's wave never drained: leaked retains / undelivered sinks; the CI `wave_state_clear_outermost` assert). **Perf characterization corrected:** the Phase J disjoint-regime "speedup" was substantially this bug (B's drain skipped); post-fix `fnfire_parallel_2t_disjoint` ≈2.8× slower than serial, `parallel_4t_disjoint` +27%, serial ±5%. Accepted: correctness over a bug-inflated number; per-subgraph disjoint value flagged for spec re-validation. Follow-up **C** (cheap-correct-drain fast-path) scheduled. Canonical: `docs/rust-port-decisions.md` D047; `docs/porting-deferred.md` Phase J CORRECTION + Sub-slice-4 `:846` NOTE; `CLAUDE.md` invariant #3.
+
 ### D203 native-ship — LANDED 2026-05-15 (Slices 1+2+3, decisions D204/D205)
 
 `/porting-to-rs` "high-priority blockers" batch. All 7 NEXT-BATCH items resolved or correctly scoped:

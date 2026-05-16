@@ -1026,6 +1026,82 @@ mod std_thread_tests {
             complete_idx
         );
     }
+
+    /// Regression: two threads emitting on DISJOINT partitions of one
+    /// Core concurrently must EACH fully drain their own wave — every
+    /// emitted value is delivered to that partition's subscriber, and no
+    /// payload retains leak.
+    ///
+    /// Pins the `in_tick` re-keying (Core-global → per-(Core, thread)).
+    /// Under the old Core-global flag, whichever thread entered second
+    /// observed the first thread's `in_tick=true`, wrongly treated its
+    /// independent disjoint wave as nested, and no-op'd its drop — so its
+    /// subscriber silently missed Data and its per-emit payload retains
+    /// leaked (caught late by `wave_state_clear_outermost`). This asserts
+    /// the *observable* correctness directly (delivery + bounded handle
+    /// count), independent of the debug-assert.
+    #[test]
+    fn disjoint_partition_concurrent_emits_each_drain_and_deliver() {
+        const N: i64 = 300;
+        let rt = TestRuntime::new();
+        // Sentinel initial ⇒ no handshake Data; the derived's first-run
+        // gate opens on the first real emit, so the delivered sequence is
+        // exactly the emitted values 0..N (no initial-value prefix).
+        let s_a = rt.state(None);
+        let s_b = rt.state(None);
+
+        // No deps between them ⇒ disjoint partitions (pins the premise).
+        let p_a = rt.core.partition_of(s_a.id).expect("registered");
+        let p_b = rt.core.partition_of(s_b.id).expect("registered");
+        assert_ne!(p_a, p_b, "s_a and s_b must be in disjoint partitions");
+
+        // A subscribed derived per state node ⇒ each wave has real drain
+        // work (a sink to deliver to); identity passthrough of the value.
+        let d_a = rt.derived(&[s_a.id], |deps| Some(deps[0].clone()));
+        let d_b = rt.derived(&[s_b.id], |deps| Some(deps[0].clone()));
+        let rec_a = rt.subscribe_recorder(d_a);
+        let rec_b = rt.subscribe_recorder(d_b);
+
+        let baseline_handles = rt.binding.live_handles();
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let mk = |sh: super::common::StateHandle, b: Arc<std::sync::Barrier>| {
+            thread::spawn(move || {
+                b.wait();
+                for i in 0..N {
+                    sh.set(TestValue::Int(i));
+                }
+            })
+        };
+        let t_a = mk(s_a, start.clone());
+        let t_b = mk(s_b, start.clone());
+        join_with_timeout(t_a, 10, "thread A");
+        join_with_timeout(t_b, 10, "thread B");
+
+        let want: Vec<TestValue> = (0..N).map(TestValue::Int).collect();
+        assert_eq!(
+            rec_a.data_values(),
+            want,
+            "thread A's disjoint wave must deliver every value (got {} of {N})",
+            rec_a.data_values().len()
+        );
+        assert_eq!(
+            rec_b.data_values(),
+            want,
+            "thread B's disjoint wave must deliver every value (got {} of {N})",
+            rec_b.data_values().len()
+        );
+
+        // Leak guard: per-emit payload retains are released by each
+        // wave's drain. Live handle count must NOT scale with N — under
+        // the bug the skipped drains leaked ~N retains per leaked thread.
+        let after = rt.binding.live_handles();
+        assert!(
+            after <= baseline_handles + 8,
+            "payload retains leaked: live_handles {after} vs baseline \
+             {baseline_handles} after {N} emits/thread (skipped drain?)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2,21 +2,38 @@
 #
 # Closes the DX gap: you don't hand-craft `native-v*` tags. On merge to
 # main, this inspects the Conventional-Commit subjects of the commits
-# just landed that touched `crates/graphrefly-bindings-js/`, bumps the
-# version, commits it, and pushes the `native-v<next>` tag — which fires
-# `native-npm-publish.yml` (the napi cross-compile matrix + OIDC publish).
+# just landed that touched `crates/graphrefly-bindings-js/`, computes
+# the next version, and pushes ONLY a `native-v<next>` tag — which
+# fires `native-npm-publish.yml` (the napi cross-compile matrix + OIDC
+# publish; that workflow derives the package version from the tag).
+#
+# ── LOOP SAFETY (STRUCTURAL — read this) ────────────────────────────
+# This workflow triggers on `push` to `main`. It NEVER pushes a commit
+# to `main` and never opens a release PR — it only creates+pushes a
+# git TAG (`native-v*`). Therefore it physically cannot re-trigger
+# itself: a tag push is not a `push` to a branch, and nothing this
+# workflow does lands on `main`. There is deliberately NO commit-
+# message `if:` guard, because there is no self-trigger to guard
+# against. (The earlier design pushed a `chore(native-release)` bump
+# commit to main and relied on an `if:` prefix guard to break the
+# loop — a single point of failure. Removed. The npm-published version
+# is the source of truth for "what's next", not main's package.json,
+# so no bump commit is needed.)
 #
 # WHY a tag-push and not `changeset publish` / release-plz: neither can
 # cross-compile Rust to 5 platforms or assemble the napi per-platform
 # sub-packages (see native-npm-publish.yml header). This workflow only
-# does the *versioning + trigger*; the matrix workflow does the publish.
+# does the *versioning + trigger*; the matrix workflow does the publish
+# and stamps the version from the tag.
 #
 # BUMP RULES (0.x preview phase — single editable `case` below):
-#   - breaking (`<type>!:` subject, or `BREAKING CHANGE:` in body) → MINOR  (0.0.1 → 0.1.0)
-#   - feat                                                          → PATCH  (0.0.1 → 0.0.2)
-#   - fix | perf | refactor | revert                                → PATCH
+#   - breaking (`<type>!:` subject, or `BREAKING CHANGE:` in body) → MINOR  (0.1.0 → 0.2.0)
+#   - feat | fix | perf | refactor | revert                        → PATCH  (0.1.0 → 0.1.1)
 #   - only chore/docs/test/ci/build/style (or no bindings commits)  → NO RELEASE (no-op)
 #   Post-1.0 you'll likely want feat→MINOR; change the `case` then.
+#   NOTE: GitHub-generated reverts are `Revert "<subj>"` (not
+#   `revert:`) and won't match — that yields no-release, which is
+#   safe. Use a manual `revert:` subject if you want an auto-release.
 #
 # PREREQUISITES (one-time):
 #   - The same GitHub App graphrefly-ts/release.yml uses, installed on
@@ -26,14 +43,8 @@
 #     The App token is REQUIRED: a tag pushed with the default
 #     GITHUB_TOKEN does NOT trigger native-npm-publish.yml (GitHub
 #     suppresses workflow runs from GITHUB_TOKEN-pushed refs). Same
-#     reason graphrefly-ts/release.yml uses an App token.
-#   - If `main` is branch-protected, allow this App to push to it
-#     (it pushes the one-line version-bump commit + the tag).
-#
-# LOOP SAFETY: the bump commit (`chore(native-release): …`) is pushed to
-# main, which re-triggers this workflow — the job `if:` short-circuits
-# on that commit-message prefix. The tag push triggers
-# native-npm-publish.yml (tags-only; no such guard there) — correct.
+#     reason graphrefly-ts/release.yml uses an App token. Tag-only
+#     means main branch-protection is irrelevant here (no main write).
 
 name: native-auto-release
 
@@ -47,14 +58,16 @@ permissions:
   contents: read
 
 concurrency:
+  # Serialize releases (never cancel a release mid-flight). Two PRs
+  # merging close together queue; the second job checks out AFTER the
+  # first finished, sees the new published version, and computes the
+  # next one off it — no double-release.
   group: native-auto-release
   cancel-in-progress: false
 
 jobs:
   release:
     name: version + tag
-    # Break the loop: skip our own version-bump commit.
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore(native-release):') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -82,17 +95,10 @@ jobs:
           git config user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
           git config user.email "${user_id}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Install deps (napi cli for `napi version`)
-        working-directory: crates/graphrefly-bindings-js
-        run: pnpm install --frozen-lockfile
 
       - name: Decide bump from Conventional Commits
         id: bump
@@ -129,33 +135,47 @@ jobs:
           echo "Resolved bump level: $level"
           echo "level=$level" >> "$GITHUB_OUTPUT"
 
-      - name: Bump version, commit, tag, push
+      - name: Compute next version, create + push tag (tag-only — no main write)
         if: ${{ steps.bump.outputs.level != 'none' }}
-        working-directory: crates/graphrefly-bindings-js
         env:
           LEVEL: ${{ steps.bump.outputs.level }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          cur="$(node -p "require('./package.json').version")"
-          IFS=. read -r MA MI PA <<< "$cur"
+          # Baseline = the REAL published latest (source of truth),
+          # robust regardless of how prior versions were published
+          # (bootstrap script, manual, or a previous auto-release).
+          # Fallbacks: highest native-v* tag → committed package.json.
+          base=""
+          if base="$(npm view @graphrefly/native version 2>/dev/null)" && [ -n "$base" ]; then
+            echo "Baseline from npm: $base"
+          else
+            tag="$(git tag --list 'native-v*' --sort=-v:refname | head -n1 || true)"
+            if [ -n "$tag" ]; then
+              base="${tag#native-v}"; echo "Baseline from latest tag: $base"
+            else
+              base="$(node -p "require('./crates/graphrefly-bindings-js/package.json').version")"
+              echo "Baseline from package.json: $base"
+            fi
+          fi
+          IFS=. read -r MA MI PA <<< "$base"
           case "$LEVEL" in
             minor) MI=$((MI+1)); PA=0 ;;
             patch) PA=$((PA+1)) ;;
-            *) echo "unexpected level '$LEVEL'"; exit 1 ;;
+            *) echo "::error::unexpected level '$LEVEL'"; exit 1 ;;
           esac
           next="${MA}.${MI}.${PA}"
-          echo "::notice::@graphrefly/native ${cur} → ${next} (${LEVEL})"
+          echo "::notice::@graphrefly/native ${base} → ${next} (${LEVEL})"
+          # Immutability / idempotency guards (abort, never force).
           if npm view "@graphrefly/native@${next}" version >/dev/null 2>&1; then
             echo "::error::@graphrefly/native@${next} already on npm (immutable). Aborting."; exit 1
           fi
-          npm pkg set "version=${next}"
-          # Sync the per-platform sub-package versions + the umbrella's
-          # optionalDependencies pins to the new version.
-          pnpm exec napi version
-          cd "$GITHUB_WORKSPACE"
-          git add crates/graphrefly-bindings-js/package.json
-          git commit -m "chore(native-release): v${next}"
-          git tag "native-v${next}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if git rev-parse -q --verify "refs/tags/native-v${next}" >/dev/null \
+             || git ls-remote --exit-code --tags origin "native-v${next}" >/dev/null 2>&1; then
+            echo "::error::tag native-v${next} already exists. Aborting (no force)."; exit 1
+          fi
+          # Tag the dev's merge commit. NO commit, NO push to main →
+          # this workflow cannot re-trigger itself.
+          git tag "native-v${next}" "$SHA"
           git push origin "native-v${next}"
-          echo "::notice::Pushed native-v${next} → native-npm-publish.yml will build + publish via OIDC."
+          echo "::notice::Pushed native-v${next} → native-npm-publish.yml builds + publishes (version stamped from the tag)."

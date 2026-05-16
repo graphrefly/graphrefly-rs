@@ -130,6 +130,25 @@ jobs:
           version: 10.33.0
       - name: Install deps
         run: pnpm install --frozen-lockfile
+      - name: Stamp version from tag
+        working-directory: crates/graphrefly-bindings-js
+        # Tag-only release model (native-auto-release.yml): the tagged
+        # commit's package.json still carries the PREVIOUS version
+        # (no bump commit is pushed to main — that's what makes the
+        # auto-release loop structurally impossible). Derive the release
+        # version from the tag name (`native-vX.Y.Z`) and set it on the
+        # umbrella; the later `napi prepublish` step propagates it to
+        # the 5 per-platform sub-package manifests + the umbrella's
+        # optionalDependencies pins. Manual `git tag native-vX.Y.Z`
+        # pushes work identically.
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#native-v}"
+          if [ "$ver" = "$GITHUB_REF_NAME" ] || [ -z "$ver" ]; then
+            echo "::error::expected a native-v* tag, got ref '${GITHUB_REF_NAME}'"; exit 1
+          fi
+          echo "::notice::Publishing @graphrefly/native@${ver} (from tag ${GITHUB_REF_NAME})"
+          npm pkg set "version=${ver}"
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:

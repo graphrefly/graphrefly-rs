@@ -35,7 +35,7 @@
 //! - **`BindingBoundary::invoke_fn`** in `fire_fn` fires lock-released —
 //!   user fn callbacks may re-enter `Core::emit` / `pause` / `resume` /
 //!   `invalidate` / `complete` / `error` / `teardown` and run a nested
-//!   wave (the existing `s.in_tick` re-entrance gate composes
+//!   wave (the existing `in_tick` re-entrance gate composes
 //!   transparently).
 //! - **`BindingBoundary::custom_equals`** in `commit_emission`'s equals
 //!   check fires lock-released.
@@ -134,6 +134,58 @@ thread_local! {
     static WAVE_STATE: RefCell<WaveState> = RefCell::new(WaveState::new());
 }
 
+// Wave-ownership flag, keyed per-(Core, thread). Membership of a
+// `Core::generation` value means "this thread is currently inside an
+// OWNING wave on that Core" — i.e. the outermost `BatchGuard` whose drop
+// must run the drain. Replaces the former Core-global `CoreState::in_tick`
+// bool.
+//
+// **Why per-(Core, thread).** The flag must jointly satisfy three
+// constraints that no single-scope placement can:
+//   - **Cross-Core isolation (/qa F1).** A thread holding a live
+//     `BatchGuard` on Core-A and then entering a wave on Core-B must not
+//     see Core-A's flag. Keying by `Core::generation` (a process-monotonic
+//     id, never reused) gives each Core a distinct slot. A purely
+//     thread-local bool failed here (Core-A's `in_tick` leaked to Core-B
+//     on the same OS thread → Core-B non-owning → its writes drained by
+//     Core-A's binding).
+//   - **Disjoint-partition drain correctness.** Two threads running waves
+//     on disjoint partitions of ONE Core run truly parallel (separate
+//     `wave_owner`s — they do not block each other). A Core-global flag
+//     made thread B observe thread A's `in_tick=true`, wrongly classify
+//     its independent wave as nested, and no-op its drop — so B's wave
+//     never drained (leaked payload retains, undelivered sink batches;
+//     caught late by `wave_state_clear_outermost`). A per-thread slot
+//     makes each thread own and drain its own disjoint wave.
+//   - **Nested same-(Core, thread) re-entry (/qa EC#3).** A nested
+//     `run_wave` / `actions.up` on the same Core and thread MUST observe
+//     ownership so its drop no-ops and the outer wave drains. A shared
+//     slot within one (Core, thread) preserves this.
+//
+// **No lock required.** `in_tick` is only ever read or written by the
+// wave-owner thread: cross-thread same-partition emits BLOCK on the
+// partition `wave_owner`, and cross-partition cascades acquire every
+// touched partition upfront. So — unlike `currently_firing`, which the
+// cross-thread P13 set_deps check (/qa F2) requires be Core-global and
+// cross-thread-visible — `in_tick` has no cross-thread read requirement
+// and needs no shared-state lock. (`currently_firing` deliberately stays
+// on `CoreState`; see `node.rs`.)
+//
+// Stale slots: a `Core` that drops while a thread still has its
+// generation interned (only reachable if a drop was bypassed) leaves an
+// inert key — generations are never reused, so it can never false-match a
+// future Core. Bounded by the number of distinct Cores a thread ever
+// enters a wave on; not an unbounded leak in practice.
+//
+// History: this flag lived briefly per-thread (Q-beyond sub-slice 3),
+// was reverted to Core-global (/qa F1+F2), and is now keyed per-(Core,
+// thread) — the placement that satisfies all three constraints at once.
+// See `docs/rust-port-decisions.md` and the `docs/porting-deferred.md`
+// Phase-J / "in_tick Core-global→per-(Core,thread)" entry (2026-05-15).
+thread_local! {
+    static IN_TICK_OWNED: RefCell<AHashSet<u64>> = RefCell::new(AHashSet::new());
+}
+
 /// Wave-scoped state previously held under [`Core::cross_partition`]'s
 /// `parking_lot::Mutex<CrossPartitionState>`. Now per-thread (Q-beyond
 /// Sub-slice 1, 2026-05-09; Sub-slice 2 added `pending_fires` +
@@ -228,28 +280,27 @@ pub(crate) struct WaveState {
     /// `flush_notifications` → `deferred_handle_releases`; panic path:
     /// directly in `BatchGuard::drop`'s panic branch).
     pub(crate) pending_notify: IndexMap<NodeId, PendingPerNode>,
-    // Q-beyond Sub-slice 3 (D108, 2026-05-09 → /qa F1+F2 reverted
-    // 2026-05-10): `in_tick` and `currently_firing` were moved from
-    // `CoreState` to per-thread `WaveState` in sub-slice 3, then moved
-    // BACK to `CoreState` after /qa surfaced two architectural
-    // regressions:
+    // Q-beyond Sub-slice 3 (D108, 2026-05-09) moved `in_tick` and
+    // `currently_firing` from `CoreState` to per-thread `WaveState`;
+    // /qa F1+F2 (2026-05-10) reverted both to `CoreState`; the in_tick
+    // placement was finalized 2026-05-15 (see below). The two fields have
+    // *different* scope requirements:
     //
-    // - **F1 (in_tick):** per-thread placement broke cross-Core
-    //   same-thread BatchGuard isolation. A thread holding a live
-    //   BatchGuard on Core-A and starting a wave on Core-B would
-    //   read `ws.in_tick = true` (set by Core-A) → Core-B becomes
-    //   non-owning → Core-B's writes get drained by Core-A's
-    //   binding (silent corruption). Per-Core placement on
-    //   `CoreState::in_tick` restores cross-Core isolation.
+    // - **`in_tick` — per-(Core, thread).** Pure thread-local broke
+    //   cross-Core isolation (Core-A's flag leaked to Core-B on the same
+    //   OS thread → Core-B non-owning → its writes drained by Core-A's
+    //   binding, /qa F1). Pure Core-global broke disjoint-partition drain
+    //   ownership (thread B's independent disjoint wave saw thread A's
+    //   flag → non-owning → never drained). The (Core, thread) key —
+    //   `crate::batch::IN_TICK_OWNED`, keyed by `Core::generation` —
+    //   satisfies both, plus same-(Core, thread) nested re-entry
+    //   (/qa EC#3). NOT a `CoreState` field.
     //
-    // - **F2 (currently_firing):** per-thread placement silently
-    //   bypassed the cross-thread P13 partition-migration check in
-    //   `Core::set_deps`. Pre-sub-slice-3 the shared `s.currently_firing`
-    //   was readable cross-thread; thread B's set_deps could observe
-    //   thread A's firing pushes. Per-thread placement made thread B
-    //   read its own empty stack → P13 silently bypassed for
-    //   cross-thread set_deps. Per-Core placement restores the D091
-    //   safety check.
+    // - **`currently_firing` — Core-global (stays on `CoreState`).**
+    //   Per-thread placement silently bypassed the cross-thread P13
+    //   partition-migration check in `Core::set_deps`: thread B's set_deps
+    //   must observe thread A's firing pushes. Per-Core (cross-thread
+    //   visible) placement restores the D091 safety check (/qa F2).
     //
     // The other 11 wave-scoped fields stay per-thread because they're
     // accessed only by the wave-owner thread under `wave_owner`
@@ -1298,11 +1349,10 @@ impl Core {
             // snapshot (`old_handle`) and this point.
             let current_cache = s.require_node(node_id).cache;
             // Q-beyond Sub-slice 1 (D108, 2026-05-09): wave_cache_snapshots
-            // lives on per-thread WaveState. /qa F1 reverted (2026-05-10):
-            // in_tick lives on CoreState (cross-Core isolation requires
-            // per-Core placement, not per-thread). Read in_tick under the
-            // already-held state lock; snapshot-take via with_wave_state.
-            let in_tick = s.in_tick;
+            // lives on per-thread WaveState. `in_tick` is per-(Core,
+            // thread) (`IN_TICK_OWNED`); this read is on the wave-owner
+            // thread, so it observes this thread's own ownership.
+            let in_tick = self.in_tick();
             let snapshot_taken = if in_tick && current_cache != NO_HANDLE {
                 use std::collections::hash_map::Entry;
                 with_wave_state(|ws| match ws.wave_cache_snapshots.entry(node_id) {
@@ -1345,9 +1395,10 @@ impl Core {
             // rewrite this Resolved to Data using the snapshot.
             // Q-beyond Sub-slice 1 (D108, 2026-05-09): wave_cache_snapshots
             // lives on per-thread WaveState. /qa F1 reverted (2026-05-10):
-            // in_tick lives on CoreState — read under held state lock.
+            // `in_tick` is per-(Core, thread); read on the wave-owner
+            // thread (observes this thread's own ownership).
             let current_cache = s.require_node(node_id).cache;
-            if s.in_tick && current_cache != NO_HANDLE {
+            if self.in_tick() && current_cache != NO_HANDLE {
                 use std::collections::hash_map::Entry;
                 with_wave_state(|ws| {
                     if let Entry::Vacant(slot) = ws.wave_cache_snapshots.entry(node_id) {
@@ -1502,9 +1553,9 @@ impl Core {
         // Always DATA — no equals substitution for Batch emissions.
         // Q-beyond Sub-slice 1 (D108, 2026-05-09): wave_cache_snapshots
         // lives on per-thread WaveState. /qa F1 reverted (2026-05-10):
-        // in_tick lives on CoreState — read under held state lock.
+        // `in_tick` is per-(Core, thread); read on the wave-owner thread.
         let current_cache = s.require_node(node_id).cache;
-        let snapshot_taken = if s.in_tick && current_cache != NO_HANDLE {
+        let snapshot_taken = if self.in_tick() && current_cache != NO_HANDLE {
             use std::collections::hash_map::Entry;
             with_wave_state(|ws| match ws.wave_cache_snapshots.entry(node_id) {
                 Entry::Vacant(slot) => {
@@ -3117,7 +3168,7 @@ impl Core {
     ///
     /// Nested `batch()` calls share the outer wave; only the outermost call
     /// drives the drain. Re-entrant calls from inside an `emit`/fn (the wave
-    /// engine's own `s.in_tick` re-entrance) compose with this method
+    /// engine's own `in_tick` re-entrance) compose with this method
     /// transparently — they observe `in_tick = true` and skip drain just
     /// like nested `batch()`.
     ///
@@ -3355,6 +3406,33 @@ impl Core {
         );
     }
 
+    /// Is this thread currently inside an owning wave on this Core?
+    /// Per-(Core, thread) — see [`IN_TICK_OWNED`]. Read on the wave-owner
+    /// thread (e.g. by `commit_emission` to decide cache-snapshot taking).
+    fn in_tick(&self) -> bool {
+        IN_TICK_OWNED.with(|s| s.borrow().contains(&self.generation))
+    }
+
+    /// Claim wave ownership for this (Core, thread). Returns `true` iff
+    /// this call is the outermost entry (slot was absent) — i.e.
+    /// `owns_tick`; `false` for nested same-(Core, thread) re-entry.
+    /// `AHashSet::insert` returns `true` exactly when the value was newly
+    /// inserted, which is precisely the `owns_tick` semantics.
+    fn claim_in_tick(&self) -> bool {
+        IN_TICK_OWNED.with(|s| s.borrow_mut().insert(self.generation))
+    }
+
+    /// Release wave ownership for this (Core, thread). Called only by the
+    /// outermost (owning) [`BatchGuard::drop`], on both the success and
+    /// panic-discard paths (drop early-returns when `!owns_tick`, so a
+    /// nested guard never reaches here — ownership is released exactly
+    /// once per (Core, thread, wave)).
+    fn clear_in_tick(&self) {
+        IN_TICK_OWNED.with(|s| {
+            s.borrow_mut().remove(&self.generation);
+        });
+    }
+
     /// Internal helper: claim `in_tick` and assemble a [`BatchGuard`]
     /// with the supplied (already-acquired) partition wave-owner guards.
     /// `wave_guards` MUST be in ascending [`crate::subgraph::SubgraphId`]
@@ -3366,23 +3444,12 @@ impl Core {
         &self,
         wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
     ) -> BatchGuard {
-        // /qa F1 reverted (2026-05-10): `in_tick` lives on CoreState
-        // (per-Core, cross-thread visible). Per-thread placement broke
-        // cross-Core same-thread BatchGuard isolation — a thread holding
-        // a live BatchGuard on Core-A and starting a wave on Core-B
-        // would see ws.in_tick=true (set by Core-A) → Core-B's writes
-        // get drained by Core-A's binding. Per-Core placement on
-        // CoreState restores cross-Core isolation. Cost: one state lock
-        // acquire on outermost batch entry (small; negligible vs the
-        // wave's drain).
-        let owns_tick = {
-            let mut s = self.lock_state();
-            let was_in = s.in_tick;
-            if !was_in {
-                s.in_tick = true;
-            }
-            !was_in
-        };
+        // Claim wave ownership for this (Core, thread). Keyed per-(Core,
+        // thread) in the `IN_TICK_OWNED` thread_local (see its doc for
+        // the cross-Core / disjoint-partition / nested-re-entry rationale)
+        // — no state lock needed, since `in_tick` has no cross-thread read
+        // requirement.
+        let owns_tick = self.claim_in_tick();
         // D1 patch (2026-05-09): defensive wave-start clear of the
         // per-thread Slice G tier3 tracker on outermost owning entry.
         // The thread-local is cleared at outermost BatchGuard drop on
@@ -3432,13 +3499,13 @@ impl Core {
 /// # Thread safety
 ///
 /// `BatchGuard` is **`!Send`** by design. `begin_batch` claims the
-/// per-`Core` `in_tick` flag AND the per-partition `wave_owner`
-/// re-entrant mutex(es) on the calling thread; sending the guard to
-/// another thread and dropping it there would clear `in_tick` and
-/// release the wave-owner guards from a different thread than the
-/// one that acquired them, breaking both the thread-local "I own
-/// the wave scope" semantic and `parking_lot::ReentrantMutex`'s
-/// ownership invariant. The `wave_guards` field is a `SmallVec` of
+/// per-(Core, thread) `in_tick` ownership slot AND the per-partition
+/// `wave_owner` re-entrant mutex(es) on the calling thread; sending the
+/// guard to another thread and dropping it there would clear `in_tick`
+/// against the wrong thread's slot and release the wave-owner guards
+/// from a different thread than the one that acquired them, breaking
+/// both the per-(Core, thread) "I own the wave scope" semantic and
+/// `parking_lot::ReentrantMutex`'s ownership invariant. The `wave_guards` field is a `SmallVec` of
 /// `!Send` `ArcReentrantMutexGuard<()>`; the `PhantomData<*const ()>`
 /// marker is belt-and-suspenders.
 ///
@@ -3490,8 +3557,29 @@ pub struct BatchGuard {
 impl Drop for BatchGuard {
     fn drop(&mut self) {
         if !self.owns_tick {
+            // Nested / non-owning guard: never claimed ownership, so it
+            // must never release it. The owning guard's RAII releaser
+            // (below) is the single clear site.
             return;
         }
+        // Release per-(Core, thread) wave ownership on EVERY exit path of
+        // the owning guard — normal return, the panic-discard branch's
+        // `return`, AND an unwind through `drain_and_flush()` (a fn/sink
+        // panic in the drain phase that escapes the inner `catch_unwind`
+        // isolation). Declared first ⇒ dropped last (after all wave work
+        // and any nested re-entry has completed), exactly once. /qa
+        // hardening (D047): the prior explicit post-drain clear was
+        // skipped if `drain_and_flush()` unwound — pre-existing window
+        // (old `s.in_tick = false` had the identical placement), closed
+        // here so a panicked drain can't leave this (Core, thread)
+        // permanently non-owning.
+        struct ReleaseOwnership<'a>(&'a Core);
+        impl Drop for ReleaseOwnership<'_> {
+            fn drop(&mut self) {
+                self.0.clear_in_tick();
+            }
+        }
+        let _release_ownership = ReleaseOwnership(&self.core);
         if std::thread::panicking() {
             // Discard pending wave work to avoid firing sinks during
             // unwind (sink panic during unwind would abort the process).
@@ -3544,11 +3632,8 @@ impl Drop for BatchGuard {
                     let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
                     (pending, deferred_releases, restored)
                 });
-                // /qa F1 reverted (2026-05-10): in_tick lives on CoreState.
-                // Cleared after the WaveState borrow drops; lock is still
-                // held, so cross-thread observers see in_tick=false
-                // atomic with the wave-state cleanup completing.
-                s.in_tick = false;
+                // Ownership released by `_release_ownership` (RAII) at
+                // end of drop — covers this panic-discard `return` too.
                 result
             };
             // Lock dropped — release retains lock-released so the binding
@@ -3614,9 +3699,8 @@ impl Drop for BatchGuard {
                 let (jobs, releases, hooks, wipes) = Core::drain_deferred(&mut s, ws);
                 (jobs, releases, hooks, wipes, snapshot_releases)
             });
-            // /qa F1 reverted (2026-05-10): in_tick lives on CoreState.
-            // Cleared after the WaveState borrow drops; lock still held.
-            s.in_tick = false;
+            // Ownership released by `_release_ownership` (RAII) at end of
+            // drop — fires even if `drain_and_flush()` above unwound.
             result
         };
         // Lock dropped — fire deferred sinks + release retains + fire

@@ -46,8 +46,9 @@
 //! - **Wave-end sink fires** drop the state lock first. A subscriber's sink
 //!   that calls back into `Core::emit` / `pause` / `resume` / `invalidate` /
 //!   `complete` / `error` / `teardown` re-acquires the lock cleanly and runs
-//!   a nested wave (`WaveState::in_tick` is cleared before the
-//!   deferred-fire phase).
+//!   a nested wave (the per-(Core, thread) `in_tick` ownership slot is
+//!   cleared by the owning `BatchGuard::drop` before the deferred-fire
+//!   phase).
 //! - **`BindingBoundary::invoke_fn`** fires lock-released. The wave engine
 //!   acquires + drops the state lock per fn-fire iteration around the
 //!   `invoke_fn` callback. User fns may re-enter `Core::emit` / `pause` /
@@ -1781,9 +1782,13 @@ impl NodeRecord {
 /// entirely — its four fields moved to per-thread `WaveState`
 /// thread_local in `crate::batch`. Sub-slice 2 + 3 moved 8 more
 /// wave-scoped fields the same way. /qa F1+F2 (2026-05-10) reverted
-/// `in_tick` and `currently_firing` BACK to CoreState (per-Core,
-/// cross-thread visible — load-bearing for cross-Core same-thread
-/// isolation and cross-thread P13 set_deps check respectively).
+/// `in_tick` and `currently_firing` to CoreState; `currently_firing`
+/// stays here (cross-thread P13 set_deps check, /qa F2), but `in_tick`
+/// was later re-keyed per-(Core, thread) into the
+/// `crate::batch::IN_TICK_OWNED` thread_local (2026-05-15) — Core-global
+/// placement broke disjoint-partition drain ownership while per-thread
+/// broke cross-Core isolation; the (Core, thread) key satisfies both.
+/// See `docs/rust-port-decisions.md`.
 ///
 /// The D1 patch (2026-05-09) moved Slice G's `tier3_emitted_this_wave`
 /// set to a per-thread thread-local in `crate::batch` (was briefly
@@ -1808,11 +1813,12 @@ pub(crate) struct CoreState {
     // the OTHER thread's wave context, so the per-thread placement is
     // safe by construction.
     //
-    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `in_tick`,
-    // `currently_firing`, `deferred_flush_jobs`, `deferred_cleanup_hooks`,
-    // `pending_wipes`, and `invalidate_hooks_fired_this_wave` likewise
-    // moved to [`crate::batch::WaveState`]. Same wave-scoped per-thread
-    // rationale.
+    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `deferred_flush_jobs`,
+    // `deferred_cleanup_hooks`, `pending_wipes`, and
+    // `invalidate_hooks_fired_this_wave` likewise moved to
+    // [`crate::batch::WaveState`] (same wave-scoped per-thread rationale).
+    // `in_tick` is per-(Core, thread) in `crate::batch::IN_TICK_OWNED`;
+    // `currently_firing` stays on `CoreState` (/qa F2, see below).
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -1833,22 +1839,12 @@ pub(crate) struct CoreState {
     /// cannot transitively reach the new node). The drain bound is the
     /// safety net for runtime cycles that bypass both static checks.
     pub(crate) max_batch_drain_iterations: u32,
-    /// Wave-active flag — true between outermost `BatchGuard` entry and
-    /// the matching outermost drop. Per-Core (cross-thread visible) so
-    /// cross-Core same-thread BatchGuard nesting is correctly isolated:
-    /// Core-A's `in_tick=true` does NOT cause Core-B's `begin_batch` to
-    /// see itself as nested.
-    ///
-    /// /qa F1 reverted (2026-05-10): briefly placed on per-thread
-    /// `WaveState` in Sub-slice 3, then moved BACK to `CoreState` after
-    /// /qa F1 surfaced the cross-Core same-thread isolation regression
-    /// (a thread holding a live BatchGuard on Core-A and starting a wave
-    /// on Core-B would observe `ws.in_tick=true` set by Core-A → Core-B
-    /// becomes non-owning → Core-B's writes drained by Core-A's binding
-    /// → silent corruption). The other 11 wave-scoped fields stay on
-    /// per-thread `WaveState` because they're accessed only by the
-    /// wave-owner thread under `wave_owner` discipline.
-    pub(crate) in_tick: bool,
+    // Wave-ownership (`in_tick`) is NOT a `CoreState` field: it is keyed
+    // per-(Core, thread) in the `crate::batch::IN_TICK_OWNED` thread_local
+    // (see its doc for the cross-Core / disjoint-partition / nested-
+    // re-entry rationale and history). `currently_firing` below DOES stay
+    // on `CoreState` — the cross-thread P13 set_deps check (/qa F2)
+    // requires it be cross-thread-visible.
     /// A6 reentrancy guard stack (Slice F, 2026-05-07): the stack of
     /// NodeIds whose fn is currently being invoked. Pushed at the top of
     /// `fire_fn` (just before the lock-released `invoke_fn` call) and
@@ -2149,11 +2145,10 @@ impl Core {
                 // deferred_cleanup_hooks, pending_wipes, and
                 // invalidate_hooks_fired_this_wave all live on per-thread
                 // [`crate::batch::WaveState`].
-                // /qa F1+F2 reverted (2026-05-10): in_tick + currently_firing
-                // stay on CoreState (per-Core, cross-thread visible) for
-                // cross-Core same-thread isolation (F1) and cross-thread
-                // P13 set_deps check (F2).
-                in_tick: false,
+                // `currently_firing` stays on CoreState (cross-thread
+                // visible) for the cross-thread P13 set_deps check (/qa
+                // F2). `in_tick` is NOT here — it is per-(Core, thread) in
+                // `crate::batch::IN_TICK_OWNED` (see its doc).
                 currently_firing: Vec::new(),
                 pause_buffer_cap: None,
                 max_batch_drain_iterations: 10_000,

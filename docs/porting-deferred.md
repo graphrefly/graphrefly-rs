@@ -530,6 +530,31 @@ The original entry body is preserved below for archival reference.
   wall-clock-speedup properties — Phase J bench is the
   speedup-measurement source.
 
+  **CORRECTION (2026-05-15, D047) — the disjoint-regime numbers above
+  were inflated by an `in_tick` drain-skip bug.** `in_tick` (the wave
+  ownership / drain gate) was Core-global. In concurrent emits on
+  disjoint partitions of one Core, thread B observed thread A's
+  `in_tick = true`, wrongly treated its independent disjoint wave as
+  nested, and **no-op'd its `BatchGuard::drop` — B's wave never
+  drained.** The Phase J "fn-fire-heavy 2t-disjoint = 1.35 ms, 1.23×
+  speedup" measured a path that *skipped thread B's entire drain*. After
+  the per-(Core, thread) re-keying (D047), a clean back-to-back A/B (low
+  machine load) shows:
+  - `fnfire_parallel_2t_disjoint` ≈ **4.63 ms** (was ≈1.09 ms buggy) —
+    i.e. **≈2.8× SLOWER than serial**, not 1.23× faster.
+  - `parallel_4t_disjoint` (state-emit) **+27%**; serial ±5%;
+    same-partition / fn-fire-serial ≈ neutral.
+
+  **The "Q2/Q3 is the next concrete step toward wide-spectrum
+  parallelism" implication and all disjoint-regime speedup evidence in
+  this Phase J block must be RE-VALIDATED against post-D047 numbers
+  before being relied on. The per-subgraph-parallelism value proposition
+  in the disjoint regime is materially weaker than this section claims**
+  (flagged for spec-owner re-validation; not silently rewritten).
+  Follow-up C (cheap-correct-drain fast-path for trivial disjoint waves)
+  targets recovering the avoidable fraction; the fn-fire drain cost is
+  largely irreducible. See `docs/rust-port-decisions.md` D047.
+
 ### ~~Cross-partition acquire-during-fire deadlock (Phase H+) — bundled into next batch (2026-05-09)~~ — FULLY CLOSED 2026-05-10 (LIMITED 2026-05-09 + STRICT D115 2026-05-10)
 
 **Closure summary (limited variant, 2026-05-09):** Phase H+ option (d)
@@ -844,6 +869,14 @@ spec enrichment if a future investigation needs the missing coverage.
   5. Wire the set_deps wave_owner-acquire-on-split fix + add the new test.
   6. Update `Drop for CoreState` to walk shards.
   7. Bench: confirm ≥5% improvement on `fnfire_parallel_2t_disjoint` per `crates/graphrefly-core/benches/per_subgraph_parallelism.rs`. If <5%, REVERT — the engineering risk doesn't justify the gain.
+
+  **NOTE (2026-05-15, D047): this ≥5% gate's baseline was bug-inflated.**
+  The `fnfire_parallel_2t_disjoint` figure this step compares against
+  (≈1.1–1.35 ms) was an artifact of the `in_tick` drain-skip bug — thread
+  B's wave never drained (see the Phase J **CORRECTION** above). The
+  honest post-D047 baseline is ≈4.6 ms. Re-base this gate against the
+  post-D047 number before running the Sub-slice 4 shard refactor; the
+  old "≥5% vs ≈1.1 ms" target is **void**.
 
 - **Source:** Q-beyond batch close (2026-05-10) D110 first drop; D113 (2026-05-10) re-exploration + HONEST bench + final defer. Subagent transcripts in conversation history surfaced the structural blocker analysis.
 

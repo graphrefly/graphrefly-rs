@@ -1043,3 +1043,57 @@ fn batch_fn_result_propagates_to_grandchild() {
         "wave: grandchild sees mid's last batch value"
     );
 }
+
+/// Cross-Core isolation (/qa F1) under the per-(Core, thread) `in_tick`
+/// keying: a thread holding a live `BatchGuard` on Core-A and then
+/// running a full wave on a SEPARATE Core-B (same OS thread) must have
+/// Core-B's wave be OWNING and fully drain — Core-A's ownership must not
+/// leak into Core-B.
+///
+/// This is the exact regression that forced `in_tick` off a pure
+/// thread-local originally. The (Core, thread) key (keyed by
+/// `Core::generation`) must preserve it: Core-A's set slot is a
+/// different key than Core-B's, so Core-B's `begin_batch` sees itself
+/// as outermost and drains. If isolation regressed, Core-B's wave would
+/// be wrongly nested and its subscriber would never see the value.
+#[test]
+fn cross_core_same_thread_batchguard_isolation() {
+    let rt_a = TestRuntime::new();
+    let rt_b = TestRuntime::new();
+
+    let s_b = rt_b.state(Some(TestValue::Int(0)));
+    let d_b = rt_b.derived(&[s_b.id], |deps| Some(deps[0].clone()));
+    let rec_b = rt_b.subscribe_recorder(d_b);
+
+    let s_a = rt_a.state(Some(TestValue::Int(0)));
+
+    // Hold a live, OWNING BatchGuard on Core-A (sets Core-A's per-(Core,
+    // thread) in_tick slot).
+    let guard_a = rt_a.core.begin_batch();
+
+    // Same thread, while Core-A's guard is alive: a full wave on Core-B.
+    // Must be owning + drain (Core-B's key is distinct from Core-A's).
+    let h = rt_b.binding.intern(TestValue::Int(7));
+    rt_b.core.emit(s_b.id, h);
+
+    assert!(
+        rec_b
+            .data_values()
+            .contains(&TestValue::Int(7)),
+        "Core-B's wave must drain despite a live Core-A BatchGuard on the \
+         same thread (cross-Core isolation / qa F1); got {:?}",
+        rec_b.data_values()
+    );
+
+    // Releasing Core-A's guard drains/clears Core-A's slot; Core-A still
+    // works normally afterward.
+    drop(guard_a);
+    let d_a = rt_a.derived(&[s_a.id], |deps| Some(deps[0].clone()));
+    let rec_a = rt_a.subscribe_recorder(d_a);
+    s_a.set(TestValue::Int(99));
+    assert!(
+        rec_a.data_values().contains(&TestValue::Int(99)),
+        "Core-A must work normally after its BatchGuard drops; got {:?}",
+        rec_a.data_values()
+    );
+}
