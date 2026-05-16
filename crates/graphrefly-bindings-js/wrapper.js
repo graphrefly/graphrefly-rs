@@ -252,6 +252,12 @@ class NativeNode {
         encoded.push(MSG_CODE_ERROR, h);
       } else if (tier === TEARDOWN) {
         encoded.push(MSG_CODE_TEARDOWN, 0);
+      } else {
+        // Terminal else — an unmapped tier (foreign symbol, RESOLVED,
+        // START, …) would otherwise be silently dropped from `encoded`,
+        // turning a programmer error into an invisible no-op. Fail loud,
+        // mirroring `symbolToCode`'s unknown-symbol throw.
+        throw new Error(`[graphrefly/native] unmapped tier in down(): ${String(tier)}`);
       }
     }
     await this.core.batchEmitHandleMessages(this.nodeId, encoded);
