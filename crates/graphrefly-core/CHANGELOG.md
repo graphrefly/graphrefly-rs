@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.5...graphrefly-core-v0.0.6) - 2026-05-16
+
+### Added
+
+- *(native)* Option C — ergonomic async @graphrefly/native public surface (D206)
+- clean up M1-M3
+- clean up slice G
+
+### Fixed
+
+- fix ci
+- fix batch
+- *(qa)* native-auto-release is structurally loop-proof (tag-only)
+- fix ci
+- more porting
+- clean up
+- more operators
+- clean up
+- M4
+- H+
+
 ## [0.0.5](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.4...graphrefly-core-v0.0.5) - 2026-05-10
 
 ### Added
