@@ -2580,6 +2580,43 @@ throughput win independent of the single-thread floor. Tests
 graphrefly-core --all-targets` clean; `cargo fmt --check` clean;
 `#![forbid(unsafe_code)]` preserved; zero new `unsafe`.
 
+### Slice B — per-shard parallelism (D218=B4 / D219 / D220) — B-1 LANDED 2026-05-16
+
+Locked design: replace "per-`SerializationGroupId` `ReentrantMutex` *on
+top of* one global `Mutex<CoreState>`" (D216-proven worthless — the
+global state mutex serializes every emit regardless of group → zero
+parallelism) with "each shard *owns* an independent `CoreState`
+sub-store with its own lock." Seam-first internal decomposition (D220):
+
+- **B-1 — LANDED + GREEN (2026-05-16).** `Core::with_shard(key,
+  |s| …)` — the D219 closure-shaped shard-access seam (B3-overlay
+  compatible: M6 owner-thread + crossbeam-channel for napi V8 /
+  pyo3 GIL affinity re-impls this one method). B-1 is single-shard,
+  `key` ignored, `f(&mut self.lock_state())` — **behaviour-identical**,
+  near-zero churn, `#[allow(dead_code)]` (justified, wired in B-2).
+  Gate: `cargo nextest run --profile ci` workspace **825/825** (incl.
+  the 4 `cascade_depth` 5000-node stress tests); build clean; clippy
+  `-p graphrefly-core --all-targets` 0; fmt clean;
+  `#![forbid(unsafe_code)]` preserved; zero new `unsafe`.
+- **B-2 — NOT STARTED (multi-session heavy lift).** Partition
+  `CoreState` → `CoreShared` (id counters, `binding`,
+  `topology_sinks`, `currently_firing` [cross-shard-visible /qa
+  F2/D214], caps) + per-`Option<SerializationGroupId>` `ShardState`
+  (`nodes`/`children`; `None` = `DEFAULT_SHARD` = the ≈515 ns floor
+  shard). Reshape `StateCell` to hold shard-map + shared; migrate the
+  ~104 `lock_state()` sites onto `with_shard(group_of(node))`;
+  `begin_batch_for(seed)` locks the seed's shard + cross-shard-touched
+  in ascending key order (replaces the ReentrantMutex-on-top +
+  `global_wave`). Deliberately deferred to a fresh context budget —
+  a rushed 104-site struct-split is the unmeasured-big-move failure
+  mode the §7/D217 arc proved costly (D220).
+- **B-3 — NOT STARTED.** §7-B bounded cross-shard ordered-acquire
+  guard + §7-C/§7-F vestigial union-find deletion.
+
+Gates for B-2/B-3: `group_scaling.rs` disjoint must finally scale (the
+whole point); `floor_compare.rs` all-`None` must stay ≈515 ns (one
+default shard = zero regression); 825 green.
+
 ## Post-1.0 backlog
 
 Per the deferral guardrails in `~/src/graphrefly-ts/docs/implementation-plan.md` Phase 14:

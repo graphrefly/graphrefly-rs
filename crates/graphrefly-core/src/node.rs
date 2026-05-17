@@ -2037,6 +2037,46 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         self.state.lock()
     }
 
+    /// Slice B-1 (D218=B4 / D219, 2026-05-16) — the **shard-access
+    /// seam**.
+    ///
+    /// The locked Slice B design replaces "per-`SerializationGroupId`
+    /// `ReentrantMutex` *on top of* one global `Mutex<CoreState>`"
+    /// (D216-proven worthless: the global state mutex serializes every
+    /// emit regardless of group → zero parallelism) with "each shard
+    /// *owns* an independent `CoreState` sub-store with its own lock"
+    /// (B-2). Every wave-scoped state access must flow through THIS
+    /// seam so the routing change in B-2 (and the B3 owner-thread +
+    /// crossbeam-channel overlay at M6 for napi V8-isolate / pyo3-GIL
+    /// thread-affinity — D219) is a re-impl of one method, not a
+    /// re-architecture of ~104 call sites mid-rewrite.
+    ///
+    /// `key`: the node's `serialization_group`. `None` =
+    /// `DEFAULT_SHARD` (the all-`None` zero-regression floor path —
+    /// stays the single ≈515 ns `Core<SingleThreadCell>` shard).
+    ///
+    /// **B-1 (this stage): single shard, behaviour-identical.** `key`
+    /// is ignored; this is exactly `f(&mut self.lock_state())`. B-2
+    /// partitions `CoreState` into `CoreShared` + per-key `ShardState`
+    /// and routes here by `key` so disjoint groups hold disjoint
+    /// mutexes (true parallelism — the property `group_scaling.rs`
+    /// found missing). The closure shape (`FnOnce(&mut CoreState) ->
+    /// R`) is the B3-overlay-compatible form: B3 sends the closure to
+    /// the shard's owner thread and returns `R` over a channel.
+    ///
+    /// `#[allow(dead_code)]`: B-1 establishes + compiles + behaviour-
+    /// gates the seam; B-2 migrates the call sites onto it. Per the
+    /// Rust-port invariant, allow is justified inline (transient,
+    /// one-stage).
+    #[allow(dead_code)]
+    pub(crate) fn with_shard<R>(
+        &self,
+        _key: Option<crate::handle::SerializationGroupId>,
+        f: impl FnOnce(&mut crate::node::CoreState) -> R,
+    ) -> R {
+        f(&mut self.lock_state())
+    }
+
     /// Whether `self` and `other` point to the same dispatcher state.
     /// True when one was produced by `Clone`-ing the other (or they
     /// were both cloned from a common ancestor); false for two
