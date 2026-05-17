@@ -2669,51 +2669,68 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   **SingleThreadCell 501.75 ns** (vs ≈515 cap — preserved),
   **LockedCell 549.08 ns** (vs ≈579 prior — no regression) ⇒
   D220-EXEC floor gate MET. Zero new `unsafe`.
-- **B-2 Step 2b-ii — NEXT (the real parallelism; correctness-
-  critical, coupled with B-3).** Route registration + the wave so
-  grouped nodes live in / waves run on their group's shard:
-  (1) `CoreShared` gains a `node_group: HashMap<NodeId,
-  SerializationGroupId>` (Some-only; absent=None=DEFAULT) so
-  `group_of(n)` is a pure-`with_shared` lookup with NO shard lock
-  (resolves the chicken-egg: a grouped node's record isn't in
-  DEFAULT). (2) Registration of a node declared with group `g`
-  places its `NodeRecord` in shard `g` + records `node_group[n]=g`.
-  (3) A per-thread ambient `CURRENT_SHARD_KEY` set by
-  `begin_batch`/`begin_batch_for` (RAII restore on `BatchGuard`
-  drop) and READ by `St::new`/`lock_state` (instead of hardcoded
-  `None`) so the ~104 combined-guard sites auto-route to the wave's
-  shard — sound because the **§7 component-homogeneity invariant**
-  (already enforced at register/set_deps: a dep-connected component
-  is all-`None` or all-one-group) ⇒ one wave touches exactly one
-  group ⇒ one shard key for the whole wave. (4) **Wave-ownership
-  model change (the hard part, coupled with B-3):** today
-  cross-thread wave serialization relies on `BatchGuard` holding a
-  wave-lock (`group_locks`/`global_wave`) for the ENTIRE wave;
-  per-shard mutexes acquired per-`lock_state` do NOT give whole-
-  wave serialization, so `begin_batch_for(seed)` must hold the
-  seed shard's wave-lock for the wave duration. This makes
-  `group_locks`/`global_wave`/`SERIALIZE_WAVES`/
-  `acquire_touched_group_guards`/`with_global_wave_fallback`/
-  `compute_touched_groups` **vestigial** → their deletion + the
-  §7-B bounded cross-shard ordered-acquire guard is **B-3**, so
-  2b-ii and B-3 are best executed together. There is NO smaller
-  sub-step that yields gateable parallelism without (3)+(4). Gated
-  by `group_scaling.rs` (disjoint MUST finally scale) +
-  `floor_compare.rs` (≈515 ns) + 825 + (B-3) CI-green (delete the
-  vestigial `benches/per_subgraph_parallelism.rs`). Full design:
-  `~/src/graphrefly-ts/docs/rust-port-decisions.md` D220-EXEC
-  "Step 2 — BANKED 2a/2b" + "STEP 2 STATUS".
-- **B-3 — NOT STARTED (execute with / right after 2b-ii — coupled).**
-  §7-B bounded cross-shard ordered-acquire/defer guard for meta/
-  dynamic re-entry into an unheld shard + delete the now-vestigial
-  union-find / wave-lock layer that 2b-ii's per-shard wave-ownership
-  obsoletes: `group_locks` / `global_wave` / `GroupLockRegistry` /
-  `SERIALIZE_WAVES` / `acquire_touched_group_guards` /
-  `with_global_wave_fallback` / `compute_touched_groups` /
-  `PartitionOrderViolation` / `*_or_defer` / `DeferredProducerOp`
-  **+ `benches/per_subgraph_parallelism.rs`** (invalid D3-union-find
-  premise post-§7 → the current `--all-targets` CI red; superseded
-  by `group_scaling.rs`). Closes the CI redness.
+- **B-2 Step 2b-ii — LANDED CORRECTNESS-COMPLETE; PARALLELISM GATE
+  RED (2026-05-17)** = graphrefly-rs `864f02c`. Decoupled
+  `CoreShared.node_group` (declared group → `partition_of` +
+  wave-lock set) from `CoreShared.node_shard` (component-uniform
+  PLACEMENT → all `lock_state`/`St` routing) — the real invariant
+  is **all-`None` OR all-`Some`** (a component MAY span DISTINCT
+  `Some` groups: `register_all_some_chain_ok` proves it; "one
+  component = one group = one shard" is FALSE). Per-thread ambient
+  `CURRENT_SHARD_KEY` (RAII `ShardKeyGuard`) set by
+  `begin_batch_for`=`shard_of(seed)` + ~18 single-node entry points
+  + `register` (placement = deps' shard; shard-agnostic None/Some-mix
+  reject via index) + `set_serialization_group` (whole-component
+  cross-shard migrate, both indices) + `set_deps` (shard-agnostic
+  mix-check via held `s.shared`, hoisted before the new-dep
+  existence loop). New `tests/group_sharding.rs` (6 cross-shard
+  delivery tests). Gate: `mise run gate` **825 + 24 grouped +
+  cascade_depth ALL GREEN**; `floor_compare` SingleThreadCell
+  **519 ns** (≈515 preserved), LockedCell **605 ns** (~10 % vs 549
+  at 2b-i). **BUT `group_scaling/disjoint` REGRESSES 729→504→366→232
+  Kelem/s (1→2→4→8 t) — = the serialized controls — the unchanged
+  D216 finding. PARALLELISM GATE FAILED.** Root cause (proven,
+  architectural): the **combined-guard `St`** (which made
+  2a/2b-i/2b-ii tractable + behaviour-correct with ~0 of the
+  ~104+23 sites changed) acquires the single **`Mutex<CoreShared>`
+  on EVERY hot-path `lock_state()`** → moved the D216 bottleneck
+  from `Mutex<CoreState>` to `Mutex<CoreShared>`. The combined-guard
+  shortcut and disjoint-group parallelism are **mutually
+  exclusive**. 2b-ii lands the **correct, load-bearing cross-shard
+  substrate** (indices/routing/validation the eventual parallel
+  impl reuses) but **not the perf win**. Full evidence + the
+  required path: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  D220-EXEC "STEP 2b-ii EMPIRICAL FINDING".
+- **B-2 Step 2c (was the deferred per-site split) — the OPEN perf
+  work, now evidence-mandated.** Migrate the hot emit/cascade/drain
+  path OFF the combined `St` onto **pure shard-only `with_shard(
+  shard_of(node))`** (no `CoreShared` on the hot path); the
+  genuinely-shared sites (id alloc, topology, scratch-release,
+  `currently_firing` P13 — none per-emit) take brief `with_shared`
+  OFF the hot path; "both" sites restructured to touch `CoreShared`
+  once per wave, not per `lock_state`. This is the ~104-site triage
+  D220-EXEC's Step-2 originally specified; 2b-ii proved there is NO
+  combined-guard shortcut to parallelism — it is unavoidable. Gated
+  by `group_scaling.rs` disjoint MUST finally scale + `floor_compare`
+  ≈515 ns + 825 + 24 grouped.
+- **B-3 — `per_subgraph_parallelism.rs` DELETED (2026-05-17, CI red
+  fixed); §7-B + symbol-deletion REASSESSED.** The CI-red vestigial
+  bench + its `[[bench]]` removed (graphrefly-rs commit pending) →
+  `cargo nextest run --profile ci --all-targets` green by
+  construction (the only red target is gone; all else green via the
+  full gate). **Reassessment vs the original B-3 plan:** this
+  implementation **keeps** `group_locks`/`global_wave`/
+  `acquire_touched_group_guards`/`compute_touched_groups` — they are
+  **NOT vestigial here** (they correctly serialize same-group /
+  parallelize disjoint-group waves cross-thread; never the D216
+  bottleneck — the state lock was). Deleting them would break
+  cross-thread wave serialization. **§7-B** (bounded cross-shard
+  ordered-acquire/defer guard) is **unnecessary under
+  component-uniform placement** (a wave never crosses shards) →
+  documented defer. The `PartitionOrderViolation` / `*_or_defer` /
+  `DeferredProducerOp` no-op shims are harmless D211-minimal-churn
+  remnants; deleting = 8-file `graphrefly-operators` churn, zero
+  functional value → documented defer (not required for Slice B).
 
 Gates for B-2/B-3: `group_scaling.rs` disjoint must finally scale (the
 whole point); `floor_compare.rs` all-`None` must stay ≈515 ns (one

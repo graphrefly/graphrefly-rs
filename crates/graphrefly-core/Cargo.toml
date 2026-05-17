@@ -44,10 +44,6 @@ name    = "dispatcher"
 harness = false
 
 [[bench]]
-name    = "per_subgraph_parallelism"
-harness = false
-
-[[bench]]
 name    = "lock_strategy"
 harness = false
 

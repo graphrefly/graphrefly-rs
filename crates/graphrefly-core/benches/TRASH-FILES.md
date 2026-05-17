@@ -1,0 +1,1 @@
+benches/per_subgraph_parallelism.rs - moved to benches/TRASH/ - B-3 (D220-EXEC): vestigial §7-F D3-union-find bench; its assert_ne!(partition_of(s_a), partition_of(s_b)) premise is invalid post-§7 (both None) → the CI-red on `cargo nextest run --profile ci --all-targets`; superseded by group_scaling.rs.
