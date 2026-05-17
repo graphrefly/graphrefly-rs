@@ -796,7 +796,7 @@ impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
                                 .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
                             let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
                             if let Some(old_box) = old {
-                                s.pending_scratch_release.push(old_box);
+                                s.shared.pending_scratch_release.push(old_box);
                             }
                             // The "scratch_to_release" for lock-released
                             // release stays None here — the resubscribable
@@ -1579,6 +1579,115 @@ impl NodeRecord {
 // `CrossPartitionState` held for its `Drop` impl is no longer needed —
 // `BatchGuard` already holds a `Core` clone with the binding).
 
+/// Core-global state with NO per-[`crate::handle::SerializationGroupId`]
+/// partition (Slice B-2 Step 1, D220-EXEC). Hoisted out of [`CoreState`]
+/// so that when Step 2 shards `nodes`/`children` per `ShardKey`, THESE
+/// remain singular: monotonic id counters, the topology-sink registry,
+/// the cross-shard-visible `currently_firing` reentrancy stack (P13 /
+/// /qa F2 — the load-bearing cross-thread-visibility property), the two
+/// Core-global caps, and the Core-shutdown scratch-release queue.
+///
+/// **Step 1 (this stage): behaviour-identical.** A plain sub-struct of
+/// [`CoreState`] under the SAME single cell/lock — `s.shared.<f>` is
+/// exactly the old `s.<f>`. Step 2 reshapes [`crate::state_cell`] to
+/// hold one `CoreShared` + a per-`ShardKey` shard map; pure-shared ops
+/// then take only the shared guard (`with_shared`), shard ops the shard
+/// guard (`with_shard`), and when both are needed the deadlock-free
+/// rule is **shard guard OUTER, shared guard INNER** (D220-EXEC).
+pub(crate) struct CoreShared {
+    pub(crate) next_node_id: u64,
+    pub(crate) next_subscription_id: u64,
+    pub(crate) next_lock_id: u64,
+    /// Topology-change sinks. Keyed by subscription id for O(1) removal.
+    pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
+    pub(crate) next_topology_id: u64,
+    /// Core-global cap on per-node pause replay buffer length. `None` means
+    /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
+    /// per-node override can be added later as a pure addition without API
+    /// breakage. Default `None`.
+    pub(crate) pause_buffer_cap: Option<usize>,
+    /// Core-global cap on wave-drain iterations before
+    /// [`crate::batch::Core::drain_and_flush`] aborts with a diagnostic panic.
+    /// Replaces the prior `MAX_DRAIN_ITERATIONS` hard-coded constant
+    /// (R4.3 / Lock 2.F′). Default `10_000`.
+    ///
+    /// The drain loop bound exists to surface runtime cycles
+    /// (e.g. an operator that re-arms its own `pending_fires` slot during
+    /// `invoke_fn`) as a panic with context, rather than letting Core
+    /// spin forever. Structural cycles via [`Core::set_deps`] are
+    /// rejected at edge-mutation time (`SetDepsError::WouldCreateCycle`);
+    /// registration is structurally cycle-safe by construction (the new
+    /// node's id is not allocated until AFTER deps are validated, so deps
+    /// cannot transitively reach the new node). The drain bound is the
+    /// safety net for runtime cycles that bypass both static checks.
+    pub(crate) max_batch_drain_iterations: u32,
+    /// A6 reentrancy guard stack (Slice F, 2026-05-07): the stack of
+    /// NodeIds whose fn is currently being invoked. Pushed at the top of
+    /// `fire_fn` (just before the lock-released `invoke_fn` call) and
+    /// popped on return / unwind via the [`crate::batch::FiringGuard`]
+    /// RAII helper. [`Core::set_deps`] consults this set and rejects
+    /// with [`SetDepsError::ReentrantOnFiringNode`] if `n` is currently
+    /// firing — preventing the D1 `tracked` index corruption. Read by
+    /// the P13 partition-migration check (D091) to reject mid-fire
+    /// `set_deps` that would migrate a firing node's partition.
+    ///
+    /// **Core-global / cross-shard-visible.** /qa F2 reverted
+    /// (2026-05-10): briefly placed on per-thread `WaveState`, then
+    /// moved BACK after /qa F2 surfaced the cross-thread P13 bypass
+    /// (per-thread placement made Thread B's `set_deps` read its own
+    /// empty stack → P13 silently bypassed for cross-thread `set_deps`
+    /// during Thread A's lock-released `invoke_fn`). Cross-thread
+    /// visibility is the load-bearing property D091 requires; keeping it
+    /// in `CoreShared` (NOT a per-`ShardKey` shard) preserves it across
+    /// the Slice B-2 shard split (D220-EXEC / /qa F2 / D214 P13).
+    ///
+    /// Membership semantics (NOT strict LIFO): consumed via
+    /// `contains(&n)` membership test. `FiringGuard::drop` pops the
+    /// right-most matching `node_id` via `rposition` + `swap_remove`;
+    /// physical order of remaining entries may not match construction
+    /// order, but membership is preserved.
+    pub(crate) currently_firing: Vec<NodeId>,
+    /// D-α (D028 full close, 2026-05-10): per-Core defer queue for old
+    /// operator-scratch boxes pushed by Phase G on resubscribable nodes.
+    /// Phase G builds a fresh scratch via [`Core::make_op_scratch`] and
+    /// installs it on the node's `op_scratch` slot (so re-activation
+    /// sees fresh counters / a fresh seed-share); the OLD scratch's
+    /// handle retains are deferred to one of two drain points to
+    /// preserve the Slice C-3 /qa P1 retain-before-release invariant
+    /// (the C-3 test
+    /// `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry`
+    /// fails if the old `acc` share is released before the fresh seed
+    /// share is taken — when `acc == seed` interns to the same registry
+    /// slot, eager release drops the slot to zero before the fresh
+    /// retain bumps it back up).
+    ///
+    /// Drain points:
+    /// 1. [`Core::reset_for_fresh_lifecycle`] — after Phase 2 takes
+    ///    fresh retains on the new seed/default, the queue drain
+    ///    releases queued boxes whose handles may have aliased.
+    /// 2. [`Drop for CoreState`] — catch-all on Core shutdown.
+    ///
+    /// Note that the queue lives on `CoreShared` within `CoreState` (not
+    /// on `Core`) so `Drop for CoreState` has access to both the binding
+    /// and the queue under the single state lock — no separate mutex
+    /// needed.
+    ///
+    /// **Growth bound (/qa m17, 2026-05-10):** size is bounded by the
+    /// number of non-terminal deactivate-reactivate cycles since the
+    /// last terminal-then-resubscribe reset on any resubscribable +
+    /// has-op node in this Core. Each entry is a `Box<dyn OperatorScratch>`
+    /// holding O(1) handles (Scan/Reduce/Last: 1 handle; Take/Skip/
+    /// TakeWhile/DistinctUntilChanged/Pairwise: 0 or 1 handle). Typical
+    /// workloads: O(few KB). Degenerate workloads (long-lived Cores
+    /// with frequent deactivate-reactivate cycles and no terminal
+    /// resets) should call `core.complete()` / `core.error()` on the
+    /// op node periodically to trigger queue drain via
+    /// `reset_for_fresh_lifecycle`. The release happens unconditionally
+    /// on Core drop, so this is not a leak — just a deferred-release
+    /// growth concern under unusual workloads.
+    pub(crate) pending_scratch_release: Vec<Box<dyn crate::op_state::OperatorScratch>>,
+}
+
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
 ///
 /// **Architecture history.** Q2 (2026-05-09) split four wave-scoped
@@ -1609,79 +1718,18 @@ impl NodeRecord {
 // exported). The struct *name* is public but every field stays `pub(crate)`,
 // so it is an opaque token outside the crate — no internal state is reachable.
 pub struct CoreState {
-    pub(crate) next_node_id: u64,
-    pub(crate) next_subscription_id: u64,
-    pub(crate) next_lock_id: u64,
     pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     /// Inverted adjacency: `parent → children`. Updated on registration.
     pub(crate) children: HashMap<NodeId, HashSet<NodeId>>,
-    // Q-beyond Sub-slice 2 (D108, 2026-05-09): `pending_fires` and
-    // `pending_notify` moved to per-thread
-    // [`crate::batch::WaveState`]. Both fields are wave-scoped — emit
-    // populates them on the same thread that drains them at wave end.
-    // Cross-thread emits block on partition `wave_owner` and land in
-    // the OTHER thread's wave context, so the per-thread placement is
-    // safe by construction.
-    //
-    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `deferred_flush_jobs`,
-    // `deferred_cleanup_hooks`, `pending_wipes`, and
-    // `invalidate_hooks_fired_this_wave` likewise moved to
-    // [`crate::batch::WaveState`] (same wave-scoped per-thread rationale).
-    // `in_tick` is per-(Core, thread) in `crate::batch::IN_TICK_OWNED`;
-    // `currently_firing` stays on `CoreState` (/qa F2, see below).
-    /// Core-global cap on per-node pause replay buffer length. `None` means
-    /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
-    /// per-node override can be added later as a pure addition without API
-    /// breakage. Default `None`.
-    pub(crate) pause_buffer_cap: Option<usize>,
-    /// Core-global cap on wave-drain iterations before
-    /// [`crate::batch::Core::drain_and_flush`] aborts with a diagnostic panic.
-    /// Replaces the prior `MAX_DRAIN_ITERATIONS` hard-coded constant
-    /// (R4.3 / Lock 2.F′). Default `10_000`.
-    ///
-    /// The drain loop bound exists to surface runtime cycles
-    /// (e.g. an operator that re-arms its own `pending_fires` slot during
-    /// `invoke_fn`) as a panic with context, rather than letting Core
-    /// spin forever. Structural cycles via [`Core::set_deps`] are
-    /// rejected at edge-mutation time (`SetDepsError::WouldCreateCycle`);
-    /// registration is structurally cycle-safe by construction (the new
-    /// node's id is not allocated until AFTER deps are validated, so deps
-    /// cannot transitively reach the new node). The drain bound is the
-    /// safety net for runtime cycles that bypass both static checks.
-    pub(crate) max_batch_drain_iterations: u32,
-    // Wave-ownership (`in_tick`) is NOT a `CoreState` field: it is keyed
-    // per-(Core, thread) in the `crate::batch::IN_TICK_OWNED` thread_local
-    // (see its doc for the cross-Core / disjoint-partition / nested-
-    // re-entry rationale and history). `currently_firing` below DOES stay
-    // on `CoreState` — the cross-thread P13 set_deps check (/qa F2)
-    // requires it be cross-thread-visible.
-    /// A6 reentrancy guard stack (Slice F, 2026-05-07): the stack of
-    /// NodeIds whose fn is currently being invoked. Pushed at the top of
-    /// `fire_fn` (just before the lock-released `invoke_fn` call) and
-    /// popped on return / unwind via the [`crate::batch::FiringGuard`]
-    /// RAII helper. [`Core::set_deps`] consults this set and rejects
-    /// with [`SetDepsError::ReentrantOnFiringNode`] if `n` is currently
-    /// firing — preventing the D1 `tracked` index corruption. Read by
-    /// the P13 partition-migration check (D091) to reject mid-fire
-    /// `set_deps` that would migrate a firing node's partition.
-    ///
-    /// **Per-Core (cross-thread visible).** /qa F2 reverted (2026-05-10):
-    /// briefly placed on per-thread `WaveState` in Sub-slice 3, then
-    /// moved BACK to `CoreState` after /qa F2 surfaced the cross-thread
-    /// P13 bypass (per-thread placement made Thread B's `set_deps` read
-    /// its own empty stack → P13 silently bypassed for cross-thread
-    /// `set_deps` calls during Thread A's lock-released `invoke_fn`).
-    /// Cross-thread visibility on shared `CoreState` is the load-bearing
-    /// property the D091 check requires.
-    ///
-    /// Membership semantics (NOT strict LIFO): consumed via
-    /// `contains(&n)` membership test. `FiringGuard::drop` pops the
-    /// right-most matching `node_id` via `rposition` + `swap_remove`;
-    /// physical order of remaining entries may not match construction
-    /// order, but membership is preserved.
-    pub(crate) currently_firing: Vec<NodeId>,
-    // Q-beyond Sub-slice 3 (D108, 2026-05-09): `deferred_flush_jobs`
-    // moved to [`crate::batch::WaveState`].
+    /// Core-global, NOT per-shard state (Slice B-2 Step 1, D220-EXEC):
+    /// id counters, the topology-sink registry, the cross-shard-visible
+    /// `currently_firing` reentrancy stack, the two Core-global caps,
+    /// and the shutdown scratch-release queue. Step 1 keeps this a
+    /// plain sub-struct under the SAME single lock (`s.shared.<f>` ≡
+    /// the old `s.<f>` — behaviour-identical); Step 2 hoists it out of
+    /// the per-`ShardKey` shard map so `nodes`/`children` shard while
+    /// these stay singular.
+    pub(crate) shared: CoreShared,
     /// Binding-boundary handle for `Drop`-time refcount balancing.
     /// `Core` also holds a clone of this Arc; storing it here lets
     /// `Drop for CoreState` walk every retained slot and release the
@@ -1689,74 +1737,19 @@ pub struct CoreState {
     /// `cache` / `terminal` / `dep_terminals` Error / pause-buffer payload
     /// handle refs leak in the binding registry until process exit.
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `wave_cache_snapshots`
-    // moved to [`crate::batch::WaveState::wave_cache_snapshots`].
-    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `pending_auto_resolve`
-    // moved to [`crate::batch::WaveState::pending_auto_resolve`].
-    /// Topology-change sinks. Keyed by subscription id for O(1) removal.
-    pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
-    pub(crate) next_topology_id: u64,
-    /// D-α (D028 full close, 2026-05-10): per-Core defer queue for old
-    /// operator-scratch boxes pushed by Phase G on resubscribable nodes.
-    /// Phase G builds a fresh scratch via [`Core::make_op_scratch`] and
-    /// installs it on the node's `op_scratch` slot (so re-activation
-    /// sees fresh counters / a fresh seed-share); the OLD scratch's
-    /// handle retains are deferred to one of two drain points to
-    /// preserve the Slice C-3 /qa P1 retain-before-release invariant
-    /// (the C-3 test
-    /// `scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry`
-    /// fails if the old `acc` share is released before the fresh seed
-    /// share is taken — when `acc == seed` interns to the same registry
-    /// slot, eager release drops the slot to zero before the fresh
-    /// retain bumps it back up).
-    ///
-    /// Drain points:
-    /// 1. [`Core::reset_for_fresh_lifecycle`] — after Phase 2 takes
-    ///    fresh retains on the new seed/default, the queue drain
-    ///    releases queued boxes whose handles may have aliased.
-    /// 2. [`Drop for CoreState`] — catch-all on Core shutdown.
-    ///
-    /// Note that the queue lives on `CoreState` (not on `Core`) so
-    /// `Drop for CoreState` has access to both the binding and the
-    /// queue under the single state lock — no separate mutex needed.
-    ///
-    /// **Growth bound (/qa m17, 2026-05-10):** size is bounded by the
-    /// number of non-terminal deactivate-reactivate cycles since the
-    /// last terminal-then-resubscribe reset on any resubscribable +
-    /// has-op node in this Core. Each entry is a `Box<dyn OperatorScratch>`
-    /// holding O(1) handles (Scan/Reduce/Last: 1 handle; Take/Skip/
-    /// TakeWhile/DistinctUntilChanged/Pairwise: 0 or 1 handle). Typical
-    /// workloads: O(few KB). Degenerate workloads (long-lived Cores
-    /// with frequent deactivate-reactivate cycles and no terminal
-    /// resets) should call `core.complete()` / `core.error()` on the
-    /// op node periodically to trigger queue drain via
-    /// `reset_for_fresh_lifecycle`. The release happens unconditionally
-    /// on Core drop, so this is not a leak — just a deferred-release
-    /// growth concern under unusual workloads.
-    pub(crate) pending_scratch_release: Vec<Box<dyn crate::op_state::OperatorScratch>>,
-    // /qa F2 reverted (2026-05-10): `currently_firing` field is declared
-    // EARLIER in this struct (above `pause_buffer_cap`). Sub-slice 3
-    // briefly moved it to `crate::batch::WaveState::currently_firing` on
-    // the per-thread thread_local, but per-thread placement silently
-    // bypassed the cross-thread P13 partition-migration check. /qa F2
-    // (2026-05-10) moved it BACK to CoreState (cross-thread visible).
-    // Q-beyond Sub-slice 1 (D108, 2026-05-09): `pending_pause_overflow`
-    // moved to [`crate::batch::WaveState::pending_pause_overflow`].
-    // Slice G (R1.3.2.d / R1.3.3.a — 2026-05-07): tier3-emitted-this-wave
-    // tracker MOVED to a per-thread thread-local in `crate::batch`
-    // (D1 patch, 2026-05-09 — was briefly per-partition under Q3 v1
-    // 2026-05-09 morning). Wave-scope = thread; per-thread placement
-    // is robust to mid-wave cross-thread `set_deps` partition splits
-    // because thread B's split doesn't touch thread A's thread-local.
-    // See [`crate::batch::TIER3_EMITTED_THIS_WAVE`] for the per-thread
-    // wave-scope rationale and lifecycle (cleared at outermost
-    // [`crate::batch::BatchGuard`] drop, both success + panic).
-    //
-    // Q-beyond Sub-slice 3 (D108, 2026-05-09):
-    // `invalidate_hooks_fired_this_wave`, `deferred_cleanup_hooks`,
-    // and `pending_wipes` moved to [`crate::batch::WaveState`].
-    // Wave-scoped per-thread; same rationale as the other Sub-slice 3
-    // migrations.
+    // Wave-scoped state lives off `CoreState`:
+    // - `pending_fires` / `pending_notify` / `deferred_flush_jobs` /
+    //   `deferred_cleanup_hooks` / `pending_wipes` /
+    //   `invalidate_hooks_fired_this_wave` / `wave_cache_snapshots` /
+    //   `pending_auto_resolve` / `pending_pause_overflow` →
+    //   per-thread [`crate::batch::WaveState`] (D108 Sub-slices 1–3).
+    // - `in_tick` → per-(Core, thread) [`crate::batch::IN_TICK_OWNED`].
+    // - tier3-emitted-this-wave → per-thread
+    //   [`crate::batch::TIER3_EMITTED_THIS_WAVE`] (Slice G / D1).
+    // Core-global non-shard state (`next_*`, `topology_sinks`,
+    // `currently_firing` [cross-shard-visible /qa F2], the two caps,
+    // `pending_scratch_release`) lives on [`CoreShared`] (Slice B-2
+    // Step 1, D220-EXEC) — see its doc for each field's rationale.
 }
 
 /// The handle-protocol Core dispatcher.
@@ -1977,42 +1970,47 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     pub fn new_with_cell(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
             state: Arc::new(C::from_state(CoreState {
-                next_node_id: 1,
-                next_subscription_id: 1,
-                // A4 (Slice F, 2026-05-07): start `next_lock_id` in the high
-                // half of the u32 range so `alloc_lock_id` can't collide with
-                // user-supplied `LockId::new(N)` constructors (which the
-                // napi-rs binding marshals from `u32` and tests typically use
-                // in the low range, 1..1024). Phase E /qa F1 (2026-05-08):
-                // lowered from `1u64 << 32` to `1u64 << 31` so the value
-                // round-trips through `u32::try_from(...)` at the napi
-                // boundary — the previous seed errored every napi
-                // `alloc_lock_id` call. Anti-collision intent (high range vs
-                // low user range) preserved at half the prior ceiling
-                // (2^31 ≈ 2 billion allocations per Core, ample for parity
-                // tests). Lift the floor when the deferred BigInt-narrowing
-                // migration extends `LockId` to `u64` at the FFI layer
-                // (porting-deferred "BigInt migration for u32-narrowed napi
-                // types" entry).
-                next_lock_id: 1u64 << 31,
                 nodes: HashMap::new(),
                 children: HashMap::new(),
                 // Q-beyond Sub-slice 2 + 3 (D108, 2026-05-09): pending_fires,
                 // pending_notify, deferred_flush_jobs,
                 // deferred_cleanup_hooks, pending_wipes, and
                 // invalidate_hooks_fired_this_wave all live on per-thread
-                // [`crate::batch::WaveState`].
-                // `currently_firing` stays on CoreState (cross-thread
-                // visible) for the cross-thread P13 set_deps check (/qa
-                // F2). `in_tick` is NOT here — it is per-(Core, thread) in
-                // `crate::batch::IN_TICK_OWNED` (see its doc).
-                currently_firing: Vec::new(),
-                pause_buffer_cap: None,
-                max_batch_drain_iterations: 10_000,
+                // [`crate::batch::WaveState`]. `in_tick` is per-(Core,
+                // thread) in `crate::batch::IN_TICK_OWNED` (see its doc).
+                // Core-global non-shard state is grouped under `shared`
+                // (Slice B-2 Step 1, D220-EXEC).
+                shared: CoreShared {
+                    next_node_id: 1,
+                    next_subscription_id: 1,
+                    // A4 (Slice F, 2026-05-07): start `next_lock_id` in the
+                    // high half of the u32 range so `alloc_lock_id` can't
+                    // collide with user-supplied `LockId::new(N)`
+                    // constructors (which the napi-rs binding marshals from
+                    // `u32` and tests typically use in the low range,
+                    // 1..1024). Phase E /qa F1 (2026-05-08): lowered from
+                    // `1u64 << 32` to `1u64 << 31` so the value round-trips
+                    // through `u32::try_from(...)` at the napi boundary —
+                    // the previous seed errored every napi `alloc_lock_id`
+                    // call. Anti-collision intent (high range vs low user
+                    // range) preserved at half the prior ceiling (2^31 ≈ 2
+                    // billion allocations per Core, ample for parity
+                    // tests). Lift the floor when the deferred
+                    // BigInt-narrowing migration extends `LockId` to `u64`
+                    // at the FFI layer (porting-deferred "BigInt migration
+                    // for u32-narrowed napi types" entry).
+                    next_lock_id: 1u64 << 31,
+                    // `currently_firing` stays Core-global (cross-shard /
+                    // cross-thread visible) for the P13 set_deps check
+                    // (/qa F2).
+                    currently_firing: Vec::new(),
+                    pause_buffer_cap: None,
+                    max_batch_drain_iterations: 10_000,
+                    topology_sinks: HashMap::new(),
+                    next_topology_id: 1,
+                    pending_scratch_release: Vec::new(),
+                },
                 binding: binding.clone(),
-                topology_sinks: HashMap::new(),
-                next_topology_id: 1,
-                pending_scratch_release: Vec::new(),
             })),
             binding,
             group_locks: Arc::new(parking_lot::Mutex::new(
@@ -2484,7 +2482,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// resume callback (see [`ResumeReport`]). `None` (default) means
     /// unbounded; messages buffer indefinitely until the lockset clears.
     pub fn set_pause_buffer_cap(&self, cap: Option<usize>) {
-        self.lock_state().pause_buffer_cap = cap;
+        self.lock_state().shared.pause_buffer_cap = cap;
     }
 
     /// Configure the replay buffer cap on `node_id` (R2.6.5 / Lock 6.G —
@@ -2578,7 +2576,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// first iteration, deadlocking any subsequent dispatcher work.
     pub fn set_max_batch_drain_iterations(&self, cap: u32) {
         assert!(cap > 0, "max_batch_drain_iterations must be > 0");
-        self.lock_state().max_batch_drain_iterations = cap;
+        self.lock_state().shared.max_batch_drain_iterations = cap;
     }
 
     /// Send a message UPSTREAM from `node_id` to each of its declared deps
@@ -2659,8 +2657,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     #[must_use]
     pub fn alloc_lock_id(&self) -> LockId {
         let mut s = self.lock_state();
-        let id = LockId::new(s.next_lock_id);
-        s.next_lock_id += 1;
+        let id = LockId::new(s.shared.next_lock_id);
+        s.shared.next_lock_id += 1;
         id
     }
 
@@ -3639,7 +3637,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // even when the queue is empty (no prior deactivations
         // happened).
         let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
-            std::mem::take(&mut s.pending_scratch_release);
+            std::mem::take(&mut s.shared.pending_scratch_release);
         for mut scratch in queued {
             scratch.release_handles(&*self.binding);
         }
@@ -5078,7 +5076,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // observing Thread A's firing pushes during A's lock-released
         // invoke_fn). Per-Core placement on shared CoreState delivers
         // both. Read under the already-held state lock.
-        if s.currently_firing.contains(&n) {
+        if s.shared.currently_firing.contains(&n) {
             return Err(SetDepsError::ReentrantOnFiringNode { n });
         }
         // Self-rewire rejection.
@@ -5462,14 +5460,14 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // to the lock guard.
 impl CoreState {
     fn alloc_node_id(&mut self) -> NodeId {
-        let id = NodeId::new(self.next_node_id);
-        self.next_node_id += 1;
+        let id = NodeId::new(self.shared.next_node_id);
+        self.shared.next_node_id += 1;
         id
     }
 
     fn alloc_sub_id(&mut self) -> SubscriptionId {
-        let id = SubscriptionId(self.next_subscription_id);
-        self.next_subscription_id += 1;
+        let id = SubscriptionId(self.shared.next_subscription_id);
+        self.shared.next_subscription_id += 1;
         id
     }
 
@@ -5512,7 +5510,7 @@ impl CoreState {
         // net (`FiringGuard`'s RAII push/pop is balanced even on panic;
         // a future code path that bypasses the guard would otherwise
         // leak a stale entry into the next wave).
-        self.currently_firing.clear();
+        self.shared.currently_firing.clear();
         //
         // Slice G tier3 emit tracking moved to per-partition state (Q3,
         // 2026-05-09); cleared by [`super::WaveOwnerGuard::drop`] on
@@ -5659,7 +5657,7 @@ impl Drop for CoreState {
         // re-enter the binding on drop). Without this explicit drain
         // the binding-side refcount is left bumped on Core shutdown.
         let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
-            std::mem::take(&mut self.pending_scratch_release);
+            std::mem::take(&mut self.shared.pending_scratch_release);
         for mut scratch in queued {
             scratch.release_handles(&*self.binding);
         }

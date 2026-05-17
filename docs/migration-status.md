@@ -2598,18 +2598,38 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   the 4 `cascade_depth` 5000-node stress tests); build clean; clippy
   `-p graphrefly-core --all-targets` 0; fmt clean;
   `#![forbid(unsafe_code)]` preserved; zero new `unsafe`.
-- **B-2 — NOT STARTED (multi-session heavy lift).** Partition
-  `CoreState` → `CoreShared` (id counters, `binding`,
-  `topology_sinks`, `currently_firing` [cross-shard-visible /qa
-  F2/D214], caps) + per-`Option<SerializationGroupId>` `ShardState`
-  (`nodes`/`children`; `None` = `DEFAULT_SHARD` = the ≈515 ns floor
-  shard). Reshape `StateCell` to hold shard-map + shared; migrate the
-  ~104 `lock_state()` sites onto `with_shard(group_of(node))`;
-  `begin_batch_for(seed)` locks the seed's shard + cross-shard-touched
-  in ascending key order (replaces the ReentrantMutex-on-top +
-  `global_wave`). Deliberately deferred to a fresh context budget —
-  a rushed 104-site struct-split is the unmeasured-big-move failure
-  mode the §7/D217 arc proved costly (D220).
+- **B-2 Step 1 — LANDED + GREEN (2026-05-16).** `CoreShared`
+  sub-struct extraction: the 9 Core-global non-shard fields
+  (`next_node_id`/`next_subscription_id`/`next_lock_id`/
+  `next_topology_id`, `topology_sinks`, `currently_firing`
+  [cross-shard-visible /qa F2/D214], `pause_buffer_cap`,
+  `max_batch_drain_iterations`, `pending_scratch_release`) grouped
+  out of `CoreState` into `pub(crate) struct CoreShared` +
+  `pub(crate) shared: CoreShared`. **Behaviour-identical** — SAME
+  single cell/lock, `s.shared.<f>` ≡ the old `s.<f>`; `binding`
+  intentionally stays on `CoreState` (Step-1 9-field set per
+  D220-EXEC). Fixed ctor (`new_with_cell`), `Drop for CoreState`,
+  and all 23 mechanical access sites (batch.rs ×5, topology.rs ×5,
+  node.rs ×13). Gate: `scripts/gate.sh` (full) — rustfmt ✓, clippy
+  default-members --all-targets ✓, `cargo nextest run --profile ci`
+  **825/825 passed, 0 skipped** (incl. cascade_depth); zero new
+  `unsafe`, `#![forbid(unsafe_code)]` preserved. Note: the
+  multi-hour test-execution ordeal was a self-inflicted
+  overlapping-cargo / broad-`pkill` thrash (now fixed via the
+  landed `scripts/gate.sh` sanctioned runner); the change itself
+  is a clean mechanical re-nest. Set up B-2 Step 2 (the
+  `StateCell` shard reshape) against this stable seam.
+- **B-2 Step 2 — NOT STARTED (the multi-session heavy lift).**
+  Hoist `CoreShared` to its own single lock; reshape `StateCell` to
+  `with_shared(|sh|…)` + `with_shard(key,|s|…)` (closure-form,
+  B3-overlay shape), per-`Option<SerializationGroupId>` shard
+  (`None`=`DEFAULT_SHARD`=≈515 ns floor) as
+  `Arc<parking_lot::Mutex<CoreState>>` + `lock_arc` owned guard
+  (`SingleThreadCell` stays one `RefCell`); migrate the ~104
+  `lock_state()` sites onto `with_shard(group_of(node))` /
+  `with_shared` / both (shard-OUTER, shared-INNER, held together);
+  `begin_batch_for(seed)` locks seed's shard + cross-shard-touched
+  ascending (replaces ReentrantMutex-on-top + `global_wave`).
 - **B-3 — NOT STARTED.** §7-B bounded cross-shard ordered-acquire
   guard + §7-C/§7-F vestigial union-find deletion.
 

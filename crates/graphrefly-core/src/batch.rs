@@ -710,7 +710,7 @@ impl<C: crate::state_cell::StateCell> FiringGuard<C> {
         // Push under the state lock scope.
         {
             let mut s = core.lock_state();
-            s.currently_firing.push(node_id);
+            s.shared.currently_firing.push(node_id);
         }
         Self {
             core: core.clone(),
@@ -728,8 +728,13 @@ impl<C: crate::state_cell::StateCell> Drop for FiringGuard<C> {
             // Pop the right-most matching node_id (membership semantics —
             // not strict LIFO). If absent, an external rebalance already
             // popped — silent no-op (panic-in-Drop is poison).
-            if let Some(pos) = s.currently_firing.iter().rposition(|n| *n == self.node_id) {
-                s.currently_firing.swap_remove(pos);
+            if let Some(pos) = s
+                .shared
+                .currently_firing
+                .iter()
+                .rposition(|n| *n == self.node_id)
+            {
+                s.shared.currently_firing.swap_remove(pos);
             }
         }
     }
@@ -950,7 +955,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             // via fire_regular / fire_operator).
             let (next, cap, pending_size) = {
                 let s = self.lock_state();
-                let cap = s.max_batch_drain_iterations;
+                let cap = s.shared.max_batch_drain_iterations;
                 let (next, pending_size) = with_wave_state(|ws| {
                     if ws.pending_fires.is_empty() {
                         return (None, 0);
@@ -2819,7 +2824,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         }
 
         let buffered_tier = matches!(msg.tier(), 3 | 4);
-        let cap = s.pause_buffer_cap;
+        let cap = s.shared.pause_buffer_cap;
 
         // Pause-routing branch — handles its own retain/release and returns
         // before we touch `pending_notify`, so the rec borrow is contained.

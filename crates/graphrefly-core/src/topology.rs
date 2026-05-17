@@ -34,7 +34,7 @@ pub type TopologySink = Arc<dyn Fn(&TopologyEvent) + Send + Sync>;
 /// RAII handle for a topology subscription. Dropping it unregisters the sink.
 #[must_use = "TopologySubscription holds the subscription; dropping it unregisters the sink"]
 pub struct TopologySubscription<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    /// Index into `CoreState.topology_sinks`. We use a generational
+    /// Index into `CoreShared.topology_sinks`. We use a generational
     /// approach: each subscription gets a unique id; unsubscribe
     /// marks the slot as `None`.
     id: u64,
@@ -46,7 +46,7 @@ impl<C: crate::state_cell::StateCell> Drop for TopologySubscription<C> {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
             let mut s = state.lock();
-            s.topology_sinks.remove(&self.id);
+            s.shared.topology_sinks.remove(&self.id);
         }
     }
 }
@@ -85,9 +85,9 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     ///   set) returns without firing.
     pub fn subscribe_topology(&self, sink: TopologySink) -> TopologySubscription<C> {
         let mut s = self.lock_state();
-        let id = s.next_topology_id;
-        s.next_topology_id += 1;
-        s.topology_sinks.insert(id, sink);
+        let id = s.shared.next_topology_id;
+        s.shared.next_topology_id += 1;
+        s.shared.topology_sinks.insert(id, sink);
         TopologySubscription {
             id,
             state: Arc::downgrade(&self.state),
@@ -100,7 +100,7 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     pub(crate) fn fire_topology_event(&self, event: &TopologyEvent) {
         let sinks: Vec<TopologySink> = {
             let s = self.state.lock();
-            s.topology_sinks.values().cloned().collect()
+            s.shared.topology_sinks.values().cloned().collect()
         };
         for sink in sinks {
             sink(event);
