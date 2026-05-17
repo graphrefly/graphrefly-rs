@@ -576,6 +576,11 @@ impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
         // those subs eventually drop. Either path fires exactly one
         // wipe per terminal lifecycle.
         let (was_last_sub, is_producer, has_user_cleanup, fire_wipe, binding) = {
+            // Step 2b-ii-B: route to the node's shard (this drop runs
+            // OUTSIDE any wave ⇒ ambient `None`; a grouped node's
+            // record is in shard `g`, so without this the unsubscribe
+            // would no-op on `DEFAULT_SHARD` → lost cleanup / leak).
+            let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, self.node_id));
             let mut s = St::new(&*state);
             let Some(rec) = s.nodes.get_mut(&self.node_id) else {
                 return;
@@ -698,6 +703,11 @@ impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
                     Vec<HandleId>,
                     Option<Box<dyn crate::op_state::OperatorScratch>>,
                 ) = {
+                    // Step 2b-ii-B: route to the node's shard (drop
+                    // runs outside any wave; grouped node's record is
+                    // in shard `g` — without this the scratch/refcount
+                    // cleanup would no-op on `DEFAULT_SHARD`).
+                    let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, self.node_id));
                     let mut s = St::new(&*state);
                     if let Some(rec) = s.nodes.get_mut(&self.node_id) {
                         // F1 re-entrance check.
@@ -1605,6 +1615,35 @@ pub struct CoreShared {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
+    /// **Node → shard routing index (Slice B-2 Step 2b-ii, D220-EXEC).**
+    /// `Some(g)` entries only — a node absent here is `ShardKey::None`
+    /// (`DEFAULT_SHARD`). Single source of truth for which shard a
+    /// node's `CoreState` record lives in, so `group_of(n)` /
+    /// `partition_of(n)` is a pure-`CoreShared` lookup with **no shard
+    /// lock** — resolving the chicken-egg (a grouped node's record is
+    /// NOT in `DEFAULT_SHARD`, so you can't read its group from a
+    /// `lock_state()` that defaulted to `DEFAULT_SHARD`). Maintained by
+    /// register-with-group + `set_serialization_group`'s cross-shard
+    /// component migration; mirrors each shard's
+    /// `NodeRecord::serialization_group`. Empty for an all-`None`
+    /// graph ⇒ behaviour-identical floor.
+    pub(crate) node_group: HashMap<NodeId, crate::handle::SerializationGroupId>,
+    /// **Node → PLACEMENT shard index (Slice B-2 Step 2b-ii, D220-EXEC).**
+    /// Distinct from `node_group`: the §7 invariant is "all-`None` OR
+    /// all-`Some`", NOT "all-same-group" — a dep-connected component
+    /// MAY span distinct `Some` groups (e.g. `s:G1 ← d:G2`). So a
+    /// node's *declared group* (`node_group` → `partition_of` + the
+    /// wave-lock set) is decoupled from the *shard its record lives
+    /// in*: the shard is **component-uniform** (a node joins its
+    /// deps' shard) so a single wave never crosses shards (the
+    /// ambient-single-shard model stays sound). `Some(g)` only;
+    /// absent ⇒ `DEFAULT_SHARD`. For the parallelism path
+    /// (`set_serialization_group` homogenises a whole component to one
+    /// group) shard == group ⇒ disjoint groups = disjoint shards =
+    /// parallel. Only register-with-distinct-`Some`-deps creates a
+    /// multi-group component → all its records share ONE shard
+    /// (correct, not internally parallel — a rare non-perf case).
+    pub(crate) node_shard: HashMap<NodeId, crate::handle::SerializationGroupId>,
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -2003,6 +2042,68 @@ pub(crate) struct St<'a, C: crate::state_cell::StateCell> {
     pub(crate) shared: <C as crate::state_cell::StateCell>::SharedGuard<'a>,
 }
 
+thread_local! {
+    /// **Ambient wave shard key (Slice B-2 Step 2b-ii, D220-EXEC).**
+    /// `St::new`/`lock_state` lock THIS shard (default `None` =
+    /// `DEFAULT_SHARD`). `begin_batch`/`begin_batch_for` set it for
+    /// the wave's duration from the seed's group (RAII-restored on
+    /// `BatchGuard` drop); single-node entry points that touch a
+    /// grouped node set it from the node's `node_group` index entry.
+    ///
+    /// **Soundness:** the §7 component-homogeneity invariant (enforced
+    /// at register / set_deps / set_serialization_group: a
+    /// dep-connected component is uniformly all-`None` or all-one-group)
+    /// guarantees one wave touches exactly ONE group ⇒ one shard key
+    /// for every `lock_state()` in that wave. Per-thread because waves
+    /// are per-thread; nested same-thread re-entry saves/restores via
+    /// [`ShardKeyGuard`]. Empty index / all-`None` ⇒ always `None` ⇒
+    /// behaviour-identical floor.
+    static CURRENT_SHARD_KEY: std::cell::Cell<crate::state_cell::ShardKey> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Read the calling thread's ambient wave shard key.
+#[inline]
+pub(crate) fn current_shard_key() -> crate::state_cell::ShardKey {
+    CURRENT_SHARD_KEY.with(std::cell::Cell::get)
+}
+
+/// Resolve `node`'s shard key from the `CoreShared.node_group` index
+/// given only the cell (Step 2b-ii-B). Used by the `Weak<C>`-upgrade
+/// drop paths (`Subscription::Drop`), which hold `&C` + a `node_id`
+/// but run OUTSIDE any wave (ambient `None`): a grouped node's record
+/// is in shard `g`, so they MUST set the ambient from this before
+/// `St::new` or the unsubscribe/teardown would no-op on `DEFAULT_SHARD`
+/// (lost cleanup / refcount leak). Pure shared lock, no shard lock.
+#[inline]
+pub(crate) fn shard_key_for_node<C: crate::state_cell::StateCell>(
+    cell: &C,
+    node: NodeId,
+) -> crate::state_cell::ShardKey {
+    cell.lock_shared().node_shard.get(&node).copied()
+}
+
+/// RAII: set the ambient wave shard key, restore the previous on drop
+/// (supports nested same-thread re-entry — the inner wave restores the
+/// outer's key). Held in [`crate::batch::BatchGuard`] for the wave.
+#[must_use = "the guard restores the previous shard key on drop"]
+pub(crate) struct ShardKeyGuard(crate::state_cell::ShardKey);
+
+impl ShardKeyGuard {
+    #[inline]
+    pub(crate) fn set(key: crate::state_cell::ShardKey) -> Self {
+        let prev = CURRENT_SHARD_KEY.with(|c| c.replace(key));
+        Self(prev)
+    }
+}
+
+impl Drop for ShardKeyGuard {
+    #[inline]
+    fn drop(&mut self) {
+        CURRENT_SHARD_KEY.with(|c| c.set(self.0));
+    }
+}
+
 impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
     /// Acquire the combined guard from a cell: `DEFAULT_SHARD`
     /// (`key=None`, Step 2a's only shard) OUTER, then `CoreShared`
@@ -2010,7 +2111,12 @@ impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
     /// drop paths (which hold `&C`, not `&Core`).
     #[inline]
     pub(crate) fn new(cell: &'a C) -> Self {
-        let shard = cell.lock_shard(None);
+        // Step 2b-ii: route to the calling thread's ambient wave shard
+        // (set by `begin_batch*` from the seed's group, or by a
+        // single-node entry point from the node's `node_group` index).
+        // `None` (default / all-`None` / outside a wave) = DEFAULT_SHARD
+        // ⇒ behaviour-identical floor. Shard OUTER, shared INNER.
+        let shard = cell.lock_shard(current_shard_key());
         let shared = cell.lock_shared();
         Self { shard, shared }
     }
@@ -2087,6 +2193,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
                     max_batch_drain_iterations: 10_000,
                     topology_sinks: HashMap::new(),
                     next_topology_id: 1,
+                    node_group: HashMap::new(),
+                    node_shard: HashMap::new(),
                     pending_scratch_release: Vec::new(),
                     binding: binding.clone(),
                 },
@@ -2236,10 +2344,45 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// distinguished via [`Self::kind_of`] if needed).
     #[must_use]
     pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
-        self.lock_state()
-            .nodes
-            .get(&node)
-            .and_then(|r| r.serialization_group)
+        // Step 2b-ii-B: the `CoreShared.node_group` index is the
+        // authority (a grouped node's record is in shard `g`, NOT
+        // `DEFAULT_SHARD`, so the old `lock_state().nodes.get` —
+        // which defaults to `DEFAULT_SHARD` — would no longer find
+        // it). Pure-`with_shared` lookup, no shard lock. Unregistered
+        // & registered-ungrouped both → absent → `None` (unchanged
+        // observable contract).
+        self.group_of(node)
+    }
+
+    /// The shard a node's `CoreState` record lives in — a pure
+    /// [`CoreShared`] index lookup (NO shard lock). This is the
+    /// chicken-egg break (Step 2b-ii, D220-EXEC): a grouped node's
+    /// record is in shard `g`, NOT `DEFAULT_SHARD`, so its group
+    /// cannot be read from a `lock_state()` that defaulted to
+    /// `DEFAULT_SHARD`. The `node_group` index (maintained by
+    /// register-with-group + `set_serialization_group`) is the
+    /// authority; a node absent from it is `ShardKey::None`
+    /// (ungrouped/unregistered — both report `None`, matching the
+    /// pre-2b `nodes.get(&n).and_then(serialization_group)` contract:
+    /// unregistered → not in index → `None`; registered ungrouped →
+    /// not in index → `None`; registered grouped → index → `Some(g)`).
+    #[must_use]
+    pub(crate) fn group_of(&self, node: NodeId) -> crate::state_cell::ShardKey {
+        self.with_shared(|sh| sh.node_group.get(&node).copied())
+    }
+
+    /// The **placement shard** a node's `CoreState` record lives in
+    /// (Step 2b-ii-B) — distinct from [`Self::group_of`] (the declared
+    /// group, for `partition_of` + the wave-lock set). Component-
+    /// uniform: a node joins its deps' shard, so a wave never crosses
+    /// shards (the ambient-single-shard model stays sound even for a
+    /// multi-group component). Drives ALL `lock_state`/`St` routing
+    /// (the `ShardKeyGuard::set` sites + `begin_batch_for` ambient +
+    /// the `Weak`-drop paths). Pure `with_shared` index lookup, no
+    /// shard lock. Single-group component ⇒ `shard_of == group_of`.
+    #[must_use]
+    pub(crate) fn shard_of(&self, node: NodeId) -> crate::state_cell::ShardKey {
+        self.with_shared(|sh| sh.node_shard.get(&node).copied())
     }
 
     /// Execute a producer-pattern op. §7: the union-find ascending-order
@@ -2648,6 +2791,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node_id: NodeId,
         mode: PausableMode,
     ) -> Result<(), SetPausableModeError> {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s
             .nodes
@@ -2717,6 +2861,9 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// - [`UpError::UnknownNode`] — `node_id` is not registered.
     /// - [`UpError::TierForbidden`] — tier 3 or tier 5.
     pub fn up(&self, node_id: NodeId, message: Message) -> Result<(), UpError> {
+        // 2b-ii-B (D220-EXEC): route to the node's shard before the
+        // pre-wave/cold `lock_state()` (see `try_emit`).
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         // QA A10 (2026-05-07): check unknown node BEFORE tier rejection
         // for consistent error UX — `up(unknown, Data)` and
         // `up(unknown, Pause)` both report `UnknownNode` rather than
@@ -2892,6 +3039,31 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // first on any return path.
         let scratch_guard = ScratchReleaseGuard::new(scratch, &*self.binding);
 
+        // Step 2b-ii-B (D220-EXEC): §7 invariant is "all-`None` OR
+        // all-`Some`" (NOT all-same-group — a component MAY span
+        // distinct `Some` groups). (1) Shard-agnostic None/Some-mix
+        // rejection via the `node_group` index (a grouped dep lives in
+        // its own shard, so the post-insert same-shard walk can't see
+        // it — it'd misreport `UnknownDep`; the index is the
+        // cross-shard authority for the *declared group*). (2)
+        // Placement shard is **component-uniform**: a node joins its
+        // deps' shard (so a wave never crosses shards), keyed by
+        // `shard_of`, NOT its own declared group. No deps ⇒ its own
+        // group's shard. (Merging two *distinct grouped multi-node
+        // components* via shared deps would need a union-find-style
+        // shard migration — out of the tested surface; the §7-B
+        // cross-shard residual, D220-EXEC-deferred.)
+        for &dep in &deps {
+            if serialization_group.is_none() != self.group_of(dep).is_none() {
+                return Err(RegisterError::GroupInconsistent);
+            }
+        }
+        let placement: crate::state_cell::ShardKey = match deps.first() {
+            Some(&d0) => self.shard_of(d0),
+            None => serialization_group,
+        };
+        let _shard_key_guard = crate::node::ShardKeyGuard::set(placement);
+
         // Phase 3 — state-lock-required validation, FOLDED with insertion
         // under a single `lock_state()` acquisition per /qa F1. The
         // pre-/qa version split this into two acquisitions (one for
@@ -2983,6 +3155,18 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         for &dep in &deps {
             s.children.entry(dep).or_default().insert(id);
         }
+        // Step 2b-ii-B: maintain BOTH `CoreShared` indices —
+        // `node_group` = declared group (drives `partition_of` + the
+        // wave-lock set), `node_shard` = component-uniform PLACEMENT
+        // (drives all `lock_state`/`St` routing). Single-group
+        // component ⇒ both == `g` ⇒ disjoint groups = disjoint shards
+        // = parallel. Absent ⇒ `None` ⇒ `DEFAULT_SHARD`.
+        if let Some(g) = serialization_group {
+            s.shared.node_group.insert(id, g);
+        }
+        if let Some(p) = placement {
+            s.shared.node_shard.insert(id, p);
+        }
         // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
         // membership BEFORE dropping the state lock. Closes the
         // eventual-consistency window where a concurrent thread observed
@@ -3008,9 +3192,15 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // (`component_is_group_consistent`, deps + children + meta) decides
         // it. Topology-mutation time only — never the hot path.
         if !component_is_group_consistent(&s, id) {
-            // Roll back the partial insert before returning.
+            // Roll back the partial insert before returning — incl.
+            // BOTH 2b-ii-B indices (else a stale `node_group`/
+            // `node_shard` entry mis-routes a future re-used… NodeIds
+            // are monotonic so no reuse, but leaving the entries would
+            // still leak + wrongly report `partition_of`).
             s.nodes.remove(&id);
             s.children.remove(&id);
+            s.shared.node_group.remove(&id);
+            s.shared.node_shard.remove(&id);
             for &dep in &deps {
                 if let Some(c) = s.children.get_mut(&dep) {
                     c.remove(&id);
@@ -3363,6 +3553,17 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // the single-threaded floor. Same-thread re-entry passes through
         // each group's `ReentrantMutex`. Infallible: groups are static +
         // acquired sorted upfront, so there is no order violation.
+        // Step 2b-ii-B (D220-EXEC): `try_subscribe` drives its own
+        // subscribe wave WITHOUT going through `begin_batch_for`, so it
+        // must set the ambient shard key itself (a grouped node's
+        // record is in shard `g`, not `DEFAULT_SHARD` — without this
+        // the `lock_state()` below + the step-4 activation would
+        // operate on the wrong shard and the sink would never see the
+        // node). Held for the whole `try_subscribe` scope; the nested
+        // step-4 `run_wave_for(node_id)` re-derives the same key
+        // (`group_of(node_id)`) so the nested set is a no-op restore.
+        // `None`/all-`None` ⇒ `DEFAULT_SHARD` ⇒ behaviour-identical.
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let wave_guards = self.acquire_touched_group_guards(node_id);
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
@@ -3595,6 +3796,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// behavior; changing it after the fact would change semantics for
     /// existing sinks).
     pub fn set_resubscribable(&self, node_id: NodeId, resubscribable: bool) {
+        // 2b-ii-B (D220-EXEC): route to the node's shard (see `try_emit`).
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s.require_node_mut(node_id);
         assert!(
@@ -3878,6 +4081,15 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node_id: NodeId,
         new_handle: HandleId,
     ) -> Result<(), PartitionOrderViolation> {
+        // Step 2b-ii-B (D220-EXEC): route this whole entry point to the
+        // node's shard. Single-node public entry points do a pre-wave
+        // `lock_state().require_node(node)` BEFORE `try_run_wave_for`
+        // sets the ambient — a grouped node's record is in shard `g`,
+        // not `DEFAULT_SHARD`, so without this the validation panics
+        // `unknown node`. Held for the whole fn; the nested
+        // `try_run_wave_for(node_id)` re-derives the same key
+        // (no-op restore). `None`/all-`None` ⇒ behaviour-identical.
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         assert!(
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
@@ -3945,6 +4157,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Read a node's current cache. Returns [`NO_HANDLE`] if sentinel.
     #[must_use]
     pub fn cache_of(&self, node_id: NodeId) -> HandleId {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().require_node(node_id).cache
     }
 
@@ -3952,6 +4165,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// a non-sentinel value (state).
     #[must_use]
     pub fn has_fired_once(&self, node_id: NodeId) -> bool {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().require_node(node_id).has_fired_once
     }
 
@@ -3988,6 +4202,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// **derived** from the field shape per D030 — see [`NodeKind`].
     #[must_use]
     pub fn kind_of(&self, node_id: NodeId) -> Option<NodeKind> {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().nodes.get(&node_id).map(NodeRecord::kind)
     }
 
@@ -3995,6 +4210,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// unknown nodes or for state nodes (which have no deps).
     #[must_use]
     pub fn deps_of(&self, node_id: NodeId) -> Vec<NodeId> {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .nodes
             .get(&node_id)
@@ -4079,6 +4295,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown.
     pub fn complete(&self, node_id: NodeId) {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_complete(node_id) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4114,6 +4331,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown or `error_handle == NO_HANDLE`.
     pub fn error(&self, node_id: NodeId, error_handle: HandleId) {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_error(node_id, error_handle) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4370,6 +4588,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown.
     pub fn teardown(&self, node_id: NodeId) {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4382,6 +4601,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     where
         C: Send + Sync,
     {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(_) => {
@@ -4533,6 +4753,11 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// differently-grouped companion is a wiring error, like a cycle.
     pub fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
         assert!(parent != companion, "node cannot be its own meta companion");
+        // 2b-ii-B (D220-EXEC): the meta edge joins `companion` into
+        // `parent`'s component ⇒ same group ⇒ same shard (the
+        // component-consistency check below rejects a mix). Route by
+        // `parent`'s shard (see `try_emit`).
+        let _skg = ShardKeyGuard::set(self.shard_of(parent));
         let mut s = self.lock_state();
         assert!(s.nodes.contains_key(&parent), "unknown parent {parent:?}");
         assert!(
@@ -4598,6 +4823,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown, consistent with `emit` / `pause`.
     pub fn invalidate(&self, node_id: NodeId) {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -4620,6 +4846,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     where
         C: Send + Sync,
     {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -4769,6 +4996,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Re-acquiring the same `lock_id` is an idempotent no-op (matches TS
     /// convention, R1.2.6 silent on the case).
     pub fn pause(&self, node_id: NodeId, lock_id: LockId) -> Result<(), PauseError> {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s
             .nodes
@@ -4808,6 +5036,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node_id: NodeId,
         lock_id: LockId,
     ) -> Result<Option<ResumeReport>, PauseError> {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         // Phase 1 (lock-held): collect drained buffer + pending-wave flag +
         // sink Arcs. For default-mode nodes whose `pending_wave` was set
         // during pause, schedule a single fn-fire by adding to
@@ -4891,6 +5120,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// True if the node currently holds at least one pause lock.
     #[must_use]
     pub fn is_paused(&self, node_id: NodeId) -> bool {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -4900,6 +5130,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Number of pause locks currently held on `node_id`. `0` if Active.
     #[must_use]
     pub fn pause_lock_count(&self, node_id: NodeId) -> usize {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -4909,6 +5140,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Test helper: whether `node_id` currently holds the given `lock_id`.
     #[must_use]
     pub fn holds_pause_lock(&self, node_id: NodeId, lock_id: LockId) -> bool {
+        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -5101,16 +5333,85 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node: NodeId,
         group: Option<crate::handle::SerializationGroupId>,
     ) -> Result<(), SetGroupError> {
-        let mut s = self.lock_state();
-        if !s.nodes.contains_key(&node) {
-            return Err(SetGroupError::UnknownNode(node));
+        // Step 2b-ii-B (D220-EXEC): the component currently lives in
+        // its CURRENT group's shard (`g_old`); reassigning to `group`
+        // (`g_new`) MOVES every component member's `NodeRecord` +
+        // children-adjacency from shard `g_old` to shard `g_new` and
+        // updates the `CoreShared.node_group` routing index. Topology-
+        // mutation call only (serialized; not concurrent with a wave
+        // on this component — Groups are static, no node re-fires).
+        // Sequential extract→reinsert (g_old guard fully dropped before
+        // g_new is locked) ⇒ never holds two shard guards ⇒ no ABBA.
+        // Step 2b-ii-B: a node's record lives in its PLACEMENT shard
+        // (`shard_of`) — for a multi-group component that is NOT its
+        // declared group. Extract the whole component from its current
+        // placement shard, homogenise it to `group` (every member's
+        // declared group AND placement ⇒ `group`), reinsert into shard
+        // `group`. After this the component is single-group ⇒ shard ==
+        // group ⇒ disjoint groups run parallel (the `group_scaling` /
+        // `set_serialization_group` parallelism path). ALWAYS migrate
+        // (even same shard) — eliminates the idempotent /
+        // multi-group-index-skew edge. Topology-mutation op, serialized
+        // (not concurrent with a wave on this component). Sequential
+        // extract→reinsert (src guard dropped before dst locked) ⇒
+        // never two shard guards ⇒ no ABBA.
+        let src = self.shard_of(node);
+
+        let moved: Vec<(NodeId, NodeRecord)>;
+        let moved_kids: Vec<(NodeId, HashSet<NodeId>)>;
+        {
+            let _src_guard = crate::node::ShardKeyGuard::set(src);
+            let mut s = self.lock_state();
+            if !s.nodes.contains_key(&node) {
+                return Err(SetGroupError::UnknownNode(node));
+            }
+            let component = walk_undirected_dep_graph(&s, node, None, &[]);
+            let mut recs = Vec::with_capacity(component.len());
+            let mut kids = Vec::with_capacity(component.len());
+            for m in &component {
+                if let Some(mut rec) = s.nodes.remove(m) {
+                    rec.serialization_group = group;
+                    recs.push((*m, rec));
+                }
+                if let Some(cs) = s.children.remove(m) {
+                    kids.push((*m, cs));
+                }
+            }
+            moved = recs;
+            moved_kids = kids;
         }
-        // Assign `group` to every member of the unified (deps + children
-        // + meta) component — consistent by construction.
-        let component = walk_undirected_dep_graph(&s, node, None, &[]);
-        for m in component {
-            if let Some(rec) = s.nodes.get_mut(&m) {
-                rec.serialization_group = group;
+
+        // Phase 2: homogenise BOTH `CoreShared` indices for every
+        // component member — `node_group` (declared) AND `node_shard`
+        // (placement) both ⇒ `group` (or absent for `None`).
+        // Single-writer topology op ⇒ no reader races the move.
+        self.with_shared(|sh| {
+            for (m, _) in &moved {
+                match group {
+                    Some(g) => {
+                        sh.node_group.insert(*m, g);
+                        sh.node_shard.insert(*m, g);
+                    }
+                    None => {
+                        sh.node_group.remove(m);
+                        sh.node_shard.remove(m);
+                    }
+                }
+            }
+        });
+
+        // Phase 3 (shard `group` = the new uniform placement):
+        // reinsert records + children-adjacency. The dep-connected
+        // component is closed, so every member's children-set
+        // references only members — wholesale move is self-contained.
+        {
+            let _dst_guard = crate::node::ShardKeyGuard::set(group);
+            let mut s = self.lock_state();
+            for (m, rec) in moved {
+                s.nodes.insert(m, rec);
+            }
+            for (m, cs) in moved_kids {
+                s.children.insert(m, cs);
             }
         }
         Ok(())
@@ -5140,6 +5441,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// locality is what makes the F1 refcount-leak collection work.
     #[allow(clippy::too_many_lines)]
     pub fn set_deps(&self, n: NodeId, new_deps: &[NodeId]) -> Result<(), SetDepsError> {
+        // 2b-ii-B (D220-EXEC): route to the node's shard; the new deps
+        // are in the same component ⇒ same group ⇒ same shard (the
+        // component-consistency check enforces). See `try_emit`.
+        let _skg = ShardKeyGuard::set(self.shard_of(n));
         let mut s = self.lock_state();
         // Validate node exists and is compute. Read-once via the helper so
         // subsequent code can use `require_node(n)` without re-checking.
@@ -5181,6 +5486,33 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         if new_deps.contains(&n) {
             return Err(SetDepsError::SelfDependency { n });
         }
+        // Step 2b-ii-B (D220-EXEC): §7 None/Some-mix rejection, BEFORE
+        // the new-dep existence loop below. A grouped new-dep lives in
+        // ITS shard, not `n`'s, so `s.nodes.contains_key(dep)` (n's
+        // shard) would miss it and wrongly report `UnknownNode(dep)`
+        // instead of `GroupInconsistent` (the dep DOES exist — it's a
+        // mix, not unknown). Read the declared-group class from the
+        // shard-agnostic `CoreShared.node_group` index via the
+        // already-held `s.shared` guard (NO re-lock; `contains_key` ⇔
+        // `Some`). Endpoint check `{n} ∪ new_deps`; early return ⇒
+        // topology unchanged on reject. Precedence:
+        // Reentrant > SelfDependency > GroupInconsistent > UnknownDep
+        // > Cycle (all-`None` ⇒ no entries ⇒ falls through unchanged).
+        {
+            let node_some = s.shared.node_group.contains_key(&n);
+            let mut saw_some = node_some;
+            let mut saw_none = !node_some;
+            for &d in new_deps {
+                if s.shared.node_group.contains_key(&d) {
+                    saw_some = true;
+                } else {
+                    saw_none = true;
+                }
+            }
+            if saw_some && saw_none {
+                return Err(SetDepsError::GroupInconsistent { n });
+            }
+        }
         // Validate all new deps exist.
         for &d in new_deps {
             if !s.nodes.contains_key(&d) {
@@ -5221,43 +5553,14 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
         // §7 strict serialization-group consistency (D208–D211; QA F2 /
-        // point-3, 2026-05-16). Replaces the deleted union-find P13
-        // partition-migration rejection. Groups are static + user-declared,
-        // so set_deps can NEVER migrate a node's group; the only concern is
-        // that the rewired adjacency merges `n` with deps of a different
-        // consistency class. The mutation is applied LATER in this atomic
-        // (TLA+-verified) transaction, so the unified
-        // `component_is_group_consistent` walk would see stale adjacency
-        // here; instead the inductive endpoint check `{n} ∪ new_deps` is
-        // used. **Soundness:** every component is internally consistent —
-        // including its meta edges — because `register` /
-        // `add_meta_companion` / `set_serialization_group` ALL now enforce
-        // the unified deps+children+meta guard. Merging internally-consistent
-        // components is consistent iff their representative values agree,
-        // i.e. `{n} ∪ new_deps` is not mixed. Topology-mutation time only.
-        {
-            let node_some = s
-                .nodes
-                .get(&n)
-                .and_then(|r| r.serialization_group)
-                .is_some();
-            let mut saw_some = node_some;
-            let mut saw_none = !node_some;
-            for &dep in &new_deps_set {
-                if s.nodes
-                    .get(&dep)
-                    .and_then(|r| r.serialization_group)
-                    .is_some()
-                {
-                    saw_some = true;
-                } else {
-                    saw_none = true;
-                }
-            }
-            if saw_some && saw_none {
-                return Err(SetDepsError::GroupInconsistent { n });
-            }
-        }
+        // point-3): the `{n} ∪ new_deps` None/Some-mix endpoint check
+        // is HOISTED above (Step 2b-ii-B) — before the new-dep
+        // existence loop, so a grouped cross-shard dep yields
+        // `GroupInconsistent` (it exists, in its own shard) rather than
+        // `UnknownNode`. Soundness unchanged: every component is
+        // internally consistent (register / add_meta_companion /
+        // set_serialization_group enforce the unified guard), so
+        // merging is consistent iff `{n} ∪ new_deps` is not mixed.
         // Idempotent fast-path. Now safe to short-circuit since the P13
         // check above already considered both `added` and `removed`.
         if added.is_empty() && removed.is_empty() {

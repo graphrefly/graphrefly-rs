@@ -3304,7 +3304,14 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // retries. For an all-`None` graph this acquires nothing (the
         // single-threaded floor).
         let wave_guards = self.acquire_all_group_guards();
-        self.begin_batch_with_guards(wave_guards)
+        // Closure-form has no single seed → ambient `None`
+        // (`DEFAULT_SHARD`). The real per-emit waves nested inside are
+        // seeded (via `run_wave_for`/`begin_batch_for`) and set their
+        // own group-routed ambient; this umbrella's own `lock_state`
+        // usage is coalescing setup on the default shard. All-`None`
+        // ⇒ behaviour-identical (Step 2b-ii, D220-EXEC).
+        let shard_key_guard = crate::node::ShardKeyGuard::set(None);
+        self.begin_batch_with_guards(wave_guards, shard_key_guard)
     }
 
     /// Begin a batch scoped to the partitions transitively touched from
@@ -3359,8 +3366,16 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         &self,
         seed: crate::handle::NodeId,
     ) -> Result<BatchGuard<C>, crate::node::PartitionOrderViolation> {
+        // Step 2b-ii (D220-EXEC): route the entire wave to the seed's
+        // shard. Set the ambient BEFORE `acquire_touched_group_guards`
+        // — it calls `compute_touched_groups(seed)` → `lock_state()`,
+        // which must lock the seed's shard to find the (group-
+        // homogeneous) component. §7 component-homogeneity ⇒ one
+        // group ⇒ one shard key for every `lock_state` in this wave.
+        // Empty index / all-`None` ⇒ `None` ⇒ behaviour-identical.
+        let shard_key_guard = crate::node::ShardKeyGuard::set(self.shard_of(seed));
         let wave_guards = self.acquire_touched_group_guards(seed);
-        Ok(self.begin_batch_with_guards(wave_guards))
+        Ok(self.begin_batch_with_guards(wave_guards, shard_key_guard))
     }
 
     /// Is this thread currently inside an owning wave on this Core?
@@ -3408,6 +3423,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     fn begin_batch_with_guards(
         &self,
         wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
+        shard_key_guard: crate::node::ShardKeyGuard,
     ) -> BatchGuard<C> {
         // Claim wave ownership for this (Core, thread). Keyed per-(Core,
         // thread) in the `IN_TICK_OWNED` thread_local (see its doc for
@@ -3438,6 +3454,13 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             core: self.clone(),
             owns_tick,
             wave_guards,
+            // Held for the wave's duration; restores the previous
+            // ambient shard key on drop. Declared AFTER `wave_guards`
+            // and dropped only after `BatchGuard::drop`'s explicit
+            // drain body (which uses `lock_state` and must still route
+            // to the wave's shard), so the ambient stays valid through
+            // the entire drain/flush/sink-fire (Step 2b-ii, D220-EXEC).
+            shard_key_guard,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -3516,6 +3539,20 @@ pub struct BatchGuard<C: crate::state_cell::StateCell = crate::state_cell::Locke
     /// across threads would violate `parking_lot::ReentrantMutex`'s
     /// thread-ownership invariant.
     wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
+    /// Ambient wave shard-key guard (Step 2b-ii, D220-EXEC). Set from
+    /// the seed's group (`begin_batch_for`) or `None`
+    /// (`begin_batch`/all-`None`); every `lock_state()` in the wave
+    /// routes to this shard. Drops AFTER `BatchGuard::drop`'s explicit
+    /// drain body (field drop runs post-`drop()`), restoring the
+    /// previous ambient — so the drain/flush/sink-fire still routes
+    /// correctly, then nested/outer scope is restored.
+    ///
+    /// `#[allow(dead_code)]`: held **purely for its RAII `Drop`** (the
+    /// ambient-shard-key restore); never read by name — same pattern
+    /// as `wave_guards` / `_not_send`. Justified inline per the
+    /// Rust-port invariant.
+    #[allow(dead_code)]
+    shard_key_guard: crate::node::ShardKeyGuard,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
