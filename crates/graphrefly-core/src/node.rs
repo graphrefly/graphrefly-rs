@@ -576,7 +576,7 @@ impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
         // those subs eventually drop. Either path fires exactly one
         // wipe per terminal lifecycle.
         let (was_last_sub, is_producer, has_user_cleanup, fire_wipe, binding) = {
-            let mut s = state.lock();
+            let mut s = St::new(&*state);
             let Some(rec) = s.nodes.get_mut(&self.node_id) else {
                 return;
             };
@@ -698,7 +698,7 @@ impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
                     Vec<HandleId>,
                     Option<Box<dyn crate::op_state::OperatorScratch>>,
                 ) = {
-                    let mut s = state.lock();
+                    let mut s = St::new(&*state);
                     if let Some(rec) = s.nodes.get_mut(&self.node_id) {
                         // F1 re-entrance check.
                         if !rec.subscribers.is_empty() {
@@ -1594,7 +1594,11 @@ impl NodeRecord {
 /// then take only the shared guard (`with_shared`), shard ops the shard
 /// guard (`with_shard`), and when both are needed the deadlock-free
 /// rule is **shard guard OUTER, shared guard INNER** (D220-EXEC).
-pub(crate) struct CoreShared {
+// `pub` (not `pub(crate)`): appears in the public `StateCell` trait
+// surface (`from_parts` / `lock_shared`), same as `CoreState`. The
+// struct *name* is public but every field is `pub(crate)`, so it is an
+// opaque token outside the crate — no internal state is reachable.
+pub struct CoreShared {
     pub(crate) next_node_id: u64,
     pub(crate) next_subscription_id: u64,
     pub(crate) next_lock_id: u64,
@@ -1686,8 +1690,33 @@ pub(crate) struct CoreShared {
     /// on Core drop, so this is not a leak — just a deferred-release
     /// growth concern under unusual workloads.
     pub(crate) pending_scratch_release: Vec<Box<dyn crate::op_state::OperatorScratch>>,
+    /// Binding handle, held here so [`Drop for CoreShared`] can drain
+    /// `pending_scratch_release` on Core shutdown (Step 2a, D220-EXEC:
+    /// `CoreShared` is hoisted to its own region, separate from any
+    /// shard's `CoreState`, so the old `Drop for CoreState` scratch-drain
+    /// — which used `CoreState::binding` — moves here). Cheap `Arc`
+    /// clone; `Core` / each shard `CoreState` also hold one.
+    pub(crate) binding: Arc<dyn BindingBoundary>,
 }
 
+impl Drop for CoreShared {
+    fn drop(&mut self) {
+        // D-α (D028) catch-all drain of the deferred operator-scratch
+        // queue on Core shutdown (moved from `Drop for CoreState`'s tail
+        // with the `pending_scratch_release` + `binding` hoist). Release
+        // BEFORE the `Vec<Box<…>>` drops (each box's `Drop` is a plain
+        // field drop — HandleIds are raw u64s, no binding re-entry).
+        let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
+            std::mem::take(&mut self.pending_scratch_release);
+        for mut scratch in queued {
+            scratch.release_handles(&*self.binding);
+        }
+    }
+}
+
+/// Per-shard mutable Core state (Step 2a, D220-EXEC: still exactly ONE
+/// shard — behaviour-identical with the pre-B-2 single `CoreState`;
+/// Step 2b keys a per-[`crate::state_cell::ShardKey`] map of these).
 /// All mutable Core state, behind one [`parking_lot::Mutex`].
 ///
 /// **Architecture history.** Q2 (2026-05-09) split four wave-scoped
@@ -1721,15 +1750,6 @@ pub struct CoreState {
     pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     /// Inverted adjacency: `parent → children`. Updated on registration.
     pub(crate) children: HashMap<NodeId, HashSet<NodeId>>,
-    /// Core-global, NOT per-shard state (Slice B-2 Step 1, D220-EXEC):
-    /// id counters, the topology-sink registry, the cross-shard-visible
-    /// `currently_firing` reentrancy stack, the two Core-global caps,
-    /// and the shutdown scratch-release queue. Step 1 keeps this a
-    /// plain sub-struct under the SAME single lock (`s.shared.<f>` ≡
-    /// the old `s.<f>` — behaviour-identical); Step 2 hoists it out of
-    /// the per-`ShardKey` shard map so `nodes`/`children` shard while
-    /// these stay singular.
-    pub(crate) shared: CoreShared,
     /// Binding-boundary handle for `Drop`-time refcount balancing.
     /// `Core` also holds a clone of this Arc; storing it here lets
     /// `Drop for CoreState` walk every retained slot and release the
@@ -1962,6 +1982,73 @@ impl Core<crate::state_cell::LockedCell> {
     }
 }
 
+/// Combined RAII guard returned by [`Core::lock_state`] (Slice B-2
+/// Step 2a, D220-EXEC). Holds the `DEFAULT_SHARD` [`CoreState`] guard +
+/// the [`CoreShared`] guard **together** (shard OUTER, shared INNER —
+/// the deadlock-free acquisition order). `DerefMut`s to [`CoreState`]
+/// (so `s.nodes` / `s.children` / `s.binding` port verbatim) **and**
+/// exposes an inherent `shared` field (so `s.shared.<f>` ports verbatim
+/// — inherent-field access is resolved before `Deref`). This is the
+/// zero-churn carrier that lets the ~104 existing
+/// `let mut s = self.lock_state(); …` sites stay unchanged while
+/// `CoreShared` is hoisted to its own lock. Step 2a holds ONE shard
+/// (`None`); Step 2b routes the wave hot path by `group_of(node)`.
+///
+/// Field declaration order is `shard` then `shared`: Rust drops fields
+/// in declaration order, so the shared guard is released LAST — harmless
+/// for `parking_lot` (release order doesn't matter) but keeps the RAII
+/// shape symmetric with the OUTER/INNER acquire order.
+pub(crate) struct St<'a, C: crate::state_cell::StateCell> {
+    shard: <C as crate::state_cell::StateCell>::ShardGuard<'a>,
+    pub(crate) shared: <C as crate::state_cell::StateCell>::SharedGuard<'a>,
+}
+
+impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
+    /// Acquire the combined guard from a cell: `DEFAULT_SHARD`
+    /// (`key=None`, Step 2a's only shard) OUTER, then `CoreShared`
+    /// INNER. Used by [`Core::lock_state`] and the `Weak<C>`-upgrade
+    /// drop paths (which hold `&C`, not `&Core`).
+    #[inline]
+    pub(crate) fn new(cell: &'a C) -> Self {
+        let shard = cell.lock_shard(None);
+        let shared = cell.lock_shared();
+        Self { shard, shared }
+    }
+
+    /// Allocate a fresh [`NodeId`] (was `impl CoreState`; moved here in
+    /// Step 2a because the counter now lives in the separate
+    /// `CoreShared` region — `St` is the only place holding both).
+    pub(crate) fn alloc_node_id(&mut self) -> NodeId {
+        let id = NodeId::new(self.shared.next_node_id);
+        self.shared.next_node_id += 1;
+        id
+    }
+
+    /// Allocate a fresh [`SubscriptionId`] (moved from `impl CoreState`
+    /// — same rationale as [`Self::alloc_node_id`]).
+    pub(crate) fn alloc_sub_id(&mut self) -> SubscriptionId {
+        let id = SubscriptionId(self.shared.next_subscription_id);
+        self.shared.next_subscription_id += 1;
+        id
+    }
+}
+
+impl<C: crate::state_cell::StateCell> std::ops::Deref for St<'_, C> {
+    type Target = CoreState;
+    #[inline]
+    fn deref(&self) -> &CoreState {
+        // `self.shard` is the GAT `ShardGuard: DerefMut<Target=CoreState>`;
+        &*self.shard
+    }
+}
+
+impl<C: crate::state_cell::StateCell> std::ops::DerefMut for St<'_, C> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut CoreState {
+        &mut *self.shard
+    }
+}
+
 impl<C: crate::state_cell::StateCell> Core<C> {
     /// Construct a fresh Core wired to the given binding on cell `C`. Pause
     /// buffer cap defaults to unbounded; set via
@@ -1969,18 +2056,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     #[must_use]
     pub fn new_with_cell(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
-            state: Arc::new(C::from_state(CoreState {
-                nodes: HashMap::new(),
-                children: HashMap::new(),
-                // Q-beyond Sub-slice 2 + 3 (D108, 2026-05-09): pending_fires,
-                // pending_notify, deferred_flush_jobs,
-                // deferred_cleanup_hooks, pending_wipes, and
-                // invalidate_hooks_fired_this_wave all live on per-thread
-                // [`crate::batch::WaveState`]. `in_tick` is per-(Core,
-                // thread) in `crate::batch::IN_TICK_OWNED` (see its doc).
-                // Core-global non-shard state is grouped under `shared`
-                // (Slice B-2 Step 1, D220-EXEC).
-                shared: CoreShared {
+            state: Arc::new(C::from_parts(
+                // Core-global region (Slice B-2 Step 2a, D220-EXEC): its
+                // own lock, hoisted out of any shard's `CoreState`.
+                CoreShared {
                     next_node_id: 1,
                     next_subscription_id: 1,
                     // A4 (Slice F, 2026-05-07): start `next_lock_id` in the
@@ -2009,9 +2088,17 @@ impl<C: crate::state_cell::StateCell> Core<C> {
                     topology_sinks: HashMap::new(),
                     next_topology_id: 1,
                     pending_scratch_release: Vec::new(),
+                    binding: binding.clone(),
                 },
-                binding: binding.clone(),
-            })),
+                // Default shard (Step 2a: the ONLY shard). `nodes` /
+                // `children` are per-shard; `binding` cloned per shard
+                // for `Drop for CoreState`'s node-retain release walk.
+                CoreState {
+                    nodes: HashMap::new(),
+                    children: HashMap::new(),
+                    binding: binding.clone(),
+                },
+            )),
             binding,
             group_locks: Arc::new(parking_lot::Mutex::new(
                 crate::groups::GroupLockRegistry::new(),
@@ -2031,48 +2118,62 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// outer subscribe completes, preserving R1.3.5.a happens-after
     /// ordering. The previous `IN_HANDSHAKE_FIRE` panic-diagnostic is no
     /// longer needed.
-    pub(crate) fn lock_state(&self) -> <C as crate::state_cell::StateCell>::Guard<'_> {
-        self.state.lock()
+    /// Acquire the **combined** state guard (Step 2a, D220-EXEC):
+    /// `DEFAULT_SHARD` [`CoreState`] + [`CoreShared`], held together
+    /// (shard OUTER, shared INNER). Returns [`St`] — `DerefMut`s to
+    /// `CoreState` and exposes a `.shared` field, so the ~104 existing
+    /// `let mut s = self.lock_state(); … s.nodes … s.shared.x …` sites
+    /// are unchanged. Behaviour-identical for the all-`None` suite (one
+    /// shard). Step 2b splits the hot path onto pure
+    /// [`Self::with_shard`] for true parallelism.
+    ///
+    /// Post-Slice-E: handshake fires LOCK-RELEASED; same-thread re-entry
+    /// passes through transparently; cross-thread emits block on
+    /// `wave_owner`.
+    pub(crate) fn lock_state(&self) -> St<'_, C> {
+        St::new(&self.state)
     }
 
-    /// Slice B-1 (D218=B4 / D219, 2026-05-16) — the **shard-access
-    /// seam**.
-    ///
-    /// The locked Slice B design replaces "per-`SerializationGroupId`
-    /// `ReentrantMutex` *on top of* one global `Mutex<CoreState>`"
-    /// (D216-proven worthless: the global state mutex serializes every
-    /// emit regardless of group → zero parallelism) with "each shard
-    /// *owns* an independent `CoreState` sub-store with its own lock"
-    /// (B-2). Every wave-scoped state access must flow through THIS
-    /// seam so the routing change in B-2 (and the B3 owner-thread +
-    /// crossbeam-channel overlay at M6 for napi V8-isolate / pyo3-GIL
-    /// thread-affinity — D219) is a re-impl of one method, not a
-    /// re-architecture of ~104 call sites mid-rewrite.
+    /// Run `f` with mutable access to the Core-global [`CoreShared`]
+    /// region ONLY (id counters, topology-sink registry,
+    /// `currently_firing`, the two caps, the scratch-release queue).
+    /// Pure-shared ops (id alloc outside a held shard, topology) take
+    /// only this. When a section needs both regions, use
+    /// [`Self::lock_state`] (which encodes the OUTER/INNER order) or
+    /// nest `with_shared` inside a `with_shard` closure — never the
+    /// reverse (D220-EXEC deadlock-free order).
+    pub(crate) fn with_shared<R>(&self, f: impl FnOnce(&mut CoreShared) -> R) -> R {
+        f(&mut self.state.lock_shared())
+    }
+
+    /// Slice B-1/B-2 (D218=B4 / D219) — the **shard-access seam**.
+    /// Every wave-scoped shard access flows through here so Step 2b's
+    /// per-`ShardKey` routing (and the M6 B3 owner-thread overlay) is a
+    /// re-impl of one method, not a re-architecture of ~104 sites.
     ///
     /// `key`: the node's `serialization_group`. `None` =
-    /// `DEFAULT_SHARD` (the all-`None` zero-regression floor path —
-    /// stays the single ≈515 ns `Core<SingleThreadCell>` shard).
+    /// `DEFAULT_SHARD` (the all-`None` ≈515 ns floor shard).
     ///
-    /// **B-1 (this stage): single shard, behaviour-identical.** `key`
-    /// is ignored; this is exactly `f(&mut self.lock_state())`. B-2
-    /// partitions `CoreState` into `CoreShared` + per-key `ShardState`
-    /// and routes here by `key` so disjoint groups hold disjoint
-    /// mutexes (true parallelism — the property `group_scaling.rs`
-    /// found missing). The closure shape (`FnOnce(&mut CoreState) ->
-    /// R`) is the B3-overlay-compatible form: B3 sends the closure to
-    /// the shard's owner thread and returns `R` over a channel.
+    /// **Step 2a: single shard, behaviour-identical.** `key` is
+    /// ignored (one shard). Step 2b routes by `key` to a per-`ShardKey`
+    /// `Arc<Mutex<CoreState>>` so disjoint groups hold disjoint mutexes
+    /// (true parallelism — the property `group_scaling.rs` found
+    /// missing). The closure shape (`FnOnce(&mut CoreState) -> R`) is
+    /// the B3-overlay form (M6 sends it to the shard's owner thread,
+    /// returns `R` over a channel — no caller change).
     ///
-    /// `#[allow(dead_code)]`: B-1 establishes + compiles + behaviour-
-    /// gates the seam; B-2 migrates the call sites onto it. Per the
-    /// Rust-port invariant, allow is justified inline (transient,
-    /// one-stage).
+    /// `#[allow(dead_code)]`: Step 2a routes shard access through the
+    /// combined `lock_state()`/`St` guard (single shard); this pure
+    /// shard-only seam is wired by the Step 2b hot-path migration
+    /// (`group_of(node)` routing). Transient one-stage allow, justified
+    /// inline per the Rust-port invariant (mirrors B-1's `with_shard`).
     #[allow(dead_code)]
     pub(crate) fn with_shard<R>(
         &self,
-        _key: Option<crate::handle::SerializationGroupId>,
+        key: crate::state_cell::ShardKey,
         f: impl FnOnce(&mut crate::node::CoreState) -> R,
     ) -> R {
-        f(&mut self.lock_state())
+        f(&mut self.state.lock_shard(key))
     }
 
     /// Whether `self` and `other` point to the same dispatcher state.
@@ -3513,7 +3614,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// dep_records to sentinel, the pause lockset (any held locks are
     /// released — replay buffer drops silently because there are no
     /// subscribers to flush to).
-    fn reset_for_fresh_lifecycle(&self, s: &mut CoreState, node_id: NodeId) {
+    fn reset_for_fresh_lifecycle(&self, s: &mut St<'_, C>, node_id: NodeId) {
         // Phase 1: collect wave-state handle releases + take the old
         // op_scratch + reset other state. Take all mutations under one
         // borrow so the post-borrow phases don't re-walk dep_records.
@@ -4081,7 +4182,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Iterative implementation (Slice A-bigger, M1-close): a work-queue
     /// drives the cascade so deep linear chains don't overflow the OS
     /// thread stack. Mirrors `path_from_to`'s explicit-stack pattern.
-    fn terminate_node(&self, s: &mut CoreState, node_id: NodeId, terminal: TerminalKind) {
+    fn terminate_node(&self, s: &mut St<'_, C>, node_id: NodeId, terminal: TerminalKind) {
         let mut work: Vec<(NodeId, TerminalKind)> = vec![(node_id, terminal)];
         while let Some((id, t)) = work.pop() {
             if s.require_node(id).terminal.is_some() {
@@ -4345,7 +4446,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// pop. Idempotency via `has_received_teardown` keeps each node
     /// visited at most once even when multi-parent diamonds re-enter via
     /// a sibling path.
-    fn teardown_inner(&self, s: &mut CoreState, root: NodeId) -> Vec<NodeId> {
+    fn teardown_inner(&self, s: &mut St<'_, C>, root: NodeId) -> Vec<NodeId> {
         enum Action {
             Visit(NodeId),
             EmitTeardown(NodeId),
@@ -4554,7 +4655,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// metas-first constraint) — Invalidate is a tier-4 broadcast where
     /// the never-populated / already-invalidated guard provides natural
     /// idempotency for diamond fan-in.
-    fn invalidate_inner(&self, s: &mut CoreState, root: NodeId) {
+    fn invalidate_inner(&self, s: &mut St<'_, C>, root: NodeId) {
         let mut work: Vec<NodeId> = vec![root];
         while let Some(node_id) = work.pop() {
             // Never-populated / already-invalidated: no-op (R1.4 idempotency).
@@ -4790,8 +4891,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// True if the node currently holds at least one pause lock.
     #[must_use]
     pub fn is_paused(&self, node_id: NodeId) -> bool {
-        self.state
-            .lock()
+        self.lock_state()
             .require_node(node_id)
             .pause_state
             .is_paused()
@@ -4800,8 +4900,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Number of pause locks currently held on `node_id`. `0` if Active.
     #[must_use]
     pub fn pause_lock_count(&self, node_id: NodeId) -> usize {
-        self.state
-            .lock()
+        self.lock_state()
             .require_node(node_id)
             .pause_state
             .lock_count()
@@ -4810,8 +4909,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Test helper: whether `node_id` currently holds the given `lock_id`.
     #[must_use]
     pub fn holds_pause_lock(&self, node_id: NodeId, lock_id: LockId) -> bool {
-        self.state
-            .lock()
+        self.lock_state()
             .require_node(node_id)
             .pause_state
             .contains_lock(lock_id)
@@ -5459,17 +5557,12 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // CoreState helpers — kept on the inner struct so they're naturally scoped
 // to the lock guard.
 impl CoreState {
-    fn alloc_node_id(&mut self) -> NodeId {
-        let id = NodeId::new(self.shared.next_node_id);
-        self.shared.next_node_id += 1;
-        id
-    }
-
-    fn alloc_sub_id(&mut self) -> SubscriptionId {
-        let id = SubscriptionId(self.shared.next_subscription_id);
-        self.shared.next_subscription_id += 1;
-        id
-    }
+    // `alloc_node_id` / `alloc_sub_id` moved to `impl St` (Step 2a,
+    // D220-EXEC): their counters now live in the separate `CoreShared`
+    // region, which only the combined `St` guard holds alongside the
+    // shard. Call sites (`s.alloc_node_id()` / `s.alloc_sub_id()` where
+    // `s = self.lock_state()`) are unchanged — inherent `St` methods
+    // resolve before the `Deref`-to-`CoreState` ones.
 
     /// Clear wave-scoped flags and rotate per-dep batch data on every
     /// node. Run at the end of every wave (regular drain via `run_wave`,
@@ -5510,7 +5603,13 @@ impl CoreState {
         // net (`FiringGuard`'s RAII push/pop is balanced even on panic;
         // a future code path that bypasses the guard would otherwise
         // leak a stale entry into the next wave).
-        self.shared.currently_firing.clear();
+        //
+        // Step 2a (D220-EXEC): `currently_firing` now lives in the
+        // separate `CoreShared` region (unreachable from `&mut
+        // CoreState`). The defensive clear is performed by the two
+        // `clear_wave_state` call sites in `batch.rs` via the combined
+        // `St` guard's `.shared` field, immediately adjacent — same
+        // wave-end point, same belt-and-suspenders intent.
         //
         // Slice G tier3 emit tracking moved to per-partition state (Q3,
         // 2026-05-09); cleared by [`super::WaveOwnerGuard::drop`] on
@@ -5645,22 +5744,14 @@ impl Drop for CoreState {
             }
         }
 
-        // D-α (D028 full close, 2026-05-10): drain the
-        // `pending_scratch_release` queue (Phase G of
-        // `Subscription::Drop` pushes old operator-scratch boxes here
-        // on resubscribable + non-terminal deactivate). Catch-all for
-        // Core shutdown — anything still queued never made it through
-        // a `reset_for_fresh_lifecycle` drain. Release happens BEFORE
-        // the queue's `Vec<Box<dyn OperatorScratch>>` drops, because
-        // each box's `Drop` impl is a plain `mem::drop` of the state
-        // struct fields (HandleIds are raw u64s; the boxes don't
-        // re-enter the binding on drop). Without this explicit drain
-        // the binding-side refcount is left bumped on Core shutdown.
-        let queued: Vec<Box<dyn crate::op_state::OperatorScratch>> =
-            std::mem::take(&mut self.shared.pending_scratch_release);
-        for mut scratch in queued {
-            scratch.release_handles(&*self.binding);
-        }
+        // D-α (D028) `pending_scratch_release` shutdown drain moved to
+        // `impl Drop for CoreShared` (Step 2a, D220-EXEC): the queue +
+        // its `binding` were hoisted into the separate `CoreShared`
+        // region, so `Drop for CoreState` can no longer reach them.
+        // `CoreShared` (one per Core, owned by the cell) drops with the
+        // cell — its `Drop` performs the identical
+        // release-before-Vec-drop discipline. The per-node retain walk
+        // above stays here (per-shard `CoreState` owns its `nodes`).
 
         // Q-beyond Sub-slice 1 + 2 (D108, 2026-05-09): WaveState's
         // retain-holding fields (`wave_cache_snapshots`,

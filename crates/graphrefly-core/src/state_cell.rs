@@ -1,129 +1,151 @@
-//! The `StateCell` seam — the single-threaded / cross-thread interior-mutability
-//! split that makes the §7 "single-threaded substrate + `Option<LockId>`"
-//! contract expressible without `unsafe` (D208, Option A).
+//! The `StateCell` seam — reshaped for Slice B-2 Step 2 (D220-EXEC) into
+//! **two independently-lockable regions**: a single Core-global
+//! [`CoreShared`] + a per-[`ShardKey`] [`CoreState`].
 //!
-//! The [`Core`](crate::Core) dispatcher is generic over `C: StateCell`. The
-//! seam has exactly two monomorphizations:
+//! Step 2a (this stage) keeps exactly ONE shard (`key` ignored —
+//! `DEFAULT_SHARD`); [`Core::lock_state`](crate::Core) returns a *combined*
+//! guard that holds the default-shard guard + the shared guard together
+//! (shard OUTER, shared INNER — the D220-EXEC deadlock-free order), so the
+//! ~104 existing `let mut s = self.lock_state(); … s.nodes … s.shared.x …`
+//! call sites port **verbatim** (the combined guard `DerefMut`s to
+//! `CoreState` for `nodes`/`children`/`binding` and exposes an inherent
+//! `shared` field for `s.shared.<f>`). Behaviour-identical for the all-`None`
+//! suite (one shard). Step 2b turns the single shard into a per-`ShardKey`
+//! `Arc<Mutex<CoreState>>` map and routes the wave hot path by
+//! `group_of(node)` for true disjoint-group parallelism.
 //!
-//! - [`SingleThreadCell`] — `RefCell<CoreState>`. **`!Sync`**, single-threaded,
-//!   lock-free. This is the §7 *floor* path: `RefCell::borrow_mut` lowers to a
-//!   non-atomic borrow-flag check the optimizer largely elides, and — because
-//!   no node carries a `SerializationGroupId` on this path by construction —
-//!   the wave engine's group-collect + ordered-acquire step iterates an empty
-//!   set and monomorphizes away entirely. ~83 ns/emit; ~7.6× faster than the
-//!   pre-rewrite production dispatcher.
-//! - [`LockedCell`] — `parking_lot::Mutex<CoreState>`. **`Send + Sync`**. The
-//!   default exported `Core` type parameter (so `graphrefly-graph`,
-//!   `graphrefly-operators`, `graphrefly-storage`, `graphrefly-structures` and
-//!   the napi bindings keep compiling unchanged — D211), and the substrate for
-//!   cross-thread serialization: nodes that share a `SerializationGroupId`
-//!   serialize through a per-group `Arc<ReentrantMutex<()>>` acquired in
-//!   sorted order at wave entry.
+//! [`Core`](crate::Core) is generic over `C: StateCell`. Two
+//! monomorphizations:
 //!
-//! Both impls are 100% safe (`RefCell` / `parking_lot` wrappers); the crate's
-//! `#![forbid(unsafe_code)]` is preserved.
+//! - [`SingleThreadCell`] — `RefCell` regions. **`!Sync`**, lock-free; the
+//!   §7 ≈515 ns floor path (one shard by construction; the group machinery
+//!   monomorphizes away).
+//! - [`LockedCell`] — `parking_lot::Mutex` regions. **`Send + Sync`**; the
+//!   default `Core` type parameter (D211) and the cross-thread substrate.
 //!
-//! The seam is a GAT-based guard rather than a closure callback so the
-//! existing `let mut st = self.lock_state(); … drop(st); …` access pattern
-//! (~50 sites across `node.rs` / `batch.rs`, several with mid-fn lock-release
-//! for re-entrant binding callbacks) ports unchanged: both guard types impl
-//! `DerefMut<Target = CoreState>`.
+//! Both impls are 100% safe; `#![forbid(unsafe_code)]` is preserved.
+//!
+//! **Lock-ordering rule (deadlock-free; D220-EXEC):** when both regions are
+//! needed, acquire **shard guard OUTER, shared guard INNER**, never
+//! reversed. The combined `lock_state()` guard encodes exactly that order;
+//! pure-shared ops use [`StateCell::lock_shared`] only.
 
-use std::cell::{RefCell, RefMut};
-use std::ops::DerefMut;
+use crate::node::{CoreShared, CoreState};
 
-use crate::node::CoreState;
+/// The shard selector. `None` = `DEFAULT_SHARD` (the all-`None` §7 floor;
+/// in Step 2a the *only* shard). Step 2b keys a per-shard `CoreState` map
+/// by this so disjoint [`crate::handle::SerializationGroupId`]s hold
+/// disjoint mutexes (true parallelism).
+pub type ShardKey = Option<crate::handle::SerializationGroupId>;
 
-/// Interior-mutability strategy for [`CoreState`].
+/// Interior-mutability strategy for the two state regions
+/// ([`CoreShared`] + per-[`ShardKey`] [`CoreState`]).
 ///
-/// See the module docs. Used only via generics/monomorphization — never as a
-/// trait object — so the chosen strategy's acquire cost is inlined and, for
-/// [`SingleThreadCell`], elided.
+/// Used only via generics/monomorphization — never as a trait object — so
+/// the acquire cost is inlined and, for [`SingleThreadCell`], elided.
 pub trait StateCell: 'static {
     /// Whether waves on this substrate need cross-thread serialization.
-    ///
-    /// `false` for [`SingleThreadCell`] (the lock-free floor — `!Send`+`!Sync`
-    /// by construction, so cross-thread sharing is compile-impossible and a
-    /// per-wave lock would be pure overhead; the branch dead-code-eliminates
-    /// at monomorphization, preserving the §7 ~83 ns floor).
-    ///
-    /// `true` for [`LockedCell`] (`Send + Sync`, the shared default). When a
-    /// wave's transitively-touched `SerializationGroupId` set is **empty**
-    /// (an all-`None` cascade), the per-thread `WAVE_STATE` /
-    /// `TIER3_EMITTED_THIS_WAVE` / `IN_TICK_OWNED` invariants — which assume
-    /// "cross-thread emits BLOCK on a wave-lock" (`batch.rs`) — would
-    /// otherwise be unprotected. The engine acquires a single Core-global
-    /// wave `ReentrantMutex` for that case (QA F1), restoring the
-    /// pre-rewrite "every wave serializes per Core" safety floor that the
-    /// deleted union-find `wave_owner` used to provide. Grouped waves still
-    /// acquire only their disjoint group locks (parallelism preserved).
+    /// `false` for [`SingleThreadCell`] (the lock-free floor); `true` for
+    /// [`LockedCell`] (the QA-F1 all-`None` global wave lock — vestigial,
+    /// folds into B-3's §7-C deletion once Step 2b's shard routing
+    /// replaces it).
     const SERIALIZE_WAVES: bool;
 
-    /// The RAII guard yielded by [`StateCell::lock`]. `DerefMut` to
-    /// [`CoreState`] so call sites are strategy-agnostic.
-    type Guard<'a>: DerefMut<Target = CoreState>
+    /// RAII guard over the Core-global [`CoreShared`] region.
+    type SharedGuard<'a>: std::ops::DerefMut<Target = CoreShared>
     where
         Self: 'a;
 
-    /// Wrap freshly-constructed [`CoreState`] in this cell.
-    #[must_use]
-    fn from_state(state: CoreState) -> Self;
+    /// RAII guard over a shard's [`CoreState`] region.
+    type ShardGuard<'a>: std::ops::DerefMut<Target = CoreState>
+    where
+        Self: 'a;
 
-    /// Acquire mutable access. For [`SingleThreadCell`] this is a
-    /// non-atomic borrow; for [`LockedCell`] a `parking_lot::Mutex::lock`.
+    /// Wrap a freshly-constructed `CoreShared` + the default-shard
+    /// `CoreState` in this cell. (Step 2a: the single shard.)
     #[must_use]
-    fn lock(&self) -> Self::Guard<'_>;
+    fn from_parts(shared: CoreShared, default_shard: CoreState) -> Self;
+
+    /// Acquire the Core-global [`CoreShared`] region.
+    #[must_use]
+    fn lock_shared(&self) -> Self::SharedGuard<'_>;
+
+    /// Acquire `key`'s shard [`CoreState`] region. Step 2a: `key` is
+    /// ignored — exactly one shard (behaviour-identical with the pre-B-2
+    /// single `CoreState`). Step 2b routes by `key`.
+    #[must_use]
+    fn lock_shard(&self, key: ShardKey) -> Self::ShardGuard<'_>;
 }
 
 /// Single-threaded, lock-free cell — the §7 floor path. **`!Sync`.**
 ///
-/// Used by `Core<SingleThreadCell>` (the `minimal_handle_core` bench and the
-/// floor regression tests). All nodes on this path have
-/// `serialization_group == None` by construction; the wave engine's
-/// group-acquisition machinery monomorphizes out.
-pub struct SingleThreadCell(RefCell<CoreState>);
+/// `RefCell` regions; `key` ignored (one shard by construction). A
+/// re-entrant double-borrow panics loudly — a dispatcher bug (a missing
+/// lock-released bracket around a binding callback), not a user error;
+/// same observable contract as the `LockedCell` re-entrant-deadlock path.
+pub struct SingleThreadCell {
+    shared: std::cell::RefCell<CoreShared>,
+    shard: std::cell::RefCell<CoreState>,
+}
 
 impl StateCell for SingleThreadCell {
     const SERIALIZE_WAVES: bool = false;
 
-    type Guard<'a> = RefMut<'a, CoreState>;
+    type SharedGuard<'a> = std::cell::RefMut<'a, CoreShared>;
+    type ShardGuard<'a> = std::cell::RefMut<'a, CoreState>;
 
     #[inline]
-    fn from_state(state: CoreState) -> Self {
-        Self(RefCell::new(state))
+    fn from_parts(shared: CoreShared, default_shard: CoreState) -> Self {
+        Self {
+            shared: std::cell::RefCell::new(shared),
+            shard: std::cell::RefCell::new(default_shard),
+        }
     }
 
     #[inline]
-    fn lock(&self) -> RefMut<'_, CoreState> {
-        // `borrow_mut` (not `try_borrow_mut`): a re-entrant double-borrow is a
-        // dispatcher bug (lock-released bracket missing around a binding
-        // callback), not a user error — panic is the correct, loud failure,
-        // same observable contract as the `LockedCell` re-entrant-deadlock
-        // path surfacing as a hang in tests.
-        self.0.borrow_mut()
+    fn lock_shared(&self) -> std::cell::RefMut<'_, CoreShared> {
+        self.shared.borrow_mut()
+    }
+
+    #[inline]
+    fn lock_shard(&self, _key: ShardKey) -> std::cell::RefMut<'_, CoreState> {
+        self.shard.borrow_mut()
     }
 }
 
 /// Cross-thread serialization-capable cell. **`Send + Sync`.**
 ///
-/// The default `Core` type parameter (D211) and the substrate for
-/// `SerializationGroupId` cross-thread serialization. Uses
-/// `parking_lot::Mutex` (no poisoning — matches the pre-rewrite
-/// `Arc<parking_lot::Mutex<CoreState>>` shape).
-pub struct LockedCell(parking_lot::Mutex<CoreState>);
+/// The default `Core` type parameter (D211). `parking_lot::Mutex` regions
+/// (no poisoning — matches the pre-rewrite shape). Step 2a holds ONE shard
+/// mutex; Step 2b replaces `shard` with a per-`ShardKey`
+/// `Mutex<HashMap<ShardKey, Arc<Mutex<CoreState>>>>` + `lock_arc` owned
+/// guards.
+pub struct LockedCell {
+    shared: parking_lot::Mutex<CoreShared>,
+    shard: parking_lot::Mutex<CoreState>,
+}
 
 impl StateCell for LockedCell {
     const SERIALIZE_WAVES: bool = true;
 
-    type Guard<'a> = parking_lot::MutexGuard<'a, CoreState>;
+    type SharedGuard<'a> = parking_lot::MutexGuard<'a, CoreShared>;
+    type ShardGuard<'a> = parking_lot::MutexGuard<'a, CoreState>;
 
     #[inline]
-    fn from_state(state: CoreState) -> Self {
-        Self(parking_lot::Mutex::new(state))
+    fn from_parts(shared: CoreShared, default_shard: CoreState) -> Self {
+        Self {
+            shared: parking_lot::Mutex::new(shared),
+            shard: parking_lot::Mutex::new(default_shard),
+        }
     }
 
     #[inline]
-    fn lock(&self) -> parking_lot::MutexGuard<'_, CoreState> {
-        self.0.lock()
+    fn lock_shared(&self) -> parking_lot::MutexGuard<'_, CoreShared> {
+        self.shared.lock()
+    }
+
+    #[inline]
+    fn lock_shard(&self, _key: ShardKey) -> parking_lot::MutexGuard<'_, CoreState> {
+        self.shard.lock()
     }
 }

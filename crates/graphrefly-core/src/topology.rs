@@ -45,7 +45,9 @@ pub struct TopologySubscription<C: crate::state_cell::StateCell = crate::state_c
 impl<C: crate::state_cell::StateCell> Drop for TopologySubscription<C> {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            let mut s = state.lock();
+            // Step 2a (D220-EXEC): combined guard — `topology_sinks`
+            // lives in the `CoreShared` region (`St`'s `.shared` field).
+            let mut s = crate::node::St::new(&*state);
             s.shared.topology_sinks.remove(&self.id);
         }
     }
@@ -98,10 +100,10 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// registration, teardown, and `set_deps` sites AFTER the state
     /// lock is dropped.
     pub(crate) fn fire_topology_event(&self, event: &TopologyEvent) {
-        let sinks: Vec<TopologySink> = {
-            let s = self.state.lock();
-            s.shared.topology_sinks.values().cloned().collect()
-        };
+        // Step 2a (D220-EXEC): `topology_sinks` is pure-shared — take
+        // ONLY the `CoreShared` region (no shard lock needed).
+        let sinks: Vec<TopologySink> =
+            self.with_shared(|sh| sh.topology_sinks.values().cloned().collect());
         for sink in sinks {
             sink(event);
         }

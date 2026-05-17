@@ -2769,7 +2769,12 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///   COMPLETE/ERROR tier 5, TEARDOWN tier 6) bypass the buffer and
     ///   flush immediately. START (tier 0) is per-subscription and never
     ///   transits queue_notify.
-    pub(crate) fn queue_notify(&self, s: &mut CoreState, node_id: NodeId, msg: Message) {
+    pub(crate) fn queue_notify(
+        &self,
+        s: &mut crate::node::St<'_, C>,
+        node_id: NodeId,
+        msg: Message,
+    ) {
         // R1.3.3.a / R1.3.3.d (Slice G — re-added 2026-05-07): dev-mode
         // wave-content invariant assertion. The tier-3 slot at one node in
         // one wave is either ≥1 DATA or exactly 1 RESOLVED — never mixed,
@@ -3565,6 +3570,14 @@ impl<C: crate::state_cell::StateCell> BatchGuard<C> {
                 // ws.deferred_handle_releases, so take ws's queue AFTER
                 // the clear.
                 s.clear_wave_state(ws);
+                // Step 2a (D220-EXEC): defensive `currently_firing`
+                // clear, relocated here from `CoreState::clear_wave_state`
+                // (the field moved to the separate `CoreShared` region;
+                // `St`'s `.shared` reaches it, a `&mut CoreState` can't).
+                // Same wave-end point; `FiringGuard` RAII already
+                // balances push/pop — this is the belt-and-suspenders
+                // net for a future guard-bypassing path.
+                s.shared.currently_firing.clear();
                 ws.clear_wave_state();
                 let deferred_releases = std::mem::take(&mut ws.deferred_handle_releases);
                 // Slice E2 (D061): panic-discard wave drops queued
@@ -3684,6 +3697,14 @@ impl<C: crate::state_cell::StateCell> Drop for BatchGuard<C> {
             // CoreState::clear_wave_state under the held state lock.
             let result = with_wave_state(|ws| {
                 s.clear_wave_state(ws);
+                // Step 2a (D220-EXEC): defensive `currently_firing`
+                // clear, relocated here from `CoreState::clear_wave_state`
+                // (the field moved to the separate `CoreShared` region;
+                // `St`'s `.shared` reaches it, a `&mut CoreState` can't).
+                // Same wave-end point; `FiringGuard` RAII already
+                // balances push/pop — this is the belt-and-suspenders
+                // net for a future guard-bypassing path.
+                s.shared.currently_firing.clear();
                 ws.clear_wave_state();
                 // /qa A1 (2026-05-09) discipline preserved: drain snapshot
                 // retains under lock, release lock-released below to avoid
