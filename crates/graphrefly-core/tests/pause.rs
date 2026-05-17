@@ -269,6 +269,159 @@ fn pause_does_not_buffer_unrelated_node() {
     rt.core.resume(s_a.id, lock).expect("resume a");
 }
 
+// ---------------------------------------------------------------------
+// R2.6.0 (QA B1) — the multi-pauser lock-set arithmetic and cross-node
+// pause isolation are MODE-INDEPENDENT properties (`pause_state`
+// add/remove + per-node buffer keying do not branch on `PausableMode`).
+// The verbatim-buffer variants above were converted to `ResumeAll`
+// (that IS the buffer contract), which would have left these
+// mode-independent properties asserted ONLY under `ResumeAll`. These
+// two tests restore Default-mode (the post-R2.6.0 common path)
+// coverage: under Default a leaf source's self-emit delivers
+// immediately (R2.6.0), so the lock arithmetic / isolation is verified
+// against immediate delivery rather than buffered replay.
+// ---------------------------------------------------------------------
+
+#[test]
+fn multi_pauser_lock_arithmetic_default_mode() {
+    // Default mode (no set_pausable_mode). Lock-set arithmetic — count,
+    // partial-release-stays-paused, final-release-yields-report — is
+    // mode-independent. Under R2.6.0 a Default leaf source's self-emit
+    // is delivered immediately while paused (NOT buffered), so the
+    // final ResumeReport replays 0.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+    let rec = rt.subscribe_recorder(s.id);
+    let baseline = rec.snapshot().len();
+
+    let lock_a = rt.core.alloc_lock_id();
+    let lock_b = rt.core.alloc_lock_id();
+    let lock_c = rt.core.alloc_lock_id();
+
+    rt.core.pause(s.id, lock_a).expect("pause a");
+    rt.core.pause(s.id, lock_b).expect("pause b");
+    rt.core.pause(s.id, lock_c).expect("pause c");
+    assert_eq!(rt.core.pause_lock_count(s.id), 3);
+    assert!(rt.core.is_paused(s.id));
+
+    s.set(TestValue::Int(1));
+    s.set(TestValue::Int(2));
+    s.set(TestValue::Int(3));
+
+    // R2.6.0: Default-mode leaf source self-emits deliver IMMEDIATELY
+    // while self-paused — not buffered behind the lockset.
+    let mid_data: Vec<i64> = rec
+        .snapshot()
+        .iter()
+        .skip(baseline)
+        .filter_map(|e| match e {
+            RecordedEvent::Data(TestValue::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mid_data,
+        vec![1, 2, 3],
+        "Default-mode self-emit delivered immediately while multi-paused (R2.6.0)"
+    );
+
+    // Lock arithmetic (mode-independent): partial release stays paused.
+    let no_drain_b = rt.core.resume(s.id, lock_b).expect("resume b");
+    assert!(no_drain_b.is_none(), "non-final resume returns None");
+    let no_drain_c = rt.core.resume(s.id, lock_c).expect("resume c");
+    assert!(no_drain_c.is_none());
+    assert!(rt.core.is_paused(s.id), "still paused — lock_a held");
+    assert_eq!(rt.core.pause_lock_count(s.id), 1);
+
+    // Final release yields a ResumeReport; nothing was buffered (Default).
+    let report = rt
+        .core
+        .resume(s.id, lock_a)
+        .expect("resume a")
+        .expect("final lock release yields a ResumeReport");
+    assert_eq!(
+        report.replayed, 0,
+        "Default mode buffers nothing — RESUME replays 0 (R2.6.0)"
+    );
+    assert_eq!(report.dropped, 0);
+    assert!(!rt.core.is_paused(s.id));
+
+    // No duplicate/replayed DATA after the final release.
+    let final_data: Vec<i64> = rec
+        .snapshot()
+        .iter()
+        .skip(baseline)
+        .filter_map(|e| match e {
+            RecordedEvent::Data(TestValue::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        final_data,
+        vec![1, 2, 3],
+        "no replay on final release in Default mode (R2.6.0)"
+    );
+    assert_eq!(rt.cache_value(s.id), Some(TestValue::Int(3)));
+}
+
+#[test]
+fn pause_does_not_leak_to_unrelated_node_default_mode() {
+    // Default mode (no set_pausable_mode). Pause isolation is per-node
+    // and mode-independent: pausing s_a must not block/buffer s_b. Under
+    // R2.6.0, Default-mode s_a's OWN self-emit also delivers immediately
+    // (s_a is a depless leaf source) — so neither node is gated.
+    let rt = TestRuntime::new();
+    let s_a = rt.state(Some(TestValue::Int(0)));
+    let s_b = rt.state(Some(TestValue::Int(0)));
+    let rec_a = rt.subscribe_recorder(s_a.id);
+    let rec_b = rt.subscribe_recorder(s_b.id);
+    let baseline_a = rec_a.snapshot().len();
+    let baseline_b = rec_b.snapshot().len();
+
+    let lock = rt.core.alloc_lock_id();
+    rt.core.pause(s_a.id, lock).expect("pause a only");
+    assert!(rt.core.is_paused(s_a.id));
+    assert!(!rt.core.is_paused(s_b.id), "s_b never paused");
+
+    s_a.set(TestValue::Int(1));
+    s_b.set(TestValue::Int(99));
+
+    // s_b (unrelated, unpaused) delivers immediately — isolation holds.
+    let b_data: Vec<i64> = rec_b
+        .snapshot()
+        .iter()
+        .skip(baseline_b)
+        .filter_map(|e| match e {
+            RecordedEvent::Data(TestValue::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(b_data, vec![99], "unrelated node not blocked by s_a pause");
+
+    // R2.6.0: s_a's OWN self-emit also delivered immediately under
+    // Default mode (depless leaf source — no dep wave, no buffer).
+    let a_data: Vec<i64> = rec_a
+        .snapshot()
+        .iter()
+        .skip(baseline_a)
+        .filter_map(|e| match e {
+            RecordedEvent::Data(TestValue::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        a_data,
+        vec![1],
+        "Default-mode self-paused leaf source self-emit delivered immediately (R2.6.0)"
+    );
+
+    let report = rt.core.resume(s_a.id, lock).expect("resume a");
+    assert!(
+        report.is_none() || report.unwrap().replayed == 0,
+        "Default mode replays nothing on resume (R2.6.0)"
+    );
+}
+
 #[test]
 fn equals_substituted_resolved_buffers_too() {
     // R2.6.0: RESOLVED buffering alongside DATA is the `ResumeAll`
