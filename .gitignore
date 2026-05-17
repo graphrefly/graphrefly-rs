@@ -3,6 +3,9 @@
 **/target/
 **/*.rs.bk
 
+# gate.sh runtime — direct logs + the atomic mkdir mutex (scripts/gate.sh)
+/.gate/
+
 # Cargo.lock — kept committed because this workspace contains binary-producing
 # crates (cdylib bindings). Per Cargo guidance: lib-only repos omit it; repos
 # that build binaries commit it for reproducible builds.

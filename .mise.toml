@@ -41,3 +41,20 @@ run = "python3 docs/audit/auto_cite.py"
 description = "Re-extract all data, then serve the dashboard"
 depends = ["audit-extract"]
 run = "python3 -m http.server 8769 --directory docs"
+
+# ─── long-gate runner (THE sanctioned entrypoint) ───────────────────
+# `scripts/gate.sh` is the ONLY sanctioned way to run the full gate:
+# atomic mutex (refuses a second concurrent run), sequential fmt→clippy→
+# nextest (never a `;`-chain), process-group teardown, bounded jobs +
+# RAM precheck, direct file log, self-timeout with a thrash-vs-deadlock
+# diagnostic. Never hand-launch `;`-chained cargo in the background.
+# Rationale: ~/src/graphrefly-ts/docs/test-guidance.md § "Running the
+# full Rust gate / diagnosing a stuck run".
+
+[tasks.gate]
+description = "FULL gate: fmt --check + clippy + nextest --profile ci (incl. cascade_depth). The only sanctioned long-gate runner."
+run = "scripts/gate.sh"
+
+[tasks."gate:core"]
+description = "FAST gate variant: fmt --check + clippy + nextest, scoped to -p graphrefly-core (default profile)."
+run = "scripts/gate.sh core"

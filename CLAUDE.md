@@ -55,6 +55,20 @@ cargo nextest run --profile stress  # FULL on dev box (incl. cascade_depth)
 cargo test --workspace              # legacy fallback (slow; runs cascade_depth too)
 cargo test -p graphrefly-core       # one crate (legacy)
 
+# ⚠ LONG GATE — use the sanctioned runner, NEVER `;`-chained bg cargo.
+# A `;`-chained `sh -c "fmt; clippy; nextest; nextest --profile ci" &`
+# launcher is the documented foot-gun: `pkill` kills one cargo child while
+# the surviving chain relaunches the next → overlapping cargo runs fight
+# the single target lock → swap thrash that mimics a deadlock for ~1h
+# (memory: feedback_no_chained_background_cargo.md; the Slice B-2 incident).
+mise run gate:core                  # FAST gate: fmt --check + clippy + nextest -p graphrefly-core
+mise run gate                       # FULL gate: fmt --check + clippy + nextest --profile ci
+# → scripts/gate.sh: atomic mutex (2nd concurrent run refuses), sequential
+#   steps, process-group teardown, bounded jobs + RAM precheck, direct file
+#   log, self-timeout w/ thrash-vs-deadlock diagnostic. Full rationale + the
+#   stuck-run signature table: ~/src/graphrefly-ts/docs/test-guidance.md
+#   § "Running the full Rust gate / diagnosing a stuck run".
+
 # ⚠ Parallel sessions: `cargo test`/`cargo t` share `target/` and its
 # build lock — a second run BLOCKS behind the first (and is wedged forever
 # if the first deadlocks). Use `scripts/dev-test.sh`: it sets a
