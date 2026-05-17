@@ -22,7 +22,7 @@ mise trust && mise install
 
 # Verify the scaffold compiles
 cargo check --workspace
-cargo test --workspace
+cargo nextest run --profile ci     # full suite incl. cascade_depth guards
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -39,7 +39,7 @@ Per the project's [single-source-of-truth principle](CLAUDE.md#memory-principles
 
 - Branch from `main`. Open PRs against `main`.
 - One logical change per PR. Multi-crate refactors are fine; mixing unrelated concerns is not.
-- Commits should pass: `cargo check --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --all --check`. CI enforces.
+- Commits should pass: `cargo check --workspace`, `cargo nextest run --profile ci` (full suite incl. cascade_depth stack-safety guards), `cargo clippy --workspace --all-targets`, `cargo fmt --all --check`. CI enforces.
 - Pre-1.0: **no backward-compatibility shims.** Rename freely; update all call sites in the same PR. See [`CLAUDE.md`](CLAUDE.md) → "Memory principles" for the full discipline.
 - Conventional commits style optional but appreciated (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`).
 

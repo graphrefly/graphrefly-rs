@@ -2403,8 +2403,8 @@ pub(crate) fn component_is_group_consistent(s: &CoreState, node: NodeId) -> bool
 }
 
 impl<C: crate::state_cell::StateCell> Core<C> {
-    /// Test-only inspection: number of `PendingBatch`es queued for
-    /// `node` in the current wave. Used by Slice X4 D2 regression
+    /// Internal inspection helper: number of `PendingBatch`es queued
+    /// for `node` in the current wave. Used by Slice X4 D2 regression
     /// tests to pin the "common case = single batch, no SmallVec
     /// spill" perf invariant.
     ///
@@ -2412,7 +2412,19 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// (no tier-1+ message has been queued for this node yet in this
     /// wave). `Some(0)` is unreachable by construction (a vacant
     /// entry implies no batches; an occupied entry has at least one).
-    #[cfg(any(test, debug_assertions))]
+    ///
+    /// `#[doc(hidden)]` + unconditionally `pub` (NOT
+    /// `cfg(any(test, debug_assertions))`): integration tests are a
+    /// separate crate, so they get neither `cfg(test)` nor
+    /// `debug_assertions` on the lib dependency under `--release`.
+    /// Gating this out of release builds made the entire
+    /// integration-test suite fail to compile under
+    /// `cargo nextest run --release`, blocking release-optimized test
+    /// runs (e.g. the `cascade_depth` stress tests). It is NOT primary
+    /// public API — `#[doc(hidden)]` keeps it off the generated
+    /// surface (spec §5.12: protocol-internal inspection is allowed
+    /// but never a primary API).
+    #[doc(hidden)]
     #[must_use]
     pub fn pending_batch_count(&self, node: NodeId) -> Option<usize> {
         // Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_notify lives

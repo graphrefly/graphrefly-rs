@@ -53,11 +53,15 @@ cargo check --workspace
 # Build everything (default-members; bindings excluded)
 cargo build
 
-# Run all tests
-cargo test --workspace
+# Run tests (cargo-nextest — the canonical loop; install via
+# `cargo install cargo-nextest --locked` or the prebuilt tarball at
+# https://get.nexte.st). `cargo test` is a legacy fallback only.
+cargo nextest run                    # fast default loop (cascade_depth quarantined)
+cargo nextest run --profile ci       # full suite incl. cascade_depth guards (== `cargo tc`)
+scripts/dev-test.sh                  # default loop, per-worktree-isolated target
 
 # Run tests for one crate
-cargo test -p graphrefly-core
+cargo nextest run -p graphrefly-core
 
 # Lint (clippy::pedantic warn-by-default — see CLAUDE.md "Rust-specific invariants")
 cargo clippy --workspace --all-targets
@@ -102,7 +106,7 @@ Config lives in [`../deny.toml`](../deny.toml). CI runs this on every PR.
 
 ## Bindings — separate toolchains
 
-The three binding crates (`graphrefly-bindings-{js,py,wasm}`) require their own non-Cargo build tools. They are NOT compiled by `cargo build` or `cargo test --workspace`. Build them via their toolchains:
+The three binding crates (`graphrefly-bindings-{js,py,wasm}`) require their own non-Cargo build tools. They are NOT compiled by `cargo build` or `cargo nextest run` (both scoped to workspace `default-members`). Build them via their toolchains:
 
 ### JavaScript (napi-rs)
 
@@ -154,7 +158,7 @@ Before opening a PR, run all of:
 
 ```bash
 cargo check --workspace
-cargo test --workspace
+cargo nextest run --profile ci           # full suite incl. cascade_depth guards
 cargo clippy --workspace --all-targets   # zero warnings
 cargo fmt --all --check                  # zero diffs
 cargo deny check                         # if cargo-deny installed
@@ -183,7 +187,7 @@ CI enforces all five. Failing locally is faster to fix than failing in CI.
 1. Edit `[workspace.dependencies]` in the root `Cargo.toml`.
 2. `cargo update` to refresh `Cargo.lock`.
 3. `cargo check --workspace` to confirm no API breaks.
-4. `cargo test --workspace` to confirm behavior intact.
+4. `cargo nextest run --profile ci` to confirm behavior intact.
 5. Commit `Cargo.toml` + `Cargo.lock` together.
 
 For the Rust toolchain itself, edit BOTH `rust-toolchain.toml` AND `.mise.toml` (and the `rust-version` field in `Cargo.toml`'s `[workspace.package]`). Three files, same version.
@@ -193,7 +197,7 @@ For the Rust toolchain itself, edit BOTH `rust-toolchain.toml` AND `.mise.toml` 
 The Core implementation must verify against `~/src/graphrefly/formal/wave_protocol.tla` (TLA+ spec) and the [property tests in graphrefly-ts](https://github.com/graphrefly/graphrefly-ts/tree/main/src/__tests__/properties) (fast-check). If a Rust test fails:
 
 1. **Read [COMPOSITION-GUIDE-PROTOCOL.md](https://github.com/graphrefly/graphrefly/blob/main/COMPOSITION-GUIDE-PROTOCOL.md) FIRST** before improvising fixes. Per the project memory rule: skipping leads to null-guard violations and layer-breaking optimizations.
-2. Isolate the failing test (`cargo test -p <crate> --lib <test_name> -- --exact --nocapture`).
+2. Isolate the failing test (`cargo nextest run -p <crate> -E 'test(<test_name>)' --no-capture`; nextest names a SLOW test by name and hard-kills a deadlock — so a hang is unambiguous vs a legitimately long test).
 3. Run the equivalent TLC scenario MC against `wave_protocol.tla` to see if the bug exists in the spec interpretation.
 4. Decide: protocol bug (file against `graphrefly/graphrefly`) vs Rust impl bug (fix here).
 

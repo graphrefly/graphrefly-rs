@@ -2938,7 +2938,11 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **Why noted:** Not a deferral — this is a resolved concern. The Display output is a debug-quality string (`HandleId(42)`), not a user-facing representation. If a future surface needs human-readable handle rendering, the Display impl may need revisiting.
 - **Source:** Slice U-napi S4, discovered while compiling structures_bindings.rs (2026-05-12).
 
-### §7-A — `commit_emission` single-pass collapse — DEFERRED (evidence-based; flagged for user ratification)
+### §7-A — `commit_emission` single-pass collapse — RE-DISPOSITIONED 2026-05-16 (D216): absorbed into Slice A floor rewrite
+
+> **2026-05-16 (D216) update — supersedes the "flagged for user ratification" status below.** The §7 perf-verification bench (`benches/floor_compare.rs`) confirmed §5b: deleting union-find (a *far* larger change than this collapse) moved the real `Core<SingleThreadCell>` hot path only ~4% (627 ns ≈ old prod 634 ns), and the real bottleneck is the monolithic `CoreState` machinery, not the multi-phase re-lock. **Final disposition:** NOT done standalone (bench-confirmed ~0 value, §7's riskiest behavioral change) and NOT deferred-forever — **absorbed into Slice A** (the dispatcher data-structure floor rewrite: slab store + single-pass commit + refcount-churn cut, target <150 ns), where single-pass commit is a coherent component of the holistic rewrite done for a *measured* target under fresh coverage. Scoped by the design session (D216 routing). The original analysis below is retained as the rationale Slice A inherits.
+
+
 
 - **What:** §7 item (1) bundles, alongside the union-find deletion, collapsing `commit_emission`'s defensive multi-phase re-lock (Phase-1 snapshot / Phase-3 re-lock / terminal re-checks) into a single pass. This slice (D208–D211) shipped the union-find deletion + lock-free `None` floor + `SerializationGroupId` contract but **did not** collapse `commit_emission`.
 - **Why deferred:** `SESSION-rust-port-perf-value-investigation.md` §5b *measured* the lock-cycle collapse at **~0% single-thread benefit** (contended-only ~10%); the ~7.6× win is the union-find/machinery deletion (§4b/§4c), not the re-lock collapse. The collapse is also the single riskiest behavioral change in §7 (terminal/equals/DIRTY ordering under the multi-phase structure). Deferring it materially de-risked an already-maximal slice while still delivering §7's measured perf lever and the ~83 ns floor.
@@ -2954,7 +2958,11 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **Lift point:** If a real consumer hits cross-component dynamic re-entry under multi-thread grouped load, add a minimal "acquire-or-defer-to-wave-end if it would descend" guard (a much smaller mechanism than the deleted union-find defer). Until then, prefer keeping co-emitting nodes in one component (so the target group is in the seed cascade and pre-acquired sorted).
 - **Source:** §7 wave-acquisition spec; this slice.
 
-### §7-C — Vestigial union-find surface retained for downstream zero-churn (cleanup follow-on)
+### §7-C — Vestigial union-find surface — RE-DISPOSITIONED 2026-05-16 (D216): absorbed into Slice B parallelism redesign
+
+> **2026-05-16 (D216) update.** This is genuinely dead code (never constructed/taken) — it should be *deleted*, not kept as permanent vestigial noise. It was "not cheap" only as a *standalone* 166-ref/8-file `graphrefly-operators` slice. **Slice B** (the group-owned-shard parallelism redesign — `SerializationGroupId` owns an independent `CoreState` sub-store, replacing the bench-proven-worthless "ReentrantMutex on top of one global mutex") rewrites the *exact* group/lock layer these symbols live in ⇒ deleting them there is **free**, not standalone churn. **§7-F folds in with it** (the `where C: Send + Sync` cliff on `*_or_defer` disappears when that layer is rewritten). Scoped by the design session (D216 routing). Original rationale retained below.
+
+
 
 - **What:** To honor D211 (keep `graphrefly-graph`/`-operators`/`-storage`/`-structures` + napi compiling with zero churn), these now-dead symbols were kept as **vestigial, never-constructed** surface: `PartitionOrderViolation` (fields → `u64`, never produced), `SubscribeError::PartitionOrderViolation`, `SetDepsError::PartitionMigrationDuringFire`, `DeferredProducerOp` (+ `push_deferred_producer_op`, now immediate-exec), the `*_or_defer` methods (now thin aliases to the non-deferred ops), `Core::drain_deferred_producer_ops` (empty inline no-op). The `graphrefly-operators` `Err(SubscribeError::PartitionOrderViolation(_))` defer arms are now dead (never taken).
 - **Why deferred:** Removing them requires editing the matching `Err(_)` arms + call sites across `graphrefly-operators` (`producer.rs`, `higher_order.rs`) — a pure downstream-churn refactor disjoint from the Core rewrite. Pre-1.0, no compat constraint; it's a cleanup, not a correctness issue.
@@ -2973,7 +2981,11 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **Lift point:** When a consumer creates unboundedly-many distinct groups, add per-group live-node refcounting (decrement on unmount/destroy; drop the registry entry at zero) or a periodic sweep keyed off `partition_of` membership.
 - **Source:** QA review (Blind Hunter §7 pass); this slice.
 
-### §7-F — `*_or_defer` family carries `where C: Send + Sync` → unavailable on `Core<SingleThreadCell>`
+### §7-F — `*_or_defer` `where C: Send + Sync` cliff — RE-DISPOSITIONED 2026-05-16 (D216): folds into Slice B with §7-C
+
+> **2026-05-16 (D216) update.** Folds into **Slice B** alongside §7-C (same group/lock layer rewrite). Original analysis below.
+
+
 
 - **What:** The vestigial `emit_or_defer`/`complete_or_defer`/… aliases (§7-C) retained a `where C: Send + Sync` bound. `SingleThreadCell` is `!Send + !Sync`, so producer-pattern operators (`stratify`/`control` and anything routing through `*_or_defer`) are not callable on the §7 floor substrate. Not a current break — `graphrefly-operators` is monomorphic over the default `Core<LockedCell>`, so the workspace compiles and all 825 tests pass.
 - **Why deferred (QA F7, 2026-05-16):** "operators on `Core<SingleThreadCell>`" is a future milestone (the floor today is the bench/regression harness + leaf substrate use, not the operator layer). Removing the bound requires the §7-C cleanup slice to also re-check that the immediate-exec `*_or_defer` bodies don't themselves need `Send + Sync` (they shouldn't post-rewrite — no closure is queued/sent anymore).

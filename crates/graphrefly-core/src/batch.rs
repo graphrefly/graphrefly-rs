@@ -285,6 +285,18 @@ pub(crate) struct WaveState {
     /// `flush_notifications` → `deferred_handle_releases`; panic path:
     /// directly in `BatchGuard::drop`'s panic branch).
     pub(crate) pending_notify: IndexMap<NodeId, PendingPerNode>,
+    /// D217-AMEND-2 (2026-05-16): persistent spare for `pending_notify`,
+    /// ping-ponged with it at wave end so a fresh `IndexMap::default()`
+    /// (a new `ahash::RandomState` via `gen_hasher_seed`/`from_keys`
+    /// PLUS RawVec realloc churn on the next wave's `queue_notify`) is
+    /// NEVER constructed after thread init. The empirical attribution
+    /// (`examples/profile_st_emit.rs` + macOS `sample`) put the old
+    /// per-wave `mem::take(&mut pending_notify)` at ~1250 of ~4767
+    /// hot-path samples — the dominant §7 floor tax (D217 lever-1
+    /// "slab store" falsified; the node store is minor). Holds NO
+    /// retains between waves: it is always empty (cleared, capacity +
+    /// hasher retained) outside `flush_notifications`.
+    pub(crate) pending_notify_recycle: IndexMap<NodeId, PendingPerNode>,
     // Q-beyond Sub-slice 3 (D108, 2026-05-09) moved `in_tick` and
     // `currently_firing` from `CoreState` to per-thread `WaveState`;
     // /qa F1+F2 (2026-05-10) reverted both to `CoreState`; the in_tick
@@ -365,6 +377,9 @@ impl WaveState {
             pending_pause_overflow: Vec::new(),
             pending_fires: AHashSet::new(),
             pending_notify: IndexMap::new(),
+            // D217-AMEND-2: one `IndexMap::default()` for the thread's
+            // life — its ahash seed + capacity are recycled forever.
+            pending_notify_recycle: IndexMap::new(),
             invalidate_hooks_fired_this_wave: AHashSet::new(),
             deferred_flush_jobs: Vec::new(),
             deferred_cleanup_hooks: Vec::new(),
@@ -483,6 +498,21 @@ fn wave_state_clear_outermost() {
              outermost wave start ({} entries) — prior BatchGuard::drop \
              bypassed the drain. See /qa F4 (2026-05-10).",
             ws.pending_notify.len()
+        );
+        // D217-AMEND-2 / QA: enforce the invariant the field's own doc
+        // claims ("always empty outside `flush_notifications`"). The
+        // recycle slot is cleared at the end of every `flush_notifications`
+        // and drained on the panic-discard path (`discard_wave_cleanup`);
+        // a non-empty slot here means a panic bypassed both — surface it
+        // loudly in tests rather than silently injecting a prior wave's
+        // stale entries into the next wave's `mem::swap`.
+        debug_assert!(
+            ws.pending_notify_recycle.is_empty(),
+            "wave_state_clear_outermost: pending_notify_recycle non-empty \
+             at outermost wave start ({} entries) — a panic bypassed both \
+             flush_notifications' clear AND discard_wave_cleanup's drain. \
+             See D217-AMEND-2 / QA (2026-05-16).",
+            ws.pending_notify_recycle.len()
         );
         ws.pending_auto_resolve.clear();
         ws.pending_pause_overflow.clear();
@@ -2988,48 +3018,85 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // removing the parameter would break the caller's ability to
         // express the lock-discipline contract at the call site.
         let _ = &*s; // explicit no-op acknowledgement; lock held by caller.
-        let pending = with_wave_state(|ws| std::mem::take(&mut ws.pending_notify));
-        let mut jobs: DeferredJobs = Vec::new();
-        for &phase_tiers in PHASES {
-            for (_node_id, entry) in &pending {
-                // Slice X4 / D2: iterate batches in arrival order. Each
-                // batch carries its own sink snapshot frozen at open-time;
-                // a batch's messages flush to ITS sinks only. Within a
-                // single (phase, node), batches stay in arrival order so
-                // emit-order semantics are preserved across batches.
-                for batch in &entry.batches {
-                    if batch.sinks.is_empty() {
-                        continue;
-                    }
-                    let phase_msgs: Vec<Message> = batch
-                        .messages
-                        .iter()
-                        .copied()
-                        .filter(|m| phase_tiers.contains(&m.tier()))
-                        .collect();
-                    if phase_msgs.is_empty() {
-                        continue;
-                    }
-                    let sinks_clone: Vec<Sink> = batch.sinks.iter().map(Arc::clone).collect();
-                    jobs.push((sinks_clone, phase_msgs));
-                }
-            }
-        }
-        // Single WaveState borrow at the end: push the collected jobs
-        // and the payload-handle releases. Refcount release balances the
-        // retain done in `queue_notify` for every payload-bearing message
-        // that landed in pending_notify (across ALL batches per node);
-        // deferred to post-lock-drop so the binding's release path can't
-        // re-enter Core under our lock.
+                     // D217-AMEND-2 (2026-05-16): recycle the per-wave `pending_notify`
+                     // map instead of `mem::take`-ing it. `mem::take` installed a
+                     // fresh `IndexMap::default()` every wave → a new `ahash::
+                     // RandomState` (entropy via `gen_hasher_seed`/`from_keys`) PLUS
+                     // RawVec realloc churn (`finish_grow`/`grow_one`) on the next
+                     // wave's `queue_notify`. Empirical attribution
+                     // (`examples/profile_st_emit.rs` + macOS `sample`): ~1250 of
+                     // ~4767 hot-path samples — the dominant §7 floor tax (D217
+                     // lever-1 "slab store" falsified; `require_node` was minor).
+                     // Fix: swap the live map with a persistent spare so the next
+                     // wave fills a capacity-retained, fixed-seed map; process this
+                     // wave's full map from the spare slot and `.clear()` it (retain
+                     // capacity + hasher; no drop, no realloc, no reseed). Zero
+                     // `IndexMap::default()` after thread init.
+                     //
+                     // The jobs-building loop now runs INSIDE the single WaveState
+                     // borrow. This is sound: the loop is pure (iteration +
+                     // `Arc::clone` + `Vec` collect; no re-entrant `with_wave_state`
+                     // / `lock_state`), and the caller holds the CoreState lock
+                     // throughout regardless — so R1.3.5.a per-tier
+                     // handshake-vs-flush ordering is unchanged. Refcount discipline
+                     // is unchanged: payload-handle releases are still collected into
+                     // `deferred_handle_releases` (released post-lock-drop by
+                     // `BatchGuard::drop`); `.clear()` runs the same element drops as
+                     // the old map-drop and the `PendingPerNode`/`Message` payloads
+                     // carry no refcount-releasing `Drop`.
         with_wave_state(|ws| {
-            ws.deferred_flush_jobs.append(&mut jobs);
-            for entry in pending.values() {
-                for msg in entry.iter_messages() {
-                    if let Some(h) = msg.payload_handle() {
-                        ws.deferred_handle_releases.push(h);
+            core::mem::swap(&mut ws.pending_notify, &mut ws.pending_notify_recycle);
+            // ws.pending_notify         = empty spare (next wave fills it)
+            // ws.pending_notify_recycle = THIS wave's full map (below)
+            let mut jobs: DeferredJobs = Vec::new();
+            let mut releases: Vec<HandleId> = Vec::new();
+            {
+                let full = &ws.pending_notify_recycle;
+                for &phase_tiers in PHASES {
+                    for (_node_id, entry) in full {
+                        // Slice X4 / D2: iterate batches in arrival
+                        // order. Each batch carries its own sink
+                        // snapshot frozen at open-time; a batch's
+                        // messages flush to ITS sinks only. Within a
+                        // single (phase, node), batches stay in arrival
+                        // order so emit-order semantics are preserved.
+                        for batch in &entry.batches {
+                            if batch.sinks.is_empty() {
+                                continue;
+                            }
+                            let phase_msgs: Vec<Message> = batch
+                                .messages
+                                .iter()
+                                .copied()
+                                .filter(|m| phase_tiers.contains(&m.tier()))
+                                .collect();
+                            if phase_msgs.is_empty() {
+                                continue;
+                            }
+                            let sinks_clone: Vec<Sink> =
+                                batch.sinks.iter().map(Arc::clone).collect();
+                            jobs.push((sinks_clone, phase_msgs));
+                        }
+                    }
+                }
+                // Refcount release balances the retain done in
+                // `queue_notify` for every payload-bearing message that
+                // landed in pending_notify (across ALL batches per
+                // node); deferred to post-lock-drop so the binding's
+                // release path can't re-enter Core under our lock.
+                for entry in full.values() {
+                    for msg in entry.iter_messages() {
+                        if let Some(h) = msg.payload_handle() {
+                            releases.push(h);
+                        }
                     }
                 }
             }
+            ws.deferred_flush_jobs.append(&mut jobs);
+            ws.deferred_handle_releases.append(&mut releases);
+            // Retain capacity + the existing ahash seed for next wave's
+            // swap-in. No drop, no realloc, no reseed.
+            ws.pending_notify_recycle.clear();
         });
     }
 
@@ -3461,7 +3528,7 @@ impl<C: crate::state_cell::StateCell> BatchGuard<C> {
     /// `fire_deferred` (so a re-entrant sink emit runs as a fresh owning
     /// wave).
     fn discard_wave_cleanup(&self) {
-        let (pending, deferred_releases, restored_releases) = {
+        let (pending, pending_recycle, deferred_releases, restored_releases) = {
             let mut s = self.core.lock_state();
             // WaveState borrowed alongside state for panic-discard
             // cleanup. The WaveState borrow is per-thread, independent of
@@ -3471,6 +3538,21 @@ impl<C: crate::state_cell::StateCell> BatchGuard<C> {
             // WaveState retain-fields.
             with_wave_state(|ws| {
                 let pending = std::mem::take(&mut ws.pending_notify);
+                // D217-AMEND-2 / QA: `pending_notify_recycle` is the
+                // ONE retain-capable WaveState field whose retains live
+                // in a *persistent* slot (not an owned local that drops
+                // on unwind). On the success path it is empty here
+                // (`flush_notifications` cleared it). But if a wave
+                // panic-discards mid-`flush_notifications` AFTER the
+                // swap but before `.clear()`, this slot holds the full
+                // wave's payload-retaining map while `pending_notify` is
+                // the empty spare. Drain it symmetrically so the same
+                // "every retain field released on the panic path"
+                // invariant the sibling fields uphold also covers
+                // recycle (closes the leak + the stale-entry-injected-
+                // into-next-wave hazard; success path: this is a no-op
+                // take of an already-empty map).
+                let pending_recycle = std::mem::take(&mut ws.pending_notify_recycle);
                 let _: DeferredJobs = std::mem::take(&mut ws.deferred_flush_jobs);
                 ws.pending_fires.clear();
                 let restored = self.core.restore_wave_cache_snapshots(&mut s, ws);
@@ -3496,12 +3578,23 @@ impl<C: crate::state_cell::StateCell> BatchGuard<C> {
                 // This mirrors D061's external-resource-cleanup gap and
                 // is documented similarly.
                 let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
-                (pending, deferred_releases, restored)
+                (pending, pending_recycle, deferred_releases, restored)
             })
         };
         // Lock dropped — release retains lock-released so the binding
         // can't deadlock against an internal binding mutex.
         for entry in pending.values() {
+            for msg in entry.iter_messages() {
+                if let Some(h) = msg.payload_handle() {
+                    self.core.binding.release_handle(h);
+                }
+            }
+        }
+        // Symmetric with the `pending` loop above (D217-AMEND-2 / QA):
+        // releases the full-map retains stranded in the recycle slot by
+        // a panic between `flush_notifications`'s swap and clear. Empty
+        // (no-op) on every non-panic path.
+        for entry in pending_recycle.values() {
             for msg in entry.iter_messages() {
                 if let Some(h) = msg.payload_handle() {
                     self.core.binding.release_handle(h);

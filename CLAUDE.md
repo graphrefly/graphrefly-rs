@@ -39,12 +39,20 @@ cargo check --workspace             # fast type-check, all crates
 # binary); nextest runs ALL tests across ALL binaries in one global thread
 # pool, and its slow-timeout (.config/nextest.toml) KILLS a deadlocked
 # test after 3min instead of wedging the suite + the cargo build lock.
-scripts/dev-test.sh                 # ALL default-members tests, isolated
+#
+# The default profile QUARANTINES the 4 cascade_depth stack-safety stress
+# tests (~95% of wall time, ~13.6s each) → inner loop ≈ 0.5s for 304 tests
+# vs ~14s. They are NOT benchmarks — they guard the iterative-cascade /
+# no-stack-overflow invariant — so they STILL run under the ci/stress
+# profiles. Run the full suite (incl. cascade_depth) before merge / after
+# touching cascade/terminate/teardown/invalidate code.
+scripts/dev-test.sh                 # 304 tests, isolated, ~0.5s (no cascade_depth)
 scripts/dev-test.sh -p graphrefly-core            # one crate
 scripts/dev-test.sh -p graphrefly-core <filter>   # filtered
-cargo t                             # = `cargo nextest run` (shared target)
-cargo tc                            # = nextest run --profile ci
-cargo test --workspace              # legacy fallback (slow, binary-by-binary)
+cargo t                             # = nextest run (default; shared target)
+cargo tc                            # = nextest run --profile ci (FULL, incl. cascade_depth)
+cargo nextest run --profile stress  # FULL on dev box (incl. cascade_depth)
+cargo test --workspace              # legacy fallback (slow; runs cascade_depth too)
 cargo test -p graphrefly-core       # one crate (legacy)
 
 # ⚠ Parallel sessions: `cargo test`/`cargo t` share `target/` and its

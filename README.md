@@ -65,13 +65,22 @@ cargo check --workspace
 # Build core crates (default-members; bindings excluded)
 cargo build
 
-# Test everything
-cargo test --workspace
+# Test loop (cargo-nextest — install: `cargo install cargo-nextest --locked`
+# or prebuilt: `curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ~/.cargo/bin`)
+cargo nextest run                       # default-members; fast inner loop
+cargo nextest run -p graphrefly-core    # only one crate
 
-# Test only one crate
-cargo test -p graphrefly-core
+# Full suite incl. the cascade_depth stack-safety stress tests
+# (quarantined from the default loop — see .config/nextest.toml). Run
+# before merge / after touching cascade/terminate/teardown/invalidate:
+cargo nextest run --profile ci          # == `cargo tc`
 
-# Property-test with concurrency permutations
+# Parallel sessions: use the isolated wrapper so a second run never
+# blocks on the shared `target/` build lock:
+scripts/dev-test.sh                     # default loop, per-worktree target
+
+# Property-test with concurrency permutations (loom — stays on `cargo
+# test`: loom needs the `--cfg loom` build, not a nextest run):
 cargo test -p graphrefly-core --features loom-checked
 
 # Lint

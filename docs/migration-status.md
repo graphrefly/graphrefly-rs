@@ -2421,6 +2421,165 @@ passed, 0 failed** (was 825). `cargo clippy -p graphrefly-core
 --all-targets` clean; `cargo fmt --check` clean; `#![forbid(unsafe_code)]`
 preserved across all 6 crate roots; zero new `unsafe`.
 
+### §7 perf-verification — landed 2026-05-16 (D216); **thesis REFUTED**
+
+Source: `project_next_porting_batch.md` user-locked §7 perf-verification
+batch; decision D216 in
+`~/src/graphrefly-ts/docs/rust-port-decisions.md`. Two criterion benches
+added (`crates/graphrefly-core/benches/floor_compare.rs`,
+`group_scaling.rs` + `[[bench]]` entries) measuring the **real shipped
+`Core<C>`** — NOT the lean `minimal_handle_core` mirror. No `src/`
+change. The slice's job was to *verify* the §7 floor + parallelism
+thesis; it **falsified it on both axes**.
+
+**Axis 1 — single-thread floor (`floor_compare`, criterion `--quick`):**
+
+| workload | real `Core<SingleThreadCell>` (§7 floor) | real `Core<LockedCell>` (prod default, D211) | lean mirror (§4c) | old pre-§7 prod |
+|---|--:|--:|--:|--:|
+| identity_dedup | **~627 ns** | ~652 ns | **83 ns** | **634 ns** |
+| chain/4 | 1.79 µs | 1.96 µs | 1.15 µs | — |
+| chain/64 | 18.97 µs | 19.84 µs | 13.17 µs | — |
+| diamond/32 | 13.56 µs | 14.57 µs | — | — |
+| fanout/10 | 5.97 µs | 7.20 µs | — | — |
+| fanout/1000 | 2.196 ms | 2.264 ms | — | — |
+
+The real `Core<SingleThreadCell>` hot path (~627 ns) **≈ the old
+pre-§7 production dispatcher (~634 ns)**. The §7 rewrite bought **~4%**
+on the dedup hot path (~4–17% workload-dependent) — **not the
+predicted ~7.6×**. The 83 ns / 7.6× is a property of the lean
+hand-written mirror only (no `CoreState` HashMap / `Arc` / refcount /
+`BatchGuard` / multi-phase `commit_emission` — none of which §7
+touched). `RefCell` ≈ `Mutex` (~25 ns delta) ⇒ **the lock is not the
+cost**; the per-emit machinery under it is the ~7.6× the mirror omits.
+
+**Axis 2 — disjoint-group parallel scaling (`group_scaling`, aggregate
+emits/s):**
+
+| threads | disjoint | same_group (ctrl) | all_none (ctrl) |
+|--:|--:|--:|--:|
+| 1 | 1.09 M/s | 1.07 M/s | 1.08 M/s |
+| 2 | 0.66 M/s | 0.76 M/s | 0.74 M/s |
+| 4 | 0.54 M/s | 0.57 M/s | 0.61 M/s |
+| 8 | 0.34 M/s | 0.26 M/s | 0.37 M/s |
+
+Disjoint `SerializationGroupId` sets **do NOT run in parallel** —
+aggregate throughput regresses with thread count and is
+indistinguishable from the serialized controls. `LockedCell` wraps the
+*entire* `CoreState` in one `parking_lot::Mutex`; the per-group
+`ReentrantMutex` sits *on top* ⇒ adds overhead, never unlocks
+parallelism. Independently reproduces the §5 prior finding (disjoint
+state-emit slower than serial, worsens with thread count).
+
+**Net + resolution (user-directed):** §7 deleted union-find correctly
+and the model is sound *as a contract*, but delivered ~0 of its claimed
+perf value on the real dispatcher. The data separates two problems §7
+conflated:
+
+- **Slice A — dispatcher floor rewrite** (threading-independent): slab/
+  slotmap node store (`NodeId` = index, kill the per-emit HashMap),
+  shrink handle refcount churn, single-pass commit. Target: approach
+  the mirror's floor, <150 ns. **§7-A (`commit_emission` multi-phase →
+  single-pass collapse) folds in here** — single-pass commit *is* part
+  of this holistic rewrite, done for a measured target under fresh
+  coverage, NOT standalone for ~0 (§5b/D216 bench-confirmed).
+- **Slice B — group-owned-shard parallelism:** `SerializationGroupId`
+  *owns* an independent `CoreState` sub-store with its own lock
+  (all-`None` → one default shard = zero regression). Replaces the
+  proven-worthless "lock on top of one global mutex". **§7-C/§7-F
+  (vestigial union-find surface + `Send+Sync` cliff) fold in here** —
+  B rewrites that exact group/lock layer ⇒ deletion is free, not
+  standalone 8-file `graphrefly-operators` churn.
+- **Order: A then B** (parallelizing 627 ns work is pointless).
+  **Routing: full design session FIRST** — no redesign code until the
+  session locks scope. `floor_compare.rs` / `group_scaling.rs` are the
+  retained regression instruments for A/B.
+
+**Test status:** unchanged — no `src/` touched. `graphrefly-core`
+304/304 (nextest count; first-run flake
+`concurrent_subscribe_during_emit…` self-reports vacuous, passes on
+retry — pre-existing, unrelated). `cargo clippy -p graphrefly-core
+--all-targets` clean (incl. new benches); `cargo fmt --check` clean;
+`#![forbid(unsafe_code)]` preserved.
+
+### Slice A floor work — landed 2026-05-16 (D217-AMEND-2); lever falsified, bounded win, CAPPED
+
+Design session (D217–D219) scoped Slice A as a bench-gated lever rewrite
+to <150 ns. Pre-implementation premise check **falsified D217's lever
+ranking**: the 83 ns `minimal_handle_core` mirror uses the *same*
+`HashMap` node store production does (slower `std` SipHash) — the store
+is not a lever. Empirical attribution
+(`crates/graphrefly-core/examples/profile_st_emit.rs` + macOS `sample`,
+the retained attribution harness) found the dominant frame was per-wave
+`mem::take(&mut ws.pending_notify)` (fresh `IndexMap::default()` →
+ahash-reseed + RawVec realloc every wave).
+
+**Landed (user-locked: bounded alloc-elimination, no <150 ns target):**
+`WaveState::pending_notify_recycle` — a persistent spare ping-ponged
+with `pending_notify` (`mem::swap` + `.clear()`; zero
+`IndexMap::default()` after thread init; behavior-identical; refcount /
+R1.3.5.a ordering unchanged). `crates/graphrefly-core/src/batch.rs`
+only.
+
+| scenario | pre | post | Δ |
+|---|--:|--:|--:|
+| `Core<SingleThreadCell>` identity-dedup (clean 100-sample release) | 627 ns | **515 ns** | **−18%** |
+| `Core<LockedCell>` identity-dedup | 652 ns | **579 ns** | **−11%** |
+
+(chain/diamond/fanout in the D216 table predate the recycle; the swap
+is uniformly applied, directionally similar, not separately re-benched
+clean.)
+
+**Decisive structural finding:** the post-fix self-time profile shows
+the *remaining* 7.6× is **uniformly-distributed full-protocol machinery
+with NO 80/20 lever** — ~⅓ allocator churn, ~⅓ per-wave structure
+construct/destruct, ~⅓ protocol bookkeeping (`tier3_*` / `in_tick` /
+`clear_wave_state` / `payload_handle` / `is_state`); no symbol >~6% of
+the gap. The other `mem::take`-per-wave hash containers
+(`wave_cache_snapshots`, `pending_auto_resolve`) **early-out empty on
+the dedup hot path** → no further bounded alloc win without entering
+protocol bookkeeping (scoped out) or a ground-up mirror-shaped rewrite
+(the A3 the design session rejected). The mirror is fast because it
+implements a strict *subset* of the protocol (does less), not because
+it is better-structured — empirically confirms + generalizes §5b.
+**`<150 ns` is unreachable by incremental shaving.**
+
+**/qa pass — landed 2026-05-16.** Two parallel review subagents
+**converged** on one finding: `pending_notify_recycle` was the only
+retain-capable `WaveState` field with no panic-path drain
+(`discard_wave_cleanup`) and no `wave_state_clear_outermost`
+`debug_assert!` tripwire — breaking the uniform "every retain field
+released on the abort path + asserted empty at outermost-wave-start"
+invariant the surrounding machinery deliberately maintains. Calibrated
+**minor/latent** (not reachable today: every op between the swap and
+`.clear()` is infallible and Rust alloc-failure aborts rather than
+unwinds; the handle-leak-on-panic-mid-flush was also *pre-existing* —
+the old `mem::take`-at-top shape leaked identically), but a real
+defense-in-depth + future-footgun regression (a later fallible call in
+that window would silently reintroduce a handle leak **and**
+stale-map-injected-into-next-wave corruption). **Fixed** (mirrors the
+existing `pending_notify` pattern verbatim, zero success-path behavior
+change): symmetric `mem::take` + lock-released `release_handle` drain of
+`pending_notify_recycle` in `discard_wave_cleanup`; `debug_assert!` on
+`pending_notify_recycle.is_empty()` in `wave_state_clear_outermost`.
+Bench/harness files reviewed clean (two benign measurement-asymmetry
+nits accepted — symmetric across arms, ratio theses hold). Post-/qa:
+`cargo nextest run --profile ci -p graphrefly-core` **308/308** (incl.
+the 4 `cascade_depth` 5000-node stack-safety stress tests);
+default-members workspace **825/825**; `cargo clippy -p graphrefly-core
+--all-targets` clean; `cargo fmt --check` clean; `#![forbid(unsafe_code)]`
+preserved on `graphrefly-core`; zero new `unsafe`.
+
+**Slice A status: CAPPED.** §7 union-find deletion ≈4% + this recycle
+≈18% is the realizable single-thread improvement; ~515 ns is structural
+to the full-protocol dispatcher (consistent with "Rust perf =
+secondary/workload-gated claim; primary value = safety + canonical
+impl"). **Next: Slice B (D218/D219)** — per-shard parallelism is a
+throughput win independent of the single-thread floor. Tests
+(post-/qa, `ci` profile): graphrefly-core **308/308** (incl.
+`cascade_depth` stress), workspace **825/825**; clippy `-p
+graphrefly-core --all-targets` clean; `cargo fmt --check` clean;
+`#![forbid(unsafe_code)]` preserved; zero new `unsafe`.
+
 ## Post-1.0 backlog
 
 Per the deferral guardrails in `~/src/graphrefly-ts/docs/implementation-plan.md` Phase 14:

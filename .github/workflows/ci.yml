@@ -42,7 +42,7 @@ jobs:
   # ---------------------------------------------------------------------
   # Rust: check + test + clippy + fmt + cargo-deny on the pinned 1.95
   # toolchain (workspace `rust-toolchain.toml`). Excludes binding crates
-  # from `cargo test`/`cargo build` via workspace `default-members` —
+  # from `cargo nextest`/`cargo build` via workspace `default-members` —
   # they need their own toolchains (napi-rs, maturin, wasm-pack) and
   # land separately in the binding-specific jobs below.
   # ---------------------------------------------------------------------
@@ -79,8 +79,17 @@ jobs:
       - name: Cargo clippy (default-members, all targets, pedantic-tier)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Cargo test (default-members)
-        run: cargo test --all-targets
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # nextest `ci` profile: `default-filter = "all()"` so the
+      # cascade_depth stack-safety stress tests (quarantined out of the
+      # local default loop in .config/nextest.toml) DO run here — the
+      # no-stack-overflow invariant is merge-gated. The profile's
+      # slow-timeout also kills a deadlocked test after 4×60s instead of
+      # burning the whole job's wall-clock budget.
+      - name: Cargo nextest (default-members, ci profile — incl. cascade_depth)
+        run: cargo nextest run --profile ci --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 

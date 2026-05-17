@@ -58,6 +58,22 @@ harness = false
 name    = "minimal_handle_core"
 harness = false
 
+# §7 floor-verification (D216) — the REAL shipped `Core<C>`, both
+# `SingleThreadCell` (floor) and `LockedCell` (production default)
+# arms, same workloads as `dispatcher.rs`. The honest measure of what
+# the §7 rewrite bought on the genuine dispatcher (vs the lean
+# `minimal_handle_core` mirror).
+[[bench]]
+name    = "floor_compare"
+harness = false
+
+# §7 parallel-scaling (D216) — does a disjoint `SerializationGroupId`
+# set actually run in parallel? N-thread aggregate-throughput scaling
+# with `same_group` / `all_none` serialized controls.
+[[bench]]
+name    = "group_scaling"
+harness = false
+
 [features]
 default      = ["std", "tokio"]
 # `std` is the only supported configuration for now. Kept as a feature so
