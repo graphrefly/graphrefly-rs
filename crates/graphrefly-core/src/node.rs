@@ -5557,6 +5557,21 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // CoreState helpers — kept on the inner struct so they're naturally scoped
 // to the lock guard.
 impl CoreState {
+    /// Construct a fresh empty shard `CoreState` (Step 2b): no nodes,
+    /// no children, just the binding clone its `Drop` node-retain walk
+    /// needs. Used by `LockedCell::lock_shard` when a new `ShardKey`
+    /// is first touched. Centralizes the field set + the `ahash`
+    /// `HashMap`/`HashSet` types so the cell layer doesn't hard-code
+    /// them.
+    #[must_use]
+    pub(crate) fn empty_shard(binding: Arc<dyn BindingBoundary>) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            children: HashMap::new(),
+            binding,
+        }
+    }
+
     // `alloc_node_id` / `alloc_sub_id` moved to `impl St` (Step 2a,
     // D220-EXEC): their counters now live in the separate `CoreShared`
     // region, which only the combined `St` guard holds alongside the
