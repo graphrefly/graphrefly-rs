@@ -2619,31 +2619,49 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   landed `scripts/gate.sh` sanctioned runner); the change itself
   is a clean mechanical re-nest. Set up B-2 Step 2 (the
   `StateCell` shard reshape) against this stable seam.
-- **B-2 Step 2 — ATTEMPTED + REVERTED to green Step 1 (2026-05-16);
-  turnkey-banked for a fresh-budget session.** Decomposed into
-  **2a** (behaviour-identical structural reshape + the ~104-site
-  closure migration, single shard, 825-gated — ZERO concurrency
-  change) and **2b** (per-`ShardKey` `Arc<parking_lot::Mutex<
-  CoreState>>` map + `lock_arc` owned guards + `begin_batch_for`
-  ascending routing — the real parallelism, gated by
-  `group_scaling` + `floor_compare` + 825). The 2a *structural*
-  reshape (closure-form `StateCell` trait `with_shared`/`with_shard`
-  + `ShardKey` + `from_parts`; `CoreShared` gains `binding` +
-  `Drop for CoreShared`; `CoreState`→`{nodes,children,binding}`;
-  ctor; `Core` plumbing) was applied, but the ~101-site
-  `lock_state()`→closure migration (multi-thousand-line, batch.rs
-  lock-release-around-callback control-flow restructuring — the
-  port's single highest-risk change) could not be completed AND
-  gated in the budget left after a ~2 h self-inflicted test-infra
-  saga (overlapping-cargo/`pkill` thrash; permanently fixed by the
-  landed `scripts/gate.sh`). Per discipline (never commit a half
-  Step 2 / unverified mega-diff) the uncommitted 2a edits were
-  `git restore`d — tree is exactly `918c28c` (825-green). Full
-  turnkey 2a/2b execution design (exact trait shape, the
-  shard-OUTER/shared-INNER nesting rule, 2a-`key=None` invariant,
-  Drop relocation, the CI-red `per_subgraph_parallelism.rs` →
-  B-3): `~/src/graphrefly-ts/docs/rust-port-decisions.md`
-  D220-EXEC "Step 2 — BANKED 2a/2b" + "STEP 2 STATUS".
+- **B-2 Step 2a — LANDED + GREEN (2026-05-16)** = graphrefly-rs
+  `328015c` (`feat: B-2 Step 2a — hoist CoreShared to its own
+  lock`). `CoreShared` hoisted OUT of `CoreState` into its own
+  region behind its own lock; `CoreState` → per-shard
+  `{nodes,children,binding}`. **Step 2a keeps exactly ONE shard
+  (`key` ignored) ⇒ behaviour-identical for the all-`None` suite.**
+  Key move: instead of rewriting the ~104 `lock_state()` sites to
+  closures, `Core::lock_state()` returns a **combined `St<'_,C>`
+  guard** that `DerefMut`s to `CoreState` (so `s.nodes`/`s.children`
+  /`s.binding` are verbatim) AND exposes an inherent `.shared`
+  field (so `s.shared.<f>` is verbatim — inherent-field resolves
+  before `Deref`) — the ~104 + 23 sites stayed UNCHANGED. Only
+  changed: `StateCell` two-region GAT seam (`lock_shared`/
+  `lock_shard`/`from_parts`, `ShardKey`); `CoreShared` gains
+  `binding` + `Drop for CoreShared` (took the scratch-drain off
+  `Drop for CoreState`); `alloc_node_id`/`alloc_sub_id`
+  `CoreState`→`St`; `currently_firing` defensive clear → the 2
+  `clear_wave_state` call sites; the 5 shared-touching `&mut
+  CoreState` helpers (`queue_notify`/`terminate_node`/
+  `teardown_inner`/`invalidate_inner`/`reset_for_fresh_lifecycle`)
+  → `&mut St<'_,C>` (zero body change); 4 `Weak→state.lock()` →
+  `St::new(&*state)`. Lock order shard-OUTER/shared-INNER
+  everywhere (`St` encodes it) — **no ABBA, no re-entrancy: 825
+  incl. cross-thread + cascade_depth pass**. Gate (`mise run
+  gate`, undisturbed, 70 s): rustfmt ✓, clippy default-members
+  --all-targets ✓ clean, `nextest --profile ci` **825/825, 0
+  skipped**; zero new `unsafe`. (Earlier 2a-as-closures attempt
+  reverted to `918c28c` first; the combined-guard approach
+  replaced it — far lower churn, committed.)
+- **B-2 Step 2b — NEXT.** Real parallelism: `LockedCell.shard`
+  `Mutex<CoreState>` → `Mutex<HashMap<ShardKey, Arc<parking_lot::
+  Mutex<CoreState>>>>` + `lock_arc` owned guards (`SingleThreadCell`
+  stays one `RefCell`); registration places a node in
+  `group_of(node)`'s shard; the wave hot path
+  (`begin_batch_for`/emit/cascade) routes by `group_of(seed)` —
+  `St`/`lock_state` (which locks `DEFAULT_SHARD`) stays correct
+  for the all-`None` floor + cold paths, the hot path moves to
+  pure `with_shard(group)`; `begin_batch_for` acquires seed's
+  shard + cross-shard-touched ascending (replaces ReentrantMutex-
+  on-top + `global_wave`). Gated by `group_scaling.rs` (disjoint
+  MUST scale) + `floor_compare.rs` (all-`None` ≈515 ns) + 825.
+  Full design: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  D220-EXEC "Step 2 — BANKED 2a/2b".
 - **B-3 — NOT STARTED.** §7-B bounded cross-shard ordered-acquire
   guard + §7-C/§7-F vestigial union-find deletion.
 
