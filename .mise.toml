@@ -58,3 +58,17 @@ run = "scripts/gate.sh"
 [tasks."gate:core"]
 description = "FAST gate variant: fmt --check + clippy + nextest, scoped to -p graphrefly-core (default profile)."
 run = "scripts/gate.sh core"
+
+# ─── generic long-command runner (reuse the gate's run+observe core) ─
+# `scripts/run-logged.sh` is the sanctioned way to run ANY long command
+# (cargo build/test/bench, pnpm, anything) and reliably know its terminal
+# state: direct unbuffered file log (never tail-piped), a GUARANTEED
+# terminal sentinel a monitor greps, process-group teardown, self-timeout
+# with a macOS-correct thrash/lock diagnostic. gate.sh sources it.
+# Usage: `mise run run-logged -- cargo build --release`
+# Rationale: ~/src/graphrefly-ts/docs/test-guidance.md § "Running long
+# commands reliably / diagnosing a stuck run".
+
+[tasks.run-logged]
+description = "Run ANY long command with a direct log + guaranteed terminal sentinel + self-timeout diagnostic. Usage: mise run run-logged -- <cmd>"
+run = "scripts/run-logged.sh"

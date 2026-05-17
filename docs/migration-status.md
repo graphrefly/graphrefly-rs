@@ -1389,7 +1389,7 @@ DS-14 locked 2026-05-05; full M1 parity unblocked.
 | **M4** | `graphrefly-storage` | ✅ closed 2026-05-11 | DS-14-storage substrate. **Sub-slices:** M4.A ✅ WAL frame substrate + storage errors (2026-05-10); M4.B ✅ tier traits + memory backend (2026-05-10); M4.C ✅ file backend (2026-05-10); M4.D ✅ redb backend + F1/F3 close (2026-05-11); M4.E ✅ graph integration (M4.E1 snapshot/restore + M4.E2 attach_storage, 2026-05-11); M4.F ✅ parity tests (2026-05-11). **Deferred:** imbl backends (bench evidence), versioning integration (§7 blocked), `format_version` WAL field, file backend case-insensitive collision. |
 | **Slice T (temporal operators)** | `graphrefly-core` + `graphrefly-operators` | ✅ landed 2026-05-11 | Timer substrate (feature-gated tokio) in core + 6 temporal operators (sample, debounce, throttle, delay, audit, interval). Per-operator async tasks via `TemporalCmd` mpsc channel. 17 tests (5 timer + 12 operator). Unblocks M4.B `debounce_ms` lift point. |
 | **M5** | `graphrefly-structures` | ✅ closed 2026-05-11 | Reactive data structures. M5.A ✅ base operations (ReactiveLog/List/Map/Index + backends + change envelopes + mutation log, 2026-05-11); M5.B ✅ views/scan/attach + TTL/LRU/retention + custom equals + /qa fixes (2026-05-11). **Deferred:** imbl backends (bench evidence), versioning integration (§7 blocked), graph-level sugar (consumer pressure). |
-| M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap |
+| M6 | `graphrefly-bindings-py` | ⏸ blocked | After M5; closes graphrefly-py G.6 parity gap. **+ binding-layer group executor** (D221 actor-model lock, 2026-05-17): pyo3/Python pluggable-seam+default executor adapter (Core↔host runtime); see § Slice B note + ts D221 "DECISION LOCKED" |
 | any | `graphrefly-bindings-wasm` | ⏸ blocked | Lands alongside napi-rs progression |
 
 ## Next batch candidates (queued 2026-05-13, post-Slice-W)
@@ -2766,10 +2766,125 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   ~10 % floor) + Edge-verified-sound (refcount-across-migration,
   Drop ordering, `Send+Sync`).
 
+- **B-2 Step 2c — BOUNDED SPIKE run 2026-05-17 (D221); DECISIVE
+  NEGATIVE — both gates RED, approach redirected.** User chose
+  "bounded spike first" (HALT Q1=A) over the ~155-site full-2c
+  rewrite. Spike (~33 sites, uncommitted working-tree artifact —
+  NOT a merge candidate): `currently_firing` + the two config caps
+  moved off `CoreShared` to dedicated `Core` fields
+  (`Arc<Mutex<SmallVec>>` + 2 `Arc<Atomic>`); `St` shared guard made
+  **lazy** (acquired only on first `.shared()` — the disjoint
+  emit/cascade/drain hot path never calls it). **Correctness GREEN
+  & bankable:** `mise run gate` → rustfmt ✓, clippy ✓ (2 *pre-existing*
+  non-diff `&*self.shard` warnings only), `nextest --profile ci`
+  **831/831, 0 skipped (incl. cascade_depth)**, zero new `unsafe`.
+  **Gate 1 (parallelism) STILL RED but diagnosed:** `group_scaling`
+  disjoint **593→511→376→342** Kelem/s (1→2→4→8 t — still regresses)
+  yet now **1.55× separated from same_group** + **+45 % vs 2b-ii at
+  8t** ⇒ combined-guard removal is *necessary but insufficient*; the
+  residual serializer is the per-`lock_state` `grouped_shards` map
+  mutex in `LockedCell::lock_shard(Some)` — **NOT the ~155 call
+  sites**, so full-2c was aimed at the wrong layer. **Gate 2 (§7
+  floor) REGRESSED ~25 %** (full quiescent: SingleThreadCell 648 ns
+  vs ≈519; LockedCell 764 vs ≈605) — the unconditional
+  `Arc<parking_lot::Mutex>` `currently_firing` + 3 extra `Core::clone`
+  Arcs in `FiringGuard` tax the lock-free single-thread floor the
+  RefCell field avoided. **Redirected path (replaces the deferred
+  155-site triage):** (P) per-wave shard-`Arc` caching (resolve the
+  routed shard once per wave, kill the per-`lock_state`
+  `grouped_shards.lock()`); (F) cell-aware `currently_firing` home +
+  stop `FiringGuard` cloning `Core`. Full evidence + data tables +
+  root-cause: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  D221 "SPIKE EMPIRICAL FINDING". **ROUTING (user 2026-05-17,
+  AMENDED → LOCKED):** spike stashed → branch
+  `wip/b2-2c-spike-d221`@81f7f55 (main clean). The spike proved
+  lock-on-shared-`Core` is **structurally whack-a-mole**; the
+  strategic re-decision session was conducted and **DECISION
+  LOCKED**: the **actor / work-stealing model** — **no shared
+  `Core`, no `LockedCell`**; only cell = single-thread lock-free +
+  **`Send`**; `SerializationGroupId` → **`SchedulingGroupId`** (user
+  partition key replacing the deleted union-find; no decl ⇒ one
+  serial single-thread `Core` = safe default); correctness =
+  ownership `move` + `Send` (borrow checker is the lock; zero
+  runtime lock); run-to-quiescence non-preemptive per group;
+  GraphReFly = `Send` unit + per-group wake signal + sync `drain`,
+  **no scheduler, `Core` never async**; parallelism host-native
+  (TS worker_threads / Py multiproc-or-free-threaded / Go
+  goroutine / standalone Rust any executor — tokio NEVER required);
+  M6 = bridge wake to host executor. **Supersedes D218 B2/B3 +
+  D220-EXEC ~155-site + D220 seam-first/2b-ii infra (dead for
+  parallelism).** (F) floor restoration now strategy-core. DESIGN
+  LOCK only — implementation = future `/porting-to-rs` slice,
+  explicit user go-ahead required, NOT auto-started. Canonical:
+  `~/src/graphrefly-ts/docs/rust-port-decisions.md` "D221 —
+  DECISION LOCKED" + `archive/docs/SESSION-rust-port-actor-model.md`.
+  **M6 scope addition (user-locked 2026-05-17):** the binding-layer
+  group executor (adapter between `Core`'s {`Send` unit + wake
+  signal + sync `drain`} and the host runtime) **is a GraphReFly
+  per-binding deliverable** — shape **(ii) pluggable seam + shipped
+  default impl**. M6 = the pyo3/Python executor; napi/TS rides
+  `@graphrefly/native`; an optional `std::thread`+`crossbeam`
+  default pool ships as a `graphrefly-rs` feature for standalone
+  embedders. Not `Core` (scheduler-free), not a host-runtime
+  reimpl. Detail: D221 "DECISION LOCKED" + the SESSION doc §7.
+
 Gates for B-2/B-3: `group_scaling.rs` disjoint must finally scale (the
-whole point — STILL RED post-2b-ii, the combined-guard finding; 2c is
-the path); `floor_compare.rs` all-`None` ≈515 ns (519 ns post-2b-ii,
-preserved); 825 + 24 grouped + cascade green (post-/qa).
+whole point — STILL RED post-2b-ii AND post-2c-spike: the spike proved
+combined-guard removal is necessary-but-insufficient; the residual
+serializer is the cell-level `grouped_shards` map-lock, redirected path
+(P)+(F) per D221); `floor_compare.rs` all-`None` ≈515 ns (519 ns
+post-2b-ii; the 2c-spike REGRESSED it to 648 ns via the naive dedicated
+`currently_firing` lock — must be cell-aware, D221 (F)); 825 + 24
+grouped + cascade green (831/831 under the spike — correctness sound).
+
+## R2.6.0 — Default-mode leaf-source self-emit convergence — landed 2026-05-17 (LOCAL-ONLY, NOT pushed)
+
+Cross-impl divergence closed: a self-paused **default-`pausable`** leaf
+source's own direct `down([[DATA, v]])` now delivers **immediately**
+(cache advances now, RESUME replays 0, no PAUSE synthesized), matching
+the `@graphrefly/pure-ts` reference and the newly-pinned upstream spec
+`GRAPHREFLY-SPEC` §2.6 **R2.6.0** ("Option A", 2026-05-17). This is a
+**conformance restoration**, not a behavior change: canonical
+**R1.3.8.b** already scoped the pause buffer to `"resumeAll"`-only; the
+prior `mode_buffers_tier3` `Default => rec.is_state()` *violated* it by
+buffering Default+state. Canonical mirror gained the explicit corollary
+**R2.6.2.a** (`~/src/graphrefly-ts/docs/implementation-plan-13.6-canonical-spec.md`).
+
+- **Fix:** `crates/graphrefly-core/src/batch.rs` `queue_notify`
+  `mode_buffers_tier3` — `Default => false` (was `rec.is_state()`).
+  `ResumeAll => true` / `Off => false` byte-identical. Compute-default-
+  paused suppression (upstream in `deliver_data_to_consumer`) unchanged.
+  Hot single-thread floor preserved by construction (drops an
+  `is_state()` call).
+- **Commits (LOCAL, UNPUSHED):** `ab133d7` (core fix + test conversions
+  + `r2_6_0_*` regression test) and the QA follow-up commit (B1
+  Default-mode lock-arithmetic + cross-node-isolation tests; this doc +
+  `porting-deferred.md` R2.6.0 entries). **⚠️ NOT pushed — pushing
+  graphrefly-rs `main` touching the bindings auto-publishes
+  `@graphrefly/native`; the user gates the push.** The local `link:`
+  dep + rebuilt `.node` already feed the graphrefly-ts parity arm.
+- **Test count:** `cargo nextest run --profile ci` 825 → **832**
+  (ab133d7: +7) → **834** (QA B1: +2 Default-mode tests). clippy +
+  rustfmt clean; `#![forbid(unsafe_code)]` intact. (Re-confirm via
+  `mise run gate` after the QA follow-up commit.)
+- **Test-conversion note:** ~10 pre-existing buffer/replay/overflow
+  tests (`pause.rs`, `invalidate.rs`, `proptest_invariants.rs`,
+  `slice_f_corrections.rs`, `terminal.rs`) opt into
+  `PausableMode::ResumeAll` — the mode whose contract *is*
+  buffer-then-replay. QA (B1) added Default-mode coverage of the
+  mode-independent multi-pauser lock-arithmetic + cross-node-isolation
+  properties so converting those did not leave Default (the common path)
+  under-covered.
+- **Cross-track:** `~/src/graphrefly-ts/docs/cross-track-ledger.md` §2;
+  `docs/optimizations.md` "PAUSE/RESUME self-pause".
+
+### Carried forward to porting-deferred.md
+
+- None new. The old inline batch.rs "collapse-to-latest is a future
+  enhancement; v1 keeps verbatim" comment was NOT a tracked deferral —
+  R2.6.0 resolves it by pinning that Default-mode does not buffer a leaf
+  source's self-emit at all (recorded in `porting-deferred.md` under the
+  resolved Cross-wave-DIRTY-then-DATA PAUSE entry).
 
 ## Post-1.0 backlog
 

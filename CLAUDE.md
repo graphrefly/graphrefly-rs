@@ -63,11 +63,20 @@ cargo test -p graphrefly-core       # one crate (legacy)
 # (memory: feedback_no_chained_background_cargo.md; the Slice B-2 incident).
 mise run gate:core                  # FAST gate: fmt --check + clippy + nextest -p graphrefly-core
 mise run gate                       # FULL gate: fmt --check + clippy + nextest --profile ci
+mise run run-logged -- <cmd>        # ANY long command (cargo build/bench, pnpm…)
 # → scripts/gate.sh: atomic mutex (2nd concurrent run refuses), sequential
 #   steps, process-group teardown, bounded jobs + RAM precheck, direct file
-#   log, self-timeout w/ thrash-vs-deadlock diagnostic. Full rationale + the
-#   stuck-run signature table: ~/src/graphrefly-ts/docs/test-guidance.md
-#   § "Running the full Rust gate / diagnosing a stuck run".
+#   log, self-timeout w/ thrash-vs-deadlock diagnostic. gate.sh now SOURCES
+#   the generic run+observe core in scripts/run-logged.sh (reuse it for any
+#   long command). Both emit a GUARANTEED terminal sentinel
+#   `<<<RUN-LOGGED:DONE>>> exit=… reason=ok|fail|timeout|signal|crash …` on
+#   every path — MONITOR by grepping that token (direct log OR stdout),
+#   never a non-guaranteed string or harness-buffered tool output.
+#   Full rationale + stuck-run checklist + the disk/gate.sh-doubles-disk
+#   tradeoff: ~/src/graphrefly-ts/docs/test-guidance.md
+#   § "Running long commands reliably / diagnosing a stuck run"
+#   (memories: feedback_long_command_observation.md,
+#   feedback_subagent_bg_hygiene.md).
 
 # ⚠ Parallel sessions: `cargo test`/`cargo t` share `target/` and its
 # build lock — a second run BLOCKS behind the first (and is wedged forever

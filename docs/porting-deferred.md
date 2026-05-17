@@ -1886,6 +1886,30 @@ The cross-repo audit (2026-05-07) confirmed:
   (`_pendingWave = true` gate) + `node.ts:3103-3106`
   (`_maybeRunFnOnSettlement()` on RESUME).
 
+**R2.6.0 extension (2026-05-17) — leaf-source self-emit; the "three
+modes" framing above is incomplete for a *depless* source.** The bullet
+"§2.6 documents three modes; all three are canonical" is accurate for a
+COMPUTE node's fn-fire suppression but does NOT capture a depless **leaf
+source**'s own direct `down([[DATA, v]])`: for that case `Default` ≠
+`"resumeAll"` — **`Default` delivers immediately** (no dep wave to
+coalesce, no buffer; cache advances now, RESUME replays 0), while
+`"resumeAll"` buffers+replays it. This is a *corollary* of the
+already-locked **R1.3.8.b** (pause buffer is `"resumeAll"`-scoped only),
+pinned explicitly as upstream `GRAPHREFLY-SPEC` §2.6 **R2.6.0** /
+canonical mirror **R2.6.2.a** ("Option A", 2026-05-17). The prior inline
+batch.rs comment "Default + STATE node … buffer like resumeAll
+(collapse-to-latest is a future enhancement; v1 keeps verbatim)" was an
+implementation choice that *violated* R1.3.8.b — **NOT a tracked
+deferral**, and there is **no outstanding collapse-to-latest work**: the
+only buffering contract is `"resumeAll"`. Fix: `mode_buffers_tier3`
+`Default => false` (graphrefly-rs `ab133d7`, local-only/unpushed). Pins:
+`pure-ts/src/__tests__/core/protocol.test.ts` "R2.6.0 boundary";
+`packages/parity-tests/scenarios/core/pause-resume.test.ts` (cross-arm);
+`tests/pause.rs` `multi_pauser_lock_arithmetic_default_mode` +
+`pause_does_not_leak_to_unrelated_node_default_mode` (QA B1, Default-mode
+mode-independent-property coverage); `tests/slice_f_corrections.rs`
+`r2_6_0_default_leaf_source_self_emit_delivers_immediately_while_self_paused`.
+
 Rust impl in `crates/graphrefly-core/src/node.rs` `PauseState::Paused.pending_wave`
 flag + `Core::set_pausable_mode` setter + `deliver_data_to_consumer`
 suppression branch + `Core::resume` Phase-4 consolidated fn-fire schedule.
@@ -3110,3 +3134,64 @@ pointing at a moved bench — was fixed by amend, HEAD now consistent.)
   makes a single wave never cross shards), so this is a test-coverage
   gap on an already-deferred path, not a new bug.
 - **Source:** Slice B-2 Step 2b-ii /qa (Blind#6).
+
+## Slice B-2 Step 2c bounded spike (2026-05-17, D221) — redirected perf path; the 155-site triage is OFF
+
+The D220-EXEC "STEP 2b-ii FINDING" prescribed the residual Slice B
+perf work as "migrate the hot path off the combined `St` (the
+~155-site `lock_state` triage)". A **bounded spike** (D221, user
+HALT Q1=A) empirically **refuted that as the path**:
+
+- **What the spike proved (full evidence: `~/src/graphrefly-ts/docs/rust-port-decisions.md` D221 "SPIKE EMPIRICAL FINDING"):**
+  removing the per-emit `CoreShared` serialization (lazy-`St` +
+  `currently_firing`/caps off `CoreShared`) is **necessary but
+  insufficient** — `group_scaling` disjoint improved +45 % vs 2b-ii
+  and separated 1.55× from the serialized controls but **still does
+  not scale** (593→342 Kelem/s, 1→8 t). The residual serializer is
+  the per-`lock_state` `grouped_shards: Mutex<HashMap>` map-lock in
+  `LockedCell::lock_shard(Some(g))` — a **cell-layer** lock, NOT the
+  ~155 call sites. The naive dedicated `Arc<parking_lot::Mutex>`
+  `currently_firing` also **regressed the §7 floor ~25 %**
+  (SingleThreadCell 519→648 ns) by taxing the lock-free path with
+  atomic mutex ops + `FiringGuard`'s widened `Core::clone`.
+  Correctness was fully green (831/831, incl. cascade_depth).
+- **Redirected path (replaces the deferred 155-site triage):**
+  - **(P) per-wave shard-`Arc` caching** — resolve the routed shard
+    ONCE per wave from the ambient `current_shard_key()` (stash the
+    `Arc<Mutex<CoreState>>` in `WaveState`/`BatchGuard`), so
+    `lock_state()` never re-locks the Core-global `grouped_shards`
+    map. This is the actual disjoint-parallelism unlock; far smaller
+    + lower-risk than the 155-site rework.
+  - **(F) cell-aware `currently_firing` home** — RefCell-cheap for
+    `SingleThreadCell`, dedicated `parking_lot::Mutex` only for
+    `LockedCell`; and stop `FiringGuard` cloning `Core` (hold
+    `&Core` via the existing lifetime / a narrower handle) to drop
+    the per-fire Arc-clone tax. Restores the ≈515 ns §7 floor.
+- **Why deferred:** the spike achieved its purpose (cheap decisive
+  evidence). **ROUTING (user 2026-05-17, AMENDED):** spike stashed →
+  branch `wip/b2-2c-spike-d221`@81f7f55 (main clean). The spike
+  proved lock-on-shared-`Core` is **structurally whack-a-mole**, so
+  the next step is a **design session reframed as a STRATEGIC
+  RE-DECISION** → **DECISION LOCKED 2026-05-17**: the **actor /
+  work-stealing model**. **No shared `Core`, no `LockedCell`**; only
+  cell = single-thread lock-free + **`Send`**; `SerializationGroupId`
+  → **`SchedulingGroupId`** (user partition key replacing the
+  deleted union-find; no decl ⇒ one serial single-thread `Core` =
+  safe default); correctness = ownership `move` + `Send` (borrow
+  checker is the lock; zero runtime lock; `Sync` not required);
+  run-to-quiescence non-preemptive per group; GraphReFly = `Send`
+  unit + per-group runnable wake signal + sync `drain`, **no
+  scheduler, `Core` never async**; parallelism host-native (NOT
+  tokio); M6 = bridge wake to host executor. **Supersedes D218
+  B2/B3, D220-EXEC ~155-site, and D220 seam-first / 2b-ii routing /
+  `grouped_shards` / `group_locks` / `global_wave` (all dead for
+  parallelism — delete on implementation).** The deferred §7-B
+  cross-shard guard + the `*_or_defer`/`PartitionOrderViolation`/
+  `DeferredProducerOp` no-op shims are also obsolete under this
+  model (no shards). (F) floor restoration is now strategy-core.
+  DESIGN LOCK only — implementation = a future `/porting-to-rs`
+  slice, explicit user go-ahead required, NOT auto-started.
+  Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  "D221 — DECISION LOCKED" + `archive/docs/SESSION-rust-port-actor-model.md`.
+- **Source:** Slice B-2 Step 2c bounded spike + strategic
+  re-decision session (D221, 2026-05-17).
