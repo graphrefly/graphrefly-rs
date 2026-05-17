@@ -3010,3 +3010,103 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
   file set is stable, do the consolidation as its own slice. Verify under an
   isolated `CARGO_TARGET_DIR` via `scripts/dev-test.sh`.
 - **Source:** D215 test-loop speedup (this slice).
+
+## Slice B-2 Step 2b-ii /qa (2026-05-17) — surfaced deferrals + applied fixes
+
+QA pass (Blind Hunter + Edge Case Hunter, converged) on the committed
+Slice B (918c28c→a67fa0b). Findings A(i)/B(i) FIXED in-/qa; the rest
+deferred here. (QA #0 — an incomplete B-3 commit that left `Cargo.toml`
+pointing at a moved bench — was fixed by amend, HEAD now consistent.)
+
+### Multi-distinct-`Some`-group component construction — UNSUPPORTED v1 (spec divergence)
+- **What:** the §7 invariant is "all-`None` OR all-`Some`" and the
+  spec permits a dep-connected component to span DISTINCT `Some`
+  groups (`register_all_some_chain_ok_even_with_distinct_groups`).
+  This impl supports the **single-dep distinct-`Some` chain** only.
+  A component with **≥2 deps in distinct `Some` shards** is
+  unconstructable: `register`/`set_deps` return `Err(UnknownDep/
+  UnknownNode)` (the dep-existence loop runs on the placement shard
+  only); `add_meta_companion` across distinct-`Some` shards now
+  panics with the §7 diagnostic (was a misleading "unknown
+  companion" assert — fixed in-/qa A(i)/D).
+- **Why deferred:** full support is the SAME problem as the
+  parallelism residual — a genuinely multi-group component needs
+  multi-shard-per-wave (`begin_batch_for` acquiring + the wave
+  walking multiple shards) or component-uniform shard migration on
+  merge. That is the deep B-2 Step 2c rework, not a bounded /qa fix.
+  The single-group + all-`None` paths (the entire `group_scaling` /
+  `group_parallelism` / `set_serialization_group` surface) are
+  correct + tested. The 2b-ii doc/commit overclaim ("a component MAY
+  span distinct Some groups") is corrected in D220-EXEC +
+  migration-status to state this divergence honestly.
+- **Source:** Slice B-2 Step 2b-ii /qa (Blind#2, Edge#1/#2/#3).
+
+### `set_serialization_group` concurrency precondition (atomicity regression vs pre-2b)
+- **What:** the shard split made the component migration **non-atomic
+  across 3 lock scopes** (src-shard extract → `CoreShared` index
+  flip → dst-shard reinsert), with a torn "record in no shard"
+  window. Pre-2b (one `Mutex<CoreState>`) it was atomic: a concurrent
+  reader blocked on the one mutex and saw old-or-new, never "gone".
+  Now a concurrent `shard_of`-routed reader on `Core<LockedCell>`
+  (the explicit cross-thread substrate) mid-migration → `require_node`
+  "unknown node" panic.
+- **Applied in-/qa (B(i)):** a same-thread in-fire reject
+  (`SetGroupError::ReentrantOnFiringNode`, mirrors
+  `SetDepsError::ReentrantOnFiringNode`) + a `MigrationRollback`
+  defence-in-depth guard that, on any unwind before Phase 3 reinsert,
+  restores the component to `src` + reverts the index (latent today —
+  in-window ops are infallible `HashMap` insert/remove, Rust
+  alloc-failure aborts not unwinds — but closes the future-footgun,
+  mirroring `register`'s `ScratchReleaseGuard`).
+- **Why still deferred (the cross-thread atomicity gap):**
+  `set_serialization_group` is a **topology-mutation op that MUST be
+  externally excluded from concurrent Core access to the component on
+  other threads** — it is NOT safe to call concurrently with a
+  wave/read on a member from another thread. Making it truly atomic
+  (hold `CoreShared` across the whole 3-scope migration) inverts the
+  shard-OUTER/shared-INNER lock order → ABBA risk; deferred with the
+  rest of the cross-shard work. This contract was a bare code comment
+  pre-/qa; it is now an explicit documented precondition.
+- **Source:** Slice B-2 Step 2b-ii /qa (Blind#1 + Edge#4, converged).
+
+### Combined-guard `CoreShared` re-entrancy is comment-only (superseded by 2c)
+- **What:** `with_shared`/`shard_of`/`group_of`/`partition_of` re-lock
+  the single `Mutex<CoreShared>`; the ~20 entry points are safe ONLY
+  because each calls `shard_of(node)` (→`lock_shared`, released)
+  strictly BEFORE `lock_state()` (→`lock_shared` again). Any site
+  calling `self.shard_of/group_of/with_shared/partition_of` while an
+  `St` is alive = same-thread self-deadlock (`LockedCell`) / borrow
+  panic (`SingleThreadCell`). No compile-time guard; comment-enforced
+  across a 5k-line file. (Blind traced the all-`None`/single-group
+  paths clean — no concrete CURRENT deadlock; the risk is future
+  edits.)
+- **Why deferred:** this is the documented architectural corollary of
+  the combined-guard (D220-EXEC "STEP 2b-ii EMPIRICAL FINDING"). The
+  entire combined-guard hot path is replaced by B-2 Step 2c
+  (hot-path pure shard-only `with_shard`, zero `CoreShared` on the
+  hot path); a compile-time guard now is wasted on code 2c rewrites.
+- **Source:** Slice B-2 Step 2b-ii /qa (Blind#3).
+
+### `SingleThreadCell` two-region split diverges cross-region re-entrancy failure-mode
+- **What:** pre-2a `SingleThreadCell` was one `RefCell<CoreState>` —
+  ANY re-entrant double-borrow panicked loudly (the documented
+  bug-catching canary, "same observable contract as `LockedCell`"²).
+  Now `shared` + `shard` are independent `RefCell`s: cross-region
+  re-entry (hold shard borrow, touch `shared`) succeeds silently
+  instead of panicking, masking a missing-lock-released-bracket
+  dispatcher bug. The module-doc "same observable contract" claim is
+  now true only for same-region re-entry.
+- **Why deferred:** consequence of the two-region split inherent to
+  2a/2b; the real reconciliation is part of the 2c hot-path redesign.
+  Module-doc claim should be narrowed (noted; not behaviour-affecting).
+- **Source:** Slice B-2 Step 2b-ii /qa (Blind#7).
+
+### Nested/re-entrant cross-shard wave — no test coverage
+- **What:** `ShardKeyGuard` nested-restore was traced correct, but no
+  test exercises a wave on shard A re-entering and running a wave on
+  shard B (the `repeated_regroup` test is sequential, not
+  nested/re-entrant). Cross-shard runtime re-entry is itself the
+  §7-B deferred guard's domain (component-uniform placement currently
+  makes a single wave never cross shards), so this is a test-coverage
+  gap on an already-deferred path, not a new bug.
+- **Source:** Slice B-2 Step 2b-ii /qa (Blind#6).

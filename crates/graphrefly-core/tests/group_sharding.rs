@@ -21,6 +21,18 @@ use graphrefly_core::{NodeOpts, NodeRegistration, SerializationGroupId};
 const G1: SerializationGroupId = SerializationGroupId::new(1);
 const G2: SerializationGroupId = SerializationGroupId::new(2);
 
+/// /qa C: exact-count, not membership. The cross-shard migration's
+/// risk is double / extra delivery (a record re-running activation on
+/// both `src` and `dst` shard, or replay after a regroup) — a
+/// `.contains()` assertion would green-light that regression. Assert
+/// each expected value is delivered EXACTLY once.
+fn count(rec: &common::Recorder, v: i64) -> usize {
+    rec.data_values()
+        .into_iter()
+        .filter(|x| *x == TestValue::Int(v))
+        .count()
+}
+
 /// `set_serialization_group` migrates a single-node component
 /// `DEFAULT_SHARD → g`; subsequent emits route to shard `g` (ambient
 /// set from `group_of(seed)` by `begin_batch_for`) and still deliver.
@@ -34,9 +46,11 @@ fn grouped_state_round_trip_delivers() {
     assert_eq!(rt.core.partition_of(s.id), Some(G1));
     let rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Int(7));
-    assert!(
-        rec.data_values().contains(&TestValue::Int(7)),
-        "grouped (shard-G1) state emit must deliver — got {:?}",
+    assert_eq!(
+        count(&rec, 7),
+        1,
+        "grouped (shard-G1) state emit must deliver EXACTLY once (no \
+         migration double-delivery) — got {:?}",
         rec.data_values()
     );
 }
@@ -60,9 +74,11 @@ fn grouped_derived_component_migrates_and_delivers() {
     assert_eq!(rt.core.partition_of(d), Some(G1));
     let rec = rt.subscribe_recorder(d);
     s.set(TestValue::Int(4));
-    assert!(
-        rec.data_values().contains(&TestValue::Int(40)),
-        "derived in migrated shard-G1 component must recompute+deliver — got {:?}",
+    assert_eq!(
+        count(&rec, 40),
+        1,
+        "derived in migrated shard-G1 component must recompute+deliver \
+         EXACTLY once — got {:?}",
         rec.data_values()
     );
 }
@@ -90,9 +106,11 @@ fn register_with_group_places_and_delivers() {
     let rec = rt.subscribe_recorder(s);
     let h = rt.binding.intern(TestValue::Int(99));
     rt.core.emit(s, h);
-    assert!(
-        rec.data_values().contains(&TestValue::Int(99)),
-        "register-with-group node must deliver from its shard — got {:?}",
+    assert_eq!(
+        count(&rec, 99),
+        1,
+        "register-with-group node must deliver from its shard EXACTLY \
+         once — got {:?}",
         rec.data_values()
     );
 }
@@ -112,11 +130,12 @@ fn disjoint_groups_deliver_independently() {
     let rb = rt.subscribe_recorder(b.id);
     a.set(TestValue::Int(11));
     b.set(TestValue::Int(22));
-    assert!(ra.data_values().contains(&TestValue::Int(11)));
-    assert!(rb.data_values().contains(&TestValue::Int(22)));
-    assert!(
-        !ra.data_values().contains(&TestValue::Int(22)),
-        "G1 recorder must not see G2's value (no cross-shard mis-route)"
+    assert_eq!(count(&ra, 11), 1, "G1 delivers its own value exactly once");
+    assert_eq!(count(&rb, 22), 1, "G2 delivers its own value exactly once");
+    assert_eq!(
+        count(&ra, 22),
+        0,
+        "G1 recorder must NOT see G2's value (no cross-shard mis-route/leak)"
     );
 }
 
@@ -146,9 +165,12 @@ fn repeated_regroup_round_trips_delivery_and_index() {
 
     let got = rec.data_values();
     for n in [1, 2, 3, 4] {
-        assert!(
-            got.contains(&TestValue::Int(n)),
-            "value {n} (across None/G1/None/G2 migrations) must deliver — got {got:?}"
+        assert_eq!(
+            count(&rec, n),
+            1,
+            "value {n} (across None/G1/None/G2 migrations) must deliver \
+             EXACTLY once — a regroup must NOT replay prior values \
+             (cross-shard double-delivery) — got {got:?}"
         );
     }
 }
@@ -168,9 +190,10 @@ fn ungrouped_floor_still_delivers() {
     assert_eq!(rt.core.partition_of(d), None);
     let rec = rt.subscribe_recorder(d);
     s.set(TestValue::Int(41));
-    assert!(
-        rec.data_values().contains(&TestValue::Int(42)),
-        "all-None floor must still deliver — got {:?}",
+    assert_eq!(
+        count(&rec, 42),
+        1,
+        "all-None floor must still deliver EXACTLY once — got {:?}",
         rec.data_values()
     );
 }

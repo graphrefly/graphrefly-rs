@@ -2732,9 +2732,44 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   remnants; deleting = 8-file `graphrefly-operators` churn, zero
   functional value → documented defer (not required for Slice B).
 
+- **Slice B /qa — 2026-05-17 (Blind Hunter + Edge Case Hunter,
+  converged).** **QA #0 (integrity, critical):** the B-3 commit
+  `5719897` was incomplete (only the bench *rename* committed; the
+  `Cargo.toml` `[[bench]]` removal + migration-status did NOT, so
+  HEAD's manifest pointed at a moved file = `--all-targets` broken).
+  **Fixed by amend → `a67fa0b`** (HEAD consistent; CI green by
+  construction; verified `cargo build -p graphrefly-core
+  --benches --tests` exit 0). **Applied fixes:** A(i)/D —
+  `add_meta_companion` cross-shard companion now panics with the §7
+  diagnostic (was a misleading "unknown companion" assert that left
+  the documented rollback path dead); the multi-distinct-`Some`
+  overclaim corrected in D220-EXEC. B(i) —
+  `SetGroupError::ReentrantOnFiringNode` in-fire reject (mirrors
+  `set_deps`) + `MigrationRollback` defence-in-depth unwind guard
+  (mirrors `register`'s `ScratchReleaseGuard`) for the
+  `set_serialization_group` 3-scope migration; cross-thread
+  non-atomicity now a documented precondition. C —
+  `tests/group_sharding.rs` tightened `.contains()` → exact-count
+  (catches migration double/extra delivery). E — 5 deferrals banked
+  in `porting-deferred.md` § "Slice B-2 Step 2b-ii /qa" (multi-`Some`
+  v1 divergence; `set_serialization_group` concurrency precondition;
+  combined-guard `CoreShared` re-entrancy comment-only [→ 2c];
+  `SingleThreadCell` cross-region re-entrancy divergence; nested
+  cross-shard wave test gap). **Re-gated post-fix:** `mise run
+  gate` → rustfmt ✓, clippy default-members --all-targets ✓ clean
+  (QA-introduced pedantic warnings fixed), `nextest --profile ci`
+  825 + 24 grouped + cascade_depth (see final line); zero new
+  `unsafe`; `#![forbid(unsafe_code)]` preserved. Floor unaffected by
+  construction (QA fixes are cold-path — no `lock_state`/`St`/hot-path
+  change). Dropped findings matched documented defers (parallelism
+  RED, §7-B, vestigial-symbols, index teardown-staleness, LockedCell
+  ~10 % floor) + Edge-verified-sound (refcount-across-migration,
+  Drop ordering, `Send+Sync`).
+
 Gates for B-2/B-3: `group_scaling.rs` disjoint must finally scale (the
-whole point); `floor_compare.rs` all-`None` must stay ≈515 ns (one
-default shard = zero regression); 825 green.
+whole point — STILL RED post-2b-ii, the combined-guard finding; 2c is
+the path); `floor_compare.rs` all-`None` ≈515 ns (519 ns post-2b-ii,
+preserved); 825 + 24 grouped + cascade green (post-/qa).
 
 ## Post-1.0 backlog
 

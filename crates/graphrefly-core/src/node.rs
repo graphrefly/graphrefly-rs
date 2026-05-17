@@ -4753,10 +4753,36 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// differently-grouped companion is a wiring error, like a cycle.
     pub fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
         assert!(parent != companion, "node cannot be its own meta companion");
-        // 2b-ii-B (D220-EXEC): the meta edge joins `companion` into
-        // `parent`'s component ⇒ same group ⇒ same shard (the
-        // component-consistency check below rejects a mix). Route by
-        // `parent`'s shard (see `try_emit`).
+        // /qa A(i)/D (Slice B-2 Step 2b-ii): a meta edge joins
+        // `companion` into `parent`'s component. If the two resolve to
+        // DIFFERENT placement shards, the resulting component would
+        // span shards — either a §7 `None`/`Some` mix OR a distinct-
+        // `Some`-group component (the latter is an unsupported v1
+        // residual: multi-`Some`-group component construction needs
+        // the multi-shard-per-wave / component-uniform-migration the
+        // parallelism work also needs — see `porting-deferred.md`).
+        // Reject loudly with the §7 diagnostic here, NOT the
+        // misleading `assert!(contains_key(companion))` "unknown
+        // companion" panic — that fired first (the pre-`lock_state`
+        // route to `parent`'s shard cannot see a cross-shard
+        // companion), leaving the documented rollback/diagnostic path
+        // below DEAD for every cross-shard companion (Edge#2).
+        assert!(
+            self.shard_of(parent) == self.shard_of(companion),
+            "add_meta_companion({parent:?}, {companion:?}): companion is \
+             not in parent's serialization shard — the meta edge would \
+             make the dep+children+meta component span shards (§7 strict \
+             invariant: a component must be uniformly all-None or \
+             all-Some; multi-distinct-Some-group component construction \
+             is an unsupported v1 residual — reassign the component via \
+             set_serialization_group, or see porting-deferred.md \
+             \"multi-Some-group component construction\")"
+        );
+        // 2b-ii-B: same shard ⇒ route by `parent`'s shard. A `None`/
+        // `Some` mix resolves to different shards (`None`=DEFAULT vs
+        // `Some`=g) so it is already caught above; the post-insert
+        // `component_is_group_consistent` path below is now
+        // defence-in-depth (impossible-by-construction for the mix).
         let _skg = ShardKeyGuard::set(self.shard_of(parent));
         let mut s = self.lock_state();
         assert!(s.nodes.contains_key(&parent), "unknown parent {parent:?}");
@@ -5303,6 +5329,96 @@ pub enum SetGroupError {
          point-3 component-wide assignment; report as a bug if observed)"
     )]
     ComponentInconsistent { node: NodeId },
+
+    /// `set_serialization_group` was called on a node that is currently
+    /// firing its fn (the §7 cross-shard component migration would
+    /// move a record out from under an in-flight `invoke_fn` →
+    /// `unknown node` panic). Mirrors
+    /// [`SetDepsError::ReentrantOnFiringNode`] (Slice B-2 Step 2b-ii
+    /// /qa B). The migration is a topology-mutation op and MUST be
+    /// externally excluded from concurrent Core access to the
+    /// component (see `porting-deferred.md` "set_serialization_group
+    /// concurrency precondition"); this guard catches the in-fire
+    /// case loudly rather than corrupting state.
+    #[error("set_serialization_group({node:?}): node is currently firing its fn")]
+    ReentrantOnFiringNode { node: NodeId },
+}
+
+/// Defense-in-depth rollback for the `set_serialization_group`
+/// extract→reinsert component migration (Slice B-2 Step 2b-ii /qa B,
+/// converged Blind#1 + Edge#4). Phase 1 removes the whole component
+/// out of the `src` shard into owned vecs; if anything unwinds before
+/// Phase 3 reinserts it (today unreachable — the in-window ops are
+/// infallible `HashMap` insert/remove and Rust alloc-failure *aborts*,
+/// not unwinds — but a future fallible call in the window would
+/// otherwise lose the component from BOTH shards, skew the index, and
+/// leak binding retains: exactly the hazard `register`'s
+/// `ScratchReleaseGuard` exists for), this puts the component back
+/// into `src` and reverts the index to its pre-migration state.
+/// `take_payload()` disarms it (mirrors `ScratchReleaseGuard::take`).
+/// The component is single-group-or-all-`None` by construction
+/// (multi-`Some`-group construction is unsupported — see A(i) /
+/// `porting-deferred.md`), so a single `(old_group, src)` pair
+/// restores every member's index entry.
+/// Extracted component payload (records + per-node children-adjacency)
+/// handed from `set_serialization_group` Phase 1 to Phase 3.
+type MovedComponent = (Vec<(NodeId, NodeRecord)>, Vec<(NodeId, HashSet<NodeId>)>);
+
+struct MigrationRollback<C: crate::state_cell::StateCell> {
+    core: Core<C>,
+    src: crate::state_cell::ShardKey,
+    old_group: crate::state_cell::ShardKey,
+    members: Vec<NodeId>,
+    recs: Vec<(NodeId, NodeRecord)>,
+    kids: Vec<(NodeId, HashSet<NodeId>)>,
+    armed: bool,
+}
+
+impl<C: crate::state_cell::StateCell> MigrationRollback<C> {
+    /// Disarm + hand the extracted component to Phase 3 (single move;
+    /// the only ops between this and `disarm` are infallible inserts).
+    fn take_payload(&mut self) -> MovedComponent {
+        self.armed = false;
+        (
+            std::mem::take(&mut self.recs),
+            std::mem::take(&mut self.kids),
+        )
+    }
+}
+
+impl<C: crate::state_cell::StateCell> Drop for MigrationRollback<C> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Revert the index to pre-migration (pure `CoreShared`), then
+        // reinsert the records into `src`. Component is uniform, so
+        // `old_group` restores every member's `node_group`/`node_shard`.
+        let (og, sr) = (self.old_group, self.src);
+        let members = std::mem::take(&mut self.members);
+        self.core.with_shared(|sh| {
+            for m in &members {
+                if let Some(g) = og {
+                    sh.node_group.insert(*m, g);
+                } else {
+                    sh.node_group.remove(m);
+                }
+                if let Some(s) = sr {
+                    sh.node_shard.insert(*m, s);
+                } else {
+                    sh.node_shard.remove(m);
+                }
+            }
+        });
+        let _g = ShardKeyGuard::set(sr);
+        let mut s = self.core.lock_state();
+        for (m, rec) in self.recs.drain(..) {
+            s.nodes.insert(m, rec);
+        }
+        for (m, cs) in self.kids.drain(..) {
+            s.children.insert(m, cs);
+        }
+    }
 }
 
 impl<C: crate::state_cell::StateCell> Core<C> {
@@ -5355,65 +5471,94 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // (not concurrent with a wave on this component). Sequential
         // extract→reinsert (src guard dropped before dst locked) ⇒
         // never two shard guards ⇒ no ABBA.
-        let src = self.shard_of(node);
+        // /qa B (Slice B-2 Step 2b-ii): in-fire reject — mirrors
+        // `set_deps`'s `ReentrantOnFiringNode`. The cross-shard
+        // component migration moves records out from under any
+        // in-flight `invoke_fn`; rejecting loudly here beats
+        // corrupting state. (Pure `CoreShared`, pre-lock — no St held
+        // yet. The broader "not concurrent with ANY Core access to
+        // the component on another thread" precondition is a
+        // documented contract — `porting-deferred.md`
+        // "set_serialization_group concurrency precondition" — since
+        // the shard split made the 3-scope migration non-atomic vs a
+        // concurrent `shard_of`-routed reader; this guard only catches
+        // the same-thread mid-fire case.)
+        if self.with_shared(|sh| sh.currently_firing.contains(&node)) {
+            return Err(SetGroupError::ReentrantOnFiringNode { node });
+        }
 
-        let moved: Vec<(NodeId, NodeRecord)>;
-        let moved_kids: Vec<(NodeId, HashSet<NodeId>)>;
+        let src = self.shard_of(node);
+        // Component is single-group-or-all-`None` by construction
+        // (multi-`Some`-group construction is unsupported — see A(i) /
+        // `porting-deferred.md`), so `group_of(node)` is the uniform
+        // pre-migration declared group for every member.
+        let old_group = self.group_of(node);
+
+        // Phase 1 (shard `src`): validate + extract the whole component.
+        let mut rollback = MigrationRollback {
+            core: self.clone(),
+            src,
+            old_group,
+            members: Vec::new(),
+            recs: Vec::new(),
+            kids: Vec::new(),
+            armed: true,
+        };
         {
             let _src_guard = crate::node::ShardKeyGuard::set(src);
             let mut s = self.lock_state();
             if !s.nodes.contains_key(&node) {
+                // Nothing extracted yet → disarm (no-op rollback).
+                rollback.armed = false;
                 return Err(SetGroupError::UnknownNode(node));
             }
             let component = walk_undirected_dep_graph(&s, node, None, &[]);
-            let mut recs = Vec::with_capacity(component.len());
-            let mut kids = Vec::with_capacity(component.len());
             for m in &component {
                 if let Some(mut rec) = s.nodes.remove(m) {
                     rec.serialization_group = group;
-                    recs.push((*m, rec));
+                    rollback.recs.push((*m, rec));
                 }
                 if let Some(cs) = s.children.remove(m) {
-                    kids.push((*m, cs));
+                    rollback.kids.push((*m, cs));
                 }
+                rollback.members.push(*m);
             }
-            moved = recs;
-            moved_kids = kids;
         }
 
         // Phase 2: homogenise BOTH `CoreShared` indices for every
         // component member — `node_group` (declared) AND `node_shard`
-        // (placement) both ⇒ `group` (or absent for `None`).
-        // Single-writer topology op ⇒ no reader races the move.
+        // (placement) both ⇒ `group` (or absent for `None`). Done
+        // while `rollback` is armed: an unwind here reverts the index
+        // to `(old_group, src)` AND reinserts the records into `src`.
         self.with_shared(|sh| {
-            for (m, _) in &moved {
-                match group {
-                    Some(g) => {
-                        sh.node_group.insert(*m, g);
-                        sh.node_shard.insert(*m, g);
-                    }
-                    None => {
-                        sh.node_group.remove(m);
-                        sh.node_shard.remove(m);
-                    }
+            for m in &rollback.members {
+                if let Some(g) = group {
+                    sh.node_group.insert(*m, g);
+                    sh.node_shard.insert(*m, g);
+                } else {
+                    sh.node_group.remove(m);
+                    sh.node_shard.remove(m);
                 }
             }
         });
 
-        // Phase 3 (shard `group` = the new uniform placement):
-        // reinsert records + children-adjacency. The dep-connected
-        // component is closed, so every member's children-set
-        // references only members — wholesale move is self-contained.
+        // Phase 3 (shard `group`): take the payload (disarms the
+        // rollback — the only ops after this are infallible inserts),
+        // reinsert records + children-adjacency. The component is
+        // closed, so every member's children-set references only
+        // members — wholesale move is self-contained.
+        let (recs, kids) = rollback.take_payload();
         {
             let _dst_guard = crate::node::ShardKeyGuard::set(group);
             let mut s = self.lock_state();
-            for (m, rec) in moved {
+            for (m, rec) in recs {
                 s.nodes.insert(m, rec);
             }
-            for (m, cs) in moved_kids {
+            for (m, cs) in kids {
                 s.children.insert(m, cs);
             }
         }
+        drop(rollback);
         Ok(())
     }
 
