@@ -177,8 +177,16 @@ fn invalidate_releases_handle_via_refcount() {
 
 #[test]
 fn invalidate_buffers_through_pause() {
+    // R2.6.0 (canonical §2.6 "Option A", pinned 2026-05-17): a Default-mode
+    // leaf source's direct external messages — tier-3 AND tier-4 — flush
+    // immediately while self-paused (gating is fn/dep-pipeline-scoped only).
+    // The tier-4 buffer-then-replay machinery this test exercises is the
+    // `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 

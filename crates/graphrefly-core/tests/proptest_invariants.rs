@@ -438,6 +438,13 @@ proptest! {
     ) {
         let rt = TestRuntime::new();
         let s = rt.state(Some(TestValue::Int(0)));
+        // R2.6.0 (canonical §2.6 "Option A"): a Default-mode leaf source's
+        // direct emit flushes immediately while self-paused. The verbatim
+        // buffer-then-replay invariant under test is the `ResumeAll`
+        // contract — opt in.
+        rt.core
+            .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
+            .unwrap();
         let rec = rt.subscribe_recorder(s.id);
 
         let locks: Vec<_> = (0..n_locks).map(|_| rt.core.alloc_lock_id()).collect();
@@ -495,6 +502,10 @@ proptest! {
     ) {
         let rt = TestRuntime::new();
         let s = rt.state(Some(TestValue::Int(0)));
+        // R2.6.0: verbatim buffer-replay is the `ResumeAll` contract.
+        rt.core
+            .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
+            .unwrap();
         let rec = rt.subscribe_recorder(s.id);
         let baseline = rec.snapshot().len();
         let lock = rt.core.alloc_lock_id();

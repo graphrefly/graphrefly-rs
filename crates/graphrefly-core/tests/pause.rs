@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 mod common;
 use common::{RecordedEvent, TestRuntime, TestValue};
+use graphrefly_core::PausableMode;
 
 #[test]
 fn pause_then_resume_with_no_emissions_drains_empty_buffer() {
@@ -35,8 +36,17 @@ fn pause_then_resume_with_no_emissions_drains_empty_buffer() {
 
 #[test]
 fn single_pauser_buffers_data_and_resolved_then_replays_on_resume() {
+    // R2.6.0 (canonical §2.6 "Option A", pinned 2026-05-17): a Default-mode
+    // leaf source delivers its OWN direct emit immediately while self-paused
+    // (verified by `r2_6_0_*` in slice_f_corrections.rs). The verbatim
+    // buffer-then-replay contract this test exercises is the `ResumeAll`
+    // contract — opt in explicitly (the established Slice-F pattern, cf.
+    // `pause_buffers_derived_data_through_diamond`).
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
 
     // Activate: push-on-subscribe delivers START + DATA(0).
@@ -87,8 +97,12 @@ fn single_pauser_buffers_data_and_resolved_then_replays_on_resume() {
 
 #[test]
 fn multi_pauser_remains_paused_until_final_release() {
+    // R2.6.0: verbatim buffer-replay is the `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
@@ -181,9 +195,14 @@ fn unknown_resume_lockid_is_noop_and_returns_none() {
 
 #[test]
 fn pause_buffer_cap_drops_oldest_and_reports_dropped() {
+    // R2.6.0: buffer-cap eviction is part of the `ResumeAll` buffer
+    // machinery — opt in (a Default leaf source has no buffer to cap).
     let rt = TestRuntime::new();
     rt.core.set_pause_buffer_cap(Some(2));
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let _rec = rt.subscribe_recorder(s.id);
     let lock = rt.core.alloc_lock_id();
     rt.core.pause(s.id, lock).expect("pause");
@@ -209,9 +228,15 @@ fn pause_buffer_cap_drops_oldest_and_reports_dropped() {
 
 #[test]
 fn pause_does_not_buffer_unrelated_node() {
+    // R2.6.0: s_a's buffered-while-paused expectation is the `ResumeAll`
+    // contract — opt in. The "unrelated node not buffered" property under
+    // test is mode-independent.
     let rt = TestRuntime::new();
     let s_a = rt.state(Some(TestValue::Int(0)));
     let s_b = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s_a.id, PausableMode::ResumeAll)
+        .unwrap();
     let rec_a = rt.subscribe_recorder(s_a.id);
     let rec_b = rt.subscribe_recorder(s_b.id);
     let baseline_b = rec_b.snapshot().len();
@@ -246,8 +271,13 @@ fn pause_does_not_buffer_unrelated_node() {
 
 #[test]
 fn equals_substituted_resolved_buffers_too() {
+    // R2.6.0: RESOLVED buffering alongside DATA is the `ResumeAll`
+    // contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(7)));
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
     let lock = rt.core.alloc_lock_id();
@@ -279,9 +309,13 @@ fn equals_substituted_resolved_buffers_too() {
 
 #[test]
 fn unbounded_buffer_holds_many_emissions() {
+    // R2.6.0: the unbounded buffer is the `ResumeAll` buffer — opt in.
     let rt = TestRuntime::new();
     // Default cap = None (unbounded).
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let _rec = rt.subscribe_recorder(s.id);
     let lock = rt.core.alloc_lock_id();
     rt.core.pause(s.id, lock).expect("pause");

@@ -217,8 +217,15 @@ fn complete_buffers_through_pause_only_for_buffered_tiers() {
     // version of this test asserted `replayed == 1` post-complete, which
     // exercised the bug; the new assertion is `replayed == 0` because the
     // buffer is drained by the terminal cascade.
+    // R2.6.0 (canonical §2.6 "Option A", pinned 2026-05-17): a Default-mode
+    // leaf source's direct emit flushes IMMEDIATELY while self-paused, so
+    // the "tier-3 buffered then drained-without-replay by the terminal
+    // cascade" property under test is the `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
+    rt.core
+        .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 

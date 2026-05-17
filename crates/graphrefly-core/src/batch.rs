@@ -2838,11 +2838,22 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             if rec.subscribers.is_empty() {
                 return;
             }
-            // Slice F audit close (2026-05-07): pause routing depends on mode.
+            // Slice F audit close (2026-05-07); amended 2026-05-17 for
+            // canonical §2.6 R2.6.0 ("Option A"). Pause routing depends on
+            // mode:
             //   - `ResumeAll`: buffer tier-3/4 for verbatim replay on RESUME.
-            //   - `Default` + STATE node: state nodes have no fn-fire to
-            //     suppress, so buffer like resumeAll (collapse-to-latest is
-            //     a future enhancement; v1 keeps verbatim).
+            //   - `Default` + STATE node (leaf source — no deps): a state
+            //     node's value is intrinsic, NOT produced by an fn/dep
+            //     settle pipeline. PAUSE/RESUME gating is fn/dep-pipeline-
+            //     scoped only (R2.6.0). A leaf source that holds its own
+            //     pause lock and then self-emits via a direct external
+            //     `down([[DATA, v]])` is pushing OUTSIDE that pipeline, so
+            //     the DATA MUST flush immediately (cache advances now, no
+            //     PAUSE synthesized, nothing replayed on RESUME). Therefore
+            //     Default-mode state nodes do NOT buffer — they fall
+            //     through to the immediate queue path, matching the
+            //     `@graphrefly/pure-ts` reference (only `pausable:
+            //     "resumeAll"` buffers a leaf source's direct `down()`).
             //   - `Default` + COMPUTE node: suppression happens upstream at
             //     fn-fire scheduling (see `deliver_data_to_consumer`); no
             //     outgoing tier-3 is produced from this node while paused,
@@ -2852,7 +2863,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             //     immediately. Fallthrough.
             let mode_buffers_tier3 = match rec.pausable {
                 crate::node::PausableMode::ResumeAll => true,
-                crate::node::PausableMode::Default => rec.is_state(),
+                crate::node::PausableMode::Default => false,
                 crate::node::PausableMode::Off => false,
             };
             if buffered_tier && mode_buffers_tier3 && rec.pause_state.is_paused() {

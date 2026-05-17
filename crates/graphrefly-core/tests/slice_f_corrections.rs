@@ -340,6 +340,12 @@ fn a3_pause_overflow_synthesizes_error_once_per_cycle() {
 
     let initial = inner.intern(TestValue::Int(0));
     let s = core.register_state(initial, false).unwrap();
+    // R2.6.0 (canonical §2.6 "Option A", pinned 2026-05-17): a Default-mode
+    // leaf source's direct emit flushes immediately while self-paused (no
+    // buffer → no overflow). The pause-buffer overflow / ERROR-synthesis
+    // machinery under test is the `ResumeAll` contract — opt in (set BEFORE
+    // subscribe so activation runs under the same semantics).
+    core.set_pausable_mode(s, PausableMode::ResumeAll).unwrap();
 
     // Subscribe with a recorder so we can observe the cascade.
     let events = Arc::new(Mutex::new(Vec::<RecordedEvent>::new()));
@@ -417,6 +423,11 @@ fn a3_overflow_silently_dropped_when_binding_returns_none() {
     let rt = TestRuntime::new();
     rt.core.set_pause_buffer_cap(Some(2));
     let s = rt.state(Some(TestValue::Int(0)));
+    // R2.6.0: the pause-buffer drop/overflow path is the `ResumeAll`
+    // contract (a Default leaf source has no buffer to overflow) — opt in.
+    rt.core
+        .set_pausable_mode(s.id, PausableMode::ResumeAll)
+        .unwrap();
     let rec = rt.subscribe_recorder(s.id);
 
     let lock = rt.core.alloc_lock_id();
@@ -622,6 +633,91 @@ fn item5_off_mode_pause_is_no_op() {
         *calls.lock().unwrap(),
         baseline + 1,
         "fn fired immediately even after pause() — Off mode"
+    );
+}
+
+// =====================================================================
+// R2.6.0 ("Option A", canonical §2.6, pinned 2026-05-17) — a Default-mode
+// LEAF SOURCE (state node, no deps) that holds its OWN pause lock and then
+// self-emits via a direct external `emit`/`down([[DATA, v]])` is pushing
+// OUTSIDE the fn/dep settle pipeline. PAUSE/RESUME gating is fn/dep-
+// pipeline-scoped only, so that DATA MUST be delivered IMMEDIATELY at
+// emit time (cache advances now, no PAUSE synthesized to the sink, and
+// RESUME replays nothing). Buffering only applies to a node's own
+// fn/dep-driven settle slices, never a leaf source's direct emit. This is
+// the cross-impl parity contract with `@graphrefly/pure-ts` (only
+// `pausable: "resumeAll"` buffers a leaf source's direct `down()`).
+// =====================================================================
+
+#[test]
+fn r2_6_0_default_leaf_source_self_emit_delivers_immediately_while_self_paused() {
+    let rt = TestRuntime::new();
+    // 1. leaf source: state node, no deps, initial: 1. Default pausable.
+    let n = rt.state(Some(TestValue::Int(1)));
+    assert_eq!(rt.cache_value(n.id), Some(TestValue::Int(1)));
+
+    // 2. subscribe a recording sink.
+    let rec = rt.subscribe_recorder(n.id);
+
+    // 3. allocate a lock id and 4. self-pause the leaf source.
+    let lock = rt.core.alloc_lock_id();
+    rt.core.pause(n.id, lock).expect("pause leaf source");
+    assert!(rt.core.is_paused(n.id), "leaf source holds its own lock");
+
+    // 5. baseline the recorded events (mirrors item5_* "clear" pattern —
+    //    the Recorder has no clear(); a baseline index is the idiom).
+    let baseline = rec.snapshot().len();
+    let baseline_data = rec.data_values().len();
+
+    // 6. self-emit DATA=42 while self-paused.
+    n.set(TestValue::Int(42));
+
+    // 7. ASSERT (BEFORE resume): the [DATA, 42] was delivered immediately
+    //    and the cache advanced now — NOT buffered/deferred to RESUME.
+    let post_pause: Vec<RecordedEvent> = rec.snapshot().into_iter().skip(baseline).collect();
+    let data_after: Vec<TestValue> = rec.data_values().into_iter().skip(baseline_data).collect();
+    assert_eq!(
+        data_after,
+        vec![TestValue::Int(42)],
+        "leaf source self-emit must be delivered immediately while self-paused (R2.6.0)"
+    );
+    assert_eq!(
+        rt.cache_value(n.id),
+        Some(TestValue::Int(42)),
+        "cache must advance to the self-emitted value immediately (R2.6.0)"
+    );
+    // No PAUSE tier message synthesized/surfaced to the sink for the
+    // lock acquisition.
+    assert!(
+        !post_pause
+            .iter()
+            .any(|e| matches!(e, RecordedEvent::Pause(_))),
+        "no PAUSE surfaced to the sink for a self-paused leaf source (R2.6.0)"
+    );
+
+    // 8. resume the leaf source's own lock.
+    let report = rt
+        .core
+        .resume(n.id, lock)
+        .expect("resume")
+        .expect("final resume");
+
+    // 9. ASSERT: nothing replayed (replayed == 0), no duplicate/second
+    //    [DATA, 42], no reordering of the post-pause DATA, cache still 42.
+    assert_eq!(
+        report.replayed, 0,
+        "RESUME of a self-paused leaf source replays nothing (R2.6.0)"
+    );
+    let total_data: Vec<TestValue> = rec.data_values().into_iter().skip(baseline_data).collect();
+    assert_eq!(
+        total_data,
+        vec![TestValue::Int(42)],
+        "exactly one DATA=42 across the whole pause/resume cycle — no duplicate, no reorder (R2.6.0)"
+    );
+    assert_eq!(
+        rt.cache_value(n.id),
+        Some(TestValue::Int(42)),
+        "cache unchanged by RESUME (R2.6.0)"
     );
 }
 
