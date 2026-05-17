@@ -2619,17 +2619,31 @@ sub-store with its own lock." Seam-first internal decomposition (D220):
   landed `scripts/gate.sh` sanctioned runner); the change itself
   is a clean mechanical re-nest. Set up B-2 Step 2 (the
   `StateCell` shard reshape) against this stable seam.
-- **B-2 Step 2 — NOT STARTED (the multi-session heavy lift).**
-  Hoist `CoreShared` to its own single lock; reshape `StateCell` to
-  `with_shared(|sh|…)` + `with_shard(key,|s|…)` (closure-form,
-  B3-overlay shape), per-`Option<SerializationGroupId>` shard
-  (`None`=`DEFAULT_SHARD`=≈515 ns floor) as
-  `Arc<parking_lot::Mutex<CoreState>>` + `lock_arc` owned guard
-  (`SingleThreadCell` stays one `RefCell`); migrate the ~104
-  `lock_state()` sites onto `with_shard(group_of(node))` /
-  `with_shared` / both (shard-OUTER, shared-INNER, held together);
-  `begin_batch_for(seed)` locks seed's shard + cross-shard-touched
-  ascending (replaces ReentrantMutex-on-top + `global_wave`).
+- **B-2 Step 2 — ATTEMPTED + REVERTED to green Step 1 (2026-05-16);
+  turnkey-banked for a fresh-budget session.** Decomposed into
+  **2a** (behaviour-identical structural reshape + the ~104-site
+  closure migration, single shard, 825-gated — ZERO concurrency
+  change) and **2b** (per-`ShardKey` `Arc<parking_lot::Mutex<
+  CoreState>>` map + `lock_arc` owned guards + `begin_batch_for`
+  ascending routing — the real parallelism, gated by
+  `group_scaling` + `floor_compare` + 825). The 2a *structural*
+  reshape (closure-form `StateCell` trait `with_shared`/`with_shard`
+  + `ShardKey` + `from_parts`; `CoreShared` gains `binding` +
+  `Drop for CoreShared`; `CoreState`→`{nodes,children,binding}`;
+  ctor; `Core` plumbing) was applied, but the ~101-site
+  `lock_state()`→closure migration (multi-thousand-line, batch.rs
+  lock-release-around-callback control-flow restructuring — the
+  port's single highest-risk change) could not be completed AND
+  gated in the budget left after a ~2 h self-inflicted test-infra
+  saga (overlapping-cargo/`pkill` thrash; permanently fixed by the
+  landed `scripts/gate.sh`). Per discipline (never commit a half
+  Step 2 / unverified mega-diff) the uncommitted 2a edits were
+  `git restore`d — tree is exactly `918c28c` (825-green). Full
+  turnkey 2a/2b execution design (exact trait shape, the
+  shard-OUTER/shared-INNER nesting rule, 2a-`key=None` invariant,
+  Drop relocation, the CI-red `per_subgraph_parallelism.rs` →
+  B-3): `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  D220-EXEC "Step 2 — BANKED 2a/2b" + "STEP 2 STATUS".
 - **B-3 — NOT STARTED.** §7-B bounded cross-shard ordered-acquire
   guard + §7-C/§7-F vestigial union-find deletion.
 
