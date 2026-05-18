@@ -532,312 +532,329 @@ impl<C: crate::state_cell::StateCell> Subscription<C> {
     }
 }
 
-impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
-    #[allow(clippy::too_many_lines)] // Phase G is one continuous lifecycle hook chain (user cleanup → producer_deactivate → wipe_ctx → Core cache-clear); splitting it would obscure the ordering invariant.
-    fn drop(&mut self) {
-        // Silent no-op if Core is gone. This keeps Drop infallible (no panics
-        // from a dropped subscription racing a dropped Core) and avoids
-        // surprising users with errors on shutdown.
-        //
-        // Producer deactivation (Slice D, D031): if removing this sub
-        // empties the subscribers map AND the node is a producer, fire
-        // `BindingBoundary::producer_deactivate(node_id)` AFTER releasing
-        // the state lock. The binding then drops its per-node state
-        // (subscriptions to upstream sources, captured closure state),
-        // which transitively unsubs from upstreams via their own
-        // `Subscription::Drop`. Re-entrance into Core from the deactivate
-        // hook is permitted since the lock is released first.
-        let Some(state) = self.state.upgrade() else {
+/// Deregister `sub_id` from `node_id` and run the Phase G / lifecycle
+/// cleanup chain (OnDeactivation → `producer_deactivate` → `wipe_ctx` →
+/// Core cache-clear). Extracted verbatim from the former
+/// `Subscription::Drop` (D225 refined A2, S2a) so `Core::unsubscribe`
+/// (the synchronous owner-invoked path) and the legacy RAII `Drop`
+/// share ONE body. Operates on `&C` directly — the body already used
+/// only `&dyn BindingBoundary` (via `make_op_scratch_with_binding`),
+/// never a `Core`, so this is a behaviour-identical move.
+///
+/// Producer deactivation (Slice D, D031): if removing this sub empties
+/// the subscribers map AND the node is a producer, fire
+/// `BindingBoundary::producer_deactivate(node_id)` AFTER releasing the
+/// state lock. The binding then drops its per-node state (subscriptions
+/// to upstream sources, captured closure state), which transitively
+/// unsubs from upstreams via their own unsubscribe. Re-entrance into
+/// Core from the deactivate hook is permitted since the lock is
+/// released first.
+#[allow(clippy::too_many_lines)] // Phase G is one continuous lifecycle hook chain (user cleanup → producer_deactivate → wipe_ctx → Core cache-clear); splitting it would obscure the ordering invariant.
+pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
+    state: &C,
+    node_id: NodeId,
+    sub_id: SubscriptionId,
+) {
+    // Slice E2 (D056): when the last subscriber drops, fire the
+    // node's OnDeactivation cleanup hook BEFORE producer_deactivate
+    // (cleanup may release handles the producer subscription owns;
+    // reverse order would let producer_deactivate drop subs that user
+    // cleanup expected to be live). Both calls are lock-released per
+    // D045.
+    //
+    // OnDeactivation gating (D068, QA Q3 fix): fires only when the
+    // node has fired its fn at least once AND has a fn (`fn_id`
+    // populated). State nodes have no fn — they cannot register a
+    // cleanup spec via the production fn-return path (R2.4.5), so
+    // firing `cleanup_for` on them is wasted FFI; the binding's
+    // lookup is guaranteed to find no `current_cleanup`. Skipping
+    // here saves the FFI hop and matches the design-doc wording
+    // ("never-fired state nodes" — state-with-initial-value satisfies
+    // `has_fired_once = true` but still has no fn).
+    //
+    // Slice E2 /qa Q2(b) (D069): if the node is a resubscribable
+    // node that's ALREADY terminal (terminate fired BEFORE this last
+    // sub drop), fire `wipe_ctx` lock-released AFTER OnDeactivation
+    // + producer_deactivate. Mutually exclusive with `terminate_node`'s
+    // queue-wipe site: terminate-with-empty-subs goes through
+    // `pending_wipes`; terminate-with-live-subs routes here when
+    // those subs eventually drop. Either path fires exactly one
+    // wipe per terminal lifecycle.
+    let (was_last_sub, is_producer, has_user_cleanup, fire_wipe, binding) = {
+        // Step 2b-ii-B: route to the node's shard (this drop runs
+        // OUTSIDE any wave ⇒ ambient `None`; a grouped node's
+        // record is in shard `g`, so without this the unsubscribe
+        // would no-op on `DEFAULT_SHARD` → lost cleanup / leak).
+        let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, node_id));
+        let mut s = St::new(&*state);
+        let Some(rec) = s.nodes.get_mut(&node_id) else {
             return;
         };
-        // Slice E2 (D056): when the last subscriber drops, fire the
-        // node's OnDeactivation cleanup hook BEFORE producer_deactivate
-        // (cleanup may release handles the producer subscription owns;
-        // reverse order would let producer_deactivate drop subs that user
-        // cleanup expected to be live). Both calls are lock-released per
-        // D045.
-        //
-        // OnDeactivation gating (D068, QA Q3 fix): fires only when the
-        // node has fired its fn at least once AND has a fn (`fn_id`
-        // populated). State nodes have no fn — they cannot register a
-        // cleanup spec via the production fn-return path (R2.4.5), so
-        // firing `cleanup_for` on them is wasted FFI; the binding's
-        // lookup is guaranteed to find no `current_cleanup`. Skipping
-        // here saves the FFI hop and matches the design-doc wording
-        // ("never-fired state nodes" — state-with-initial-value satisfies
-        // `has_fired_once = true` but still has no fn).
-        //
-        // Slice E2 /qa Q2(b) (D069): if the node is a resubscribable
-        // node that's ALREADY terminal (terminate fired BEFORE this last
-        // sub drop), fire `wipe_ctx` lock-released AFTER OnDeactivation
-        // + producer_deactivate. Mutually exclusive with `terminate_node`'s
-        // queue-wipe site: terminate-with-empty-subs goes through
-        // `pending_wipes`; terminate-with-live-subs routes here when
-        // those subs eventually drop. Either path fires exactly one
-        // wipe per terminal lifecycle.
-        let (was_last_sub, is_producer, has_user_cleanup, fire_wipe, binding) = {
-            // Step 2b-ii-B: route to the node's shard (this drop runs
-            // OUTSIDE any wave ⇒ ambient `None`; a grouped node's
-            // record is in shard `g`, so without this the unsubscribe
-            // would no-op on `DEFAULT_SHARD` → lost cleanup / leak).
-            let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, self.node_id));
-            let mut s = St::new(&*state);
-            let Some(rec) = s.nodes.get_mut(&self.node_id) else {
-                return;
-            };
-            rec.subscribers.remove(&self.sub_id);
-            // Slice X4 / D2: bump revision so any pending_notify entry for
-            // this node opened earlier in the wave starts a fresh batch on
-            // the next queue_notify, dropping the now-departed sink from
-            // the snapshot.
-            rec.subscribers_revision = rec.subscribers_revision.wrapping_add(1);
-            let last = rec.subscribers.is_empty();
-            let producer = rec.is_producer();
-            // OnDeactivation gate: must have run a fn at least once
-            // (has_fired_once) AND have a fn registered (fn_id.is_some()).
-            // The fn_id check excludes state nodes whose has_fired_once
-            // tracks initial-value status, not "user fn ran."
-            let user_cleanup = rec.has_fired_once && rec.fn_id.is_some();
-            let fire_wipe = last && rec.resubscribable && rec.terminal.is_some();
-            // Phase G (D119/D120/D121, 2026-05-10): always clone the
-            // binding when last sub leaves so we can run the Core
-            // cache-clear after the existing hooks. The Arc::clone is
-            // cheap and dwarfed by the cost of the hooks themselves.
-            let binding = if last { Some(s.binding.clone()) } else { None };
-            (last, producer, user_cleanup, fire_wipe, binding)
-        };
-        if was_last_sub {
-            if let Some(binding) = binding {
-                if has_user_cleanup {
-                    binding.cleanup_for(self.node_id, CleanupTrigger::OnDeactivation);
-                }
-                if is_producer {
-                    binding.producer_deactivate(self.node_id);
-                }
-                // D069: eager wipe — fires AFTER OnDeactivation so the
-                // user closure observes pre-wipe `store` (matches the
-                // existing "OnDeactivation runs before wipe on terminal
-                // reset" invariant covered by test 10). Idempotent —
-                // `HashMap::remove` on absent key is a no-op, so even
-                // if the wave already drained `pending_wipes` earlier,
-                // this fire is benign.
-                if fire_wipe {
-                    binding.wipe_ctx(self.node_id);
-                }
+        rec.subscribers.remove(&sub_id);
+        // Slice X4 / D2: bump revision so any pending_notify entry for
+        // this node opened earlier in the wave starts a fresh batch on
+        // the next queue_notify, dropping the now-departed sink from
+        // the snapshot.
+        rec.subscribers_revision = rec.subscribers_revision.wrapping_add(1);
+        let last = rec.subscribers.is_empty();
+        let producer = rec.is_producer();
+        // OnDeactivation gate: must have run a fn at least once
+        // (has_fired_once) AND have a fn registered (fn_id.is_some()).
+        // The fn_id check excludes state nodes whose has_fired_once
+        // tracks initial-value status, not "user fn ran."
+        let user_cleanup = rec.has_fired_once && rec.fn_id.is_some();
+        let fire_wipe = last && rec.resubscribable && rec.terminal.is_some();
+        // Phase G (D119/D120/D121, 2026-05-10): always clone the
+        // binding when last sub leaves so we can run the Core
+        // cache-clear after the existing hooks. The Arc::clone is
+        // cheap and dwarfed by the cost of the hooks themselves.
+        let binding = if last { Some(s.binding.clone()) } else { None };
+        (last, producer, user_cleanup, fire_wipe, binding)
+    };
+    if was_last_sub {
+        if let Some(binding) = binding {
+            if has_user_cleanup {
+                binding.cleanup_for(node_id, CleanupTrigger::OnDeactivation);
+            }
+            if is_producer {
+                binding.producer_deactivate(node_id);
+            }
+            // D069: eager wipe — fires AFTER OnDeactivation so the
+            // user closure observes pre-wipe `store` (matches the
+            // existing "OnDeactivation runs before wipe on terminal
+            // reset" invariant covered by test 10). Idempotent —
+            // `HashMap::remove` on absent key is a no-op, so even
+            // if the wave already drained `pending_wipes` earlier,
+            // this fire is benign.
+            if fire_wipe {
+                binding.wipe_ctx(node_id);
+            }
 
-                // Phase G (D118/D119/D120/D121, 2026-05-10) — Core
-                // cache-clear on deactivation, mirroring TS `_deactivate`
-                // (`pure-ts/src/core/node.ts:2185-2297`):
-                //
-                //   1. user `cleanup_for(OnDeactivation)`  ← above
-                //   2. `producer_deactivate`                ← above
-                //   3. `wipe_ctx` (resubscribable+terminal) ← above
-                //   4. **NEW: Core cache-clear**            ← here
-                //
-                // Releases per-dep `prev_data` + `data_batch` retains +
-                // `dep_terminals` Error retains (the latter closes the
-                // long-standing "Non-resubscribable terminal Error
-                // handles leak via diamond cascade" porting-deferred
-                // entry — D121). Clears pause/replay buffers. Releases
-                // `cached` for compute nodes (R2.2.7 / R2.2.8 ROM:
-                // state nodes preserve cache; compute nodes clear).
-                // Keeps the per-node `terminal` slot intact (D121:
-                // producer-side terminal stays for late-subscriber
-                // R2.2.7.a reset or R2.2.7.b rejection).
-                //
-                // Lock-released release discipline: collect handles
-                // under the lock, drop the lock, fire `release_handle`
-                // outside (mirrors `Core::resume` Phase 2 + the
-                // existing F1 `set_deps` removed-handles release at
-                // node.rs:5003).
-                //
-                // Re-entrance safety (F1 / D123, /qa 2026-05-10): if the
-                // user `cleanup_for` / `producer_deactivate` / `wipe_ctx`
-                // hook re-subscribed via some path, `subscribers` is now
-                // non-empty. **Skip Phase G entirely in that case** —
-                // the new subscriber's handshake delivered the live
-                // `cache` handle to its sink and is holding a refcount
-                // share through `pending_notify`; clearing cache here
-                // would race with the new subscriber's wave and cause
-                // a use-after-release in bindings that reap registry
-                // slots at refcount-zero.
-                //
-                // Why this diverges from TS `_deactivate` (which clears
-                // unconditionally): TS runs the cleanup hook + cache
-                // clear as ONE sync block under the (implicit) JS
-                // single-thread mutex; there's no released-lock window
-                // for a re-subscribe to install a sub before the
-                // cache-clear runs. Rust's lock-released hook discipline
-                // (D045) opens that window, so the re-check is
-                // necessary to preserve refcount soundness.
-                //
-                // Re-acquire state lock atomically with the recheck so
-                // a concurrent thread cannot install a sub between the
-                // emptiness check and the cache mutation.
-                // F8 (/qa 2026-05-10): also take `op_scratch` so its
-                // retains release lock-released after the state-lock
-                // scope. Pre-F8 Phase G only released per-edge handles
-                // + the compute `cache`, leaving operator-internal
-                // retains (Last.latest, Scan.acc, Reduce.acc, etc.)
-                // in-place. For non-resubscribable nodes that never
-                // re-subscribe, this was a permanent leak —
-                // asymmetric with the per-edge cleanup. F8 closes that
-                // by taking the scratch alongside per-edge handles
-                // and calling `release_handles` lock-released.
-                //
-                // D-α (D028 full close, 2026-05-10): for resubscribable
-                // operator nodes, take the OLD scratch AND build a
-                // FRESH scratch via `make_op_scratch` (lock-held, but
-                // `binding.retain_handle` is a leaf operation per
-                // op_state.rs:69-80 docs), install the fresh scratch
-                // on `rec.op_scratch`, and push the old scratch to
-                // `pending_scratch_release` for deferred release. The
-                // queue drains on the next `reset_for_fresh_lifecycle`
-                // (after Phase 2 takes fresh retains — preserves the
-                // C-3 /qa P1 seed-aliasing-acc invariant) or on
-                // `Drop for CoreState`. The fresh install gives
-                // re-activation correct counter / acc state (Take.taken
-                // back to 0, Scan.acc back to seed, etc.) matching TS
-                // Lock 6.D ("resets on every deactivation").
-                let (to_release, scratch_to_release): (
-                    Vec<HandleId>,
-                    Option<Box<dyn crate::op_state::OperatorScratch>>,
-                ) = {
-                    // Step 2b-ii-B: route to the node's shard (drop
-                    // runs outside any wave; grouped node's record is
-                    // in shard `g` — without this the scratch/refcount
-                    // cleanup would no-op on `DEFAULT_SHARD`).
-                    let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, self.node_id));
-                    let mut s = St::new(&*state);
-                    if let Some(rec) = s.nodes.get_mut(&self.node_id) {
-                        // F1 re-entrance check.
-                        if !rec.subscribers.is_empty() {
-                            // A user hook re-subscribed during the
-                            // lock-released window; the new lifecycle
-                            // owns this node now. Phase G is a no-op.
-                            return;
+            // Phase G (D118/D119/D120/D121, 2026-05-10) — Core
+            // cache-clear on deactivation, mirroring TS `_deactivate`
+            // (`pure-ts/src/core/node.ts:2185-2297`):
+            //
+            //   1. user `cleanup_for(OnDeactivation)`  ← above
+            //   2. `producer_deactivate`                ← above
+            //   3. `wipe_ctx` (resubscribable+terminal) ← above
+            //   4. **NEW: Core cache-clear**            ← here
+            //
+            // Releases per-dep `prev_data` + `data_batch` retains +
+            // `dep_terminals` Error retains (the latter closes the
+            // long-standing "Non-resubscribable terminal Error
+            // handles leak via diamond cascade" porting-deferred
+            // entry — D121). Clears pause/replay buffers. Releases
+            // `cached` for compute nodes (R2.2.7 / R2.2.8 ROM:
+            // state nodes preserve cache; compute nodes clear).
+            // Keeps the per-node `terminal` slot intact (D121:
+            // producer-side terminal stays for late-subscriber
+            // R2.2.7.a reset or R2.2.7.b rejection).
+            //
+            // Lock-released release discipline: collect handles
+            // under the lock, drop the lock, fire `release_handle`
+            // outside (mirrors `Core::resume` Phase 2 + the
+            // existing F1 `set_deps` removed-handles release at
+            // node.rs:5003).
+            //
+            // Re-entrance safety (F1 / D123, /qa 2026-05-10): if the
+            // user `cleanup_for` / `producer_deactivate` / `wipe_ctx`
+            // hook re-subscribed via some path, `subscribers` is now
+            // non-empty. **Skip Phase G entirely in that case** —
+            // the new subscriber's handshake delivered the live
+            // `cache` handle to its sink and is holding a refcount
+            // share through `pending_notify`; clearing cache here
+            // would race with the new subscriber's wave and cause
+            // a use-after-release in bindings that reap registry
+            // slots at refcount-zero.
+            //
+            // Why this diverges from TS `_deactivate` (which clears
+            // unconditionally): TS runs the cleanup hook + cache
+            // clear as ONE sync block under the (implicit) JS
+            // single-thread mutex; there's no released-lock window
+            // for a re-subscribe to install a sub before the
+            // cache-clear runs. Rust's lock-released hook discipline
+            // (D045) opens that window, so the re-check is
+            // necessary to preserve refcount soundness.
+            //
+            // Re-acquire state lock atomically with the recheck so
+            // a concurrent thread cannot install a sub between the
+            // emptiness check and the cache mutation.
+            // F8 (/qa 2026-05-10): also take `op_scratch` so its
+            // retains release lock-released after the state-lock
+            // scope. Pre-F8 Phase G only released per-edge handles
+            // + the compute `cache`, leaving operator-internal
+            // retains (Last.latest, Scan.acc, Reduce.acc, etc.)
+            // in-place. For non-resubscribable nodes that never
+            // re-subscribe, this was a permanent leak —
+            // asymmetric with the per-edge cleanup. F8 closes that
+            // by taking the scratch alongside per-edge handles
+            // and calling `release_handles` lock-released.
+            //
+            // D-α (D028 full close, 2026-05-10): for resubscribable
+            // operator nodes, take the OLD scratch AND build a
+            // FRESH scratch via `make_op_scratch` (lock-held, but
+            // `binding.retain_handle` is a leaf operation per
+            // op_state.rs:69-80 docs), install the fresh scratch
+            // on `rec.op_scratch`, and push the old scratch to
+            // `pending_scratch_release` for deferred release. The
+            // queue drains on the next `reset_for_fresh_lifecycle`
+            // (after Phase 2 takes fresh retains — preserves the
+            // C-3 /qa P1 seed-aliasing-acc invariant) or on
+            // `Drop for CoreState`. The fresh install gives
+            // re-activation correct counter / acc state (Take.taken
+            // back to 0, Scan.acc back to seed, etc.) matching TS
+            // Lock 6.D ("resets on every deactivation").
+            let (to_release, scratch_to_release): (
+                Vec<HandleId>,
+                Option<Box<dyn crate::op_state::OperatorScratch>>,
+            ) = {
+                // Step 2b-ii-B: route to the node's shard (drop
+                // runs outside any wave; grouped node's record is
+                // in shard `g` — without this the scratch/refcount
+                // cleanup would no-op on `DEFAULT_SHARD`).
+                let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, node_id));
+                let mut s = St::new(&*state);
+                if let Some(rec) = s.nodes.get_mut(&node_id) {
+                    // F1 re-entrance check.
+                    if !rec.subscribers.is_empty() {
+                        // A user hook re-subscribed during the
+                        // lock-released window; the new lifecycle
+                        // owns this node now. Phase G is a no-op.
+                        return;
+                    }
+                    let mut handles: Vec<HandleId> = Vec::new();
+                    // Per-dep state. Empty for state nodes.
+                    for dr in &mut rec.dep_records {
+                        if dr.prev_data != NO_HANDLE {
+                            handles.push(dr.prev_data);
+                            dr.prev_data = NO_HANDLE;
                         }
-                        let mut handles: Vec<HandleId> = Vec::new();
-                        // Per-dep state. Empty for state nodes.
-                        for dr in &mut rec.dep_records {
-                            if dr.prev_data != NO_HANDLE {
-                                handles.push(dr.prev_data);
-                                dr.prev_data = NO_HANDLE;
-                            }
-                            for h in dr.data_batch.drain(..) {
-                                handles.push(h);
-                            }
-                            // D121: per-edge terminal-Error retain
-                            // released here. Closes the cascade leak.
-                            // The producer's own `rec.terminal` slot
-                            // stays intact (preserved below).
-                            if let Some(TerminalKind::Error(h)) = dr.terminal {
-                                handles.push(h);
-                            }
-                            dr.terminal = None;
-                            dr.dirty = false;
-                            dr.involved_this_wave = false;
-                        }
-                        // Pause buffer DATA / replay buffer.
-                        if let PauseState::Paused { ref mut buffer, .. } = rec.pause_state {
-                            for msg in buffer.drain(..) {
-                                if let Some(h) = msg.payload_handle() {
-                                    handles.push(h);
-                                }
-                            }
-                        }
-                        for h in rec.replay_buffer.drain(..) {
+                        for h in dr.data_batch.drain(..) {
                             handles.push(h);
                         }
-                        // Pause locks drained → node back to Active.
-                        rec.pause_state = PauseState::Active;
-                        // R2.2.7 / R2.2.8 ROM: state nodes preserve
-                        // cache; compute (fn or op) nodes clear.
-                        // D119: state nodes keep `cached` because the
-                        // value is intrinsic and non-volatile;
-                        // resubscribe sees the same value.
-                        let is_compute = rec.fn_id.is_some() || rec.op.is_some();
-                        if is_compute && rec.cache != NO_HANDLE {
-                            handles.push(rec.cache);
-                            rec.cache = NO_HANDLE;
+                        // D121: per-edge terminal-Error retain
+                        // released here. Closes the cascade leak.
+                        // The producer's own `rec.terminal` slot
+                        // stays intact (preserved below).
+                        if let Some(TerminalKind::Error(h)) = dr.terminal {
+                            handles.push(h);
                         }
-                        // Reset wave + lifecycle state so reactivation
-                        // begins fresh. `terminal` STAYS (D121).
-                        rec.has_fired_once = false;
-                        rec.dirty = false;
-                        rec.involved_this_wave = false;
-                        // §10.13 perf (D047): reset received_mask — all deps back
-                        // to sentinel on resubscribe.
-                        rec.received_mask = 0;
-                        // §10.3 perf (Slice V1): reset involved_mask.
-                        rec.involved_mask = 0;
-                        if rec.is_dynamic {
-                            rec.tracked.clear();
-                        }
-                        // F8 + D-α: op_scratch handling forks by
-                        // `resubscribable`. Non-resubscribable: eager
-                        // release (F8 path — there's no future reset
-                        // so the leak ends here). Resubscribable +
-                        // has-op: take old AND install fresh; defer
-                        // old release to the queue.
-                        let scratch = if !rec.resubscribable {
-                            std::mem::take(&mut rec.op_scratch)
-                        } else if let Some(op) = rec.op {
-                            // Slice C-3 /qa P1 (retain-before-release):
-                            // build fresh scratch FIRST (this calls
-                            // `binding.retain_handle` for any seed /
-                            // default the op carries), THEN swap. The
-                            // old scratch's release is deferred to the
-                            // `pending_scratch_release` queue (drained
-                            // on next reset_for_fresh_lifecycle or
-                            // Drop for CoreState).
-                            //
-                            // make_op_scratch is fallible only for
-                            // OperatorSeedSentinel; the OperatorOp
-                            // stored on NodeRecord passed validation
-                            // at registration time, so the unwrap
-                            // here is structurally guaranteed (mirrors
-                            // reset_for_fresh_lifecycle).
-                            //
-                            // Uses the binding-explicit static variant
-                            // because we have only `&dyn BindingBoundary`
-                            // here (Subscription::Drop holds no Core).
-                            let new_scratch = Core::<C>::make_op_scratch_with_binding(&*binding, op)
-                                .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
-                            let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
-                            if let Some(old_box) = old {
-                                s.shared.pending_scratch_release.push(old_box);
-                            }
-                            // The "scratch_to_release" for lock-released
-                            // release stays None here — the resubscribable
-                            // case routes through the queue.
-                            None
-                        } else {
-                            // Resubscribable but no op (e.g. derived
-                            // compute / dynamic / state). Nothing to
-                            // do for op_scratch.
-                            None
-                        };
-                        (handles, scratch)
-                    } else {
-                        // Node destroyed between lock-released hooks
-                        // and this re-acquire (terminate cascade or
-                        // graph removal) — nothing to clear.
-                        (Vec::new(), None)
+                        dr.terminal = None;
+                        dr.dirty = false;
+                        dr.involved_this_wave = false;
                     }
-                };
-                // Release handles lock-released. Binding may re-enter
-                // Core during `release_handle` (final-Drop callbacks
-                // are user code).
-                for h in to_release {
-                    binding.release_handle(h);
+                    // Pause buffer DATA / replay buffer.
+                    if let PauseState::Paused { ref mut buffer, .. } = rec.pause_state {
+                        for msg in buffer.drain(..) {
+                            if let Some(h) = msg.payload_handle() {
+                                handles.push(h);
+                            }
+                        }
+                    }
+                    for h in rec.replay_buffer.drain(..) {
+                        handles.push(h);
+                    }
+                    // Pause locks drained → node back to Active.
+                    rec.pause_state = PauseState::Active;
+                    // R2.2.7 / R2.2.8 ROM: state nodes preserve
+                    // cache; compute (fn or op) nodes clear.
+                    // D119: state nodes keep `cached` because the
+                    // value is intrinsic and non-volatile;
+                    // resubscribe sees the same value.
+                    let is_compute = rec.fn_id.is_some() || rec.op.is_some();
+                    if is_compute && rec.cache != NO_HANDLE {
+                        handles.push(rec.cache);
+                        rec.cache = NO_HANDLE;
+                    }
+                    // Reset wave + lifecycle state so reactivation
+                    // begins fresh. `terminal` STAYS (D121).
+                    rec.has_fired_once = false;
+                    rec.dirty = false;
+                    rec.involved_this_wave = false;
+                    // §10.13 perf (D047): reset received_mask — all deps back
+                    // to sentinel on resubscribe.
+                    rec.received_mask = 0;
+                    // §10.3 perf (Slice V1): reset involved_mask.
+                    rec.involved_mask = 0;
+                    if rec.is_dynamic {
+                        rec.tracked.clear();
+                    }
+                    // F8 + D-α: op_scratch handling forks by
+                    // `resubscribable`. Non-resubscribable: eager
+                    // release (F8 path — there's no future reset
+                    // so the leak ends here). Resubscribable +
+                    // has-op: take old AND install fresh; defer
+                    // old release to the queue.
+                    let scratch = if !rec.resubscribable {
+                        std::mem::take(&mut rec.op_scratch)
+                    } else if let Some(op) = rec.op {
+                        // Slice C-3 /qa P1 (retain-before-release):
+                        // build fresh scratch FIRST (this calls
+                        // `binding.retain_handle` for any seed /
+                        // default the op carries), THEN swap. The
+                        // old scratch's release is deferred to the
+                        // `pending_scratch_release` queue (drained
+                        // on next reset_for_fresh_lifecycle or
+                        // Drop for CoreState).
+                        //
+                        // make_op_scratch is fallible only for
+                        // OperatorSeedSentinel; the OperatorOp
+                        // stored on NodeRecord passed validation
+                        // at registration time, so the unwrap
+                        // here is structurally guaranteed (mirrors
+                        // reset_for_fresh_lifecycle).
+                        //
+                        // Uses the binding-explicit static variant
+                        // because we have only `&dyn BindingBoundary`
+                        // here (Subscription::Drop holds no Core).
+                        let new_scratch = Core::<C>::make_op_scratch_with_binding(&*binding, op)
+                                .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
+                        let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
+                        if let Some(old_box) = old {
+                            s.shared.pending_scratch_release.push(old_box);
+                        }
+                        // The "scratch_to_release" for lock-released
+                        // release stays None here — the resubscribable
+                        // case routes through the queue.
+                        None
+                    } else {
+                        // Resubscribable but no op (e.g. derived
+                        // compute / dynamic / state). Nothing to
+                        // do for op_scratch.
+                        None
+                    };
+                    (handles, scratch)
+                } else {
+                    // Node destroyed between lock-released hooks
+                    // and this re-acquire (terminate cascade or
+                    // graph removal) — nothing to clear.
+                    (Vec::new(), None)
                 }
-                // F8: release operator-scratch handles lock-released
-                // (mirrors `ScratchReleaseGuard::drop` ordering).
-                if let Some(mut scratch) = scratch_to_release {
-                    scratch.release_handles(&*binding);
-                }
+            };
+            // Release handles lock-released. Binding may re-enter
+            // Core during `release_handle` (final-Drop callbacks
+            // are user code).
+            for h in to_release {
+                binding.release_handle(h);
             }
+            // F8: release operator-scratch handles lock-released
+            // (mirrors `ScratchReleaseGuard::drop` ordering).
+            if let Some(mut scratch) = scratch_to_release {
+                scratch.release_handles(&*binding);
+            }
+        }
+    }
+}
+
+impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
+    fn drop(&mut self) {
+        // Legacy RAII path (D225 refined A2, S2a). Silent no-op if the
+        // Core is gone (the sink has nowhere to deregister from — keeps
+        // Drop infallible). Delegates to the shared `unsubscribe_sink`;
+        // S2b moves RAII to the binding layer over the synchronous
+        // owner-invoked `Core::unsubscribe`.
+        if let Some(state) = self.state.upgrade() {
+            unsubscribe_sink(&*state, self.node_id, self.sub_id);
         }
     }
 }
@@ -3502,6 +3519,25 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             Ok(sub) => sub,
             Err(e) => panic!("{e}"),
         }
+    }
+
+    /// Synchronous owner-invoked unsubscribe (D225 refined A2). Symmetric
+    /// with [`Core::subscribe`] (the caller has `&Core`, exactly like
+    /// [`Core::emit`]). Runs the full deregister + Phase G / lifecycle
+    /// cleanup chain (OnDeactivation → `producer_deactivate` → `wipe_ctx`
+    /// → Core cache-clear), behaviour-identical to the legacy
+    /// `Subscription::Drop`. Idempotent: a `sub_id` already gone (node
+    /// destroyed / double-unsub) is a silent no-op. D225 S2b retires the
+    /// core-level RAII `Subscription` in favour of a binding-layer RAII
+    /// wrapper over this method (the binding holds its `Core` on its
+    /// affinity worker, so its wrapper's `Drop` calls this synchronously).
+    ///
+    /// `pub(crate)` for S2a (no external caller yet; `SubscriptionId` is
+    /// `pub(crate)`). S2b promotes both to `pub` as the binding-facing
+    /// surface that replaces the core-level RAII `Subscription`.
+    #[allow(dead_code)] // wired to a caller (binding-layer RAII) in S2b; S2a lands the method behaviour-identical.
+    pub(crate) fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        unsubscribe_sink(&*self.state, node_id, sub_id);
     }
 
     /// Fallible subscribe. Returns `Err` on:

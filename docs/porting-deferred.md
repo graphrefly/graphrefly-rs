@@ -148,6 +148,27 @@ per fn-fire).
 - **Lift point:** widen the `BindingBoundary` trait's `release_handle` rustdoc to make the leaf-operation requirement a HARD contract (currently it reads more like an implementation hint). Add a `release_handle_lock_held: bool` capability flag if a future binding genuinely needs Core re-entrance during refcount paths. Until then, defer.
 - **Source:** /qa F2 / M1 (2026-05-10 A/B/D/E/F batch review). Pre-existing for Phase 3/5; expanded for Phase 3b + Drop drain via D-α.
 
+### Actor-model (D221/D222) — S0 V3: bench-harness `GLOBAL_CORE` must not back production multi-Core
+
+- **What:** `static GLOBAL_CORE: OnceLock<Arc<BenchCore>>` +
+  `fn global() -> Arc<BenchCore>` in
+  `crates/graphrefly-bindings-js/src/core_bindings.rs:1817` is a process-global
+  *single* `BenchCore` used by the napi bench/parity-harness global-call surface.
+  Surfaced by the D222 S0 V3 verification (no process-global state may break
+  "N independent `Core`s never interfere" under the D221 actor / work-stealing
+  model).
+- **Why this is fine now / deferred:** it is a **bench-harness artifact**, not a
+  production multi-Core path — the per-`BenchCore` instance API does not route
+  through it. Not a Core-substrate blocker (S0 V3 = PASS for Core). It only
+  becomes load-bearing when the **M6 / `@graphrefly/native` binding-layer group
+  executor** (D221 — DECISION LOCKED, shape (ii)) is built: that slice must
+  build production multi-Core (one `Core` per worker_threads/Web Worker) using
+  per-instance Cores, *not* a process-global `GLOBAL_CORE`. Re-look trigger: the
+  M6 binding-executor implementation slice.
+- **Source:** D222 S0 V3 verification pass (2026-05-17);
+  `~/src/graphrefly-ts/docs/rust-port-decisions.md` D221 "DECISION LOCKED" +
+  D222; `archive/docs/SESSION-rust-port-actor-model.md` §7.
+
 ### ~~`signal_invalidate` uses unbounded recursion (stack overflow risk on deep mount trees)~~ — RESOLVED 2026-05-12 (Slice 3e/3f)
 
 - **Resolution:** `collect_signal_invalidate_ids` converted from recursive to iterative using an explicit `Vec<Graph>` worklist. Pop a graph, lock briefly, push children to worklist, push own ids to `out`. Mirrors the `destroy()` cascade pattern.

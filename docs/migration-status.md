@@ -2837,6 +2837,159 @@ post-2b-ii; the 2c-spike REGRESSED it to 648 ns via the naive dedicated
 `currently_firing` lock — must be cell-aware, D221 (F)); 825 + 24
 grouped + cascade green (831/831 under the spike — correctness sound).
 
+### Actor-model batch S0+S1 — LANDED 2026-05-17 (D222; S0 verification CLEAR + S1 (F-b) floor-harden)
+
+`/porting-to-rs` batch under the **D221 DECISION LOCKED actor / work-stealing
+model**. D221 is design-lock only; this batch is the user-approved S0+S1
+scope (D222 in `~/src/graphrefly-ts/docs/rust-port-decisions.md`). S2 (delete
+`LockedCell` + shard machinery), S3 (`SerializationGroupId`→`SchedulingGroupId`),
+S4 (wave-scope + per-group wake signal) and the M6 binding-layer group executor
+remain **separate, explicitly-approved future batches**.
+
+- **S0 — three D221 pre-impl verification code-checks: CLEAR (no model↔code conflict).**
+  - **V1 (claim→drain-to-quiescence→release, no mid-drain handoff): PASS.**
+    `BatchGuard::drop` (the owning guard, `crates/graphrefly-core/src/batch.rs:3689`)
+    *is* the lifecycle: `drain_and_flush()` inside `catch_unwind` (bounded by
+    `max_batch_drain_iterations`) → `clear_wave_state`+`ws.clear_wave_state()`
+    resets the thread-local `WaveState` to empty (quiescent) → `clear_in_tick()`
+    releases the per-(Core,thread) ownership slot — on **every** path (success,
+    closure-panic, drain-panic). `assert_outermost_wave_clean` (batch.rs:472)
+    asserts `WaveState` quiescent at each outermost wave start. The actor model's
+    run-to-quiescence-before-release maps 1:1; replacing the
+    `wave_owner`/`global_wave` runtime lock with ownership-move+`Send` preserves
+    the same single-owner-per-drain property (compile-time, zero runtime lock).
+  - **V2 (Core/group state genuinely `Send`): PASS.** Zero `std::rc::Rc` in any
+    substrate crate. Surviving cell = `SingleThreadCell`
+    (`RefCell<CoreShared>`+`RefCell<CoreState>`); `RefCell<T>: Send` iff `T: Send`;
+    `CoreState`/`CoreShared` fields are HashMaps of newtypes +
+    `Arc<dyn BindingBoundary>`, and `BindingBoundary: Send + Sync`
+    (`boundary.rs:187`, with an existing `assert_send_sync` scaffold at :699).
+    `Sync` not required (model = ownership-move, not Arc-share) — exactly why
+    dropping `LockedCell`'s `Arc<C>` share removes the only `Sync` pressure.
+  - **V3 (no process-global state breaking N-independent-Cores): PASS (Core); 1
+    M6 note.** `CORE_GENERATION: AtomicU64` is a monotonic ID source that *keeps
+    Cores distinct* (not a coupling hazard); `MONOTONIC_ORIGIN: OnceLock<Instant>`
+    is an intentional read-only cross-Core clock base; the thread-locals
+    (`WAVE_STATE`/`IN_TICK_OWNED`/`CURRENT_SHARD_KEY`) are drain scratch, safe by
+    V1. **M6 note (not a Core blocker):** `GLOBAL_CORE: OnceLock<Arc<BenchCore>>`
+    (`crates/graphrefly-bindings-js/src/core_bindings.rs:1817`) is a
+    bench/parity-harness process-global single Core — the M6/native
+    binding-executor slice must build production multi-Core *without* routing
+    through it. Banked in `docs/porting-deferred.md`.
+  - **Doc-drift (cosmetic, fix in S2):** `node.rs:1844–1848` still references
+    `PARTITION_CACHE` (deleted by §7/D208–D211).
+
+- **S1 — (F-b) floor-harden: `FiringGuard` borrows `&'a Core<C>`, no per-fn-fire
+  `Core::clone`. LANDED.** Premise corrected vs the D221/memory framing: `main`
+  was **not** floor-regressed (the 648 ns regression is branch-local to
+  `wip/b2-2c-spike-d221`); `currently_firing` already lives cell-resident on
+  `CoreShared` so (F-a) cell-awareness was a no-op on `main`. The real, present
+  cost on `main` was `FiringGuard::new` doing `core: core.clone()` on **every
+  fn-fire** (≥4 `Arc` bump/drop pairs: `state`/`binding`/`group_locks`/
+  `global_wave`). Fix: `FiringGuard<'a, C>` holds `core: &'a Core<C>`; both
+  construction sites (`fire_regular` batch.rs:~1148, `fire_operator`
+  batch.rs:~1719) are locals in a `&self` method so the `self: &Core<C>` borrow
+  strictly outlives the guard — sound by construction. Also removes S2's ability
+  to reintroduce the tax when `LockedCell` is deleted.
+  - **Gate (`mise run gate`, full):** rustfmt ✓ · clippy (default-members,
+    --all-targets) ✓ · `nextest --profile ci` **834/834 passed, 0 skipped**
+    (incl. cascade_depth + grouped); zero new `unsafe`; `#![forbid(unsafe_code)]`
+    preserved; `cargo check --all-targets` exit 0.
+  - **Floor (`floor_compare`, criterion):** `identity_dedup/SingleThreadCell`
+    **508.07 ns** (−21.6%, "Performance has improved" — *below* the ≈515 ns
+    target, not merely no-regression); `identity_dedup/LockedCell` **588.06 ns**
+    (−23.1%, below the ≈605 ns `main` baseline). The lock-free single-thread
+    floor (the actor model's foundation) is now never taxed by the firing guard.
+  - Canonical decision: `~/src/graphrefly-ts/docs/rust-port-decisions.md` D222.
+    Files changed: `crates/graphrefly-core/src/batch.rs` (FiringGuard struct +
+    `new` + `Drop` impl signature). No public-API surface change → no
+    parity-test widening (skip 3d per the skill).
+
+- **S2 design FULLY LOCKED (D223/D224/D225) + S2a LANDED 2026-05-17.** User
+  authorized implementing all remaining actor-model work up to (excl.) M6.
+  Three S2 forks D221 left open were surfaced + user-locked:
+  - **D223 (A2):** `Core` owns `C` directly (drop `Arc<C>`); a tiny `Send+Sync`
+    `Arc<CoreMailbox>` replaces `Weak<C>` back-refs. Mailbox is structurally
+    required NOT because subscriptions are cross-thread (they are not — sub ∈
+    component ∈ group ∈ one owner) but because the **`Core` moves by value
+    between workers** (a long-lived handle can't hold `&Core`/`Arc<C>`/`Rc<C>`).
+  - **D225 (refined A2, supersedes D224):** a within-`Drop()` synchronous
+    unsubscribe is **impossible** under A2 + `#![forbid(unsafe_code)]`
+    (parameterless `Drop` can't reach a relocating owned Core without the
+    deleted `Weak<C>`/`Arc<C>` or `unsafe`). The asymmetry is *parameterless
+    `Drop`*, not unsubscribe-the-operation: `emit`/`subscribe` are sync because
+    the caller passes `&Core`. LOCKED: `Core::unsubscribe(node_id,sub_id)` +
+    `Core::unsubscribe_topology(id)` become ordinary synchronous owner-invoked
+    methods (symmetric with `emit`, same lifecycle chain, zero `Weak<C>`);
+    core-level RAII `Subscription`/`TopologySubscription` retire from substrate
+    (parameterless-RAII-magic = binding-idiomatic = presentation per D193);
+    RAII convenience is binding-layer. `CoreMailbox` shrinks to timer `Emit`
+    + the S4 per-group runnable wake bit only. Zero unsubscribe contract
+    change (stays synchronous); no `unsafe`. Canonical:
+    `~/src/graphrefly-ts/docs/rust-port-decisions.md` D223/D224/D225.
+  - **S2a LANDED (behaviour-identical, zero consumer churn, gate green):** the
+    verbatim `Subscription::Drop` (~310 invariant-dense lines: D045/D119/D121/
+    D-α/F1/F8) + `TopologySubscription::Drop` bodies extracted into shared free
+    fns `node::unsubscribe_sink<C>(state:&C,node_id,sub_id)` /
+    `topology::unsubscribe_topology_sink<C>(state:&C,id)` (bodies were already
+    `Core`-free — they used only `&dyn BindingBoundary` via
+    `make_op_scratch_with_binding`); the legacy `Drop` impls now upgrade
+    `Weak<C>` + delegate; `Core::unsubscribe` (`pub(crate)`, S2b promotes to
+    `pub`) + `Core::unsubscribe_topology` (`pub`) added. **Gate (`mise run
+    gate`):** rustfmt ✓ · clippy ✓ · `nextest --profile ci` **834/834, 0
+    skipped** (incl. cascade_depth); `cargo check --all-targets` exit 0; both
+    cells compile; `#![forbid(unsafe_code)]` preserved. Files:
+    `crates/graphrefly-core/src/{node,topology}.rs`.
+  - **REMAINING (each its own focused, individually-gated `/porting-to-rs`
+    pass + `/qa`; NOT a one-shot mega-diff):** **S2b** = `Core` owns `C` (drop
+    `Arc<C>`+`impl Clone`); remove core RAII `Subscription`/`TopologySubscription`
+    + `Weak<C>`; `subscribe*`→id; binding-layer RAII (napi `BenchCore` +
+    test-harness `tests/common/mod.rs`) over `core.unsubscribe`;
+    `where C: Send+Sync`→`C: Send`; ≈30-file/3-crate consumer churn; floor
+    ≈508 held. **S2c** = delete `LockedCell`/`grouped_shards`/`group_locks`/
+    `global_wave`/`SERIALIZE_WAVES`/2b-ii routing/`St` combined-guard/
+    `groups.rs`; collapse `StateCell`; fix `PARTITION_CACHE` doc-drift +
+    benches/bindings/parity. **S3** = `SerializationGroupId`→`SchedulingGroupId`
+    (≈59 refs; None⇒one serial unit). **S4** = scope `WaveState`/`IN_TICK`/
+    `CURRENT_SHARD_KEY` to one uninterrupted drain + finalize per-group `Send`
+    runnable wake on `CoreMailbox`; `group_scaling` re-measure (meaningful =
+    independent Cores). **M6** (separate, later): per-binding pluggable group
+    executor + shipped default (shape (ii)).
+  - **S1+S2a /qa — 2026-05-17 (Blind Hunter + Edge Case Hunter): SHIP-CLEAN,
+    zero findings.** Both adversarial reviewers independently verified, with
+    evidence: (S1) `FiringGuard<'a,C>` borrow is sound by construction — both
+    sites are non-escaping `let _firing` locals in `&self` methods
+    (`fire_regular`/`fire_operator`); `self` strictly outlives the guard; the
+    removed `core.clone()` was pure refcount churn with zero teardown-ordering
+    effect (the borrowed `self` already holds those Arcs for the call). (S2a)
+    the `unsubscribe_sink` extraction is **byte-identical** — comment-stripped
+    structural diff = 0 differences over 101 executable lines, brace balance 0,
+    every `self.node_id/sub_id`→param, `&*state` yields the same `&C`,
+    `ShardKeyGuard`/`St`/lock-release/Phase-G/D045/D119/D121/D-α/F1/F8 ordering
+    all preserved; `assert_send_sync::<Subscription/TopologySubscription>`
+    still holds (structs untouched). `Core::unsubscribe` `pub(crate)`+
+    `#[allow(dead_code)]` confirmed *correct* (no caller until S2b;
+    `SubscriptionId` is `pub(crate)` so `pub` would leak a private type) —
+    explicitly NOT a defect. No finding overlaps an unacknowledged
+    `porting-deferred.md` entry. **Phase-3 gate (`mise run gate`):** rustfmt
+    ✓ · clippy ✓ · `nextest --profile ci` **834/834, 0 skipped** (incl.
+    cascade_depth) · `#![forbid(unsafe_code)]` confirmed (lib.rs:30). **Loom:**
+    full `--features loom-checked` run built under `--cfg loom` (9-min build)
+    + 12/12 completed integration binaries clean, then hit the run-logged
+    30-min cap (`exit=124 reason=timeout` — a cap, NOT a failure; 0
+    failures/panics in completed binaries); targeted `--test
+    loom_subscription` collected 0 tests (loom cases gate via the full
+    build path). The diff is **concurrency-neutral by construction** (no
+    lock/atomic/ordering/thread-spawn primitive touched — `FiringGuard` does
+    the identical `lock_state()` `currently_firing` push/pop; `unsubscribe_sink`
+    is a verbatim move), so loom carries no added regression signal here;
+    the concurrency-sensitive ci binaries (cascade_depth / lock_discipline /
+    serialization_groups / dispatcher) are green. **Floor** (`floor_compare`,
+    measured earlier this session on this exact tree, code unchanged since):
+    `identity_dedup/SingleThreadCell` 508 ns (−21.6%). Verdict: S1+S2a
+    bankable; S2b/S2c correctly out of scope (deferred, design-locked
+    D221–D225).
+
 ## R2.6.0 — Default-mode leaf-source self-emit convergence — landed 2026-05-17 (LOCAL-ONLY, NOT pushed)
 
 Cross-impl divergence closed: a self-paused **default-`pausable`** leaf

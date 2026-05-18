@@ -698,13 +698,24 @@ impl PendingPerNode {
 /// but membership is preserved. If a future call site needs strict LIFO
 /// (e.g. "pop the most recently fired node"), switch to `pop()` + assert
 /// the popped value equals `self.node_id`. (QA A6, 2026-05-07)
-pub(crate) struct FiringGuard<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    core: Core<C>,
+// D221 (F-b) floor-hardening, 2026-05-17: holds `&'a Core<C>`, NOT an
+// owned `core.clone()`. The prior owned clone bumped/dropped ≥4 `Arc`s
+// (`state`, `binding`, `group_locks`, `global_wave`) on EVERY fn-fire —
+// pure tax on the lock-free `SingleThreadCell` floor (the actor model's
+// foundation; D221 DECISION LOCKED). Both construction sites
+// (`fire_regular` batch.rs:~1148, `fire_operator` batch.rs:~1719) are
+// locals in a `&self` method, so the `self: &Core<C>` borrow strictly
+// outlives the guard — the lifetime is sound by construction (no
+// escape, dropped within the same method). Removing the clone here also
+// stops S2's `LockedCell` deletion from being able to reintroduce the
+// tax.
+pub(crate) struct FiringGuard<'a, C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    core: &'a Core<C>,
     node_id: NodeId,
 }
 
-impl<C: crate::state_cell::StateCell> FiringGuard<C> {
-    pub(crate) fn new(core: &Core<C>, node_id: NodeId) -> Self {
+impl<'a, C: crate::state_cell::StateCell> FiringGuard<'a, C> {
+    pub(crate) fn new(core: &'a Core<C>, node_id: NodeId) -> Self {
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
         // CoreState (cross-thread visible, restoring the D091 P13 check).
         // Push under the state lock scope.
@@ -712,14 +723,11 @@ impl<C: crate::state_cell::StateCell> FiringGuard<C> {
             let mut s = core.lock_state();
             s.shared.currently_firing.push(node_id);
         }
-        Self {
-            core: core.clone(),
-            node_id,
-        }
+        Self { core, node_id }
     }
 }
 
-impl<C: crate::state_cell::StateCell> Drop for FiringGuard<C> {
+impl<C: crate::state_cell::StateCell> Drop for FiringGuard<'_, C> {
     fn drop(&mut self) {
         // /qa F2 reverted (2026-05-10): currently_firing moved BACK to
         // CoreState. Pop under state lock.

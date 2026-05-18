@@ -42,13 +42,20 @@ pub struct TopologySubscription<C: crate::state_cell::StateCell = crate::state_c
     state: std::sync::Weak<C>,
 }
 
+/// Deregister topology sink `id`. Extracted from `TopologySubscription::Drop`
+/// (D225 S2a) so `Core::unsubscribe_topology` and the (legacy) RAII `Drop`
+/// share one body. Operates on `&C` directly — it never needed a `Core`.
+pub(crate) fn unsubscribe_topology_sink<C: crate::state_cell::StateCell>(state: &C, id: u64) {
+    // Step 2a (D220-EXEC): combined guard — `topology_sinks`
+    // lives in the `CoreShared` region (`St`'s `.shared` field).
+    let mut s = crate::node::St::new(state);
+    s.shared.topology_sinks.remove(&id);
+}
+
 impl<C: crate::state_cell::StateCell> Drop for TopologySubscription<C> {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            // Step 2a (D220-EXEC): combined guard — `topology_sinks`
-            // lives in the `CoreShared` region (`St`'s `.shared` field).
-            let mut s = crate::node::St::new(&*state);
-            s.shared.topology_sinks.remove(&self.id);
+            unsubscribe_topology_sink(&*state, self.id);
         }
     }
 }
@@ -94,6 +101,14 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
             id,
             state: Arc::downgrade(&self.state),
         }
+    }
+
+    /// Synchronous owner-invoked topology unsubscribe (D225 refined A2).
+    /// Symmetric with `subscribe_topology`; the binding-layer / embedder
+    /// RAII wrapper calls this on `Drop` (it holds the `Core` on its
+    /// affinity worker). Idempotent — removing an absent id is a no-op.
+    pub fn unsubscribe_topology(&self, id: u64) {
+        unsubscribe_topology_sink(&*self.state, id);
     }
 
     /// Fire topology event to all registered sinks. Called from
