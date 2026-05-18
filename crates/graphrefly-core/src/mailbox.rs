@@ -1,0 +1,301 @@
+//! `CoreMailbox` — the `Send + Sync` bridge between autonomous async
+//! producers (timer tasks) and an owned, relocatable [`crate::node::Core`].
+//!
+//! # Why this exists (D223 / D225 / D227 / D230)
+//!
+//! Under the actor / work-stealing model (D221) a `Core` owns its state
+//! cell **by value** and moves between workers — so a long-lived async
+//! task (e.g. a `tokio::spawn`-ed timer loop) can no longer hold
+//! `&Core` / `Arc<C>` / `Weak<C>` to call `Core::emit` directly (that
+//! was the deleted `WeakCore` path; D223 forbids `Weak<C>` back-refs).
+//!
+//! Instead the task holds an `Arc<CoreMailbox>` (`Send + Sync`) and
+//! **posts** a `(NodeId, HandleId)` emit request. The mailbox is drained
+//! **owner-side** by the synchronous [`crate::node::Core::drain_mailbox`]
+//! (applied via the existing sync `Core::emit` — *no async in Core*,
+//! honoring the locked "Core never async" invariant). The drain point is
+//! the embedder's existing advance/pump site (test harness `TestRuntime`
+//! advance helper, napi pump): timer tasks already require the host
+//! runtime to be advanced before they fire, so draining there is
+//! **behaviour-identical** to the old autonomous `Weak::upgrade →
+//! core.emit` (D230).
+//!
+//! # Shape (D227 full)
+//!
+//! - **Op queue** — FIFO of [`MailboxOp`]s, applied owner-side.
+//! - **`closed`** — set when the owning `Core` drops; a timer task that
+//!   observes it releases its pending handle and bails (mirrors the old
+//!   `Weak::upgrade() == None` teardown path exactly).
+//! - **`runnable`** — the per-group "this Core has work" wake bit. S2b
+//!   lands the field + sets/clears it (D227 builds the *full* mailbox
+//!   shape now); S4 wires it to wave drain-scoping + finalize, and the
+//!   host-executor (M6) reads it to schedule the owning worker. The
+//!   in-wave drain (`BatchGuard::drain_and_flush`) already gates on it
+//!   so the no-producer §7 floor pays one atomic load, not a mutex.
+//!
+//! # This is ONE mechanism (not six)
+//!
+//! The S2b design history records six producer "forks" (D227–D233);
+//! that is *design-question* count, not runtime surface. What actually
+//! exists is **one** owner-side re-entry mechanism:
+//!
+//! > A `Send + Sync` FIFO of deferred [`MailboxOp`]s, drained on the
+//! > owner thread — **in-wave to quiescence** for producer sinks
+//! > (`BatchGuard::drain_and_flush`) and at the embedder pump point for
+//! > autonomous timer tasks ([`crate::node::Core::drain_mailbox`]) —
+//! > each op applied via the one object-safe owner re-entry surface
+//! > [`crate::node::CoreFull`].
+//!
+//! `MailboxOp` keeps a **typed fast path** (`Emit`/`Complete`/`Error`:
+//! zero-alloc, and a deterministic `Core`-gone handle-release contract —
+//! see the per-kind `post_*`) plus a **`Defer` escape hatch** (a boxed
+//! `FnOnce(&dyn CoreFull)` for value-returning topology mutation:
+//! windowing / higher-order inner subscribe). Collapsing the enum to
+//! pure `Defer` was considered and rejected — it would heap-allocate per
+//! timer/producer emit AND lose the typed `Core`-gone release affordance
+//! (a dropped `FnOnce` can't run an else-branch). `ProducerEmitter`
+//! (`graphrefly-operators`) is thin sugar over `post_*`; the producer
+//! *build* closure isn't a mechanism at all — it uses the `&Core` its
+//! `ProducerCtx` already lends it (D231). One queue, one drain loop, one
+//! `match`, one re-entry trait.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::handle::{HandleId, NodeId};
+
+/// Owner-side deferred-closure payload of [`MailboxOp::Defer`] (D233):
+/// runs on the owner thread with the object-safe full-`Core` surface.
+/// `Send` keeps the queue `Send` for the cross-thread *post* side; it
+/// is never *run* off-owner.
+pub type DeferFn = Box<dyn FnOnce(&dyn crate::node::CoreFull) + Send>;
+
+/// A re-entry request posted to the [`CoreMailbox`] by an autonomous
+/// async producer (timer task → `Emit`) or by a producer-operator sink
+/// (D232-AMEND/A′ → `Emit`/`Complete`/`Error`). Applied owner-side via
+/// the sync `Core::{emit,complete,error}` by [`crate::node::Core::drain_mailbox`]
+/// — drained **in-wave to quiescence** by the `BatchGuard` drain loop
+/// for producer sinks (immediate, cascade-ordering-preserving), and at
+/// the embedder pump point for timer tasks (D230).
+pub enum MailboxOp {
+    /// `Core::emit(node, handle)`. Posted by timer tasks + producer sinks.
+    Emit(NodeId, HandleId),
+    /// `Core::complete(node)`. Posted by producer sinks.
+    Complete(NodeId),
+    /// `Core::error(node, handle)`. Posted by producer sinks.
+    Error(NodeId, HandleId),
+    /// Owner-side closure given the full object-safe Core surface
+    /// ([`crate::node::CoreFull`]) — D233. Applied **in-wave** by the
+    /// drain-to-quiescence loop (the owner holds `&Core`), so producer
+    /// sinks that must perform value-returning topology mutation
+    /// (windowing `create_window_node`, higher-order dynamic-inner
+    /// `subscribe`) run synchronously with full Core access; the
+    /// returned `NodeId`/`SubscriptionId` is consumed inside the closure
+    /// to drive the operator's captured state. `FnOnce` + `Send`
+    /// (crosses no thread — applied on the owner — but `Send` keeps the
+    /// queue `Send` for the cross-thread *post* side).
+    Defer(DeferFn),
+}
+
+impl std::fmt::Debug for MailboxOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Emit(n, h) => write!(f, "Emit({n:?}, {h:?})"),
+            Self::Complete(n) => write!(f, "Complete({n:?})"),
+            Self::Error(n, h) => write!(f, "Error({n:?}, {h:?})"),
+            Self::Defer(_) => write!(f, "Defer(<closure>)"),
+        }
+    }
+}
+
+/// `Send + Sync` mailbox bridging autonomous async producers to an owned,
+/// relocatable [`crate::node::Core`]. Held behind an `Arc`; the `Core`
+/// owns one clone, each timer task another. See the module docs.
+pub struct CoreMailbox {
+    /// FIFO of [`MailboxOp`]s posted by timer tasks (`Emit`) and
+    /// producer-operator sinks (`Emit`/`Complete`/`Error`), applied
+    /// owner-side by [`crate::node::Core::drain_mailbox`] via the sync
+    /// `Core::{emit,complete,error}`.
+    ops: parking_lot::Mutex<VecDeque<MailboxOp>>,
+    /// Set by [`Self::close`] when the owning `Core` drops. A timer task
+    /// observing `true` from [`Self::post_emit`] is told to release its
+    /// pending handle and bail (the old `Weak::upgrade() == None` path).
+    closed: AtomicBool,
+    /// Per-group "this Core has queued work" wake bit (D227 full shape).
+    /// Set on every successful [`Self::post_emit`]; cleared by
+    /// [`Self::drain_into`] once the queue empties. S4 wires it to wave
+    /// drain-scoping + finalize; M6 reads it from the host executor.
+    runnable: AtomicBool,
+}
+
+impl CoreMailbox {
+    /// A fresh, open, empty mailbox.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ops: parking_lot::Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+            runnable: AtomicBool::new(false),
+        }
+    }
+
+    /// Post a timer-fired emit request. Returns `false` iff the owning
+    /// `Core` has already dropped ([`Self::close`] was called) — the
+    /// caller MUST then release `handle` and stop (mirrors the old
+    /// `WeakCore::upgrade() == None` teardown branch in `timer.rs`).
+    /// Returns `true` when queued (and sets the `runnable` wake bit).
+    #[must_use]
+    pub fn post_emit(&self, node_id: NodeId, handle: HandleId) -> bool {
+        self.post_op(MailboxOp::Emit(node_id, handle))
+    }
+
+    /// Post a producer-sink `Complete` (D232-AMEND/A′). Returns `false`
+    /// iff the owning `Core` is gone (caller stops; nothing to release).
+    #[must_use]
+    pub fn post_complete(&self, node_id: NodeId) -> bool {
+        self.post_op(MailboxOp::Complete(node_id))
+    }
+
+    /// Post a producer-sink `Error` (D232-AMEND/A′). Returns `false` iff
+    /// the owning `Core` is gone — the caller MUST then release
+    /// `handle` (it owned a retain for the would-be `error` payload).
+    #[must_use]
+    pub fn post_error(&self, node_id: NodeId, handle: HandleId) -> bool {
+        self.post_op(MailboxOp::Error(node_id, handle))
+    }
+
+    /// Post a `Defer` owner-side closure (D233). Returns `false` iff the
+    /// owning `Core` is gone — the caller's closure is dropped unrun
+    /// (any handles it captured are the caller's responsibility, same as
+    /// the `WeakCore`-gone branch the old code had).
+    #[must_use]
+    pub fn post_defer(&self, f: DeferFn) -> bool {
+        self.post_op(MailboxOp::Defer(f))
+    }
+
+    /// Post a [`MailboxOp`]. Returns `false` iff the owning `Core` has
+    /// already dropped ([`Self::close`]) — see the per-kind wrappers for
+    /// the caller's handle-release obligation.
+    ///
+    /// QA F-A (2026-05-18): the `closed` check and the `push_back` are
+    /// performed **in one `ops`-lock critical section** so a concurrent
+    /// owner-thread `close()` (which also takes `ops`) cannot interleave
+    /// between "observed not-closed" and "enqueued" — that TOCTOU would
+    /// strand the op (with its retained `HandleId`) in a queue
+    /// `Drop for Core` already walked → leak. `close()` takes the same
+    /// lock, so the two are mutually exclusive.
+    #[must_use]
+    pub fn post_op(&self, op: MailboxOp) -> bool {
+        let mut q = self.ops.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        q.push_back(op);
+        self.runnable.store(true, Ordering::Release);
+        true
+    }
+
+    /// Owner-side drain. Pops every queued [`MailboxOp`] in FIFO order
+    /// and hands each to `apply` (the caller passes a closure over the
+    /// sync `Core::{emit,complete,error}`). Re-entrancy: `apply` may
+    /// itself cascade and a concurrent timer task / re-entrant sink may
+    /// post again — a fresh post re-sets `runnable`, so the enclosing
+    /// drain-to-quiescence loop (or a later drain) picks it up.
+    ///
+    /// QA F-#4 (2026-05-18): the empty observation and the
+    /// `runnable = false` store happen **in the same `ops`-lock critical
+    /// section. Previously the empty `pop_front` released the lock before
+    /// storing `false`, so a concurrent `post_op` (which takes `ops`)
+    /// could push and set `runnable=true` in between, then our `false`
+    /// store would clobber it — a lost wakeup invisible to the
+    /// `is_runnable`-gated in-wave drain and the S4/M6 scheduler.
+    /// Clearing `runnable` while still holding the lock every `post_op`
+    /// must take orders them: a post is either popped here or runs
+    /// strictly after the `false` store and re-sets `true`.
+    /// `max_ops` bounds a single drain (QA P3, 2026-05-18): `apply` may
+    /// re-post (a `Defer` that re-`defer`s, a producer re-subscribing),
+    /// which this loop correctly drains in the *same* call — but a
+    /// closure that re-posts itself on *every* application is an
+    /// unbounded mailbox livelock (the producer-authoring analogue of a
+    /// fn that emits to itself). That livelock lives HERE (the inner
+    /// drain loop), not in `drain_and_flush`'s fire-cascade `cap`, so it
+    /// is bounded + panics here — decoupled from the fire counter so a
+    /// legitimately large finite producer drain never false-trips the
+    /// fire `cap`.
+    pub fn drain_into(&self, max_ops: u32, mut apply: impl FnMut(MailboxOp)) {
+        let mut applied = 0u32;
+        loop {
+            let op = {
+                let mut q = self.ops.lock();
+                let Some(op) = q.pop_front() else {
+                    self.runnable.store(false, Ordering::Release);
+                    return;
+                };
+                op
+            };
+            applied += 1;
+            assert!(
+                applied < max_ops,
+                "mailbox drain exceeded {max_ops} ops in one drain — a \
+                 producer/Defer op is re-posting itself every application \
+                 (mailbox livelock). Tune via \
+                 Core::set_max_batch_drain_iterations only with concrete \
+                 evidence the workload needs more."
+            );
+            apply(op);
+        }
+    }
+
+    /// Whether the mailbox currently holds queued work (the wake bit).
+    /// Advisory pre-M6 (the embedder pump drains unconditionally); S4/M6
+    /// consumers gate scheduling on it.
+    #[must_use]
+    pub fn is_runnable(&self) -> bool {
+        self.runnable.load(Ordering::Acquire)
+    }
+
+    /// Mark the owning `Core` gone. Idempotent. Takes the `ops` lock so
+    /// it is mutually exclusive with [`Self::post_op`]'s under-lock
+    /// `closed` check (QA F-A): after this returns, no further `post_op`
+    /// can enqueue. Callers MUST then [`Self::take_all`] and release any
+    /// `Emit`/`Error` payload handles still queued (a TOCTOU-enqueued op
+    /// posted just before `close` won the lock).
+    pub fn close(&self) {
+        let _q = self.ops.lock();
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Drain and return every still-queued [`MailboxOp`] without
+    /// applying it — for `Drop for Core` teardown (QA F-A / Blind #2).
+    /// `Emit`/`Error` ops carry a retained `HandleId` the caller must
+    /// release; `Defer` closures are dropped unrun (running a closure
+    /// that calls [`crate::node::CoreFull`] on a half-dropped `Core`
+    /// would be unsound — user-locked QA decision A, 2026-05-18). Clears
+    /// `runnable` under the lock (same race discipline as `drain_into`).
+    #[must_use]
+    pub fn take_all(&self) -> VecDeque<MailboxOp> {
+        let mut q = self.ops.lock();
+        self.runnable.store(false, Ordering::Release);
+        std::mem::take(&mut *q)
+    }
+
+    /// Whether [`Self::close`] has been called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CoreMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// `CoreMailbox` is `Send + Sync` by construction (parking_lot::Mutex +
+// atomics). Asserted so a future field that breaks it fails here, not at
+// the `Arc<CoreMailbox>` share site in `timer.rs`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CoreMailbox>();
+};

@@ -3216,3 +3216,291 @@ HALT Q1=A) empirically **refuted that as the path**:
   "D221 — DECISION LOCKED" + `archive/docs/SESSION-rust-port-actor-model.md`.
 - **Source:** Slice B-2 Step 2c bounded spike + strategic
   re-decision session (D221, 2026-05-17).
+
+## Actor-model S2b — IN PROGRESS, uncommitted; resume contract (2026-05-17)
+
+S2b is **partially landed in the working tree, NOT committed** (base
+`0465cc6 fix: s2a` clean — nothing broken committed). Design **fully
+locked**: D226–D232 (`~/src/graphrefly-ts/docs/rust-port-decisions.md`)
++ the comprehensive § "Actor-model S2b — DESIGN FULLY LOCKED" block in
+`migration-status.md` (landed vs remaining itemized there).
+
+- **Done:** `graphrefly-core` **lib compiles cleanly** with the full
+  S2b semantic core (mailbox/owned-`C`/RAII-retired/`subscribe→id`/
+  `producer_deactivate` widened/timer→mailbox/producer.rs id-pairs/
+  `Send` bounds). `mailbox.rs` is new; `reentry` module NOT yet created.
+- **Resume contract (do these to reach the S2b gate-green commit):**
+  1. Create `graphrefly-core::reentry` (D232): `trait CoreReentry`
+     (`emit/complete/error` by `NodeId`/`HandleId`), blanket-impl for
+     `Core<C>`; `scoped-tls` (already in Cargo.lock + offline cache —
+     add as direct dep) `CURRENT_CORE`; `pub fn with_core`.
+  2. **scoped-tls is closure-scoped, `BatchGuard` is RAII** — wire the
+     `set` at the closure wave-runners `run_wave_for` /
+     `try_run_wave_for` (`batch.rs:826/838`) wrapping
+     `{ let _guard = begin_batch*; op(self); }`, plus the direct
+     `begin_batch()` site (`batch.rs:3271`) and `try_subscribe`'s own
+     wave — bounded ~4–6 chokepoints (NOT every `lock_state`).
+  3. Rewrite ALL producer factories (`graphrefly-operators`
+     `buffer/control/higher_order/source/temporal/ops_impl.rs`): drop
+     `core.weak_handle()`/`WeakCore`/binding-`Weak`; build closure uses
+     `ctx.core()` (D231); spawned sinks call
+     `graphrefly_core::with_core(|c| c.emit/complete/error(pid,h))`
+     (D232) instead of captured `core_s.clone()`.
+  4. Binding-layer RAII `Subscription` wrapper over `Core::unsubscribe`
+     in `crates/graphrefly-core/tests/common/mod.rs` + napi `BenchCore`
+     (D228-A, tests/napi only). 5 `producer_deactivate` impls
+     (`tests/common/mod.rs`, `tests/producer.rs`,
+     `tests/slice_e2_cleanup.rs`, napi `core_bindings.rs`,
+     `boundary.rs` default already done) → new D229 signature, looping
+     `default_producer_deactivate(storage,node,unsub)`.
+  5. Compiler-drive the ~70 consumer errors (`graphrefly-operators` 40,
+     `graphrefly-graph` 20, `graphrefly-core` tests ~20):
+     `core.subscribe()` now returns `SubscriptionId` (pair with the
+     `node_id`); no `Core::clone`; `Subscription`/`TopologySubscription`
+     imports → `SubscriptionId`/`TopologySubscriptionId`.
+  6. `mise run gate` green → commit the S2b boundary. Then S2c/S3/S4
+     per D226; single `/qa` at end.
+- **Source:** `/porting-to-rs finish s2–s6` (2026-05-17), D226–D232.
+
+### S2b progress update (2026-05-17, session 2) — substrate mechanism DONE; producer-operator defer-restructure REMAINS
+
+Supersedes the resume contract above for steps already done. Design
+extended: **D233** (`MailboxOp::Defer(FnOnce(&dyn CoreFull))` drained
+in-wave) + **D232-AMEND/A′** (scoped-TLS infeasible offline → mailbox
+producer-op queue drained in-wave; scoped-tls dep reverted; no `reentry`
+module). Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+D233 + D232-AMEND.
+
+- **DONE + `graphrefly-core` lib compiles clean:** the *entire* S2b
+  substrate mechanism — `CoreMailbox` = `MailboxOp{Emit,Complete,Error,
+  Defer}` + `post_emit/complete/error/defer/op`; `CoreFull` object-safe
+  trait + blanket `impl for Core<C>`; `Core::drain_mailbox` applies all
+  four; **in-wave drain wired at the top of `BatchGuard::drain_and_flush`'s
+  quiescence loop** (`self.drain_mailbox()`); `Core::binding()` accessor;
+  `ProducerEmitter` (`emit/complete/error_or_defer` + `defer`) +
+  `ProducerCtx::emitter()`/`core()`; plus all session-1 core changes
+  (owned `C`, RAII retired, `producer_deactivate(&unsub)` D229, timer →
+  mailbox D230, `producer.rs` id-pairs).
+- **DONE — mechanical producer factories:** `source.rs` (build-only:
+  `core_weak`/`binding_weak` → `ctx.core()`/`ctx.core().binding()`),
+  `control.rs`, `temporal.rs` (sink captures `core_X = core_s.clone()`
+  → `= em.clone()`; `core_s` build-side = `ctx.core()`; `binding_s` =
+  `ctx.core().binding()`). Template proven.
+- **REMAINING — careful per-operator defer-restructure (NOT mechanical):**
+  - `ops_impl.rs` (zip/concat/race/take_until): sinks that
+    `ctx.subscribe_to` the *next* source (concat phase advance,
+    take_until notifier) must move that subscribe-and-react into
+    `em.defer(|c| { … c.subscribe(...) … })`; var names are
+    `core_clone`/`core_for_build`/`binding_clone`, guard is a 2-line
+    `let (Some(..),Some(..)) =\n  (..upgrade..)\nelse {`.
+  - `buffer.rs` windowing (`window`/`window_count`): **DONE** —
+    `create_window_node` generalized to `&dyn CoreFull`; build-side
+    callers fixed; `buffer`/`buffer_count` fully mechanical-converted.
+    **REMAINING (careful, semantics + test):** 2 sink-side
+    `create_window_node` sites (`window` notifier_sink ~:520,
+    `window_count` ~:677). Old code created the inner window node
+    **synchronously under the state lock** so `s.inner_id` was
+    consistent at the exact window boundary; a sink can now only reach
+    `CoreFull` via `em.defer` (applied later in the drain loop). **Design
+    (user-pending, recorded for clean continuation):** route BOTH the
+    `source_sink` forward AND the `notifier_sink`/count roll through
+    `em.defer` — mailbox FIFO = arrival order ⇒ "create new inner BEFORE
+    subsequent source forwards" is preserved; `s.inner_id` is read
+    *inside* the owner-serialized defer closures. Requires a
+    window-boundary correctness test (notifier-DATA interleaved with
+    source-DATA must not mis-route across the boundary). Also fix
+    `use std::sync::{Arc, Weak}` → `Arc` (Weak now unused).
+  - `higher_order.rs` (switch/merge/concat/exhaust_map): TRIPLE weak
+    (`core_weak` + `Weak<dyn HigherOrderBinding>` + `Weak<dyn
+    ProducerBinding>`); inner-source dynamic `subscribe`/`unsubscribe`
+    from sinks → `em.defer` (D234, inner-lifecycle test obligated).
+    The `HigherOrderBinding` is reachable via the binding; confirm how
+    (likely a downcast/accessor) before rewriting.
+
+  ### S2b producer-factory progress — session 3 (2026-05-18)
+
+  **DONE + error-free:** `source.rs`; `ops_impl.rs` zip/concat/race/
+  take_until (mechanical); `control.rs` (mechanical ops); `temporal.rs`
+  *producer* sinks; `buffer.rs` `buffer`/`buffer_count` (mechanical)
+  **and `window`/`window_count` FULLY D234-restructured** (both sinks
+  via `em.defer`, `inner_id` read in-closure, FIFO-ordered, retain +
+  Core-gone-release discipline preserved, `create_window_node`→
+  `&dyn CoreFull`). Substrate fully done + `/qa`-hardened (F1/A/#4/F2/F3).
+
+  **REMAINING (careful residue — classification refined):**
+  1. **`producer_storage()` access:** build closures that track sink
+     subs called `binding_s.producer_storage()`; `binding_s` is now
+     `Arc<dyn BindingBoundary>` (no `ProducerBinding` methods). Add a
+     `ProducerCtx::storage()` accessor (the `ProducerStorage`
+     `Arc<Mutex<…>>` is `'static`/cloneable) and capture THAT into
+     sinks. Affects the sub-tracking ops in `ops_impl.rs`/`control.rs`.
+  2. **`control.rs` sink-side `try_subscribe`** (~:738) —
+     mis-classified as mechanical; it is a D234 case (sink subscribes
+     dynamically → `em.defer`, sub-id tracked via #1's storage).
+  3. **`temporal.rs` timer tasks (~19 errs) — DE-RISKED approach found:**
+     temporal's 5 task fns (`debounce_task`/`audit_task`/`delay_task`/
+     `throttle_task`/+1) take `core: WeakCore` and their bodies already
+     call `c.emit_or_defer`/`c.complete_or_defer`/`c.error_or_defer`
+     with `else { binding.release_handle(h) }` — **the exact
+     `ProducerEmitter` method contract**. Conversion:
+     (a) task-fn param `core: WeakCore` → `em: ProducerEmitter`;
+     (b) build sites `tokio::spawn(<task>(rx, core_s.weak_handle(), …))`
+     → `(rx, ctx.emitter(), …)`;
+     (c) `binding_s.producer_storage()` → `ctx.storage()` (the new
+     `ProducerCtx::storage()` accessor — already landed);
+     (d) collapse each `if let Some(c)=core.upgrade(){ c.X_or_defer(..) }
+     else { binding.release_handle(..) }` to a direct
+     `em.X_or_defer(..)` (ProducerEmitter does post + Core-gone-release
+     internally — QA-hardened F2).
+     **CAREFUL (not blind perl):** where the old `else` branch also
+     `return;`s (Core-gone ⇒ stop the task promptly + release any
+     held `pending` handle), preserve that — add a
+     `ProducerEmitter::is_core_gone()` (delegates `mailbox.is_closed()`)
+     and keep an explicit `if em.is_core_gone() { <release pending>;
+     return; }` at those sites. Not load-bearing for leaks (the task
+     also exits on channel-close and `em` releases handles), but keep
+     teardown promptness behaviour-faithful. Drop `WeakCore`/
+     `Subscription` from the temporal `use` (line 45).
+  4. **`higher_order.rs`** — heaviest; see entry above (D234 +
+     inner-lifecycle test).
+  5. `stratify.rs`/`instrument.rs` — 1 `weak_handle` each
+     (other-consumer churn, mechanical).
+
+  ### S2b producer-factory progress — session 4 COMPLETE (2026-05-18)
+
+  **DONE — `graphrefly-core` lib + `graphrefly-operators` lib both
+  compile clean:**
+  - Substrate: full S2b mechanism, `/qa`-hardened (F1/A/#4/F2/F3);
+    `CoreFull` gained `teardown`+`invalidate`; mailbox/Defer/A′ in-wave
+    drain + `is_runnable` gate.
+  - ALL producer operators converted: `source`, `ops_impl`
+    (zip/concat/race/take_until), `control` (incl. `repeat` D234),
+    `temporal` (all 8 task fns → `ProducerEmitter`, +
+    `ProducerEmitter::is_core_gone`, `window_time` D234 shared
+    `Arc<Mutex<NodeId>>`), `buffer`/`buffer_count`,
+    `window`/`window_count` (full D234, both sinks via `em.defer`,
+    `inner_id` read in-closure), `stratify`, `higher_order`
+    (switch/exhaust/merge/concat — `SubGuard` RAII for inner-sub
+    lifetime, triple-weak→binding-weaks-only, `em.defer` subscribe).
+  - `ProducerCtx::storage()` + `ProducerEmitter::for_core` +
+    **`SubGuard`** (binding-layer RAII over `em.defer(unsubscribe)` —
+    D228-A/D234) added to `producer.rs`.
+  - All 5 `producer_deactivate` impls → D229 sig; operators
+    `tests/common` Recorder→`SubGuard` + `TestRuntime::settle()`.
+
+  **REMAINING = test-suite + graph reconciliation (NOT mechanical —
+  partly semantic; scoped into S2b per user 2026-05-18):**
+  - `graphrefly-core/tests/*` + `graphrefly-operators/tests/*`:
+    `use … Subscription` removal; `Option/Vec<Subscription>` →
+    `SubGuard`/explicit `core.unsubscribe`/drop; harness `core.clone()`.
+    **`TestRuntime`/`StateHandle` (core `tests/common`) hold
+    `core: Core` cloned** — needs restructure (handle holds id +
+    borrows runtime, OR `SubGuard`-style). **MULTI-THREAD core tests
+    (`lock_discipline`/`serialization_groups`/`dispatcher`
+    cross-thread) share ONE Core across threads — the actor model
+    (D221: Core `Send` not `Sync`) removes that; these tests need
+    actor-model rethink (one Core per thread / `SchedulingGroup`), a
+    SEMANTIC change, not a type swap. Flag before rewriting — do not
+    silently change test intent.**
+  - `graphrefly-graph` (M2 crate) Core-sharing redesign: `Graph{core:
+    Core}` cloned into child graphs (`mount.rs`) + `observe`/`describe`
+    rebuild `Graph{core:core.clone(),inner}` inside long-lived
+    topology/namespace sink closures that re-enter Core
+    (`graph.describe()` reads Core state). Same WeakCore→relocatable
+    problem at the Graph layer; apply the em/`CoreFull`/defer pattern
+    (deferred describe-snapshot rebuild is acceptable — describe is an
+    observation, in-wave-deferred like producer emit). Design-bearing.
+  - napi `BenchCore` (`core_bindings.rs`) `Mutex<Option<Core>>.clone()`.
+  - `examples/profile_disjoint_*` `core.clone()` (profiling-only;
+    restructure or feature-gate).
+  - Then: clean operators unused-var warnings (`cargo fix`-able),
+    `mise run gate`, commit S2b. Natural independently-valuable
+    boundary IF splitting: `graphrefly-core` lib + `graphrefly-operators`
+    lib (the true M1-substrate ownership deliverable) gate-green.
+  - Then: binding-layer RAII `Subscription` wrapper (tests/common +
+    napi `BenchCore`); 5 `producer_deactivate` impls → D229 sig
+    (`default_producer_deactivate(storage,node,unsub)`); ~70
+    consumer-churn errors (subscribe→id, no `Core::clone`,
+    `Subscription`/`TopologySubscription` imports →
+    `SubscriptionId`/`TopologySubscriptionId`); `mise run gate`; commit
+    S2b. Then S2c/S3/S4 per D226; single `/qa` at end.
+
+### S2b scope-review /qa (2026-05-18, session 5) — P1/P2/P3/P4/P5 fixed; P6/P7/P8 deferred
+
+Scoped adversarial /qa (Blind + Edge) on the full substrate+operators
+diff before the boundary commit. **Fixed in this diff** (canonical:
+`~/src/graphrefly-ts/docs/rust-port-decisions.md` D235): P1 (window/
+window_count per-message terminal gate + `mem::replace` atomic
+terminal-winner — R2.6.4); P2 (`SwitchState.epoch` newer-supersedes for
+`switch_map`; `ExhaustState.pending` older-wins for `exhaust_map`); P3
+(mailbox livelock bound moved INTO `CoreMailbox::drain_into(max_ops,…)`,
+decoupled from the fire-cascade `cap`; `drain_and_flush` mailbox-continue
+no longer counts the fire `guard`); P4 (operators warning-clean —
+removed dead `core_s`/`core_clone`/`core_for_build` + unused `Weak`
+imports); P5 (`is_runnable` sink-vs-task ordering comment); F4 rejected
+(invariant comment on `alloc_sub_id`: monotonic-never-recycled).
+`graphrefly-core` lib + `graphrefly-operators` lib compile **warning-free**.
+
+**DEFERRED to the next /porting-to-rs slice (with rationale):**
+
+- **P6 — `panic!("partition-order violation inside em.defer")` arms**
+  (switch/exhaust/merge + `producer.rs::subscribe_to`). NOT a regression:
+  the retired deferred `DeferredProducerOp::Callback` called the
+  *panicking* `core.subscribe()` on that case and `push_deferred` ran
+  immediately (D211 shim), so old behaviour on a genuine in-context
+  violation was *also* a panic. **Verify-when:** confirm whether an
+  in-wave `drain_mailbox` (inside a seed-routed `BatchGuard` holding
+  `wave_guards`) can legitimately `try_subscribe` a node in an
+  untouched serialization group → if yes, replace the `panic!` with a
+  non-panicking re-post (fresh `Defer` drained a later iteration);
+  if provably impossible, downgrade to `debug_assert!`. Source: /qa
+  Blind 6.1.
+
+- **P7 — Blind #6 re-entrant `drain_mailbox` FIFO interleaving**: the
+  earlier "verify-when" trigger (the `buffer.rs`/`higher_order.rs`
+  `Defer` restructure) is **now LANDED in this diff** → the obligation
+  is live. Next slice MUST add the test: a `Defer` closure whose
+  `subscribe`/`register` triggers a nested wave that re-enters
+  `drain_mailbox`; assert cascade order vs the retired path; add a
+  `draining` re-entrancy flag on `CoreMailbox` (skip the in-wave drain
+  while a drain is active on this thread; the outermost owns the FIFO)
+  if divergence is observed. Source: /qa Blind 3.3 / Edge F6.
+
+- **P8 — `let _ = em.defer(...)` `#[must_use]` suppression** at ~7
+  sites (window/window_count COMPLETE, `SubGuard::Drop`,
+  `Action::Invalidate/Teardown`, stratify Teardown, window_time
+  COMPLETE/rotation). Both reviewers verified **all currently
+  handle-free → no leak**. Next slice: add a one-line
+  "// no payload handle captured — discard is safe" assertion-comment
+  at each, OR convert the leak-relevant-by-shape ones to the explicit
+  `if !em.defer(...) { release }` form for uniformity. Not a current
+  bug. Source: /qa Blind 6.2 / Edge.
+
+### Re-entrant `drain_mailbox` FIFO interleaving — verify when `Defer` callers land (QA Blind #6, 2026-05-18)
+
+- **What:** `CoreMailbox::drain_into` re-locks per pop (it does NOT
+  hold `ops` across `apply`, deliberately — holding it across the
+  re-entrant `Core::emit` would deadlock). If a `MailboxOp::Defer`
+  closure calls `subscribe`/`register_*` that runs a *nested* wave,
+  that nested `BatchGuard::drain_and_flush` re-enters
+  `if self.mailbox.is_runnable() { self.drain_mailbox() }` →
+  **recursive `drain_into` on the same FIFO**. Not a deadlock
+  (per-pop locking) and not unsound, but the inner drain can consume
+  ops the outer cascade logically owns, weakening the
+  "cascade-ordering-preserving" claim in `batch.rs`'s drain comment.
+- **Why deferred:** purely speculative until a concrete `Defer` caller
+  exists — the only `Defer`-emitting operators are the not-yet-written
+  windowing (`buffer.rs`) + higher-order (`higher_order.rs`)
+  restructures (see the S2b progress entry above). Adding a
+  re-entrancy guard now, with no reproducing path, risks
+  over-engineering. The QA F1 fix (break tests `mailbox.is_runnable()`,
+  not just `pending_fires`) already closes the *lost-op* failure mode;
+  #6 is a residual *ordering* concern only.
+- **Verify when:** the `buffer.rs`/`higher_order.rs` `Defer`
+  restructure lands — add a test where a `Defer` closure's
+  `subscribe` triggers a nested wave that re-enters `drain_mailbox`,
+  assert cascade order vs the retired `WeakCore` path; if it diverges,
+  add a `draining`-flag re-entrancy guard so nested waves skip the
+  in-wave drain and the outermost loop owns the FIFO.
+- **Source:** `/qa` Blind Hunter #6 (2026-05-18); user-locked
+  decision B (defer, don't pre-guard).

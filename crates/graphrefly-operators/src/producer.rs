@@ -48,7 +48,7 @@ use std::sync::Arc;
 use ahash::AHashMap as HashMap;
 use parking_lot::Mutex;
 
-use graphrefly_core::{BindingBoundary, Core, FnId, NodeId, Sink, Subscription};
+use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink, SubscriptionId};
 
 /// Outcome of [`ProducerCtx::subscribe_to`] — the producer-layer
 /// translation of [`graphrefly_core::SubscribeError`] into a positive
@@ -118,9 +118,14 @@ pub type ProducerBuildFn = Box<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
 /// trait-object storage.)
 #[derive(Default)]
 pub struct ProducerNodeState {
-    /// Subscriptions to upstream sources, taken by
-    /// [`ProducerCtx::subscribe_to`]. Dropped on producer deactivation.
-    pub subs: Vec<Subscription>,
+    /// Recorded upstream `(source_node, sub_id)` pairs taken by
+    /// [`ProducerCtx::subscribe_to`]. S2b/D229: core-level RAII
+    /// `Subscription` is retired — these are explicitly unsubscribed by
+    /// the binding's [`BindingBoundary::producer_deactivate`] impl via
+    /// the owner-supplied `unsub` closure (see
+    /// [`default_producer_deactivate`]), behaviour-identical to the old
+    /// `Vec<Subscription>`-drop cascade.
+    pub subs: Vec<(NodeId, SubscriptionId)>,
     /// Optional op-specific scratch (rarely used; most ops capture
     /// state via closure).
     pub op_state: Option<Box<dyn Any + Send + Sync>>,
@@ -153,6 +158,140 @@ pub trait ProducerBinding: BindingBoundary {
     /// per-node entry, and by the binding's `producer_deactivate`
     /// impl to drop the entry on last unsubscribe.
     fn producer_storage(&self) -> &ProducerStorage;
+}
+
+/// Sink-side emit handle (S2b / D231 / D232-AMEND/A′).
+///
+/// Producer build closures spawn long-lived `Sink`s that fire on every
+/// future upstream emit — long after the build closure's `&Core`
+/// (`ctx`) is gone. Under the actor model the `Core` is owned by value
+/// and relocates between workers, so sinks can no longer capture a
+/// cloned `Core` / `WeakCore`. Instead they capture a `ProducerEmitter`
+/// (cheap `Clone`: two `Arc`s) and post `MailboxOp`s to the
+/// `Core`-owned [`graphrefly_core::CoreMailbox`]; the `BatchGuard`
+/// drain-to-quiescence loop applies them **in-wave** via the sync
+/// `Core::{emit,complete,error}` (immediate, cascade-ordering-preserving
+/// — D232-AMEND).
+///
+/// Method names mirror the old `Core::{emit,complete,error}_or_defer`
+/// so sink bodies are unchanged: only the captured handle's
+/// construction differs (`em = ctx.emitter()` instead of
+/// `core_s.clone()`).
+#[derive(Clone)]
+pub struct ProducerEmitter {
+    mailbox: Arc<graphrefly_core::CoreMailbox>,
+    /// For the `Core`-gone branch only: if the owning `Core` already
+    /// dropped (mailbox closed), an `Emit`/`Error` payload handle would
+    /// leak — release it (mirrors `timer.rs`'s post-`false` path).
+    binding: Arc<dyn BindingBoundary>,
+}
+
+impl ProducerEmitter {
+    /// Construct directly from any `&Core` (S2b). Used by the
+    /// **binding-layer RAII** convenience (D228-A): a test harness /
+    /// napi `BenchCore` that co-owns the `Core` builds a [`SubGuard`]
+    /// over `core.subscribe(...)`'s returned `SubscriptionId` so drop
+    /// schedules the unsubscribe — the sanctioned replacement for the
+    /// retired core-level RAII `Subscription`.
+    #[must_use]
+    pub fn for_core<C: graphrefly_core::StateCell>(core: &Core<C>) -> Self {
+        Self {
+            mailbox: core.mailbox(),
+            binding: core.binding(),
+        }
+    }
+
+    /// Post an `Emit`. If the owning `Core` is gone, release `handle`
+    /// (it held a retain for the would-be payload) — no leak.
+    pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
+        if !self.mailbox.post_emit(node_id, handle) {
+            self.binding.release_handle(handle);
+        }
+    }
+
+    /// Post a `Complete`. No payload handle; `Core`-gone is a no-op.
+    pub fn complete_or_defer(&self, node_id: NodeId) {
+        let _ = self.mailbox.post_complete(node_id);
+    }
+
+    /// Post an `Error`. If the owning `Core` is gone, release the error
+    /// payload `handle` — no leak.
+    pub fn error_or_defer(&self, node_id: NodeId, handle: HandleId) {
+        if !self.mailbox.post_error(node_id, handle) {
+            self.binding.release_handle(handle);
+        }
+    }
+
+    /// Post an owner-side closure (D233) given the full object-safe
+    /// `Core` surface — for sinks that must perform value-returning
+    /// topology mutation (windowing `create_window_node`, higher-order
+    /// dynamic-inner `subscribe`). Runs **in-wave** (the drain loop
+    /// holds `&Core`); the closure consumes any returned
+    /// `NodeId`/`SubscriptionId` to drive its captured op-state.
+    ///
+    /// Returns `false` iff the owning `Core` is already gone — the
+    /// closure is dropped **unrun** (running `CoreFull` on a half-dropped
+    /// `Core` is unsound; user-locked QA decision A). QA F2 (2026-05-18):
+    /// this now surfaces the `Core`-gone signal (was a silent
+    /// `let _ = …`) so a caller whose closure captured retained
+    /// `HandleId`s can release them on `false` — mirroring the
+    /// `emit_or_defer` / `error_or_defer` release-on-`false` contract.
+    /// The not-yet-written windowing / higher-order callers MUST honour
+    /// this (release captured payload handles when it returns `false`).
+    #[must_use = "a `false` return means the Core is gone and the closure was dropped unrun; release any handles it captured"]
+    pub fn defer(&self, f: impl FnOnce(&dyn graphrefly_core::CoreFull) + Send + 'static) -> bool {
+        self.mailbox.post_defer(Box::new(f))
+    }
+
+    /// Whether the owning `Core` has dropped (mailbox closed). Lets a
+    /// long-lived async task (e.g. a `temporal.rs` timer task) stop
+    /// promptly + release any handle it is still holding, preserving
+    /// the teardown-promptness the old `WeakCore::upgrade() == None`
+    /// branch gave. NOT required for leak-safety (`*_or_defer` already
+    /// releases on a closed post) — only for prompt task shutdown.
+    #[must_use]
+    pub fn is_core_gone(&self) -> bool {
+        self.mailbox.is_closed()
+    }
+}
+
+/// Binding-layer RAII subscription handle (S2b / D225 / D234). The
+/// core-level RAII `Subscription` was retired (a parameterless `Drop`
+/// can't reach a relocating owned `Core`); this wrapper IS the
+/// sanctioned binding-layer replacement for *substrate operators* that
+/// manage an inner subscription's lifetime by ownership (higher-order
+/// `switch/exhaust/merge/concat_map` inner subs). It holds a
+/// `ProducerEmitter` (an `Arc<CoreMailbox>` — `Send + Sync`, `'static`,
+/// NOT the `Core`), so its `Drop` legitimately posts a deferred
+/// `unsubscribe` via `em.defer` (owner-side, in-wave, FIFO-ordered —
+/// D234). FIFO ordering gives the correct cancel-then-resubscribe
+/// semantics: a `SubGuard` dropped before a new subscribe is posted is
+/// drained (unsub) before the new subscribe. A `Core`-gone post is
+/// dropped unrun (subscription moot at teardown — no leak).
+#[must_use = "dropping a SubGuard schedules the inner unsubscribe"]
+pub struct SubGuard {
+    node: NodeId,
+    sub: SubscriptionId,
+    em: ProducerEmitter,
+}
+
+impl SubGuard {
+    /// Track `sub` (returned by `CoreFull::try_subscribe` on `node`) so
+    /// dropping this guard unsubscribes it.
+    #[must_use]
+    pub fn new(node: NodeId, sub: SubscriptionId, em: ProducerEmitter) -> Self {
+        Self { node, sub, em }
+    }
+}
+
+impl Drop for SubGuard {
+    fn drop(&mut self) {
+        let (n, s) = (self.node, self.sub);
+        // D234: post the unsubscribe owner-side, in-wave, FIFO-ordered
+        // (so a cancel-before-resubscribe drains in order). Dropped
+        // unrun if the Core is already gone — the sub is moot then.
+        let _ = self.em.defer(move |c| c.unsubscribe(n, s));
+    }
 }
 
 /// Context handed to a producer's build closure on activation.
@@ -188,11 +327,40 @@ impl<'a> ProducerCtx<'a> {
         self.node_id
     }
 
-    /// The Core dispatcher. Sink closures use this to re-enter Core —
-    /// `core.emit(self.node_id(), h)` to emit a value, etc.
+    /// The Core dispatcher. **Build-closure-side only** — valid only for
+    /// the duration of the build call (the `Core` relocates; D231).
+    /// Long-lived sinks must use [`Self::emitter`] instead.
     #[must_use]
     pub fn core(&self) -> &Core {
         self.core
+    }
+
+    /// Sink-side emit handle (D232-AMEND/A′). Cheap-`Clone`; capture it
+    /// into spawned sink closures and call
+    /// `emit_or_defer`/`complete_or_defer`/`error_or_defer` exactly as
+    /// the old cloned-`Core` did — ops post to the `Core`-owned mailbox
+    /// and are applied in-wave by the drain-to-quiescence loop.
+    #[must_use]
+    pub fn emitter(&self) -> ProducerEmitter {
+        ProducerEmitter {
+            mailbox: self.core.mailbox(),
+            binding: self.core.binding(),
+        }
+    }
+
+    /// The binding's per-producer state storage (S2b). Replaces
+    /// `binding.producer_storage()` for build closures / spawned sinks
+    /// that track their own upstream subscriptions or per-op state:
+    /// under D231 the build closure no longer holds a
+    /// `Arc<dyn ProducerBinding>` (only `ctx`'s borrowed `&Core` +
+    /// `&ProducerStorage`), and a sink can't reach `ProducerBinding`
+    /// either. The returned `ProducerStorage` is
+    /// `Arc<Mutex<…>>` — `'static` + cheap-`Clone`, so it can be
+    /// captured into long-lived sink closures (exactly how the old code
+    /// captured `binding.producer_storage().clone()`).
+    #[must_use]
+    pub fn storage(&self) -> ProducerStorage {
+        self.storage.clone()
     }
 
     /// Subscribe `sink` to upstream `source`. The `Subscription` is
@@ -221,63 +389,52 @@ impl<'a> ProducerCtx<'a> {
         let sink_for_defer = sink.clone();
         match self.core.try_subscribe(source, sink) {
             Ok(sub) => {
+                // S2b/D229: record `(source, sub_id)` for explicit
+                // owner-driven unsubscribe at `producer_deactivate`.
                 self.storage
                     .lock()
                     .entry(self.node_id)
                     .or_default()
                     .subs
-                    .push(sub);
+                    .push((source, sub));
                 SubscribeOutcome::Live
             }
             Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                let core = self.core.clone();
-                let core_for_callback = core.clone();
-                let storage = self.storage.clone();
-                let node_id = self.node_id;
-                // F2 /qa (2026-05-10): deferred Callback uses
-                // `try_subscribe` (not the panicking `subscribe`) so a
-                // source that became non-resubscribable + terminal
-                // between the original defer-queue push and the
-                // wave-end drain doesn't crash the binding boundary.
-                // On TornDown at drain time, the producer-layer's
-                // SubscribeOutcome::Dead path was never reached at
-                // subscribe-time (because we deferred); we silently
-                // drop the deferred sub here. Per-operator dead-source
-                // semantics rely on the subscribe-time outcome — if
-                // the source went terminal during the defer window,
-                // the operator's other inputs / lifecycle paths must
-                // handle it (e.g., zip with one Live + one
-                // raced-to-Dead source would still emit until the
-                // dead one Complete-cascades to the operator via
-                // other state, which it doesn't here — but the
-                // condition requires concurrent termination during
-                // wave-end drain which is a narrow window).
-                core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
-                    Box::new(move || {
-                        match core_for_callback.try_subscribe(source, sink_for_defer) {
-                            Ok(sub) => {
-                                storage.lock().entry(node_id).or_default().subs.push(sub);
-                            }
-                            Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
-                                // Source became Dead during the defer
-                                // window — silently drop (see comment
-                                // above).
-                            }
-                            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                                // Should never happen: the deferred
-                                // Callback drains AFTER wave_guards
-                                // release, so partition acquisition
-                                // can't fail. Surface as a panic if
-                                // it ever does.
-                                panic!(
-                                    "deferred producer-op Callback: partition-order \
-                                     violation at wave-end drain — substrate invariant \
-                                     broken (wave_guards still held during drain)"
-                                );
-                            }
-                        }
-                    }),
-                ));
+                // S2b (D223/D231): the old code boxed a cloned-`Core`
+                // `DeferredProducerOp::Callback` only for
+                // `push_deferred_producer_op` to run it *immediately*
+                // (the deferred queue is a deleted D211 no-op shim — see
+                // `node::push_deferred_producer_op`). `Core` is no longer
+                // `Clone`; an inline retry on `self.core` is
+                // behaviour-identical (the prior path was already
+                // immediate). F2 /qa: still `try_subscribe` (not the
+                // panicking `subscribe`) so a source that raced to
+                // non-resubscribable+terminal doesn't crash the boundary.
+                match self.core.try_subscribe(source, sink_for_defer) {
+                    Ok(sub) => {
+                        self.storage
+                            .lock()
+                            .entry(self.node_id)
+                            .or_default()
+                            .subs
+                            .push((source, sub));
+                    }
+                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                        // Source became Dead during the (now-immediate)
+                        // retry — silently drop, as before.
+                    }
+                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                        // The original deferral existed to retry with no
+                        // partition held; the D211 shim already made it
+                        // immediate, so a second order violation here is
+                        // the same substrate-invariant break the old
+                        // wave-end-drain panic guarded.
+                        panic!(
+                            "producer-op subscribe retry: partition-order violation — \
+                             substrate invariant broken (wave_guards still held)"
+                        );
+                    }
+                }
                 SubscribeOutcome::Deferred
             }
             Err(graphrefly_core::SubscribeError::TornDown { node }) => {
@@ -287,13 +444,44 @@ impl<'a> ProducerCtx<'a> {
     }
 }
 
-/// Default helper — drop the producer's storage entry on
-/// deactivation. Bindings can call this from their
-/// [`BindingBoundary::producer_deactivate`] impl to get the standard
-/// auto-cleanup behavior.
-pub fn default_producer_deactivate(storage: &ProducerStorage, node_id: NodeId) {
-    let mut states = storage.lock();
-    states.remove(&node_id);
+/// Default helper — explicitly unsubscribe the producer's recorded
+/// upstream subs, then drop its storage entry, on deactivation.
+///
+/// S2b/D229: core-level RAII `Subscription` is retired, so the binding's
+/// [`BindingBoundary::producer_deactivate`] impl receives a
+/// `Core::unsubscribe`-capable `unsub` closure (the owner-driven chain
+/// passes it the `&Core` it already holds). Looping it over the recorded
+/// `(source, sub_id)` pairs is behaviour-identical to the old
+/// `Vec<Subscription>`-drop cascade (same deregister + Phase-G chain,
+/// lock-released so re-entrant producer cascades are safe).
+///
+/// Ordering (QA F3, 2026-05-18 — corrected from an earlier
+/// remove-AFTER comment that contradicted the code): the entry is
+/// **taken out under the `storage` lock FIRST**, then the `unsub`
+/// cascade runs lock-released over the moved-out `subs`. This is
+/// behaviour-identical to the retired path (old code did
+/// `states.remove(&node_id)` and the dropped `Vec<Subscription>`'s
+/// `Drop` ran the cascade — i.e. remove-then-cascade). Because the
+/// entry is already gone before any re-entrant call, a re-entrant
+/// `subscribe_to(node_id, …)` *during* the cascade `or_default()`s a
+/// **fresh** entry that correctly survives this deactivation (a
+/// genuine re-subscription) — there is never a half-cleared entry to
+/// observe. Do NOT reorder to remove-after-unsub: that *would* expose
+/// the live entry to the lock-released re-entrant cascade.
+pub fn default_producer_deactivate(
+    storage: &ProducerStorage,
+    node_id: NodeId,
+    unsub: &dyn Fn(NodeId, SubscriptionId),
+) {
+    // Take the entry out under the lock, then unsubscribe lock-released
+    // (the `unsub` closure re-enters Core; holding `storage` across it
+    // would risk a binding-vs-Core lock-order inversion).
+    let removed = storage.lock().remove(&node_id);
+    if let Some(state) = removed {
+        for (source, sub_id) in state.subs {
+            unsub(source, sub_id);
+        }
+    }
 }
 
 // =====================================================================

@@ -597,8 +597,13 @@ impl BindingBoundary for BenchBinding {
     /// which transitively drops upstream subscriptions via
     /// `Subscription::Drop`. Fires lock-released per D045.
     #[cfg(feature = "operators")]
-    fn producer_deactivate(&self, node_id: NodeId) {
-        default_producer_deactivate(&self.producer_storage, node_id);
+    fn producer_deactivate(
+        &self,
+        node_id: NodeId,
+        unsub: &dyn Fn(NodeId, graphrefly_core::SubscriptionId),
+    ) {
+        // S2b/D229: owner-driven explicit upstream unsubscribe.
+        default_producer_deactivate(&self.producer_storage, node_id, unsub);
     }
 
     // -----------------------------------------------------------------

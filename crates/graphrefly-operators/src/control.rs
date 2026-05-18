@@ -11,7 +11,7 @@
 
 #![allow(clippy::too_many_lines, clippy::items_after_statements)]
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -29,16 +29,14 @@ use crate::producer::{ProducerBinding, ProducerBuildFn, ProducerCtx, SubscribeOu
 /// Forwards COMPLETE and ERROR unchanged.
 #[must_use]
 pub fn tap(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, fn_id: FnId) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
 
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
@@ -110,16 +108,14 @@ pub fn tap_observer(
     error_fn_id: Option<FnId>,
     complete_fn_id: Option<FnId>,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
 
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
@@ -199,20 +195,18 @@ pub fn on_first_data(
     source: NodeId,
     fn_id: FnId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     struct OnFirstState {
         fired: bool,
     }
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
         let state: Arc<Mutex<OnFirstState>> = Arc::new(Mutex::new(OnFirstState { fired: false }));
 
         let source_sink: Sink = Arc::new(move |msgs| {
@@ -292,16 +286,14 @@ pub fn rescue(
     source: NodeId,
     fn_id: FnId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
 
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
@@ -387,8 +379,6 @@ pub fn valve(
     gate_fn_id: FnId,
     cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     struct ValveState {
         open: bool,
@@ -396,9 +386,9 @@ pub fn valve(
     }
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<ValveState>> = Arc::new(Mutex::new(ValveState {
             open: false,
@@ -408,7 +398,7 @@ pub fn valve(
         // --- control sink ---
         let st_ctrl = state.clone();
         let bb_ctrl: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_ctrl = core_s.clone();
+        let core_ctrl = em.clone();
         let cancel_ctrl = cancel.clone();
         let control_sink: Sink = Arc::new(move |msgs| {
             let mut should_cancel = false;
@@ -466,7 +456,7 @@ pub fn valve(
         // --- source sink ---
         let st_src = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let core_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
@@ -547,8 +537,6 @@ pub fn settle(
     quiet_waves: u32,
     max_waves: Option<u32>,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     struct SettleState {
         wave_count: u32,
@@ -557,12 +545,12 @@ pub fn settle(
     }
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
         let state: Arc<Mutex<SettleState>> = Arc::new(Mutex::new(SettleState {
             wave_count: 0,
             quiet_count: 0,
@@ -662,8 +650,6 @@ pub fn repeat(
     source: NodeId,
     count: u32,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     struct RepeatState {
         remaining: u32,
@@ -671,9 +657,9 @@ pub fn repeat(
     }
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<RepeatState>> = Arc::new(Mutex::new(RepeatState {
             remaining: count,
@@ -681,18 +667,19 @@ pub fn repeat(
         }));
 
         // We need to store the subscription in producer storage and be able
-        // to replace it on resubscribe. The producer storage already holds
-        // subs via ProducerCtx::subscribe_to. For resubscribe, we use
-        // Core::try_subscribe directly and manage the subscription ourselves
-        // in op_state.
-        let storage = binding_s.producer_storage().clone();
+        // to replace it on resubscribe. S2b/D231: storage via the new
+        // `ProducerCtx::storage()` accessor (the build closure no longer
+        // holds a `ProducerBinding`). Resubscribe re-enters Core to
+        // `try_subscribe`, which a long-lived sink can only do via
+        // `em.defer` (D234) — see the `Act::Resubscribe` arm.
+        let storage = ctx.storage();
 
         // Build the sink closure. It needs to reference itself for
         // resubscription, so we use a shared slot.
         let sink_slot: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let sink_slot_inner = sink_slot.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_sink = core_s.clone();
+        let core_sink = em.clone();
         let storage_inner = storage.clone();
 
         let source_sink: Sink = Arc::new(move |msgs| {
@@ -749,18 +736,37 @@ pub fn repeat(
                         // Get our own sink from the shared slot.
                         let maybe_sink = sink_slot_inner.lock().clone();
                         if let Some(new_sink) = maybe_sink {
-                            if let Ok(sub) = core_sink.try_subscribe(source, new_sink) {
-                                storage_inner.lock().entry(pid).or_default().subs.push(sub);
-                            } else {
-                                // Source is dead or partition violation —
-                                // treat as terminal complete.
-                                let mut s = state.lock();
-                                if !s.terminated {
-                                    s.terminated = true;
-                                    drop(s);
-                                    core_sink.complete_or_defer(pid);
+                            // D234: a long-lived sink can't hold `&Core`;
+                            // route the re-subscribe through `em.defer`
+                            // (owner-side, in-wave, FIFO-ordered). The
+                            // returned `SubscriptionId` is recorded
+                            // (D229 `(source, sub)` pair) inside the
+                            // closure; the dead/violation path completes
+                            // self there too.
+                            let storage_d = storage_inner.clone();
+                            let state_d = state.clone();
+                            let _ = core_sink.defer(move |c| {
+                                match c.try_subscribe(source, new_sink) {
+                                    Ok(sub) => {
+                                        storage_d
+                                            .lock()
+                                            .entry(pid)
+                                            .or_default()
+                                            .subs
+                                            .push((source, sub));
+                                    }
+                                    Err(_) => {
+                                        // Source dead / partition
+                                        // violation — terminal complete.
+                                        let mut s = state_d.lock();
+                                        if !s.terminated {
+                                            s.terminated = true;
+                                            drop(s);
+                                            c.complete(pid);
+                                        }
+                                    }
                                 }
-                            }
+                            });
                         }
                     }
                 }

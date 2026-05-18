@@ -31,40 +31,24 @@ pub enum TopologyEvent {
 /// Callback for topology changes. `Send + Sync` for cross-thread Core usage.
 pub type TopologySink = Arc<dyn Fn(&TopologyEvent) + Send + Sync>;
 
-/// RAII handle for a topology subscription. Dropping it unregisters the sink.
-#[must_use = "TopologySubscription holds the subscription; dropping it unregisters the sink"]
-pub struct TopologySubscription<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    /// Index into `CoreShared.topology_sinks`. We use a generational
-    /// approach: each subscription gets a unique id; unsubscribe
-    /// marks the slot as `None`.
-    id: u64,
-    /// Weak ref to the state cell — silent no-op if Core is dropped first.
-    state: std::sync::Weak<C>,
-}
+/// Identifier for a topology subscription (S2b / D225). Returned by
+/// [`super::node::Core::subscribe_topology`]; pass it to
+/// [`super::node::Core::unsubscribe_topology`] to deregister. The
+/// core-level RAII `TopologySubscription` is retired for the same
+/// reason as [`crate::node::SubscriptionId`] (D223: owned relocatable
+/// `Core`, no parameterless-`Drop` reach). Binding-layer RAII wraps
+/// `unsubscribe_topology` where the holder co-owns the `Core`.
+pub type TopologySubscriptionId = u64;
 
-/// Deregister topology sink `id`. Extracted from `TopologySubscription::Drop`
-/// (D225 S2a) so `Core::unsubscribe_topology` and the (legacy) RAII `Drop`
-/// share one body. Operates on `&C` directly — it never needed a `Core`.
+/// Deregister topology sink `id`. Shared body (D225 S2a) for the
+/// synchronous owner-invoked [`super::node::Core::unsubscribe_topology`].
+/// Operates on `&C` directly — it never needed a `Core`.
 pub(crate) fn unsubscribe_topology_sink<C: crate::state_cell::StateCell>(state: &C, id: u64) {
     // Step 2a (D220-EXEC): combined guard — `topology_sinks`
     // lives in the `CoreShared` region (`St`'s `.shared` field).
     let mut s = crate::node::St::new(state);
     s.shared.topology_sinks.remove(&id);
 }
-
-impl<C: crate::state_cell::StateCell> Drop for TopologySubscription<C> {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.upgrade() {
-            unsubscribe_topology_sink(&*state, self.id);
-        }
-    }
-}
-
-// Send + Sync compile-time assertion.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<TopologySubscription>();
-};
 
 impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// Subscribe to topology changes. The sink fires synchronously
@@ -73,8 +57,9 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// MAY re-enter Core (`register_*`, `teardown`, `set_deps`, etc.)
     /// — the lock-released discipline (Slice A close) makes this safe.
     ///
-    /// Returns a [`TopologySubscription`] — dropping it unregisters
-    /// the sink.
+    /// Returns a [`TopologySubscriptionId`]; pass it to
+    /// [`Self::unsubscribe_topology`] to deregister (S2b / D225: core
+    /// RAII retired — binding-layer RAII wraps `unsubscribe_topology`).
     ///
     /// # Event semantics
     ///
@@ -92,23 +77,20 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// - `DepsChanged { ... }` fires only when `set_deps` actually
     ///   rewires deps. The idempotent fast-path (deps unchanged as a
     ///   set) returns without firing.
-    pub fn subscribe_topology(&self, sink: TopologySink) -> TopologySubscription<C> {
+    pub fn subscribe_topology(&self, sink: TopologySink) -> TopologySubscriptionId {
         let mut s = self.lock_state();
         let id = s.shared.next_topology_id;
         s.shared.next_topology_id += 1;
         s.shared.topology_sinks.insert(id, sink);
-        TopologySubscription {
-            id,
-            state: Arc::downgrade(&self.state),
-        }
+        id
     }
 
     /// Synchronous owner-invoked topology unsubscribe (D225 refined A2).
     /// Symmetric with `subscribe_topology`; the binding-layer / embedder
     /// RAII wrapper calls this on `Drop` (it holds the `Core` on its
     /// affinity worker). Idempotent — removing an absent id is a no-op.
-    pub fn unsubscribe_topology(&self, id: u64) {
-        unsubscribe_topology_sink(&*self.state, id);
+    pub fn unsubscribe_topology(&self, id: TopologySubscriptionId) {
+        unsubscribe_topology_sink(&self.state, id);
     }
 
     /// Fire topology event to all registered sinks. Called from

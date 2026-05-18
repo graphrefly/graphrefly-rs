@@ -203,15 +203,14 @@ pub fn stratify_branch(
     rules: NodeId,
     classifier_fn_id: FnId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let binding_weak_for_state: Weak<dyn BindingBoundary> =
         Arc::downgrade(binding) as Weak<dyn BindingBoundary>;
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        // S2b/D231: build-side `&Core` via ctx; sinks use `em`.
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<StratifyState>> = Arc::new(Mutex::new(StratifyState {
             latest_rules: None,
@@ -226,7 +225,7 @@ pub fn stratify_branch(
         // --- rules sink ---
         let st_rules = state.clone();
         let bb_rules: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_rules = core_s.clone();
+        let core_rules = em.clone();
         let rules_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 ReleaseOldRules(HandleId),
@@ -318,7 +317,7 @@ pub fn stratify_branch(
         // --- source sink ---
         let st_src = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let core_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
@@ -429,7 +428,10 @@ pub fn stratify_branch(
                     Act::Drop(h) => bb_src.release_handle(h),
                     Act::Complete => core_src.complete_or_defer(pid),
                     Act::Error(h) => core_src.error_or_defer(pid, h),
-                    Act::Teardown => core_src.teardown_or_defer(pid),
+                    Act::Teardown => {
+                        // D234: sink-side terminal forward via em.defer.
+                        let _ = core_src.defer(move |c| c.teardown(pid));
+                    }
                 }
             }
         });

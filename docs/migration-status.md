@@ -2990,6 +2990,149 @@ remain **separate, explicitly-approved future batches**.
     bankable; S2b/S2c correctly out of scope (deferred, design-locked
     D221–D225).
 
+### Actor-model S2b — DESIGN FULLY LOCKED + core-crate landed; consumer churn IN PROGRESS (2026-05-17, NOT committed)
+
+`/porting-to-rs finish s2–s6` re-invoked. User chose fused S2b+S2c+S3+S4
+(M6 out) with gate+commit per S-boundary (**D226**). S0+S1+S2a committed
+as the clean base (`0465cc6 fix: s2a`). **Phase-1 surfaced FIVE buried
+architectural forks in S2b, each user-resolved (vindicating the locked
+"each its own gated pass; NOT one-shot" discipline five times):**
+
+- **D227** — full `CoreMailbox` (timer Emit + S4 wake bit) built in S2b.
+- **D228→D229** — D228-A (parameterless-`Drop` producer wrapper)
+  contradicted D225's "parameterless `Drop` can't reach a relocating
+  owned `Core`" lock; **D229** = owner-driven chain,
+  `BindingBoundary::producer_deactivate` widened to receive a
+  `Core::unsubscribe`-capable `&dyn Fn(NodeId,SubscriptionId)`
+  (substrate-contract widening — cross-track entry below).
+- **D230** — bounded mini-M6: timer-`Emit` `CoreMailbox` drainer
+  (`Core::drain_mailbox`, owner-side sync via `emit`); embedder pump
+  point = existing test-harness/napi advance site (behaviour-identical;
+  full host-executor wake wiring still M6).
+- **D231** — producer build/teardown run owner-side with `&Core` (no
+  stored/cloned `Core`); `ProducerNodeState.subs:
+  Vec<(NodeId,SubscriptionId)>`.
+- **D232** — producer **sink** Core-reentry = ambient owner-`Core`
+  safe scoped-TLS (`scoped-tls`, already in Cargo.lock + offline cache)
+  exposing a minimal `dyn CoreReentry` (`emit/complete/error` by
+  `NodeId`/`HandleId`); set for the wave, sinks re-enter via
+  `with_core(|c| …)`. Behaviour-identical (in-wave synchronous;
+  preserves cascade ordering), zero `Sink`-surface churn, D225/D227
+  untouched, `forbid(unsafe)`-clean. Canonical: all in
+  `~/src/graphrefly-ts/docs/rust-port-decisions.md` D226–D232.
+
+**Landed (uncommitted working tree; base `0465cc6` clean — nothing
+broken committed):** `graphrefly-core` **lib compiles cleanly** with the
+full S2b semantic core — new `mailbox.rs` (`CoreMailbox`); `Core` owns
+`C` by value (no `Arc<C>`/`Clone`/`Weak<C>`/`WeakCore`/`weak_handle`);
+`Drop for Core` closes the mailbox; `drain_mailbox`/`mailbox()`;
+`same_dispatcher` via `generation`; core RAII `Subscription`/
+`TopologySubscription` retired (`subscribe*`→`SubscriptionId`,
+`subscribe_topology`→`TopologySubscriptionId`, `unsubscribe*` `pub`);
+`BindingBoundary::producer_deactivate` widened (D229);
+`teardown_or_defer`/`invalidate_or_defer`/producer-defer boxed-clone
+closures → direct owner calls (D211 shim ran them immediately anyway);
+`BatchGuard`/`MigrationRollback` → `&'a Core` (S1 `FiringGuard`
+pattern); `C: Send+Sync`→`C: Send` ×5; `timer.rs` `WeakCore`→
+`Arc<CoreMailbox>` + harness drain (D230); `producer.rs`
+`Subscription`→id pairs + `default_producer_deactivate(unsub)` (D229).
+`lib.rs` exports updated.
+
+**REMAINING for the S2b gate-green commit (NOT yet done):** the
+`reentry` module (`CoreReentry`/`with_core`/scoped-TLS, D232) + its
+wave-entry wiring (wrap `run_wave_for`/`try_run_wave_for` closure bodies
++ a `with_wave` helper for the few direct `begin_batch` wave entries —
+scoped-tls is closure-scoped, BatchGuard is RAII; the closure runners
+are the chokepoint); rewrite ALL producer factories (`buffer.rs`/
+`control.rs`/`higher_order.rs`/`source.rs`/`temporal.rs`/`ops_impl.rs`:
+drop `weak_handle`/`WeakCore`/binding-`Weak`, build→`ctx.core()`,
+sinks→`with_core`); binding-layer RAII wrapper (tests/common + napi
+`BenchCore`, D228-A scoped to tests/napi only); 5 `producer_deactivate`
+impls (test harness/`producer.rs`/`slice_e2_cleanup`/napi
+`core_bindings`) to the new signature; ~70 consumer-churn errors across
+`graphrefly-operators` (40), `graphrefly-graph` (20), `graphrefly-core`
+tests (~20); `mise run gate`; commit the S2b boundary. Then S2c/S3/S4
+per D226. **Single `/qa` at end (D226).**
+
+**Cross-track / substrate-contract widenings (record in
+`~/src/graphrefly-ts/docs/cross-track-ledger.md`):**
+`BindingBoundary::producer_deactivate(&self, NodeId, &dyn
+Fn(NodeId,SubscriptionId))` (D229); core RAII retirement →
+`SubscriptionId`/`TopologySubscriptionId` public + `unsubscribe*` public
+(D225/S2b). (D232's `scoped-tls` dep was reverted — A′/D233 needs no
+TLS; no new `graphrefly-core` dep.)
+
+**Scoped `/qa` — substrate mechanism, 2026-05-18 (Blind Hunter + Edge
+Case Hunter, pre-factory-churn).** Ran adversarial review on the
+compiling substrate diff (`graphrefly-core` + `producer.rs` +
+source/control/temporal) *before* the producer-factory rewrite builds on
+it. Both reviewers independently flagged the same critical. Landed fixes
+(all correctness hardening of the new mechanism, no architecture change;
+user-approved batch + decisions A=drop-unrun, B=defer):
+
+- **F1 (critical, both reviewers):** `BatchGuard::drain_and_flush` break
+  tested only `pending_fires`, not the mailbox — the code comment
+  asserted "quiescence requires BOTH" but didn't enforce it. Fixed:
+  `pending_size==0` now `continue`s while `self.mailbox.is_runnable()`
+  (guard-bounded so a self-re-posting `Defer` still trips the `cap`
+  assert), `break`s only when both empty. §7 floor unaffected (no
+  producer/timer ⇒ never runnable ⇒ breaks first empty `pending_fires`).
+- **A / Blind #2+#3 (critical):** `Drop for Core` only `close()`d the
+  mailbox; queued `Emit`/`Error` ops leaked their retained `HandleId`
+  (regressing the exact `WeakCore`-teardown leak the design claims
+  parity with), and a cross-thread `post_op` could TOCTOU-enqueue
+  post-close. Fixed: `post_op`'s `closed` check + `push_back` now one
+  `ops`-lock critical section; `close()` takes that lock;
+  `CoreMailbox::take_all` added; `Drop for Core` drains it and releases
+  `Emit`/`Error` handles (Defer dropped unrun — running `CoreFull` on a
+  half-dropped Core is unsound, user-locked decision A).
+- **Blind #4 (major):** `drain_into` cleared `runnable` *after*
+  releasing the lock on empty → lost-wakeup vs a concurrent post. Fixed:
+  empty-observation + `runnable=false` now in the same `ops`-lock
+  critical section.
+- **F2 (major):** `ProducerEmitter::defer` ignored `post_defer`'s
+  `false` (Core-gone) — no release affordance, unlike
+  `emit/error_or_defer`. Fixed: `defer` now returns `bool` (`#[must_use]`);
+  the not-yet-written windowing/higher-order callers must release
+  captured handles on `false`.
+- **F3 (minor):** `default_producer_deactivate` doc said "removed AFTER
+  unsubscribing"; code (correctly, behaviour-identical to the retired
+  `Vec<Subscription>`-drop) removes first. Doc rewritten to match +
+  warn against reordering.
+- **Blind #6 (deferred, decision B):** re-entrant `drain_mailbox` FIFO
+  interleaving — speculative until `Defer` callers exist; logged to
+  `porting-deferred.md` to verify when `buffer.rs`/`higher_order.rs`
+  land. **Blind #7 rejected** (Edge verified `CORE_GENERATION` is the
+  sole unconditional writer — `same_dispatcher` sound).
+
+Bonus clippy cleanup of QA-touched code (added `DeferFn` alias,
+let-else, doc reflow): graphrefly-core lib clippy 19→13 (no new
+warnings; remaining 13 are pre-existing mid-flight churn). `cargo check
+-p graphrefly-core --lib` clean; `#![forbid(unsafe_code)]` intact.
+Full `mise run gate` deferred to S2b completion (workspace mid-flight).
+
+**Maintenance reflection (2026-05-17) — "six mechanisms" is one
+mechanism.** The six producer forks (D227–D233) are *design-question*
+count, not runtime surface. Runtime = **one** owner-side re-entry
+mechanism: a `Send+Sync` FIFO of deferred `MailboxOp`s drained on the
+owner thread (in-wave-to-quiescence for sinks; pump point for timer)
+applied through the one object-safe `CoreFull` surface. Decisions:
+(1) **applied** — gate the in-wave `drain_and_flush` mailbox drain on
+the cheap `runnable` atomic so the no-producer §7 floor pays one
+`Acquire` load, not a `parking_lot::Mutex` + deque pop (also the exact
+S4 wake bit — coherent front-run, not throwaway); (2) **applied** —
+framed as one mechanism in `mailbox.rs` module docs; (3) **rejected**
+— collapsing `MailboxOp` to pure `Defer` (heap-alloc per timer/producer
+emit + loses the typed `Core`-gone handle-release contract a dropped
+`FnOnce` can't honor); (4) **rejected** — folding D229's cleanup
+closure onto `CoreFull` (the `unsubscribe_sink` body is deliberately at
+the `&C` cell layer *below* `Core`/`CoreFull` per D225/S2a; the tiny
+`Fn(NodeId,SubscriptionId)` is the correct minimal surface there —
+unifying would *increase* coupling). D231 is not a mechanism (the build
+closure uses the `&Core` `ProducerCtx` already lends it). Canonical:
+`~/src/graphrefly-ts/docs/rust-port-decisions.md` D233 + the mailbox
+module docs.
+
 ## R2.6.0 — Default-mode leaf-source self-emit convergence — landed 2026-05-17 (LOCAL-ONLY, NOT pushed)
 
 Cross-impl divergence closed: a self-paused **default-`pausable`** leaf

@@ -61,10 +61,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
 use ahash::AHashMap;
-use graphrefly_core::{Core, FnId, HandleId, Message, NodeId, Sink, Subscription};
+use graphrefly_core::{Core, FnId, HandleId, Message, NodeId, Sink};
 use smallvec::SmallVec;
 
-use super::producer::{ProducerBinding, ProducerCtx};
+use super::producer::{ProducerBinding, ProducerCtx, ProducerEmitter, SubGuard};
 
 // =====================================================================
 // HigherOrderBinding — closure registration for project: T -> Node<R>
@@ -122,8 +122,12 @@ pub trait HigherOrderBinding: ProducerBinding {
 // - Tier 6 (Teardown) — forwards via `Core::teardown(producer_id)`
 //   per R2.6.4. Inner permanent destruction propagates.
 
+// S2b/D230/D234: long-lived inner sink takes `em: ProducerEmitter`
+// (was `core: Core`, no longer `Clone`). Emit is the mailbox fast path;
+// the rare INVALIDATE/TEARDOWN terminal forwards route through
+// `em.defer` (`CoreFull`).
 fn build_inner_sink(
-    core: Core,
+    em: ProducerEmitter,
     producer_binding: Arc<dyn ProducerBinding>,
     producer_id: NodeId,
     on_inner_complete: Arc<dyn Fn() + Send + Sync>,
@@ -175,11 +179,15 @@ fn build_inner_sink(
         }
         for action in actions {
             match action {
-                Action::Emit(h) => core.emit_or_defer(producer_id, h),
+                Action::Emit(h) => em.emit_or_defer(producer_id, h),
                 Action::Complete => on_inner_complete(),
                 Action::Error(h) => on_inner_error(h),
-                Action::Invalidate => core.invalidate_or_defer(producer_id),
-                Action::Teardown => core.teardown_or_defer(producer_id),
+                Action::Invalidate => {
+                    let _ = em.defer(move |c| c.invalidate(producer_id));
+                }
+                Action::Teardown => {
+                    let _ = em.defer(move |c| c.teardown(producer_id));
+                }
             }
         }
     })
@@ -191,8 +199,20 @@ fn build_inner_sink(
 
 struct SwitchState {
     /// Currently-active inner subscription (if any). Cancelling the
-    /// prior inner is `Option::take` + lock-released drop.
-    inner_sub: Option<Subscription>,
+    /// prior inner is `Option::take` + drop — S2b: `SubGuard::Drop`
+    /// posts the `unsubscribe` via `em.defer` (owner-side, in-wave,
+    /// FIFO-ordered so cancel drains before any resubscribe — D234).
+    inner_sub: Option<SubGuard>,
+    /// QA P2 (2026-05-18): monotonic switch epoch. Under D234 the
+    /// cancel-prev is `inner_sub.take()` at outer-fire, but the prior
+    /// subscribe is a still-queued `em.defer` that hasn't populated
+    /// `inner_sub` yet — so a fast double-switch within one wave would
+    /// `take()` an empty slot and leave BOTH inners live. Each accepted
+    /// outer DATA bumps `epoch`; the subscribe-defer captures the value
+    /// and, after `try_subscribe`, drops the new `SubGuard` immediately
+    /// (deferred unsubscribe) instead of installing it if `epoch` has
+    /// moved on — i.e. a newer outer DATA superseded it.
+    epoch: u64,
     source_done: bool,
     terminated: bool,
 }
@@ -201,6 +221,7 @@ impl SwitchState {
     fn new() -> Self {
         Self {
             inner_sub: None,
+            epoch: 0,
             source_done: false,
             terminated: false,
         }
@@ -220,26 +241,26 @@ pub fn switch_map(
     project: ProjectFn,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    // Weak captures break the producer-build Arc cycle (see
-    // `graphrefly_operators::ops_impl::zip` doc).
-    let core_weak = core.weak_handle();
+    // S2b/D223: the Core weak is GONE (Core relocates; long-lived sinks
+    // reach it via `ProducerEmitter`/`em.defer`). The *binding* weaks
+    // stay — they break the registry→build-closure→strong-binding cycle
+    // (unrelated to Core ownership; D223 only forbids `Weak<C>`).
     let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
     let producer_binding_weak: Weak<dyn ProducerBinding> =
         Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
-            core_weak.upgrade(),
-            binding_weak.upgrade(),
-            producer_binding_weak.upgrade(),
-        ) else {
+        let (Some(binding_clone), Some(producer_binding)) =
+            (binding_weak.upgrade(), producer_binding_weak.upgrade())
+        else {
             return;
         };
+        let em = ctx.emitter();
         let state: Arc<Mutex<SwitchState>> = Arc::new(Mutex::new(SwitchState::new()));
 
         let state_for_outer = state.clone();
-        let core_for_outer = core_clone.clone();
+        let em_for_outer = em.clone();
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
@@ -325,91 +346,95 @@ pub fn switch_map(
                     .latest_outer_h
                     .expect("latest_retained implies latest_outer_h is Some");
 
-                // Cancel prior inner sub (if any) lock-released.
-                let prev_inner = {
+                // Cancel prior inner sub (if any) + bump the switch
+                // epoch (QA P2). `take()` only catches an *already
+                // installed* prior inner; a prior subscribe still queued
+                // as an `em.defer` hasn't populated `inner_sub` yet, so
+                // bumping `epoch` here and re-checking it inside the
+                // subscribe-defer is what actually invalidates a
+                // superseded-but-still-queued prior subscribe.
+                let my_epoch = {
                     let mut s = state_for_outer.lock().unwrap();
-                    s.inner_sub.take()
+                    let prev = s.inner_sub.take();
+                    s.epoch += 1;
+                    let e = s.epoch;
+                    drop(s);
+                    drop(prev); // SubGuard::Drop → deferred unsubscribe.
+                    e
                 };
-                drop(prev_inner);
 
-                // invoke_project lock-released. Releases our retain after.
+                // invoke_project lock-released (binding call, not Core).
                 let inner_node = binding_for_outer.invoke_project(project_fn_id, outer_h);
                 binding_for_outer.release_handle(outer_h);
 
                 let on_complete = make_switch_on_complete(
                     state_for_outer.clone(),
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_id,
                 );
                 let on_error = make_switch_on_error(
                     state_for_outer.clone(),
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_id,
                 );
-                // F2 /qa (2026-05-10): clone `on_complete` so the Dead
-                // branch can invoke it as an immediate "inner completed
-                // before any emit" signal — closes the bug where a
-                // batched `[outer.Data, outer.Complete]` projected to a
-                // dead inner wedged the producer (source_done=true,
-                // inner_sub=None, no future trigger).
+                // F2 /qa: TornDown synthesizes inner-Complete so the
+                // self-Complete trigger can fire (batched
+                // [Data,Complete]→dead-inner wedge fix).
                 let on_complete_for_dead = on_complete.clone();
                 let inner_sink = build_inner_sink(
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_binding_for_outer.clone(),
                     producer_id,
                     on_complete,
                     on_error,
                 );
-                // Phase H+ STRICT: try_subscribe + defer for inner source.
-                // F2 /qa: TornDown synthesizes inner-Complete via
-                // on_complete (so the operator's self-Complete trigger
-                // can fire).
-                let inner_sink_for_defer = inner_sink.clone();
-                match core_for_outer.try_subscribe(inner_node, inner_sink) {
-                    Ok(inner_sub) => {
-                        let to_drop = {
-                            let mut s = state_for_outer.lock().unwrap();
-                            if s.terminated {
-                                Some(inner_sub)
-                            } else {
-                                s.inner_sub.replace(inner_sub)
-                            }
-                        };
-                        drop(to_drop);
+                // D234: the inner subscribe needs `CoreFull` from a
+                // long-lived sink → `em.defer` (owner-side, in-wave,
+                // FIFO after the cancel above). The returned
+                // `SubscriptionId` is wrapped in a `SubGuard` (its Drop
+                // schedules the eventual unsubscribe). QA P2: the
+                // captured `my_epoch` invalidates this subscribe if a
+                // newer outer DATA superseded it while it was queued.
+                let state_sub = state_for_outer.clone();
+                let em_guard = em_for_outer.clone();
+                let _ = em_for_outer.defer(move |c| {
+                    match c.try_subscribe(inner_node, inner_sink) {
+                        Ok(sub) => {
+                            let guard = SubGuard::new(inner_node, sub, em_guard);
+                            let to_drop = {
+                                let mut s = state_sub.lock().unwrap();
+                                if s.terminated || s.epoch != my_epoch {
+                                    Some(guard)
+                                } else {
+                                    s.inner_sub.replace(guard)
+                                }
+                            };
+                            drop(to_drop);
+                        }
+                        Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                            // R2.2.7.b: inner dead — synthesize
+                            // inner-Complete (clears inner_sub, checks
+                            // self-Complete trigger).
+                            on_complete_for_dead();
+                        }
+                        Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                            // Already inside the in-wave drain (no
+                            // partitions held the old way) — a violation
+                            // here is the substrate-invariant break the
+                            // old wave-end-drain guard caught.
+                            panic!(
+                                "switch_map inner subscribe: partition-order \
+                                 violation inside em.defer — substrate invariant broken"
+                            );
+                        }
                     }
-                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                        let core_cb = core_for_outer.clone();
-                        let state_cb = state_for_outer.clone();
-                        core_for_outer.push_deferred_producer_op(
-                            graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
-                                let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                                let to_drop = {
-                                    let mut s = state_cb.lock().unwrap();
-                                    if s.terminated {
-                                        Some(inner_sub)
-                                    } else {
-                                        s.inner_sub.replace(inner_sub)
-                                    }
-                                };
-                                drop(to_drop);
-                            })),
-                        );
-                    }
-                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
-                        // R2.2.7.b: inner is dead. Synthesize
-                        // inner-Complete so switch's state machine
-                        // clears inner_sub and checks the self-Complete
-                        // trigger (closes the [Data,Complete] batched
-                        // wedge bug).
-                        on_complete_for_dead();
-                    }
-                }
+                });
             }
 
             if plan.self_complete {
-                core_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete_or_defer(producer_id);
             } else if let Some(h) = plan.self_error {
-                core_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error_or_defer(producer_id, h);
             }
         });
 
@@ -423,7 +448,7 @@ pub fn switch_map(
 
 fn make_switch_on_complete(
     state: Arc<Mutex<SwitchState>>,
-    core: Core,
+    em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
@@ -440,16 +465,16 @@ fn make_switch_on_complete(
                 should_complete = true;
             }
         }
-        drop(prev_inner);
+        drop(prev_inner); // SubGuard::Drop → deferred unsubscribe.
         if should_complete {
-            core.complete_or_defer(producer_id);
+            em.complete_or_defer(producer_id);
         }
     })
 }
 
 fn make_switch_on_error(
     state: Arc<Mutex<SwitchState>>,
-    core: Core,
+    em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Arc<dyn Fn(HandleId) + Send + Sync> {
     Arc::new(move |h| {
@@ -463,7 +488,7 @@ fn make_switch_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        core.error_or_defer(producer_id, h);
+        em.error_or_defer(producer_id, h);
     })
 }
 
@@ -472,7 +497,19 @@ fn make_switch_on_error(
 // =====================================================================
 
 struct ExhaustState {
-    inner_sub: Option<Subscription>,
+    /// Active inner sub. S2b: `Option<SubGuard>` — drop posts the
+    /// deferred unsubscribe (D234).
+    inner_sub: Option<SubGuard>,
+    /// QA P2 (2026-05-18): exhaust is *older-wins* — while a projected
+    /// inner is pending OR active, new outer DATA is dropped. Under
+    /// D234 the subscribe is a queued `em.defer`, so `inner_sub` is
+    /// `None` between accept and install; without this flag a 2nd
+    /// outer DATA in that window would also pass `inner_sub.is_none()`
+    /// and project a 2nd inner (exhaust contract violation). Set true
+    /// when an outer DATA is accepted + its subscribe queued; cleared
+    /// when the inner completes/errors or its subscribe finds the
+    /// source dead.
+    pending: bool,
     source_done: bool,
     terminated: bool,
 }
@@ -481,6 +518,7 @@ impl ExhaustState {
     fn new() -> Self {
         Self {
             inner_sub: None,
+            pending: false,
             source_done: false,
             terminated: false,
         }
@@ -499,25 +537,24 @@ pub fn exhaust_map(
     project: ProjectFn,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    // Weak captures break the producer-build Arc cycle (see `switch_map` doc).
-    let core_weak = core.weak_handle();
+    // S2b/D223: binding weaks stay (registry-cycle break); Core weak
+    // gone — sinks reach Core via `em`/`em.defer`.
     let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
     let producer_binding_weak: Weak<dyn ProducerBinding> =
         Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
-            core_weak.upgrade(),
-            binding_weak.upgrade(),
-            producer_binding_weak.upgrade(),
-        ) else {
+        let (Some(binding_clone), Some(producer_binding)) =
+            (binding_weak.upgrade(), producer_binding_weak.upgrade())
+        else {
             return;
         };
+        let em = ctx.emitter();
         let state: Arc<Mutex<ExhaustState>> = Arc::new(Mutex::new(ExhaustState::new()));
 
         let state_for_outer = state.clone();
-        let core_for_outer = core_clone.clone();
+        let em_for_outer = em.clone();
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
@@ -544,10 +581,18 @@ pub fn exhaust_map(
                                 // First DATA per active window wins.
                                 // Remember the first one we accept; subsequent
                                 // batch entries (or DATAs after) drop.
-                                if s.inner_sub.is_none() && plan.first_outer_h.is_none() {
+                                // QA P2: also gate on `!s.pending` — a
+                                // prior accepted DATA's subscribe may be
+                                // queued (inner_sub still None); exhaust
+                                // must drop this one (older-wins).
+                                if s.inner_sub.is_none()
+                                    && !s.pending
+                                    && plan.first_outer_h.is_none()
+                                {
                                     binding_for_outer.retain_handle(h);
                                     plan.first_outer_h = Some(h);
                                     plan.first_retained = true;
+                                    s.pending = true;
                                 }
                             }
                             // else: Resolved on outer source — no action.
@@ -594,79 +639,60 @@ pub fn exhaust_map(
 
                 let on_complete = make_exhaust_on_complete(
                     state_for_outer.clone(),
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_id,
                 );
                 let on_error = make_exhaust_on_error(
                     state_for_outer.clone(),
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_id,
                 );
                 // F2 /qa: clone for TornDown synthesis (mirrors switch_map).
                 let on_complete_for_dead = on_complete.clone();
                 let inner_sink = build_inner_sink(
-                    core_for_outer.clone(),
+                    em_for_outer.clone(),
                     producer_binding_for_outer.clone(),
                     producer_id,
                     on_complete,
                     on_error,
                 );
-                // If inner already pre-completed during the handshake,
-                // on_complete already cleared `inner_sub`. We `replace`
-                // either way; in the synchronous-completion path,
-                // `inner_sub` was None so our just-subscribed (and
-                // already-dead) sub is dropped on the next iteration.
-                // Phase H+ STRICT: try_subscribe + defer for inner source.
-                // R2.2.7.b: TornDown means the inner source is non-resubscribable
-                // and terminal — skip silently.
-                let inner_sink_for_defer = inner_sink.clone();
-                match core_for_outer.try_subscribe(inner_node, inner_sink) {
-                    Ok(inner_sub) => {
-                        let to_drop = {
-                            let mut s = state_for_outer.lock().unwrap();
-                            if s.terminated {
-                                Some(inner_sub)
-                            } else {
-                                s.inner_sub.replace(inner_sub)
-                            }
-                        };
-                        drop(to_drop);
+                // D234: inner subscribe via `em.defer` (long-lived sink
+                // can't hold `&Core`). TornDown → synthesize
+                // inner-Complete so `inner_sub` clears and the next
+                // outer DATA can re-project (F2 /qa).
+                let state_sub = state_for_outer.clone();
+                let em_guard = em_for_outer.clone();
+                let _ = em_for_outer.defer(move |c| {
+                    match c.try_subscribe(inner_node, inner_sink) {
+                        Ok(sub) => {
+                            let guard = SubGuard::new(inner_node, sub, em_guard);
+                            let to_drop = {
+                                let mut s = state_sub.lock().unwrap();
+                                if s.terminated {
+                                    Some(guard)
+                                } else {
+                                    s.inner_sub.replace(guard)
+                                }
+                            };
+                            drop(to_drop);
+                        }
+                        Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                            on_complete_for_dead();
+                        }
+                        Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                            panic!(
+                                "exhaust_map inner subscribe: partition-order \
+                                 violation inside em.defer — substrate invariant broken"
+                            );
+                        }
                     }
-                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                        let core_cb = core_for_outer.clone();
-                        let state_cb = state_for_outer.clone();
-                        core_for_outer.push_deferred_producer_op(
-                            graphrefly_core::DeferredProducerOp::Callback(Box::new(move || {
-                                let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                                let to_drop = {
-                                    let mut s = state_cb.lock().unwrap();
-                                    if s.terminated {
-                                        Some(inner_sub)
-                                    } else {
-                                        s.inner_sub.replace(inner_sub)
-                                    }
-                                };
-                                drop(to_drop);
-                            })),
-                        );
-                    }
-                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
-                        // R2.2.7.b / F2 /qa: synthesize inner-Complete
-                        // so exhaust's `s.inner_sub` clears and the
-                        // next outer DATA can re-project (previously
-                        // the TornDown branch was a silent no-op which
-                        // could leave outer spawning more dead
-                        // projections indefinitely without ever
-                        // advancing the state machine).
-                        on_complete_for_dead();
-                    }
-                }
+                });
             }
 
             if plan.self_complete {
-                core_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete_or_defer(producer_id);
             } else if let Some(h) = plan.self_error {
-                core_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error_or_defer(producer_id, h);
             }
         });
 
@@ -680,7 +706,7 @@ pub fn exhaust_map(
 
 fn make_exhaust_on_complete(
     state: Arc<Mutex<ExhaustState>>,
-    core: Core,
+    em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
@@ -692,6 +718,9 @@ fn make_exhaust_on_complete(
                 return;
             }
             prev_inner = s.inner_sub.take();
+            // QA P2: inner finished (or was dead) — exhaust window
+            // re-opens; the next outer DATA may project again.
+            s.pending = false;
             if s.source_done && !s.terminated {
                 s.terminated = true;
                 should_complete = true;
@@ -699,14 +728,14 @@ fn make_exhaust_on_complete(
         }
         drop(prev_inner);
         if should_complete {
-            core.complete_or_defer(producer_id);
+            em.complete_or_defer(producer_id);
         }
     })
 }
 
 fn make_exhaust_on_error(
     state: Arc<Mutex<ExhaustState>>,
-    core: Core,
+    em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Arc<dyn Fn(HandleId) + Send + Sync> {
     Arc::new(move |h| {
@@ -720,7 +749,7 @@ fn make_exhaust_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        core.error_or_defer(producer_id, h);
+        em.error_or_defer(producer_id, h);
     })
 }
 
@@ -750,7 +779,7 @@ struct MergeMapState {
     /// Per-inner `Subscription`s, keyed by `next_inner_id`. Each
     /// inner's `on_complete` removes its entry by id (lock-released
     /// drop).
-    inner_subs: AHashMap<u64, Subscription>,
+    inner_subs: AHashMap<u64, SubGuard>,
     /// Pending inner ids (between `subscribe` call and
     /// `inner_subs.insert`). Used to detect synchronous-completion:
     /// if `on_complete` runs during `subscribe`, it removes from
@@ -823,25 +852,24 @@ pub fn merge_map_with_concurrency(
     concurrency: Option<u32>,
 ) -> NodeId {
     let project_fn_id = binding.register_project(project);
-    // Weak captures break the producer-build Arc cycle (see `switch_map` doc).
-    let core_weak = core.weak_handle();
+    // S2b/D223: binding weaks stay (registry-cycle break); Core weak
+    // gone — sinks reach Core via `em`/`em.defer`.
     let binding_weak: Weak<dyn HigherOrderBinding> = Arc::downgrade(binding);
     let producer_binding_weak: Weak<dyn ProducerBinding> =
         Arc::downgrade(&(binding.clone() as Arc<dyn ProducerBinding>));
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone), Some(producer_binding)) = (
-            core_weak.upgrade(),
-            binding_weak.upgrade(),
-            producer_binding_weak.upgrade(),
-        ) else {
+        let (Some(binding_clone), Some(producer_binding)) =
+            (binding_weak.upgrade(), producer_binding_weak.upgrade())
+        else {
             return;
         };
+        let em = ctx.emitter();
         let state: Arc<Mutex<MergeMapState>> = Arc::new(Mutex::new(MergeMapState::new()));
 
         let state_for_outer = state.clone();
-        let core_for_outer = core_clone.clone();
+        let em_for_outer = em.clone();
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
@@ -895,18 +923,18 @@ pub fn merge_map_with_concurrency(
             }
 
             if let Some(h) = error_action {
-                core_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error_or_defer(producer_id, h);
                 return;
             }
             if self_complete_now {
-                core_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete_or_defer(producer_id);
                 return;
             }
 
             // Phase 2: drain buffer iteratively up to concurrency cap.
             drain_merge_buffer(
                 &state_for_outer,
-                &core_for_outer,
+                &em_for_outer,
                 &binding_for_outer,
                 &producer_binding_for_outer,
                 producer_id,
@@ -927,9 +955,13 @@ pub fn merge_map_with_concurrency(
 /// or buffer is empty. Re-entrance from a nested `on_complete` is
 /// short-circuited via [`MERGE_DRAIN_ACTIVE`]; the outermost call owns
 /// the drain loop and picks up cap-frees on subsequent iterations.
+// S2b/D234: `core: &Core` → `em: &ProducerEmitter`. The per-inner
+// subscribe routes through `em.defer` (`CoreFull`); the returned
+// `SubscriptionId` is wrapped in a `SubGuard` keyed in `inner_subs`
+// (its Drop schedules the unsubscribe).
 fn drain_merge_buffer(
     state: &Arc<Mutex<MergeMapState>>,
-    core: &Core,
+    em: &ProducerEmitter,
     binding: &Arc<dyn HigherOrderBinding>,
     producer_binding: &Arc<dyn ProducerBinding>,
     producer_id: NodeId,
@@ -976,7 +1008,7 @@ fn drain_merge_buffer(
 
         if should_self_complete {
             MERGE_DRAIN_ACTIVE.with(|f| f.set(false));
-            core.complete_or_defer(producer_id);
+            em.complete_or_defer(producer_id);
             return;
         }
 
@@ -991,7 +1023,7 @@ fn drain_merge_buffer(
 
         let on_complete = make_merge_on_complete(
             state.clone(),
-            core.clone(),
+            em.clone(),
             binding.clone(),
             producer_binding.clone(),
             producer_id,
@@ -1000,71 +1032,57 @@ fn drain_merge_buffer(
             concurrency,
         );
         let on_error =
-            make_merge_on_error(state.clone(), core.clone(), binding.clone(), producer_id);
+            make_merge_on_error(state.clone(), em.clone(), binding.clone(), producer_id);
         // F2 /qa: clone on_complete so the TornDown branch can
         // synthesize inner-Complete (closes the merge_map `s.active`
         // leak that left the producer never self-completing when a
         // projected inner was dead).
         let on_complete_for_dead = on_complete.clone();
         let inner_sink = build_inner_sink(
-            core.clone(),
+            em.clone(),
             producer_binding.clone(),
             producer_id,
             on_complete,
             on_error,
         );
-        // Phase H+ STRICT: try_subscribe + defer for inner source.
-        // R2.2.7.b: TornDown means the inner source is non-resubscribable
-        // and terminal — skip silently and remove from pending so the
-        // overall lifecycle isn't wedged waiting on a dead inner.
-        let inner_sink_for_defer = inner_sink.clone();
-        match core.try_subscribe(inner_node, inner_sink) {
-            Ok(inner_sub) => {
-                // Decide whether to install the sub: if `on_complete` fired
-                // synchronously inside `subscribe` (pre-completed inner), it
-                // already removed `inner_id` from `pending_inner_ids`.
-                let to_drop = {
-                    let mut s = state.lock().unwrap();
-                    if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
-                        Some(inner_sub)
-                    } else {
-                        s.inner_subs.insert(inner_id, inner_sub);
-                        None
-                    }
-                };
-                drop(to_drop);
+        // D234: inner subscribe via `em.defer` (long-lived drain can't
+        // hold `&Core`). The sync-completion detection still works: if
+        // the inner pre-completes during `try_subscribe`'s handshake,
+        // `on_complete` fires INSIDE this defer (owner-side) and removes
+        // `inner_id` from `pending_inner_ids` before the post-subscribe
+        // check below — so a now-dead sub is dropped, not installed.
+        let state_sub = state.clone();
+        let em_guard = em.clone();
+        let _ = em.defer(move |c| {
+            match c.try_subscribe(inner_node, inner_sink) {
+                Ok(sub) => {
+                    let guard = SubGuard::new(inner_node, sub, em_guard);
+                    let to_drop = {
+                        let mut s = state_sub.lock().unwrap();
+                        if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
+                            Some(guard)
+                        } else {
+                            s.inner_subs.insert(inner_id, guard);
+                            None
+                        }
+                    };
+                    drop(to_drop);
+                }
+                Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
+                    // R2.2.7.b / F2 /qa: synthesize inner-Complete so
+                    // `make_merge_on_complete` decrements `s.active`,
+                    // clears pending, and checks the self-Complete
+                    // trigger (Dead-inner `s.active` leak fix).
+                    on_complete_for_dead();
+                }
+                Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
+                    panic!(
+                        "merge_map inner subscribe: partition-order \
+                         violation inside em.defer — substrate invariant broken"
+                    );
+                }
             }
-            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                let core_cb = core.clone();
-                let state_cb = state.clone();
-                core.push_deferred_producer_op(graphrefly_core::DeferredProducerOp::Callback(
-                    Box::new(move || {
-                        let inner_sub = core_cb.subscribe(inner_node, inner_sink_for_defer);
-                        let to_drop = {
-                            let mut s = state_cb.lock().unwrap();
-                            if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
-                                Some(inner_sub)
-                            } else {
-                                s.inner_subs.insert(inner_id, inner_sub);
-                                None
-                            }
-                        };
-                        drop(to_drop);
-                    }),
-                ));
-            }
-            Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
-                // R2.2.7.b / F2 /qa: synthesize inner-Complete. This
-                // delegates to `make_merge_on_complete`'s state-machine
-                // which decrements `s.active`, removes inner_id from
-                // pending, and checks the self-Complete trigger
-                // (source_done && active == 0 && buffer.empty()) —
-                // closing the wedge bug where a Dead inner left
-                // `s.active` permanently inflated and merge_map
-                // never self-completed even after source completed.
-                on_complete_for_dead();
-            }
-        }
+        });
 
         // Loop continues — pops next from buffer or returns.
     }
@@ -1072,7 +1090,7 @@ fn drain_merge_buffer(
 
 fn make_merge_on_complete(
     state: Arc<Mutex<MergeMapState>>,
-    core: Core,
+    em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_binding: Arc<dyn ProducerBinding>,
     producer_id: NodeId,
@@ -1098,14 +1116,14 @@ fn make_merge_on_complete(
             s.pending_inner_ids.remove(&this_inner_id);
             removed_sub = s.inner_subs.remove(&this_inner_id);
         }
-        drop(removed_sub);
+        drop(removed_sub); // SubGuard::Drop → deferred unsubscribe.
 
         // Try to drain — if we're nested inside an outer drain loop
         // (sync-completion path), this is a no-op and the outer drain
         // continues.
         drain_merge_buffer(
             &state,
-            &core,
+            &em,
             &binding,
             &producer_binding,
             producer_id,
@@ -1123,7 +1141,7 @@ fn make_merge_on_complete(
 /// shares.
 fn make_merge_on_error(
     state: Arc<Mutex<MergeMapState>>,
-    core: Core,
+    em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_id: NodeId,
 ) -> Arc<dyn Fn(HandleId) + Send + Sync> {
@@ -1140,11 +1158,11 @@ fn make_merge_on_error(
             s.pending_inner_ids.clear();
             buffered_to_release = s.buffer.drain(..).collect::<Vec<_>>();
         }
-        drop(removed_subs);
+        drop(removed_subs); // each SubGuard::Drop → deferred unsubscribe.
         for h_b in buffered_to_release {
             binding.release_handle(h_b);
         }
-        core.error_or_defer(producer_id, h);
+        em.error_or_defer(producer_id, h);
     })
 }
 

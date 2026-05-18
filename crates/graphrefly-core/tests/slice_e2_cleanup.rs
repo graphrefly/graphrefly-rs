@@ -180,12 +180,16 @@ fn r2_4_5_on_deactivation_precedes_producer_deactivate() {
                 .push(format!("cleanup_for({n:?}, {t:?})"));
             self.inner.cleanup_for(n, t);
         }
-        fn producer_deactivate(&self, n: NodeId) {
+        fn producer_deactivate(
+            &self,
+            n: NodeId,
+            unsub: &dyn Fn(NodeId, graphrefly_core::SubscriptionId),
+        ) {
             self.events
                 .lock()
                 .unwrap()
                 .push(format!("producer_deactivate({n:?})"));
-            self.inner.producer_deactivate(n);
+            self.inner.producer_deactivate(n, unsub);
         }
         fn wipe_ctx(&self, n: NodeId) {
             self.inner.wipe_ctx(n);

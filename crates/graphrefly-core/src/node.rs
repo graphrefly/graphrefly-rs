@@ -69,7 +69,7 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use parking_lot::{ArcReentrantMutexGuard, Mutex};
@@ -484,53 +484,21 @@ pub enum EqualsMode {
     Custom(FnId),
 }
 
-/// Internal identifier for a single subscription. Allocated per
-/// [`Core::subscribe`] call. Wrapped by [`Subscription`] for the public API;
-/// consumed directly only by Core internals and the [`Subscription::Drop`]
-/// path.
+/// Public identifier for a single subscription (S2b / D225: promoted
+/// from `pub(crate)`). Returned by [`Core::subscribe`] /
+/// [`Core::try_subscribe`]; pair it with the `node_id` you subscribed
+/// and pass both to [`Core::unsubscribe`] to deregister.
+///
+/// S2b retires the core-level RAII `Subscription`/`WeakCore` (D223:
+/// the `Core` is owned by value and relocates between workers, so a
+/// parameterless `Drop` cannot reach it without `Weak<C>`/`unsafe` —
+/// D225). Drop-convenience is a *binding-layer* RAII wrapper over
+/// [`Core::unsubscribe`], used only where the holder co-owns the `Core`
+/// on its affinity worker (test harness, napi `BenchCore`). Substrate
+/// callers (e.g. producer upstream-sub cleanup, D229) unsubscribe
+/// explicitly via the owner-driven chain.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub(crate) struct SubscriptionId(u64);
-
-/// RAII subscription handle.
-///
-/// Returned by [`Core::subscribe`]. While the handle is held, the sink stays
-/// registered against its node. Dropping the handle (explicitly via
-/// `drop(sub)` or implicitly at scope exit) unsubscribes the sink — no manual
-/// `unsubscribe()` call is needed. Per §10.12 of the rust-port session doc.
-///
-/// # Lifetime semantics
-///
-/// The subscription holds a [`Weak`] reference back to the Core's state. If
-/// the Core is dropped before the subscription, the Drop impl is a silent
-/// no-op (the sink has nowhere to deregister from anyway). This avoids a
-/// reference cycle when subscribers capture an `Arc<Core>` in their closure.
-///
-/// # Thread safety
-///
-/// `Send + Sync`. The handle can be moved across threads or dropped from
-/// any thread.
-///
-/// # Not Clone
-///
-/// `Subscription` owns the unsubscribe action exclusively. Cloning would
-/// require either "first drop wins" or "last drop wins" semantics, both
-/// of which surprise. If a binding needs multiple deregistration handles,
-/// it should subscribe multiple times (each producing a fresh handle) or
-/// wrap the single `Subscription` in `Arc<Mutex<Option<Subscription>>>`.
-#[must_use = "dropping a Subscription unsubscribes its sink immediately"]
-pub struct Subscription<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    state: Weak<C>,
-    node_id: NodeId,
-    sub_id: SubscriptionId,
-}
-
-impl<C: crate::state_cell::StateCell> Subscription<C> {
-    /// The node this subscription is attached to.
-    #[must_use]
-    pub fn node_id(&self) -> NodeId {
-        self.node_id
-    }
-}
+pub struct SubscriptionId(u64);
 
 /// Deregister `sub_id` from `node_id` and run the Phase G / lifecycle
 /// cleanup chain (OnDeactivation → `producer_deactivate` → `wipe_ctx` →
@@ -617,7 +585,19 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
                 binding.cleanup_for(node_id, CleanupTrigger::OnDeactivation);
             }
             if is_producer {
-                binding.producer_deactivate(node_id);
+                // D229: hand the binding a `Core::unsubscribe`-capable
+                // closure over the `&C` already in scope (the owner's
+                // synchronous unsubscribe context — exactly what D225
+                // requires; no `Weak<C>`, no parameterless-`Drop`). The
+                // binding loops it over its recorded upstream
+                // `(NodeId, SubscriptionId)` pairs. Lock-released here, so
+                // the recursive `unsubscribe_sink` (re-entrant producer
+                // cascade) is safe — behaviour-identical to the retired
+                // `Subscription::Drop` cascade.
+                let unsub = |up_node: NodeId, up_sub: SubscriptionId| {
+                    unsubscribe_sink(state, up_node, up_sub);
+                };
+                binding.producer_deactivate(node_id, &unsub);
             }
             // D069: eager wipe — fires AFTER OnDeactivation so the
             // user closure observes pre-wipe `store` (matches the
@@ -846,26 +826,11 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
     }
 }
 
-impl<C: crate::state_cell::StateCell> Drop for Subscription<C> {
-    fn drop(&mut self) {
-        // Legacy RAII path (D225 refined A2, S2a). Silent no-op if the
-        // Core is gone (the sink has nowhere to deregister from — keeps
-        // Drop infallible). Delegates to the shared `unsubscribe_sink`;
-        // S2b moves RAII to the binding layer over the synchronous
-        // owner-invoked `Core::unsubscribe`.
-        if let Some(state) = self.state.upgrade() {
-            unsubscribe_sink(&*state, self.node_id, self.sub_id);
-        }
-    }
-}
-
-// Compile-time assertion that Subscription is Send + Sync. If a future field
-// breaks this, the build fails here rather than downstream at the binding
-// site.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<Subscription>();
-};
+// S2b (D225): no `impl Drop for Subscription` and no `Subscription`
+// Send+Sync assertion — the core-level RAII handle is retired. The sole
+// deregister path is the synchronous owner-invoked `Core::unsubscribe`
+// (which delegates to the shared `unsubscribe_sink` free fn below);
+// binding-layer RAII wraps it where the holder co-owns the Core.
 
 /// A subscriber callback. `Send + Sync` so the Core can fire it from any
 /// thread; `Fn` (not `FnMut`) so multiple references coexist — capture
@@ -1866,7 +1831,18 @@ pub struct CoreState {
 static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct Core<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    pub(crate) state: Arc<C>,
+    /// The state cell, owned **by value** (D223/S2b). No longer `Arc<C>`
+    /// — under the actor model the `Core` is moved between workers, not
+    /// shared; there is no `Clone` and no `Weak<C>` back-ref. `C: Send`
+    /// (not `Sync`): the owned cell crosses worker boundaries by `move`,
+    /// the borrow checker is the lock (D221).
+    pub(crate) state: C,
+    /// `Send + Sync` bridge for autonomous async producers (timer tasks)
+    /// that can no longer hold `&Core`/`Weak<C>` (D223/D227/D230). Timer
+    /// tasks post `(node, handle)`; [`Self::drain_mailbox`] applies them
+    /// owner-side via the sync `emit`. Owns the per-group `runnable` wake
+    /// bit (S4 wires it; M6 reads it from the host executor).
+    pub(crate) mailbox: Arc<crate::mailbox::CoreMailbox>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
     /// §7 serialization-group wave-lock registry (D208–D211, 2026-05-16).
     /// Replaces the deleted D3 union-find `SubgraphRegistry`. Maps each
@@ -1897,68 +1873,128 @@ pub struct Core<C: crate::state_cell::StateCell = crate::state_cell::LockedCell>
     pub(crate) generation: u64,
 }
 
-// Manual `Clone` (not `#[derive]`): a derived `Clone` would impose a spurious
-// `C: Clone` bound on the cell. The cell is shared via `Arc`, never cloned.
-impl<C: crate::state_cell::StateCell> Clone for Core<C> {
-    fn clone(&self) -> Self {
-        Self {
-            state: Arc::clone(&self.state),
-            binding: Arc::clone(&self.binding),
-            group_locks: Arc::clone(&self.group_locks),
-            global_wave: Arc::clone(&self.global_wave),
-            generation: self.generation,
+// S2b (D223): `Core` is **not** `Clone` and has **no** `WeakCore`. Under
+// the actor / work-stealing model a `Core` owns its state cell by value
+// and is moved between workers, never shared — so the old `Arc<C>`-shared
+// `Clone` and the `Weak<C>`-back-ref `WeakCore` (used to break the
+// BenchBinding→registry→closure→strong-Core cycle for long-lived
+// binding-stored closures / timer tasks) are deleted. Autonomous async
+// producers (timer tasks) now reach the `Core` via the `Send + Sync`
+// [`crate::mailbox::CoreMailbox`] instead of upgrading a `Weak<C>`
+// (D227/D230). Identity (`same_dispatcher`) is the unique per-`Core`
+// `generation` counter, not `Arc::ptr_eq`.
+
+impl<C: crate::state_cell::StateCell> Drop for Core<C> {
+    fn drop(&mut self) {
+        // Tell any in-flight timer tasks the Core is gone so they release
+        // their pending handle and bail instead of leaking it into a
+        // mailbox no one will drain (mirrors the old
+        // `WeakCore::upgrade() == None` teardown branch in `timer.rs`).
+        // `close()` is mutually exclusive with `post_op` (shared `ops`
+        // lock), so after it returns no new op can enqueue.
+        self.mailbox.close();
+        // QA F-A / Blind #2 (2026-05-18): an op posted just before
+        // `close()` won the lock is now stranded in the queue with its
+        // retained `HandleId`. Drain the remainder and release those
+        // handles — without this `Drop` regresses the exact
+        // BenchCore-teardown leak the deleted `WeakCore` path prevented.
+        // `Defer` closures are dropped unrun (running `CoreFull` on a
+        // half-dropped `Core` is unsound — user-locked QA decision A).
+        for op in self.mailbox.take_all() {
+            match op {
+                crate::mailbox::MailboxOp::Emit(_, h)
+                | crate::mailbox::MailboxOp::Error(_, h) => {
+                    self.binding.release_handle(h);
+                }
+                crate::mailbox::MailboxOp::Complete(_)
+                | crate::mailbox::MailboxOp::Defer(_) => {}
+            }
         }
     }
 }
 
-/// Weak handle to a [`Core`] — does not contribute to strong refcount.
-///
-/// Constructed via [`Core::weak_handle`]; upgraded back to a strong
-/// [`Core`] via [`WeakCore::upgrade`]. Used by long-lived binding-stored
-/// closures (notably `ProducerBuildFn`s registered via
-/// [`graphrefly_operators::ProducerBinding::register_producer_build`])
-/// to break the BenchBinding → registry → closure → strong-Core cycle
-/// that would otherwise leak the entire graph state when a `BenchCore`
-/// drops with active producer registrations.
-///
-/// Upgrade on each invocation; if the host `Core` was already dropped,
-/// `upgrade()` returns `None` and the closure should no-op (the host
-/// is being torn down, no work to do).
-pub struct WeakCore<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    state: Weak<C>,
-    binding: Weak<dyn BindingBoundary>,
-    group_locks: Weak<parking_lot::Mutex<crate::groups::GroupLockRegistry>>,
-    global_wave: Weak<parking_lot::ReentrantMutex<()>>,
-    generation: u64,
+/// Object-safe full-`Core` re-entry surface (S2b / D233) — the methods a
+/// producer sink's owner-side [`crate::mailbox::MailboxOp::Defer`]
+/// closure needs, by `NodeId`/`HandleId`/`Sink`/id only (no `C`/`T`),
+/// blanket-impl'd for every `Core<C>`. Lets windowing /
+/// higher-order-operator sinks perform value-returning topology mutation
+/// (`register_*`/`subscribe`) **in-wave** without naming the cell type:
+/// the `BatchGuard` drain-to-quiescence loop calls
+/// `f(self as &dyn CoreFull)` while it holds the owner `&Core`.
+pub trait CoreFull {
+    /// See [`Core::register_state`].
+    fn register_state(&self, initial: HandleId, partial: bool) -> Result<NodeId, RegisterError>;
+    /// See [`Core::register_producer`].
+    fn register_producer(&self, fn_id: FnId) -> Result<NodeId, RegisterError>;
+    /// See [`Core::subscribe`].
+    fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId;
+    /// See [`Core::try_subscribe`].
+    fn try_subscribe(
+        &self,
+        node_id: NodeId,
+        sink: Sink,
+    ) -> Result<SubscriptionId, SubscribeError>;
+    /// See [`Core::unsubscribe`].
+    fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId);
+    /// See [`Core::emit`].
+    fn emit(&self, node_id: NodeId, handle: HandleId);
+    /// See [`Core::complete`].
+    fn complete(&self, node_id: NodeId);
+    /// See [`Core::error`].
+    fn error(&self, node_id: NodeId, handle: HandleId);
+    /// See [`Core::teardown`]. Sink-side terminal forwards (e.g.
+    /// `stratify` TEARDOWN passthrough) route through `em.defer` — rare,
+    /// so `Defer` rather than a 5th `MailboxOp` fast-path variant.
+    fn teardown(&self, node_id: NodeId);
+    /// See [`Core::invalidate`]. Sink-side INVALIDATE forwards
+    /// (higher-order `build_inner_sink`) route through `em.defer`.
+    fn invalidate(&self, node_id: NodeId);
 }
 
-// Manual `Clone` (not `#[derive]`): a derived `Clone` would impose a spurious
-// `C: Clone` bound. The cell `C` is never cloned — only the `Weak`s are.
-impl<C: crate::state_cell::StateCell> Clone for WeakCore<C> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            binding: self.binding.clone(),
-            group_locks: self.group_locks.clone(),
-            global_wave: self.global_wave.clone(),
-            generation: self.generation,
-        }
+impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
+    #[inline]
+    fn register_state(&self, initial: HandleId, partial: bool) -> Result<NodeId, RegisterError> {
+        Core::register_state(self, initial, partial)
     }
-}
-
-impl<C: crate::state_cell::StateCell> WeakCore<C> {
-    /// Try to upgrade back to a strong [`Core`]. Returns `None` if the
-    /// host `Core`'s strong count has reached zero (i.e. the host
-    /// `BenchCore` / equivalent owner was dropped).
-    #[must_use]
-    pub fn upgrade(&self) -> Option<Core<C>> {
-        Some(Core {
-            state: self.state.upgrade()?,
-            binding: self.binding.upgrade()?,
-            group_locks: self.group_locks.upgrade()?,
-            global_wave: self.global_wave.upgrade()?,
-            generation: self.generation,
-        })
+    #[inline]
+    fn register_producer(&self, fn_id: FnId) -> Result<NodeId, RegisterError> {
+        Core::register_producer(self, fn_id)
+    }
+    #[inline]
+    fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
+        Core::subscribe(self, node_id, sink)
+    }
+    #[inline]
+    fn try_subscribe(
+        &self,
+        node_id: NodeId,
+        sink: Sink,
+    ) -> Result<SubscriptionId, SubscribeError> {
+        Core::try_subscribe(self, node_id, sink)
+    }
+    #[inline]
+    fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        Core::unsubscribe(self, node_id, sub_id);
+    }
+    #[inline]
+    fn emit(&self, node_id: NodeId, handle: HandleId) {
+        Core::emit(self, node_id, handle);
+    }
+    #[inline]
+    fn complete(&self, node_id: NodeId) {
+        Core::complete(self, node_id);
+    }
+    #[inline]
+    fn error(&self, node_id: NodeId, handle: HandleId) {
+        Core::error(self, node_id, handle);
+    }
+    #[inline]
+    fn teardown(&self, node_id: NodeId) {
+        Core::teardown(self, node_id);
+    }
+    #[inline]
+    fn invalidate(&self, node_id: NodeId) {
+        Core::invalidate(self, node_id);
     }
 }
 
@@ -2149,6 +2185,16 @@ impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
 
     /// Allocate a fresh [`SubscriptionId`] (moved from `impl CoreState`
     /// — same rationale as [`Self::alloc_node_id`]).
+    ///
+    /// **Invariant (QA F4, 2026-05-18): monotonic, never recycled for
+    /// the `Core`'s lifetime.** A strictly-incrementing counter, never
+    /// decremented or reset. This is what makes the S2b owner-driven
+    /// `unsubscribe` model sound: a `(NodeId, SubscriptionId)` pair
+    /// recorded by `producer_deactivate` / `SubGuard` and unsubscribed
+    /// later (after the slot may have been removed by a re-entrant
+    /// cascade) can NEVER deregister a *different* subscription —
+    /// `unsubscribe_sink` on a since-departed `sub_id` is a documented
+    /// no-op, not a wrong-target removal.
     pub(crate) fn alloc_sub_id(&mut self) -> SubscriptionId {
         let id = SubscriptionId(self.shared.next_subscription_id);
         self.shared.next_subscription_id += 1;
@@ -2179,7 +2225,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     #[must_use]
     pub fn new_with_cell(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
-            state: Arc::new(C::from_parts(
+            // S2b (D223): owned by value — no `Arc<C>`, no `Clone`.
+            state: C::from_parts(
                 // Core-global region (Slice B-2 Step 2a, D220-EXEC): its
                 // own lock, hoisted out of any shard's `CoreState`.
                 CoreShared {
@@ -2223,7 +2270,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
                     children: HashMap::new(),
                     binding: binding.clone(),
                 },
-            )),
+            ),
+            mailbox: Arc::new(crate::mailbox::CoreMailbox::new()),
             binding,
             group_locks: Arc::new(parking_lot::Mutex::new(
                 crate::groups::GroupLockRegistry::new(),
@@ -2301,47 +2349,75 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         f(&mut self.state.lock_shard(key))
     }
 
-    /// Whether `self` and `other` point to the same dispatcher state.
-    /// True when one was produced by `Clone`-ing the other (or they
-    /// were both cloned from a common ancestor); false for two
-    /// independently `Core::new`-constructed instances even with the
-    /// same binding.
+    /// Whether `self` and `other` are the same dispatcher instance.
+    ///
+    /// S2b (D223): `Core` is owned by value (no `Arc<C>`, no `Clone`), so
+    /// identity is the unique per-`Core` [`Self::generation`] counter
+    /// (assigned once from [`CORE_GENERATION`] at construction), not
+    /// `Arc::ptr_eq`. Two independently `Core::new`-constructed instances
+    /// have distinct generations even with the same binding; there is no
+    /// longer any way to produce two handles to one `Core` (no `Clone`),
+    /// so this is `true` only for genuine self-vs-self comparison.
     ///
     /// Used by `graphrefly-graph`'s `mount` to enforce the "shared-Core
     /// only" v1 invariant — cross-Core mount is post-M6.
     #[must_use]
     pub fn same_dispatcher(&self, other: &Core<C>) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
+        self.generation == other.generation
     }
 
-    /// Downgrade to a [`WeakCore`] handle that doesn't contribute to
-    /// strong refcount of the underlying state / binding / wave_owner.
+    /// Owner-side mailbox drain (D227/D230). Pops every
+    /// [`crate::mailbox::CoreMailbox`]-queued timer `Emit` request in
+    /// FIFO order and applies it via the synchronous [`Self::emit`] — so
+    /// autonomous timer tasks (which can no longer hold `&Core`/`Weak<C>`
+    /// under D223) get their fires delivered with **no async in Core**.
     ///
-    /// Used by binding-stored long-lived closures (e.g.
-    /// `register_producer_build`-stored `ProducerBuildFn`s) to avoid the
-    /// Arc cycle:
-    ///
-    /// ```text
-    /// BenchBinding → registry → producer_builds[fn_id]
-    ///   → closure → strong Arc<dyn _Binding> → BenchBinding
-    /// ```
-    ///
-    /// Closures hold `WeakCore` and `Weak<dyn _Binding>` instead, then
-    /// upgrade-on-fire (returning early if either weak is dangling —
-    /// indicating the host BenchCore was already dropped). Upgraded
-    /// strong refs live only for the build closure's invocation; sinks
-    /// the build closure spawns close over those upgraded strongs and
-    /// stay alive only while the producer is active (cleared via
-    /// `producer_deactivate` on last-subscriber unsubscribe).
+    /// Called from the embedder's existing advance/pump site (test
+    /// harness `TestRuntime` advance helper, napi pump). Timer tasks
+    /// already require the host runtime to be advanced before they fire,
+    /// so draining here is behaviour-identical to the deleted autonomous
+    /// `WeakCore::upgrade → core.emit` path. Idempotent on an empty
+    /// mailbox. Re-entrant-safe: `emit` may cascade and a concurrent
+    /// timer task may post again — the next drain picks it up (the
+    /// `runnable` bit is re-set on every post).
+    pub fn drain_mailbox(&self) {
+        // Clone the Arc out so the drain closure can call `&self.*`
+        // without aliasing `self.mailbox` through `&self`.
+        let mailbox = Arc::clone(&self.mailbox);
+        // QA P3: bound the inner drain by the configured cap (the
+        // self-reposting-Defer livelock guard lives here, NOT in
+        // `drain_and_flush`'s fire-cascade counter).
+        let max_ops = self.with_shared(|sh| sh.max_batch_drain_iterations);
+        mailbox.drain_into(max_ops, |op| match op {
+            crate::mailbox::MailboxOp::Emit(node_id, handle) => self.emit(node_id, handle),
+            crate::mailbox::MailboxOp::Complete(node_id) => self.complete(node_id),
+            crate::mailbox::MailboxOp::Error(node_id, handle) => self.error(node_id, handle),
+            // D233: owner-side closure with the full object-safe Core
+            // surface — applied in-wave (we hold `&Core`); the sink's
+            // topology mutation + result consumption runs here.
+            crate::mailbox::MailboxOp::Defer(f) => f(self),
+        });
+    }
+
+    /// Shared handle to this `Core`'s [`crate::mailbox::CoreMailbox`].
+    /// Handed to autonomous async producers (timer tasks via
+    /// [`crate::timer::spawn_timer_task`]) so they can post `Emit`
+    /// requests without holding `&Core`/`Weak<C>` (D223/D227/D230).
     #[must_use]
-    pub fn weak_handle(&self) -> WeakCore<C> {
-        WeakCore {
-            state: Arc::downgrade(&self.state),
-            binding: Arc::downgrade(&self.binding),
-            group_locks: Arc::downgrade(&self.group_locks),
-            global_wave: Arc::downgrade(&self.global_wave),
-            generation: self.generation,
-        }
+    pub fn mailbox(&self) -> Arc<crate::mailbox::CoreMailbox> {
+        Arc::clone(&self.mailbox)
+    }
+
+    /// Shared handle to this `Core`'s binding. S2b/D231/A′: producer
+    /// build closures obtain the binding here (via `ctx.core()`) for
+    /// their spawned sinks' `retain_handle`/`pack_tuple`/`release_handle`
+    /// — instead of the deleted `Weak<dyn ProducerBinding>` cycle-break.
+    /// No cycle: the registry-stored build closure captures nothing
+    /// strong; the `Arc<dyn BindingBoundary>` a sink clones lives in
+    /// `Core`'s subscriber map and drops on unsubscribe.
+    #[must_use]
+    pub fn binding(&self) -> Arc<dyn BindingBoundary> {
+        Arc::clone(&self.binding)
     }
 
     /// Number of distinct serialization groups touched so far (§7 group
@@ -3513,8 +3589,13 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///   invariant ([`SubscribeError::PartitionOrderViolation`]).
     /// - The node is non-resubscribable AND has terminated
     ///   ([`SubscribeError::TornDown`], R2.2.7.b).
+    /// Returns the [`SubscriptionId`]. Pair it with the `node_id` you
+    /// passed here and call [`Self::unsubscribe`] to deregister (S2b /
+    /// D225: core-level RAII retired — a binding-layer RAII wrapper over
+    /// `unsubscribe` provides drop-convenience where the holder co-owns
+    /// the `Core` on its affinity worker).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
-    pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> Subscription<C> {
+    pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
         match self.try_subscribe(node_id, sink) {
             Ok(sub) => sub,
             Err(e) => panic!("{e}"),
@@ -3532,12 +3613,13 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// wrapper over this method (the binding holds its `Core` on its
     /// affinity worker, so its wrapper's `Drop` calls this synchronously).
     ///
-    /// `pub(crate)` for S2a (no external caller yet; `SubscriptionId` is
-    /// `pub(crate)`). S2b promotes both to `pub` as the binding-facing
-    /// surface that replaces the core-level RAII `Subscription`.
-    #[allow(dead_code)] // wired to a caller (binding-layer RAII) in S2b; S2a lands the method behaviour-identical.
-    pub(crate) fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
-        unsubscribe_sink(&*self.state, node_id, sub_id);
+    /// S2b promotes this (and [`SubscriptionId`]) to `pub` as the
+    /// binding-facing surface that replaces the retired core-level RAII
+    /// `Subscription`. Callers (binding-layer RAII wrapper, producer
+    /// `producer_deactivate` per D229, tests) pair the `node_id` they
+    /// subscribed with the returned `sub_id`.
+    pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        unsubscribe_sink(&self.state, node_id, sub_id);
     }
 
     /// Fallible subscribe. Returns `Err` on:
@@ -3551,7 +3633,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         &self,
         node_id: NodeId,
         sink: Sink,
-    ) -> Result<Subscription<C>, SubscribeError> {
+    ) -> Result<SubscriptionId, SubscribeError> {
         // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
         //
         // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
@@ -3811,11 +3893,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // may itself produce new deferred ops.
         self.drain_deferred_producer_ops();
 
-        Ok(Subscription {
-            state: Arc::downgrade(&self.state),
-            node_id,
-            sub_id,
-        })
+        Ok(sub_id)
     }
 
     /// Mark `node_id` as resubscribable per R2.2.7. Resubscribable nodes
@@ -4179,7 +4257,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// the drain releases it after firing (or on discard).
     pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId)
     where
-        C: Send + Sync,
+        // S2b (D221/D223): the owned cell relocates between workers by
+        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
+        // no cross-thread sharing of `&Core`.
+        C: Send,
     {
         if self.try_emit(node_id, new_handle).is_err() {
             self.binding.retain_handle(new_handle);
@@ -4347,7 +4428,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// For producer-pattern operator sinks.
     pub fn complete_or_defer(&self, node_id: NodeId)
     where
-        C: Send + Sync,
+        // S2b (D221/D223): the owned cell relocates between workers by
+        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
+        // no cross-thread sharing of `&Core`.
+        C: Send,
     {
         match self.try_complete(node_id) {
             Ok(()) => {}
@@ -4400,7 +4484,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// the drain releases it after firing (or on discard).
     pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId)
     where
-        C: Send + Sync,
+        // S2b (D221/D223): the owned cell relocates between workers by
+        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
+        // no cross-thread sharing of `&Core`.
+        C: Send,
     {
         if self.try_error(node_id, error_handle).is_err() {
             self.binding.retain_handle(error_handle);
@@ -4635,18 +4722,23 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// For producer-pattern operator sinks.
     pub fn teardown_or_defer(&self, node_id: NodeId)
     where
-        C: Send + Sync,
+        // S2b (D221/D223): the owned cell relocates between workers by
+        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
+        // no cross-thread sharing of `&Core`.
+        C: Send,
     {
         let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(_) => {
-                self.push_deferred_producer_op(DeferredProducerOp::Callback(Box::new({
-                    let core = self.clone();
-                    move || {
-                        core.teardown(node_id);
-                    }
-                })));
+                // S2b (D223): `Core` is no longer `Clone`. The old
+                // `DeferredProducerOp::Callback(move || core.teardown(..))`
+                // boxed a cloned `Core` only to have
+                // `push_deferred_producer_op` run it *immediately* (the
+                // deferred queue is a deleted D211 no-op shim). A direct
+                // owner-context call is behaviour-identical and drops the
+                // pointless `Send`-closure (which now needs `C: Sync`).
+                self.teardown(node_id);
             }
         }
     }
@@ -4906,7 +4998,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Panics if `node_id` is not registered in this Core.
     pub fn invalidate_or_defer(&self, node_id: NodeId)
     where
-        C: Send + Sync,
+        // S2b (D221/D223): the owned cell relocates between workers by
+        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
+        // no cross-thread sharing of `&Core`.
+        C: Send,
     {
         let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         {
@@ -4918,12 +5013,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             this.invalidate_inner(&mut s, node_id);
         });
         if result.is_err() {
-            self.push_deferred_producer_op(DeferredProducerOp::Callback(Box::new({
-                let core = self.clone();
-                move || {
-                    core.invalidate(node_id);
-                }
-            })));
+            // S2b (D223): direct owner-context call — see the identical
+            // rationale in `teardown_or_defer` (immediate-run no-op shim;
+            // no `Clone`, no pointless `Send` closure needing `C: Sync`).
+            self.invalidate(node_id);
         }
     }
 
@@ -5400,8 +5493,11 @@ pub enum SetGroupError {
 /// handed from `set_serialization_group` Phase 1 to Phase 3.
 type MovedComponent = (Vec<(NodeId, NodeRecord)>, Vec<(NodeId, HashSet<NodeId>)>);
 
-struct MigrationRollback<C: crate::state_cell::StateCell> {
-    core: Core<C>,
+// S2b (D223): borrows `&'a Core` (no `Clone`). Lives entirely within
+// `set_serialization_group`'s scope — `self` strictly outlives it
+// (same pattern as S1's `FiringGuard<'a, C>`).
+struct MigrationRollback<'a, C: crate::state_cell::StateCell> {
+    core: &'a Core<C>,
     src: crate::state_cell::ShardKey,
     old_group: crate::state_cell::ShardKey,
     members: Vec<NodeId>,
@@ -5410,7 +5506,7 @@ struct MigrationRollback<C: crate::state_cell::StateCell> {
     armed: bool,
 }
 
-impl<C: crate::state_cell::StateCell> MigrationRollback<C> {
+impl<C: crate::state_cell::StateCell> MigrationRollback<'_, C> {
     /// Disarm + hand the extracted component to Phase 3 (single move;
     /// the only ops between this and `disarm` are infallible inserts).
     fn take_payload(&mut self) -> MovedComponent {
@@ -5422,7 +5518,7 @@ impl<C: crate::state_cell::StateCell> MigrationRollback<C> {
     }
 }
 
-impl<C: crate::state_cell::StateCell> Drop for MigrationRollback<C> {
+impl<C: crate::state_cell::StateCell> Drop for MigrationRollback<'_, C> {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -5532,7 +5628,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 
         // Phase 1 (shard `src`): validate + extract the whole component.
         let mut rollback = MigrationRollback {
-            core: self.clone(),
+            core: self,
             src,
             old_group,
             members: Vec::new(),

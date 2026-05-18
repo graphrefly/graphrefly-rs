@@ -124,7 +124,14 @@ impl BindingBoundary for ProducerBinding {
         *inner.refcounts.entry(handle).or_insert(0) += 1;
     }
 
-    fn producer_deactivate(&self, node_id: NodeId) {
+    fn producer_deactivate(
+        &self,
+        node_id: NodeId,
+        _unsub: &dyn Fn(NodeId, graphrefly_core::SubscriptionId),
+    ) {
+        // S2b/D229: this test binding only counts deactivations; it
+        // records no upstream subs, so the owner-supplied `unsub` is
+        // unused here.
         let mut inner = self.inner.lock().unwrap();
         *inner.deactivate_calls.entry(node_id).or_insert(0) += 1;
     }

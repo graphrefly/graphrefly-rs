@@ -915,6 +915,41 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     pub(crate) fn drain_and_flush(&self) {
         let mut guard = 0u32;
         loop {
+            // A′ (D232-AMEND): apply any producer-sink / timer
+            // `MailboxOp`s **in-wave** at the top of every drain
+            // iteration. Each applied op re-enters `Core::{emit,
+            // complete,error}` with `in_tick = true` (non-owning batch
+            // guard → it does NOT start its own drain; it queues into
+            // this wave's `pending_fires`), so a sink that posted during
+            // the previous `fire_fn` is picked up on the very next
+            // iteration — immediate, in-wave, cascade-ordering-preserving
+            // (consistent with the pre-S2b deferred-producer-op
+            // drained-within-the-wave behaviour). Quiescence requires
+            // BOTH `pending_fires` AND the mailbox empty.
+            //
+            // §7-floor guard (D-reflect, 2026-05-17): gate on the cheap
+            // `runnable` atomic (one `Acquire` load) BEFORE touching the
+            // mailbox `parking_lot::Mutex`. A no-producer / no-timer wave
+            // (the `identity_dedup` ≈508 ns floor path) never posts, so
+            // `runnable` stays `false` and this costs one relaxed-ish
+            // atomic load per drain iteration — NOT a mutex lock + deque
+            // pop. **Sink-side** posts are same-thread, in-wave: the
+            // `runnable` Release precedes this Acquire on the same
+            // thread, so no in-wave op is missed. **Task-side** posts
+            // (timer/temporal `tokio::spawn` tasks) are cross-thread:
+            // their happens-before is the `ops` `parking_lot::Mutex`
+            // (acquire/release), NOT this atomic — `runnable` is only an
+            // advisory fast-path bit there, and a racing task post is
+            // caught by the embedder pump's *unconditional*
+            // `drain_mailbox()` (timer tasks drain at the pump, not this
+            // in-wave gate). Do NOT remove the unconditional pump drain.
+            // This is exactly the per-group wake bit S4 wires to the
+            // host executor — doing it here now is coherent, not
+            // throwaway.
+            if self.mailbox.is_runnable() {
+                self.drain_mailbox();
+            }
+
             // R1.3.8.c (Slice F, A3): if no fires are pending but there are
             // queued pause-overflow ERRORs, synthesize them now. The
             // resulting ERROR cascade may add to pending_fires (children
@@ -972,11 +1007,37 @@ impl<C: crate::state_cell::StateCell> Core<C> {
                     let next = Self::pick_next_fire(&s, ws);
                     (next, size)
                 });
-                if pending_size == 0 {
-                    break;
-                }
                 (next, cap, pending_size)
             };
+            if pending_size == 0 {
+                // QA F1 (2026-05-18): quiescence requires BOTH
+                // `pending_fires` AND the mailbox empty — the asserted
+                // invariant the old `if pending_size == 0 { break }`
+                // did NOT enforce. If the mailbox still holds work,
+                // `continue` so the next iteration's top-of-loop
+                // `is_runnable()`-gated `drain_mailbox()` applies it
+                // (an applied op either cascades into `pending_fires`
+                // or, if terminal/no-op, leaves the mailbox empty so
+                // the *next* check breaks). §7 floor: no producer/timer
+                // ⇒ never posted ⇒ `is_runnable()` false ⇒ breaks on the
+                // first empty `pending_fires` (one atomic load — already
+                // in the floor budget).
+                // QA P3 (2026-05-18): the mailbox-continue does NOT
+                // count against the fire-cascade `cap`. `drain_mailbox`
+                // already drains the FIFO to quiescence in ONE call
+                // (re-posts during `apply` are popped by the same
+                // `drain_into` loop), and the self-reposting-`Defer`
+                // livelock is bounded INSIDE `drain_into` (its own
+                // `max_ops`). Reaching here `is_runnable()` again means
+                // genuinely-new cross-thread (timer) work — bounded by
+                // external input, not a fire cycle — so counting it
+                // against the fire `cap` would false-trip a production
+                // panic on heavy producer/timer graphs.
+                if self.mailbox.is_runnable() {
+                    continue;
+                }
+                break;
+            }
             guard += 1;
             assert!(
                 guard < cap,
@@ -3313,7 +3374,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// wave (only the outermost guard drains).
     ///
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-    pub fn begin_batch(&self) -> BatchGuard<C> {
+    pub fn begin_batch(&self) -> BatchGuard<'_, C> {
         // §7 (D208–D211): closure-form batch has no known seed, so it
         // serializes against **every** serialization group. Acquire each
         // group's wave-lock in ascending `SerializationGroupId` order
@@ -3366,7 +3427,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Slice Y1 / Phase E (2026-05-08); QA-fix #2 (2026-05-09).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-    pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<C> {
+    pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<'_, C> {
         match self.try_begin_batch_for(seed) {
             Ok(guard) => guard,
             Err(e) => panic!("{e}"),
@@ -3384,7 +3445,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     pub(crate) fn try_begin_batch_for(
         &self,
         seed: crate::handle::NodeId,
-    ) -> Result<BatchGuard<C>, crate::node::PartitionOrderViolation> {
+    ) -> Result<BatchGuard<'_, C>, crate::node::PartitionOrderViolation> {
         // Step 2b-ii (D220-EXEC): route the entire wave to the seed's
         // shard. Set the ambient BEFORE `acquire_touched_group_guards`
         // — it calls `compute_touched_groups(seed)` → `lock_state()`,
@@ -3443,7 +3504,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         &self,
         wave_guards: SmallVec<[crate::node::WaveOwnerGuard; 4]>,
         shard_key_guard: crate::node::ShardKeyGuard,
-    ) -> BatchGuard<C> {
+    ) -> BatchGuard<'_, C> {
         // Claim wave ownership for this (Core, thread). Keyed per-(Core,
         // thread) in the `IN_TICK_OWNED` thread_local (see its doc for
         // the cross-Core / disjoint-partition / nested-re-entry rationale)
@@ -3470,7 +3531,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             wave_state_clear_outermost();
         }
         BatchGuard {
-            core: self.clone(),
+            core: self,
             owns_tick,
             wave_guards,
             // Held for the wave's duration; restores the previous
@@ -3541,8 +3602,14 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 /// requires_send(guard); // <- compile_fail: BatchGuard is !Send.
 /// ```
 #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
-pub struct BatchGuard<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    core: Core<C>,
+pub struct BatchGuard<'a, C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
+    // S2b (D223): borrows `&'a Core` — `Core` is no longer `Clone`
+    // (owned-by-value, relocates between workers). The guard lives
+    // entirely within the wave scope of the `&self` that produced it
+    // (`begin_batch*` takes `&self`), so `self` strictly outlives the
+    // guard — identical to S1's `FiringGuard<'a, C>`. Still `!Send` via
+    // `_not_send` + the `wave_guards` `!Send` `ArcReentrantMutexGuard`s.
+    core: &'a Core<C>,
     owns_tick: bool,
     /// Re-entrant mutex guards held for the wave's duration. One entry
     /// per touched partition's `wave_owner`, in ascending
@@ -3575,7 +3642,7 @@ pub struct BatchGuard<C: crate::state_cell::StateCell = crate::state_cell::Locke
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
-impl<C: crate::state_cell::StateCell> BatchGuard<C> {
+impl<C: crate::state_cell::StateCell> BatchGuard<'_, C> {
     /// Panic-discard cleanup for the owning guard: drop pending wave
     /// work, release queued payload + handle retains lock-released,
     /// restore pre-wave cache snapshots, clear per-thread `WaveState` +
@@ -3694,7 +3761,7 @@ impl<C: crate::state_cell::StateCell> BatchGuard<C> {
     }
 }
 
-impl<C: crate::state_cell::StateCell> Drop for BatchGuard<C> {
+impl<C: crate::state_cell::StateCell> Drop for BatchGuard<'_, C> {
     fn drop(&mut self) {
         if !self.owns_tick {
             // Nested / non-owning guard: never claimed ownership, so it

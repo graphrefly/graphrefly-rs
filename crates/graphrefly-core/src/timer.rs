@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 
 use crate::boundary::BindingBoundary;
 use crate::handle::{HandleId, NodeId};
-use crate::node::WeakCore;
+use crate::mailbox::CoreMailbox;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -149,12 +149,12 @@ impl Drop for TimerTaskHandle {
 ///
 /// Must be called from within a tokio runtime context.
 pub fn spawn_timer_task(
-    core: WeakCore,
+    mailbox: Arc<CoreMailbox>,
     node_id: NodeId,
     binding: Arc<dyn BindingBoundary>,
 ) -> TimerTaskHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(timer_task_loop(rx, core, node_id, binding));
+    tokio::spawn(timer_task_loop(rx, mailbox, node_id, binding));
     TimerTaskHandle { tx: Some(tx) }
 }
 
@@ -165,7 +165,7 @@ pub fn spawn_timer_task(
 /// Internal: the async task that manages timers for one node.
 async fn timer_task_loop(
     mut rx: mpsc::UnboundedReceiver<TimerCmd>,
-    core: WeakCore,
+    mailbox: Arc<CoreMailbox>,
     node_id: NodeId,
     binding: Arc<dyn BindingBoundary>,
 ) {
@@ -213,9 +213,18 @@ async fn timer_task_loop(
                         let slot = slots.swap_remove(i);
                         match slot.kind {
                             TimerSlotKind::Emit(handle) => {
-                                if let Some(c) = core.upgrade() {
-                                    c.emit(node_id, handle);
-                                } else {
+                                // D227/D230: post to the `Send + Sync`
+                                // mailbox instead of upgrading a `Weak<C>`
+                                // (deleted in S2b — the `Core` relocates
+                                // between workers). The owner applies it
+                                // via `Core::drain_mailbox` → sync `emit`
+                                // (no async in Core). `post_emit` returns
+                                // `false` iff the owning `Core` already
+                                // dropped — the exact teardown branch the
+                                // old `WeakCore::upgrade() == None` took
+                                // (release the handle, drain the rest,
+                                // exit the task).
+                                if !mailbox.post_emit(node_id, handle) {
                                     binding.release_handle(handle);
                                     release_all_slots(&mut slots, &*binding);
                                     return;
@@ -291,12 +300,19 @@ mod tests {
     use crate::boundary::{DepBatch, FnResult};
     use crate::handle::FnId;
 
-    /// Yield multiple times to let spawned tasks process commands and
-    /// complete emit→wave→sink chains in the current-thread runtime.
-    async fn settle() {
+    /// Yield multiple times to let spawned tasks process commands, then
+    /// drain the mailbox owner-side (D230). Timer tasks post `Emit`s to
+    /// the `CoreMailbox`; `drain_mailbox` applies them via the sync
+    /// `emit` → wave → sink. This is the embedder's pump point and is
+    /// behaviour-identical to the deleted autonomous
+    /// `WeakCore::upgrade → core.emit`: the test already had to advance
+    /// the runtime for the timer task to fire at all. Draining an empty
+    /// mailbox is an idempotent no-op (safe before any timer fires).
+    async fn settle(core: &crate::node::Core) {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+        core.drain_mailbox();
     }
 
     /// Minimal binding for timer tests — tracks released handles.
@@ -341,7 +357,7 @@ mod tests {
 
         let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (core, node, binding) = make_test_core(released.clone());
-        let weak = core.weak_handle();
+        let mailbox = core.mailbox();
 
         let emitted = Arc::new(parking_lot::Mutex::new(Vec::<HandleId>::new()));
         let em = emitted.clone();
@@ -356,7 +372,7 @@ mod tests {
             }),
         );
 
-        let task = spawn_timer_task(weak, node, binding.clone());
+        let task = spawn_timer_task(mailbox, node, binding.clone());
         let h1 = HandleId::new(42);
         binding.retain_handle(h1);
 
@@ -368,10 +384,10 @@ mod tests {
             })
             .unwrap();
 
-        settle().await; // task processes Schedule, enters sleep_until
+        settle(&core).await; // task processes Schedule, enters sleep_until
 
         tokio::time::advance(Duration::from_millis(51)).await;
-        settle().await; // task fires timer, emit → wave → sink
+        settle(&core).await; // task fires timer, emit → wave → sink
 
         let got = emitted.lock().clone();
         assert_eq!(got, vec![h1], "timer should have emitted h1");
@@ -383,9 +399,9 @@ mod tests {
 
         let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (core, node, binding) = make_test_core(released.clone());
-        let weak = core.weak_handle();
+        let mailbox = core.mailbox();
 
-        let task = spawn_timer_task(weak, node, binding.clone());
+        let task = spawn_timer_task(mailbox, node, binding.clone());
         let h1 = HandleId::new(42);
         binding.retain_handle(h1);
 
@@ -398,7 +414,7 @@ mod tests {
             .unwrap();
 
         task.sender().send(TimerCmd::Cancel { tag: 0 }).unwrap();
-        settle().await;
+        settle(&core).await;
 
         assert!(
             released.lock().contains(&h1),
@@ -412,7 +428,7 @@ mod tests {
 
         let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (core, node, binding) = make_test_core(released.clone());
-        let weak = core.weak_handle();
+        let mailbox = core.mailbox();
 
         let emitted = Arc::new(parking_lot::Mutex::new(Vec::<HandleId>::new()));
         let em = emitted.clone();
@@ -427,7 +443,7 @@ mod tests {
             }),
         );
 
-        let task = spawn_timer_task(weak, node, binding.clone());
+        let task = spawn_timer_task(mailbox, node, binding.clone());
         let h1 = HandleId::new(10);
         let h2 = HandleId::new(20);
         binding.retain_handle(h1);
@@ -451,14 +467,14 @@ mod tests {
             })
             .unwrap();
 
-        settle().await;
+        settle(&core).await;
 
         // h1 released (cancelled).
         assert!(released.lock().contains(&h1));
 
         // Advance past h2's deadline.
         tokio::time::advance(Duration::from_millis(51)).await;
-        settle().await;
+        settle(&core).await;
 
         let got = emitted.lock().clone();
         assert_eq!(got, vec![h2], "only h2 should fire");
@@ -470,9 +486,9 @@ mod tests {
 
         let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (core, node, binding) = make_test_core(released.clone());
-        let weak = core.weak_handle();
+        let mailbox = core.mailbox();
 
-        let mut task = spawn_timer_task(weak, node, binding.clone());
+        let mut task = spawn_timer_task(mailbox, node, binding.clone());
         let h1 = HandleId::new(42);
         binding.retain_handle(h1);
 
@@ -484,11 +500,11 @@ mod tests {
             })
             .unwrap();
 
-        settle().await;
+        settle(&core).await;
 
         // Shutdown (simulates operator deactivation).
         task.shutdown();
-        settle().await;
+        settle(&core).await;
 
         assert!(
             released.lock().contains(&h1),
@@ -502,7 +518,7 @@ mod tests {
 
         let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (core, node, binding) = make_test_core(released.clone());
-        let weak = core.weak_handle();
+        let mailbox = core.mailbox();
 
         let emitted = Arc::new(parking_lot::Mutex::new(Vec::<HandleId>::new()));
         let em = emitted.clone();
@@ -517,7 +533,7 @@ mod tests {
             }),
         );
 
-        let task = spawn_timer_task(weak, node, binding.clone());
+        let task = spawn_timer_task(mailbox, node, binding.clone());
         let h1 = HandleId::new(10);
         let h2 = HandleId::new(20);
         binding.retain_handle(h1);
@@ -540,16 +556,16 @@ mod tests {
             .unwrap();
 
         // Yield so the task processes both Schedule commands.
-        settle().await; // task processes both Schedule commands
+        settle(&core).await; // task processes both Schedule commands
 
         // Advance to 51ms — h2 fires.
         tokio::time::advance(Duration::from_millis(51)).await;
-        settle().await;
+        settle(&core).await;
         assert_eq!(*emitted.lock(), vec![h2]);
 
         // Advance to 101ms — h1 fires.
         tokio::time::advance(Duration::from_millis(50)).await;
-        settle().await;
+        settle(&core).await;
         assert_eq!(*emitted.lock(), vec![h2, h1]);
     }
 }

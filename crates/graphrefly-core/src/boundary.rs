@@ -23,6 +23,7 @@
 use smallvec::SmallVec;
 
 use crate::handle::{FnId, HandleId, NodeId, NO_HANDLE};
+use crate::node::SubscriptionId;
 
 /// Per-dep batch data passed to [`BindingBoundary::invoke_fn`].
 ///
@@ -376,13 +377,23 @@ pub trait BindingBoundary: Send + Sync {
 
     /// Called when a producer node loses its last subscriber. The binding
     /// should drop any per-node state for `node_id` — captured closures,
-    /// `Vec<Subscription>` to upstream sources, etc. Default no-op for
-    /// bindings that don't ship producers.
+    /// recorded upstream `(NodeId, SubscriptionId)` pairs, etc. Default
+    /// no-op for bindings that don't ship producers.
     ///
-    /// Fires lock-released; re-entrance into Core (e.g., `release_handle`
-    /// on captured handle shares, or even `subscribe` for re-activation
-    /// scenarios — though the latter is unusual) is permitted.
-    fn producer_deactivate(&self, _node_id: NodeId) {}
+    /// Fires lock-released; re-entrance into Core is permitted.
+    ///
+    /// S2b / D229: core-level RAII `Subscription` is retired (D223/D225 —
+    /// a parameterless `Drop` cannot reach a relocating owned `Core`). The
+    /// binding therefore records upstream subs as `(NodeId,
+    /// SubscriptionId)` and unsubscribes them HERE via `unsub` — a
+    /// `Core::unsubscribe`-capable closure the owner-driven `unsubscribe`
+    /// chain passes in (it holds the `&Core` already, exactly the
+    /// synchronous owner context D225 requires; no `Weak<C>`, no
+    /// `unsafe`, no parameterless-`Drop`). Calling `unsub(up_node,
+    /// up_sub)` is behaviour-identical to the old `Subscription::Drop`
+    /// (it runs the same deregister + Phase-G chain, and re-entrant
+    /// producer cascades work because the call is lock-released).
+    fn producer_deactivate(&self, _node_id: NodeId, _unsub: &dyn Fn(NodeId, SubscriptionId)) {}
 
     /// R1.3.8.c / Lock 6.A — synthesize an ERROR payload when a paused
     /// node's pause buffer overflows the configured cap. Called once per

@@ -7,7 +7,7 @@
 //! - [`window`] — notifier-triggered sub-node splitting.
 //! - [`window_count`] — count-based sub-node splitting.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -56,20 +56,18 @@ pub fn buffer(
     notifier: NodeId,
     pack_fn_id: FnId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<BufferState>> = Arc::new(Mutex::new(BufferState::new()));
 
         // --- source sink ---
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let core_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 Flush(Vec<HandleId>),
@@ -152,7 +150,7 @@ pub fn buffer(
 
         // --- notifier sink ---
         let st2 = state.clone();
-        let core_n = core_s.clone();
+        let core_n = em.clone();
         let bb2: Arc<dyn BindingBoundary> = binding_s.clone();
         let notifier_sink: Sink = Arc::new(move |msgs| {
             enum Act {
@@ -258,19 +256,17 @@ pub fn buffer_count(
 ) -> NodeId {
     assert!(count > 0, "buffer_count: count must be > 0");
 
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<BufferCountState>> = Arc::new(Mutex::new(BufferCountState::new()));
 
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let core_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 Flush(Vec<HandleId>),
@@ -397,19 +393,17 @@ pub fn window(
     source: NodeId,
     notifier: NodeId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<WindowState>> = Arc::new(Mutex::new(WindowState::new()));
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
         // Create first inner window node and emit it.
-        let first_inner = create_window_node(&core_s, &*bb);
+        let first_inner = create_window_node(core_s, &*bb);
         {
             let mut s = state.lock();
             s.inner_id = Some(first_inner.0);
@@ -417,69 +411,82 @@ pub fn window(
         core_s.emit_or_defer(pid, first_inner.1);
 
         // --- source sink ---
+        // D234: the inner-window selector `s.inner_id` MUST be read
+        // INSIDE the owner-serialized defer closures (never at sink-fire
+        // time) so a source-DATA firing between a notifier-DATA and its
+        // window-roll defer still routes to the correct window. Mailbox
+        // FIFO = arrival order ⇒ a roll posted before a forward is
+        // applied first, so the in-closure `inner_id` read sees the new
+        // window. `terminated` stays a fire-time monotonic gate; retains
+        // happen at fire time (Core owns the share for the emit) and are
+        // released if `em.defer` reports the Core gone (F2 contract).
         let st = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let em_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
-            enum Act {
-                Forward(NodeId, HandleId),
-                CompleteInner(NodeId),
-                CompleteSelf,
-                ErrorInner(NodeId, HandleId),
-                ErrorSelf(HandleId),
-            }
-            let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
-            {
-                let mut s = st.lock();
-                if s.terminated {
-                    return;
+            for m in msgs {
+                // QA P1: per-message terminal gate (restores the retired
+                // `if s.terminated { break }`) — a batched
+                // `[COMPLETE, DATA]` must NOT forward DATA after the
+                // COMPLETE (R2.6.4 / no-data-after-terminal).
+                if st.lock().terminated {
+                    break;
                 }
-                for m in msgs {
-                    if s.terminated {
+                match m.tier() {
+                    3 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_src.retain_handle(h);
+                            let st_c = st.clone();
+                            let bb_c = bb_src.clone();
+                            if !em_src.defer(move |c| {
+                                let inner = st_c.lock().inner_id;
+                                match inner {
+                                    Some(i) => c.emit(i, h),
+                                    None => bb_c.release_handle(h),
+                                }
+                            }) {
+                                bb_src.release_handle(h);
+                            }
+                        }
+                    }
+                    5 => {
+                        // QA P1: atomic terminal-winner — only the first
+                        // terminal (across THIS sink and the notifier
+                        // sink) defers the terminal cascade. Without
+                        // this, source-COMPLETE and notifier-ERROR each
+                        // pass their fire-time check before either defer
+                        // runs → double terminal on `pid`.
+                        let was = std::mem::replace(&mut st.lock().terminated, true);
+                        if was {
+                            break;
+                        }
+                        if let Some(h) = m.payload_handle() {
+                            // ERROR — error current window + error self.
+                            bb_src.retain_handle(h);
+                            let st_c = st.clone();
+                            let bb_c = bb_src.clone();
+                            if !em_src.defer(move |c| {
+                                if let Some(i) = st_c.lock().inner_id.take() {
+                                    bb_c.retain_handle(h);
+                                    c.error(i, h);
+                                }
+                                c.error(pid, h);
+                            }) {
+                                bb_src.release_handle(h);
+                            }
+                        } else {
+                            // COMPLETE — complete current window, then self.
+                            let st_c = st.clone();
+                            let _ = em_src.defer(move |c| {
+                                if let Some(i) = st_c.lock().inner_id.take() {
+                                    c.complete(i);
+                                }
+                                c.complete(pid);
+                            });
+                        }
                         break;
                     }
-                    match m.tier() {
-                        3 => {
-                            if let Some(h) = m.payload_handle() {
-                                bb_src.retain_handle(h);
-                                if let Some(inner) = s.inner_id {
-                                    actions.push(Act::Forward(inner, h));
-                                } else {
-                                    bb_src.release_handle(h);
-                                }
-                            }
-                        }
-                        5 => {
-                            if let Some(h) = m.payload_handle() {
-                                // ERROR — error current window + error self
-                                s.terminated = true;
-                                bb_src.retain_handle(h);
-                                if let Some(inner) = s.inner_id.take() {
-                                    // Retain again for inner error
-                                    bb_src.retain_handle(h);
-                                    actions.push(Act::ErrorInner(inner, h));
-                                }
-                                actions.push(Act::ErrorSelf(h));
-                            } else {
-                                // COMPLETE — complete current window, then self
-                                s.terminated = true;
-                                if let Some(inner) = s.inner_id.take() {
-                                    actions.push(Act::CompleteInner(inner));
-                                }
-                                actions.push(Act::CompleteSelf);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            for a in actions {
-                match a {
-                    Act::Forward(inner, h) => core_src.emit_or_defer(inner, h),
-                    Act::CompleteInner(inner) => core_src.complete_or_defer(inner),
-                    Act::CompleteSelf => core_src.complete_or_defer(pid),
-                    Act::ErrorInner(inner, h) => core_src.error_or_defer(inner, h),
-                    Act::ErrorSelf(h) => core_src.error_or_defer(pid, h),
+                    _ => {}
                 }
             }
         });
@@ -500,64 +507,67 @@ pub fn window(
         }
 
         // --- notifier sink ---
+        // D234: the window roll (complete old → create new → swap
+        // `inner_id` → emit new) is ONE owner-side defer closure, so it
+        // is atomic w.r.t. the FIFO drain and `create_window_node` (a
+        // `CoreFull::register_state`) runs in-wave. A roll posted before
+        // a later source-forward defer is applied first ⇒ that forward's
+        // in-closure `inner_id` read sees the new window. The `new_id`
+        // is consumed entirely inside the closure (drives captured
+        // state); a Core-gone `defer` drops it unrun with nothing
+        // created/retained yet (no leak — that is why the create lives
+        // in the closure, not before it).
         let st2 = state.clone();
-        let core_n = core_s.clone();
+        let em_not = em.clone();
         let bb_not: Arc<dyn BindingBoundary> = binding_s.clone();
         let notifier_sink: Sink = Arc::new(move |msgs| {
-            enum Act {
-                CompleteOldEmitNew(NodeId, HandleId),
-                ErrorInner(NodeId, HandleId),
-                ErrorSelf(HandleId),
-            }
-            let mut actions: SmallVec<[Act; 2]> = SmallVec::new();
-            {
-                let mut s = st2.lock();
-                if s.terminated {
-                    return;
+            for m in msgs {
+                // QA P1: per-message terminal gate.
+                if st2.lock().terminated {
+                    break;
                 }
-                for m in msgs {
-                    if s.terminated {
-                        break;
-                    }
-                    match m.tier() {
-                        3 if m.payload_handle().is_some() => {
-                            // Complete current window, create new one, emit it.
-                            let old_inner = s.inner_id.take();
-                            let (new_id, new_handle) = create_window_node(&core_n, &*bb_not);
-                            s.inner_id = Some(new_id);
+                match m.tier() {
+                    3 if m.payload_handle().is_some() => {
+                        let st_c = st2.clone();
+                        let bb_c = bb_not.clone();
+                        let _ = em_not.defer(move |c| {
+                            let (new_id, new_handle) = create_window_node(c, &*bb_c);
+                            let old_inner = st_c.lock().inner_id.replace(new_id);
+                            // Degenerate `None` (unreachable when not
+                            // terminated): there is no prior window to
+                            // complete; just emit the new one.
                             if let Some(old) = old_inner {
-                                actions.push(Act::CompleteOldEmitNew(old, new_handle));
-                            } else {
-                                // Degenerate: inner_id was None (unreachable if
-                                // not terminated). Emit the new window directly.
-                                actions.push(Act::CompleteOldEmitNew(new_id, new_handle));
+                                c.complete(old);
                             }
-                        }
-                        5 => {
-                            if let Some(h) = m.payload_handle() {
-                                // Notifier ERROR — error current window + error self
-                                s.terminated = true;
-                                bb_not.retain_handle(h);
-                                if let Some(inner) = s.inner_id.take() {
-                                    bb_not.retain_handle(h);
-                                    actions.push(Act::ErrorInner(inner, h));
+                            c.emit(pid, new_handle);
+                        });
+                    }
+                    5 => {
+                        if let Some(h) = m.payload_handle() {
+                            // Notifier ERROR — error current window + self.
+                            // QA P1: atomic terminal-winner vs the source
+                            // sink's COMPLETE/ERROR (no double-terminal).
+                            let was = std::mem::replace(&mut st2.lock().terminated, true);
+                            if was {
+                                break;
+                            }
+                            bb_not.retain_handle(h);
+                            let st_c = st2.clone();
+                            let bb_c = bb_not.clone();
+                            if !em_not.defer(move |c| {
+                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                    bb_c.retain_handle(h);
+                                    c.error(inner, h);
                                 }
-                                actions.push(Act::ErrorSelf(h));
+                                c.error(pid, h);
+                            }) {
+                                bb_not.release_handle(h);
                             }
-                            // Notifier COMPLETE: do NOT auto-complete.
+                            break;
                         }
-                        _ => {}
+                        // Notifier COMPLETE: do NOT auto-complete.
                     }
-                }
-            }
-            for a in actions {
-                match a {
-                    Act::CompleteOldEmitNew(old, new_handle) => {
-                        core_n.complete_or_defer(old);
-                        core_n.emit_or_defer(pid, new_handle);
-                    }
-                    Act::ErrorInner(inner, h) => core_n.error_or_defer(inner, h),
-                    Act::ErrorSelf(h) => core_n.error_or_defer(pid, h),
+                    _ => {}
                 }
             }
         });
@@ -572,7 +582,10 @@ pub fn window(
 
 /// Create a new inner window state node and return `(NodeId, HandleId)`.
 /// The `HandleId` represents the inner node as a value (via `intern_node`).
-fn create_window_node(core: &Core, binding: &dyn BindingBoundary) -> (NodeId, HandleId) {
+fn create_window_node(
+    core: &dyn graphrefly_core::CoreFull,
+    binding: &dyn BindingBoundary,
+) -> (NodeId, HandleId) {
     let inner_id = core
         .register_state(graphrefly_core::NO_HANDLE, false)
         .expect("window: register_state for inner node failed");
@@ -626,19 +639,17 @@ pub fn window_count(
 ) -> NodeId {
     assert!(count > 0, "window_count: count must be > 0");
 
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<WindowCountState>> = Arc::new(Mutex::new(WindowCountState::new()));
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
         // Create first inner window and emit it.
-        let first_inner = create_window_node(&core_s, &*bb);
+        let first_inner = create_window_node(core_s, &*bb);
         {
             let mut s = state.lock();
             s.inner_id = Some(first_inner.0);
@@ -647,82 +658,97 @@ pub fn window_count(
         core_s.emit_or_defer(pid, first_inner.1);
 
         // --- source sink ---
+        // D234: forward + count + window-roll are ONE owner-side defer
+        // per source-DATA. Defer closures run serially in FIFO drain
+        // order, so the counter increment, the threshold check, the
+        // `create_window_node` (a `CoreFull::register_state`), the
+        // `inner_id` swap, the old-window complete and the new-window
+        // emit are all consistent — equivalent to the old
+        // synchronous-under-lock path, just relocated owner-side. The
+        // operator `Mutex` is dropped before every `CoreFull` call
+        // (no operator-lock held across Core re-entry); it is safe to
+        // re-lock because no other defer runs concurrently (serial drain).
         let st = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let em_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
-            enum Act {
-                Forward(NodeId, HandleId),
-                CompleteWindowEmitNew(NodeId, HandleId),
-                CompleteInner(NodeId),
-                CompleteSelf,
-                ErrorInner(NodeId, HandleId),
-                ErrorSelf(HandleId),
-            }
-            let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
-            {
-                let mut s = st.lock();
-                if s.terminated {
-                    return;
+            for m in msgs {
+                // QA P1: per-message terminal gate.
+                if st.lock().terminated {
+                    break;
                 }
-                for m in msgs {
-                    if s.terminated {
-                        break;
-                    }
-                    match m.tier() {
-                        3 => {
-                            if let Some(h) = m.payload_handle() {
-                                bb_src.retain_handle(h);
-                                if let Some(inner) = s.inner_id {
-                                    actions.push(Act::Forward(inner, h));
-                                    s.counter += 1;
-                                    if s.counter == count {
-                                        // Window full — complete it, open new one.
-                                        let (new_id, new_handle) =
-                                            create_window_node(&core_src, &*bb_src);
-                                        actions.push(Act::CompleteWindowEmitNew(inner, new_handle));
+                match m.tier() {
+                    3 => {
+                        if let Some(h) = m.payload_handle() {
+                            bb_src.retain_handle(h);
+                            let st_c = st.clone();
+                            let bb_c = bb_src.clone();
+                            if !em_src.defer(move |c| {
+                                let (inner, roll) = {
+                                    let mut s = st_c.lock();
+                                    match s.inner_id {
+                                        Some(inner) => {
+                                            s.counter += 1;
+                                            let roll = s.counter == count;
+                                            (Some(inner), roll)
+                                        }
+                                        None => (None, false),
+                                    }
+                                };
+                                let Some(inner) = inner else {
+                                    bb_c.release_handle(h);
+                                    return;
+                                };
+                                c.emit(inner, h);
+                                if roll {
+                                    let (new_id, new_handle) =
+                                        create_window_node(c, &*bb_c);
+                                    {
+                                        let mut s = st_c.lock();
                                         s.inner_id = Some(new_id);
                                         s.counter = 0;
                                     }
-                                } else {
-                                    bb_src.release_handle(h);
+                                    c.complete(inner);
+                                    c.emit(pid, new_handle);
                                 }
+                            }) {
+                                bb_src.release_handle(h);
                             }
                         }
-                        5 => {
-                            if let Some(h) = m.payload_handle() {
-                                // ERROR — error current window + self
-                                s.terminated = true;
-                                bb_src.retain_handle(h);
-                                if let Some(inner) = s.inner_id.take() {
-                                    bb_src.retain_handle(h);
-                                    actions.push(Act::ErrorInner(inner, h));
-                                }
-                                actions.push(Act::ErrorSelf(h));
-                            } else {
-                                // COMPLETE
-                                s.terminated = true;
-                                if let Some(inner) = s.inner_id.take() {
-                                    actions.push(Act::CompleteInner(inner));
-                                }
-                                actions.push(Act::CompleteSelf);
-                            }
+                    }
+                    5 => {
+                        // QA P1: atomic terminal-winner.
+                        let was = std::mem::replace(&mut st.lock().terminated, true);
+                        if was {
+                            break;
                         }
-                        _ => {}
+                        if let Some(h) = m.payload_handle() {
+                            // ERROR — error current window + self.
+                            bb_src.retain_handle(h);
+                            let st_c = st.clone();
+                            let bb_c = bb_src.clone();
+                            if !em_src.defer(move |c| {
+                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                    bb_c.retain_handle(h);
+                                    c.error(inner, h);
+                                }
+                                c.error(pid, h);
+                            }) {
+                                bb_src.release_handle(h);
+                            }
+                        } else {
+                            // COMPLETE.
+                            let st_c = st.clone();
+                            let _ = em_src.defer(move |c| {
+                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                    c.complete(inner);
+                                }
+                                c.complete(pid);
+                            });
+                        }
+                        break;
                     }
-                }
-            }
-            for a in actions {
-                match a {
-                    Act::Forward(inner, h) => core_src.emit_or_defer(inner, h),
-                    Act::CompleteWindowEmitNew(old_inner, new_handle) => {
-                        core_src.complete_or_defer(old_inner);
-                        core_src.emit_or_defer(pid, new_handle);
-                    }
-                    Act::CompleteInner(inner) => core_src.complete_or_defer(inner),
-                    Act::CompleteSelf => core_src.complete_or_defer(pid),
-                    Act::ErrorInner(inner, h) => core_src.error_or_defer(inner, h),
-                    Act::ErrorSelf(h) => core_src.error_or_defer(pid, h),
+                    _ => {}
                 }
             }
         });

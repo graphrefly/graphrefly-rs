@@ -37,15 +37,17 @@
 //! `tokio::spawn`).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink, WeakCore};
+use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
 
-use crate::producer::{ProducerBinding, ProducerBuildFn, ProducerCtx, SubscribeOutcome};
+use crate::producer::{
+    ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerEmitter, SubscribeOutcome,
+};
 
 // =========================================================================
 // Shared command type
@@ -106,20 +108,18 @@ pub fn sample(
     source: NodeId,
     notifier: NodeId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let state: Arc<Mutex<SampleState>> = Arc::new(Mutex::new(SampleState::default()));
 
         // --- source sink ---
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let core_src = core_s.clone();
+        let core_src = em.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Act {
                 Release(HandleId),
@@ -175,7 +175,7 @@ pub fn sample(
 
         // --- notifier sink ---
         let st2 = state.clone();
-        let core_n = core_s.clone();
+        let core_n = em.clone();
         let bb2: Arc<dyn BindingBoundary> = binding_s.clone();
         let notifier_sink: Sink = Arc::new(move |msgs| {
             let mut s = st2.lock();
@@ -265,14 +265,11 @@ pub fn debounce(
     source: NodeId,
     ms: u64,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let delay = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
@@ -281,7 +278,7 @@ pub fn debounce(
         let tx_dead = tx.clone();
         let task = tokio::spawn(debounce_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             bb.clone(),
             delay,
@@ -289,7 +286,8 @@ pub fn debounce(
 
         // Store guard: drops tx (clean shutdown) then aborts task (fallback).
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
         }
@@ -332,9 +330,17 @@ pub fn debounce(
         .expect("debounce: register_producer failed")
 }
 
+// S2b/D230/D232-AMEND: takes a `ProducerEmitter` (was `WeakCore`).
+// `em.{emit,complete,error}_or_defer` post to the `Core`-owned mailbox
+// and internally release the payload handle if the `Core` is gone (F2,
+// QA-hardened) — so every old `if let Some(c)=core.upgrade(){ c.X }
+// else { binding.release_handle(h) }` collapses to a direct `em.X`.
+// `em.is_core_gone()` preserves the old teardown-promptness where the
+// `else` branch also `return`ed (not leak-load-bearing — the task also
+// exits on channel-close — only prompt shutdown).
 async fn debounce_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -352,22 +358,15 @@ async fn debounce_task(
                             pending = Some(new_h);
                         }
                         Some(TemporalCmd::Complete) => {
-                            // Flush pending then complete.
-                            if let Some(c) = core.upgrade() {
-                                c.emit_or_defer(pid, h);
-                                c.complete_or_defer(pid);
-                            } else {
-                                binding.release_handle(h);
-                            }
+                            // Flush pending then complete (em releases
+                            // `h` itself if the Core is gone).
+                            em.emit_or_defer(pid, h);
+                            em.complete_or_defer(pid);
                             return;
                         }
                         Some(TemporalCmd::Error(err_h)) => {
                             binding.release_handle(h);
-                            if let Some(c) = core.upgrade() {
-                                c.error_or_defer(pid, err_h);
-                            } else {
-                                binding.release_handle(err_h);
-                            }
+                            em.error_or_defer(pid, err_h);
                             return;
                         }
                         None => {
@@ -379,10 +378,8 @@ async fn debounce_task(
                 }
                 () = tokio::time::sleep(delay) => {
                     // Timer fired — emit pending.
-                    if let Some(c) = core.upgrade() {
-                        c.emit_or_defer(pid, h);
-                    } else {
-                        binding.release_handle(h);
+                    em.emit_or_defer(pid, h);
+                    if em.is_core_gone() {
                         return;
                     }
                     pending = None;
@@ -395,17 +392,11 @@ async fn debounce_task(
                     pending = Some(h);
                 }
                 Some(TemporalCmd::Complete) => {
-                    if let Some(c) = core.upgrade() {
-                        c.complete_or_defer(pid);
-                    }
+                    em.complete_or_defer(pid);
                     return;
                 }
                 Some(TemporalCmd::Error(err_h)) => {
-                    if let Some(c) = core.upgrade() {
-                        c.error_or_defer(pid, err_h);
-                    } else {
-                        binding.release_handle(err_h);
-                    }
+                    em.error_or_defer(pid, err_h);
                     return;
                 }
                 None => return,
@@ -427,24 +418,22 @@ async fn debounce_task(
 /// audit fires at a fixed interval after the first DATA in the window.
 #[must_use]
 pub fn audit(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms: u64) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let delay = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(audit_task(rx, core_s.weak_handle(), pid, bb.clone(), delay));
+        let task = tokio::spawn(audit_task(rx, em.clone(), pid, bb.clone(), delay));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
         }
@@ -487,9 +476,11 @@ pub fn audit(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         .expect("audit: register_producer failed")
 }
 
+// S2b/D230/D232-AMEND: `core: WeakCore` → `em: ProducerEmitter` (same
+// collapse rationale as `debounce_task`).
 async fn audit_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -516,21 +507,13 @@ async fn audit_task(
                                         }
                                         Some(TemporalCmd::Complete) => {
                                             // Emit latest, then complete.
-                                            if let Some(c) = core.upgrade() {
-                                                c.emit_or_defer(pid, latest);
-                                                c.complete_or_defer(pid);
-                                            } else {
-                                                binding.release_handle(latest);
-                                            }
+                                            em.emit_or_defer(pid, latest);
+                                            em.complete_or_defer(pid);
                                             return; // exits the async block
                                         }
                                         Some(TemporalCmd::Error(err_h)) => {
                                             binding.release_handle(latest);
-                                            if let Some(c) = core.upgrade() {
-                                                c.error_or_defer(pid, err_h);
-                                            } else {
-                                                binding.release_handle(err_h);
-                                            }
+                                            em.error_or_defer(pid, err_h);
                                             return;
                                         }
                                         None => {
@@ -546,10 +529,8 @@ async fn audit_task(
                     }
                     () = tokio::time::sleep(delay) => {
                         // Timer fired — emit latest, window closes.
-                        if let Some(c) = core.upgrade() {
-                            c.emit_or_defer(pid, latest);
-                        } else {
-                            binding.release_handle(latest);
+                        em.emit_or_defer(pid, latest);
+                        if em.is_core_gone() {
                             return;
                         }
                         // Continue outer loop — wait for next window.
@@ -557,17 +538,11 @@ async fn audit_task(
                 }
             }
             Some(TemporalCmd::Complete) => {
-                if let Some(c) = core.upgrade() {
-                    c.complete_or_defer(pid);
-                }
+                em.complete_or_defer(pid);
                 return;
             }
             Some(TemporalCmd::Error(err_h)) => {
-                if let Some(c) = core.upgrade() {
-                    c.error_or_defer(pid, err_h);
-                } else {
-                    binding.release_handle(err_h);
-                }
+                em.error_or_defer(pid, err_h);
                 return;
             }
             None => return,
@@ -586,14 +561,11 @@ async fn audit_task(
 /// - ERROR cancels all pending and propagates immediately.
 #[must_use]
 pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms: u64) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let delay_dur = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
@@ -602,14 +574,15 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         let tx_dead = tx.clone();
         let task = tokio::spawn(delay_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             bb.clone(),
             delay_dur,
         ));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
         }
@@ -652,9 +625,10 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         .expect("delay: register_producer failed")
 }
 
+// S2b/D230/D232-AMEND: `core: WeakCore` → `em: ProducerEmitter`.
 async fn delay_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -675,9 +649,7 @@ async fn delay_task(
                     Some(TemporalCmd::Complete) => {
                         complete_pending = true;
                         if queue.is_empty() {
-                            if let Some(c) = core.upgrade() {
-                                c.complete_or_defer(pid);
-                            }
+                            em.complete_or_defer(pid);
                             return;
                         }
                         // Wait for pending timers to drain.
@@ -687,11 +659,7 @@ async fn delay_task(
                         for (_, h) in queue.drain(..) {
                             binding.release_handle(h);
                         }
-                        if let Some(c) = core.upgrade() {
-                            c.error_or_defer(pid, err_h);
-                        } else {
-                            binding.release_handle(err_h);
-                        }
+                        em.error_or_defer(pid, err_h);
                         return;
                     }
                     None => {
@@ -708,10 +676,8 @@ async fn delay_task(
                 while let Some(&(deadline, _)) = queue.front() {
                     if deadline <= now {
                         let (_, h) = queue.pop_front().unwrap();
-                        if let Some(c) = core.upgrade() {
-                            c.emit_or_defer(pid, h);
-                        } else {
-                            binding.release_handle(h);
+                        em.emit_or_defer(pid, h);
+                        if em.is_core_gone() {
                             for (_, h2) in queue.drain(..) {
                                 binding.release_handle(h2);
                             }
@@ -722,9 +688,7 @@ async fn delay_task(
                     }
                 }
                 if complete_pending && queue.is_empty() {
-                    if let Some(c) = core.upgrade() {
-                        c.complete_or_defer(pid);
-                    }
+                    em.complete_or_defer(pid);
                     return;
                 }
             }
@@ -769,14 +733,11 @@ pub fn throttle(
     ms: u64,
     opts: ThrottleOpts,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let window = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
@@ -785,7 +746,7 @@ pub fn throttle(
         let tx_dead = tx.clone();
         let task = tokio::spawn(throttle_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             bb.clone(),
             window,
@@ -793,7 +754,8 @@ pub fn throttle(
         ));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
         }
@@ -838,7 +800,8 @@ pub fn throttle(
 
 async fn throttle_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    core: WeakCore,
+    // S2b/D230/D232-AMEND: `WeakCore` → `ProducerEmitter`.
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     window: Duration,
@@ -862,10 +825,8 @@ async fn throttle_task(
                             // Window open — start new window.
                             window_deadline = Some(tokio::time::Instant::now() + window);
                             if opts.leading {
-                                if let Some(c) = core.upgrade() {
-                                    c.emit_or_defer(pid, h);
-                                } else {
-                                    binding.release_handle(h);
+                                em.emit_or_defer(pid, h);
+                                if em.is_core_gone() {
                                     release_opt(&mut trailing_pending, &*binding);
                                     return;
                                 }
@@ -887,24 +848,14 @@ async fn throttle_task(
                     }
                     Some(TemporalCmd::Complete) => {
                         if let Some(h) = trailing_pending.take() {
-                            if let Some(c) = core.upgrade() {
-                                c.emit_or_defer(pid, h);
-                                c.complete_or_defer(pid);
-                            } else {
-                                binding.release_handle(h);
-                            }
-                        } else if let Some(c) = core.upgrade() {
-                            c.complete_or_defer(pid);
+                            em.emit_or_defer(pid, h);
                         }
+                        em.complete_or_defer(pid);
                         return;
                     }
                     Some(TemporalCmd::Error(err_h)) => {
                         release_opt(&mut trailing_pending, &*binding);
-                        if let Some(c) = core.upgrade() {
-                            c.error_or_defer(pid, err_h);
-                        } else {
-                            binding.release_handle(err_h);
-                        }
+                        em.error_or_defer(pid, err_h);
                         return;
                     }
                     None => {
@@ -917,14 +868,12 @@ async fn throttle_task(
                 // Window expired — emit trailing if any, reopen window.
                 window_deadline = None;
                 if let Some(h) = trailing_pending.take() {
-                    if let Some(c) = core.upgrade() {
-                        c.emit_or_defer(pid, h);
-                        // Start new window for the trailing emission.
-                        window_deadline = Some(tokio::time::Instant::now() + window);
-                    } else {
-                        binding.release_handle(h);
+                    em.emit_or_defer(pid, h);
+                    if em.is_core_gone() {
                         return;
                     }
+                    // Start new window for the trailing emission.
+                    window_deadline = Some(tokio::time::Instant::now() + window);
                 }
             }
         }
@@ -944,17 +893,14 @@ async fn throttle_task(
 /// register these as integer handles.
 #[must_use]
 pub fn interval(core: &Core, binding: &Arc<dyn ProducerBinding>, period_ms: u64) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let period = Duration::from_millis(period_ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let weak = core_s.weak_handle();
+        let em_task = em.clone();
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
@@ -962,19 +908,22 @@ pub fn interval(core: &Core, binding: &Arc<dyn ProducerBinding>, period_ms: u64)
             let mut counter: u64 = 1; // Start at 1: HandleId(0) = NO_HANDLE.
             loop {
                 ticker.tick().await;
-                if let Some(c) = weak.upgrade() {
-                    let h = HandleId::new(counter);
-                    bb.retain_handle(h);
-                    c.emit_or_defer(pid, h);
-                    counter += 1;
-                } else {
+                // S2b/D230: stop ticking once the Core is gone (was the
+                // `weak.upgrade() == None` break); check BEFORE retaining
+                // so a dead Core never leaks a fresh counter handle.
+                if em_task.is_core_gone() {
                     break;
                 }
+                let h = HandleId::new(counter);
+                bb.retain_handle(h);
+                em_task.emit_or_defer(pid, h);
+                counter += 1;
             }
         });
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(AbortOnDrop(task)));
         }
@@ -1022,14 +971,11 @@ pub fn timeout(
     ms: u64,
     error_handle: HandleId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let duration = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
@@ -1038,7 +984,7 @@ pub fn timeout(
         let tx_dead = tx.clone();
         let task = tokio::spawn(timeout_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             bb.clone(),
             duration,
@@ -1046,7 +992,8 @@ pub fn timeout(
         ));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(TemporalTaskGuard { _tx: tx, task }));
         }
@@ -1089,9 +1036,10 @@ pub fn timeout(
         .expect("timeout: register_producer failed")
 }
 
+// S2b/D230/D232-AMEND: `WeakCore` → `ProducerEmitter`.
 async fn timeout_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     duration: Duration,
@@ -1107,36 +1055,29 @@ async fn timeout_task(
                     Some(TemporalCmd::Value(h)) => {
                         // DATA arrived — forward it and reset the timer
                         // (the next loop iteration restarts the sleep).
-                        if let Some(c) = core.upgrade() {
-                            c.emit_or_defer(pid, h);
-                        } else {
-                            binding.release_handle(h);
+                        em.emit_or_defer(pid, h);
+                        if em.is_core_gone() {
                             return;
                         }
                         // Continue loop → resets the sleep timer.
                     }
                     Some(TemporalCmd::Complete) => {
-                        if let Some(c) = core.upgrade() {
-                            c.complete_or_defer(pid);
-                        }
+                        em.complete_or_defer(pid);
                         return;
                     }
                     Some(TemporalCmd::Error(err_h)) => {
-                        if let Some(c) = core.upgrade() {
-                            c.error_or_defer(pid, err_h);
-                        } else {
-                            binding.release_handle(err_h);
-                        }
+                        em.error_or_defer(pid, err_h);
                         return;
                     }
                     None => return,
                 }
             }
             () = tokio::time::sleep(duration) => {
-                // Timeout fired — emit error.
-                if let Some(c) = core.upgrade() {
+                // Timeout fired — emit error. Retain BEFORE the post
+                // (skip if the Core is gone — nothing to error into).
+                if !em.is_core_gone() {
                     binding.retain_handle(error_handle);
-                    c.error_or_defer(pid, error_handle);
+                    em.error_or_defer(pid, error_handle);
                 }
                 return;
             }
@@ -1174,14 +1115,11 @@ pub fn buffer_time(
     ms: u64,
     pack_fn_id: FnId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let period = Duration::from_millis(ms);
 
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
@@ -1190,7 +1128,7 @@ pub fn buffer_time(
         let tx_dead = tx.clone();
         let task = tokio::spawn(buffer_time_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             bb.clone(),
             period,
@@ -1198,7 +1136,8 @@ pub fn buffer_time(
         ));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(BufferTimeTaskGuard { _tx: tx, task }));
         }
@@ -1254,9 +1193,14 @@ impl Drop for BufferTimeTaskGuard {
     }
 }
 
+// S2b/D230/D232-AMEND: `WeakCore` → `ProducerEmitter`. Note: the
+// emit-path now always `pack_tuple`s even on a gone Core (em releases
+// the packed handle); the buffered component handles are drained-released
+// exactly as before — behaviour-equivalent, just one extra teardown-only
+// pack FFI.
 async fn buffer_time_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<BufferTimeCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     period: Duration,
@@ -1277,28 +1221,20 @@ async fn buffer_time_task(
                     Some(BufferTimeCmd::Complete) => {
                         // Flush remaining buffer then complete.
                         if !buf.is_empty() {
-                            if let Some(c) = core.upgrade() {
-                                let packed = binding.pack_tuple(pack_fn_id, &buf);
-                                c.emit_or_defer(pid, packed);
-                            }
+                            let packed = binding.pack_tuple(pack_fn_id, &buf);
+                            em.emit_or_defer(pid, packed);
                             for h in buf.drain(..) {
                                 binding.release_handle(h);
                             }
                         }
-                        if let Some(c) = core.upgrade() {
-                            c.complete_or_defer(pid);
-                        }
+                        em.complete_or_defer(pid);
                         return;
                     }
                     Some(BufferTimeCmd::Error(err_h)) => {
                         for h in buf.drain(..) {
                             binding.release_handle(h);
                         }
-                        if let Some(c) = core.upgrade() {
-                            c.error_or_defer(pid, err_h);
-                        } else {
-                            binding.release_handle(err_h);
-                        }
+                        em.error_or_defer(pid, err_h);
                         return;
                     }
                     None => {
@@ -1312,16 +1248,12 @@ async fn buffer_time_task(
             }
             _ = ticker.tick() => {
                 if !buf.is_empty() {
-                    if let Some(c) = core.upgrade() {
-                        let packed = binding.pack_tuple(pack_fn_id, &buf);
-                        c.emit_or_defer(pid, packed);
-                        for h in buf.drain(..) {
-                            binding.release_handle(h);
-                        }
-                    } else {
-                        for h in buf.drain(..) {
-                            binding.release_handle(h);
-                        }
+                    let packed = binding.pack_tuple(pack_fn_id, &buf);
+                    em.emit_or_defer(pid, packed);
+                    for h in buf.drain(..) {
+                        binding.release_handle(h);
+                    }
+                    if em.is_core_gone() {
                         return;
                     }
                 }
@@ -1360,24 +1292,23 @@ pub fn window_time(
     source: NodeId,
     ms: u64,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
     let period = Duration::from_millis(ms);
 
+    // S2b/D231: register the reusable no-op inner-window build at FACTORY
+    // scope (where `binding: &Arc<dyn ProducerBinding>` is in hand) — the
+    // build closure no longer holds a `ProducerBinding`, only `ctx`.
+    // `FnId` is `Copy`; capture it into the build/task.
+    let noop_fn_id = binding.register_producer_build(Box::new(|_ctx: ProducerCtx<'_>| {
+        // Inner window nodes are passive — all emissions are driven by
+        // the parent window_time task via the mailbox.
+    }));
+
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
+        let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-
-        // Pre-register a reusable no-op FnId for creating inner window
-        // nodes. The async task reuses this FnId for every window rotation
-        // so it only needs Core (via WeakCore), not ProducerBinding.
-        let noop_fn_id = binding_s.register_producer_build(Box::new(|_ctx: ProducerCtx<'_>| {
-            // Inner window nodes are passive — all emissions are driven by
-            // the parent window_time task via emit_or_defer / complete_or_defer.
-        }));
 
         // Create the first inner window node and emit its handle.
         let first_inner = core_s
@@ -1391,7 +1322,7 @@ pub fn window_time(
         let tx_dead = tx.clone();
         let task = tokio::spawn(window_time_task(
             rx,
-            core_s.weak_handle(),
+            em.clone(),
             pid,
             first_inner,
             bb.clone(),
@@ -1400,7 +1331,8 @@ pub fn window_time(
         ));
 
         {
-            let mut storage = binding_s.producer_storage().lock();
+            let st = ctx.storage();
+            let mut storage = st.lock();
             let entry = storage.entry(pid).or_default();
             entry.op_state = Some(Box::new(WindowTimeTaskGuard { _tx: tx, task }));
         }
@@ -1455,16 +1387,23 @@ impl Drop for WindowTimeTaskGuard {
     }
 }
 
+// S2b/D230/D234: `WeakCore` → `ProducerEmitter`; the window rotation
+// does task-side topology mutation (`register_producer`) so it routes
+// through `em.defer` (`CoreFull`). `current_inner` (the routing
+// selector) becomes a shared `Arc<Mutex<NodeId>>` read INSIDE the
+// owner-serialized defer closures, so the FIFO mailbox order
+// (arrival order) keeps every forward routed to the window live at the
+// time it arrived — the D234 invariant (same as `window`).
 async fn window_time_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<WindowTimeCmd>,
-    core: WeakCore,
+    em: ProducerEmitter,
     pid: NodeId,
     initial_inner: NodeId,
     binding: Arc<dyn BindingBoundary>,
     period: Duration,
     noop_fn_id: FnId,
 ) {
-    let mut current_inner = initial_inner;
+    let current_inner = Arc::new(Mutex::new(initial_inner));
     let mut ticker = tokio::time::interval(period);
     ticker.tick().await; // First tick is immediate — skip it.
 
@@ -1474,32 +1413,39 @@ async fn window_time_task(
             cmd = rx.recv() => {
                 match cmd {
                     Some(WindowTimeCmd::Value(h)) => {
-                        // Forward DATA to current inner window.
-                        if let Some(c) = core.upgrade() {
-                            c.emit_or_defer(current_inner, h);
-                        } else {
-                            binding.release_handle(h);
-                            return;
+                        // Forward DATA to whatever window is current when
+                        // this defer runs (FIFO-ordered after any rotation
+                        // posted earlier).
+                        let cur = current_inner.clone();
+                        let b = binding.clone();
+                        if !em.defer(move |c| {
+                            c.emit(*cur.lock(), h);
+                        }) {
+                            b.release_handle(h);
                         }
                     }
                     Some(WindowTimeCmd::Complete) => {
-                        // Complete current inner window, then complete self.
-                        if let Some(c) = core.upgrade() {
-                            c.complete_or_defer(current_inner);
-                            c.complete_or_defer(pid);
-                        }
+                        let cur = current_inner.clone();
+                        let _ = em.defer(move |c| {
+                            c.complete(*cur.lock());
+                            c.complete(pid);
+                        });
                         return;
                     }
                     Some(WindowTimeCmd::Error(err_h)) => {
-                        // Error current inner window, then error self.
-                        if let Some(c) = core.upgrade() {
-                            binding.retain_handle(err_h);
-                            c.error_or_defer(current_inner, err_h);
-                            // err_h already retained once by sink + once above;
-                            // the inner node consumes one retain, self consumes the other.
-                            c.error_or_defer(pid, err_h);
-                        } else {
-                            binding.release_handle(err_h);
+                        // err_h retained once by the sink; the 2nd retain
+                        // (for the self-error) is done INSIDE the closure
+                        // so a Core-gone drop leaves exactly the sink's
+                        // one retain to release (mirrors the old `else`).
+                        let cur = current_inner.clone();
+                        let b = binding.clone();
+                        let b2 = binding.clone();
+                        if !em.defer(move |c| {
+                            b2.retain_handle(err_h);
+                            c.error(*cur.lock(), err_h);
+                            c.error(pid, err_h);
+                        }) {
+                            b.release_handle(err_h);
                         }
                         return;
                     }
@@ -1510,23 +1456,28 @@ async fn window_time_task(
                 }
             }
             _ = ticker.tick() => {
-                // Window rotation: complete current, create new, emit handle.
-                if let Some(c) = core.upgrade() {
-                    c.complete_or_defer(current_inner);
-
-                    // Create a new inner window node using the pre-registered
-                    // noop FnId. Each inner node is a passive producer whose
-                    // emissions are driven externally by this task.
-                    if let Ok(new_inner) = c.register_producer(noop_fn_id) {
-                        current_inner = new_inner;
-                        let h = binding.intern_node(new_inner);
-                        c.emit_or_defer(pid, h);
-                    } else {
-                        // Registration failed — complete self and exit.
-                        c.complete_or_defer(pid);
-                        return;
+                // Window rotation: complete current, create new, emit
+                // handle — ALL inside one owner-side closure so the
+                // `register_producer` + `current_inner` swap is atomic
+                // w.r.t. the FIFO drain (D234).
+                let cur = current_inner.clone();
+                let b = binding.clone();
+                let _ = em.defer(move |c| {
+                    let old = *cur.lock();
+                    c.complete(old);
+                    match c.register_producer(noop_fn_id) {
+                        Ok(new_inner) => {
+                            *cur.lock() = new_inner;
+                            let h = b.intern_node(new_inner);
+                            c.emit(pid, h);
+                        }
+                        Err(_) => {
+                            // Registration failed — complete self.
+                            c.complete(pid);
+                        }
                     }
-                } else {
+                });
+                if em.is_core_gone() {
                     return;
                 }
             }

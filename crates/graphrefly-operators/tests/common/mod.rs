@@ -29,11 +29,14 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use graphrefly_core::{
-    BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, Subscription, NO_HANDLE,
+    BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, NO_HANDLE,
 };
 use graphrefly_operators::{
     higher_order::{HigherOrderBinding, ProjectFn},
-    producer::{default_producer_deactivate, ProducerBuildFn, ProducerCtx, ProducerStorage},
+    producer::{
+        default_producer_deactivate, ProducerBuildFn, ProducerCtx, ProducerEmitter,
+        ProducerStorage, SubGuard,
+    },
     OperatorBinding, ProducerBinding,
 };
 
@@ -476,10 +479,15 @@ impl BindingBoundary for InnerBinding {
         self.intern(TestValue::Int(raw as i64))
     }
 
-    fn producer_deactivate(&self, node_id: NodeId) {
-        // Default behavior — drop the producer's storage entry, which
-        // cascades into Subscription drops + sink unsubscription.
-        default_producer_deactivate(&self.producer_storage, node_id);
+    fn producer_deactivate(
+        &self,
+        node_id: NodeId,
+        unsub: &dyn Fn(NodeId, graphrefly_core::SubscriptionId),
+    ) {
+        // S2b/D229: drop the producer's storage entry, explicitly
+        // unsubscribing recorded upstream subs via the owner-supplied
+        // closure (was the retired `Vec<Subscription>`-drop cascade).
+        default_producer_deactivate(&self.producer_storage, node_id, unsub);
     }
 }
 
@@ -622,9 +630,28 @@ impl OpRuntime {
     pub fn subscribe_recorder(&self, node: NodeId) -> Recorder {
         let recorder = Recorder::new(self.binding.clone());
         let sink: Sink = recorder.sink();
-        let sub = self.core.subscribe(node, sink);
-        recorder.attach(sub);
+        // S2b: `subscribe` returns a `SubscriptionId`; wrap it in a
+        // binding-layer `SubGuard` (D228-A) so dropping the Recorder
+        // schedules the unsubscribe. The harness co-owns the Core, so
+        // `ProducerEmitter::for_core` is the sanctioned bridge.
+        let sub_id = self.core.subscribe(node, sink);
+        recorder.attach(SubGuard::new(
+            node,
+            sub_id,
+            ProducerEmitter::for_core(&self.core),
+        ));
         recorder
+    }
+
+    /// Drain any deferred mailbox ops (timer/producer/`SubGuard`
+    /// unsubscribe) **now**, owner-side (S2b/D230/D234). The sync test
+    /// harness has no autonomous pump; tests that drop a Recorder and
+    /// then assert deactivation/unsubscribe *without* a subsequent wave
+    /// call this to force the deferred unsubscribe to apply (mirrors the
+    /// embedder pump point — behaviour-equivalent to the retired
+    /// synchronous `Subscription::Drop`).
+    pub fn settle(&self) {
+        self.core.drain_mailbox();
     }
 
     /// Convenience: emit an integer DATA on a state node.
@@ -740,7 +767,11 @@ pub struct Recorder {
 struct RecorderInner {
     binding: Arc<InnerBinding>,
     events: Mutex<Vec<RecordedEvent>>,
-    sub: Mutex<Option<Subscription>>,
+    // S2b/D228-A: binding-layer RAII over `Core::unsubscribe` (core
+    // RAII retired). `SubGuard::Drop` posts the unsubscribe via the
+    // mailbox; the in-wave `drain_mailbox` (A′) applies it on the next
+    // wave, or `TestRuntime::settle()` forces it immediately.
+    sub: Mutex<Option<SubGuard>>,
     fire_count: AtomicU64,
 }
 
@@ -793,8 +824,8 @@ impl Recorder {
         })
     }
 
-    fn attach(&self, sub: Subscription) {
-        *self.inner.sub.lock() = Some(sub);
+    fn attach(&self, guard: SubGuard) {
+        *self.inner.sub.lock() = Some(guard);
     }
 
     pub fn events(&self) -> Vec<RecordedEvent> {

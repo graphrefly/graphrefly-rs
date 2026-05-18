@@ -13,7 +13,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{Core, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
@@ -95,17 +95,11 @@ pub fn zip(
     // → closure → strong-Arc<dyn ProducerBinding> cycle that would otherwise
     // pin the entire graph state when the host BenchCore drops with active
     // producer registrations. See `Core::weak_handle` doc + Slice Y close.
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_for_build), Some(binding_clone)) =
-            (core_weak.upgrade(), binding_weak.upgrade())
-        else {
-            // Host Core / binding already dropped — no-op.
-            return;
-        };
+        let binding_clone = ctx.core().binding();
+        let em = ctx.emitter();
         // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
         let state: Arc<Mutex<ZipState>> = Arc::new(Mutex::new(ZipState::new(n)));
 
@@ -114,7 +108,7 @@ pub fn zip(
             // Sinks live only while the producer is active (cleared via
             // producer_deactivate on last-subscriber unsubscribe), so they
             // can safely capture strong refs cloned from the upgraded weaks.
-            let core_inner = core_for_build.clone();
+            let core_inner = em.clone();
             let binding_inner = binding_clone.clone();
             let sink: Sink = Arc::new(move |msgs| {
                 // Phase 1 (lock held): mutate queues + collect actions.
@@ -218,7 +212,7 @@ pub fn zip(
             // would never fill → silent wedge.
             let outcome = ctx.subscribe_to(source, sink);
             if matches!(outcome, crate::producer::SubscribeOutcome::Dead { .. }) {
-                let core_dead = core_for_build.clone();
+                let core_dead = em.clone();
                 let binding_dead = binding_clone.clone();
                 let mut should_complete = false;
                 let mut to_release: SmallVec<[HandleId; 8]> = SmallVec::new();
@@ -296,22 +290,18 @@ pub fn concat(
     second: NodeId,
 ) -> NodeId {
     // Weak captures break the producer-build Arc cycle (see `zip` doc).
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone)) = (core_weak.upgrade(), binding_weak.upgrade())
-        else {
-            return;
-        };
+        let binding_clone = ctx.core().binding();
+        let em = ctx.emitter();
         let state: Arc<Mutex<ConcatState>> = Arc::new(Mutex::new(ConcatState::new()));
 
         // Subscribe to second FIRST so phase-0 DATA buffering catches
         // synchronous initial emissions. Sinks capture strong refs cloned
         // from the upgraded weaks; sink lifetime tied to producer activation.
         let state_for_second = state.clone();
-        let core_for_second = core_clone.clone();
+        let core_for_second = em.clone();
         let binding_for_second = binding_clone.clone();
         let second_sink: Sink = Arc::new(move |msgs| {
             enum Action {
@@ -398,7 +388,7 @@ pub fn concat(
         }
 
         let state_for_first = state.clone();
-        let core_for_first = core_clone.clone();
+        let core_for_first = em.clone();
         let binding_for_first = binding_clone.clone();
         let first_sink: Sink = Arc::new(move |msgs| {
             // first.Complete triggers the phase transition (handled
@@ -496,7 +486,7 @@ pub fn concat(
             first_outcome,
             crate::producer::SubscribeOutcome::Dead { .. }
         ) {
-            let core_first_dead = core_clone.clone();
+            let core_first_dead = em.clone();
             let mut should_complete = false;
             let mut pending_to_emit: Vec<HandleId> = Vec::new();
             {
@@ -572,21 +562,17 @@ pub fn race(
     }
     let n = sources.len();
     // Weak captures break the producer-build Arc cycle (see `zip` doc).
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone)) = (core_weak.upgrade(), binding_weak.upgrade())
-        else {
-            return;
-        };
+        let binding_clone = ctx.core().binding();
+        let em = ctx.emitter();
         // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
         let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
             let state_inner = state.clone();
-            let core_inner = core_clone.clone();
+            let core_inner = em.clone();
             let binding_inner = binding_clone.clone();
             let sink: Sink = Arc::new(move |msgs| {
                 enum Action {
@@ -668,7 +654,7 @@ pub fn race(
             // branch in the per-source sink above).
             let outcome = ctx.subscribe_to(source, sink);
             if matches!(outcome, crate::producer::SubscribeOutcome::Dead { .. }) {
-                let core_dead = core_clone.clone();
+                let core_dead = em.clone();
                 let mut should_complete = false;
                 {
                     let mut s = state.lock().unwrap();
@@ -723,20 +709,16 @@ pub fn take_until(
     notifier: NodeId,
 ) -> NodeId {
     // Weak captures break the producer-build Arc cycle (see `zip` doc).
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
 
     let build = Box::new(move |ctx: ProducerCtx<'_>| {
         let producer_id = ctx.node_id();
-        let (Some(core_clone), Some(binding_clone)) = (core_weak.upgrade(), binding_weak.upgrade())
-        else {
-            return;
-        };
+        let binding_clone = ctx.core().binding();
+        let em = ctx.emitter();
         let state: Arc<Mutex<TakeUntilState>> = Arc::new(Mutex::new(TakeUntilState::new()));
 
         // Source sink: forward DATA, propagate terminals.
         let state_for_source = state.clone();
-        let core_for_source = core_clone.clone();
+        let core_for_source = em.clone();
         let binding_for_source = binding_clone.clone();
         let source_sink: Sink = Arc::new(move |msgs| {
             enum Action {
@@ -796,7 +778,7 @@ pub fn take_until(
             source_outcome,
             crate::producer::SubscribeOutcome::Dead { .. }
         ) {
-            let core_dead = core_clone.clone();
+            let core_dead = em.clone();
             let mut should_complete = false;
             {
                 let mut s = state.lock().unwrap();
@@ -812,7 +794,7 @@ pub fn take_until(
 
         // Notifier sink: any DATA → terminate; ERROR → cascade.
         let state_for_notifier = state.clone();
-        let core_for_notifier = core_clone.clone();
+        let core_for_notifier = em.clone();
         let binding_for_notifier = binding_clone.clone();
         let notifier_sink: Sink = Arc::new(move |msgs| {
             enum Action {

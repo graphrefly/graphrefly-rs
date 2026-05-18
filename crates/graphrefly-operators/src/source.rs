@@ -26,7 +26,7 @@
 //! `empty` and `never` need no handles — they are pure lifecycle
 //! sources.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use graphrefly_core::{Core, HandleId, NodeId};
 
@@ -45,13 +45,11 @@ pub fn from_iter(
     binding: &Arc<dyn ProducerBinding>,
     handles: Vec<HandleId>,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        // S2b/D231: build-side only (no spawned sinks) — use the
+        // ctx-borrowed `&Core` directly; no `WeakCore`/`Clone`.
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
         let pid = ctx.node_id();
 
         for &h in &handles {
@@ -82,13 +80,8 @@ pub fn of(core: &Core, binding: &Arc<dyn ProducerBinding>, handles: Vec<HandleId
 /// Complete immediately with no DATA (cold EMPTY analogue).
 #[must_use]
 pub fn empty(core: &Core, binding: &Arc<dyn ProducerBinding>) -> NodeId {
-    let core_weak = core.weak_handle();
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let Some(core_s) = core_weak.upgrade() else {
-            return;
-        };
-        core_s.complete_or_defer(ctx.node_id());
+        ctx.core().complete_or_defer(ctx.node_id());
     });
 
     let fn_id = binding.register_producer_build(build);
@@ -121,13 +114,9 @@ pub fn throw_error(
     binding: &Arc<dyn ProducerBinding>,
     error_handle: HandleId,
 ) -> NodeId {
-    let core_weak = core.weak_handle();
-    let binding_weak: Weak<dyn ProducerBinding> = Arc::downgrade(binding);
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        let (Some(core_s), Some(binding_s)) = (core_weak.upgrade(), binding_weak.upgrade()) else {
-            return;
-        };
+        let core_s = ctx.core();
+        let binding_s = ctx.core().binding();
         // Retain for the emission — Core takes ownership.
         binding_s.retain_handle(error_handle);
         core_s.error_or_defer(ctx.node_id(), error_handle);
