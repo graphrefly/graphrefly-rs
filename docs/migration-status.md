@@ -3390,6 +3390,141 @@ D246-r8 stale-premise reconciled post-D249).
 D252 (IN_TICK collapse + hard invariant), D253 (SchedulingGroupId
 delete), D254 (Tier A bundle + process memory).
 
+### S6 — PLANNED (locked 2026-05-19) — napi bindings reconciliation against post-S2c `!Send` Core
+
+> **Path B from the CI-failure exchange (2026-05-19).** Locked as a
+> dedicated follow-on slice (post-S5; not on the critical path —
+> bindings are excluded from the D226 default-members gate per the
+> S2c block, and the failing CI step has been gated `if: false` in
+> `.github/workflows/ci.yml` until S6 lands — Path A applied
+> alongside this lock). Reason for the separate slice: substantial
+> design surface; sequencing it after S5 lets the D252 (`IN_TICK`
+> collapse + "one Core per OS thread") + D253 (`SchedulingGroupId`
+> deletion) simplifications land first so S6 binds the *simpler*
+> substrate, not the current transitional shape.
+
+**The mismatch.** `crates/graphrefly-bindings-js/src/core_bindings.rs`
+(~1800 LOC) was written under the **pre-S2c** substrate shape:
+
+- `Core: Send + Sync + Clone` — used by `BenchCore { core: Core }`,
+  `self.core.clone()` (~36 sites), `OnceLock<Arc<BenchCore>>`,
+  `spawn_blocking(move || { core... })`, and `async fn` napi methods
+  whose futures must be `Send`.
+- Type name `Subscription` (renamed `SubscriptionId` by D241/D246
+  rule 3 in boundary-1).
+
+Post-S2c (committed `0182c18`, 2026-05-19):
+
+- D247 — `GraphInner` `Arc<Mutex>` → `Rc<RefCell>` (`!Send`).
+- D248 — substrate `Sink` / `TopologySink` dropped `Send + Sync` ⇒
+  `CoreShared.namespace_sinks` / `CoreState.subscribers` /
+  `node_topology_sinks` are `!Sync`, so `RefCell<CoreShared>` and
+  `RefCell<CoreState>` are `!Send + !Sync` ⇒ `Core` is **`!Send + !Sync`**.
+- D249 — owner-only `!Send` `DeferQueue` lives in `Core` via `Rc`.
+- D221/D246 — `impl Clone for Core` deleted (move-only single-owner).
+
+Net: every binding-side `core.clone()` / `spawn_blocking + Core`
+move / `OnceLock<Arc<BenchCore>>` static fails to compile against
+the post-S2c substrate. The combined CI failure surface is the
+54-error build you'd see if `cargo build -p graphrefly-bindings-js
+--features tracing` were un-gated.
+
+**S6 scope (locked):**
+
+1. **Storage model swap.** `BenchCore` stops storing `Core` by
+   value. The cross-thread bridge into a `!Send` Core is the id-only
+   `Arc<CoreMailbox>` (D227/D230/D249; the only `Send + Sync` handle
+   into a `!Send` Core). Replace `BenchCore { core: Core, ... }` with
+   `BenchCore { mailbox: Arc<CoreMailbox>, /* owner-thread-pinned
+   Core via a pin mechanism */, ... }`. The pin mechanism is the
+   load-bearing design call (see step 4).
+2. **Type-name fix.** `Subscription` → `SubscriptionId` import; the
+   `Vec<Subscription>` storage pattern → `Vec<(NodeId,
+   SubscriptionId)>` per D241/D246 rule 3.
+3. **`Core::clone` removal.** Every `let core = self.core.clone();`
+   site (~36 in `core_bindings.rs`) becomes either: (a) a mailbox
+   handle clone (cheap `Arc::clone`) for cross-thread post paths;
+   (b) an owner-thread-pinned `&Core` borrow for in-wave
+   operations. Each call site decides per its actual usage.
+4. **The hard design call — async-on-tokio vs owner-thread-pinned
+   sync.** napi-rs runs `async fn` methods on tokio's worker pool.
+   Each invocation lands on an arbitrary tokio worker thread. But
+   `Core` is `!Send`, so the worker thread must be **the same
+   owner thread that owns the Core**, OR the operation must go
+   through the mailbox (id-only ops) without touching `Core`
+   directly. Three credible shapes:
+   - **(α) Owner-thread-pinned worker.** Pin one tokio worker as
+     the Core owner; route every napi method that needs `&Core` to
+     that worker via a channel. Matches the actor model literally;
+     binding becomes "actor wrapper around `Core`." Largest
+     refactor; cleanest correspondence to the substrate.
+   - **(β) Mailbox-only async API.** Every napi method that needs
+     to mutate Core posts a `MailboxOp` and either fire-and-forgets
+     or awaits a one-shot reply channel. No method ever holds
+     `&Core`. Operations like `subscribe` that return a
+     `SubscriptionId` post a `MailboxOp::Defer` whose closure runs
+     the op + replies. Conceptually clean; serialises everything
+     through the mailbox; subscribe latency ≈ mailbox round-trip.
+   - **(γ) Sync owner-thread API (Option C of D206, already partly
+     landed).** Keep napi methods synchronous via tokio's
+     `spawn_blocking` ONTO the pinned owner thread (not a worker
+     pool — a dedicated thread the Core lives on). The shipped
+     `wrapper.js` Option C surface aligns with this. Inverts the
+     usual napi async model but matches `Core`'s single-owner
+     reality.
+   The choice is design-bearing; surfaces a HALT at the start of
+   the S6 slice. The Option C wrapper (D206/D207) is already
+   landed at the JS layer, so (γ) has prior commitment that argues
+   for it. (β) is the canonical actor-model shape.
+5. **`OnceLock<Arc<BenchCore>>` static.** The current
+   `GLOBAL_CORE` lazy-init pattern requires `BenchCore: Sync`. Drop
+   the global; per-binding instantiation. If a singleton-like
+   pattern is needed, use `thread_local!(RefCell<Option<BenchCore>>)`
+   on the owner thread.
+6. **`spawn_blocking` call sites.** Audit every `spawn_blocking(move
+   || { core... })` site; replace with the chosen mechanism from
+   step 4.
+7. **`#[napi]` async fn returning `&BenchCore` data.** The macro
+   wraps the future requiring `Send`. Under (γ) every method
+   becomes sync `pub fn` (the macro accepts sync too). Under (α)/(β)
+   the future-Send requirement is satisfied by the spawned-onto-
+   owner-thread / channel pattern.
+8. **Re-enable the gated CI jobs.** Flip
+   `.github/workflows/ci.yml` `bindings-js` + `napi-build-matrix`
+   `if: false` back to the prior bot/release condition (preserved
+   in commented form in the diff that gated them).
+
+**Gate expectations:**
+
+- 54 build errors → 0; `cargo build -p graphrefly-bindings-js
+  --features tracing` GREEN; `cargo clippy -p graphrefly-bindings-js
+  --features tracing` GREEN (informational); CI workflow `bindings-js`
+  + `napi-build-matrix` jobs un-gated and green.
+- `pnpm test:parity` (graphrefly-ts) — the rust arm's runtime tests
+  start exercising the bound surface; current 3 typecheck-only
+  failures (`packages/parity-tests/impls/{rust,types}.ts` +
+  `scenarios/core/release-callback-reinstall.test.ts`) resolve.
+- `#![deny(unsafe_code)]` preserved on `graphrefly-bindings-js`.
+
+**Cross-track-ledger event.** YES — S6 is a substrate-contract
+event. The `Impl` parity contract surface (`packages/parity-tests/
+impls/types.ts`) gets cross-impl coverage for the rust arm via the
+post-S6 build. Add a `cross-track-ledger.md` §1 row at S6-start
+documenting the napi-side D248/D249 reconciliation completion.
+
+**Decisions (to be appended at S6-start, when the (α)/(β)/(γ)
+choice is locked):** D255 — napi binding's `Core`-access shape
+under post-S2c `!Send + !Sync` Core. Plus any downstream rule
+additions (e.g., D256 if a new mailbox surface is needed for
+subscribe-returning-id flows).
+
+**Sequencing.** S5 first (accretion-mass cleanup; substrate
+simplification). S6 binds the simpler substrate; can land any time
+post-S5 when there's a consumer pressure (memo:Re premium-backend
+native swap, or a downstream repo that needs `@graphrefly/native`).
+Per D196 consumer-pressure rule the slice is **not auto-scheduled**
+— it's locked-as-ready but landing waits for the trigger.
+
 ### D246 S2c+S3+S4 — /qa LANDED (2026-05-19) — combined sweep per D226
 
 > Single `/qa` over the combined `b2dacec..HEAD` diff (boundary-1 →
