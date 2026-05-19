@@ -152,29 +152,36 @@ impl LockId {
     }
 }
 
-/// Identifier for a **concurrency serialization group** (§7 single-threaded
+/// Identifier for a **concurrency scheduling group** (§7 single-threaded
 /// substrate + `Option<LockId>` contract, user-locked 2026-05-16).
 ///
 /// Orthogonal to [`LockId`] (which is the spec-mandated *pause-lock*
 /// identifier, R1.2.6 / R2.6 — see D210 amendment). A node carries
-/// `serialization_group: Option<SerializationGroupId>`:
+/// `scheduling_group: Option<SchedulingGroupId>`:
 ///
-/// - `None` (default) — the node runs on the single-threaded, lock-free
-///   path. When *every* node in a `Core` is `None`, the wave engine's
-///   group-collect + ordered-acquire step has nothing to do and
+/// Post-S2c the `Core` is **single-owner** (one driving thread; the
+/// cross-thread shared-`Core` group-lock machinery — `GroupLockRegistry`,
+/// the per-group `Arc<ReentrantMutex<()>>`, ordered-acquire — is deleted,
+/// D246/S2c). `SchedulingGroupId` survives as a *static declared
+/// scheduling-unit identity*: it no longer gates an in-`Core` lock, it
+/// partitions nodes into the units S4's per-group runnable-wake on
+/// `CoreMailbox` schedules. Cross-`Core` parallelism is host-native via
+/// independent per-worker `Core`s, not via in-`Core` group locks.
+///
+/// - `None` (default) — the node is its own single serial scheduling
+///   unit on the lock-free path. When *every* node in a `Core` is `None`,
+///   the wave engine's group-collect step has nothing to do and
 ///   monomorphizes out (the §7 ~83 ns floor).
-/// - `Some(g)` — the node belongs to serialization group `g`. All nodes
-///   sharing `g` serialize through one `Arc<ReentrantMutex<()>>` held for
-///   the lifetime of any wave that touches them. Distinct groups whose
-///   touched-sets are disjoint run truly parallel; overlapping touched-sets
-///   serialize. Acquisition is in ascending `SerializationGroupId` order
-///   (deadlock-free under any interleaving).
+/// - `Some(g)` — the node is declared into scheduling unit `g`; nodes
+///   sharing `g` form one schedulable unit (the S4 per-group wake bit is
+///   keyed by `g`). Identity only — no lock, no ordered acquire under the
+///   single-owner drain.
 ///
 /// **Strict consistency invariant (user-locked):** a node's dep-connected
 /// component MUST be lock-consistent — either every member is `None`, or
 /// every member carries a group. Mixed components are rejected at
-/// `register` / `set_serialization_group` time (topology-mutation time
-/// only, never the hot path). See [`crate::Core::set_serialization_group`].
+/// `register` / `set_scheduling_group` time (topology-mutation time
+/// only, never the hot path). See [`crate::Core::set_scheduling_group`].
 ///
 /// Replaces the deleted D3 union-find per-subgraph partitioning
 /// (`SESSION-rust-port-d3-per-subgraph-parallelism.md`, D085/D086 — flagged
@@ -183,10 +190,10 @@ impl LockId {
 /// (registry lock, `find`/path-compression, epoch, `PARTITION_CACHE`,
 /// retry-validate) is needed.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
-pub struct SerializationGroupId(u64);
+pub struct SchedulingGroupId(u64);
 
-impl SerializationGroupId {
-    /// Wrap a raw `u64` as a serialization-group id. Group ids are
+impl SchedulingGroupId {
+    /// Wrap a raw `u64` as a scheduling-group id. Group ids are
     /// user-assigned and carry no allocation-range convention (unlike
     /// [`LockId`]) — two nodes are co-serialized iff they were given the
     /// same value.

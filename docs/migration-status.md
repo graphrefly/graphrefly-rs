@@ -3154,6 +3154,60 @@ surfaced & resolved (`feedback_no_autonomous_decisions`).
 (producer-based β rewrite), `floor_compare` bench + `profile_st_emit`
 example (superseded → S4 rebuild).
 
+### D246 S3 — LANDED + GATE-GREEN + COMMITTED (2026-05-19)
+
+> **This is the current authoritative state for the S-sequence**
+> (supersedes the S2c block above). Next `/porting-to-rs` batch is
+> **S4**. Single `/qa` still deferred to after S4 per D226.
+
+**Gate:** `mise run gate` (fmt --check + clippy --all-targets +
+nextest --profile ci incl. `cascade_depth`) **GREEN — 824 passed, 8
+skipped, 0 failed** (identical to S2c — S3 is a pure rename,
+behavior-neutral; the 8 skips are the unchanged §7/D250-pending stubs).
+
+**What landed (pure mechanical rename + concept doc-drift fix):**
+
+- **`SerializationGroupId` → `SchedulingGroupId`** (public newtype in
+  `graphrefly-core` lib; **NOT** napi-bound, **NOT** on the parity
+  `Impl` contract ⇒ no `docs/cross-track-ledger.md` event; pre-1.0
+  rename, no shim). `set_serialization_group` → `set_scheduling_group`;
+  `serialization_group` field/var/opts → `scheduling_group`;
+  `serialization_groups` → `scheduling_groups`; prose
+  "serialization group(s)/-group" → "scheduling …". Zero residual old
+  token across `crates/**/*.rs` (verified). `set_serialization_group_*`
+  test fn names renamed in-place.
+- **`git mv crates/graphrefly-core/tests/serialization_groups.rs →
+  tests/scheduling_groups.rs`** (auto-discovered integration test; no
+  Cargo `[[test]]` / `mod` reference to fix). Cross-file references in
+  `group_sharding.rs` / `operators/tests/flow.rs` comments updated.
+- **"None ⇒ one serial unit" doc-drift fixed** (the S3-scoped drift the
+  migration plan names): `handle.rs` `SchedulingGroupId` docstring +
+  `node.rs` `scheduling_group` field doc corrected from the now-false
+  deleted-§7 model ("serializes through one `Arc<ReentrantMutex<()>>`
+  held for the wave / disjoint touched-sets run truly parallel /
+  ascending ordered-acquire") to the post-S2c single-owner truth:
+  declared **identity only**, no in-`Core` group lock, the S4 per-group
+  runnable-wake on `CoreMailbox` is keyed by `g`; `None` = the node is
+  its own single serial scheduling unit on the lock-free floor;
+  cross-`Core` parallelism is host-native via independent per-worker
+  Cores. Fixed one self-referential rename-narration broken by the
+  blanket sub (`benches/group_scaling.rs` header).
+- **Deferred to S4 (recorded, not skipped):** the deeper §7
+  deleted-machinery *internal* comments (`wave_owner` / per-group
+  `ReentrantMutex` prose at `node.rs:~1751/2443/3500/4060`) are NOT
+  the S3 concept-doc-drift — they ride S4's §7 deleted-model + bench
+  rebuild sweep (keeps S3 a tight, reviewable rename). Logged in
+  `porting-deferred.md` § "D246 record-and-skip".
+
+**Files:** `crates/graphrefly-core/src/{handle,node,lib,batch}.rs`,
+`crates/graphrefly-core/tests/{scheduling_groups(was serialization_groups),
+group_parallelism,group_sharding}.rs`,
+`crates/graphrefly-core/benches/group_scaling.rs`,
+`crates/graphrefly-operators/tests/flow.rs`. Decision: the S4 re-entry
+seam is pre-decided **D250** (`~/src/graphrefly-ts/docs/rust-port-decisions.md`)
+— retire the 3 imperative pause/resume/set_deps re-entry stubs as
+deleted-model (no new substrate surface).
+
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 
 > **2026-05-18 STATUS CORRECTION (D236, verify-before-greenfield).** The

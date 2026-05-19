@@ -1,14 +1,14 @@
-//! §7 single-threaded substrate + `SerializationGroupId` contract
+//! §7 single-threaded substrate + `SchedulingGroupId` contract
 //! (D208–D211, 2026-05-16). Replaces the deleted `subgraph_registry.rs`
 //! (which tested the now-removed D3 union-find connected-component
 //! semantics).
 //!
 //! Covers: default-`None` floor (`partition_of` == `None`,
 //! `partition_count` == 0); group assignment via `NodeOpts` +
-//! `Core::set_serialization_group`; and the **strict
+//! `Core::set_scheduling_group`; and the **strict
 //! dep-component-consistency invariant** (a component must be uniformly
 //! all-`None` or all-`Some`) at every topology-mutation entry point
-//! (`register` / `set_deps` / `set_serialization_group`).
+//! (`register` / `set_deps` / `set_scheduling_group`).
 
 mod common;
 
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use common::{TestRuntime, TestValue};
 use graphrefly_core::{
     BindingBoundary, Core, EqualsMode, NodeOpts, NodeRegistration, RegisterError,
-    SerializationGroupId, SetDepsError, SetGroupError,
+    SchedulingGroupId, SetDepsError, SetGroupError,
 };
 
 // D248/D249/S2c: `Core` is now **`!Send + !Sync`** (full single-owner).
@@ -29,11 +29,11 @@ use graphrefly_core::{
 // invariant 2: Core stays Send+Sync" + the S2b `Core: Send` premise —
 // a documented consequence of D248 (user-locked). The
 // `Core<SingleThreadCell>` / `Core<LockedCell>` cell-generic split is
-// deleted (D246/S2c). `SerializationGroupId` is a plain newtype and
+// deleted (D246/S2c). `SchedulingGroupId` is a plain newtype and
 // stays `Send + Sync` (S3 renames it to `SchedulingGroupId`).
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SerializationGroupId>();
+    assert_send_sync::<SchedulingGroupId>();
 
     // `Core` must be `!Send` (it holds `!Send` sinks + `Rc`): the
     // canonical no-dep ambiguity trick — if `Core` impl'd `Send`,
@@ -47,8 +47,8 @@ const _: fn() = || {
     let _ = <graphrefly_core::Core as AmbiguousIfSend<_>>::probe;
 };
 
-const G1: SerializationGroupId = SerializationGroupId::new(1);
-const G2: SerializationGroupId = SerializationGroupId::new(2);
+const G1: SchedulingGroupId = SchedulingGroupId::new(1);
+const G2: SchedulingGroupId = SchedulingGroupId::new(2);
 
 // ---------------------------------------------------------------------
 // Default-None floor
@@ -93,7 +93,7 @@ fn register_with_group_then_partition_of_reports_it() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -102,27 +102,27 @@ fn register_with_group_then_partition_of_reports_it() {
 }
 
 #[test]
-fn set_serialization_group_on_isolated_node_ok() {
+fn set_scheduling_group_on_isolated_node_ok() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     // Single-node component — setting a group keeps it uniformly all-Some.
     rt.core()
-        .set_serialization_group(s.id, Some(G1))
+        .set_scheduling_group(s.id, Some(G1))
         .expect("isolated node group assignment");
     assert_eq!(rt.core().partition_of(s.id), Some(G1));
     // Clearing back to None is also consistent (single-node, all-None).
     rt.core()
-        .set_serialization_group(s.id, None)
+        .set_scheduling_group(s.id, None)
         .expect("clear group");
     assert_eq!(rt.core().partition_of(s.id), None);
 }
 
 #[test]
-fn set_serialization_group_unknown_node() {
+fn set_scheduling_group_unknown_node() {
     let rt = TestRuntime::new();
     let err = rt
         .core()
-        .set_serialization_group(graphrefly_core::NodeId::new(42), Some(G1))
+        .set_scheduling_group(graphrefly_core::NodeId::new(42), Some(G1))
         .unwrap_err();
     assert!(matches!(err, SetGroupError::UnknownNode(_)));
 }
@@ -150,7 +150,7 @@ fn register_all_some_chain_ok_even_with_distinct_groups() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -166,7 +166,7 @@ fn register_all_some_chain_ok_even_with_distinct_groups() {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
             opts: NodeOpts {
-                serialization_group: Some(G2),
+                scheduling_group: Some(G2),
                 ..Default::default()
             },
         })
@@ -187,7 +187,7 @@ fn register_mixed_component_rejected() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -201,7 +201,7 @@ fn register_mixed_component_rejected() {
         .register(NodeRegistration {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
-            opts: NodeOpts::default(), // serialization_group: None
+            opts: NodeOpts::default(), // scheduling_group: None
         })
         .unwrap_err();
     assert!(
@@ -229,7 +229,7 @@ fn set_deps_into_mixed_component_rejected() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init2,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -262,21 +262,21 @@ fn set_deps_consistent_rewire_ok() {
 }
 
 // ---------------------------------------------------------------------
-// QA point-3 (2026-05-16): set_serialization_group is COMPONENT-WIDE —
+// QA point-3 (2026-05-16): set_scheduling_group is COMPONENT-WIDE —
 // the retroactive-regrouping primitive. Assigning to any member assigns
 // the whole dep+children+meta component atomically (consistent by
 // construction; never the chicken-and-egg per-node rejection).
 // ---------------------------------------------------------------------
 
 #[test]
-fn set_serialization_group_is_component_wide_retroactive_regroup() {
+fn set_scheduling_group_is_component_wide_retroactive_regroup() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let d = rt.derived(&[s.id], |_| Some(TestValue::Int(1)));
     // {s, d} is a 2-node all-None component. Grouping `s` now groups the
     // ENTIRE component (s AND d) → uniformly G1, invariant holds.
     rt.core()
-        .set_serialization_group(s.id, Some(G1))
+        .set_scheduling_group(s.id, Some(G1))
         .expect("component-wide assign succeeds (consistent by construction)");
     assert_eq!(rt.core().partition_of(s.id), Some(G1));
     assert_eq!(
@@ -286,7 +286,7 @@ fn set_serialization_group_is_component_wide_retroactive_regroup() {
     );
     // Retroactive clear back to the all-None floor, also component-wide.
     rt.core()
-        .set_serialization_group(d, None)
+        .set_scheduling_group(d, None)
         .expect("component-wide clear succeeds");
     assert_eq!(rt.core().partition_of(s.id), None);
     assert_eq!(rt.core().partition_of(d), None);
@@ -299,7 +299,7 @@ fn set_serialization_group_is_component_wide_retroactive_regroup() {
 // and the walk ignored meta).
 // ---------------------------------------------------------------------
 
-fn grouped_state(rt: &TestRuntime, g: Option<SerializationGroupId>) -> graphrefly_core::NodeId {
+fn grouped_state(rt: &TestRuntime, g: Option<SchedulingGroupId>) -> graphrefly_core::NodeId {
     let init = rt.binding.intern(TestValue::Int(0));
     rt.core()
         .register(NodeRegistration {
@@ -307,7 +307,7 @@ fn grouped_state(rt: &TestRuntime, g: Option<SerializationGroupId>) -> graphrefl
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: g,
+                scheduling_group: g,
                 ..Default::default()
             },
         })
@@ -346,7 +346,7 @@ fn add_meta_companion_consistent_and_walk_includes_meta() {
     // at `parent` must reach `companion` ONLY via the meta edge (there is
     // no dep/child edge between them).
     rt.core()
-        .set_serialization_group(parent, None)
+        .set_scheduling_group(parent, None)
         .expect("component-wide clear");
     assert_eq!(rt.core().partition_of(parent), None);
     assert_eq!(
@@ -376,7 +376,7 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -393,7 +393,7 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
             opts: NodeOpts {
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -406,7 +406,7 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
     assert_eq!(
         rt.core().partition_count(),
         1,
-        "the wave touched serialization group G1 → one group lock resolved"
+        "the wave touched scheduling group G1 → one group lock resolved"
     );
 }
 

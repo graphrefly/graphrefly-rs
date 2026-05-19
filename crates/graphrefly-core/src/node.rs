@@ -388,12 +388,12 @@ pub struct NodeOpts {
     /// terminal slice). Only DATA is buffered; RESOLVED entries are NOT
     /// (R2.6.5 explicit "DATA only").
     pub replay_buffer: Option<usize>,
-    /// §7 concurrency serialization group (D208–D211). `None` (default)
+    /// §7 concurrency scheduling group (D208–D211). `None` (default)
     /// = single-threaded lock-free path. `Some(g)` registers the node
-    /// into serialization group `g`. Subject to the strict
+    /// into scheduling group `g`. Subject to the strict
     /// dep-component-consistency check in [`Core::register`] (all deps'
     /// component must be all-`None` or all-`Some`).
-    pub serialization_group: Option<crate::handle::SerializationGroupId>,
+    pub scheduling_group: Option<crate::handle::SchedulingGroupId>,
 }
 
 impl Default for NodeOpts {
@@ -405,7 +405,7 @@ impl Default for NodeOpts {
             is_dynamic: false,
             pausable: PausableMode::Default,
             replay_buffer: None,
-            serialization_group: None,
+            scheduling_group: None,
         }
     }
 }
@@ -1038,7 +1038,7 @@ pub(crate) struct PendingPauseOverflow {
 /// operation to wave-end (when no partitions are held) and retry.
 /// **Vestigial (§7, D208–D211, 2026-05-16).** The union-find ascending-
 /// order acquisition discipline that this represented is deleted:
-/// serialization groups are user-declared + static and the wave engine
+/// scheduling groups are user-declared + static and the wave engine
 /// acquires the whole touched-group set sorted **upfront**, so there is
 /// no incremental mid-wave acquisition that could violate ordering.
 /// This type is **never constructed** post-§7. It is retained only so
@@ -1188,15 +1188,15 @@ pub enum RegisterError {
     #[error("register: operator seed must be a real handle (R2.5.3); got NO_HANDLE")]
     OperatorSeedSentinel,
 
-    /// §7 strict serialization-group consistency (D208–D211): the new
+    /// §7 strict scheduling-group consistency (D208–D211): the new
     /// node's dep-connected component would be **mixed** — some members
-    /// carry a [`crate::handle::SerializationGroupId`] and some are
+    /// carry a [`crate::handle::SchedulingGroupId`] and some are
     /// `None`. A component MUST be uniformly all-`None` (single-threaded
     /// floor) or all-`Some` (grouped). Assign the node/its deps a group
     /// (or none) consistently before registering. Checked at
     /// topology-mutation time only; never on the hot path.
     #[error(
-        "register: serialization-group inconsistency — node's dep component \
+        "register: scheduling-group inconsistency — node's dep component \
          mixes grouped and ungrouped nodes (must be uniformly all-None or all-Some)"
     )]
     GroupInconsistent,
@@ -1408,15 +1408,17 @@ pub(crate) struct NodeRecord {
     /// Per-fire helpers retain the new value before releasing the old;
     /// `release_handles` releases the current shares at end-of-life.
     pub(crate) op_scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
-    /// §7 concurrency serialization group (D208–D211, 2026-05-16).
-    /// `None` = single-threaded lock-free path (the floor). `Some(g)` =
-    /// this node serializes with every other node carrying `g` through
-    /// one wave-lock. Static + user-declared; set at [`Core::register`]
-    /// (via [`NodeOpts`]) or [`Core::set_serialization_group`]. The
-    /// strict dep-component-consistency invariant (all-`None` or
-    /// all-`Some`) is enforced at those topology-mutation points only,
-    /// never on the hot path.
-    pub(crate) serialization_group: Option<crate::handle::SerializationGroupId>,
+    /// §7 concurrency scheduling group (D208–D211, 2026-05-16; renamed
+    /// `Serialization`→`Scheduling` at S3). `None` = the node is its own
+    /// single serial scheduling unit on the lock-free floor. `Some(g)` =
+    /// the node is declared into scheduling unit `g` (identity only —
+    /// post-S2c single-owner `Core` has no in-`Core` group lock; the S4
+    /// per-group runnable-wake on `CoreMailbox` is keyed by `g`). Static
+    /// + user-declared; set at [`Core::register`] (via [`NodeOpts`]) or
+    /// [`Core::set_scheduling_group`]. The strict dep-component-
+    /// consistency invariant (all-`None` or all-`Some`) is enforced at
+    /// those topology-mutation points only, never on the hot path.
+    pub(crate) scheduling_group: Option<crate::handle::SchedulingGroupId>,
 }
 
 impl NodeRecord {
@@ -1535,7 +1537,7 @@ impl NodeRecord {
 // `CrossPartitionState` held for its `Drop` impl is no longer needed —
 // `BatchGuard` already holds a `Core` clone with the binding).
 
-/// Core-global state with NO per-[`crate::handle::SerializationGroupId`]
+/// Core-global state with NO per-[`crate::handle::SchedulingGroupId`]
 /// partition (Slice B-2 Step 1, D220-EXEC). Hoisted out of [`CoreState`]
 /// so that when Step 2 shards `nodes`/`children` per `ShardKey`, THESE
 /// remain singular: monotonic id counters, the topology-sink registry,
@@ -1561,15 +1563,15 @@ pub struct CoreShared {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
-    /// **Node → declared serialization-group index.** `Some(g)`
+    /// **Node → declared scheduling-group index.** `Some(g)`
     /// entries only — a node absent here is ungrouped. The authority
     /// for `group_of(n)` / `partition_of(n)`. Maintained by
-    /// register-with-group + [`Core::set_serialization_group`]. Empty
+    /// register-with-group + [`Core::set_scheduling_group`]. Empty
     /// for an all-`None` graph. D246/S2c: single-owner ⇒ no placement
     /// shard (the old `node_shard` index is deleted; one shard always).
     /// S3 renames the concept to `SchedulingGroupId`; S4 wires the
     /// per-group `Send` wake.
-    pub(crate) node_group: HashMap<NodeId, crate::handle::SerializationGroupId>,
+    pub(crate) node_group: HashMap<NodeId, crate::handle::SchedulingGroupId>,
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -2223,7 +2225,7 @@ impl Core {
                 max_batch_drain_iterations: 10_000,
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
-                // Declared serialization-group identity (S3 renames
+                // Declared scheduling-group identity (S3 renames
                 // this to `SchedulingGroupId`; S4 wires per-group
                 // wake). S2c keeps the identity; the cross-thread
                 // wave-lock registry + placement-shard map are gone.
@@ -2403,7 +2405,7 @@ impl Core {
         Arc::clone(&self.binding)
     }
 
-    /// Number of distinct serialization groups currently declared.
+    /// Number of distinct scheduling groups currently declared.
     /// Inspection / acceptance-bar only. An all-`None` graph reports
     /// `0`. D246/S2c: single-owner ⇒ no wave-lock registry; the
     /// `node_group` index is the authority (S3 renames the concept to
@@ -2411,27 +2413,27 @@ impl Core {
     #[must_use]
     pub fn partition_count(&self) -> usize {
         self.with_shared(|sh| {
-            let mut seen: HashSet<crate::handle::SerializationGroupId> = HashSet::default();
+            let mut seen: HashSet<crate::handle::SchedulingGroupId> = HashSet::default();
             seen.extend(sh.node_group.values().copied());
             seen.len()
         })
     }
 
-    /// Resolve `node`'s declared serialization group. Returns `None`
+    /// Resolve `node`'s declared scheduling group. Returns `None`
     /// for unregistered nodes **and** for registered nodes with no
     /// group assigned (the two are distinguished via [`Self::kind_of`]
     /// if needed). Pure `node_group` index lookup.
     #[must_use]
-    pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
+    pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SchedulingGroupId> {
         self.group_of(node)
     }
 
     /// `node`'s declared group — the `CoreShared.node_group` index is
     /// the authority (maintained by register-with-group +
-    /// `set_serialization_group`). Unregistered & registered-ungrouped
+    /// `set_scheduling_group`). Unregistered & registered-ungrouped
     /// both → absent → `None`.
     #[must_use]
-    pub(crate) fn group_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
+    pub(crate) fn group_of(&self, node: NodeId) -> Option<crate::handle::SchedulingGroupId> {
         self.with_shared(|sh| sh.node_group.get(&node).copied())
     }
 
@@ -2531,7 +2533,7 @@ pub(crate) fn walk_undirected_dep_graph(
 ) -> HashSet<NodeId> {
     // QA F2 / point-3 (2026-05-16): the component is defined over deps
     // **+ children + meta** — ONE unified connectivity relation, reused
-    // by register / set_deps / add_meta_companion / set_serialization_group
+    // by register / set_deps / add_meta_companion / set_scheduling_group
     // so the strict all-`None`|all-`Some` invariant and the wave cascade
     // agree on what "the component" is. Meta edges are directional
     // (`parent.meta_companions ∋ companion`); for undirected reachability
@@ -2597,7 +2599,7 @@ pub(crate) fn walk_undirected_dep_graph(
 /// The ONE strict-consistency guard (QA F2 / point-3, 2026-05-16): is
 /// `node`'s full dep+children+meta component uniformly all-`None` or
 /// all-`Some`? Reused by `register`, `set_deps`, `add_meta_companion`
-/// and `set_serialization_group` so every topology-mutation entry point
+/// and `set_scheduling_group` so every topology-mutation entry point
 /// enforces the §7 invariant against the *same* component definition
 /// (closing the prior hole where register/set_deps used a deps-only
 /// inductive shortcut that meta edges could bypass). Declare-time only —
@@ -2608,11 +2610,7 @@ pub(crate) fn component_is_group_consistent(s: &CoreState, node: NodeId) -> bool
     let mut saw_some = false;
     let mut saw_none = false;
     for m in component {
-        if s.nodes
-            .get(&m)
-            .and_then(|r| r.serialization_group)
-            .is_some()
-        {
+        if s.nodes.get(&m).and_then(|r| r.scheduling_group).is_some() {
             saw_some = true;
         } else {
             saw_none = true;
@@ -2932,7 +2930,7 @@ impl Core {
             is_dynamic,
             pausable,
             replay_buffer,
-            serialization_group,
+            scheduling_group,
         } = opts;
 
         // Derive the field shape from fn_or_op + deps.
@@ -2989,7 +2987,7 @@ impl Core {
         // placement shard (one shard always); only the declared
         // `node_group` identity is maintained (S3/S4).
         for &dep in &deps {
-            if serialization_group.is_none() != self.group_of(dep).is_none() {
+            if scheduling_group.is_none() != self.group_of(dep).is_none() {
                 return Err(RegisterError::GroupInconsistent);
             }
         }
@@ -3078,7 +3076,7 @@ impl Core {
             received_mask: 0,
             involved_mask: 0,
             op_scratch: installed_scratch,
-            serialization_group,
+            scheduling_group,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
@@ -3088,7 +3086,7 @@ impl Core {
         // Maintain the declared-group index (`partition_of` authority;
         // S3 `SchedulingGroupId` rename / S4 per-group wake). Absent ⇒
         // `None` (ungrouped).
-        if let Some(g) = serialization_group {
+        if let Some(g) = scheduling_group {
             s.shared.node_group.insert(id, g);
         }
         // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
@@ -3109,7 +3107,7 @@ impl Core {
         // `partition_count`/`partition_of` and (Y1+) `lock_for` — none
         // of which take the state lock — so the inner critical section
         // adds negligible latency.
-        // §7 strict serialization-group consistency (D208–D211; QA F2 /
+        // §7 strict scheduling-group consistency (D208–D211; QA F2 /
         // point-3 unified the guard 2026-05-16). The node is already
         // inserted with its deps wired into `s.children` / `dep_records`,
         // so the merged component is fully walkable: the ONE guard
@@ -3493,7 +3491,7 @@ impl Core {
         // a Core-global one. Subscribe touches only `node_id`'s
         // partition (activation cascade stays within the partition
         // because dep edges are unioned). `partition_wave_owner_lock_arc`
-        // §7 (D208–D211): acquire every serialization group transitively
+        // §7 (D208–D211): acquire every scheduling group transitively
         // touched from `node_id`, sorted ascending, held for the
         // subscribe wave. Empty (zero locks) for an all-`None` cascade —
         // the single-threaded floor. Same-thread re-entry passes through
@@ -4702,7 +4700,7 @@ impl Core {
                 "add_meta_companion({parent:?}, {companion:?}): would make \
                  the component mix grouped and ungrouped nodes \
                  (§7 strict invariant — must be uniformly all-None or \
-                 all-Some; reassign the component via set_serialization_group)"
+                 all-Some; reassign the component via set_scheduling_group)"
             );
         }
     }
@@ -5174,7 +5172,7 @@ pub enum SetDepsError {
     /// callback running post-flush).
     ///
     /// Slice Y1 (D3 / D091, 2026-05-08).
-    /// **Vestigial (§7, D208–D211).** Serialization groups are static
+    /// **Vestigial (§7, D208–D211).** scheduling groups are static
     /// and user-declared, so `set_deps` never migrates a node's group;
     /// this is never returned post-§7. Retained only so downstream
     /// `Err(_)` match arms compile unchanged (D211); removal is a
@@ -5182,60 +5180,60 @@ pub enum SetDepsError {
     #[error("vestigial PartitionMigrationDuringFire (never returned post-§7)")]
     PartitionMigrationDuringFire { n: NodeId, firing: NodeId },
 
-    /// §7 strict serialization-group consistency (D208–D211): the
+    /// §7 strict scheduling-group consistency (D208–D211): the
     /// rewired dep set would make node `n`'s component **mixed**
     /// (grouped + ungrouped members). A component must be uniformly
     /// all-`None` or all-`Some`. Checked at topology-mutation time only.
     #[error(
-        "set_deps({n:?}, ...): serialization-group inconsistency — the new \
+        "set_deps({n:?}, ...): scheduling-group inconsistency — the new \
          dep set mixes grouped and ungrouped nodes in n's component \
          (must be uniformly all-None or all-Some)"
     )]
     GroupInconsistent { n: NodeId },
 }
 
-/// Errors returnable by [`Core::set_serialization_group`] (§7, D208–D211).
+/// Errors returnable by [`Core::set_scheduling_group`] (§7, D208–D211).
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum SetGroupError {
     /// The node id is not registered.
-    #[error("set_serialization_group: unknown node {0:?}")]
+    #[error("set_scheduling_group: unknown node {0:?}")]
     UnknownNode(NodeId),
 
     /// **Unreachable since QA point-3 (2026-05-16):**
-    /// [`Core::set_serialization_group`] now assigns the group to the
+    /// [`Core::set_scheduling_group`] now assigns the group to the
     /// node's *entire* dep+children+meta component atomically, so the
     /// result is consistent by construction. Retained (pre-1.0, no
     /// removal churn) for the impossible-by-construction arm and any
     /// future per-node variant. Was: "assigning would make the component
     /// mix grouped and ungrouped nodes."
     #[error(
-        "set_serialization_group({node:?}): component-mixed (unreachable since \
+        "set_scheduling_group({node:?}): component-mixed (unreachable since \
          point-3 component-wide assignment; report as a bug if observed)"
     )]
     ComponentInconsistent { node: NodeId },
 
-    /// `set_serialization_group` was called on a node that is currently
+    /// `set_scheduling_group` was called on a node that is currently
     /// firing its fn (the §7 cross-shard component migration would
     /// move a record out from under an in-flight `invoke_fn` →
     /// `unknown node` panic). Mirrors
     /// [`SetDepsError::ReentrantOnFiringNode`] (Slice B-2 Step 2b-ii
     /// /qa B). The migration is a topology-mutation op and MUST be
     /// externally excluded from concurrent Core access to the
-    /// component (see `porting-deferred.md` "set_serialization_group
+    /// component (see `porting-deferred.md` "set_scheduling_group
     /// concurrency precondition"); this guard catches the in-fire
     /// case loudly rather than corrupting state.
-    #[error("set_serialization_group({node:?}): node is currently firing its fn")]
+    #[error("set_scheduling_group({node:?}): node is currently firing its fn")]
     ReentrantOnFiringNode { node: NodeId },
 }
 
 // D246/S2c: `MigrationRollback` + `MovedComponent` deleted — there is
 // no cross-shard extract→reinsert (single shard always under
-// single-owner). `set_serialization_group` now mutates the declared
+// single-owner). `set_scheduling_group` now mutates the declared
 // group in place under one borrow; nothing to roll back.
 
 impl Core {
     /// §7 (D208–D211; QA point-3 made it component-wide, 2026-05-16):
-    /// assign (or clear, with `None`) the [`crate::handle::SerializationGroupId`]
+    /// assign (or clear, with `None`) the [`crate::handle::SchedulingGroupId`]
     /// for `node`'s **entire** dep+children+meta component.
     ///
     /// This is the **retroactive regrouping** primitive: because
@@ -5256,10 +5254,10 @@ impl Core {
     /// Groups are static: this does not re-fire any node or move an
     /// in-flight wave; it only changes which wave-lock future waves
     /// touching the component will acquire.
-    pub fn set_serialization_group(
+    pub fn set_scheduling_group(
         &self,
         node: NodeId,
-        group: Option<crate::handle::SerializationGroupId>,
+        group: Option<crate::handle::SchedulingGroupId>,
     ) -> Result<(), SetGroupError> {
         // /qa B: in-fire reject — mirrors `set_deps`'s
         // `ReentrantOnFiringNode`. Reassigning a firing node's group
@@ -5274,7 +5272,7 @@ impl Core {
         // extract→reinsert migration and nothing to roll back — the
         // component's records never move. Walk the component once and
         // homogenise the declared group in place: every member's
-        // `NodeRecord.serialization_group` and the `node_group` index
+        // `NodeRecord.scheduling_group` and the `node_group` index
         // both ⇒ `group` (or cleared for `None`). The component is
         // single-group-or-all-`None` by construction, so the result is
         // uniform and `SetGroupError::ComponentInconsistent` is
@@ -5286,7 +5284,7 @@ impl Core {
         let component = walk_undirected_dep_graph(&s, node, None, &[]);
         for m in &component {
             if let Some(rec) = s.nodes.get_mut(m) {
-                rec.serialization_group = group;
+                rec.scheduling_group = group;
             }
             if let Some(g) = group {
                 s.shared.node_group.insert(*m, g);
@@ -5431,14 +5429,14 @@ impl Core {
         // P13 check accordingly.
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
-        // §7 strict serialization-group consistency (D208–D211; QA F2 /
+        // §7 strict scheduling-group consistency (D208–D211; QA F2 /
         // point-3): the `{n} ∪ new_deps` None/Some-mix endpoint check
         // is HOISTED above (Step 2b-ii-B) — before the new-dep
         // existence loop, so a grouped cross-shard dep yields
         // `GroupInconsistent` (it exists, in its own shard) rather than
         // `UnknownNode`. Soundness unchanged: every component is
         // internally consistent (register / add_meta_companion /
-        // set_serialization_group enforce the unified guard), so
+        // set_scheduling_group enforce the unified guard), so
         // merging is consistent iff `{n} ∪ new_deps` is not mixed.
         // Idempotent fast-path. Now safe to short-circuit since the P13
         // check above already considered both `added` and `removed`.
@@ -5595,7 +5593,7 @@ impl Core {
         // re-read sees a coherent post-validation state.
         let added_for_wave: Vec<NodeId> = added.iter().copied().collect();
         // §7 (D208–D211): the union-find union/split-eager block that
-        // lived here is DELETED. Serialization groups are static +
+        // lived here is DELETED. scheduling groups are static +
         // user-declared and do NOT migrate with topology, so adding /
         // removing dep edges never recomputes any node's group. The
         // group-consistency invariant for the new adjacency was already

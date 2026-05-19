@@ -567,7 +567,7 @@ fn wave_state_clear_outermost() {
 // §7 (D208–D211): the per-thread `PARTITION_CACHE` is DELETED. It existed
 // to amortize the union-find `compute_touched_partitions` BFS + registry
 // epoch round-trips across repeated same-seed emits. With static
-// user-declared serialization groups there is no epoch and the
+// user-declared scheduling groups there is no epoch and the
 // touched-group walk resolves group `Arc`s under a single uncontended
 // `group_locks` lock (and is entirely skipped for the all-`None` floor),
 // so the cache (and its ABA-avoidance generation keying) is unnecessary.
@@ -3443,7 +3443,7 @@ impl Core {
     /// §7: now-infallible variant of [`Self::begin_batch_for`]. The
     /// `Result` is retained so existing callers (`try_run_wave_for`,
     /// the `?`-using wave entry points) compile unchanged (D211); it is
-    /// **always `Ok`** — serialization groups are static + user-declared
+    /// **always `Ok`** — scheduling groups are static + user-declared
     /// and the touched-group set is acquired sorted upfront, so there is
     /// no `PartitionOrderViolation` and no epoch retry. For an
     /// all-`None` cascade this acquires nothing (single-threaded floor).

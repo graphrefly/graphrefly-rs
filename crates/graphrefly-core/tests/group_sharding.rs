@@ -1,12 +1,12 @@
 //! Slice B-2 Step 2b-ii (D220-EXEC) — **cross-shard routing delivery**
 //! regression tests.
 //!
-//! `serialization_groups.rs` asserts the `partition_of` *contract* but
+//! `scheduling_groups.rs` asserts the `partition_of` *contract* but
 //! not that a grouped node's waves actually DELIVER through a
 //! non-`DEFAULT_SHARD` shard (the exact coverage gap 2b-ii introduces:
 //! a grouped node's `CoreState` record lives in shard `g`, NOT
 //! `DEFAULT_SHARD`, so register-with-group placement, the
-//! `set_serialization_group` cross-shard component migration, the
+//! `set_scheduling_group` cross-shard component migration, the
 //! `begin_batch_for`→`group_of(seed)` ambient wave routing, and the
 //! `node_group` index must all be coherent or emits silently no-op on
 //! the wrong shard). These tests drive real emits + recorders across
@@ -16,10 +16,10 @@
 mod common;
 
 use common::{TestRuntime, TestValue};
-use graphrefly_core::{NodeOpts, NodeRegistration, SerializationGroupId};
+use graphrefly_core::{NodeOpts, NodeRegistration, SchedulingGroupId};
 
-const G1: SerializationGroupId = SerializationGroupId::new(1);
-const G2: SerializationGroupId = SerializationGroupId::new(2);
+const G1: SchedulingGroupId = SchedulingGroupId::new(1);
+const G2: SchedulingGroupId = SchedulingGroupId::new(2);
 
 /// /qa C: exact-count, not membership. The cross-shard migration's
 /// risk is double / extra delivery (a record re-running activation on
@@ -33,7 +33,7 @@ fn count(rec: &common::Recorder, v: i64) -> usize {
         .count()
 }
 
-/// `set_serialization_group` migrates a single-node component
+/// `set_scheduling_group` migrates a single-node component
 /// `DEFAULT_SHARD → g`; subsequent emits route to shard `g` (ambient
 /// set from `group_of(seed)` by `begin_batch_for`) and still deliver.
 #[test]
@@ -41,7 +41,7 @@ fn grouped_state_round_trip_delivers() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     rt.core()
-        .set_serialization_group(s.id, Some(G1))
+        .set_scheduling_group(s.id, Some(G1))
         .expect("migrate to G1 shard");
     assert_eq!(rt.core().partition_of(s.id), Some(G1));
     let rec = rt.subscribe_recorder(s.id);
@@ -67,7 +67,7 @@ fn grouped_derived_component_migrates_and_delivers() {
         _ => None,
     });
     rt.core()
-        .set_serialization_group(s.id, Some(G1))
+        .set_scheduling_group(s.id, Some(G1))
         .expect("migrate component {s,d} to G1");
     // Whole dep-connected component moved (homogeneity).
     assert_eq!(rt.core().partition_of(s.id), Some(G1));
@@ -97,7 +97,7 @@ fn register_with_group_places_and_delivers() {
             fn_or_op: None,
             opts: NodeOpts {
                 initial: init,
-                serialization_group: Some(G1),
+                scheduling_group: Some(G1),
                 ..Default::default()
             },
         })
@@ -122,8 +122,8 @@ fn disjoint_groups_deliver_independently() {
     let rt = TestRuntime::new();
     let a = rt.state(Some(TestValue::Int(0)));
     let b = rt.state(Some(TestValue::Int(0)));
-    rt.core().set_serialization_group(a.id, Some(G1)).unwrap();
-    rt.core().set_serialization_group(b.id, Some(G2)).unwrap();
+    rt.core().set_scheduling_group(a.id, Some(G1)).unwrap();
+    rt.core().set_scheduling_group(b.id, Some(G2)).unwrap();
     assert_eq!(rt.core().partition_of(a.id), Some(G1));
     assert_eq!(rt.core().partition_of(b.id), Some(G2));
     let ra = rt.subscribe_recorder(a.id);
@@ -151,15 +151,15 @@ fn repeated_regroup_round_trips_delivery_and_index() {
     s.set(TestValue::Int(1));
     assert_eq!(rt.core().partition_of(s.id), None);
 
-    rt.core().set_serialization_group(s.id, Some(G1)).unwrap();
+    rt.core().set_scheduling_group(s.id, Some(G1)).unwrap();
     assert_eq!(rt.core().partition_of(s.id), Some(G1));
     s.set(TestValue::Int(2));
 
-    rt.core().set_serialization_group(s.id, None).unwrap();
+    rt.core().set_scheduling_group(s.id, None).unwrap();
     assert_eq!(rt.core().partition_of(s.id), None);
     s.set(TestValue::Int(3));
 
-    rt.core().set_serialization_group(s.id, Some(G2)).unwrap();
+    rt.core().set_scheduling_group(s.id, Some(G2)).unwrap();
     assert_eq!(rt.core().partition_of(s.id), Some(G2));
     s.set(TestValue::Int(4));
 

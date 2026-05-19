@@ -3788,6 +3788,42 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   loop into the per-group-wake design. The "don't churn the mailbox
   twice" lock is consciously spent once here (D249 rationale).
 
+- **[S3 → S4 scope handoff (NOT a skip) — deleted-§7 internal comments]**
+  S3 fixed the *concept* doc-drift (`SchedulingGroupId`/`scheduling_group`
+  semantic docstrings: identity-only, single-owner, S4 per-group wake).
+  The deeper deleted-§7-*machinery* internal comments still asserting
+  `wave_owner` / per-group `parking_lot::ReentrantMutex` /
+  "disjoint touched-sets run truly parallel" / ascending ordered-acquire
+  (`node.rs:~1751` wave-owner doc block, `:~2443` producer-shim comment,
+  `:~3500` subscribe-wave comment, `:~4060` emit-wave comment) describe
+  machinery S2c **already deleted** — they lag, but they are not the
+  S3-scoped concept drift. Folded into S4's §7 deleted-model + bench
+  rebuild sweep (S4 already converts the §7 `#[ignore]` tests and
+  rebuilds `group_scaling`/`floor_compare`/`profile_*`, so the matching
+  comment correction rides that pass — keeps S3 a tight reviewable
+  rename). Source: S3 slice (2026-05-19). NOT non-applicable — a real
+  comment-accuracy item correctly fused with S4.
+
+- **[D250 — S4 re-entry-stub disposition LOCKED (pre-decided, NOT a
+  skip)]** The 3 still-`#[ignore]` "invariant stays LIVE" stubs
+  (`lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`,
+  `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
+  `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`)
+  are **retired as deleted-model** at S4 per **D250**
+  (`~/src/graphrefly-ts/docs/rust-port-decisions.md`): the only
+  historical trigger (binding-holds-cloned-`Core` synchronous re-entry)
+  is structurally deleted by D221/D246; a synchronous fn/sink re-entry
+  into `pause`/`resume`/`set_deps` is the imperative-from-reactive-layer
+  anti-pattern design invariant #2 forbids; the β-valid reactive path
+  (emit → controller → owner-side op) already exists & is tested.
+  Disposition at S4: `#[ignore = "retired (D250): …"]` with intent
+  preserved (never deleted — same treatment as the §7 cross-thread
+  group tests); the `SetDepsError::ReentrantOnFiringNode` guard *code*
+  stays live as defensive cover. **No `CoreFull`/`MailboxOp`/substrate
+  widening ⇒ no cross-track-ledger event.** This supersedes the prior
+  "S4 owner-side seam — when the seam lands" record-and-skip wording
+  for these 3 entries.
+
 ### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
 
 `2494dea fix: s2b` = **checkpoint of `graphrefly-core`+`graphrefly-operators`

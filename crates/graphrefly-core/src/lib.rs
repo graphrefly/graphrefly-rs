@@ -62,7 +62,7 @@ pub use batch::BatchGuard;
 
 pub use boundary::{BindingBoundary, CleanupTrigger, DepBatch, FnEmission, FnResult};
 pub use clock::{monotonic_ns, wall_clock_ns};
-pub use handle::{FnId, HandleId, LockId, NodeId, SerializationGroupId, NO_HANDLE};
+pub use handle::{FnId, HandleId, LockId, NodeId, SchedulingGroupId, NO_HANDLE};
 pub use hash::sha256_hex;
 pub use mailbox::{CoreMailbox, DeferFn, DeferQueue, MailboxOp};
 pub use message::{Message, Messages};

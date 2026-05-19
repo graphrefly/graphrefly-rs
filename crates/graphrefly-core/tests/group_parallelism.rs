@@ -1,4 +1,4 @@
-//! §7 serialization-group concurrency (D208–D211). Replaces the deleted
+//! §7 scheduling-group concurrency (D208–D211). Replaces the deleted
 //! `per_subgraph_parallelism.rs` (union-find per-partition `wave_owner`).
 //!
 //! Parallelism itself is a perf property (not deterministically
@@ -26,15 +26,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::{TestBinding, TestValue};
-use graphrefly_core::{BindingBoundary, Core, NodeOpts, NodeRegistration, SerializationGroupId};
+use graphrefly_core::{BindingBoundary, Core, NodeOpts, NodeRegistration, SchedulingGroupId};
 
-const GA: SerializationGroupId = SerializationGroupId::new(1);
-const GB: SerializationGroupId = SerializationGroupId::new(2);
+const GA: SchedulingGroupId = SchedulingGroupId::new(1);
+const GB: SchedulingGroupId = SchedulingGroupId::new(2);
 
 fn grouped_state(
     core: &Core,
     binding: &Arc<TestBinding>,
-    g: SerializationGroupId,
+    g: SchedulingGroupId,
 ) -> graphrefly_core::NodeId {
     let init = binding.intern(TestValue::Int(0));
     core.register(NodeRegistration {
@@ -42,7 +42,7 @@ fn grouped_state(
         fn_or_op: None,
         opts: NodeOpts {
             initial: init,
-            serialization_group: Some(g),
+            scheduling_group: Some(g),
             ..Default::default()
         },
     })
