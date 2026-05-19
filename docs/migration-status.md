@@ -3300,6 +3300,96 @@ the previously-skipped §7/D250 stubs are now converted or retired).
 (retire imperative re-entry stubs) + D251 (rule-8 = reusable slot;
 D246-r8 stale-premise reconciled post-D249).
 
+### S5 — PLANNED (locked 2026-05-19 post-S4 honest reflection) — accretion-mass cleanup
+
+> **Locked next `/porting-to-rs` batch.** User directive: "ignore legacy
+> or backward compat; clean/correct/simple/performant/memory-efficient/
+> less-maintenance-burden." Three decisions (D252/D253/D254 in
+> `~/src/graphrefly-ts/docs/rust-port-decisions.md`) fully locked; zero
+> open design forks. Execution: single gated commit per D226; single
+> `/qa` over the S5 diff after.
+
+**Scope:**
+
+1. **D252 — `IN_TICK_OWNED` collapse + "one Core per OS thread" hard
+   invariant.** Replace `thread_local!(RefCell<AHashSet<u64>>)` with
+   `thread_local!(Cell<u64>)` (0 = no active Core; nonzero = active
+   `Core::generation`). `BatchGuard` claim-time guard panics
+   fail-loud if a non-matching non-zero generation is observed —
+   locking in the stronger "no cross-Core same-thread nesting"
+   contract. Documents the invariant in the `IN_TICK_OWNED` /
+   `BatchGuard` module docs. Reverses the D047 per-(Core,thread)
+   keying (which itself was a fix for the now-deleted shared-Core
+   cross-thread model).
+2. **D253 — DELETE `SchedulingGroupId` API surface entirely.** Until
+   M6 actually consumes per-group scheduling (post-1.0). Delete:
+   `SchedulingGroupId` newtype (`crates/graphrefly-core/src/handle.rs`),
+   `CoreShared.node_group: HashMap<NodeId, SchedulingGroupId>`
+   (`node.rs`), `Core::set_scheduling_group` /
+   `Core::partition_of` / `Core::group_of` methods,
+   `NodeOpts.scheduling_group: Option<SchedulingGroupId>` field,
+   the dep-component-consistency `RegisterError::GroupComponentInconsistent`
+   variant + the dispatch check at `register`/`set_deps`, the
+   `pub use` from `lib.rs`, the
+   `crates/graphrefly-core/tests/scheduling_groups.rs` test file,
+   the `crates/graphrefly-core/tests/group_sharding.rs` test file
+   (it tests the deleted cross-shard routing — model is gone), the
+   `g: SchedulingGroupId` parameter on `group_parallelism.rs`'s
+   `run_grouped_cascade` helper (replace with a plain
+   `state → derived` cascade — workers don't need group ids; the
+   test characterises independent-Core serialisation, not group
+   identity). Plus every `SchedulingGroupId` import + the
+   `scheduling_group: Some(g)` setter in `NodeOpts`-constructing
+   tests (`operators/tests/flow.rs`, etc.). Re-introduce in M6
+   with M6's actual scheduling needs in view. Reverses S3.
+3. **D254 — Tier A bundle:**
+   - **`DeferQueue` `parking_lot::Mutex` → `RefCell<VecDeque<DeferFn>>` +
+     `AtomicBool` → `Cell<bool>`.** Owner-thread-only by D248
+     construction; the lock + atomic are unused capacity. Drops a
+     `parking_lot::Mutex` acquire on every owner-side defer
+     post/drain (the hottest D251 path).
+   - **Typed `MailboxOp::TimerEmit(NodeId, HandleId)` variant.**
+     Audit `crates/graphrefly-operators/src/temporal.rs` + every
+     `mailbox.post_defer(SendDeferFn)` call site. For `Send`-defers
+     whose body is `core.emit(n, h)`, introduce the typed variant
+     and `CoreMailbox::post_timer_emit(NodeId, HandleId)`. The
+     timer task uses it. `MailboxOp::Defer(SendDeferFn)` stays only
+     if the audit finds non-emit `Send` closures that survive; if
+     none, drop the variant entirely. Saves a `Box` alloc + dyn
+     dispatch per timer fire.
+   - **Test-file module-doc sweep.** `lock_discipline.rs:1-27`
+     still asserts "Core::subscribe acquires wave_owner (re-entrant)
+     first / Cross-thread emits block on wave_owner until the
+     subscribe scope ends." Grep all test files + `_internal`
+     module docs for residual `wave_owner` / `partition_wave_owner`
+     / "Cross-thread emits block" prose; fix to the post-S2c/D248
+     single-owner truth.
+4. **Process-discipline memory (DONE in the planning session,
+   2026-05-19):** `~/.claude/projects/.../memory/feedback_pre_design_full_decision_set.md`
+   captures the lessons from S2c-S4: pre-design FULL decision-set
+   before slicing (avoid the D232→D232-AMEND→…→D251 mid-flight
+   amendment chain); design facade traits' full surface once (avoid
+   `CoreFull` accretion across D243-D245); cite spec rule IDs in
+   test expectation vectors (S4's first-commit 4-of-4 failures were
+   intuition-anchored, missed R1.3.5.a / push-on-subscribe cached-
+   initial replay); audit user-visible semantics at design time
+   (M2 `compact_every` cadence regression masked by D251's
+   "internal refactor" framing).
+
+**Gate expectations:**
+
+- Test count drops by 2 test files (`scheduling_groups.rs` ~25 tests
+  + `group_sharding.rs` ~15 tests) — 830 → ~790 passed, still 3
+  skipped (D250).
+- `mise run gate` GREEN required before commit; single `/qa` after.
+- **No napi / cross-track-ledger event** (`SchedulingGroupId` was
+  never bound; the rest is internal).
+- `#![forbid(unsafe_code)]` preserved.
+
+**Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+D252 (IN_TICK collapse + hard invariant), D253 (SchedulingGroupId
+delete), D254 (Tier A bundle + process memory).
+
 ### D246 S2c+S3+S4 — /qa LANDED (2026-05-19) — combined sweep per D226
 
 > Single `/qa` over the combined `b2dacec..HEAD` diff (boundary-1 →
