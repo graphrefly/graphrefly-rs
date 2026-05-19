@@ -25,8 +25,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use graphrefly_core::Message;
-use graphrefly_graph::{Graph, GraphPersistSnapshot, NodeSlice};
+use graphrefly_core::{CoreFull, Message};
+use graphrefly_graph::{
+    Graph, GraphObserveAllReactive, GraphOps, GraphPersistSnapshot, NodeSlice, SnapshotOps,
+};
 use graphrefly_structures::{BaseChange, Lifecycle, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -356,16 +358,19 @@ pub struct AttachOptions {
 
 /// Handle returned by [`attach_snapshot_storage`]. Dropping this handle
 /// unsubscribes the observe sink (RAII disposal).
-pub struct StorageHandle {
+/// S2b/β (D242): borrows the owner's `&'g Graph` (via the held
+/// `GraphObserveAllReactive<'g>`); the `'g` borrow keeps the graph
+/// alive for the handle's lifetime — the old `_graph: Graph`
+/// keep-alive clone is gone (`Graph` is move-only under the actor
+/// model).
+pub struct StorageHandle<'g> {
     /// Shared state; inner `disposed` flag prevents late-fire callbacks.
     state: Arc<Mutex<Vec<TierState>>>,
-    /// Graph reference (kept alive so the observe subscription stays valid).
-    _graph: Graph,
     /// The observe handle — dropping it unsubscribes all sinks.
-    _observe: graphrefly_graph::GraphObserveAllReactive,
+    _observe: GraphObserveAllReactive<'g>,
 }
 
-impl StorageHandle {
+impl StorageHandle<'_> {
     /// Explicitly dispose (equivalent to `Drop`, but callable).
     ///
     /// F3 (QA 2026-05-14): on `PoisonError` (a panic in the observe
@@ -491,7 +496,7 @@ impl StorageHandle {
     }
 }
 
-impl Drop for StorageHandle {
+impl Drop for StorageHandle<'_> {
     fn drop(&mut self) {
         self.dispose();
     }
@@ -523,11 +528,11 @@ impl Drop for StorageHandle {
 /// disappears at this boundary.
 #[must_use = "the returned StorageHandle owns the observe subscription; \
               dropping it immediately unsubscribes and stops persistence"]
-pub fn attach_snapshot_storage(
-    graph: &Graph,
+pub fn attach_snapshot_storage<'g>(
+    graph: &'g Graph,
     pairs: Vec<AttachTierPair>,
     options: AttachOptions,
-) -> StorageHandle {
+) -> StorageHandle<'g> {
     let graph_name = graph.name();
     let wal_prefix = graph_wal_prefix(&graph_name);
 
@@ -567,9 +572,21 @@ pub fn attach_snapshot_storage(
 
     let shared_states = Arc::new(Mutex::new(states));
     let states_for_sink = shared_states.clone();
-    let graph_clone = graph.clone();
     let filter = options.filter;
-    let on_error = options.on_error;
+    // β/D244: wrap in `Arc` so each per-fire `MailboxOp::Defer` can
+    // clone the callback (`ErrorCallback` is a non-`Clone` `Box`).
+    let on_error = options.on_error.map(Arc::new);
+    // β/D242/D244: the observe sink fires *in-wave* (during Core
+    // dispatch) and has no `&Core`; capture the `Send` `NamespaceHandle`
+    // (graph identity) + `Arc<CoreMailbox>` (owner-side reentry). The
+    // snapshot + tier-flush is posted as a `MailboxOp::Defer` and runs
+    // on the owner with a real `&dyn CoreFull` (`serialize_handle` via
+    // D244). Behaviour: snapshot+persist is now in-wave-deferred to
+    // quiescence rather than synchronous in the sink — consistent with
+    // D243/D244 "deferred snapshot acceptable" (storage persistence is
+    // a downstream observation).
+    let ns = graph.namespace();
+    let mailbox = graph.core().mailbox();
 
     // Wire observe_all_reactive so late-added nodes are also covered.
     let mut observe = graph.observe_all_reactive();
@@ -583,50 +600,54 @@ pub fn attach_snapshot_storage(
             return;
         }
 
-        // Optional path filter.
+        // Optional path filter (cheap, no Core — stays synchronous).
         if let Some(ref f) = filter {
             if !f(path) {
                 return;
             }
         }
 
-        // Take a snapshot once, shared across all sync tiers.
-        let snapshot = graph_clone.snapshot();
+        let ns = ns.clone();
+        let states_for_defer = states_for_sink.clone();
+        let on_error = on_error.clone();
+        // Defer the snapshot + flush owner-side (D244). Core-gone
+        // (`false`) ⇒ dropped unrun: nothing to persist on a
+        // torn-down graph, no handles captured (no leak).
+        let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
+            // Take a snapshot once, shared across all sync tiers.
+            let snapshot = ns.snapshot(cf);
 
-        // N3 (QA 2026-05-14) — collect errors INSIDE the lock,
-        // invoke `on_error` AFTER releasing the lock. The earlier
-        // pattern called `cb(&e)` while holding `states_for_sink`,
-        // which deadlocked if the user's callback re-entered
-        // `StorageHandle::flush_all` / `dispose` (both acquire the
-        // same `Mutex`). F3: recover from poisoned lock via
-        // `into_inner` rather than silently no-op.
-        let collected_errors: Vec<StorageError> = {
-            let mut states = states_for_sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut errs = Vec::new();
-            for s in states.iter_mut() {
-                if s.disposed {
-                    continue;
+            // N3 (QA 2026-05-14) — collect errors INSIDE the lock,
+            // invoke `on_error` AFTER releasing the lock (re-entrant
+            // `flush_all`/`dispose` would otherwise deadlock). F3:
+            // recover from a poisoned lock via `into_inner`.
+            let collected_errors: Vec<StorageError> = {
+                let mut states = states_for_defer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut errs = Vec::new();
+                for s in states.iter_mut() {
+                    if s.disposed {
+                        continue;
+                    }
+                    if let Err(e) = flush_tier(s, &snapshot) {
+                        errs.push(e);
+                    }
                 }
-                if let Err(e) = flush_tier(s, &snapshot) {
-                    errs.push(e);
-                }
-            }
-            errs
-        };
-        if !collected_errors.is_empty() {
-            if let Some(ref cb) = on_error {
-                for e in &collected_errors {
-                    cb(e);
+                errs
+            };
+            if !collected_errors.is_empty() {
+                if let Some(ref cb) = on_error {
+                    for e in &collected_errors {
+                        cb(e);
+                    }
                 }
             }
-        }
+        }));
     });
 
     StorageHandle {
         state: shared_states,
-        _graph: graph.clone(),
         _observe: observe,
     }
 }

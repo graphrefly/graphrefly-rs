@@ -1,13 +1,18 @@
 //! Mount / unmount + `ancestors()` (canonical spec §3.4).
 //!
-//! v1 limitation: shared-Core only. Mounting a child graph requires
-//! `Arc::ptr_eq` of the inner `Arc<Core>` — cross-Core (multi-binding)
-//! mount is post-M6 per Open Question 1 in
-//! `archive/docs/SESSION-rust-port-architecture.md` Part 6.
+//! S2b/β (D237/D240/D242): subgraphs are namespace handles
+//! (`Arc<Mutex<GraphInner>>`) under the root's single owned `Core`.
+//! These free fns take the root `&Core` + the parent namespace handle
+//! and return borrowed [`SubgraphRef`]s. v1 limitation: shared-Core
+//! only — mounting a child requires `Core::same_dispatcher` (cross-Core
+//! / multi-binding mount is post-M6).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use crate::graph::{Graph, GraphInner, NameError};
+use graphrefly_core::Core;
+use parking_lot::Mutex;
+
+use crate::graph::{destroy_subtree, fire_ns, GraphInner, NameError, SubgraphRef};
 
 /// Errors from `mount` / `mount_new` / `unmount`.
 #[derive(Debug, thiserror::Error)]
@@ -31,8 +36,7 @@ pub enum MountError {
     Destroyed,
 }
 
-/// Result of [`Graph::unmount`] (and exposed for future
-/// [`Graph::remove`] parity, canonical spec §3.2.1 `GraphRemoveAudit`).
+/// Result of [`crate::GraphOps::unmount`] / [`crate::GraphOps::remove`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphRemoveAudit {
     /// Number of nodes torn down (own + recursive into mounts).
@@ -51,144 +55,169 @@ impl From<NameError> for MountError {
     }
 }
 
-pub(crate) fn mount(parent: &Graph, name: String, child: Graph) -> Result<Graph, MountError> {
+/// Construct a fresh empty child `GraphInner` handle with `parent` set.
+fn new_child_inner(name: String, parent: Weak<Mutex<GraphInner>>) -> Arc<Mutex<GraphInner>> {
+    Arc::new(Mutex::new(GraphInner {
+        name,
+        names: indexmap::IndexMap::new(),
+        names_inverse: indexmap::IndexMap::new(),
+        children: indexmap::IndexMap::new(),
+        parent: Some(parent),
+        destroyed: false,
+        namespace_sinks: indexmap::IndexMap::new(),
+        next_ns_sink_id: 0,
+    }))
+}
+
+pub(crate) fn mount<'a>(
+    core: &'a Core,
+    parent_inner: &Arc<Mutex<GraphInner>>,
+    name: String,
+    child: SubgraphRef<'_>,
+) -> Result<SubgraphRef<'a>, MountError> {
     if name.contains("::") {
         return Err(MountError::InvalidName(name));
     }
     // Same-Core check — child must share the parent's Core. Cross-Core
     // mount is post-M6 per session-doc Open Question 1.
-    if !parent.core.same_dispatcher(&child.core) {
+    if !core.same_dispatcher(child.core) {
         return Err(MountError::CoreMismatch);
     }
     // Validate + claim the namespace slot under the parent lock so
     // concurrent mount(name, ...) calls cannot both pass validation
-    // and overwrite each other's insert (TOCTOU fix from /qa Slice E+).
-    // We acquire the child lock under the parent lock (lock ordering:
-    // parent → child, never child → parent — there is no Graph code
-    // that acquires a parent lock from inside a child lock). Both are
-    // `parking_lot::Mutex` so the hold is short and contention-bound.
+    // (TOCTOU fix from /qa Slice E+). Lock order: parent → child.
     {
-        let mut parent_inner = parent.inner.lock();
-        if parent_inner.destroyed {
+        let mut p = parent_inner.lock();
+        if p.destroyed {
             return Err(MountError::Destroyed);
         }
-        if parent_inner.children.contains_key(&name) {
+        if p.children.contains_key(&name) {
             return Err(MountError::NameCollision(name));
         }
-        if parent_inner.names.contains_key(&name) {
+        if p.names.contains_key(&name) {
             return Err(MountError::NodeNameCollision(name));
         }
         {
-            let mut child_inner = child.inner.lock();
-            if child_inner.parent.is_some() {
+            let mut c = child.inner.lock();
+            if c.parent.is_some() {
                 return Err(MountError::AlreadyMounted);
             }
-            child_inner.parent = Some(Arc::downgrade(&parent.inner));
+            c.parent = Some(Arc::downgrade(parent_inner));
         }
-        parent_inner.children.insert(name, child.clone());
+        p.children.insert(name, child.inner.clone());
     }
-    // Fire AFTER lock drops (P3 — reactive describe / observe_all
-    // must see mounts as namespace changes).
-    parent.fire_namespace_change();
-    Ok(child)
+    // Fire AFTER lock drops (P3 — reactive describe / observe_all must
+    // see mounts as namespace changes).
+    fire_ns(core, parent_inner);
+    Ok(SubgraphRef {
+        core,
+        inner: child.inner,
+    })
 }
 
-pub(crate) fn mount_new(parent: &Graph, name: String) -> Result<Graph, MountError> {
+pub(crate) fn mount_new<'a>(
+    core: &'a Core,
+    parent_inner: &Arc<Mutex<GraphInner>>,
+    name: String,
+) -> Result<SubgraphRef<'a>, MountError> {
     if name.contains("::") {
         return Err(MountError::InvalidName(name));
     }
-    let parent_weak = Arc::downgrade(&parent.inner);
-    // Hold the parent lock across validation, child construction, and
-    // insert (TOCTOU fix from /qa Slice E+). `Graph::with_core` does
-    // not take any lock that conflicts — it allocates `Arc<Mutex<...>>`
-    // for the new child's GraphInner.
-    let child = {
-        let mut parent_inner = parent.inner.lock();
-        if parent_inner.destroyed {
+    let parent_weak = Arc::downgrade(parent_inner);
+    // Hold the parent lock across validation + child construction +
+    // insert (TOCTOU fix from /qa Slice E+).
+    let child_inner = {
+        let mut p = parent_inner.lock();
+        if p.destroyed {
             return Err(MountError::Destroyed);
         }
-        if parent_inner.children.contains_key(&name) {
+        if p.children.contains_key(&name) {
             return Err(MountError::NameCollision(name));
         }
-        if parent_inner.names.contains_key(&name) {
+        if p.names.contains_key(&name) {
             return Err(MountError::NodeNameCollision(name));
         }
-        let child = Graph::with_core(name.clone(), parent.core.clone(), Some(parent_weak));
-        parent_inner.children.insert(name, child.clone());
-        child
+        let child_inner = new_child_inner(name.clone(), parent_weak);
+        p.children.insert(name, child_inner.clone());
+        child_inner
     };
     // Fire AFTER lock drops (P3).
-    parent.fire_namespace_change();
-    Ok(child)
+    fire_ns(core, parent_inner);
+    Ok(SubgraphRef {
+        core,
+        inner: child_inner,
+    })
 }
 
-pub(crate) fn unmount(parent: &Graph, name: &str) -> Result<GraphRemoveAudit, MountError> {
+pub(crate) fn unmount(
+    core: &Core,
+    parent_inner: &Arc<Mutex<GraphInner>>,
+    name: &str,
+) -> Result<GraphRemoveAudit, MountError> {
     let child = {
-        let mut parent_inner = parent.inner.lock();
-        if parent_inner.destroyed {
+        let mut p = parent_inner.lock();
+        if p.destroyed {
             return Err(MountError::Destroyed);
         }
-        parent_inner
-            .children
+        p.children
             .shift_remove(name)
             .ok_or_else(|| MountError::NotMounted(name.to_owned()))?
     };
     let audit = audit_of(&child);
     // Detach + destroy.
-    child.inner.lock().parent = None;
-    child.destroy();
+    child.lock().parent = None;
+    destroy_subtree(core, &child);
     // Fire on the parent AFTER the child's destroy completes (P3).
-    parent.fire_namespace_change();
+    fire_ns(core, parent_inner);
     Ok(audit)
 }
 
-pub(crate) fn ancestors(graph: &Graph, include_self: bool) -> Vec<Graph> {
-    let mut chain: Vec<Graph> = Vec::new();
+pub(crate) fn ancestors<'a>(
+    core: &'a Core,
+    inner: &Arc<Mutex<GraphInner>>,
+    include_self: bool,
+) -> Vec<SubgraphRef<'a>> {
+    let mut chain: Vec<SubgraphRef<'a>> = Vec::new();
     if include_self {
-        chain.push(graph.clone());
+        chain.push(SubgraphRef {
+            core,
+            inner: inner.clone(),
+        });
     }
-    // Walk up via Weak parent pointers. We need to reconstruct a `Graph`
-    // from the `Arc<Mutex<GraphInner>>` — but `Graph` also needs a
-    // `Core`. Because mount is shared-Core only, walking up never
-    // changes the Core; reuse `graph.core.clone()`.
+    // Walk up via Weak parent pointers. Mount is shared-Core only, so
+    // every ancestor is reached via the same root `&Core`.
     //
     // Slice V3: visited-set cycle insurance per porting-deferred.md.
-    // Mount validation prevents cycles, but this belt-and-braces check
-    // guards against future bugs in mount/unmount.
     let mut visited = std::collections::HashSet::new();
-    visited.insert(Arc::as_ptr(&graph.inner) as usize);
-    let mut cursor: Option<Arc<parking_lot::Mutex<GraphInner>>> = graph
-        .inner
+    visited.insert(Arc::as_ptr(inner) as usize);
+    let mut cursor: Option<Arc<Mutex<GraphInner>>> = inner
         .lock()
         .parent
         .as_ref()
         .and_then(std::sync::Weak::upgrade);
-    while let Some(inner) = cursor {
-        let ptr = Arc::as_ptr(&inner) as usize;
+    while let Some(cur) = cursor {
+        let ptr = Arc::as_ptr(&cur) as usize;
         if !visited.insert(ptr) {
             break; // Cycle detected — break rather than infinite-loop.
         }
-        let next_parent = inner
+        let next_parent = cur
             .lock()
             .parent
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
-        chain.push(Graph {
-            core: graph.core.clone(),
-            inner,
-        });
+        chain.push(SubgraphRef { core, inner: cur });
         cursor = next_parent;
     }
     chain
 }
 
-fn audit_of(graph: &Graph) -> GraphRemoveAudit {
-    let inner = graph.inner.lock();
+fn audit_of(inner_arc: &Arc<Mutex<GraphInner>>) -> GraphRemoveAudit {
+    let inner = inner_arc.lock();
     let own = inner.names.len();
     let mount_count_self = inner.children.len();
     let mut node_count = own;
     let mut mount_count = mount_count_self;
-    let kids: Vec<Graph> = inner.children.values().cloned().collect();
+    let kids: Vec<Arc<Mutex<GraphInner>>> = inner.children.values().cloned().collect();
     drop(inner);
     for kid in kids {
         let sub = audit_of(&kid);

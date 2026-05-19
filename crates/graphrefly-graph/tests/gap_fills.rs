@@ -4,7 +4,7 @@
 mod common;
 
 use graphrefly_core::{EqualsMode, FnId, HandleId, Message, NO_HANDLE};
-use graphrefly_graph::{Graph, GraphRemoveAudit, RemoveError, SignalKind};
+use graphrefly_graph::{Graph, GraphOps, GraphRemoveAudit, RemoveError, SignalKind};
 use std::sync::{Arc, Mutex};
 
 fn h(n: u64) -> HandleId {
@@ -148,7 +148,7 @@ fn remove_preserves_namespace_during_teardown_cascade() {
     let g = Graph::new("test", common::binding());
     let s = g.state("temp", Some(h(1))).unwrap();
 
-    let g_clone = g.clone();
+    let g_clone = g.namespace();
     let observed_name = Arc::new(Mutex::new(None::<String>));
     let observed_clone = observed_name.clone();
     let _sub = g.subscribe(

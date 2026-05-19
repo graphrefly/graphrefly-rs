@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{BindingBoundary, DepBatch, FnId, FnResult, HandleId, NodeId, NO_HANDLE};
-use graphrefly_graph::{Graph, GraphPersistSnapshot, NodeSlice, NodeSnapshotStatus};
+use graphrefly_graph::{
+    Graph, GraphOps, GraphPersistSnapshot, NodeSlice, NodeSnapshotStatus, SnapshotOps,
+};
 use graphrefly_storage::{
     attach_snapshot_storage, decompose_diff_to_frames, diff_snapshots, kv_storage, memory_backend,
     restore_snapshot, snapshot_storage, AttachOptions, AttachTierPair, BaseStorageTier,

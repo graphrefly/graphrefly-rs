@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink, Subscription,
+    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink, SubscriptionId,
 };
 use serde_json::Value;
 
@@ -97,14 +97,16 @@ pub enum RecordedEvent {
 /// Records events from a subscriber.
 pub struct Recorder {
     events: Arc<Mutex<Vec<RecordedEvent>>>,
-    subscription: Mutex<Option<Subscription>>,
+    /// β/D238: owner-driven teardown via [`StructuresRuntime`] (core
+    /// RAII `Subscription` retired under the actor model).
+    attached: Mutex<Option<(NodeId, SubscriptionId)>>,
 }
 
 impl Recorder {
     pub fn new() -> Self {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
-            subscription: Mutex::new(None),
+            attached: Mutex::new(None),
         }
     }
 
@@ -125,8 +127,18 @@ impl Recorder {
         })
     }
 
-    pub fn attach(&self, sub: Subscription) {
-        *self.subscription.lock().expect("lock") = Some(sub);
+    pub fn attach(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        *self.attached.lock().expect("lock") = Some((node_id, sub_id));
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.attached.lock().expect("lock").expect("not attached").0
+    }
+
+    #[must_use]
+    pub fn sub_id(&self) -> SubscriptionId {
+        self.attached.lock().expect("lock").expect("not attached").1
     }
 
     pub fn snapshot(&self) -> Vec<RecordedEvent> {
@@ -155,21 +167,58 @@ impl Recorder {
 pub struct StructuresRuntime {
     pub binding: Arc<StructuresTestBinding>,
     pub core: Core,
+    /// β/D238/D241-AMEND: owner tracks subs, tears down on `Drop`
+    /// (owner-thread, Core alive — sound; replaces retired core RAII).
+    subs: Mutex<Vec<(NodeId, SubscriptionId)>>,
+}
+
+impl Drop for StructuresRuntime {
+    fn drop(&mut self) {
+        for (n, s) in std::mem::take(
+            &mut *self
+                .subs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) {
+            self.core.unsubscribe(n, s);
+        }
+    }
 }
 
 impl StructuresRuntime {
     pub fn new() -> Self {
         let binding = StructuresTestBinding::new();
         let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
-        Self { binding, core }
+        Self {
+            binding,
+            core,
+            subs: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn track_subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
+        let sub_id = self.core.subscribe(node_id, sink);
+        self.subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((node_id, sub_id));
+        sub_id
+    }
+
+    pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        self.subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&(n, s)| !(n == node_id && s == sub_id));
+        self.core.unsubscribe(node_id, sub_id);
     }
 
     /// Subscribe a recorder to a node.
     pub fn subscribe_recorder(&self, node_id: NodeId) -> Recorder {
         let recorder = Recorder::new();
         let sink = recorder.sink(self.binding.clone());
-        let sub = self.core.subscribe(node_id, sink);
-        recorder.attach(sub);
+        let sub_id = self.track_subscribe(node_id, sink);
+        recorder.attach(node_id, sub_id);
         recorder
     }
 

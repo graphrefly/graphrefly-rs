@@ -156,7 +156,7 @@ fn d2_unsubscribe_between_emits_skips_post_unsub_data() {
     rt.core.batch(|| {
         rt.core.emit(s.id, h1);
         // Batch 1: sinks = [rec_doomed, rec_old], messages = [Dirty, Data(h1)].
-        rec_doomed.unsubscribe();
+        rt.unsubscribe(rec_doomed.node_id(), rec_doomed.sub_id());
         // Subscription dropped → removed from subscribers map; revision bumps.
         // The Recorder itself stays alive so we can inspect events afterward.
         rt.core.emit(s.id, h2);

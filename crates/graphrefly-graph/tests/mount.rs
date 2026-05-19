@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use common::binding;
 use graphrefly_core::{HandleId, Message, Sink};
-use graphrefly_graph::{Graph, MountError};
+use graphrefly_graph::{Graph, GraphOps, MountError};
 
 fn recording_sink() -> (Arc<Mutex<Vec<Message>>>, Sink) {
     let log: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
@@ -39,7 +39,7 @@ fn mount_new_collision_rejected() {
 fn mount_existing_with_different_core_rejected() {
     let parent = Graph::new("system", binding());
     let other = Graph::new("foreign", binding()); // different binding => different Core
-    let err = parent.mount("foreign", other).unwrap_err();
+    let err = parent.mount("foreign", other.view()).unwrap_err();
     assert!(matches!(err, MountError::CoreMismatch));
 }
 
@@ -80,10 +80,10 @@ fn ancestors_walks_parent_chain() {
     let payment = root.mount_new("payment").unwrap();
     let leaf = payment.mount_new("validate").unwrap();
     let chain_self = leaf.ancestors(true);
-    let names: Vec<String> = chain_self.iter().map(Graph::name).collect();
+    let names: Vec<String> = chain_self.iter().map(|s| s.name()).collect();
     assert_eq!(names, vec!["validate", "payment", "system"]);
     let chain_only = leaf.ancestors(false);
-    let names: Vec<String> = chain_only.iter().map(Graph::name).collect();
+    let names: Vec<String> = chain_only.iter().map(|s| s.name()).collect();
     assert_eq!(names, vec!["payment", "system"]);
 }
 
@@ -161,14 +161,13 @@ fn mount_path_with_separator_rejected() {
 
 #[test]
 fn re_mount_into_same_parent_collides_on_name() {
-    // Cloning a `Graph` shares the inner state, so re-mounting under
-    // the same parent collides on the namespace key before the
-    // AlreadyMounted backlink check can fire. Multi-parent same-Core
-    // mount (where AlreadyMounted is the user-visible error) needs a
-    // separate Graph::with_core-equivalent escape hatch we don't
-    // expose in v1.
+    // β/D242: two `SubgraphRef` views of the same root share the
+    // inner state, so re-mounting under the same parent collides on
+    // the namespace key before the AlreadyMounted backlink check can
+    // fire. Multi-parent same-Core mount (where AlreadyMounted is the
+    // user-visible error) needs a separate escape hatch not in v1.
     let parent = Graph::new("system", binding());
-    let other_parent = parent.clone();
+    let other_parent = parent.view();
     let child = parent.mount_new("p").unwrap();
     let err = other_parent.mount("p", child).unwrap_err();
     assert!(matches!(err, MountError::NameCollision(_)));
@@ -213,11 +212,13 @@ fn destroy_preserves_namespace_during_teardown_cascade() {
     let s = g.state("sentinel_node", Some(HandleId::new(1))).unwrap();
     let observed_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let observed_for_sink = observed_name.clone();
-    let g_for_sink = g.clone();
+    // β/D242: capture the Send `NamespaceHandle` (Core-free) — a Sink
+    // is `Send + Sync + 'static` and cannot hold a `!Send` SubgraphRef.
+    let ns_for_sink = g.namespace();
     let sink: Sink = Arc::new(move |msgs: &[Message]| {
         if msgs.iter().any(|m| matches!(m, Message::Teardown)) {
             // Look up the node's name DURING the teardown cascade.
-            *observed_for_sink.lock().unwrap() = g_for_sink.name_of(s);
+            *observed_for_sink.lock().unwrap() = ns_for_sink.name_of(s);
         }
     });
     let _sub = g.subscribe(s, sink);
@@ -361,7 +362,7 @@ fn signal_invalidate_gather_does_not_hold_graph_lock_during_core_call() {
     use graphrefly_core::Message;
     let g = Graph::new("system", binding());
     let s = g.state("named", Some(HandleId::new(1))).unwrap();
-    let g_for_sink = g.clone();
+    let ns_for_sink = g.namespace();
     let observed_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let observed_for_sink = observed_name.clone();
     let sink: Sink = Arc::new(move |msgs: &[Message]| {
@@ -370,7 +371,7 @@ fn signal_invalidate_gather_does_not_hold_graph_lock_during_core_call() {
                 // Re-enter Graph layer mid-cascade. Pre-fix this would
                 // deadlock against the held inner lock; post-fix it
                 // resolves cleanly.
-                *observed_for_sink.lock().unwrap() = g_for_sink.name_of(s);
+                *observed_for_sink.lock().unwrap() = ns_for_sink.name_of(s);
             }
         }
     });

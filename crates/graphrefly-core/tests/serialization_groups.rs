@@ -32,24 +32,27 @@ const _: fn() = || {
     assert_sync::<SerializationGroupId>();
 };
 
-// QA F3 (2026-05-16): regression guard that the §7 floor substrate
-// `Core<SingleThreadCell>` is **neither `Send` nor `Sync`**. The
-// soundness of the lock-free path depends on it being structurally
-// impossible to share/move across threads (it holds `Arc<RefCell<…>>`,
-// auto `!Send + !Sync` because `Arc<T>: Send` requires `T: Sync` and
-// `RefCell` is `!Sync`). No `unsafe`, no negative impls — the canonical
-// no-dep `assert_not_impl_any` ambiguity trick: if the type impl'd
-// `Send` OR `Sync`, method resolution below is ambiguous → compile
-// error; impl'ing NEITHER leaves only the blanket `()` impl →
-// unambiguous → compiles.
+// S2b/β actor-model invariant (D221/D223, supersedes QA F3 2026-05-16):
+// the lock-free floor substrate `Core<SingleThreadCell>` is now **`Send`
+// but NOT `Sync`**. `Send` is required — under the actor / work-stealing
+// model the whole `Core` *moves by value* between workers at quiescence
+// (the borrow checker is the lock; ownership-move is the safety
+// mechanism). `!Sync` is preserved — it is a single-thread lock-free
+// cell and must never be *shared* across threads (only moved). No
+// `unsafe`, no negative impls: `Send` via a direct bound; `!Sync` via
+// the canonical no-dep ambiguity trick (if it impl'd `Sync`, method
+// resolution is ambiguous → compile error; `!Sync` leaves only the
+// blanket `()` impl → unambiguous → compiles).
 const _: fn() = || {
-    trait AmbiguousIfSendOrSync<A> {
+    fn assert_send<T: Send>() {}
+    assert_send::<graphrefly_core::Core<graphrefly_core::SingleThreadCell>>();
+
+    trait AmbiguousIfSync<A> {
         fn probe() {}
     }
-    impl<T: ?Sized> AmbiguousIfSendOrSync<()> for T {}
-    impl<T: ?Sized + Send> AmbiguousIfSendOrSync<u8> for T {}
-    impl<T: ?Sized + Sync> AmbiguousIfSendOrSync<u16> for T {}
-    let _ = <graphrefly_core::Core<graphrefly_core::SingleThreadCell> as AmbiguousIfSendOrSync<
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u16> for T {}
+    let _ = <graphrefly_core::Core<graphrefly_core::SingleThreadCell> as AmbiguousIfSync<
         _,
     >>::probe;
 };

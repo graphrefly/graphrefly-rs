@@ -54,121 +54,21 @@ where
 }
 
 #[test]
+#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
 fn sink_can_reenter_core_via_emit() {
-    let rt = Arc::new(TestRuntime::new());
-    let s = rt.state(Some(TestValue::Int(0)));
-    let s_id = s.id;
-
-    let t = rt.state(Some(TestValue::Int(0)));
-    let t_id = t.id;
-    let t_rec = rt.subscribe_recorder(t_id);
-    let baseline_t = t_rec.snapshot().len();
-
-    let armed = Arc::new(Mutex::new(false));
-    let triggered = Arc::new(Mutex::new(false));
-    let rt_inner = Arc::clone(&rt);
-    let triggered_inner = triggered.clone();
-    let sink = armed_sink(armed.clone(), move |_msg| {
-        let already = {
-            let mut t = triggered_inner.lock().unwrap();
-            let prev = *t;
-            *t = true;
-            prev
-        };
-        if !already {
-            let h = rt_inner.binding.intern(TestValue::Int(99));
-            rt_inner.core.emit(t_id, h);
-        }
-    });
-    std::mem::forget(rt.core.subscribe(s_id, sink));
-    *armed.lock().unwrap() = true;
-
-    // Trigger a wave on s. The sink fires lock-released via flush; safely
-    // re-enters Core to emit on t.
-    let h = rt.binding.intern(TestValue::Int(7));
-    rt.core.emit(s_id, h);
-
-    let t_events = t_rec.snapshot();
-    let new_t = &t_events[baseline_t..];
-    assert!(
-        new_t
-            .iter()
-            .any(|e| matches!(e, common::RecordedEvent::Data(TestValue::Int(99)))),
-        "expected re-entrant emit to deliver Data(99) to t; got {t_events:?}"
-    );
+    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
 }
 
 #[test]
+#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
 fn sink_can_reenter_core_via_pause_and_resume() {
-    let rt = Arc::new(TestRuntime::new());
-    let s = rt.state(Some(TestValue::Int(0)));
-    let s_id = s.id;
-    let t = rt.state(Some(TestValue::Int(0)));
-    let t_id = t.id;
-    let _t_rec = rt.subscribe_recorder(t_id);
-    let lock = rt.core.alloc_lock_id();
-
-    let armed = Arc::new(Mutex::new(false));
-    let pauses_seen = Arc::new(Mutex::new(0u32));
-    let rt_inner = Arc::clone(&rt);
-    let pauses_inner = pauses_seen.clone();
-    let sink = armed_sink(armed.clone(), move |_msg| {
-        let mut p = pauses_inner.lock().unwrap();
-        if *p == 0 {
-            *p = 1;
-            drop(p);
-            rt_inner.core.pause(t_id, lock).expect("pause from sink");
-            rt_inner.core.resume(t_id, lock).expect("resume from sink");
-        }
-    });
-    std::mem::forget(rt.core.subscribe(s_id, sink));
-    *armed.lock().unwrap() = true;
-
-    let h = rt.binding.intern(TestValue::Int(42));
-    rt.core.emit(s_id, h);
-
-    assert_eq!(
-        *pauses_seen.lock().unwrap(),
-        1,
-        "sink should have re-entered Core via pause/resume"
-    );
+    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
 }
 
 #[test]
+#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
 fn sink_can_complete_another_node_from_callback() {
-    let rt = Arc::new(TestRuntime::new());
-    let s = rt.state(Some(TestValue::Int(0)));
-    let t = rt.state(Some(TestValue::Int(0)));
-    let t_id = t.id;
-    let t_rec = rt.subscribe_recorder(t_id);
-    let baseline = t_rec.snapshot().len();
-
-    let armed = Arc::new(Mutex::new(false));
-    let fired = Arc::new(Mutex::new(false));
-    let rt_inner = Arc::clone(&rt);
-    let fired_inner = fired.clone();
-    let sink = armed_sink(armed.clone(), move |_msg| {
-        let mut f = fired_inner.lock().unwrap();
-        if !*f {
-            *f = true;
-            drop(f);
-            rt_inner.core.complete(t_id);
-        }
-    });
-    std::mem::forget(rt.core.subscribe(s.id, sink));
-    *armed.lock().unwrap() = true;
-
-    let h = rt.binding.intern(TestValue::Int(11));
-    rt.core.emit(s.id, h);
-
-    let t_events = t_rec.snapshot();
-    let new_t = &t_events[baseline..];
-    assert!(
-        new_t
-            .iter()
-            .any(|e| matches!(e, common::RecordedEvent::Complete)),
-        "t should observe Complete after re-entrant complete from s's sink; got {t_events:?}"
-    );
+    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
 }
 
 #[test]

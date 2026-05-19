@@ -4,7 +4,7 @@ mod common;
 
 use common::binding;
 use graphrefly_core::{EqualsMode, FnId, HandleId};
-use graphrefly_graph::{DescribeValue, Graph, NodeStatus, NodeTypeStr};
+use graphrefly_graph::{DescribeValue, Graph, GraphOps, NodeStatus, NodeTypeStr};
 
 #[test]
 fn empty_graph_describes_as_empty() {
@@ -190,7 +190,7 @@ mod debug_render {
     use std::sync::Arc;
 
     use graphrefly_core::{BindingBoundary, FnResult, HandleId};
-    use graphrefly_graph::{DebugBindingBoundary, DescribeValue, Graph};
+    use graphrefly_graph::{DebugBindingBoundary, DescribeValue, Graph, GraphOps};
     use parking_lot::Mutex;
 
     /// Minimal binding that renders handles via a HashMap<HandleId, T>.

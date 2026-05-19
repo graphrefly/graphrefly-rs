@@ -55,10 +55,13 @@ pub use describe::{
     DescribeSink, DescribeValue, EdgeDescribe, GraphDescribeOutput, NodeDescribe, NodeStatus,
     NodeTypeStr, ReactiveDescribeHandle,
 };
-pub use graph::{Graph, NameError, PathError, RemoveError, SignalKind};
+pub use graph::{
+    Graph, GraphInner, GraphOps, NameError, NamespaceHandle, PathError, RemoveError, SignalKind,
+    SubgraphRef,
+};
 pub use mount::{GraphRemoveAudit, MountError};
-pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne};
+pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne, ObserveSub};
 pub use snapshot::{
     GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus, SnapshotBuilder,
-    SnapshotError,
+    SnapshotError, SnapshotOps,
 };

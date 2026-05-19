@@ -40,6 +40,8 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 > **⏳ Storage-parity follow-up — `appendLogStorage`/WAL `flush()` durability contract (handed off from graphrefly-ts cross-track-ledger §2, 2026-05-16).** A TS-side memo:Re P0 was fixed in `~/src/graphrefly-ts/packages/pure-ts/src/extra/storage/tiers.ts`: the no-`debounceMs` `appendLogStorage` tier scheduled a microtask-chained `doFlush` per `appendEntries` wave, and `flush()` early-returned (`pending` empty) **before the in-flight chain drained** → only the first wave was durable (silent data loss; `appendMany`'s single wave masked it). Fix: `flushNow()` returns the outstanding `flushChain` when `pending` is empty so `flush()` awaits the full chain. **Native obligation (verify, no scenario gate needed — this is a correctness contract, not a surface widening):** the Rust `@graphrefly/native` storage path (`graphrefly-storage` `appendLogStorage`/WAL flush + `StorageHandle::flush_all` + tier shutdown / `destroyAsync` drain) must guarantee `flush()` resolves **only after all buffered/in-flight writes commit** (durability-on-resolve). The TS bug was a JS chained-microtask artifact specific to the no-debounce auto-flush path; confirm the Rust impl has no analogous "flush returns before queued writes land" gap (N3's `flush_all` lock-discipline work is adjacent but distinct). **Two more semantics surfaced by the graphrefly-ts /qa pass that the Rust parity arm must mirror (not just durability):** (a) **error-surfacing** — post-fix TS `flush()` *rejects* if a prior in-flight write failed (was: silently resolved); make the same reject-vs-swallow decision and test the **rejection** path, not only the happy path; (b) **debounced-flush driver (F9, now FIXED in TS)** — the `appendLogStorage` *tier* still has NO internal timer, but `attachStorage` now drives each debounced tier's `flush()` from a **reactive timer source** (`fromTimer(d,{period:d})`) plus a final drain on detach/teardown. The Rust reactive-log `attach_storage` must mirror this: drive debounced-tier flush from the **Rust reactive timer source** (NOT an internal tier timer, NOT a raw OS timer in the reactive layer) + drain on teardown; (c) **`rollback()` strong semantic (now FIXED in TS)** — a `rollbackEpoch` generation token: `rollback()` bumps it + clears pending; `do_flush` captures the epoch at schedule time and skips if it advanced, so in-flight chained writes scheduled pre-rollback are discarded (best-effort; an already-started backend write can't be un-sent). Mirror the epoch/abort, not just a pending-clear. Cross-ref: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §2 + `optimizations.md` memo:Re P0. Not blocking; fold into the M4/M5 storage parity pass or a `scenarios/storage-wal/` durability+reject+rollback scenario.
 
+> **⏳ `set_deps` napi-surface follow-on — `@graphrefly/native` node-level dynamic rewire (handed off from graphrefly-ts cross-track-ledger §1 D5, 2026-05-18).** graphrefly-ts landed the **TS side** of the rewire trio: `_setDeps`/`_addDep`/`_removeDep` were promoted to **public** `setDeps`/`addDep`/`removeDep` on the `@graphrefly/pure-ts` substrate `Node` interface, and `ImplNode.{setDeps,addDep,removeDep}` were added to the `Impl` parity contract (`packages/parity-tests/impls/types.ts`). `packages/parity-tests/scenarios/core/set-deps.test.ts` is now a real 3-test scenario (rewire dep A→B + addDep/removeDep edge wiring + self-dep rejection) **`skipIf`-gated to the pure-ts arm**. **Native obligation (this follow-on, a separate `/porting-to-rs` slice — NOT auto-scheduled):** `Core::set_deps` is fully implemented in `graphrefly-core` (TLA+-verified `wave_protocol_rewire_MC`) and a non-`#[napi]` `async fn set_deps` already exists at `crates/graphrefly-bindings-js/src/core_bindings.rs:1489` — but it is **NOT exposed** on the napi node surface (`wrapper.d.ts` `NativeNode<T>` has no `setDeps`; deferred per `crates/graphrefly-bindings-js/src/lib.rs` "…set_deps, etc.) lands once v0 numbers justify it"). To close: (1) `#[napi]`-export `set_deps` (+ `add_dep`/`remove_dep` for the full trio) on the Bench node, mirroring the async-surface convention; (2) re-expose them on the hand-written `@graphrefly/native` wrapper (`wrapper.js`/`wrapper.d.ts` `NativeNode`); (3) wire `rust.ts`'s `ImplNode` through; (4) **drop the `skipIf(nativePending)` gate** in `set-deps.test.ts` so the existing 3-test scenario runs cross-arm unchanged; (5) republish `@graphrefly/native` (OIDC, user-gated). The scenario is the parity forcing function (D196-aligned: a real cross-arm scenario already exists and is waiting). Cross-ref: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §1 (D5 row → TS LANDED / native pending) + `optimizations.md` set_deps item + `project_rewire_gap`. Not blocking any TS work.
+
 M6 (Python / pyo3) remains separate and post-1.0.
 
 ### D047 in_tick re-keying — LANDED 2026-05-15 (CI `cargo test --all-targets` fix)
@@ -2990,7 +2992,59 @@ remain **separate, explicitly-approved future batches**.
     bankable; S2b/S2c correctly out of scope (deferred, design-locked
     D221–D225).
 
-### Actor-model S2b — DESIGN FULLY LOCKED + core-crate landed; consumer churn IN PROGRESS (2026-05-17, NOT committed)
+### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
+
+> **2026-05-18 STATUS CORRECTION (D236, verify-before-greenfield).** The
+> commit subject `2494dea fix: s2b` + the original section text below
+> ("consumer churn IN PROGRESS … NOT committed") together implied S2b
+> was done. **It is not.** `2494dea` is a *checkpoint commit of the
+> `graphrefly-core` + `graphrefly-operators` sub-boundary only* (the
+> "natural independently-valuable boundary" `porting-deferred.md`
+> session-4 named). The full S2b boundary is **NOT closed**:
+>
+> - **`graphrefly-graph` (M2, in `default-members`) is still on the
+>   pre-S2b Core API** — `core.clone()` (mount/describe/observe/graph)
+>   + retired `Subscription`/`TopologySubscription` imports → 10
+>   compile errors → full `mise run gate` **RED**. Reconciliation is a
+>   *design-bearing M2 internal-model rewrite* (shape **β** per D237/
+>   D240: root owns `Core`, `Graph` drops `Clone`, tree-walks off
+>   `Graph::clone`, reactive observe/describe Core re-entry →
+>   ns-sink owner-side `&Core` (D231) + topology-sub `MailboxOp::Defer`
+>   (D233); M2 RAII → owner-driven ids + explicit detach per D241).
+> - **Cross-thread core tests** (`lock_discipline`/`serialization_groups`/
+>   `group_parallelism`/`group_sharding`/`dispatcher`) assert
+>   shared-Core serialization the actor model removes → **actor-model
+>   rewrite now** (D238), not a type-swap.
+> - **D235 P7** (re-entrant `drain_mailbox` FIFO test) is a *live*
+>   obligation (callers landed in `2494dea`) → folded into the
+>   S2b-finish slice (D239).
+> - napi `BenchCore` + `examples/profile_disjoint_*` `core.clone()`.
+>
+> **S2b-finish plan (D240 = per-boundary gated commits, keep fusing):**
+> {β graphrefly-graph} → {D238 cross-thread tests} → {P7} → full
+> `mise run gate` green → **commit the true S2b boundary** → then
+> S2c→S3→S4 per D226 (each its own gated commit) → single `/qa` at end.
+> Canonical decisions: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+> **D236–D245**.
+>
+> **STATUS 2026-05-18 (sessions 2–3 + /qa):** ALL 5 workspace **libs**
+> β-green (core/graph/operators/structures/storage); graphrefly-graph
+> tests 112/112; core/structures/storage tests β-green; tests/common
+> keystones rebuilt (own-Core + Drop-teardown + id-Recorders). 12
+> decisions locked D236–D245, zero open forks. Adversarial **/qa run
+> 2026-05-18** (Blind + Edge) — design verified SOUND; applied
+> F1/F2-relabel+`#[ignore]` (8 stubs), Blind #4 observe-Drop
+> lock-discipline fix, Blind #2 example gut. **MUST-FIX before
+> boundary-1** (decided, recorded `porting-deferred.md` §
+> "/qa-2026-05-18"): 🔴 Blind #3 structures-mutation-emit regression →
+> fix (c) hybrid (mutation methods take `&Core` sync; mailbox only for
+> `attach` sink); D239 P7 test (locked, currently unmet); F2
+> coverage-gap (β-rewrite at S4); D245 producer-build slice (§1e).
+> Full `mise run gate` deferred to boundary-1 (uncommitted WIP; D245 +
+> Blind #3(c) intentionally unimplemented). The original
+> (now-superseded-for-status) section text follows for history.
+
+### Actor-model S2b — DESIGN FULLY LOCKED + core-crate landed; consumer churn IN PROGRESS (2026-05-17, NOT committed) [STATUS SUPERSEDED — see correction box above]
 
 `/porting-to-rs finish s2–s6` re-invoked. User chose fused S2b+S2c+S3+S4
 (M6 out) with gate+commit per S-boundary (**D226**). S0+S1+S2a committed

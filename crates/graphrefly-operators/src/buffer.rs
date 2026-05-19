@@ -56,7 +56,6 @@ pub fn buffer(
     notifier: NodeId,
     pack_fn_id: FnId,
 ) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -256,7 +255,6 @@ pub fn buffer_count(
 ) -> NodeId {
     assert!(count > 0, "buffer_count: count must be > 0");
 
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -393,7 +391,6 @@ pub fn window(
     source: NodeId,
     notifier: NodeId,
 ) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -639,7 +636,6 @@ pub fn window_count(
 ) -> NodeId {
     assert!(count > 0, "window_count: count must be > 0");
 
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -701,8 +697,7 @@ pub fn window_count(
                                 };
                                 c.emit(inner, h);
                                 if roll {
-                                    let (new_id, new_handle) =
-                                        create_window_node(c, &*bb_c);
+                                    let (new_id, new_handle) = create_window_node(c, &*bb_c);
                                     {
                                         let mut s = st_c.lock();
                                         s.inner_id = Some(new_id);

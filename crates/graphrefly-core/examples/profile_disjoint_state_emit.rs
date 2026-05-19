@@ -14,11 +14,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
 
-use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink,
-};
+use graphrefly_core::{BindingBoundary, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink};
 
 const EMITS_PER_THREAD: usize = 1_500_000;
 const THREADS: usize = 4;
@@ -51,55 +48,24 @@ fn noop_sink() -> Sink {
     Arc::new(|_: &[Message]| {})
 }
 
+// S2b/β /qa-2026-05-18 Blind #2: this profiler's premise — ONE
+// shared `Core` cloned across N threads emitting on "disjoint
+// partitions" (`core.partition_of`, the §7 union-find) — is exactly
+// the model the actor / work-stealing rewrite deletes (S2c removes
+// `partition_of`/`LockedCell`; `Core` is move-only `!Sync`). Disjoint
+// parallelism is re-measured at S4 via `benches/group_scaling.rs`
+// with the actor model (independent Cores per worker), not a
+// cloned-shared Core. Gutted to a deferred note so the example target
+// compiles; do NOT resurrect the cross-thread-shared-Core shape.
+#[allow(dead_code)]
+fn _superseded_uses(_b: fn() -> Arc<WorkBinding>, _s: fn() -> Sink) {}
+
 fn main() {
-    let binding = WorkBinding::new();
-    let core = Core::new(binding.clone());
-
-    let states: Vec<NodeId> = (0..THREADS)
-        .map(|i| {
-            let s = core
-                .register_state(HandleId::new((i + 10) as u64), false)
-                .unwrap();
-            std::mem::forget(core.subscribe(s, noop_sink()));
-            s
-        })
-        .collect();
-
-    // Premise: all disjoint partitions.
-    for i in 0..THREADS {
-        for j in (i + 1)..THREADS {
-            assert_ne!(
-                core.partition_of(states[i]),
-                core.partition_of(states[j]),
-                "premise: disjoint partitions"
-            );
-        }
-    }
-
-    let handles: Vec<HandleId> = (0..THREADS)
-        .map(|i| HandleId::new((i + 10) as u64))
-        .collect();
-
-    let start = std::time::Instant::now();
-    let mut ts = Vec::with_capacity(THREADS);
-    for i in 0..THREADS {
-        let core_i = core.clone();
-        let s_i = states[i];
-        let h_i = handles[i];
-        ts.push(thread::spawn(move || {
-            for _ in 0..EMITS_PER_THREAD {
-                core_i.emit(s_i, h_i);
-            }
-        }));
-    }
-    for t in ts {
-        t.join().unwrap();
-    }
-    let elapsed = start.elapsed();
+    let _ = (WorkBinding::new, noop_sink, THREADS, EMITS_PER_THREAD);
     eprintln!(
-        "state-emit profile complete: {} total emits, {:?} wall, {:.1} ns/emit",
-        THREADS * EMITS_PER_THREAD,
-        elapsed,
-        elapsed.as_nanos() as f64 / (THREADS * EMITS_PER_THREAD) as f64
+        "profile_disjoint_state_emit: superseded by the actor model \
+         (S2c deletes §7 partitioning; S4 re-measures disjoint \
+         parallelism via benches/group_scaling.rs with independent \
+         per-worker Cores). See porting-deferred § /qa-2026-05-18."
     );
 }

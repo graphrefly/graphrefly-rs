@@ -69,10 +69,9 @@ pub use mailbox::{CoreMailbox, MailboxOp};
 pub use message::{Message, Messages};
 pub use node::{
     Core, CoreFull, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts,
-    NodeRegistration,
-    OperatorOp, OperatorOpts, PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError,
-    SetGroupError, SetPausableModeError, Sink, SubscribeError, SubscriptionId, TerminalKind,
-    UpError,
+    NodeRegistration, OperatorOp, OperatorOpts, PausableMode, PauseError, RegisterError,
+    ResumeReport, SetDepsError, SetGroupError, SetPausableModeError, Sink, SubscribeError,
+    SubscriptionId, TerminalKind, UpError,
 };
 pub use state_cell::{LockedCell, SingleThreadCell, StateCell};
 pub use topology::{TopologyEvent, TopologySink, TopologySubscriptionId};

@@ -3504,3 +3504,368 @@ imports); P5 (`is_runnable` sink-vs-task ordering comment); F4 rejected
   in-wave drain and the outermost loop owns the FIFO.
 - **Source:** `/qa` Blind Hunter #6 (2026-05-18); user-locked
   decision B (defer, don't pre-guard).
+
+### ⭐ D246 β-SIMPLIFICATION LOCKED (2026-05-18) — read FIRST; supersedes the legacy-shape plan below
+
+**Next session's FIRST action is D246, not "finish the current shape."**
+Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md` **D246**
+(the correct design + operating rules + supersession map). The plan
+text in the §"turnkey execution plan" / §1b–1e / §"/qa-2026-05-18"
+blocks below is the **legacy-preserving** shape (`SubgraphRef<'g>` /
+`GraphOps` / `NamespaceHandle` / RAII-via-borrow / reactive `CoreFull`
+widenings); D246 **deletes** that machinery rather than completing it.
+Use those blocks only as the consumer-site inventory (which crates /
+files / call-sites touch Core) — NOT as the design. The design is D246:
+
+- `Graph` = Core-free namespace tree (one type; no `SubgraphRef`/
+  `GraphOps`/`NamespaceHandle`/`'g`); `&Core` passed explicitly;
+  `subscribe→id` + `core.unsubscribe` (no RAII below binding); ship one
+  `OwnedCore` (owns Core + tracks subs + Drop-teardown + producer-build
+  site; replaces the 3 test-harness keystones + folds D245); one
+  complete object-safe Core facade up front (mutation+inspection+
+  serialize+mailbox; supersedes D233/D243/D244/D245 accretion);
+  re-entry classified owner-sync-`&Core` vs sink-in-wave-mailbox from
+  day one (structures **mutation** = owner-sync — Blind #3 structural,
+  not a patch); S2c also drops `Mutex<GraphInner>`→`RefCell`/owner-`&mut`
+  (single-owner; the Mutex is shared-Core-era legacy); typed
+  mailbox/reusable-slot on hot describe/observe/storage paths (no
+  `post_defer(Box)` per emission). Net: **code removed > added.**
+- /qa MUST-FIX absorbed structurally: Blind#3→owner-sync rule;
+  Blind#4→no-RAII-Drop eliminates it; F2/F3→**β-valid rewrites now**
+  (the still-live reentry invariants are trivially expressible under
+  `&Core`-explicit — a derived fn re-entering Core synchronously needs
+  no Core clone); D245→`OwnedCore`+facade. Only genuinely-deleted-model
+  §7 cross-thread tests stay `#[ignore]`→S4.
+- **Operating rules:** NO stubs/deferrals/workarounds for the core
+  thread — finish each S fully (S2b-correct → S2c → S3 → S4, gate+commit
+  per D226, single /qa at end). Don't HALT mid-thread for a
+  non-applicable flag — record it in §"D246 record-and-skip" and keep
+  going; report the full list at session end.
+
+### D246 record-and-skip (running list — flags where the D246 pattern genuinely does NOT apply; report at session end)
+
+_(empty — append `- [area] what / why D246 doesn't fit / proposed handling` as encountered; do NOT HALT for these.)_
+
+### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
+
+`2494dea fix: s2b` = **checkpoint of `graphrefly-core`+`graphrefly-operators`
+only**, NOT the closed S2b boundary (migration-status.md S2b correction
+box). Phase-1 + Phase-2 done: design fully locked, **zero open forks**.
+Decisions canonical in `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+**D236–D241**. Remaining S2b-finish work, in order, each its own
+gate-green commit (D240 = per-boundary, keep fusing):
+
+1. **β graphrefly-graph** (D237/D240/D241) — atomic per-crate boundary
+   (won't compile until fully reconciled; 10 baseline errors:
+   `cargo check -p graphrefly-graph`). Resolved shape:
+   - `Graph { core: Core, inner: Arc<Mutex<GraphInner>> }`, **drop
+     `#[derive(Clone)]`**. `GraphInner.children:
+     IndexMap<String, Arc<Mutex<GraphInner>>>` (child = namespace
+     handle, no Core).
+   - Extract Core-touching logic into free fns over
+     `(&Core, &Arc<Mutex<GraphInner>>)` (`describe_of`, edge/walk
+     helpers); `Graph` methods become thin `(&self.core,&self.inner)`
+     wrappers. Recursive walks (`signal_*`/`destroy`/`edges`/
+     `ancestors`/`collect_*`/`audit_of`/`try_resolve_checked`) →
+     `Arc<Mutex<GraphInner>>` worklists + single `&self.core`
+     (mount = shared-Core only ⇒ one root Core serves the tree).
+   - `NamespaceChangeSink = Arc<dyn Fn(&Core)+Send+Sync>`;
+     `fire_namespace_change(&self)` passes `&self.core` (owner-side,
+     D231 — NOT em.defer; ns changes are owner-invoked).
+   - **topology-sub** path (`DepsChanged`/`NodeTornDown` from inside
+     Core's wave) → reactive describe/observe re-snapshot via
+     `MailboxOp::Defer(FnOnce(&dyn CoreFull))` (D233; deferred
+     describe-snapshot acceptable).
+   - **D242 unifying design (LOCKED):** all Core-touching/tree-walk
+     logic = free fns over `(core: &Core, inner: &Arc<Mutex<GraphInner>>)`;
+     `Graph` (root, owns `Core`, **not `Clone`**) and
+     `SubgraphRef<'g> { core: &'g Core, inner: Arc<Mutex<GraphInner>> }`
+     (`Clone`) are thin wrappers. `mount`/`mount_new`/`mount_with`→
+     `SubgraphRef<'_>`; `ancestors`→`Vec<SubgraphRef<'g>>`;
+     `Graph::view(&self)->SubgraphRef<'_>`.
+   - **RESUME POINT (graph.rs uncommitted WIP, base `2494dea` clean):**
+     DONE in `graph.rs`: imports (`Subscription`→`SubscriptionId`/
+     `TopologySubscriptionId`); `Graph` `#[derive(Clone)]` removed;
+     `GraphInner.children: IndexMap<String, Arc<Mutex<GraphInner>>>`;
+     `NamespaceChangeSink = Arc<dyn Fn(&Core)+Send+Sync>`;
+     `fire_namespace_change`/`destroy`/`try_resolve_checked`/`edges`/
+     `collect_signal_*` delegate to free fns; the 5 free fns
+     (`resolve_checked`/`fire_ns`/`destroy_subtree`/
+     `collect_qualified_names_in`/`edges_in`) + `SubgraphRef<'g>`
+     struct + `Graph::view` ADDED at end of file.
+     **NEXT (graph.rs):** (a) implement the full `SubgraphRef<'g>`
+     method surface (state/derived/dynamic/add/node/name/name_of/
+     node_count/node_names/child_names/is_destroyed/try_resolve*/
+     set/get/invalidate_by_name/complete_by_name/error_by_name/remove/
+     edges/subscribe/unsubscribe/unsubscribe_topology/emit/cache_of/
+     has_fired_once/complete/error/teardown/invalidate/pause/resume/
+     alloc_lock_id/set_deps/set_resubscribable/add_meta_companion/
+     batch/signal*/destroy/mount/mount_new/mount_with/unmount/
+     ancestors/observe*/describe*) as thin wrappers over the free fns
+     (extract remaining method bodies — register_state/derived/dynamic,
+     add/remove, signal_* — into `*_in` free fns; `Graph`'s own
+     Core-touching methods then delegate to `self.view().<m>()`);
+     (b) change `Graph::mount/mount_new/mount_with/unmount` return
+     types to `SubgraphRef<'_>`.
+   - M2 RAII (D241): `Graph::subscribe`→`SubscriptionId`;
+     `observe`/`observe_all`/`observe_all_reactive`/`describe_reactive`
+     return ids; add owner-invoked `Graph::unsubscribe(node,id)` /
+     `unsubscribe_topology(id)` / `detach`. Reactive handles store ids,
+     **no parameterless-Drop Core reach**. User-facing RAII = binding
+     wrapper (napi). Imports `Subscription`→`SubscriptionId`,
+     `TopologySubscription`→`TopologySubscriptionId`.
+   - Files: `crates/graphrefly-graph/src/{graph,mount,describe,observe}.rs`
+     + `tests/*` + napi `crates/graphrefly-bindings-js/src/core_bindings.rs`.
+   - Post-S2b core API: `Core::subscribe(n,sink)->SubscriptionId`,
+     `Core::unsubscribe(n,id)`, `subscribe_topology(sink)->`
+     `TopologySubscriptionId`, `unsubscribe_topology(id)`,
+     `Core::mailbox()->Arc<CoreMailbox>`, `MailboxOp::{Emit,Complete,
+     Error,Defer}`, `same_dispatcher`, `trait CoreFull`. All exported
+     from `graphrefly_core` lib.
+1b. **graphrefly-structures (M5) — SURFACED 2026-05-18 (verify-before-
+   greenfield); NOT on the original plan.** `2494dea` left
+   `crates/graphrefly-structures/src/reactive.rs` (1857 LOC) S2b-broken:
+   `EmitHandle<S>{ core: WeakCore }` + `core.upgrade()?.emit()` (×4
+   construct sites `core: core.weak_handle()` @163/676/1126/1636),
+   `use graphrefly_core::{Subscription, WeakCore}`, `*HandleId` deref
+   sites @387/517. **Same producer-pattern as operators — locked
+   mechanisms apply, NO new fork:** `EmitHandle.core: WeakCore` →
+   `mailbox: Arc<CoreMailbox>`; `emit()` → `let _ = self.mailbox
+   .post_emit(node,h)` (D227/D232-AMEND A′; Core-gone ⇒ drop-unrun,
+   same as pre-S2b `upgrade()` None — no handle leak: binding owns
+   intern/release). `Subscription` (Vec/return/`_subscription`) →
+   `(NodeId, SubscriptionId)` + owner-driven detach (D241 *not* -AMEND:
+   `EmitHandle` is **stored** long-lived in the structure, not a
+   borrowed `&Core` handle for *emit* (→ mailbox/D232-AMEND). `*h`
+   deref → match current `Message::Data(HandleId)` shape. Bundle with
+   the graph β commit (both = substrate-lib S2b Core-consumer churn).
+   `cargo check -p graphrefly-structures --lib` = 7 baseline errors.
+   **PROGRESS 2026-05-18 (uncommitted; base `2494dea` clean):** DONE —
+   `use` line (`Subscription,WeakCore`→`SubscriptionId`,`CoreMailbox`);
+   `EmitHandle.core:WeakCore`→`mailbox:Arc<CoreMailbox>`;
+   `EmitHandle::emit`→`let _ = self.mailbox.post_emit(node,h)`
+   (D232-AMEND; Core-gone⇒drop-unrun, no leak); all 4
+   `core:core.weak_handle()` construct sites→`mailbox:core.mailbox()`.
+   **REMAINING (deterministic, locked-pattern; ~16 lib errors):** every
+   `ReactiveLog`/`Map`/`List`/`Index` method doing `let core =
+   self.emitter.core.upgrade().expect("Core dropped")` (`view`@328,
+   `scan`@456, `attach`@515, `attach_storage`@555/579 + Map/List/Index
+   analogues ~670/1126/1636) **gains a `core:&'c Core` param** (D231
+   owner-side — caller holds it) used directly; nested
+   `EmitHandle{core:self.emitter.core.clone()}`→`mailbox:core.mailbox()`;
+   `attach` long-lived sink `weak_core.upgrade()?.emit()`→capture
+   `mailbox=core.mailbox()`+`let _ = mailbox.post_emit()` (D232-AMEND);
+   `core.subscribe(..)`→`SubscriptionId`, collect
+   `Vec<(NodeId,SubscriptionId)>`; handles `LogView`/`ScanHandle`/
+   `AttachStorageHandle`/`attach`-return→`<'c>` carrying `core:&'c
+   Core`+id-pairs, RAII `Drop`→`self.core.unsubscribe(n,s)`
+   (**D241-AMEND applies**: the returned handle borrows `&'c Core`, so
+   Drop-unsub is sound — same proof as the graph reactive handles;
+   the "stored, not borrowed" note above is only about *emit*, which
+   uses the mailbox); `*h`@396/526 — let the compiler pick `*h` vs `h`.
+   Then `+ structures tests` (same `&core` threading) → `cargo check
+   -p graphrefly-structures` green. FULLY mechanical (zero new design
+   forks). Then commit boundary-1 (graph+structures β: workspace libs
+   build, both crates' tests green).
+1c. **graphrefly-storage (M4) — SURFACED + DONE 2026-05-18.** `2494dea`
+   left `graph_integration.rs` S2b-broken (`Graph::clone`, `Graph`
+   methods now on `GraphOps`, in-wave observe-sink `graph.snapshot()`).
+   FIXED: `D244` widened `CoreFull += serialize_handle`; `snapshot_of`
+   over `&dyn CoreFull`; `NamespaceHandle::snapshot(&dyn CoreFull)`;
+   `StorageHandle<'g>` borrows `&'g Graph` (drop `_graph` clone);
+   observe-sink → captures `NamespaceHandle`+`Arc<CoreMailbox>`, posts
+   `MailboxOp::Defer` (snapshot+flush in-wave-deferred, D243/D244
+   "deferred snapshot acceptable"); `use GraphOps,SnapshotOps`.
+   **ALL 5 WORKSPACE LIBS NOW β-GREEN** (`cargo check` clean:
+   core/graph/operators/structures/storage). graphrefly-graph tests
+   112/112. **Decisions locked through D244** (D236–D244 +
+   D241-AMEND + D232-AMEND-applied), zero open forks.
+
+1d. **REMAINING for boundary-1 (workspace `--all-targets` green) =
+   core+structures+storage TESTS** (the D238 layer; `cargo check
+   --all-targets` ≈ 36 sites / ~13 core test files + structures tests
+   ~9 `&core`-arg + storage tests). **DONE so far:** `tests/common/
+   mod.rs` keystone β — `TestRuntime` owns `Core` + `subs:
+   Mutex<Vec<(NodeId,SubscriptionId)>>` + `Drop` tears all down
+   (owner-thread, sound); `track_subscribe`/`unsubscribe`;
+   `StateHandle<'rt>` borrows `&'rt Core`; `Recorder` `Subscription`→
+   `attached:(NodeId,SubscriptionId)` + `node_id()`/`sub_id()`;
+   `subscribe_recorder` via `track_subscribe`. This cascaded ~6
+   crate-fails → ~36 residual sites. **Residual fix patterns
+   (locked-mechanism, mechanical):** (a) `let core=rt.core.clone()`
+   captured into a re-entrant sink/onDeactivation → capture
+   `rt.core.mailbox()` + `let _ = mb.post_emit(..)` (mirror the
+   production producer fix, D232-AMEND); (b) single-Core
+   `core.clone()` → `&core`; (c) `make_runtime()->(Core,binding)` +
+   `drop(sub)` producer tests → `core.unsubscribe(producer,sub)`
+   (sub is now `SubscriptionId`); (d) `rec.attach(sub)` →
+   `rec.attach(node,sub)`; (e) `rec.unsubscribe()` (2 callers:
+   loom_subscription, sink_snapshot) → `rt.unsubscribe(rec.node_id(),
+   rec.sub_id())`; (f) `sub.node_id()` (subscription.rs:90) → drop the
+   assertion (bare id carries no node); (g) **`subscription.rs` whole
+   file** tests the *retired* core RAII `Subscription` (D225) — rewrite
+   to test `Core::subscribe→SubscriptionId` + owner-invoked
+   `Core::unsubscribe` (id, double-unsub-safe, unsub-after-teardown);
+   (h) **`serialization_groups.rs:47` `AmbiguousIfSendOrSync` probe**
+   asserted `Core<SingleThreadCell>: !Send` — actor model makes it
+   **`Send` (not `Sync`)** (D221/D223): flip the probe to
+   `assert_send::<Core<SingleThreadCell>>()` + a `!Sync` static-assert
+   (intended contract change, not a regression); (i) **D238
+   cross-thread parallelism tests** (`group_parallelism.rs`,
+   `serialization_groups.rs` group cases, `lock_discipline.rs`
+   cross-thread) test the §7 shared-Core group model **S2c deletes +
+   S4 re-measures** — `#[ignore="actor-model: §7 shared-Core groups
+   deleted at S2c; group_scaling re-measured at S4 (D238/D226)"]` +
+   keep as deferred stubs; rewrite at S4 where the actor-model group
+   story lands (NOT a silent intent change — explicit ignore+ref;
+   correctly sequences the semantic rewrite to where the model
+   exists). Then `cargo check --all-targets` green → **commit
+   boundary-1**; full `mise run gate`; commit; then S2c/S3/S4 per the
+   plan below; single `/qa` at end (D226).
+
+1e. **D245 — producer-build `BindingBoundary` widening (the SOLE
+   blocker for boundary-1; everything else `--all-targets` green).**
+   Fully decided + spec'd (canonical `rust-port-decisions.md` D245),
+   ZERO open design questions. Scope (default-members only — napi is
+   NOT in default-members so it does NOT block the boundary-1 gate;
+   napi `invoke_producer_build` is a follow-on with the same shape):
+   - `graphrefly-core/src/boundary.rs`: `BindingBoundary +=
+     `fn invoke_producer_build(&self, node_id: NodeId, fn_id: FnId,
+     core: &dyn CoreFull) {}` (default no-op; FFI-contract widen →
+     cross-track-ledger §1).
+   - `graphrefly-core/src/node.rs`: `CoreFull += fn mailbox(&self) ->
+     std::sync::Arc<crate::mailbox::CoreMailbox>` + blanket impl
+     `Core::mailbox(self)` (needed so `ProducerCtx::emitter()` —
+     `ProducerEmitter::for_core` — works off `&dyn CoreFull`; same
+     owner-side-re-entry-surface justification as D243/D244).
+   - `graphrefly-core` producer-activation site: where Core fires
+     `invoke_fn` for a producer node on first subscribe, instead call
+     `binding.invoke_producer_build(node, fn_id, self as &dyn
+     CoreFull)` (Core has `&self` there). (Find via the producer
+     first-subscribe/activation path; `invoke_fn`'s producer branch
+     in bindings moves here.)
+   - `graphrefly-operators/src/producer.rs`: `ProducerCtx<'a>{ core:
+     &'a dyn CoreFull, .. }`; `new(node, &dyn CoreFull, &storage)`;
+     `core()->&dyn CoreFull`; `emitter()` builds `ProducerEmitter`
+     from `self.core.mailbox()` (was `ProducerEmitter::for_core(&Core
+     <C>)` — switch to a mailbox-based ctor `ProducerEmitter::
+     from_mailbox(node, sub, Arc<CoreMailbox>)` or generalize
+     `for_core`); `subscribe_to`/register via `CoreFull`
+     (`subscribe`/`try_subscribe`/`register_*` already on it).
+   - ALL `BindingBoundary` impls add `invoke_producer_build`:
+     operators `tests/common/mod.rs` `InnerBinding` — DELETE
+     `core_ref: Mutex<Option<Core>>` + `test_core_ref` + `set_core_ref`
+     + `take_core_ref`; impl `invoke_producer_build` = look up
+     `self.state.lock().producer_builds.get(&fn_id)` and run
+     `build(ProducerCtx::new(node_id, core, &self.producer_storage))`;
+     remove the producer branch from `invoke_fn` (leave its
+     `unreachable!` for non-producer). `OpRuntime`/`set_core_self_ref`
+     plumbing that fed `core_ref` is deleted. napi `core_bindings.rs`
+     BenchBinding — same (drop `CURRENT_CORE` TL + `CoreThreadGuard`;
+     impl `invoke_producer_build`); **napi is a follow-on, not
+     boundary-1-blocking**.
+   - graphrefly-core producer tests already β-green; re-verify.
+   Then `cargo check --all-targets` green → **commit boundary-1**
+   (graph+structures+storage+core β; operators harness β). Then full
+   `mise run gate`; then P7; then close-S2b commit; then S2c→S3→S4;
+   single `/qa` at end (D226). **All 5 LIBS ARE ALREADY β-GREEN +
+   graph 112/112 + core/structures/storage TESTS β-green; only the
+   operators producer-build harness (this D245 slice) remains for
+   boundary-1.**
+
+### /qa-2026-05-18 findings (SESSION 3 adversarial review — Blind + Edge)
+
+Ran on the uncommitted S2b-finish β diff (base `2494dea`). Canonical:
+graphrefly-ts `docs/rust-port-decisions.md` (D236–D245). D241-AMEND
+soundness, Drop ordering, mailbox-defer split, D243/D244 widenings,
+destroy/mount/`resolve_checked` rewrite, `subscription.rs`, and the
+`Core<SingleThreadCell>: Send + !Sync` probe **verified SOUND** by both
+reviewers.
+
+**APPLIED in this /qa pass:**
+- **F1/F2 (user-focus, user-locked "re-label honest + record gap"):**
+  the 8 stubbed reentry tests (`lock_released` fn_can_reenter_*×3 /
+  custom_equals / late_subscriber / invoke_fn_can_call_core_cache_of_
+  directly; `slice_e2` cleanup_can_reenter; `slice_f` a6_set_deps) now
+  carry `#[ignore = "…invariant LIVE…NOT covered by producer tests/
+  P7…β rewrite S4…"]` + honest body comment (were vacuous-GREEN with a
+  **false** "covered by producer tests" claim — D232-AMEND/D233 mailbox
+  covers producer **sink** re-entry only; these are synchronous
+  fn-fire / custom_equals / read-during-fire / set_deps-reentry
+  invariants, still live, β-mechanism-invalid but invariant-valid).
+- **Blind #4 (MAJOR latent deadlock):** `GraphObserveAllReactive::Drop`
+  held `self.inner` lock across the `core.unsubscribe` cascade (pre-β
+  code explicitly avoided this). Fixed: drain subs into a local Vec,
+  release the lock, THEN unsubscribe.
+- **Blind #2:** `examples/profile_disjoint_state_emit.rs` (§7
+  cloned-shared-Core cross-thread profiler) gutted to a deferred note
+  (superseded by S4 `benches/group_scaling.rs` independent-Core
+  re-measure) — unblocks `cargo check --all-targets` / `cargo test
+  -p graphrefly-core`.
+
+**MUST-FIX before boundary-1 (recorded; decided mechanisms):**
+- **🔴 Blind #3 (CRITICAL real regression):** structures **mutation**
+  emit (`reactiveMap.set`/`log.append`→`EmitHandle::emit`→
+  `mailbox.post_emit`) has **no drainer** → `cargo test -p
+  graphrefly-structures` = **19 failures**; real regression for every
+  synchronous structures consumer (the "identical to pre-S2b
+  `WeakCore`→None" claim is FALSE — old path emitted synchronously).
+  **User-locked fix = (c) hybrid:** structure mutation methods
+  (`append`/`set`/`insert`/`pop`/`clear`/… ~20) take `&Core` and emit
+  **synchronously** via `core.emit` (owner-side, mirrors the landed
+  `view`/`scan`/`attach` `&Core` pattern); `Arc<CoreMailbox>` retained
+  **only** for the long-lived `attach` upstream sink (genuine deferred
+  sink re-entry). Resolves Blind #5 (storage observes, doesn't mutate)
+  + #9 (unbounded mailbox) — same "who drains" root cause.
+- **F3 (D239 locked obligation, currently UNMET):** the P7 re-entrant
+  `drain_mailbox` FIFO nested-wave test **does not exist**, yet ~11
+  stubs cite "P7" as coverage. D239 mandates P7 *in this slice before
+  boundary-1*. Add the nested-wave FIFO-ordering test (+ conditional
+  `CoreMailbox` `draining` re-entrancy flag if divergence observed);
+  until it lands, the cited coverage is overstated.
+- **F2 coverage-gap (recorded):** the 8 relabeled stubs' invariants
+  (synchronous fn/equals/read/set_deps Core re-entry; D1
+  set_deps-reentry guard `SetDepsError::ReentrantOnFiringNode`) have
+  **NO replacement coverage**. β-valid owner-side rewrite (the
+  *invariant* is live; only the binding-clones-Core *mechanism* was
+  β-invalid — a derived fn re-entering Core synchronously needs no
+  Core clone) scheduled at **S4** with the D238 cross-thread batch.
+- **Blind #6:** stub rewrites left dead helpers/imports (`armed_sink`,
+  `grouped_state`, unused `Recorder`/`EqualsMode`/`Message`/`Sink`/
+  `GA`/`GB`) → noisy under `-D warnings` (gate clippy is NOT `-D` by
+  default so non-fatal, but clean up at boundary-1).
+
+**REJECT (already acknowledged-deferred):** Blind #1 — `graphrefly-
+bindings-js` un-ported (36 errs); explicitly the post-S2b napi
+follow-on per D245/§1e, not in default-members, not boundary-1-blocking.
+
+**DEFER/benign (documented):** Edge F4 — `GraphObserveAllReactive::Drop`
+vs a still-pending `NodeTornDown` prune `MailboxOp::Defer`: the post-
+Drop deferred `cf.unsubscribe` on already-drained ids is idempotent
+(monotonic-never-recycled ids, F4 invariant, `subscription.rs`
+`double_unsubscribe_is_safe`) — analyzed-benign no-op, `subscribed`
+left stale on a dropped (unobservable) handle. No fix needed.
+
+**Phase-3 gate status:** full `mise run gate` intentionally NOT run —
+the workspace is uncommitted WIP with the D245 producer-build slice
+(boundary-1 blocker, §1e) + Blind #3 (c) deliberately unimplemented;
+a gate now would RED on those known/locked items. Gate runs at
+boundary-1 once D245 + Blind #3(c) + F3-P7 land (per D226 plan).
+
+2. **D238 cross-thread core tests** — actor-model rewrite (one Core per
+   worker / `SchedulingGroup`), NOT type-swap; `tests/common/` Core
+   ownership; "do not silently change test intent."
+3. **D239 / D235 P7** — re-entrant `drain_mailbox` FIFO nested-wave
+   ordering test + conditional `CoreMailbox` `draining` flag if
+   divergence observed. (P6 reassessed at S2c; P8 → post-S2c sweep.)
+4. **napi `BenchCore` + `examples/profile_disjoint_*`** — drop
+   `core.clone()` / `Mutex<Option<Core>>.clone()`.
+5. Full `mise run gate` green (default-members incl. graph +
+   cascade_depth) → **commit the true S2b boundary**.
+6. Then **S2c** (delete `LockedCell`/`groups.rs`/`St`/collapse
+   `StateCell`; reassess P6) → **S3** (`SerializationGroupId`→
+   `SchedulingGroupId`, ~59 refs) → **S4** (wave-scope drain +
+   per-group `Send` runnable wake on `CoreMailbox`; `group_scaling`
+   re-measure) — each its own gated commit per D226.
+7. **Single `/qa` at end** (D226). Update migration-status.md (close
+   S2b section properly) + this file + memory `project_next_porting_batch.md`.

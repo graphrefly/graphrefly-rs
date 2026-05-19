@@ -1,43 +1,64 @@
-//! `Graph::observe()` / `Graph::observe_all()` — default sink-style
-//! message tap (canonical spec §3.6.2 default mode).
+//! `Graph::observe()` / `observe_all()` / `observe_all_reactive()` —
+//! default sink-style message tap (canonical §3.6.2 default mode).
 //!
-//! `observe_all_reactive()` auto-subscribes late-added nodes via
-//! the Core topology-change notification primitive (Slice F+).
+//! S2b/β (D237/D240/D242/D241-AMEND): observe handles carry a borrowed
+//! [`SubgraphRef`] (the root `&Core` + namespace handle). The `&Core`
+//! borrow statically pins the Core alive for the handle's lifetime and
+//! makes the handle `!Send` (owner-thread-bound), so RAII `Drop`
+//! **synchronously unsubscribes** — sound, not the D225 relocating-Core
+//! case. Subscribe returns ids (D241); the RAII guards wrap them.
 //!
-//! Async-iterable / reactive (`Node<ObserveChangeset>`) / changeset
-//! variants are deferred (Phase 14).
+//! The reactive `observe_all` ns-listener fires owner-side with `&Core`
+//! (D231). The Core-topology prune of torn-down nodes fires *inside* a
+//! wave, so its `unsubscribe` is routed through `MailboxOp::Defer`
+//! (D233 — sink-side Core mutation never runs synchronously in-wave).
 
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 
 use graphrefly_core::{
-    Core, LockId, Message, NodeId, PauseError, Sink, Subscription, TopologyEvent,
-    TopologySubscription,
+    Core, CoreFull, LockId, Message, NodeId, PauseError, ResumeReport, Sink, SubscriptionId,
+    TopologyEvent, TopologySubscriptionId,
 };
 use parking_lot::Mutex;
 
-use crate::graph::{Graph, GraphInner};
+use crate::graph::{register_ns_sink, GraphInner, GraphOps, NamespaceChangeSink, SubgraphRef};
 
-/// Single-node observe handle. `subscribe` taps downstream messages
-/// from the observed node (same payload shape as a direct
-/// [`graphrefly_core::Core::subscribe`], including the
-/// `[Start, Data?]` handshake when a cache is present per R1.2.3
-/// / R1.3.5.a).
-///
-/// `up` methods send tier-2 / tier-4 messages upstream
-/// (`PAUSE` / `RESUME` / `INVALIDATE`) — the `up(messages)` API per
-/// canonical §3.6.2 specialized to the supported message kinds.
-/// Tier-3 / tier-5 / tier-6 messages have no upstream-injection
-/// semantics.
+/// RAII guard for a single observe subscription. Dropping it
+/// synchronously unsubscribes (β/D241-AMEND: `&'g Core` borrow pins
+/// the Core alive; `!Send` ⇒ owner-thread drop).
+#[must_use = "ObserveSub unsubscribes on drop; bind it to keep the tap alive"]
+pub struct ObserveSub<'g> {
+    core: &'g Core,
+    node_id: NodeId,
+    sub_id: SubscriptionId,
+}
+
+impl ObserveSub<'_> {
+    /// The observed node.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
+
+impl Drop for ObserveSub<'_> {
+    fn drop(&mut self) {
+        self.core.unsubscribe(self.node_id, self.sub_id);
+    }
+}
+
+/// Single-node observe handle (canonical §3.6.2). β/D242: borrows the
+/// root via [`SubgraphRef`].
 #[must_use = "GraphObserveOne does nothing until you call subscribe()"]
-pub struct GraphObserveOne {
-    graph: Graph,
+pub struct GraphObserveOne<'g> {
+    sub: SubgraphRef<'g>,
     node_id: NodeId,
 }
 
-impl GraphObserveOne {
-    pub(crate) fn new(graph: Graph, node_id: NodeId) -> Self {
-        Self { graph, node_id }
+impl<'g> GraphObserveOne<'g> {
+    pub(crate) fn new(sub: SubgraphRef<'g>, node_id: NodeId) -> Self {
+        Self { sub, node_id }
     }
 
     /// The observed `NodeId`.
@@ -46,68 +67,58 @@ impl GraphObserveOne {
         self.node_id
     }
 
-    /// Subscribe a sink. Drop the returned [`Subscription`] to detach.
-    pub fn subscribe(&self, sink: Sink) -> Subscription {
-        self.graph.subscribe(self.node_id, sink)
+    /// Subscribe a sink. Returns an [`ObserveSub`] RAII guard — drop it
+    /// to detach (β/D241-AMEND).
+    pub fn subscribe(&self, sink: Sink) -> ObserveSub<'g> {
+        let sub_id = self.sub.subscribe(self.node_id, sink);
+        ObserveSub {
+            core: self.sub.core,
+            node_id: self.node_id,
+            sub_id,
+        }
     }
 
-    /// Send `[PAUSE, lock]` upstream (per canonical §3.6.2 `up(...)`).
+    /// Send `[PAUSE, lock]` upstream.
     pub fn pause(&self, lock: LockId) -> Result<(), PauseError> {
-        self.graph.pause(self.node_id, lock)
+        self.sub.pause(self.node_id, lock)
     }
 
     /// Send `[RESUME, lock]` upstream.
-    pub fn resume(
-        &self,
-        lock: LockId,
-    ) -> Result<Option<graphrefly_core::ResumeReport>, PauseError> {
-        self.graph.resume(self.node_id, lock)
+    pub fn resume(&self, lock: LockId) -> Result<Option<ResumeReport>, PauseError> {
+        self.sub.resume(self.node_id, lock)
     }
 
     /// Send `[INVALIDATE]` upstream.
     pub fn invalidate(&self) {
-        self.graph.invalidate(self.node_id);
+        self.sub.invalidate(self.node_id);
     }
 }
 
-/// All-nodes observe handle. `subscribe` multiplexes across every
-/// named node in the graph (NOT recursive into mounts — observers
-/// wanting recursion compose with `child.observe_all()` per
-/// subgraph).
-///
-/// The sink receives `(name, &[Message])` tuples; `name` is the
-/// local namespace name. Subscriptions stay tied to the set of
-/// nodes named at `observe_all()` call time — late-added nodes
-/// are NOT auto-subscribed in this slice (lifts with the reactive
-/// observe topology-change primitive in a later slice).
-#[must_use = "GraphObserveAll holds Subscriptions; dropping it unsubscribes all sinks"]
-pub struct GraphObserveAll {
-    graph: Graph,
-    /// One `Subscription` per named node at `observe_all()` call time.
-    /// Held by the handle; dropping the handle unsubscribes every
-    /// fan-out sink.
-    subs: Vec<Subscription>,
+/// All-nodes observe handle. Subscriptions are tied to the set of
+/// nodes named at `subscribe()` call time. β/D241-AMEND: RAII `Drop`
+/// unsubscribes every fan-out sink.
+#[must_use = "GraphObserveAll holds subscriptions; dropping it unsubscribes all sinks"]
+pub struct GraphObserveAll<'g> {
+    sub: SubgraphRef<'g>,
+    subs: Vec<(NodeId, SubscriptionId)>,
 }
 
-impl GraphObserveAll {
-    pub(crate) fn new(graph: Graph) -> Self {
+impl<'g> GraphObserveAll<'g> {
+    pub(crate) fn new(sub: SubgraphRef<'g>) -> Self {
         Self {
-            graph,
+            sub,
             subs: Vec::new(),
         }
     }
 
-    /// Multi-cast subscribe — registers `sink` against every named
-    /// node at this exact moment. Each underlying subscription is
-    /// kept alive in `self`; drop the handle to unsubscribe all.
-    ///
-    /// Returns the number of nodes the sink was registered against.
+    /// Multi-cast subscribe against every named node at this moment.
+    /// Returns the node count.
     pub fn subscribe<F>(&mut self, sink: F) -> usize
     where
         F: Fn(&str, &[Message]) + Send + Sync + 'static,
     {
         let names_to_ids: Vec<(String, NodeId)> = {
-            let inner = self.graph.inner.lock();
+            let inner = self.sub.inner.lock();
             inner.names.iter().map(|(n, id)| (n.clone(), *id)).collect()
         };
         let sink_arc: Arc<F> = Arc::new(sink);
@@ -118,45 +129,18 @@ impl GraphObserveAll {
             let inner_sink: Sink = Arc::new(move |msgs: &[Message]| {
                 sink_clone(&owned_name, msgs);
             });
-            let sub = self.graph.subscribe(id, inner_sink);
-            self.subs.push(sub);
+            let sub_id = self.sub.subscribe(id, inner_sink);
+            self.subs.push((id, sub_id));
         }
         count
     }
 }
 
-impl Graph {
-    /// Tap a single node's downstream message stream.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `path` doesn't resolve. Use [`Graph::try_resolve`]
-    /// + a manual subscribe if non-panicking is required.
-    pub fn observe(&self, path: &str) -> GraphObserveOne {
-        let id = self.node(path);
-        GraphObserveOne::new(self.clone(), id)
-    }
-
-    /// Tap every named node in this graph.
-    ///
-    /// # Snapshot semantics
-    ///
-    /// The returned handle subscribes against the namespace at
-    /// the moment `subscribe()` is called. Nodes named AFTER that
-    /// call are not auto-subscribed. Use [`Self::observe_all_reactive`]
-    /// for dynamic membership.
-    pub fn observe_all(&self) -> GraphObserveAll {
-        GraphObserveAll::new(self.clone())
-    }
-
-    /// Tap every named node AND auto-subscribe late-added nodes.
-    ///
-    /// Like [`Self::observe_all`] but subscribes to topology changes
-    /// so that nodes registered AFTER the initial `subscribe()` call
-    /// are automatically picked up. Dropping the returned handle
-    /// unsubscribes all fan-out sinks AND the topology listener.
-    pub fn observe_all_reactive(&self) -> GraphObserveAllReactive {
-        GraphObserveAllReactive::new(self.clone())
+impl Drop for GraphObserveAll<'_> {
+    fn drop(&mut self) {
+        for (node_id, sub_id) in self.subs.drain(..) {
+            self.sub.core.unsubscribe(node_id, sub_id);
+        }
     }
 }
 
@@ -164,55 +148,61 @@ impl Graph {
 // Reactive observe_all — auto-subscribe late-added nodes
 // -------------------------------------------------------------------
 
-/// Shared state for the reactive `observe_all` subscription.
 struct ObserveAllReactiveInner {
     /// Set of `NodeId`s we've already subscribed to.
     subscribed: HashSet<NodeId>,
-    /// Live subscriptions — kept alive so dropping them unsubscribes.
-    subs: Vec<Subscription>,
+    /// Live `(node, sub)` pairs — unsubscribed on drop / prune.
+    subs: Vec<(NodeId, SubscriptionId)>,
 }
 
-/// Reactive variant of [`GraphObserveAll`] that auto-subscribes
-/// late-added named nodes via Graph namespace-change notifications.
-///
-/// Drop to unsubscribe everything.
-#[must_use = "GraphObserveAllReactive holds Subscriptions; dropping it unsubscribes all sinks"]
-pub struct GraphObserveAllReactive {
-    graph: Graph,
-    /// Namespace-change subscription id. Dropped BEFORE `inner` to
-    /// avoid deadlock: unsubscribe removes the sink (which holds a
-    /// `Weak<Mutex<GraphInner>>`); the closure's captured Arcs are
-    /// not the last refs because `inner` is still owned by `Self`.
+/// Reactive `observe_all` — auto-subscribes late-added named nodes via
+/// the owner-side namespace-change listener, and prunes torn-down
+/// nodes via the Core topology sub (the prune `unsubscribe` is
+/// `MailboxOp::Defer`'d since `NodeTornDown` fires in-wave — D233).
+/// β/D241-AMEND: RAII `Drop` unsubscribes everything.
+#[must_use = "GraphObserveAllReactive holds subscriptions; dropping it unsubscribes all sinks"]
+pub struct GraphObserveAllReactive<'g> {
+    sub: SubgraphRef<'g>,
     ns_sink_id: Option<u64>,
-    /// Slice V3: Core topology subscription for pruning torn-down nodes
-    /// from `inner.subscribed` + `inner.subs`. Prevents unbounded
-    /// accumulation on long-running graphs (D2 in porting-deferred.md).
-    topo_sub: Option<TopologySubscription>,
+    topo_sub_id: Option<TopologySubscriptionId>,
     inner: Arc<Mutex<ObserveAllReactiveInner>>,
 }
 
-// Send + Sync compile-time assertion.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<GraphObserveAllReactive>();
-};
-
-impl Drop for GraphObserveAllReactive {
+impl Drop for GraphObserveAllReactive<'_> {
     fn drop(&mut self) {
-        // Unsubscribe namespace sink BEFORE inner drops, to avoid
-        // the deadlock described in the field comment.
+        // Topology sub first, then namespace sink, then the fan-out
+        // subs — all synchronous + owner-thread (β/D241-AMEND).
+        if let Some(id) = self.topo_sub_id.take() {
+            self.sub.core.unsubscribe_topology(id);
+        }
         if let Some(id) = self.ns_sink_id.take() {
-            self.graph.unsubscribe_namespace_change(id);
+            crate::graph::unregister_ns_sink(&self.sub.inner, id);
+        }
+        // /qa-2026-05-18 Blind #4: drain the fan-out subs into a local
+        // Vec and RELEASE the `inner` lock BEFORE the `core.unsubscribe`
+        // cascade. `Core::unsubscribe` runs the full
+        // OnDeactivation→producer_deactivate→wipe_ctx→cache-clear chain
+        // and can fire teardown/topology sinks synchronously; any such
+        // sink re-entering a path that locks this non-reentrant
+        // `ObserveAllReactiveInner` mutex would self-deadlock. The
+        // pre-β code avoided this for the same reason ("dropped BEFORE
+        // inner to avoid deadlock").
+        let drained: Vec<(NodeId, SubscriptionId)> = {
+            let mut state = self.inner.lock();
+            state.subs.drain(..).collect()
+        };
+        for (node_id, sub_id) in drained {
+            self.sub.core.unsubscribe(node_id, sub_id);
         }
     }
 }
 
-impl GraphObserveAllReactive {
-    fn new(graph: Graph) -> Self {
+impl<'g> GraphObserveAllReactive<'g> {
+    pub(crate) fn new(sub: SubgraphRef<'g>) -> Self {
         Self {
-            graph,
+            sub,
             ns_sink_id: None,
-            topo_sub: None,
+            topo_sub_id: None,
             inner: Arc::new(Mutex::new(ObserveAllReactiveInner {
                 subscribed: HashSet::new(),
                 subs: Vec::new(),
@@ -222,23 +212,14 @@ impl GraphObserveAllReactive {
 
     /// Subscribe a sink to all current AND future named nodes.
     ///
-    /// The sink receives `(name, &[Message])` tuples, same as
-    /// [`GraphObserveAll::subscribe`]. Returns the number of nodes
-    /// subscribed at call time (future auto-subscriptions are not
-    /// counted).
-    ///
     /// # Panics
     ///
-    /// Panics if called more than once on the same handle. The v1
-    /// contract is "single-shot wiring"; rebuild the handle via
-    /// [`Graph::observe_all_reactive`] to install another sink.
+    /// Panics if called more than once on the same handle (single-shot
+    /// wiring; rebuild via `observe_all_reactive`).
     pub fn subscribe<F>(&mut self, sink: F) -> usize
     where
         F: Fn(&str, &[Message]) + Send + Sync + 'static,
     {
-        // P5 — subscribe-once contract. A second call would leak the
-        // first namespace sink (we'd overwrite `ns_sink_id` without
-        // unsubscribing the prior). Panic on misuse instead.
         assert!(
             self.ns_sink_id.is_none(),
             "GraphObserveAllReactive::subscribe is single-shot; called twice on the same handle"
@@ -246,82 +227,82 @@ impl GraphObserveAllReactive {
 
         let sink_arc: Arc<F> = Arc::new(sink);
 
-        // P4 — install the namespace listener BEFORE the initial
-        // snapshot. A node added concurrently between snapshot and
-        // listener-install would otherwise be permanently missed.
-        // The listener's `inner.subscribed.insert(id)` dedups against
-        // the snapshot, so an idempotent overlap is harmless.
-        //
-        // P6 — capture Weak<inner> + Core (clone) instead of the full
-        // Graph clone. This breaks the namespace_sinks → sink → Graph
-        // → namespace_sinks Arc cycle so leaking the handle does not
-        // leak the graph.
-        let weak_graph_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.graph.inner);
-        let core: Core = self.graph.core.clone();
+        // P4: install the namespace listener BEFORE the initial
+        // snapshot (the listener's `subscribed.insert` dedups).
+        // β/D231: the listener receives the owner's `&Core` at
+        // fire-time (no stored/cloned Core); it subscribes new nodes
+        // synchronously (fire_namespace_change is owner-side, not
+        // in-wave).
+        let weak_graph_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.sub.inner);
         let inner_for_ns = self.inner.clone();
         let sink_for_ns = sink_arc.clone();
-        let ns_sink = Arc::new(move || {
+        let ns_sink: NamespaceChangeSink = Arc::new(move |core: &Core| {
             let Some(arc_inner) = weak_graph_inner.upgrade() else {
-                // Graph dropped; silent no-op.
                 return;
             };
-            let graph = Graph {
-                core: core.clone(),
-                inner: arc_inner,
-            };
-            // Scan for any newly-named nodes we haven't subscribed to.
             let new_nodes: Vec<(String, NodeId)> = {
-                let graph_inner = graph.inner.lock();
+                let graph_inner = arc_inner.lock();
                 let state = inner_for_ns.lock();
                 graph_inner
                     .names
                     .iter()
-                    .filter(|(_name, id)| !state.subscribed.contains(id))
+                    .filter(|(_n, id)| !state.subscribed.contains(id))
                     .map(|(n, id)| (n.clone(), *id))
                     .collect()
             };
             for (name, id) in new_nodes {
-                let should_subscribe = {
+                let should = {
                     let mut state = inner_for_ns.lock();
                     state.subscribed.insert(id)
                 };
-                if should_subscribe {
+                if should {
                     let sink_clone = sink_for_ns.clone();
                     let owned_name = name;
                     let msg_sink: Sink = Arc::new(move |msgs: &[Message]| {
                         sink_clone(&owned_name, msgs);
                     });
-                    let sub = graph.subscribe(id, msg_sink);
-                    inner_for_ns.lock().subs.push(sub);
+                    let sub_id = core.subscribe(id, msg_sink);
+                    inner_for_ns.lock().subs.push((id, sub_id));
                 }
             }
         });
-        self.ns_sink_id = Some(self.graph.subscribe_namespace_change(ns_sink));
+        self.ns_sink_id = Some(register_ns_sink(&self.sub.inner, ns_sink));
 
-        // Slice V3: subscribe to Core topology events to prune torn-down
-        // nodes from subscribed + subs. Prevents unbounded accumulation
-        // on long-running graphs (D2 in porting-deferred.md).
+        // Slice V3 D2: prune torn-down nodes. `NodeTornDown` fires
+        // in-wave → the `unsubscribe` is `MailboxOp::Defer`'d (D233:
+        // no synchronous sink-side Core mutation).
         let inner_for_topo = self.inner.clone();
+        let mailbox = self.sub.core.mailbox();
         let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
             Arc::new(move |event: &TopologyEvent| {
                 if let TopologyEvent::NodeTornDown(id) = event {
-                    let mut state = inner_for_topo.lock();
-                    if state.subscribed.remove(id) {
-                        // Drop the Subscription for this node. The
-                        // Subscription's Drop will unsubscribe the sink
-                        // from Core.
-                        state.subs.retain(|sub| sub.node_id() != *id);
-                    }
+                    let id = *id;
+                    let inner_for_defer = inner_for_topo.clone();
+                    // No `HandleId` captured — Core-gone (`false`) just
+                    // skips the prune; nothing to release (D235 P8).
+                    let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
+                        let to_unsub: Vec<(NodeId, SubscriptionId)> = {
+                            let mut state = inner_for_defer.lock();
+                            if state.subscribed.remove(&id) {
+                                let (keep, drop_): (Vec<_>, Vec<_>) =
+                                    state.subs.drain(..).partition(|(n, _)| *n != id);
+                                state.subs = keep;
+                                drop_
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        for (n, s) in to_unsub {
+                            cf.unsubscribe(n, s);
+                        }
+                    }));
                 }
             });
-        self.topo_sub = Some(self.graph.core.subscribe_topology(topo_sink));
+        self.topo_sub_id = Some(self.sub.core.subscribe_topology(topo_sink));
 
-        // Now take the initial snapshot. Any node added between
-        // listener-install and snapshot will be picked up by the
-        // listener's idempotent walk — `inner.subscribed.insert(id)`
-        // returns false if we beat the listener to it.
+        // Initial snapshot (listener's idempotent walk dedups overlap).
         let names_to_ids: Vec<(String, NodeId)> = {
-            let graph_inner = self.graph.inner.lock();
+            let graph_inner = self.sub.inner.lock();
             graph_inner
                 .names
                 .iter()
@@ -330,10 +311,10 @@ impl GraphObserveAllReactive {
         };
         let initial_count = names_to_ids.len();
         let to_subscribe: Vec<(String, NodeId)> = {
-            let mut inner = self.inner.lock();
+            let mut state = self.inner.lock();
             names_to_ids
                 .into_iter()
-                .filter(|(_name, id)| inner.subscribed.insert(*id))
+                .filter(|(_n, id)| state.subscribed.insert(*id))
                 .collect()
         };
         for (name, id) in to_subscribe {
@@ -341,8 +322,8 @@ impl GraphObserveAllReactive {
             let msg_sink: Sink = Arc::new(move |msgs: &[Message]| {
                 sink_clone(&name, msgs);
             });
-            let sub = self.graph.subscribe(id, msg_sink);
-            self.inner.lock().subs.push(sub);
+            let sub_id = self.sub.subscribe(id, msg_sink);
+            self.inner.lock().subs.push((id, sub_id));
         }
 
         initial_count

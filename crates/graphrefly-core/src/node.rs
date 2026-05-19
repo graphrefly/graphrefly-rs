@@ -1902,12 +1902,10 @@ impl<C: crate::state_cell::StateCell> Drop for Core<C> {
         // half-dropped `Core` is unsound — user-locked QA decision A).
         for op in self.mailbox.take_all() {
             match op {
-                crate::mailbox::MailboxOp::Emit(_, h)
-                | crate::mailbox::MailboxOp::Error(_, h) => {
+                crate::mailbox::MailboxOp::Emit(_, h) | crate::mailbox::MailboxOp::Error(_, h) => {
                     self.binding.release_handle(h);
                 }
-                crate::mailbox::MailboxOp::Complete(_)
-                | crate::mailbox::MailboxOp::Defer(_) => {}
+                crate::mailbox::MailboxOp::Complete(_) | crate::mailbox::MailboxOp::Defer(_) => {}
             }
         }
     }
@@ -1929,11 +1927,7 @@ pub trait CoreFull {
     /// See [`Core::subscribe`].
     fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId;
     /// See [`Core::try_subscribe`].
-    fn try_subscribe(
-        &self,
-        node_id: NodeId,
-        sink: Sink,
-    ) -> Result<SubscriptionId, SubscribeError>;
+    fn try_subscribe(&self, node_id: NodeId, sink: Sink) -> Result<SubscriptionId, SubscribeError>;
     /// See [`Core::unsubscribe`].
     fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId);
     /// See [`Core::emit`].
@@ -1949,6 +1943,33 @@ pub trait CoreFull {
     /// See [`Core::invalidate`]. Sink-side INVALIDATE forwards
     /// (higher-order `build_inner_sink`) route through `em.defer`.
     fn invalidate(&self, node_id: NodeId);
+
+    // --- read-only inspection (S2b/β D243 / D237-A-AMEND) ---
+    //
+    // Needed so a `MailboxOp::Defer` closure (the in-wave owner-side
+    // re-entry point — D233) can run `graphrefly_graph::describe_of`
+    // for the reactive-describe / observe topology-sub path. These are
+    // pure reads (no `C`/`T` surfaced) — `HandleId`/`NodeId`/enum only.
+
+    /// See [`Core::cache_of`].
+    fn cache_of(&self, node_id: NodeId) -> HandleId;
+    /// See [`Core::has_fired_once`].
+    fn has_fired_once(&self, node_id: NodeId) -> bool;
+    /// See [`Core::kind_of`].
+    fn kind_of(&self, node_id: NodeId) -> Option<NodeKind>;
+    /// See [`Core::deps_of`].
+    fn deps_of(&self, node_id: NodeId) -> Vec<NodeId>;
+    /// See [`Core::is_terminal`].
+    fn is_terminal(&self, node_id: NodeId) -> Option<TerminalKind>;
+    /// See [`Core::is_dirty`].
+    fn is_dirty(&self, node_id: NodeId) -> bool;
+
+    /// Serialize a node's cached `HandleId` via the binding (S2b/β
+    /// D244). Delegates to `binding_ptr().serialize_handle` — needed so
+    /// an in-wave `MailboxOp::Defer` closure (storage snapshot-on-
+    /// observe) can run `graphrefly_graph` snapshot through `&dyn
+    /// CoreFull`. Pure binding-delegating read; no `C`/`T` surfaced.
+    fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value>;
 }
 
 impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
@@ -1965,11 +1986,7 @@ impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
         Core::subscribe(self, node_id, sink)
     }
     #[inline]
-    fn try_subscribe(
-        &self,
-        node_id: NodeId,
-        sink: Sink,
-    ) -> Result<SubscriptionId, SubscribeError> {
+    fn try_subscribe(&self, node_id: NodeId, sink: Sink) -> Result<SubscriptionId, SubscribeError> {
         Core::try_subscribe(self, node_id, sink)
     }
     #[inline]
@@ -1995,6 +2012,34 @@ impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
     #[inline]
     fn invalidate(&self, node_id: NodeId) {
         Core::invalidate(self, node_id);
+    }
+    #[inline]
+    fn cache_of(&self, node_id: NodeId) -> HandleId {
+        Core::cache_of(self, node_id)
+    }
+    #[inline]
+    fn has_fired_once(&self, node_id: NodeId) -> bool {
+        Core::has_fired_once(self, node_id)
+    }
+    #[inline]
+    fn kind_of(&self, node_id: NodeId) -> Option<NodeKind> {
+        Core::kind_of(self, node_id)
+    }
+    #[inline]
+    fn deps_of(&self, node_id: NodeId) -> Vec<NodeId> {
+        Core::deps_of(self, node_id)
+    }
+    #[inline]
+    fn is_terminal(&self, node_id: NodeId) -> Option<TerminalKind> {
+        Core::is_terminal(self, node_id)
+    }
+    #[inline]
+    fn is_dirty(&self, node_id: NodeId) -> bool {
+        Core::is_dirty(self, node_id)
+    }
+    #[inline]
+    fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
+        self.binding_ptr().serialize_handle(handle)
     }
 }
 

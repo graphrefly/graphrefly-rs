@@ -530,7 +530,7 @@ fn batch_panic_restores_state_node_caches() {
     let initial_cache = runtime.cache_value(s_id).expect("initial cache");
     assert_eq!(initial_cache, TestValue::Int(7));
 
-    let core = runtime.core.clone();
+    let core = &runtime.core;
     let binding = runtime.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         core.batch(|| {
@@ -561,7 +561,7 @@ fn batch_panic_restores_multi_emit_state_node_to_first_pre_wave_value() {
     let runtime = TestRuntime::new();
     let s = runtime.state(Some(TestValue::Int(0)));
     let s_id = s.id;
-    let core = runtime.core.clone();
+    let core = &runtime.core;
     let binding = runtime.binding.clone();
     let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         core.batch(|| {
@@ -588,7 +588,7 @@ fn batch_success_does_not_revert_caches() {
     let runtime = TestRuntime::new();
     let s = runtime.state(Some(TestValue::Int(0)));
     let s_id = s.id;
-    let core = runtime.core.clone();
+    let core = &runtime.core;
     let binding = runtime.binding.clone();
     core.batch(|| {
         let h = binding.intern(TestValue::Int(42));
@@ -617,7 +617,7 @@ fn batch_panic_discards_pending_wave() {
         .filter(|e| matches!(e, common::RecordedEvent::Data(_)))
         .count();
 
-    let core = runtime.core.clone();
+    let core = &runtime.core;
     let s_id = s.id;
     let binding = runtime.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -1123,7 +1123,7 @@ fn panic_in_drain_phase_releases_wave_ownership_for_next_wave() {
     });
     let rec = rt.subscribe_recorder(d);
 
-    let core = rt.core.clone();
+    let core = &rt.core;
     let sid = s.id;
     let binding = rt.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {

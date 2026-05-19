@@ -279,7 +279,7 @@ fn phase_g_skips_cache_clear_when_cleanup_hook_re_subscribes() {
     // already-implemented F1 guard is correct by sequencing
     // drop(rec1) → assert cache_h alive → re-subscribe → assert cache
     // remains live.
-    let new_sub_slot: Mutex<Option<graphrefly_core::Subscription>> = Mutex::new(None);
+    let new_sub_slot: Mutex<Option<graphrefly_core::SubscriptionId>> = Mutex::new(None);
     drop(rec1);
     // Phase G ran. Cache was cleared (compute) — cache_h refcount
     // dropped to 0 in TestBinding (which tracks live_handles via

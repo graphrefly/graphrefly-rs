@@ -662,8 +662,8 @@ pub fn exhaust_map(
                 // outer DATA can re-project (F2 /qa).
                 let state_sub = state_for_outer.clone();
                 let em_guard = em_for_outer.clone();
-                let _ = em_for_outer.defer(move |c| {
-                    match c.try_subscribe(inner_node, inner_sink) {
+                let _ =
+                    em_for_outer.defer(move |c| match c.try_subscribe(inner_node, inner_sink) {
                         Ok(sub) => {
                             let guard = SubGuard::new(inner_node, sub, em_guard);
                             let to_drop = {
@@ -685,8 +685,7 @@ pub fn exhaust_map(
                                  violation inside em.defer — substrate invariant broken"
                             );
                         }
-                    }
-                });
+                    });
             }
 
             if plan.self_complete {
@@ -1031,8 +1030,7 @@ fn drain_merge_buffer(
             inner_id,
             concurrency,
         );
-        let on_error =
-            make_merge_on_error(state.clone(), em.clone(), binding.clone(), producer_id);
+        let on_error = make_merge_on_error(state.clone(), em.clone(), binding.clone(), producer_id);
         // F2 /qa: clone on_complete so the TornDown branch can
         // synthesize inner-Complete (closes the merge_map `s.active`
         // leak that left the producer never self-completing when a

@@ -3,7 +3,7 @@
 mod common;
 
 use graphrefly_core::{HandleId, Message};
-use graphrefly_graph::Graph;
+use graphrefly_graph::{Graph, GraphOps};
 use std::sync::{Arc, Mutex};
 
 fn h(n: u64) -> HandleId {

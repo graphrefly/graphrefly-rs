@@ -28,9 +28,7 @@ use ahash::{AHashMap, AHashSet};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use graphrefly_core::{
-    BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, NO_HANDLE,
-};
+use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, NO_HANDLE};
 use graphrefly_operators::{
     higher_order::{HigherOrderBinding, ProjectFn},
     producer::{

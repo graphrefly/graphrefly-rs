@@ -716,7 +716,7 @@ fn subscriber_can_read_during_emission() {
 fn log_view_tail() {
     let rt = StructuresRuntime::new();
     let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
-    let view = log.view(ViewSpec::Tail { n: 2 }, rt.intern_vec_fn());
+    let view = log.view(&rt.core, ViewSpec::Tail { n: 2 }, rt.intern_vec_fn());
     let rec = rt.subscribe_recorder(view.node_id);
 
     log.append(1);
@@ -739,7 +739,7 @@ fn log_view_tail() {
 fn log_view_slice() {
     let rt = StructuresRuntime::new();
     let log = ReactiveLog::new(&rt.core, rt.intern_vec_fn(), ReactiveLogOptions::default());
-    let view = log.view(
+    let view = log.view(&rt.core, 
         ViewSpec::Slice {
             start: 1,
             stop: Some(3),
@@ -779,7 +779,7 @@ fn log_view_from_cursor() {
             v.as_u64().unwrap() as usize
         });
 
-    let view = log.view(
+    let view = log.view(&rt.core, 
         ViewSpec::FromCursor {
             cursor_node,
             read_cursor,
@@ -819,7 +819,7 @@ fn log_scan_incremental() {
         std::sync::Arc::new(move |sum: i64| b.intern(serde_json::json!(sum)))
     };
 
-    let scan = log.scan(
+    let scan = log.scan(&rt.core, 
         0i64,
         std::sync::Arc::new(|acc: &i64, item: &i64| acc + item),
         intern_sum,
@@ -845,7 +845,7 @@ fn log_scan_rescan_on_clear() {
         std::sync::Arc::new(move |sum: i64| b.intern(serde_json::json!(sum)))
     };
 
-    let scan = log.scan(
+    let scan = log.scan(&rt.core, 
         0i64,
         std::sync::Arc::new(|acc: &i64, item: &i64| acc + item),
         intern_sum,
@@ -886,7 +886,7 @@ fn log_attach_upstream() {
     let read_value: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> i64 + Send + Sync> =
         std::sync::Arc::new(move |h| binding.deref(h).as_i64().unwrap());
 
-    let _sub = log.attach(upstream, read_value);
+    let _sub = log.attach(&rt.core, upstream, read_value);
 
     // Emit values to upstream — they should appear in the log.
     let h1 = rt.binding.intern(serde_json::json!(100));
@@ -929,7 +929,7 @@ fn log_attach_storage_preload_and_delta() {
         stored: Mutex::new(vec![1, 2]),
     });
 
-    let _handle = log.attach_storage(vec![sink.clone()], true);
+    let _handle = log.attach_storage(&rt.core, vec![sink.clone()], true);
 
     // Pre-loaded entries should be in the log.
     assert_eq!(log.to_vec(), vec![1, 2]);

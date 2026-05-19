@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
     BindingBoundary, CleanupTrigger, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message,
-    NodeId, Sink, Subscription,
+    NodeId, Sink, SubscriptionId,
 };
 
 #[derive(Clone, Debug)]
@@ -569,20 +569,65 @@ impl BindingBoundary for TestBinding {
 
 /// High-level facade: wraps Core + TestBinding with ergonomics matching the
 /// TS `HandleRuntime`. Hides the handle/binding plumbing from test code.
+/// S2b/β (D238/D241-AMEND): `TestRuntime` **owns** the move-only
+/// actor-model `Core`. Subscriptions registered through the runtime are
+/// tracked here and torn down in `Drop` (the runtime is dropped on the
+/// owner thread with the `Core` still alive — sound, mirrors the
+/// production binding-layer owner-driven teardown). Replaces the
+/// retired per-`Recorder` core RAII `Subscription`.
 pub struct TestRuntime {
     pub binding: Arc<TestBinding>,
     pub core: Core,
+    subs: Mutex<Vec<(NodeId, SubscriptionId)>>,
+}
+
+impl Drop for TestRuntime {
+    fn drop(&mut self) {
+        for (node_id, sub_id) in std::mem::take(
+            &mut *self
+                .subs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) {
+            self.core.unsubscribe(node_id, sub_id);
+        }
+    }
 }
 
 impl TestRuntime {
     pub fn new() -> Self {
         let binding = TestBinding::new();
         let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
-        Self { binding, core }
+        Self {
+            binding,
+            core,
+            subs: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Subscribe a sink and track the subscription for teardown on
+    /// runtime drop. Returns the `SubscriptionId` for explicit early
+    /// unsubscription via [`Self::unsubscribe`].
+    pub fn track_subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
+        let sub_id = self.core.subscribe(node_id, sink);
+        self.subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((node_id, sub_id));
+        sub_id
+    }
+
+    /// Explicit early unsubscribe (owner-invoked, β/D241).
+    pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        self.subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&(n, s)| !(n == node_id && s == sub_id));
+        self.core.unsubscribe(node_id, sub_id);
     }
 
     /// Register a state node. `initial = None` ⇒ sentinel.
-    pub fn state(&self, initial: Option<TestValue>) -> StateHandle {
+    pub fn state(&self, initial: Option<TestValue>) -> StateHandle<'_> {
         let initial_handle = match initial {
             Some(v) => self.binding.intern(v),
             None => HandleId::new(0), // NO_HANDLE
@@ -591,7 +636,7 @@ impl TestRuntime {
         StateHandle {
             id,
             binding: self.binding.clone(),
-            core: self.core.clone(),
+            core: &self.core,
         }
     }
 
@@ -642,8 +687,8 @@ impl TestRuntime {
     pub fn subscribe_recorder(&self, node_id: NodeId) -> Recorder {
         let recorder = Recorder::new();
         let sink: Sink = recorder.sink(self.binding.clone());
-        let sub = self.core.subscribe(node_id, sink);
-        recorder.attach(sub);
+        let sub_id = self.track_subscribe(node_id, sink);
+        recorder.attach(node_id, sub_id);
         recorder
     }
 
@@ -658,13 +703,13 @@ impl TestRuntime {
 }
 
 /// Test handle for state nodes; mirrors the TS `state.set(value)` ergonomics.
-pub struct StateHandle {
+pub struct StateHandle<'rt> {
     pub id: NodeId,
     pub binding: Arc<TestBinding>,
-    pub core: Core,
+    pub core: &'rt Core,
 }
 
-impl StateHandle {
+impl StateHandle<'_> {
     pub fn set(&self, value: TestValue) {
         let handle = self.binding.intern(value);
         self.core.emit(self.id, handle);
@@ -712,10 +757,12 @@ pub struct Recorder {
     call_boundaries: Arc<Mutex<Vec<usize>>>,
     /// Number of sink calls observed. Cheap to read from any thread.
     call_count: Arc<AtomicU64>,
-    /// Holds the subscription so that dropping the Recorder unsubscribes.
-    /// `Option` so [`Self::new`] can construct the recorder before the sink
-    /// is registered, then [`Self::attach`] fills it in.
-    subscription: Mutex<Option<Subscription>>,
+    /// S2b/β (D238): the `(NodeId, SubscriptionId)` this recorder's
+    /// sink is registered under. Teardown is owner-driven via
+    /// [`TestRuntime`] (tracked there, unsubscribed on runtime drop or
+    /// explicit `TestRuntime::unsubscribe`) — the recorder no longer
+    /// owns a core RAII `Subscription` (retired under the actor model).
+    attached: Mutex<Option<(NodeId, SubscriptionId)>>,
 }
 
 impl Recorder {
@@ -724,7 +771,7 @@ impl Recorder {
             events: Arc::new(Mutex::new(Vec::new())),
             call_boundaries: Arc::new(Mutex::new(Vec::new())),
             call_count: Arc::new(AtomicU64::new(0)),
-            subscription: Mutex::new(None),
+            attached: Mutex::new(None),
         }
     }
 
@@ -772,15 +819,32 @@ impl Recorder {
         self.call_boundaries.lock().expect("recorder lock").clone()
     }
 
-    pub fn attach(&self, sub: Subscription) {
-        *self.subscription.lock().expect("recorder lock") = Some(sub);
+    /// β/D238: record which `(NodeId, SubscriptionId)` this recorder's
+    /// sink was registered under (set by `TestRuntime::subscribe_recorder`).
+    pub fn attach(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        *self.attached.lock().expect("recorder lock") = Some((node_id, sub_id));
     }
 
-    /// Manually unsubscribe early (before recorder drop). Useful for tests
-    /// that want to verify post-unsubscribe behavior without dropping the
-    /// whole recorder.
-    pub fn unsubscribe(&self) {
-        *self.subscription.lock().expect("recorder lock") = None;
+    /// The observed `NodeId` (panics if not yet attached).
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.attached
+            .lock()
+            .expect("recorder lock")
+            .expect("recorder not attached")
+            .0
+    }
+
+    /// The `SubscriptionId` (panics if not yet attached). Pass with
+    /// [`Self::node_id`] to [`TestRuntime::unsubscribe`] for an
+    /// explicit early unsubscribe (β/D241 — owner-invoked).
+    #[must_use]
+    pub fn sub_id(&self) -> SubscriptionId {
+        self.attached
+            .lock()
+            .expect("recorder lock")
+            .expect("recorder not attached")
+            .1
     }
 
     pub fn snapshot(&self) -> Vec<RecordedEvent> {

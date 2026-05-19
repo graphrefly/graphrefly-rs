@@ -87,11 +87,13 @@ fn is_dirty_false_for_unknown_id() {
 }
 
 #[test]
-fn same_dispatcher_true_for_clones_false_for_independents() {
+fn same_dispatcher_true_for_same_core_false_for_independents() {
+    // β/D242: `Core` is move-only; "same dispatcher" is now tested via
+    // two borrows of the one owned Core (clones no longer exist).
     let rt = TestRuntime::new();
-    let core1 = rt.core.clone();
-    let core2 = rt.core.clone();
-    assert!(core1.same_dispatcher(&core2));
+    let core1 = &rt.core;
+    let core2 = &rt.core;
+    assert!(core1.same_dispatcher(core2));
 
     // Independent Core (different binding) — explicit Core::new
     // bypasses TestRuntime; simplest is to compare against another

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use graphrefly_core::{
-    monotonic_ns, wall_clock_ns, Core, HandleId, Message, NodeId, Subscription, WeakCore,
+    monotonic_ns, wall_clock_ns, Core, CoreMailbox, HandleId, Message, NodeId, SubscriptionId,
 };
 
 use crate::backend::{
@@ -45,20 +45,29 @@ pub type InternFn<S> = Arc<dyn Fn(S) -> HandleId + Send + Sync>;
 /// Emission handle stored outside the inner Mutex. Uses `AtomicU64` for the
 /// version counter so no lock is needed during `Core::emit()`.
 struct EmitHandle<S> {
-    core: WeakCore,
+    /// S2b/β (D227/D232-AMEND A′): the actor-model `Core` is move-only
+    /// and relocates between workers, so a long-lived structure can no
+    /// longer hold a `WeakCore`. It holds the `Send + Sync`
+    /// `Arc<CoreMailbox>` instead and posts `MailboxOp::Emit`, drained
+    /// owner-side in-wave / at the embedder pump (identical to
+    /// `timer.rs` and the producer operators).
+    mailbox: Arc<CoreMailbox>,
     node_id: NodeId,
     intern: InternFn<S>,
     version: AtomicU64,
 }
 
 impl<S> EmitHandle<S> {
-    /// Bump version, intern snapshot, emit via Core. Returns the new version.
+    /// Bump version, intern snapshot, post the emit. Returns the new
+    /// version.
     fn emit(&self, snapshot: S) -> Version {
         let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = (self.intern)(snapshot);
-        if let Some(core) = self.core.upgrade() {
-            core.emit(self.node_id, handle);
-        }
+        // Core-gone (`false`) ⇒ the op is dropped unrun — identical to
+        // the pre-S2b `WeakCore::upgrade()` → `None` no-op (the
+        // structure is being torn down; the binding owns intern/release
+        // so there is no handle leak the old path didn't also have).
+        let _ = self.mailbox.post_emit(self.node_id, handle);
         Version::Counter(ver)
     }
 }
@@ -160,7 +169,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             emitter: EmitHandle {
-                core: core.weak_handle(),
+                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -276,18 +285,37 @@ pub enum ViewSpec {
     },
 }
 
+/// S2b/β (D241-AMEND): an RAII subscription bundle that borrows the
+/// owner's `&'c Core`. The borrow statically pins the `Core` alive for
+/// `'c` and makes the handle `!Send` (Core `!Sync`) so it drops on the
+/// owner thread — therefore the parameterless `Drop` may synchronously
+/// `unsubscribe` (sound; NOT the D225 relocating-Core case). Replaces
+/// the retired core RAII `Subscription`.
+pub struct ReactiveSub<'c> {
+    core: &'c Core,
+    subs: Vec<(NodeId, SubscriptionId)>,
+}
+
+impl Drop for ReactiveSub<'_> {
+    fn drop(&mut self) {
+        for (node_id, sub_id) in self.subs.drain(..) {
+            self.core.unsubscribe(node_id, sub_id);
+        }
+    }
+}
+
 /// Handle to a log view. Dropping disposes the view subscription.
-pub struct LogView {
+pub struct LogView<'c> {
     /// The state node backing this view. Subscribe to receive view snapshots.
     pub node_id: NodeId,
-    _subscriptions: Vec<Subscription>,
+    _sub: ReactiveSub<'c>,
 }
 
 /// Handle to a log scan. Dropping disposes the scan subscription.
-pub struct ScanHandle {
+pub struct ScanHandle<'c> {
     /// The state node backing this scan. Subscribe to receive accumulator snapshots.
     pub node_id: NodeId,
-    _subscription: Subscription,
+    _sub: ReactiveSub<'c>,
 }
 
 /// Trait for append-log storage sinks used by [`ReactiveLog::attach_storage`].
@@ -305,8 +333,8 @@ pub trait AppendLogSink<T>: Send + Sync {
 }
 
 /// Handle to an attach-storage subscription. Dropping disposes the subscription.
-pub struct AttachStorageHandle {
-    _subscription: Subscription,
+pub struct AttachStorageHandle<'c> {
+    _sub: ReactiveSub<'c>,
 }
 
 impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
@@ -314,21 +342,27 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// `node_id` emits `Vec<T>` snapshots on every log mutation.
     ///
     /// `intern` converts the view `Vec<T>` into a `HandleId` for Core emission.
+    /// β/D231: takes the owner's `&Core` (no stored Core under the
+    /// actor model). The returned [`LogView`] borrows it for `'c`.
     #[allow(clippy::too_many_lines)]
-    pub fn view(&self, spec: ViewSpec, intern: InternFn<Vec<T>>) -> LogView {
-        let core = self.emitter.core.upgrade().expect("Core dropped");
+    pub fn view<'c>(
+        &self,
+        core: &'c Core,
+        spec: ViewSpec,
+        intern: InternFn<Vec<T>>,
+    ) -> LogView<'c> {
         let view_node = core
             .register_state(HandleId::new(0), false)
             .expect("register_state for LogView");
         let view_emitter = Arc::new(EmitHandle {
-            core: self.emitter.core.clone(),
+            mailbox: core.mailbox(),
             node_id: view_node,
             intern,
             version: AtomicU64::new(0),
         });
 
         let inner = Arc::clone(&self.inner);
-        let mut subscriptions = Vec::new();
+        let mut subscriptions: Vec<(NodeId, SubscriptionId)> = Vec::new();
 
         match spec {
             ViewSpec::Tail { n } => {
@@ -347,7 +381,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                         }
                     }),
                 );
-                subscriptions.push(sub);
+                subscriptions.push((self.node_id, sub));
             }
             ViewSpec::Slice { start, stop } => {
                 let inner_c = Arc::clone(&inner);
@@ -366,7 +400,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                         }
                     }),
                 );
-                subscriptions.push(sub);
+                subscriptions.push((self.node_id, sub));
             }
             ViewSpec::FromCursor {
                 cursor_node,
@@ -396,7 +430,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                         }
                     }),
                 );
-                subscriptions.push(sub_cursor);
+                subscriptions.push((cursor_node, sub_cursor));
 
                 // Log subscription: recompute with current cursor.
                 let cursor_pos_c2 = Arc::clone(&cursor_pos);
@@ -416,13 +450,16 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                         }
                     }),
                 );
-                subscriptions.push(sub_log);
+                subscriptions.push((self.node_id, sub_log));
             }
         }
 
         LogView {
             node_id: view_node,
-            _subscriptions: subscriptions,
+            _sub: ReactiveSub {
+                core,
+                subs: subscriptions,
+            },
         }
     }
 
@@ -431,12 +468,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// Returns a [`ScanHandle`] whose `node_id` emits the current accumulator
     /// on every log mutation. Appends are O(1) (only new entries processed);
     /// `trimHead`/`clear` trigger a full rescan.
-    pub fn scan<TAcc: Clone + Send + Sync + 'static>(
+    pub fn scan<'c, TAcc: Clone + Send + Sync + 'static>(
         &self,
+        core: &'c Core,
         initial: TAcc,
         step: Arc<dyn Fn(&TAcc, &T) -> TAcc + Send + Sync>,
         intern: InternFn<TAcc>,
-    ) -> ScanHandle {
+    ) -> ScanHandle<'c> {
         struct ScanState<T, TAcc> {
             acc: TAcc,
             processed: usize,
@@ -444,7 +482,6 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             step: Arc<dyn Fn(&TAcc, &T) -> TAcc + Send + Sync>,
         }
 
-        let core = self.emitter.core.upgrade().expect("Core dropped");
         let scan_node = core
             .register_state(HandleId::new(0), false)
             .expect("register_state for Scan");
@@ -457,7 +494,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         }));
         let inner = Arc::clone(&self.inner);
         let scan_emitter = Arc::new(EmitHandle {
-            core: self.emitter.core.clone(),
+            mailbox: core.mailbox(),
             node_id: scan_node,
             intern,
             version: AtomicU64::new(0),
@@ -490,26 +527,34 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         ScanHandle {
             node_id: scan_node,
-            _subscription: sub,
+            _sub: ReactiveSub {
+                core,
+                subs: vec![(self.node_id, sub)],
+            },
         }
     }
 
     /// Subscribe to an upstream node and append every DATA value into this log.
     ///
     /// `read_value` converts the upstream `HandleId` to a `T` for appending.
-    /// Returns a `Subscription` — dropping it stops the attachment.
-    pub fn attach(
+    /// Returns an RAII handle — dropping it stops the attachment.
+    /// β/D231: takes the owner's `&Core`.
+    pub fn attach<'c>(
         &self,
+        core: &'c Core,
         upstream: NodeId,
         read_value: Arc<dyn Fn(HandleId) -> T + Send + Sync>,
-    ) -> Subscription {
-        let core = self.emitter.core.upgrade().expect("Core dropped");
+    ) -> ReactiveSub<'c> {
         let inner = Arc::clone(&self.inner);
-        let weak_core = self.emitter.core.clone();
+        // β/D232-AMEND: the long-lived attach sink re-enters Core to
+        // emit; it captures the `Send + Sync` `Arc<CoreMailbox>` and
+        // posts `MailboxOp::Emit` (drained owner-side in-wave / at the
+        // pump) — it can no longer hold a relocatable `WeakCore`.
+        let mailbox = core.mailbox();
         let node_id = self.node_id;
         let intern = Arc::clone(&self.emitter.intern);
 
-        core.subscribe(
+        let sub = core.subscribe(
             upstream,
             Arc::new(move |msgs| {
                 for m in msgs {
@@ -521,13 +566,17 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                             guard.backend.to_vec()
                         };
                         let handle = (intern)(snapshot);
-                        if let Some(c) = weak_core.upgrade() {
-                            c.emit(node_id, handle);
-                        }
+                        // Core-gone ⇒ drop-unrun, same as the pre-S2b
+                        // `weak_core.upgrade()` → `None` no-op.
+                        let _ = mailbox.post_emit(node_id, handle);
                     }
                 }
             }),
-        )
+        );
+        ReactiveSub {
+            core,
+            subs: vec![(upstream, sub)],
+        }
     }
 
     /// Wire append-log storage sinks to this log.
@@ -537,15 +586,20 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// subscription, deltas are forwarded to ALL sinks. On trim/clear, the
     /// full snapshot is re-shipped. Sink errors are swallowed (logged via
     /// `eprintln!`) so a failing tier doesn't break the reactive graph.
-    pub fn attach_storage(
+    pub fn attach_storage<'c>(
         &self,
+        core: &'c Core,
         sinks: Vec<Arc<dyn AppendLogSink<T>>>,
         preload: bool,
-    ) -> AttachStorageHandle {
+    ) -> AttachStorageHandle<'c> {
         if sinks.is_empty() {
-            let core = self.emitter.core.upgrade().expect("Core dropped");
             let sub = core.subscribe(self.node_id, Arc::new(|_| {}));
-            return AttachStorageHandle { _subscription: sub };
+            return AttachStorageHandle {
+                _sub: ReactiveSub {
+                    core,
+                    subs: vec![(self.node_id, sub)],
+                },
+            };
         }
 
         if preload {
@@ -567,7 +621,6 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             .map(|_| Arc::new(Mutex::new(current_size)))
             .collect();
 
-        let core = self.emitter.core.upgrade().expect("Core dropped");
         let inner = Arc::clone(&self.inner);
         let sinks_arc = sinks;
         let delivered_arc = delivered;
@@ -596,7 +649,12 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             }),
         );
 
-        AttachStorageHandle { _subscription: sub }
+        AttachStorageHandle {
+            _sub: ReactiveSub {
+                core,
+                subs: vec![(self.node_id, sub)],
+            },
+        }
     }
 }
 
@@ -673,7 +731,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
         Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                core: core.weak_handle(),
+                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -1123,7 +1181,7 @@ where
         Ok(Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                core: core.weak_handle(),
+                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -1633,7 +1691,7 @@ where
         Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                core: core.weak_handle(),
+                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),

@@ -108,7 +108,6 @@ pub fn sample(
     source: NodeId,
     notifier: NodeId,
 ) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -276,13 +275,7 @@ pub fn debounce(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(debounce_task(
-            rx,
-            em.clone(),
-            pid,
-            bb.clone(),
-            delay,
-        ));
+        let task = tokio::spawn(debounce_task(rx, em.clone(), pid, bb.clone(), delay));
 
         // Store guard: drops tx (clean shutdown) then aborts task (fallback).
         {
@@ -572,13 +565,7 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(delay_task(
-            rx,
-            em.clone(),
-            pid,
-            bb.clone(),
-            delay_dur,
-        ));
+        let task = tokio::spawn(delay_task(rx, em.clone(), pid, bb.clone(), delay_dur));
 
         {
             let st = ctx.storage();
@@ -744,14 +731,7 @@ pub fn throttle(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(throttle_task(
-            rx,
-            em.clone(),
-            pid,
-            bb.clone(),
-            window,
-            opts,
-        ));
+        let task = tokio::spawn(throttle_task(rx, em.clone(), pid, bb.clone(), window, opts));
 
         {
             let st = ctx.storage();

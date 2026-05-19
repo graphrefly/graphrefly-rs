@@ -11,7 +11,8 @@ use graphrefly_core::{
     BindingBoundary, DepBatch, EqualsMode, FnId, FnResult, HandleId, NodeId, NO_HANDLE,
 };
 use graphrefly_graph::{
-    Graph, GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus, SnapshotError,
+    Graph, GraphOps, GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus,
+    SnapshotError, SnapshotOps, SubgraphRef,
 };
 use indexmap::IndexMap;
 
@@ -409,7 +410,7 @@ fn r3_8_from_snapshot_builder_mode() {
     let g = Graph::from_snapshot(
         &snap,
         &(binding.clone() as Arc<dyn BindingBoundary>),
-        Some(Box::new(|g: &Graph| {
+        Some(Box::new(|g: &SubgraphRef<'_>| {
             g.state("x", None).unwrap();
         })),
         None,

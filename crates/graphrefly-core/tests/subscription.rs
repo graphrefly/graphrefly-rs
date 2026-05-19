@@ -1,8 +1,16 @@
-//! [`Subscription`] RAII semantics — §10.12 of the rust-port session doc.
+//! Subscription lifecycle — S2b/β owner-invoked contract (D225/D241).
 //!
-//! Verifies the public API surface change from manual `unsubscribe(node, id)`
-//! to a `Subscription` handle that deregisters its sink on Drop. The Drop
-//! is silent if the Core has been dropped (no panic-on-shutdown).
+//! The core RAII `Subscription` (drop-deregisters, `Weak`-upgrade
+//! silent-no-op, `Send + Sync` cross-thread move) is **retired** under
+//! the actor model: a parameterless `Drop` cannot reach a relocating
+//! owned `Core` (D225). `Core::subscribe` now returns a plain `Copy`
+//! `SubscriptionId`; deregistration is the explicit owner-invoked
+//! `Core::unsubscribe(node, id)` carrying the exact lock-released
+//! lifecycle chain. RAII convenience is a binding-layer concern
+//! (binding/embedder holds its Core on its affinity worker and calls
+//! `core.unsubscribe` from its wrapper's `Drop`); the `TestRuntime`
+//! harness models that (tracks subs, tears down on its own `Drop`).
+//! This file verifies the replacement contract.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -10,12 +18,12 @@ use std::sync::Arc;
 mod common;
 use common::{TestRuntime, TestValue};
 
-/// Helper: subscribe a sink that just counts DATA messages. Returns the
-/// counter (Arc) and the Subscription handle.
+/// Subscribe a sink that counts DATA messages. Returns the counter and
+/// the `SubscriptionId` (β: a plain `Copy` id, not an RAII handle).
 fn data_counter(
     rt: &TestRuntime,
     node_id: graphrefly_core::NodeId,
-) -> (Arc<AtomicU32>, graphrefly_core::Subscription) {
+) -> (Arc<AtomicU32>, graphrefly_core::SubscriptionId) {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_clone = counter.clone();
     let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
@@ -30,82 +38,50 @@ fn data_counter(
 }
 
 #[test]
-fn dropping_subscription_unsubscribes_sink() {
+fn unsubscribe_deregisters_sink() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let (counter, sub) = data_counter(&rt, s.id);
 
-    // Push-on-subscribe delivered initial DATA (cache=0 at subscribe time).
-    let initial = counter.load(Ordering::SeqCst);
-    assert_eq!(initial, 1, "push-on-subscribe should deliver one DATA");
+    // Push-on-subscribe delivered initial DATA (cache=0 at subscribe).
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "push-on-subscribe should deliver one DATA"
+    );
+
+    // Owner-invoked unsubscribe (β/D225) — sink deregistered.
+    rt.core.unsubscribe(s.id, sub);
 
     s.set(TestValue::Int(1));
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
-
-    // Drop the subscription — sink should no longer receive DATA.
-    drop(sub);
-    s.set(TestValue::Int(2));
-    s.set(TestValue::Int(3));
     assert_eq!(
         counter.load(Ordering::SeqCst),
-        2,
-        "post-drop emissions must not reach the sink"
+        1,
+        "no DATA after unsubscribe"
     );
 }
 
 #[test]
-fn implicit_drop_at_scope_end_unsubscribes() {
+fn double_unsubscribe_is_safe() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    let counter = Arc::new(AtomicU32::new(0));
-    {
-        let counter_inner = counter.clone();
-        let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
-            for m in msgs {
-                if matches!(m, graphrefly_core::Message::Data(_)) {
-                    counter_inner.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        });
-        let _sub = rt.core.subscribe(s.id, sink);
-        // _sub is in scope here; subscription is live.
-        s.set(TestValue::Int(1));
-    }
-    // Scope exited — _sub dropped — subscription deregistered.
-    let count_at_scope_exit = counter.load(Ordering::SeqCst);
+    let (_counter, sub) = data_counter(&rt, s.id);
+    rt.core.unsubscribe(s.id, sub);
+    // Idempotent: a second unsubscribe of the same id is a no-op, not
+    // a panic (monotonic-never-recycled ids; F4 invariant).
+    rt.core.unsubscribe(s.id, sub);
     s.set(TestValue::Int(2));
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        count_at_scope_exit,
-        "post-scope-exit emissions must not reach the sink"
-    );
 }
 
 #[test]
-fn subscription_holds_node_id() {
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(0)));
-    let sink: graphrefly_core::Sink = Arc::new(|_: &[graphrefly_core::Message]| {});
-    let sub = rt.core.subscribe(s.id, sink);
-    assert_eq!(sub.node_id(), s.id);
-}
-
-#[test]
-fn dropping_subscription_after_core_drop_is_silent_no_op() {
-    // Subscribe, then drop the runtime (which drops Core), then drop the
-    // subscription. The Subscription's Drop tries to upgrade a Weak; if the
-    // Core is gone, the Drop is a silent no-op and we don't panic.
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(0)));
-    let sink: graphrefly_core::Sink = Arc::new(|_: &[graphrefly_core::Message]| {});
-    let sub = rt.core.subscribe(s.id, sink);
-
-    // Drop the runtime first (Core goes away).
-    drop(rt);
-
-    // Now drop the subscription. Should be silent.
-    drop(sub);
-    // If we got here without panic, the test passes.
+fn subscription_id_is_copy_send_sync() {
+    // β/D225: the handle is now a plain `SubscriptionId` newtype —
+    // `Copy + Send + Sync` (no `Weak<C>`/RAII). Replaces the retired
+    // `Subscription: Send + Sync` static assertion.
+    fn assert_copy<T: Copy>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_copy::<graphrefly_core::SubscriptionId>();
+    assert_send_sync::<graphrefly_core::SubscriptionId>();
 }
 
 #[test]
@@ -115,48 +91,27 @@ fn multiple_subscriptions_to_same_node_are_independent() {
     let (c1, sub1) = data_counter(&rt, s.id);
     let (c2, sub2) = data_counter(&rt, s.id);
 
-    // Both got push-on-subscribe.
     assert_eq!(c1.load(Ordering::SeqCst), 1);
     assert_eq!(c2.load(Ordering::SeqCst), 1);
 
+    // Unsubscribing one leaves the other live.
+    rt.core.unsubscribe(s.id, sub1);
     s.set(TestValue::Int(1));
-    assert_eq!(c1.load(Ordering::SeqCst), 2);
-    assert_eq!(c2.load(Ordering::SeqCst), 2);
+    assert_eq!(c1.load(Ordering::SeqCst), 1, "sub1 detached");
+    assert_eq!(c2.load(Ordering::SeqCst), 2, "sub2 still live");
 
-    // Drop only sub1.
-    drop(sub1);
-    s.set(TestValue::Int(2));
-    assert_eq!(c1.load(Ordering::SeqCst), 2, "sub1 deregistered");
-    assert_eq!(c2.load(Ordering::SeqCst), 3, "sub2 still active");
-
-    drop(sub2);
+    rt.core.unsubscribe(s.id, sub2);
 }
 
 #[test]
-fn subscription_is_send_and_sync() {
-    // Already enforced statically in node.rs via a const fn assertion;
-    // this test re-confirms at the integration test layer so a regression
-    // in the inner module would still surface here.
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<graphrefly_core::Subscription>();
-}
-
-#[test]
-fn moving_subscription_across_threads_works() {
+fn runtime_drop_tears_down_remaining_subscriptions() {
+    // β/D241: the binding-layer owner (here `TestRuntime`) holds the
+    // Core on its thread and unsubscribes tracked subs on its own
+    // `Drop` — the RAII convenience that replaces core-level RAII.
+    // Smoke: leaving a sub registered must not panic on runtime drop.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    let (counter, sub) = data_counter(&rt, s.id);
+    let _rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Int(1));
-    let count_before_move = counter.load(Ordering::SeqCst);
-
-    // Move the subscription to another thread; drop it there.
-    std::thread::spawn(move || {
-        drop(sub);
-    })
-    .join()
-    .expect("worker thread");
-
-    // After remote-thread drop, sink is deregistered.
-    s.set(TestValue::Int(2));
-    assert_eq!(counter.load(Ordering::SeqCst), count_before_move);
+    drop(rt); // tracked-sub teardown on the owner thread — no panic.
 }

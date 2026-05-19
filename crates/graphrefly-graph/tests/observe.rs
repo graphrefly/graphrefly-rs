@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use common::binding;
 use graphrefly_core::{HandleId, Message, Sink};
-use graphrefly_graph::Graph;
+use graphrefly_graph::{Graph, GraphOps};
 
 fn recording_sink() -> (Arc<Mutex<Vec<Message>>>, Sink) {
     let log: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));

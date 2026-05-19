@@ -48,6 +48,6 @@ pub use changeset::{
 pub use reactive::{
     AppendLogSink, AttachStorageHandle, IndexEqualsFn, IndexOutOfBounds, InternFn, LogView,
     MapConfigError, ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions,
-    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, RetentionPolicy, ScanHandle,
-    UpsertOptions, ViewSpec,
+    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, ReactiveSub, RetentionPolicy,
+    ScanHandle, UpsertOptions, ViewSpec,
 };

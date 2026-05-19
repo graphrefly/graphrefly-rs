@@ -29,7 +29,6 @@ use crate::producer::{ProducerBinding, ProducerBuildFn, ProducerCtx, SubscribeOu
 /// Forwards COMPLETE and ERROR unchanged.
 #[must_use]
 pub fn tap(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, fn_id: FnId) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -108,7 +107,6 @@ pub fn tap_observer(
     error_fn_id: Option<FnId>,
     complete_fn_id: Option<FnId>,
 ) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -195,7 +193,6 @@ pub fn on_first_data(
     source: NodeId,
     fn_id: FnId,
 ) -> NodeId {
-
     struct OnFirstState {
         fired: bool,
     }
@@ -286,7 +283,6 @@ pub fn rescue(
     source: NodeId,
     fn_id: FnId,
 ) -> NodeId {
-
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
         let core_s = ctx.core();
         let binding_s = ctx.core().binding();
@@ -379,7 +375,6 @@ pub fn valve(
     gate_fn_id: FnId,
     cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> NodeId {
-
     struct ValveState {
         open: bool,
         terminated: bool,
@@ -537,7 +532,6 @@ pub fn settle(
     quiet_waves: u32,
     max_waves: Option<u32>,
 ) -> NodeId {
-
     struct SettleState {
         wave_count: u32,
         quiet_count: u32,
@@ -650,7 +644,6 @@ pub fn repeat(
     source: NodeId,
     count: u32,
 ) -> NodeId {
-
     struct RepeatState {
         remaining: u32,
         terminated: bool,

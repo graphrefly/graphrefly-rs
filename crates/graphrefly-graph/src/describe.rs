@@ -1,50 +1,39 @@
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
-//! Static JSON form (Slice E+) + reactive describe (Slice F+). Pretty
-//! / mermaid / d2 / stage-log / explain / reachable variants are
-//! deferred (subsequent slices).
+//! S2b/β (D237/D240/D242/D243): describe logic is a free fn
+//! [`describe_of`] over `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)` so
+//! both [`Graph`](crate::Graph) and
+//! [`SubgraphRef`](crate::SubgraphRef) (via the
+//! [`GraphOps`](crate::GraphOps) trait) reuse it, AND so the in-wave
+//! reactive-describe `MailboxOp::Defer` closure (D233) can run it
+//! through the `&dyn CoreFull` it is handed (D243 widened `CoreFull`
+//! with read-only inspection). `ReactiveDescribeHandle<'g>` borrows the
+//! root `&Core` (D242) so its RAII `Drop` synchronously unsubscribes
+//! (D241-AMEND: the borrow statically pins the Core alive + the
+//! handle is `!Send`, so this is sound — NOT the D225 relocating-Core
+//! problem).
 //!
-//! # Value rendering — raw vs. binding-rendered (F sub-slice, 2026-05-10)
+//! # Value rendering — raw vs. binding-rendered
 //!
 //! Canonical TS surfaces `value: T` directly. The Rust port preserves
-//! the handle-protocol cleaving plane (Core operates on opaque
-//! `HandleId` integers; binding-side owns `HandleId → T`) by surfacing
-//! `value: DescribeValue`:
-//!
-//! - `DescribeValue::Handle(HandleId)` — raw u64 view, used by
-//!   `Graph::describe()` (the default). Suitable for parity tests
-//!   that compare against TS by mapping handles through the binding
-//!   manually, and for debug contexts that don't have a debug
-//!   binding wired up.
-//! - `DescribeValue::Rendered(serde_json::Value)` — binding-rendered
-//!   view, used by `Graph::describe_with_debug(debug)`. The caller
-//!   passes a [`DebugBindingBoundary`] impl that knows how to
-//!   project each registered value into a JSON form. This is the
-//!   "developer-friendly" surface — looks just like TS's `value: T`
-//!   in the serialized JSON because the rendering happens at the
-//!   binding boundary, off the Core hot path.
-//!
-//! Each value field serializes uniformly: as a u64 number for
-//! `Handle`, or as the binding's chosen JSON shape for `Rendered`.
-//! `None` (sentinel cache) serializes as `null` in both modes.
+//! the handle-protocol cleaving plane (`value: DescribeValue`):
+//! `Handle(HandleId)` raw u64 (default) or `Rendered(serde_json::Value)`
+//! via [`DebugBindingBoundary`].
 
 use std::sync::{Arc, Weak};
 
 use graphrefly_core::{
-    Core, HandleId, NodeId, NodeKind, OperatorOp, TerminalKind, TopologyEvent,
-    TopologySubscription, NO_HANDLE,
+    Core, CoreFull, HandleId, NodeId, NodeKind, OperatorOp, TerminalKind, TopologyEvent,
+    TopologySubscriptionId, NO_HANDLE,
 };
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 
 use crate::debug::DebugBindingBoundary;
-use crate::graph::{Graph, GraphInner};
+use crate::graph::{register_ns_sink, GraphInner};
 
 /// Top-level `describe()` output (canonical Appendix B JSON schema).
-///
-/// `nodes` is insertion-ordered (matches namespace registration
-/// order) — load-bearing for stable serialized output.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphDescribeOutput {
     /// Graph name as set at construction / mount.
@@ -53,7 +42,7 @@ pub struct GraphDescribeOutput {
     pub nodes: IndexMap<String, NodeDescribe>,
     /// Local edges (dep → consumer).
     pub edges: Vec<EdgeDescribe>,
-    /// Mounted child names (recurse via `Graph::node(child).describe()`).
+    /// Mounted child names.
     pub subgraphs: Vec<String>,
 }
 
@@ -61,62 +50,30 @@ pub struct GraphDescribeOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeDescribe {
     /// `"state"` / `"derived"` / `"dynamic"` / `"producer"`.
-    /// Producer-vs-state inference: a state node with no fn-id but
-    /// `has_fired_once=true` may stem from a producer pattern; the
-    /// rust-side classifier just reports `kind` directly. (Producer
-    /// inference is a binding-side concern — see canonical §3.6.1.)
     #[serde(rename = "type")]
     pub r#type: NodeTypeStr,
     /// Lifecycle status (canonical Appendix B enum).
     pub status: NodeStatus,
-    /// Current cache value (F sub-slice, 2026-05-10). `None` when
-    /// the cache is sentinel (`NO_HANDLE`). Otherwise:
-    ///
-    /// - `DescribeValue::Handle(HandleId)` — raw u64 (from
-    ///   [`Graph::describe`]).
-    /// - `DescribeValue::Rendered(serde_json::Value)` — binding-
-    ///   rendered (from [`Graph::describe_with_debug`]).
-    ///
-    /// Serialization is uniform: the inner u64 or JSON value
-    /// appears directly in the output (no enum tag).
+    /// Current cache value. `None` when sentinel (`NO_HANDLE`).
     pub value: Option<DescribeValue>,
-    /// Dep names in declaration order. Unnamed deps surface as
-    /// `_anon_<NodeId>` to keep the output lossless without
-    /// elevating Core-only nodes into the namespace.
+    /// Dep names in declaration order (`_anon_<NodeId>` for unnamed).
     pub deps: Vec<String>,
-    /// Operator discriminant (e.g. `"map"`, `"filter"`, `"combine"`).
-    /// `None` for non-operator nodes. Slice V5: surfaces the
-    /// `OperatorOp` variant name so consumers can distinguish
-    /// operator kinds (was previously just `type: "operator"`).
+    /// Operator discriminant (e.g. `"map"`); `None` for non-operators.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "operator")]
     pub operator_kind: Option<String>,
-    /// Free-form metadata per canonical Appendix B (e.g. `{
-    /// "description": "...", "type": "integer", "range": [1, 10] }`).
-    /// Always `None` in this slice — the metadata-storage primitive
-    /// on Core hasn't shipped yet. Reserved as `Option<serde_json::Value>`
-    /// so the JSON shape stays forward-compatible (omitted via
-    /// `skip_serializing_if` when None to keep current outputs slim).
+    /// Free-form metadata per canonical Appendix B. Always `None` in
+    /// this slice (metadata-storage primitive not yet shipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }
 
-/// Per-node cache value in `describe` output. Surfaced as `value:
-/// <u64>` when produced by [`Graph::describe`] (raw handle view), or
-/// as `value: <T>` when produced by
-/// [`Graph::describe_with_debug`] (binding-rendered view). Serialized
-/// uniformly without an enum tag — consumers see either a number
-/// or whatever JSON shape the binding emits.
+/// Per-node cache value in `describe` output. Serialized uniformly
+/// without an enum tag.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DescribeValue {
-    /// Raw handle view. Default for [`Graph::describe`]. The
-    /// serialized JSON is a `Number` (the u64 raw view of the
-    /// handle).
+    /// Raw handle view (default for [`crate::GraphOps::describe`]).
     Handle(HandleId),
-    /// Binding-rendered view. Produced by
-    /// [`Graph::describe_with_debug`] via the supplied
-    /// [`DebugBindingBoundary`]. The serialized JSON is whatever
-    /// shape the binding's `handle_to_debug` returned (string,
-    /// number, object — fully under binding control).
+    /// Binding-rendered view (from [`crate::GraphOps::describe_with_debug`]).
     Rendered(serde_json::Value),
 }
 
@@ -129,8 +86,7 @@ impl Serialize for DescribeValue {
     }
 }
 
-/// Edge between two named nodes (or a named node and an anonymous
-/// dep, surfaced as `_anon_<NodeId>`).
+/// Edge between two named nodes (or a named node and `_anon_<NodeId>`).
 #[derive(Debug, Clone, Serialize)]
 pub struct EdgeDescribe {
     pub from: String,
@@ -144,14 +100,8 @@ pub enum NodeTypeStr {
     State,
     Derived,
     Dynamic,
-    /// Reserved for future producer-pattern classification — the Rust
-    /// port doesn't infer this kind today; emitted only when the
-    /// binding side has annotated it.
     Producer,
-    /// Reserved for future side-effect classification. Same caveat
-    /// as `Producer`.
     Effect,
-    /// Reserved for the operator catalog when M3 lands.
     Operator,
 }
 
@@ -159,58 +109,25 @@ pub enum NodeTypeStr {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeStatus {
-    /// State node with sentinel cache (never had a value).
     Sentinel,
-    /// Compute node that has not yet fired (first-run gate not satisfied).
     Pending,
-    /// DIRTY queued; tier-3 settle has not flushed yet.
     Dirty,
-    /// Has a value, no terminal, no DIRTY pending.
     Settled,
-    /// Same as `Settled` for static descriptors — wave-internal
-    /// "resolved-this-wave" doesn't survive flush. Reserved for
-    /// reactive-describe later.
     Resolved,
-    /// Terminated via `[COMPLETE]`.
     Completed,
-    /// Terminated via `[ERROR, h]`.
     Errored,
 }
 
-impl Graph {
-    /// Snapshot the graph's topology + lifecycle state. JSON form only
-    /// in this slice (see module docs).
-    ///
-    /// `value` fields serialize as raw u64 handles. Pass a
-    /// [`DebugBindingBoundary`] to
-    /// [`Self::describe_with_debug`](Self::describe_with_debug)
-    /// instead if you want `value: T`-shaped output.
-    #[must_use]
-    pub fn describe(&self) -> GraphDescribeOutput {
-        self.describe_inner(None)
-    }
-
-    /// Variant of [`Self::describe`] that renders each node's
-    /// `value` via the supplied [`DebugBindingBoundary`].
-    ///
-    /// Useful when consuming `describe()` output to display values
-    /// to humans (e.g., debugging UIs, log scrapers) — the JSON
-    /// surfaces the binding's `T` shape rather than opaque u64
-    /// handles.
-    ///
-    /// The trait is intentionally outside
-    /// [`graphrefly_core::BindingBoundary`] so the hot-path FFI
-    /// surface stays narrow. Bindings opt in by implementing both.
-    /// Pre-1.0: bindings that don't ship `DebugBindingBoundary`
-    /// simply force callers to use raw [`Self::describe`] (no
-    /// fallback). See [`crate::debug`] for the trait's contract.
-    #[must_use]
-    pub fn describe_with_debug(&self, debug: &dyn DebugBindingBoundary) -> GraphDescribeOutput {
-        self.describe_inner(Some(debug))
-    }
-
-    fn describe_inner(&self, debug: Option<&dyn DebugBindingBoundary>) -> GraphDescribeOutput {
-        let inner = self.inner.lock();
+/// β/D243: describe over the read-only-inspection `&dyn CoreFull` (so
+/// the in-wave `MailboxOp::Defer` reactive-describe closure can run it)
+/// + the namespace handle. Pure read; no `Core`-mutation.
+pub(crate) fn describe_of(
+    core: &dyn CoreFull,
+    inner_arc: &Arc<Mutex<GraphInner>>,
+    debug: Option<&dyn DebugBindingBoundary>,
+) -> GraphDescribeOutput {
+    let (graph_name, local_names, subgraphs, names_iter) = {
+        let inner = inner_arc.lock();
         let graph_name = inner.name.clone();
         let local_names: IndexMap<NodeId, String> = inner
             .names
@@ -220,70 +137,66 @@ impl Graph {
         let subgraphs: Vec<String> = inner.children.keys().cloned().collect();
         let names_iter: Vec<(String, NodeId)> =
             inner.names.iter().map(|(n, id)| (n.clone(), *id)).collect();
-        drop(inner);
+        (graph_name, local_names, subgraphs, names_iter)
+    };
 
-        let mut nodes: IndexMap<String, NodeDescribe> = IndexMap::new();
-        let mut edges: Vec<EdgeDescribe> = Vec::new();
+    let mut nodes: IndexMap<String, NodeDescribe> = IndexMap::new();
+    let mut edges: Vec<EdgeDescribe> = Vec::new();
 
-        for (name, id) in &names_iter {
-            let kind = self.core.kind_of(*id).unwrap_or(NodeKind::State);
-            let cache = self.core.cache_of(*id);
-            let terminal = self.core.is_terminal(*id);
-            let dirty = self.core.is_dirty(*id);
-            let fired = self.core.has_fired_once(*id);
+    for (name, id) in &names_iter {
+        let kind = core.kind_of(*id).unwrap_or(NodeKind::State);
+        let cache = core.cache_of(*id);
+        let terminal = core.is_terminal(*id);
+        let dirty = core.is_dirty(*id);
+        let fired = core.has_fired_once(*id);
 
-            let dep_ids = self.core.deps_of(*id);
-            let dep_names: Vec<String> = dep_ids
-                .iter()
-                .map(|d| {
-                    local_names
-                        .get(d)
-                        .cloned()
-                        .unwrap_or_else(|| format!("_anon_{}", d.raw()))
-                })
-                .collect();
-            for dep_name in &dep_names {
-                edges.push(EdgeDescribe {
-                    from: dep_name.clone(),
-                    to: name.clone(),
-                });
-            }
-
-            // F sub-slice (2026-05-10): pick raw vs binding-rendered
-            // value. Sentinel cache (NO_HANDLE) → None regardless of
-            // mode. Real handle: route through debug binding when
-            // supplied, else surface raw.
-            let value = if cache == NO_HANDLE {
-                None
-            } else if let Some(debug) = debug {
-                Some(DescribeValue::Rendered(debug.handle_to_debug(cache)))
-            } else {
-                Some(DescribeValue::Handle(cache))
-            };
-
-            let operator_kind = match kind {
-                NodeKind::Operator(op) => Some(operator_op_name(op)),
-                _ => None,
-            };
-            nodes.insert(
-                name.clone(),
-                NodeDescribe {
-                    r#type: type_str_of(kind),
-                    status: status_of(kind, cache, terminal, dirty, fired),
-                    value,
-                    deps: dep_names,
-                    operator_kind,
-                    meta: None,
-                },
-            );
+        let dep_ids = core.deps_of(*id);
+        let dep_names: Vec<String> = dep_ids
+            .iter()
+            .map(|d| {
+                local_names
+                    .get(d)
+                    .cloned()
+                    .unwrap_or_else(|| format!("_anon_{}", d.raw()))
+            })
+            .collect();
+        for dep_name in &dep_names {
+            edges.push(EdgeDescribe {
+                from: dep_name.clone(),
+                to: name.clone(),
+            });
         }
 
-        GraphDescribeOutput {
-            name: graph_name,
-            nodes,
-            edges,
-            subgraphs,
-        }
+        let value = if cache == NO_HANDLE {
+            None
+        } else if let Some(debug) = debug {
+            Some(DescribeValue::Rendered(debug.handle_to_debug(cache)))
+        } else {
+            Some(DescribeValue::Handle(cache))
+        };
+
+        let operator_kind = match kind {
+            NodeKind::Operator(op) => Some(operator_op_name(op)),
+            _ => None,
+        };
+        nodes.insert(
+            name.clone(),
+            NodeDescribe {
+                r#type: type_str_of(kind),
+                status: status_of(kind, cache, terminal, dirty, fired),
+                value,
+                deps: dep_names,
+                operator_kind,
+                meta: None,
+            },
+        );
+    }
+
+    GraphDescribeOutput {
+        name: graph_name,
+        nodes,
+        edges,
+        subgraphs,
     }
 }
 
@@ -297,8 +210,6 @@ fn type_str_of(kind: NodeKind) -> NodeTypeStr {
     }
 }
 
-/// Slice V5: surfaces the `OperatorOp` variant name as a lowercase
-/// string for the `operator` field in `NodeDescribe`.
 fn operator_op_name(op: OperatorOp) -> String {
     match op {
         OperatorOp::Map { .. } => "map",
@@ -322,32 +233,10 @@ fn operator_op_name(op: OperatorOp) -> String {
     .to_owned()
 }
 
-/// Canonical-spec §3.6.1 status mapping.
-///
-/// Precedence (high to low): `errored` > `completed` > `dirty` >
-/// (cache-cleared discriminator) > (`settled` if `cache != NO_HANDLE`)
-/// > (`pending` for unfired compute) > (`sentinel` for state).
-///
-/// # R1.3.7.b post-INVALIDATE classification (Slice F, A8 — 2026-05-07)
-///
-/// Per canonical R1.3.7.b: "The emitting node's status transitions to
-/// 'sentinel' (no value, nothing pending) — NOT 'dirty' (value about to
-/// change) — because INVALIDATE has cleared the cache outright with no new
-/// value pending."
-///
-/// Implementation: a *fired* compute node with `cache == NO_HANDLE` and no
-/// terminal and no DIRTY pending has been `INVALIDATE`-d (the only path that
-/// clears the cache without setting a terminal). Report `Sentinel`, NOT
-/// `Settled` (the prior bug). State nodes use the same logic — `cache == NO_HANDLE`
-/// always means `Sentinel` regardless of `fired`.
-///
-/// # Reactive-describe note
-///
-/// When both `terminal.is_some()` AND `dirty == true` (a wave that began
-/// before the terminal was installed and still has unflushed tier-1 traffic),
-/// this static classifier reports the terminal status. Reactive describe will
-/// need a `terminating` substate to surface the unflushed wave — not modeled
-/// here because the static walk happens between waves in practice.
+/// Canonical-spec §3.6.1 status mapping. Precedence: errored >
+/// completed > dirty > (cache-cleared) > settled > pending > sentinel.
+/// R1.3.7.b: `cache == NO_HANDLE` discriminates Sentinel-vs-Settled
+/// BEFORE the `fired` check (post-INVALIDATE fired compute → Sentinel).
 fn status_of(
     kind: NodeKind,
     cache: HandleId,
@@ -363,18 +252,11 @@ fn status_of(
     if dirty {
         return NodeStatus::Dirty;
     }
-    // R1.3.7.b: `cache == NO_HANDLE` discriminates Sentinel vs Settled
-    // BEFORE the `fired` check, so post-INVALIDATE on fired compute nodes
-    // correctly reports `Sentinel` (was incorrectly `Settled` pre-A8).
     if cache == NO_HANDLE {
         return match kind {
             NodeKind::State => NodeStatus::Sentinel,
             NodeKind::Producer | NodeKind::Derived | NodeKind::Dynamic | NodeKind::Operator(_) => {
                 if fired {
-                    // Compute node that previously fired but currently has
-                    // sentinel cache → INVALIDATE wiped it. R1.3.7.b says
-                    // status is `sentinel`, not `pending` (pending = first-fire
-                    // gate not yet satisfied).
                     NodeStatus::Sentinel
                 } else {
                     NodeStatus::Pending
@@ -389,115 +271,92 @@ fn status_of(
 // Reactive describe (canonical §3.6.1 `reactive: true` mode)
 // -------------------------------------------------------------------
 
-/// Sink type for reactive describe — receives a fresh `GraphDescribeOutput`
-/// on every namespace change.
+/// Sink type for reactive describe.
 pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
 
-/// RAII handle for a reactive describe subscription. Dropping it stops
-/// the namespace listener and frees the describe-sink.
+/// RAII handle for a reactive describe subscription.
 ///
-/// The reactive describe fires synchronously from Graph-level
-/// namespace mutations (`add`, `remove`, `destroy`, `mount`,
-/// `unmount`, and the cascaded teardowns of `core.teardown`). Each
-/// fire re-snapshots the full `Graph::describe()` and delivers it
-/// to the sink.
+/// β/D242/D241-AMEND: carries the root `&'g Core` (borrow statically
+/// pins the Core alive for `'g`; the handle is `!Send` so it drops on
+/// the owner thread). `Drop` therefore **synchronously unsubscribes**
+/// both the namespace sink (inner-only) and the Core topology
+/// subscription — sound, not the D225 relocating-Core case.
 #[must_use = "ReactiveDescribeHandle holds the subscription; dropping it unsubscribes"]
-pub struct ReactiveDescribeHandle {
-    graph: Graph,
+pub struct ReactiveDescribeHandle<'g> {
+    core: &'g Core,
+    inner: Arc<Mutex<GraphInner>>,
     ns_sink_id: u64,
-    /// Slice V3 D5: Core topology subscription for `DepsChanged` events.
-    /// When deps change (via `set_deps`), edges in describe output change
-    /// even though the namespace hasn't changed. Dropping this field
-    /// automatically unsubscribes from Core topology events.
-    topo_sub: Option<TopologySubscription>,
+    /// Slice V3 D5: Core topology sub for `DepsChanged` (edges change
+    /// without a namespace change). D243: re-snapshot is in-wave
+    /// `MailboxOp::Defer`'d (the topology event fires inside a Core
+    /// wave; `describe_of` runs via the handed `&dyn CoreFull`).
+    topo_sub_id: TopologySubscriptionId,
 }
 
-impl Drop for ReactiveDescribeHandle {
+impl Drop for ReactiveDescribeHandle<'_> {
     fn drop(&mut self) {
-        // Drop topology sub BEFORE unsubscribing namespace sink to avoid
-        // potential deadlock if the topology sink fires during unsubscribe.
-        self.topo_sub.take();
-        self.graph.unsubscribe_namespace_change(self.ns_sink_id);
+        // Topology sub first (so a topo fire mid-unsubscribe can't
+        // re-snapshot through a half-removed namespace sink), then the
+        // namespace sink. Both synchronous + owner-thread (D241-AMEND).
+        self.core.unsubscribe_topology(self.topo_sub_id);
+        self.inner
+            .lock()
+            .namespace_sinks
+            .shift_remove(&self.ns_sink_id);
     }
 }
 
-// Send + Sync compile-time assertion.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<ReactiveDescribeHandle>();
-};
+/// β: build a reactive-describe subscription. Push-on-subscribe fires
+/// the current snapshot once, then re-fires on every namespace change
+/// (owner-side `&Core`, D231) and on `set_deps` `DepsChanged`
+/// (in-wave `MailboxOp::Defer` → `&dyn CoreFull`, D243).
+pub(crate) fn describe_reactive_in<'g>(
+    core: &'g Core,
+    inner: &Arc<Mutex<GraphInner>>,
+    sink: DescribeSink,
+) -> ReactiveDescribeHandle<'g> {
+    // Push-on-subscribe (no lock held).
+    sink(&describe_of(core, inner, None));
 
-impl Graph {
-    /// Subscribe to live topology snapshots. The sink fires immediately
-    /// with the current [`GraphDescribeOutput`] (push-on-subscribe per
-    /// canonical §2.5.2 / R3.6.1) and then again with a fresh snapshot
-    /// every time a node is added, removed, mounted, unmounted, or the
-    /// graph is destroyed.
-    ///
-    /// Returns a [`ReactiveDescribeHandle`] — dropping it unsubscribes.
-    ///
-    /// This is the `reactive: true` mode from canonical §3.6.1. The
-    /// `reactive: "diff"` (changeset) mode is deferred to Phase 14.
-    ///
-    /// Note: `set_deps` topology changes fire via Core's topology
-    /// primitive, not this Graph-level namespace hook. If callers also
-    /// need `set_deps` notifications, compose with
-    /// [`graphrefly_core::Core::subscribe_topology`].
-    ///
-    /// The sink captures only a [`Weak`] reference to the graph's inner
-    /// state, so the `namespace_sinks` → sink → Graph → `namespace_sinks`
-    /// Arc cycle is broken at the sink edge (see P6 in the Slice F /qa
-    /// closing notes).
-    pub fn describe_reactive(&self, sink: DescribeSink) -> ReactiveDescribeHandle {
-        // Push-on-subscribe: fire current snapshot once before installing
-        // the listener. Sink runs without any Graph lock held.
-        sink(&self.describe());
+    // Namespace-change path (owner-side `&Core`, β/D231).
+    let weak_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(inner);
+    let sink_ns = sink.clone();
+    let ns_sink: crate::graph::NamespaceChangeSink = Arc::new(move |c: &Core| {
+        let Some(arc_inner) = weak_inner.upgrade() else {
+            return;
+        };
+        sink_ns(&describe_of(c, &arc_inner, None));
+    });
+    let ns_sink_id = register_ns_sink(inner, ns_sink);
 
-        // Capture Weak<inner> + Core (clone) to break the
-        // namespace_sinks → sink → Graph → namespace_sinks Arc cycle.
-        // If the user leaks the handle, the graph still drops cleanly
-        // because the sink's Weak ref does not keep `inner` alive.
-        let weak_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.inner);
-        let core: Core = self.core.clone();
-        let sink_for_ns = sink.clone();
-        let ns_sink = Arc::new(move || {
-            let Some(arc_inner) = weak_inner.upgrade() else {
-                return;
-            };
-            let graph = Graph {
-                core: core.clone(),
-                inner: arc_inner,
-            };
-            let snapshot = graph.describe();
-            sink_for_ns(&snapshot);
+    // Topology path (set_deps → `DepsChanged`, fired inside a Core
+    // wave): re-snapshot via an in-wave `MailboxOp::Defer` so it runs
+    // owner-side with a real `&dyn CoreFull` (D243/D233).
+    let weak_inner_topo: Weak<Mutex<GraphInner>> = Arc::downgrade(inner);
+    let mailbox = core.mailbox();
+    let sink_topo = sink.clone();
+    let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
+        Arc::new(move |event: &TopologyEvent| {
+            if matches!(event, TopologyEvent::DepsChanged { .. }) {
+                let Some(arc_inner) = weak_inner_topo.upgrade() else {
+                    return;
+                };
+                let s = sink_topo.clone();
+                // The Defer closure captures no `HandleId` (only an
+                // `Arc<sink>` + a `Weak`-upgraded inner) — if the Core
+                // is gone (`false`) the snapshot simply won't fire;
+                // nothing to release (D235 P8 pattern).
+                let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
+                    s(&describe_of(cf, &arc_inner, None));
+                }));
+            }
         });
-        let ns_sink_id = self.subscribe_namespace_change(ns_sink);
+    let topo_sub_id = core.subscribe_topology(topo_sink);
 
-        // Slice V3 D5: subscribe to Core topology events so that
-        // `set_deps` changes (which alter edges without touching the
-        // namespace) also trigger a describe update.
-        let weak_inner_topo: Weak<Mutex<GraphInner>> = Arc::downgrade(&self.inner);
-        let core_topo: Core = self.core.clone();
-        let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
-            Arc::new(move |event: &TopologyEvent| {
-                if matches!(event, TopologyEvent::DepsChanged { .. }) {
-                    let Some(arc_inner) = weak_inner_topo.upgrade() else {
-                        return;
-                    };
-                    let graph = Graph {
-                        core: core_topo.clone(),
-                        inner: arc_inner,
-                    };
-                    let snapshot = graph.describe();
-                    sink(&snapshot);
-                }
-            });
-        let topo_sub = self.core.subscribe_topology(topo_sink);
-
-        ReactiveDescribeHandle {
-            graph: self.clone(),
-            ns_sink_id,
-            topo_sub: Some(topo_sub),
-        }
+    ReactiveDescribeHandle {
+        core,
+        inner: inner.clone(),
+        ns_sink_id,
+        topo_sub_id,
     }
 }

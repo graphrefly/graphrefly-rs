@@ -5,7 +5,7 @@ mod common;
 
 use common::binding;
 use graphrefly_core::{EqualsMode, FnId, HandleId, NO_HANDLE};
-use graphrefly_graph::{Graph, NameError};
+use graphrefly_graph::{Graph, GraphOps, NameError};
 
 #[test]
 fn state_registers_under_name_and_resolves() {
@@ -103,11 +103,14 @@ fn node_names_preserves_insertion_order() {
 }
 
 #[test]
-fn graph_clone_shares_namespace() {
+fn graph_view_shares_namespace() {
+    // β/D242: `Graph` is move-only (owns the single Core). The
+    // namespace-sharing intent now holds across `SubgraphRef` views of
+    // the same root.
     let g1 = Graph::new("system", binding());
-    let g2 = g1.clone();
+    let g2 = g1.view();
     let id = g1.state("x", Some(HandleId::new(5))).unwrap();
-    // Visible via the cloned graph.
+    // Visible via the borrowed view.
     assert_eq!(g2.try_resolve("x"), Some(id));
     assert_eq!(g2.cache_of(id), HandleId::new(5));
 }
