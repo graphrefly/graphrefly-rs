@@ -155,7 +155,9 @@ fn noop_sink() -> Sink {
 fn r_d030_producer_kind_derives_from_field_shape() {
     // D030 — kind is derived, not stored. A node with empty deps + a
     // fn_id but no op should report Producer.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
     assert_eq!(core.kind_of(producer), Some(NodeKind::Producer));
@@ -173,7 +175,9 @@ fn r_d030_state_kind_unchanged_after_unification() {
 fn r_d030_unified_register_dispatches_correctly() {
     // Drive the unified `Core::register` directly — exercise all four
     // shape combinations to confirm `kind()` returns the right variant.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
 
     let state = core
@@ -229,7 +233,9 @@ fn r_d030_unified_register_dispatches_correctly() {
 
 #[test]
 fn r_d031_producer_fn_fires_once_on_first_subscribe() {
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
 
@@ -253,7 +259,9 @@ fn r_d031_producer_fn_does_not_re_fire_on_additional_subscribers() {
     // R2.2.3 — activation is per-node, not per-subscriber. The producer
     // fn fires once when the first subscriber attaches; subsequent
     // subscribers attach without re-firing.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
 
@@ -274,7 +282,9 @@ fn r_d031_producer_fn_does_not_re_fire_on_additional_subscribers() {
 
 #[test]
 fn r_d031_producer_deactivate_fires_on_last_unsub() {
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
 
@@ -294,7 +304,9 @@ fn r_d031_producer_deactivate_fires_on_last_unsub() {
 
 #[test]
 fn r_d031_producer_deactivate_does_not_fire_when_one_of_many_unsubs() {
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
 
@@ -315,7 +327,9 @@ fn r_d031_producer_deactivate_does_not_fire_when_one_of_many_unsubs() {
 
 #[test]
 fn r_d031_producer_re_fires_fn_after_deactivate_then_resubscribe() {
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let producer = core.register_producer(fn_id).unwrap();
 
@@ -339,7 +353,9 @@ fn r_d031_producer_re_fires_fn_after_deactivate_then_resubscribe() {
 
 #[test]
 fn r_d031_deactivate_does_not_fire_for_state_nodes() {
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let s = core.register_state(NO_HANDLE, false).unwrap();
 
     let sub = core.subscribe(s, noop_sink());
@@ -356,7 +372,9 @@ fn r_d031_deactivate_does_not_fire_for_state_nodes() {
 fn r_d031_deactivate_does_not_fire_for_derived_nodes() {
     // Even non-producer compute nodes (Derived) don't fire
     // producer_deactivate. The hook is keyed on `is_producer()`.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let s = core.register_state(NO_HANDLE, false).unwrap();
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
     let derived = core
@@ -381,7 +399,9 @@ fn r_d031_deactivate_does_not_fire_for_derived_nodes() {
 fn r_d031_producer_returning_data_emits_value() {
     // When a producer fn returns FnResult::Data, the subscriber receives
     // the corresponding wave just like a derived would.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let payload = binding.alloc_handle();
     let fn_id = binding.register_producer_fn(FnResult::Data {
         handle: payload,
@@ -415,7 +435,9 @@ fn r_d031_producer_returning_data_emits_value() {
 fn r_d030_kind_of_is_derived_metadata_not_stored() {
     // Sanity: register a node, verify `kind_of` returns the expected
     // variant. Confirms the derive-on-read path works for all kinds.
-    let rt_mr = make_runtime(); let core = &rt_mr.0; let binding = &rt_mr.1;
+    let rt_mr = make_runtime();
+    let core = &rt_mr.0;
+    let binding = &rt_mr.1;
     let fn_id = binding.register_producer_fn(FnResult::Noop { tracked: None });
 
     let state = core.register_state(NO_HANDLE, false).unwrap();

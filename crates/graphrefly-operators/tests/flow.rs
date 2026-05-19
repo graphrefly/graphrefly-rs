@@ -20,7 +20,7 @@ use common::{OpRuntime, RecordedEvent, TestValue};
 fn take_emits_first_n_then_self_completes() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let taken = take(&rt.core, source, 2).into_node();
+    let taken = take(rt.core(), source, 2).into_node();
 
     let rec = rt.subscribe_recorder(taken);
     rt.emit_int(source, 10);
@@ -46,7 +46,7 @@ fn take_zero_self_completes_on_first_fire_with_no_data() {
     // waves; pure-terminal waves don't need a preceding DIRTY).
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let taken = take(&rt.core, source, 0).into_node();
+    let taken = take(rt.core(), source, 0).into_node();
 
     let rec = rt.subscribe_recorder(taken);
     rt.emit_int(source, 99);
@@ -66,12 +66,12 @@ fn take_propagates_upstream_complete_when_count_not_reached() {
     // downstream subscriber should see [Data(1), Data(2), Complete].
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let taken = take(&rt.core, source, 5).into_node();
+    let taken = take(rt.core(), source, 5).into_node();
 
     let rec = rt.subscribe_recorder(taken);
     rt.emit_int(source, 1);
     rt.emit_int(source, 2);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert_eq!(
         rec.data_values(),
@@ -91,8 +91,8 @@ fn take_resubscribable_resets_counter_on_lifecycle_reset() {
     // emits then proceed through a clean take(2) cycle.
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let taken = take(&rt.core, source, 2).into_node();
-    rt.core.set_resubscribable(taken, true);
+    let taken = take(rt.core(), source, 2).into_node();
+    rt.core().set_resubscribable(taken, true);
 
     // Cycle 1: emit 2 values, take completes.
     let rec1 = rt.subscribe_recorder(taken);
@@ -114,7 +114,7 @@ fn take_resubscribable_resets_counter_on_lifecycle_reset() {
     // fresh emits — the count would still be reset by
     // reset_for_fresh_lifecycle, but immediately re-incremented by
     // activation).
-    rt.core.invalidate(source);
+    rt.core().invalidate(source);
 
     let rec2 = rt.subscribe_recorder(taken);
     rt.emit_int(source, 100);
@@ -150,7 +150,7 @@ fn take_resubscribable_resets_counter_on_lifecycle_reset() {
 fn skip_drops_first_n_then_emits_remaining() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let skipped = skip(&rt.core, source, 2).into_node();
+    let skipped = skip(rt.core(), source, 2).into_node();
 
     let rec = rt.subscribe_recorder(skipped);
     rt.emit_int(source, 1);
@@ -171,7 +171,7 @@ fn skip_full_window_settles_dirty_resolved_per_d018() {
     // settle (D018 pattern).
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let skipped = skip(&rt.core, source, 3).into_node();
+    let skipped = skip(rt.core(), source, 3).into_node();
 
     let rec = rt.subscribe_recorder(skipped);
     rt.emit_int(source, 1);
@@ -196,7 +196,7 @@ fn take_while_emits_until_first_false_then_self_completes() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let taken = take_while(&rt.core, &rt.op_binding, source, move |h| {
+    let taken = take_while(rt.core(), &rt.op_binding, source, move |h| {
         binding.deref(h).int() < 10
     })
     .into_node();
@@ -228,7 +228,7 @@ fn take_while_emits_until_first_false_then_self_completes() {
 fn last_emits_buffered_latest_on_upstream_complete() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = last(&rt.core, source).into_node();
+    let n = last(rt.core(), source).into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 1);
@@ -242,7 +242,7 @@ fn last_emits_buffered_latest_on_upstream_complete() {
         rec.events()
     );
 
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(3)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -252,10 +252,10 @@ fn last_emits_buffered_latest_on_upstream_complete() {
 fn last_no_default_on_empty_stream_emits_only_complete() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = last(&rt.core, source).into_node();
+    let n = last(rt.core(), source).into_node();
 
     let rec = rt.subscribe_recorder(n);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert!(
         rec.data_values().is_empty(),
@@ -270,12 +270,12 @@ fn last_with_default_on_empty_stream_emits_default() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let default = rt.intern_int(42);
-    let n = last_with_default(&rt.core, source, default)
+    let n = last_with_default(rt.core(), source, default)
         .unwrap()
         .into_node();
 
     let rec = rt.subscribe_recorder(n);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(42)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -286,13 +286,13 @@ fn last_with_default_prefers_latest_over_default() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let default = rt.intern_int(42);
-    let n = last_with_default(&rt.core, source, default)
+    let n = last_with_default(rt.core(), source, default)
         .unwrap()
         .into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 7);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(7)]);
 }
@@ -301,12 +301,12 @@ fn last_with_default_prefers_latest_over_default() {
 fn last_propagates_upstream_error() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = last(&rt.core, source).into_node();
+    let n = last(rt.core(), source).into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 1);
     let err_h = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
 
     let saw_error = rec
         .events()
@@ -333,7 +333,7 @@ fn last_propagates_upstream_error() {
 fn first_alias_for_take_one() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = first(&rt.core, source).into_node();
+    let n = first(rt.core(), source).into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 7);
@@ -348,7 +348,7 @@ fn find_emits_first_matching_then_completes() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let n = find(&rt.core, &rt.op_binding, source, move |h| {
+    let n = find(rt.core(), &rt.op_binding, source, move |h| {
         binding.deref(h).int() > 5
     })
     .into_node();
@@ -367,7 +367,7 @@ fn find_emits_first_matching_then_completes() {
 fn element_at_emits_indexed_value_then_completes() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = element_at(&rt.core, source, 2).into_node();
+    let n = element_at(rt.core(), source, 2).into_node();
 
     let rec = rt.subscribe_recorder(n);
     rt.emit_int(source, 10);
@@ -396,7 +396,7 @@ fn last_with_default_releases_default_on_core_drop() {
         default_handle = rt.intern_int(99);
         // Caller's intern share: 1.
         assert_eq!(binding.refcount_of(default_handle), 1);
-        let _n = last_with_default(&rt.core, source, default_handle)
+        let _n = last_with_default(rt.core(), source, default_handle)
             .unwrap()
             .into_node();
         // Core retained inside register_operator: now 2.
@@ -428,8 +428,8 @@ fn last_releases_buffered_latest_on_lifecycle_reset() {
     // delta between cycle 1 (buffered) and post-reset (released).
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let n = last(&rt.core, source).into_node();
-    rt.core.set_resubscribable(n, true);
+    let n = last(rt.core(), source).into_node();
+    rt.core().set_resubscribable(n, true);
 
     // Diagnostic intern: hold an extra share of `5` so its refcount
     // doesn't drop to zero when LastState releases its share. This
@@ -441,23 +441,29 @@ fn last_releases_buffered_latest_on_lifecycle_reset() {
 
     let rec1 = rt.subscribe_recorder(n);
     rt.emit_int(source, 5);
-    // After emit + wave drain: source's cache holds one share, Last's
-    // dep_records[0].prev_data holds one (transferred from data_batch
-    // by clear_wave_state's wave-end rotation), LastState.latest
-    // holds one (from fire_op_last's retain), and our diagnostic
-    // share remains. Total: 4.
+    rt.settle(); // D246: pump deferred ops so refcount accounting settles.
+                 // After emit + wave drain: source's cache holds one share, Last's
+                 // dep_records[0].prev_data holds one (transferred from data_batch
+                 // by clear_wave_state's wave-end rotation), LastState.latest
+                 // holds one (from fire_op_last's retain), and our diagnostic
+                 // share remains. Total: 4.
     assert_eq!(
         rt.binding.refcount_of(observed_handle),
         4,
         "after emit + wave drain: 1 (diag) + 1 (source cache) + 1 (prev_data) + 1 (LastState.latest)"
     );
 
-    rt.core.complete(source);
-    // Terminal-aware fire_op_last emits Data(5) + Complete: it
-    // retains the buffered handle once more, commit_emission_verbatim
-    // consumes that retain into Last.cache. Refcount becomes 5.
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred ops so refcount accounting settles.
+                 // Terminal-aware fire_op_last emits Data(5) + Complete: it
+                 // retains the buffered handle once more, commit_emission_verbatim
+                 // consumes that retain into Last.cache. Refcount becomes 5.
     assert_eq!(rec1.data_values(), vec![TestValue::Int(5)]);
     drop(rec1);
+    // D246: `drop(rec1)` posts a deferred unsubscribe (binding-layer
+    // SubGuard); pump it owner-side so the last-sub-leaves Phase G
+    // cache-clear fires BEFORE the rec2 re-subscribe below.
+    rt.settle();
     // After drop(rec1): rec1's Subscription drops. Phase G (D119,
     // 2026-05-10) fires Core cache-clear on the last-sub-leaves
     // transition. For compute nodes (R2.2.7 / R2.2.8 ROM rule, D119),
@@ -486,6 +492,7 @@ fn last_releases_buffered_latest_on_lifecycle_reset() {
     // Final: 1 (diag) + 1 (source.cache) + 1 (re-activated prev_data) +
     //        1 (re-activated LastState.latest) = 4.
     let _rec2 = rt.subscribe_recorder(n);
+    rt.settle(); // D246: pump deferred ops so refcount accounting settles.
     assert_eq!(
         rt.binding.refcount_of(observed_handle),
         4,
@@ -506,8 +513,8 @@ fn take_after_skip_produces_window() {
     // skip(2) → take(3) → emits inputs 3..=5
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let skipped = skip(&rt.core, source, 2).into_node();
-    let windowed = take(&rt.core, skipped, 3).into_node();
+    let skipped = skip(rt.core(), source, 2).into_node();
+    let windowed = take(rt.core(), skipped, 3).into_node();
 
     let rec = rt.subscribe_recorder(windowed);
     for v in 1..=10 {

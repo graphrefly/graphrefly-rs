@@ -30,11 +30,12 @@ fn tap_forwards_data_and_calls_side_effect() {
         c.fetch_add(v.int(), Ordering::SeqCst);
     }));
 
-    let tapped = tap(&rt.core, &rt.producer_binding, source, fn_id);
+    let tapped = tap(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(tapped);
 
     rt.emit_int(source, 10);
     rt.emit_int(source, 20);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -49,11 +50,12 @@ fn tap_forwards_complete() {
     let source = rt.state_int(None);
 
     let fn_id = rt.binding.register_tap(Box::new(|_| {}));
-    let tapped = tap(&rt.core, &rt.producer_binding, source, fn_id);
+    let tapped = tap(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(tapped);
 
     rt.emit_int(source, 1);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -65,11 +67,12 @@ fn tap_forwards_error() {
     let source = rt.state_int(None);
 
     let fn_id = rt.binding.register_tap(Box::new(|_| {}));
-    let tapped = tap(&rt.core, &rt.producer_binding, source, fn_id);
+    let tapped = tap(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(tapped);
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec
         .events()
@@ -98,7 +101,7 @@ fn tap_observer_calls_data_error_complete_callbacks() {
     }));
 
     let observed = tap_observer(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         Some(data_fn),
@@ -108,7 +111,8 @@ fn tap_observer_calls_data_error_complete_callbacks() {
     let rec = rt.subscribe_recorder(observed);
 
     rt.emit_int(source, 42);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(42)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -121,11 +125,12 @@ fn tap_observer_none_callbacks_still_forwards() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let observed = tap_observer(&rt.core, &rt.producer_binding, source, None, None, None);
+    let observed = tap_observer(rt.core(), &rt.producer_binding, source, None, None, None);
     let rec = rt.subscribe_recorder(observed);
 
     rt.emit_int(source, 5);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(5)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -146,12 +151,13 @@ fn on_first_data_calls_tap_only_once() {
         c.fetch_add(1, Ordering::SeqCst);
     }));
 
-    let node = on_first_data(&rt.core, &rt.producer_binding, source, fn_id);
+    let node = on_first_data(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(node);
 
     rt.emit_int(source, 1);
     rt.emit_int(source, 2);
     rt.emit_int(source, 3);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     // All data forwarded
     assert_eq!(
@@ -168,10 +174,11 @@ fn on_first_data_forwards_complete_and_error() {
     let source = rt.state_int(None);
 
     let fn_id = rt.binding.register_tap(Box::new(|_| {}));
-    let node = on_first_data(&rt.core, &rt.producer_binding, source, fn_id);
+    let node = on_first_data(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(node);
 
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec.events().contains(&RecordedEvent::Complete));
     assert!(rec.data_values().is_empty());
@@ -192,12 +199,13 @@ fn rescue_recovers_from_error() {
         Ok(b.intern(TestValue::Int(999)))
     }));
 
-    let rescued = rescue(&rt.core, &rt.producer_binding, source, fn_id);
+    let rescued = rescue(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(rescued);
 
     rt.emit_int(source, 1);
     let err_h = rt.intern(TestValue::Str("fail".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -220,11 +228,12 @@ fn rescue_propagates_error_when_recovery_fails() {
 
     let fn_id = rt.binding.register_rescue(Box::new(move |_| Err(())));
 
-    let rescued = rescue(&rt.core, &rt.producer_binding, source, fn_id);
+    let rescued = rescue(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(rescued);
 
     let err_h = rt.intern(TestValue::Str("unrecoverable".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec.events().contains(&RecordedEvent::Error(TestValue::Str(
         "unrecoverable".into()
@@ -237,11 +246,12 @@ fn rescue_passes_data_through() {
     let source = rt.state_int(None);
 
     let fn_id = rt.binding.register_rescue(Box::new(move |_| Err(())));
-    let rescued = rescue(&rt.core, &rt.producer_binding, source, fn_id);
+    let rescued = rescue(rt.core(), &rt.producer_binding, source, fn_id);
     let rec = rt.subscribe_recorder(rescued);
 
     rt.emit_int(source, 10);
     rt.emit_int(source, 20);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -266,7 +276,7 @@ fn valve_gates_data_by_control_signal() {
         .register_predicate(Box::new(move |h| b.deref(h).int() > 0));
 
     let gated = valve(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         control,
@@ -290,6 +300,7 @@ fn valve_gates_data_by_control_signal() {
     // Re-open
     rt.emit_int(control, 1);
     rt.emit_int(source, 5); // passes
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -309,7 +320,7 @@ fn valve_forwards_source_complete() {
         .register_predicate(Box::new(move |h| b.deref(h).int() > 0));
 
     let gated = valve(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         control,
@@ -320,7 +331,8 @@ fn valve_forwards_source_complete() {
 
     rt.emit_int(control, 1); // open
     rt.emit_int(source, 10);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(10)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -338,7 +350,7 @@ fn valve_control_error_terminates() {
         .register_predicate(Box::new(move |h| b.deref(h).int() > 0));
 
     let gated = valve(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         control,
@@ -348,7 +360,8 @@ fn valve_control_error_terminates() {
     let rec = rt.subscribe_recorder(gated);
 
     let err_h = rt.intern(TestValue::Str("ctrl_err".into()));
-    rt.core.error(control, err_h);
+    rt.core().error(control, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec
         .events()
@@ -368,7 +381,7 @@ fn valve_cancellation_token_fires_on_close() {
 
     let token = tokio_util::sync::CancellationToken::new();
     let gated = valve(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         control,
@@ -395,7 +408,7 @@ fn settle_completes_after_max_waves() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let settled = settle(&rt.core, &rt.producer_binding, source, 10, Some(3));
+    let settled = settle(rt.core(), &rt.producer_binding, source, 10, Some(3));
     let rec = rt.subscribe_recorder(settled);
 
     rt.emit_int(source, 1);
@@ -415,11 +428,12 @@ fn settle_forwards_complete_from_source() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let settled = settle(&rt.core, &rt.producer_binding, source, 5, None);
+    let settled = settle(rt.core(), &rt.producer_binding, source, 5, None);
     let rec = rt.subscribe_recorder(settled);
 
     rt.emit_int(source, 1);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -430,11 +444,12 @@ fn settle_forwards_error() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let settled = settle(&rt.core, &rt.producer_binding, source, 5, None);
+    let settled = settle(rt.core(), &rt.producer_binding, source, 5, None);
     let rec = rt.subscribe_recorder(settled);
 
     let err_h = rt.intern(TestValue::Str("settle_err".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec
         .events()
@@ -450,11 +465,12 @@ fn repeat_zero_is_identity() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let repeated = repeat(&rt.core, &rt.producer_binding, source, 0);
+    let repeated = repeat(rt.core(), &rt.producer_binding, source, 0);
     let rec = rt.subscribe_recorder(repeated);
 
     rt.emit_int(source, 1);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -465,11 +481,12 @@ fn repeat_forwards_error_immediately() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let repeated = repeat(&rt.core, &rt.producer_binding, source, 5);
+    let repeated = repeat(rt.core(), &rt.producer_binding, source, 5);
     let rec = rt.subscribe_recorder(repeated);
 
     let err_h = rt.intern(TestValue::Str("repeat_err".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(rec
         .events()
@@ -481,11 +498,12 @@ fn repeat_data_passthrough() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let repeated = repeat(&rt.core, &rt.producer_binding, source, 0);
+    let repeated = repeat(rt.core(), &rt.producer_binding, source, 0);
     let rec = rt.subscribe_recorder(repeated);
 
     rt.emit_int(source, 10);
     rt.emit_int(source, 20);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),

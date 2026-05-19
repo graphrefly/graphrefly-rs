@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use graphrefly_core::{BindingBoundary, DepBatch, FnId, FnResult, HandleId, NodeId, NO_HANDLE};
-use graphrefly_graph::{
-    Graph, GraphOps, GraphPersistSnapshot, NodeSlice, NodeSnapshotStatus, SnapshotOps,
+use graphrefly_core::{
+    BindingBoundary, DepBatch, FnId, FnResult, HandleId, NodeId, OwnedCore, NO_HANDLE,
 };
+use graphrefly_graph::{Graph, GraphPersistSnapshot, NodeSlice, NodeSnapshotStatus};
 use graphrefly_storage::{
     attach_snapshot_storage, decompose_diff_to_frames, diff_snapshots, kv_storage, memory_backend,
     restore_snapshot, snapshot_storage, AttachOptions, AttachTierPair, BaseStorageTier,
@@ -77,10 +77,14 @@ impl BindingBoundary for TestBinding {
     }
 }
 
-fn make_graph(name: &str) -> (Graph, Arc<TestBinding>) {
+/// D246: the embedder owns the `Core` via [`OwnedCore`]; `Graph` is
+/// Core-free (`Graph::new(name)`). Every Core-touching `g.*` call
+/// threads `rt.core()`.
+fn make_graph(name: &str) -> (OwnedCore, Graph, Arc<TestBinding>) {
     let b = TestBinding::new();
-    let g = Graph::new(name, b.clone() as Arc<dyn BindingBoundary>);
-    (g, b)
+    let rt = OwnedCore::new(b.clone() as Arc<dyn BindingBoundary>);
+    let g = Graph::new(name);
+    (rt, g, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,15 +296,16 @@ fn decompose_checksum_verifies() {
 
 #[test]
 fn attach_full_baseline_on_first_flush() {
-    let (g, b) = make_graph("test");
+    let (rt, g, b) = make_graph("test");
     let h1 = b.intern(Value::from(10));
-    g.state("counter", Some(h1)).unwrap();
+    g.state(rt.core(), "counter", Some(h1)).unwrap();
 
     let backend = memory_backend();
     let snap_tier = make_snap_tier(backend.clone(), "test");
     let snap_tier_box: Box<dyn SnapshotStorageTier<GraphCheckpointRecord>> = Box::new(snap_tier);
 
-    let _handle = attach_snapshot_storage(
+    let handle = attach_snapshot_storage(
+        rt.core(),
         &g,
         vec![AttachTierPair {
             snapshot: snap_tier_box,
@@ -311,7 +316,7 @@ fn attach_full_baseline_on_first_flush() {
 
     // Emit a value to trigger flush.
     let h2 = b.intern(Value::from(20));
-    g.set("counter", h2);
+    g.set(rt.core(), "counter", h2);
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     // Verify baseline was written.
@@ -321,13 +326,15 @@ fn attach_full_baseline_on_first_flush() {
     assert_eq!(record.name, "test");
     assert_eq!(record.mode, "full");
     assert_eq!(record.format_version, SNAPSHOT_VERSION);
+
+    handle.detach(rt.core());
 }
 
 #[test]
 fn attach_wal_delta_after_baseline() {
-    let (g, b) = make_graph("wal-test");
+    let (rt, g, b) = make_graph("wal-test");
     let h1 = b.intern(Value::from(1));
-    g.state("x", Some(h1)).unwrap();
+    g.state(rt.core(), "x", Some(h1)).unwrap();
 
     let snap_backend = memory_backend();
     let snap_tier = make_snap_tier_with_compact(snap_backend.clone(), "wal-test", 10);
@@ -337,7 +344,8 @@ fn attach_wal_delta_after_baseline() {
     let wal_tier = make_wal_tier(wal_backend.clone(), "wal");
     let wal_box: Box<dyn KvStorageTier<graphrefly_storage::WALFrame<Value>>> = Box::new(wal_tier);
 
-    let _handle = attach_snapshot_storage(
+    let handle = attach_snapshot_storage(
+        rt.core(),
         &g,
         vec![AttachTierPair {
             snapshot: snap_box,
@@ -348,17 +356,19 @@ fn attach_wal_delta_after_baseline() {
 
     // First emit → full baseline.
     let h2 = b.intern(Value::from(2));
-    g.set("x", h2);
+    g.set(rt.core(), "x", h2);
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(snap_backend.read("wal-test").unwrap().is_some());
 
     // Second emit → WAL delta.
     let h3 = b.intern(Value::from(3));
-    g.set("x", h3);
+    g.set(rt.core(), "x", h3);
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let wal_keys = wal_backend.list("wal-test/wal").unwrap();
     assert!(!wal_keys.is_empty(), "WAL frames should exist after delta");
+
+    handle.detach(rt.core());
 }
 
 /// D171: when the snapshot tier is configured with `debounce_ms > 0`,
@@ -367,9 +377,9 @@ fn attach_wal_delta_after_baseline() {
 /// buffered writes via `StorageHandle::flush_all()`.
 #[test]
 fn attach_respects_snapshot_debounce_ms_buffering() {
-    let (g, b) = make_graph("debounce-test");
+    let (rt, g, b) = make_graph("debounce-test");
     let h1 = b.intern(Value::from(10));
-    g.state("counter", Some(h1)).unwrap();
+    g.state(rt.core(), "counter", Some(h1)).unwrap();
 
     let backend = memory_backend();
     let snap_tier = snapshot_storage::<_, GraphCheckpointRecord, _>(
@@ -383,6 +393,7 @@ fn attach_respects_snapshot_debounce_ms_buffering() {
     let snap_box: Box<dyn SnapshotStorageTier<GraphCheckpointRecord>> = Box::new(snap_tier);
 
     let handle = attach_snapshot_storage(
+        rt.core(),
         &g,
         vec![AttachTierPair {
             snapshot: snap_box,
@@ -394,7 +405,7 @@ fn attach_respects_snapshot_debounce_ms_buffering() {
     // Emit a value — observe fires and tier.save() buffers. tier.flush()
     // is suppressed under debounce_ms > 0, so the backend stays empty.
     let h2 = b.intern(Value::from(20));
-    g.set("counter", h2);
+    g.set(rt.core(), "counter", h2);
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let stored = backend.read("debounce-test").unwrap();
@@ -416,19 +427,22 @@ fn attach_respects_snapshot_debounce_ms_buffering() {
     );
     let record: GraphCheckpointRecord = serde_json::from_slice(&stored.unwrap()).unwrap();
     assert_eq!(record.name, "debounce-test");
+
+    handle.detach(rt.core());
 }
 
 #[test]
 fn attach_dispose_stops_persistence() {
-    let (g, b) = make_graph("dispose");
+    let (rt, g, b) = make_graph("dispose");
     let h1 = b.intern(Value::from(1));
-    g.state("x", Some(h1)).unwrap();
+    g.state(rt.core(), "x", Some(h1)).unwrap();
 
     let snap_backend = memory_backend();
     let snap_tier = make_snap_tier(snap_backend.clone(), "dispose");
     let snap_box: Box<dyn SnapshotStorageTier<GraphCheckpointRecord>> = Box::new(snap_tier);
 
     let handle = attach_snapshot_storage(
+        rt.core(),
         &g,
         vec![AttachTierPair {
             snapshot: snap_box,
@@ -438,20 +452,22 @@ fn attach_dispose_stops_persistence() {
     );
 
     let h2 = b.intern(Value::from(2));
-    g.set("x", h2);
+    g.set(rt.core(), "x", h2);
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(snap_backend.read("dispose").unwrap().is_some());
 
-    // Dispose.
+    // Dispose (Core-free flag flip — late persistence stops).
     handle.dispose();
     snap_backend.write("dispose", &[]).unwrap(); // clear
 
     let h3 = b.intern(Value::from(3));
-    g.set("x", h3);
+    g.set(rt.core(), "x", h3);
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let stored = snap_backend.read("dispose").unwrap().unwrap();
     assert!(stored.is_empty(), "after dispose, no new snapshot");
+
+    handle.detach(rt.core());
 }
 
 // ---------------------------------------------------------------------------
@@ -460,9 +476,9 @@ fn attach_dispose_stops_persistence() {
 
 #[test]
 fn restore_baseline_only() {
-    let (g, b) = make_graph("r");
+    let (rt, g, b) = make_graph("r");
     let h = b.intern(Value::from(42));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_backend = memory_backend();
     let snap_tier = make_snap_tier(snap_backend, "r");
@@ -470,7 +486,7 @@ fn restore_baseline_only() {
         .save(GraphCheckpointRecord {
             name: "r".to_owned(),
             mode: "full".to_owned(),
-            snapshot: g.snapshot(),
+            snapshot: g.snapshot(rt.core()),
             seq: 0,
             timestamp_ns: 1000,
             format_version: SNAPSHOT_VERSION,
@@ -481,10 +497,11 @@ fn restore_baseline_only() {
     let wal_backend = memory_backend();
     let wal_tier = make_wal_tier(wal_backend, "wal");
 
-    let (g2, b2) = make_graph("r");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, b2) = make_graph("r");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let result = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -496,20 +513,21 @@ fn restore_baseline_only() {
     .unwrap();
 
     assert_eq!(result.replayed_frames, 0);
-    let cache = g2.get("x");
+    let cache = g2.get(rt2.core(), "x");
     assert_ne!(cache, NO_HANDLE);
     assert_eq!(b2.deref(cache), Value::from(42));
 }
 
 #[test]
 fn restore_missing_baseline_errors() {
-    let (g, _) = make_graph("e");
-    g.state("x", None).unwrap();
+    let (rt, g, _) = make_graph("e");
+    g.state(rt.core(), "x", None).unwrap();
 
     let snap_tier = make_snap_tier(memory_backend(), "e");
     let wal_tier = make_wal_tier(memory_backend(), "wal");
 
     let err = restore_snapshot(
+        rt.core(),
         &g,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -523,13 +541,13 @@ fn restore_missing_baseline_errors() {
 
 #[test]
 fn restore_with_wal_replay() {
-    let (g, b) = make_graph("replay");
+    let (rt, g, b) = make_graph("replay");
     let h = b.intern(Value::from(10));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_backend = memory_backend();
     let snap_tier = make_snap_tier(snap_backend, "replay");
-    let baseline = g.snapshot();
+    let baseline = g.snapshot(rt.core());
     snap_tier
         .save(GraphCheckpointRecord {
             name: "replay".to_owned(),
@@ -563,10 +581,11 @@ fn restore_with_wal_replay() {
     }
     wal_tier.flush().unwrap();
 
-    let (g2, b2) = make_graph("replay");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, b2) = make_graph("replay");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let result = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -579,21 +598,21 @@ fn restore_with_wal_replay() {
 
     assert_eq!(result.replayed_frames, 1);
     assert_eq!(result.phases[0].lifecycle, Lifecycle::Data);
-    assert_eq!(b2.deref(g2.get("x")), Value::from(20));
+    assert_eq!(b2.deref(g2.get(rt2.core(), "x")), Value::from(20));
 }
 
 #[test]
 fn restore_torn_tail_skipped() {
-    let (g, b) = make_graph("torn");
+    let (rt, g, b) = make_graph("torn");
     let h = b.intern(Value::from(1));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_tier = make_snap_tier(memory_backend(), "torn");
     snap_tier
         .save(GraphCheckpointRecord {
             name: "torn".to_owned(),
             mode: "full".to_owned(),
-            snapshot: g.snapshot(),
+            snapshot: g.snapshot(rt.core()),
             seq: 0,
             timestamp_ns: 1000,
             format_version: SNAPSHOT_VERSION,
@@ -627,10 +646,11 @@ fn restore_torn_tail_skipped() {
         .unwrap();
     wal_tier.flush().unwrap();
 
-    let (g2, _) = make_graph("torn");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, _) = make_graph("torn");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let result = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -647,16 +667,16 @@ fn restore_torn_tail_skipped() {
 
 #[test]
 fn restore_torn_mid_aborts() {
-    let (g, b) = make_graph("torn-mid");
+    let (rt, g, b) = make_graph("torn-mid");
     let h = b.intern(Value::from(1));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_tier = make_snap_tier(memory_backend(), "torn-mid");
     snap_tier
         .save(GraphCheckpointRecord {
             name: "torn-mid".to_owned(),
             mode: "full".to_owned(),
-            snapshot: g.snapshot(),
+            snapshot: g.snapshot(rt.core()),
             seq: 0,
             timestamp_ns: 1000,
             format_version: SNAPSHOT_VERSION,
@@ -714,10 +734,11 @@ fn restore_torn_mid_aborts() {
         .unwrap();
     wal_tier.flush().unwrap();
 
-    let (g2, _) = make_graph("torn-mid");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, _) = make_graph("torn-mid");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let err = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -732,16 +753,16 @@ fn restore_torn_mid_aborts() {
 
 #[test]
 fn restore_target_seq_limits_replay() {
-    let (g, b) = make_graph("target");
+    let (rt, g, b) = make_graph("target");
     let h = b.intern(Value::from(1));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_tier = make_snap_tier(memory_backend(), "target");
     snap_tier
         .save(GraphCheckpointRecord {
             name: "target".to_owned(),
             mode: "full".to_owned(),
-            snapshot: g.snapshot(),
+            snapshot: g.snapshot(rt.core()),
             seq: 0,
             timestamp_ns: 1000,
             format_version: SNAPSHOT_VERSION,
@@ -774,10 +795,11 @@ fn restore_target_seq_limits_replay() {
     }
     wal_tier.flush().unwrap();
 
-    let (g2, b2) = make_graph("target");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, b2) = make_graph("target");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let result = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,
@@ -790,21 +812,21 @@ fn restore_target_seq_limits_replay() {
 
     assert_eq!(result.replayed_frames, 2);
     assert_eq!(result.final_seq, 2);
-    assert_eq!(b2.deref(g2.get("x")), Value::from(20));
+    assert_eq!(b2.deref(g2.get(rt2.core(), "x")), Value::from(20));
 }
 
 #[test]
 fn restore_custom_torn_policy_skip_all() {
-    let (g, b) = make_graph("custom");
+    let (rt, g, b) = make_graph("custom");
     let h = b.intern(Value::from(1));
-    g.state("x", Some(h)).unwrap();
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
     let snap_tier = make_snap_tier(memory_backend(), "custom");
     snap_tier
         .save(GraphCheckpointRecord {
             name: "custom".to_owned(),
             mode: "full".to_owned(),
-            snapshot: g.snapshot(),
+            snapshot: g.snapshot(rt.core()),
             seq: 0,
             timestamp_ns: 1000,
             format_version: SNAPSHOT_VERSION,
@@ -843,10 +865,11 @@ fn restore_custom_torn_policy_skip_all() {
     }
     wal_tier.flush().unwrap();
 
-    let (g2, _) = make_graph("custom");
-    g2.state("x", None).unwrap();
+    let (rt2, g2, _) = make_graph("custom");
+    g2.state(rt2.core(), "x", None).unwrap();
 
     let result = restore_snapshot(
+        rt2.core(),
         &g2,
         &RestoreOptions {
             snapshot_tier: &snap_tier,

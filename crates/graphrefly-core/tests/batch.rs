@@ -142,11 +142,15 @@ impl Diamond {
         // Subscribe in topo order (A, B, C, D) so insertion-order
         // `pending_notify` iteration produces a deterministic test sequence.
         for n in [a, b, c, d] {
-            std::mem::forget(runtime.core.subscribe(n, log.sink_for(n)));
+            // D246 rule 3: `subscribe` returns a Copy `SubscriptionId`;
+            // the subscription persists Core-side until owner-invoked
+            // unsubscribe. The old `mem::forget(RAII guard)` (keep
+            // subscribed for the test) is now just "discard the id".
+            let _ = runtime.core().subscribe(n, log.sink_for(n));
         }
         // Reset to ignore activation chatter. `a_state` (StateHandle) is
         // dropped here, but the state node itself stays registered in Core;
-        // `emit_a` interns + emits directly via `runtime.binding`/`runtime.core`.
+        // `emit_a` interns + emits directly via `runtime.binding`/`runtime.core()`.
         log.reset();
         Self {
             runtime,
@@ -160,7 +164,7 @@ impl Diamond {
 
     fn emit_a(&self, value: i64) {
         let h = self.runtime.binding.intern(TestValue::Int(value));
-        self.runtime.core.emit(self.a, h);
+        self.runtime.core().emit(self.a, h);
     }
 }
 
@@ -259,12 +263,14 @@ fn r1_3_1_b_complex_topology_dirty_first() {
 
     let log = GlobalLog::new();
     for &n in &[a, b, c, d, e, f] {
-        std::mem::forget(runtime.core.subscribe(n, log.sink_for(n)));
+        // D246 rule 3: discard the Copy `SubscriptionId`; the
+        // subscription persists Core-side for the test.
+        let _ = runtime.core().subscribe(n, log.sink_for(n));
     }
     log.reset();
 
     let h = runtime.binding.intern(TestValue::Int(10));
-    runtime.core.emit(a, h);
+    runtime.core().emit(a, h);
 
     let entries = log.snapshot();
     assert_dirty_before_settle(&entries);
@@ -315,9 +321,9 @@ fn batch_closure_coalesces_two_state_emits_into_one_wave() {
 
     let h_a = runtime.binding.intern(TestValue::Int(7));
     let h_b = runtime.binding.intern(TestValue::Int(13));
-    runtime.core.batch(|| {
-        runtime.core.emit(a_state.id, h_a);
-        runtime.core.emit(b_state.id, h_b);
+    runtime.core().batch(|| {
+        runtime.core().emit(a_state.id, h_a);
+        runtime.core().emit(b_state.id, h_b);
     });
 
     let post = rec.snapshot();
@@ -368,9 +374,9 @@ fn batch_diamond_d_fires_once_when_two_state_emits_coalesce() {
 
     let h_l = runtime.binding.intern(TestValue::Int(5));
     let h_r = runtime.binding.intern(TestValue::Int(10));
-    runtime.core.batch(|| {
-        runtime.core.emit(s_left.id, h_l);
-        runtime.core.emit(s_right.id, h_r);
+    runtime.core().batch(|| {
+        runtime.core().emit(s_left.id, h_l);
+        runtime.core().emit(s_right.id, h_r);
     });
 
     let after = *d_fire_count.lock().expect("d count");
@@ -402,12 +408,12 @@ fn batch_nested_only_outer_drains() {
     let h1 = runtime.binding.intern(TestValue::Int(1));
     let h2 = runtime.binding.intern(TestValue::Int(2));
     let h3 = runtime.binding.intern(TestValue::Int(3));
-    runtime.core.batch(|| {
-        runtime.core.emit(s.id, h1);
-        runtime.core.batch(|| {
-            runtime.core.emit(s.id, h2);
+    runtime.core().batch(|| {
+        runtime.core().emit(s.id, h1);
+        runtime.core().batch(|| {
+            runtime.core().emit(s.id, h2);
         });
-        runtime.core.emit(s.id, h3);
+        runtime.core().emit(s.id, h3);
     });
 
     let post = rec
@@ -443,11 +449,11 @@ fn begin_batch_raii_drains_on_drop() {
         .count();
 
     {
-        let _g = runtime.core.begin_batch();
+        let _g = runtime.core().begin_batch();
         let h1 = runtime.binding.intern(TestValue::Int(7));
         let h2 = runtime.binding.intern(TestValue::Int(11));
-        runtime.core.emit(s.id, h1);
-        runtime.core.emit(s.id, h2);
+        runtime.core().emit(s.id, h1);
+        runtime.core().emit(s.id, h2);
         // No drain yet — pre-drop; verify cache propagation hasn't happened
         // at the derived yet (the source's own emit-time DIRTY broadcast
         // doesn't fire derived's fn — that's the wave drain's job).
@@ -485,10 +491,10 @@ fn batch_with_complete_inside_drains_terminal_at_scope_end() {
     // batch's wave.
     let baseline_len = rec.snapshot().len();
 
-    runtime.core.batch(|| {
+    runtime.core().batch(|| {
         let h = runtime.binding.intern(TestValue::Int(5));
-        runtime.core.emit(s.id, h);
-        runtime.core.complete(s.id);
+        runtime.core().emit(s.id, h);
+        runtime.core().complete(s.id);
     });
 
     let events = rec.snapshot();
@@ -530,7 +536,7 @@ fn batch_panic_restores_state_node_caches() {
     let initial_cache = runtime.cache_value(s_id).expect("initial cache");
     assert_eq!(initial_cache, TestValue::Int(7));
 
-    let core = &runtime.core;
+    let core = runtime.core();
     let binding = runtime.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         core.batch(|| {
@@ -561,7 +567,7 @@ fn batch_panic_restores_multi_emit_state_node_to_first_pre_wave_value() {
     let runtime = TestRuntime::new();
     let s = runtime.state(Some(TestValue::Int(0)));
     let s_id = s.id;
-    let core = &runtime.core;
+    let core = runtime.core();
     let binding = runtime.binding.clone();
     let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         core.batch(|| {
@@ -588,7 +594,7 @@ fn batch_success_does_not_revert_caches() {
     let runtime = TestRuntime::new();
     let s = runtime.state(Some(TestValue::Int(0)));
     let s_id = s.id;
-    let core = &runtime.core;
+    let core = runtime.core();
     let binding = runtime.binding.clone();
     core.batch(|| {
         let h = binding.intern(TestValue::Int(42));
@@ -617,7 +623,7 @@ fn batch_panic_discards_pending_wave() {
         .filter(|e| matches!(e, common::RecordedEvent::Data(_)))
         .count();
 
-    let core = &runtime.core;
+    let core = runtime.core();
     let s_id = s.id;
     let binding = runtime.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -650,7 +656,7 @@ fn batch_panic_discards_pending_wave() {
     // And the in-tick state should be cleared — a fresh emit after the
     // panic should drive a normal wave.
     let h2 = runtime.binding.intern(TestValue::Int(100));
-    runtime.core.emit(s.id, h2);
+    runtime.core().emit(s.id, h2);
     let after_recover = rec
         .snapshot()
         .iter()
@@ -677,14 +683,14 @@ fn batch_with_pause_resume_buffers_and_replays_at_resume() {
         .iter()
         .filter(|e| matches!(e, common::RecordedEvent::Data(_)))
         .count();
-    let lock = runtime.core.alloc_lock_id();
+    let lock = runtime.core().alloc_lock_id();
 
-    runtime.core.batch(|| {
-        runtime.core.pause(derived, lock).expect("pause");
+    runtime.core().batch(|| {
+        runtime.core().pause(derived, lock).expect("pause");
         let h1 = runtime.binding.intern(TestValue::Int(1));
         let h2 = runtime.binding.intern(TestValue::Int(2));
-        runtime.core.emit(s.id, h1);
-        runtime.core.emit(s.id, h2);
+        runtime.core().emit(s.id, h1);
+        runtime.core().emit(s.id, h2);
     });
 
     // Still paused — derived sink should not have observed any tier-3
@@ -702,7 +708,7 @@ fn batch_with_pause_resume_buffers_and_replays_at_resume() {
     );
 
     let report = runtime
-        .core
+        .core()
         .resume(derived, lock)
         .expect("resume")
         .expect("final lock report");
@@ -736,10 +742,10 @@ fn flush_preserves_per_node_message_order_within_tier() {
     let h1 = runtime.binding.intern(TestValue::Int(1));
     let h2 = runtime.binding.intern(TestValue::Int(2));
     let h3 = runtime.binding.intern(TestValue::Int(3));
-    runtime.core.batch(|| {
-        runtime.core.emit(s.id, h1);
-        runtime.core.emit(s.id, h2);
-        runtime.core.emit(s.id, h3);
+    runtime.core().batch(|| {
+        runtime.core().emit(s.id, h1);
+        runtime.core().emit(s.id, h2);
+        runtime.core().emit(s.id, h3);
     });
 
     let post_data: Vec<TestValue> = rec.data_values();
@@ -782,7 +788,7 @@ fn batch_fn_result_multi_data_delivers_all_values() {
         });
 
     let derived = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let rec = rt.subscribe_recorder(derived);
@@ -831,7 +837,7 @@ fn batch_fn_result_data_then_complete() {
         });
 
     let derived = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let rec = rt.subscribe_recorder(derived);
@@ -868,7 +874,7 @@ fn batch_fn_result_data_then_error() {
         });
 
     let derived = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let rec = rt.subscribe_recorder(derived);
@@ -907,7 +913,7 @@ fn batch_fn_result_dirty_queued_once_per_wave() {
         });
 
     let derived = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let rec = rt.subscribe_recorder(derived);
@@ -969,7 +975,7 @@ fn batch_fn_result_no_equals_substitution() {
         });
 
     let derived = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let rec = rt.subscribe_recorder(derived);
@@ -1018,7 +1024,7 @@ fn batch_fn_result_propagates_to_grandchild() {
             }
         });
     let mid = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id_mid, EqualsMode::Identity, false)
         .unwrap();
 
@@ -1069,12 +1075,12 @@ fn cross_core_same_thread_batchguard_isolation() {
 
     // Hold a live, OWNING BatchGuard on Core-A (sets Core-A's per-(Core,
     // thread) in_tick slot).
-    let guard_a = rt_a.core.begin_batch();
+    let guard_a = rt_a.core().begin_batch();
 
     // Same thread, while Core-A's guard is alive: a full wave on Core-B.
     // Must be owning + drain (Core-B's key is distinct from Core-A's).
     let h = rt_b.binding.intern(TestValue::Int(7));
-    rt_b.core.emit(s_b.id, h);
+    rt_b.core().emit(s_b.id, h);
 
     assert!(
         rec_b.data_values().contains(&TestValue::Int(7)),
@@ -1123,7 +1129,7 @@ fn panic_in_drain_phase_releases_wave_ownership_for_next_wave() {
     });
     let rec = rt.subscribe_recorder(d);
 
-    let core = &rt.core;
+    let core = rt.core();
     let sid = s.id;
     let binding = rt.binding.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {

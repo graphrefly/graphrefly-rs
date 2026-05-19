@@ -48,10 +48,11 @@ fn switch_map_emits_inner_data_from_cached_inner() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(Some(10));
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(10)]);
 }
 
@@ -62,13 +63,15 @@ fn switch_map_cancels_previous_inner_on_new_outer_data() {
     let inner1 = rt.state_int(Some(100));
     let inner2 = rt.state_int(Some(200));
     let inners = Arc::new(Mutex::new(vec![inner1, inner2]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1); // -> subscribe inner1 (cached 100)
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(100)]);
 
     rt.emit_int(outer, 2); // -> cancel inner1, subscribe inner2 (cached 200)
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![TestValue::Int(100), TestValue::Int(200)]
@@ -76,6 +79,7 @@ fn switch_map_cancels_previous_inner_on_new_outer_data() {
 
     rt.emit_int(inner1, 999); // ignored — canceled
     rt.emit_int(inner2, 222);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![
@@ -91,10 +95,11 @@ fn switch_map_completes_when_outer_completes_with_no_active_inner() {
     let rt = OpRuntime::new();
     let outer = rt.state_int(None);
     let inners: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(vec![]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
-    rt.core.complete(outer);
+    rt.core().complete(outer);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let events = rec.events();
     assert!(
         events.iter().any(|e| matches!(e, RecordedEvent::Complete)),
@@ -108,18 +113,20 @@ fn switch_map_completes_when_inner_completes_after_outer_done() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
-    rt.core.complete(outer); // outer done, inner1 still active
+    rt.core().complete(outer); // outer done, inner1 still active
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let pre = rec.events();
     assert!(
         !pre.iter().any(|e| matches!(e, RecordedEvent::Complete)),
         "switch_map should NOT complete while inner is still active"
     );
 
-    rt.core.complete(inner1);
+    rt.core().complete(inner1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let post = rec.events();
     assert!(
         post.iter().any(|e| matches!(e, RecordedEvent::Complete)),
@@ -132,11 +139,12 @@ fn switch_map_propagates_outer_error() {
     let rt = OpRuntime::new();
     let outer = rt.state_int(None);
     let inners: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(vec![]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
-    rt.core.error(outer, err_h);
+    rt.core().error(outer, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(events.iter().any(|e| matches!(e, RecordedEvent::Error(_))));
@@ -152,7 +160,7 @@ fn switch_map_data_then_error_in_same_batch_does_not_underflow_handle() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(Some(10));
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let _rec = rt.subscribe_recorder(m);
 
     // Hold a diagnostic intern share on the DATA handle so we can
@@ -162,9 +170,9 @@ fn switch_map_data_then_error_in_same_batch_does_not_underflow_handle() {
 
     let pre_data_rc = rt.binding.refcount_of(data_h);
 
-    rt.core.batch(|| {
-        rt.core.emit(outer, data_h);
-        rt.core.error(outer, err_h);
+    rt.core().batch(|| {
+        rt.core().emit(outer, data_h);
+        rt.core().error(outer, err_h);
     });
 
     // After the batch:
@@ -187,15 +195,17 @@ fn switch_map_forwards_inner_invalidate_to_producer() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(Some(10));
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
-    // Subscribed to inner1 (cached 10); rec saw Data(10).
+    rt.settle(); // D246: pump deferred inner-subscribe + Data owner-side.
+                 // Subscribed to inner1 (cached 10); rec saw Data(10).
 
-    rt.core.invalidate(inner1);
-    // Inner emits [INVALIDATE]; build_inner_sink forwards to producer
-    // via Core::invalidate(producer_id); downstream rec sees Invalidate.
+    rt.core().invalidate(inner1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
+                 // Inner emits [INVALIDATE]; build_inner_sink forwards to producer
+                 // via Core::invalidate(producer_id); downstream rec sees Invalidate.
     let events = rec.events();
     let saw_invalidate = events
         .iter()
@@ -224,12 +234,13 @@ fn exhaust_map_drops_outer_data_while_inner_active() {
         let mut v = inners_for_proj.lock().unwrap();
         v.remove(0)
     });
-    let m = exhaust_map(&rt.core, &rt.ho_binding, outer, project);
+    let m = exhaust_map(rt.core(), &rt.ho_binding, outer, project);
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1); // -> inner1 active
     rt.emit_int(outer, 2); // dropped (inner1 active; project NOT called)
     rt.emit_int(outer, 3); // dropped
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         project_count.load(Ordering::SeqCst),
@@ -238,6 +249,7 @@ fn exhaust_map_drops_outer_data_while_inner_active() {
     );
 
     rt.emit_int(inner1, 100);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(100)]);
 }
 
@@ -248,12 +260,12 @@ fn exhaust_map_accepts_new_outer_data_after_inner_completes() {
     let inner1 = rt.state_int(None);
     let inner2 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1, inner2]));
-    let m = exhaust_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = exhaust_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
     rt.emit_int(inner1, 100);
-    rt.core.complete(inner1); // window closed
+    rt.core().complete(inner1); // window closed
     rt.emit_int(outer, 2); // window reopened -> inner2
     rt.emit_int(inner2, 200);
     assert_eq!(
@@ -282,7 +294,7 @@ fn concat_map_processes_inners_sequentially() {
         let mut v = inners_for_proj.lock().unwrap();
         v.remove(0)
     });
-    let m = concat_map(&rt.core, &rt.ho_binding, outer, project);
+    let m = concat_map(rt.core(), &rt.ho_binding, outer, project);
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
@@ -292,11 +304,11 @@ fn concat_map_processes_inners_sequentially() {
     assert_eq!(project_count.load(Ordering::SeqCst), 1);
 
     rt.emit_int(inner1, 10);
-    rt.core.complete(inner1); // -> dequeue, project inner2
+    rt.core().complete(inner1); // -> dequeue, project inner2
     assert_eq!(project_count.load(Ordering::SeqCst), 2);
 
     rt.emit_int(inner2, 20);
-    rt.core.complete(inner2); // -> dequeue, project inner3
+    rt.core().complete(inner2); // -> dequeue, project inner3
     assert_eq!(project_count.load(Ordering::SeqCst), 3);
 
     rt.emit_int(inner3, 30);
@@ -313,14 +325,14 @@ fn concat_map_completes_after_outer_done_and_queue_drains() {
     let inner1 = rt.state_int(None);
     let inner2 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1, inner2]));
-    let m = concat_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = concat_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
     rt.emit_int(outer, 2);
-    rt.core.complete(outer);
-    rt.core.complete(inner1);
-    rt.core.complete(inner2);
+    rt.core().complete(outer);
+    rt.core().complete(inner1);
+    rt.core().complete(inner2);
 
     let events = rec.events();
     assert!(
@@ -341,7 +353,7 @@ fn merge_map_unbounded_spawns_all_inners() {
     let inner2 = rt.state_int(None);
     let inner3 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1, inner2, inner3]));
-    let m = merge_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = merge_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
@@ -351,6 +363,7 @@ fn merge_map_unbounded_spawns_all_inners() {
     rt.emit_int(inner1, 10);
     rt.emit_int(inner2, 20);
     rt.emit_int(inner3, 30);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let mut data = rec.data_values();
     data.sort_by_key(|v| match v {
@@ -378,14 +391,14 @@ fn merge_map_with_concurrency_one_processes_sequentially() {
         let mut v = inners_for_proj.lock().unwrap();
         v.remove(0)
     });
-    let m = merge_map_with_concurrency(&rt.core, &rt.ho_binding, outer, project, Some(1));
+    let m = merge_map_with_concurrency(rt.core(), &rt.ho_binding, outer, project, Some(1));
     let _rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
     rt.emit_int(outer, 2);
     assert_eq!(project_count.load(Ordering::SeqCst), 1);
 
-    rt.core.complete(inner1);
+    rt.core().complete(inner1);
     assert_eq!(project_count.load(Ordering::SeqCst), 2);
 }
 
@@ -405,7 +418,7 @@ fn merge_map_with_concurrency_two_caps_active() {
         let mut v = inners_for_proj.lock().unwrap();
         v.remove(0)
     });
-    let m = merge_map_with_concurrency(&rt.core, &rt.ho_binding, outer, project, Some(2));
+    let m = merge_map_with_concurrency(rt.core(), &rt.ho_binding, outer, project, Some(2));
     let _rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
@@ -417,7 +430,7 @@ fn merge_map_with_concurrency_two_caps_active() {
         "concurrency=2: only first two spawn; third buffers"
     );
 
-    rt.core.complete(inner1);
+    rt.core().complete(inner1);
     assert_eq!(
         project_count.load(Ordering::SeqCst),
         3,
@@ -432,12 +445,13 @@ fn merge_map_completes_after_outer_and_all_inners_complete() {
     let inner1 = rt.state_int(None);
     let inner2 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1, inner2]));
-    let m = merge_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = merge_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
     rt.emit_int(outer, 2);
-    rt.core.complete(outer);
+    rt.core().complete(outer);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let pre = rec.events();
     assert!(
@@ -445,14 +459,16 @@ fn merge_map_completes_after_outer_and_all_inners_complete() {
         "merge_map must NOT complete while inners are active"
     );
 
-    rt.core.complete(inner1);
+    rt.core().complete(inner1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let mid = rec.events();
     assert!(
         !mid.iter().any(|e| matches!(e, RecordedEvent::Complete)),
         "merge_map must NOT complete while any inner is still active"
     );
 
-    rt.core.complete(inner2);
+    rt.core().complete(inner2);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let post = rec.events();
     assert!(
         post.iter().any(|e| matches!(e, RecordedEvent::Complete)),
@@ -466,12 +482,14 @@ fn merge_map_propagates_inner_error() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = merge_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = merge_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
+    rt.settle(); // D246: pump deferred inner-subscribe owner-side first.
     let err_h = rt.intern(TestValue::Str("inner1-boom".into()));
-    rt.core.error(inner1, err_h);
+    rt.core().error(inner1, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(events.iter().any(|e| matches!(e, RecordedEvent::Error(_))));
@@ -493,11 +511,12 @@ fn switch_map_cleans_up_subs_on_deactivation() {
     let outer = rt.state_int(None);
     let inner1 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1]));
-    let m = switch_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = switch_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
 
     {
         let _rec = rt.subscribe_recorder(m);
         rt.emit_int(outer, 1);
+        rt.settle(); // D246: pump deferred producer-sink emits owner-side.
         let storage = rt.binding.producer_storage().lock();
         let entry = storage
             .get(&m)
@@ -506,6 +525,9 @@ fn switch_map_cleans_up_subs_on_deactivation() {
         // inner sub is in SwitchState.inner_sub.
         assert_eq!(entry.subs.len(), 1, "outer source sub only");
     }
+    // D246: `_rec` drop posts a deferred unsubscribe; pump it owner-side
+    // so `producer_deactivate` runs and clears the storage entry.
+    rt.settle();
     let storage = rt.binding.producer_storage().lock();
     assert!(
         storage.get(&m).is_none(),
@@ -525,7 +547,7 @@ fn merge_map_does_not_accumulate_completed_inner_subs_in_producer_storage() {
     let inner2 = rt.state_int(None);
     let inner3 = rt.state_int(None);
     let inners = Arc::new(Mutex::new(vec![inner1, inner2, inner3]));
-    let m = merge_map(&rt.core, &rt.ho_binding, outer, make_seq_project(inners));
+    let m = merge_map(rt.core(), &rt.ho_binding, outer, make_seq_project(inners));
     let _rec = rt.subscribe_recorder(m);
 
     rt.emit_int(outer, 1);
@@ -542,9 +564,9 @@ fn merge_map_does_not_accumulate_completed_inner_subs_in_producer_storage() {
         );
     }
 
-    rt.core.complete(inner1);
-    rt.core.complete(inner2);
-    rt.core.complete(inner3);
+    rt.core().complete(inner1);
+    rt.core().complete(inner2);
+    rt.core().complete(inner3);
 
     {
         let storage = rt.binding.producer_storage().lock();
@@ -575,12 +597,13 @@ fn switch_map_with_cached_outer_does_not_drop_outer_sub() {
     let inner1 = rt.state_int(Some(100));
     let inners = Arc::new(Mutex::new(vec![inner1]));
     let m = switch_map(
-        &rt.core,
+        rt.core(),
         &rt.ho_binding,
         outer,
         make_seq_project(inners.clone()),
     );
     let rec = rt.subscribe_recorder(m);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     // Cached outer + cached inner: handshake delivers Data(100) immediately.
     let data = rec.data_values();
@@ -603,6 +626,7 @@ fn switch_map_with_cached_outer_does_not_drop_outer_sub() {
     // dropped (the bug), nothing would happen. If alive, inner2 gets
     // subscribed.
     rt.emit_int(outer, 2);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let data_after = rec.data_values();
     assert_eq!(
         data_after,

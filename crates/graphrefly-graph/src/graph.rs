@@ -1,21 +1,28 @@
-//! `Graph` container — namespace, sugar constructors, and lifecycle
-//! pass-throughs over the single owned [`Core`].
+//! `Graph` container — a **Core-free** namespace + mount tree (D246).
 //!
-//! S2b/β (D237/D240/D242): the actor-model `Core` is move-only and
-//! single-owner. The root [`Graph`] owns it by value (no `Clone`).
-//! Subgraphs are borrowed [`SubgraphRef`]s carrying the root's `&Core`
-//! + a namespace handle (`Arc<Mutex<GraphInner>>`). All Core-touching /
-//! tree-walk logic lives in [`GraphOps`] trait defaults + free fns over
-//! `(&Core, &Arc<Mutex<GraphInner>>)`, so `Graph` and `SubgraphRef`
-//! share one implementation.
+//! D246 β-simplification: the actor-model [`Core`] is move-only and
+//! single-owner; the embedder owns it (via
+//! [`graphrefly_core::OwnedCore`]). `Graph` carries **no `Core` and no
+//! `&Core`** — it is purely the named namespace + mount tree. There is
+//! **one** `Graph` type (no `SubgraphRef`/`GraphOps`/`NamespaceHandle`,
+//! no `'g` lifetime): a subgraph is just another `Graph` handle into a
+//! child node of the tree (a cheap `Arc` clone). Every Core-touching op
+//! takes an explicit `&Core` first argument (D246 rule 2 — the owner
+//! always has it; one arg, trivially-correct ownership). Pure-namespace
+//! ops (`node`, `name_of`, `try_resolve`, …) take no `Core`.
 //!
-//! `mount` / `describe` / `observe` live in sibling modules.
+//! `Graph` is `Send + Sync + 'static` and `Clone` (an `Arc` bump): safe
+//! to capture into `Sink`/`MailboxOp::Defer` closures that out-live any
+//! borrowed `&Core` — it replaces the old `NamespaceHandle`.
+//!
+//! `mount` / `describe` / `observe` / `snapshot` live in sibling
+//! modules and follow the same `&Core`-explicit convention.
 
 use std::sync::{Arc, Weak};
 
 use graphrefly_core::{
-    BindingBoundary, Core, CoreFull, EqualsMode, FnId, HandleId, LockId, NodeId, PauseError,
-    ResumeReport, SetDepsError, Sink, SubscriptionId, TopologySubscriptionId,
+    Core, EqualsMode, FnId, HandleId, LockId, NodeId, PauseError, ResumeReport, SetDepsError, Sink,
+    SubscriptionId, TopologySubscriptionId,
 };
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -26,12 +33,11 @@ use crate::describe::{
 };
 use crate::mount::{GraphRemoveAudit, MountError};
 use crate::observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne};
-use crate::snapshot::{snapshot_of, GraphPersistSnapshot};
 
 /// Namespace path separator (canonical spec R3.5.1).
 pub(crate) const PATH_SEP: &str = "::";
 
-/// Errors from [`GraphOps::remove`].
+/// Errors from [`Graph::remove`].
 #[derive(Debug, thiserror::Error)]
 pub enum RemoveError {
     #[error("Graph::remove: name `{0}` not found (neither a node nor a mounted subgraph)")]
@@ -40,7 +46,7 @@ pub enum RemoveError {
     Destroyed,
 }
 
-/// Signal kind for [`GraphOps::signal`] (canonical R3.7.1).
+/// Signal kind for [`Graph::signal`] (canonical R3.7.1).
 #[derive(Debug, Clone, Copy)]
 pub enum SignalKind {
     /// Wipe caches (with meta filtering per R3.7.2).
@@ -55,7 +61,7 @@ pub enum SignalKind {
     Error(HandleId),
 }
 
-/// Path resolution errors returned by [`GraphOps::try_resolve_checked`].
+/// Path resolution errors returned by [`Graph::try_resolve_checked`].
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     /// Path is empty.
@@ -85,23 +91,22 @@ pub enum NameError {
     Destroyed,
 }
 
-/// Callback type for graph-level namespace change notifications.
-/// Used by reactive describe and reactive `observe_all`.
+/// Callback type for graph-level namespace change notifications, used
+/// by reactive describe and reactive `observe_all`.
 ///
-/// S2b/β (D237/D240/D231): the sink receives the owner's `&Core`.
-/// Namespace changes (`add`/`remove`/`mount`/`unmount`/`destroy`) fire
-/// owner-side (the caller holds `&self.core`), so reactive
-/// describe/observe sinks that re-snapshot or re-subscribe get the
-/// relocatable owned `Core` by borrow at fire-time (NOT a stored/cloned
-/// Core, NOT `em.defer`; the in-wave `DepsChanged`/`NodeTornDown`
-/// re-entry path is the one that defers — see `describe.rs`/`observe.rs`).
+/// D246 (rule 2/6): namespace changes (`add`/`remove`/`mount`/`unmount`/
+/// `destroy`) are **owner-invoked** — the caller holds `&Core` — so the
+/// sink receives that `&Core` and may re-snapshot / re-subscribe
+/// synchronously owner-side. (The in-wave `DepsChanged`/`NodeTornDown`
+/// re-entry path is the one that defers via `MailboxOp::Defer` — see
+/// `describe.rs`/`observe.rs`.)
 pub(crate) type NamespaceChangeSink = Arc<dyn Fn(&Core) + Send + Sync>;
 
-/// Opaque per-graph-level namespace + mount-tree handle. Public only
-/// so the [`GraphOps`] `graph_inner` accessor (the `Graph` ↔
-/// `SubgraphRef` unification seam) doesn't leak a more-private type;
-/// it has no public fields or methods — not constructible or
-/// inspectable by external callers.
+/// Inner namespace + mount-tree state for one graph level. D246: holds
+/// **no `Core`** — purely the named namespace, the mounted children,
+/// and the namespace-change sinks. (S2c collapses the `Mutex` to
+/// single-owner; for now the `Arc<Mutex<…>>` keeps the shareable-handle
+/// + parent-`Weak` cycle intact.)
 pub struct GraphInner {
     pub(crate) name: String,
     /// Local namespace: name → `NodeId`. Insertion order is load-bearing
@@ -109,11 +114,9 @@ pub struct GraphInner {
     pub(crate) names: IndexMap<String, NodeId>,
     /// Reverse lookup.
     pub(crate) names_inverse: IndexMap<NodeId, String>,
-    /// Mounted child subgraphs. S2b/β (D237/D240): a child is just its
-    /// namespace handle `Arc<Mutex<GraphInner>>` — it does NOT carry a
-    /// `Core`. The single owned `Core` lives on the root `Graph`; all
-    /// Core-touching tree-walks thread the root's `&Core` (mount is
-    /// shared-Core only ⇒ one Core serves the whole tree).
+    /// Mounted child subgraphs — each is just another level's inner
+    /// state (no `Core`; the single owned `Core` is the embedder's, and
+    /// is threaded as `&Core` through every Core-touching tree-walk).
     pub(crate) children: IndexMap<String, Arc<Mutex<GraphInner>>>,
     /// Parent inner-state pointer (for `ancestors()`). Weak to break
     /// the strong cycle.
@@ -126,17 +129,16 @@ pub struct GraphInner {
     pub(crate) next_ns_sink_id: u64,
 }
 
-/// Graph container — Phase 1+ public API.
+/// Graph container — the one Core-free namespace + mount-tree handle
+/// (canonical §3, D246).
 ///
-/// S2b/β (D237/D240): the root `Graph` **owns** the single relocatable
-/// `Core` by value — it is **no longer `Clone`** (the actor-model Core
-/// is move-only, `!Sync`). Subgraphs are [`SubgraphRef`] handles, not
-/// standalone Core-carrying `Graph`s. The full operation surface is the
-/// [`GraphOps`] trait (implemented for both `Graph` and `SubgraphRef`);
-/// bring it into scope to call `state`/`derived`/`mount_new`/… on a
-/// graph or subgraph.
+/// `Clone` is a cheap `Arc` bump; a subgraph (from `mount*`/`ancestors`)
+/// is just a `Graph` into a child level. `Send + Sync + 'static`: no
+/// `Core`, no borrow — capture freely into long-lived sinks. Pass the
+/// embedder's `&Core` (e.g. `owned.core()`) into every Core-touching
+/// method.
+#[derive(Clone)]
 pub struct Graph {
-    pub(crate) core: Core,
     pub(crate) inner: Arc<Mutex<GraphInner>>,
 }
 
@@ -152,20 +154,22 @@ impl std::fmt::Debug for Graph {
     }
 }
 
+// `state`/`derived`/`dynamic` use `.expect()` on invariant-unreachable
+// `register_*` error paths (caller-validated) — same documented stance
+// the pre-D246 `GraphOps` trait carried via this exact allow.
+#[allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
 impl Graph {
-    /// Construct a named, empty root graph wired to the given binding.
+    /// Construct a named, empty root graph. D246: the graph is
+    /// Core-free — the embedder owns the `Core` (see
+    /// [`graphrefly_core::OwnedCore`]) and passes `&Core` into
+    /// Core-touching ops.
     #[must_use]
-    pub fn new(name: impl Into<String>, binding: Arc<dyn BindingBoundary>) -> Self {
-        Self::with_core(name.into(), Core::new(binding), None)
+    pub fn new(name: impl Into<String>) -> Self {
+        Self::with_parent(name.into(), None)
     }
 
-    pub(crate) fn with_core(
-        name: String,
-        core: Core,
-        parent: Option<Weak<Mutex<GraphInner>>>,
-    ) -> Self {
+    pub(crate) fn with_parent(name: String, parent: Option<Weak<Mutex<GraphInner>>>) -> Self {
         Self {
-            core,
             inner: Arc::new(Mutex::new(GraphInner {
                 name,
                 names: IndexMap::new(),
@@ -179,11 +183,15 @@ impl Graph {
         }
     }
 
-    /// Construct a fresh root [`Graph`] wrapping an existing [`Core`]
-    /// the caller already owns (binding crates: napi-rs / pyo3 / wasm).
-    #[must_use]
-    pub fn with_existing_core(name: impl Into<String>, core: Core) -> Self {
-        Self::with_core(name.into(), core, None)
+    /// Wrap an existing inner level as a `Graph` handle (mount/ancestors).
+    pub(crate) fn from_inner(inner: Arc<Mutex<GraphInner>>) -> Self {
+        Self { inner }
+    }
+
+    /// This level's namespace handle (the `Graph` ↔ tree-walk seam).
+    #[inline]
+    pub(crate) fn inner_arc(&self) -> &Arc<Mutex<GraphInner>> {
+        &self.inner
     }
 
     /// Whether `name` is a legal local node/subgraph name.
@@ -192,107 +200,10 @@ impl Graph {
         !name.contains(PATH_SEP) && !name.starts_with("_anon_")
     }
 
-    /// β/D242: a borrowed view of this root as a [`SubgraphRef`]
-    /// (carries `&self.core`). The unifying primitive — `Graph`'s
-    /// Core-touching methods and every subgraph op funnel through
-    /// the [`GraphOps`] trait.
-    #[must_use]
-    pub fn view(&self) -> SubgraphRef<'_> {
-        SubgraphRef {
-            core: &self.core,
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl GraphOps for Graph {
-    #[inline]
-    fn graph_core(&self) -> &Core {
-        &self.core
-    }
-    #[inline]
-    fn graph_inner(&self) -> &Arc<Mutex<GraphInner>> {
-        &self.inner
-    }
-}
-
-// =====================================================================
-// β/D242: SubgraphRef<'g> — borrowed subgraph handle
-// =====================================================================
-
-/// A borrowed handle to a (sub)graph: the root's `&'g Core` + the
-/// node-namespace handle `Arc<Mutex<GraphInner>>`. Returned by
-/// `mount`/`mount_new`/`mount_with`/`ancestors`/[`Graph::view`].
-///
-/// S2b/β (D237/D240/D242): the actor-model `Core` is move-only and
-/// single-owner — only the root [`Graph`] owns it. A subgraph reaches
-/// Core by **borrowing the owner's `&Core`** (D231: pass `&Core`
-/// owner-side, never store/clone it), valid for as long as the root
-/// `Graph` is alive (`'g`). Cloning a `SubgraphRef` is cheap (a
-/// reference copy + an `Arc` bump); it carries no `Core`. The
-/// operation surface is the [`GraphOps`] trait.
-#[derive(Clone)]
-pub struct SubgraphRef<'g> {
-    pub(crate) core: &'g Core,
-    pub(crate) inner: Arc<Mutex<GraphInner>>,
-}
-
-impl std::fmt::Debug for SubgraphRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock();
-        f.debug_struct("SubgraphRef")
-            .field("name", &inner.name)
-            .field("node_count", &inner.names.len())
-            .field("subgraph_count", &inner.children.len())
-            .field("destroyed", &inner.destroyed)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'g> GraphOps for SubgraphRef<'g> {
-    #[inline]
-    fn graph_core(&self) -> &Core {
-        self.core
-    }
-    #[inline]
-    fn graph_inner(&self) -> &Arc<Mutex<GraphInner>> {
-        &self.inner
-    }
-}
-
-// =====================================================================
-// β/D242: GraphOps — the unified operation surface
-//
-// One implementation, shared by `Graph` (root, owns Core) and
-// `SubgraphRef<'g>` (borrowed). Required: the two accessors. Everything
-// else is a default method over `self.graph_core()` / `self.graph_inner()`
-// + the free fns at the end of this file.
-// =====================================================================
-
-#[allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
-pub trait GraphOps {
-    /// The single owned dispatcher (borrowed). On a [`Graph`] this is
-    /// the owned `Core`; on a [`SubgraphRef`] it is the root's `&Core`.
-    fn graph_core(&self) -> &Core;
-    /// This (sub)graph level's namespace handle.
-    fn graph_inner(&self) -> &Arc<Mutex<GraphInner>>;
-
-    /// Borrow the underlying [`Core`] — the M1 dispatcher.
-    fn core(&self) -> &Core {
-        self.graph_core()
-    }
-
-    /// A borrowed [`SubgraphRef`] view of this (sub)graph level.
-    fn as_subgraph(&self) -> SubgraphRef<'_> {
-        SubgraphRef {
-            core: self.graph_core(),
-            inner: self.graph_inner().clone(),
-        }
-    }
-
     /// The graph's name as set at construction (or via `mount`).
-    fn name(&self) -> String {
-        self.graph_inner().lock().name.clone()
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.inner.lock().name.clone()
     }
 
     // --- namespace-change sinks (used by observe / describe / mount) ---
@@ -300,85 +211,88 @@ pub trait GraphOps {
     /// Subscribe to namespace changes (add, remove, mount, unmount,
     /// destroy). The sink fires AFTER the inner lock is dropped, with
     /// the owner's `&Core`. Returns a subscription id.
-    fn subscribe_namespace_change(&self, sink: NamespaceChangeSink) -> u64 {
-        register_ns_sink(self.graph_inner(), sink)
+    pub fn subscribe_namespace_change(&self, sink: NamespaceChangeSink) -> u64 {
+        register_ns_sink(&self.inner, sink)
     }
 
-    /// Unsubscribe a namespace-change sink by id.
-    fn unsubscribe_namespace_change(&self, id: u64) {
-        unregister_ns_sink(self.graph_inner(), id);
+    /// Unsubscribe a namespace-change sink by id (owner-invoked,
+    /// D246 rule 3 — no RAII below the binding).
+    pub fn unsubscribe_namespace_change(&self, id: u64) {
+        unregister_ns_sink(&self.inner, id);
     }
 
     // --------------------- describe / observe (§3.6) -------------------
 
     /// Snapshot the graph's topology + lifecycle state (JSON form).
     /// `value` fields are raw u64 handles.
-    fn describe(&self) -> GraphDescribeOutput {
-        describe_of(self.graph_core(), self.graph_inner(), None)
+    #[must_use]
+    pub fn describe(&self, core: &Core) -> GraphDescribeOutput {
+        describe_of(core, &self.inner, None)
     }
 
     /// [`Self::describe`] with each `value` rendered via `debug`.
-    fn describe_with_debug(&self, debug: &dyn DebugBindingBoundary) -> GraphDescribeOutput {
-        describe_of(self.graph_core(), self.graph_inner(), Some(debug))
+    #[must_use]
+    pub fn describe_with_debug(
+        &self,
+        core: &Core,
+        debug: &dyn DebugBindingBoundary,
+    ) -> GraphDescribeOutput {
+        describe_of(core, &self.inner, Some(debug))
     }
 
     /// Subscribe to live topology snapshots (canonical §3.6.1
     /// `reactive: true`). Push-on-subscribe + re-fires on namespace
-    /// changes and `set_deps`. β/D242: the handle borrows the root
-    /// `&Core`.
-    fn describe_reactive(&self, sink: DescribeSink) -> ReactiveDescribeHandle<'_> {
-        describe_reactive_in(self.graph_core(), self.graph_inner(), sink)
+    /// changes and `set_deps`. D246 rule 3: returns an id-bearing
+    /// handle with an explicit owner-invoked
+    /// [`ReactiveDescribeHandle::detach`] — no RAII `Drop`.
+    #[must_use]
+    pub fn describe_reactive(&self, core: &Core, sink: DescribeSink) -> ReactiveDescribeHandle {
+        describe_reactive_in(core, &self.inner, sink)
     }
 
-    /// Tap a single node's downstream message stream.
-    fn observe(&self, path: &str) -> GraphObserveOne<'_> {
+    /// Tap a single node's downstream message stream. Pure-namespace
+    /// resolution; pass `&Core` to the returned handle's `subscribe`.
+    #[must_use]
+    pub fn observe(&self, path: &str) -> GraphObserveOne {
         let id = self.node(path);
-        GraphObserveOne::new(self.as_subgraph_for_observe(), id)
+        GraphObserveOne::new(self.clone(), id)
     }
 
     /// Tap every named node in this graph (snapshot at `subscribe()`).
-    fn observe_all(&self) -> GraphObserveAll<'_> {
-        GraphObserveAll::new(self.as_subgraph_for_observe())
+    #[must_use]
+    pub fn observe_all(&self) -> GraphObserveAll {
+        GraphObserveAll::new(self.clone())
     }
 
     /// Tap every named node AND auto-subscribe late-added nodes.
-    fn observe_all_reactive(&self) -> GraphObserveAllReactive<'_> {
-        GraphObserveAllReactive::new(self.as_subgraph_for_observe())
+    #[must_use]
+    pub fn observe_all_reactive(&self) -> GraphObserveAllReactive {
+        GraphObserveAllReactive::new(self.clone())
     }
 
-    /// A `Send + Sync + 'static` **namespace-only** handle to this
-    /// graph level (β/D242: namespace resolution is Core-free). Use
-    /// this to capture name lookups into a `Sink`/closure that
-    /// out-lives the borrowed [`SubgraphRef`] (which is `!Send` because
-    /// it carries `&Core`). E.g. a teardown-observing sink that resolves
-    /// a node's name mid-cascade.
-    fn namespace(&self) -> NamespaceHandle {
-        NamespaceHandle {
-            inner: self.graph_inner().clone(),
-        }
-    }
-
-    /// Internal: a borrowed [`SubgraphRef`] for observe handles to hold
-    /// (carries `&Core` for owner-side subscribe + RAII unsubscribe).
-    #[doc(hidden)]
-    fn as_subgraph_for_observe(&self) -> SubgraphRef<'_> {
-        self.as_subgraph()
-    }
-
-    /// Fire all namespace-change sinks (β/D231: owner-side `&Core`).
-    fn fire_namespace_change(&self) {
-        fire_ns(self.graph_core(), self.graph_inner());
+    /// Fire all namespace-change sinks owner-side (D246 rule 2 —
+    /// caller holds `&Core`).
+    pub fn fire_namespace_change(&self, core: &Core) {
+        fire_ns(core, &self.inner);
     }
 
     // ------------------------- namespace (§3.5) -------------------------
 
     /// Register an existing `node_id` under `name` in this graph's
     /// namespace.
-    fn add(&self, node_id: NodeId, name: impl Into<String>) -> Result<NodeId, NameError> {
+    ///
+    /// # Errors
+    /// See [`NameError`].
+    pub fn add(
+        &self,
+        core: &Core,
+        node_id: NodeId,
+        name: impl Into<String>,
+    ) -> Result<NodeId, NameError> {
         let name = name.into();
         validate_name(&name)?;
         {
-            let mut inner = self.graph_inner().lock();
+            let mut inner = self.inner.lock();
             if inner.destroyed {
                 return Err(NameError::Destroyed);
             }
@@ -388,154 +302,172 @@ pub trait GraphOps {
             inner.names.insert(name.clone(), node_id);
             inner.names_inverse.insert(node_id, name);
         }
-        self.fire_namespace_change();
+        self.fire_namespace_change(core);
         Ok(node_id)
     }
 
     /// Resolve a path to a `NodeId`. Panics if missing.
-    fn node(&self, path: &str) -> NodeId {
+    #[must_use]
+    pub fn node(&self, path: &str) -> NodeId {
         self.try_resolve(path)
             .unwrap_or_else(|| panic!("Graph::node: no node at path `{path}`"))
     }
 
     /// Non-panicking [`Self::node`].
-    fn try_resolve(&self, path: &str) -> Option<NodeId> {
+    #[must_use]
+    pub fn try_resolve(&self, path: &str) -> Option<NodeId> {
         self.try_resolve_checked(path).ok().flatten()
     }
 
-    /// Path resolution with typed errors (pure-namespace; β/D237 —
-    /// never touches Core; walks `Arc<Mutex<GraphInner>>` handles).
-    fn try_resolve_checked(&self, path: &str) -> Result<Option<NodeId>, PathError> {
-        resolve_checked(self.graph_inner(), path)
+    /// Path resolution with typed errors (pure-namespace; never touches
+    /// `Core`).
+    ///
+    /// # Errors
+    /// See [`PathError`].
+    pub fn try_resolve_checked(&self, path: &str) -> Result<Option<NodeId>, PathError> {
+        resolve_checked(&self.inner, path)
     }
 
     /// Reverse lookup: the local name for a `node_id`.
-    fn name_of(&self, node_id: NodeId) -> Option<String> {
-        self.graph_inner()
-            .lock()
-            .names_inverse
-            .get(&node_id)
-            .cloned()
+    #[must_use]
+    pub fn name_of(&self, node_id: NodeId) -> Option<String> {
+        self.inner.lock().names_inverse.get(&node_id).cloned()
     }
 
     /// Number of named nodes in this graph.
-    fn node_count(&self) -> usize {
-        self.graph_inner().lock().names.len()
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.inner.lock().names.len()
     }
 
     /// Snapshot of local node names in insertion order.
-    fn node_names(&self) -> Vec<String> {
-        self.graph_inner().lock().names.keys().cloned().collect()
+    #[must_use]
+    pub fn node_names(&self) -> Vec<String> {
+        self.inner.lock().names.keys().cloned().collect()
     }
 
     /// Snapshot of mounted child names in insertion order.
-    fn child_names(&self) -> Vec<String> {
-        self.graph_inner().lock().children.keys().cloned().collect()
+    #[must_use]
+    pub fn child_names(&self) -> Vec<String> {
+        self.inner.lock().children.keys().cloned().collect()
     }
 
     /// Returns `true` after [`Self::destroy`] has been called.
-    fn is_destroyed(&self) -> bool {
-        self.graph_inner().lock().destroyed
+    #[must_use]
+    pub fn is_destroyed(&self) -> bool {
+        self.inner.lock().destroyed
     }
 
     // ---------------------- sugar constructors (§3.9) -------------------
 
     /// Register a state node under `name`.
-    fn state(
+    ///
+    /// # Errors
+    /// See [`NameError`].
+    pub fn state(
         &self,
+        core: &Core,
         name: impl Into<String>,
         initial: Option<HandleId>,
     ) -> Result<NodeId, NameError> {
-        let id = self
-            .graph_core()
+        let id = core
             .register_state(initial.unwrap_or(graphrefly_core::NO_HANDLE), false)
             .expect("invariant: register_state has no error variants reachable for caller-controlled inputs");
-        self.add(id, name)
+        self.add(core, id, name)
     }
 
     /// Register a static-derived node (fn fires on every dep change).
-    fn derived(
+    ///
+    /// # Errors
+    /// See [`NameError`].
+    pub fn derived(
         &self,
+        core: &Core,
         name: impl Into<String>,
         deps: &[NodeId],
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self
-            .graph_core()
+        let id = core
             .register_derived(deps, fn_id, equals, false)
             .expect("invariant: caller has validated dep ids before calling register_derived");
-        self.add(id, name)
+        self.add(core, id, name)
     }
 
     /// Register a dynamic-derived node (fn declares read dep indices).
-    fn dynamic(
+    ///
+    /// # Errors
+    /// See [`NameError`].
+    pub fn dynamic(
         &self,
+        core: &Core,
         name: impl Into<String>,
         deps: &[NodeId],
         fn_id: FnId,
         equals: EqualsMode,
     ) -> Result<NodeId, NameError> {
-        let id = self
-            .graph_core()
+        let id = core
             .register_dynamic(deps, fn_id, equals, false)
             .expect("invariant: caller has validated dep ids before calling register_dynamic");
-        self.add(id, name)
+        self.add(core, id, name)
     }
 
     // -------------------- named-sugar wrappers (§3.2.1) -----------------
 
     /// Emit a value on a named state node.
-    fn set(&self, name: &str, handle: HandleId) {
+    pub fn set(&self, core: &Core, name: &str, handle: HandleId) {
         let id = self.node(name);
-        self.graph_core().emit(id, handle);
+        core.emit(id, handle);
     }
 
     /// Read the cached value of a named node.
-    fn get(&self, name: &str) -> HandleId {
+    #[must_use]
+    pub fn get(&self, core: &Core, name: &str) -> HandleId {
         let id = self.node(name);
-        self.graph_core().cache_of(id)
+        core.cache_of(id)
     }
 
     /// Clear the cache of a named node and cascade `[INVALIDATE]`.
-    fn invalidate_by_name(&self, name: &str) {
+    pub fn invalidate_by_name(&self, core: &Core, name: &str) {
         let id = self.node(name);
-        self.graph_core().invalidate(id);
+        core.invalidate(id);
     }
 
     /// Mark a named node terminal with COMPLETE.
-    fn complete_by_name(&self, name: &str) {
+    pub fn complete_by_name(&self, core: &Core, name: &str) {
         let id = self.node(name);
-        self.graph_core().complete(id);
+        core.complete(id);
     }
 
     /// Mark a named node terminal with ERROR.
-    fn error_by_name(&self, name: &str, error_handle: HandleId) {
+    pub fn error_by_name(&self, core: &Core, name: &str, error_handle: HandleId) {
         let id = self.node(name);
-        self.graph_core().error(id, error_handle);
+        core.error(id, error_handle);
     }
 
     // --------------------------- remove (§3.2.3) ------------------------
 
     /// Remove a named node OR mounted subgraph (R3.2.3 / R3.7.3
     /// ordering — namespace cleared AFTER the TEARDOWN cascade).
-    #[must_use = "remove returns Err on missing name; ignoring may hide bugs"]
-    fn remove(&self, name: &str) -> Result<GraphRemoveAudit, RemoveError> {
+    ///
+    /// # Errors
+    /// See [`RemoveError`].
+    pub fn remove(&self, core: &Core, name: &str) -> Result<GraphRemoveAudit, RemoveError> {
         {
-            let inner = self.graph_inner().lock();
+            let inner = self.inner.lock();
             if inner.destroyed {
                 return Err(RemoveError::Destroyed);
             }
             if inner.children.contains_key(name) {
                 drop(inner);
-                return self.unmount(name).map_err(|e| match e {
+                return self.unmount(core, name).map_err(|e| match e {
                     MountError::Destroyed => RemoveError::Destroyed,
                     _ => RemoveError::NotFound(name.to_owned()),
                 });
             }
         }
         let node_id = {
-            let inner = self.graph_inner().lock();
+            let inner = self.inner.lock();
             if inner.destroyed {
                 return Err(RemoveError::Destroyed);
             }
@@ -544,13 +476,13 @@ pub trait GraphOps {
                 .get(name)
                 .ok_or_else(|| RemoveError::NotFound(name.to_owned()))?
         };
-        self.graph_core().teardown(node_id);
+        core.teardown(node_id);
         {
-            let mut inner = self.graph_inner().lock();
+            let mut inner = self.inner.lock();
             inner.names.shift_remove(name);
             inner.names_inverse.shift_remove(&node_id);
         }
-        self.fire_namespace_change();
+        self.fire_namespace_change(core);
         Ok(GraphRemoveAudit {
             node_count: 1,
             mount_count: 0,
@@ -561,90 +493,100 @@ pub trait GraphOps {
 
     /// Derive `[from, to]` edge name pairs. `recursive` qualifies names
     /// across the mount tree with `::`.
-    fn edges(&self, recursive: bool) -> Vec<(String, String)> {
-        let names_map = collect_qualified_names_in(self.graph_inner(), "", recursive);
-        edges_in(
-            self.graph_core(),
-            self.graph_inner(),
-            "",
-            recursive,
-            &names_map,
-        )
+    #[must_use]
+    pub fn edges(&self, core: &Core, recursive: bool) -> Vec<(String, String)> {
+        let names_map = collect_qualified_names_in(&self.inner, "", recursive);
+        edges_in(core, &self.inner, "", recursive, &names_map)
     }
 
     // ------------------- lifecycle pass-throughs (§3.7) -----------------
 
     /// Subscribe a sink. Returns a [`SubscriptionId`]; pass it back to
-    /// [`Self::unsubscribe`] to detach. S2b/β/D241: core RAII
-    /// `Subscription` is retired (parameterless `Drop` cannot reach a
-    /// relocating owned `Core`); unsubscribe is explicit owner-invoked.
+    /// [`Self::unsubscribe`] (owner-invoked, synchronous — D246 rule 3;
+    /// no RAII below the binding).
     #[must_use = "the SubscriptionId must be kept to later unsubscribe; dropping it leaks the sink"]
-    fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
-        self.graph_core().subscribe(node_id, sink)
+    pub fn subscribe(&self, core: &Core, node_id: NodeId, sink: Sink) -> SubscriptionId {
+        core.subscribe(node_id, sink)
     }
 
     /// Detach a sink previously registered via [`Self::subscribe`].
-    /// Owner-invoked, synchronous (D225/D241).
-    fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
-        self.graph_core().unsubscribe(node_id, sub_id);
+    pub fn unsubscribe(&self, core: &Core, node_id: NodeId, sub_id: SubscriptionId) {
+        core.unsubscribe(node_id, sub_id);
     }
 
-    /// Detach a Core topology subscription by id (D225/D241).
-    fn unsubscribe_topology(&self, id: TopologySubscriptionId) {
-        self.graph_core().unsubscribe_topology(id);
+    /// Detach a Core topology subscription by id.
+    pub fn unsubscribe_topology(&self, core: &Core, id: TopologySubscriptionId) {
+        core.unsubscribe_topology(id);
     }
 
     /// Emit a value on a state node.
-    fn emit(&self, node_id: NodeId, new_handle: HandleId) {
-        self.graph_core().emit(node_id, new_handle);
+    pub fn emit(&self, core: &Core, node_id: NodeId, new_handle: HandleId) {
+        core.emit(node_id, new_handle);
     }
 
     /// Read a node's current cache.
-    fn cache_of(&self, node_id: NodeId) -> HandleId {
-        self.graph_core().cache_of(node_id)
+    #[must_use]
+    pub fn cache_of(&self, core: &Core, node_id: NodeId) -> HandleId {
+        core.cache_of(node_id)
     }
 
     /// Whether the node's fn has fired at least once.
-    fn has_fired_once(&self, node_id: NodeId) -> bool {
-        self.graph_core().has_fired_once(node_id)
+    #[must_use]
+    pub fn has_fired_once(&self, core: &Core, node_id: NodeId) -> bool {
+        core.has_fired_once(node_id)
     }
 
     /// Mark the node terminal with COMPLETE.
-    fn complete(&self, node_id: NodeId) {
-        self.graph_core().complete(node_id);
+    pub fn complete(&self, core: &Core, node_id: NodeId) {
+        core.complete(node_id);
     }
 
     /// Mark the node terminal with ERROR.
-    fn error(&self, node_id: NodeId, error_handle: HandleId) {
-        self.graph_core().error(node_id, error_handle);
+    pub fn error(&self, core: &Core, node_id: NodeId, error_handle: HandleId) {
+        core.error(node_id, error_handle);
     }
 
     /// Tear the node down (R2.6.4).
-    fn teardown(&self, node_id: NodeId) {
-        self.graph_core().teardown(node_id);
+    pub fn teardown(&self, core: &Core, node_id: NodeId) {
+        core.teardown(node_id);
     }
 
     /// Clear the node's cache and cascade `[INVALIDATE]`.
-    fn invalidate(&self, node_id: NodeId) {
-        self.graph_core().invalidate(node_id);
+    pub fn invalidate(&self, core: &Core, node_id: NodeId) {
+        core.invalidate(node_id);
     }
 
     /// Acquire a pause lock.
-    fn pause(&self, node_id: NodeId, lock_id: LockId) -> Result<(), PauseError> {
-        self.graph_core().pause(node_id, lock_id)
+    ///
+    /// # Errors
+    /// See [`PauseError`].
+    pub fn pause(&self, core: &Core, node_id: NodeId, lock_id: LockId) -> Result<(), PauseError> {
+        core.pause(node_id, lock_id)
     }
 
     /// Release a pause lock.
-    fn resume(&self, node_id: NodeId, lock_id: LockId) -> Result<Option<ResumeReport>, PauseError> {
-        self.graph_core().resume(node_id, lock_id)
+    ///
+    /// # Errors
+    /// See [`PauseError`].
+    pub fn resume(
+        &self,
+        core: &Core,
+        node_id: NodeId,
+        lock_id: LockId,
+    ) -> Result<Option<ResumeReport>, PauseError> {
+        core.resume(node_id, lock_id)
     }
 
     /// Allocate a fresh `LockId`.
-    fn alloc_lock_id(&self) -> LockId {
-        self.graph_core().alloc_lock_id()
+    #[must_use]
+    pub fn alloc_lock_id(&self, core: &Core) -> LockId {
+        core.alloc_lock_id()
     }
 
     /// Atomically rewire a node's deps.
+    ///
+    /// # Errors
+    /// See [`SetDepsError`].
     ///
     /// # Hazards
     ///
@@ -652,60 +594,60 @@ pub trait GraphOps {
     /// corrupts Dynamic `tracked` indices (D1 in
     /// `~/src/graphrefly-rs/docs/porting-deferred.md`). Acceptable v1:
     /// most callers are external orchestrators, not the firing node.
-    fn set_deps(&self, n: NodeId, new_deps: &[NodeId]) -> Result<(), SetDepsError> {
-        self.graph_core().set_deps(n, new_deps)
+    pub fn set_deps(
+        &self,
+        core: &Core,
+        n: NodeId,
+        new_deps: &[NodeId],
+    ) -> Result<(), SetDepsError> {
+        core.set_deps(n, new_deps)
     }
 
     /// Mark the node as resubscribable (R2.2.7).
-    fn set_resubscribable(&self, node_id: NodeId, resubscribable: bool) {
-        self.graph_core()
-            .set_resubscribable(node_id, resubscribable);
+    pub fn set_resubscribable(&self, core: &Core, node_id: NodeId, resubscribable: bool) {
+        core.set_resubscribable(node_id, resubscribable);
     }
 
     /// Attach `companion` as a meta companion of `parent` (R1.3.9.d).
-    fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
-        self.graph_core().add_meta_companion(parent, companion);
+    pub fn add_meta_companion(&self, core: &Core, parent: NodeId, companion: NodeId) {
+        core.add_meta_companion(parent, companion);
     }
 
     /// Coalesce multiple emissions into a single wave.
-    fn batch<F: FnOnce()>(&self, f: F) {
-        self.graph_core().batch(f);
+    pub fn batch<F: FnOnce()>(&self, core: &Core, f: F) {
+        core.batch(f);
     }
 
     // --------------------- graph-level lifecycle (§3.7) -----------------
 
     /// General broadcast (canonical R3.7.1).
-    fn signal(&self, kind: SignalKind) {
+    pub fn signal(&self, core: &Core, kind: SignalKind) {
         match kind {
-            SignalKind::Invalidate => self.signal_invalidate(),
+            SignalKind::Invalidate => self.signal_invalidate(core),
             SignalKind::Pause(lock_id) => {
-                for id in collect_signal_ids_with_meta_filter(self.graph_core(), self.graph_inner())
-                {
-                    let _ = self.graph_core().pause(id, lock_id);
+                for id in collect_signal_ids_with_meta_filter(core, &self.inner) {
+                    let _ = core.pause(id, lock_id);
                 }
             }
             SignalKind::Resume(lock_id) => {
-                for id in collect_signal_ids_with_meta_filter(self.graph_core(), self.graph_inner())
-                {
-                    let _ = self.graph_core().resume(id, lock_id);
+                for id in collect_signal_ids_with_meta_filter(core, &self.inner) {
+                    let _ = core.resume(id, lock_id);
                 }
             }
             SignalKind::Complete => {
-                for id in collect_signal_ids_with_meta_filter(self.graph_core(), self.graph_inner())
-                {
-                    self.graph_core().complete(id);
+                for id in collect_signal_ids_with_meta_filter(core, &self.inner) {
+                    core.complete(id);
                 }
             }
             SignalKind::Error(h) => {
-                let ids =
-                    collect_signal_ids_with_meta_filter(self.graph_core(), self.graph_inner());
+                let ids = collect_signal_ids_with_meta_filter(core, &self.inner);
                 // F1 /qa fix: each core.error() releases one caller share.
                 // Pre-retain (N-1) so the handle survives all N releases.
                 for _ in 1..ids.len() {
-                    self.graph_core().binding_ptr().retain_handle(h);
+                    core.binding_ptr().retain_handle(h);
                 }
                 for id in ids {
-                    self.graph_core().error(id, h);
+                    core.error(id, h);
                 }
             }
         }
@@ -714,10 +656,10 @@ pub trait GraphOps {
     /// Broadcast `[INVALIDATE]` across this graph + mount tree
     /// (meta-companion filtered per R3.7.2; Graph locks dropped before
     /// any `Core::invalidate`). Idempotent on a destroyed graph.
-    fn signal_invalidate(&self) {
-        let to_invalidate = collect_signal_invalidate_ids(self.graph_core(), self.graph_inner());
+    pub fn signal_invalidate(&self, core: &Core) {
+        let to_invalidate = collect_signal_invalidate_ids(core, &self.inner);
         for id in to_invalidate {
-            self.graph_core().invalidate(id);
+            core.invalidate(id);
         }
     }
 
@@ -725,116 +667,67 @@ pub trait GraphOps {
     /// then clear namespace + mount-tree state. R3.7.3 ordering
     /// (children-first, then own teardown, then clear, then fire
     /// ns-change) preserved verbatim.
-    fn destroy(&self) {
-        destroy_subtree(self.graph_core(), self.graph_inner());
+    pub fn destroy(&self, core: &Core) {
+        destroy_subtree(core, &self.inner);
     }
 
     // --------------------------- mount (§3.4) ---------------------------
 
-    /// Embed an existing `child` subgraph under `name`. `child` must
-    /// share this graph's `Core` (cross-Core mount is post-M6).
-    fn mount<'a>(
-        &'a self,
+    /// Embed an existing `child` subgraph under `name`. Fires ns-change
+    /// sinks owner-side (P3) — hence `&Core` (D246 rule 2).
+    ///
+    /// # Errors
+    /// See [`MountError`].
+    pub fn mount(
+        &self,
+        core: &Core,
         name: impl Into<String>,
-        child: SubgraphRef<'_>,
-    ) -> Result<SubgraphRef<'a>, MountError> {
-        crate::mount::mount(self.graph_core(), self.graph_inner(), name.into(), child)
+        child: &Graph,
+    ) -> Result<Graph, MountError> {
+        crate::mount::mount(core, &self.inner, name.into(), child)
     }
 
-    /// Create an empty subgraph sharing this graph's `Core`.
-    fn mount_new<'a>(&'a self, name: impl Into<String>) -> Result<SubgraphRef<'a>, MountError> {
-        crate::mount::mount_new(self.graph_core(), self.graph_inner(), name.into())
+    /// Create an empty subgraph (shares the embedder's one `Core`).
+    ///
+    /// # Errors
+    /// See [`MountError`].
+    pub fn mount_new(&self, core: &Core, name: impl Into<String>) -> Result<Graph, MountError> {
+        crate::mount::mount_new(core, &self.inner, name.into())
     }
 
     /// Builder pattern: create an empty subgraph, run `builder`, return it.
-    fn mount_with<'a, F: FnOnce(&SubgraphRef<'_>)>(
-        &'a self,
+    ///
+    /// # Errors
+    /// See [`MountError`].
+    pub fn mount_with<F: FnOnce(&Graph)>(
+        &self,
+        core: &Core,
         name: impl Into<String>,
         builder: F,
-    ) -> Result<SubgraphRef<'a>, MountError> {
-        let child = self.mount_new(name)?;
+    ) -> Result<Graph, MountError> {
+        let child = self.mount_new(core, name)?;
         builder(&child);
         Ok(child)
     }
 
     /// Detach a previously-mounted subgraph (TEARDOWN cascade).
-    fn unmount(&self, name: &str) -> Result<GraphRemoveAudit, MountError> {
-        crate::mount::unmount(self.graph_core(), self.graph_inner(), name)
+    ///
+    /// # Errors
+    /// See [`MountError`].
+    pub fn unmount(&self, core: &Core, name: &str) -> Result<GraphRemoveAudit, MountError> {
+        crate::mount::unmount(core, &self.inner, name)
     }
 
     /// Parent chain (root last). `include_self = true` prepends this
-    /// graph. β/D242: returns borrowed [`SubgraphRef`]s.
-    fn ancestors(&self, include_self: bool) -> Vec<SubgraphRef<'_>> {
-        crate::mount::ancestors(self.graph_core(), self.graph_inner(), include_self)
-    }
-}
-
-/// A `Send + Sync + 'static` namespace-only view (no `Core`). Cloning
-/// is an `Arc` bump. β/D242: the namespace half of the
-/// root-owns-Core/namespace-is-separate split — safe to capture into
-/// `Sink` closures that out-live a borrowed [`SubgraphRef`].
-#[derive(Clone)]
-pub struct NamespaceHandle {
-    inner: Arc<Mutex<GraphInner>>,
-}
-
-impl NamespaceHandle {
-    /// This graph level's name.
+    /// graph.
     #[must_use]
-    pub fn name(&self) -> String {
-        self.inner.lock().name.clone()
-    }
-
-    /// Local name for `node_id`, if any.
-    #[must_use]
-    pub fn name_of(&self, node_id: NodeId) -> Option<String> {
-        self.inner.lock().names_inverse.get(&node_id).cloned()
-    }
-
-    /// Non-panicking path resolution (pure namespace).
-    #[must_use]
-    pub fn try_resolve(&self, path: &str) -> Option<NodeId> {
-        resolve_checked(&self.inner, path).ok().flatten()
-    }
-
-    /// Path resolution with typed errors.
-    ///
-    /// # Errors
-    /// See [`PathError`].
-    pub fn try_resolve_checked(&self, path: &str) -> Result<Option<NodeId>, PathError> {
-        resolve_checked(&self.inner, path)
-    }
-
-    /// Local node names in insertion order.
-    #[must_use]
-    pub fn node_names(&self) -> Vec<String> {
-        self.inner.lock().names.keys().cloned().collect()
-    }
-
-    /// Mounted child names in insertion order.
-    #[must_use]
-    pub fn child_names(&self) -> Vec<String> {
-        self.inner.lock().children.keys().cloned().collect()
-    }
-
-    /// Whether this graph level has been destroyed.
-    #[must_use]
-    pub fn is_destroyed(&self) -> bool {
-        self.inner.lock().destroyed
-    }
-
-    /// β/D244: snapshot this (sub)graph given an in-wave `&dyn CoreFull`
-    /// (the storage `observe`-sink `MailboxOp::Defer` path — the
-    /// `NamespaceHandle` is the `Send` graph identity, `CoreFull` the
-    /// owner-side reentry that carries `serialize_handle`).
-    #[must_use]
-    pub fn snapshot(&self, core: &dyn CoreFull) -> GraphPersistSnapshot {
-        snapshot_of(core, &self.inner)
+    pub fn ancestors(&self, include_self: bool) -> Vec<Graph> {
+        crate::mount::ancestors(&self.inner, include_self)
     }
 }
 
 // =====================================================================
-// β/D237/D242: free fns over (&Core, &Arc<Mutex<GraphInner>>)
+// D246/D237: free fns over (&Core, &Arc<Mutex<GraphInner>>)
 // =====================================================================
 
 fn validate_name(name: &str) -> Result<(), NameError> {
@@ -902,7 +795,7 @@ pub(crate) fn resolve_checked(
 }
 
 /// Fire one graph level's namespace-change sinks with the owner's
-/// `&Core` (β/D231 owner-side). Sinks run with no Graph lock held.
+/// `&Core` (D246 rule 2 owner-side). Sinks run with no Graph lock held.
 pub(crate) fn fire_ns(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
     let sinks: Vec<NamespaceChangeSink> = {
         let inner = inner_arc.lock();

@@ -125,12 +125,15 @@ fn r2_4_5_on_deactivation_fires_on_last_unsub() {
     );
 
     let rec = rt.subscribe_recorder(derived_node);
-    drop(rec); // last subscriber leaves
+    // D246 rule 3: subscriptions are owner-tracked by `OwnedCore`;
+    // dropping the Recorder no longer unsubscribes. The last sub
+    // leaves via owner-invoked `unsubscribe`.
+    rt.unsubscribe(rec.node_id(), rec.sub_id());
 
     assert_eq!(
         on_deact_count.load(Ordering::SeqCst),
         1,
-        "OnDeactivation fires once on last-sub-drop"
+        "OnDeactivation fires once on last-sub unsubscribe"
     );
 }
 
@@ -218,7 +221,10 @@ fn r2_4_5_on_deactivation_precedes_producer_deactivate() {
 
     let sink: graphrefly_core::Sink = Arc::new(|_| {});
     let sub = core.subscribe(prod_id, sink);
-    drop(sub);
+    // D246 rule 3: `subscribe` returns a Copy `SubscriptionId`; the
+    // last-sub-leaves OnDeactivation is driven by owner-invoked
+    // `unsubscribe` (the old `drop(sub)` RAII no longer unsubscribes).
+    core.unsubscribe(prod_id, sub);
 
     let events = ordering.events.lock().unwrap().clone();
     let cleanup_idx = events
@@ -258,7 +264,7 @@ fn r2_4_5_on_deactivation_skipped_on_never_fired() {
     );
 
     let rec = rt.subscribe_recorder(s.id);
-    drop(rec);
+    rt.unsub_recorder(&rec);
 
     assert_eq!(
         on_deact_count.load(Ordering::SeqCst),
@@ -308,7 +314,7 @@ fn r1_3_9_b_on_invalidate_dedup_diamond() {
         },
     );
 
-    rt.core.invalidate(a.id);
+    rt.core().invalidate(a.id);
 
     assert_eq!(
         d_invalidate_count.load(Ordering::SeqCst),
@@ -339,7 +345,7 @@ fn r1_3_9_c_on_invalidate_skipped_on_never_populated() {
         },
     );
 
-    rt.core.invalidate(s.id);
+    rt.core().invalidate(s.id);
 
     assert_eq!(
         on_inv_count.load(Ordering::SeqCst),
@@ -406,7 +412,7 @@ fn r2_4_6_store_persists_across_deactivation() {
 fn r2_4_6_store_wiped_on_resubscribable_reset() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
 
     let _rec = rt.subscribe_recorder(s.id);
     rt.binding.store_set(s.id, "scratch", TestValue::Int(99));
@@ -416,8 +422,8 @@ fn r2_4_6_store_wiped_on_resubscribable_reset() {
     );
 
     // Drop subscriber, complete the resubscribable node, then re-subscribe.
-    drop(_rec);
-    rt.core.complete(s.id);
+    rt.unsub_recorder(&_rec);
+    rt.core().complete(s.id);
 
     // Re-subscribe triggers reset_for_fresh_lifecycle → wipe_ctx.
     let _rec2 = rt.subscribe_recorder(s.id);
@@ -458,12 +464,12 @@ fn on_deactivation_runs_before_wipe_on_terminal_reset() {
 
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
     let derived_node = rt.derived(&[s.id], |deps| match &deps[0] {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
-    rt.core.set_resubscribable(derived_node, true);
+    rt.core().set_resubscribable(derived_node, true);
 
     // OnDeactivation hook records what it sees in store at fire-time —
     // proving it ran BEFORE wipe.
@@ -482,14 +488,15 @@ fn on_deactivation_runs_before_wipe_on_terminal_reset() {
         },
     );
 
-    // First lifecycle: subscribe, write store, complete, drop sub.
+    // First lifecycle: subscribe, write store, unsubscribe, complete.
     let rec = rt.subscribe_recorder(derived_node);
     rt.binding
         .store_set(derived_node, "k", TestValue::Int(2026));
-    drop(rec);
-    rt.core.complete(derived_node);
+    // D246 rule 3: owner-invoked unsubscribe (the last sub leaving).
+    rt.unsubscribe(rec.node_id(), rec.sub_id());
+    rt.core().complete(derived_node);
 
-    // OnDeactivation fired during drop(rec) — should have seen pre-wipe value.
+    // OnDeactivation fired during unsubscribe — should have seen pre-wipe value.
     assert_eq!(
         *observed_store_at_deact.lock().unwrap(),
         Some(TestValue::Int(2026)),
@@ -509,9 +516,64 @@ fn on_deactivation_runs_before_wipe_on_terminal_reset() {
 // =====================================================================
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
 fn cleanup_can_reenter_core_lock_released() {
-    // see #[ignore] — invariant live; S4 β-rewrite; porting-deferred /qa-2026-05-18
+    // D045/D060 invariant (LIVE): a cleanup closure may re-enter Core.
+    // The old mechanism (binding holds a cloned Core, calls
+    // `core.emit` synchronously inside `cleanup_for`) is β-invalid
+    // under the actor model. β-valid expression (D233/D246 rule 6):
+    // the cleanup closure captures `Arc<CoreMailbox>` and posts a
+    // deferred op; the owner drains it as a nested wave. No deadlock
+    // (the old hazard was the Core state-lock held across the user
+    // closure — there is no such lock under owner-driven mailbox
+    // drain), no Core clone, no async.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+    let derived_node = rt.derived(&[s.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => panic!("type"),
+    });
+
+    // A side node the cleanup closure re-emits onto via the mailbox.
+    let side = rt.state(None);
+    let side_obs = rt.derived(&[side.id], |deps| Some(deps[0].clone()));
+    let side_rec = rt.subscribe_recorder(side_obs);
+
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let side_id = side.id;
+    let reenter_hook: CleanupClosure = Arc::new(move || {
+        let h = binding.intern(TestValue::Int(777));
+        assert!(mailbox.post_emit(side_id, h), "Core alive");
+    });
+    rt.binding.register_cleanup(
+        derived_node,
+        TestNodeFnCleanup {
+            on_deactivation: Some(reenter_hook),
+            ..Default::default()
+        },
+    );
+
+    let rec = rt.subscribe_recorder(derived_node);
+    // First fire happened (has_fired_once) so OnDeactivation will run.
+    assert_eq!(rt.cache_value(derived_node), Some(TestValue::Int(1)));
+
+    // Owner-invoked unsubscribe (D241/D246 rule 3) → last sub leaves →
+    // OnDeactivation fires the re-entrant cleanup closure (queues the
+    // Emit on the mailbox).
+    rt.unsubscribe(rec.node_id(), rec.sub_id());
+    assert_eq!(
+        side_rec.data_values(),
+        vec![],
+        "cleanup re-entrant emit queued, not yet applied"
+    );
+
+    // Owner drains → nested wave delivers the cleanup's re-entrant emit.
+    rt.drain_mailbox();
+    assert_eq!(
+        side_rec.data_values(),
+        vec![TestValue::Int(777)],
+        "cleanup closure re-entered Core (mailbox) → delivered as a nested wave"
+    );
 }
 
 // =====================================================================
@@ -592,9 +654,9 @@ fn on_invalidate_fires_at_cache_clear_not_replay() {
     // Pause the derived node, then invalidate. Cache should clear
     // immediately and OnInvalidate should fire at the wave end (not
     // deferred to a future resume).
-    let lock_id = rt.core.alloc_lock_id();
-    rt.core.pause(derived_node, lock_id).unwrap();
-    rt.core.invalidate(s.id);
+    let lock_id = rt.core().alloc_lock_id();
+    rt.core().pause(derived_node, lock_id).unwrap();
+    rt.core().invalidate(s.id);
 
     assert_eq!(
         on_inv_count.load(Ordering::SeqCst),
@@ -603,7 +665,7 @@ fn on_invalidate_fires_at_cache_clear_not_replay() {
     );
     // Resume — the buffered INVALIDATE wire delivery happens, but
     // OnInvalidate count must NOT increment again.
-    rt.core.resume(derived_node, lock_id).unwrap();
+    rt.core().resume(derived_node, lock_id).unwrap();
     assert_eq!(
         on_inv_count.load(Ordering::SeqCst),
         1,
@@ -688,8 +750,8 @@ fn r1_3_9_b_strict_dedup_across_repopulate() {
     // then invalidate again. All in one batch → one wave.
     let s_id = s.id;
     let derived_node_clone = derived_node;
-    let core = &rt.core;
-    rt.core.batch(|| {
+    let core = rt.core();
+    rt.core().batch(|| {
         core.invalidate(s_id); // cascades to derived_node — first OnInvalidate
         let h = rt.binding.intern(TestValue::Int(99));
         core.emit(s_id, h); // s reemits → derived_node re-fires + repopulates
@@ -706,8 +768,8 @@ fn r1_3_9_b_strict_dedup_across_repopulate() {
     // Second wave: another invalidate on a populated cache should fire
     // OnInvalidate again (set is wave-scoped).
     let h = rt.binding.intern(TestValue::Int(7));
-    rt.core.emit(s_id, h);
-    rt.core.invalidate(s_id);
+    rt.core().emit(s_id, h);
+    rt.core().invalidate(s_id);
     assert_eq!(
         on_inv_count.load(Ordering::SeqCst),
         2,
@@ -746,7 +808,7 @@ fn d067_set_deps_fires_on_rerun_for_dynamic() {
     // Per D067, OnRerun must fire because set_deps doesn't end the
     // activation cycle; the prior fn-fire's cleanup spec must run before
     // any subsequent invoke_fn overwrites it.
-    rt.core.set_deps(dyn_id, &[s2.id]).unwrap();
+    rt.core().set_deps(dyn_id, &[s2.id]).unwrap();
 
     assert_eq!(
         on_rerun_count.load(Ordering::SeqCst),
@@ -788,9 +850,9 @@ fn batch_multi_emit_fires_on_rerun_once_per_wave() {
     // and `derived_node`'s fn fires ONCE for the wave (R1.3.6.b). OnRerun
     // must fire ONCE before that single re-fire (not 3 times).
     let s_id = s.id;
-    let core = &rt.core;
+    let core = rt.core();
     let binding = rt.binding.clone();
-    rt.core.batch(|| {
+    rt.core().batch(|| {
         for v in [10, 20, 30] {
             let h = binding.intern(TestValue::Int(v));
             core.emit(s_id, h);
@@ -827,9 +889,10 @@ fn on_deactivation_fires_on_paused_node() {
 
     let rec = rt.subscribe_recorder(derived_node);
     // Pause the node — wire delivery buffers, but lifecycle continues.
-    let lock_id = rt.core.alloc_lock_id();
-    rt.core.pause(derived_node, lock_id).unwrap();
-    drop(rec);
+    let lock_id = rt.core().alloc_lock_id();
+    rt.core().pause(derived_node, lock_id).unwrap();
+    // D246 rule 3: owner-invoked unsubscribe (last sub leaves).
+    rt.unsubscribe(rec.node_id(), rec.sub_id());
 
     assert_eq!(
         on_deact_count.load(Ordering::SeqCst),
@@ -868,7 +931,7 @@ fn teardown_does_not_fire_any_cleanup_slot() {
     // there is no `onTeardown`. The cleanup spec persists; nothing fires
     // until a separate trigger (OnDeactivation on last-sub-drop, or
     // OnInvalidate on a cache-clearing path).
-    rt.core.teardown(derived_node);
+    rt.core().teardown(derived_node);
 
     assert_eq!(
         r.load(Ordering::SeqCst),
@@ -925,7 +988,7 @@ fn d068_state_with_initial_value_skips_on_deactivation() {
     );
 
     let rec = rt.subscribe_recorder(s.id);
-    drop(rec);
+    rt.unsub_recorder(&rec);
 
     assert_eq!(
         on_deact_count.load(Ordering::SeqCst),
@@ -946,15 +1009,17 @@ fn d068_state_with_initial_value_skips_on_deactivation() {
 fn d069_terminate_with_no_subs_fires_eager_wipe() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
 
-    // First lifecycle: subscribe → write store → drop sub. Store
+    // First lifecycle: subscribe → write store → unsubscribe. Store
     // persists across deactivation (R2.4.6). Then complete the node
     // with no subscribers active — eager wipe path.
     {
-        let _rec = rt.subscribe_recorder(s.id);
+        let rec = rt.subscribe_recorder(s.id);
         rt.binding.store_set(s.id, "k", TestValue::Int(99));
-    } // sub drops here; node still NOT terminal yet
+        // D246 rule 3: owner-invoked unsubscribe (no core RAII Drop).
+        rt.unsubscribe(rec.node_id(), rec.sub_id());
+    } // node deactivated but still NOT terminal yet
 
     assert!(
         rt.binding.has_ctx(s.id),
@@ -963,7 +1028,7 @@ fn d069_terminate_with_no_subs_fires_eager_wipe() {
 
     // Now complete with subscribers.is_empty() — D069 path: terminate_node
     // queues `pending_wipes`, wave drains, `fire_deferred` fires wipe_ctx.
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     assert!(
         !rt.binding.has_ctx(s.id),
@@ -977,22 +1042,26 @@ fn d069_terminate_with_no_subs_fires_eager_wipe() {
 }
 
 // =====================================================================
-// Test 22 — D069: terminate-then-last-sub-drops fires wipe via Subscription::Drop
+// Test 22 — D069: terminate-then-last-sub-leaves fires wipe via
+// owner-invoked unsubscribe (D246 rule 3 deleted the core RAII
+// `Subscription::Drop` — the wipe-on-last-leave invariant is LIVE,
+// the trigger is now the owner-invoked `Core::unsubscribe` path).
 // =====================================================================
 
 #[test]
-fn d069_terminate_then_last_sub_drops_fires_wipe_via_subscription_drop() {
+fn d069_terminate_then_last_sub_leaves_fires_wipe_via_unsubscribe() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
 
     let rec = rt.subscribe_recorder(s.id);
     rt.binding.store_set(s.id, "k", TestValue::Int(2026));
 
     // Complete WHILE subscribers exist. D069: terminate_node sees
     // subscribers.is_empty() == false → pending_wipes NOT pushed.
-    // Subscription::Drop will fire wipe directly when the last sub drops.
-    rt.core.complete(s.id);
+    // The owner-invoked unsubscribe will fire wipe directly when the
+    // last sub leaves.
+    rt.core().complete(s.id);
     assert!(
         rt.binding.has_ctx(s.id),
         "store still present while sub is alive (terminate didn't queue wipe)"
@@ -1002,18 +1071,19 @@ fn d069_terminate_then_last_sub_drops_fires_wipe_via_subscription_drop() {
         "no wipe fired yet — terminate_node skipped because subs were live"
     );
 
-    // Now drop the sub. Subscription::Drop sees terminal.is_some() &&
+    // Now the last sub leaves via owner-invoked unsubscribe (D246
+    // rule 3): the unsubscribe path sees terminal.is_some() &&
     // resubscribable → fires wipe_ctx directly.
-    drop(rec);
+    rt.unsubscribe(rec.node_id(), rec.sub_id());
 
     assert!(
         !rt.binding.has_ctx(s.id),
-        "D069: Subscription::Drop fired wipe when last sub dropped on terminal-resubscribable node"
+        "D069: unsubscribe fired wipe when last sub left on terminal-resubscribable node"
     );
     assert_eq!(
         rt.binding.wipe_calls(),
         vec![s.id],
-        "exactly one wipe fired via Subscription::Drop direct-fire path"
+        "exactly one wipe fired via the owner-invoked unsubscribe direct-fire path"
     );
 }
 
@@ -1043,7 +1113,7 @@ fn on_invalidate_dropped_silently_on_panic_discard_wave() {
     // Panic mid-wave AFTER queueing an OnInvalidate. The wave is
     // panic-discarded → cleanup queue dropped silently per D061.
     let s_id = s.id;
-    let core = &rt.core;
+    let core = rt.core();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         core.batch(|| {
             core.invalidate(s_id); // queues OnInvalidate for derived_node
@@ -1062,8 +1132,8 @@ fn on_invalidate_dropped_silently_on_panic_discard_wave() {
 
     // CoreState should be clean — next wave should still work.
     let h = rt.binding.intern(TestValue::Int(42));
-    rt.core.emit(s_id, h);
-    rt.core.invalidate(s_id);
+    rt.core().emit(s_id, h);
+    rt.core().invalidate(s_id);
     assert_eq!(
         on_inv_count.load(Ordering::SeqCst),
         1,

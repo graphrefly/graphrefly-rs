@@ -35,9 +35,9 @@ fn register_operator_with_zero_deps_errors_operator_without_deps() {
     let fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt
-        .core
-        .register_operator(&[], OperatorOp::Map { fn_id }, OperatorOpts::default());
+    let result =
+        rt.core()
+            .register_operator(&[], OperatorOp::Map { fn_id }, OperatorOpts::default());
     assert_eq!(result, Err(RegisterError::OperatorWithoutDeps));
 }
 
@@ -55,7 +55,7 @@ fn register_with_initial_on_non_state_shape_errors() {
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
     let h = rt.binding.intern(TestValue::Int(99));
     // Derived shape (deps non-empty, fn present) with non-sentinel initial.
-    let result = rt.core.register(NodeRegistration {
+    let result = rt.core().register(NodeRegistration {
         deps: vec![s.id],
         fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
         opts: NodeOpts {
@@ -78,7 +78,7 @@ fn register_derived_with_unknown_dep_errors() {
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
     let result = rt
-        .core
+        .core()
         .register_derived(&[bogus], fn_id, EqualsMode::Identity, false);
     assert_eq!(result, Err(RegisterError::UnknownDep(bogus)));
 }
@@ -97,7 +97,7 @@ fn register_operator_scan_with_no_handle_seed_errors() {
     let dummy_fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[s.id],
         OperatorOp::Scan {
             fn_id: dummy_fn_id,
@@ -115,7 +115,7 @@ fn register_operator_reduce_with_no_handle_seed_errors() {
     let dummy_fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[s.id],
         OperatorOp::Reduce {
             fn_id: dummy_fn_id,
@@ -140,19 +140,19 @@ fn set_pausable_mode_on_unknown_node_errors() {
     let known = rt.state(Some(TestValue::Int(0)));
 
     // Sanity-check baseline mode by setting it explicitly.
-    rt.core
+    rt.core()
         .set_pausable_mode(known.id, PausableMode::Off)
         .expect("baseline mode set");
 
     // Attempt to change mode on a bogus id — must error AND must not
     // reach into another record.
     let bogus = NodeId::new(99_999);
-    let result = rt.core.set_pausable_mode(bogus, PausableMode::ResumeAll);
+    let result = rt.core().set_pausable_mode(bogus, PausableMode::ResumeAll);
     assert_eq!(result, Err(SetPausableModeError::UnknownNode(bogus)));
 
     // Existing node's mode is still `Off` — the failed call did not
     // touch any state.
-    rt.core
+    rt.core()
         .set_pausable_mode(known.id, PausableMode::Off)
         .expect("re-set Off on known node");
 }
@@ -177,7 +177,7 @@ fn register_operator_scan_with_unknown_dep_does_not_leak_seed() {
     let dummy_fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[bogus],
         OperatorOp::Scan {
             fn_id: dummy_fn_id,
@@ -203,7 +203,7 @@ fn register_operator_reduce_with_terminal_dep_does_not_leak_seed() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
     let _rec = rt.subscribe_recorder(s.id);
-    rt.core.complete(s.id); // terminate WITHOUT marking resubscribable.
+    rt.core().complete(s.id); // terminate WITHOUT marking resubscribable.
 
     let seed = rt.binding.intern(TestValue::Int(13));
     let pre_refcount = rt.binding.refcount_of(seed);
@@ -211,7 +211,7 @@ fn register_operator_reduce_with_terminal_dep_does_not_leak_seed() {
     let dummy_fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[s.id],
         OperatorOp::Reduce {
             fn_id: dummy_fn_id,
@@ -242,7 +242,7 @@ fn register_operator_scan_sentinel_seed_takes_no_retain() {
     let dummy_fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[s.id],
         OperatorOp::Scan {
             fn_id: dummy_fn_id,
@@ -269,19 +269,19 @@ fn register_operator_scan_sentinel_seed_takes_no_retain() {
 fn register_err_does_not_add_node_to_graph() {
     let rt = TestRuntime::new();
     let _s = rt.state(Some(TestValue::Int(0)));
-    let pre_count = rt.core.node_count();
+    let pre_count = rt.core().node_count();
 
     let bogus = NodeId::new(99_999);
     let fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
     let result = rt
-        .core
+        .core()
         .register_derived(&[bogus], fn_id, EqualsMode::Identity, false);
 
     assert_eq!(result, Err(RegisterError::UnknownDep(bogus)));
     assert_eq!(
-        rt.core.node_count(),
+        rt.core().node_count(),
         pre_count,
         "node_count must be unchanged after a failed register"
     );
@@ -303,7 +303,7 @@ fn register_operator_last_with_default_with_unknown_dep_does_not_leak_default() 
     let default = rt.binding.intern(TestValue::Int(42));
     let pre_refcount = rt.binding.refcount_of(default);
 
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[bogus],
         OperatorOp::Last { default },
         OperatorOpts::default(),
@@ -332,7 +332,7 @@ fn op_without_deps_takes_precedence_over_seed_sentinel() {
         .register_fn(|deps: &[TestValue]| deps.first().cloned());
     // Both conditions hold: deps empty AND Scan seed is NO_HANDLE.
     // Phase 1 should fire first → OperatorWithoutDeps.
-    let result = rt.core.register_operator(
+    let result = rt.core().register_operator(
         &[],
         OperatorOp::Scan {
             fn_id: dummy_fn_id,

@@ -47,7 +47,7 @@ fn drop_releases_terminal_error_handles() {
         // on derived.dep_terminals[0] AND s.cache stays. Cascade also marks
         // derived terminal with the same error — third retain.
         let err = rt.binding.intern(TestValue::Str("oops".into()));
-        rt.core.error(s.id, err);
+        rt.core().error(s.id, err);
         // Live handles: s.cache (1), s.terminal err (1), derived.cache (1),
         // derived.dep_terminals[0] err (1), derived.terminal err (1).
         // Plus the err handle from intern transferred to s.terminal — same
@@ -75,11 +75,11 @@ fn drop_releases_pause_buffer_payloads() {
         let _rec = rt.subscribe_recorder(derived);
         // Pause the derived; emits to source push tier-3 messages into
         // its pause buffer (each retain'd).
-        let lock = rt.core.alloc_lock_id();
-        rt.core.pause(derived, lock).expect("pause");
+        let lock = rt.core().alloc_lock_id();
+        rt.core().pause(derived, lock).expect("pause");
         for v in 1..=5 {
             let h = rt.binding.intern(TestValue::Int(v));
-            rt.core.emit(s.id, h);
+            rt.core().emit(s.id, h);
         }
         // Buffer should hold 5 retained payloads (one per emit, all reach
         // derived since each value is distinct). Don't resume — let drop
@@ -112,7 +112,7 @@ fn drop_balanced_after_normal_wave() {
         // Push a few waves through.
         for v in 1..=10 {
             let h = rt.binding.intern(TestValue::Int(v));
-            rt.core.emit(s.id, h);
+            rt.core().emit(s.id, h);
         }
         rt.binding.clone()
     };

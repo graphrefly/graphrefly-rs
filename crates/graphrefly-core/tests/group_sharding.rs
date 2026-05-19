@@ -40,10 +40,10 @@ fn count(rec: &common::Recorder, v: i64) -> usize {
 fn grouped_state_round_trip_delivers() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_serialization_group(s.id, Some(G1))
         .expect("migrate to G1 shard");
-    assert_eq!(rt.core.partition_of(s.id), Some(G1));
+    assert_eq!(rt.core().partition_of(s.id), Some(G1));
     let rec = rt.subscribe_recorder(s.id);
     s.set(TestValue::Int(7));
     assert_eq!(
@@ -66,12 +66,12 @@ fn grouped_derived_component_migrates_and_delivers() {
         TestValue::Int(n) => Some(TestValue::Int(n * 10)),
         _ => None,
     });
-    rt.core
+    rt.core()
         .set_serialization_group(s.id, Some(G1))
         .expect("migrate component {s,d} to G1");
     // Whole dep-connected component moved (homogeneity).
-    assert_eq!(rt.core.partition_of(s.id), Some(G1));
-    assert_eq!(rt.core.partition_of(d), Some(G1));
+    assert_eq!(rt.core().partition_of(s.id), Some(G1));
+    assert_eq!(rt.core().partition_of(d), Some(G1));
     let rec = rt.subscribe_recorder(d);
     s.set(TestValue::Int(4));
     assert_eq!(
@@ -91,7 +91,7 @@ fn register_with_group_places_and_delivers() {
     let rt = TestRuntime::new();
     let init = rt.binding.intern(TestValue::Int(0));
     let s = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -102,10 +102,10 @@ fn register_with_group_places_and_delivers() {
             },
         })
         .expect("register grouped state");
-    assert_eq!(rt.core.partition_of(s), Some(G1));
+    assert_eq!(rt.core().partition_of(s), Some(G1));
     let rec = rt.subscribe_recorder(s);
     let h = rt.binding.intern(TestValue::Int(99));
-    rt.core.emit(s, h);
+    rt.core().emit(s, h);
     assert_eq!(
         count(&rec, 99),
         1,
@@ -122,10 +122,10 @@ fn disjoint_groups_deliver_independently() {
     let rt = TestRuntime::new();
     let a = rt.state(Some(TestValue::Int(0)));
     let b = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_serialization_group(a.id, Some(G1)).unwrap();
-    rt.core.set_serialization_group(b.id, Some(G2)).unwrap();
-    assert_eq!(rt.core.partition_of(a.id), Some(G1));
-    assert_eq!(rt.core.partition_of(b.id), Some(G2));
+    rt.core().set_serialization_group(a.id, Some(G1)).unwrap();
+    rt.core().set_serialization_group(b.id, Some(G2)).unwrap();
+    assert_eq!(rt.core().partition_of(a.id), Some(G1));
+    assert_eq!(rt.core().partition_of(b.id), Some(G2));
     let ra = rt.subscribe_recorder(a.id);
     let rb = rt.subscribe_recorder(b.id);
     a.set(TestValue::Int(11));
@@ -149,18 +149,18 @@ fn repeated_regroup_round_trips_delivery_and_index() {
     let rec = rt.subscribe_recorder(s.id);
 
     s.set(TestValue::Int(1));
-    assert_eq!(rt.core.partition_of(s.id), None);
+    assert_eq!(rt.core().partition_of(s.id), None);
 
-    rt.core.set_serialization_group(s.id, Some(G1)).unwrap();
-    assert_eq!(rt.core.partition_of(s.id), Some(G1));
+    rt.core().set_serialization_group(s.id, Some(G1)).unwrap();
+    assert_eq!(rt.core().partition_of(s.id), Some(G1));
     s.set(TestValue::Int(2));
 
-    rt.core.set_serialization_group(s.id, None).unwrap();
-    assert_eq!(rt.core.partition_of(s.id), None);
+    rt.core().set_serialization_group(s.id, None).unwrap();
+    assert_eq!(rt.core().partition_of(s.id), None);
     s.set(TestValue::Int(3));
 
-    rt.core.set_serialization_group(s.id, Some(G2)).unwrap();
-    assert_eq!(rt.core.partition_of(s.id), Some(G2));
+    rt.core().set_serialization_group(s.id, Some(G2)).unwrap();
+    assert_eq!(rt.core().partition_of(s.id), Some(G2));
     s.set(TestValue::Int(4));
 
     let got = rec.data_values();
@@ -186,8 +186,8 @@ fn ungrouped_floor_still_delivers() {
         TestValue::Int(n) => Some(TestValue::Int(n + 1)),
         _ => None,
     });
-    assert_eq!(rt.core.partition_of(s.id), None);
-    assert_eq!(rt.core.partition_of(d), None);
+    assert_eq!(rt.core().partition_of(s.id), None);
+    assert_eq!(rt.core().partition_of(d), None);
     let rec = rt.subscribe_recorder(d);
     s.set(TestValue::Int(41));
     assert_eq!(

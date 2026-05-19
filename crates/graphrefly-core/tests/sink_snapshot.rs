@@ -46,15 +46,15 @@ fn d2_late_subscribe_between_emits_receives_subsequent_data() {
     let h1 = rt.binding.intern(TestValue::Int(1));
     let h2 = rt.binding.intern(TestValue::Int(2));
 
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h1);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h1);
         // Batch 1 has just opened with sinks = [rec_old] and messages
         // = [Dirty, Data(h1)]. Subscribers revision = R0 at this point.
         let rec_late = rt.subscribe_recorder(s.id);
         // Handshake fires lock-released and delivers [Start, Data(h1)]
         // to rec_late. subscribers_revision bumps to R1.
         *rec_late_holder.borrow_mut() = Some(rec_late);
-        rt.core.emit(s.id, h2);
+        rt.core().emit(s.id, h2);
         // Batch 2 opens with sinks = [rec_old, rec_late], messages
         // = [Data(h2)] (Dirty already queued in batch 1; verbatim path
         // skips equals substitution per Slice G).
@@ -105,8 +105,8 @@ fn d2_late_subscribe_after_single_emit_no_duplicate_data() {
 
     let h1 = rt.binding.intern(TestValue::Int(1));
 
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h1);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h1);
         let rec_late = rt.subscribe_recorder(s.id);
         *rec_late_holder.borrow_mut() = Some(rec_late);
         // No second emit — batch 1 stays open as the only batch with
@@ -153,13 +153,13 @@ fn d2_unsubscribe_between_emits_skips_post_unsub_data() {
     let h1 = rt.binding.intern(TestValue::Int(1));
     let h2 = rt.binding.intern(TestValue::Int(2));
 
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h1);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h1);
         // Batch 1: sinks = [rec_doomed, rec_old], messages = [Dirty, Data(h1)].
         rt.unsubscribe(rec_doomed.node_id(), rec_doomed.sub_id());
         // Subscription dropped → removed from subscribers map; revision bumps.
         // The Recorder itself stays alive so we can inspect events afterward.
-        rt.core.emit(s.id, h2);
+        rt.core().emit(s.id, h2);
         // Batch 2 opens with sinks = [rec_old] (the only remaining
         // subscriber), messages = [Data(h2)].
     });
@@ -204,11 +204,11 @@ fn d2_multi_emit_no_sub_change_single_batch_behavior() {
     // future regression that always opens a fresh batch per emit
     // would still pass the message-sequence assertion below.
     let mid_wave_batch_count: Cell<Option<usize>> = Cell::new(None);
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h1);
-        rt.core.emit(s.id, h2);
-        rt.core.emit(s.id, h3);
-        mid_wave_batch_count.set(rt.core.pending_batch_count(s.id));
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h1);
+        rt.core().emit(s.id, h2);
+        rt.core().emit(s.id, h3);
+        mid_wave_batch_count.set(rt.core().pending_batch_count(s.id));
     });
     assert_eq!(
         mid_wave_batch_count.get(),

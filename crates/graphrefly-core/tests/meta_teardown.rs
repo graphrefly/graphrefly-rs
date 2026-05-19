@@ -62,25 +62,27 @@ fn single_meta_companion_tears_down_before_parent() {
     let rt = TestRuntime::new();
     let parent = rt.state(Some(TestValue::Int(1)));
     let meta = rt.state(Some(TestValue::Int(99)));
-    rt.core.add_meta_companion(parent.id, meta.id);
+    rt.core().add_meta_companion(parent.id, meta.id);
 
     let tracker = OrderTracker::new();
     let parent_sub = rt
-        .core
+        .core()
         .subscribe(parent.id, tracker.record_sink("parent", rt.binding.clone()));
     let meta_sub = rt
-        .core
+        .core()
         .subscribe(meta.id, tracker.record_sink("meta", rt.binding.clone()));
 
-    rt.core.teardown(parent.id);
+    rt.core().teardown(parent.id);
 
     let order = tracker.order();
     assert_eq!(order.len(), 2, "both subscribers see TEARDOWN");
     assert_eq!(order[0].0, "meta", "meta tears down before parent");
     assert_eq!(order[1].0, "parent");
 
-    drop(parent_sub);
-    drop(meta_sub);
+    // D246 rule 3: owner-invoked unsubscribe (Copy ids; idempotent
+    // even after the nodes were torn down above).
+    rt.core().unsubscribe(parent.id, parent_sub);
+    rt.core().unsubscribe(meta.id, meta_sub);
 }
 
 #[test]
@@ -90,25 +92,25 @@ fn multiple_meta_companions_all_precede_parent() {
     let m1 = rt.state(Some(TestValue::Int(2)));
     let m2 = rt.state(Some(TestValue::Int(3)));
     let m3 = rt.state(Some(TestValue::Int(4)));
-    rt.core.add_meta_companion(parent.id, m1.id);
-    rt.core.add_meta_companion(parent.id, m2.id);
-    rt.core.add_meta_companion(parent.id, m3.id);
+    rt.core().add_meta_companion(parent.id, m1.id);
+    rt.core().add_meta_companion(parent.id, m2.id);
+    rt.core().add_meta_companion(parent.id, m3.id);
 
     let tracker = OrderTracker::new();
     let _parent_sub = rt
-        .core
+        .core()
         .subscribe(parent.id, tracker.record_sink("parent", rt.binding.clone()));
     let _m1_sub = rt
-        .core
+        .core()
         .subscribe(m1.id, tracker.record_sink("m1", rt.binding.clone()));
     let _m2_sub = rt
-        .core
+        .core()
         .subscribe(m2.id, tracker.record_sink("m2", rt.binding.clone()));
     let _m3_sub = rt
-        .core
+        .core()
         .subscribe(m3.id, tracker.record_sink("m3", rt.binding.clone()));
 
-    rt.core.teardown(parent.id);
+    rt.core().teardown(parent.id);
 
     let order = tracker.order();
     assert_eq!(order.len(), 4);
@@ -138,21 +140,21 @@ fn nested_meta_companion_tears_down_first() {
     let parent = rt.state(Some(TestValue::Int(1)));
     let meta1 = rt.state(Some(TestValue::Int(2)));
     let meta2 = rt.state(Some(TestValue::Int(3)));
-    rt.core.add_meta_companion(parent.id, meta1.id);
-    rt.core.add_meta_companion(meta1.id, meta2.id);
+    rt.core().add_meta_companion(parent.id, meta1.id);
+    rt.core().add_meta_companion(meta1.id, meta2.id);
 
     let tracker = OrderTracker::new();
     let _p_sub = rt
-        .core
+        .core()
         .subscribe(parent.id, tracker.record_sink("parent", rt.binding.clone()));
     let _m1_sub = rt
-        .core
+        .core()
         .subscribe(meta1.id, tracker.record_sink("meta1", rt.binding.clone()));
     let _m2_sub = rt
-        .core
+        .core()
         .subscribe(meta2.id, tracker.record_sink("meta2", rt.binding.clone()));
 
-    rt.core.teardown(parent.id);
+    rt.core().teardown(parent.id);
 
     let order = tracker.order();
     assert_eq!(order.len(), 3);
@@ -165,14 +167,14 @@ fn duplicate_add_meta_companion_is_idempotent() {
     let rt = TestRuntime::new();
     let parent = rt.state(Some(TestValue::Int(1)));
     let meta = rt.state(Some(TestValue::Int(2)));
-    rt.core.add_meta_companion(parent.id, meta.id);
-    rt.core.add_meta_companion(parent.id, meta.id);
-    rt.core.add_meta_companion(parent.id, meta.id);
+    rt.core().add_meta_companion(parent.id, meta.id);
+    rt.core().add_meta_companion(parent.id, meta.id);
+    rt.core().add_meta_companion(parent.id, meta.id);
 
     let rec_meta = rt.subscribe_recorder(meta.id);
     let _rec_parent = rt.subscribe_recorder(parent.id);
 
-    rt.core.teardown(parent.id);
+    rt.core().teardown(parent.id);
 
     let teardown_count = rec_meta
         .snapshot()
@@ -190,10 +192,10 @@ fn meta_complete_cascades_independently_of_parent() {
     let rt = TestRuntime::new();
     let parent = rt.state(Some(TestValue::Int(1)));
     let meta = rt.state(Some(TestValue::Int(2)));
-    rt.core.add_meta_companion(parent.id, meta.id);
+    rt.core().add_meta_companion(parent.id, meta.id);
 
     let rec_meta = rt.subscribe_recorder(meta.id);
-    rt.core.complete(parent.id);
+    rt.core().complete(parent.id);
 
     let meta_completes = rec_meta
         .snapshot()
@@ -211,7 +213,7 @@ fn meta_complete_cascades_independently_of_parent() {
 fn self_meta_companion_panics() {
     let rt = TestRuntime::new();
     let n = rt.state(Some(TestValue::Int(1)));
-    rt.core.add_meta_companion(n.id, n.id);
+    rt.core().add_meta_companion(n.id, n.id);
 }
 
 #[test]
@@ -220,7 +222,7 @@ fn unknown_parent_meta_companion_panics() {
     let rt = TestRuntime::new();
     let bogus = graphrefly_core::NodeId::new(99_999);
     let real = rt.state(Some(TestValue::Int(1)));
-    rt.core.add_meta_companion(bogus, real.id);
+    rt.core().add_meta_companion(bogus, real.id);
 }
 
 #[test]
@@ -229,5 +231,5 @@ fn unknown_companion_meta_companion_panics() {
     let rt = TestRuntime::new();
     let real = rt.state(Some(TestValue::Int(1)));
     let bogus = graphrefly_core::NodeId::new(99_999);
-    rt.core.add_meta_companion(real.id, bogus);
+    rt.core().add_meta_companion(real.id, bogus);
 }

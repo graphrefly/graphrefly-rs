@@ -256,7 +256,7 @@ fn emitting_no_handle_panics() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
     // Bypass the binding's intern path to construct a NO_HANDLE emission directly.
-    rt.core.emit(s.id, NO_HANDLE);
+    rt.core().emit(s.id, NO_HANDLE);
 }
 
 #[test]

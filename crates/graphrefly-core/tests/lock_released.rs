@@ -18,44 +18,171 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use common::{RecordedEvent, Recorder, TestBinding, TestRuntime, TestValue};
-
-use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message, NodeId, Sink,
-};
+use common::{RecordedEvent, TestRuntime, TestValue};
 
 // ---------------------------------------------------------------------------
-// Fn re-entrance via invoke_fn
+// Fn re-entrance via the mailbox (D233/D246 rule 6)
+//
+// Under the actor model a binding fn cannot hold/clone the move-only
+// single-owner `Core` to re-enter it synchronously (the old
+// `ReentrantBinding { core_slot: Mutex<Option<Core>> }` mechanism is
+// β-invalid). The LIVE invariant — "a fn-fire can cause Core re-entry
+// that runs as a correctly-ordered nested wave, no deadlock, no Core
+// clone, no async" — is expressed β-validly by the fn capturing
+// `Arc<CoreMailbox>` and posting a deferred op during its fire; the
+// owner applies it via `drain_mailbox()` (FIFO, synchronous, owner-
+// driven). This IS the canonical D233/D246-rule-6 re-entry seam.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
 fn fn_can_reenter_core_emit_during_invoke_fn_runs_nested_wave() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
+    // A derived fn over `s`, during its fire, posts an `Emit` for a
+    // side state node `side` via the captured mailbox. The wave
+    // engine drains the mailbox IN-WAVE to quiescence
+    // (`batch.rs` drain loop: quiescence requires `pending_fires`
+    // AND mailbox empty) — so the re-entrant emit is applied as a
+    // nested wave automatically, before the triggering call returns.
+    // No deadlock, no Core clone, no async.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+    let side = rt.state(None);
+    let side_obs = rt.derived(&[side.id], |deps| Some(deps[0].clone()));
+    let side_rec = rt.subscribe_recorder(side_obs);
+
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let side_id = side.id;
+    let d = rt.derived(&[s.id], move |deps| {
+        // Re-enter Core mid-fire: post an Emit on `side`. Applied by
+        // the in-wave drain-to-quiescence loop (nested wave).
+        let TestValue::Int(n) = &deps[0] else {
+            panic!("type")
+        };
+        let h = binding.intern(TestValue::Int(n * 100));
+        assert!(mailbox.post_emit(side_id, h), "Core alive");
+        Some(TestValue::Int(*n))
+    });
+    let _rec_d = rt.subscribe_recorder(d);
+
+    // The re-entrant emit was applied IN-WAVE during `d`'s first
+    // fire (the subscribe handshake drove the wave to quiescence).
+    assert_eq!(rt.cache_value(d), Some(TestValue::Int(1)));
+    assert_eq!(
+        side_rec.data_values(),
+        vec![TestValue::Int(100)],
+        "re-entrant emit delivered as an in-wave nested wave"
+    );
+
+    // An explicit owner drain is idempotent (mailbox already empty).
+    rt.drain_mailbox();
+    assert_eq!(
+        side_rec.data_values(),
+        vec![TestValue::Int(100)],
+        "explicit drain is a no-op once the in-wave drain emptied the mailbox"
+    );
 }
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
-fn fn_can_reenter_core_pause_resume_during_invoke_fn() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
-}
-
-#[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
 fn fn_can_reenter_core_invalidate_during_invoke_fn() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
+    // The β-valid full-Core re-entry surface is `MailboxOp::Defer`
+    // (runs owner-side with `&dyn CoreFull`, which exposes
+    // `invalidate`). A fn posts a Defer that invalidates a sibling
+    // node; the owner drain applies it as a nested wave.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(7)));
+    let sibling = rt.state(Some(TestValue::Int(99)));
+    let sib_obs = rt.derived(&[sibling.id], |deps| Some(deps[0].clone()));
+    let sib_rec = rt.subscribe_recorder(sib_obs);
+
+    let mailbox = rt.mailbox();
+    let sib_id = sibling.id;
+    let d = rt.derived(&[s.id], move |deps| {
+        assert!(
+            mailbox.post_defer(Box::new(move |cf| {
+                // Full owner-side Core surface mid-drain: invalidate the
+                // sibling (clears its cache → re-handshake on next emit).
+                cf.invalidate(sib_id);
+            })),
+            "Core alive"
+        );
+        Some(deps[0].clone())
+    });
+    let _rec_d = rt.subscribe_recorder(d);
+    assert_eq!(rt.cache_value(d), Some(TestValue::Int(7)));
+
+    // The Defer was applied IN-WAVE during `d`'s first fire: it
+    // invalidated the sibling, so an Invalidate message reached the
+    // sibling observer's downstream (sib initially cached at 99,
+    // then invalidated → cache cleared).
+    assert!(
+        sib_rec
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, RecordedEvent::Invalidate)),
+        "re-entrant Defer invalidate delivered as an in-wave nested wave; got {:?}",
+        sib_rec.snapshot()
+    );
+    assert_eq!(
+        rt.cache_value(sibling.id),
+        None,
+        "sibling cache cleared by the re-entrant invalidate"
+    );
+}
+
+#[test]
+#[ignore = "D246 record-and-skip: pause/resume re-entry from a fn-fire has NO β-valid seam — CoreFull (the MailboxOp::Defer surface) exposes emit/complete/error/teardown/invalidate/subscribe/register + reads, but NOT pause/resume; and invoke_fn carries no &Core. The synchronous binding-holds-Core trigger is structurally deleted by the actor model. Invariant (a fn-fire can re-enter pause/resume) stays live → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
+fn fn_can_reenter_core_pause_resume_during_invoke_fn() {
+    // No β-valid expression: pause/resume absent from CoreFull/MailboxOp;
+    // the deleted mechanism was binding-clones-Core. → S4.
 }
 
 // ---------------------------------------------------------------------------
-// custom_equals re-entrance
+// custom_equals re-entrance via the mailbox
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
 fn custom_equals_can_reenter_core_during_emission() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
+    // A custom-equals oracle, evaluated during commit, posts an Emit
+    // on a side node via the captured mailbox. The owner drain
+    // applies it (nested wave). Invariant: equals re-entry is
+    // delivered correctly, no deadlock, no Core clone.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+    let side = rt.state(None);
+    let side_obs = rt.derived(&[side.id], |deps| Some(deps[0].clone()));
+    let side_rec = rt.subscribe_recorder(side_obs);
+
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let side_id = side.id;
+    let d = rt.derived_with_equals(
+        &[s.id],
+        |deps| Some(deps[0].clone()),
+        move |a, b| {
+            // equals oracle re-enters Core via the mailbox.
+            let h = binding.intern(TestValue::Int(42));
+            assert!(mailbox.post_emit(side_id, h), "Core alive");
+            a == b
+        },
+    );
+    let _rec_d = rt.subscribe_recorder(d);
+    // The handshake-time first commit may already run custom_equals;
+    // reset the side recorder's view by snapshotting after a forced
+    // second commit so the assertion is deterministic regardless of
+    // how many times equals fired.
+    let _ = side_rec.snapshot();
+
+    // Force a second commit so custom_equals runs (compares new vs
+    // cached). The re-entrant emit is applied IN-WAVE.
+    s.set(TestValue::Int(2));
+    rt.drain_mailbox(); // idempotent; mailbox already drained in-wave
+    assert!(
+        side_rec.data_values().contains(&TestValue::Int(42)),
+        "custom_equals re-entrant emit delivered as an in-wave nested wave; got {:?}",
+        side_rec.data_values()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -113,9 +240,53 @@ fn handshake_tier_split_cached_state_two_calls() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
 fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_data() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
+    // A fn-fire posts a Defer that subscribes a NEW sink to a node
+    // that already has queued/cached DATA. The β-valid re-entrant
+    // subscribe (owner-side, via CoreFull) must deliver the
+    // handshake-cached DATA exactly once to the late sink — never
+    // double-receive already-queued wave messages
+    // (sink-snapshot-on-first-touch).
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(5)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+    let _rec_d = rt.subscribe_recorder(d);
+    assert_eq!(rt.cache_value(d), Some(TestValue::Int(5)));
+
+    // A trigger node whose fn posts a Defer that late-subscribes a
+    // recorder to `d` (which is already cached at 5).
+    let late = common::Recorder::new();
+    let late_sink = late.sink(rt.binding.clone());
+    let mailbox = rt.mailbox();
+    let d_id = d;
+    let trig_src = rt.state(Some(TestValue::Int(0)));
+    let trig = rt.derived(&[trig_src.id], move |_deps| {
+        let sink = late_sink.clone();
+        assert!(
+            mailbox.post_defer(Box::new(move |cf| {
+                cf.subscribe(d_id, sink);
+            })),
+            "Core alive"
+        );
+        Some(TestValue::Int(1))
+    });
+    let _rec_trig = rt.subscribe_recorder(trig);
+
+    rt.drain_mailbox();
+
+    // The late subscriber received the cached handshake EXACTLY once:
+    // `[Start, Data(5)]` — no duplicate Dirty/Data from already-queued
+    // wave messages.
+    assert_eq!(
+        late.snapshot(),
+        vec![RecordedEvent::Start, RecordedEvent::Data(TestValue::Int(5))],
+        "late subscriber gets the cached handshake exactly once, no double-receive"
+    );
+    assert_eq!(
+        late.count(|e| matches!(e, RecordedEvent::Data(_))),
+        1,
+        "exactly one DATA delivered to the late sink"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,57 +338,55 @@ fn lock_released_refactor_does_not_leak_handles_under_basic_emit() {
 }
 
 // ---------------------------------------------------------------------------
-// Direct binding hooks used by the dispatcher's lock-released paths
+// Re-entrant Core read mid-fire (D246: CoreFull read surface)
+//
+// The old `ReentrantBinding { core_slot: Mutex<Option<Core>> }` (a
+// binding holding a cloned Core to call `cache_of` synchronously
+// mid-`invoke_fn`) is the exact β-invalid deleted mechanism. The LIVE
+// invariant — "a re-entrant Core READ during a fire returns the
+// correct value with no deadlock" — is expressed β-validly via a
+// `MailboxOp::Defer` reading `cf.cache_of` owner-side mid-drain.
 // ---------------------------------------------------------------------------
 
-/// Sentinel binding: a BindingBoundary whose invoke_fn re-acquires the
-/// Core's state lock via Core::cache_of mid-fire. Used to verify the
-/// lock-released-around-invoke_fn discipline directly (without going
-/// through TestRuntime's Sink wrapping).
-struct ReentrantBinding {
-    inner: Arc<TestBinding>,
-    core_slot: Mutex<Option<Core>>,
-    probe_node: Mutex<Option<NodeId>>,
-}
-
-impl ReentrantBinding {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: TestBinding::new(),
-            core_slot: Mutex::new(None),
-            probe_node: Mutex::new(None),
-        })
-    }
-}
-
-impl BindingBoundary for ReentrantBinding {
-    fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
-        // Re-enter Core::cache_of mid-fire — depends on lock being
-        // released around this call.
-        if let (Some(core), Some(probe)) = (
-            self.core_slot.lock().unwrap().as_ref(),
-            *self.probe_node.lock().unwrap(),
-        ) {
-            let _ = core.cache_of(probe);
-        }
-        self.inner.invoke_fn(node_id, fn_id, dep_data)
-    }
-
-    fn custom_equals(&self, equals_handle: FnId, a: HandleId, b: HandleId) -> bool {
-        self.inner.custom_equals(equals_handle, a, b)
-    }
-
-    fn release_handle(&self, handle: HandleId) {
-        self.inner.release_handle(handle);
-    }
-
-    fn retain_handle(&self, handle: HandleId) {
-        self.inner.retain_handle(handle);
-    }
-}
-
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
-fn invoke_fn_can_call_core_cache_of_directly() {
-    // see #[ignore] — invariant still live; β-valid rewrite at S4; gap in porting-deferred /qa-2026-05-18
+fn reentrant_core_cache_of_read_via_defer_returns_correct_value() {
+    let rt = TestRuntime::new();
+    let probe_src = rt.state(Some(TestValue::Int(0)));
+    let probe = rt.derived(&[probe_src.id], |deps| {
+        let TestValue::Int(n) = &deps[0] else {
+            panic!("type")
+        };
+        Some(TestValue::Int(n + 1000))
+    });
+    let _rec_probe = rt.subscribe_recorder(probe);
+    assert_eq!(rt.cache_value(probe), Some(TestValue::Int(1000)));
+
+    let observed: Arc<std::sync::Mutex<Option<graphrefly_core::HandleId>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed_w = observed.clone();
+    let mailbox = rt.mailbox();
+    let probe_id = probe;
+    let s = rt.state(Some(TestValue::Int(1)));
+    let d = rt.derived(&[s.id], move |deps| {
+        let observed_w = observed_w.clone();
+        assert!(
+            mailbox.post_defer(Box::new(move |cf| {
+                // Re-enter Core READ mid-drain — no deadlock under the
+                // actor model (owner holds &Core; CoreFull read).
+                *observed_w.lock().unwrap() = Some(cf.cache_of(probe_id));
+            })),
+            "Core alive"
+        );
+        Some(deps[0].clone())
+    });
+    let _rec_d = rt.subscribe_recorder(d);
+    assert_eq!(rt.cache_value(d), Some(TestValue::Int(1)));
+
+    rt.drain_mailbox();
+    let h = observed.lock().unwrap().expect("defer ran");
+    assert_eq!(
+        rt.binding.deref(h),
+        TestValue::Int(1000),
+        "re-entrant cache_of read returned the correct cached value, no deadlock"
+    );
 }

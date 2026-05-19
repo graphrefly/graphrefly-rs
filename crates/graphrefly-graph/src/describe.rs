@@ -1,17 +1,13 @@
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
-//! S2b/β (D237/D240/D242/D243): describe logic is a free fn
-//! [`describe_of`] over `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)` so
-//! both [`Graph`](crate::Graph) and
-//! [`SubgraphRef`](crate::SubgraphRef) (via the
-//! [`GraphOps`](crate::GraphOps) trait) reuse it, AND so the in-wave
-//! reactive-describe `MailboxOp::Defer` closure (D233) can run it
-//! through the `&dyn CoreFull` it is handed (D243 widened `CoreFull`
-//! with read-only inspection). `ReactiveDescribeHandle<'g>` borrows the
-//! root `&Core` (D242) so its RAII `Drop` synchronously unsubscribes
-//! (D241-AMEND: the borrow statically pins the Core alive + the
-//! handle is `!Send`, so this is sound — NOT the D225 relocating-Core
-//! problem).
+//! D246: describe logic is a free fn [`describe_of`] over
+//! `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)` so the one [`Graph`]
+//! (crate::Graph) reuses it, AND so the in-wave reactive-describe
+//! `MailboxOp::Defer` closure (D246 rule 6) can run it through the
+//! `&dyn CoreFull` it is handed (the one facade carries read-only
+//! inspection). `ReactiveDescribeHandle` holds ids only (Core-free,
+//! `Send`); there is **no RAII `Drop`** (D246 rule 3) — teardown is the
+//! owner-invoked [`ReactiveDescribeHandle::detach`].
 //!
 //! # Value rendering — raw vs. binding-rendered
 //!
@@ -31,7 +27,7 @@ use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 
 use crate::debug::DebugBindingBoundary;
-use crate::graph::{register_ns_sink, GraphInner};
+use crate::graph::{register_ns_sink, unregister_ns_sink, GraphInner};
 
 /// Top-level `describe()` output (canonical Appendix B JSON schema).
 #[derive(Debug, Clone, Serialize)]
@@ -274,47 +270,42 @@ fn status_of(
 /// Sink type for reactive describe.
 pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
 
-/// RAII handle for a reactive describe subscription.
+/// Id-bearing handle for a reactive describe subscription.
 ///
-/// β/D242/D241-AMEND: carries the root `&'g Core` (borrow statically
-/// pins the Core alive for `'g`; the handle is `!Send` so it drops on
-/// the owner thread). `Drop` therefore **synchronously unsubscribes**
-/// both the namespace sink (inner-only) and the Core topology
-/// subscription — sound, not the D225 relocating-Core case.
-#[must_use = "ReactiveDescribeHandle holds the subscription; dropping it unsubscribes"]
-pub struct ReactiveDescribeHandle<'g> {
-    core: &'g Core,
+/// D246 rule 3: Core-free (`Send`), **no RAII `Drop`** — teardown is
+/// the owner-invoked synchronous [`Self::detach`]. This eliminates the
+/// "unsubscribe in `Drop`" deadlock class. The embedder's
+/// [`graphrefly_core::OwnedCore`] is the one RAII boundary.
+#[must_use = "ReactiveDescribeHandle holds the subscription; detach() (or OwnedCore drop) unsubscribes"]
+pub struct ReactiveDescribeHandle {
     inner: Arc<Mutex<GraphInner>>,
     ns_sink_id: u64,
     /// Slice V3 D5: Core topology sub for `DepsChanged` (edges change
-    /// without a namespace change). D243: re-snapshot is in-wave
+    /// without a namespace change). D246 r6: re-snapshot is in-wave
     /// `MailboxOp::Defer`'d (the topology event fires inside a Core
     /// wave; `describe_of` runs via the handed `&dyn CoreFull`).
     topo_sub_id: TopologySubscriptionId,
 }
 
-impl Drop for ReactiveDescribeHandle<'_> {
-    fn drop(&mut self) {
-        // Topology sub first (so a topo fire mid-unsubscribe can't
-        // re-snapshot through a half-removed namespace sink), then the
-        // namespace sink. Both synchronous + owner-thread (D241-AMEND).
-        self.core.unsubscribe_topology(self.topo_sub_id);
-        self.inner
-            .lock()
-            .namespace_sinks
-            .shift_remove(&self.ns_sink_id);
+impl ReactiveDescribeHandle {
+    /// Owner-invoked, synchronous detach (D246 rule 3). Topology sub
+    /// first (so a topo fire mid-detach can't re-snapshot through a
+    /// half-removed namespace sink), then the namespace sink.
+    pub fn detach(&self, core: &Core) {
+        core.unsubscribe_topology(self.topo_sub_id);
+        unregister_ns_sink(&self.inner, self.ns_sink_id);
     }
 }
 
-/// β: build a reactive-describe subscription. Push-on-subscribe fires
+/// Build a reactive-describe subscription. Push-on-subscribe fires
 /// the current snapshot once, then re-fires on every namespace change
-/// (owner-side `&Core`, D231) and on `set_deps` `DepsChanged`
-/// (in-wave `MailboxOp::Defer` → `&dyn CoreFull`, D243).
-pub(crate) fn describe_reactive_in<'g>(
-    core: &'g Core,
+/// (owner-side `&Core`, D246 r2) and on `set_deps` `DepsChanged`
+/// (in-wave `MailboxOp::Defer` → `&dyn CoreFull`, D246 r6).
+pub(crate) fn describe_reactive_in(
+    core: &Core,
     inner: &Arc<Mutex<GraphInner>>,
     sink: DescribeSink,
-) -> ReactiveDescribeHandle<'g> {
+) -> ReactiveDescribeHandle {
     // Push-on-subscribe (no lock held).
     sink(&describe_of(core, inner, None));
 
@@ -354,7 +345,6 @@ pub(crate) fn describe_reactive_in<'g>(
     let topo_sub_id = core.subscribe_topology(topo_sink);
 
     ReactiveDescribeHandle {
-        core,
         inner: inner.clone(),
         ns_sink_id,
         topo_sub_id,

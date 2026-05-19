@@ -38,8 +38,8 @@ fn take_resubscribable_non_terminal_deactivate_resets_counter() {
     // on non-terminal deactivate, so the next cycle counts from zero.
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let taken = take(&rt.core, source, 3).into_node();
-    rt.core.set_resubscribable(taken, true);
+    let taken = take(rt.core(), source, 3).into_node();
+    rt.core().set_resubscribable(taken, true);
 
     // Cycle 1: emit 2 of the 3 — take has NOT self-completed yet (so
     // this is genuinely a non-terminal deactivate path, distinct from
@@ -63,7 +63,7 @@ fn take_resubscribable_non_terminal_deactivate_resets_counter() {
     // Invalidate source so the resubscribe's re-walk doesn't redeliver
     // the cached source value (which would consume one of the quota
     // slots before our fresh emits).
-    rt.core.invalidate(source);
+    rt.core().invalidate(source);
 
     // Cycle 2: re-subscribe and emit a fresh 3-value window.
     let rec2 = rt.subscribe_recorder(taken);
@@ -105,7 +105,7 @@ fn scan_resubscribable_non_terminal_deactivate_resets_acc_to_seed() {
     // fold: acc + x
     let binding_for_fold = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -116,7 +116,7 @@ fn scan_resubscribable_non_terminal_deactivate_resets_acc_to_seed() {
         seed,
     )
     .node;
-    rt.core.set_resubscribable(scanned, true);
+    rt.core().set_resubscribable(scanned, true);
 
     let rec1 = rt.subscribe_recorder(scanned);
     rt.emit_int(source, 5);
@@ -131,7 +131,7 @@ fn scan_resubscribable_non_terminal_deactivate_resets_acc_to_seed() {
 
     // Phase G ran (non-terminal). On the next subscribe + emit, acc
     // must restart from seed=10.
-    rt.core.invalidate(source);
+    rt.core().invalidate(source);
 
     let rec2 = rt.subscribe_recorder(scanned);
     rt.emit_int(source, 7);
@@ -187,7 +187,7 @@ fn phase_g_resubscribable_seed_aliasing_acc_does_not_collapse_registry() {
     // Identity-acc fold: `|acc, _| acc` — acc never changes from seed.
     let binding_for_fold = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, _x| {
@@ -199,7 +199,7 @@ fn phase_g_resubscribable_seed_aliasing_acc_does_not_collapse_registry() {
         seed,
     )
     .node;
-    rt.core.set_resubscribable(scanned, true);
+    rt.core().set_resubscribable(scanned, true);
     assert_eq!(
         rt.binding.refcount_of(seed),
         3,
@@ -235,7 +235,7 @@ fn phase_g_resubscribable_seed_aliasing_acc_does_not_collapse_registry() {
         rt.binding.refcount_of(seed)
     );
 
-    rt.core.invalidate(source);
+    rt.core().invalidate(source);
     let _rec2 = rt.subscribe_recorder(scanned);
     rt.emit_int(source, 3);
     assert!(
@@ -270,7 +270,7 @@ fn pending_scratch_release_drains_on_core_drop() {
     let seed = rt.intern_int(100);
     let binding_for_fold = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -281,7 +281,7 @@ fn pending_scratch_release_drains_on_core_drop() {
         seed,
     )
     .node;
-    rt.core.set_resubscribable(scanned, true);
+    rt.core().set_resubscribable(scanned, true);
 
     let rec = rt.subscribe_recorder(scanned);
     rt.emit_int(source, 1);
@@ -338,10 +338,10 @@ fn pending_scratch_release_drains_on_reset_for_fresh_lifecycle() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let default_handle = rt.intern_int(0);
-    let n = last_with_default(&rt.core, source, default_handle)
+    let n = last_with_default(rt.core(), source, default_handle)
         .expect("last_with_default registers cleanly for live non-terminal source")
         .into_node();
-    rt.core.set_resubscribable(n, true);
+    rt.core().set_resubscribable(n, true);
 
     // Cycle 1: subscribe, emit, deactivate (no terminal).
     let rec1 = rt.subscribe_recorder(n);
@@ -351,7 +351,7 @@ fn pending_scratch_release_drains_on_reset_for_fresh_lifecycle() {
     // fresh LastState (latest=NO_HANDLE, default=0 retained fresh).
 
     // Cycle 2: subscribe, emit different value, deactivate.
-    rt.core.invalidate(source);
+    rt.core().invalidate(source);
     let rec2 = rt.subscribe_recorder(n);
     rt.emit_int(source, 9);
     drop(rec2);
@@ -364,7 +364,7 @@ fn pending_scratch_release_drains_on_reset_for_fresh_lifecycle() {
     // the values still actively held by Core (source.cache, etc.) +
     // operator scratch + dep_records — no orphan shares from queued
     // old LastStates.
-    rt.core.complete(source);
+    rt.core().complete(source);
     let live_pre_reset = rt.binding.live_handles();
     let _rec3 = rt.subscribe_recorder(n);
     // After reset, the queued boxes' shares of 7 and 9 must be

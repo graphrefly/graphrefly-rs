@@ -1,18 +1,20 @@
 //! Mount / unmount + `ancestors()` (canonical spec §3.4).
 //!
-//! S2b/β (D237/D240/D242): subgraphs are namespace handles
-//! (`Arc<Mutex<GraphInner>>`) under the root's single owned `Core`.
-//! These free fns take the root `&Core` + the parent namespace handle
-//! and return borrowed [`SubgraphRef`]s. v1 limitation: shared-Core
-//! only — mounting a child requires `Core::same_dispatcher` (cross-Core
-//! / multi-binding mount is post-M6).
+//! D246: subgraphs are just child levels of the **Core-free** namespace
+//! tree (`Arc<Mutex<GraphInner>>`); the embedder owns the one `Core`.
+//! `mount` / `mount_new` / `ancestors` are pure-namespace (no `&Core`);
+//! `unmount` takes the embedder's `&Core` because it runs the TEARDOWN
+//! cascade. Returns plain [`Graph`] handles (a cheap `Arc` clone). The
+//! old `SubgraphRef`/`same_dispatcher`/`CoreMismatch` machinery is
+//! deleted — there is only ever the one embedder `Core` (no Core lives
+//! on a `Graph` to mismatch).
 
 use std::sync::{Arc, Weak};
 
 use graphrefly_core::Core;
 use parking_lot::Mutex;
 
-use crate::graph::{destroy_subtree, fire_ns, GraphInner, NameError, SubgraphRef};
+use crate::graph::{destroy_subtree, fire_ns, Graph, GraphInner, NameError};
 
 /// Errors from `mount` / `mount_new` / `unmount`.
 #[derive(Debug, thiserror::Error)]
@@ -23,11 +25,6 @@ pub enum MountError {
     NodeNameCollision(String),
     #[error("Graph::mount: name `{0}` may not contain the `::` path separator")]
     InvalidName(String),
-    #[error(
-        "Graph::mount: child graph has a different Core (cross-Core mount is post-M6); \
-         clone-and-rebuild against this graph's Core, or use `mount_new` + builder"
-    )]
-    CoreMismatch,
     #[error("Graph::mount: child graph already has a parent; unmount it first")]
     AlreadyMounted,
     #[error("Graph::unmount: no subgraph named `{0}`")]
@@ -36,7 +33,7 @@ pub enum MountError {
     Destroyed,
 }
 
-/// Result of [`crate::GraphOps::unmount`] / [`crate::GraphOps::remove`].
+/// Result of [`Graph::unmount`] / [`Graph::remove`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphRemoveAudit {
     /// Number of nodes torn down (own + recursive into mounts).
@@ -69,20 +66,16 @@ fn new_child_inner(name: String, parent: Weak<Mutex<GraphInner>>) -> Arc<Mutex<G
     }))
 }
 
-pub(crate) fn mount<'a>(
-    core: &'a Core,
+pub(crate) fn mount(
+    core: &Core,
     parent_inner: &Arc<Mutex<GraphInner>>,
     name: String,
-    child: SubgraphRef<'_>,
-) -> Result<SubgraphRef<'a>, MountError> {
+    child: &Graph,
+) -> Result<Graph, MountError> {
     if name.contains("::") {
         return Err(MountError::InvalidName(name));
     }
-    // Same-Core check — child must share the parent's Core. Cross-Core
-    // mount is post-M6 per session-doc Open Question 1.
-    if !core.same_dispatcher(child.core) {
-        return Err(MountError::CoreMismatch);
-    }
+    let child_inner = child.inner_arc().clone();
     // Validate + claim the namespace slot under the parent lock so
     // concurrent mount(name, ...) calls cannot both pass validation
     // (TOCTOU fix from /qa Slice E+). Lock order: parent → child.
@@ -98,28 +91,26 @@ pub(crate) fn mount<'a>(
             return Err(MountError::NodeNameCollision(name));
         }
         {
-            let mut c = child.inner.lock();
+            let mut c = child_inner.lock();
             if c.parent.is_some() {
                 return Err(MountError::AlreadyMounted);
             }
             c.parent = Some(Arc::downgrade(parent_inner));
         }
-        p.children.insert(name, child.inner.clone());
+        p.children.insert(name, child_inner.clone());
     }
     // Fire AFTER lock drops (P3 — reactive describe / observe_all must
-    // see mounts as namespace changes).
+    // see mounts as namespace changes). Owner-side `&Core` (D246 r2:
+    // firing ns sinks hands them `&Core`, so it IS a Core-touching op).
     fire_ns(core, parent_inner);
-    Ok(SubgraphRef {
-        core,
-        inner: child.inner,
-    })
+    Ok(Graph::from_inner(child_inner))
 }
 
-pub(crate) fn mount_new<'a>(
-    core: &'a Core,
+pub(crate) fn mount_new(
+    core: &Core,
     parent_inner: &Arc<Mutex<GraphInner>>,
     name: String,
-) -> Result<SubgraphRef<'a>, MountError> {
+) -> Result<Graph, MountError> {
     if name.contains("::") {
         return Err(MountError::InvalidName(name));
     }
@@ -141,12 +132,9 @@ pub(crate) fn mount_new<'a>(
         p.children.insert(name, child_inner.clone());
         child_inner
     };
-    // Fire AFTER lock drops (P3).
+    // Fire AFTER lock drops (P3). Owner-side `&Core` (D246 r2).
     fire_ns(core, parent_inner);
-    Ok(SubgraphRef {
-        core,
-        inner: child_inner,
-    })
+    Ok(Graph::from_inner(child_inner))
 }
 
 pub(crate) fn unmount(
@@ -172,20 +160,12 @@ pub(crate) fn unmount(
     Ok(audit)
 }
 
-pub(crate) fn ancestors<'a>(
-    core: &'a Core,
-    inner: &Arc<Mutex<GraphInner>>,
-    include_self: bool,
-) -> Vec<SubgraphRef<'a>> {
-    let mut chain: Vec<SubgraphRef<'a>> = Vec::new();
+pub(crate) fn ancestors(inner: &Arc<Mutex<GraphInner>>, include_self: bool) -> Vec<Graph> {
+    let mut chain: Vec<Graph> = Vec::new();
     if include_self {
-        chain.push(SubgraphRef {
-            core,
-            inner: inner.clone(),
-        });
+        chain.push(Graph::from_inner(inner.clone()));
     }
-    // Walk up via Weak parent pointers. Mount is shared-Core only, so
-    // every ancestor is reached via the same root `&Core`.
+    // Walk up via Weak parent pointers.
     //
     // Slice V3: visited-set cycle insurance per porting-deferred.md.
     let mut visited = std::collections::HashSet::new();
@@ -205,7 +185,7 @@ pub(crate) fn ancestors<'a>(
             .parent
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
-        chain.push(SubgraphRef { core, inner: cur });
+        chain.push(Graph::from_inner(cur));
         cursor = next_parent;
     }
     chain

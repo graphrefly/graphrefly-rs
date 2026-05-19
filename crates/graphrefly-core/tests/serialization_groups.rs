@@ -52,9 +52,7 @@ const _: fn() = || {
     }
     impl<T: ?Sized> AmbiguousIfSync<()> for T {}
     impl<T: ?Sized + Sync> AmbiguousIfSync<u16> for T {}
-    let _ = <graphrefly_core::Core<graphrefly_core::SingleThreadCell> as AmbiguousIfSync<
-        _,
-    >>::probe;
+    let _ = <graphrefly_core::Core<graphrefly_core::SingleThreadCell> as AmbiguousIfSync<_>>::probe;
 };
 
 const G1: SerializationGroupId = SerializationGroupId::new(1);
@@ -70,10 +68,10 @@ fn default_none_graph_has_no_groups() {
     let s = rt.state(Some(TestValue::Int(0)));
     let d = rt.derived(&[s.id], |_| Some(TestValue::Int(1)));
     // No node carries a group → the §7 single-threaded lock-free floor.
-    assert_eq!(rt.core.partition_of(s.id), None);
-    assert_eq!(rt.core.partition_of(d), None);
+    assert_eq!(rt.core().partition_of(s.id), None);
+    assert_eq!(rt.core().partition_of(d), None);
     assert_eq!(
-        rt.core.partition_count(),
+        rt.core().partition_count(),
         0,
         "all-None graph touches no group lock — the floor"
     );
@@ -83,7 +81,7 @@ fn default_none_graph_has_no_groups() {
 fn partition_of_unregistered_is_none() {
     let rt = TestRuntime::new();
     assert_eq!(
-        rt.core.partition_of(graphrefly_core::NodeId::new(9999)),
+        rt.core().partition_of(graphrefly_core::NodeId::new(9999)),
         None
     );
 }
@@ -97,7 +95,7 @@ fn register_with_group_then_partition_of_reports_it() {
     let rt = TestRuntime::new();
     let init = rt.binding.intern(TestValue::Int(0));
     let s = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -108,7 +106,7 @@ fn register_with_group_then_partition_of_reports_it() {
             },
         })
         .expect("register grouped state");
-    assert_eq!(rt.core.partition_of(s), Some(G1));
+    assert_eq!(rt.core().partition_of(s), Some(G1));
 }
 
 #[test]
@@ -116,22 +114,22 @@ fn set_serialization_group_on_isolated_node_ok() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     // Single-node component — setting a group keeps it uniformly all-Some.
-    rt.core
+    rt.core()
         .set_serialization_group(s.id, Some(G1))
         .expect("isolated node group assignment");
-    assert_eq!(rt.core.partition_of(s.id), Some(G1));
+    assert_eq!(rt.core().partition_of(s.id), Some(G1));
     // Clearing back to None is also consistent (single-node, all-None).
-    rt.core
+    rt.core()
         .set_serialization_group(s.id, None)
         .expect("clear group");
-    assert_eq!(rt.core.partition_of(s.id), None);
+    assert_eq!(rt.core().partition_of(s.id), None);
 }
 
 #[test]
 fn set_serialization_group_unknown_node() {
     let rt = TestRuntime::new();
     let err = rt
-        .core
+        .core()
         .set_serialization_group(graphrefly_core::NodeId::new(42), Some(G1))
         .unwrap_err();
     assert!(matches!(err, SetGroupError::UnknownNode(_)));
@@ -154,7 +152,7 @@ fn register_all_some_chain_ok_even_with_distinct_groups() {
     let rt = TestRuntime::new();
     let init = rt.binding.intern(TestValue::Int(0));
     let s = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -171,7 +169,7 @@ fn register_all_some_chain_ok_even_with_distinct_groups() {
     // Distinct group on a dep-connected node is allowed — the invariant
     // is "all-None OR all-Some", not "all-same-group".
     let d = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
@@ -181,8 +179,8 @@ fn register_all_some_chain_ok_even_with_distinct_groups() {
             },
         })
         .expect("all-Some component with distinct groups is consistent");
-    assert_eq!(rt.core.partition_of(s), Some(G1));
-    assert_eq!(rt.core.partition_of(d), Some(G2));
+    assert_eq!(rt.core().partition_of(s), Some(G1));
+    assert_eq!(rt.core().partition_of(d), Some(G2));
 }
 
 #[test]
@@ -191,7 +189,7 @@ fn register_mixed_component_rejected() {
     let init = rt.binding.intern(TestValue::Int(0));
     // Grouped state ...
     let s = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -207,7 +205,7 @@ fn register_mixed_component_rejected() {
         .register_fn(|_: &[TestValue]| Some(TestValue::Int(0)));
     // ... ungrouped derived depending on it → mixed component → reject.
     let err = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
@@ -233,7 +231,7 @@ fn set_deps_into_mixed_component_rejected() {
     // Grouped s2 (isolated, all-Some single-node — fine).
     let init2 = rt.binding.intern(TestValue::Int(2));
     let s2 = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -246,12 +244,16 @@ fn set_deps_into_mixed_component_rejected() {
         .unwrap();
     // Rewiring d to also depend on grouped s2 mixes None (d, s1) with
     // Some (s2) in one component → reject; topology unchanged.
-    let err = rt.core.set_deps(d, &[s1.id, s2]).unwrap_err();
+    let err = rt.core().set_deps(d, &[s1.id, s2]).unwrap_err();
     assert!(
         matches!(err, SetDepsError::GroupInconsistent { n } if n == d),
         "set_deps creating a mixed component must be rejected; got {err:?}"
     );
-    assert_eq!(rt.core.deps_of(d), vec![s1.id], "rejected — deps unchanged");
+    assert_eq!(
+        rt.core().deps_of(d),
+        vec![s1.id],
+        "rejected — deps unchanged"
+    );
 }
 
 #[test]
@@ -261,10 +263,10 @@ fn set_deps_consistent_rewire_ok() {
     let s2 = rt.state(Some(TestValue::Int(2)));
     let d = rt.dynamic(&[s1.id], |_| (Some(TestValue::Int(0)), None));
     // All-None rewire — consistent.
-    rt.core
+    rt.core()
         .set_deps(d, &[s1.id, s2.id])
         .expect("all-None rewire");
-    assert_eq!(rt.core.deps_of(d), vec![s1.id, s2.id]);
+    assert_eq!(rt.core().deps_of(d), vec![s1.id, s2.id]);
 }
 
 // ---------------------------------------------------------------------
@@ -281,21 +283,21 @@ fn set_serialization_group_is_component_wide_retroactive_regroup() {
     let d = rt.derived(&[s.id], |_| Some(TestValue::Int(1)));
     // {s, d} is a 2-node all-None component. Grouping `s` now groups the
     // ENTIRE component (s AND d) → uniformly G1, invariant holds.
-    rt.core
+    rt.core()
         .set_serialization_group(s.id, Some(G1))
         .expect("component-wide assign succeeds (consistent by construction)");
-    assert_eq!(rt.core.partition_of(s.id), Some(G1));
+    assert_eq!(rt.core().partition_of(s.id), Some(G1));
     assert_eq!(
-        rt.core.partition_of(d),
+        rt.core().partition_of(d),
         Some(G1),
         "the connected derived node was regrouped too (component-wide)"
     );
     // Retroactive clear back to the all-None floor, also component-wide.
-    rt.core
+    rt.core()
         .set_serialization_group(d, None)
         .expect("component-wide clear succeeds");
-    assert_eq!(rt.core.partition_of(s.id), None);
-    assert_eq!(rt.core.partition_of(d), None);
+    assert_eq!(rt.core().partition_of(s.id), None);
+    assert_eq!(rt.core().partition_of(d), None);
 }
 
 // ---------------------------------------------------------------------
@@ -307,7 +309,7 @@ fn set_serialization_group_is_component_wide_retroactive_regroup() {
 
 fn grouped_state(rt: &TestRuntime, g: Option<SerializationGroupId>) -> graphrefly_core::NodeId {
     let init = rt.binding.intern(TestValue::Int(0));
-    rt.core
+    rt.core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -328,7 +330,7 @@ fn add_meta_companion_mixed_component_panics() {
                                               // Meta edge would join a Some component with a None one → §7 strict
                                               // invariant violation → panic (this API's assert-based contract).
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.core.add_meta_companion(parent, companion);
+        rt.core().add_meta_companion(parent, companion);
     }));
     assert!(
         res.is_err(),
@@ -336,7 +338,7 @@ fn add_meta_companion_mixed_component_panics() {
     );
     // Rolled back: the meta edge must NOT have been retained.
     assert!(
-        rt.core.meta_companions_of(parent).is_empty(),
+        rt.core().meta_companions_of(parent).is_empty(),
         "meta edge rolled back on the panic path"
     );
 }
@@ -347,16 +349,16 @@ fn add_meta_companion_consistent_and_walk_includes_meta() {
     let parent = grouped_state(&rt, Some(G1));
     let companion = grouped_state(&rt, Some(G1));
     // Both Some(G1): consistent → ok.
-    rt.core.add_meta_companion(parent, companion);
+    rt.core().add_meta_companion(parent, companion);
     // Proof the unified walk includes meta: a component-wide clear seeded
     // at `parent` must reach `companion` ONLY via the meta edge (there is
     // no dep/child edge between them).
-    rt.core
+    rt.core()
         .set_serialization_group(parent, None)
         .expect("component-wide clear");
-    assert_eq!(rt.core.partition_of(parent), None);
+    assert_eq!(rt.core().partition_of(parent), None);
     assert_eq!(
-        rt.core.partition_of(companion),
+        rt.core().partition_of(companion),
         None,
         "meta companion regrouped via the unified deps+children+meta walk"
     );
@@ -376,7 +378,7 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
     let rt = TestRuntime::new();
     let init = rt.binding.intern(TestValue::Int(1));
     let s = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![],
             fn_or_op: None,
@@ -394,7 +396,7 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
             _ => None,
         });
     let d = rt
-        .core
+        .core()
         .register(NodeRegistration {
             deps: vec![s],
             fn_or_op: Some(graphrefly_core::NodeFnOrOp::Fn(f)),
@@ -405,12 +407,12 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
         })
         .unwrap();
     let _sub = rt
-        .core
+        .core()
         .subscribe(d, Arc::new(|_msgs: &[graphrefly_core::Message]| {}));
     let v = rt.binding.intern(TestValue::Int(41));
-    rt.core.emit(s, v);
+    rt.core().emit(s, v);
     assert_eq!(
-        rt.core.partition_count(),
+        rt.core().partition_count(),
         1,
         "the wave touched serialization group G1 → one group lock resolved"
     );

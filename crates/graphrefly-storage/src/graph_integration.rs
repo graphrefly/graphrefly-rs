@@ -25,10 +25,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use graphrefly_core::{CoreFull, Message};
-use graphrefly_graph::{
-    Graph, GraphObserveAllReactive, GraphOps, GraphPersistSnapshot, NodeSlice, SnapshotOps,
-};
+use graphrefly_core::{Core, CoreFull, Message};
+use graphrefly_graph::{Graph, GraphObserveAllReactive, GraphPersistSnapshot, NodeSlice};
 use graphrefly_structures::{BaseChange, Lifecycle, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -356,22 +354,34 @@ pub struct AttachOptions {
     pub on_error: Option<ErrorCallback>,
 }
 
-/// Handle returned by [`attach_snapshot_storage`]. Dropping this handle
-/// unsubscribes the observe sink (RAII disposal).
-/// S2b/β (D242): borrows the owner's `&'g Graph` (via the held
-/// `GraphObserveAllReactive<'g>`); the `'g` borrow keeps the graph
-/// alive for the handle's lifetime — the old `_graph: Graph`
-/// keep-alive clone is gone (`Graph` is move-only under the actor
-/// model).
-pub struct StorageHandle<'g> {
+/// Handle returned by [`attach_snapshot_storage`].
+///
+/// D246 r3: there is **no RAII `Drop`**. The observe subscription is
+/// torn down owner-side, synchronously, by calling
+/// [`StorageHandle::detach`] with the owner's `&Core` (the
+/// [`graphrefly_core::OwnedCore`] borrow). [`StorageHandle::dispose`]
+/// remains a Core-free flag flip that stops late-fire persistence
+/// without unsubscribing (e.g. when the `&Core` is not in hand);
+/// `detach` is the full teardown.
+///
+/// `Graph` is now `Send + Sync + 'static` and Core-free; the held
+/// [`GraphObserveAllReactive`] owns a cheap `Arc`-clone of the graph
+/// (no `'g` borrow), so `StorageHandle` is `'static`.
+pub struct StorageHandle {
     /// Shared state; inner `disposed` flag prevents late-fire callbacks.
     state: Arc<Mutex<Vec<TierState>>>,
-    /// The observe handle — dropping it unsubscribes all sinks.
-    _observe: GraphObserveAllReactive<'g>,
+    /// The observe handle. `detach(core)` unsubscribes all sinks
+    /// (owner-invoked, synchronous — D246 r3). Wrapped in a `Mutex`
+    /// because `GraphObserveAllReactive::detach` is `&mut self` while
+    /// `StorageHandle` exposes `&self` teardown for ergonomics.
+    observe: Mutex<Option<GraphObserveAllReactive>>,
 }
 
-impl StorageHandle<'_> {
-    /// Explicitly dispose (equivalent to `Drop`, but callable).
+impl StorageHandle {
+    /// Explicitly dispose: flip the per-tier `disposed` flag so the
+    /// in-wave observe sink stops scheduling persistence. Core-free
+    /// (no unsubscribe) — use [`StorageHandle::detach`] for the full
+    /// owner-side teardown when the `&Core` is available.
     ///
     /// F3 (QA 2026-05-14): on `PoisonError` (a panic in the observe
     /// sink poisoned the state mutex), recover via `into_inner()`
@@ -384,6 +394,24 @@ impl StorageHandle<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for s in states.iter_mut() {
             s.disposed = true;
+        }
+    }
+
+    /// Owner-invoked, synchronous teardown (D246 r3 — replaces the
+    /// retired RAII `Drop`). Flips the `disposed` flags then detaches
+    /// the observe handle (unsubscribes every per-node sink, the
+    /// namespace-change sink, and the topology sub) via the owner's
+    /// `&Core`. Idempotent: a second call is a no-op (the observe
+    /// handle is taken on first call).
+    pub fn detach(&self, core: &Core) {
+        self.dispose();
+        let observe = self
+            .observe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut observe) = observe {
+            observe.detach(core);
         }
     }
 
@@ -496,11 +524,11 @@ impl StorageHandle<'_> {
     }
 }
 
-impl Drop for StorageHandle<'_> {
-    fn drop(&mut self) {
-        self.dispose();
-    }
-}
+// D246 r3: no `impl Drop` — teardown is owner-invoked
+// ([`StorageHandle::detach`]); a parameterless `Drop` cannot reach
+// `&Core`. Dropping a `StorageHandle` without calling `detach` leaves
+// the observe subscription live until the graph is destroyed
+// (`graph.destroy(core)`) or the owning `OwnedCore` drops.
 
 /// Wire an observe subscription on `graph` that persists node changes
 /// to the provided snapshot+WAL tier pairs.
@@ -526,13 +554,20 @@ impl Drop for StorageHandle<'_> {
 /// The snapshot tier's backend key is derived from `graph.name` via
 /// the checkpoint record's `name` field. Cross-impl `key_of` divergence
 /// disappears at this boundary.
+/// D246: the embedder owns the [`Core`] (see
+/// [`graphrefly_core::OwnedCore`]) and passes `&Core` in — the
+/// `observe_all_reactive` subscription is opened owner-side. Teardown
+/// is owner-invoked via [`StorageHandle::detach`] (no RAII `Drop`,
+/// D246 r3).
 #[must_use = "the returned StorageHandle owns the observe subscription; \
-              dropping it immediately unsubscribes and stops persistence"]
-pub fn attach_snapshot_storage<'g>(
-    graph: &'g Graph,
+              call StorageHandle::detach(core) to unsubscribe and stop \
+              persistence (D246 r3 — no RAII Drop)"]
+pub fn attach_snapshot_storage(
+    core: &Core,
+    graph: &Graph,
     pairs: Vec<AttachTierPair>,
     options: AttachOptions,
-) -> StorageHandle<'g> {
+) -> StorageHandle {
     let graph_name = graph.name();
     let wal_prefix = graph_wal_prefix(&graph_name);
 
@@ -576,21 +611,22 @@ pub fn attach_snapshot_storage<'g>(
     // β/D244: wrap in `Arc` so each per-fire `MailboxOp::Defer` can
     // clone the callback (`ErrorCallback` is a non-`Clone` `Box`).
     let on_error = options.on_error.map(Arc::new);
-    // β/D242/D244: the observe sink fires *in-wave* (during Core
-    // dispatch) and has no `&Core`; capture the `Send` `NamespaceHandle`
-    // (graph identity) + `Arc<CoreMailbox>` (owner-side reentry). The
-    // snapshot + tier-flush is posted as a `MailboxOp::Defer` and runs
-    // on the owner with a real `&dyn CoreFull` (`serialize_handle` via
-    // D244). Behaviour: snapshot+persist is now in-wave-deferred to
-    // quiescence rather than synchronous in the sink — consistent with
-    // D243/D244 "deferred snapshot acceptable" (storage persistence is
-    // a downstream observation).
-    let ns = graph.namespace();
-    let mailbox = graph.core().mailbox();
+    // β/D242/D244/D246: the observe sink fires *in-wave* (during Core
+    // dispatch) and has no `&Core`. `Graph` is now Core-free and
+    // `Send + Sync + 'static` (D246), so a cheap `Arc`-clone is
+    // captured directly into the deferred closure (the old
+    // `NamespaceHandle` split is gone). The snapshot + tier-flush is
+    // posted as a `MailboxOp::Defer` and runs on the owner with a real
+    // `&dyn CoreFull`. Behaviour: snapshot+persist is in-wave-deferred
+    // to quiescence rather than synchronous in the sink — consistent
+    // with D243/D244 "deferred snapshot acceptable" (storage
+    // persistence is a downstream observation).
+    let graph_for_sink = graph.clone();
+    let mailbox = core.mailbox();
 
     // Wire observe_all_reactive so late-added nodes are also covered.
     let mut observe = graph.observe_all_reactive();
-    observe.subscribe(move |path: &str, messages: &[Message]| {
+    observe.subscribe(core, move |path: &str, messages: &[Message]| {
         // Filter: only tiers 3–5 (DATA/RESOLVED, INVALIDATE, COMPLETE/ERROR).
         let dominated_by_tier = messages.iter().any(|m| {
             let t = m.tier();
@@ -607,7 +643,7 @@ pub fn attach_snapshot_storage<'g>(
             }
         }
 
-        let ns = ns.clone();
+        let graph_for_defer = graph_for_sink.clone();
         let states_for_defer = states_for_sink.clone();
         let on_error = on_error.clone();
         // Defer the snapshot + flush owner-side (D244). Core-gone
@@ -615,7 +651,10 @@ pub fn attach_snapshot_storage<'g>(
         // torn-down graph, no handles captured (no leak).
         let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
             // Take a snapshot once, shared across all sync tiers.
-            let snapshot = ns.snapshot(cf);
+            // D246: the in-wave facade `&dyn CoreFull` drives the
+            // snapshot through the one public `Graph` type (Core-free,
+            // Send+Sync — captured directly).
+            let snapshot = graph_for_defer.snapshot_full(cf);
 
             // N3 (QA 2026-05-14) — collect errors INSIDE the lock,
             // invoke `on_error` AFTER releasing the lock (re-entrant
@@ -648,7 +687,7 @@ pub fn attach_snapshot_storage<'g>(
 
     StorageHandle {
         state: shared_states,
-        _observe: observe,
+        observe: Mutex::new(Some(observe)),
     }
 }
 
@@ -774,12 +813,17 @@ pub struct RestoreOptions<'a> {
 /// Groups verified frames by lifecycle. Replays in cross-scope order
 /// (`Spec → Data → Ownership`). Each lifecycle runs in a `graph.batch()`
 /// for atomic partial-restore semantics (Q2).
+///
+/// D246: the embedder owns the [`Core`] (see
+/// [`graphrefly_core::OwnedCore`]) and threads `&Core` into every
+/// Core-touching graph mutation (baseline restore + WAL replay).
 pub fn restore_snapshot(
+    core: &Core,
     graph: &Graph,
     opts: &RestoreOptions<'_>,
 ) -> Result<RestoreResult, RestoreError> {
     // Phase 1: Load and apply baseline.
-    let baseline = load_baseline(graph, opts)?;
+    let baseline = load_baseline(core, graph, opts)?;
     let baseline_seq = baseline.seq;
 
     // Phase 1b: Collect WAL frames post-baseline.
@@ -789,11 +833,18 @@ pub fn restore_snapshot(
     let (verified, skipped) = verify_frames(collected, opts.on_torn_write.as_ref())?;
 
     // Phase 3: Lifecycle-scoped batch replay.
-    Ok(replay_by_lifecycle(graph, &verified, baseline_seq, skipped))
+    Ok(replay_by_lifecycle(
+        core,
+        graph,
+        &verified,
+        baseline_seq,
+        skipped,
+    ))
 }
 
 /// Phase 1: Load baseline from snapshot tier + apply to graph.
 fn load_baseline(
+    core: &Core,
     graph: &Graph,
     opts: &RestoreOptions<'_>,
 ) -> Result<GraphCheckpointRecord, RestoreError> {
@@ -812,7 +863,7 @@ fn load_baseline(
     }
 
     graph
-        .restore(&baseline.snapshot)
+        .restore(core, &baseline.snapshot)
         .map_err(|e| RestoreError::PhaseFailed {
             lifecycle: Lifecycle::Spec,
             frame_seq: 0,
@@ -912,6 +963,7 @@ fn verify_frames(
 
 /// Phase 3: Group by lifecycle, replay in cross-scope order.
 fn replay_by_lifecycle(
+    core: &Core,
     graph: &Graph,
     verified: &[WALFrame<Value>],
     baseline_seq: u64,
@@ -939,11 +991,9 @@ fn replay_by_lifecycle(
         let frame_count = life_frames.len() as u64;
         let max_seq = life_frames.iter().map(|f| f.frame_seq).max().unwrap_or(0);
 
-        let frames_for_batch = life_frames.clone();
-        let graph_for_batch = graph.clone();
-        graph.batch(move || {
-            for frame in &frames_for_batch {
-                apply_wal_frame(&graph_for_batch, frame);
+        graph.batch(core, || {
+            for frame in life_frames {
+                apply_wal_frame(core, graph, frame);
             }
         });
 
@@ -964,7 +1014,11 @@ fn replay_by_lifecycle(
 }
 
 /// Apply a single WAL frame to a graph. Mirrors TS `applyWalFrame`.
-fn apply_wal_frame(graph: &Graph, frame: &WALFrame<Value>) {
+///
+/// D246: every Core-touching `graph.*` call takes the owner's `&Core`;
+/// binding access is `core.binding_ptr()` (the retired `Graph::core()`
+/// is gone — `Graph` is Core-free).
+fn apply_wal_frame(core: &Core, graph: &Graph, frame: &WALFrame<Value>) {
     let change = &frame.change.change;
     let kind = change.get("kind").and_then(Value::as_str).unwrap_or("");
 
@@ -986,14 +1040,14 @@ fn apply_wal_frame(graph: &Graph, frame: &WALFrame<Value>) {
                 }
                 let initial_value = slice.and_then(|s| s.get("value")).cloned();
                 let handle = initial_value.map_or(graphrefly_core::NO_HANDLE, |v| {
-                    graph.core().binding_ptr().deserialize_value(v)
+                    core.binding_ptr().deserialize_value(v)
                 });
-                let _ = graph.state(node_id_str, Some(handle));
+                let _ = graph.state(core, node_id_str, Some(handle));
             }
             "graph.remove" => {
                 let node_id_str = change.get("nodeId").and_then(Value::as_str).unwrap_or("");
                 if !node_id_str.is_empty() && graph.try_resolve(node_id_str).is_some() {
-                    let _ = graph.remove(node_id_str);
+                    let _ = graph.remove(core, node_id_str);
                 }
             }
             // graph.mount, graph.unmount — deferred (Phase 14.6+)
@@ -1004,8 +1058,8 @@ fn apply_wal_frame(graph: &Graph, frame: &WALFrame<Value>) {
                 let path = change.get("path").and_then(Value::as_str).unwrap_or("");
                 if let Some(value) = change.get("value") {
                     if !path.is_empty() && graph.try_resolve(path).is_some() {
-                        let handle = graph.core().binding_ptr().deserialize_value(value.clone());
-                        graph.set(path, handle);
+                        let handle = core.binding_ptr().deserialize_value(value.clone());
+                        graph.set(core, path, handle);
                     }
                 }
             }
@@ -1013,7 +1067,7 @@ fn apply_wal_frame(graph: &Graph, frame: &WALFrame<Value>) {
                 let path = change.get("path").and_then(Value::as_str).unwrap_or("");
                 if !path.is_empty() {
                     if let Some(id) = graph.try_resolve(path) {
-                        graph.invalidate(id);
+                        graph.invalidate(core, id);
                     }
                 }
             }

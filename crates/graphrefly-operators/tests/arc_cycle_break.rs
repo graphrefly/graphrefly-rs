@@ -56,9 +56,11 @@ where
             "binding should be alive while runtime is held"
         );
         register(&rt);
-        // rt drops here — OpRuntime::Drop breaks the binding↔Core
-        // `core_ref` back-reference; the weak-Arc fix in producer
-        // factories breaks the producer-build closure cycle.
+        // rt drops here — D246: `OpRuntime` composes `OwnedCore`, which
+        // owns the one move-only `Core` by value; dropping the runtime
+        // drops `Core`, which drops the binding `Arc` (no `core_ref`
+        // self-reference cycle exists anymore). The weak-Arc fix in
+        // producer factories breaks the producer-build closure cycle.
         weak
     };
     assert!(
@@ -73,7 +75,7 @@ fn zip_no_leak_after_runtime_drop() {
         let s1 = rt.state_int(None);
         let s2 = rt.state_int(None);
         let pack_fn = rt.register_tuple_packer();
-        let _ = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+        let _ = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     });
 }
 
@@ -82,7 +84,7 @@ fn concat_no_leak_after_runtime_drop() {
     assert_binding_drops_after(|rt| {
         let s1 = rt.state_int(None);
         let s2 = rt.state_int(None);
-        let _ = concat(&rt.core, &rt.producer_binding, s1, s2);
+        let _ = concat(rt.core(), &rt.producer_binding, s1, s2);
     });
 }
 
@@ -91,7 +93,7 @@ fn race_no_leak_after_runtime_drop() {
     assert_binding_drops_after(|rt| {
         let s1 = rt.state_int(None);
         let s2 = rt.state_int(None);
-        let _ = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
+        let _ = race(rt.core(), &rt.producer_binding, vec![s1, s2]).unwrap();
     });
 }
 
@@ -100,7 +102,7 @@ fn take_until_no_leak_after_runtime_drop() {
     assert_binding_drops_after(|rt| {
         let s = rt.state_int(None);
         let n = rt.state_int(None);
-        let _ = take_until(&rt.core, &rt.producer_binding, s, n);
+        let _ = take_until(rt.core(), &rt.producer_binding, s, n);
     });
 }
 
@@ -113,7 +115,7 @@ fn switch_map_no_leak_after_runtime_drop() {
             // the operator and drop). Returns a dummy NodeId.
             graphrefly_core::NodeId::new(0)
         });
-        let _ = switch_map(&rt.core, &rt.ho_binding, s, project);
+        let _ = switch_map(rt.core(), &rt.ho_binding, s, project);
     });
 }
 
@@ -123,7 +125,7 @@ fn exhaust_map_no_leak_after_runtime_drop() {
         let s = rt.state_int(None);
         let project: graphrefly_operators::higher_order::ProjectFn =
             Box::new(|_h| graphrefly_core::NodeId::new(0));
-        let _ = exhaust_map(&rt.core, &rt.ho_binding, s, project);
+        let _ = exhaust_map(rt.core(), &rt.ho_binding, s, project);
     });
 }
 
@@ -133,7 +135,7 @@ fn merge_map_no_leak_after_runtime_drop() {
         let s = rt.state_int(None);
         let project: graphrefly_operators::higher_order::ProjectFn =
             Box::new(|_h| graphrefly_core::NodeId::new(0));
-        let _ = merge_map_with_concurrency(&rt.core, &rt.ho_binding, s, project, None);
+        let _ = merge_map_with_concurrency(rt.core(), &rt.ho_binding, s, project, None);
     });
 }
 
@@ -147,24 +149,24 @@ fn many_producers_no_leak_after_runtime_drop() {
         let a = rt.state_int(None);
         let b = rt.state_int(None);
         let pack_fn = rt.register_tuple_packer();
-        let _ = zip(&rt.core, &rt.producer_binding, vec![a, b], pack_fn).unwrap();
-        let _ = concat(&rt.core, &rt.producer_binding, a, b);
-        let _ = race(&rt.core, &rt.producer_binding, vec![a, b]).unwrap();
-        let _ = take_until(&rt.core, &rt.producer_binding, a, b);
+        let _ = zip(rt.core(), &rt.producer_binding, vec![a, b], pack_fn).unwrap();
+        let _ = concat(rt.core(), &rt.producer_binding, a, b);
+        let _ = race(rt.core(), &rt.producer_binding, vec![a, b]).unwrap();
+        let _ = take_until(rt.core(), &rt.producer_binding, a, b);
         let _ = switch_map(
-            &rt.core,
+            rt.core(),
             &rt.ho_binding,
             a,
             Box::new(|_| graphrefly_core::NodeId::new(0)),
         );
         let _ = exhaust_map(
-            &rt.core,
+            rt.core(),
             &rt.ho_binding,
             a,
             Box::new(|_| graphrefly_core::NodeId::new(0)),
         );
         let _ = merge_map_with_concurrency(
-            &rt.core,
+            rt.core(),
             &rt.ho_binding,
             a,
             Box::new(|_| graphrefly_core::NodeId::new(0)),

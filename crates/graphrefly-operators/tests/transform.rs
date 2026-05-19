@@ -21,7 +21,7 @@ fn map_per_value_projection_in_single_emit_wave() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let mapped = map(&rt.core, &rt.op_binding, source, move |h| {
+    let mapped = map(rt.core(), &rt.op_binding, source, move |h| {
         let v = binding.deref(h).int();
         let new = TestValue::Int(v * 10);
         binding.intern(new)
@@ -56,7 +56,7 @@ fn map_batch_emits_one_dirty_per_wave_per_r1_3_1_a() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let mapped = map(&rt.core, &rt.op_binding, source, move |h| {
+    let mapped = map(rt.core(), &rt.op_binding, source, move |h| {
         let v = binding.deref(h).int();
         binding.intern(TestValue::Int(v + 100))
     })
@@ -67,12 +67,11 @@ fn map_batch_emits_one_dirty_per_wave_per_r1_3_1_a() {
     let h1 = rt.intern_int(1);
     let h2 = rt.intern_int(2);
     let h3 = rt.intern_int(3);
-    let core = rt.core.clone();
     let s = source;
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h2);
-        core.emit(s, h3);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h3);
     });
 
     let events = rec.events();
@@ -102,23 +101,22 @@ fn filter_passes_only_matching_items() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let filtered = filter(&rt.core, &rt.op_binding, source, move |h| {
+    let filtered = filter(rt.core(), &rt.op_binding, source, move |h| {
         binding.deref(h).int() % 2 == 0
     })
     .into_node();
 
     let rec = rt.subscribe_recorder(filtered);
-    let core = rt.core.clone();
     let h1 = rt.intern_int(1);
     let h2 = rt.intern_int(2);
     let h3 = rt.intern_int(3);
     let h4 = rt.intern_int(4);
     let s = source;
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h2);
-        core.emit(s, h3);
-        core.emit(s, h4);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h3);
+        rt.core().emit(s, h4);
     });
 
     // Only even values pass.
@@ -130,7 +128,7 @@ fn filter_passes_only_matching_items() {
 fn filter_full_reject_emits_dirty_resolved_per_d018() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let filtered = filter(&rt.core, &rt.op_binding, source, |_h| false).into_node();
+    let filtered = filter(rt.core(), &rt.op_binding, source, |_h| false).into_node();
 
     let rec = rt.subscribe_recorder(filtered);
     rt.emit_int(source, 7);
@@ -157,23 +155,22 @@ fn filter_mixed_wave_no_resolved_when_at_least_one_passes() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let filtered = filter(&rt.core, &rt.op_binding, source, move |h| {
+    let filtered = filter(rt.core(), &rt.op_binding, source, move |h| {
         binding.deref(h).int() > 5
     })
     .into_node();
 
     let rec = rt.subscribe_recorder(filtered);
-    let core = rt.core.clone();
     let s = source;
     let h1 = rt.intern_int(2);
     let h2 = rt.intern_int(7);
     let h3 = rt.intern_int(3);
     let h4 = rt.intern_int(9);
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h2);
-        core.emit(s, h3);
-        core.emit(s, h4);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h3);
+        rt.core().emit(s, h4);
     });
 
     let events = rec.events();
@@ -202,7 +199,7 @@ fn scan_emits_running_accumulator_per_input() {
     let seed = rt.intern_int(0);
     let binding = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -215,15 +212,14 @@ fn scan_emits_running_accumulator_per_input() {
     .into_node();
 
     let rec = rt.subscribe_recorder(scanned);
-    let core = rt.core.clone();
     let s = source;
     let h1 = rt.intern_int(1);
     let h2 = rt.intern_int(2);
     let h3 = rt.intern_int(3);
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h2);
-        core.emit(s, h3);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h3);
     });
 
     // Cumulative sums: 0+1=1, 1+2=3, 3+3=6.
@@ -240,7 +236,7 @@ fn scan_persists_acc_across_waves() {
     let seed = rt.intern_int(10);
     let binding = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -275,7 +271,7 @@ fn reduce_emits_acc_on_upstream_complete() {
     let seed = rt.intern_int(0);
     let binding = rt.binding.clone();
     let reduced = reduce(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -299,7 +295,7 @@ fn reduce_emits_acc_on_upstream_complete() {
         rec.events()
     );
 
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     // Final acc = 0+1+2+3 = 6, then Complete.
     assert_eq!(rec.data_values(), vec![TestValue::Int(6)]);
@@ -316,7 +312,7 @@ fn reduce_no_data_emits_seed_on_complete() {
     let source = rt.state_int(None);
     let seed = rt.intern_int(42);
     let reduced = reduce(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         |_acc, _x| panic!("fold should not run when no DATA arrives"),
@@ -325,7 +321,7 @@ fn reduce_no_data_emits_seed_on_complete() {
     .into_node();
 
     let rec = rt.subscribe_recorder(reduced);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(42)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -338,7 +334,7 @@ fn reduce_propagates_upstream_error() {
     let seed = rt.intern_int(0);
     let binding = rt.binding.clone();
     let reduced = reduce(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -353,7 +349,7 @@ fn reduce_propagates_upstream_error() {
     let rec = rt.subscribe_recorder(reduced);
     rt.emit_int(source, 5);
     let err_h = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
 
     // Error propagates verbatim — no Data(acc) emitted.
     assert!(
@@ -377,25 +373,24 @@ fn distinct_until_changed_suppresses_consecutive_duplicates() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let distinct = distinct_until_changed(&rt.core, &rt.op_binding, source, move |a, b| {
+    let distinct = distinct_until_changed(rt.core(), &rt.op_binding, source, move |a, b| {
         binding.deref(a) == binding.deref(b)
     })
     .into_node();
 
     let rec = rt.subscribe_recorder(distinct);
-    let core = rt.core.clone();
     let s = source;
     let h1 = rt.intern_int(1);
     let h1b = rt.intern_int(1);
     let h2 = rt.intern_int(2);
     let h2b = rt.intern_int(2);
     let h3 = rt.intern_int(3);
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h1b);
-        core.emit(s, h2);
-        core.emit(s, h2b);
-        core.emit(s, h3);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h1b);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h2b);
+        rt.core().emit(s, h3);
     });
 
     // Suppresses adjacent duplicates: emits 1, 2, 3.
@@ -409,7 +404,7 @@ fn distinct_until_changed_suppresses_consecutive_duplicates() {
 fn distinct_emits_on_first_value_always() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let distinct = distinct_until_changed(&rt.core, &rt.op_binding, source, |_, _| {
+    let distinct = distinct_until_changed(rt.core(), &rt.op_binding, source, |_, _| {
         // Even claiming "always equal" — first value still emits since
         // there's no prev to compare.
         true
@@ -430,7 +425,7 @@ fn pairwise_emits_pairs_starting_from_second_value() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
     let binding = rt.binding.clone();
-    let paired = pairwise(&rt.core, &rt.op_binding, source, move |prev, curr| {
+    let paired = pairwise(rt.core(), &rt.op_binding, source, move |prev, curr| {
         let p = binding.deref(prev);
         let c = binding.deref(curr);
         binding.intern(TestValue::Pair(Box::new(p), Box::new(c)))
@@ -438,15 +433,14 @@ fn pairwise_emits_pairs_starting_from_second_value() {
     .into_node();
 
     let rec = rt.subscribe_recorder(paired);
-    let core = rt.core.clone();
     let s = source;
     let h1 = rt.intern_int(1);
     let h2 = rt.intern_int(2);
     let h3 = rt.intern_int(3);
-    core.clone().batch(move || {
-        core.emit(s, h1);
-        core.emit(s, h2);
-        core.emit(s, h3);
+    rt.core().batch(|| {
+        rt.core().emit(s, h1);
+        rt.core().emit(s, h2);
+        rt.core().emit(s, h3);
     });
 
     // First value swallowed; emits (1,2), (2,3).
@@ -466,7 +460,7 @@ fn pairwise_emits_pairs_starting_from_second_value() {
 fn pairwise_first_value_alone_emits_nothing() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
-    let paired = pairwise(&rt.core, &rt.op_binding, source, |_, _| {
+    let paired = pairwise(rt.core(), &rt.op_binding, source, |_, _| {
         unreachable!("pack should not run with only one value")
     })
     .into_node();
@@ -492,7 +486,7 @@ fn map_does_not_leak_handles_after_drop() {
         live_before = rt.binding.live_handles();
         let source = rt.state_int(None);
         let binding = rt.binding.clone();
-        let mapped = map(&rt.core, &rt.op_binding, source, move |h| {
+        let mapped = map(rt.core(), &rt.op_binding, source, move |h| {
             let v = binding.deref(h).int();
             binding.intern(TestValue::Int(v + 1))
         })
@@ -522,7 +516,7 @@ fn scan_seed_retain_balances_on_core_drop() {
         let source = rt.state_int(None);
         let bd = rt.binding.clone();
         let _scanned = scan(
-            &rt.core,
+            rt.core(),
             &rt.op_binding,
             source,
             move |acc, x| {
@@ -584,7 +578,7 @@ fn scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry()
 
     let binding = rt.binding.clone();
     let scanned = scan(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         source,
         move |acc, x| {
@@ -611,13 +605,13 @@ fn scan_resubscribable_reset_with_seed_aliasing_acc_does_not_collapse_registry()
 
     // Mark resubscribable so the second subscribe triggers the
     // lifecycle reset.
-    rt.core.set_resubscribable(scanned, true);
+    rt.core().set_resubscribable(scanned, true);
 
     // Cycle 1: subscribe, complete the source without emitting any
     // DATA. This means scan's fold never runs; `acc` stays equal to
     // `seed_h`. Then drop the subscriber.
     let rec1 = rt.subscribe_recorder(scanned);
-    rt.core.complete(source);
+    rt.core().complete(source);
     assert!(rec1.events().contains(&RecordedEvent::Complete));
     drop(rec1);
 
@@ -659,7 +653,7 @@ fn map_does_not_fire_on_sentinel_source_until_first_emit() {
     let fire_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let binding = rt.binding.clone();
     let counter = fire_count.clone();
-    let mapped = map(&rt.core, &rt.op_binding, source, move |h| {
+    let mapped = map(rt.core(), &rt.op_binding, source, move |h| {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         binding.intern(TestValue::Int(binding.deref(h).int()))
     })

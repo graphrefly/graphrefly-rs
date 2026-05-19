@@ -29,7 +29,7 @@ async fn sample_emits_source_latest_on_notifier_data() {
     let source = rt.state_int(None);
     let notifier = rt.state_int(None);
 
-    let sampled = temporal::sample(&rt.core, &rt.producer_binding, source, notifier);
+    let sampled = temporal::sample(rt.core(), &rt.producer_binding, source, notifier);
     let rec = rt.subscribe_recorder(sampled);
 
     // Emit source values.
@@ -38,6 +38,7 @@ async fn sample_emits_source_latest_on_notifier_data() {
 
     // Notifier fires → should emit 20 (latest source value).
     rt.emit_int(notifier, 1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let data = rec.data_values();
     assert_eq!(data, vec![TestValue::Int(20)]);
@@ -49,11 +50,11 @@ async fn sample_no_emit_if_source_completed() {
     let source = rt.state_int(None);
     let notifier = rt.state_int(None);
 
-    let sampled = temporal::sample(&rt.core, &rt.producer_binding, source, notifier);
+    let sampled = temporal::sample(rt.core(), &rt.producer_binding, source, notifier);
     let rec = rt.subscribe_recorder(sampled);
 
     rt.emit_int(source, 10);
-    rt.core.complete(source);
+    rt.core().complete(source);
 
     // Notifier fires after source complete → no emission.
     rt.emit_int(notifier, 1);
@@ -68,11 +69,12 @@ async fn sample_completes_on_notifier_complete() {
     let source = rt.state_int(None);
     let notifier = rt.state_int(None);
 
-    let sampled = temporal::sample(&rt.core, &rt.producer_binding, source, notifier);
+    let sampled = temporal::sample(rt.core(), &rt.producer_binding, source, notifier);
     let rec = rt.subscribe_recorder(sampled);
 
     rt.emit_int(source, 10);
-    rt.core.complete(notifier);
+    rt.core().complete(notifier);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(
         rec.events().contains(&RecordedEvent::Complete),
@@ -91,7 +93,7 @@ async fn debounce_emits_after_quiet() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let debounced = temporal::debounce(&rt.core, &rt.producer_binding, source, 50);
+    let debounced = temporal::debounce(rt.core(), &rt.producer_binding, source, 50);
     let rec = rt.subscribe_recorder(debounced);
 
     rt.emit_int(source, 10);
@@ -100,11 +102,13 @@ async fn debounce_emits_after_quiet() {
     // Before deadline — nothing emitted.
     tokio::time::advance(Duration::from_millis(30)).await;
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty(), "nothing before deadline");
 
     // Past deadline — should emit.
     tokio::time::advance(Duration::from_millis(25)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(10)]);
 }
@@ -116,7 +120,7 @@ async fn debounce_resets_on_new_data() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let debounced = temporal::debounce(&rt.core, &rt.producer_binding, source, 50);
+    let debounced = temporal::debounce(rt.core(), &rt.producer_binding, source, 50);
     let rec = rt.subscribe_recorder(debounced);
 
     rt.emit_int(source, 10);
@@ -131,11 +135,13 @@ async fn debounce_resets_on_new_data() {
     // 30ms more (60ms total, but only 30ms since last data).
     tokio::time::advance(Duration::from_millis(30)).await;
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty(), "timer reset, not yet fired");
 
     // 25ms more (55ms since second data).
     tokio::time::advance(Duration::from_millis(25)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(20)], "emits latest");
 }
@@ -147,15 +153,16 @@ async fn debounce_flushes_on_complete() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let debounced = temporal::debounce(&rt.core, &rt.producer_binding, source, 50);
+    let debounced = temporal::debounce(rt.core(), &rt.producer_binding, source, 50);
     let rec = rt.subscribe_recorder(debounced);
 
     rt.emit_int(source, 10);
     multi_yield(5).await;
 
     // Complete before timer fires — should flush pending.
-    rt.core.complete(source);
+    rt.core().complete(source);
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(
@@ -179,7 +186,7 @@ async fn delay_emits_after_duration() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let delayed = temporal::delay(&rt.core, &rt.producer_binding, source, 100);
+    let delayed = temporal::delay(rt.core(), &rt.producer_binding, source, 100);
     let rec = rt.subscribe_recorder(delayed);
 
     rt.emit_int(source, 42);
@@ -188,11 +195,13 @@ async fn delay_emits_after_duration() {
     // Not yet.
     tokio::time::advance(Duration::from_millis(50)).await;
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty());
 
     // Now.
     tokio::time::advance(Duration::from_millis(55)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(42)]);
 }
@@ -204,7 +213,7 @@ async fn delay_multiple_in_flight() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let delayed = temporal::delay(&rt.core, &rt.producer_binding, source, 100);
+    let delayed = temporal::delay(rt.core(), &rt.producer_binding, source, 100);
     let rec = rt.subscribe_recorder(delayed);
 
     rt.emit_int(source, 1);
@@ -218,11 +227,13 @@ async fn delay_multiple_in_flight() {
     // At 105ms: first fires.
     tokio::time::advance(Duration::from_millis(75)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
 
     // At 135ms: second fires.
     tokio::time::advance(Duration::from_millis(30)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![TestValue::Int(1), TestValue::Int(2)]
@@ -240,7 +251,7 @@ async fn audit_emits_latest_after_window() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let audited = temporal::audit(&rt.core, &rt.producer_binding, source, 50);
+    let audited = temporal::audit(rt.core(), &rt.producer_binding, source, 50);
     let rec = rt.subscribe_recorder(audited);
 
     // First DATA starts window.
@@ -256,11 +267,13 @@ async fn audit_emits_latest_after_window() {
     // At 30ms since first DATA — still within 50ms window.
     tokio::time::advance(Duration::from_millis(10)).await;
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty(), "window hasn't closed yet");
 
     // At 55ms — window fires. Should emit 20 (latest).
     tokio::time::advance(Duration::from_millis(25)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(20)]);
 }
@@ -277,7 +290,7 @@ async fn throttle_leading_emits_first_then_drops() {
     let source = rt.state_int(None);
 
     let throttled = temporal::throttle(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         100,
@@ -288,11 +301,13 @@ async fn throttle_leading_emits_first_then_drops() {
     // First DATA — emitted immediately (leading edge).
     rt.emit_int(source, 1);
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
 
     // Second DATA within window — dropped (no trailing).
     rt.emit_int(source, 2);
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![TestValue::Int(1)],
@@ -306,6 +321,7 @@ async fn throttle_leading_emits_first_then_drops() {
     // Third DATA — new window, emitted immediately.
     rt.emit_int(source, 3);
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![TestValue::Int(1), TestValue::Int(3)]
@@ -320,7 +336,7 @@ async fn throttle_trailing_emits_at_window_end() {
     let source = rt.state_int(None);
 
     let throttled = temporal::throttle(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         100,
@@ -334,6 +350,7 @@ async fn throttle_trailing_emits_at_window_end() {
     // First DATA — leading.
     rt.emit_int(source, 1);
     multi_yield(5).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(rec.data_values(), vec![TestValue::Int(1)]);
 
     // More data during window — stored for trailing.
@@ -345,6 +362,7 @@ async fn throttle_trailing_emits_at_window_end() {
     // Window expires — trailing emits latest (3).
     tokio::time::advance(Duration::from_millis(105)).await;
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -362,7 +380,7 @@ async fn interval_emits_incrementing_counter() {
 
     let rt = OpRuntime::new();
 
-    let iv = temporal::interval(&rt.core, &rt.producer_binding, 50);
+    let iv = temporal::interval(rt.core(), &rt.producer_binding, 50);
 
     // Use a raw sink because interval emits HandleId::new(counter)
     // which isn't in the test binding's value registry.
@@ -370,7 +388,7 @@ async fn interval_emits_incrementing_counter() {
         Vec::<graphrefly_core::HandleId>::new(),
     ));
     let em = emitted.clone();
-    let _sub = rt.core.subscribe(
+    let _sub = rt.core().subscribe(
         iv,
         std::sync::Arc::new(move |msgs: &[graphrefly_core::Message]| {
             for &m in msgs {
@@ -395,6 +413,7 @@ async fn interval_emits_incrementing_counter() {
     // Third real tick at 150ms.
     tokio::time::advance(Duration::from_millis(55)).await;
     multi_yield(20).await;
+    rt.settle(); // D246: pump deferred timer-task emits owner-side.
 
     let handles = emitted.lock().unwrap().clone();
     assert!(
@@ -419,15 +438,16 @@ async fn debounce_error_releases_pending() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let debounced = temporal::debounce(&rt.core, &rt.producer_binding, source, 50);
+    let debounced = temporal::debounce(rt.core(), &rt.producer_binding, source, 50);
     let rec = rt.subscribe_recorder(debounced);
 
     rt.emit_int(source, 10);
     multi_yield(5).await;
 
     // Error before timer fires — pending should be released, error propagated.
-    rt.core.error(source, rt.intern_int(99));
+    rt.core().error(source, rt.intern_int(99));
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(
@@ -448,7 +468,7 @@ async fn delay_error_releases_all_pending() {
     let rt = OpRuntime::new();
     let source = rt.state_int(None);
 
-    let delayed = temporal::delay(&rt.core, &rt.producer_binding, source, 100);
+    let delayed = temporal::delay(rt.core(), &rt.producer_binding, source, 100);
     let rec = rt.subscribe_recorder(delayed);
 
     rt.emit_int(source, 1);
@@ -457,8 +477,9 @@ async fn delay_error_releases_all_pending() {
     multi_yield(5).await;
 
     // Error cancels all pending delays.
-    rt.core.error(source, rt.intern_int(99));
+    rt.core().error(source, rt.intern_int(99));
     multi_yield(10).await;
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(
@@ -483,16 +504,17 @@ async fn sample_notifier_data_then_complete_in_batch() {
     let source = rt.state_int(None);
     let notifier = rt.state_int(None);
 
-    let sampled = temporal::sample(&rt.core, &rt.producer_binding, source, notifier);
+    let sampled = temporal::sample(rt.core(), &rt.producer_binding, source, notifier);
     let rec = rt.subscribe_recorder(sampled);
 
     rt.emit_int(source, 42);
 
     // Emit then complete on notifier in one batch.
-    rt.core.batch(|| {
+    rt.core().batch(|| {
         rt.emit_int(notifier, 1);
-        rt.core.complete(notifier);
+        rt.core().complete(notifier);
     });
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     assert!(

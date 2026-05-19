@@ -28,7 +28,10 @@ use ahash::{AHashMap, AHashSet};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, Message, NodeId, Sink, NO_HANDLE};
+use graphrefly_core::{
+    BindingBoundary, Core, FnId, HandleId, Message, NodeId, OwnedCore, Sink, SubscriptionId,
+    NO_HANDLE,
+};
 use graphrefly_operators::{
     higher_order::{HigherOrderBinding, ProjectFn},
     producer::{
@@ -111,13 +114,29 @@ pub struct InnerBinding {
     /// the main `state` Mutex so the producer's build closure can
     /// access it without nested-locking against `state`.
     producer_storage: ProducerStorage,
-    /// Self-Core back-reference, set post-construction via
-    /// [`InnerBinding::set_core_ref`]. Required for
-    /// [`ProducerCtx::new`] to construct a Core ref. Creates an Arc
-    /// cycle (Core → binding → core_ref → Core); broken explicitly
-    /// when the test runtime drops via [`OpRuntime::drop`].
-    core_ref: Mutex<Option<Core>>,
 }
+
+// ---------------------------------------------------------------------
+// Producer-dispatch Core access (D246 r5 / D245) — explicit facade.
+//
+// `BindingBoundary::invoke_fn` has no `&Core`, yet the producer-dispatch
+// branch must construct a `ProducerCtx`. Under the actor model `Core`
+// is move-only (not `Clone`, no `WeakCore`), so the binding can't hold
+// a self-`Core` back-reference.
+//
+// D246 rule 5 / D245 Option A resolves this at the trait surface: Core
+// hands the binding the one object-safe facade through a dedicated
+// dispatch method, `BindingBoundary::invoke_fn_with_core(.., core: &dyn
+// CoreFull)` (Core passes `self as &dyn CoreFull` from
+// `batch::fire_regular` Phase 2). The harness overrides
+// `invoke_fn_with_core` to build the `ProducerCtx` from the passed
+// facade — so producer dispatch is correct for ALL paths, including a
+// bare `rt.core().subscribe(..)` outside any harness helper, with NO
+// thread-local / `Core` clone / stored back-reference. The previous
+// safe `scoped-tls` `CURRENT_CORE` machinery is therefore deleted: the
+// facade is now passed explicitly (strictly cleaner, fully
+// D246-faithful — the forbid-raw-code crate attribute holds, zero raw
+// pointers).
 
 struct RegistryState {
     values: HashMap<HandleId, TestValue>,
@@ -166,7 +185,6 @@ impl InnerBinding {
                 next_fn_id: 1,
             }),
             producer_storage: Arc::new(parking_lot::Mutex::new(ahash::AHashMap::new())),
-            core_ref: Mutex::new(None),
         })
     }
 
@@ -175,24 +193,6 @@ impl InnerBinding {
     /// storage's invariants (e.g. "deactivation cleared the entry").
     pub fn producer_storage(&self) -> &ProducerStorage {
         &self.producer_storage
-    }
-
-    /// Set the binding's self-Core back-reference. Called by
-    /// [`OpRuntime::new`] after Core construction.
-    pub fn set_core_ref(&self, core: Core) {
-        *self.core_ref.lock() = Some(core);
-    }
-
-    /// Take the Core ref out (breaks the Arc cycle on shutdown).
-    /// Called from [`OpRuntime::drop`].
-    pub fn take_core_ref(&self) -> Option<Core> {
-        self.core_ref.lock().take()
-    }
-
-    fn test_core_ref(&self) -> Core {
-        self.core_ref.lock().clone().expect(
-            "InnerBinding::set_core_ref must be called post-construction for producer dispatch",
-        )
     }
 
     /// Intern a value, returning the (possibly-shared) handle. Bumps
@@ -274,40 +274,54 @@ impl InnerBinding {
 impl BindingBoundary for InnerBinding {
     fn invoke_fn(
         &self,
-        node_id: NodeId,
+        _node_id: NodeId,
         fn_id: FnId,
         _dep_data: &[graphrefly_core::DepBatch],
+    ) -> graphrefly_core::FnResult {
+        // D246 r5 / D245: the parameterless `invoke_fn` has no way to
+        // build a `ProducerCtx` (no `&Core`). Core never calls this for
+        // a producer node — it dispatches through
+        // `invoke_fn_with_core` (below), which receives the facade. If
+        // we land here for a registered producer build, the dispatch
+        // contract was violated; otherwise the fn_id is genuinely
+        // unknown (operator nodes never reach `invoke_fn`).
+        assert!(
+            !self.state.lock().producer_builds.contains_key(&fn_id),
+            "producer fn_id {fn_id:?} reached the parameterless invoke_fn — \
+             Core must dispatch producers via invoke_fn_with_core (D246 r5)",
+        );
+        unreachable!("InnerBinding only supports operator + producer dispatch (got fn_id {fn_id:?} not in registry)")
+    }
+
+    fn invoke_fn_with_core(
+        &self,
+        node_id: NodeId,
+        fn_id: FnId,
+        dep_data: &[graphrefly_core::DepBatch],
+        core: &dyn graphrefly_core::CoreFull,
     ) -> graphrefly_core::FnResult {
         // Producer dispatch (Slice D, D031): if the FnId is a registered
         // producer build closure, run it with a ProducerCtx. The build
         // closure subscribes to upstream sources via the ctx; emissions
         // come later from sink callbacks re-entering Core. The fn
         // itself returns Noop because there's no immediate emission.
+        //
+        // D246 r5 / D245: Core hands us the one object-safe facade
+        // (`self as &dyn CoreFull`, from `batch::fire_regular` Phase 2).
+        // Build the `ProducerCtx` directly from it — correct for ALL
+        // producer-activation paths (including a bare
+        // `rt.core().subscribe(..)` outside any OpRuntime helper), with
+        // no thread-local / `Core` clone / stored back-reference.
         let build = self.state.lock().producer_builds.get(&fn_id).cloned();
         if let Some(build) = build {
-            // Need a Core ref for ProducerCtx::core(). Tests that
-            // exercise producers do so via `OpRuntime::set_core_self_ref`
-            // which gives the binding a Weak<...> — but for the v1
-            // substrate we accept the cycle and clone Core via
-            // `OpRuntime::core_arc`. The build closure captured Core
-            // at registration time (via the operator factory), so it
-            // doesn't need ctx.core(); ctx is just for `subscribe_to`.
-            //
-            // For ctx.core() to work, we'd need a binding-side Core
-            // ref. Operators that use ctx.core() directly aren't in
-            // scope for the substrate tests (operators capture Core
-            // at factory time). So we panic if a build closure tries
-            // ctx.core() — tests must construct a separate ctx with
-            // their own Core ref if needed.
-            let core_ref = self.test_core_ref();
-            let ctx = ProducerCtx::new(node_id, &core_ref, &self.producer_storage);
+            let ctx = ProducerCtx::for_corefull(node_id, core, &self.producer_storage);
             build(ctx);
             return graphrefly_core::FnResult::Noop { tracked: None };
         }
-        // Operator tests don't go through invoke_fn beyond producer
-        // dispatch — fire_operator's path doesn't touch invoke_fn for
-        // Operator nodes.
-        unreachable!("InnerBinding only supports operator + producer dispatch (got fn_id {fn_id:?} not in registry)")
+        // Not a producer — fall through to the parameterless path
+        // (which `unreachable!`s for genuinely-unknown fn_ids; operator
+        // nodes never reach invoke_fn at all).
+        self.invoke_fn(node_id, fn_id, dep_data)
     }
 
     fn custom_equals(&self, equals_handle: FnId, a: HandleId, b: HandleId) -> bool {
@@ -577,8 +591,27 @@ impl HigherOrderBinding for InnerBinding {
 // OpRuntime — Core + binding glue for tests.
 // ---------------------------------------------------------------------
 
+/// D246: thin newtype that **composes** [`graphrefly_core::OwnedCore`]
+/// — the one canonical Core-ownership + subscription-tracking +
+/// owner-thread `Drop`-teardown keystone — plus the operator
+/// `InnerBinding`/`Recorder` infra. The hand-rolled `subs`/`impl Drop`
+/// AND the `core_ref` self-`Core` back-reference (+ its
+/// `OpRuntime::drop`-breaks-the-cycle dance) were deleted: `OwnedCore`
+/// owns the one move-only `Core` by value, so dropping the runtime
+/// drops `Core`, which drops the binding `Arc` — the cycle is gone
+/// structurally (D246 rule 3/4).
+///
+/// D246 r5 / D245: producer-build Core access is no longer a harness
+/// concern. Core hands the binding the one object-safe facade through
+/// `BindingBoundary::invoke_fn_with_core(.., &dyn CoreFull)`, which
+/// `InnerBinding` overrides to construct the `ProducerCtx`. The boxed
+/// `OwnedCore` (boxed, stable address) + the previous safe
+/// `scoped-tls` `CURRENT_CORE` wave-scoping wrappers were deleted: the
+/// facade is passed explicitly, so producer dispatch is correct even
+/// for a bare `rt.core().subscribe(..)` outside any helper, with no
+/// thread-local and the crate-root forbid-raw-code attribute intact.
 pub struct OpRuntime {
-    pub core: Core,
+    rt: OwnedCore,
     pub binding: Arc<InnerBinding>,
     pub op_binding: Arc<dyn OperatorBinding>,
     pub producer_binding: Arc<dyn ProducerBinding>,
@@ -588,21 +621,34 @@ pub struct OpRuntime {
 impl OpRuntime {
     pub fn new() -> Self {
         let inner = InnerBinding::new();
-        let core = Core::new(inner.clone() as Arc<dyn BindingBoundary>);
-        // Set the binding's self-Core back-ref. Required for producer
-        // dispatch (the `invoke_fn` path constructs a `ProducerCtx`
-        // with this ref).
-        inner.set_core_ref(core.clone());
+        let rt = OwnedCore::new(inner.clone() as Arc<dyn BindingBoundary>);
         let op_binding: Arc<dyn OperatorBinding> = inner.clone();
         let producer_binding: Arc<dyn ProducerBinding> = inner.clone();
         let ho_binding: Arc<dyn HigherOrderBinding> = inner.clone();
         Self {
-            core,
+            rt,
             binding: inner,
             op_binding,
             producer_binding,
             ho_binding,
         }
+    }
+
+    /// Borrow the owned dispatcher (D231 owner-side `&Core`). Routes
+    /// through the inner [`OwnedCore`]. Pass this into every
+    /// Core-touching factory / op.
+    #[must_use]
+    pub fn core(&self) -> &Core {
+        self.rt.core()
+    }
+
+    /// Explicit early unsubscribe (owner-invoked, D241/D246 rule 3) —
+    /// routes through the inner [`OwnedCore`]'s tracked set. A
+    /// last-subscriber unsubscribe drives a deactivation wave; any
+    /// producer dispatch nested in it reaches Core via
+    /// `invoke_fn_with_core` (D246 r5) — no scoping needed.
+    pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
+        self.rt.unsubscribe(node_id, sub_id);
     }
 
     pub fn intern(&self, v: TestValue) -> HandleId {
@@ -622,7 +668,7 @@ impl OpRuntime {
             Some(n) => self.intern_int(n),
             None => NO_HANDLE,
         };
-        self.core.register_state(h, false).unwrap()
+        self.core().register_state(h, false).unwrap()
     }
 
     pub fn subscribe_recorder(&self, node: NodeId) -> Recorder {
@@ -632,11 +678,14 @@ impl OpRuntime {
         // binding-layer `SubGuard` (D228-A) so dropping the Recorder
         // schedules the unsubscribe. The harness co-owns the Core, so
         // `ProducerEmitter::for_core` is the sanctioned bridge.
-        let sub_id = self.core.subscribe(node, sink);
+        // First subscribe to a producer node synchronously fires its
+        // build closure — Core dispatches it via `invoke_fn_with_core`
+        // (D246 r5), so no `&Core` scoping is needed here.
+        let sub_id = self.core().subscribe(node, sink);
         recorder.attach(SubGuard::new(
             node,
             sub_id,
-            ProducerEmitter::for_core(&self.core),
+            ProducerEmitter::for_core(self.core()),
         ));
         recorder
     }
@@ -649,13 +698,16 @@ impl OpRuntime {
     /// embedder pump point — behaviour-equivalent to the retired
     /// synchronous `Subscription::Drop`).
     pub fn settle(&self) {
-        self.core.drain_mailbox();
+        // Draining deferred mailbox ops can run producer-driving waves
+        // (deferred subscribe/activation); any producer dispatch reaches
+        // Core via `invoke_fn_with_core` (D246 r5) — no scoping needed.
+        self.core().drain_mailbox();
     }
 
     /// Convenience: emit an integer DATA on a state node.
     pub fn emit_int(&self, node: NodeId, n: i64) {
         let h = self.intern_int(n);
-        self.core.emit(node, h);
+        self.core().emit(node, h);
     }
 
     /// Create a packer closure that packs N HandleIds into a Tuple TestValue.
@@ -724,19 +776,12 @@ impl OpRuntime {
     ///    that interleave registration with this helper may surface
     ///    this; the panic is informative.
     pub fn with_all_partitions_held<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
-        let _g = self.core.begin_batch();
+        // The closure subscribes inside the batch — producer activation
+        // fires synchronously here, dispatched through
+        // `invoke_fn_with_core` (D246 r5), so no `&Core` scoping is
+        // needed.
+        let _g = self.core().begin_batch();
         f(self)
-    }
-}
-
-impl Drop for OpRuntime {
-    fn drop(&mut self) {
-        // Break the binding ⇆ Core Arc cycle introduced by
-        // `set_core_ref`. Without this, every OpRuntime leaks Core
-        // state (the binding's `core_ref` keeps Core alive; Core
-        // keeps binding alive via its `binding` Arc). Tests rely on
-        // refcount assertions, so this matters.
-        self.binding.take_core_ref();
     }
 }
 

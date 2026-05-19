@@ -14,7 +14,7 @@ fn invalidate_clears_cache_and_emits_invalidate() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.invalidate(s.id);
+    rt.core().invalidate(s.id);
 
     assert_eq!(rt.cache_value(s.id), None, "cache cleared to sentinel");
     let snap = rec.snapshot();
@@ -32,7 +32,7 @@ fn invalidate_on_never_populated_state_is_noop() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.invalidate(s.id);
+    rt.core().invalidate(s.id);
 
     assert_eq!(rt.cache_value(s.id), None);
     let snap = rec.snapshot();
@@ -47,9 +47,9 @@ fn invalidate_is_idempotent_within_wave() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.invalidate(s.id);
-    rt.core.invalidate(s.id); // second call — cache already NO_HANDLE
-    rt.core.invalidate(s.id); // third call — same
+    rt.core().invalidate(s.id);
+    rt.core().invalidate(s.id); // second call — cache already NO_HANDLE
+    rt.core().invalidate(s.id); // third call — same
 
     let invalidate_count = rec
         .snapshot()
@@ -75,7 +75,7 @@ fn invalidate_cascades_to_derived_dependents() {
     assert_eq!(rt.cache_value(b), Some(TestValue::Int(20)));
     let baseline_b = rec_b.snapshot().len();
 
-    rt.core.invalidate(a.id);
+    rt.core().invalidate(a.id);
 
     // A's cache cleared.
     assert_eq!(rt.cache_value(a.id), None);
@@ -99,7 +99,7 @@ fn re_emit_after_invalidate_repopulates_cache() {
     });
     let _rec = rt.subscribe_recorder(b);
 
-    rt.core.invalidate(a.id);
+    rt.core().invalidate(a.id);
     assert_eq!(rt.cache_value(a.id), None);
     assert_eq!(rt.cache_value(b), None);
 
@@ -129,7 +129,7 @@ fn invalidate_on_diamond_root_cascades_to_sink_once_per_path() {
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(302))); // (1+100)+(1+200)
     let baseline = rec_d.snapshot().len();
 
-    rt.core.invalidate(a.id);
+    rt.core().invalidate(a.id);
     assert_eq!(rt.cache_value(d), None, "diamond sink invalidated");
 
     // The cascade visits D twice (once via B, once via C). The second visit
@@ -153,7 +153,7 @@ fn invalidate_on_unsubscribed_compute_with_no_cache_is_noop() {
         _ => panic!("type"),
     });
     // Not subscribed — b never fires; cache stays NO_HANDLE.
-    rt.core.invalidate(b);
+    rt.core().invalidate(b);
     // No panic, no cascade visible.
     assert_eq!(rt.cache_value(b), None);
 }
@@ -165,7 +165,7 @@ fn invalidate_releases_handle_via_refcount() {
     let _rec = rt.subscribe_recorder(s.id);
     let live_before = rt.binding.live_handles();
 
-    rt.core.invalidate(s.id);
+    rt.core().invalidate(s.id);
     let live_after = rt.binding.live_handles();
     // The handle for `7` is no longer in the cache; its registry entry
     // (refcount=1 from intern) drops to 0 → evicted.
@@ -184,15 +184,15 @@ fn invalidate_buffers_through_pause() {
     // `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
-    rt.core.invalidate(s.id);
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
+    rt.core().invalidate(s.id);
 
     // Cache cleared immediately (it's bookkeeping); INVALIDATE wire-message
     // is buffered (tier 4).
@@ -208,7 +208,11 @@ fn invalidate_buffers_through_pause() {
         "INVALIDATE should buffer alongside DATA while paused"
     );
 
-    let report = rt.core.resume(s.id, lock).expect("resume").expect("final");
+    let report = rt
+        .core()
+        .resume(s.id, lock)
+        .expect("resume")
+        .expect("final");
     assert_eq!(report.replayed, 1);
 
     let post_invalidate = rec
@@ -238,7 +242,7 @@ fn invalidated_dep_closes_first_run_gate_until_re_emit() {
     assert_eq!(rt.cache_value(sum), Some(TestValue::Int(30)));
     let initial_calls = *calls.lock().unwrap();
 
-    rt.core.invalidate(a.id);
+    rt.core().invalidate(a.id);
     // sum's dep_handles[idx_a] = NO_HANDLE → first-run gate closed.
     // b emits — gate still closed (a still NO_HANDLE).
     b.set(TestValue::Int(99));
@@ -259,5 +263,5 @@ fn invalidated_dep_closes_first_run_gate_until_re_emit() {
 fn invalidate_unknown_node_panics() {
     let rt = TestRuntime::new();
     let bogus = graphrefly_core::NodeId::new(99_999);
-    rt.core.invalidate(bogus);
+    rt.core().invalidate(bogus);
 }

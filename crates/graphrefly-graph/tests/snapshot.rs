@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use common::graph_with;
 use graphrefly_core::{
-    BindingBoundary, DepBatch, EqualsMode, FnId, FnResult, HandleId, NodeId, NO_HANDLE,
+    BindingBoundary, DepBatch, EqualsMode, FnId, FnResult, HandleId, NodeId, OwnedCore, NO_HANDLE,
 };
 use graphrefly_graph::{
-    Graph, GraphOps, GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus,
-    SnapshotError, SnapshotOps, SubgraphRef,
+    Graph, GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus, SnapshotError,
 };
 use indexmap::IndexMap;
 
@@ -111,9 +111,9 @@ impl BindingBoundary for SnapshotBinding {
 #[test]
 fn r3_8_snapshot_empty_graph() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("empty", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("empty", binding as Arc<dyn BindingBoundary>);
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     assert_eq!(snap.name, "empty");
     assert!(snap.nodes.is_empty());
     assert!(snap.subgraphs.is_empty());
@@ -123,11 +123,11 @@ fn r3_8_snapshot_empty_graph() {
 fn r3_8_snapshot_state_with_value() {
     let binding = SnapshotBinding::new();
     let h = binding.intern(serde_json::json!(42));
-    let g = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
 
-    g.state("counter", Some(h)).unwrap();
+    g.state(rt.core(), "counter", Some(h)).unwrap();
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     assert_eq!(snap.nodes.len(), 1);
     let node = &snap.nodes["counter"];
     assert_eq!(node.node_type, "state");
@@ -139,11 +139,11 @@ fn r3_8_snapshot_state_with_value() {
 #[test]
 fn r3_8_snapshot_sentinel_state() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
 
-    g.state("x", None).unwrap();
+    g.state(rt.core(), "x", None).unwrap();
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     let node = &snap.nodes["x"];
     assert_eq!(node.status, NodeSnapshotStatus::Sentinel);
     assert_eq!(node.value, None);
@@ -157,17 +157,17 @@ fn r3_8_snapshot_derived_with_deps() {
         let x = args[0].as_i64().unwrap_or(0);
         serde_json::json!(x * 2)
     });
-    let g = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
 
-    let x = g.state("x", Some(initial)).unwrap();
-    g.derived("doubled", &[x], fn_id, EqualsMode::Identity)
+    let x = g.state(rt.core(), "x", Some(initial)).unwrap();
+    g.derived(rt.core(), "doubled", &[x], fn_id, EqualsMode::Identity)
         .unwrap();
 
     // Subscribe to trigger fn fire.
     let doubled_id = g.node("doubled");
-    let _sub = g.subscribe(doubled_id, Arc::new(|_| {}));
+    let sub = g.subscribe(rt.core(), doubled_id, Arc::new(|_| {}));
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     assert_eq!(snap.nodes.len(), 2);
 
     let doubled = &snap.nodes["doubled"];
@@ -175,18 +175,19 @@ fn r3_8_snapshot_derived_with_deps() {
     assert_eq!(doubled.deps, vec!["x"]);
     // Derived should have computed: 10 * 2 = 20
     assert_eq!(doubled.value, Some(serde_json::json!(20)));
+    g.unsubscribe(rt.core(), doubled_id, sub);
 }
 
 #[test]
 fn r3_8_snapshot_completed_terminal() {
     let binding = SnapshotBinding::new();
     let h = binding.intern(serde_json::json!("hello"));
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
 
-    let x = g.state("x", Some(h)).unwrap();
-    g.complete(x);
+    let x = g.state(rt.core(), "x", Some(h)).unwrap();
+    g.complete(rt.core(), x);
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     assert_eq!(snap.nodes["x"].status, NodeSnapshotStatus::Completed);
 }
 
@@ -195,12 +196,12 @@ fn r3_8_snapshot_errored_terminal() {
     let binding = SnapshotBinding::new();
     let h = binding.intern(serde_json::json!("value"));
     let err = binding.intern(serde_json::json!({"code": 500}));
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
 
-    let x = g.state("x", Some(h)).unwrap();
-    g.error(x, err);
+    let x = g.state(rt.core(), "x", Some(h)).unwrap();
+    g.error(rt.core(), x, err);
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     match &snap.nodes["x"].status {
         NodeSnapshotStatus::Errored { error } => {
             assert_eq!(error, &Some(serde_json::json!({"code": 500})));
@@ -214,13 +215,13 @@ fn r3_8_snapshot_with_mounted_subgraph() {
     let binding = SnapshotBinding::new();
     let h1 = binding.intern(serde_json::json!("root"));
     let h2 = binding.intern(serde_json::json!("child"));
-    let g = Graph::new("root", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("root", binding as Arc<dyn BindingBoundary>);
 
-    g.state("a", Some(h1)).unwrap();
-    let sub = g.mount_new("sub").unwrap();
-    sub.state("b", Some(h2)).unwrap();
+    g.state(rt.core(), "a", Some(h1)).unwrap();
+    let sub = g.mount_new(rt.core(), "sub").unwrap();
+    sub.state(rt.core(), "b", Some(h2)).unwrap();
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     assert_eq!(snap.nodes.len(), 1);
     assert_eq!(snap.subgraphs.len(), 1);
 
@@ -234,10 +235,10 @@ fn r3_8_snapshot_with_mounted_subgraph() {
 fn r3_8_snapshot_json_round_trip() {
     let binding = SnapshotBinding::new();
     let h = binding.intern(serde_json::json!(42));
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
-    g.state("x", Some(h)).unwrap();
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
+    g.state(rt.core(), "x", Some(h)).unwrap();
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     let json = serde_json::to_string(&snap).unwrap();
     let restored: GraphPersistSnapshot = serde_json::from_str(&json).unwrap();
 
@@ -249,9 +250,9 @@ fn r3_8_snapshot_json_round_trip() {
 #[test]
 fn r3_8_restore_state_values() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
-    g.state("x", None).unwrap();
-    g.state("y", None).unwrap();
+    let (rt, g) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
+    g.state(rt.core(), "x", None).unwrap();
+    g.state(rt.core(), "y", None).unwrap();
 
     // Build a snapshot with values.
     let snap = GraphPersistSnapshot {
@@ -281,10 +282,10 @@ fn r3_8_restore_state_values() {
         subgraphs: IndexMap::new(),
     };
 
-    g.restore(&snap).unwrap();
+    g.restore(rt.core(), &snap).unwrap();
 
-    let x_cache = g.cache_of(g.node("x"));
-    let y_cache = g.cache_of(g.node("y"));
+    let x_cache = g.cache_of(rt.core(), g.node("x"));
+    let y_cache = g.cache_of(rt.core(), g.node("y"));
     assert_ne!(x_cache, NO_HANDLE);
     assert_ne!(y_cache, NO_HANDLE);
     assert_eq!(binding.deref(x_cache), serde_json::json!(100));
@@ -294,7 +295,7 @@ fn r3_8_restore_state_values() {
 #[test]
 fn r3_8_restore_name_mismatch_errors() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("graph-a", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("graph-a", binding as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "graph-b".to_owned(),
@@ -302,14 +303,14 @@ fn r3_8_restore_name_mismatch_errors() {
         subgraphs: IndexMap::new(),
     };
 
-    let err = g.restore(&snap).unwrap_err();
+    let err = g.restore(rt.core(), &snap).unwrap_err();
     assert!(matches!(err, SnapshotError::NameMismatch { .. }));
 }
 
 #[test]
 fn r3_8_restore_unknown_node_errors() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "test".to_owned(),
@@ -329,15 +330,15 @@ fn r3_8_restore_unknown_node_errors() {
         subgraphs: IndexMap::new(),
     };
 
-    let err = g.restore(&snap).unwrap_err();
+    let err = g.restore(rt.core(), &snap).unwrap_err();
     assert!(matches!(err, SnapshotError::UnknownNode(_)));
 }
 
 #[test]
 fn r3_8_restore_completed_terminal() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("test", binding as Arc<dyn BindingBoundary>);
-    let x = g.state("x", None).unwrap();
+    let (rt, g) = graph_with("test", binding as Arc<dyn BindingBoundary>);
+    let x = g.state(rt.core(), "x", None).unwrap();
 
     let snap = GraphPersistSnapshot {
         name: "test".to_owned(),
@@ -357,8 +358,8 @@ fn r3_8_restore_completed_terminal() {
         subgraphs: IndexMap::new(),
     };
 
-    g.restore(&snap).unwrap();
-    assert!(g.core().is_terminal(x).is_some());
+    g.restore(rt.core(), &snap).unwrap();
+    assert!(rt.core().is_terminal(x).is_some());
 }
 
 #[test]
@@ -367,20 +368,20 @@ fn r3_8_snapshot_then_restore_round_trip() {
     let h1 = binding.intern(serde_json::json!(42));
     let h2 = binding.intern(serde_json::json!("world"));
 
-    let g1 = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
-    g1.state("counter", Some(h1)).unwrap();
-    g1.state("label", Some(h2)).unwrap();
+    let (rt1, g1) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
+    g1.state(rt1.core(), "counter", Some(h1)).unwrap();
+    g1.state(rt1.core(), "label", Some(h2)).unwrap();
 
-    let snap = g1.snapshot();
+    let snap = g1.snapshot(rt1.core());
 
     // Build a second graph and restore.
-    let g2 = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
-    g2.state("counter", None).unwrap();
-    g2.state("label", None).unwrap();
-    g2.restore(&snap).unwrap();
+    let (rt2, g2) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
+    g2.state(rt2.core(), "counter", None).unwrap();
+    g2.state(rt2.core(), "label", None).unwrap();
+    g2.restore(rt2.core(), &snap).unwrap();
 
-    let c = g2.cache_of(g2.node("counter"));
-    let l = g2.cache_of(g2.node("label"));
+    let c = g2.cache_of(rt2.core(), g2.node("counter"));
+    let l = g2.cache_of(rt2.core(), g2.node("label"));
     assert_eq!(binding.deref(c), serde_json::json!(42));
     assert_eq!(binding.deref(l), serde_json::json!("world"));
 }
@@ -388,6 +389,7 @@ fn r3_8_snapshot_then_restore_round_trip() {
 #[test]
 fn r3_8_from_snapshot_builder_mode() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "test".to_owned(),
@@ -408,22 +410,23 @@ fn r3_8_from_snapshot_builder_mode() {
     };
 
     let g = Graph::from_snapshot(
+        rt.core(),
         &snap,
-        &(binding.clone() as Arc<dyn BindingBoundary>),
-        Some(Box::new(|g: &SubgraphRef<'_>| {
-            g.state("x", None).unwrap();
+        Some(Box::new(|core: &graphrefly_core::Core, g: &Graph| {
+            g.state(core, "x", None).unwrap();
         })),
         None,
     )
     .unwrap();
 
-    let x_cache = g.cache_of(g.node("x"));
+    let x_cache = g.cache_of(rt.core(), g.node("x"));
     assert_eq!(binding.deref(x_cache), serde_json::json!(99));
 }
 
 #[test]
 fn r3_8_from_snapshot_auto_hydration_state_only() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "test".to_owned(),
@@ -453,36 +456,43 @@ fn r3_8_from_snapshot_auto_hydration_state_only() {
     };
 
     // Auto-hydrate — state nodes need no factory.
-    let g = Graph::from_snapshot(
-        &snap,
-        &(binding.clone() as Arc<dyn BindingBoundary>),
-        None,
-        None,
-    )
-    .unwrap();
+    let g = Graph::from_snapshot(rt.core(), &snap, None, None).unwrap();
 
     assert_eq!(g.node_count(), 2);
-    assert_eq!(binding.deref(g.cache_of(g.node("a"))), serde_json::json!(1));
-    assert_eq!(binding.deref(g.cache_of(g.node("b"))), serde_json::json!(2));
+    assert_eq!(
+        binding.deref(g.cache_of(rt.core(), g.node("a"))),
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        binding.deref(g.cache_of(rt.core(), g.node("b"))),
+        serde_json::json!(2)
+    );
 }
 
 #[test]
 fn r3_8_from_snapshot_auto_hydration_with_derived_factory() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
     let binding_clone = binding.clone();
 
     let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
     factories.insert(
         "derived".to_owned(),
-        Box::new(move |graph, name, _slice, dep_ids| {
-            let fn_id = binding_clone.register_fn(|args| {
-                let x = args[0].as_i64().unwrap_or(0);
-                serde_json::json!(x * 10)
-            });
-            graph
-                .derived(name, dep_ids, fn_id, EqualsMode::Identity)
-                .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
-        }),
+        Box::new(
+            move |core: &graphrefly_core::Core,
+                  graph: &Graph,
+                  name: &str,
+                  _slice: &NodeSlice,
+                  dep_ids: &[NodeId]| {
+                let fn_id = binding_clone.register_fn(|args| {
+                    let x = args[0].as_i64().unwrap_or(0);
+                    serde_json::json!(x * 10)
+                });
+                graph
+                    .derived(core, name, dep_ids, fn_id, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
     );
 
     let snap = GraphPersistSnapshot {
@@ -512,28 +522,24 @@ fn r3_8_from_snapshot_auto_hydration_with_derived_factory() {
         subgraphs: IndexMap::new(),
     };
 
-    let g = Graph::from_snapshot(
-        &snap,
-        &(binding.clone() as Arc<dyn BindingBoundary>),
-        None,
-        Some(factories),
-    )
-    .unwrap();
+    let g = Graph::from_snapshot(rt.core(), &snap, None, Some(factories)).unwrap();
 
     assert_eq!(g.node_count(), 2);
 
     // Subscribe to trigger derived computation.
     let times_ten = g.node("times_ten");
-    let _sub = g.subscribe(times_ten, Arc::new(|_| {}));
+    let sub = g.subscribe(rt.core(), times_ten, Arc::new(|_| {}));
 
-    let cache = g.cache_of(times_ten);
+    let cache = g.cache_of(rt.core(), times_ten);
     assert_ne!(cache, NO_HANDLE);
     assert_eq!(binding.deref(cache), serde_json::json!(50));
+    g.unsubscribe(rt.core(), times_ten, sub);
 }
 
 #[test]
 fn r3_8_from_snapshot_missing_factory_errors() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "test".to_owned(),
@@ -553,24 +559,31 @@ fn r3_8_from_snapshot_missing_factory_errors() {
         subgraphs: IndexMap::new(),
     };
 
-    let result = Graph::from_snapshot(&snap, &(binding as Arc<dyn BindingBoundary>), None, None);
+    let result = Graph::from_snapshot(rt.core(), &snap, None, None);
     assert!(matches!(result, Err(SnapshotError::MissingFactory(..))));
 }
 
 #[test]
 fn r3_8_from_snapshot_unresolvable_deps_errors() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding as Arc<dyn BindingBoundary>);
 
     let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
     factories.insert(
         "derived".to_owned(),
-        Box::new(|graph, name, _slice, dep_ids| {
-            // Won't actually be called — deps can't resolve.
-            let fn_id = FnId::new(999);
-            graph
-                .derived(name, dep_ids, fn_id, EqualsMode::Identity)
-                .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
-        }),
+        Box::new(
+            |core: &graphrefly_core::Core,
+             graph: &Graph,
+             name: &str,
+             _slice: &NodeSlice,
+             dep_ids: &[NodeId]| {
+                // Won't actually be called — deps can't resolve.
+                let fn_id = FnId::new(999);
+                graph
+                    .derived(core, name, dep_ids, fn_id, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
     );
 
     let snap = GraphPersistSnapshot {
@@ -591,18 +604,14 @@ fn r3_8_from_snapshot_unresolvable_deps_errors() {
         subgraphs: IndexMap::new(),
     };
 
-    let result = Graph::from_snapshot(
-        &snap,
-        &(binding as Arc<dyn BindingBoundary>),
-        None,
-        Some(factories),
-    );
+    let result = Graph::from_snapshot(rt.core(), &snap, None, Some(factories));
     assert!(matches!(result, Err(SnapshotError::UnresolvableDeps(..))));
 }
 
 #[test]
 fn r3_8_from_snapshot_auto_hydration_with_subgraph() {
     let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
 
     let snap = GraphPersistSnapshot {
         name: "root".to_owned(),
@@ -645,34 +654,34 @@ fn r3_8_from_snapshot_auto_hydration_with_subgraph() {
         },
     };
 
-    let g = Graph::from_snapshot(
-        &snap,
-        &(binding.clone() as Arc<dyn BindingBoundary>),
-        None,
-        None,
-    )
-    .unwrap();
+    let g = Graph::from_snapshot(rt.core(), &snap, None, None).unwrap();
 
     assert_eq!(g.node_count(), 1);
-    assert_eq!(binding.deref(g.cache_of(g.node("a"))), serde_json::json!(1));
+    assert_eq!(
+        binding.deref(g.cache_of(rt.core(), g.node("a"))),
+        serde_json::json!(1)
+    );
 
     // Access the child's node via path.
     let b_id = g.try_resolve("child::b").unwrap();
-    assert_eq!(binding.deref(g.cache_of(b_id)), serde_json::json!(2));
+    assert_eq!(
+        binding.deref(g.cache_of(rt.core(), b_id)),
+        serde_json::json!(2)
+    );
 }
 
 #[test]
 fn r3_8_snapshot_preserves_insertion_order() {
     let binding = SnapshotBinding::new();
-    let g = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
 
     let names = ["z", "a", "m", "b"];
     for &name in &names {
         let h = binding.intern(serde_json::json!(name));
-        g.state(name, Some(h)).unwrap();
+        g.state(rt.core(), name, Some(h)).unwrap();
     }
 
-    let snap = g.snapshot();
+    let snap = g.snapshot(rt.core());
     let snap_names: Vec<&str> = snap.nodes.keys().map(String::as_str).collect();
     assert_eq!(snap_names, names);
 }
@@ -687,10 +696,11 @@ fn r3_8_restore_skips_derived_nodes() {
         let x = args[0].as_i64().unwrap_or(0);
         serde_json::json!(x + 1)
     });
-    let g = Graph::new("test", binding.clone() as Arc<dyn BindingBoundary>);
+    let (rt, g) = graph_with("test", binding.clone() as Arc<dyn BindingBoundary>);
 
-    let x = g.state("x", Some(initial)).unwrap();
-    g.derived("inc", &[x], fn_id, EqualsMode::Identity).unwrap();
+    let x = g.state(rt.core(), "x", Some(initial)).unwrap();
+    g.derived(rt.core(), "inc", &[x], fn_id, EqualsMode::Identity)
+        .unwrap();
 
     // Snapshot includes derived with its computed value.
     let snap = GraphPersistSnapshot {
@@ -720,16 +730,20 @@ fn r3_8_restore_skips_derived_nodes() {
         subgraphs: IndexMap::new(),
     };
 
-    g.restore(&snap).unwrap();
+    g.restore(rt.core(), &snap).unwrap();
 
     // x should have the restored value.
     assert_eq!(
-        binding.deref(g.cache_of(g.node("x"))),
+        binding.deref(g.cache_of(rt.core(), g.node("x"))),
         serde_json::json!(10)
     );
 
     // inc should recompute from x (10 + 1 = 11), NOT use the snapshot's 999.
     let inc_id = g.node("inc");
-    let _sub = g.subscribe(inc_id, Arc::new(|_| {}));
-    assert_eq!(binding.deref(g.cache_of(inc_id)), serde_json::json!(11));
+    let sub = g.subscribe(rt.core(), inc_id, Arc::new(|_| {}));
+    assert_eq!(
+        binding.deref(g.cache_of(rt.core(), inc_id)),
+        serde_json::json!(11)
+    );
+    g.unsubscribe(rt.core(), inc_id, sub);
 }

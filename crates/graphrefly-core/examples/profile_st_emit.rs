@@ -70,8 +70,10 @@ fn main() {
     // The real shipped §7 floor path — NOT the minimal_handle_core mirror.
     let core = Core::<SingleThreadCell>::new_with_cell(binding);
     let s = core.register_state(HandleId::new(1), false).unwrap();
-    // RAII: keep the subscription alive for the whole run (drop at end).
-    let _sub = core.subscribe(s, noop_sink());
+    // Owner-invoked teardown (D246 r3 — core RAII Subscription
+    // deleted): keep the sub alive for the whole run, unsubscribe at
+    // end on the owner thread.
+    let sub = core.subscribe(s, noop_sink());
     let same = HandleId::new(1);
 
     let start = std::time::Instant::now();
@@ -86,5 +88,5 @@ fn main() {
         "profile_st_emit: {emits} emits in {dt:?} = {:.1} ns/emit (real Core<SingleThreadCell> dedup)",
         dt.as_nanos() as f64 / emits as f64
     );
-    drop(_sub);
+    core.unsubscribe(s, sub);
 }

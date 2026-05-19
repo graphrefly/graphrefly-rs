@@ -1,11 +1,13 @@
 //! `snapshot()` / `restore()` / `Graph::from_snapshot()` — portable
 //! serialization of graph state (M4.E1, R3.8).
 //!
-//! S2b/β (D237/D240/D242): `snapshot`/`restore` are [`GraphOps`] trait
-//! methods delegating to free fns over `(&Core, &Arc<Mutex<GraphInner>>)`
-//! (called owner-side, so `&Core` is fine — `binding_ptr` is a `Core`
-//! method, not on `CoreFull`). `from_snapshot` builds the root [`Graph`]
-//! and drives factories/builders through borrowed [`SubgraphRef`]s.
+//! D246: `snapshot`/`restore`/`from_snapshot` are inherent [`Graph`]
+//! methods over the Core-free namespace tree, taking the embedder's
+//! `&Core` explicitly (D246 rule 2). `snapshot_of` is generic over
+//! `&dyn CoreFull` (the one facade) so the storage in-wave
+//! `MailboxOp::Defer` observe-sink can run it (read-only;
+//! `serialize_handle` delegates to the binding). No `SubgraphRef`/
+//! `GraphOps`/`SnapshotOps` — one `Graph`, plain free fns.
 //!
 //! # Handle-protocol boundary
 //!
@@ -15,14 +17,12 @@
 
 use std::sync::Arc;
 
-use graphrefly_core::{
-    BindingBoundary, Core, CoreFull, NodeId, NodeKind, TerminalKind, NO_HANDLE,
-};
+use graphrefly_core::{BindingBoundary, Core, CoreFull, NodeId, NodeKind, TerminalKind, NO_HANDLE};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{resolve_checked, Graph, GraphInner, GraphOps, SubgraphRef};
+use crate::graph::{resolve_checked, Graph, GraphInner};
 
 /// Portable snapshot of a graph's state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub enum NodeSnapshotStatus {
     },
 }
 
-/// Errors from [`GraphOps::restore`] and [`Graph::from_snapshot`].
+/// Errors from [`Graph::restore`] and [`Graph::from_snapshot`].
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error("snapshot name `{expected}` does not match graph name `{actual}`")]
@@ -84,20 +84,19 @@ pub enum SnapshotError {
     MissingFactory(String, String),
 }
 
-/// Factory for auto-hydration mode. β/D242: receives a borrowed
-/// [`SubgraphRef`] (the universal handle — the root [`Graph`] yields
-/// one via [`GraphOps::as_subgraph`]).
+/// Factory for auto-hydration mode. D246: receives the embedder's
+/// `&Core` + the Core-free [`Graph`] handle.
 pub type NodeFactory =
-    Box<dyn Fn(&SubgraphRef<'_>, &str, &NodeSlice, &[NodeId]) -> Result<NodeId, SnapshotError>>;
+    Box<dyn Fn(&Core, &Graph, &str, &NodeSlice, &[NodeId]) -> Result<NodeId, SnapshotError>>;
 
-/// Builder function for `Graph::from_snapshot` builder mode (β/D242:
-/// borrowed [`SubgraphRef`]).
-pub type SnapshotBuilder = Box<dyn FnOnce(&SubgraphRef<'_>)>;
+/// Builder function for `Graph::from_snapshot` builder mode (D246:
+/// `&Core` + Core-free [`Graph`]).
+pub type SnapshotBuilder = Box<dyn FnOnce(&Core, &Graph)>;
 
-/// β/D244: recursive snapshot over `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)`
-/// — `&dyn CoreFull` (not `&Core`) so the storage in-wave
-/// `MailboxOp::Defer` observe-sink can run it (snapshot is read-only;
-/// `serialize_handle` delegates to the binding via D244).
+/// D246: recursive snapshot over `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)`
+/// — `&dyn CoreFull` (the one facade) so the storage in-wave
+/// `MailboxOp::Defer` observe-sink can run it (read-only;
+/// `serialize_handle` delegates to the binding).
 pub(crate) fn snapshot_of(
     core: &dyn CoreFull,
     inner_arc: &Arc<Mutex<GraphInner>>,
@@ -186,7 +185,7 @@ pub(crate) fn snapshot_of(
     }
 }
 
-/// β: recursive restore over `(&Core, &Arc<Mutex<GraphInner>>)`.
+/// Recursive restore over `(&Core, &Arc<Mutex<GraphInner>>)`.
 fn restore_into(
     core: &Core,
     inner_arc: &Arc<Mutex<GraphInner>>,
@@ -250,12 +249,20 @@ fn restore_into(
     Ok(())
 }
 
-/// Snapshot / restore as part of the unified [`GraphOps`] surface.
-pub trait SnapshotOps: GraphOps {
+impl Graph {
     /// Serialize this graph's state into a portable snapshot.
     #[must_use]
-    fn snapshot(&self) -> GraphPersistSnapshot {
-        snapshot_of(self.graph_core(), self.graph_inner())
+    pub fn snapshot(&self, core: &Core) -> GraphPersistSnapshot {
+        snapshot_of(core, &self.inner)
+    }
+
+    /// [`Self::snapshot`] over the one object-safe facade (D246 rule 5)
+    /// — for the storage in-wave `MailboxOp::Defer(|cf: &dyn CoreFull|)`
+    /// path, which only has a `&dyn CoreFull` (not a concrete `&Core`).
+    /// Read-only; `serialize_handle` delegates to the binding.
+    #[must_use]
+    pub fn snapshot_full(&self, core: &dyn CoreFull) -> GraphPersistSnapshot {
+        snapshot_of(core, &self.inner)
     }
 
     /// Restore state from a snapshot into this existing graph.
@@ -263,74 +270,73 @@ pub trait SnapshotOps: GraphOps {
     /// # Errors
     /// `NameMismatch` if names differ; `UnknownNode`/`UnknownSubgraph`
     /// for snapshot entries absent from the graph.
-    fn restore(&self, snapshot: &GraphPersistSnapshot) -> Result<(), SnapshotError> {
-        restore_into(self.graph_core(), self.graph_inner(), snapshot)
+    pub fn restore(
+        &self,
+        core: &Core,
+        snapshot: &GraphPersistSnapshot,
+    ) -> Result<(), SnapshotError> {
+        restore_into(core, &self.inner, snapshot)
     }
-}
 
-impl<G: GraphOps> SnapshotOps for G {}
-
-impl Graph {
     /// Reconstruct a graph from a snapshot. **Builder mode**
     /// (`builder = Some`): build topology then `restore()` values.
     /// **Auto-hydration** (`builder = None`): reconstruct topology +
     /// state from the snapshot via `factories` (state nodes need none).
     ///
+    /// D246: the embedder owns the `Core` (see
+    /// [`graphrefly_core::OwnedCore`]) and passes it in; the binding is
+    /// `core.binding_ptr()`.
+    ///
     /// # Errors
     /// `UnresolvableDeps` if auto-hydration can't resolve a node's
     /// deps; `MissingFactory` for a non-state node type with no factory.
     pub fn from_snapshot(
+        core: &Core,
         snapshot: &GraphPersistSnapshot,
-        binding: &Arc<dyn BindingBoundary>,
         builder: Option<SnapshotBuilder>,
         factories: Option<IndexMap<String, NodeFactory>>,
     ) -> Result<Self, SnapshotError> {
-        let graph = Graph::new(&snapshot.name, Arc::clone(binding));
+        let graph = Graph::new(&snapshot.name);
+        let binding: Arc<dyn BindingBoundary> = core.binding();
 
         if let Some(build_fn) = builder {
-            {
-                let root = graph.view();
-                build_fn(&root);
-            }
-            graph.restore(snapshot)?;
+            build_fn(core, &graph);
+            graph.restore(core, snapshot)?;
             return Ok(graph);
         }
 
         let factories = factories.unwrap_or_default();
-        // Scope the borrowed views so `graph` is free to move into
-        // `Ok(graph)` (β/D242: `view()` borrows `&graph.core`).
-        {
-            let root = graph.view();
-            for (child_name, child_snapshot) in &snapshot.subgraphs {
-                let child = root
-                    .mount_new(child_name)
-                    .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
-                hydrate_subgraph(&child, child_snapshot, binding, &factories)?;
-            }
-            hydrate_nodes(&root, snapshot, binding, &factories)?;
+        for (child_name, child_snapshot) in &snapshot.subgraphs {
+            let child = graph
+                .mount_new(core, child_name)
+                .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
+            hydrate_subgraph(core, &child, child_snapshot, &binding, &factories)?;
         }
+        hydrate_nodes(core, &graph, snapshot, &binding, &factories)?;
 
         Ok(graph)
     }
 }
 
 fn hydrate_subgraph(
-    g: &SubgraphRef<'_>,
+    core: &Core,
+    g: &Graph,
     snapshot: &GraphPersistSnapshot,
     binding: &Arc<dyn BindingBoundary>,
     factories: &IndexMap<String, NodeFactory>,
 ) -> Result<(), SnapshotError> {
     for (child_name, child_snapshot) in &snapshot.subgraphs {
         let child = g
-            .mount_new(child_name)
+            .mount_new(core, child_name)
             .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
-        hydrate_subgraph(&child, child_snapshot, binding, factories)?;
+        hydrate_subgraph(core, &child, child_snapshot, binding, factories)?;
     }
-    hydrate_nodes(g, snapshot, binding, factories)
+    hydrate_nodes(core, g, snapshot, binding, factories)
 }
 
 fn hydrate_nodes(
-    g: &SubgraphRef<'_>,
+    core: &Core,
+    g: &Graph,
     snapshot: &GraphPersistSnapshot,
     binding: &Arc<dyn BindingBoundary>,
     factories: &IndexMap<String, NodeFactory>,
@@ -373,13 +379,13 @@ fn hydrate_nodes(
                         .value
                         .as_ref()
                         .map(|v| binding.deserialize_value(v.clone()));
-                    g.state(&name, initial)
+                    g.state(core, &name, initial)
                         .map_err(|_| SnapshotError::UnknownNode(name.clone()))?
                 } else {
                     let factory = factories.get(&slice.node_type).ok_or_else(|| {
                         SnapshotError::MissingFactory(slice.node_type.clone(), name.clone())
                     })?;
-                    factory(g, &name, &slice, &dep_ids)?
+                    factory(core, g, &name, &slice, &dep_ids)?
                 };
                 created.insert(name, node_id);
             } else {
@@ -404,12 +410,12 @@ fn hydrate_nodes(
         if let Some(&node_id) = created.get(name) {
             match &slice.status {
                 NodeSnapshotStatus::Completed => {
-                    g.complete(node_id);
+                    g.complete(core, node_id);
                 }
                 NodeSnapshotStatus::Errored { error } => {
                     if let Some(err_val) = error {
                         let err_handle = binding.deserialize_value(err_val.clone());
-                        g.error(node_id, err_handle);
+                        g.error(core, node_id, err_handle);
                     }
                 }
                 NodeSnapshotStatus::Sentinel | NodeSnapshotStatus::Live => {}

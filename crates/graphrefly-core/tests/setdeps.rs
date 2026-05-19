@@ -36,7 +36,7 @@ fn straight_rewire_a_to_b() {
     let calls_before = *calls.lock().unwrap();
 
     // Rewire C from {A} to {B}.
-    rt.core.set_deps(c, &[b.id]).expect("rewire ok");
+    rt.core().set_deps(c, &[b.id]).expect("rewire ok");
     // Push-on-subscribe should have fired fn with B's cached value.
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(20)));
     assert!(*calls.lock().unwrap() > calls_before);
@@ -74,7 +74,7 @@ fn additive_rewire_a_to_a_b() {
     // we just verify the mechanical behavior.
     //
     // Reusing the same fn that ignores deps[1]:
-    rt.core.set_deps(c, &[a.id, b.id]).expect("rewire ok");
+    rt.core().set_deps(c, &[a.id, b.id]).expect("rewire ok");
     // C should still derive from A's cache (=10).
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
     // B's emission triggers C — fn re-runs and returns deps[0] (=10).
@@ -93,7 +93,7 @@ fn full_removal_to_empty_deps() {
     let _rec = rt.subscribe_recorder(c);
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
 
-    rt.core.set_deps(c, &[]).expect("rewire to empty ok");
+    rt.core().set_deps(c, &[]).expect("rewire to empty ok");
     // Cache preserved per ROM/RAM (active compute node, so cache stays).
     assert_eq!(rt.cache_value(c), Some(TestValue::Int(10)));
     // Future emissions on A no longer affect C.
@@ -133,11 +133,11 @@ fn set_deps_full_removal_mid_wave_pairs_dirty_with_resolved() {
     // Dirty for C and adds C to pending_auto_resolve; the wave-end sweep
     // must still emit a Resolved for C even after deps are cleared.
     {
-        let _bg = rt.core.begin_batch();
+        let _bg = rt.core().begin_batch();
         // Same value as cache → equals substitution → RESOLVED on A.
         a.set(TestValue::Int(10));
         // Mid-wave full-removal of C's deps.
-        rt.core.set_deps(c, &[]).expect("rewire to empty ok");
+        rt.core().set_deps(c, &[]).expect("rewire to empty ok");
     } // BatchGuard drop drains the wave.
 
     // Every Dirty in C's post-pre-recorder events must be paired with a
@@ -193,7 +193,7 @@ fn idempotent_no_change() {
     let calls_before = *calls.lock().unwrap();
 
     // Idempotent rewire: same deps.
-    rt.core.set_deps(c, &[a.id]).expect("idempotent ok");
+    rt.core().set_deps(c, &[a.id]).expect("idempotent ok");
     // No additional fires.
     assert_eq!(*calls.lock().unwrap(), calls_before);
 }
@@ -206,7 +206,7 @@ fn self_rewire_rejected() {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
-    let result = rt.core.set_deps(c, &[c]);
+    let result = rt.core().set_deps(c, &[c]);
     assert!(matches!(result, Err(SetDepsError::SelfDependency { .. })));
 }
 
@@ -232,7 +232,7 @@ fn cycle_rejected() {
 
     // Try to rewire B to depend on D. Existing chain: B → C → D. Adding the
     // edge D → B would close a cycle (B → C → D → B).
-    let result = rt.core.set_deps(b, &[d]);
+    let result = rt.core().set_deps(b, &[d]);
     match result {
         Err(SetDepsError::WouldCreateCycle {
             n: cycle_n,
@@ -254,7 +254,7 @@ fn cycle_rejected() {
 
     // Sanity: a non-cyclic rewire still works.
     let unrelated = rt.state(Some(TestValue::Int(7)));
-    rt.core
+    rt.core()
         .set_deps(b, &[unrelated.id])
         .expect("unrelated rewire ok");
 }
@@ -263,7 +263,7 @@ fn cycle_rejected() {
 fn unknown_node_rejected() {
     let rt = TestRuntime::new();
     let bogus = NodeId::new(99999);
-    let result = rt.core.set_deps(bogus, &[]);
+    let result = rt.core().set_deps(bogus, &[]);
     assert!(matches!(result, Err(SetDepsError::UnknownNode(_))));
 }
 
@@ -271,7 +271,7 @@ fn unknown_node_rejected() {
 fn rewire_state_node_rejected() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
-    let result = rt.core.set_deps(s.id, &[]);
+    let result = rt.core().set_deps(s.id, &[]);
     assert!(matches!(result, Err(SetDepsError::NotComputeNode(_))));
 }
 
@@ -289,7 +289,7 @@ fn cache_preserved_across_rewire() {
     assert_eq!(cache_before, Some(TestValue::Int(100)));
 
     // Rewire to B (which is sentinel — no cached DATA → no push-on-subscribe).
-    rt.core.set_deps(c, &[b.id]).expect("rewire ok");
+    rt.core().set_deps(c, &[b.id]).expect("rewire ok");
     // Cache preserved per ROM/RAM (Q7).
     assert_eq!(rt.cache_value(c), cache_before);
 }
@@ -328,7 +328,7 @@ fn dynamic_rewire_refires_fn_on_new_deps() {
     assert_eq!(rt.cache_value(n), Some(TestValue::Int(10)));
 
     // Rewire to [b.id] (cached value 20).
-    rt.core.set_deps(n, &[b.id]).expect("rewire ok");
+    rt.core().set_deps(n, &[b.id]).expect("rewire ok");
     // Pre-fix: this assertion fails — fn never re-fired so cache stuck at 10.
     assert_eq!(
         rt.cache_value(n),
@@ -369,8 +369,8 @@ fn rewire_terminal_node_rejected() {
         _ => panic!("type"),
     });
     let _rec = rt.subscribe_recorder(c);
-    rt.core.complete(c);
-    let result = rt.core.set_deps(c, &[b.id]);
+    rt.core().complete(c);
+    let result = rt.core().set_deps(c, &[b.id]);
     assert!(matches!(result, Err(SetDepsError::TerminalNode { .. })));
 }
 
@@ -387,8 +387,8 @@ fn rewire_to_terminal_non_resubscribable_dep_rejected() {
     });
     let _rec = rt.subscribe_recorder(c);
     // Terminate b — it's not resubscribable.
-    rt.core.complete(b.id);
-    let result = rt.core.set_deps(c, &[b.id]);
+    rt.core().complete(b.id);
+    let result = rt.core().set_deps(c, &[b.id]);
     match result {
         Err(SetDepsError::TerminalDep { dep, .. }) => assert_eq!(dep, b.id),
         other => panic!("expected TerminalDep, got {other:?}"),
@@ -402,15 +402,15 @@ fn rewire_to_terminal_resubscribable_dep_accepted() {
     let rt = TestRuntime::new();
     let a = rt.state(Some(TestValue::Int(10)));
     let b = rt.state(Some(TestValue::Int(20)));
-    rt.core.set_resubscribable(b.id, true);
+    rt.core().set_resubscribable(b.id, true);
     let c = rt.derived(&[a.id], |deps| match &deps[0] {
         TestValue::Int(n) => Some(TestValue::Int(*n)),
         _ => panic!("type"),
     });
     let _rec = rt.subscribe_recorder(c);
     // Terminate b but it's flagged resubscribable.
-    rt.core.complete(b.id);
-    let result = rt.core.set_deps(c, &[b.id]);
+    rt.core().complete(b.id);
+    let result = rt.core().set_deps(c, &[b.id]);
     assert!(
         result.is_ok(),
         "resubscribable terminal dep should be accepted"
@@ -431,9 +431,9 @@ fn rewire_with_kept_terminal_dep_does_not_re_check() {
     let _rec = rt.subscribe_recorder(c);
     // Terminate a — c's auto-cascade gating doesn't fire because b is still
     // live. a stays in c's deps as a terminal-but-kept slot.
-    rt.core.complete(a.id);
+    rt.core().complete(a.id);
     // Rewire c, keeping a (a stays terminal but is not newly-added → no re-check).
-    let result = rt.core.set_deps(c, &[a.id, b.id]);
+    let result = rt.core().set_deps(c, &[a.id, b.id]);
     assert!(result.is_ok(), "kept terminal dep is not re-validated");
 }
 
@@ -459,7 +459,7 @@ fn rewire_releases_error_handles_in_removed_dep_slots() {
     // (The intern share is released by `Core::error` itself, since
     // `terminate_node` takes its own slot retain.)
     let err = rt.binding.intern(TestValue::Str("p-err".into()));
-    rt.core.error(p.id, err);
+    rt.core().error(p.id, err);
     let count_after_error = rt.binding.refcount_of(err);
     assert_eq!(
         count_after_error, 2,
@@ -469,7 +469,7 @@ fn rewire_releases_error_handles_in_removed_dep_slots() {
 
     // Rewire consumer to drop p. F1 fix releases the consumer.dep_terminals
     // slot retain for err.
-    rt.core.set_deps(consumer, &[q.id]).expect("rewire ok");
+    rt.core().set_deps(consumer, &[q.id]).expect("rewire ok");
     let count_after_rewire = rt.binding.refcount_of(err);
     assert_eq!(
         count_after_rewire, 1,
@@ -498,7 +498,7 @@ fn dynamic_rewire_to_sentinel_dep_holds_until_dep_emits() {
 
     // Rewire to sentinel — push-on-subscribe finds no cache → no delivery →
     // fn doesn't fire.
-    rt.core.set_deps(n, &[b.id]).expect("rewire ok");
+    rt.core().set_deps(n, &[b.id]).expect("rewire ok");
     assert_eq!(
         *calls.lock().unwrap(),
         calls_at_setup,

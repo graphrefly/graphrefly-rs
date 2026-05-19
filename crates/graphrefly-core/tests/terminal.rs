@@ -14,7 +14,7 @@ fn complete_emits_complete_message() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     let post = rec.snapshot();
     let complete_count = post[baseline..]
@@ -32,7 +32,7 @@ fn error_emits_error_message_with_payload() {
     let baseline = rec.snapshot().len();
 
     let err_handle = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(s.id, err_handle);
+    rt.core().error(s.id, err_handle);
 
     let post = rec.snapshot();
     let error_payloads: Vec<&TestValue> = post[baseline..]
@@ -53,9 +53,9 @@ fn complete_is_idempotent() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.complete(s.id);
-    rt.core.complete(s.id);
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
+    rt.core().complete(s.id);
+    rt.core().complete(s.id);
 
     let count = rec.snapshot()[baseline..]
         .iter()
@@ -70,7 +70,7 @@ fn emit_after_complete_is_silent_noop() {
     let s = rt.state(Some(TestValue::Int(7)));
     let _rec = rt.subscribe_recorder(s.id);
 
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
     let cache_after_complete = rt.cache_value(s.id);
 
     s.set(TestValue::Int(99));
@@ -93,7 +93,7 @@ fn complete_cascades_to_single_dep_derived() {
     assert_eq!(rt.cache_value(b), Some(TestValue::Int(11)));
     let baseline = rec_b.snapshot().len();
 
-    rt.core.complete(a.id);
+    rt.core().complete(a.id);
 
     // Auto-cascade: B's only dep terminated → B auto-completes.
     let b_completes = rec_b.snapshot()[baseline..]
@@ -116,7 +116,7 @@ fn complete_does_not_cascade_with_partial_terminal_deps() {
     let baseline = rec_b.snapshot().len();
 
     // Only A completes — C still live → B does NOT auto-cascade.
-    rt.core.complete(a.id);
+    rt.core().complete(a.id);
     let b_completes = rec_b.snapshot()[baseline..]
         .iter()
         .filter(|e| matches!(e, RecordedEvent::Complete))
@@ -124,7 +124,7 @@ fn complete_does_not_cascade_with_partial_terminal_deps() {
     assert_eq!(b_completes, 0);
 
     // C completes too → all B deps terminal → B auto-cascades.
-    rt.core.complete(c.id);
+    rt.core().complete(c.id);
     let b_completes = rec_b.snapshot()[baseline..]
         .iter()
         .filter(|e| matches!(e, RecordedEvent::Complete))
@@ -144,9 +144,9 @@ fn error_dominates_complete_in_cascade_lock_2b() {
     let rec_b = rt.subscribe_recorder(b);
     let baseline = rec_b.snapshot().len();
 
-    rt.core.complete(a.id);
+    rt.core().complete(a.id);
     let err = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(c.id, err);
+    rt.core().error(c.id, err);
 
     // B's deps: A=Complete, C=Error("boom") → ERROR dominates → B emits Error("boom").
     let post = rec_b.snapshot();
@@ -188,7 +188,7 @@ fn complete_cascades_through_diamond() {
     let rec_d = rt.subscribe_recorder(d);
     let baseline = rec_d.snapshot().len();
 
-    rt.core.complete(a.id);
+    rt.core().complete(a.id);
 
     // B and C both auto-complete (their only dep, A, terminated). D's deps
     // (B, C) both terminal → D auto-completes.
@@ -223,17 +223,17 @@ fn complete_buffers_through_pause_only_for_buffered_tiers() {
     // cascade" property under test is the `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
 
     s.set(TestValue::Int(1)); // tier 3 — buffered
-    rt.core.complete(s.id); // tier 5 — bypasses buffer; ALSO drains buffer
+    rt.core().complete(s.id); // tier 5 — bypasses buffer; ALSO drains buffer
 
     // Subscriber should have seen COMPLETE immediately even while paused.
     let mid_complete = rec.snapshot()[baseline..]
@@ -246,7 +246,7 @@ fn complete_buffers_through_pause_only_for_buffered_tiers() {
     // no longer paused (terminate_node collapsed pause_state to Active).
     // Per `Core::resume` semantics, an unknown lockId on an unpaused node
     // returns `Ok(None)` — the lockset is empty, no final-resume report.
-    let report = rt.core.resume(s.id, lock).expect("resume");
+    let report = rt.core().resume(s.id, lock).expect("resume");
     assert!(
         report.is_none(),
         "node was unpaused by complete; resume is a no-op"
@@ -281,7 +281,7 @@ fn complete_drops_pending_fires() {
     let _rec = rt.subscribe_recorder(b);
     let initial = *calls.lock().unwrap();
 
-    rt.core.complete(b);
+    rt.core().complete(b);
     a.set(TestValue::Int(99));
     assert_eq!(
         *calls.lock().unwrap(),
@@ -302,7 +302,7 @@ fn error_handle_retained_across_subscribers() {
     let baseline2 = rec2.snapshot().len();
 
     let err = rt.binding.intern(TestValue::Str("oops".into()));
-    rt.core.error(s.id, err);
+    rt.core().error(s.id, err);
 
     let r1_err = rec1.snapshot()[baseline1..].iter().find_map(|e| match e {
         RecordedEvent::Error(v) => Some(v.clone()),
@@ -321,5 +321,5 @@ fn error_handle_retained_across_subscribers() {
 fn error_with_no_handle_panics() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.error(s.id, graphrefly_core::NO_HANDLE);
+    rt.core().error(s.id, graphrefly_core::NO_HANDLE);
 }

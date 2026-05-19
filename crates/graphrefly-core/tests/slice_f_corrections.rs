@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use common::{RecordedEvent, TestBinding, TestRuntime, TestValue};
 use graphrefly_core::{
     BindingBoundary, Core, EqualsMode, FnId, FnResult, HandleId, LockId, Message, NodeId,
-    PausableMode, SetDepsError,
+    PausableMode,
 };
 
 // =====================================================================
@@ -24,7 +24,7 @@ fn a2_max_batch_drain_iterations_default_is_10000() {
     // observe the default value directly through the public API (no
     // getter), but we can lower the cap and verify it's enforced.
     let rt = TestRuntime::new();
-    rt.core.set_max_batch_drain_iterations(5);
+    rt.core().set_max_batch_drain_iterations(5);
     // Cap accepted without panic — sanity check the setter wired in.
 }
 
@@ -32,7 +32,7 @@ fn a2_max_batch_drain_iterations_default_is_10000() {
 #[should_panic(expected = "max_batch_drain_iterations must be > 0")]
 fn a2_zero_cap_rejected() {
     let rt = TestRuntime::new();
-    rt.core.set_max_batch_drain_iterations(0);
+    rt.core().set_max_batch_drain_iterations(0);
 }
 
 // =====================================================================
@@ -42,7 +42,7 @@ fn a2_zero_cap_rejected() {
 #[test]
 fn a4_alloc_lock_id_starts_above_user_range() {
     let rt = TestRuntime::new();
-    let allocated = rt.core.alloc_lock_id();
+    let allocated = rt.core().alloc_lock_id();
     // Phase E /qa F1 (2026-05-08): seed lowered from `1u64 << 32` to
     // `1u64 << 31` so values round-trip through napi's u32 boundary.
     // Anti-collision intent (high vs low range) preserved.
@@ -67,26 +67,26 @@ fn a4_user_supplied_low_lock_id_does_not_collide_with_alloc() {
 
     // User-supplied lock in the u32 range.
     let user_lock = LockId::new(42);
-    rt.core.pause(s.id, user_lock).expect("pause");
-    assert!(rt.core.is_paused(s.id));
-    assert!(rt.core.holds_pause_lock(s.id, user_lock));
+    rt.core().pause(s.id, user_lock).expect("pause");
+    assert!(rt.core().is_paused(s.id));
+    assert!(rt.core().holds_pause_lock(s.id, user_lock));
 
     // Allocator-issued lock — should NOT collide with user_lock.
-    let alloc_lock = rt.core.alloc_lock_id();
+    let alloc_lock = rt.core().alloc_lock_id();
     assert_ne!(user_lock, alloc_lock);
-    rt.core.pause(s.id, alloc_lock).expect("alloc pause");
-    assert_eq!(rt.core.pause_lock_count(s.id), 2);
+    rt.core().pause(s.id, alloc_lock).expect("alloc pause");
+    assert_eq!(rt.core().pause_lock_count(s.id), 2);
 
     // Resume in either order: removing alloc first leaves the node paused
     // (user_lock still held); removing user lock then resumes.
-    rt.core.resume(s.id, alloc_lock).expect("resume alloc");
-    assert!(rt.core.is_paused(s.id));
+    rt.core().resume(s.id, alloc_lock).expect("resume alloc");
+    assert!(rt.core().is_paused(s.id));
     let report = rt
-        .core
+        .core()
         .resume(s.id, user_lock)
         .expect("resume user")
         .expect("final");
-    assert!(!rt.core.is_paused(s.id));
+    assert!(!rt.core().is_paused(s.id));
     assert_eq!(report.replayed, 0);
 }
 
@@ -94,54 +94,18 @@ fn a4_user_supplied_low_lock_id_does_not_collide_with_alloc() {
 // A6 — D1 reentrancy guard: set_deps from firing fn rejected
 // =====================================================================
 
-/// Helper binding that exposes a hook for fn-fire to call set_deps on
-/// itself (the firing node). Models the D1 hazard scenario.
-struct D1Binding {
-    inner: Arc<TestBinding>,
-    /// Filled in by the test before fire. The fn-fire callback re-enters
-    /// `Core::set_deps(target, &new_deps)`; we capture the result so the
-    /// test can assert on it.
-    target: Mutex<Option<NodeId>>,
-    new_deps: Mutex<Vec<NodeId>>,
-    captured_result: Mutex<Option<Result<(), SetDepsError>>>,
-}
-
-impl BindingBoundary for D1Binding {
-    fn invoke_fn(
-        &self,
-        node_id: NodeId,
-        fn_id: FnId,
-        dep_data: &[graphrefly_core::DepBatch],
-    ) -> FnResult {
-        // S2b/β (D238/D232-AMEND): the D1 set_deps-from-firing-fn
-        // re-entry hook is retired here — a binding callback can no
-        // longer hold/clone a relocating `Core`, and `set_deps` has no
-        // mailbox path (not on `CoreFull`). The D1 reentrancy-guard
-        // assertion is deferred to the actor-model owner-side seam
-        // (S4); see the stubbed `a6_*` test. `target`/`new_deps`/
-        // `captured_result` retained as inert wiring.
-        let _ = (&self.target, &self.new_deps, &self.captured_result, node_id);
-        // Delegate to the inner binding for the actual emission.
-        self.inner.invoke_fn(node_id, fn_id, dep_data)
-    }
-
-    fn release_handle(&self, handle: HandleId) {
-        self.inner.release_handle(handle);
-    }
-
-    fn retain_handle(&self, handle: HandleId) {
-        self.inner.retain_handle(handle);
-    }
-
-    fn custom_equals(&self, fn_id: FnId, a: HandleId, b: HandleId) -> bool {
-        self.inner.custom_equals(fn_id, a, b)
-    }
-}
+// D1 reentrancy guard (`SetDepsError::ReentrantOnFiringNode`): the
+// β-invalid `D1Binding { ..: Mutex<..>, captured_result }` helper —
+// a binding holding a cloned relocating `Core` to re-enter
+// `set_deps(n)` synchronously from inside `n`'s own `invoke_fn` — is
+// DELETED (the exact actor-model-forbidden mechanism). See the
+// record-and-skip note on the stub below for why this one specific
+// invariant has no β-valid expression yet.
 
 #[test]
-#[ignore = "S2b/β /qa-2026-05-18 F1/F2: invariant LIVE (synchronous fn/equals/read/set_deps Core re-entry — NOT the producer mailbox path; NOT covered by producer tests or P7). Old binding-clones-Core mechanism is β-invalid; β-valid owner-side rewrite deferred to S4. Coverage gap: porting-deferred § /qa-2026-05-18."]
+#[ignore = "D246 record-and-skip: D1 `SetDepsError::ReentrantOnFiringNode` guard is LIVE (node-mid-fire-rewrite-corrupts-tracked-indices, node.rs `currently_firing.contains(&n)` check), but its ONLY trigger is a synchronous `set_deps(n)` re-entry while `n ∈ currently_firing` (i.e. from inside `n`'s own fn-fire). Under the actor model: `invoke_fn` carries no `&Core`; `set_deps` is NOT on `CoreFull` (the `MailboxOp::Defer` re-entry surface) and is NOT a `MailboxOp` variant; and a `Defer` runs owner-side AFTER the wave settles when `currently_firing` is empty — so the guard can never fire via the mailbox seam. The synchronous binding-holds-Core trigger is structurally deleted (D221/D246). The guard code itself stays live (still rejects owner-side mid-wave self-rewire attempts the owner could make in S4's owner-side seam). → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
 fn a6_set_deps_from_firing_fn_rejected_with_reentrant_error() {
-    // see #[ignore] — D1 set_deps-reentry guard still live; S4 β-rewrite; porting-deferred /qa-2026-05-18
+    // No β-valid expression under the actor model — see #[ignore]. → S4.
 }
 
 // =====================================================================
@@ -166,7 +130,7 @@ fn a7_handshake_panic_removes_sink_and_does_not_re_fire_on_next_wave() {
     });
 
     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = rt.core.subscribe(s.id, bad_sink);
+        let _ = rt.core().subscribe(s.id, bad_sink);
     }));
     assert!(panic_result.is_err(), "subscribe should have unwound");
     assert!(*panicked.lock().unwrap(), "the sink did get called");
@@ -181,7 +145,7 @@ fn a7_handshake_panic_removes_sink_and_does_not_re_fire_on_next_wave() {
             counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
-    let _sub = rt.core.subscribe(s.id, good_sink);
+    let _sub = rt.core().subscribe(s.id, good_sink);
 
     s.set(TestValue::Int(100));
     let n = counter.load(std::sync::atomic::Ordering::SeqCst);
@@ -212,15 +176,15 @@ fn a8_post_invalidate_compute_node_cache_is_sentinel() {
     });
     let _rec = rt.subscribe_recorder(n);
     // Confirm n fired and cached.
-    assert!(rt.core.has_fired_once(n));
-    let cache_pre = rt.core.cache_of(n);
+    assert!(rt.core().has_fired_once(n));
+    let cache_pre = rt.core().cache_of(n);
     assert_ne!(cache_pre, HandleId::new(0), "n cached before invalidate");
 
     // Invalidate n.
-    rt.core.invalidate(n);
+    rt.core().invalidate(n);
 
     // Per R1.3.7.b: cache cleared, status sentinel.
-    let cache_post = rt.core.cache_of(n);
+    let cache_post = rt.core().cache_of(n);
     assert_eq!(
         cache_post,
         HandleId::new(0),
@@ -374,24 +338,28 @@ fn a3_overflow_silently_dropped_when_binding_returns_none() {
     // Default BindingBoundary impl returns None for synthesize_pause_overflow_error.
     // TestBinding doesn't override it, so this exercises the silent-drop fallback.
     let rt = TestRuntime::new();
-    rt.core.set_pause_buffer_cap(Some(2));
+    rt.core().set_pause_buffer_cap(Some(2));
     let s = rt.state(Some(TestValue::Int(0)));
     // R2.6.0: the pause-buffer drop/overflow path is the `ResumeAll`
     // contract (a Default leaf source has no buffer to overflow) — opt in.
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
 
     // 5 emits with cap=2 → 3 dropped, no ERROR (binding opted out).
     for v in 1..=5 {
         s.set(TestValue::Int(v));
     }
 
-    let report = rt.core.resume(s.id, lock).expect("resume").expect("final");
+    let report = rt
+        .core()
+        .resume(s.id, lock)
+        .expect("resume")
+        .expect("final");
     assert_eq!(report.dropped, 3, "dropped count surfaced via ResumeReport");
     // Subscriber received the surviving 2 buffered values on resume but no ERROR.
     let saw_error = rec
@@ -423,13 +391,13 @@ fn item4_register_rejects_non_resubscribable_terminal_dep() {
     let _rec = rt.subscribe_recorder(s.id);
 
     // Terminate s WITHOUT marking resubscribable.
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     let fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| Some(deps[0].clone()));
     let result = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false);
     assert_eq!(
         result,
@@ -443,16 +411,16 @@ fn item4_register_accepts_resubscribable_terminal_dep() {
     // resets their lifecycle. Mirrors `set_deps`'s `TerminalDep` policy.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
     let _rec = rt.subscribe_recorder(s.id);
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     let fn_id = rt
         .binding
         .register_fn(|deps: &[TestValue]| Some(deps[0].clone()));
     // Should not panic.
     let _ok = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
 }
@@ -478,15 +446,17 @@ fn item5_default_mode_consolidates_to_one_fn_fire_on_resume() {
         }
     });
     // Default mode is the default; explicit for clarity in this test.
-    rt.core.set_pausable_mode(n, PausableMode::Default).unwrap();
+    rt.core()
+        .set_pausable_mode(n, PausableMode::Default)
+        .unwrap();
     let rec = rt.subscribe_recorder(n);
 
     // Activation fires fn once.
     assert_eq!(*calls.lock().unwrap(), 1);
     let baseline_calls = 1u32;
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(n, lock).expect("pause n");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(n, lock).expect("pause n");
     let baseline_data = rec.data_values().len();
 
     // 3 upstream emissions during pause — fn must NOT fire (default mode
@@ -507,7 +477,7 @@ fn item5_default_mode_consolidates_to_one_fn_fire_on_resume() {
     );
 
     // Resume → exactly ONE fn fire consolidating the pause-window dep state.
-    let report = rt.core.resume(n, lock).expect("resume").expect("final");
+    let report = rt.core().resume(n, lock).expect("resume").expect("final");
     assert_eq!(
         *calls.lock().unwrap(),
         baseline_calls + 1,
@@ -544,10 +514,10 @@ fn item5_default_mode_no_emit_during_pause_means_no_fire_on_resume() {
     let _rec = rt.subscribe_recorder(n);
     let baseline = *calls.lock().unwrap();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(n, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(n, lock).expect("pause");
     // No emits during pause.
-    let report = rt.core.resume(n, lock).expect("resume").expect("final");
+    let report = rt.core().resume(n, lock).expect("resume").expect("final");
 
     assert_eq!(
         *calls.lock().unwrap(),
@@ -573,13 +543,16 @@ fn item5_off_mode_pause_is_no_op() {
             _ => None,
         }
     });
-    rt.core.set_pausable_mode(n, PausableMode::Off).unwrap();
+    rt.core().set_pausable_mode(n, PausableMode::Off).unwrap();
     let _rec = rt.subscribe_recorder(n);
     let baseline = *calls.lock().unwrap();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(n, lock).expect("pause"); // no-op for Off
-    assert!(!rt.core.is_paused(n), "Off mode treats pause() as a no-op");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(n, lock).expect("pause"); // no-op for Off
+    assert!(
+        !rt.core().is_paused(n),
+        "Off mode treats pause() as a no-op"
+    );
 
     a.set(TestValue::Int(5));
     assert_eq!(
@@ -613,9 +586,9 @@ fn r2_6_0_default_leaf_source_self_emit_delivers_immediately_while_self_paused()
     let rec = rt.subscribe_recorder(n.id);
 
     // 3. allocate a lock id and 4. self-pause the leaf source.
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(n.id, lock).expect("pause leaf source");
-    assert!(rt.core.is_paused(n.id), "leaf source holds its own lock");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(n.id, lock).expect("pause leaf source");
+    assert!(rt.core().is_paused(n.id), "leaf source holds its own lock");
 
     // 5. baseline the recorded events (mirrors item5_* "clear" pattern —
     //    the Recorder has no clear(); a baseline index is the idiom).
@@ -650,7 +623,7 @@ fn r2_6_0_default_leaf_source_self_emit_delivers_immediately_while_self_paused()
 
     // 8. resume the leaf source's own lock.
     let report = rt
-        .core
+        .core()
         .resume(n.id, lock)
         .expect("resume")
         .expect("final resume");
@@ -681,9 +654,9 @@ fn item5_set_pausable_mode_rejects_when_paused() {
     // `Err(SetPausableModeError::WhilePaused)` rather than panicking.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
-    let result = rt.core.set_pausable_mode(s.id, PausableMode::ResumeAll);
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
+    let result = rt.core().set_pausable_mode(s.id, PausableMode::ResumeAll);
     assert_eq!(
         result,
         Err(graphrefly_core::SetPausableModeError::WhilePaused)
@@ -703,7 +676,7 @@ fn f2_up_rejects_tier3_data() {
     let s = rt.state(Some(TestValue::Int(1)));
     let n = rt.derived(&[s.id], |deps| deps.first().cloned());
     let h = rt.binding.intern(TestValue::Int(99));
-    let result = rt.core.up(n, Message::Data(h));
+    let result = rt.core().up(n, Message::Data(h));
     assert!(
         matches!(
             result,
@@ -718,7 +691,7 @@ fn f2_up_rejects_tier3_resolved() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
     let n = rt.derived(&[s.id], |deps| deps.first().cloned());
-    let result = rt.core.up(n, Message::Resolved);
+    let result = rt.core().up(n, Message::Resolved);
     assert!(matches!(
         result,
         Err(graphrefly_core::UpError::TierForbidden { tier: 3 })
@@ -730,7 +703,7 @@ fn f2_up_rejects_tier5_complete() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
     let n = rt.derived(&[s.id], |deps| deps.first().cloned());
-    let result = rt.core.up(n, Message::Complete);
+    let result = rt.core().up(n, Message::Complete);
     assert!(matches!(
         result,
         Err(graphrefly_core::UpError::TierForbidden { tier: 5 })
@@ -743,7 +716,7 @@ fn f2_up_rejects_tier5_error() {
     let s = rt.state(Some(TestValue::Int(1)));
     let n = rt.derived(&[s.id], |deps| deps.first().cloned());
     let h = rt.binding.intern(TestValue::Int(0));
-    let result = rt.core.up(n, Message::Error(h));
+    let result = rt.core().up(n, Message::Error(h));
     assert!(matches!(
         result,
         Err(graphrefly_core::UpError::TierForbidden { tier: 5 })
@@ -761,13 +734,13 @@ fn f2_up_invalidate_clears_dep_cache() {
     let _rec = rt.subscribe_recorder(n);
 
     // s has cached value pre-up.
-    assert_ne!(rt.core.cache_of(s.id), HandleId::new(0));
+    assert_ne!(rt.core().cache_of(s.id), HandleId::new(0));
 
     // up(n, INVALIDATE) routes to invalidate(s) for each dep s.
-    rt.core.up(n, Message::Invalidate).expect("up ok");
+    rt.core().up(n, Message::Invalidate).expect("up ok");
 
     // s's cache cleared.
-    assert_eq!(rt.core.cache_of(s.id), HandleId::new(0));
+    assert_eq!(rt.core().cache_of(s.id), HandleId::new(0));
 }
 
 #[test]
@@ -778,15 +751,15 @@ fn f2_up_pause_routes_to_each_dep() {
     let _rec = rt.subscribe_recorder(n);
 
     let lock = LockId::new(7);
-    rt.core.up(n, Message::Pause(lock)).expect("up pause");
+    rt.core().up(n, Message::Pause(lock)).expect("up pause");
     assert!(
-        rt.core.is_paused(s.id),
+        rt.core().is_paused(s.id),
         "up(Pause) should pause each dep of n"
     );
 
-    rt.core.up(n, Message::Resume(lock)).expect("up resume");
+    rt.core().up(n, Message::Resume(lock)).expect("up resume");
     assert!(
-        !rt.core.is_paused(s.id),
+        !rt.core().is_paused(s.id),
         "up(Resume) should resume each dep of n"
     );
 }
@@ -795,7 +768,7 @@ fn f2_up_pause_routes_to_each_dep() {
 fn f2_up_unknown_node_rejected() {
     let rt = TestRuntime::new();
     let bogus = graphrefly_core::NodeId::new(99_999);
-    let result = rt.core.up(bogus, Message::Invalidate);
+    let result = rt.core().up(bogus, Message::Invalidate);
     assert!(matches!(
         result,
         Err(graphrefly_core::UpError::UnknownNode(_))
@@ -811,15 +784,15 @@ fn f2_up_dirty_and_start_are_no_ops() {
     let n = rt.derived(&[s.id], |deps| deps.first().cloned());
     let _rec = rt.subscribe_recorder(n);
 
-    let cache_pre = rt.core.cache_of(s.id);
-    let paused_pre = rt.core.is_paused(s.id);
+    let cache_pre = rt.core().cache_of(s.id);
+    let paused_pre = rt.core().is_paused(s.id);
 
-    rt.core.up(n, Message::Dirty).expect("up dirty");
-    rt.core.up(n, Message::Start).expect("up start");
+    rt.core().up(n, Message::Dirty).expect("up dirty");
+    rt.core().up(n, Message::Start).expect("up start");
 
     // No state change on s.
-    assert_eq!(rt.core.cache_of(s.id), cache_pre);
-    assert_eq!(rt.core.is_paused(s.id), paused_pre);
+    assert_eq!(rt.core().cache_of(s.id), cache_pre);
+    assert_eq!(rt.core().is_paused(s.id), paused_pre);
 }
 
 // =====================================================================
@@ -854,7 +827,7 @@ fn slice_g_batch_multi_same_value_emit_does_not_produce_multi_resolved() {
     let baseline = rec.snapshot().len();
 
     // Two same-value emits within one batch wave.
-    rt.core.batch(|| {
+    rt.core().batch(|| {
         s.set(TestValue::Int(42));
         s.set(TestValue::Int(42));
     });
@@ -904,7 +877,7 @@ fn slice_e1_replay_buffer_disabled_by_default() {
 fn slice_e1_replay_buffer_replays_recent_data_to_late_subscriber() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(1)));
-    rt.core.set_replay_buffer_cap(s.id, Some(3));
+    rt.core().set_replay_buffer_cap(s.id, Some(3));
 
     s.set(TestValue::Int(2));
     s.set(TestValue::Int(3));
@@ -934,7 +907,7 @@ fn slice_e1_replay_buffer_replays_recent_data_to_late_subscriber() {
 fn slice_e1_replay_buffer_evicts_oldest_when_cap_exceeded() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    rt.core.set_replay_buffer_cap(s.id, Some(2));
+    rt.core().set_replay_buffer_cap(s.id, Some(2));
 
     // 5 emits with cap=2 → buffer ends with last 2 (4, 5); 3 evicted.
     for v in 1..=5 {
@@ -957,10 +930,10 @@ fn slice_e1_set_replay_buffer_cap_to_none_drains_existing() {
     // Lowering cap to None should drain existing entries (releasing retains).
     let rt = TestRuntime::new();
     let s = rt.state(None);
-    rt.core.set_replay_buffer_cap(s.id, Some(3));
+    rt.core().set_replay_buffer_cap(s.id, Some(3));
     s.set(TestValue::Int(1));
     s.set(TestValue::Int(2));
-    rt.core.set_replay_buffer_cap(s.id, None);
+    rt.core().set_replay_buffer_cap(s.id, None);
 
     let rec = rt.subscribe_recorder(s.id);
     let data: Vec<TestValue> = rec.data_values();

@@ -21,11 +21,11 @@ use graphrefly_core::SubscribeError;
 fn subscribe_to_non_resubscribable_completed_returns_torn_down_error() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     // try_subscribe returns Err(TornDown).
     let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
@@ -36,7 +36,7 @@ fn subscribe_to_non_resubscribable_completed_returns_torn_down_error() {
 fn subscribe_to_non_resubscribable_completed_panics() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.complete(s.id);
+    rt.core().complete(s.id);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _rec = rt.subscribe_recorder(s.id);
@@ -52,10 +52,10 @@ fn subscribe_to_non_resubscribable_errored_returns_torn_down_error() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
     let err = rt.binding.intern(TestValue::Str("boom".into()));
-    rt.core.error(s.id, err);
+    rt.core().error(s.id, err);
 
     let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
@@ -66,10 +66,10 @@ fn subscribe_to_non_resubscribable_errored_returns_torn_down_error() {
 fn subscribe_to_non_resubscribable_torndown_returns_torn_down_error() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(5)));
-    rt.core.teardown(s.id);
+    rt.core().teardown(s.id);
 
     let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
@@ -80,10 +80,10 @@ fn subscribe_to_non_resubscribable_torndown_returns_torn_down_error() {
 fn resubscribable_late_subscriber_resets_terminal_state() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.set_resubscribable(s.id, true);
-    rt.core.complete(s.id);
+    rt.core().set_resubscribable(s.id, true);
+    rt.core().complete(s.id);
     assert!(!rt
-        .core
+        .core()
         .holds_pause_lock(s.id, graphrefly_core::LockId::new(0)));
 
     // Late subscribe to resubscribable terminal node — should reset.
@@ -108,8 +108,8 @@ fn resubscribable_late_subscriber_resets_terminal_state() {
 fn resubscribable_resumes_after_reset_accepts_new_emits() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.set_resubscribable(s.id, true);
-    rt.core.complete(s.id);
+    rt.core().set_resubscribable(s.id, true);
+    rt.core().complete(s.id);
 
     // First lifecycle dies; resubscribe → reset.
     let rec = rt.subscribe_recorder(s.id);
@@ -137,12 +137,12 @@ fn resubscribable_clears_dep_handles_for_compute_nodes() {
             _ => None,
         }
     });
-    rt.core.set_resubscribable(b, true);
+    rt.core().set_resubscribable(b, true);
     let rec1 = rt.subscribe_recorder(b);
     assert_eq!(*calls.lock().unwrap(), 1);
-    drop(rec1); // release first subscription
+    rt.unsub_recorder(&rec1); // release first subscription
 
-    rt.core.complete(b);
+    rt.core().complete(b);
 
     // Resubscribe — reset clears dep_handles and has_fired_once. Compute
     // node's first-run gate re-closes; activation walks deps again; fn
@@ -160,7 +160,7 @@ fn set_resubscribable_after_subscribe_panics() {
     let s = rt.state(Some(TestValue::Int(0)));
     let _rec = rt.subscribe_recorder(s.id);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.core.set_resubscribable(s.id, true);
+        rt.core().set_resubscribable(s.id, true);
     }));
     assert!(
         result.is_err(),
@@ -172,17 +172,17 @@ fn set_resubscribable_after_subscribe_panics() {
 fn resubscribable_resets_pause_state_drops_buffer() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
     let rec = rt.subscribe_recorder(s.id);
 
     // Pause and emit some buffered DATAs.
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
     s.set(TestValue::Int(1));
     s.set(TestValue::Int(2));
     // Terminate while paused; buffered messages won't replay.
-    rt.core.complete(s.id);
-    drop(rec);
+    rt.core().complete(s.id);
+    rt.unsub_recorder(&rec);
 
     // Resubscribe — reset drains pause locks and the buffer (no replay
     // because the buffer is cleared along with the lifecycle).
@@ -197,7 +197,7 @@ fn resubscribable_resets_pause_state_drops_buffer() {
         buffered_data_post_reset, 1,
         "exactly one DATA from cache; buffered DATAs not replayed post-reset"
     );
-    assert!(!rt.core.is_paused(s.id), "pause state cleared on reset");
+    assert!(!rt.core().is_paused(s.id), "pause state cleared on reset");
 }
 
 #[test]
@@ -212,8 +212,8 @@ fn resubscribable_resets_after_teardown() {
     // that was over-defensive and is corrected by D118.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.set_resubscribable(s.id, true);
-    rt.core.teardown(s.id);
+    rt.core().set_resubscribable(s.id, true);
+    rt.core().teardown(s.id);
 
     // Late subscribe — should reset because resubscribable.
     let rec = rt.subscribe_recorder(s.id);
@@ -251,16 +251,16 @@ fn resubscribable_resets_after_any_terminal_including_teardown() {
     // R2.2.7.a (D118): the prior `!has_received_teardown` guard is removed.
     let rt = TestRuntime::new();
     let a = rt.state(Some(TestValue::Int(1)));
-    rt.core.set_resubscribable(a.id, true);
-    rt.core.complete(a.id);
+    rt.core().set_resubscribable(a.id, true);
+    rt.core().complete(a.id);
     let rec_a = rt.subscribe_recorder(a.id);
     let snap_a = rec_a.snapshot();
     let a_has_complete = snap_a.iter().any(|e| matches!(e, RecordedEvent::Complete));
     assert!(!a_has_complete, "complete: reset clears terminal");
 
     let b = rt.state(Some(TestValue::Int(1)));
-    rt.core.set_resubscribable(b.id, true);
-    rt.core.teardown(b.id);
+    rt.core().set_resubscribable(b.id, true);
+    rt.core().teardown(b.id);
     let rec_b = rt.subscribe_recorder(b.id);
     let snap_b = rec_b.snapshot();
     let b_has_complete = snap_b.iter().any(|e| matches!(e, RecordedEvent::Complete));
@@ -282,11 +282,11 @@ fn subscribe_to_non_resubscribable_terminated_with_invalidated_cache_returns_tor
     // refuses subscribe — the stream is over.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(42)));
-    rt.core.invalidate(s.id); // clears cache to NO_HANDLE
-    rt.core.complete(s.id);
+    rt.core().invalidate(s.id); // clears cache to NO_HANDLE
+    rt.core().complete(s.id);
 
     let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),

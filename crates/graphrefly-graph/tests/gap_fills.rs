@@ -3,8 +3,9 @@
 
 mod common;
 
+use common::graph;
 use graphrefly_core::{EqualsMode, FnId, HandleId, Message, NO_HANDLE};
-use graphrefly_graph::{Graph, GraphOps, GraphRemoveAudit, RemoveError, SignalKind};
+use graphrefly_graph::{GraphRemoveAudit, RemoveError, SignalKind};
 use std::sync::{Arc, Mutex};
 
 fn h(n: u64) -> HandleId {
@@ -17,74 +18,80 @@ fn h(n: u64) -> HandleId {
 
 #[test]
 fn set_and_get_by_name() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("count", Some(h(10))).unwrap();
-    assert_eq!(g.get("count"), h(10));
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "count", Some(h(10))).unwrap();
+    assert_eq!(g.get(rt.core(), "count"), h(10));
 
-    g.set("count", h(20));
-    assert_eq!(g.get("count"), h(20));
-    assert_eq!(g.cache_of(s), h(20));
+    g.set(rt.core(), "count", h(20));
+    assert_eq!(g.get(rt.core(), "count"), h(20));
+    assert_eq!(g.cache_of(rt.core(), s), h(20));
 }
 
 #[test]
 #[should_panic(expected = "no node at path")]
 fn get_panics_on_missing_name() {
-    let g = Graph::new("test", common::binding());
-    let _ = g.get("nonexistent");
+    let (rt, g) = graph("test");
+    let _ = g.get(rt.core(), "nonexistent");
 }
 
 #[test]
 #[should_panic(expected = "no node at path")]
 fn set_panics_on_missing_name() {
-    let g = Graph::new("test", common::binding());
-    g.set("nonexistent", h(1));
+    let (rt, g) = graph("test");
+    g.set(rt.core(), "nonexistent", h(1));
 }
 
 #[test]
 fn invalidate_by_name_clears_cache() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("x", Some(h(5))).unwrap();
-    assert_eq!(g.cache_of(s), h(5));
-    g.invalidate_by_name("x");
-    assert_eq!(g.cache_of(s), NO_HANDLE);
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "x", Some(h(5))).unwrap();
+    assert_eq!(g.cache_of(rt.core(), s), h(5));
+    g.invalidate_by_name(rt.core(), "x");
+    assert_eq!(g.cache_of(rt.core(), s), NO_HANDLE);
 }
 
 #[test]
 fn complete_by_name_terminates() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("x", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "x", Some(h(1))).unwrap();
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
-    let _sub = g.subscribe(
+    let sub = g.subscribe(
+        rt.core(),
         s,
         Arc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
 
-    g.complete_by_name("x");
+    g.complete_by_name(rt.core(), "x");
     let evts = events.lock().unwrap();
     assert!(evts.iter().any(|m| matches!(m, Message::Complete)));
+    drop(evts);
+    g.unsubscribe(rt.core(), s, sub);
 }
 
 #[test]
 fn error_by_name_terminates_with_handle() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("x", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "x", Some(h(1))).unwrap();
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
-    let _sub = g.subscribe(
+    let sub = g.subscribe(
+        rt.core(),
         s,
         Arc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
 
-    g.error_by_name("x", h(99));
+    g.error_by_name(rt.core(), "x", h(99));
     let evts = events.lock().unwrap();
     assert!(evts.iter().any(|m| matches!(m, Message::Error(_))));
+    drop(evts);
+    g.unsubscribe(rt.core(), s, sub);
 }
 
 // -------------------------------------------------------------------
@@ -93,19 +100,20 @@ fn error_by_name_terminates_with_handle() {
 
 #[test]
 fn remove_node_sends_teardown_and_clears_namespace() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("temp", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "temp", Some(h(1))).unwrap();
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
-    let _sub = g.subscribe(
+    let sub = g.subscribe(
+        rt.core(),
         s,
         Arc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
 
-    let audit = g.remove("temp").unwrap();
+    let audit = g.remove(rt.core(), "temp").unwrap();
     assert_eq!(
         audit,
         GraphRemoveAudit {
@@ -118,16 +126,18 @@ fn remove_node_sends_teardown_and_clears_namespace() {
     // TEARDOWN was delivered.
     let evts = events.lock().unwrap();
     assert!(evts.iter().any(|m| matches!(m, Message::Teardown)));
+    drop(evts);
+    g.unsubscribe(rt.core(), s, sub);
 }
 
 #[test]
 fn remove_mounted_subgraph_delegates_to_unmount() {
-    let g = Graph::new("root", common::binding());
-    let child = g.mount_new("child").unwrap();
-    child.state("a", Some(h(1))).unwrap();
-    child.state("b", Some(h(2))).unwrap();
+    let (rt, g) = graph("root");
+    let child = g.mount_new(rt.core(), "child").unwrap();
+    child.state(rt.core(), "a", Some(h(1))).unwrap();
+    child.state(rt.core(), "b", Some(h(2))).unwrap();
 
-    let audit = g.remove("child").unwrap();
+    let audit = g.remove(rt.core(), "child").unwrap();
     assert_eq!(audit.node_count, 2);
     assert_eq!(audit.mount_count, 0); // child itself had 0 sub-mounts
     assert!(g.try_resolve("child::a").is_none());
@@ -135,8 +145,8 @@ fn remove_mounted_subgraph_delegates_to_unmount() {
 
 #[test]
 fn remove_not_found_returns_error() {
-    let g = Graph::new("test", common::binding());
-    let err = g.remove("ghost").unwrap_err();
+    let (rt, g) = graph("test");
+    let err = g.remove(rt.core(), "ghost").unwrap_err();
     assert!(matches!(err, RemoveError::NotFound(_)));
 }
 
@@ -145,13 +155,14 @@ fn remove_preserves_namespace_during_teardown_cascade() {
     // P1 — sinks observing TEARDOWN must be able to resolve the name
     // mid-cascade. R3.2.3 / R3.7.3 ordering: clear namespace AFTER the
     // teardown returns, mirroring destroy()'s Slice E+ /qa B3 fix.
-    let g = Graph::new("test", common::binding());
-    let s = g.state("temp", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "temp", Some(h(1))).unwrap();
 
-    let g_clone = g.namespace();
+    let g_clone = g.clone();
     let observed_name = Arc::new(Mutex::new(None::<String>));
     let observed_clone = observed_name.clone();
-    let _sub = g.subscribe(
+    let sub = g.subscribe(
+        rt.core(),
         s,
         Arc::new(move |msgs: &[Message]| {
             for m in msgs {
@@ -164,7 +175,7 @@ fn remove_preserves_namespace_during_teardown_cascade() {
         }),
     );
 
-    g.remove("temp").unwrap();
+    g.remove(rt.core(), "temp").unwrap();
     // Mid-cascade lookup observed the name.
     assert_eq!(
         observed_name.lock().unwrap().as_deref(),
@@ -173,14 +184,15 @@ fn remove_preserves_namespace_during_teardown_cascade() {
     );
     // After remove returns, the name is gone.
     assert_eq!(g.name_of(s), None);
+    g.unsubscribe(rt.core(), s, sub);
 }
 
 #[test]
 fn remove_on_destroyed_graph() {
-    let g = Graph::new("test", common::binding());
-    g.state("x", None).unwrap();
-    g.destroy();
-    let err = g.remove("x").unwrap_err();
+    let (rt, g) = graph("test");
+    g.state(rt.core(), "x", None).unwrap();
+    g.destroy(rt.core());
+    let err = g.remove(rt.core(), "x").unwrap_err();
     assert!(matches!(err, RemoveError::Destroyed));
 }
 
@@ -190,45 +202,45 @@ fn remove_on_destroyed_graph() {
 
 #[test]
 fn signal_invalidate_clears_all_named_caches() {
-    let g = Graph::new("test", common::binding());
-    let a = g.state("a", Some(h(1))).unwrap();
-    let b = g.state("b", Some(h(2))).unwrap();
+    let (rt, g) = graph("test");
+    let a = g.state(rt.core(), "a", Some(h(1))).unwrap();
+    let b = g.state(rt.core(), "b", Some(h(2))).unwrap();
 
-    g.signal(SignalKind::Invalidate);
-    assert_eq!(g.cache_of(a), NO_HANDLE);
-    assert_eq!(g.cache_of(b), NO_HANDLE);
+    g.signal(rt.core(), SignalKind::Invalidate);
+    assert_eq!(g.cache_of(rt.core(), a), NO_HANDLE);
+    assert_eq!(g.cache_of(rt.core(), b), NO_HANDLE);
 }
 
 #[test]
 fn signal_pause_and_resume_round_trip() {
-    let g = Graph::new("test", common::binding());
-    let s = g.state("x", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    let s = g.state(rt.core(), "x", Some(h(1))).unwrap();
 
-    let lock = g.alloc_lock_id();
-    g.signal(SignalKind::Pause(lock));
-    assert!(g.core().is_paused(s));
+    let lock = g.alloc_lock_id(rt.core());
+    g.signal(rt.core(), SignalKind::Pause(lock));
+    assert!(rt.core().is_paused(s));
 
-    g.signal(SignalKind::Resume(lock));
-    assert!(!g.core().is_paused(s));
+    g.signal(rt.core(), SignalKind::Resume(lock));
+    assert!(!rt.core().is_paused(s));
 }
 
 #[test]
 fn signal_invalidate_recurses_into_mounts() {
-    let g = Graph::new("root", common::binding());
-    let child = g.mount_new("child").unwrap();
-    let c = child.state("x", Some(h(5))).unwrap();
+    let (rt, g) = graph("root");
+    let child = g.mount_new(rt.core(), "child").unwrap();
+    let c = child.state(rt.core(), "x", Some(h(5))).unwrap();
 
-    g.signal(SignalKind::Invalidate);
-    assert_eq!(g.cache_of(c), NO_HANDLE);
+    g.signal(rt.core(), SignalKind::Invalidate);
+    assert_eq!(g.cache_of(rt.core(), c), NO_HANDLE);
 }
 
 #[test]
 fn signal_on_destroyed_graph_is_noop() {
-    let g = Graph::new("test", common::binding());
-    g.state("x", Some(h(1))).unwrap();
-    g.destroy();
+    let (rt, g) = graph("test");
+    g.state(rt.core(), "x", Some(h(1))).unwrap();
+    g.destroy(rt.core());
     // Should not panic.
-    g.signal(SignalKind::Invalidate);
+    g.signal(rt.core(), SignalKind::Invalidate);
 }
 
 // -------------------------------------------------------------------
@@ -237,30 +249,30 @@ fn signal_on_destroyed_graph_is_noop() {
 
 #[test]
 fn edges_local_only() {
-    let g = Graph::new("test", common::binding());
-    let a = g.state("a", None).unwrap();
-    g.derived("b", &[a], FnId::new(1), EqualsMode::Identity)
+    let (rt, g) = graph("test");
+    let a = g.state(rt.core(), "a", None).unwrap();
+    g.derived(rt.core(), "b", &[a], FnId::new(1), EqualsMode::Identity)
         .unwrap();
 
-    let edges = g.edges(false);
+    let edges = g.edges(rt.core(), false);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0], ("a".to_string(), "b".to_string()));
 }
 
 #[test]
 fn edges_recursive_into_mounts() {
-    let g = Graph::new("root", common::binding());
-    let a = g.state("a", None).unwrap();
-    g.derived("b", &[a], FnId::new(1), EqualsMode::Identity)
+    let (rt, g) = graph("root");
+    let a = g.state(rt.core(), "a", None).unwrap();
+    g.derived(rt.core(), "b", &[a], FnId::new(1), EqualsMode::Identity)
         .unwrap();
 
-    let child = g.mount_new("child").unwrap();
-    let c = child.state("c", None).unwrap();
+    let child = g.mount_new(rt.core(), "child").unwrap();
+    let c = child.state(rt.core(), "c", None).unwrap();
     child
-        .derived("d", &[c], FnId::new(2), EqualsMode::Identity)
+        .derived(rt.core(), "d", &[c], FnId::new(2), EqualsMode::Identity)
         .unwrap();
 
-    let edges = g.edges(true);
+    let edges = g.edges(rt.core(), true);
     assert_eq!(edges.len(), 2);
     assert!(edges.contains(&("a".to_string(), "b".to_string())));
     assert!(edges.contains(&("child::c".to_string(), "child::d".to_string())));
@@ -268,13 +280,13 @@ fn edges_recursive_into_mounts() {
 
 #[test]
 fn edges_cross_graph_dep_shows_as_anon() {
-    let g = Graph::new("test", common::binding());
+    let (rt, g) = graph("test");
     // Register a node through Core without naming it.
-    let anon = g.core().register_state(h(1), false).unwrap();
-    g.derived("d", &[anon], FnId::new(1), EqualsMode::Identity)
+    let anon = rt.core().register_state(h(1), false).unwrap();
+    g.derived(rt.core(), "d", &[anon], FnId::new(1), EqualsMode::Identity)
         .unwrap();
 
-    let edges = g.edges(false);
+    let edges = g.edges(rt.core(), false);
     assert_eq!(edges.len(), 1);
     assert!(edges[0].0.starts_with("_anon_"));
     assert_eq!(edges[0].1, "d");
@@ -282,7 +294,7 @@ fn edges_cross_graph_dep_shows_as_anon() {
 
 #[test]
 fn edges_empty_graph() {
-    let g = Graph::new("empty", common::binding());
-    assert!(g.edges(false).is_empty());
-    assert!(g.edges(true).is_empty());
+    let (rt, g) = graph("empty");
+    assert!(g.edges(rt.core(), false).is_empty());
+    assert!(g.edges(rt.core(), true).is_empty());
 }

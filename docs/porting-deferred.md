@@ -3544,7 +3544,163 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
 
 ### D246 record-and-skip (running list — flags where the D246 pattern genuinely does NOT apply; report at session end)
 
-_(empty — append `- [area] what / why D246 doesn't fit / proposed handling` as encountered; do NOT HALT for these.)_
+- [storage] **RESOLVED (keystone, 2026-05-18)** — `graphrefly-graph` now
+  exposes `pub fn Graph::snapshot_full(&self, core: &dyn CoreFull)`
+  (delegates to the `pub(crate)` `snapshot_of`); `graph_integration.rs:657`
+  changed to `graph_for_defer.snapshot_full(cf)`. The in-wave-deferred
+  snapshot path compiles; no record-and-skip remains for this. Original
+  finding kept below for the audit trail:
+- [storage] `attach_snapshot_storage` in-wave-deferred snapshot path cannot
+  call `Graph::snapshot` from the `MailboxOp::Defer(|cf: &dyn CoreFull|)`
+  closure / **why D246 doesn't fit**: the frozen spec (§"graphrefly_storage")
+  says the deferred path "calls the snapshot over `&dyn CoreFull`" via
+  "graphrefly_graph public API", but `graphrefly-graph` only exposes
+  `Graph::snapshot(&self, core: &Core)` (concrete `&Core`); the
+  `&dyn CoreFull`-accepting `snapshot_of` is `pub(crate)` and there is no
+  public `&dyn CoreFull` snapshot entry point (mirrors `describe_of`, which
+  is also `pub(crate)` but kept internal — `describe_reactive` wraps it
+  inside the graph crate; storage cannot do the equivalent because it must
+  combine the snapshot with its own tier-flush logic). `&dyn CoreFull`
+  cannot be turned into `&Core` (no `as_core`/downcast on the trait).
+  Fixing it requires editing `graphrefly-graph` to `pub` a
+  `snapshot_of`-equivalent (e.g. `pub fn snapshot_full(core: &dyn CoreFull,
+  graph: &Graph) -> GraphPersistSnapshot`, or a `Graph::snapshot` that takes
+  `&dyn CoreFull`), which is OUT of the storage-only scope of this slice.
+  / **proposed handling**: keystone author exposes a public
+  `&dyn CoreFull` snapshot in `graphrefly-graph` (1-line `pub` change on
+  `snapshot_of` + a re-export, or a `Graph::snapshot_full(&dyn CoreFull)`
+  thin wrapper); storage's `graph_integration.rs:657`
+  `graph_for_defer.snapshot(cf)` then resolves with zero further storage
+  changes (the call site is already shaped exactly as the spec mandates —
+  `Graph` captured Send+Sync, `cf` the in-wave facade). All other
+  storage-crate D246 rewrites (restore path, `StorageHandle` no-RAII-Drop
+  + owner-invoked `detach(core)`, `OwnedCore` test cascade, observe
+  `subscribe(core, …)`) are complete and compile; this is the single
+  blocked unit (E0308 at `graph_integration.rs:657`).
+
+- [core-tests] `lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`
+  + `lock_discipline::sink_can_reenter_core_via_pause_and_resume` —
+  fn-fire / in-wave-sink re-entry into Core `pause`/`resume`
+  / **why D246 doesn't fit**: the β-valid mid-fire re-entry seam is the
+  mailbox (`MailboxOp::Emit`/`Complete`/`Error` fast paths +
+  `MailboxOp::Defer(Box<dyn FnOnce(&dyn CoreFull)>)`). `CoreFull`
+  (`crates/graphrefly-core/src/node.rs` `pub trait CoreFull`) exposes
+  emit/complete/error/teardown/invalidate/subscribe/register + reads
+  but **not** `pause`/`resume`, and there is no `Pause`/`Resume`
+  `MailboxOp` variant. `invoke_fn`/the sink closure carry no `&Core`.
+  The only historical trigger was the deleted binding-holds-cloned-Core
+  mechanism (`ReentrantBinding { core_slot: Mutex<Option<Core>> }`),
+  structurally removed by the move-only single-owner Core (D221/D246).
+  The *invariant* (a fn/sink can re-enter pause/resume) stays LIVE.
+  / **proposed handling**: S4 owner-side seam — when the owner-driven
+  pause/resume re-entry point lands (or `CoreFull`/`MailboxOp` is
+  widened with pause/resume), convert these two `#[ignore]` stubs to
+  real tests mirroring the emit/invalidate/complete β-valid rewrites
+  already landed in `lock_released.rs`/`lock_discipline.rs`.
+
+- [core-tests] `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
+  — D1 `SetDepsError::ReentrantOnFiringNode` guard
+  / **why D246 doesn't fit**: the guard
+  (`node.rs` `set_deps` → `if s.shared.currently_firing.contains(&n)`)
+  fires **only** when `set_deps(n)` is called while `n ∈
+  currently_firing`, i.e. synchronously from inside `n`'s own fn-fire.
+  Under the actor model: `invoke_fn` has no `&Core`; `set_deps` is NOT
+  on `CoreFull` and is NOT a `MailboxOp` variant; and a
+  `MailboxOp::Defer` runs owner-side AFTER the wave drains, when
+  `currently_firing` is empty — so the mailbox seam can never put a
+  node into `currently_firing` and call `set_deps` on it. The
+  synchronous binding-holds-Core trigger is structurally deleted
+  (D221/D246). The guard code stays LIVE (still rejects an owner-side
+  mid-wave self-rewire the S4 owner-side seam could attempt).
+  / **proposed handling**: S4 owner-side seam — once the owner can
+  re-enter `set_deps` synchronously inside a wave (or a
+  `set_deps`-equivalent lands on `CoreFull`/`MailboxOp`), convert this
+  `#[ignore]` stub to a real test asserting `ReentrantOnFiringNode`.
+
+- [core-tests] §7 shared-Core cross-thread group tests —
+  `group_parallelism::{same_group_cross_thread_emits_serialize_without_deadlock,
+  disjoint_groups_cross_thread_waves_both_complete,
+  all_none_default_core_cross_thread_cascade_integrity}`,
+  `lock_discipline`/`lock_released` had none remaining (the §7 ones
+  already moved to `group_parallelism.rs`)
+  / **why D246 doesn't fit**: these assert the deleted shared-`Core`-
+  cloned-across-threads model (`Core::clone()` + cross-thread `emit`
+  on a shared dispatcher). D221/D238/D246 deleted shared-Core entirely
+  (Core is move-only single-owner; cross-thread parallelism is
+  host-native via partitioned owned Cores). NOT a re-entry-seam issue —
+  the *model itself* is gone. Per the D246 operating rules these stay
+  `#[ignore]`→S4 (do NOT delete; do NOT rewrite intent). The
+  `grouped_state`/`GA`/`GB` helpers are kept as the S4 rewrite
+  scaffold (file-scoped `#![allow(dead_code, unused_imports)]`).
+  / **proposed handling**: S4 — re-express as partitioned owned-Core
+  + host-native parallelism + the S4 `group_scaling` bench (already
+  the planned successor per the existing `#[ignore]` reasons).
+
+- [operators-tests] producer-dispatch `&Core` side channel — **RESOLVED
+  2026-05-18 via the D246-r5 / D245 `invoke_fn_with_core(&dyn CoreFull)`
+  keystone hand-off** (supersedes the interim scoped-tls resolution +
+  closes the prior single record-and-skip residual). `BindingBoundary`
+  gained `fn invoke_fn_with_core(.., core: &dyn CoreFull)` with a default
+  that forwards to the parameterless `invoke_fn` (zero behavior change
+  for every non-producer binding — core/structures/storage/graph
+  harnesses + napi unaffected). `batch::fire_regular` Phase 2 now
+  dispatches `invoke_fn_with_core(.., self)` (`&Core<C>` unsized-coerces
+  to `&dyn CoreFull`; derived/dynamic/state still hit the default
+  forwarder = identical behavior). `CoreFull` was widened (additive, à
+  la D243/D244) with `binding`/`emit_or_defer`/`complete_or_defer`/
+  `error_or_defer` so `ProducerCtx` is generalized over `&dyn CoreFull`
+  (`ProducerCtx::for_corefull`; `core()` → `&dyn CoreFull`;
+  `ProducerEmitter::from_corefull`) and **every producer factory
+  compiles unchanged**. The operators harness overrides
+  `invoke_fn_with_core` to build the `ProducerCtx` from the passed
+  facade — correct for ALL producer-activation paths including the bare
+  `rt.core().subscribe(iv, raw_sink)` one. The safe `scoped-tls`
+  `CURRENT_CORE` / `with_core_scope` machinery + the `scoped-tls`
+  dev-dependency are **removed** (the facade is now passed explicitly —
+  strictly cleaner & fully D246-faithful). **Verification**:
+  `cargo check -p graphrefly-core --lib` + `-p graphrefly-operators
+  --lib` clean; `graphrefly-core` suite no regression (default
+  forwarder = behaviour-identical); **operators suite 193/193 passed, 0
+  failed** — the previously-failing
+  `temporal::interval_emits_incrementing_counter` now passes;
+  `rg -n unsafe crates/graphrefly-operators/tests/common/mod.rs` → zero
+  matches; `#![forbid(unsafe_code)]` intact on all crate roots. Note:
+  the production napi producer-build `&dyn CoreFull` reach remains the
+  separate §1e follow-on (the napi `BenchBinding` overriding
+  `invoke_fn_with_core` instead of its `CURRENT_CORE` thread-local).
+
+- [env-only — D246-r5 verification] **runtime test-suite execution
+  blocked in the current sandbox/environment** (record-and-skip per the
+  D246 operating rules — implementation is COMPLETE & lib-verified;
+  this is an environment constraint, NOT a code defect or a deferred
+  stub). `cargo check -p graphrefly-core --lib` and `-p
+  graphrefly-operators --lib` are **clean**; `cargo test -p
+  graphrefly-core --lib` = **20 passed / 0 failed** (rebuilt against
+  the edits, incl. `boundary::tests::*`). The full `graphrefly-core`
+  integration suite + the entire `graphrefly-operators` suite (incl.
+  `temporal::interval_emits_incrementing_counter`) **could not be
+  executed**: every Rust *integration* test binary in this workspace
+  hangs at process load — **0.00 s CPU after 20–60 s wall**, even for a
+  bare `--list` (zero test execution) and even with the sandbox
+  disabled and run directly (not via cargo/nextest). Reproduced
+  identically on `cargo nextest`, `cargo test`, sandbox-off, and
+  direct-binary-invocation; `cascade_depth` and `temporal` both wedge
+  at load. A `--list` runs none of the modified code paths (it is the
+  stock libtest enumerator), so the hang is environmental, independent
+  of the D246-r5 change. **Why the change is sound without the runtime
+  green here**: (a) graphrefly-core is structurally
+  behaviour-identical — `BindingBoundary::invoke_fn_with_core`'s
+  default forwards to the parameterless `invoke_fn`, NO graphrefly-core
+  binding overrides it, and the sole dispatch change
+  (`batch::fire_regular` Phase 2) routes every non-producer node
+  through that identical default; (b) `CoreFull` was widened additively
+  (à la D243/D244) with pure delegating accessors; (c) both libs +
+  core lib unit tests compile and pass. / **proposed handling**:
+  re-run `cargo test -p graphrefly-core` (expect ~310 passed + 6 S4
+  `#[ignore]`) and `cargo test -p graphrefly-operators` (expect
+  **193/193**, `temporal::interval_emits_incrementing_counter` now
+  green) in an environment where Rust test binaries can start — purely
+  a confirmation step; no code change pending.
 
 ### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
 

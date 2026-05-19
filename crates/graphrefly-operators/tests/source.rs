@@ -18,7 +18,7 @@ fn from_iter_emits_each_handle_then_completes() {
     let h2 = rt.intern_int(20);
     let h3 = rt.intern_int(30);
 
-    let node = from_iter(&rt.core, &rt.producer_binding, vec![h1, h2, h3]);
+    let node = from_iter(rt.core(), &rt.producer_binding, vec![h1, h2, h3]);
     let rec = rt.subscribe_recorder(node);
 
     // Multi-emit produces Dirty before Data (R1.3.1.b two-phase push).
@@ -41,7 +41,7 @@ fn of_emits_values_then_completes() {
     let rt = OpRuntime::new();
     let h1 = rt.intern_int(42);
 
-    let node = of(&rt.core, &rt.producer_binding, vec![h1]);
+    let node = of(rt.core(), &rt.producer_binding, vec![h1]);
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
@@ -60,7 +60,7 @@ fn of_emits_values_then_completes() {
 fn from_iter_empty_vec_behaves_like_empty() {
     let rt = OpRuntime::new();
 
-    let node = from_iter(&rt.core, &rt.producer_binding, vec![]);
+    let node = from_iter(rt.core(), &rt.producer_binding, vec![]);
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
@@ -75,7 +75,7 @@ fn from_iter_empty_vec_behaves_like_empty() {
 fn empty_completes_immediately() {
     let rt = OpRuntime::new();
 
-    let node = empty(&rt.core, &rt.producer_binding);
+    let node = empty(rt.core(), &rt.producer_binding);
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
@@ -90,7 +90,7 @@ fn empty_completes_immediately() {
 fn never_emits_start_only() {
     let rt = OpRuntime::new();
 
-    let node = never(&rt.core, &rt.producer_binding);
+    let node = never(rt.core(), &rt.producer_binding);
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
@@ -101,7 +101,7 @@ fn never_emits_start_only() {
 fn never_cleanup_on_last_unsub() {
     let rt = OpRuntime::new();
 
-    let node = never(&rt.core, &rt.producer_binding);
+    let node = never(rt.core(), &rt.producer_binding);
     let rec = rt.subscribe_recorder(node);
 
     // Only Start — no DATA, no terminal.
@@ -128,7 +128,7 @@ fn throw_error_emits_error_immediately() {
     let rt = OpRuntime::new();
     let err_handle = rt.intern_int(999);
 
-    let node = throw_error(&rt.core, &rt.producer_binding, err_handle);
+    let node = throw_error(rt.core(), &rt.producer_binding, err_handle);
     let rec = rt.subscribe_recorder(node);
 
     let events = rec.events();
@@ -152,7 +152,7 @@ fn from_iter_data_values_only() {
     let h2 = rt.intern_int(2);
     let h3 = rt.intern_int(3);
 
-    let node = from_iter(&rt.core, &rt.producer_binding, vec![h1, h2, h3]);
+    let node = from_iter(rt.core(), &rt.producer_binding, vec![h1, h2, h3]);
     let rec = rt.subscribe_recorder(node);
 
     // data_values() strips lifecycle events.
@@ -168,7 +168,7 @@ fn from_iter_single_element() {
     let rt = OpRuntime::new();
     let h = rt.intern_int(7);
 
-    let node = from_iter(&rt.core, &rt.producer_binding, vec![h]);
+    let node = from_iter(rt.core(), &rt.producer_binding, vec![h]);
     let rec = rt.subscribe_recorder(node);
 
     let data = rec.data_values();
@@ -183,8 +183,8 @@ fn from_iter_single_element() {
 fn empty_into_take_completes_with_no_data() {
     let rt = OpRuntime::new();
 
-    let source = empty(&rt.core, &rt.producer_binding);
-    let take_reg = graphrefly_operators::take(&rt.core, source, 5);
+    let source = empty(rt.core(), &rt.producer_binding);
+    let take_reg = graphrefly_operators::take(rt.core(), source, 5);
     let rec = rt.subscribe_recorder(take_reg.node);
 
     let events = rec.events();

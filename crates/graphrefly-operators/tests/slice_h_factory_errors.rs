@@ -28,21 +28,21 @@ use graphrefly_operators::OperatorFactoryError;
 #[test]
 fn combine_with_empty_sources_errors_empty_sources() {
     let rt = OpRuntime::new();
-    let result = combine(&rt.core, &rt.op_binding, &[], rt.make_packer());
+    let result = combine(rt.core(), &rt.op_binding, &[], rt.make_packer());
     assert_eq!(result.err(), Some(OperatorFactoryError::EmptySources));
 }
 
 #[test]
 fn merge_with_empty_sources_errors_empty_sources() {
     let rt = OpRuntime::new();
-    let result = merge(&rt.core, &[]);
+    let result = merge(rt.core(), &[]);
     assert_eq!(result.err(), Some(OperatorFactoryError::EmptySources));
 }
 
 #[test]
 fn merge_as_op_with_empty_sources_errors_empty_sources() {
     let rt = OpRuntime::new();
-    let result = merge_as_op(&rt.core, &[]);
+    let result = merge_as_op(rt.core(), &[]);
     assert_eq!(result.err(), Some(OperatorFactoryError::EmptySources));
 }
 
@@ -54,7 +54,7 @@ fn merge_as_op_with_empty_sources_errors_empty_sources() {
 fn last_with_default_zero_handle_errors_zero_default() {
     let rt = OpRuntime::new();
     let s = rt.state_int(Some(1));
-    let result = last_with_default(&rt.core, s, NO_HANDLE);
+    let result = last_with_default(rt.core(), s, NO_HANDLE);
     assert_eq!(result.err(), Some(OperatorFactoryError::ZeroDefault));
 }
 
@@ -63,7 +63,7 @@ fn last_with_default_with_zero_handle_errors_zero_default() {
     let rt = OpRuntime::new();
     let s = rt.state_int(Some(1));
     let result = last_with_default_with(
-        &rt.core,
+        rt.core(),
         s,
         NO_HANDLE,
         graphrefly_core::OperatorOpts::default(),
@@ -80,7 +80,7 @@ fn last_with_default_with_zero_handle_errors_zero_default() {
 fn merge_with_unknown_dep_propagates_register_error() {
     let rt = OpRuntime::new();
     let bogus = NodeId::new(99_999);
-    let result = merge(&rt.core, &[bogus]);
+    let result = merge(rt.core(), &[bogus]);
     assert_eq!(
         result.err(),
         Some(OperatorFactoryError::Register(RegisterError::UnknownDep(
@@ -94,7 +94,7 @@ fn combine_with_unknown_dep_propagates_register_error() {
     let rt = OpRuntime::new();
     let known = rt.state_int(Some(1));
     let bogus = NodeId::new(99_999);
-    let result = combine(&rt.core, &rt.op_binding, &[known, bogus], rt.make_packer());
+    let result = combine(rt.core(), &rt.op_binding, &[known, bogus], rt.make_packer());
     assert_eq!(
         result.err(),
         Some(OperatorFactoryError::Register(RegisterError::UnknownDep(
@@ -114,7 +114,7 @@ fn combine_with_unknown_dep_propagates_register_error() {
 #[test]
 fn merge_empty_sources_takes_precedence_over_core_check() {
     let rt = OpRuntime::new();
-    let result = merge(&rt.core, &[]);
+    let result = merge(rt.core(), &[]);
     // Must be EmptySources (factory layer), NOT
     // Register(OperatorWithoutDeps) — the factory short-circuits before
     // calling register_operator.
@@ -136,7 +136,7 @@ fn combine_success_path_preserves_registration_shape() {
     let rt = OpRuntime::new();
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
-    let reg = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).expect("combine ok");
+    let reg = combine(rt.core(), &rt.op_binding, &[a, b], rt.make_packer()).expect("combine ok");
     // The combined node should fire on subscribe (push-on-subscribe).
     let rec = rt.subscribe_recorder(reg.node);
     let values = rec.data_values();

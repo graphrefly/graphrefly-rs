@@ -21,13 +21,14 @@ fn zip_pairs_data_from_two_sources() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
     rt.emit_int(s2, 10);
     rt.emit_int(s1, 2);
     rt.emit_int(s2, 20);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let data = rec.data_values();
     assert_eq!(data.len(), 2, "should emit 2 tuples; got {data:?}");
@@ -47,16 +48,18 @@ fn zip_buffers_until_all_sources_have_data() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     // Three emits on s1 before s2 emits — should buffer.
     rt.emit_int(s1, 1);
     rt.emit_int(s1, 2);
     rt.emit_int(s1, 3);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty(), "no tuples until s2 emits");
 
     rt.emit_int(s2, 100);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let data = rec.data_values();
     assert_eq!(data.len(), 1);
     assert_eq!(
@@ -71,12 +74,13 @@ fn zip_completes_when_one_source_completes_with_empty_queue() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
     rt.emit_int(s2, 10);
-    rt.core.complete(s1);
+    rt.core().complete(s1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let has_complete = events.iter().any(|e| matches!(e, RecordedEvent::Complete));
@@ -90,13 +94,15 @@ fn zip_with_three_sources() {
     let s2 = rt.state_int(None);
     let s3 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2, s3], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2, s3], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     rt.emit_int(s1, 1);
     rt.emit_int(s2, 10);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert!(rec.data_values().is_empty(), "need s3 too");
     rt.emit_int(s3, 100);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let data = rec.data_values();
     assert_eq!(data.len(), 1);
@@ -112,11 +118,12 @@ fn zip_propagates_error_from_any_source() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
     let rec = rt.subscribe_recorder(z);
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
-    rt.core.error(s1, err_h);
+    rt.core().error(s1, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let errored = events.iter().any(|e| matches!(e, RecordedEvent::Error(_)));
@@ -132,14 +139,15 @@ fn concat_forwards_first_then_second() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
     rt.emit_int(s1, 1);
     rt.emit_int(s1, 2);
-    rt.core.complete(s1);
+    rt.core().complete(s1);
     rt.emit_int(s2, 10);
     rt.emit_int(s2, 20);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let data = rec.data_values();
     assert_eq!(
@@ -158,20 +166,22 @@ fn concat_buffers_second_data_during_phase_zero() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
     rt.emit_int(s1, 1);
     // s2 emits BEFORE s1 completes — should buffer, not forward.
     rt.emit_int(s2, 99);
     rt.emit_int(s1, 2);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     assert_eq!(
         rec.data_values(),
         vec![TestValue::Int(1), TestValue::Int(2)],
         "s2 data must be buffered until s1 completes"
     );
 
-    rt.core.complete(s1);
+    rt.core().complete(s1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
     let data_after_handoff = rec.data_values();
     assert_eq!(
         data_after_handoff,
@@ -188,13 +198,14 @@ fn concat_completes_when_second_completes() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
     rt.emit_int(s1, 1);
-    rt.core.complete(s1);
+    rt.core().complete(s1);
     rt.emit_int(s2, 10);
-    rt.core.complete(s2);
+    rt.core().complete(s2);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let has_complete = events.iter().any(|e| matches!(e, RecordedEvent::Complete));
@@ -206,11 +217,12 @@ fn concat_propagates_error_from_first() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
     let err = rt.intern(TestValue::Str("first-err".into()));
-    rt.core.error(s1, err);
+    rt.core().error(s1, err);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let errored = events.iter().any(|e| matches!(e, RecordedEvent::Error(_)));
@@ -222,12 +234,13 @@ fn concat_propagates_error_from_second_after_handoff() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
-    rt.core.complete(s1);
+    rt.core().complete(s1);
     let err = rt.intern(TestValue::Str("second-err".into()));
-    rt.core.error(s2, err);
+    rt.core().error(s2, err);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let errored = events.iter().any(|e| matches!(e, RecordedEvent::Error(_)));
@@ -244,13 +257,14 @@ fn concat_completes_when_second_completes_before_first_in_phase_zero() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let c = concat(&rt.core, &rt.producer_binding, s1, s2);
+    let c = concat(rt.core(), &rt.producer_binding, s1, s2);
     let rec = rt.subscribe_recorder(c);
 
     // Phase 0: s1 emits, then s2 emits + completes (buffered).
     rt.emit_int(s1, 1);
     rt.emit_int(s2, 99);
-    rt.core.complete(s2);
+    rt.core().complete(s2);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     // s1 still going — concat must NOT have completed yet (s2's
     // pending is still buffered).
@@ -265,7 +279,8 @@ fn concat_completes_when_second_completes_before_first_in_phase_zero() {
 
     // s1 completes -> phase transition: drains pending(99) -> sees
     // second_completed=true -> self-completes.
-    rt.core.complete(s1);
+    rt.core().complete(s1);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let data: Vec<i64> = events
@@ -297,12 +312,13 @@ fn race_winner_emits_subsequent_data() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
+    let r = race(rt.core(), &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1); // s1 wins
     rt.emit_int(s2, 99); // ignored — loser
     rt.emit_int(s1, 2); // forwarded — winner
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -316,13 +332,14 @@ fn race_loser_data_is_silently_ignored() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let s3 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2, s3]).unwrap();
+    let r = race(rt.core(), &rt.producer_binding, vec![s1, s2, s3]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s2, 50); // s2 wins
     rt.emit_int(s1, 1);
     rt.emit_int(s3, 100);
     rt.emit_int(s2, 60); // forwarded
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -335,11 +352,12 @@ fn race_winner_complete_terminates_producer() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
+    let r = race(rt.core(), &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1);
-    rt.core.complete(s1); // winner completes
+    rt.core().complete(s1); // winner completes
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let has_complete = events.iter().any(|e| matches!(e, RecordedEvent::Complete));
@@ -354,11 +372,11 @@ fn race_loser_complete_does_not_terminate() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
+    let r = race(rt.core(), &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     rt.emit_int(s1, 1); // s1 wins
-    rt.core.complete(s2); // loser completes — should be ignored
+    rt.core().complete(s2); // loser completes — should be ignored
 
     let events = rec.events();
     // Should NOT have a Complete event for the producer (winner is alive).
@@ -374,11 +392,12 @@ fn race_pre_winner_error_cascades() {
     let rt = OpRuntime::new();
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
-    let r = race(&rt.core, &rt.producer_binding, vec![s1, s2]).unwrap();
+    let r = race(rt.core(), &rt.producer_binding, vec![s1, s2]).unwrap();
     let rec = rt.subscribe_recorder(r);
 
     let err = rt.intern(TestValue::Str("err".into()));
-    rt.core.error(s1, err); // pre-winner error
+    rt.core().error(s1, err); // pre-winner error
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let errored = events.iter().any(|e| matches!(e, RecordedEvent::Error(_)));
@@ -394,7 +413,7 @@ fn take_until_forwards_source_until_notifier_emits() {
     let rt = OpRuntime::new();
     let src = rt.state_int(None);
     let notif = rt.state_int(None);
-    let t = take_until(&rt.core, &rt.producer_binding, src, notif);
+    let t = take_until(rt.core(), &rt.producer_binding, src, notif);
     let rec = rt.subscribe_recorder(t);
 
     rt.emit_int(src, 1);
@@ -418,7 +437,7 @@ fn take_until_does_not_forward_notifier_value() {
     let rt = OpRuntime::new();
     let src = rt.state_int(None);
     let notif = rt.state_int(None);
-    let t = take_until(&rt.core, &rt.producer_binding, src, notif);
+    let t = take_until(rt.core(), &rt.producer_binding, src, notif);
     let rec = rt.subscribe_recorder(t);
 
     rt.emit_int(notif, 999); // notifier emits BEFORE source
@@ -435,11 +454,12 @@ fn take_until_source_complete_propagates() {
     let rt = OpRuntime::new();
     let src = rt.state_int(None);
     let notif = rt.state_int(None);
-    let t = take_until(&rt.core, &rt.producer_binding, src, notif);
+    let t = take_until(rt.core(), &rt.producer_binding, src, notif);
     let rec = rt.subscribe_recorder(t);
 
     rt.emit_int(src, 1);
-    rt.core.complete(src); // source completes naturally — propagate
+    rt.core().complete(src); // source completes naturally — propagate
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let has_complete = events.iter().any(|e| matches!(e, RecordedEvent::Complete));
@@ -451,11 +471,12 @@ fn take_until_source_error_propagates() {
     let rt = OpRuntime::new();
     let src = rt.state_int(None);
     let notif = rt.state_int(None);
-    let t = take_until(&rt.core, &rt.producer_binding, src, notif);
+    let t = take_until(rt.core(), &rt.producer_binding, src, notif);
     let rec = rt.subscribe_recorder(t);
 
     let err = rt.intern(TestValue::Str("src-err".into()));
-    rt.core.error(src, err);
+    rt.core().error(src, err);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     let events = rec.events();
     let errored = events.iter().any(|e| matches!(e, RecordedEvent::Error(_)));
@@ -472,7 +493,7 @@ fn producer_storage_cleared_on_deactivation() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
 
     {
         let _rec = rt.subscribe_recorder(z);
@@ -484,6 +505,8 @@ fn producer_storage_cleared_on_deactivation() {
     }
     // Recorder dropped → last sub on producer drops →
     // producer_deactivate fires → storage entry removed.
+    // D246: the unsubscribe is posted deferred; pump it owner-side.
+    rt.settle();
 
     let storage = rt.binding.producer_storage().lock();
     assert!(
@@ -498,13 +521,14 @@ fn producer_re_subscribe_re_runs_build_closure() {
     let s1 = rt.state_int(None);
     let s2 = rt.state_int(None);
     let pack_fn = rt.register_tuple_packer();
-    let z = zip(&rt.core, &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
+    let z = zip(rt.core(), &rt.producer_binding, vec![s1, s2], pack_fn).unwrap();
 
     // First activation cycle.
     {
         let rec = rt.subscribe_recorder(z);
         rt.emit_int(s1, 1);
         rt.emit_int(s2, 10);
+        rt.settle(); // D246: pump deferred producer-sink emits owner-side.
         assert_eq!(
             rec.data_values(),
             vec![TestValue::Tuple(vec![
@@ -520,13 +544,14 @@ fn producer_re_subscribe_re_runs_build_closure() {
     // the producer's sink, which can't re-enter Core under the
     // handshake-fires-lock-held discipline (pre-existing v1 limitation;
     // see `porting-deferred.md`).
-    rt.core.invalidate(s1);
-    rt.core.invalidate(s2);
+    rt.core().invalidate(s1);
+    rt.core().invalidate(s2);
 
     {
         let rec = rt.subscribe_recorder(z);
         rt.emit_int(s1, 2);
         rt.emit_int(s2, 20);
+        rt.settle(); // D246: pump deferred producer-sink emits owner-side.
         let data = rec.data_values();
         // Push-on-subscribe replays the cached cycle-1 tuple (the
         // producer's cache survives deactivation), THEN the new emit

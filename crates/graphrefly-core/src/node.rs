@@ -1970,6 +1970,33 @@ pub trait CoreFull {
     /// observe) can run `graphrefly_graph` snapshot through `&dyn
     /// CoreFull`. Pure binding-delegating read; no `C`/`T` surfaced.
     fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value>;
+
+    /// The wave-drained [`CoreMailbox`] (D246 rule 5: the one facade is
+    /// mutation + inspection + serialize + **mailbox**). Lets a holder
+    /// of `&dyn CoreFull` post deferred ops without naming the cell
+    /// type — folds D245's per-binding "how do I reach the mailbox".
+    fn mailbox(&self) -> Arc<crate::mailbox::CoreMailbox>;
+
+    // --- producer-build accessors (D246 r5 / D245) ---
+    //
+    // The producer-build path runs owner-side with this one facade
+    // (D245 Option A: `BindingBoundary::invoke_fn_with_core` hands the
+    // binding `&dyn CoreFull`, from which it builds its `ProducerCtx`).
+    // A build closure + its spawned sinks need the binding `Arc` (for
+    // `retain_handle`/`release_handle` around payload shares) and the
+    // build-side deferred-emit helpers — these mirror `Core`'s existing
+    // same-named methods, so `ProducerCtx::core()` over `&dyn CoreFull`
+    // keeps every producer factory compiling unchanged. Pure
+    // delegation; no `C`/`T` surfaced.
+
+    /// See [`Core::binding`].
+    fn binding(&self) -> Arc<dyn crate::boundary::BindingBoundary>;
+    /// See [`Core::emit_or_defer`].
+    fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId);
+    /// See [`Core::complete_or_defer`].
+    fn complete_or_defer(&self, node_id: NodeId);
+    /// See [`Core::error_or_defer`].
+    fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId);
 }
 
 impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
@@ -2040,6 +2067,46 @@ impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
     #[inline]
     fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
         self.binding_ptr().serialize_handle(handle)
+    }
+    #[inline]
+    fn mailbox(&self) -> Arc<crate::mailbox::CoreMailbox> {
+        Core::mailbox(self)
+    }
+    #[inline]
+    fn binding(&self) -> Arc<dyn crate::boundary::BindingBoundary> {
+        Core::binding(self)
+    }
+    // The public `Core::{emit,complete,error}_or_defer` carry a
+    // `where C: Send` bound (the actor-model relocation invariant,
+    // D221/D223). The blanket `CoreFull` impl is unconstrained over
+    // every `C: StateCell`, so we inline the (behaviour-identical)
+    // body over the unconstrained `try_*` + `push_deferred_producer_op`
+    // primitives rather than delegate to the `Send`-bounded wrappers.
+    #[inline]
+    fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
+        if self.try_emit(node_id, new_handle).is_err() {
+            self.binding.retain_handle(new_handle);
+            self.push_deferred_producer_op(DeferredProducerOp::Emit {
+                node_id,
+                handle: new_handle,
+            });
+        }
+    }
+    #[inline]
+    fn complete_or_defer(&self, node_id: NodeId) {
+        if self.try_complete(node_id).is_err() {
+            self.push_deferred_producer_op(DeferredProducerOp::Complete { node_id });
+        }
+    }
+    #[inline]
+    fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
+        if self.try_error(node_id, error_handle).is_err() {
+            self.binding.retain_handle(error_handle);
+            self.push_deferred_producer_op(DeferredProducerOp::Error {
+                node_id,
+                handle: error_handle,
+            });
+        }
     }
 }
 

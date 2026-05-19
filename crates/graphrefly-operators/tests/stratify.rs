@@ -51,7 +51,7 @@ fn stratify_routes_matching_values_only() {
     // Branch "evens": matches when value % 2 == 0.
     let classifier_evens = make_modulo_classifier(&rt, 0);
     let evens = stratify_branch(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         rules,
@@ -63,6 +63,7 @@ fn stratify_routes_matching_values_only() {
     rt.emit_int(source, 2); // even → emit
     rt.emit_int(source, 3); // odd → drop
     rt.emit_int(source, 4); // even → emit
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec_evens.data_values(),
@@ -83,7 +84,7 @@ fn stratify_multi_branch_independent_routing() {
 
     let classifier_zeros = make_modulo_classifier(&rt, 0);
     let zeros = stratify_branch(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         rules,
@@ -92,7 +93,7 @@ fn stratify_multi_branch_independent_routing() {
 
     let classifier_ones = make_modulo_classifier(&rt, 1);
     let ones = stratify_branch(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         rules,
@@ -101,7 +102,7 @@ fn stratify_multi_branch_independent_routing() {
 
     let classifier_twos = make_modulo_classifier(&rt, 2);
     let twos = stratify_branch(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         rules,
@@ -115,6 +116,7 @@ fn stratify_multi_branch_independent_routing() {
     for n in 0..9 {
         rt.emit_int(source, n);
     }
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec_zeros.data_values(),
@@ -144,7 +146,7 @@ fn stratify_reactive_rules_change_future_classification() {
 
     let classifier_zeros = make_modulo_classifier(&rt, 0);
     let zeros = stratify_branch(
-        &rt.core,
+        rt.core(),
         &rt.producer_binding,
         source,
         rules,
@@ -166,6 +168,7 @@ fn stratify_reactive_rules_change_future_classification() {
     rt.emit_int(source, 9); // 9 % 3 == 0 → emit
     rt.emit_int(source, 7); // 7 % 3 == 1 → drop
     rt.emit_int(source, 12); // 12 % 3 == 0 → emit
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -185,7 +188,7 @@ fn stratify_no_rules_sentinel_drops_all() {
     let rules = rt.state_int(None); // SENTINEL — never emits DATA
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     rt.emit_int(source, 2);
@@ -208,11 +211,12 @@ fn stratify_forwards_source_complete() {
     let rules = rt.state_int(Some(2));
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     rt.emit_int(source, 2);
-    rt.core.complete(source);
+    rt.core().complete(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(2)]);
     assert!(rec.events().contains(&RecordedEvent::Complete));
@@ -229,11 +233,12 @@ fn stratify_forwards_source_error() {
     let rules = rt.state_int(Some(2));
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
-    rt.core.error(source, err_h);
+    rt.core().error(source, err_h);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert!(
         rec.events()
@@ -257,12 +262,13 @@ fn stratify_absorbs_rules_complete_silently() {
     let rules = rt.state_int(Some(2));
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     rt.emit_int(source, 2);
-    rt.core.complete(rules); // rules terminates — branch unaffected
+    rt.core().complete(rules); // rules terminates — branch unaffected
     rt.emit_int(source, 4); // still classified under cached mode=2
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -288,11 +294,12 @@ fn stratify_forwards_source_teardown() {
     let rules = rt.state_int(Some(2));
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     rt.emit_int(source, 2);
-    rt.core.teardown(source);
+    rt.core().teardown(source);
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(rec.data_values(), vec![TestValue::Int(2)]);
     assert!(
@@ -319,7 +326,7 @@ fn stratify_same_wave_gating_uses_new_rules() {
     // Branch matches `value % rules == 0`. Under mode=2, value 3 misses.
     // Under mode=3, value 3 matches.
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
     let rec = rt.subscribe_recorder(branch);
 
     // Update both rules and source in the same batch. Without gating,
@@ -328,10 +335,11 @@ fn stratify_same_wave_gating_uses_new_rules() {
     // 3 % 2 == 1 → drop. With gating, both deps settle first, then
     // resolve under new rules (mode=3) → 3 % 3 == 0 → emit.
     {
-        let _g = rt.core.begin_batch();
+        let _g = rt.core().begin_batch();
         rt.emit_int(rules, 3);
         rt.emit_int(source, 3);
     }
+    rt.settle(); // D246: pump deferred producer-sink emits owner-side.
 
     assert_eq!(
         rec.data_values(),
@@ -364,7 +372,7 @@ fn stratify_drop_releases_cached_rules_handle() {
     let baseline_live = rt.binding.live_handles();
 
     let classifier = make_modulo_classifier(&rt, 0);
-    let branch = stratify_branch(&rt.core, &rt.producer_binding, source, rules, classifier);
+    let branch = stratify_branch(rt.core(), &rt.producer_binding, source, rules, classifier);
 
     {
         let rec = rt.subscribe_recorder(branch);

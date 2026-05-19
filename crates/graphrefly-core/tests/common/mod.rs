@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
     BindingBoundary, CleanupTrigger, Core, DepBatch, EqualsMode, FnId, FnResult, HandleId, Message,
-    NodeId, Sink, SubscriptionId,
+    NodeId, OwnedCore, Sink, SubscriptionId,
 };
 
 #[derive(Clone, Debug)]
@@ -569,61 +569,73 @@ impl BindingBoundary for TestBinding {
 
 /// High-level facade: wraps Core + TestBinding with ergonomics matching the
 /// TS `HandleRuntime`. Hides the handle/binding plumbing from test code.
-/// S2b/β (D238/D241-AMEND): `TestRuntime` **owns** the move-only
-/// actor-model `Core`. Subscriptions registered through the runtime are
-/// tracked here and torn down in `Drop` (the runtime is dropped on the
-/// owner thread with the `Core` still alive — sound, mirrors the
-/// production binding-layer owner-driven teardown). Replaces the
-/// retired per-`Recorder` core RAII `Subscription`.
+/// D246: `TestRuntime` is a thin newtype that **composes**
+/// [`graphrefly_core::OwnedCore`] — the one canonical Core-ownership +
+/// subscription-tracking + owner-thread `Drop`-teardown keystone — plus
+/// the test `TestBinding`/`Recorder` infra. The hand-rolled `subs`
+/// `Mutex` and `impl Drop` were deleted; `OwnedCore` owns that now
+/// (D246 rule 3/4). The Core is reached owner-side via `self.core()`
+/// (D231 explicit `&Core`).
 pub struct TestRuntime {
     pub binding: Arc<TestBinding>,
-    pub core: Core,
-    subs: Mutex<Vec<(NodeId, SubscriptionId)>>,
-}
-
-impl Drop for TestRuntime {
-    fn drop(&mut self) {
-        for (node_id, sub_id) in std::mem::take(
-            &mut *self
-                .subs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ) {
-            self.core.unsubscribe(node_id, sub_id);
-        }
-    }
+    rt: OwnedCore,
 }
 
 impl TestRuntime {
     pub fn new() -> Self {
         let binding = TestBinding::new();
-        let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
-        Self {
-            binding,
-            core,
-            subs: Mutex::new(Vec::new()),
-        }
+        let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
+        Self { binding, rt }
+    }
+
+    /// Borrow the owned dispatcher (D231 owner-side `&Core`). Routes
+    /// through the inner [`OwnedCore`].
+    #[must_use]
+    pub fn core(&self) -> &Core {
+        self.rt.core()
+    }
+
+    /// The Core's [`graphrefly_core::CoreMailbox`]. β-valid Core
+    /// re-entry from inside a fire (fn/equals/cleanup/sink) is
+    /// expressed by capturing this `Arc` and posting a deferred op
+    /// (`post_emit`/`post_defer`); the owner applies them via
+    /// [`Self::drain_mailbox`] — a nested wave (D233/D246 rule 6).
+    /// No `Core` clone, no async: the deferred op runs synchronously
+    /// in the owner-driven drain.
+    #[must_use]
+    pub fn mailbox(&self) -> Arc<graphrefly_core::CoreMailbox> {
+        self.rt.core().mailbox()
+    }
+
+    /// Owner-side mailbox drain (D227/D230/D246). Applies every
+    /// queued deferred op in FIFO order via the synchronous Core
+    /// surface, cascading nested waves. Idempotent on an empty
+    /// mailbox.
+    pub fn drain_mailbox(&self) {
+        self.rt.core().drain_mailbox();
     }
 
     /// Subscribe a sink and track the subscription for teardown on
     /// runtime drop. Returns the `SubscriptionId` for explicit early
     /// unsubscription via [`Self::unsubscribe`].
     pub fn track_subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
-        let sub_id = self.core.subscribe(node_id, sink);
-        self.subs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((node_id, sub_id));
-        sub_id
+        self.rt.track_subscribe(node_id, sink)
     }
 
-    /// Explicit early unsubscribe (owner-invoked, β/D241).
+    /// Explicit early unsubscribe (owner-invoked, D241/D246 rule 3).
     pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
-        self.subs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&(n, s)| !(n == node_id && s == sub_id));
-        self.core.unsubscribe(node_id, sub_id);
+        self.rt.unsubscribe(node_id, sub_id);
+    }
+
+    /// Owner-invoked unsubscribe of a [`Recorder`]'s tracked
+    /// subscription (D246 rule 3). Replaces the pre-actor-model
+    /// `drop(recorder)` RAII-unsubscribe: the `Recorder` no longer
+    /// owns a core `Subscription`, so dropping it does NOT
+    /// unsubscribe — the owner must call this (mirrors the
+    /// production binding-layer owner-driven teardown). The recorder
+    /// stays usable for post-unsubscribe event inspection.
+    pub fn unsub_recorder(&self, recorder: &Recorder) {
+        self.rt.unsubscribe(recorder.node_id(), recorder.sub_id());
     }
 
     /// Register a state node. `initial = None` ⇒ sentinel.
@@ -632,11 +644,11 @@ impl TestRuntime {
             Some(v) => self.binding.intern(v),
             None => HandleId::new(0), // NO_HANDLE
         };
-        let id = self.core.register_state(initial_handle, false).unwrap();
+        let id = self.core().register_state(initial_handle, false).unwrap();
         StateHandle {
             id,
             binding: self.binding.clone(),
-            core: &self.core,
+            core: self.core(),
         }
     }
 
@@ -647,7 +659,7 @@ impl TestRuntime {
         F: Fn(&[TestValue]) -> Option<TestValue> + Send + Sync + 'static,
     {
         let fn_id = self.binding.register_fn(f);
-        self.core
+        self.core()
             .register_derived(deps, fn_id, EqualsMode::Identity, false)
             .unwrap()
     }
@@ -660,7 +672,7 @@ impl TestRuntime {
     {
         let fn_id = self.binding.register_fn(f);
         let eq_id = self.binding.register_custom_equals(equals);
-        self.core
+        self.core()
             .register_derived(deps, fn_id, EqualsMode::Custom(eq_id), false)
             .unwrap()
     }
@@ -673,7 +685,7 @@ impl TestRuntime {
         F: Fn(&[TestValue]) -> (Option<TestValue>, Option<Vec<usize>>) + Send + Sync + 'static,
     {
         let fn_id = self.binding.register_dynamic_fn(f);
-        self.core
+        self.core()
             .register_dynamic(deps, fn_id, EqualsMode::Identity, false)
             .unwrap()
     }
@@ -693,7 +705,7 @@ impl TestRuntime {
     }
 
     pub fn cache_value(&self, node_id: NodeId) -> Option<TestValue> {
-        let h = self.core.cache_of(node_id);
+        let h = self.core().cache_of(node_id);
         if h == HandleId::new(0) {
             None
         } else {

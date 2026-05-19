@@ -33,7 +33,7 @@ fn data_counter(
             }
         }
     });
-    let sub = rt.core.subscribe(node_id, sink);
+    let sub = rt.core().subscribe(node_id, sink);
     (counter, sub)
 }
 
@@ -51,7 +51,7 @@ fn unsubscribe_deregisters_sink() {
     );
 
     // Owner-invoked unsubscribe (β/D225) — sink deregistered.
-    rt.core.unsubscribe(s.id, sub);
+    rt.core().unsubscribe(s.id, sub);
 
     s.set(TestValue::Int(1));
     assert_eq!(
@@ -66,10 +66,10 @@ fn double_unsubscribe_is_safe() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let (_counter, sub) = data_counter(&rt, s.id);
-    rt.core.unsubscribe(s.id, sub);
+    rt.core().unsubscribe(s.id, sub);
     // Idempotent: a second unsubscribe of the same id is a no-op, not
     // a panic (monotonic-never-recycled ids; F4 invariant).
-    rt.core.unsubscribe(s.id, sub);
+    rt.core().unsubscribe(s.id, sub);
     s.set(TestValue::Int(2));
 }
 
@@ -95,12 +95,12 @@ fn multiple_subscriptions_to_same_node_are_independent() {
     assert_eq!(c2.load(Ordering::SeqCst), 1);
 
     // Unsubscribing one leaves the other live.
-    rt.core.unsubscribe(s.id, sub1);
+    rt.core().unsubscribe(s.id, sub1);
     s.set(TestValue::Int(1));
     assert_eq!(c1.load(Ordering::SeqCst), 1, "sub1 detached");
     assert_eq!(c2.load(Ordering::SeqCst), 2, "sub2 still live");
 
-    rt.core.unsubscribe(s.id, sub2);
+    rt.core().unsubscribe(s.id, sub2);
 }
 
 #[test]

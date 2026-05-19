@@ -48,7 +48,9 @@ use std::sync::Arc;
 use ahash::AHashMap as HashMap;
 use parking_lot::Mutex;
 
-use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink, SubscriptionId};
+use graphrefly_core::{
+    BindingBoundary, Core, CoreFull, FnId, HandleId, NodeId, Sink, SubscriptionId,
+};
 
 /// Outcome of [`ProducerCtx::subscribe_to`] — the producer-layer
 /// translation of [`graphrefly_core::SubscribeError`] into a positive
@@ -201,6 +203,19 @@ impl ProducerEmitter {
         }
     }
 
+    /// Construct from the object-safe [`CoreFull`] facade (D246 r5 /
+    /// D245). Used by [`ProducerCtx::emitter`] now that the ctx holds
+    /// `&dyn CoreFull` rather than a concrete `&Core` — `CoreFull`
+    /// carries both `mailbox()` and `binding()`, the only two pieces a
+    /// `ProducerEmitter` needs.
+    #[must_use]
+    pub fn from_corefull(core: &dyn CoreFull) -> Self {
+        Self {
+            mailbox: core.mailbox(),
+            binding: core.binding(),
+        }
+    }
+
     /// Post an `Emit`. If the owning `Core` is gone, release `handle`
     /// (it held a retain for the would-be payload) — no leak.
     pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
@@ -305,7 +320,7 @@ impl Drop for SubGuard {
 ///   producer deactivation.
 pub struct ProducerCtx<'a> {
     node_id: NodeId,
-    core: &'a Core,
+    core: &'a dyn CoreFull,
     storage: &'a ProducerStorage,
 }
 
@@ -313,12 +328,35 @@ impl<'a> ProducerCtx<'a> {
     /// Construct a new context for the binding's `invoke_fn` dispatch
     /// to call build closures. Internal — bindings call this; user
     /// code receives the constructed ctx via the build closure's arg.
-    pub fn new(node_id: NodeId, core: &'a Core, storage: &'a ProducerStorage) -> Self {
+    ///
+    /// D246 r5 / D245: takes `&dyn CoreFull` — the one object-safe Core
+    /// facade Core hands the binding via
+    /// [`graphrefly_core::BindingBoundary::invoke_fn_with_core`]. A
+    /// concrete `&Core` unsized-coerces to `&dyn CoreFull` at the call
+    /// site, so existing `&Core`-holding call sites pass it directly
+    /// (`ProducerCtx::new(node, &core, &storage)`). `ProducerCtx` only
+    /// needs `subscribe`/`try_subscribe`/`register_*`/`emit`/`mailbox`/
+    /// `binding`/`*_or_defer` — all on `CoreFull` — so no concrete
+    /// `Core` / thread-local / stored back-reference is required.
+    pub fn new(node_id: NodeId, core: &'a dyn CoreFull, storage: &'a ProducerStorage) -> Self {
         Self {
             node_id,
             core,
             storage,
         }
+    }
+
+    /// Construct from the full object-safe Core facade (D246 r5 /
+    /// D245). Identical to [`Self::new`] — kept as a named entry point
+    /// for call sites that hold a `&dyn CoreFull` (the
+    /// `invoke_fn_with_core` producer-build path) and want the intent
+    /// explicit at the construction site.
+    pub fn for_corefull(
+        node_id: NodeId,
+        core: &'a dyn CoreFull,
+        storage: &'a ProducerStorage,
+    ) -> Self {
+        Self::new(node_id, core, storage)
     }
 
     /// The producer node's id.
@@ -327,11 +365,15 @@ impl<'a> ProducerCtx<'a> {
         self.node_id
     }
 
-    /// The Core dispatcher. **Build-closure-side only** — valid only for
+    /// The Core dispatcher, as the object-safe [`CoreFull`] facade
+    /// (D246 r5 / D245). **Build-closure-side only** — valid only for
     /// the duration of the build call (the `Core` relocates; D231).
-    /// Long-lived sinks must use [`Self::emitter`] instead.
+    /// Long-lived sinks must use [`Self::emitter`] instead. Carries
+    /// everything a build closure uses (`subscribe`/`try_subscribe`/
+    /// `register_*`/`emit`/`binding`/`*_or_defer`) without naming the
+    /// concrete cell type.
     #[must_use]
-    pub fn core(&self) -> &Core {
+    pub fn core(&self) -> &dyn CoreFull {
         self.core
     }
 
@@ -342,10 +384,7 @@ impl<'a> ProducerCtx<'a> {
     /// and are applied in-wave by the drain-to-quiescence loop.
     #[must_use]
     pub fn emitter(&self) -> ProducerEmitter {
-        ProducerEmitter {
-            mailbox: self.core.mailbox(),
-            binding: self.core.binding(),
-        }
+        ProducerEmitter::from_corefull(self.core)
     }
 
     /// The binding's per-producer state storage (S2b). Replaces

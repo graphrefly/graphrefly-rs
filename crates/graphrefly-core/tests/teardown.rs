@@ -10,7 +10,7 @@ fn teardown_on_live_node_emits_complete_then_teardown() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.teardown(s.id);
+    rt.core().teardown(s.id);
 
     let snap = rec.snapshot();
     let post: Vec<&RecordedEvent> = snap[baseline..].iter().collect();
@@ -35,8 +35,8 @@ fn teardown_on_already_terminal_node_does_not_duplicate_complete() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.complete(s.id);
-    rt.core.teardown(s.id);
+    rt.core().complete(s.id);
+    rt.core().teardown(s.id);
 
     let snap = rec.snapshot();
     let complete_count = snap[baseline..]
@@ -61,9 +61,9 @@ fn duplicate_teardown_is_idempotent() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    rt.core.teardown(s.id);
-    rt.core.teardown(s.id);
-    rt.core.teardown(s.id);
+    rt.core().teardown(s.id);
+    rt.core().teardown(s.id);
+    rt.core().teardown(s.id);
 
     let snap = rec.snapshot();
     let complete_count = snap[baseline..]
@@ -95,7 +95,7 @@ fn teardown_cascades_through_chain() {
     let baseline_b = rec_b.snapshot().len();
     let baseline_c = rec_c.snapshot().len();
 
-    rt.core.teardown(a.id);
+    rt.core().teardown(a.id);
 
     for (name, snap, baseline) in [
         ("B", rec_b.snapshot(), baseline_b),
@@ -136,7 +136,7 @@ fn teardown_diamond_each_node_sees_one_pair() {
     let rec_d = rt.subscribe_recorder(d);
     let baseline = rec_d.snapshot().len();
 
-    rt.core.teardown(a.id);
+    rt.core().teardown(a.id);
 
     let snap = rec_d.snapshot();
     let complete_count = snap[baseline..]
@@ -165,8 +165,8 @@ fn teardown_after_error_does_not_re_emit_complete() {
     let baseline = rec.snapshot().len();
 
     let err = rt.binding.intern(TestValue::Str("bad".into()));
-    rt.core.error(s.id, err);
-    rt.core.teardown(s.id);
+    rt.core().error(s.id, err);
+    rt.core().teardown(s.id);
 
     let snap = rec.snapshot();
     let complete_count = snap[baseline..]
@@ -194,5 +194,5 @@ fn teardown_after_error_does_not_re_emit_complete() {
 fn teardown_unknown_node_panics() {
     let rt = TestRuntime::new();
     let bogus = graphrefly_core::NodeId::new(99_999);
-    rt.core.teardown(bogus);
+    rt.core().teardown(bogus);
 }

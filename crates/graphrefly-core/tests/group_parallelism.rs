@@ -13,6 +13,13 @@
 //! `Core` is `Send + Sync` on the default `LockedCell` substrate, so it
 //! is shared across threads by clone.
 
+// §7 shared-Core cross-thread group tests are genuinely-deleted-model
+// (D221/D238/D246) and stay `#[ignore]`→S4. The helpers/consts below
+// are the S4 rewrite scaffold kept intact per the D246 operating
+// rules ("do not delete; do not rewrite their intent"); dead until
+// the S4 owner-side seam revives them.
+#![allow(dead_code, unused_imports)]
+
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -54,6 +54,7 @@ pub mod mailbox;
 pub mod message;
 pub mod node;
 pub(crate) mod op_state;
+pub mod owned;
 pub mod state_cell;
 #[cfg(feature = "tokio")]
 pub mod timer;
@@ -73,5 +74,6 @@ pub use node::{
     ResumeReport, SetDepsError, SetGroupError, SetPausableModeError, Sink, SubscribeError,
     SubscriptionId, TerminalKind, UpError,
 };
+pub use owned::OwnedCore;
 pub use state_cell::{LockedCell, SingleThreadCell, StateCell};
 pub use topology::{TopologyEvent, TopologySink, TopologySubscriptionId};

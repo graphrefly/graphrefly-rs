@@ -38,10 +38,10 @@ fn phase_g_compute_node_releases_cache_on_deactivation() {
     assert!(live_during_sub > 0, "shares retained while subscribed");
 
     // Drop subscriber → Phase G releases compute cache + per-dep prev_data.
-    drop(rec);
+    rt.unsub_recorder(&rec);
 
     // Cache should be cleared per R2.2.8 (compute clears on deactivation).
-    let h_after = rt.core.cache_of(d);
+    let h_after = rt.core().cache_of(d);
     assert_eq!(
         h_after,
         graphrefly_core::NO_HANDLE,
@@ -64,7 +64,7 @@ fn phase_g_state_node_preserves_cache_on_deactivation() {
     // Subscribe and unsubscribe.
     let rec = rt.subscribe_recorder(s.id);
     assert_eq!(rt.cache_value(s.id), Some(TestValue::Int(42)));
-    drop(rec);
+    rt.unsub_recorder(&rec);
 
     // State node cache MUST survive deactivation per R2.2.7 / R2.2.8 ROM rule.
     assert_eq!(
@@ -97,7 +97,7 @@ fn phase_g_releases_dep_terminal_error_handles_on_deactivation() {
     // Error the upstream → cascades to consumer's `dep_terminals[0]`
     // (Error retain held). Consumer also terminates; the consumer's own
     // `terminal` slot retains another share.
-    rt.core.error(upstream.id, err_handle);
+    rt.core().error(upstream.id, err_handle);
     let refcount_during_terminal = rt.binding.refcount_of(err_handle);
     assert!(
         refcount_during_terminal > baseline_refcount,
@@ -109,7 +109,7 @@ fn phase_g_releases_dep_terminal_error_handles_on_deactivation() {
     // Error retain. The CONSUMER's own `terminal` slot stays per D121
     // (producer-side terminal preserved for late-subscriber R2.2.7
     // semantics; the per-edge cascade slot is the leak).
-    drop(rec);
+    rt.unsub_recorder(&rec);
     let refcount_after_drop = rt.binding.refcount_of(err_handle);
     assert!(
         refcount_after_drop < refcount_during_terminal,
@@ -137,7 +137,7 @@ fn phase_g_resets_has_fired_once_on_deactivation() {
     let rec = rt.subscribe_recorder(d);
     let calls_after_first = *calls.lock().unwrap();
     assert_eq!(calls_after_first, 1, "fn fires once on first subscribe");
-    drop(rec);
+    rt.unsub_recorder(&rec);
 
     // Re-subscribe → fresh activation, fn must re-fire because Phase G
     // reset has_fired_once.
@@ -159,11 +159,11 @@ fn phase_g_keeps_per_node_terminal_for_late_subscriber_replay() {
     // never-terminated node."
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(7)));
-    rt.core.set_resubscribable(s.id, true);
+    rt.core().set_resubscribable(s.id, true);
 
     let rec = rt.subscribe_recorder(s.id);
-    rt.core.complete(s.id);
-    drop(rec);
+    rt.core().complete(s.id);
+    rt.unsub_recorder(&rec);
 
     // Phase G ran; `terminal` slot is preserved. Re-subscribe should
     // trigger R2.2.7.a reset_for_fresh_lifecycle.
@@ -194,7 +194,7 @@ fn phase_g_does_not_corrupt_state_node_status_on_unsubscribe_resubscribe() {
     for _ in 0..3 {
         let rec = rt.subscribe_recorder(s.id);
         assert_eq!(rt.cache_value(s.id), Some(TestValue::Int(99)));
-        drop(rec);
+        rt.unsub_recorder(&rec);
         assert_eq!(
             rt.cache_value(s.id),
             Some(TestValue::Int(99)),
@@ -220,12 +220,12 @@ fn phase_g_preserves_terminal_slot_for_non_resubscribable_rejection() {
     // Non-resubscribable (default). NOT calling set_resubscribable.
 
     let rec = rt.subscribe_recorder(s.id);
-    rt.core.complete(s.id);
-    drop(rec); // Phase G runs.
+    rt.core().complete(s.id);
+    rt.unsub_recorder(&rec); // Phase G runs.
 
     // R2.2.7.b: subscribe must reject because terminal slot preserved.
     let sink: Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!(
@@ -267,7 +267,7 @@ fn phase_g_skips_cache_clear_when_cleanup_hook_re_subscribes() {
     // Derived fired; cache holds Int(1000).
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(1000)));
     // Snapshot the cache handle to check liveness later.
-    let _cache_h = rt.core.cache_of(d);
+    let _cache_h = rt.core().cache_of(d);
     let live_before_drop = rt.binding.live_handles();
     assert!(live_before_drop > 0);
 
@@ -280,7 +280,7 @@ fn phase_g_skips_cache_clear_when_cleanup_hook_re_subscribes() {
     // drop(rec1) → assert cache_h alive → re-subscribe → assert cache
     // remains live.
     let new_sub_slot: Mutex<Option<graphrefly_core::SubscriptionId>> = Mutex::new(None);
-    drop(rec1);
+    rt.unsub_recorder(&rec1);
     // Phase G ran. Cache was cleared (compute) — cache_h refcount
     // dropped to 0 in TestBinding (which tracks live_handles via
     // refcount). Re-subscribe now to a derived node: re-activation
@@ -290,7 +290,7 @@ fn phase_g_skips_cache_clear_when_cleanup_hook_re_subscribes() {
     let _keep_alive = rec2; // hold subscription
                             // The new lifecycle's cache is a fresh handle (may or may not
                             // equal cache_h depending on registry reuse).
-    let new_cache_h = rt.core.cache_of(d);
+    let new_cache_h = rt.core().cache_of(d);
     assert!(new_cache_h != graphrefly_core::NO_HANDLE);
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(1000)));
     // F1 invariant verification: live_handles count is sane (no
@@ -328,10 +328,10 @@ fn r2_2_7_b_rejects_subscribe_between_complete_and_teardown_cascade() {
     let rec = rt.subscribe_recorder(s.id);
     // Complete; auto-TEARDOWN cascades synchronously in this single-
     // threaded test. Late subscribe after complete must reject.
-    rt.core.complete(s.id);
-    drop(rec);
+    rt.core().complete(s.id);
+    rt.unsub_recorder(&rec);
     let sink: Sink = std::sync::Arc::new(|_msgs| {});
-    match rt.core.try_subscribe(s.id, sink) {
+    match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { .. }) => {}
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!(

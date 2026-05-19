@@ -15,15 +15,16 @@
 //!   Cross-thread emits block on `wave_owner` until the subscribe scope
 //!   ends, preserving R1.3.5.a happens-after ordering.
 //!
-//! Tests at the bottom of this file use an `armed` flag to opt out of
-//! re-entrance during the initial handshake call where they only want
-//! to test the wave-end-flush path; the dedicated handshake re-entry
-//! test (`handshake_sink_can_reenter_core_emit_on_other_node`) verifies
-//! the Slice E rework.
+//! D246 (rule 6): a long-lived sink that fires IN-WAVE re-enters Core
+//! via the mailbox (`post_emit`/`post_complete`/`post_defer`), drained
+//! owner-side by `drain_mailbox` as a FIFO nested wave (the P7/D239
+//! obligation). Synchronous handshake-time sink re-entry (owner holds
+//! `&Core` during subscribe) still works directly — see
+//! `handshake_sink_can_reenter_core_emit_on_other_node`.
 //!
-//! Fn re-entrance via [`BindingBoundary::invoke_fn`] was lifted in Slice
-//! A close (lock-released `invoke_fn`); custom-equals re-entrance was
-//! lifted in the same slice.
+//! Fn re-entrance via [`graphrefly_core::BindingBoundary::invoke_fn`]
+//! and custom-equals re-entrance use the same mailbox seam — see
+//! `tests/lock_released.rs`.
 
 mod common;
 
@@ -33,42 +34,149 @@ use graphrefly_core::Message;
 
 use common::{TestRuntime, TestValue};
 
-/// Helper: build a sink that becomes "armed" only after `armed.set(true)`.
-/// Pre-arming, sink ignores all messages (lets the lock-held handshake
-/// run cleanly). Post-arming, the sink runs `on_data` on every Data
-/// message it observes.
-fn armed_sink<F>(armed: Arc<Mutex<bool>>, on_data: F) -> graphrefly_core::Sink
-where
-    F: Fn(&Message) + Send + Sync + 'static,
-{
-    Arc::new(move |msgs: &[Message]| {
-        if !*armed.lock().unwrap() {
-            return;
-        }
+#[test]
+fn sink_can_reenter_core_via_emit() {
+    // LIVE invariant: a long-lived sink that fires IN-WAVE may
+    // re-enter Core. Under the actor model the β-valid seam is the
+    // mailbox (D233/D246 rule 6): the sink posts `MailboxOp::Emit`;
+    // the owner's drain applies it as a nested wave. No deadlock, no
+    // shared/cloned Core.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+    let other = rt.state(None);
+    let other_obs = rt.derived(&[other.id], |deps| Some(deps[0].clone()));
+    let other_rec = rt.subscribe_recorder(other_obs);
+
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let other_id = other.id;
+    let reentrant_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_)) {
-                on_data(m);
+                let h = binding.intern(TestValue::Int(55));
+                let _ = mailbox.post_emit(other_id, h);
             }
         }
-    })
+    });
+    let sub = rt.track_subscribe(d, reentrant_sink);
+
+    // Drive a wave: the in-wave sink posts an Emit on `other`.
+    s.set(TestValue::Int(2));
+    rt.drain_mailbox();
+    assert!(
+        other_rec.data_values().contains(&TestValue::Int(55)),
+        "in-wave sink re-entered Core via mailbox emit → delivered as nested wave"
+    );
+    rt.unsubscribe(d, sub);
 }
 
 #[test]
-#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
-fn sink_can_reenter_core_via_emit() {
-    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
-}
-
-#[test]
-#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
+#[ignore = "D246 record-and-skip: sink→Core pause/resume re-entry has NO β-valid seam — pause/resume are absent from CoreFull (the MailboxOp::Defer surface) and are not MailboxOp variants; the deleted synchronous shared-Core mechanism is the only path. Invariant (an in-wave sink can pause/resume) stays live → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
 fn sink_can_reenter_core_via_pause_and_resume() {
-    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
+    // No β-valid expression: pause/resume not on CoreFull/MailboxOp. → S4.
 }
 
 #[test]
-#[ignore = "actor-model (D238/D232-AMEND): sink→Core re-entry is now mailbox-deferred (em.defer/post_*), not synchronous shared-Core; covered by graphrefly-operators producer tests + the P7 re-entrant-drain obligation"]
 fn sink_can_complete_another_node_from_callback() {
-    // deferred stub (D238/D232-AMEND): body did synchronous sink->Core re-entry; now mailbox-deferred. Covered by graphrefly-operators producer tests + P7.
+    // LIVE invariant: an in-wave sink may `complete` another node.
+    // β-valid via `MailboxOp::Complete` (D246 rule 6); owner drain
+    // applies it as a nested wave.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(1)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+    let target = rt.state(Some(TestValue::Int(0)));
+    let target_rec = rt.subscribe_recorder(target.id);
+
+    let mailbox = rt.mailbox();
+    let target_id = target.id;
+    let completing_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if matches!(m, Message::Data(_)) {
+                let _ = mailbox.post_complete(target_id);
+            }
+        }
+    });
+    let sub = rt.track_subscribe(d, completing_sink);
+
+    s.set(TestValue::Int(2));
+    rt.drain_mailbox();
+    assert!(
+        target_rec
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, common::RecordedEvent::Complete)),
+        "in-wave sink completed another node via mailbox → delivered as nested wave"
+    );
+    rt.unsubscribe(d, sub);
+}
+
+#[test]
+fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
+    // P7 (D239) — re-entrant `drain_mailbox` FIFO nested-wave
+    // ordering. Multiple in-wave sink re-entries post `Emit`s; the
+    // owner's `drain_mailbox` MUST apply them in FIFO post order,
+    // each cascading its own nested wave, with no re-ordering and no
+    // deadlock when a drained op itself posts further ops.
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+
+    // A recorder on a sink that captures the FIFO arrival order of
+    // re-entrant emits.
+    let order = Arc::new(Mutex::new(Vec::<i64>::new()));
+    let sink_node = rt.state(None);
+    let order_w = order.clone();
+    let binding_o = rt.binding.clone();
+    let order_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if let Message::Data(h) = m {
+                if let common::TestValue::Int(n) = binding_o.deref(*h) {
+                    order_w.lock().unwrap().push(n);
+                }
+            }
+        }
+    });
+    let order_sub = rt.track_subscribe(sink_node.id, order_sink);
+
+    // The in-wave sink on `d` posts THREE emits in order 10, 20, 30.
+    // The first drained op (10) itself posts a follow-on (40) — the
+    // re-entrant-during-drain case P7 must keep FIFO.
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let sink_id = sink_node.id;
+    let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reentrant: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if matches!(m, Message::Data(_))
+                && !posted.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                for v in [10i64, 20, 30] {
+                    let h = binding.intern(common::TestValue::Int(v));
+                    let _ = mailbox.post_emit(sink_id, h);
+                }
+                // The op draining `10` re-enters and posts `40`.
+                let mailbox2 = mailbox.clone();
+                let binding2 = binding.clone();
+                let _ = mailbox.post_defer(Box::new(move |_cf| {
+                    let h = binding2.intern(common::TestValue::Int(40));
+                    let _ = mailbox2.post_emit(sink_id, h);
+                }));
+            }
+        }
+    });
+    let d_sub = rt.track_subscribe(d, reentrant);
+
+    s.set(TestValue::Int(1));
+    rt.drain_mailbox();
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![10, 20, 30, 40],
+        "re-entrant drain_mailbox applied nested waves in strict FIFO post order"
+    );
+    rt.unsubscribe(d, d_sub);
+    rt.unsubscribe(sink_node.id, order_sub);
 }
 
 #[test]
@@ -98,13 +206,13 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
         for m in msgs {
             if matches!(m, graphrefly_core::Message::Data(_)) {
                 let h = rt_inner.binding.intern(TestValue::Int(99));
-                rt_inner.core.emit(other_id, h);
+                rt_inner.core().emit(other_id, h);
             }
         }
     });
 
     // No panic; re-entrant emit lands on `other_rec`.
-    let _sub = rt.core.subscribe(s_id, sink);
+    let _sub = rt.core().subscribe(s_id, sink);
 
     let other_events = other_rec.snapshot();
     let saw_99 = other_events
@@ -148,7 +256,7 @@ fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
         let mut counter = 1i64;
         while !*stop_emit.lock().unwrap() && counter <= 1000 {
             let h = rt_emit.binding.intern(TestValue::Int(counter));
-            rt_emit.core.emit(s_id, h);
+            rt_emit.core().emit(s_id, h);
             emit_count_inner.store(counter, Ordering::SeqCst);
             counter += 1;
         }

@@ -17,7 +17,7 @@ fn combine_emits_tuple_on_any_dep_fire() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
+    let c = combine(rt.core(), &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
 
     // Both deps have initial values → first-run gate satisfied at subscribe →
@@ -57,7 +57,7 @@ fn combine_first_run_gate_holds_until_all_deps_fire() {
     let a = rt.state_int(None);
     let b = rt.state_int(None);
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
+    let c = combine(rt.core(), &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
 
     // No data yet — gate holds.
@@ -84,7 +84,7 @@ fn combine_3_deps() {
     let b = rt.state_int(Some(2));
     let c = rt.state_int(Some(3));
 
-    let combined = combine(&rt.core, &rt.op_binding, &[a, b, c], rt.make_packer()).unwrap();
+    let combined = combine(rt.core(), &rt.op_binding, &[a, b, c], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(combined.node);
 
     let data = rec.data_values();
@@ -117,16 +117,16 @@ fn combine_complete_when_all_deps_complete() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let c = combine(&rt.core, &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
+    let c = combine(rt.core(), &rt.op_binding, &[a, b], rt.make_packer()).unwrap();
     let rec = rt.subscribe_recorder(c.node);
     rec.clear();
 
     // Complete a — combine doesn't complete yet.
-    rt.core.complete(a);
+    rt.core().complete(a);
     assert!(!rec.events().contains(&RecordedEvent::Complete));
 
     // Complete b — now combine completes (R1.3.4.b).
-    rt.core.complete(b);
+    rt.core().complete(b);
     assert!(rec.events().contains(&RecordedEvent::Complete));
 }
 
@@ -141,7 +141,7 @@ fn with_latest_from_emits_only_on_primary() {
     let secondary = rt.state_int(Some(2));
 
     let wlf = with_latest_from(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         primary,
         secondary,
@@ -181,7 +181,7 @@ fn with_latest_from_gate_holds_until_both_deliver() {
     let secondary = rt.state_int(None);
 
     let wlf = with_latest_from(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         primary,
         secondary,
@@ -230,7 +230,7 @@ fn with_latest_from_secondary_update_samples_latest() {
     let secondary = rt.state_int(Some(100));
 
     let wlf = with_latest_from(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         primary,
         secondary,
@@ -260,7 +260,7 @@ fn with_latest_from_complete_when_all_deps_complete() {
     let secondary = rt.state_int(Some(2));
 
     let wlf = with_latest_from(
-        &rt.core,
+        rt.core(),
         &rt.op_binding,
         primary,
         secondary,
@@ -269,10 +269,10 @@ fn with_latest_from_complete_when_all_deps_complete() {
     let rec = rt.subscribe_recorder(wlf.node);
     rec.clear();
 
-    rt.core.complete(primary);
+    rt.core().complete(primary);
     assert!(!rec.events().contains(&RecordedEvent::Complete));
 
-    rt.core.complete(secondary);
+    rt.core().complete(secondary);
     assert!(rec.events().contains(&RecordedEvent::Complete));
 }
 
@@ -286,7 +286,7 @@ fn merge_forwards_all_dep_data_verbatim() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]).unwrap();
+    let m = merge(rt.core(), &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // Push-on-subscribe: merge is partial:true, so fires on first dep.
@@ -321,7 +321,7 @@ fn merge_zero_ffi_no_binding_call() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]).unwrap();
+    let m = merge(rt.core(), &[a, b]).unwrap();
     let _rec = rt.subscribe_recorder(m.node);
 
     // If any FFI method were called, InnerBinding would unreachable! on
@@ -337,17 +337,17 @@ fn merge_complete_when_all_deps_complete() {
     let b = rt.state_int(Some(2));
     let c = rt.state_int(Some(3));
 
-    let m = merge(&rt.core, &[a, b, c]).unwrap();
+    let m = merge(rt.core(), &[a, b, c]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
     rec.clear();
 
-    rt.core.complete(a);
+    rt.core().complete(a);
     assert!(!rec.events().contains(&RecordedEvent::Complete));
 
-    rt.core.complete(b);
+    rt.core().complete(b);
     assert!(!rec.events().contains(&RecordedEvent::Complete));
 
-    rt.core.complete(c);
+    rt.core().complete(c);
     assert!(rec.events().contains(&RecordedEvent::Complete));
 }
 
@@ -361,12 +361,12 @@ fn merge_error_cascades_when_all_deps_terminal() {
     let a = rt.state_int(Some(1));
     let b = rt.state_int(Some(2));
 
-    let m = merge(&rt.core, &[a, b]).unwrap();
+    let m = merge(rt.core(), &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
     rec.clear();
 
     let err_h = rt.intern(TestValue::Str("boom".into()));
-    rt.core.error(a, err_h);
+    rt.core().error(a, err_h);
     // Only dep a is terminal — merge doesn't cascade yet.
     assert!(!rec
         .events()
@@ -374,7 +374,7 @@ fn merge_error_cascades_when_all_deps_terminal() {
         .any(|e| matches!(e, RecordedEvent::Error(_))));
 
     // Complete dep b → all deps terminal, ERROR dominates → merge errors.
-    rt.core.complete(b);
+    rt.core().complete(b);
     assert!(rec
         .events()
         .iter()
@@ -388,7 +388,7 @@ fn merge_partial_mode_fires_on_first_dep() {
     let a = rt.state_int(None); // sentinel
     let b = rt.state_int(None); // sentinel
 
-    let m = merge(&rt.core, &[a, b]).unwrap();
+    let m = merge(rt.core(), &[a, b]).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // No data yet — both sentinel.
@@ -406,7 +406,7 @@ fn merge_many_sources() {
     let rt = OpRuntime::new();
     let sources: Vec<_> = (0..5).map(|i| rt.state_int(Some(i))).collect();
 
-    let m = merge(&rt.core, &sources).unwrap();
+    let m = merge(rt.core(), &sources).unwrap();
     let rec = rt.subscribe_recorder(m.node);
 
     // Push-on-subscribe delivers each source's initial value.

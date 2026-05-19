@@ -203,6 +203,41 @@ pub trait BindingBoundary: Send + Sync {
     /// separate channel — exact error-propagation discipline is binding-side.)
     fn invoke_fn(&self, node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult;
 
+    /// Invoke a user function **with the owner-side full `Core` facade in
+    /// hand** (D246 rule 5 / D245 Option A — the producer-build facade
+    /// hand-off, folding D245).
+    ///
+    /// Core calls this — not the parameterless [`Self::invoke_fn`] — for
+    /// every fn-fire dispatch ([`crate::batch`] `fire_regular` Phase 2),
+    /// passing `self as &dyn CoreFull` (the one object-safe
+    /// mutation+inspection+serialize+mailbox facade, [`crate::node::CoreFull`]).
+    /// A binding whose `invoke_fn` builds a *producer* (the operators test
+    /// harness, the napi bench binding) needs a real Core surface during
+    /// the build — `subscribe`/`register_*` for upstream wiring, not just
+    /// the emit-only mailbox. D231 located producer build/teardown
+    /// owner-side with `&Core`; D245 made that concrete at the trait
+    /// surface so the build path receives a Core facade explicitly
+    /// **without** a thread-local / `Core` clone / stored back-reference
+    /// (all β-invalid under the actor model — `Core` is move-only).
+    ///
+    /// The default forwards to [`Self::invoke_fn`] (ignoring `core`), so
+    /// every binding that does **not** build producers is completely
+    /// unaffected — core/structures/storage/graph test harnesses and the
+    /// napi non-producer paths keep their existing parameterless
+    /// `invoke_fn` semantics with zero behavior change. Only a
+    /// producer-building binding overrides this to construct its
+    /// `ProducerCtx` from the passed `&dyn CoreFull`.
+    fn invoke_fn_with_core(
+        &self,
+        node_id: NodeId,
+        fn_id: FnId,
+        dep_data: &[DepBatch],
+        core: &dyn crate::node::CoreFull,
+    ) -> FnResult {
+        let _ = core;
+        self.invoke_fn(node_id, fn_id, dep_data)
+    }
+
     /// Custom equals oracle. Called only when a node declares
     /// `EqualsMode::Custom`. Identity equals (the default) is a `u64` compare
     /// inside the Core — zero FFI per check.

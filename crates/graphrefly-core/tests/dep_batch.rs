@@ -58,7 +58,7 @@ fn single_emit_outside_batch_yields_data_len_1() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -89,7 +89,7 @@ fn k_emit_in_batch_coalesces_into_one_fire_with_k_data_entries() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -98,10 +98,10 @@ fn k_emit_in_batch_coalesces_into_one_fire_with_k_data_entries() {
     let h1 = rt.binding.intern(TestValue::Int(1));
     let h2 = rt.binding.intern(TestValue::Int(2));
     let h3 = rt.binding.intern(TestValue::Int(3));
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h1);
-        rt.core.emit(s.id, h2);
-        rt.core.emit(s.id, h3);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h1);
+        rt.core().emit(s.id, h2);
+        rt.core().emit(s.id, h3);
     });
 
     let snaps = captured.lock().unwrap().clone();
@@ -126,7 +126,7 @@ fn prev_data_rotates_to_last_batch_entry_across_waves() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -135,14 +135,14 @@ fn prev_data_rotates_to_last_batch_entry_across_waves() {
     // Wave 1: 2-emit batch produces last_h1 = h_b
     let h_a = rt.binding.intern(TestValue::Int(10));
     let h_b = rt.binding.intern(TestValue::Int(20));
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h_a);
-        rt.core.emit(s.id, h_b);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h_a);
+        rt.core().emit(s.id, h_b);
     });
 
     // Wave 2: emit h_c. prev_data should be h_b (last entry of prior batch).
     let h_c = rt.binding.intern(TestValue::Int(30));
-    rt.core.emit(s.id, h_c);
+    rt.core().emit(s.id, h_c);
 
     let snaps = captured.lock().unwrap().clone();
     assert_eq!(snaps.len(), 2);
@@ -176,7 +176,7 @@ fn uninvolved_dep_shows_data_empty_and_involved_false() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[s1.id, s2.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -221,7 +221,7 @@ fn resolved_in_wave_yields_involved_true_with_empty_data() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -272,7 +272,7 @@ fn k_emit_batch_refcounts_balance_after_wave_end() {
         .binding
         .register_raw_fn(|_deps| FnResult::Noop { tracked: None });
     let d = rt
-        .core
+        .core()
         .register_derived(&[s.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);
@@ -285,10 +285,10 @@ fn k_emit_batch_refcounts_balance_after_wave_end() {
     let rc_b_before = rt.binding.refcount_of(h_b);
     let rc_c_before = rt.binding.refcount_of(h_c);
 
-    rt.core.batch(|| {
-        rt.core.emit(s.id, h_a);
-        rt.core.emit(s.id, h_b);
-        rt.core.emit(s.id, h_c);
+    rt.core().batch(|| {
+        rt.core().emit(s.id, h_a);
+        rt.core().emit(s.id, h_b);
+        rt.core().emit(s.id, h_c);
     });
 
     // Refcount discipline (A1 — /qa fix: previous `<= rc_before + 1`
@@ -337,7 +337,7 @@ fn multi_dep_each_dep_rotates_prev_data_independently() {
     });
 
     let d = rt
-        .core
+        .core()
         .register_derived(&[a.id, b.id], fn_id, EqualsMode::Identity, false)
         .unwrap();
     let _rec = rt.subscribe_recorder(d);

@@ -21,17 +21,17 @@ fn pause_then_resume_with_no_emissions_drains_empty_buffer() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
     let _rec = rt.subscribe_recorder(s.id);
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause ok");
-    assert!(rt.core.is_paused(s.id));
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause ok");
+    assert!(rt.core().is_paused(s.id));
     let report = rt
-        .core
+        .core()
         .resume(s.id, lock)
         .expect("resume ok")
         .expect("final lock release should yield a ResumeReport");
     assert_eq!(report.replayed, 0);
     assert_eq!(report.dropped, 0);
-    assert!(!rt.core.is_paused(s.id));
+    assert!(!rt.core().is_paused(s.id));
 }
 
 #[test]
@@ -44,17 +44,17 @@ fn single_pauser_buffers_data_and_resolved_then_replays_on_resume() {
     // `pause_buffers_derived_data_through_diamond`).
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
 
     // Activate: push-on-subscribe delivers START + DATA(0).
     let baseline = rec.snapshot();
-    let lock = rt.core.alloc_lock_id();
+    let lock = rt.core().alloc_lock_id();
 
     // Pause; subsequent emissions buffer.
-    rt.core.pause(s.id, lock).expect("pause ok");
+    rt.core().pause(s.id, lock).expect("pause ok");
     s.set(TestValue::Int(1)); // DIRTY (immediate) + DATA(1) (buffered)
     s.set(TestValue::Int(2)); // DIRTY (immediate) + DATA(2) (buffered)
 
@@ -73,7 +73,7 @@ fn single_pauser_buffers_data_and_resolved_then_replays_on_resume() {
 
     // Resume and verify replay.
     let report = rt
-        .core
+        .core()
         .resume(s.id, lock)
         .expect("resume ok")
         .expect("final lock release should yield a ResumeReport");
@@ -100,32 +100,32 @@ fn multi_pauser_remains_paused_until_final_release() {
     // R2.6.0: verbatim buffer-replay is the `ResumeAll` contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    let lock_a = rt.core.alloc_lock_id();
-    let lock_b = rt.core.alloc_lock_id();
-    let lock_c = rt.core.alloc_lock_id();
+    let lock_a = rt.core().alloc_lock_id();
+    let lock_b = rt.core().alloc_lock_id();
+    let lock_c = rt.core().alloc_lock_id();
 
-    rt.core.pause(s.id, lock_a).expect("pause a");
-    rt.core.pause(s.id, lock_b).expect("pause b");
-    rt.core.pause(s.id, lock_c).expect("pause c");
-    assert_eq!(rt.core.pause_lock_count(s.id), 3);
+    rt.core().pause(s.id, lock_a).expect("pause a");
+    rt.core().pause(s.id, lock_b).expect("pause b");
+    rt.core().pause(s.id, lock_c).expect("pause c");
+    assert_eq!(rt.core().pause_lock_count(s.id), 3);
 
     s.set(TestValue::Int(1));
     s.set(TestValue::Int(2));
     s.set(TestValue::Int(3));
 
     // Release two of three locks — still paused.
-    let no_drain_b = rt.core.resume(s.id, lock_b).expect("resume b");
+    let no_drain_b = rt.core().resume(s.id, lock_b).expect("resume b");
     assert!(no_drain_b.is_none(), "non-final resume returns None");
-    let no_drain_c = rt.core.resume(s.id, lock_c).expect("resume c");
+    let no_drain_c = rt.core().resume(s.id, lock_c).expect("resume c");
     assert!(no_drain_c.is_none());
-    assert!(rt.core.is_paused(s.id));
-    assert_eq!(rt.core.pause_lock_count(s.id), 1);
+    assert!(rt.core().is_paused(s.id));
+    assert_eq!(rt.core().pause_lock_count(s.id), 1);
 
     // No DATA delivered yet during multi-pause.
     let mid_count_data = rec
@@ -138,7 +138,7 @@ fn multi_pauser_remains_paused_until_final_release() {
 
     // Final release drains the buffer.
     let report = rt
-        .core
+        .core()
         .resume(s.id, lock_a)
         .expect("resume a")
         .expect("final lock release yields a ResumeReport");
@@ -161,13 +161,13 @@ fn multi_pauser_remains_paused_until_final_release() {
 fn duplicate_pause_lockid_is_idempotent() {
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(0)));
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
-    rt.core.pause(s.id, lock).expect("pause again");
-    rt.core.pause(s.id, lock).expect("pause yet again");
-    assert_eq!(rt.core.pause_lock_count(s.id), 1, "duplicate ids dedupe");
-    rt.core.resume(s.id, lock).expect("resume");
-    assert!(!rt.core.is_paused(s.id));
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
+    rt.core().pause(s.id, lock).expect("pause again");
+    rt.core().pause(s.id, lock).expect("pause yet again");
+    assert_eq!(rt.core().pause_lock_count(s.id), 1, "duplicate ids dedupe");
+    rt.core().resume(s.id, lock).expect("resume");
+    assert!(!rt.core().is_paused(s.id));
 }
 
 #[test]
@@ -177,20 +177,20 @@ fn unknown_resume_lockid_is_noop_and_returns_none() {
 
     // Resume on Active node with bogus lock — silent no-op.
     let bogus = graphrefly_core::LockId::new(99_999);
-    let result = rt.core.resume(s.id, bogus).expect("resume ok");
+    let result = rt.core().resume(s.id, bogus).expect("resume ok");
     assert!(result.is_none());
-    assert!(!rt.core.is_paused(s.id));
+    assert!(!rt.core().is_paused(s.id));
 
     // Same when actually paused with a different lock.
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
-    let result = rt.core.resume(s.id, bogus).expect("resume bogus");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
+    let result = rt.core().resume(s.id, bogus).expect("resume bogus");
     assert!(result.is_none());
     assert!(
-        rt.core.is_paused(s.id),
+        rt.core().is_paused(s.id),
         "still paused — bogus didn't release"
     );
-    assert!(rt.core.holds_pause_lock(s.id, lock));
+    assert!(rt.core().holds_pause_lock(s.id, lock));
 }
 
 #[test]
@@ -198,14 +198,14 @@ fn pause_buffer_cap_drops_oldest_and_reports_dropped() {
     // R2.6.0: buffer-cap eviction is part of the `ResumeAll` buffer
     // machinery — opt in (a Default leaf source has no buffer to cap).
     let rt = TestRuntime::new();
-    rt.core.set_pause_buffer_cap(Some(2));
+    rt.core().set_pause_buffer_cap(Some(2));
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let _rec = rt.subscribe_recorder(s.id);
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
 
     s.set(TestValue::Int(1));
     s.set(TestValue::Int(2));
@@ -215,7 +215,7 @@ fn pause_buffer_cap_drops_oldest_and_reports_dropped() {
     // 5 DATAs emitted; cap=2, so 3 dropped from the front.
 
     let report = rt
-        .core
+        .core()
         .resume(s.id, lock)
         .expect("resume")
         .expect("final lock release yields a ResumeReport");
@@ -234,15 +234,15 @@ fn pause_does_not_buffer_unrelated_node() {
     let rt = TestRuntime::new();
     let s_a = rt.state(Some(TestValue::Int(0)));
     let s_b = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s_a.id, PausableMode::ResumeAll)
         .unwrap();
     let rec_a = rt.subscribe_recorder(s_a.id);
     let rec_b = rt.subscribe_recorder(s_b.id);
     let baseline_b = rec_b.snapshot().len();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s_a.id, lock).expect("pause a only");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s_a.id, lock).expect("pause a only");
     s_a.set(TestValue::Int(1));
     s_b.set(TestValue::Int(99));
 
@@ -266,7 +266,7 @@ fn pause_does_not_buffer_unrelated_node() {
         .count();
     assert_eq!(a_data_count, 0, "s_a DATA(1) should still be buffered");
 
-    rt.core.resume(s_a.id, lock).expect("resume a");
+    rt.core().resume(s_a.id, lock).expect("resume a");
 }
 
 // ---------------------------------------------------------------------
@@ -294,15 +294,15 @@ fn multi_pauser_lock_arithmetic_default_mode() {
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
 
-    let lock_a = rt.core.alloc_lock_id();
-    let lock_b = rt.core.alloc_lock_id();
-    let lock_c = rt.core.alloc_lock_id();
+    let lock_a = rt.core().alloc_lock_id();
+    let lock_b = rt.core().alloc_lock_id();
+    let lock_c = rt.core().alloc_lock_id();
 
-    rt.core.pause(s.id, lock_a).expect("pause a");
-    rt.core.pause(s.id, lock_b).expect("pause b");
-    rt.core.pause(s.id, lock_c).expect("pause c");
-    assert_eq!(rt.core.pause_lock_count(s.id), 3);
-    assert!(rt.core.is_paused(s.id));
+    rt.core().pause(s.id, lock_a).expect("pause a");
+    rt.core().pause(s.id, lock_b).expect("pause b");
+    rt.core().pause(s.id, lock_c).expect("pause c");
+    assert_eq!(rt.core().pause_lock_count(s.id), 3);
+    assert!(rt.core().is_paused(s.id));
 
     s.set(TestValue::Int(1));
     s.set(TestValue::Int(2));
@@ -326,16 +326,16 @@ fn multi_pauser_lock_arithmetic_default_mode() {
     );
 
     // Lock arithmetic (mode-independent): partial release stays paused.
-    let no_drain_b = rt.core.resume(s.id, lock_b).expect("resume b");
+    let no_drain_b = rt.core().resume(s.id, lock_b).expect("resume b");
     assert!(no_drain_b.is_none(), "non-final resume returns None");
-    let no_drain_c = rt.core.resume(s.id, lock_c).expect("resume c");
+    let no_drain_c = rt.core().resume(s.id, lock_c).expect("resume c");
     assert!(no_drain_c.is_none());
-    assert!(rt.core.is_paused(s.id), "still paused — lock_a held");
-    assert_eq!(rt.core.pause_lock_count(s.id), 1);
+    assert!(rt.core().is_paused(s.id), "still paused — lock_a held");
+    assert_eq!(rt.core().pause_lock_count(s.id), 1);
 
     // Final release yields a ResumeReport; nothing was buffered (Default).
     let report = rt
-        .core
+        .core()
         .resume(s.id, lock_a)
         .expect("resume a")
         .expect("final lock release yields a ResumeReport");
@@ -344,7 +344,7 @@ fn multi_pauser_lock_arithmetic_default_mode() {
         "Default mode buffers nothing — RESUME replays 0 (R2.6.0)"
     );
     assert_eq!(report.dropped, 0);
-    assert!(!rt.core.is_paused(s.id));
+    assert!(!rt.core().is_paused(s.id));
 
     // No duplicate/replayed DATA after the final release.
     let final_data: Vec<i64> = rec
@@ -378,10 +378,10 @@ fn pause_does_not_leak_to_unrelated_node_default_mode() {
     let baseline_a = rec_a.snapshot().len();
     let baseline_b = rec_b.snapshot().len();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s_a.id, lock).expect("pause a only");
-    assert!(rt.core.is_paused(s_a.id));
-    assert!(!rt.core.is_paused(s_b.id), "s_b never paused");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s_a.id, lock).expect("pause a only");
+    assert!(rt.core().is_paused(s_a.id));
+    assert!(!rt.core().is_paused(s_b.id), "s_b never paused");
 
     s_a.set(TestValue::Int(1));
     s_b.set(TestValue::Int(99));
@@ -415,7 +415,7 @@ fn pause_does_not_leak_to_unrelated_node_default_mode() {
         "Default-mode self-paused leaf source self-emit delivered immediately (R2.6.0)"
     );
 
-    let report = rt.core.resume(s_a.id, lock).expect("resume a");
+    let report = rt.core().resume(s_a.id, lock).expect("resume a");
     assert!(
         report.is_none() || report.unwrap().replayed == 0,
         "Default mode replays nothing on resume (R2.6.0)"
@@ -428,14 +428,14 @@ fn equals_substituted_resolved_buffers_too() {
     // contract — opt in.
     let rt = TestRuntime::new();
     let s = rt.state(Some(TestValue::Int(7)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(s.id);
     let baseline = rec.snapshot().len();
-    let lock = rt.core.alloc_lock_id();
+    let lock = rt.core().alloc_lock_id();
 
-    rt.core.pause(s.id, lock).expect("pause");
+    rt.core().pause(s.id, lock).expect("pause");
     // Same value as cache → equals-substitution → RESOLVED. Tier 3, buffered.
     s.set(TestValue::Int(7));
     s.set(TestValue::Int(7));
@@ -448,7 +448,11 @@ fn equals_substituted_resolved_buffers_too() {
         .count();
     assert_eq!(mid_resolved, 0, "RESOLVED should buffer alongside DATA");
 
-    let report = rt.core.resume(s.id, lock).expect("resume").expect("final");
+    let report = rt
+        .core()
+        .resume(s.id, lock)
+        .expect("resume")
+        .expect("final");
     assert_eq!(report.replayed, 2);
 
     let post_resolved = rec
@@ -466,16 +470,20 @@ fn unbounded_buffer_holds_many_emissions() {
     let rt = TestRuntime::new();
     // Default cap = None (unbounded).
     let s = rt.state(Some(TestValue::Int(0)));
-    rt.core
+    rt.core()
         .set_pausable_mode(s.id, PausableMode::ResumeAll)
         .unwrap();
     let _rec = rt.subscribe_recorder(s.id);
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(s.id, lock).expect("pause");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(s.id, lock).expect("pause");
     for i in 1..=1_000_i64 {
         s.set(TestValue::Int(i));
     }
-    let report = rt.core.resume(s.id, lock).expect("resume").expect("final");
+    let report = rt
+        .core()
+        .resume(s.id, lock)
+        .expect("resume")
+        .expect("final");
     assert_eq!(report.replayed, 1_000);
     assert_eq!(report.dropped, 0);
 }
@@ -484,13 +492,13 @@ fn unbounded_buffer_holds_many_emissions() {
 fn pause_unknown_node_returns_error() {
     let rt = TestRuntime::new();
     let bogus = graphrefly_core::NodeId::new(99_999);
-    let lock = rt.core.alloc_lock_id();
-    let result = rt.core.pause(bogus, lock);
+    let lock = rt.core().alloc_lock_id();
+    let result = rt.core().pause(bogus, lock);
     assert!(matches!(
         result,
         Err(graphrefly_core::PauseError::UnknownNode(_))
     ));
-    let result = rt.core.resume(bogus, lock);
+    let result = rt.core().resume(bogus, lock);
     assert!(matches!(
         result,
         Err(graphrefly_core::PauseError::UnknownNode(_))
@@ -502,7 +510,7 @@ fn lock_ids_are_unique() {
     let rt = TestRuntime::new();
     let mut ids = Vec::new();
     for _ in 0..16 {
-        ids.push(rt.core.alloc_lock_id());
+        ids.push(rt.core().alloc_lock_id());
     }
     let mut sorted = ids.clone();
     sorted.sort();
@@ -545,7 +553,7 @@ fn pause_buffers_derived_data_through_diamond() {
     });
     // Opt into ResumeAll BEFORE subscribe so the activation wave runs
     // under the same semantics the rest of the test expects.
-    rt.core
+    rt.core()
         .set_pausable_mode(d, PausableMode::ResumeAll)
         .unwrap();
     let rec = rt.subscribe_recorder(d);
@@ -555,8 +563,8 @@ fn pause_buffers_derived_data_through_diamond() {
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(5)));
     let baseline = rec.snapshot().len();
 
-    let lock = rt.core.alloc_lock_id();
-    rt.core.pause(d, lock).expect("pause d");
+    let lock = rt.core().alloc_lock_id();
+    rt.core().pause(d, lock).expect("pause d");
 
     a.set(TestValue::Int(10)); // → b=20, c=30, d=50 (one fire)
     a.set(TestValue::Int(100)); // → b=200, c=300, d=500 (one fire)
@@ -574,7 +582,7 @@ fn pause_buffers_derived_data_through_diamond() {
         "d's outgoing DATA buffered while d is paused (ResumeAll mode)"
     );
 
-    let report = rt.core.resume(d, lock).expect("resume").expect("final");
+    let report = rt.core().resume(d, lock).expect("resume").expect("final");
     assert_eq!(report.replayed, 2, "two waves replayed");
     assert_eq!(rt.cache_value(d), Some(TestValue::Int(500)));
 }

@@ -41,7 +41,7 @@ fn complete_cascades_through_5000_node_chain_without_stack_overflow() {
     let leaf_rec = rt.subscribe_recorder(*ids.last().expect("non-empty chain"));
     let baseline = leaf_rec.snapshot().len();
     // Complete the head → cascade COMPLETE through 5000 nodes.
-    rt.core.complete(ids[0]);
+    rt.core().complete(ids[0]);
     let post = leaf_rec.snapshot();
     assert!(
         post.iter()
@@ -59,7 +59,7 @@ fn teardown_cascades_through_5000_node_chain_without_stack_overflow() {
     let baseline = leaf_rec.snapshot().len();
     // Teardown the head → cascade TEARDOWN (with auto-COMPLETE prepend)
     // through 5000 nodes.
-    rt.core.teardown(ids[0]);
+    rt.core().teardown(ids[0]);
     let post = leaf_rec.snapshot();
     let new = &post[baseline..];
     assert!(
@@ -81,7 +81,7 @@ fn invalidate_cascades_through_5000_node_chain_without_stack_overflow() {
     let leaf_rec = rt.subscribe_recorder(*ids.last().expect("non-empty chain"));
     let baseline = leaf_rec.snapshot().len();
     // Invalidate the head → cache-clear cascade through 5000 nodes.
-    rt.core.invalidate(ids[0]);
+    rt.core().invalidate(ids[0]);
     let post = leaf_rec.snapshot();
     let new = &post[baseline..];
     assert!(
@@ -92,7 +92,7 @@ fn invalidate_cascades_through_5000_node_chain_without_stack_overflow() {
     // After invalidate, every node's cache should be NO_HANDLE.
     for &id in &ids {
         assert_eq!(
-            rt.core.cache_of(id),
+            rt.core().cache_of(id),
             graphrefly_core::NO_HANDLE,
             "node {id:?} cache should be cleared after invalidate cascade"
         );
@@ -108,7 +108,7 @@ fn error_cascades_through_5000_node_chain_without_stack_overflow() {
     // ERROR at the head → cascade through 5000 nodes (Lock 2.B: ERROR
     // dominates COMPLETE in auto-cascade gating; first ERROR seen wins).
     let err = rt.binding.intern(TestValue::Str("oops".to_string()));
-    rt.core.error(ids[0], err);
+    rt.core().error(ids[0], err);
     let post = leaf_rec.snapshot();
     let new = &post[baseline..];
     assert!(

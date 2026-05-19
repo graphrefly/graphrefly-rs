@@ -63,19 +63,19 @@ fn apply_event(
     match event {
         Event::Emit(v) => {
             let h = rt.binding.intern(TestValue::Int(*v));
-            rt.core.emit(source, h);
+            rt.core().emit(source, h);
         }
         Event::Batch(values) => {
             // User-facing batch coalesces multiple emits into one wave.
-            rt.core.batch(|| {
+            rt.core().batch(|| {
                 for v in values {
                     let h = rt.binding.intern(TestValue::Int(*v));
-                    rt.core.emit(source, h);
+                    rt.core().emit(source, h);
                 }
             });
         }
         Event::Complete => {
-            rt.core.complete(source);
+            rt.core().complete(source);
             *completed = true;
         }
     }
@@ -363,8 +363,10 @@ fn capture_call_lengths_and_first_msg(
         let first = msgs.first().copied();
         calls_inner.lock().expect("lock").push((msgs.len(), first));
     });
-    let sub = rt.core.subscribe(node_id, sink);
-    drop(sub);
+    let sub = rt.core().subscribe(node_id, sink);
+    // D246 rule 3: Copy `SubscriptionId`; owner-invoked unsubscribe
+    // (the handshake was already captured synchronously above).
+    rt.core().unsubscribe(node_id, sub);
     let r = calls.lock().expect("lock").clone();
     r
 }
@@ -442,22 +444,22 @@ proptest! {
         // direct emit flushes immediately while self-paused. The verbatim
         // buffer-then-replay invariant under test is the `ResumeAll`
         // contract — opt in.
-        rt.core
+        rt.core()
             .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
             .unwrap();
         let rec = rt.subscribe_recorder(s.id);
 
-        let locks: Vec<_> = (0..n_locks).map(|_| rt.core.alloc_lock_id()).collect();
+        let locks: Vec<_> = (0..n_locks).map(|_| rt.core().alloc_lock_id()).collect();
         for &l in &locks {
-            rt.core.pause(s.id, l).expect("pause");
+            rt.core().pause(s.id, l).expect("pause");
         }
-        prop_assert!(rt.core.is_paused(s.id));
-        prop_assert_eq!(rt.core.pause_lock_count(s.id), n_locks);
+        prop_assert!(rt.core().is_paused(s.id));
+        prop_assert_eq!(rt.core().pause_lock_count(s.id), n_locks);
 
         let baseline = rec.snapshot().len();
         for v in &emits_during {
             let h = rt.binding.intern(TestValue::Int(*v));
-            rt.core.emit(s.id, h);
+            rt.core().emit(s.id, h);
         }
         let mid = rec.snapshot();
         // Tier-3 stays buffered while at least one lock holds the pause.
@@ -471,25 +473,25 @@ proptest! {
         // Release all locks except the last; each non-final resume returns None
         // (still paused) and does not flush.
         for &l in &locks[..n_locks - 1] {
-            let r = rt.core.resume(s.id, l).expect("resume");
+            let r = rt.core().resume(s.id, l).expect("resume");
             prop_assert!(
                 r.is_none(),
                 "non-final resume should return None (still paused), got {r:?}"
             );
         }
         prop_assert!(
-            rt.core.is_paused(s.id),
+            rt.core().is_paused(s.id),
             "node should still be paused with one lock outstanding"
         );
 
         // Final release — expect a report and the buffered tier-3 to flush.
         let final_lock = *locks.last().expect("at least one lock");
         let report = rt
-            .core
+            .core()
             .resume(s.id, final_lock)
             .expect("resume")
             .expect("final lock should return a report");
-        prop_assert!(!rt.core.is_paused(s.id));
+        prop_assert!(!rt.core().is_paused(s.id));
         let _ = report; // replayed count tracked in the next test
 
         // After final resume, all DATA/RESOLVED for the buffered emits should
@@ -503,19 +505,19 @@ proptest! {
         let rt = TestRuntime::new();
         let s = rt.state(Some(TestValue::Int(0)));
         // R2.6.0: verbatim buffer-replay is the `ResumeAll` contract.
-        rt.core
+        rt.core()
             .set_pausable_mode(s.id, graphrefly_core::PausableMode::ResumeAll)
             .unwrap();
         let rec = rt.subscribe_recorder(s.id);
         let baseline = rec.snapshot().len();
-        let lock = rt.core.alloc_lock_id();
-        rt.core.pause(s.id, lock).expect("pause");
+        let lock = rt.core().alloc_lock_id();
+        rt.core().pause(s.id, lock).expect("pause");
 
         for v in &emits {
             let h = rt.binding.intern(TestValue::Int(*v));
-            rt.core.emit(s.id, h);
+            rt.core().emit(s.id, h);
         }
-        let report = rt.core.resume(s.id, lock).expect("resume").expect("final report");
+        let report = rt.core().resume(s.id, lock).expect("resume").expect("final report");
         let _ = report;
 
         let post = &rec.snapshot()[baseline..];

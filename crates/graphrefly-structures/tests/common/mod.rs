@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink, SubscriptionId,
+    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, OwnedCore, Sink,
+    SubscriptionId,
 };
 use serde_json::Value;
 
@@ -163,54 +164,43 @@ impl Recorder {
     }
 }
 
-/// Test runtime for structures — wraps Core + StructuresTestBinding.
+/// Test runtime for structures — composes [`OwnedCore`] +
+/// [`StructuresTestBinding`].
+///
+/// D246: Core ownership + subscription tracking + owner-thread `Drop`
+/// teardown all live in `OwnedCore`. This newtype only keeps the
+/// structures-specific `binding`/`Recorder`/intern infra and routes
+/// Core access through `self.core()`.
 pub struct StructuresRuntime {
     pub binding: Arc<StructuresTestBinding>,
-    pub core: Core,
-    /// β/D238/D241-AMEND: owner tracks subs, tears down on `Drop`
-    /// (owner-thread, Core alive — sound; replaces retired core RAII).
-    subs: Mutex<Vec<(NodeId, SubscriptionId)>>,
-}
-
-impl Drop for StructuresRuntime {
-    fn drop(&mut self) {
-        for (n, s) in std::mem::take(
-            &mut *self
-                .subs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ) {
-            self.core.unsubscribe(n, s);
-        }
-    }
+    rt: OwnedCore,
 }
 
 impl StructuresRuntime {
     pub fn new() -> Self {
         let binding = StructuresTestBinding::new();
-        let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
-        Self {
-            binding,
-            core,
-            subs: Mutex::new(Vec::new()),
-        }
+        let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
+        Self { binding, rt }
+    }
+
+    pub fn core(&self) -> &Core {
+        self.rt.core()
     }
 
     pub fn track_subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
-        let sub_id = self.core.subscribe(node_id, sink);
-        self.subs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((node_id, sub_id));
-        sub_id
+        self.rt.track_subscribe(node_id, sink)
     }
 
     pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
-        self.subs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&(n, s)| !(n == node_id && s == sub_id));
-        self.core.unsubscribe(node_id, sub_id);
+        self.rt.unsubscribe(node_id, sub_id);
+    }
+
+    /// Owner-side mailbox drain (D227/D230/D246 rule 6). Applies every
+    /// queued deferred op (e.g. `view`/`scan` in-wave `SinkEmitter`
+    /// `post_emit`) in FIFO order via the synchronous Core surface,
+    /// cascading nested waves. Idempotent on an empty mailbox.
+    pub fn drain_mailbox(&self) {
+        self.rt.core().drain_mailbox();
     }
 
     /// Subscribe a recorder to a node.

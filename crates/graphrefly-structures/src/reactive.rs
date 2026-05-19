@@ -43,23 +43,44 @@ pub type InternFn<S> = Arc<dyn Fn(S) -> HandleId + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Emission handle stored outside the inner Mutex. Uses `AtomicU64` for the
-/// version counter so no lock is needed during `Core::emit()`.
+/// version counter so no lock is needed during the emit.
+///
+/// D246 rule 6: structure mutation is owner-synchronous. The handle no
+/// longer holds the `Arc<CoreMailbox>`; the owner threads its `&Core`
+/// into each mutation method and `emit` calls `core.emit(..)` directly.
 struct EmitHandle<S> {
-    /// S2b/β (D227/D232-AMEND A′): the actor-model `Core` is move-only
-    /// and relocates between workers, so a long-lived structure can no
-    /// longer hold a `WeakCore`. It holds the `Send + Sync`
-    /// `Arc<CoreMailbox>` instead and posts `MailboxOp::Emit`, drained
-    /// owner-side in-wave / at the embedder pump (identical to
-    /// `timer.rs` and the producer operators).
-    mailbox: Arc<CoreMailbox>,
     node_id: NodeId,
     intern: InternFn<S>,
     version: AtomicU64,
 }
 
 impl<S> EmitHandle<S> {
-    /// Bump version, intern snapshot, post the emit. Returns the new
-    /// version.
+    /// Bump version, intern snapshot, emit synchronously owner-side.
+    /// Returns the new version.
+    fn emit(&self, core: &Core, snapshot: S) -> Version {
+        let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle = (self.intern)(snapshot);
+        core.emit(self.node_id, handle);
+        Version::Counter(ver)
+    }
+}
+
+/// In-wave sink emitter. Captured into long-lived `core.subscribe(..)`
+/// sink closures (`view`/`scan`) that fire IN-WAVE — re-entering Core
+/// synchronously from inside a wave is unsound, so it posts
+/// `MailboxOp::Emit` (deferred, drained owner-side / at the embedder
+/// pump). This is genuine deferred sink re-entry, correct under D246
+/// rule 6 (same mechanism `attach`/`attach_storage` use).
+struct SinkEmitter<S> {
+    mailbox: Arc<CoreMailbox>,
+    node_id: NodeId,
+    intern: InternFn<S>,
+    version: AtomicU64,
+}
+
+impl<S> SinkEmitter<S> {
+    /// Bump version, intern snapshot, post the deferred emit. Returns
+    /// the new version.
     fn emit(&self, snapshot: S) -> Version {
         let ver = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = (self.intern)(snapshot);
@@ -169,7 +190,6 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             emitter: EmitHandle {
-                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -188,7 +208,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         self.inner.lock().backend.at(index)
     }
 
-    pub fn append(&self, value: T) {
+    pub fn append(&self, core: &Core, value: T) {
         let (snapshot, change) = {
             let mut inner = self.inner.lock();
             let change = inner.mutation_log.is_some().then(|| LogChange::Append {
@@ -197,13 +217,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             inner.backend.append(value);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
     }
 
-    pub fn append_many(&self, values: Vec<T>) {
+    pub fn append_many(&self, core: &Core, values: Vec<T>) {
         if values.is_empty() {
             return;
         }
@@ -215,13 +235,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             inner.backend.append_many(values);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, core: &Core) {
         let (snapshot, count) = {
             let mut inner = self.inner.lock();
             let count = inner.backend.clear();
@@ -230,13 +250,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             }
             (inner.backend.to_vec(), count)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner
             .lock()
             .record(LogChange::Clear { count }, version);
     }
 
-    pub fn trim_head(&self, n: usize) {
+    pub fn trim_head(&self, core: &Core, n: usize) {
         if n == 0 {
             return;
         }
@@ -248,7 +268,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             }
             (inner.backend.to_vec(), actual)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner
             .lock()
             .record(LogChange::TrimHead { n: actual }, version);
@@ -285,37 +305,54 @@ pub enum ViewSpec {
     },
 }
 
-/// S2b/β (D241-AMEND): an RAII subscription bundle that borrows the
-/// owner's `&'c Core`. The borrow statically pins the `Core` alive for
-/// `'c` and makes the handle `!Send` (Core `!Sync`) so it drops on the
-/// owner thread — therefore the parameterless `Drop` may synchronously
-/// `unsubscribe` (sound; NOT the D225 relocating-Core case). Replaces
-/// the retired core RAII `Subscription`.
-pub struct ReactiveSub<'c> {
-    core: &'c Core,
+/// D246 rule 3: NO RAII unsubscribe below the binding. A subscription
+/// bundle that tracks its `(NodeId, SubscriptionId)` subs and is torn
+/// down by the **owner-invoked, synchronous** [`ReactiveSub::detach`] —
+/// not `Drop`. Carries no `&Core` (the `'c` lifetime is gone); the
+/// owner passes its `&Core` into `detach`.
+pub struct ReactiveSub {
     subs: Vec<(NodeId, SubscriptionId)>,
 }
 
-impl Drop for ReactiveSub<'_> {
-    fn drop(&mut self) {
+impl ReactiveSub {
+    /// Synchronously unsubscribe every tracked sub. Owner-invoked
+    /// (D246 r3). Idempotent: subs are drained, so a second call is a
+    /// no-op.
+    pub fn detach(&mut self, core: &Core) {
         for (node_id, sub_id) in self.subs.drain(..) {
-            self.core.unsubscribe(node_id, sub_id);
+            core.unsubscribe(node_id, sub_id);
         }
     }
 }
 
-/// Handle to a log view. Dropping disposes the view subscription.
-pub struct LogView<'c> {
+/// Handle to a log view. Call [`LogView::detach`] to dispose the view
+/// subscription (no RAII — D246 r3).
+pub struct LogView {
     /// The state node backing this view. Subscribe to receive view snapshots.
     pub node_id: NodeId,
-    _sub: ReactiveSub<'c>,
+    sub: ReactiveSub,
 }
 
-/// Handle to a log scan. Dropping disposes the scan subscription.
-pub struct ScanHandle<'c> {
+impl LogView {
+    /// Synchronously dispose the view subscription. Owner-invoked.
+    pub fn detach(&mut self, core: &Core) {
+        self.sub.detach(core);
+    }
+}
+
+/// Handle to a log scan. Call [`ScanHandle::detach`] to dispose the
+/// scan subscription (no RAII — D246 r3).
+pub struct ScanHandle {
     /// The state node backing this scan. Subscribe to receive accumulator snapshots.
     pub node_id: NodeId,
-    _sub: ReactiveSub<'c>,
+    sub: ReactiveSub,
+}
+
+impl ScanHandle {
+    /// Synchronously dispose the scan subscription. Owner-invoked.
+    pub fn detach(&mut self, core: &Core) {
+        self.sub.detach(core);
+    }
 }
 
 /// Trait for append-log storage sinks used by [`ReactiveLog::attach_storage`].
@@ -332,9 +369,18 @@ pub trait AppendLogSink<T>: Send + Sync {
     fn load_entries(&self) -> Result<Vec<T>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Handle to an attach-storage subscription. Dropping disposes the subscription.
-pub struct AttachStorageHandle<'c> {
-    _sub: ReactiveSub<'c>,
+/// Handle to an attach-storage subscription. Call
+/// [`AttachStorageHandle::detach`] to dispose it (no RAII — D246 r3).
+pub struct AttachStorageHandle {
+    sub: ReactiveSub,
+}
+
+impl AttachStorageHandle {
+    /// Synchronously dispose the attach-storage subscription.
+    /// Owner-invoked.
+    pub fn detach(&mut self, core: &Core) {
+        self.sub.detach(core);
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
@@ -342,19 +388,17 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// `node_id` emits `Vec<T>` snapshots on every log mutation.
     ///
     /// `intern` converts the view `Vec<T>` into a `HandleId` for Core emission.
-    /// β/D231: takes the owner's `&Core` (no stored Core under the
-    /// actor model). The returned [`LogView`] borrows it for `'c`.
+    /// β/D231/D246: takes the owner's `&Core` (no stored Core under the
+    /// actor model). The returned [`LogView`] carries no Core borrow;
+    /// tear it down via [`LogView::detach`] (D246 r3 — no RAII).
     #[allow(clippy::too_many_lines)]
-    pub fn view<'c>(
-        &self,
-        core: &'c Core,
-        spec: ViewSpec,
-        intern: InternFn<Vec<T>>,
-    ) -> LogView<'c> {
+    pub fn view(&self, core: &Core, spec: ViewSpec, intern: InternFn<Vec<T>>) -> LogView {
         let view_node = core
             .register_state(HandleId::new(0), false)
             .expect("register_state for LogView");
-        let view_emitter = Arc::new(EmitHandle {
+        // In-wave sink emitter: the `core.subscribe(..)` closures below
+        // fire IN-WAVE, so emission must be deferred (D246 r6).
+        let view_emitter = Arc::new(SinkEmitter {
             mailbox: core.mailbox(),
             node_id: view_node,
             intern,
@@ -456,8 +500,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         LogView {
             node_id: view_node,
-            _sub: ReactiveSub {
-                core,
+            sub: ReactiveSub {
                 subs: subscriptions,
             },
         }
@@ -468,13 +511,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// Returns a [`ScanHandle`] whose `node_id` emits the current accumulator
     /// on every log mutation. Appends are O(1) (only new entries processed);
     /// `trimHead`/`clear` trigger a full rescan.
-    pub fn scan<'c, TAcc: Clone + Send + Sync + 'static>(
+    pub fn scan<TAcc: Clone + Send + Sync + 'static>(
         &self,
-        core: &'c Core,
+        core: &Core,
         initial: TAcc,
         step: Arc<dyn Fn(&TAcc, &T) -> TAcc + Send + Sync>,
         intern: InternFn<TAcc>,
-    ) -> ScanHandle<'c> {
+    ) -> ScanHandle {
         struct ScanState<T, TAcc> {
             acc: TAcc,
             processed: usize,
@@ -493,7 +536,9 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             step,
         }));
         let inner = Arc::clone(&self.inner);
-        let scan_emitter = Arc::new(EmitHandle {
+        // In-wave sink emitter (D246 r6): the `core.subscribe(..)`
+        // closure below fires IN-WAVE, so emission is deferred.
+        let scan_emitter = Arc::new(SinkEmitter {
             mailbox: core.mailbox(),
             node_id: scan_node,
             intern,
@@ -527,8 +572,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         ScanHandle {
             node_id: scan_node,
-            _sub: ReactiveSub {
-                core,
+            sub: ReactiveSub {
                 subs: vec![(self.node_id, sub)],
             },
         }
@@ -537,14 +581,15 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// Subscribe to an upstream node and append every DATA value into this log.
     ///
     /// `read_value` converts the upstream `HandleId` to a `T` for appending.
-    /// Returns an RAII handle — dropping it stops the attachment.
+    /// Returns a [`ReactiveSub`] — call [`ReactiveSub::detach`] to stop
+    /// the attachment (D246 r3 — no RAII).
     /// β/D231: takes the owner's `&Core`.
-    pub fn attach<'c>(
+    pub fn attach(
         &self,
-        core: &'c Core,
+        core: &Core,
         upstream: NodeId,
         read_value: Arc<dyn Fn(HandleId) -> T + Send + Sync>,
-    ) -> ReactiveSub<'c> {
+    ) -> ReactiveSub {
         let inner = Arc::clone(&self.inner);
         // β/D232-AMEND: the long-lived attach sink re-enters Core to
         // emit; it captures the `Send + Sync` `Arc<CoreMailbox>` and
@@ -574,7 +619,6 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             }),
         );
         ReactiveSub {
-            core,
             subs: vec![(upstream, sub)],
         }
     }
@@ -586,17 +630,16 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// subscription, deltas are forwarded to ALL sinks. On trim/clear, the
     /// full snapshot is re-shipped. Sink errors are swallowed (logged via
     /// `eprintln!`) so a failing tier doesn't break the reactive graph.
-    pub fn attach_storage<'c>(
+    pub fn attach_storage(
         &self,
-        core: &'c Core,
+        core: &Core,
         sinks: Vec<Arc<dyn AppendLogSink<T>>>,
         preload: bool,
-    ) -> AttachStorageHandle<'c> {
+    ) -> AttachStorageHandle {
         if sinks.is_empty() {
             let sub = core.subscribe(self.node_id, Arc::new(|_| {}));
             return AttachStorageHandle {
-                _sub: ReactiveSub {
-                    core,
+                sub: ReactiveSub {
                     subs: vec![(self.node_id, sub)],
                 },
             };
@@ -606,7 +649,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             for sink in &sinks {
                 if let Ok(entries) = sink.load_entries() {
                     if !entries.is_empty() {
-                        self.append_many(entries);
+                        self.append_many(core, entries);
                         break;
                     }
                 }
@@ -650,8 +693,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         );
 
         AttachStorageHandle {
-            _sub: ReactiveSub {
-                core,
+            sub: ReactiveSub {
                 subs: vec![(self.node_id, sub)],
             },
         }
@@ -731,7 +773,6 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
         Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -750,7 +791,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
         self.inner.lock().backend.at(index)
     }
 
-    pub fn append(&self, value: T) {
+    pub fn append(&self, core: &Core, value: T) {
         let (snapshot, change) = {
             let mut inner = self.inner.lock();
             let change = inner.mutation_log.is_some().then(|| ListChange::Append {
@@ -759,13 +800,13 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             inner.backend.append(value);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
     }
 
-    pub fn append_many(&self, values: Vec<T>) {
+    pub fn append_many(&self, core: &Core, values: Vec<T>) {
         if values.is_empty() {
             return;
         }
@@ -780,7 +821,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             inner.backend.append_many(values);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
@@ -788,7 +829,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
 
     /// Insert `value` at `index`. Returns `Err(IndexOutOfBounds)` if
     /// `index > self.size()`.
-    pub fn insert(&self, index: usize, value: T) -> Result<(), IndexOutOfBounds> {
+    pub fn insert(&self, core: &Core, index: usize, value: T) -> Result<(), IndexOutOfBounds> {
         let (snapshot, change) = {
             let mut inner = self.inner.lock();
             if index > inner.backend.size() {
@@ -801,7 +842,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             inner.backend.insert(index, value);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
@@ -810,7 +851,12 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
 
     /// Insert `values` starting at `index`. Returns `Err(IndexOutOfBounds)` if
     /// `index > self.size()`.
-    pub fn insert_many(&self, index: usize, values: Vec<T>) -> Result<(), IndexOutOfBounds> {
+    pub fn insert_many(
+        &self,
+        core: &Core,
+        index: usize,
+        values: Vec<T>,
+    ) -> Result<(), IndexOutOfBounds> {
         if values.is_empty() {
             return Ok(());
         }
@@ -829,7 +875,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             inner.backend.insert_many(index, values);
             (inner.backend.to_vec(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
@@ -838,7 +884,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
 
     /// Remove and return element at `index`. Negative indices count from end.
     /// Returns `None` if index is out of range.
-    pub fn pop(&self, index: i64) -> Option<T> {
+    pub fn pop(&self, core: &Core, index: i64) -> Option<T> {
         let (value, snapshot, change) = {
             let mut inner = self.inner.lock();
             let value = inner.backend.pop(index)?;
@@ -849,14 +895,14 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             let snapshot = inner.backend.to_vec();
             (value, snapshot, change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
         Some(value)
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, core: &Core) {
         let (snapshot, count) = {
             let mut inner = self.inner.lock();
             let count = inner.backend.clear();
@@ -865,7 +911,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveList<T> {
             }
             (inner.backend.to_vec(), count)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner
             .lock()
             .record(ListChange::Clear { count }, version);
@@ -1181,7 +1227,6 @@ where
         Ok(Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -1197,7 +1242,7 @@ where
 
     /// Check if key exists. Expired keys are pruned (observable side-effect).
     /// LRU touch: live key is marked as most-recently-used (no emission).
-    pub fn has(&self, key: &K) -> bool {
+    pub fn has(&self, core: &Core, key: &K) -> bool {
         let (has, expired) = {
             let mut inner = self.inner.lock();
             let mut target_expired = false;
@@ -1234,7 +1279,7 @@ where
         };
         if !expired.is_empty() {
             let snapshot = self.inner.lock().backend.to_vec();
-            let version = self.emitter.emit(snapshot);
+            let version = self.emitter.emit(core, snapshot);
             let mut inner = self.inner.lock();
             for (k, prev) in expired {
                 inner.record(
@@ -1252,7 +1297,7 @@ where
 
     /// Get value by key. Expired keys return `None` (observable side-effect).
     /// LRU touch: live key is marked as most-recently-used (no emission).
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get(&self, core: &Core, key: &K) -> Option<V> {
         let (value, expired) = {
             let mut inner = self.inner.lock();
             let mut target_expired = false;
@@ -1287,7 +1332,7 @@ where
         };
         if !expired.is_empty() {
             let snapshot = self.inner.lock().backend.to_vec();
-            let version = self.emitter.emit(snapshot);
+            let version = self.emitter.emit(core, snapshot);
             let mut inner = self.inner.lock();
             for (k, prev) in expired {
                 inner.record(
@@ -1303,15 +1348,15 @@ where
         value
     }
 
-    pub fn set(&self, key: K, value: V) {
-        self.set_with_ttl(key, value, None);
+    pub fn set(&self, core: &Core, key: K, value: V) {
+        self.set_with_ttl(core, key, value, None);
     }
 
     /// Set a key with an optional per-call TTL override (seconds).
     ///
     /// # Panics
     /// Panics if `ttl` is `Some` with a non-positive or non-finite value.
-    pub fn set_with_ttl(&self, key: K, value: V, ttl: Option<f64>) {
+    pub fn set_with_ttl(&self, core: &Core, key: K, value: V, ttl: Option<f64>) {
         if let Some(t) = ttl {
             assert!(
                 t > 0.0 && t.is_finite(),
@@ -1350,7 +1395,7 @@ where
             }
             (inner.backend.to_vec(), change, eviction_changes)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if change.is_some() || !eviction_changes.is_empty() {
             let mut inner = self.inner.lock();
             if let Some(change) = change {
@@ -1369,15 +1414,15 @@ where
         }
     }
 
-    pub fn set_many(&self, entries: Vec<(K, V)>) {
-        self.set_many_with_ttl(entries, None);
+    pub fn set_many(&self, core: &Core, entries: Vec<(K, V)>) {
+        self.set_many_with_ttl(core, entries, None);
     }
 
     /// Batch set with optional per-call TTL override (seconds).
     ///
     /// # Panics
     /// Panics if `ttl` is `Some` with a non-positive or non-finite value.
-    pub fn set_many_with_ttl(&self, entries: Vec<(K, V)>, ttl: Option<f64>) {
+    pub fn set_many_with_ttl(&self, core: &Core, entries: Vec<(K, V)>, ttl: Option<f64>) {
         if let Some(t) = ttl {
             assert!(
                 t > 0.0 && t.is_finite(),
@@ -1426,7 +1471,7 @@ where
             }
             (inner.backend.to_vec(), changes, eviction_changes)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if changes.is_some() || !eviction_changes.is_empty() {
             let mut inner = self.inner.lock();
             if let Some(changes) = changes {
@@ -1447,7 +1492,7 @@ where
         }
     }
 
-    pub fn delete(&self, key: &K) {
+    pub fn delete(&self, core: &Core, key: &K) {
         let (snapshot, previous) = {
             let mut inner = self.inner.lock();
             let previous = inner.backend.get(key);
@@ -1458,7 +1503,7 @@ where
             inner.lru_remove(key);
             (inner.backend.to_vec(), previous)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(prev) = previous {
             self.inner.lock().record(
                 MapChange::Delete {
@@ -1471,7 +1516,7 @@ where
         }
     }
 
-    pub fn delete_many(&self, keys: &[K]) {
+    pub fn delete_many(&self, core: &Core, keys: &[K]) {
         let (snapshot, actually_deleted) = {
             let mut inner = self.inner.lock();
             let actually_deleted: Vec<(K, V)> = keys
@@ -1488,7 +1533,7 @@ where
             }
             (inner.backend.to_vec(), actually_deleted)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if !actually_deleted.is_empty() {
             let mut inner = self.inner.lock();
             for (k, prev) in actually_deleted {
@@ -1504,7 +1549,7 @@ where
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, core: &Core) {
         let (snapshot, count) = {
             let mut inner = self.inner.lock();
             let count = inner.backend.clear();
@@ -1515,14 +1560,14 @@ where
             inner.lru_order.clear();
             (inner.backend.to_vec(), count)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner
             .lock()
             .record(MapChange::Clear { count }, version);
     }
 
     /// Explicitly prune all expired keys. Returns the number of keys removed.
-    pub fn prune_expired(&self) -> usize {
+    pub fn prune_expired(&self, core: &Core) -> usize {
         let expired = {
             let mut inner = self.inner.lock();
             inner.prune_expired_inner()
@@ -1532,7 +1577,7 @@ where
         }
         let count = expired.len();
         let snapshot = self.inner.lock().backend.to_vec();
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         let mut inner = self.inner.lock();
         for (k, prev) in expired {
             inner.record(
@@ -1691,7 +1736,6 @@ where
         Self {
             inner: Mutex::new(inner),
             emitter: EmitHandle {
-                mailbox: core.mailbox(),
                 node_id,
                 intern,
                 version: AtomicU64::new(0),
@@ -1717,8 +1761,8 @@ where
 
     /// Insert or update a row. Returns `true` if inserted (new primary key),
     /// `false` if updated or skipped by equals idempotency.
-    pub fn upsert(&self, primary: K, secondary: String, value: V) -> bool {
-        self.upsert_with(primary, secondary, value, &UpsertOptions::default())
+    pub fn upsert(&self, core: &Core, primary: K, secondary: String, value: V) -> bool {
+        self.upsert_with(core, primary, secondary, value, &UpsertOptions::default())
     }
 
     /// Insert or update a row with per-call options.
@@ -1727,6 +1771,7 @@ where
     /// existing row vs the proposed row, the upsert is a no-op (no emission).
     pub fn upsert_with(
         &self,
+        core: &Core,
         primary: K,
         secondary: String,
         value: V,
@@ -1756,7 +1801,7 @@ where
             let is_new = inner.backend.upsert(primary, secondary, value);
             (is_new, inner.backend.to_ordered(), change)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(change) = change {
             self.inner.lock().record(change, version);
         }
@@ -1765,7 +1810,7 @@ where
 
     /// Batch upsert. Rows matching the factory-level equals are skipped.
     /// If ALL rows are skipped, no emission occurs.
-    pub fn upsert_many(&self, rows: Vec<(K, String, V)>) {
+    pub fn upsert_many(&self, core: &Core, rows: Vec<(K, String, V)>) {
         if rows.is_empty() {
             return;
         }
@@ -1806,7 +1851,7 @@ where
             inner.backend.upsert_many(effective_rows);
             (inner.backend.to_ordered(), changes)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if let Some(changes) = changes {
             let mut inner = self.inner.lock();
             for change in changes {
@@ -1815,7 +1860,7 @@ where
         }
     }
 
-    pub fn delete(&self, primary: &K) {
+    pub fn delete(&self, core: &Core, primary: &K) {
         let snapshot = {
             let mut inner = self.inner.lock();
             if !inner.backend.delete(primary) {
@@ -1823,7 +1868,7 @@ where
             }
             inner.backend.to_ordered()
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner.lock().record(
             IndexChange::Delete {
                 primary: primary.clone(),
@@ -1832,7 +1877,7 @@ where
         );
     }
 
-    pub fn delete_many(&self, primaries: &[K]) {
+    pub fn delete_many(&self, core: &Core, primaries: &[K]) {
         let (snapshot, actually_deleted) = {
             let mut inner = self.inner.lock();
             // Pre-filter to keys that actually exist (P4 fix).
@@ -1851,7 +1896,7 @@ where
             }
             (inner.backend.to_ordered(), actually_deleted)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         if !actually_deleted.is_empty() {
             self.inner.lock().record(
                 IndexChange::DeleteMany {
@@ -1862,7 +1907,7 @@ where
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, core: &Core) {
         let (snapshot, count) = {
             let mut inner = self.inner.lock();
             let count = inner.backend.clear();
@@ -1871,7 +1916,7 @@ where
             }
             (inner.backend.to_ordered(), count)
         };
-        let version = self.emitter.emit(snapshot);
+        let version = self.emitter.emit(core, snapshot);
         self.inner
             .lock()
             .record(IndexChange::Clear { count }, version);

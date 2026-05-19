@@ -1213,9 +1213,20 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // of "currently firing" because set_deps would already block on the
         // state lock by then. Drop on the guard pops the stack even if
         // invoke_fn panics, keeping `currently_firing` balanced.
+        //
+        // D246 rule 5 / D245 — hand the binding the owner-side full `Core`
+        // facade. `self: &Core<C>` unsized-coerces to `&dyn CoreFull` in
+        // arg position (`Core<C>: CoreFull` via the blanket impl), so a
+        // producer-building binding can construct its `ProducerCtx` from a
+        // real Core surface here WITHOUT a thread-local / `Core` clone /
+        // stored back-reference (all β-invalid under the actor model). The
+        // `BindingBoundary::invoke_fn_with_core` default forwards to the
+        // parameterless `invoke_fn`, so derived/dynamic/state dispatch and
+        // every non-producer binding are behaviour-identical.
         let result = {
             let _firing = FiringGuard::new(self, node_id);
-            self.binding.invoke_fn(node_id, fn_id, &dep_batches)
+            self.binding
+                .invoke_fn_with_core(node_id, fn_id, &dep_batches, self)
         };
 
         // Phase 3: apply result under the lock — defensive terminal check

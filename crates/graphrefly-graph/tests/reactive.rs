@@ -2,8 +2,8 @@
 
 mod common;
 
+use common::graph;
 use graphrefly_core::{HandleId, Message};
-use graphrefly_graph::{Graph, GraphOps};
 use std::sync::{Arc, Mutex};
 
 fn h(n: u64) -> HandleId {
@@ -16,62 +16,80 @@ fn h(n: u64) -> HandleId {
 
 #[test]
 fn describe_reactive_pushes_initial_snapshot() {
-    let g = Graph::new("test", common::binding());
-    g.state("a", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    g.state(rt.core(), "a", Some(h(1))).unwrap();
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
     // P7 — push-on-subscribe per canonical R3.6.1 / §2.5.2.
-    let snaps = snapshots.lock().unwrap();
-    assert_eq!(snaps.len(), 1);
-    assert!(snaps[0].nodes.contains_key("a"));
+    {
+        let snaps = snapshots.lock().unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert!(snaps[0].nodes.contains_key("a"));
+    }
+    handle.detach(rt.core());
 }
 
 #[test]
 fn describe_reactive_fires_on_new_node() {
-    let g = Graph::new("test", common::binding());
+    let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
     // 1 fire from the initial empty snapshot.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
 
-    g.state("a", Some(h(1))).unwrap();
+    g.state(rt.core(), "a", Some(h(1))).unwrap();
 
-    let snaps = snapshots.lock().unwrap();
-    // Initial empty snapshot + post-add snapshot.
-    assert_eq!(snaps.len(), 2);
-    assert!(snaps[0].nodes.is_empty());
-    assert!(snaps[1].nodes.contains_key("a"));
+    {
+        let snaps = snapshots.lock().unwrap();
+        // Initial empty snapshot + post-add snapshot.
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[0].nodes.is_empty());
+        assert!(snaps[1].nodes.contains_key("a"));
+    }
+    handle.detach(rt.core());
 }
 
 #[test]
 fn describe_reactive_fires_on_remove() {
-    let g = Graph::new("test", common::binding());
-    g.state("a", Some(h(1))).unwrap();
+    let (rt, g) = graph("test");
+    g.state(rt.core(), "a", Some(h(1))).unwrap();
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
     // Initial snapshot fires synchronously.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
-    g.remove("a").unwrap();
+    g.remove(rt.core(), "a").unwrap();
 
-    let snaps = snapshots.lock().unwrap();
-    // Initial (with "a") + post-remove (without "a").
-    assert_eq!(snaps.len(), 2);
-    assert!(snaps[0].nodes.contains_key("a"));
-    assert!(!snaps[1].nodes.contains_key("a"));
+    {
+        let snaps = snapshots.lock().unwrap();
+        // Initial (with "a") + post-remove (without "a").
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[0].nodes.contains_key("a"));
+        assert!(!snaps[1].nodes.contains_key("a"));
+    }
+    handle.detach(rt.core());
 }
 
 // Note: set_deps fires Core topology events, NOT Graph namespace
@@ -80,43 +98,57 @@ fn describe_reactive_fires_on_remove() {
 // core.subscribe_topology(). This is tested in topology.rs.
 
 #[test]
-fn describe_reactive_stops_on_drop() {
-    let g = Graph::new("test", common::binding());
+fn describe_reactive_stops_on_detach() {
+    // D246 rule 3: `ReactiveDescribeHandle` has NO RAII `Drop`.
+    // Teardown is owner-invoked via `detach`. This test asserts the
+    // same behavior the pre-D246 drop-based test did (no snapshots
+    // after teardown) — only the trigger changed from scope-drop to
+    // explicit detach.
+    let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
-    g.state("a", Some(h(1))).unwrap();
+    g.state(rt.core(), "a", Some(h(1))).unwrap();
     // Initial empty + post-add = 2 snapshots.
     assert_eq!(snapshots.lock().unwrap().len(), 2);
 
-    drop(handle);
+    handle.detach(rt.core());
 
-    g.state("b", Some(h(2))).unwrap();
-    // No new snapshot after drop.
+    g.state(rt.core(), "b", Some(h(2))).unwrap();
+    // No new snapshot after detach.
     assert_eq!(snapshots.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn describe_reactive_accumulates_nodes() {
-    let g = Graph::new("test", common::binding());
+    let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
-    g.state("a", Some(h(1))).unwrap();
-    g.state("b", Some(h(2))).unwrap();
+    g.state(rt.core(), "a", Some(h(1))).unwrap();
+    g.state(rt.core(), "b", Some(h(2))).unwrap();
 
-    let snaps = snapshots.lock().unwrap();
-    // Initial empty + 2 adds = 3 snapshots.
-    assert_eq!(snaps.len(), 3);
-    assert_eq!(snaps[0].nodes.len(), 0);
-    assert_eq!(snaps[1].nodes.len(), 1);
-    assert_eq!(snaps[2].nodes.len(), 2);
+    {
+        let snaps = snapshots.lock().unwrap();
+        // Initial empty + 2 adds = 3 snapshots.
+        assert_eq!(snaps.len(), 3);
+        assert_eq!(snaps[0].nodes.len(), 0);
+        assert_eq!(snaps[1].nodes.len(), 1);
+        assert_eq!(snaps[2].nodes.len(), 2);
+    }
+    handle.detach(rt.core());
 }
 
 // -------------------------------------------------------------------
@@ -125,13 +157,13 @@ fn describe_reactive_accumulates_nodes() {
 
 #[test]
 fn observe_all_reactive_subscribes_current_nodes() {
-    let g = Graph::new("test", common::binding());
-    g.state("a", Some(h(10))).unwrap();
+    let (rt, g) = graph("test");
+    g.state(rt.core(), "a", Some(h(10))).unwrap();
 
     let events = Arc::new(Mutex::new(Vec::<(String, Vec<Message>)>::new()));
     let events_clone = events.clone();
     let mut obs = g.observe_all_reactive();
-    let count = obs.subscribe(move |name: &str, msgs: &[Message]| {
+    let count = obs.subscribe(rt.core(), move |name: &str, msgs: &[Message]| {
         events_clone
             .lock()
             .unwrap()
@@ -140,19 +172,22 @@ fn observe_all_reactive_subscribes_current_nodes() {
     assert_eq!(count, 1);
 
     // Push-on-subscribe should have fired for "a".
-    let evts = events.lock().unwrap();
-    assert!(!evts.is_empty());
-    assert_eq!(evts[0].0, "a");
+    {
+        let evts = events.lock().unwrap();
+        assert!(!evts.is_empty());
+        assert_eq!(evts[0].0, "a");
+    }
+    obs.detach(rt.core());
 }
 
 #[test]
 fn observe_all_reactive_auto_subscribes_late_node() {
-    let g = Graph::new("test", common::binding());
+    let (rt, g) = graph("test");
 
     let events = Arc::new(Mutex::new(Vec::<(String, Vec<Message>)>::new()));
     let events_clone = events.clone();
     let mut obs = g.observe_all_reactive();
-    let count = obs.subscribe(move |name: &str, msgs: &[Message]| {
+    let count = obs.subscribe(rt.core(), move |name: &str, msgs: &[Message]| {
         events_clone
             .lock()
             .unwrap()
@@ -161,45 +196,51 @@ fn observe_all_reactive_auto_subscribes_late_node() {
     assert_eq!(count, 0); // No nodes yet.
 
     // Add a node AFTER subscribe — should auto-subscribe.
-    g.state("late", Some(h(42))).unwrap();
+    g.state(rt.core(), "late", Some(h(42))).unwrap();
 
-    let evts = events.lock().unwrap();
-    // Should have received push-on-subscribe for "late".
-    let late_events: Vec<_> = evts.iter().filter(|(name, _)| name == "late").collect();
-    assert!(
-        !late_events.is_empty(),
-        "expected auto-subscribe to fire for late-added node"
-    );
+    {
+        let evts = events.lock().unwrap();
+        // Should have received push-on-subscribe for "late".
+        let late_events: Vec<_> = evts.iter().filter(|(name, _)| name == "late").collect();
+        assert!(
+            !late_events.is_empty(),
+            "expected auto-subscribe to fire for late-added node"
+        );
+    }
+    obs.detach(rt.core());
 }
 
 #[test]
-fn observe_all_reactive_stops_on_drop() {
-    let g = Graph::new("test", common::binding());
+fn observe_all_reactive_stops_on_detach() {
+    // D246 rule 3: `GraphObserveAllReactive` has NO RAII `Drop`.
+    // Teardown is owner-invoked via `detach`. Asserts the same
+    // behavior as the pre-D246 drop-based test (no events after
+    // teardown) — only the trigger changed.
+    let (rt, g) = graph("test");
 
     let events = Arc::new(Mutex::new(Vec::<(String, Vec<Message>)>::new()));
     let events_clone = events.clone();
     let mut obs = g.observe_all_reactive();
-    obs.subscribe(move |name: &str, msgs: &[Message]| {
+    obs.subscribe(rt.core(), move |name: &str, msgs: &[Message]| {
         events_clone
             .lock()
             .unwrap()
             .push((name.to_string(), msgs.to_vec()));
     });
 
-    g.state("x", Some(h(1))).unwrap();
+    g.state(rt.core(), "x", Some(h(1))).unwrap();
     let count_before = events.lock().unwrap().len();
 
-    drop(obs);
+    obs.detach(rt.core());
 
-    // Set on existing node — sink should NOT fire after drop.
-    // (But we need the node_id... let's add another node instead.)
-    g.state("y", Some(h(2))).unwrap();
+    // Add another node — sink should NOT fire after detach.
+    g.state(rt.core(), "y", Some(h(2))).unwrap();
     let count_after = events.lock().unwrap().len();
-    // After drop, no new events for "y".
+    // After detach, no new events for "y".
     // Note: count_before includes events from "x".
     assert_eq!(
         count_after, count_before,
-        "no events should arrive after dropping reactive handle"
+        "no events should arrive after detaching reactive handle"
     );
 }
 
@@ -209,35 +250,44 @@ fn observe_all_reactive_stops_on_drop() {
 
 #[test]
 fn describe_reactive_fires_on_mount_new() {
-    let g = Graph::new("root", common::binding());
+    let (rt, g) = graph("root");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
     // Initial snapshot fires synchronously.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
 
-    g.mount_new("child").unwrap();
+    g.mount_new(rt.core(), "child").unwrap();
 
-    // Mount must fire as a namespace change.
-    let snaps = snapshots.lock().unwrap();
-    assert_eq!(snaps.len(), 2);
-    // Subgraph "child" appears in the post-mount snapshot.
-    assert!(snaps[1].subgraphs.iter().any(|s| s == "child"));
+    {
+        // Mount must fire as a namespace change.
+        let snaps = snapshots.lock().unwrap();
+        assert_eq!(snaps.len(), 2);
+        // Subgraph "child" appears in the post-mount snapshot.
+        assert!(snaps[1].subgraphs.iter().any(|s| s == "child"));
+    }
+    handle.detach(rt.core());
 }
 
 #[test]
 fn describe_reactive_fires_on_unmount() {
-    let g = Graph::new("root", common::binding());
-    g.mount_new("child").unwrap();
+    let (rt, g) = graph("root");
+    g.mount_new(rt.core(), "child").unwrap();
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let _handle = g.describe_reactive(Arc::new(move |output| {
-        snapshots_clone.lock().unwrap().push(output.clone());
-    }));
+    let handle = g.describe_reactive(
+        rt.core(),
+        Arc::new(move |output| {
+            snapshots_clone.lock().unwrap().push(output.clone());
+        }),
+    );
 
     // Initial snapshot includes "child".
     assert_eq!(snapshots.lock().unwrap().len(), 1);
@@ -246,23 +296,26 @@ fn describe_reactive_fires_on_unmount() {
         .iter()
         .any(|s| s == "child"));
 
-    g.unmount("child").unwrap();
+    g.unmount(rt.core(), "child").unwrap();
 
-    let snaps = snapshots.lock().unwrap();
-    // Initial + post-unmount.
-    assert_eq!(snaps.len(), 2);
-    // "child" no longer in subgraphs.
-    assert!(!snaps[1].subgraphs.iter().any(|s| s == "child"));
+    {
+        let snaps = snapshots.lock().unwrap();
+        // Initial + post-unmount.
+        assert_eq!(snaps.len(), 2);
+        // "child" no longer in subgraphs.
+        assert!(!snaps[1].subgraphs.iter().any(|s| s == "child"));
+    }
+    handle.detach(rt.core());
 }
 
 #[test]
 fn observe_all_reactive_handles_late_mount() {
-    let g = Graph::new("root", common::binding());
+    let (rt, g) = graph("root");
 
     let events = Arc::new(Mutex::new(Vec::<(String, Vec<Message>)>::new()));
     let events_clone = events.clone();
     let mut obs = g.observe_all_reactive();
-    obs.subscribe(move |name: &str, msgs: &[Message]| {
+    obs.subscribe(rt.core(), move |name: &str, msgs: &[Message]| {
         events_clone
             .lock()
             .unwrap()
@@ -275,17 +328,20 @@ fn observe_all_reactive_handles_late_mount() {
     // (each Graph has its own namespace_sinks list). Verify at least
     // that the mount didn't crash and pre-existing parent nodes still
     // fire.
-    let child = g.mount_new("child").unwrap();
-    child.state("inside", Some(h(99))).unwrap();
-    g.state("parent_node", Some(h(1))).unwrap();
+    let child = g.mount_new(rt.core(), "child").unwrap();
+    child.state(rt.core(), "inside", Some(h(99))).unwrap();
+    g.state(rt.core(), "parent_node", Some(h(1))).unwrap();
 
-    // Parent node "parent_node" must reach the sink (namespace listener
-    // fired from add()).
-    let evts = events.lock().unwrap();
-    assert!(
-        evts.iter().any(|(name, _)| name == "parent_node"),
-        "expected parent_node event after late add"
-    );
+    {
+        // Parent node "parent_node" must reach the sink (namespace
+        // listener fired from add()).
+        let evts = events.lock().unwrap();
+        assert!(
+            evts.iter().any(|(name, _)| name == "parent_node"),
+            "expected parent_node event after late add"
+        );
+    }
+    obs.detach(rt.core());
 }
 
 // -------------------------------------------------------------------
@@ -295,12 +351,12 @@ fn observe_all_reactive_handles_late_mount() {
 #[test]
 #[should_panic(expected = "single-shot")]
 fn observe_all_reactive_subscribe_twice_panics() {
-    let g = Graph::new("root", common::binding());
+    let (rt, g) = graph("root");
     let mut obs = g.observe_all_reactive();
-    obs.subscribe(|_, _| {});
+    obs.subscribe(rt.core(), |_, _| {});
     // Second subscribe must panic — would otherwise leak the first
     // namespace sink.
-    obs.subscribe(|_, _| {});
+    obs.subscribe(rt.core(), |_, _| {});
 }
 
 // -------------------------------------------------------------------
