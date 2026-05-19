@@ -3741,6 +3741,53 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   out of D246 scope. source: QA Blind Hunter #4 (boundary-1 QA). Track
   for a dedicated structures/storage slice (NOT S2c/S3/S4).
 
+- **[S2c/D248/D249 — `lock_released::late_subscriber_installed_after_first_queue_notify_does_not_double_receive_data`]**
+  `#[ignore]`-stubbed. **why D246 doesn't fit (β-rewrite-needed, NOT a
+  deleted model):** the scaffold posts the late-subscribe Defer from a
+  plain `derived` *fn*-fire capturing a `Sink`. D248 made `Sink`
+  `!Send`, so the Defer closure is `!Send` ⇒ it must use the owner-only
+  `DeferQueue`, not `CoreMailbox::post_defer`. But a plain fn is stored
+  in the `Send+Sync` `BindingBoundary` (FFI trait, UNCHANGED by D248),
+  so it cannot capture the `!Send` `Rc<DeferQueue>`. The β-valid
+  owner-side re-entrant-subscribe vehicle is a **producer node** (gets
+  `&dyn CoreFull`/emitter at fire, D246 r6). **proposed handling:** S4
+  test rebuild — convert to a producer-pattern node driving the
+  late-subscribe defer. Invariant (late subscriber to an
+  already-cached node gets the cached handshake exactly once, no
+  double-receive) stays live & is partially covered by other subscribe
+  tests.
+
+- **[S2c/D248/D249 — `lock_discipline::concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits`]**
+  `#[ignore]`-stubbed. **why D246 doesn't fit (genuinely-deleted §7
+  cross-thread model):** `thread::spawn(move || rt_emit…)` shares
+  `Arc<TestRuntime>` across threads, requiring `OwnedCore: Send+Sync`.
+  D248/D249 single-owner made `Core`/`OwnedCore` `!Send+!Sync`.
+  Concurrent two-thread Core driving is the deleted model. **proposed
+  handling:** S4 — rebuild as one-Core-per-worker (migration-status S4
+  "convert the §7 #[ignore] tests"), same treatment as the
+  `group_parallelism`/`group_sharding` cross-thread set.
+
+- **[S2c/D246 — `benches/floor_compare.rs` + `examples/profile_st_emit.rs`
+  superseded]** `floor_compare` gutted to a compiling
+  superseded-placeholder; `profile_st_emit` rewritten to plain
+  `Core::new` (the single-owner `Core` IS the lock-free floor — the
+  invariant is live, just one cell). **why:** both benchmarked the now
+  deleted `Core<SingleThreadCell>` vs `Core<LockedCell>` cell-generic
+  split. Same boundary-1 precedent (`group_scaling` bench /
+  `profile_disjoint_*` examples gutted → S4 rebuild). **proposed
+  handling:** S4 — rebuild the floor/actor-model perf bench with
+  independent per-worker Cores alongside `group_scaling.rs`.
+
+- **[S2c/D249 — S4 mailbox scope partially pre-empted (NOT a skip — a
+  scope handoff)]** D249 (user-locked) pulled the *minimal* owner-only
+  `DeferQueue` split off `CoreMailbox` into S2c (so D248's single-owner
+  `Sink` relaxation could land). S4 still owns: the per-group `Send`
+  runnable-wake on the id-`CoreMailbox`; the typed `MailboxOp`
+  snapshot/prune variants (D246 rule 8); and folding
+  `Core::drain_mailbox`'s D249 two-queue **drain-to-mutual-quiescence**
+  loop into the per-group-wake design. The "don't churn the mailbox
+  twice" lock is consciously spent once here (D249 rationale).
+
 ### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
 
 `2494dea fix: s2b` = **checkpoint of `graphrefly-core`+`graphrefly-operators`

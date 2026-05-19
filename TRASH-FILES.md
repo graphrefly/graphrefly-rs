@@ -1,0 +1,2 @@
+crates/graphrefly-core/src/state_cell.rs - moved to TRASH/ - D246/S2c: StateCell generic collapsed to single RefCell-backed Core (single-owner; the parking_lot/SingleThreadCell split was shared-Core-era legacy)
+crates/graphrefly-core/src/groups.rs - moved to TRASH/ - D246/S2c: GroupLockRegistry deleted (single-owner ⇒ no cross-thread wave serialization; declared-group identity survives on CoreShared.node_group for S3/S4)

@@ -1,7 +1,7 @@
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
 //! D246: describe logic is a free fn [`describe_of`] over
-//! `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)` so the one [`Graph`]
+//! `(&dyn CoreFull, &Rc<RefCell<GraphInner>>)` so the one [`Graph`]
 //! (crate::Graph) reuses it, AND so the in-wave reactive-describe
 //! `MailboxOp::Defer` closure (D246 rule 6) can run it through the
 //! `&dyn CoreFull` it is handed (the one facade carries read-only
@@ -16,14 +16,15 @@
 //! `Handle(HandleId)` raw u64 (default) or `Rendered(serde_json::Value)`
 //! via [`DebugBindingBoundary`].
 
-use std::sync::{Arc, Weak};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use graphrefly_core::{
     Core, CoreFull, HandleId, NodeId, NodeKind, OperatorOp, TerminalKind, TopologyEvent,
     TopologySubscriptionId, NO_HANDLE,
 };
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 
 use crate::debug::DebugBindingBoundary;
@@ -119,11 +120,11 @@ pub enum NodeStatus {
 /// + the namespace handle. Pure read; no `Core`-mutation.
 pub(crate) fn describe_of(
     core: &dyn CoreFull,
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     debug: Option<&dyn DebugBindingBoundary>,
 ) -> GraphDescribeOutput {
     let (graph_name, local_names, subgraphs, names_iter) = {
-        let inner = inner_arc.lock();
+        let inner = inner_arc.borrow_mut();
         let graph_name = inner.name.clone();
         let local_names: IndexMap<NodeId, String> = inner
             .names
@@ -268,7 +269,7 @@ fn status_of(
 // -------------------------------------------------------------------
 
 /// Sink type for reactive describe.
-pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
+pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput)>;
 
 /// Id-bearing handle for a reactive describe subscription.
 ///
@@ -281,7 +282,7 @@ pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
 /// `OwnedCore`-tracked, so only `detach(core)` collects it.
 #[must_use = "ReactiveDescribeHandle holds a Core topology sub NOT tracked by OwnedCore; you MUST call detach(core) or it leaks"]
 pub struct ReactiveDescribeHandle {
-    inner: Arc<Mutex<GraphInner>>,
+    inner: Rc<RefCell<GraphInner>>,
     ns_sink_id: u64,
     /// Slice V3 D5: Core topology sub for `DepsChanged` (edges change
     /// without a namespace change). D246 r6: re-snapshot is in-wave
@@ -306,14 +307,14 @@ impl ReactiveDescribeHandle {
 /// (in-wave `MailboxOp::Defer` → `&dyn CoreFull`, D246 r6).
 pub(crate) fn describe_reactive_in(
     core: &Core,
-    inner: &Arc<Mutex<GraphInner>>,
+    inner: &Rc<RefCell<GraphInner>>,
     sink: DescribeSink,
 ) -> ReactiveDescribeHandle {
     // Push-on-subscribe (no lock held).
     sink(&describe_of(core, inner, None));
 
     // Namespace-change path (owner-side `&Core`, β/D231).
-    let weak_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(inner);
+    let weak_inner: Weak<RefCell<GraphInner>> = Rc::downgrade(inner);
     let sink_ns = sink.clone();
     let ns_sink: crate::graph::NamespaceChangeSink = Arc::new(move |c: &Core| {
         let Some(arc_inner) = weak_inner.upgrade() else {
@@ -326,25 +327,27 @@ pub(crate) fn describe_reactive_in(
     // Topology path (set_deps → `DepsChanged`, fired inside a Core
     // wave): re-snapshot via an in-wave `MailboxOp::Defer` so it runs
     // owner-side with a real `&dyn CoreFull` (D243/D233).
-    let weak_inner_topo: Weak<Mutex<GraphInner>> = Arc::downgrade(inner);
-    let mailbox = core.mailbox();
+    let weak_inner_topo: Weak<RefCell<GraphInner>> = Rc::downgrade(inner);
+    // D249/S2c: owner-side `!Send` `DeferQueue` (the closure captures a
+    // `Weak<RefCell<GraphInner>>`, `!Send`). Owner-thread-only `Rc` —
+    // fine: this topo sink is `!Send` (D248) and fires owner-side.
+    let deferred = core.defer_queue();
     let sink_topo = sink.clone();
-    let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
-        Arc::new(move |event: &TopologyEvent| {
-            if matches!(event, TopologyEvent::DepsChanged { .. }) {
-                let Some(arc_inner) = weak_inner_topo.upgrade() else {
-                    return;
-                };
-                let s = sink_topo.clone();
-                // The Defer closure captures no `HandleId` (only an
-                // `Arc<sink>` + a `Weak`-upgraded inner) — if the Core
-                // is gone (`false`) the snapshot simply won't fire;
-                // nothing to release (D235 P8 pattern).
-                let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
-                    s(&describe_of(cf, &arc_inner, None));
-                }));
-            }
-        });
+    let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
+        if matches!(event, TopologyEvent::DepsChanged { .. }) {
+            let Some(arc_inner) = weak_inner_topo.upgrade() else {
+                return;
+            };
+            let s = sink_topo.clone();
+            // The Defer closure captures no `HandleId` (only an
+            // `Arc<sink>` + a `Weak`-upgraded inner) — if the Core
+            // is gone (`false`) the snapshot simply won't fire;
+            // nothing to release (D235 P8 pattern).
+            let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
+                s(&describe_of(cf, &arc_inner, None));
+            }));
+        }
+    });
     let topo_sub_id = core.subscribe_topology(topo_sink);
 
     ReactiveDescribeHandle {

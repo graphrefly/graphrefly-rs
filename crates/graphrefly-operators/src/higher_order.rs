@@ -130,8 +130,8 @@ fn build_inner_sink(
     em: ProducerEmitter,
     producer_binding: Arc<dyn ProducerBinding>,
     producer_id: NodeId,
-    on_inner_complete: Arc<dyn Fn() + Send + Sync>,
-    on_inner_error: Arc<dyn Fn(HandleId) + Send + Sync>,
+    on_inner_complete: Arc<dyn Fn()>,
+    on_inner_error: Arc<dyn Fn(HandleId)>,
 ) -> Sink {
     Arc::new(move |msgs: &[Message]| {
         enum Action {
@@ -450,7 +450,7 @@ fn make_switch_on_complete(
     state: Arc<Mutex<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn() + Send + Sync> {
+) -> Arc<dyn Fn()> {
     Arc::new(move || {
         let prev_inner;
         let mut should_complete = false;
@@ -476,7 +476,7 @@ fn make_switch_on_error(
     state: Arc<Mutex<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId) + Send + Sync> {
+) -> Arc<dyn Fn(HandleId)> {
     Arc::new(move |h| {
         let prev_inner;
         {
@@ -707,7 +707,7 @@ fn make_exhaust_on_complete(
     state: Arc<Mutex<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn() + Send + Sync> {
+) -> Arc<dyn Fn()> {
     Arc::new(move || {
         let prev_inner;
         let mut should_complete = false;
@@ -736,7 +736,7 @@ fn make_exhaust_on_error(
     state: Arc<Mutex<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId) + Send + Sync> {
+) -> Arc<dyn Fn(HandleId)> {
     Arc::new(move |h| {
         let prev_inner;
         {
@@ -1095,7 +1095,7 @@ fn make_merge_on_complete(
     project_fn_id: FnId,
     this_inner_id: u64,
     concurrency: Option<u32>,
-) -> Arc<dyn Fn() + Send + Sync> {
+) -> Arc<dyn Fn()> {
     Arc::new(move || {
         let removed_sub;
         {
@@ -1142,7 +1142,7 @@ fn make_merge_on_error(
     em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId) + Send + Sync> {
+) -> Arc<dyn Fn(HandleId)> {
     Arc::new(move |h| {
         let removed_subs;
         let buffered_to_release;
@@ -1165,13 +1165,18 @@ fn make_merge_on_error(
 }
 
 // =====================================================================
-// Send + Sync compile-time asserts (Slice E /qa)
+// Compile-time asserts (Slice E /qa; D248/D249-amended)
 // =====================================================================
+//
+// D248/D249/S2c: `SwitchState`/`ExhaustState`/`MergeMapState` embed a
+// `ProducerEmitter`, which now carries the owner-only `Rc<DeferQueue>`
+// (the `!Send` `Defer` split off `CoreMailbox`). Under full
+// single-owner these op-states are owner-thread-only and intentionally
+// `!Send` — the prior `Send + Sync` assertions were shared-Core-era
+// legacy and are deleted. `ProjectFn` is a pure projector (captures no
+// `!Send`), so it stays `Send + Sync`.
 
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SwitchState>();
-    assert_send_sync::<ExhaustState>();
-    assert_send_sync::<MergeMapState>();
     assert_send_sync::<ProjectFn>();
 };

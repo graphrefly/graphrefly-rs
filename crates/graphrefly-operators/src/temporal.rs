@@ -46,7 +46,7 @@ use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
 
 use crate::producer::{
-    ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerEmitter, SubscribeOutcome,
+    MailboxEmitter, ProducerBinding, ProducerBuildFn, ProducerCtx, SubscribeOutcome,
 };
 
 // =========================================================================
@@ -275,7 +275,7 @@ pub fn debounce(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(debounce_task(rx, em.clone(), pid, bb.clone(), delay));
+        let task = tokio::spawn(debounce_task(rx, em.emitter(), pid, bb.clone(), delay));
 
         // Store guard: drops tx (clean shutdown) then aborts task (fallback).
         {
@@ -333,7 +333,7 @@ pub fn debounce(
 // exits on channel-close — only prompt shutdown).
 async fn debounce_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -422,7 +422,7 @@ pub fn audit(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(audit_task(rx, em.clone(), pid, bb.clone(), delay));
+        let task = tokio::spawn(audit_task(rx, em.emitter(), pid, bb.clone(), delay));
 
         {
             let st = ctx.storage();
@@ -473,7 +473,7 @@ pub fn audit(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
 // collapse rationale as `debounce_task`).
 async fn audit_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -565,7 +565,7 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(delay_task(rx, em.clone(), pid, bb.clone(), delay_dur));
+        let task = tokio::spawn(delay_task(rx, em.emitter(), pid, bb.clone(), delay_dur));
 
         {
             let st = ctx.storage();
@@ -615,7 +615,7 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
 // S2b/D230/D232-AMEND: `core: WeakCore` → `em: ProducerEmitter`.
 async fn delay_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     delay: Duration,
@@ -731,7 +731,14 @@ pub fn throttle(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
         let tx_dead = tx.clone();
-        let task = tokio::spawn(throttle_task(rx, em.clone(), pid, bb.clone(), window, opts));
+        let task = tokio::spawn(throttle_task(
+            rx,
+            em.emitter(),
+            pid,
+            bb.clone(),
+            window,
+            opts,
+        ));
 
         {
             let st = ctx.storage();
@@ -781,7 +788,7 @@ pub fn throttle(
 async fn throttle_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
     // S2b/D230/D232-AMEND: `WeakCore` → `ProducerEmitter`.
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     window: Duration,
@@ -880,7 +887,7 @@ pub fn interval(core: &Core, binding: &Arc<dyn ProducerBinding>, period_ms: u64)
         let em = ctx.emitter();
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
-        let em_task = em.clone();
+        let em_task = em.emitter();
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
@@ -964,7 +971,7 @@ pub fn timeout(
         let tx_dead = tx.clone();
         let task = tokio::spawn(timeout_task(
             rx,
-            em.clone(),
+            em.emitter(),
             pid,
             bb.clone(),
             duration,
@@ -1019,7 +1026,7 @@ pub fn timeout(
 // S2b/D230/D232-AMEND: `WeakCore` → `ProducerEmitter`.
 async fn timeout_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TemporalCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     duration: Duration,
@@ -1108,7 +1115,7 @@ pub fn buffer_time(
         let tx_dead = tx.clone();
         let task = tokio::spawn(buffer_time_task(
             rx,
-            em.clone(),
+            em.emitter(),
             pid,
             bb.clone(),
             period,
@@ -1180,7 +1187,7 @@ impl Drop for BufferTimeTaskGuard {
 // pack FFI.
 async fn buffer_time_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<BufferTimeCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     binding: Arc<dyn BindingBoundary>,
     period: Duration,
@@ -1302,7 +1309,7 @@ pub fn window_time(
         let tx_dead = tx.clone();
         let task = tokio::spawn(window_time_task(
             rx,
-            em.clone(),
+            em.emitter(),
             pid,
             first_inner,
             bb.clone(),
@@ -1376,7 +1383,7 @@ impl Drop for WindowTimeTaskGuard {
 // time it arrived — the D234 invariant (same as `window`).
 async fn window_time_task(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<WindowTimeCmd>,
-    em: ProducerEmitter,
+    em: MailboxEmitter,
     pid: NodeId,
     initial_inner: NodeId,
     binding: Arc<dyn BindingBoundary>,

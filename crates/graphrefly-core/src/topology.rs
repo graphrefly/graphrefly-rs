@@ -28,8 +28,10 @@ pub enum TopologyEvent {
     },
 }
 
-/// Callback for topology changes. `Send + Sync` for cross-thread Core usage.
-pub type TopologySink = Arc<dyn Fn(&TopologyEvent) + Send + Sync>;
+/// Callback for topology changes. D246/S2c/D248: single-owner ⇒ no
+/// `Send + Sync` (fires owner-side; the bound was shared-Core-era
+/// legacy).
+pub type TopologySink = Arc<dyn Fn(&TopologyEvent)>;
 
 /// Identifier for a topology subscription (S2b / D225). Returned by
 /// [`super::node::Core::subscribe_topology`]; pass it to
@@ -43,14 +45,14 @@ pub type TopologySubscriptionId = u64;
 /// Deregister topology sink `id`. Shared body (D225 S2a) for the
 /// synchronous owner-invoked [`super::node::Core::unsubscribe_topology`].
 /// Operates on `&C` directly — it never needed a `Core`.
-pub(crate) fn unsubscribe_topology_sink<C: crate::state_cell::StateCell>(state: &C, id: u64) {
-    // Step 2a (D220-EXEC): combined guard — `topology_sinks`
-    // lives in the `CoreShared` region (`St`'s `.shared` field).
-    let mut s = crate::node::St::new(state);
+pub(crate) fn unsubscribe_topology_sink(core: &crate::node::Core, id: u64) {
+    // D246/S2c: `topology_sinks` lives in the `CoreShared` region
+    // (`St`'s `.shared` field).
+    let mut s = crate::node::St::new(core);
     s.shared.topology_sinks.remove(&id);
 }
 
-impl<C: crate::state_cell::StateCell> super::node::Core<C> {
+impl super::node::Core {
     /// Subscribe to topology changes. The sink fires synchronously
     /// from the registration / teardown / `set_deps` call site, under
     /// no Core lock (the state lock is dropped before firing). Sinks
@@ -90,7 +92,7 @@ impl<C: crate::state_cell::StateCell> super::node::Core<C> {
     /// RAII wrapper calls this on `Drop` (it holds the `Core` on its
     /// affinity worker). Idempotent — removing an absent id is a no-op.
     pub fn unsubscribe_topology(&self, id: TopologySubscriptionId) {
-        unsubscribe_topology_sink(&self.state, id);
+        unsubscribe_topology_sink(self, id);
     }
 
     /// Fire topology event to all registered sinks. Called from

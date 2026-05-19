@@ -179,8 +179,16 @@ pub trait ProducerBinding: BindingBoundary {
 /// so sink bodies are unchanged: only the captured handle's
 /// construction differs (`em = ctx.emitter()` instead of
 /// `core_s.clone()`).
+/// The **`Send + Sync` cross-thread** producer emit handle (D249/S2c).
+///
+/// Holds only the id-only `Arc<CoreMailbox>` post side + the binding
+/// (for the `Core`-gone handle-release branch). This is what an
+/// autonomous timer task (`temporal.rs`, `tokio::spawn`-ed) captures —
+/// it stays `Send` so the spawned future is `Send`. It deliberately
+/// has **no `defer`** (that is the `!Send` owner-side path; see
+/// [`ProducerEmitter`]).
 #[derive(Clone)]
-pub struct ProducerEmitter {
+pub struct MailboxEmitter {
     mailbox: Arc<graphrefly_core::CoreMailbox>,
     /// For the `Core`-gone branch only: if the owning `Core` already
     /// dropped (mailbox closed), an `Emit`/`Error` payload handle would
@@ -188,34 +196,7 @@ pub struct ProducerEmitter {
     binding: Arc<dyn BindingBoundary>,
 }
 
-impl ProducerEmitter {
-    /// Construct directly from any `&Core` (S2b). Used by the
-    /// **binding-layer RAII** convenience (D228-A): a test harness /
-    /// napi `BenchCore` that co-owns the `Core` builds a [`SubGuard`]
-    /// over `core.subscribe(...)`'s returned `SubscriptionId` so drop
-    /// schedules the unsubscribe — the sanctioned replacement for the
-    /// retired core-level RAII `Subscription`.
-    #[must_use]
-    pub fn for_core<C: graphrefly_core::StateCell>(core: &Core<C>) -> Self {
-        Self {
-            mailbox: core.mailbox(),
-            binding: core.binding(),
-        }
-    }
-
-    /// Construct from the object-safe [`CoreFull`] facade (D246 r5 /
-    /// D245). Used by [`ProducerCtx::emitter`] now that the ctx holds
-    /// `&dyn CoreFull` rather than a concrete `&Core` — `CoreFull`
-    /// carries both `mailbox()` and `binding()`, the only two pieces a
-    /// `ProducerEmitter` needs.
-    #[must_use]
-    pub fn from_corefull(core: &dyn CoreFull) -> Self {
-        Self {
-            mailbox: core.mailbox(),
-            binding: core.binding(),
-        }
-    }
-
+impl MailboxEmitter {
     /// Post an `Emit`. If the owning `Core` is gone, release `handle`
     /// (it held a retain for the would-be payload) — no leak.
     pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
@@ -237,6 +218,97 @@ impl ProducerEmitter {
         }
     }
 
+    /// Post a **`Send`** cross-thread owner-side closure (D233/D249).
+    /// For an autonomous timer task (`temporal.rs` `window_time`) doing
+    /// task-side topology mutation that must run owner-side in FIFO
+    /// order — the closure captures only `Send` state, so it rides the
+    /// `Send + Sync` `CoreMailbox`. Returns `false` iff the `Core` is
+    /// gone (closure dropped unrun; release any captured handles).
+    #[must_use = "a `false` return means the Core is gone and the closure was dropped unrun; release any handles it captured"]
+    pub fn defer(&self, f: impl FnOnce(&dyn graphrefly_core::CoreFull) + Send + 'static) -> bool {
+        self.mailbox.post_defer(Box::new(f))
+    }
+
+    /// Whether the owning `Core` has dropped (mailbox closed) — for
+    /// prompt timer-task shutdown (see [`ProducerEmitter::is_core_gone`]).
+    #[must_use]
+    pub fn is_core_gone(&self) -> bool {
+        self.mailbox.is_closed()
+    }
+}
+
+/// The owner-side producer handle (D249/S2c). `MailboxEmitter` (the
+/// `Send` cross-thread emit side) **plus** the owner-only `!Send`
+/// `Rc<DeferQueue>` for [`Self::defer`]. Captured into owner-side
+/// `!Send` producer sinks (control/higher-order dynamic-inner); the
+/// `Rc` makes it `!Send`, consistent with the D248 single-owner `Sink`
+/// relaxation. A timer task that needs only the cross-thread emit side
+/// takes [`Self::emitter`] (a `Send` [`MailboxEmitter`]) instead.
+#[derive(Clone)]
+pub struct ProducerEmitter {
+    emitter: MailboxEmitter,
+    /// Owner-side `!Send` `Defer` queue split off `CoreMailbox`
+    /// (D249/S2c).
+    deferred: std::rc::Rc<graphrefly_core::DeferQueue>,
+}
+
+impl ProducerEmitter {
+    /// Construct directly from any `&Core` (S2b). Used by the
+    /// **binding-layer RAII** convenience (D228-A): a test harness /
+    /// napi `BenchCore` that co-owns the `Core` builds a [`SubGuard`]
+    /// over `core.subscribe(...)`'s returned `SubscriptionId` so drop
+    /// schedules the unsubscribe — the sanctioned replacement for the
+    /// retired core-level RAII `Subscription`.
+    #[must_use]
+    pub fn for_core(core: &Core) -> Self {
+        Self {
+            emitter: MailboxEmitter {
+                mailbox: core.mailbox(),
+                binding: core.binding(),
+            },
+            deferred: core.defer_queue(),
+        }
+    }
+
+    /// Construct from the object-safe [`CoreFull`] facade (D246 r5 /
+    /// D245). Used by [`ProducerCtx::emitter`] now that the ctx holds
+    /// `&dyn CoreFull` rather than a concrete `&Core`.
+    #[must_use]
+    pub fn from_corefull(core: &dyn CoreFull) -> Self {
+        Self {
+            emitter: MailboxEmitter {
+                mailbox: core.mailbox(),
+                binding: core.binding(),
+            },
+            deferred: core.defer_queue(),
+        }
+    }
+
+    /// The `Send` cross-thread emit sub-handle — for autonomous timer
+    /// tasks (`temporal.rs`, `tokio::spawn`) that only emit/complete/
+    /// error and must keep their spawned future `Send` (D249/S2c).
+    #[must_use]
+    pub fn emitter(&self) -> MailboxEmitter {
+        self.emitter.clone()
+    }
+
+    /// Post an `Emit`. If the owning `Core` is gone, release `handle`
+    /// (it held a retain for the would-be payload) — no leak.
+    pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
+        self.emitter.emit_or_defer(node_id, handle);
+    }
+
+    /// Post a `Complete`. No payload handle; `Core`-gone is a no-op.
+    pub fn complete_or_defer(&self, node_id: NodeId) {
+        self.emitter.complete_or_defer(node_id);
+    }
+
+    /// Post an `Error`. If the owning `Core` is gone, release the error
+    /// payload `handle` — no leak.
+    pub fn error_or_defer(&self, node_id: NodeId, handle: HandleId) {
+        self.emitter.error_or_defer(node_id, handle);
+    }
+
     /// Post an owner-side closure (D233) given the full object-safe
     /// `Core` surface — for sinks that must perform value-returning
     /// topology mutation (windowing `create_window_node`, higher-order
@@ -254,19 +326,18 @@ impl ProducerEmitter {
     /// The not-yet-written windowing / higher-order callers MUST honour
     /// this (release captured payload handles when it returns `false`).
     #[must_use = "a `false` return means the Core is gone and the closure was dropped unrun; release any handles it captured"]
-    pub fn defer(&self, f: impl FnOnce(&dyn graphrefly_core::CoreFull) + Send + 'static) -> bool {
-        self.mailbox.post_defer(Box::new(f))
+    pub fn defer(&self, f: impl FnOnce(&dyn graphrefly_core::CoreFull) + 'static) -> bool {
+        self.deferred.post(Box::new(f))
     }
 
     /// Whether the owning `Core` has dropped (mailbox closed). Lets a
-    /// long-lived async task (e.g. a `temporal.rs` timer task) stop
-    /// promptly + release any handle it is still holding, preserving
-    /// the teardown-promptness the old `WeakCore::upgrade() == None`
-    /// branch gave. NOT required for leak-safety (`*_or_defer` already
-    /// releases on a closed post) — only for prompt task shutdown.
+    /// long-lived task stop promptly + release any handle it holds
+    /// (preserves the old `WeakCore::upgrade() == None` promptness).
+    /// NOT required for leak-safety (`*_or_defer` already releases on a
+    /// closed post) — only for prompt task shutdown.
     #[must_use]
     pub fn is_core_gone(&self) -> bool {
-        self.mailbox.is_closed()
+        self.emitter.is_core_gone()
     }
 }
 

@@ -1,7 +1,7 @@
 //! Mount / unmount + `ancestors()` (canonical spec §3.4).
 //!
 //! D246: subgraphs are just child levels of the **Core-free** namespace
-//! tree (`Arc<Mutex<GraphInner>>`); the embedder owns the one `Core`.
+//! tree (`Rc<RefCell<GraphInner>>`); the embedder owns the one `Core`.
 //! `mount` / `mount_new` / `ancestors` are pure-namespace (no `&Core`);
 //! `unmount` takes the embedder's `&Core` because it runs the TEARDOWN
 //! cascade. Returns plain [`Graph`] handles (a cheap `Arc` clone). The
@@ -9,10 +9,10 @@
 //! deleted — there is only ever the one embedder `Core` (no Core lives
 //! on a `Graph` to mismatch).
 
-use std::sync::{Arc, Weak};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 
 use graphrefly_core::Core;
-use parking_lot::Mutex;
 
 use crate::graph::{destroy_subtree, fire_ns, Graph, GraphInner, NameError};
 
@@ -53,8 +53,8 @@ impl From<NameError> for MountError {
 }
 
 /// Construct a fresh empty child `GraphInner` handle with `parent` set.
-fn new_child_inner(name: String, parent: Weak<Mutex<GraphInner>>) -> Arc<Mutex<GraphInner>> {
-    Arc::new(Mutex::new(GraphInner {
+fn new_child_inner(name: String, parent: Weak<RefCell<GraphInner>>) -> Rc<RefCell<GraphInner>> {
+    Rc::new(RefCell::new(GraphInner {
         name,
         names: indexmap::IndexMap::new(),
         names_inverse: indexmap::IndexMap::new(),
@@ -68,7 +68,7 @@ fn new_child_inner(name: String, parent: Weak<Mutex<GraphInner>>) -> Arc<Mutex<G
 
 pub(crate) fn mount(
     core: &Core,
-    parent_inner: &Arc<Mutex<GraphInner>>,
+    parent_inner: &Rc<RefCell<GraphInner>>,
     name: String,
     child: &Graph,
 ) -> Result<Graph, MountError> {
@@ -80,7 +80,7 @@ pub(crate) fn mount(
     // concurrent mount(name, ...) calls cannot both pass validation
     // (TOCTOU fix from /qa Slice E+). Lock order: parent → child.
     {
-        let mut p = parent_inner.lock();
+        let mut p = parent_inner.borrow_mut();
         if p.destroyed {
             return Err(MountError::Destroyed);
         }
@@ -91,11 +91,11 @@ pub(crate) fn mount(
             return Err(MountError::NodeNameCollision(name));
         }
         {
-            let mut c = child_inner.lock();
+            let mut c = child_inner.borrow_mut();
             if c.parent.is_some() {
                 return Err(MountError::AlreadyMounted);
             }
-            c.parent = Some(Arc::downgrade(parent_inner));
+            c.parent = Some(Rc::downgrade(parent_inner));
         }
         p.children.insert(name, child_inner.clone());
     }
@@ -108,17 +108,17 @@ pub(crate) fn mount(
 
 pub(crate) fn mount_new(
     core: &Core,
-    parent_inner: &Arc<Mutex<GraphInner>>,
+    parent_inner: &Rc<RefCell<GraphInner>>,
     name: String,
 ) -> Result<Graph, MountError> {
     if name.contains("::") {
         return Err(MountError::InvalidName(name));
     }
-    let parent_weak = Arc::downgrade(parent_inner);
+    let parent_weak = Rc::downgrade(parent_inner);
     // Hold the parent lock across validation + child construction +
     // insert (TOCTOU fix from /qa Slice E+).
     let child_inner = {
-        let mut p = parent_inner.lock();
+        let mut p = parent_inner.borrow_mut();
         if p.destroyed {
             return Err(MountError::Destroyed);
         }
@@ -139,11 +139,11 @@ pub(crate) fn mount_new(
 
 pub(crate) fn unmount(
     core: &Core,
-    parent_inner: &Arc<Mutex<GraphInner>>,
+    parent_inner: &Rc<RefCell<GraphInner>>,
     name: &str,
 ) -> Result<GraphRemoveAudit, MountError> {
     let child = {
-        let mut p = parent_inner.lock();
+        let mut p = parent_inner.borrow_mut();
         if p.destroyed {
             return Err(MountError::Destroyed);
         }
@@ -153,14 +153,14 @@ pub(crate) fn unmount(
     };
     let audit = audit_of(&child);
     // Detach + destroy.
-    child.lock().parent = None;
+    child.borrow_mut().parent = None;
     destroy_subtree(core, &child);
     // Fire on the parent AFTER the child's destroy completes (P3).
     fire_ns(core, parent_inner);
     Ok(audit)
 }
 
-pub(crate) fn ancestors(inner: &Arc<Mutex<GraphInner>>, include_self: bool) -> Vec<Graph> {
+pub(crate) fn ancestors(inner: &Rc<RefCell<GraphInner>>, include_self: bool) -> Vec<Graph> {
     let mut chain: Vec<Graph> = Vec::new();
     if include_self {
         chain.push(Graph::from_inner(inner.clone()));
@@ -169,35 +169,28 @@ pub(crate) fn ancestors(inner: &Arc<Mutex<GraphInner>>, include_self: bool) -> V
     //
     // Slice V3: visited-set cycle insurance per porting-deferred.md.
     let mut visited = std::collections::HashSet::new();
-    visited.insert(Arc::as_ptr(inner) as usize);
-    let mut cursor: Option<Arc<Mutex<GraphInner>>> = inner
-        .lock()
-        .parent
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade);
+    visited.insert(Rc::as_ptr(inner) as usize);
+    let mut cursor: Option<Rc<RefCell<GraphInner>>> =
+        inner.borrow_mut().parent.as_ref().and_then(Weak::upgrade);
     while let Some(cur) = cursor {
-        let ptr = Arc::as_ptr(&cur) as usize;
+        let ptr = Rc::as_ptr(&cur) as usize;
         if !visited.insert(ptr) {
             break; // Cycle detected — break rather than infinite-loop.
         }
-        let next_parent = cur
-            .lock()
-            .parent
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade);
+        let next_parent = cur.borrow_mut().parent.as_ref().and_then(Weak::upgrade);
         chain.push(Graph::from_inner(cur));
         cursor = next_parent;
     }
     chain
 }
 
-fn audit_of(inner_arc: &Arc<Mutex<GraphInner>>) -> GraphRemoveAudit {
-    let inner = inner_arc.lock();
+fn audit_of(inner_arc: &Rc<RefCell<GraphInner>>) -> GraphRemoveAudit {
+    let inner = inner_arc.borrow_mut();
     let own = inner.names.len();
     let mount_count_self = inner.children.len();
     let mut node_count = own;
     let mut mount_count = mount_count_self;
-    let kids: Vec<Arc<Mutex<GraphInner>>> = inner.children.values().cloned().collect();
+    let kids: Vec<Rc<RefCell<GraphInner>>> = inner.children.values().cloned().collect();
     drop(inner);
     for kid in kids {
         let sub = audit_of(&kid);

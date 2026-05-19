@@ -11,21 +11,24 @@
 //! always has it; one arg, trivially-correct ownership). Pure-namespace
 //! ops (`node`, `name_of`, `try_resolve`, …) take no `Core`.
 //!
-//! `Graph` is `Send + Sync + 'static` and `Clone` (an `Arc` bump): safe
-//! to capture into `Sink`/`MailboxOp::Defer` closures that out-live any
-//! borrowed `&Core` — it replaces the old `NamespaceHandle`.
+//! `Graph` is `Clone` (an `Rc` bump) and intentionally `!Send + !Sync`
+//! (D246/S2c single-owner: `Rc<RefCell<GraphInner>>`). It lives on, and
+//! is touched only by, the one thread that owns the `Core` — captured
+//! into owner-side `Sink`/`MailboxOp::Defer` closures (also `!Send`
+//! post-D248). It replaces the old `NamespaceHandle`.
 //!
 //! `mount` / `describe` / `observe` / `snapshot` live in sibling
 //! modules and follow the same `&Core`-explicit convention.
 
-use std::sync::{Arc, Weak};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use graphrefly_core::{
     Core, EqualsMode, FnId, HandleId, LockId, NodeId, PauseError, ResumeReport, SetDepsError, Sink,
     SubscriptionId, TopologySubscriptionId,
 };
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 
 use crate::debug::DebugBindingBoundary;
 use crate::describe::{
@@ -100,13 +103,14 @@ pub enum NameError {
 /// synchronously owner-side. (The in-wave `DepsChanged`/`NodeTornDown`
 /// re-entry path is the one that defers via `MailboxOp::Defer` — see
 /// `describe.rs`/`observe.rs`.)
-pub(crate) type NamespaceChangeSink = Arc<dyn Fn(&Core) + Send + Sync>;
+pub(crate) type NamespaceChangeSink = Arc<dyn Fn(&Core)>;
 
 /// Inner namespace + mount-tree state for one graph level. D246: holds
 /// **no `Core`** — purely the named namespace, the mounted children,
-/// and the namespace-change sinks. (S2c collapses the `Mutex` to
-/// single-owner; for now the `Arc<Mutex<…>>` keeps the shareable-handle
-/// + parent-`Weak` cycle intact.)
+/// and the namespace-change sinks. D246/S2c/D247: single-owner ⇒
+/// `Rc<RefCell<GraphInner>>` (the prior `Arc<Mutex<…>>` was
+/// shared-Core-era legacy); the shareable-handle + parent-`Weak` cycle
+/// stays, single-threaded.
 pub struct GraphInner {
     pub(crate) name: String,
     /// Local namespace: name → `NodeId`. Insertion order is load-bearing
@@ -117,10 +121,10 @@ pub struct GraphInner {
     /// Mounted child subgraphs — each is just another level's inner
     /// state (no `Core`; the single owned `Core` is the embedder's, and
     /// is threaded as `&Core` through every Core-touching tree-walk).
-    pub(crate) children: IndexMap<String, Arc<Mutex<GraphInner>>>,
+    pub(crate) children: IndexMap<String, Rc<RefCell<GraphInner>>>,
     /// Parent inner-state pointer (for `ancestors()`). Weak to break
     /// the strong cycle.
-    pub(crate) parent: Option<Weak<Mutex<GraphInner>>>,
+    pub(crate) parent: Option<Weak<RefCell<GraphInner>>>,
     /// True after `destroy()` completes — subsequent mutations refuse.
     pub(crate) destroyed: bool,
     /// Namespace-change sinks — fired from `add()`, `remove()`, etc.
@@ -132,19 +136,20 @@ pub struct GraphInner {
 /// Graph container — the one Core-free namespace + mount-tree handle
 /// (canonical §3, D246).
 ///
-/// `Clone` is a cheap `Arc` bump; a subgraph (from `mount*`/`ancestors`)
-/// is just a `Graph` into a child level. `Send + Sync + 'static`: no
-/// `Core`, no borrow — capture freely into long-lived sinks. Pass the
+/// `Clone` is a cheap `Rc` bump; a subgraph (from `mount*`/`ancestors`)
+/// is just a `Graph` into a child level. Intentionally `!Send + !Sync`
+/// (D246/S2c single-owner): no `Core`, no borrow — captured into
+/// owner-side sinks on the one thread that owns the `Core`. Pass the
 /// embedder's `&Core` (e.g. `owned.core()`) into every Core-touching
 /// method.
 #[derive(Clone)]
 pub struct Graph {
-    pub(crate) inner: Arc<Mutex<GraphInner>>,
+    pub(crate) inner: Rc<RefCell<GraphInner>>,
 }
 
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock();
+        let inner = self.inner.borrow_mut();
         f.debug_struct("Graph")
             .field("name", &inner.name)
             .field("node_count", &inner.names.len())
@@ -168,9 +173,9 @@ impl Graph {
         Self::with_parent(name.into(), None)
     }
 
-    pub(crate) fn with_parent(name: String, parent: Option<Weak<Mutex<GraphInner>>>) -> Self {
+    pub(crate) fn with_parent(name: String, parent: Option<Weak<RefCell<GraphInner>>>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(GraphInner {
+            inner: Rc::new(RefCell::new(GraphInner {
                 name,
                 names: IndexMap::new(),
                 names_inverse: IndexMap::new(),
@@ -184,13 +189,13 @@ impl Graph {
     }
 
     /// Wrap an existing inner level as a `Graph` handle (mount/ancestors).
-    pub(crate) fn from_inner(inner: Arc<Mutex<GraphInner>>) -> Self {
+    pub(crate) fn from_inner(inner: Rc<RefCell<GraphInner>>) -> Self {
         Self { inner }
     }
 
     /// This level's namespace handle (the `Graph` ↔ tree-walk seam).
     #[inline]
-    pub(crate) fn inner_arc(&self) -> &Arc<Mutex<GraphInner>> {
+    pub(crate) fn inner_arc(&self) -> &Rc<RefCell<GraphInner>> {
         &self.inner
     }
 
@@ -203,7 +208,7 @@ impl Graph {
     /// The graph's name as set at construction (or via `mount`).
     #[must_use]
     pub fn name(&self) -> String {
-        self.inner.lock().name.clone()
+        self.inner.borrow_mut().name.clone()
     }
 
     // --- namespace-change sinks (used by observe / describe / mount) ---
@@ -292,7 +297,7 @@ impl Graph {
         let name = name.into();
         validate_name(&name)?;
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner.borrow_mut();
             if inner.destroyed {
                 return Err(NameError::Destroyed);
             }
@@ -331,31 +336,31 @@ impl Graph {
     /// Reverse lookup: the local name for a `node_id`.
     #[must_use]
     pub fn name_of(&self, node_id: NodeId) -> Option<String> {
-        self.inner.lock().names_inverse.get(&node_id).cloned()
+        self.inner.borrow_mut().names_inverse.get(&node_id).cloned()
     }
 
     /// Number of named nodes in this graph.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.inner.lock().names.len()
+        self.inner.borrow_mut().names.len()
     }
 
     /// Snapshot of local node names in insertion order.
     #[must_use]
     pub fn node_names(&self) -> Vec<String> {
-        self.inner.lock().names.keys().cloned().collect()
+        self.inner.borrow_mut().names.keys().cloned().collect()
     }
 
     /// Snapshot of mounted child names in insertion order.
     #[must_use]
     pub fn child_names(&self) -> Vec<String> {
-        self.inner.lock().children.keys().cloned().collect()
+        self.inner.borrow_mut().children.keys().cloned().collect()
     }
 
     /// Returns `true` after [`Self::destroy`] has been called.
     #[must_use]
     pub fn is_destroyed(&self) -> bool {
-        self.inner.lock().destroyed
+        self.inner.borrow_mut().destroyed
     }
 
     // ---------------------- sugar constructors (§3.9) -------------------
@@ -454,7 +459,7 @@ impl Graph {
     /// See [`RemoveError`].
     pub fn remove(&self, core: &Core, name: &str) -> Result<GraphRemoveAudit, RemoveError> {
         {
-            let inner = self.inner.lock();
+            let inner = self.inner.borrow_mut();
             if inner.destroyed {
                 return Err(RemoveError::Destroyed);
             }
@@ -467,7 +472,7 @@ impl Graph {
             }
         }
         let node_id = {
-            let inner = self.inner.lock();
+            let inner = self.inner.borrow_mut();
             if inner.destroyed {
                 return Err(RemoveError::Destroyed);
             }
@@ -478,7 +483,7 @@ impl Graph {
         };
         core.teardown(node_id);
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner.borrow_mut();
             inner.names.shift_remove(name);
             inner.names_inverse.shift_remove(&node_id);
         }
@@ -727,7 +732,7 @@ impl Graph {
 }
 
 // =====================================================================
-// D246/D237: free fns over (&Core, &Arc<Mutex<GraphInner>>)
+// D246/D237: free fns over (&Core, &Rc<RefCell<GraphInner>>)
 // =====================================================================
 
 fn validate_name(name: &str) -> Result<(), NameError> {
@@ -742,10 +747,10 @@ fn validate_name(name: &str) -> Result<(), NameError> {
 
 /// Register a namespace-change sink on one graph level. Returns its id.
 pub(crate) fn register_ns_sink(
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     sink: NamespaceChangeSink,
 ) -> u64 {
-    let mut inner = inner_arc.lock();
+    let mut inner = inner_arc.borrow_mut();
     let id = inner.next_ns_sink_id;
     inner.next_ns_sink_id += 1;
     inner.namespace_sinks.insert(id, sink);
@@ -753,19 +758,19 @@ pub(crate) fn register_ns_sink(
 }
 
 /// Remove a namespace-change sink by id (inner-only; no `Core`).
-pub(crate) fn unregister_ns_sink(inner_arc: &Arc<Mutex<GraphInner>>, id: u64) {
-    inner_arc.lock().namespace_sinks.shift_remove(&id);
+pub(crate) fn unregister_ns_sink(inner_arc: &Rc<RefCell<GraphInner>>, id: u64) {
+    inner_arc.borrow_mut().namespace_sinks.shift_remove(&id);
 }
 
 /// Pure-namespace path resolution (R3.5.1/R3.5.2). Never touches `Core`.
 pub(crate) fn resolve_checked(
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     path: &str,
 ) -> Result<Option<NodeId>, PathError> {
     if path.is_empty() {
         return Err(PathError::Empty);
     }
-    let inner = inner_arc.lock();
+    let inner = inner_arc.borrow_mut();
     if inner.destroyed {
         return Err(PathError::Destroyed);
     }
@@ -796,9 +801,9 @@ pub(crate) fn resolve_checked(
 
 /// Fire one graph level's namespace-change sinks with the owner's
 /// `&Core` (D246 rule 2 owner-side). Sinks run with no Graph lock held.
-pub(crate) fn fire_ns(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
+pub(crate) fn fire_ns(core: &Core, inner_arc: &Rc<RefCell<GraphInner>>) {
     let sinks: Vec<NamespaceChangeSink> = {
-        let inner = inner_arc.lock();
+        let inner = inner_arc.borrow_mut();
         inner.namespace_sinks.values().cloned().collect()
     };
     for sink in sinks {
@@ -806,11 +811,11 @@ pub(crate) fn fire_ns(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
     }
 }
 
-/// `destroy()` over `Arc<Mutex<GraphInner>>` + root `&Core`. Ordering
+/// `destroy()` over `Rc<RefCell<GraphInner>>` + root `&Core`. Ordering
 /// preserved verbatim (R3.7.3).
-pub(crate) fn destroy_subtree(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
+pub(crate) fn destroy_subtree(core: &Core, inner_arc: &Rc<RefCell<GraphInner>>) {
     let (own_ids, child_clones) = {
-        let mut inner = inner_arc.lock();
+        let mut inner = inner_arc.borrow_mut();
         if inner.destroyed {
             return; // Idempotent.
         }
@@ -826,7 +831,7 @@ pub(crate) fn destroy_subtree(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
         core.teardown(id);
     }
     {
-        let mut inner = inner_arc.lock();
+        let mut inner = inner_arc.borrow_mut();
         inner.names.clear();
         inner.names_inverse.clear();
         inner.children.clear();
@@ -842,18 +847,18 @@ pub(crate) fn destroy_subtree(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
     // documented `graph.destroy(core)` teardown fallback must actually
     // collect it. (The handle's Core *topology* sub is still owner-
     // detach-only — see the corrected `#[must_use]` text.)
-    inner_arc.lock().namespace_sinks.clear();
+    inner_arc.borrow_mut().namespace_sinks.clear();
 }
 
 /// Tree-wide gather for `signal_pause`/`resume`/`complete`/`error`
-/// (meta-companion filtered per D4). `Arc<Mutex<GraphInner>>` worklist
+/// (meta-companion filtered per D4). `Rc<RefCell<GraphInner>>` worklist
 /// + the single root `&Core`.
-fn collect_signal_ids_with_meta_filter(core: &Core, root: &Arc<Mutex<GraphInner>>) -> Vec<NodeId> {
+fn collect_signal_ids_with_meta_filter(core: &Core, root: &Rc<RefCell<GraphInner>>) -> Vec<NodeId> {
     let mut out: Vec<NodeId> = Vec::new();
-    let mut worklist: Vec<Arc<Mutex<GraphInner>>> = vec![root.clone()];
+    let mut worklist: Vec<Rc<RefCell<GraphInner>>> = vec![root.clone()];
     while let Some(inner_arc) = worklist.pop() {
         let (own_ids, meta_set, child_clones) = {
-            let inner = inner_arc.lock();
+            let inner = inner_arc.borrow_mut();
             if inner.destroyed {
                 continue;
             }
@@ -881,12 +886,12 @@ fn collect_signal_ids_with_meta_filter(core: &Core, root: &Arc<Mutex<GraphInner>
 }
 
 /// Iterative gather for `signal_invalidate` (DFS, meta-filtered).
-fn collect_signal_invalidate_ids(core: &Core, root: &Arc<Mutex<GraphInner>>) -> Vec<NodeId> {
+fn collect_signal_invalidate_ids(core: &Core, root: &Rc<RefCell<GraphInner>>) -> Vec<NodeId> {
     let mut out: Vec<NodeId> = Vec::new();
-    let mut worklist: Vec<Arc<Mutex<GraphInner>>> = vec![root.clone()];
+    let mut worklist: Vec<Rc<RefCell<GraphInner>>> = vec![root.clone()];
     while let Some(inner_arc) = worklist.pop() {
         let (own_ids, meta_set, child_clones) = {
-            let inner = inner_arc.lock();
+            let inner = inner_arc.borrow_mut();
             if inner.destroyed {
                 continue;
             }
@@ -916,17 +921,17 @@ fn collect_signal_invalidate_ids(core: &Core, root: &Arc<Mutex<GraphInner>>) -> 
 /// Build an `id → qualified-name` map across this graph + (if
 /// `recursive`) its mount tree. Pure-namespace (no `Core`).
 pub(crate) fn collect_qualified_names_in(
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     prefix: &str,
     recursive: bool,
 ) -> IndexMap<NodeId, String> {
-    let inner = inner_arc.lock();
+    let inner = inner_arc.borrow_mut();
     let mut map: IndexMap<NodeId, String> = inner
         .names
         .iter()
         .map(|(n, id)| (*id, format!("{prefix}{n}")))
         .collect();
-    let children: Vec<(String, Arc<Mutex<GraphInner>>)> = if recursive {
+    let children: Vec<(String, Rc<RefCell<GraphInner>>)> = if recursive {
         inner
             .children
             .iter()
@@ -949,18 +954,18 @@ pub(crate) fn collect_qualified_names_in(
 /// Derive `[from, to]` edge name pairs. Needs the root `&Core`.
 pub(crate) fn edges_in(
     core: &Core,
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     prefix: &str,
     recursive: bool,
     names_map: &IndexMap<NodeId, String>,
 ) -> Vec<(String, String)> {
-    let inner = inner_arc.lock();
+    let inner = inner_arc.borrow_mut();
     let qualified: Vec<(String, NodeId)> = inner
         .names
         .iter()
         .map(|(n, id)| (format!("{prefix}{n}"), *id))
         .collect();
-    let children: Vec<(String, Arc<Mutex<GraphInner>>)> = if recursive {
+    let children: Vec<(String, Rc<RefCell<GraphInner>>)> = if recursive {
         inner
             .children
             .iter()
@@ -988,11 +993,9 @@ pub(crate) fn edges_in(
     result
 }
 
-// QA-A4: lock the central D246 invariant — the one Core-free `Graph` is
-// `Send + Sync + 'static` (the whole point: capturable into long-lived
-// sinks / `MailboxOp::Defer` closures). A future `Rc`/`RefCell`/`&Core`
-// field fails the build here, at the cause.
-const _: fn() = || {
-    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-    assert_send_sync_static::<Graph>();
-};
+// D247/D248: the QA-A4 `Graph: Send + Sync + 'static` assertion is
+// **deleted**. Under D246/S2c single-owner the namespace tree is
+// `Rc<RefCell<GraphInner>>` (the `Arc<Mutex<>>` + `Send+Sync` was
+// shared-Core-era legacy), so `Graph` is intentionally `!Send + !Sync`
+// — it lives on, and is touched only by, the one thread that owns the
+// `Core`.

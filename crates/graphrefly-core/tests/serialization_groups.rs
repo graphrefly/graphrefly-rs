@@ -20,39 +20,31 @@ use graphrefly_core::{
     SerializationGroupId, SetDepsError, SetGroupError,
 };
 
-// CLAUDE.md Rust invariant 2: `Core` stays `Send + Sync` on the default
-// (`LockedCell`) substrate path (the grouped/cross-thread path). The
-// deleted `SubgraphId` assertion is gone with the union-find.
+// D248/D249/S2c: `Core` is now **`!Send + !Sync`** (full single-owner).
+// The substrate `Sink`/`TopologySink` dropped `Send + Sync`
+// (shared-Core-era legacy); `Core` owns the subscriber map + the
+// owner-only `Rc<DeferQueue>`, so it is owned, driven, and dropped on
+// exactly one thread (the only cross-thread bridge is the id-only
+// `Arc<CoreMailbox>`). This **reverses** the prior "CLAUDE.md Rust
+// invariant 2: Core stays Send+Sync" + the S2b `Core: Send` premise —
+// a documented consequence of D248 (user-locked). The
+// `Core<SingleThreadCell>` / `Core<LockedCell>` cell-generic split is
+// deleted (D246/S2c). `SerializationGroupId` is a plain newtype and
+// stays `Send + Sync` (S3 renames it to `SchedulingGroupId`).
 const _: fn() = || {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    assert_send::<graphrefly_core::Core>();
-    assert_sync::<graphrefly_core::Core>();
-    assert_send::<SerializationGroupId>();
-    assert_sync::<SerializationGroupId>();
-};
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SerializationGroupId>();
 
-// S2b/β actor-model invariant (D221/D223, supersedes QA F3 2026-05-16):
-// the lock-free floor substrate `Core<SingleThreadCell>` is now **`Send`
-// but NOT `Sync`**. `Send` is required — under the actor / work-stealing
-// model the whole `Core` *moves by value* between workers at quiescence
-// (the borrow checker is the lock; ownership-move is the safety
-// mechanism). `!Sync` is preserved — it is a single-thread lock-free
-// cell and must never be *shared* across threads (only moved). No
-// `unsafe`, no negative impls: `Send` via a direct bound; `!Sync` via
-// the canonical no-dep ambiguity trick (if it impl'd `Sync`, method
-// resolution is ambiguous → compile error; `!Sync` leaves only the
-// blanket `()` impl → unambiguous → compiles).
-const _: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<graphrefly_core::Core<graphrefly_core::SingleThreadCell>>();
-
-    trait AmbiguousIfSync<A> {
+    // `Core` must be `!Send` (it holds `!Send` sinks + `Rc`): the
+    // canonical no-dep ambiguity trick — if `Core` impl'd `Send`,
+    // method resolution is ambiguous → compile error; `!Send` leaves
+    // only the blanket `()` impl → unambiguous → compiles.
+    trait AmbiguousIfSend<A> {
         fn probe() {}
     }
-    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
-    impl<T: ?Sized + Sync> AmbiguousIfSync<u16> for T {}
-    let _ = <graphrefly_core::Core<graphrefly_core::SingleThreadCell> as AmbiguousIfSync<_>>::probe;
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u16> for T {}
+    let _ = <graphrefly_core::Core as AmbiguousIfSend<_>>::probe;
 };
 
 const G1: SerializationGroupId = SerializationGroupId::new(1);
@@ -419,16 +411,16 @@ fn grouped_emit_drives_wave_and_touches_group_lock() {
 }
 
 // ---------------------------------------------------------------------
-// Single-threaded floor: Core<SingleThreadCell> is a working substrate
-// with zero lock acquisition (the §7 ~83 ns path).
+// Single-owner floor: the one (non-generic, `RefCell`-backed) `Core` is
+// a working lock-free substrate. D246/S2c: the `SingleThreadCell` /
+// `LockedCell` cell-generic split is deleted — there is one `Core` and
+// `Core::new` IS the single-owner lock-free path.
 // ---------------------------------------------------------------------
 
 #[test]
-fn single_thread_cell_core_is_functional() {
-    use graphrefly_core::SingleThreadCell;
+fn single_owner_core_is_functional() {
     let binding = common::TestBinding::new();
-    let core: Core<SingleThreadCell> =
-        Core::<SingleThreadCell>::new_with_cell(binding.clone() as Arc<dyn BindingBoundary>);
+    let core: Core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
     let init = binding.intern(TestValue::Int(10));
     let s = core.register_state(init, false).unwrap();
     let f = binding.register_fn(|deps: &[TestValue]| match deps.first() {
@@ -438,10 +430,9 @@ fn single_thread_cell_core_is_functional() {
     let d = core
         .register_derived(&[s], f, EqualsMode::Identity, false)
         .unwrap();
-    // The `Sink` type is `Arc<dyn Fn(..) + Send + Sync>` regardless of
-    // the cell, so the collector must be `Send + Sync` even on the
-    // single-threaded floor (`SingleThreadCell` only removes the state
-    // *lock*, not the binding-layer Sink bound).
+    // D248/S2c: the `Sink` type is `Arc<dyn Fn(..)>` (no `Send + Sync`
+    // — single-owner). A plain `Vec` cell would suffice, but a `Mutex`
+    // collector still works and keeps the assertion shape unchanged.
     let seen = Arc::new(std::sync::Mutex::new(Vec::<TestValue>::new()));
     let seen2 = seen.clone();
     let bclone = binding.clone();
@@ -463,7 +454,7 @@ fn single_thread_cell_core_is_functional() {
     assert_eq!(
         *seen.lock().unwrap(),
         vec![TestValue::Int(20), TestValue::Int(42)],
-        "single-threaded lock-free Core<SingleThreadCell> dispatches activation + emit correctly"
+        "single-owner lock-free Core dispatches activation + emit correctly"
     );
     // No node carries a group on the floor path.
     assert_eq!(core.partition_of(d), None);

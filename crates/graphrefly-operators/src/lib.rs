@@ -81,8 +81,8 @@ pub use higher_order::{
 };
 pub use ops_impl::{concat, race, take_until, zip};
 pub use producer::{
-    default_producer_deactivate, ProducerBinding, ProducerBuildFn, ProducerCtx, ProducerNodeState,
-    ProducerStorage, SubscribeOutcome,
+    default_producer_deactivate, MailboxEmitter, ProducerBinding, ProducerBuildFn, ProducerCtx,
+    ProducerEmitter, ProducerNodeState, ProducerStorage, SubscribeOutcome,
 };
 pub use source::{empty, from_iter, never, of, throw_error};
 pub use stratify::stratify_branch;

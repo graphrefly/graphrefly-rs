@@ -64,11 +64,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::handle::{HandleId, NodeId};
 
-/// Owner-side deferred-closure payload of [`MailboxOp::Defer`] (D233):
-/// runs on the owner thread with the object-safe full-`Core` surface.
-/// `Send` keeps the queue `Send` for the cross-thread *post* side; it
-/// is never *run* off-owner.
-pub type DeferFn = Box<dyn FnOnce(&dyn crate::node::CoreFull) + Send>;
+/// **`Send`** cross-thread deferred closure (D233; D249/S2c). Posted
+/// by an autonomous timer task (`temporal.rs` `window_time`/etc., a
+/// `tokio::spawn`ed cross-thread task whose defer closure captures only
+/// `Send` state — `Arc<Mutex<NodeId>>` / `Arc<dyn BindingBoundary>` /
+/// ids) and applied owner-side. Rides the `Send + Sync` [`CoreMailbox`]
+/// (cross-thread post side, drained owner-side via `drain_mailbox`).
+pub type SendDeferFn = Box<dyn FnOnce(&dyn crate::node::CoreFull) + Send>;
+
+/// **`!Send`** owner-side deferred closure (D248/D249/S2c). Posted by
+/// an owner-side in-wave producer/graph sink whose closure captures
+/// `!Send` state (a relaxed `Sink` / `Rc<RefCell<GraphInner>>` —
+/// D248). Lives in the owner-only [`DeferQueue`], **never** the
+/// cross-thread [`CoreMailbox`].
+pub type DeferFn = Box<dyn FnOnce(&dyn crate::node::CoreFull)>;
 
 /// A re-entry request posted to the [`CoreMailbox`] by an autonomous
 /// async producer (timer task → `Emit`) or by a producer-operator sink
@@ -84,17 +93,14 @@ pub enum MailboxOp {
     Complete(NodeId),
     /// `Core::error(node, handle)`. Posted by producer sinks.
     Error(NodeId, HandleId),
-    /// Owner-side closure given the full object-safe Core surface
-    /// ([`crate::node::CoreFull`]) — D233. Applied **in-wave** by the
-    /// drain-to-quiescence loop (the owner holds `&Core`), so producer
-    /// sinks that must perform value-returning topology mutation
-    /// (windowing `create_window_node`, higher-order dynamic-inner
-    /// `subscribe`) run synchronously with full Core access; the
-    /// returned `NodeId`/`SubscriptionId` is consumed inside the closure
-    /// to drive the operator's captured state. `FnOnce` + `Send`
-    /// (crosses no thread — applied on the owner — but `Send` keeps the
-    /// queue `Send` for the cross-thread *post* side).
-    Defer(DeferFn),
+    /// **`Send`** owner-side closure (D233; D249/S2c). Posted by a
+    /// cross-thread timer task (`temporal.rs` `window_time`/etc.) whose
+    /// closure captures only `Send` state; applied **in-wave** by the
+    /// drain loop (the owner holds `&Core`). The `!Send` owner-side
+    /// sink defers (graph describe/observe, control/higher-order
+    /// dynamic-inner) go to the separate owner-only [`DeferQueue`]
+    /// instead — D248/D249.
+    Defer(SendDeferFn),
 }
 
 impl std::fmt::Debug for MailboxOp {
@@ -103,7 +109,7 @@ impl std::fmt::Debug for MailboxOp {
             Self::Emit(n, h) => write!(f, "Emit({n:?}, {h:?})"),
             Self::Complete(n) => write!(f, "Complete({n:?})"),
             Self::Error(n, h) => write!(f, "Error({n:?}, {h:?})"),
-            Self::Defer(_) => write!(f, "Defer(<closure>)"),
+            Self::Defer(_) => write!(f, "Defer(<send closure>)"),
         }
     }
 }
@@ -164,12 +170,13 @@ impl CoreMailbox {
         self.post_op(MailboxOp::Error(node_id, handle))
     }
 
-    /// Post a `Defer` owner-side closure (D233). Returns `false` iff the
-    /// owning `Core` is gone — the caller's closure is dropped unrun
-    /// (any handles it captured are the caller's responsibility, same as
-    /// the `WeakCore`-gone branch the old code had).
+    /// Post a **`Send`** cross-thread `Defer` (D249/S2c). For an
+    /// autonomous timer task whose closure captures only `Send` state
+    /// (`temporal.rs` `window_time`/etc.). Returns `false` iff the
+    /// owning `Core` is gone — the closure is dropped unrun. The
+    /// `!Send` owner-side sink defers use [`DeferQueue::post`] instead.
     #[must_use]
-    pub fn post_defer(&self, f: DeferFn) -> bool {
+    pub fn post_defer(&self, f: SendDeferFn) -> bool {
         self.post_op(MailboxOp::Defer(f))
     }
 
@@ -268,10 +275,10 @@ impl CoreMailbox {
     /// Drain and return every still-queued [`MailboxOp`] without
     /// applying it — for `Drop for Core` teardown (QA F-A / Blind #2).
     /// `Emit`/`Error` ops carry a retained `HandleId` the caller must
-    /// release; `Defer` closures are dropped unrun (running a closure
-    /// that calls [`crate::node::CoreFull`] on a half-dropped `Core`
-    /// would be unsound — user-locked QA decision A, 2026-05-18). Clears
-    /// `runnable` under the lock (same race discipline as `drain_into`).
+    /// release; `Defer` closures are dropped unrun (running `CoreFull`
+    /// on a half-dropped `Core` is unsound — user-locked QA decision A,
+    /// 2026-05-18). Clears `runnable` under the lock (same race
+    /// discipline as `drain_into`).
     #[must_use]
     pub fn take_all(&self) -> VecDeque<MailboxOp> {
         let mut q = self.ops.lock();
@@ -293,9 +300,120 @@ impl Default for CoreMailbox {
 }
 
 // `CoreMailbox` is `Send + Sync` by construction (parking_lot::Mutex +
-// atomics). Asserted so a future field that breaks it fails here, not at
-// the `Arc<CoreMailbox>` share site in `timer.rs`.
+// atomics over the id-only `MailboxOp`). Asserted so a future field
+// that breaks it fails here, not at the `Arc<CoreMailbox>` share site
+// in `timer.rs`. D249/S2c: this MUST hold — the `!Send` owner-side
+// `Defer` payload now lives in [`DeferQueue`], NOT here.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<CoreMailbox>();
 };
+
+/// Owner-only deferred-closure queue (D249/S2c — the minimal Defer
+/// split pulled out of [`CoreMailbox`]).
+///
+/// Under D248 full single-owner the substrate `Sink`/`TopologySink`
+/// dropped `Send + Sync`, so a [`DeferFn`] (which captures relaxed
+/// `Sink`s / `Rc<RefCell<GraphInner>>`) is `!Send`. It cannot ride the
+/// `Send + Sync` [`CoreMailbox`] (that bridges the `timer.rs`
+/// cross-thread `Arc<CoreMailbox>` post side). This queue is therefore
+/// **owner-only and `!Send`**: held behind an `Rc` shared between
+/// [`crate::node::Core`] and `graphrefly-operators`' `ProducerEmitter`
+/// on the one owner thread. Drained owner-side by
+/// [`crate::node::Core::drain_mailbox`] (after the id-mailbox) and the
+/// in-wave `BatchGuard` drain.
+///
+/// S4 still does the per-group-wake + typed snapshot/prune `MailboxOp`
+/// reshape (D246 rule 8) — D249 is the acknowledged minimal first
+/// touch that lets the D248 single-owner Sink relaxation land in S2c.
+pub struct DeferQueue {
+    q: parking_lot::Mutex<VecDeque<DeferFn>>,
+    closed: std::sync::atomic::AtomicBool,
+    /// "Has queued work" bit — mirrors `CoreMailbox::runnable` so the
+    /// in-wave `BatchGuard` drain gate (`is_runnable()`) also fires
+    /// when only a `Defer` (no id-`MailboxOp`) was posted mid-wave
+    /// (the reactive describe/observe `DepsChanged` path, D246 r6).
+    runnable: std::sync::atomic::AtomicBool,
+}
+
+impl DeferQueue {
+    /// A fresh, open, empty owner-side defer queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            q: parking_lot::Mutex::new(VecDeque::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            runnable: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the queue currently holds work (the in-wave drain gate).
+    #[must_use]
+    pub fn is_runnable(&self) -> bool {
+        self.runnable.load(Ordering::Acquire)
+    }
+
+    /// Enqueue an owner-side deferred closure. Returns `false` iff the
+    /// owning `Core` has dropped ([`Self::close`]) — the caller's
+    /// closure is dropped unrun (same contract as the old
+    /// `CoreMailbox::post_defer`). Mirrors `CoreMailbox::post_op`'s
+    /// under-lock `closed` check (TOCTOU-safe vs a concurrent `close`).
+    #[must_use]
+    pub fn post(&self, f: DeferFn) -> bool {
+        let mut q = self.q.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        q.push_back(f);
+        self.runnable.store(true, Ordering::Release);
+        true
+    }
+
+    /// Owner-side drain. Pops every queued closure FIFO and applies it
+    /// (re-entrancy-safe: a closure may re-`post`; a later drain picks
+    /// it up). `max_ops` bounds one drain against a self-re-posting
+    /// livelock (mirrors `CoreMailbox::drain_into`).
+    ///
+    /// # Panics
+    /// Panics if a single drain applies `max_ops` closures — a `Defer`
+    /// closure re-posting itself every application (owner-side
+    /// livelock), the defer-queue analogue of a fn that emits to itself.
+    pub fn drain_into(&self, max_ops: u32, mut apply: impl FnMut(DeferFn)) {
+        let mut applied = 0u32;
+        loop {
+            let f = {
+                let mut q = self.q.lock();
+                let Some(f) = q.pop_front() else {
+                    // Clear `runnable` under the lock (same race
+                    // discipline as `CoreMailbox::drain_into` QA F-#4).
+                    self.runnable.store(false, Ordering::Release);
+                    return;
+                };
+                f
+            };
+            applied += 1;
+            assert!(
+                applied < max_ops,
+                "defer-queue drain exceeded {max_ops} closures in one \
+                 drain — a Defer closure is re-posting itself every \
+                 application (owner-side livelock)."
+            );
+            apply(f);
+        }
+    }
+
+    /// Mark the owning `Core` gone. Idempotent; mutually exclusive with
+    /// [`Self::post`] (shared `q` lock). Queued closures are dropped
+    /// unrun on `Core` drop (running `CoreFull` on a half-dropped
+    /// `Core` is unsound — user-locked QA decision A, 2026-05-18).
+    pub fn close(&self) {
+        let _q = self.q.lock();
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl Default for DeferQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}

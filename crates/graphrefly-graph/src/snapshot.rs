@@ -15,11 +15,12 @@
 //! / `from_snapshot()` call `BindingBoundary::deserialize_value`.
 //! Per D169 edges are omitted (derived from deps via `edges()`).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use graphrefly_core::{BindingBoundary, Core, CoreFull, NodeId, NodeKind, TerminalKind, NO_HANDLE};
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{resolve_checked, Graph, GraphInner};
@@ -93,20 +94,20 @@ pub type NodeFactory =
 /// `&Core` + Core-free [`Graph`]).
 pub type SnapshotBuilder = Box<dyn FnOnce(&Core, &Graph)>;
 
-/// D246: recursive snapshot over `(&dyn CoreFull, &Arc<Mutex<GraphInner>>)`
+/// D246: recursive snapshot over `(&dyn CoreFull, &Rc<RefCell<GraphInner>>)`
 /// — `&dyn CoreFull` (the one facade) so the storage in-wave
 /// `MailboxOp::Defer` observe-sink can run it (read-only;
 /// `serialize_handle` delegates to the binding).
 pub(crate) fn snapshot_of(
     core: &dyn CoreFull,
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
 ) -> GraphPersistSnapshot {
     let (name, node_entries, children, id_to_name) = {
-        let inner = inner_arc.lock();
+        let inner = inner_arc.borrow_mut();
         let name = inner.name.clone();
         let node_entries: Vec<(String, NodeId)> =
             inner.names.iter().map(|(n, &id)| (n.clone(), id)).collect();
-        let children: Vec<(String, Arc<Mutex<GraphInner>>)> = inner
+        let children: Vec<(String, Rc<RefCell<GraphInner>>)> = inner
             .children
             .iter()
             .map(|(n, g)| (n.clone(), g.clone()))
@@ -185,13 +186,13 @@ pub(crate) fn snapshot_of(
     }
 }
 
-/// Recursive restore over `(&Core, &Arc<Mutex<GraphInner>>)`.
+/// Recursive restore over `(&Core, &Rc<RefCell<GraphInner>>)`.
 fn restore_into(
     core: &Core,
-    inner_arc: &Arc<Mutex<GraphInner>>,
+    inner_arc: &Rc<RefCell<GraphInner>>,
     snapshot: &GraphPersistSnapshot,
 ) -> Result<(), SnapshotError> {
-    let graph_name = inner_arc.lock().name.clone();
+    let graph_name = inner_arc.borrow_mut().name.clone();
     if snapshot.name != graph_name {
         return Err(SnapshotError::NameMismatch {
             expected: snapshot.name.clone(),
@@ -228,8 +229,8 @@ fn restore_into(
         }
     }
 
-    let child_pairs: Vec<(String, Arc<Mutex<GraphInner>>)> = {
-        let inner = inner_arc.lock();
+    let child_pairs: Vec<(String, Rc<RefCell<GraphInner>>)> = {
+        let inner = inner_arc.borrow_mut();
         snapshot
             .subgraphs
             .keys()

@@ -240,53 +240,12 @@ fn handshake_tier_split_cached_state_two_calls() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "D246/D248/D249 record-and-skip: β-valid rewrite needed (still-live invariant; NOT a deleted model). The scaffold posts the late-subscribe Defer from a plain `derived` *fn*-fire capturing a `Sink`. Under D248 `Sink` is `!Send`, so the Defer closure is `!Send` ⇒ it must use the owner-only `DeferQueue`, not the `Send` `CoreMailbox::post_defer`. But a plain fn is stored in the `Send+Sync` `BindingBoundary` (FFI trait, unchanged by D248), so it cannot capture the `!Send` `Rc<DeferQueue>`. The β-valid owner-side re-entrant-subscribe vehicle is a **producer node** (gets `&dyn CoreFull`/emitter at fire, per D246 r6) — the test must be rebuilt producer-based. Invariant (late subscriber to an already-cached node gets the cached handshake exactly once, no double-receive) stays live & is partially covered by other subscribe tests. Systematic producer-rewrite of fn-posts-owner-side-!Send-Defer scaffolds: porting-deferred § D246 record-and-skip."]
 fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_data() {
-    // A fn-fire posts a Defer that subscribes a NEW sink to a node
-    // that already has queued/cached DATA. The β-valid re-entrant
-    // subscribe (owner-side, via CoreFull) must deliver the
-    // handshake-cached DATA exactly once to the late sink — never
-    // double-receive already-queued wave messages
-    // (sink-snapshot-on-first-touch).
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(5)));
-    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
-    let _rec_d = rt.subscribe_recorder(d);
-    assert_eq!(rt.cache_value(d), Some(TestValue::Int(5)));
-
-    // A trigger node whose fn posts a Defer that late-subscribes a
-    // recorder to `d` (which is already cached at 5).
-    let late = common::Recorder::new();
-    let late_sink = late.sink(rt.binding.clone());
-    let mailbox = rt.mailbox();
-    let d_id = d;
-    let trig_src = rt.state(Some(TestValue::Int(0)));
-    let trig = rt.derived(&[trig_src.id], move |_deps| {
-        let sink = late_sink.clone();
-        assert!(
-            mailbox.post_defer(Box::new(move |cf| {
-                cf.subscribe(d_id, sink);
-            })),
-            "Core alive"
-        );
-        Some(TestValue::Int(1))
-    });
-    let _rec_trig = rt.subscribe_recorder(trig);
-
-    rt.drain_mailbox();
-
-    // The late subscriber received the cached handshake EXACTLY once:
-    // `[Start, Data(5)]` — no duplicate Dirty/Data from already-queued
-    // wave messages.
-    assert_eq!(
-        late.snapshot(),
-        vec![RecordedEvent::Start, RecordedEvent::Data(TestValue::Int(5))],
-        "late subscriber gets the cached handshake exactly once, no double-receive"
-    );
-    assert_eq!(
-        late.count(|e| matches!(e, RecordedEvent::Data(_))),
-        1,
-        "exactly one DATA delivered to the late sink"
-    );
+    // β-rewrite-needed stub — see #[ignore]. The owner-side re-entrant
+    // late-subscribe must be driven by a producer node (CoreFull at
+    // fire), not a plain `derived` fn capturing a `!Send` Sink into a
+    // Defer. → producer-based β rewrite (record-and-skip).
 }
 
 // ---------------------------------------------------------------------------

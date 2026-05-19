@@ -31,8 +31,7 @@
 use std::sync::Arc;
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, SingleThreadCell,
-    Sink,
+    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink,
 };
 
 /// Minimal binding — shape-matched to `floor_compare.rs::BenchBinding`
@@ -67,8 +66,10 @@ fn main() {
         .unwrap_or(60_000_000);
 
     let binding: Arc<dyn BindingBoundary> = Arc::new(ProfBinding);
-    // The real shipped §7 floor path — NOT the minimal_handle_core mirror.
-    let core = Core::<SingleThreadCell>::new_with_cell(binding);
+    // D246/S2c: the `SingleThreadCell`/`LockedCell` cell-generic split
+    // is deleted — there is one (single-owner, `RefCell`-backed)
+    // `Core`, and `Core::new` IS the lock-free floor path.
+    let core = Core::new(binding);
     let s = core.register_state(HandleId::new(1), false).unwrap();
     // Owner-invoked teardown (D246 r3 — core RAII Subscription
     // deleted): keep the sub alive for the whole run, unsubscribe at
@@ -85,7 +86,7 @@ fn main() {
     // Printed AFTER the loop so it doesn't pollute the sampled region;
     // also a sanity check that the profiled path matches floor_compare.
     eprintln!(
-        "profile_st_emit: {emits} emits in {dt:?} = {:.1} ns/emit (real Core<SingleThreadCell> dedup)",
+        "profile_st_emit: {emits} emits in {dt:?} = {:.1} ns/emit (real single-owner Core dedup)",
         dt.as_nanos() as f64 / emits as f64
     );
     core.unsubscribe(s, sub);

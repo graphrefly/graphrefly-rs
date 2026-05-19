@@ -624,7 +624,12 @@ pub fn attach_snapshot_storage(
     // with D243/D244 "deferred snapshot acceptable" (storage
     // persistence is a downstream observation).
     let graph_for_sink = graph.clone();
-    let mailbox = core.mailbox();
+    // D249/S2c: the defer closure captures a `Graph`
+    // (`Rc<RefCell<GraphInner>>`, `!Send` post-D248), so it must use
+    // the owner-only `!Send` `DeferQueue`, not the `Send` `CoreMailbox`
+    // Defer. Owner-thread-only `Rc` — fine: `observe_all_reactive`'s
+    // sink is `!Send` and fires owner-side.
+    let deferred = core.defer_queue();
 
     // Wire observe_all_reactive so late-added nodes are also covered.
     let mut observe = graph.observe_all_reactive();
@@ -651,7 +656,7 @@ pub fn attach_snapshot_storage(
         // Defer the snapshot + flush owner-side (D244). Core-gone
         // (`false`) ⇒ dropped unrun: nothing to persist on a
         // torn-down graph, no handles captured (no leak).
-        let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
+        let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
             // Take a snapshot once, shared across all sync tiers.
             // D246: the in-wave facade `&dyn CoreFull` drives the
             // snapshot through the one public `Graph` type (Core-free,

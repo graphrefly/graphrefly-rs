@@ -72,46 +72,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use parking_lot::{ArcReentrantMutexGuard, Mutex};
+use parking_lot::Mutex;
 
-/// Held guard from `parking_lot::ReentrantMutex::lock_arc()` on a
-/// **serialization group's** wave-lock (§7; D208–D211, 2026-05-16 —
-/// replaces the deleted union-find per-partition `wave_owner`).
-///
-/// `!Send` per `parking_lot::ReentrantMutex`'s thread-affinity contract
-/// (the inner guard is `!Send`; the wrapper inherits) — the type-level
-/// `!Send` flows into [`crate::batch::BatchGuard::wave_guards`] so any
-/// attempt to send the batch guard across threads fails to compile.
-///
-/// Deadlock-freedom no longer needs a thread-local ascending-order
-/// check: groups are user-declared and static, and the wave engine
-/// acquires the entire touched-group set sorted by
-/// [`crate::handle::SerializationGroupId`] **upfront** at wave entry
-/// (`begin_batch` / `begin_batch_for`). Same-thread re-entry into an
-/// already-held group passes through `parking_lot::ReentrantMutex`
-/// transparently. There is therefore no per-guard bookkeeping — the
-/// only thing that matters is the inner guard's `Drop` releasing the
-/// mutex at wave end. (Deleted: `held_partitions` thread-local,
-/// `PartitionOrderViolation`, the retry-validate loop.)
-pub(crate) struct WaveOwnerGuard {
-    /// `#[allow(dead_code)]`: the inner guard is held purely to keep the
-    /// group's `parking_lot::ReentrantMutex` acquired for the wave's
-    /// duration; it is never read — only its `Drop` (mutex release at
-    /// wave end) matters. No custom `Drop` on the wrapper: there is no
-    /// thread-local bookkeeping to unwind (groups are static + acquired
-    /// sorted upfront), so plain field-drop is correct and sufficient.
-    #[allow(dead_code)]
-    inner: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
-}
-
-impl WaveOwnerGuard {
-    /// Wrap an acquired group wave-lock guard.
-    pub(crate) fn new(
-        inner: ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
-    ) -> Self {
-        Self { inner }
-    }
-}
+// D246/S2c: `WaveOwnerGuard` (the §7 per-group `parking_lot::ReentrantMutex`
+// wave-lock wrapper) is deleted — single-owner ⇒ no cross-thread wave
+// serialization.
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -518,11 +483,7 @@ pub struct SubscriptionId(u64);
 /// Core from the deactivate hook is permitted since the lock is
 /// released first.
 #[allow(clippy::too_many_lines)] // Phase G is one continuous lifecycle hook chain (user cleanup → producer_deactivate → wipe_ctx → Core cache-clear); splitting it would obscure the ordering invariant.
-pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
-    state: &C,
-    node_id: NodeId,
-    sub_id: SubscriptionId,
-) {
+pub(crate) fn unsubscribe_sink(core: &Core, node_id: NodeId, sub_id: SubscriptionId) {
     // Slice E2 (D056): when the last subscriber drops, fire the
     // node's OnDeactivation cleanup hook BEFORE producer_deactivate
     // (cleanup may release handles the producer subscription owns;
@@ -553,8 +514,7 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
         // OUTSIDE any wave ⇒ ambient `None`; a grouped node's
         // record is in shard `g`, so without this the unsubscribe
         // would no-op on `DEFAULT_SHARD` → lost cleanup / leak).
-        let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, node_id));
-        let mut s = St::new(&*state);
+        let mut s = St::new(core);
         let Some(rec) = s.nodes.get_mut(&node_id) else {
             return;
         };
@@ -595,7 +555,7 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
                 // cascade) is safe — behaviour-identical to the retired
                 // `Subscription::Drop` cascade.
                 let unsub = |up_node: NodeId, up_sub: SubscriptionId| {
-                    unsubscribe_sink(state, up_node, up_sub);
+                    unsubscribe_sink(core, up_node, up_sub);
                 };
                 binding.producer_deactivate(node_id, &unsub);
             }
@@ -692,8 +652,7 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
                 // runs outside any wave; grouped node's record is
                 // in shard `g` — without this the scratch/refcount
                 // cleanup would no-op on `DEFAULT_SHARD`).
-                let _skg = ShardKeyGuard::set(shard_key_for_node(&*state, node_id));
-                let mut s = St::new(&*state);
+                let mut s = St::new(core);
                 if let Some(rec) = s.nodes.get_mut(&node_id) {
                     // F1 re-entrance check.
                     if !rec.subscribers.is_empty() {
@@ -787,7 +746,7 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
                         // Uses the binding-explicit static variant
                         // because we have only `&dyn BindingBoundary`
                         // here (Subscription::Drop holds no Core).
-                        let new_scratch = Core::<C>::make_op_scratch_with_binding(&*binding, op)
+                        let new_scratch = Core::make_op_scratch_with_binding(&*binding, op)
                                 .expect("invariant: stored OperatorOp passed make_op_scratch validation at registration time");
                         let old = std::mem::replace(&mut rec.op_scratch, new_scratch);
                         if let Some(old_box) = old {
@@ -835,7 +794,12 @@ pub(crate) fn unsubscribe_sink<C: crate::state_cell::StateCell>(
 /// A subscriber callback. `Send + Sync` so the Core can fire it from any
 /// thread; `Fn` (not `FnMut`) so multiple references coexist — capture
 /// mutable state in `Mutex<T>` or atomics on the binding side.
-pub type Sink = Arc<dyn Fn(&[Message]) + Send + Sync>;
+// D246/S2c/D248: single-owner ⇒ sinks fire owner-side on the one
+// thread that drives the `Core`; the `Send + Sync` bound was
+// shared-Core-era legacy. Dropped — `Core` (which owns the subscriber
+// map) is consequently `!Send + !Sync`, the actor-model shape (the only
+// cross-thread bridge is `Arc<CoreMailbox>` for id-only timer posts).
+pub type Sink = Arc<dyn Fn(&[Message])>;
 
 // ---------------------------------------------------------------------------
 // PAUSE/RESUME state — §10.2 of the rust-port session doc
@@ -1597,35 +1561,15 @@ pub struct CoreShared {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
-    /// **Node → shard routing index (Slice B-2 Step 2b-ii, D220-EXEC).**
-    /// `Some(g)` entries only — a node absent here is `ShardKey::None`
-    /// (`DEFAULT_SHARD`). Single source of truth for which shard a
-    /// node's `CoreState` record lives in, so `group_of(n)` /
-    /// `partition_of(n)` is a pure-`CoreShared` lookup with **no shard
-    /// lock** — resolving the chicken-egg (a grouped node's record is
-    /// NOT in `DEFAULT_SHARD`, so you can't read its group from a
-    /// `lock_state()` that defaulted to `DEFAULT_SHARD`). Maintained by
-    /// register-with-group + `set_serialization_group`'s cross-shard
-    /// component migration; mirrors each shard's
-    /// `NodeRecord::serialization_group`. Empty for an all-`None`
-    /// graph ⇒ behaviour-identical floor.
+    /// **Node → declared serialization-group index.** `Some(g)`
+    /// entries only — a node absent here is ungrouped. The authority
+    /// for `group_of(n)` / `partition_of(n)`. Maintained by
+    /// register-with-group + [`Core::set_serialization_group`]. Empty
+    /// for an all-`None` graph. D246/S2c: single-owner ⇒ no placement
+    /// shard (the old `node_shard` index is deleted; one shard always).
+    /// S3 renames the concept to `SchedulingGroupId`; S4 wires the
+    /// per-group `Send` wake.
     pub(crate) node_group: HashMap<NodeId, crate::handle::SerializationGroupId>,
-    /// **Node → PLACEMENT shard index (Slice B-2 Step 2b-ii, D220-EXEC).**
-    /// Distinct from `node_group`: the §7 invariant is "all-`None` OR
-    /// all-`Some`", NOT "all-same-group" — a dep-connected component
-    /// MAY span distinct `Some` groups (e.g. `s:G1 ← d:G2`). So a
-    /// node's *declared group* (`node_group` → `partition_of` + the
-    /// wave-lock set) is decoupled from the *shard its record lives
-    /// in*: the shard is **component-uniform** (a node joins its
-    /// deps' shard) so a single wave never crosses shards (the
-    /// ambient-single-shard model stays sound). `Some(g)` only;
-    /// absent ⇒ `DEFAULT_SHARD`. For the parallelism path
-    /// (`set_serialization_group` homogenises a whole component to one
-    /// group) shard == group ⇒ disjoint groups = disjoint shards =
-    /// parallel. Only register-with-distinct-`Some`-deps creates a
-    /// multi-group component → all its records share ONE shard
-    /// (correct, not internally parallel — a rare non-perf case).
-    pub(crate) node_shard: HashMap<NodeId, crate::handle::SerializationGroupId>,
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -1830,46 +1774,38 @@ pub struct CoreState {
 /// increment per `Core::new`; negligible cost.
 static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-pub struct Core<C: crate::state_cell::StateCell = crate::state_cell::LockedCell> {
-    /// The state cell, owned **by value** (D223/S2b). No longer `Arc<C>`
-    /// — under the actor model the `Core` is moved between workers, not
-    /// shared; there is no `Clone` and no `Weak<C>` back-ref. `C: Send`
-    /// (not `Sync`): the owned cell crosses worker boundaries by `move`,
-    /// the borrow checker is the lock (D221).
-    pub(crate) state: C,
+pub struct Core {
+    /// Core-global region (id counters, topology-sink registry,
+    /// `currently_firing`, the two caps, `node_group`, the
+    /// scratch-release queue). D246/S2c: single-owner ⇒ a plain
+    /// `RefCell` (the `parking_lot`/`StateCell`-generic split was
+    /// shared-Core-era legacy; the actor model drives a `Core` from
+    /// exactly one thread). `RefCell<T>: Send where T: Send` ⇒ `Core`
+    /// stays `Send` (relocatable as a whole) but is `!Sync`, exactly
+    /// the actor-model shape (D221/D223). A re-entrant double-borrow
+    /// panics loudly — a dispatcher bug (a missing lock-released
+    /// bracket around a binding callback), not a user error.
+    pub(crate) shared: std::cell::RefCell<CoreShared>,
+    /// The node/children/binding region (was the sharded `CoreState`;
+    /// single shard always under single-owner — D246/S2c collapse).
+    pub(crate) state: std::cell::RefCell<CoreState>,
     /// `Send + Sync` bridge for autonomous async producers (timer tasks)
-    /// that can no longer hold `&Core`/`Weak<C>` (D223/D227/D230). Timer
-    /// tasks post `(node, handle)`; [`Self::drain_mailbox`] applies them
+    /// that can no longer hold `&Core` (D223/D227/D230). Timer tasks
+    /// post `(node, handle)`; [`Self::drain_mailbox`] applies them
     /// owner-side via the sync `emit`. Owns the per-group `runnable` wake
     /// bit (S4 wires it; M6 reads it from the host executor).
     pub(crate) mailbox: Arc<crate::mailbox::CoreMailbox>,
+    /// Owner-only deferred-closure queue (D249/S2c). Holds the `!Send`
+    /// `Defer` closures split off `CoreMailbox` (which stays
+    /// `Send + Sync` for the timer bridge). `Rc` (not `Arc`): shared
+    /// with `graphrefly-operators`' `ProducerEmitter` on the **one**
+    /// owner thread; never crosses threads. Drained owner-side by
+    /// [`Self::drain_mailbox`] + the in-wave `BatchGuard` drain.
+    pub(crate) deferred: std::rc::Rc<crate::mailbox::DeferQueue>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
-    /// §7 serialization-group wave-lock registry (D208–D211, 2026-05-16).
-    /// Replaces the deleted D3 union-find `SubgraphRegistry`. Maps each
-    /// touched [`crate::handle::SerializationGroupId`] to its
-    /// `Arc<ReentrantMutex<()>>`; the wave engine acquires the
-    /// touched-group set sorted upfront. **Empty for an all-`None`
-    /// graph** — the single-threaded floor never locks it.
-    pub(crate) group_locks: Arc<parking_lot::Mutex<crate::groups::GroupLockRegistry>>,
-    /// Core-global wave serialization lock (QA F1, 2026-05-16). Acquired
-    /// **only** on the `LockedCell` substrate (`C::SERIALIZE_WAVES`) and
-    /// **only** when a wave's transitively-touched `SerializationGroupId`
-    /// set is empty (an all-`None` cascade). Restores the pre-rewrite
-    /// "every wave serializes per Core" cross-thread safety floor that the
-    /// deleted union-find per-partition `wave_owner` used to provide —
-    /// without it, two threads driving an unannotated `Core<LockedCell>`
-    /// would interleave waves with no protection for the per-thread
-    /// `WAVE_STATE` / `TIER3_EMITTED_THIS_WAVE` / `IN_TICK_OWNED`
-    /// invariants. `ReentrantMutex` so same-thread re-entrant waves pass
-    /// through (mirrors the group-lock contract). On `SingleThreadCell`
-    /// the `C::SERIALIZE_WAVES` branch dead-code-eliminates → the §7
-    /// ~83 ns floor is untouched.
-    pub(crate) global_wave: Arc<parking_lot::ReentrantMutex<()>>,
     /// Unique generation ID for this Core instance. Assigned from
     /// [`CORE_GENERATION`] at construction. Keys the per-(Core, thread)
-    /// `crate::batch::IN_TICK_OWNED` re-entrance slot (kept — re-entrance
-    /// transparency survives the §7 rewrite; only the union-find
-    /// `PARTITION_CACHE` consumer was deleted).
+    /// `crate::batch::IN_TICK_OWNED` re-entrance slot.
     pub(crate) generation: u64,
 }
 
@@ -1884,7 +1820,7 @@ pub struct Core<C: crate::state_cell::StateCell = crate::state_cell::LockedCell>
 // (D227/D230). Identity (`same_dispatcher`) is the unique per-`Core`
 // `generation` counter, not `Arc::ptr_eq`.
 
-impl<C: crate::state_cell::StateCell> Drop for Core<C> {
+impl Drop for Core {
     fn drop(&mut self) {
         // Tell any in-flight timer tasks the Core is gone so they release
         // their pending handle and bail instead of leaking it into a
@@ -1893,13 +1829,17 @@ impl<C: crate::state_cell::StateCell> Drop for Core<C> {
         // `close()` is mutually exclusive with `post_op` (shared `ops`
         // lock), so after it returns no new op can enqueue.
         self.mailbox.close();
+        // D249/S2c: close the owner-side defer queue too — its queued
+        // closures are dropped unrun (running `CoreFull` on a
+        // half-dropped `Core` is unsound — user-locked QA decision A).
+        // No handle-release contract: `DeferFn`s capture no bare
+        // retained `HandleId` (D235 P8 pattern).
+        self.deferred.close();
         // QA F-A / Blind #2 (2026-05-18): an op posted just before
         // `close()` won the lock is now stranded in the queue with its
         // retained `HandleId`. Drain the remainder and release those
         // handles — without this `Drop` regresses the exact
         // BenchCore-teardown leak the deleted `WeakCore` path prevented.
-        // `Defer` closures are dropped unrun (running `CoreFull` on a
-        // half-dropped `Core` is unsound — user-locked QA decision A).
         for op in self.mailbox.take_all() {
             match op {
                 crate::mailbox::MailboxOp::Emit(_, h) | crate::mailbox::MailboxOp::Error(_, h) => {
@@ -1914,7 +1854,7 @@ impl<C: crate::state_cell::StateCell> Drop for Core<C> {
 /// Object-safe full-`Core` re-entry surface (S2b / D233) — the methods a
 /// producer sink's owner-side [`crate::mailbox::MailboxOp::Defer`]
 /// closure needs, by `NodeId`/`HandleId`/`Sink`/id only (no `C`/`T`),
-/// blanket-impl'd for every `Core<C>`. Lets windowing /
+/// blanket-impl'd for every `Core`. Lets windowing /
 /// higher-order-operator sinks perform value-returning topology mutation
 /// (`register_*`/`subscribe`) **in-wave** without naming the cell type:
 /// the `BatchGuard` drain-to-quiescence loop calls
@@ -1977,6 +1917,12 @@ pub trait CoreFull {
     /// type — folds D245's per-binding "how do I reach the mailbox".
     fn mailbox(&self) -> Arc<crate::mailbox::CoreMailbox>;
 
+    /// The owner-side [`crate::mailbox::DeferQueue`] (D249/S2c — the
+    /// `!Send` `Defer` split off `CoreMailbox`). Lets a holder of
+    /// `&dyn CoreFull` post owner-side deferred closures (`ProducerCtx`
+    /// build path) without naming the cell type.
+    fn defer_queue(&self) -> std::rc::Rc<crate::mailbox::DeferQueue>;
+
     // --- producer-build accessors (D246 r5 / D245) ---
     //
     // The producer-build path runs owner-side with this one facade
@@ -1999,7 +1945,7 @@ pub trait CoreFull {
     fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId);
 }
 
-impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
+impl CoreFull for Core {
     #[inline]
     fn register_state(&self, initial: HandleId, partial: bool) -> Result<NodeId, RegisterError> {
         Core::register_state(self, initial, partial)
@@ -2073,15 +2019,16 @@ impl<C: crate::state_cell::StateCell> CoreFull for Core<C> {
         Core::mailbox(self)
     }
     #[inline]
+    fn defer_queue(&self) -> std::rc::Rc<crate::mailbox::DeferQueue> {
+        Core::defer_queue(self)
+    }
+    #[inline]
     fn binding(&self) -> Arc<dyn crate::boundary::BindingBoundary> {
         Core::binding(self)
     }
-    // The public `Core::{emit,complete,error}_or_defer` carry a
-    // `where C: Send` bound (the actor-model relocation invariant,
-    // D221/D223). The blanket `CoreFull` impl is unconstrained over
-    // every `C: StateCell`, so we inline the (behaviour-identical)
-    // body over the unconstrained `try_*` + `push_deferred_producer_op`
-    // primitives rather than delegate to the `Send`-bounded wrappers.
+    // Inlined over the `try_*` + `push_deferred_producer_op`
+    // primitives (behaviour-identical to the public
+    // `Core::{emit,complete,error}_or_defer` wrappers).
     #[inline]
     fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
         if self.try_emit(node_id, new_handle).is_err() {
@@ -2171,123 +2118,32 @@ impl Drop for ScratchReleaseGuard<'_> {
     }
 }
 
-impl Core<crate::state_cell::LockedCell> {
-    /// Construct a fresh Core on the default cross-thread-capable
-    /// [`LockedCell`](crate::state_cell::LockedCell) cell.
-    ///
-    /// This is the inherent constructor on the *defaulted* `Core` type, so
-    /// existing call sites (`Core::new(binding)`) resolve unambiguously
-    /// without a turbofish — the generic [`Core::new_with_cell`] would be
-    /// ambiguous over `C` at a bare `Core::new` call. The single-threaded
-    /// floor path uses `Core::<SingleThreadCell>::new_with_cell(binding)`.
-    #[must_use]
-    pub fn new(binding: Arc<dyn BindingBoundary>) -> Self {
-        Self::new_with_cell(binding)
-    }
+/// Combined RAII guard returned by [`Core::lock_state`]. Holds the
+/// [`CoreState`] borrow + the [`CoreShared`] borrow **together**.
+/// `DerefMut`s to [`CoreState`] (so `s.nodes` / `s.children` /
+/// `s.binding` work) **and** exposes an inherent `shared` field (so
+/// `s.shared.<f>` works — inherent-field access is resolved before
+/// `Deref`). D246/S2c: single-owner ⇒ the two regions are plain
+/// `RefCell`s on [`Core`] (the `parking_lot`/`StateCell`-generic
+/// sharded split was shared-Core-era legacy). A re-entrant
+/// double-borrow panics loudly — a dispatcher bug (a missing
+/// lock-released bracket around a binding callback), not a user error.
+pub(crate) struct St<'a> {
+    state: std::cell::RefMut<'a, CoreState>,
+    pub(crate) shared: std::cell::RefMut<'a, CoreShared>,
 }
 
-/// Combined RAII guard returned by [`Core::lock_state`] (Slice B-2
-/// Step 2a, D220-EXEC). Holds the `DEFAULT_SHARD` [`CoreState`] guard +
-/// the [`CoreShared`] guard **together** (shard OUTER, shared INNER —
-/// the deadlock-free acquisition order). `DerefMut`s to [`CoreState`]
-/// (so `s.nodes` / `s.children` / `s.binding` port verbatim) **and**
-/// exposes an inherent `shared` field (so `s.shared.<f>` ports verbatim
-/// — inherent-field access is resolved before `Deref`). This is the
-/// zero-churn carrier that lets the ~104 existing
-/// `let mut s = self.lock_state(); …` sites stay unchanged while
-/// `CoreShared` is hoisted to its own lock. Step 2a holds ONE shard
-/// (`None`); Step 2b routes the wave hot path by `group_of(node)`.
-///
-/// Field declaration order is `shard` then `shared`: Rust drops fields
-/// in declaration order, so the shared guard is released LAST — harmless
-/// for `parking_lot` (release order doesn't matter) but keeps the RAII
-/// shape symmetric with the OUTER/INNER acquire order.
-pub(crate) struct St<'a, C: crate::state_cell::StateCell> {
-    shard: <C as crate::state_cell::StateCell>::ShardGuard<'a>,
-    pub(crate) shared: <C as crate::state_cell::StateCell>::SharedGuard<'a>,
-}
-
-thread_local! {
-    /// **Ambient wave shard key (Slice B-2 Step 2b-ii, D220-EXEC).**
-    /// `St::new`/`lock_state` lock THIS shard (default `None` =
-    /// `DEFAULT_SHARD`). `begin_batch`/`begin_batch_for` set it for
-    /// the wave's duration from the seed's group (RAII-restored on
-    /// `BatchGuard` drop); single-node entry points that touch a
-    /// grouped node set it from the node's `node_group` index entry.
-    ///
-    /// **Soundness:** the §7 component-homogeneity invariant (enforced
-    /// at register / set_deps / set_serialization_group: a
-    /// dep-connected component is uniformly all-`None` or all-one-group)
-    /// guarantees one wave touches exactly ONE group ⇒ one shard key
-    /// for every `lock_state()` in that wave. Per-thread because waves
-    /// are per-thread; nested same-thread re-entry saves/restores via
-    /// [`ShardKeyGuard`]. Empty index / all-`None` ⇒ always `None` ⇒
-    /// behaviour-identical floor.
-    static CURRENT_SHARD_KEY: std::cell::Cell<crate::state_cell::ShardKey> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Read the calling thread's ambient wave shard key.
-#[inline]
-pub(crate) fn current_shard_key() -> crate::state_cell::ShardKey {
-    CURRENT_SHARD_KEY.with(std::cell::Cell::get)
-}
-
-/// Resolve `node`'s shard key from the `CoreShared.node_group` index
-/// given only the cell (Step 2b-ii-B). Used by the `Weak<C>`-upgrade
-/// drop paths (`Subscription::Drop`), which hold `&C` + a `node_id`
-/// but run OUTSIDE any wave (ambient `None`): a grouped node's record
-/// is in shard `g`, so they MUST set the ambient from this before
-/// `St::new` or the unsubscribe/teardown would no-op on `DEFAULT_SHARD`
-/// (lost cleanup / refcount leak). Pure shared lock, no shard lock.
-#[inline]
-pub(crate) fn shard_key_for_node<C: crate::state_cell::StateCell>(
-    cell: &C,
-    node: NodeId,
-) -> crate::state_cell::ShardKey {
-    cell.lock_shared().node_shard.get(&node).copied()
-}
-
-/// RAII: set the ambient wave shard key, restore the previous on drop
-/// (supports nested same-thread re-entry — the inner wave restores the
-/// outer's key). Held in [`crate::batch::BatchGuard`] for the wave.
-#[must_use = "the guard restores the previous shard key on drop"]
-pub(crate) struct ShardKeyGuard(crate::state_cell::ShardKey);
-
-impl ShardKeyGuard {
+impl<'a> St<'a> {
+    /// Borrow both Core regions together. Used by [`Core::lock_state`]
+    /// and the owner-side drop paths (which hold `&Core`).
     #[inline]
-    pub(crate) fn set(key: crate::state_cell::ShardKey) -> Self {
-        let prev = CURRENT_SHARD_KEY.with(|c| c.replace(key));
-        Self(prev)
-    }
-}
-
-impl Drop for ShardKeyGuard {
-    #[inline]
-    fn drop(&mut self) {
-        CURRENT_SHARD_KEY.with(|c| c.set(self.0));
-    }
-}
-
-impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
-    /// Acquire the combined guard from a cell: `DEFAULT_SHARD`
-    /// (`key=None`, Step 2a's only shard) OUTER, then `CoreShared`
-    /// INNER. Used by [`Core::lock_state`] and the `Weak<C>`-upgrade
-    /// drop paths (which hold `&C`, not `&Core`).
-    #[inline]
-    pub(crate) fn new(cell: &'a C) -> Self {
-        // Step 2b-ii: route to the calling thread's ambient wave shard
-        // (set by `begin_batch*` from the seed's group, or by a
-        // single-node entry point from the node's `node_group` index).
-        // `None` (default / all-`None` / outside a wave) = DEFAULT_SHARD
-        // ⇒ behaviour-identical floor. Shard OUTER, shared INNER.
-        let shard = cell.lock_shard(current_shard_key());
-        let shared = cell.lock_shared();
-        Self { shard, shared }
+    pub(crate) fn new(core: &'a Core) -> Self {
+        let state = core.state.borrow_mut();
+        let shared = core.shared.borrow_mut();
+        Self { state, shared }
     }
 
-    /// Allocate a fresh [`NodeId`] (was `impl CoreState`; moved here in
-    /// Step 2a because the counter now lives in the separate
+    /// Allocate a fresh [`NodeId`] (the counter lives in the separate
     /// `CoreShared` region — `St` is the only place holding both).
     pub(crate) fn alloc_node_id(&mut self) -> NodeId {
         let id = NodeId::new(self.shared.next_node_id);
@@ -2295,12 +2151,11 @@ impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
         id
     }
 
-    /// Allocate a fresh [`SubscriptionId`] (moved from `impl CoreState`
-    /// — same rationale as [`Self::alloc_node_id`]).
+    /// Allocate a fresh [`SubscriptionId`].
     ///
     /// **Invariant (QA F4, 2026-05-18): monotonic, never recycled for
     /// the `Core`'s lifetime.** A strictly-incrementing counter, never
-    /// decremented or reset. This is what makes the S2b owner-driven
+    /// decremented or reset. This is what makes the owner-driven
     /// `unsubscribe` model sound: a `(NodeId, SubscriptionId)` pair
     /// recorded by `producer_deactivate` / `SubGuard` and unsubscribed
     /// later (after the slot may have been removed by a re-entrant
@@ -2314,151 +2169,112 @@ impl<'a, C: crate::state_cell::StateCell> St<'a, C> {
     }
 }
 
-impl<C: crate::state_cell::StateCell> std::ops::Deref for St<'_, C> {
+impl std::ops::Deref for St<'_> {
     type Target = CoreState;
     #[inline]
     fn deref(&self) -> &CoreState {
-        // `self.shard` is the GAT `ShardGuard: DerefMut<Target=CoreState>`;
-        &*self.shard
+        &self.state
     }
 }
 
-impl<C: crate::state_cell::StateCell> std::ops::DerefMut for St<'_, C> {
+impl std::ops::DerefMut for St<'_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut CoreState {
-        &mut *self.shard
+        &mut self.state
     }
 }
 
-impl<C: crate::state_cell::StateCell> Core<C> {
-    /// Construct a fresh Core wired to the given binding on cell `C`. Pause
-    /// buffer cap defaults to unbounded; set via
-    /// [`Self::set_pause_buffer_cap`].
+impl Core {
+    /// Construct a fresh Core wired to the given binding. Pause buffer
+    /// cap defaults to unbounded; set via [`Self::set_pause_buffer_cap`].
     #[must_use]
-    pub fn new_with_cell(binding: Arc<dyn BindingBoundary>) -> Self {
+    pub fn new(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
-            // S2b (D223): owned by value — no `Arc<C>`, no `Clone`.
-            state: C::from_parts(
-                // Core-global region (Slice B-2 Step 2a, D220-EXEC): its
-                // own lock, hoisted out of any shard's `CoreState`.
-                CoreShared {
-                    next_node_id: 1,
-                    next_subscription_id: 1,
-                    // A4 (Slice F, 2026-05-07): start `next_lock_id` in the
-                    // high half of the u32 range so `alloc_lock_id` can't
-                    // collide with user-supplied `LockId::new(N)`
-                    // constructors (which the napi-rs binding marshals from
-                    // `u32` and tests typically use in the low range,
-                    // 1..1024). Phase E /qa F1 (2026-05-08): lowered from
-                    // `1u64 << 32` to `1u64 << 31` so the value round-trips
-                    // through `u32::try_from(...)` at the napi boundary —
-                    // the previous seed errored every napi `alloc_lock_id`
-                    // call. Anti-collision intent (high range vs low user
-                    // range) preserved at half the prior ceiling (2^31 ≈ 2
-                    // billion allocations per Core, ample for parity
-                    // tests). Lift the floor when the deferred
-                    // BigInt-narrowing migration extends `LockId` to `u64`
-                    // at the FFI layer (porting-deferred "BigInt migration
-                    // for u32-narrowed napi types" entry).
-                    next_lock_id: 1u64 << 31,
-                    // `currently_firing` stays Core-global (cross-shard /
-                    // cross-thread visible) for the P13 set_deps check
-                    // (/qa F2).
-                    currently_firing: Vec::new(),
-                    pause_buffer_cap: None,
-                    max_batch_drain_iterations: 10_000,
-                    topology_sinks: HashMap::new(),
-                    next_topology_id: 1,
-                    node_group: HashMap::new(),
-                    node_shard: HashMap::new(),
-                    pending_scratch_release: Vec::new(),
-                    binding: binding.clone(),
-                },
-                // Default shard (Step 2a: the ONLY shard). `nodes` /
-                // `children` are per-shard; `binding` cloned per shard
-                // for `Drop for CoreState`'s node-retain release walk.
-                CoreState {
-                    nodes: HashMap::new(),
-                    children: HashMap::new(),
-                    binding: binding.clone(),
-                },
-            ),
+            // D246/S2c: single-owner ⇒ plain `RefCell` regions (no
+            // `StateCell` generic, no shard map). `Core` is `Send`
+            // (RefCell<T>: Send where T: Send) but `!Sync` — the
+            // actor-model shape (D221/D223).
+            shared: std::cell::RefCell::new(CoreShared {
+                next_node_id: 1,
+                next_subscription_id: 1,
+                // A4 (Slice F, 2026-05-07): start `next_lock_id` in the
+                // high half of the u32 range so `alloc_lock_id` can't
+                // collide with user-supplied `LockId::new(N)`
+                // constructors (which the napi-rs binding marshals from
+                // `u32` and tests typically use in the low range,
+                // 1..1024). Phase E /qa F1 (2026-05-08): lowered from
+                // `1u64 << 32` to `1u64 << 31` so the value round-trips
+                // through `u32::try_from(...)` at the napi boundary —
+                // the previous seed errored every napi `alloc_lock_id`
+                // call. Anti-collision intent (high range vs low user
+                // range) preserved at half the prior ceiling (2^31 ≈ 2
+                // billion allocations per Core, ample for parity
+                // tests). Lift the floor when the deferred
+                // BigInt-narrowing migration extends `LockId` to `u64`
+                // at the FFI layer (porting-deferred "BigInt migration
+                // for u32-narrowed napi types" entry).
+                next_lock_id: 1u64 << 31,
+                // `currently_firing` is the P13 set_deps reentrancy
+                // check stack (/qa F2). Single-owner ⇒ one thread,
+                // but kept here (Core-global) as the canonical
+                // location.
+                currently_firing: Vec::new(),
+                pause_buffer_cap: None,
+                max_batch_drain_iterations: 10_000,
+                topology_sinks: HashMap::new(),
+                next_topology_id: 1,
+                // Declared serialization-group identity (S3 renames
+                // this to `SchedulingGroupId`; S4 wires per-group
+                // wake). S2c keeps the identity; the cross-thread
+                // wave-lock registry + placement-shard map are gone.
+                node_group: HashMap::new(),
+                pending_scratch_release: Vec::new(),
+                binding: binding.clone(),
+            }),
+            state: std::cell::RefCell::new(CoreState {
+                nodes: HashMap::new(),
+                children: HashMap::new(),
+                binding: binding.clone(),
+            }),
             mailbox: Arc::new(crate::mailbox::CoreMailbox::new()),
+            deferred: std::rc::Rc::new(crate::mailbox::DeferQueue::new()),
             binding,
-            group_locks: Arc::new(parking_lot::Mutex::new(
-                crate::groups::GroupLockRegistry::new(),
-            )),
-            global_wave: Arc::new(parking_lot::ReentrantMutex::new(())),
             generation: CORE_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    /// Acquire the state lock.
+    /// Acquire the **combined** state guard: [`CoreState`] +
+    /// [`CoreShared`] borrowed together. Returns [`St`] — `DerefMut`s
+    /// to `CoreState` and exposes a `.shared` field, so
+    /// `let mut s = self.lock_state(); … s.nodes … s.shared.x …` works.
     ///
-    /// Post-Slice-E: `Core::subscribe` fires the per-tier handshake
-    /// LOCK-RELEASED with `wave_owner` held; sink callbacks may freely
-    /// re-enter Core (`emit` / `complete` / `error` / nested `subscribe`).
-    /// Same-thread re-entry passes through `wave_owner`'s `ReentrantMutex`
-    /// transparently; cross-thread emits block on `wave_owner` until the
-    /// outer subscribe completes, preserving R1.3.5.a happens-after
-    /// ordering. The previous `IN_HANDSHAKE_FIRE` panic-diagnostic is no
-    /// longer needed.
-    /// Acquire the **combined** state guard (Step 2a, D220-EXEC):
-    /// `DEFAULT_SHARD` [`CoreState`] + [`CoreShared`], held together
-    /// (shard OUTER, shared INNER). Returns [`St`] — `DerefMut`s to
-    /// `CoreState` and exposes a `.shared` field, so the ~104 existing
-    /// `let mut s = self.lock_state(); … s.nodes … s.shared.x …` sites
-    /// are unchanged. Behaviour-identical for the all-`None` suite (one
-    /// shard). Step 2b splits the hot path onto pure
-    /// [`Self::with_shard`] for true parallelism.
-    ///
-    /// Post-Slice-E: handshake fires LOCK-RELEASED; same-thread re-entry
-    /// passes through transparently; cross-thread emits block on
-    /// `wave_owner`.
-    pub(crate) fn lock_state(&self) -> St<'_, C> {
-        St::new(&self.state)
+    /// D246/S2c: single-owner ⇒ plain `RefCell` borrows (no lock).
+    /// Binding callbacks fire LOCK-RELEASED (the guard is dropped
+    /// before `invoke_fn`), so a re-entrant `lock_state()` while a
+    /// guard is held is a dispatcher bug — it panics loudly via
+    /// `RefCell`'s double-borrow check, the same observable contract
+    /// the prior `parking_lot` re-entrant-deadlock path had.
+    pub(crate) fn lock_state(&self) -> St<'_> {
+        St::new(self)
     }
 
-    /// Run `f` with mutable access to the Core-global [`CoreShared`]
-    /// region ONLY (id counters, topology-sink registry,
-    /// `currently_firing`, the two caps, the scratch-release queue).
-    /// Pure-shared ops (id alloc outside a held shard, topology) take
-    /// only this. When a section needs both regions, use
-    /// [`Self::lock_state`] (which encodes the OUTER/INNER order) or
-    /// nest `with_shared` inside a `with_shard` closure — never the
-    /// reverse (D220-EXEC deadlock-free order).
+    /// Run `f` with mutable access to the [`CoreShared`] region ONLY
+    /// (id counters, topology-sink registry, `currently_firing`, the
+    /// two caps, `node_group`, the scratch-release queue). Pure-shared
+    /// ops (id alloc, topology) take only this borrow.
     pub(crate) fn with_shared<R>(&self, f: impl FnOnce(&mut CoreShared) -> R) -> R {
-        f(&mut self.state.lock_shared())
+        f(&mut self.shared.borrow_mut())
     }
 
-    /// Slice B-1/B-2 (D218=B4 / D219) — the **shard-access seam**.
-    /// Every wave-scoped shard access flows through here so Step 2b's
-    /// per-`ShardKey` routing (and the M6 B3 owner-thread overlay) is a
-    /// re-impl of one method, not a re-architecture of ~104 sites.
-    ///
-    /// `key`: the node's `serialization_group`. `None` =
-    /// `DEFAULT_SHARD` (the all-`None` ≈515 ns floor shard).
-    ///
-    /// **Step 2a: single shard, behaviour-identical.** `key` is
-    /// ignored (one shard). Step 2b routes by `key` to a per-`ShardKey`
-    /// `Arc<Mutex<CoreState>>` so disjoint groups hold disjoint mutexes
-    /// (true parallelism — the property `group_scaling.rs` found
-    /// missing). The closure shape (`FnOnce(&mut CoreState) -> R`) is
-    /// the B3-overlay form (M6 sends it to the shard's owner thread,
-    /// returns `R` over a channel — no caller change).
-    ///
-    /// `#[allow(dead_code)]`: Step 2a routes shard access through the
-    /// combined `lock_state()`/`St` guard (single shard); this pure
-    /// shard-only seam is wired by the Step 2b hot-path migration
-    /// (`group_of(node)` routing). Transient one-stage allow, justified
-    /// inline per the Rust-port invariant (mirrors B-1's `with_shard`).
+    /// Run `f` with mutable access to the [`CoreState`] region ONLY
+    /// (`nodes` / `children` / `binding`). The state-access seam —
+    /// kept as a single method so a future M6 owner-thread overlay is
+    /// a re-impl of one method, not a re-architecture of the ~104 call
+    /// sites. D246/S2c: single shard always (single-owner), plain
+    /// `RefCell` borrow.
     #[allow(dead_code)]
-    pub(crate) fn with_shard<R>(
-        &self,
-        key: crate::state_cell::ShardKey,
-        f: impl FnOnce(&mut crate::node::CoreState) -> R,
-    ) -> R {
-        f(&mut self.state.lock_shard(key))
+    pub(crate) fn with_shard<R>(&self, f: impl FnOnce(&mut crate::node::CoreState) -> R) -> R {
+        f(&mut self.state.borrow_mut())
     }
 
     /// Whether `self` and `other` are the same dispatcher instance.
@@ -2471,10 +2287,10 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// longer any way to produce two handles to one `Core` (no `Clone`),
     /// so this is `true` only for genuine self-vs-self comparison.
     ///
-    /// Used by `graphrefly-graph`'s `mount` to enforce the "shared-Core
-    /// only" v1 invariant — cross-Core mount is post-M6.
+    /// Used by `graphrefly-graph`'s `mount` to enforce the single-Core
+    /// v1 invariant — cross-Core mount is post-M6.
     #[must_use]
-    pub fn same_dispatcher(&self, other: &Core<C>) -> bool {
+    pub fn same_dispatcher(&self, other: &Core) -> bool {
         self.generation == other.generation
     }
 
@@ -2499,16 +2315,71 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // QA P3: bound the inner drain by the configured cap (the
         // self-reposting-Defer livelock guard lives here, NOT in
         // `drain_and_flush`'s fire-cascade counter).
+        let deferred = std::rc::Rc::clone(&self.deferred);
+        // QA P3: bound the inner drain by the configured cap (the
+        // self-reposting-Defer livelock guard lives here, NOT in
+        // `drain_and_flush`'s fire-cascade counter).
         let max_ops = self.with_shared(|sh| sh.max_batch_drain_iterations);
-        mailbox.drain_into(max_ops, |op| match op {
-            crate::mailbox::MailboxOp::Emit(node_id, handle) => self.emit(node_id, handle),
-            crate::mailbox::MailboxOp::Complete(node_id) => self.complete(node_id),
-            crate::mailbox::MailboxOp::Error(node_id, handle) => self.error(node_id, handle),
-            // D233: owner-side closure with the full object-safe Core
-            // surface — applied in-wave (we hold `&Core`); the sink's
-            // topology mutation + result consumption runs here.
-            crate::mailbox::MailboxOp::Defer(f) => f(self),
-        });
+        // D249/S2c: the owner-side `Defer` queue was split off the
+        // `Send` id-`CoreMailbox` (so `!Send` `Defer` closures can
+        // capture relaxed `Sink`s / `Rc<RefCell<GraphInner>>`). They
+        // are now two physical queues, but a closure in either can
+        // re-post to the OTHER (the canonical case: a `DeferQueue`
+        // inner-subscribe → push-on-subscribe → an `Emit` on the
+        // id-`CoreMailbox`). Pre-D249 this was ONE FIFO drained to
+        // quiescence; restore that contract by draining BOTH to
+        // **mutual quiescence** — id-mailbox first, then deferred, loop
+        // until neither is runnable. Within each queue intra-FIFO order
+        // is preserved (D234 cancel-before-resubscribe holds — both are
+        // `DeferQueue` posts). Bounded by `max_ops` rounds.
+        let mut rounds = 0u32;
+        loop {
+            mailbox.drain_into(max_ops, |op| match op {
+                crate::mailbox::MailboxOp::Emit(node_id, handle) => self.emit(node_id, handle),
+                crate::mailbox::MailboxOp::Complete(node_id) => self.complete(node_id),
+                crate::mailbox::MailboxOp::Error(node_id, handle) => self.error(node_id, handle),
+                // D233/D249: `Send` cross-thread timer defer applied
+                // in-wave (we hold `&Core`).
+                crate::mailbox::MailboxOp::Defer(f) => f(self),
+            });
+            // Each closure runs with the full object-safe Core surface
+            // (we hold `&Core`); its topology mutation + result
+            // consumption runs here.
+            deferred.drain_into(max_ops, |f| f(self));
+            if !mailbox.is_runnable() && !deferred.is_runnable() {
+                break;
+            }
+            rounds += 1;
+            assert!(
+                rounds < max_ops,
+                "drain_mailbox: id-mailbox / defer-queue mutual re-post \
+                 livelock (> {max_ops} rounds) — a Defer/Emit pair is \
+                 re-posting across the two queues every round. Tune via \
+                 Core::set_max_batch_drain_iterations only with concrete \
+                 evidence the workload needs more."
+            );
+        }
+    }
+
+    /// Owner-side enqueue of a deferred closure (D233/D249). Runs at
+    /// the next [`Self::drain_mailbox`] / in-wave `BatchGuard` drain
+    /// with the object-safe full-`Core` surface. Returns `false` iff
+    /// the owning `Core` is gone (closure dropped unrun). The
+    /// owner-only `Rc<DeferQueue>` (also reachable via
+    /// [`Self::defer_queue`] for capture into `!Send`
+    /// `Sink`/`TopologySink` closures that cannot hold `&Core`).
+    pub fn post_defer(&self, f: crate::mailbox::DeferFn) -> bool {
+        self.deferred.post(f)
+    }
+
+    /// Shared handle to this `Core`'s owner-side defer queue (D249).
+    /// `graphrefly-operators`' `ProducerEmitter` + reactive
+    /// describe/observe topo sinks hold this `Rc` to enqueue `Defer`
+    /// work from inside a `!Send` sink closure (which carries no
+    /// `&Core`). Owner-thread-only; never sent across threads.
+    #[must_use]
+    pub fn defer_queue(&self) -> std::rc::Rc<crate::mailbox::DeferQueue> {
+        std::rc::Rc::clone(&self.deferred)
     }
 
     /// Shared handle to this `Core`'s [`crate::mailbox::CoreMailbox`].
@@ -2532,62 +2403,36 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         Arc::clone(&self.binding)
     }
 
-    /// Number of distinct serialization groups touched so far (§7 group
-    /// registry). Inspection / acceptance-bar only. An all-`None` graph
-    /// reports `0` (the single-threaded floor never touches the
-    /// registry).
+    /// Number of distinct serialization groups currently declared.
+    /// Inspection / acceptance-bar only. An all-`None` graph reports
+    /// `0`. D246/S2c: single-owner ⇒ no wave-lock registry; the
+    /// `node_group` index is the authority (S3 renames the concept to
+    /// `SchedulingGroupId`; S4 wires per-group wake).
     #[must_use]
     pub fn partition_count(&self) -> usize {
-        self.group_locks.lock().group_count()
+        self.with_shared(|sh| {
+            let mut seen: HashSet<crate::handle::SerializationGroupId> = HashSet::default();
+            seen.extend(sh.node_group.values().copied());
+            seen.len()
+        })
     }
 
-    /// Resolve `node`'s serialization group (§7). Two nodes with the
-    /// same [`crate::handle::SerializationGroupId`] serialize through
-    /// one wave-lock; `None` nodes run on the single-threaded
-    /// lock-free path. Returns `None` for unregistered nodes **and**
-    /// for registered nodes with no group assigned (the two are
-    /// distinguished via [`Self::kind_of`] if needed).
+    /// Resolve `node`'s declared serialization group. Returns `None`
+    /// for unregistered nodes **and** for registered nodes with no
+    /// group assigned (the two are distinguished via [`Self::kind_of`]
+    /// if needed). Pure `node_group` index lookup.
     #[must_use]
     pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
-        // Step 2b-ii-B: the `CoreShared.node_group` index is the
-        // authority (a grouped node's record is in shard `g`, NOT
-        // `DEFAULT_SHARD`, so the old `lock_state().nodes.get` —
-        // which defaults to `DEFAULT_SHARD` — would no longer find
-        // it). Pure-`with_shared` lookup, no shard lock. Unregistered
-        // & registered-ungrouped both → absent → `None` (unchanged
-        // observable contract).
         self.group_of(node)
     }
 
-    /// The shard a node's `CoreState` record lives in — a pure
-    /// [`CoreShared`] index lookup (NO shard lock). This is the
-    /// chicken-egg break (Step 2b-ii, D220-EXEC): a grouped node's
-    /// record is in shard `g`, NOT `DEFAULT_SHARD`, so its group
-    /// cannot be read from a `lock_state()` that defaulted to
-    /// `DEFAULT_SHARD`. The `node_group` index (maintained by
-    /// register-with-group + `set_serialization_group`) is the
-    /// authority; a node absent from it is `ShardKey::None`
-    /// (ungrouped/unregistered — both report `None`, matching the
-    /// pre-2b `nodes.get(&n).and_then(serialization_group)` contract:
-    /// unregistered → not in index → `None`; registered ungrouped →
-    /// not in index → `None`; registered grouped → index → `Some(g)`).
+    /// `node`'s declared group — the `CoreShared.node_group` index is
+    /// the authority (maintained by register-with-group +
+    /// `set_serialization_group`). Unregistered & registered-ungrouped
+    /// both → absent → `None`.
     #[must_use]
-    pub(crate) fn group_of(&self, node: NodeId) -> crate::state_cell::ShardKey {
+    pub(crate) fn group_of(&self, node: NodeId) -> Option<crate::handle::SerializationGroupId> {
         self.with_shared(|sh| sh.node_group.get(&node).copied())
-    }
-
-    /// The **placement shard** a node's `CoreState` record lives in
-    /// (Step 2b-ii-B) — distinct from [`Self::group_of`] (the declared
-    /// group, for `partition_of` + the wave-lock set). Component-
-    /// uniform: a node joins its deps' shard, so a wave never crosses
-    /// shards (the ambient-single-shard model stays sound even for a
-    /// multi-group component). Drives ALL `lock_state`/`St` routing
-    /// (the `ShardKeyGuard::set` sites + `begin_batch_for` ambient +
-    /// the `Weak`-drop paths). Pure `with_shared` index lookup, no
-    /// shard lock. Single-group component ⇒ `shard_of == group_of`.
-    #[must_use]
-    pub(crate) fn shard_of(&self, node: NodeId) -> crate::state_cell::ShardKey {
-        self.with_shared(|sh| sh.node_shard.get(&node).copied())
     }
 
     /// Execute a producer-pattern op. §7: the union-find ascending-order
@@ -2634,124 +2479,14 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     #[inline]
     pub(crate) fn drain_deferred_producer_ops(&self) {}
 
-    /// §7 wave-acquisition: the set of group wave-locks transitively
-    /// touched from `seed`, ascending by [`crate::handle::SerializationGroupId`]
-    /// (deadlock-free acquisition order — replaces the union-find
-    /// ascending-`SubgraphId` discipline). Walks `s.children`
-    /// (downstream cascade) + `meta_companions` (R1.3.9.d TEARDOWN
-    /// cascade) from `seed`, collecting each visited node's
-    /// `serialization_group`.
-    ///
-    /// **All-`None` fast path:** if no reachable node carries a group,
-    /// returns empty and the caller acquires nothing — the §7
-    /// single-threaded floor. Groups are user-declared + static, so
-    /// there is no registry epoch / retry-validate: a single
-    /// `group_locks` lock resolves every touched group's `Arc`.
-    pub(crate) fn compute_touched_groups(
-        &self,
-        seed: NodeId,
-    ) -> SmallVec<
-        [(
-            crate::handle::SerializationGroupId,
-            Arc<parking_lot::ReentrantMutex<()>>,
-        ); 4],
-    > {
-        let s = self.lock_state();
-        let mut groups: SmallVec<[crate::handle::SerializationGroupId; 4]> = SmallVec::new();
-        let mut visited: HashSet<NodeId> = HashSet::default();
-        let mut stack: SmallVec<[NodeId; 16]> = SmallVec::new();
-        stack.push(seed);
-        while let Some(n) = stack.pop() {
-            if !visited.insert(n) {
-                continue;
-            }
-            if let Some(rec) = s.nodes.get(&n) {
-                if let Some(g) = rec.serialization_group {
-                    if !groups.contains(&g) {
-                        groups.push(g);
-                    }
-                }
-                stack.extend(rec.meta_companions.iter().copied());
-            }
-            if let Some(children) = s.children.get(&n) {
-                stack.extend(children.iter().copied());
-            }
-        }
-        drop(s);
-        if groups.is_empty() {
-            return SmallVec::new();
-        }
-        groups.sort_unstable_by_key(|g| g.raw());
-        let mut reg = self.group_locks.lock();
-        groups.into_iter().map(|g| (g, reg.lock_arc(g))).collect()
-    }
-
-    /// Every known group's wave-lock, ascending by id. Backs
-    /// closure-form [`Core::begin_batch`] (no seed → serialize against
-    /// every group). Empty for an all-`None` graph.
-    pub(crate) fn all_groups_sorted(
-        &self,
-    ) -> Vec<(
-        crate::handle::SerializationGroupId,
-        Arc<parking_lot::ReentrantMutex<()>>,
-    )> {
-        self.group_locks.lock().all_sorted()
-    }
-
-    /// Acquire — in ascending [`crate::handle::SerializationGroupId`]
-    /// order — every group wave-lock transitively touched from `seed`.
-    /// Held for the wave's duration (returned guards live in
-    /// [`crate::batch::BatchGuard::wave_guards`]). **Empty** for an
-    /// all-`None` cascade — the §7 single-threaded floor acquires
-    /// nothing. Same-thread re-entry into a held group passes through
-    /// the `ReentrantMutex` transparently; deadlock-free because the
-    /// set is acquired sorted upfront and groups never migrate.
-    pub(crate) fn acquire_touched_group_guards(
-        &self,
-        seed: NodeId,
-    ) -> SmallVec<[WaveOwnerGuard; 4]> {
-        let guards: SmallVec<[WaveOwnerGuard; 4]> = self
-            .compute_touched_groups(seed)
-            .into_iter()
-            .map(|(_g, m)| WaveOwnerGuard::new(m.lock_arc()))
-            .collect();
-        self.with_global_wave_fallback(guards)
-    }
-
-    /// Acquire every known group's wave-lock, ascending. Backs
-    /// closure-form [`Core::begin_batch`] (no seed → serialize against
-    /// every group). Empty for an all-`None` graph.
-    pub(crate) fn acquire_all_group_guards(&self) -> SmallVec<[WaveOwnerGuard; 4]> {
-        let guards: SmallVec<[WaveOwnerGuard; 4]> = self
-            .all_groups_sorted()
-            .into_iter()
-            .map(|(_g, m)| WaveOwnerGuard::new(m.lock_arc()))
-            .collect();
-        self.with_global_wave_fallback(guards)
-    }
-
-    /// QA F1: when no `SerializationGroupId` is touched (an all-`None`
-    /// cascade) **and** the substrate serializes waves
-    /// ([`crate::state_cell::StateCell::SERIALIZE_WAVES`] — `true` only
-    /// for `LockedCell`), acquire the Core-global wave `ReentrantMutex`
-    /// so two threads driving an unannotated `Core<LockedCell>` cannot
-    /// interleave waves (which would corrupt the per-thread `WAVE_STATE`
-    /// / `TIER3_EMITTED_THIS_WAVE` / `IN_TICK_OWNED` invariants — the
-    /// pre-rewrite union-find `wave_owner` provided this and its deletion
-    /// removed it). On `SingleThreadCell` the const branch
-    /// dead-code-eliminates → the §7 ~83 ns floor takes zero locks. When
-    /// groups *are* touched, their disjoint locks already serialize the
-    /// wave (parallelism preserved), so the global lock is skipped.
-    #[inline]
-    fn with_global_wave_fallback(
-        &self,
-        mut guards: SmallVec<[WaveOwnerGuard; 4]>,
-    ) -> SmallVec<[WaveOwnerGuard; 4]> {
-        if C::SERIALIZE_WAVES && guards.is_empty() {
-            guards.push(WaveOwnerGuard::new(self.global_wave.lock_arc()));
-        }
-        guards
-    }
+    // D246/S2c: the §7 cross-thread wave-lock acquisition
+    // (`compute_touched_groups` / `all_groups_sorted` /
+    // `acquire_touched_group_guards` / `acquire_all_group_guards` /
+    // `with_global_wave_fallback`) is **deleted** — single-owner ⇒ a
+    // `Core` is driven by exactly one thread, so there are no
+    // interleaving waves to serialize. The declared-group identity
+    // (`node_group` / `partition_of`) survives for S3
+    // (`SchedulingGroupId` rename) + S4 (per-group `Send` wake).
 }
 
 /// Walk the undirected dep-edge graph from `start`, optionally
@@ -2889,7 +2624,7 @@ pub(crate) fn component_is_group_consistent(s: &CoreState, node: NodeId) -> bool
     true
 }
 
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// Internal inspection helper: number of `PendingBatch`es queued
     /// for `node` in the current wave. Used by Slice X4 D2 regression
     /// tests to pin the "common case = single batch, no SmallVec
@@ -2996,7 +2731,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node_id: NodeId,
         mode: PausableMode,
     ) -> Result<(), SetPausableModeError> {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s
             .nodes
@@ -3068,7 +2802,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     pub fn up(&self, node_id: NodeId, message: Message) -> Result<(), UpError> {
         // 2b-ii-B (D220-EXEC): route to the node's shard before the
         // pre-wave/cold `lock_state()` (see `try_emit`).
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         // QA A10 (2026-05-07): check unknown node BEFORE tier rejection
         // for consistent error UX — `up(unknown, Data)` and
         // `up(unknown, Pause)` both report `UnknownNode` rather than
@@ -3251,23 +2984,15 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // its own shard, so the post-insert same-shard walk can't see
         // it — it'd misreport `UnknownDep`; the index is the
         // cross-shard authority for the *declared group*). (2)
-        // Placement shard is **component-uniform**: a node joins its
-        // deps' shard (so a wave never crosses shards), keyed by
-        // `shard_of`, NOT its own declared group. No deps ⇒ its own
-        // group's shard. (Merging two *distinct grouped multi-node
-        // components* via shared deps would need a union-find-style
-        // shard migration — out of the tested surface; the §7-B
-        // cross-shard residual, D220-EXEC-deferred.)
+        // §7 group-consistency: a dep-connected component is uniformly
+        // all-`None` or all-grouped. D246/S2c: single-owner ⇒ no
+        // placement shard (one shard always); only the declared
+        // `node_group` identity is maintained (S3/S4).
         for &dep in &deps {
             if serialization_group.is_none() != self.group_of(dep).is_none() {
                 return Err(RegisterError::GroupInconsistent);
             }
         }
-        let placement: crate::state_cell::ShardKey = match deps.first() {
-            Some(&d0) => self.shard_of(d0),
-            None => serialization_group,
-        };
-        let _shard_key_guard = crate::node::ShardKeyGuard::set(placement);
 
         // Phase 3 — state-lock-required validation, FOLDED with insertion
         // under a single `lock_state()` acquisition per /qa F1. The
@@ -3360,17 +3085,11 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         for &dep in &deps {
             s.children.entry(dep).or_default().insert(id);
         }
-        // Step 2b-ii-B: maintain BOTH `CoreShared` indices —
-        // `node_group` = declared group (drives `partition_of` + the
-        // wave-lock set), `node_shard` = component-uniform PLACEMENT
-        // (drives all `lock_state`/`St` routing). Single-group
-        // component ⇒ both == `g` ⇒ disjoint groups = disjoint shards
-        // = parallel. Absent ⇒ `None` ⇒ `DEFAULT_SHARD`.
+        // Maintain the declared-group index (`partition_of` authority;
+        // S3 `SchedulingGroupId` rename / S4 per-group wake). Absent ⇒
+        // `None` (ungrouped).
         if let Some(g) = serialization_group {
             s.shared.node_group.insert(id, g);
-        }
-        if let Some(p) = placement {
-            s.shared.node_shard.insert(id, p);
         }
         // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
         // membership BEFORE dropping the state lock. Closes the
@@ -3398,14 +3117,11 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // it. Topology-mutation time only — never the hot path.
         if !component_is_group_consistent(&s, id) {
             // Roll back the partial insert before returning — incl.
-            // BOTH 2b-ii-B indices (else a stale `node_group`/
-            // `node_shard` entry mis-routes a future re-used… NodeIds
-            // are monotonic so no reuse, but leaving the entries would
-            // still leak + wrongly report `partition_of`).
+            // the `node_group` index (else a stale entry would leak +
+            // wrongly report `partition_of`).
             s.nodes.remove(&id);
             s.children.remove(&id);
             s.shared.node_group.remove(&id);
-            s.shared.node_shard.remove(&id);
             for &dep in &deps {
                 if let Some(c) = s.children.get_mut(&dep) {
                     c.remove(&id);
@@ -3731,7 +3447,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// `producer_deactivate` per D229, tests) pair the `node_id` they
     /// subscribed with the returned `sub_id`.
     pub fn unsubscribe(&self, node_id: NodeId, sub_id: SubscriptionId) {
-        unsubscribe_sink(&self.state, node_id, sub_id);
+        unsubscribe_sink(self, node_id, sub_id);
     }
 
     /// Fallible subscribe. Returns `Err` on:
@@ -3783,18 +3499,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // the single-threaded floor. Same-thread re-entry passes through
         // each group's `ReentrantMutex`. Infallible: groups are static +
         // acquired sorted upfront, so there is no order violation.
-        // Step 2b-ii-B (D220-EXEC): `try_subscribe` drives its own
-        // subscribe wave WITHOUT going through `begin_batch_for`, so it
-        // must set the ambient shard key itself (a grouped node's
-        // record is in shard `g`, not `DEFAULT_SHARD` — without this
-        // the `lock_state()` below + the step-4 activation would
-        // operate on the wrong shard and the sink would never see the
-        // node). Held for the whole `try_subscribe` scope; the nested
-        // step-4 `run_wave_for(node_id)` re-derives the same key
-        // (`group_of(node_id)`) so the nested set is a no-op restore.
-        // `None`/all-`None` ⇒ `DEFAULT_SHARD` ⇒ behaviour-identical.
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
-        let wave_guards = self.acquire_touched_group_guards(node_id);
+        // D246/S2c: single-owner ⇒ no wave-owner / shard guard to
+        // acquire for the subscribe wave (the §7 machinery is deleted).
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
@@ -3819,7 +3525,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             };
             if should_reject {
                 drop(s);
-                drop(wave_guards);
                 return Err(SubscribeError::TornDown { node: node_id });
             }
 
@@ -3995,10 +3700,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
             });
         }
 
-        // §7: drop the group wave-locks before the (now-immediate)
-        // producer-op execution below. Symmetry with the old
-        // drop-before-drain ordering; harmless if empty.
-        drop(wave_guards);
+        // D246/S2c: no group wave-locks to drop (single-owner).
 
         // Drain deferred producer ops now that no partitions are held
         // on this thread. The drain is a loop because each deferred op
@@ -4023,7 +3725,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// existing sinks).
     pub fn set_resubscribable(&self, node_id: NodeId, resubscribable: bool) {
         // 2b-ii-B (D220-EXEC): route to the node's shard (see `try_emit`).
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s.require_node_mut(node_id);
         assert!(
@@ -4043,7 +3744,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// dep_records to sentinel, the pause lockset (any held locks are
     /// released — replay buffer drops silently because there are no
     /// subscribers to flush to).
-    fn reset_for_fresh_lifecycle(&self, s: &mut St<'_, C>, node_id: NodeId) {
+    fn reset_for_fresh_lifecycle(&self, s: &mut St<'_>, node_id: NodeId) {
         // Phase 1: collect wave-state handle releases + take the old
         // op_scratch + reset other state. Take all mutations under one
         // borrow so the post-borrow phases don't re-walk dep_records.
@@ -4315,7 +4016,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // `unknown node`. Held for the whole fn; the nested
         // `try_run_wave_for(node_id)` re-derives the same key
         // (no-op restore). `None`/all-`None` ⇒ behaviour-identical.
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         assert!(
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
@@ -4367,13 +4067,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Emit or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks. Retains `handle` on defer;
     /// the drain releases it after firing (or on discard).
-    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId)
-    where
-        // S2b (D221/D223): the owned cell relocates between workers by
-        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
-        // no cross-thread sharing of `&Core`.
-        C: Send,
-    {
+    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
         if self.try_emit(node_id, new_handle).is_err() {
             self.binding.retain_handle(new_handle);
             self.push_deferred_producer_op(DeferredProducerOp::Emit {
@@ -4386,7 +4080,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Read a node's current cache. Returns [`NO_HANDLE`] if sentinel.
     #[must_use]
     pub fn cache_of(&self, node_id: NodeId) -> HandleId {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().require_node(node_id).cache
     }
 
@@ -4394,7 +4087,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// a non-sentinel value (state).
     #[must_use]
     pub fn has_fired_once(&self, node_id: NodeId) -> bool {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().require_node(node_id).has_fired_once
     }
 
@@ -4431,7 +4123,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// **derived** from the field shape per D030 — see [`NodeKind`].
     #[must_use]
     pub fn kind_of(&self, node_id: NodeId) -> Option<NodeKind> {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state().nodes.get(&node_id).map(NodeRecord::kind)
     }
 
@@ -4439,7 +4130,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// unknown nodes or for state nodes (which have no deps).
     #[must_use]
     pub fn deps_of(&self, node_id: NodeId) -> Vec<NodeId> {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .nodes
             .get(&node_id)
@@ -4503,7 +4193,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // COMPLETE / ERROR — terminal lifecycle + auto-cascade gating
 // -----------------------------------------------------------------------
 
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// Emit `[COMPLETE]` (R1.3.4) on `node_id`, marking it terminal. After
     /// this call:
     ///
@@ -4524,7 +4214,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown.
     pub fn complete(&self, node_id: NodeId) {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_complete(node_id) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4538,13 +4227,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 
     /// Complete or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks.
-    pub fn complete_or_defer(&self, node_id: NodeId)
-    where
-        // S2b (D221/D223): the owned cell relocates between workers by
-        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
-        // no cross-thread sharing of `&Core`.
-        C: Send,
-    {
+    pub fn complete_or_defer(&self, node_id: NodeId) {
         match self.try_complete(node_id) {
             Ok(()) => {}
             Err(_) => {
@@ -4563,7 +4246,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown or `error_handle == NO_HANDLE`.
     pub fn error(&self, node_id: NodeId, error_handle: HandleId) {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_error(node_id, error_handle) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4594,13 +4276,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Error or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks. Retains `handle` on defer;
     /// the drain releases it after firing (or on discard).
-    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId)
-    where
-        // S2b (D221/D223): the owned cell relocates between workers by
-        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
-        // no cross-thread sharing of `&Core`.
-        C: Send,
-    {
+    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
         if self.try_error(node_id, error_handle).is_err() {
             self.binding.retain_handle(error_handle);
             self.push_deferred_producer_op(DeferredProducerOp::Error {
@@ -4635,7 +4311,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Iterative implementation (Slice A-bigger, M1-close): a work-queue
     /// drives the cascade so deep linear chains don't overflow the OS
     /// thread stack. Mirrors `path_from_to`'s explicit-stack pattern.
-    fn terminate_node(&self, s: &mut St<'_, C>, node_id: NodeId, terminal: TerminalKind) {
+    fn terminate_node(&self, s: &mut St<'_>, node_id: NodeId, terminal: TerminalKind) {
         let mut work: Vec<(NodeId, TerminalKind)> = vec![(node_id, terminal)];
         while let Some((id, t)) = work.pop() {
             if s.require_node(id).terminal.is_some() {
@@ -4802,7 +4478,7 @@ fn pick_cascade_terminal(dep_records: &[DepRecord]) -> TerminalKind {
 // TEARDOWN — destruction, with auto-COMPLETE prepend (R2.6.4 / Lock 6.F)
 // -----------------------------------------------------------------------
 
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// Tear `node_id` down. Per R2.6.4 / Lock 6.F:
     ///
     /// - **Auto-prepend COMPLETE.** If the node has not yet emitted a
@@ -4823,7 +4499,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown.
     pub fn teardown(&self, node_id: NodeId) {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(e) => panic!("{e}"),
@@ -4832,14 +4507,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 
     /// Teardown or defer to wave-end on partition order violation.
     /// For producer-pattern operator sinks.
-    pub fn teardown_or_defer(&self, node_id: NodeId)
-    where
-        // S2b (D221/D223): the owned cell relocates between workers by
-        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
-        // no cross-thread sharing of `&Core`.
-        C: Send,
-    {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
+    pub fn teardown_or_defer(&self, node_id: NodeId) {
         match self.try_teardown(node_id) {
             Ok(()) => {}
             Err(_) => {
@@ -4906,7 +4574,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// pop. Idempotency via `has_received_teardown` keeps each node
     /// visited at most once even when multi-parent diamonds re-enter via
     /// a sibling path.
-    fn teardown_inner(&self, s: &mut St<'_, C>, root: NodeId) -> Vec<NodeId> {
+    fn teardown_inner(&self, s: &mut St<'_>, root: NodeId) -> Vec<NodeId> {
         enum Action {
             Visit(NodeId),
             EmitTeardown(NodeId),
@@ -5007,23 +4675,11 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // route to `parent`'s shard cannot see a cross-shard
         // companion), leaving the documented rollback/diagnostic path
         // below DEAD for every cross-shard companion (Edge#2).
-        assert!(
-            self.shard_of(parent) == self.shard_of(companion),
-            "add_meta_companion({parent:?}, {companion:?}): companion is \
-             not in parent's serialization shard — the meta edge would \
-             make the dep+children+meta component span shards (§7 strict \
-             invariant: a component must be uniformly all-None or \
-             all-Some; multi-distinct-Some-group component construction \
-             is an unsupported v1 residual — reassign the component via \
-             set_serialization_group, or see porting-deferred.md \
-             \"multi-Some-group component construction\")"
-        );
-        // 2b-ii-B: same shard ⇒ route by `parent`'s shard. A `None`/
-        // `Some` mix resolves to different shards (`None`=DEFAULT vs
-        // `Some`=g) so it is already caught above; the post-insert
-        // `component_is_group_consistent` path below is now
-        // defence-in-depth (impossible-by-construction for the mix).
-        let _skg = ShardKeyGuard::set(self.shard_of(parent));
+        // D246/S2c: single-owner ⇒ ONE shard; the prior cross-shard
+        // `shard_of(parent) == shard_of(companion)` assert is vacuous
+        // and deleted. The post-insert `component_is_group_consistent`
+        // check below is the authority for the §7 all-None/all-Some
+        // invariant.
         let mut s = self.lock_state();
         assert!(s.nodes.contains_key(&parent), "unknown parent {parent:?}");
         assert!(
@@ -5056,7 +4712,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // INVALIDATE — cache clear + downstream cascade
 // -----------------------------------------------------------------------
 
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// Clear `node_id`'s cache and cascade `[INVALIDATE]` to downstream
     /// dependents per canonical spec §1.4.
     ///
@@ -5089,7 +4745,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     ///
     /// Panics if `node_id` is unknown, consistent with `emit` / `pause`.
     pub fn invalidate(&self, node_id: NodeId) {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -5108,14 +4763,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// # Panics
     ///
     /// Panics if `node_id` is not registered in this Core.
-    pub fn invalidate_or_defer(&self, node_id: NodeId)
-    where
-        // S2b (D221/D223): the owned cell relocates between workers by
-        // `move` — `Send`, not `Sync`. The borrow checker is the lock;
-        // no cross-thread sharing of `&Core`.
-        C: Send,
-    {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
+    pub fn invalidate_or_defer(&self, node_id: NodeId) {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -5149,7 +4797,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// metas-first constraint) — Invalidate is a tier-4 broadcast where
     /// the never-populated / already-invalidated guard provides natural
     /// idempotency for diamond fan-in.
-    fn invalidate_inner(&self, s: &mut St<'_, C>, root: NodeId) {
+    fn invalidate_inner(&self, s: &mut St<'_>, root: NodeId) {
         let mut work: Vec<NodeId> = vec![root];
         while let Some(node_id) = work.pop() {
             // Never-populated / already-invalidated: no-op (R1.4 idempotency).
@@ -5253,7 +4901,7 @@ pub struct ResumeReport {
     pub dropped: u32,
 }
 
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// Acquire a pause lock on `node_id`. The first lock transitions the
     /// node from `Active` to `Paused`; further locks add to the lockset.
     /// While paused, tier-3 (DATA/RESOLVED) and tier-4 (INVALIDATE) outgoing
@@ -5263,7 +4911,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Re-acquiring the same `lock_id` is an idempotent no-op (matches TS
     /// convention, R1.2.6 silent on the case).
     pub fn pause(&self, node_id: NodeId, lock_id: LockId) -> Result<(), PauseError> {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         let mut s = self.lock_state();
         let rec = s
             .nodes
@@ -5303,7 +4950,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node_id: NodeId,
         lock_id: LockId,
     ) -> Result<Option<ResumeReport>, PauseError> {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         // Phase 1 (lock-held): collect drained buffer + pending-wave flag +
         // sink Arcs. For default-mode nodes whose `pending_wave` was set
         // during pause, schedule a single fn-fire by adding to
@@ -5387,7 +5033,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// True if the node currently holds at least one pause lock.
     #[must_use]
     pub fn is_paused(&self, node_id: NodeId) -> bool {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -5397,7 +5042,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Number of pause locks currently held on `node_id`. `0` if Active.
     #[must_use]
     pub fn pause_lock_count(&self, node_id: NodeId) -> usize {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -5407,7 +5051,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
     /// Test helper: whether `node_id` currently holds the given `lock_id`.
     #[must_use]
     pub fn holds_pause_lock(&self, node_id: NodeId, lock_id: LockId) -> bool {
-        let _skg = ShardKeyGuard::set(self.shard_of(node_id));
         self.lock_state()
             .require_node(node_id)
             .pause_state
@@ -5585,87 +5228,12 @@ pub enum SetGroupError {
     ReentrantOnFiringNode { node: NodeId },
 }
 
-/// Defense-in-depth rollback for the `set_serialization_group`
-/// extract→reinsert component migration (Slice B-2 Step 2b-ii /qa B,
-/// converged Blind#1 + Edge#4). Phase 1 removes the whole component
-/// out of the `src` shard into owned vecs; if anything unwinds before
-/// Phase 3 reinserts it (today unreachable — the in-window ops are
-/// infallible `HashMap` insert/remove and Rust alloc-failure *aborts*,
-/// not unwinds — but a future fallible call in the window would
-/// otherwise lose the component from BOTH shards, skew the index, and
-/// leak binding retains: exactly the hazard `register`'s
-/// `ScratchReleaseGuard` exists for), this puts the component back
-/// into `src` and reverts the index to its pre-migration state.
-/// `take_payload()` disarms it (mirrors `ScratchReleaseGuard::take`).
-/// The component is single-group-or-all-`None` by construction
-/// (multi-`Some`-group construction is unsupported — see A(i) /
-/// `porting-deferred.md`), so a single `(old_group, src)` pair
-/// restores every member's index entry.
-/// Extracted component payload (records + per-node children-adjacency)
-/// handed from `set_serialization_group` Phase 1 to Phase 3.
-type MovedComponent = (Vec<(NodeId, NodeRecord)>, Vec<(NodeId, HashSet<NodeId>)>);
+// D246/S2c: `MigrationRollback` + `MovedComponent` deleted — there is
+// no cross-shard extract→reinsert (single shard always under
+// single-owner). `set_serialization_group` now mutates the declared
+// group in place under one borrow; nothing to roll back.
 
-// S2b (D223): borrows `&'a Core` (no `Clone`). Lives entirely within
-// `set_serialization_group`'s scope — `self` strictly outlives it
-// (same pattern as S1's `FiringGuard<'a, C>`).
-struct MigrationRollback<'a, C: crate::state_cell::StateCell> {
-    core: &'a Core<C>,
-    src: crate::state_cell::ShardKey,
-    old_group: crate::state_cell::ShardKey,
-    members: Vec<NodeId>,
-    recs: Vec<(NodeId, NodeRecord)>,
-    kids: Vec<(NodeId, HashSet<NodeId>)>,
-    armed: bool,
-}
-
-impl<C: crate::state_cell::StateCell> MigrationRollback<'_, C> {
-    /// Disarm + hand the extracted component to Phase 3 (single move;
-    /// the only ops between this and `disarm` are infallible inserts).
-    fn take_payload(&mut self) -> MovedComponent {
-        self.armed = false;
-        (
-            std::mem::take(&mut self.recs),
-            std::mem::take(&mut self.kids),
-        )
-    }
-}
-
-impl<C: crate::state_cell::StateCell> Drop for MigrationRollback<'_, C> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Revert the index to pre-migration (pure `CoreShared`), then
-        // reinsert the records into `src`. Component is uniform, so
-        // `old_group` restores every member's `node_group`/`node_shard`.
-        let (og, sr) = (self.old_group, self.src);
-        let members = std::mem::take(&mut self.members);
-        self.core.with_shared(|sh| {
-            for m in &members {
-                if let Some(g) = og {
-                    sh.node_group.insert(*m, g);
-                } else {
-                    sh.node_group.remove(m);
-                }
-                if let Some(s) = sr {
-                    sh.node_shard.insert(*m, s);
-                } else {
-                    sh.node_shard.remove(m);
-                }
-            }
-        });
-        let _g = ShardKeyGuard::set(sr);
-        let mut s = self.core.lock_state();
-        for (m, rec) in self.recs.drain(..) {
-            s.nodes.insert(m, rec);
-        }
-        for (m, cs) in self.kids.drain(..) {
-            s.children.insert(m, cs);
-        }
-    }
-}
-
-impl<C: crate::state_cell::StateCell> Core<C> {
+impl Core {
     /// §7 (D208–D211; QA point-3 made it component-wide, 2026-05-16):
     /// assign (or clear, with `None`) the [`crate::handle::SerializationGroupId`]
     /// for `node`'s **entire** dep+children+meta component.
@@ -5693,116 +5261,39 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         node: NodeId,
         group: Option<crate::handle::SerializationGroupId>,
     ) -> Result<(), SetGroupError> {
-        // Step 2b-ii-B (D220-EXEC): the component currently lives in
-        // its CURRENT group's shard (`g_old`); reassigning to `group`
-        // (`g_new`) MOVES every component member's `NodeRecord` +
-        // children-adjacency from shard `g_old` to shard `g_new` and
-        // updates the `CoreShared.node_group` routing index. Topology-
-        // mutation call only (serialized; not concurrent with a wave
-        // on this component — Groups are static, no node re-fires).
-        // Sequential extract→reinsert (g_old guard fully dropped before
-        // g_new is locked) ⇒ never holds two shard guards ⇒ no ABBA.
-        // Step 2b-ii-B: a node's record lives in its PLACEMENT shard
-        // (`shard_of`) — for a multi-group component that is NOT its
-        // declared group. Extract the whole component from its current
-        // placement shard, homogenise it to `group` (every member's
-        // declared group AND placement ⇒ `group`), reinsert into shard
-        // `group`. After this the component is single-group ⇒ shard ==
-        // group ⇒ disjoint groups run parallel (the `group_scaling` /
-        // `set_serialization_group` parallelism path). ALWAYS migrate
-        // (even same shard) — eliminates the idempotent /
-        // multi-group-index-skew edge. Topology-mutation op, serialized
-        // (not concurrent with a wave on this component). Sequential
-        // extract→reinsert (src guard dropped before dst locked) ⇒
-        // never two shard guards ⇒ no ABBA.
-        // /qa B (Slice B-2 Step 2b-ii): in-fire reject — mirrors
-        // `set_deps`'s `ReentrantOnFiringNode`. The cross-shard
-        // component migration moves records out from under any
-        // in-flight `invoke_fn`; rejecting loudly here beats
-        // corrupting state. (Pure `CoreShared`, pre-lock — no St held
-        // yet. The broader "not concurrent with ANY Core access to
-        // the component on another thread" precondition is a
-        // documented contract — `porting-deferred.md`
-        // "set_serialization_group concurrency precondition" — since
-        // the shard split made the 3-scope migration non-atomic vs a
-        // concurrent `shard_of`-routed reader; this guard only catches
-        // the same-thread mid-fire case.)
+        // /qa B: in-fire reject — mirrors `set_deps`'s
+        // `ReentrantOnFiringNode`. Reassigning a firing node's group
+        // mid-`invoke_fn` would mutate state out from under it;
+        // rejecting loudly beats corrupting it. (Pure `CoreShared`,
+        // pre-lock — no `St` held yet.)
         if self.with_shared(|sh| sh.currently_firing.contains(&node)) {
             return Err(SetGroupError::ReentrantOnFiringNode { node });
         }
 
-        let src = self.shard_of(node);
-        // Component is single-group-or-all-`None` by construction
-        // (multi-`Some`-group construction is unsupported — see A(i) /
-        // `porting-deferred.md`), so `group_of(node)` is the uniform
-        // pre-migration declared group for every member.
-        let old_group = self.group_of(node);
-
-        // Phase 1 (shard `src`): validate + extract the whole component.
-        let mut rollback = MigrationRollback {
-            core: self,
-            src,
-            old_group,
-            members: Vec::new(),
-            recs: Vec::new(),
-            kids: Vec::new(),
-            armed: true,
-        };
-        {
-            let _src_guard = crate::node::ShardKeyGuard::set(src);
-            let mut s = self.lock_state();
-            if !s.nodes.contains_key(&node) {
-                // Nothing extracted yet → disarm (no-op rollback).
-                rollback.armed = false;
-                return Err(SetGroupError::UnknownNode(node));
+        // D246/S2c: single-owner ⇒ ONE shard. There is no
+        // extract→reinsert migration and nothing to roll back — the
+        // component's records never move. Walk the component once and
+        // homogenise the declared group in place: every member's
+        // `NodeRecord.serialization_group` and the `node_group` index
+        // both ⇒ `group` (or cleared for `None`). The component is
+        // single-group-or-all-`None` by construction, so the result is
+        // uniform and `SetGroupError::ComponentInconsistent` is
+        // unreachable.
+        let mut s = self.lock_state();
+        if !s.nodes.contains_key(&node) {
+            return Err(SetGroupError::UnknownNode(node));
+        }
+        let component = walk_undirected_dep_graph(&s, node, None, &[]);
+        for m in &component {
+            if let Some(rec) = s.nodes.get_mut(m) {
+                rec.serialization_group = group;
             }
-            let component = walk_undirected_dep_graph(&s, node, None, &[]);
-            for m in &component {
-                if let Some(mut rec) = s.nodes.remove(m) {
-                    rec.serialization_group = group;
-                    rollback.recs.push((*m, rec));
-                }
-                if let Some(cs) = s.children.remove(m) {
-                    rollback.kids.push((*m, cs));
-                }
-                rollback.members.push(*m);
+            if let Some(g) = group {
+                s.shared.node_group.insert(*m, g);
+            } else {
+                s.shared.node_group.remove(m);
             }
         }
-
-        // Phase 2: homogenise BOTH `CoreShared` indices for every
-        // component member — `node_group` (declared) AND `node_shard`
-        // (placement) both ⇒ `group` (or absent for `None`). Done
-        // while `rollback` is armed: an unwind here reverts the index
-        // to `(old_group, src)` AND reinserts the records into `src`.
-        self.with_shared(|sh| {
-            for m in &rollback.members {
-                if let Some(g) = group {
-                    sh.node_group.insert(*m, g);
-                    sh.node_shard.insert(*m, g);
-                } else {
-                    sh.node_group.remove(m);
-                    sh.node_shard.remove(m);
-                }
-            }
-        });
-
-        // Phase 3 (shard `group`): take the payload (disarms the
-        // rollback — the only ops after this are infallible inserts),
-        // reinsert records + children-adjacency. The component is
-        // closed, so every member's children-set references only
-        // members — wholesale move is self-contained.
-        let (recs, kids) = rollback.take_payload();
-        {
-            let _dst_guard = crate::node::ShardKeyGuard::set(group);
-            let mut s = self.lock_state();
-            for (m, rec) in recs {
-                s.nodes.insert(m, rec);
-            }
-            for (m, cs) in kids {
-                s.children.insert(m, cs);
-            }
-        }
-        drop(rollback);
         Ok(())
     }
 
@@ -5833,7 +5324,6 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // 2b-ii-B (D220-EXEC): route to the node's shard; the new deps
         // are in the same component ⇒ same group ⇒ same shard (the
         // component-consistency check enforces). See `try_emit`.
-        let _skg = ShardKeyGuard::set(self.shard_of(n));
         let mut s = self.lock_state();
         // Validate node exists and is compute. Read-once via the helper so
         // subsequent code can use `require_node(n)` without re-checking.
@@ -6249,20 +5739,8 @@ impl<C: crate::state_cell::StateCell> Core<C> {
 // CoreState helpers — kept on the inner struct so they're naturally scoped
 // to the lock guard.
 impl CoreState {
-    /// Construct a fresh empty shard `CoreState` (Step 2b): no nodes,
-    /// no children, just the binding clone its `Drop` node-retain walk
-    /// needs. Used by `LockedCell::lock_shard` when a new `ShardKey`
-    /// is first touched. Centralizes the field set + the `ahash`
-    /// `HashMap`/`HashSet` types so the cell layer doesn't hard-code
-    /// them.
-    #[must_use]
-    pub(crate) fn empty_shard(binding: Arc<dyn BindingBoundary>) -> Self {
-        Self {
-            nodes: HashMap::new(),
-            children: HashMap::new(),
-            binding,
-        }
-    }
+    // D246/S2c: `empty_shard` deleted — no per-`ShardKey` shard
+    // construction (single shard always under single-owner).
 
     // `alloc_node_id` / `alloc_sub_id` moved to `impl St` (Step 2a,
     // D220-EXEC): their counters now live in the separate `CoreShared`

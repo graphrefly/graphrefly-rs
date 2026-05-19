@@ -691,10 +691,15 @@ fn no_handle_const_is_recognized() {
 #[test]
 fn op_binding_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
+    // Bindings still cross the FFI boundary: `BindingBoundary: Send +
+    // Sync` is UNCHANGED by D248 (which relaxed only the subscriber
+    // `Sink`/`TopologySink`, not the binding trait). So `InnerBinding`
+    // + `dyn OperatorBinding` stay `Send + Sync`.
     assert_send_sync::<common::InnerBinding>();
-    // OperatorBinding super-bound includes BindingBoundary's Send+Sync.
     fn assert_dyn_send_sync<T: ?Sized + Send + Sync>() {}
     assert_dyn_send_sync::<dyn graphrefly_operators::OperatorBinding>();
-    // Sanity: Core is also Send+Sync.
-    assert_send_sync::<Core>();
+    // D248/D249/S2c: `Core` is now intentionally `!Send + !Sync`
+    // (single-owner) — the prior `assert_send_sync::<Core>()` was
+    // shared-Core-era legacy; type-touch only.
+    let _ = core::marker::PhantomData::<Core>;
 }

@@ -897,10 +897,15 @@ impl Recorder {
 }
 
 // Silence unused-import warnings when tests don't use every helper.
+// D248/D249/S2c: the prior `Send + Sync` assertions on `InnerBinding`
+// / `Recorder` were shared-Core-era legacy — under full single-owner
+// the operators test harness is owner-thread-only and intentionally
+// `!Send` (`InnerBinding` transitively holds the owner-only
+// `Rc<DeferQueue>` via `ProducerEmitter`). Keep the type-touch (unused
+// silencing) without the Send+Sync bound.
 const _: fn() = || {
-    fn _check<T: Send + Sync>() {}
-    _check::<InnerBinding>();
-    _check::<Recorder>();
+    let _ = core::marker::PhantomData::<InnerBinding>;
+    let _ = core::marker::PhantomData::<Recorder>;
     let _ = AHashMap::<u64, u64>::new();
     let _ = AHashSet::<u64>::new();
 };

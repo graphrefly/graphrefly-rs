@@ -532,9 +532,15 @@ fn take_after_skip_produces_window() {
 // Send + Sync / OperatorScratch trait-object behavior
 // ---------------------------------------------------------------------
 
+// D248/D249/S2c: `FlowRegistration` + `Core` are intentionally
+// `!Send + !Sync` under full single-owner (the substrate `Sink`
+// dropped `Send + Sync`; `Core` holds the subscriber map + the
+// owner-only `Rc<DeferQueue>`). The prior
+// `flow_registration_is_send_and_sync` assertion was shared-Core-era
+// legacy and is deleted — the single-owner contract ("owned & driven
+// on one thread") is asserted canonically in `serialization_groups.rs`.
 #[test]
-fn flow_registration_is_send_and_sync() {
-    fn _check<T: Send + Sync>() {}
-    _check::<graphrefly_operators::flow::FlowRegistration>();
-    _check::<Core>();
+fn flow_registration_type_touch() {
+    let _ = core::marker::PhantomData::<graphrefly_operators::flow::FlowRegistration>;
+    let _ = core::marker::PhantomData::<Core>;
 }

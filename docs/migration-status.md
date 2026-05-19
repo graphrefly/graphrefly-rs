@@ -3042,25 +3042,36 @@ remain **separate, explicitly-approved future batches**.
 > commit on top of `b2dacec`/`5e7d21f`.
 >
 > **REMAINING D246 boundaries (each its own gate+commit per D226;
-> single `/qa` at end) — THIS IS THE NEXT `/porting-to-rs` BATCH:**
-> - **S2c** — drop `Mutex<GraphInner>`→`RefCell`/owner-`&mut`; **AND
->   `OwnedCore.subs`/`topo_subs` `Mutex<Vec>`→`RefCell`/`Vec`** (QA-A6
->   F1: same single-owner⇒drop-the-Mutex logic, was orphaned from this
->   bullet); delete `groups.rs`/`LockedCell`; collapse `StateCell`
->   (remove the `C` generic — pervasive across the core; ~128
->   `StateCell`/`LockedCell`/`SingleThreadCell` refs + 45
->   `Mutex<GraphInner>` refs). Independent large boundary; **not
->   started** (clean — no WIP).
+> single `/qa` at end):**
+> - **S2c — ✅ LANDED + GATE-GREEN 2026-05-19 (D247/D248/D249).** See
+>   the `### D246 S2c — LANDED` closing block below for the full
+>   record. `StateCell`/`LockedCell`/`groups.rs`/`WaveOwnerGuard`/
+>   `node_shard`/`ShardKeyGuard`/`MigrationRollback` deleted; `Core`
+>   non-generic `RefCell` regions; `OwnedCore` `RefCell<Vec>`;
+>   `GraphInner`→`Rc<RefCell>` (D247); substrate `Sink`/`TopologySink`
+>   `Send+Sync` dropped + `Core`/`OwnedCore`/`Graph` now `!Send+!Sync`
+>   (D248, user-locked Opt-1); minimal owner-only `DeferQueue` split
+>   off `CoreMailbox` (D249, user-locked — **pre-empts part of S4's
+>   mailbox reshape**).
 > - **S3** — `SerializationGroupId`→`SchedulingGroupId` (~59 refs).
 > - **S4** — wave-scope drain + per-group `Send` wake on `CoreMailbox`;
 >   **+ D246 rule 8 (QA-A6): typed `MailboxOp` snapshot/prune variants
 >   (or reusable slot) replacing `post_defer(Box<dyn FnOnce>)` per
 >   emission on observe/describe/`graph_integration.rs` — fuse with the
 >   `CoreMailbox` per-group-wake reshape (don't churn the mailbox
->   twice)**; rebuild `benches/group_scaling.rs` with independent
->   per-worker Cores (actor-model re-measure); convert the 6 §7
->   `#[ignore]` tests + the 2 core-tests pause/resume + a6-set_deps
->   re-entry stubs.
+>   twice)**; rebuild `benches/group_scaling.rs` + `floor_compare` +
+>   `examples/profile_st_emit` with independent per-worker Cores
+>   (actor-model re-measure); convert the §7 `#[ignore]` tests + the 2
+>   core-tests pause/resume + a6-set_deps re-entry stubs + the
+>   **new D248/D249 S2c stubs** (`lock_discipline::concurrent_subscribe…`
+>   cross-thread → one-Core-per-worker; `lock_released::late_subscriber…`
+>   → producer-based β rewrite). **D249 NOTE — S4 mailbox scope
+>   partially pre-empted:** S2c/D249 already split the owner-only
+>   `!Send` `DeferQueue` off the `Send` id-`CoreMailbox` (the
+>   acknowledged "second mailbox touch"); S4 still does the per-group
+>   `Send` runnable-wake + typed snapshot/prune `MailboxOp` variants on
+>   the *id-mailbox*, and unifies the drain-to-mutual-quiescence loop
+>   (`Core::drain_mailbox`, D249) into the per-group wake design.
 > - **Standalone (NOT S2c/S3/S4):** pre-existing `attach_storage`
 >   re-ship-on-shrink duplication smell (QA Blind #4) — dedicated
 >   structures/storage slice; tracked in `porting-deferred.md` §
@@ -3068,6 +3079,80 @@ remain **separate, explicitly-approved future batches**.
 > - Record-and-skip running list: `porting-deferred.md` §
 >   "D246 record-and-skip" (reported at session end; QA-A6 entries
 >   appended).
+
+### D246 S2c — LANDED + GATE-GREEN + COMMITTED (2026-05-19; D247/D248/D249)
+
+> **This is the current authoritative state for the S-sequence**
+> (supersedes the S2c bullet in the boundary-1 REMAINING block above).
+> The next `/porting-to-rs` batch is **S3** (`SerializationGroupId`→
+> `SchedulingGroupId`, ~59 refs). Single `/qa` still deferred to after
+> S4 per D226.
+
+**Gate:** `mise run gate` (fmt --check + clippy --all-targets +
+nextest --profile ci incl. `cascade_depth`) **GREEN — 824 passed, 8
+skipped, 0 failed**.
+
+**What landed (net code REMOVED):**
+
+- **`StateCell` generic collapsed** (D246 r7): `state_cell.rs` +
+  `LockedCell` + `SingleThreadCell` + the `StateCell` trait DELETED;
+  `Core` is **non-generic** with two plain `RefCell` regions
+  (`shared: RefCell<CoreShared>` + `state: RefCell<CoreState>`);
+  `St<'a>` non-generic; `with_shared`/`with_shard`/`lock_state`
+  reshaped. ~128 generic refs removed across `node.rs`/`batch.rs`/
+  `topology.rs`/`owned.rs`/`operators`.
+- **§7 cross-thread wave machinery DELETED** (single-owner ⇒ one
+  driving thread): `groups.rs` (`GroupLockRegistry`), `WaveOwnerGuard`,
+  `global_wave`, `group_locks`, `grouped_shards`/shard-routing,
+  `SERIALIZE_WAVES`, `node_shard`, `ShardKeyGuard`/`CURRENT_SHARD_KEY`/
+  `shard_key_for_node`, `compute_touched_groups`/`acquire_*_group_guards`/
+  `with_global_wave_fallback`, `MigrationRollback`, `CoreState::empty_shard`,
+  `BatchGuard.wave_guards`/`shard_key_guard`. **Declared-group identity
+  kept** (`CoreShared.node_group` / `partition_of` / `partition_count`
+  / `set_serialization_group` in-place) for S3 (`SchedulingGroupId`
+  rename) + S4 (per-group wake). `set_serialization_group` simplified
+  to in-place group mutation (no extract→reinsert; nothing to roll
+  back).
+- **`OwnedCore`** `Mutex<Vec>`→`RefCell<Vec>`, non-generic; A4
+  assertion `Send+Sync`→deleted (QA-A6 F1).
+- **`GraphInner` `Arc<Mutex>`→`Rc<RefCell>`** + `Weak<RefCell>` parent
+  (D247); A4 `Graph: Send+Sync` assertion deleted; `Graph` is now
+  `Clone` (`Rc` bump) + intentionally `!Send+!Sync`.
+- **D248 (user-locked Opt-1) — substrate Sink-contract widening:**
+  `graphrefly_core::Sink` / `TopologySink` + graph
+  `NamespaceChangeSink` / `DescribeSink` dropped `Send + Sync`
+  (shared-Core-era legacy). Consequence: `Core` owns `!Send` sinks ⇒
+  **`Core` / `OwnedCore` / `Graph` are now `!Send + !Sync`** (the only
+  cross-thread bridge is the id-only `Arc<CoreMailbox>`). Reverses the
+  prior "CLAUDE.md Rust invariant 2: Core stays Send+Sync" + S2b
+  `Core: Send` premise — documented consequence of D248. **`BindingBoundary`
+  stays `Send + Sync` (FFI trait, UNCHANGED) — only the subscriber
+  callbacks relaxed.** → `docs/cross-track-ledger.md` (substrate-contract
+  widening + napi obligation).
+- **D249 (user-locked) — minimal owner-only `DeferQueue` split:**
+  `CoreMailbox` keeps `Send` id-ops + a `Send` cross-thread `Defer`
+  (`SendDeferFn`, for `temporal.rs` `window_time`/etc. timer tasks) ⇒
+  stays `Send+Sync`. New owner-only **`!Send` `DeferQueue`** (`DeferFn`,
+  `Rc`-shared `Core`↔`ProducerEmitter`) for owner-side sink defers
+  capturing relaxed `Sink`s / `Rc<RefCell<GraphInner>>`.
+  `ProducerEmitter` split into `MailboxEmitter` (`Send`, timer-task
+  emit-only) + `ProducerEmitter` (`!Send`, owner-side, `+ defer`).
+  `Core::drain_mailbox` rewritten to drain **both queues to mutual
+  quiescence** (a `DeferQueue` inner-subscribe can re-post an `Emit` to
+  the id-mailbox — the 3 `switch_map_*` regressions the first gate
+  caught; fixed). Pre-empts part of S4's mailbox reshape (acknowledged
+  second touch — see the S4 bullet).
+
+**Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+D247 (Rc<RefCell> graph tree), D248 (relax substrate Sink — user-locked
+Opt-1), D249 (minimal Defer/mailbox split — user-locked). 3 user HALTs
+surfaced & resolved (`feedback_no_autonomous_decisions`).
+
+**Record-and-skip (S4 follow-ups):** `porting-deferred.md` §
+"D246 record-and-skip" — `lock_discipline::concurrent_subscribe…`
+(cross-thread → S4 one-Core-per-worker), `lock_released::late_subscriber…`
+(producer-based β rewrite), `floor_compare` bench + `profile_st_emit`
+example (superseded → S4 rebuild).
 
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 

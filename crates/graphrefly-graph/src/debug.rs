@@ -54,7 +54,7 @@ use graphrefly_core::HandleId;
 /// ```ignore
 /// impl DebugBindingBoundary for MyBinding {
 ///     fn handle_to_debug(&self, h: HandleId) -> serde_json::Value {
-///         self.values.lock().get(&h)
+///         self.values.borrow_mut().get(&h)
 ///             .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
 ///             .unwrap_or(serde_json::Value::Null)
 ///     }

@@ -180,6 +180,13 @@ fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
 }
 
 #[test]
+// D248/D249/S2c: `Arc<TestRuntime>` / `Arc<dyn Fn(&[Message])>` (the
+// relaxed `Sink`) are `!Send` under single-owner. The `Arc` is used
+// here for *single-thread* shared ownership (the sink captures a
+// runtime handle, dropped on the owner thread) — `Rc` would be more
+// precise but the `Sink` type alias is `Arc`-based; the lint is a
+// false-positive for this owner-only pattern.
+#[allow(clippy::arc_with_non_send_sync)]
 fn handshake_sink_can_reenter_core_emit_on_other_node() {
     // Slice E rework: the handshake now fires LOCK-RELEASED with
     // `wave_owner` held. A handshake-time sink callback can re-enter
@@ -225,98 +232,15 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
 }
 
 #[test]
+#[ignore = "D246/D249 record-and-skip: genuinely-deleted §7 cross-thread model. `thread::spawn(move || rt_emit…)` shares `Arc<TestRuntime>` across threads, requiring `OwnedCore: Send+Sync`. D248/D249 single-owner made `Core`/`OwnedCore` `!Send+!Sync` (sinks relaxed off `Send+Sync`; the only cross-thread bridge is `Arc<CoreMailbox>` id-posts). Concurrent two-thread Core driving is the deleted model — rebuild as one-Core-per-worker at S4 (migration-status S4 'convert the 6 §7 #[ignore] tests'). See porting-deferred § D246 record-and-skip."]
 fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use std::thread;
-    use std::time::Duration;
-
-    let rt = Arc::new(TestRuntime::new());
-    let s = rt.state(Some(TestValue::Int(0)));
-    let s_id = s.id;
-
-    // Stronger contract than just "Start is first":
-    //   1. First observed message is `Start`.
-    //   2. Every observed `Data(n)` value after Start is monotonically
-    //      increasing (the emit thread emits `counter` strictly ascending).
-    //   3. At least one `Data` is observed AFTER subscribe returned (i.e.,
-    //      the emit thread DID race past us — sandwich check that the
-    //      concurrency window was real, not vacuously satisfied because the
-    //      emit thread finished before our subscribe).
-    //
-    // The sandwich check is the key strengthening: it fails if the emit
-    // thread completed before subscribe (vacuous-pass mode of the prior
-    // test) by requiring the highest observed counter to exceed
-    // `subscribe_at_count`.
-    let stop = Arc::new(Mutex::new(false));
-    let emit_count = Arc::new(AtomicI64::new(0));
-    let rt_emit = Arc::clone(&rt);
-    let stop_emit = Arc::clone(&stop);
-    let emit_count_inner = Arc::clone(&emit_count);
-    let emit_handle = thread::spawn(move || {
-        let mut counter = 1i64;
-        while !*stop_emit.lock().unwrap() && counter <= 1000 {
-            let h = rt_emit.binding.intern(TestValue::Int(counter));
-            rt_emit.core().emit(s_id, h);
-            emit_count_inner.store(counter, Ordering::SeqCst);
-            counter += 1;
-        }
-    });
-
-    // Brief warm-up so the emit thread definitely started.
-    thread::sleep(Duration::from_millis(2));
-    let count_before_subscribe = emit_count.load(Ordering::SeqCst);
-    let rec = rt.subscribe_recorder(s_id);
-    let count_at_subscribe = emit_count.load(Ordering::SeqCst);
-
-    // Let post-subscribe emits run for a window long enough that some
-    // emits land AFTER subscribe (sandwich check).
-    thread::sleep(Duration::from_millis(20));
-    *stop.lock().unwrap() = true;
-    emit_handle.join().expect("emit thread join");
-    let count_after_join = emit_count.load(Ordering::SeqCst);
-
-    let events = rec.snapshot();
-
-    // Invariant 1: first event is Start.
-    assert!(
-        matches!(events.first(), Some(common::RecordedEvent::Start)),
-        "first event must be Start; got {:?}",
-        events.first()
-    );
-
-    // Invariant 2: observed Data values are monotonically increasing.
-    let mut last: Option<i64> = None;
-    for e in &events {
-        if let common::RecordedEvent::Data(common::TestValue::Int(n)) = e {
-            if let Some(prev) = last {
-                assert!(
-                    *n > prev,
-                    "Data values not monotonic: prev={prev}, now={n}; full trace: {events:?}"
-                );
-            }
-            last = Some(*n);
-        }
-    }
-
-    // Invariant 3 (sandwich check): the emit thread continued past
-    // subscribe — at least some emits happened AFTER subscribe returned.
-    // If this fails, the test ran in vacuous-pass mode and didn't actually
-    // exercise the race window.
-    assert!(
-        count_after_join > count_at_subscribe,
-        "sandwich check failed: emit thread completed before/at subscribe \
-         (count before subscribe={count_before_subscribe}, at subscribe={count_at_subscribe}, \
-         after join={count_after_join}). The race window was not exercised; \
-         test result is vacuous. Increase the post-subscribe sleep or upper \
-         counter bound."
-    );
-
-    // The largest observed Data should be ≥ count_at_subscribe + 1 if any
-    // post-subscribe emits were delivered before our recorder snapshot.
-    if let Some(max_observed) = last {
-        // It's OK if max_observed < count_after_join (the thread finished
-        // emitting AFTER the snapshot). What we want: the new sub saw at
-        // least ONE post-subscribe value.
-        assert!(max_observed >= 1, "no Data values observed at all");
-    }
+    // D246/D249 record-and-skip stub: the original two-thread
+    // `thread::spawn` body shares `Arc<TestRuntime>` cross-thread
+    // (requires `OwnedCore: Send+Sync`, deleted under D248/D249
+    // single-owner). The invariant (a concurrent subscribe during emit
+    // observes Start-first + monotonic post-subscribe DATA) stays live;
+    // it is rebuilt as a **one-Core-per-worker** scenario at S4
+    // (migration-status S4 "convert the 6 §7 #[ignore] tests"). No
+    // β-valid single-owner expression of a *cross-thread* race exists
+    // pre-S4. → S4.
 }

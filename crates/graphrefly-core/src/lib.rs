@@ -47,7 +47,6 @@
 mod batch;
 pub mod boundary;
 pub mod clock;
-pub(crate) mod groups;
 pub mod handle;
 pub mod hash;
 pub mod mailbox;
@@ -55,7 +54,6 @@ pub mod message;
 pub mod node;
 pub(crate) mod op_state;
 pub mod owned;
-pub mod state_cell;
 #[cfg(feature = "tokio")]
 pub mod timer;
 pub mod topology;
@@ -66,7 +64,7 @@ pub use boundary::{BindingBoundary, CleanupTrigger, DepBatch, FnEmission, FnResu
 pub use clock::{monotonic_ns, wall_clock_ns};
 pub use handle::{FnId, HandleId, LockId, NodeId, SerializationGroupId, NO_HANDLE};
 pub use hash::sha256_hex;
-pub use mailbox::{CoreMailbox, MailboxOp};
+pub use mailbox::{CoreMailbox, DeferFn, DeferQueue, MailboxOp};
 pub use message::{Message, Messages};
 pub use node::{
     Core, CoreFull, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts,
@@ -75,5 +73,4 @@ pub use node::{
     SubscriptionId, TerminalKind, UpError,
 };
 pub use owned::OwnedCore;
-pub use state_cell::{LockedCell, SingleThreadCell, StateCell};
 pub use topology::{TopologyEvent, TopologySink, TopologySubscriptionId};

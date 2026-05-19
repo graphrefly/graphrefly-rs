@@ -15,14 +15,15 @@
 //! *inside* a wave, so its `unsubscribe` is routed through
 //! `MailboxOp::Defer` (D246 rule 6 — sink-in-wave defers).
 
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::{Arc, Weak};
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use graphrefly_core::{
     Core, CoreFull, LockId, Message, NodeId, PauseError, ResumeReport, Sink, SubscriptionId,
     TopologyEvent, TopologySubscriptionId,
 };
-use parking_lot::Mutex;
 
 use crate::graph::{register_ns_sink, Graph, GraphInner, NamespaceChangeSink};
 
@@ -135,10 +136,10 @@ impl GraphObserveAll {
     /// Returns the node count.
     pub fn subscribe<F>(&mut self, core: &Core, sink: F) -> usize
     where
-        F: Fn(&str, &[Message]) + Send + Sync + 'static,
+        F: Fn(&str, &[Message]) + 'static,
     {
         let names_to_ids: Vec<(String, NodeId)> = {
-            let inner = self.graph.inner_arc().lock();
+            let inner = self.graph.inner_arc().borrow_mut();
             inner.names.iter().map(|(n, id)| (n.clone(), *id)).collect()
         };
         let sink_arc: Arc<F> = Arc::new(sink);
@@ -190,7 +191,7 @@ pub struct GraphObserveAllReactive {
     graph: Graph,
     ns_sink_id: Option<u64>,
     topo_sub_id: Option<TopologySubscriptionId>,
-    inner: Arc<Mutex<ObserveAllReactiveInner>>,
+    inner: Rc<RefCell<ObserveAllReactiveInner>>,
 }
 
 impl GraphObserveAllReactive {
@@ -199,7 +200,7 @@ impl GraphObserveAllReactive {
             graph,
             ns_sink_id: None,
             topo_sub_id: None,
-            inner: Arc::new(Mutex::new(ObserveAllReactiveInner {
+            inner: Rc::new(RefCell::new(ObserveAllReactiveInner {
                 subscribed: HashSet::new(),
                 subs: Vec::new(),
             })),
@@ -214,7 +215,7 @@ impl GraphObserveAllReactive {
     /// wiring; rebuild via `observe_all_reactive`).
     pub fn subscribe<F>(&mut self, core: &Core, sink: F) -> usize
     where
-        F: Fn(&str, &[Message]) + Send + Sync + 'static,
+        F: Fn(&str, &[Message]) + 'static,
     {
         assert!(
             self.ns_sink_id.is_none(),
@@ -229,7 +230,7 @@ impl GraphObserveAllReactive {
         // fire-time (no stored/cloned Core); it subscribes new nodes
         // synchronously (fire_namespace_change is owner-side, not
         // in-wave).
-        let weak_graph_inner: Weak<Mutex<GraphInner>> = Arc::downgrade(self.graph.inner_arc());
+        let weak_graph_inner: Weak<RefCell<GraphInner>> = Rc::downgrade(self.graph.inner_arc());
         let inner_for_ns = self.inner.clone();
         let sink_for_ns = sink_arc.clone();
         let ns_sink: NamespaceChangeSink = Arc::new(move |core: &Core| {
@@ -237,8 +238,8 @@ impl GraphObserveAllReactive {
                 return;
             };
             let new_nodes: Vec<(String, NodeId)> = {
-                let graph_inner = arc_inner.lock();
-                let state = inner_for_ns.lock();
+                let graph_inner = arc_inner.borrow_mut();
+                let state = inner_for_ns.borrow_mut();
                 graph_inner
                     .names
                     .iter()
@@ -248,7 +249,7 @@ impl GraphObserveAllReactive {
             };
             for (name, id) in new_nodes {
                 let should = {
-                    let mut state = inner_for_ns.lock();
+                    let mut state = inner_for_ns.borrow_mut();
                     state.subscribed.insert(id)
                 };
                 if should {
@@ -258,7 +259,7 @@ impl GraphObserveAllReactive {
                         sink_clone(&owned_name, msgs);
                     });
                     let sub_id = core.subscribe(id, msg_sink);
-                    inner_for_ns.lock().subs.push((id, sub_id));
+                    inner_for_ns.borrow_mut().subs.push((id, sub_id));
                 }
             }
         });
@@ -268,37 +269,40 @@ impl GraphObserveAllReactive {
         // in-wave → the `unsubscribe` is `MailboxOp::Defer`'d (D246 r6:
         // no synchronous sink-side Core mutation).
         let inner_for_topo = self.inner.clone();
-        let mailbox = core.mailbox();
-        let topo_sink: Arc<dyn Fn(&TopologyEvent) + Send + Sync> =
-            Arc::new(move |event: &TopologyEvent| {
-                if let TopologyEvent::NodeTornDown(id) = event {
-                    let id = *id;
-                    let inner_for_defer = inner_for_topo.clone();
-                    // No `HandleId` captured — Core-gone (`false`) just
-                    // skips the prune; nothing to release (D235 P8).
-                    let _ = mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
-                        let to_unsub: Vec<(NodeId, SubscriptionId)> = {
-                            let mut state = inner_for_defer.lock();
-                            if state.subscribed.remove(&id) {
-                                let (keep, drop_): (Vec<_>, Vec<_>) =
-                                    state.subs.drain(..).partition(|(n, _)| *n != id);
-                                state.subs = keep;
-                                drop_
-                            } else {
-                                Vec::new()
-                            }
-                        };
-                        for (n, s) in to_unsub {
-                            cf.unsubscribe(n, s);
+        // D249/S2c: post to the owner-side `!Send` `DeferQueue` (the
+        // closure captures the `Rc<RefCell<ObserveAllReactiveInner>>`,
+        // `!Send`); `Rc<DeferQueue>` is owner-thread-only — fine, this
+        // topo sink is `!Send` (D248) and fires on the owner thread.
+        let deferred = core.defer_queue();
+        let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
+            if let TopologyEvent::NodeTornDown(id) = event {
+                let id = *id;
+                let inner_for_defer = inner_for_topo.clone();
+                // No `HandleId` captured — Core-gone (`false`) just
+                // skips the prune; nothing to release (D235 P8).
+                let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
+                    let to_unsub: Vec<(NodeId, SubscriptionId)> = {
+                        let mut state = inner_for_defer.borrow_mut();
+                        if state.subscribed.remove(&id) {
+                            let (keep, drop_): (Vec<_>, Vec<_>) =
+                                state.subs.drain(..).partition(|(n, _)| *n != id);
+                            state.subs = keep;
+                            drop_
+                        } else {
+                            Vec::new()
                         }
-                    }));
-                }
-            });
+                    };
+                    for (n, s) in to_unsub {
+                        cf.unsubscribe(n, s);
+                    }
+                }));
+            }
+        });
         self.topo_sub_id = Some(core.subscribe_topology(topo_sink));
 
         // Initial snapshot (listener's idempotent walk dedups overlap).
         let names_to_ids: Vec<(String, NodeId)> = {
-            let graph_inner = self.graph.inner_arc().lock();
+            let graph_inner = self.graph.inner_arc().borrow_mut();
             graph_inner
                 .names
                 .iter()
@@ -307,7 +311,7 @@ impl GraphObserveAllReactive {
         };
         let initial_count = names_to_ids.len();
         let to_subscribe: Vec<(String, NodeId)> = {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.borrow_mut();
             names_to_ids
                 .into_iter()
                 .filter(|(_n, id)| state.subscribed.insert(*id))
@@ -319,7 +323,7 @@ impl GraphObserveAllReactive {
                 sink_clone(&name, msgs);
             });
             let sub_id = core.subscribe(id, msg_sink);
-            self.inner.lock().subs.push((id, sub_id));
+            self.inner.borrow_mut().subs.push((id, sub_id));
         }
 
         initial_count
@@ -341,7 +345,7 @@ impl GraphObserveAllReactive {
             crate::graph::unregister_ns_sink(self.graph.inner_arc(), id);
         }
         let drained: Vec<(NodeId, SubscriptionId)> = {
-            let mut state = self.inner.lock();
+            let mut state = self.inner.borrow_mut();
             state.subs.drain(..).collect()
         };
         for (node_id, sub_id) in drained {
