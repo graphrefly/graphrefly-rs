@@ -285,6 +285,16 @@ impl GraphObserveAllReactive {
         let scheduled = Rc::new(std::cell::Cell::new(false));
         let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
             if let TopologyEvent::NodeTornDown(id) = event {
+                // INVARIANT (QA, 2026-05-19): push BEFORE the
+                // `scheduled.get()` check so a fire arriving while a
+                // defer is in-flight (after `sched.set(false)`,
+                // before the next batch) still gets captured by the
+                // in-flight drain's `mem::take`. Re-entry from
+                // `cf.unsubscribe` (a future code path adding
+                // teardown-on-last-unsub) would land here; the
+                // closure releases the `pending` borrow via
+                // `mem::take` BEFORE invoking `cf.*` so no
+                // `already-borrowed` panic.
                 pending.borrow_mut().push(*id);
                 if scheduled.get() {
                     return; // already armed for this drain — coalesce.

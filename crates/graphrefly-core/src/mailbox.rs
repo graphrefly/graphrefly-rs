@@ -65,10 +65,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::handle::{HandleId, NodeId};
 
 /// **`Send`** cross-thread deferred closure (D233; D249/S2c). Posted
-/// by an autonomous timer task (`temporal.rs` `window_time`/etc., a
-/// `tokio::spawn`ed cross-thread task whose defer closure captures only
-/// `Send` state — `Arc<Mutex<NodeId>>` / `Arc<dyn BindingBoundary>` /
-/// ids) and applied owner-side. Rides the `Send + Sync` [`CoreMailbox`]
+/// by any cross-thread `Send` producer (canonically an autonomous
+/// timer task — `temporal.rs` `window_time`/etc., a `tokio::spawn`ed
+/// cross-thread task whose defer closure captures only `Send` state:
+/// `Arc<Mutex<NodeId>>` / `Arc<dyn BindingBoundary>` / ids — but the
+/// API admits any future cross-thread producer with the same `Send`
+/// capture discipline, e.g. a napi/pyo3 binding-layer pump) and
+/// applied owner-side. Rides the `Send + Sync` [`CoreMailbox`]
 /// (cross-thread post side, drained owner-side via `drain_mailbox`).
 pub type SendDeferFn = Box<dyn FnOnce(&dyn crate::node::CoreFull) + Send>;
 
@@ -145,6 +148,12 @@ pub struct CoreMailbox {
     /// ([`crate::node::Core::drain_mailbox`] / the in-wave
     /// `BatchGuard`). M6 (deferred) reads [`Self::is_runnable`] from the
     /// host executor to decide when to poll a worker's Core.
+    ///
+    /// QA F12 (2026-05-19): if a future per-`SchedulingGroupId` sub-bit
+    /// is ever added, it MUST be split in lockstep across BOTH this
+    /// `CoreMailbox.runnable` AND `DeferQueue.runnable` — the in-wave
+    /// drain gate (`BatchGuard::drain_and_flush`) ORs the two, and a
+    /// half-split would silently lose wakeups for the unsplit queue.
     runnable: AtomicBool,
 }
 
@@ -296,6 +305,17 @@ impl CoreMailbox {
     #[must_use]
     pub fn take_all(&self) -> VecDeque<MailboxOp> {
         let mut q = self.ops.lock();
+        // QA F11 (2026-05-19): contract gate — `take_all` MUST be
+        // preceded by `close()` so no further `post_op` can enqueue
+        // after this returns (a post racing a standalone `take_all`
+        // would otherwise strand an op with its retained `HandleId`
+        // in a mailbox the caller assumes is empty). The one in-tree
+        // caller (`Drop for Core`) sequences `close()` first.
+        debug_assert!(
+            self.closed.load(Ordering::Acquire),
+            "CoreMailbox::take_all must be called after close() — see \
+             docstring contract"
+        );
         self.runnable.store(false, Ordering::Release);
         std::mem::take(&mut *q)
     }
@@ -417,9 +437,19 @@ impl DeferQueue {
     }
 
     /// Mark the owning `Core` gone. Idempotent; mutually exclusive with
-    /// [`Self::post`] (shared `q` lock). Queued closures are dropped
-    /// unrun on `Core` drop (running `CoreFull` on a half-dropped
-    /// `Core` is unsound — user-locked QA decision A, 2026-05-18).
+    /// [`Self::post`] (shared `q` lock).
+    ///
+    /// **Drop timing of queued closures (QA, 2026-05-19).** This method
+    /// only flips `closed` so subsequent `post` calls drop their
+    /// closures unrun (`closed == true` short-circuits enqueue) and
+    /// running `CoreFull` on a half-dropped `Core` is structurally
+    /// impossible. The *already-queued* closures are NOT drained here;
+    /// they remain in `q` and are dropped when the last `Rc<DeferQueue>`
+    /// clone drops (every `ProducerEmitter` / graph reactive handle
+    /// holds one — D249). Since closures by contract capture no
+    /// `HandleId` (D235 P8 / D246 r8 sites), this is leak-free for
+    /// refcount purposes; callers MUST honour the no-`HandleId`-in-
+    /// `DeferFn` discipline (see [`DeferFn`]'s doc) for this to hold.
     pub fn close(&self) {
         let _q = self.q.lock();
         self.closed.store(true, Ordering::Release);

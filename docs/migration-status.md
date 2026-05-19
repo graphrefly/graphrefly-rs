@@ -3300,6 +3300,108 @@ the previously-skipped §7/D250 stubs are now converted or retired).
 (retire imperative re-entry stubs) + D251 (rule-8 = reusable slot;
 D246-r8 stale-premise reconciled post-D249).
 
+### D246 S2c+S3+S4 — /qa LANDED (2026-05-19) — combined sweep per D226
+
+> Single `/qa` over the combined `b2dacec..HEAD` diff (boundary-1 →
+> S2c → S3 → S4) per D226's "single /qa at end of S2b→S4" lock. Two
+> review subagents (Blind Hunter + Edge Case Hunter) ran in parallel;
+> 14 findings triaged: 2 needs-decision (user-locked), 12
+> auto-applicable, rest rejected as already-acknowledged
+> record-and-skip entries.
+
+**Gate:** `mise run gate` — GREEN, **830 passed / 3 skipped / 0
+failed** in 163s (S4's 829 + the new M1 regression test
+`cross_queue_order_mailbox_then_deferred`).
+
+**M1 (locked) — Cross-queue FIFO inversion documented as the new
+contract + regression test.** D249's two-queue split changed
+cross-queue ordering from arrival-priority to queue-priority
+(`CoreMailbox` drains before `DeferQueue` every round, intra-queue
+FIFO preserved). Audit of operators surfaced no reliance on
+arrival-priority cross-queue ordering (D234's "in-closure routing
+state read" pattern already structurally guards windowing /
+higher-order). Doc-locked in `Core::drain_mailbox`; regression test
+`tests/lock_discipline.rs::cross_queue_order_mailbox_then_deferred`
+asserts: a sink posting `[DeferQueue::post, CoreMailbox::post_emit]`
+sees the Emit applied first (mailbox-priority), then the Defer.
+
+**M2 (locked) — `compact_every` cadence restored to per-emission
+(TS parity).** D251's coalescing slot made `compact_every: N` mean
+"every N waves" instead of "every N emissions" — a user-visible
+divergence not captured by D251's "internal refactor, unchanged
+public API" framing. Fix: `pending_count` tracks qualifying tier-3-5
+emits per wave at the filter gate (not at the closure);
+`flush_tier(s, snapshot, count)` advances `flush_count` by `count`
+and the `compact_every` boundary-crossing test (`before/cmp <
+after/cmp`) fires `write_full` if any of the increments in
+`[before+1, before+count]` crossed a multiple — equivalent to firing
+on each emit one-by-one, just batched into the coalesced flush.
+Persisted state identical; cadence now matches TS exactly. **No
+cross-track-ledger event** (Rust-internal fix preserving parity, no
+public-API / FFI change).
+
+**F1–F12 patches applied (auto-batch):**
+
+- **F1+F3** — `node.rs` subscribe-protocol comment block rewritten
+  to the single-owner sequence (acquire state lock → install sink +
+  bump `subscribers_revision` → fire handshake lock-released → run
+  activation; happens-after via X4/D2 freeze, not a cross-thread
+  block); deleted the residual "Drop the wave_owner before
+  returning" early-return prose. Completes the S3→S4 deleted-§7
+  comment-sweep.
+- **F2** — `CoreMailbox::close` / `DeferQueue::close` doc clarifies
+  that already-queued closures are NOT drained on `close`; they are
+  dropped when the last `Rc<DeferQueue>` clone drops (operators hold
+  one each). The leak-free property holds via the no-`HandleId`-in-
+  `DeferFn` discipline (D235 P8 / D246 r8).
+- **F4** — `group_parallelism::same_group_independent_cores_…` doc
+  header explicitly states workers share no state (no shared Core /
+  binding / sink / atomic counter); the deleted cross-thread
+  contract is structurally gone (D246/D248), this test characterises
+  only the post-S4 independent-Core invariant.
+- **F5** — `floor_compare`'s `FloorBinding` gains an explicit
+  `retain_handle(&self, _) {}` no-op (pinning the bench number
+  against future `BindingBoundary::retain_handle` default changes;
+  `group_scaling`'s `WorkBinding` already had it).
+- **F6** — `node.rs` `set_deps` `ReentrantOnFiringNode` guard
+  comment notes the state-lock borrow is *structural* under D246/
+  D248 single-owner (not concurrency-required; `CoreShared` is
+  owner-thread-only).
+- **F7** — `SendDeferFn` doc generalised: the API admits any
+  cross-thread `Send` producer with the documented capture
+  discipline, not just `temporal.rs`.
+- **F8** — `SendDeferFn` added to `graphrefly_core` `lib.rs`
+  re-exports (was `pub` in `mailbox` but only reachable as
+  `mailbox::SendDeferFn`).
+- **F9** — Invariant comments locked the coalescing-slot ordering
+  in `observe.rs` (push BEFORE the `scheduled.get()` check; closure
+  releases `pending` borrow via `mem::take` BEFORE any `cf.*` call)
+  and `describe.rs` (`upgrade()` check BEFORE `scheduled.set(true)`
+  so a graph-gone fire doesn't poison the slot).
+- **F10** — `Core::drain_mailbox` `max_ops` doc notes the single
+  knob bounds three dimensions (inner mailbox drain, inner deferred
+  drain, outer mutual-quiescence rounds); workloads needing deep
+  chaining must tune `Core::set_max_batch_drain_iterations` to
+  cover all three.
+- **F11** — `CoreMailbox::take_all` gains
+  `debug_assert!(self.closed.load(Acquire))` enforcing the
+  contract that `take_all` MUST be preceded by `close()` so a post
+  racing standalone `take_all` can't strand a retained-handle op.
+- **F12** — `CoreMailbox::runnable` doc notes that any future
+  per-`SchedulingGroupId` sub-bit MUST be split in lockstep across
+  BOTH `CoreMailbox.runnable` AND `DeferQueue.runnable` (the
+  in-wave drain gate ORs them — a half-split silently loses
+  wakeups).
+
+**Rejected / record-and-skip findings:** the napi-bindings
+`arc_with_non_send_sync` warning cloud + the 150 napi compile
+errors (D248/D249 → bindings excluded from default-members per
+D226; D080/D206 reconciliation pending);
+`attach_storage`-re-ship-on-shrink (pre-existing, not S4 scope);
+the test-file module-doc `wave_owner` stale prose at the top of
+`lock_discipline.rs` (test-only, no spec impact — future
+doc-sweep slice).
+
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 
 > **2026-05-18 STATUS CORRECTION (D236, verify-before-greenfield).** The

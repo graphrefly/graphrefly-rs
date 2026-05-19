@@ -39,6 +39,9 @@ impl BindingBoundary for FloorBinding {
         a == b
     }
     fn release_handle(&self, _: HandleId) {}
+    // Explicit no-op (QA, 2026-05-19): pin the bench number against
+    // any future trait-default change for `retain_handle`.
+    fn retain_handle(&self, _: HandleId) {}
 }
 
 fn noop_sink() -> Sink {

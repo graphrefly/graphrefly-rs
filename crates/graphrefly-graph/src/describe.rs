@@ -346,6 +346,10 @@ pub(crate) fn describe_reactive_in(
             if scheduled.get() {
                 return; // already armed for this drain — coalesce.
             }
+            // INVARIANT (QA, 2026-05-19): the `upgrade()` check runs
+            // BEFORE `scheduled.set(true)`, so a graph-gone fire never
+            // poisons the slot (`scheduled` stays `false`; a later
+            // fire on the next wave re-tries the upgrade fresh).
             let Some(arc_inner) = weak_inner_topo.upgrade() else {
                 return;
             };

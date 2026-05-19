@@ -636,11 +636,19 @@ pub fn attach_snapshot_storage(
     // so N qualifying emissions in one wave need only ONE deferred
     // snapshot+flush, not N boxed closures. `scheduled` (owner-thread-
     // only `Cell`) gates a single `Box` post per drain; the closure
-    // clears it so the next wave re-arms. Behaviour-equivalent: the
-    // persisted state is the final wave state (deferred-snapshot
-    // acceptable, D243/D244) — one alloc + one snapshot+flush per wave
-    // instead of per emission.
+    // clears it so the next wave re-arms.
+    //
+    // M2 (QA, 2026-05-19): `compact_every` cadence is parameterised
+    // per-emission (TS parity), so the coalescing MUST NOT also
+    // collapse the count. `pending_count` tracks the number of
+    // qualifying emits observed in the wave; the closure consumes it
+    // and `flush_tier` increments `flush_count` by that count + tests
+    // boundary-crossing of `compact_every`, preserving the per-emission
+    // compact cadence under the per-wave snapshot. Persisted state is
+    // the final wave state either way (deferred-snapshot acceptable,
+    // D243/D244) — only the *cadence* needs the count.
     let scheduled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let pending_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
 
     // Wire observe_all_reactive so late-added nodes are also covered.
     let mut observe = graph.observe_all_reactive();
@@ -661,6 +669,12 @@ pub fn attach_snapshot_storage(
             }
         }
 
+        // M2: count this qualifying emit BEFORE the coalesce gate, so
+        // `compact_every` cadence stays per-emission. Saturating add —
+        // a `usize` overflow on count-per-wave is unreachable in any
+        // realistic workload (max waves are bounded by `max_ops`).
+        pending_count.set(pending_count.get().saturating_add(1));
+
         if scheduled.get() {
             return; // already armed for this drain — coalesce.
         }
@@ -668,12 +682,16 @@ pub fn attach_snapshot_storage(
         let states_for_defer = states_for_sink.clone();
         let on_error = on_error.clone();
         let sched = std::rc::Rc::clone(&scheduled);
+        let pc = std::rc::Rc::clone(&pending_count);
         sched.set(true);
         // Defer the snapshot + flush owner-side (D244). Core-gone
         // (`false`) ⇒ dropped unrun: nothing to persist on a
         // torn-down graph, no handles captured (no leak).
         let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
             sched.set(false);
+            // M2: consume the per-emission count and reset for the
+            // next wave.
+            let count = pc.replace(0);
             // Take a snapshot once, shared across all sync tiers.
             // D246: the in-wave facade `&dyn CoreFull` drives the
             // snapshot through the one public `Graph` type (Core-free,
@@ -693,7 +711,7 @@ pub fn attach_snapshot_storage(
                     if s.disposed {
                         continue;
                     }
-                    if let Err(e) = flush_tier(s, &snapshot) {
+                    if let Err(e) = flush_tier(s, &snapshot, count) {
                         errs.push(e);
                     }
                 }
@@ -716,12 +734,34 @@ pub fn attach_snapshot_storage(
 }
 
 /// Flush a single tier: either full baseline or WAL delta.
-fn flush_tier(s: &mut TierState, snapshot: &GraphPersistSnapshot) -> Result<(), StorageError> {
-    s.flush_count += 1;
+///
+/// `count` is the number of qualifying observed emits this coalesced
+/// flush represents (M2 / QA 2026-05-19). `flush_count` advances by
+/// `count` to preserve the TS-parity per-emission cadence of
+/// `compact_every`: `write_full` fires if any of the increments in
+/// `before+1..=before+count` would have been a multiple of
+/// `compact_every` (boundary-crossing test) — equivalent to firing on
+/// each emit one-by-one, just batched into the coalesced flush.
+fn flush_tier(
+    s: &mut TierState,
+    snapshot: &GraphPersistSnapshot,
+    count: usize,
+) -> Result<(), StorageError> {
+    let before = s.flush_count;
+    // Defensive: a `count == 0` call (no qualifying emits) is a no-op
+    // here — still walks the write path so first-baseline & WAL deltas
+    // honor `last_snapshot` correctness, but doesn't tick cadence.
+    let inc = count as u64;
+    s.flush_count = s.flush_count.saturating_add(inc);
 
     let write_full = s.wal_tier.is_none()
         || s.last_snapshot.is_none()
-        || (s.compact_every > 0 && s.flush_count.is_multiple_of(u64::from(s.compact_every)));
+        || (s.compact_every > 0 && {
+            // Did the batch [before+1 ..= before+count] cross at least
+            // one multiple of `compact_every`? Integer-division test.
+            let cmp = u64::from(s.compact_every);
+            (before / cmp) < (s.flush_count / cmp)
+        });
 
     if write_full {
         write_full_baseline(s, snapshot)?;

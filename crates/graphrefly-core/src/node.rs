@@ -2333,6 +2333,17 @@ impl Core {
         // QA P3: bound the inner drain by the configured cap (the
         // self-reposting-Defer livelock guard lives here, NOT in
         // `drain_and_flush`'s fire-cascade counter).
+        //
+        // QA F10 (2026-05-19): note that `max_ops` here is **shared
+        // across three bounds** — each `mailbox.drain_into` inner
+        // cap, each `deferred.drain_into` inner cap, AND the outer
+        // mutual-quiescence round counter below. A workload requiring
+        // legitimately deep cross-queue chaining (defer→emit→defer→…)
+        // must tune `Core::set_max_batch_drain_iterations` up to
+        // cover ALL THREE; counting against each independently is
+        // intentional (the bound's purpose is "any single drain
+        // dimension's livelock fires loudly"), not a knob granularity
+        // bug.
         let max_ops = self.with_shared(|sh| sh.max_batch_drain_iterations);
         // D249/S2c: the owner-side `Defer` queue was split off the
         // `Send` id-`CoreMailbox` (so `!Send` `Defer` closures can
@@ -2343,9 +2354,22 @@ impl Core {
         // id-`CoreMailbox`). Pre-D249 this was ONE FIFO drained to
         // quiescence; restore that contract by draining BOTH to
         // **mutual quiescence** — id-mailbox first, then deferred, loop
-        // until neither is runnable. Within each queue intra-FIFO order
-        // is preserved (D234 cancel-before-resubscribe holds — both are
-        // `DeferQueue` posts). Bounded by `max_ops` rounds.
+        // until neither is runnable. Bounded by `max_ops` rounds.
+        //
+        // M1 contract (QA, 2026-05-19) — **CROSS-QUEUE ORDER = QUEUE
+        // PRIORITY, NOT ARRIVAL ORDER.** Within each queue intra-FIFO
+        // order is preserved (D234 cancel-before-resubscribe holds —
+        // both are `DeferQueue` posts). ACROSS queues the order is
+        // structurally `CoreMailbox` ops first, then `DeferQueue` ops,
+        // every round. Pre-D249 a sink posting `[defer, emit]` to ONE
+        // queue saw `defer` applied first; post-D249 a sink posting
+        // `[defer (DeferQueue), emit (CoreMailbox)]` sees `emit`
+        // applied first (mailbox-priority). Operators that need a
+        // specific cross-queue ordering MUST capture the routing state
+        // inside the *later* op's closure (D234 pattern: read shared
+        // state at apply time, not at post time). Locked by the
+        // `cross_queue_order_mailbox_then_deferred` regression in
+        // `tests/lock_discipline.rs`.
         let mut rounds = 0u32;
         loop {
             mailbox.drain_into(max_ops, |op| match op {
@@ -3471,45 +3495,31 @@ impl Core {
         node_id: NodeId,
         sink: Sink,
     ) -> Result<SubscriptionId, SubscribeError> {
-        // Subscribe protocol (Slice E rework, post-handshake-reentry-lift):
+        // Subscribe protocol (S4/D246/D248 single-owner; supersedes the
+        // pre-S2c Slice E `wave_owner` ReentrantMutex sequence which was
+        // deleted with the §7 machinery):
         //
-        // 1. Acquire `wave_owner` first (re-entrant; same-thread passes
-        //    through, cross-thread blocks). This is the cross-thread
-        //    serialization point that preserves R1.3.5.a happens-after
-        //    ordering across the lock-released handshake fire.
-        // 2. Acquire state lock briefly: alloc sub_id, run resubscribable
-        //    reset if applicable, snapshot handshake state, install sink
-        //    in `subscribers`. Drop state lock.
-        // 3. Fire handshake LOCK-RELEASED. Per-tier slices (R1.3.5.a):
-        //    `[Start]` / `[Data(cache)]?` / `[Complete]?` / `[Error(h)]?`
-        //    / `[Teardown]?`. Empty tiers are skipped. Sink callbacks
-        //    may re-enter Core freely — same-thread re-entry passes
-        //    through `wave_owner` reentrantly.
-        // 4. Run activation under `run_wave` if needed (first subscriber
-        //    on a non-state node).
-        // 5. Drop `wave_owner`.
+        // 1. Acquire the state lock briefly: alloc sub_id, run
+        //    resubscribable reset if applicable, snapshot handshake
+        //    state, install sink in `subscribers` + bump
+        //    `subscribers_revision` (Slice X4/D2 freeze). Drop the
+        //    state lock.
+        // 2. Fire the handshake LOCK-RELEASED. Per-tier slices
+        //    (R1.3.5.a): `[Start]` / `[Data(cache)]?` / `[Complete]?` /
+        //    `[Error(h)]?` / `[Teardown]?`. Empty tiers are skipped. A
+        //    sink callback may re-enter Core via the owner-side
+        //    mailbox/`DeferQueue` seam; the owner drain applies it as
+        //    a nested wave.
+        // 3. Run activation under `run_wave` if needed (first
+        //    subscriber on a non-state node).
         //
-        // Race-fix discipline: the sink is installed in `subscribers`
-        // BEFORE the state lock drops, so concurrent threads that
-        // acquire `wave_owner` after our scope sees the sink already
-        // registered. Cross-thread emits block on `wave_owner` until
-        // we drop it, ensuring all our handshake calls land before
-        // any concurrent wave's flush observes the sink.
-
-        // Acquire the partition's `wave_owner` first — cross-thread
-        // serialization point. Per Slice Y1 / Phase E (2026-05-08),
-        // subscribe routes through the per-partition lock instead of
-        // a Core-global one. Subscribe touches only `node_id`'s
-        // partition (activation cascade stays within the partition
-        // because dep edges are unioned). `partition_wave_owner_lock_arc`
-        // §7 (D208–D211): acquire every scheduling group transitively
-        // touched from `node_id`, sorted ascending, held for the
-        // subscribe wave. Empty (zero locks) for an all-`None` cascade —
-        // the single-threaded floor. Same-thread re-entry passes through
-        // each group's `ReentrantMutex`. Infallible: groups are static +
-        // acquired sorted upfront, so there is no order violation.
-        // D246/S2c: single-owner ⇒ no wave-owner / shard guard to
-        // acquire for the subscribe wave (the §7 machinery is deleted).
+        // Happens-after discipline (replaces the pre-S2c cross-thread
+        // `wave_owner` BLOCK): `Core` is single-owner `!Send + !Sync`
+        // (D248) — the one owner thread installs the sink under the
+        // state lock BEFORE the handshake fires, and the
+        // `subscribers_revision` bump (Slice X4/D2) freezes any
+        // earlier-in-wave `PendingBatch` against double-delivery to
+        // the new sink. There is no concurrent thread to block.
 
         let (sub_id, tier_slices, needs_activation, did_reset) = {
             let mut s = self.lock_state();
@@ -3518,8 +3528,7 @@ impl Core {
             // reject. The stream is permanently over; subscribe gets a
             // clean error rather than a confusing replay of past events.
             // Operators (zip / concat / race / ...) match on the variant
-            // and skip the source. Drop the wave_owner before returning so
-            // a concurrent waiter can proceed.
+            // and skip the source.
             //
             // The `has_received_teardown` flag is irrelevant here —
             // `terminal.is_some()` alone gates rejection. The auto-TEARDOWN
@@ -5375,7 +5384,9 @@ impl Core {
         // `a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
         // test is retired (D250) — no actor-model trigger to drive it.
         // `currently_firing` lives on `CoreShared`, read under the
-        // already-held state lock.
+        // already-held state lock (under D246/D248 single-owner the
+        // borrow is *structural* rather than concurrency-required —
+        // `CoreShared` is owner-thread-only).
         if s.shared.currently_firing.contains(&n) {
             return Err(SetDepsError::ReentrantOnFiringNode { n });
         }

@@ -81,10 +81,16 @@ fn run_grouped_cascade(rt: &TestRuntime, g: SchedulingGroupId) -> Vec<TestValue>
 }
 
 /// Independent same-group Cores, one per worker thread, driven
-/// concurrently. Each worker's own grouped wave must serialize
-/// (in-order, exactly-once) and the worker must not deadlock — the
-/// `join()` succeeding is the no-hang proof. (Replaces the deleted
-/// shared-Core `same_group_cross_thread_emits_serialize_without_deadlock`.)
+/// concurrently. Each worker constructs its OWN `!Send` `Core` inside
+/// the spawned closure — **the workers share no state** (no shared
+/// Core, no shared binding, no shared sink, no atomic counter); the
+/// deleted "same group, two threads on one shared Core serialize via
+/// the §7 group lock" contract is structurally gone (D246/D248), and
+/// this test now characterises only the post-S4 invariant that each
+/// *independent* same-group Core serialises its own wave in-order
+/// (single-thread trivially true) and the `join()` succeeds (no hang
+/// in the independent-Core path). (Replaces the deleted shared-Core
+/// `same_group_cross_thread_emits_serialize_without_deadlock`.)
 #[test]
 fn same_group_independent_cores_each_serialize_without_deadlock() {
     let handles: Vec<_> = (0..WORKERS)

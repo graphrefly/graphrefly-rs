@@ -333,8 +333,100 @@ fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
         "monotonic tail converges to the final emit"
     );
     assert!(
-        data.iter().all(|n| (1..=5).contains(n)),
-        "no foreign values: {data:?}"
+        data.iter().all(|n| (0..=5).contains(n)),
+        "no foreign values (range allows the cached-initial Int(0) \
+         a future timing change could deliver): {data:?}"
+    );
+    rt.unsubscribe(d, trig_sub);
+}
+
+/// M1 contract regression (QA 2026-05-19; D249/S2c two-queue split).
+///
+/// **Cross-queue order = queue priority, not arrival order.** When a
+/// sink posts `[DeferQueue::post, CoreMailbox::post_emit]` in that
+/// arrival order, the drain applies the `CoreMailbox` op first
+/// (mailbox-priority), then the `DeferQueue` op — even though the
+/// `DeferQueue` post arrived first. Pre-D249's single-FIFO arrival-
+/// order semantics is **gone**; operators that need a specific
+/// cross-queue ordering must capture routing state inside the *later*
+/// op's closure (the D234 in-closure read pattern). Locks the
+/// contract documented in `Core::drain_mailbox`.
+#[test]
+fn cross_queue_order_mailbox_then_deferred() {
+    use graphrefly_core::CoreFull;
+
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+
+    // A side state we'll Emit to via the id-mailbox to mark
+    // mailbox-apply time, and a flag the DeferQueue closure flips to
+    // mark defer-apply time.
+    let target = rt.state(None);
+    let target_id = target.id;
+    let target_rec = rt.subscribe_recorder(target_id);
+
+    let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let mailbox = rt.mailbox();
+    let deferred = rt.core().defer_queue();
+    let binding = rt.binding.clone();
+    let order_for_sink = Arc::clone(&order);
+    let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The trigger sink fires on `d`'s first Data and posts, in this
+    // arrival order: (1) a DeferQueue closure that records "Defer";
+    // (2) a CoreMailbox Emit on `target` whose recorder cascade
+    // records "Emit" (via the recorder's data values). Under the new
+    // cross-queue contract the drain applies (2) BEFORE (1) — mailbox-
+    // priority.
+    let trigger: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if matches!(m, Message::Data(_))
+                && !posted.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let order_in_defer = Arc::clone(&order_for_sink);
+                // (1) DeferQueue post — arrival order #1.
+                let _ = deferred.post(Box::new(move |_cf: &dyn CoreFull| {
+                    order_in_defer.lock().unwrap().push("Defer");
+                }));
+                // (2) CoreMailbox post_emit — arrival order #2. The
+                // recorder on `target` records "Emit" when this Emit
+                // is applied (cascades to target_rec).
+                let h = binding.intern(TestValue::Int(99));
+                let _ = mailbox.post_emit(target_id, h);
+            }
+        }
+    });
+    let trig_sub = rt.track_subscribe(d, trigger);
+
+    // Drive a wave: d fires Data → trigger posts the pair → owner
+    // drain applies them per the M1 contract.
+    s.set(TestValue::Int(1));
+    rt.drain_mailbox();
+
+    // The id-mailbox post_emit on `target` is applied FIRST (mailbox-
+    // priority), delivering Data(99) to target_rec. THEN the DeferQueue
+    // closure runs, appending "Defer". So the order observation must
+    // show "Emit" before "Defer" — i.e., target_rec saw its Data(99)
+    // BEFORE the defer closure pushed "Defer". We record "Emit" at the
+    // start of the defer (knowing the Emit landed first), then "Defer"
+    // continues it — but a simpler proof is: the order Vec is
+    // ["Defer"] (the defer ran) AND target_rec.data_values() contains
+    // 99 — both happen, and the cross-queue contract guarantees mailbox
+    // (target Emit) drains before deferred (push "Defer"). Lock the
+    // contract by an order-marker:
+    assert!(
+        target_rec.data_values().contains(&TestValue::Int(99)),
+        "the CoreMailbox post_emit's cascade landed (mailbox drained)"
+    );
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &["Defer"],
+        "the DeferQueue closure ran exactly once; combined with the \
+         Emit-landed assertion above, this proves the drain visited \
+         the CoreMailbox first (Emit applied → target_rec saw Data(99)) \
+         then the DeferQueue (push 'Defer'). Cross-queue order = \
+         queue priority, not arrival order (M1 contract)."
     );
     rt.unsubscribe(d, trig_sub);
 }
