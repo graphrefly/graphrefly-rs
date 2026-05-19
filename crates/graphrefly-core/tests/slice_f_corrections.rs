@@ -103,9 +103,11 @@ fn a4_user_supplied_low_lock_id_does_not_collide_with_alloc() {
 // invariant has no β-valid expression yet.
 
 #[test]
-#[ignore = "D246 record-and-skip: D1 `SetDepsError::ReentrantOnFiringNode` guard is LIVE (node-mid-fire-rewrite-corrupts-tracked-indices, node.rs `currently_firing.contains(&n)` check), but its ONLY trigger is a synchronous `set_deps(n)` re-entry while `n ∈ currently_firing` (i.e. from inside `n`'s own fn-fire). Under the actor model: `invoke_fn` carries no `&Core`; `set_deps` is NOT on `CoreFull` (the `MailboxOp::Defer` re-entry surface) and is NOT a `MailboxOp` variant; and a `Defer` runs owner-side AFTER the wave settles when `currently_firing` is empty — so the guard can never fire via the mailbox seam. The synchronous binding-holds-Core trigger is structurally deleted (D221/D246). The guard code itself stays live (still rejects owner-side mid-wave self-rewire attempts the owner could make in S4's owner-side seam). → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
+#[ignore = "retired (D250, S4): the `SetDepsError::ReentrantOnFiringNode` guard *code* stays LIVE (node.rs `currently_firing.contains(&n)` — defensive against an owner-side mid-wave self-rewire), but its ONLY synchronous trigger (calling `set_deps(n)` from inside `n`'s own fn-fire) was reachable only via the binding-holds-cloned-Core mechanism, structurally deleted by D221/D246: `invoke_fn` carries no `&Core`; `set_deps` is not on `CoreFull` and is not a `MailboxOp`; a Defer runs owner-side AFTER the wave settles (`currently_firing` empty). A firing fn synchronously rewiring itself is the imperative-from-reactive anti-pattern; no actor-model path produces it. Test intent preserved, never deleted; the guard remains covered structurally by the unit assertions on the `currently_firing` set. Adding set_deps to CoreFull/MailboxOp purely to keep this stub alive = substrate surface for zero consumer (D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
 fn a6_set_deps_from_firing_fn_rejected_with_reentrant_error() {
-    // No β-valid expression under the actor model — see #[ignore]. → S4.
+    // Retired (D250): no β-valid actor-model trigger. The guard code
+    // stays live (defensive); see node.rs set_deps `currently_firing`
+    // ReentrantOnFiringNode comment.
 }
 
 // =====================================================================

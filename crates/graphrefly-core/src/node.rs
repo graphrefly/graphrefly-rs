@@ -56,15 +56,18 @@
 //! - **`BindingBoundary::custom_equals`** fires lock-released.
 //!   `commit_emission` brackets the equals check around a lock release;
 //!   custom equals oracles may re-enter Core safely.
-//! - **Subscribe-time handshake** also fires lock-released. [`Core::subscribe`]
-//!   acquires the [`Core::wave_owner`] re-entrant mutex first (cross-thread
-//!   serialization), installs the sink under the state lock, drops the state
-//!   lock, then fires the per-tier handshake (`[Start]` / `[Data(cache)]?` /
-//!   `[Complete]?` / `[Error(h)]?` / `[Teardown]?` per R1.3.5.a) lock-released.
-//!   A handshake-time sink callback may re-enter Core (`emit` / `complete` /
-//!   `error` / `subscribe`); same-thread re-entry passes through `wave_owner`
-//!   transparently. Cross-thread emits block on `wave_owner` until the
-//!   subscribe path drops it, preserving R1.3.5.a happens-after ordering.
+//! - **Subscribe-time handshake** also fires lock-released.
+//!   [`Core::subscribe`] installs the sink under the state lock, drops
+//!   it, then fires the per-tier handshake (`[Start]` / `[Data(cache)]?`
+//!   / `[Complete]?` / `[Error(h)]?` / `[Teardown]?` per R1.3.5.a)
+//!   lock-released. A handshake-time sink callback may re-enter Core
+//!   via the owner-side mailbox/`DeferQueue` seam (`emit` / `complete` /
+//!   `error` / `subscribe`); the owner drain applies it as a nested
+//!   wave. Post-S4 `Core` is single-owner `!Send + !Sync` — there is no
+//!   `wave_owner` mutex and no cross-thread block; R1.3.5.a
+//!   happens-after ordering holds because the one owner thread installs
+//!   the sink (state lock) before any subsequent emit's flush observes
+//!   it (`subscribers_revision` freeze, Slice X4/D2).
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1745,30 +1748,33 @@ pub struct CoreState {
 /// to clone (the inner `Arc<Mutex<CoreState>>` is shared); pass `Core` by
 /// value to threads.
 ///
-/// # Wave-owner re-entrant mutex (Slice A close /qa, M1)
-///
-/// The state lock (`state: Mutex<CoreState>`) is **dropped** around binding
-/// callbacks (`invoke_fn`, `custom_equals`) so user fns may re-enter Core.
-/// To preserve serializability of WAVE EXECUTION across threads — without
-/// re-introducing the lock-held-during-fn-fire deadlock the Slice A close
-/// refactor lifted — the wave engine acquires `wave_owner` (a
-/// [`parking_lot::ReentrantMutex`]) for the lifetime of each wave.
-///
-/// Properties:
-///
-/// - **Same-thread re-entrance is free.** A user fn that calls back into
-///   `Core::emit` / `Core::pause` / etc. mid-fire re-acquires `wave_owner`
-///   on the same thread and runs as a nested wave (the inner `run_wave`
-///   sees `in_tick=true` and skips drain — outer drain picks up).
-/// - **Cross-thread emits BLOCK** at `wave_owner.lock_arc()` until the
-///   in-flight wave completes (drain + flush + sink fire all done). This
-///   serializes wave OWNERSHIP across threads, while still allowing the
-///   state lock to drop inside the wave for binding callbacks.
-///
-/// Without this, Slice A close's lock-released drain let cross-thread
-/// emits absorb into the in-flight wave's `pending_notify` and return
-/// before subscribers fire — breaking the user-facing happens-after
-/// contract that `emit` returning means subscribers have observed.
+// # Wave execution = one uninterrupted owner-side drain (S4, D246/D248/D249)
+//
+// The state lock (`state: RefCell<CoreState>`) is **dropped** around
+// binding callbacks (`invoke_fn`, `custom_equals`) so user fns may
+// re-enter Core. The original M1 design serialized WAVE EXECUTION
+// across threads with a `wave_owner` `parking_lot::ReentrantMutex` held
+// for the wave; S2c/D248 deleted it. `Core` is now single-owner
+// `!Send + !Sync`: exactly one owner thread ever drives a given `Core`,
+// so a wave is one uninterrupted owner-side drain. There is no
+// cross-thread emitter to block and no wave-ownership mutex.
+//
+// - Same-thread / same-Core re-entrance (a user fn or in-wave sink
+//   re-entering via the owner-side mailbox/`DeferQueue` seam) runs as a
+//   nested wave: the inner `run_wave` sees `in_tick = true` (keyed by
+//   `Core::generation`, `batch::IN_TICK_OWNED`) and skips its own drain
+//   — the outer drain picks the queued op up to quiescence.
+// - Cross-`Core` concurrency is host-native: independent per-worker
+//   Cores (actor model). The only cross-thread bridge into a `!Send`
+//   Core is the id-only `Arc<CoreMailbox>` (timer / producer `post_*` +
+//   the `runnable` wake bit), drained owner-side.
+//
+// The happens-after contract (`emit` returning ⇒ subscribers observed)
+// holds structurally: the single owner thread runs the emit's drain to
+// quiescence before returning; a mid-wave subscribe is frozen against
+// double-delivery by the `subscribers_revision` `PendingBatch` snapshot
+// (Slice X4/D2), not by a cross-thread lock.
+
 /// Monotonic generation counter for `Core` instances. Used by the
 /// per-thread `PARTITION_CACHE` in `batch.rs` to distinguish Core
 /// instances without relying on `Arc::as_ptr` (which can be reused by
@@ -1782,11 +1788,15 @@ pub struct Core {
     /// scratch-release queue). D246/S2c: single-owner ⇒ a plain
     /// `RefCell` (the `parking_lot`/`StateCell`-generic split was
     /// shared-Core-era legacy; the actor model drives a `Core` from
-    /// exactly one thread). `RefCell<T>: Send where T: Send` ⇒ `Core`
-    /// stays `Send` (relocatable as a whole) but is `!Sync`, exactly
-    /// the actor-model shape (D221/D223). A re-entrant double-borrow
-    /// panics loudly — a dispatcher bug (a missing lock-released
-    /// bracket around a binding callback), not a user error.
+    /// exactly one thread). D248 relaxed the substrate `Sink`/
+    /// `TopologySink` off `Send + Sync`, so `CoreState` owns `!Send`
+    /// sinks ⇒ **`Core` is `!Send + !Sync`** (one owner thread, never
+    /// relocated cross-thread; the only cross-thread bridge is the
+    /// id-only `Arc<CoreMailbox>`). This is the actor-model shape
+    /// (D221/D223/D248); cross-`Core` parallelism = independent
+    /// per-worker Cores. A re-entrant double-borrow panics loudly — a
+    /// dispatcher bug (a missing lock-released bracket around a binding
+    /// callback), not a user error.
     pub(crate) shared: std::cell::RefCell<CoreShared>,
     /// The node/children/binding region (was the sharded `CoreState`;
     /// single shard always under single-owner — D246/S2c collapse).
@@ -2193,9 +2203,11 @@ impl Core {
     pub fn new(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
             // D246/S2c: single-owner ⇒ plain `RefCell` regions (no
-            // `StateCell` generic, no shard map). `Core` is `Send`
-            // (RefCell<T>: Send where T: Send) but `!Sync` — the
-            // actor-model shape (D221/D223).
+            // `StateCell` generic, no shard map). D248 relaxed the
+            // substrate `Sink` off `Send+Sync` ⇒ `Core` is `!Send +
+            // !Sync` — the actor-model shape (D221/D223/D248); one
+            // owner thread, cross-`Core` parallelism via independent
+            // per-worker Cores.
             shared: std::cell::RefCell::new(CoreShared {
                 next_node_id: 1,
                 next_subscription_id: 1,
@@ -2439,15 +2451,14 @@ impl Core {
 
     /// Execute a producer-pattern op. §7: the union-find ascending-order
     /// constraint that motivated *deferring* these is deleted (groups
-    /// are static + acquired sorted upfront, so there is no
-    /// `PartitionOrderViolation` to dodge). The op therefore runs
-    /// **immediately** — re-entrant execution on the wave's thread
-    /// passes through the group `ReentrantMutex` transparently and is
-    /// absorbed by the in-flight wave drain (`IN_TICK_OWNED`), exactly
-    /// as the deferred drain used to run it at wave-end. The
-    /// `deferred_producer_ops` queue + `drain_deferred_producer_ops`
-    /// are deleted; this shim is retained so `graphrefly-operators`
-    /// compiles unchanged (D211 minimal-churn).
+    /// are static identity only — S2c removed the group-lock machinery,
+    /// so there is no `PartitionOrderViolation` to dodge). The op runs
+    /// **immediately** — re-entrant execution on the single owner thread
+    /// is absorbed by the in-flight wave drain (`IN_TICK_OWNED`,
+    /// `Core::generation`-keyed), exactly as the deferred drain used to
+    /// run it at wave-end. The `deferred_producer_ops` queue +
+    /// `drain_deferred_producer_ops` are deleted; this shim is retained
+    /// so `graphrefly-operators` compiles unchanged (D211 minimal-churn).
     ///
     /// For `Emit`/`Error` the caller retained the handle before
     /// pushing (mirroring the old drain contract); we release it after
@@ -3643,9 +3654,10 @@ impl Core {
             self.binding.wipe_ctx(node_id);
         }
 
-        // Fire handshake LOCK-RELEASED. Sink may re-enter Core; same-
-        // thread re-entry passes through `wave_owner` reentrantly.
-        // Cross-thread emits block at `wave_owner` until our scope ends.
+        // Fire handshake LOCK-RELEASED. A sink may re-enter Core via
+        // the owner-side mailbox/`DeferQueue` seam; the owner drain
+        // applies it as a nested wave. Single-owner `!Send` Core: no
+        // `wave_owner` mutex, no cross-thread emitter (S4/D248).
         //
         // A7 (Slice F, 2026-05-07): per-tier slice fire is wrapped in
         // `catch_unwind`. The sink is installed in `subscribers` BEFORE
@@ -4051,11 +4063,11 @@ impl Core {
                 return Ok(());
             }
         }
-        // Run wave on `node_id`'s touched partitions. Slice Y1 / Phase E:
-        // emit cascades only via `s.children`, all unioned with `node_id`'s
-        // partition by construction (dep edges = union edges). Common case
-        // is a single-partition acquire — disjoint-partition emits run
-        // truly parallel under per-partition `wave_owner`.
+        // Run the wave for `node_id`. Slice Y1 / Phase E: emit cascades
+        // only via `s.children`. S4/D248: single-owner `!Send` Core —
+        // one uninterrupted owner-side drain (no `wave_owner` mutex,
+        // no cross-thread parallel waves within a Core); cross-`Core`
+        // parallelism is host-native via independent per-worker Cores.
         self.try_run_wave_for(node_id, |this| {
             this.commit_emission(node_id, new_handle);
         })?;
@@ -5342,20 +5354,28 @@ impl Core {
             return Err(SetDepsError::TerminalNode { n });
         }
         // A6 reentrancy guard (Slice F, 2026-05-07): reject if `n` is
-        // currently mid-fire on the wave-owner thread. Closes the D1 hazard
-        // where `Phase 1` snapshotted `dep_handles` against pre-rewire dep
-        // ordering and `Phase 3` would store the returned `tracked` indices
-        // against post-rewire ordering. Same-thread re-entry is the only
-        // path that matters — cross-thread emits already block on
-        // `wave_owner` per the M1 design.
-        // /qa F2 reverted (2026-05-10): currently_firing lives on
-        // CoreState (per-Core, cross-thread visible). The D1 reentrance
-        // check requires the same-thread visibility (a fn re-entering
-        // set_deps on its own firing node), and the P13 cross-thread
-        // check requires cross-thread visibility (Thread B's set_deps
-        // observing Thread A's firing pushes during A's lock-released
-        // invoke_fn). Per-Core placement on shared CoreState delivers
-        // both. Read under the already-held state lock.
+        // mid-fire. Closes the D1 hazard where `Phase 1` snapshotted
+        // `dep_handles` against pre-rewire dep ordering and `Phase 3`
+        // would store the returned `tracked` indices against post-rewire
+        // ordering.
+        //
+        // D250 (S4, 2026-05-19): post-D248/D249 single-owner the only
+        // historical *trigger* for this guard — a synchronous `set_deps`
+        // re-entry from inside `n`'s own fn-fire via the binding-holds-
+        // cloned-Core mechanism — is structurally deleted (`invoke_fn`
+        // has no `&Core`; `set_deps` is not on `CoreFull`/`MailboxOp`; a
+        // Defer runs owner-side AFTER the wave settles with
+        // `currently_firing` empty). The deleted cross-thread P13 path
+        // (Thread B's set_deps observing Thread A's lock-released
+        // invoke_fn pushes) is likewise gone — Core is `!Send`, one
+        // owner thread. The guard is therefore **defensive**: it stays
+        // live so a future owner-side mid-wave self-rewire seam (or any
+        // re-entry that lands an owner inside the firing set) is
+        // rejected fail-loud rather than corrupting tracked indices. The
+        // `a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
+        // test is retired (D250) — no actor-model trigger to drive it.
+        // `currently_firing` lives on `CoreShared`, read under the
+        // already-held state lock.
         if s.shared.currently_firing.contains(&n) {
             return Err(SetDepsError::ReentrantOnFiringNode { n });
         }
@@ -5794,9 +5814,10 @@ impl CoreState {
         // `St` guard's `.shared` field, immediately adjacent — same
         // wave-end point, same belt-and-suspenders intent.
         //
-        // Slice G tier3 emit tracking moved to per-partition state (Q3,
-        // 2026-05-09); cleared by [`super::WaveOwnerGuard::drop`] on
-        // outermost release for each partition the wave touched.
+        // Slice G tier3 emit tracking lives on the per-thread
+        // `WAVE_STATE`; cleared by the outermost `BatchGuard::drop`
+        // (S4/D246: `WaveOwnerGuard` deleted — single-owner ⇒ one
+        // uninterrupted owner-side drain, no per-partition release).
         for rec in self.nodes.values_mut() {
             rec.dirty = false;
             rec.involved_this_wave = false;

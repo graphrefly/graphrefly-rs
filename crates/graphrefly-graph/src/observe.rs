@@ -274,23 +274,42 @@ impl GraphObserveAllReactive {
         // `!Send`); `Rc<DeferQueue>` is owner-thread-only — fine, this
         // topo sink is `!Send` (D248) and fires on the owner thread.
         let deferred = core.defer_queue();
+        // D246 rule 8 (S4): reusable coalescing slot. Prune is NOT
+        // idempotent (each torn id must be unsubscribed once), so
+        // accumulate torn ids into a shared owner-thread-only buffer
+        // and post ONE `Box` per drain that processes all of them —
+        // instead of one boxed closure per `NodeTornDown`.
+        // Behaviour-equivalent: the set of (node,sub) pairs unsubscribed
+        // is exactly the union, just batched into one deferred pass.
+        let pending: Rc<RefCell<Vec<NodeId>>> = Rc::new(RefCell::new(Vec::new()));
+        let scheduled = Rc::new(std::cell::Cell::new(false));
         let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
             if let TopologyEvent::NodeTornDown(id) = event {
-                let id = *id;
+                pending.borrow_mut().push(*id);
+                if scheduled.get() {
+                    return; // already armed for this drain — coalesce.
+                }
+                scheduled.set(true);
                 let inner_for_defer = inner_for_topo.clone();
+                let pending_for_defer = Rc::clone(&pending);
+                let sched = Rc::clone(&scheduled);
                 // No `HandleId` captured — Core-gone (`false`) just
                 // skips the prune; nothing to release (D235 P8).
                 let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
+                    sched.set(false);
+                    let torn: Vec<NodeId> = std::mem::take(&mut *pending_for_defer.borrow_mut());
                     let to_unsub: Vec<(NodeId, SubscriptionId)> = {
                         let mut state = inner_for_defer.borrow_mut();
-                        if state.subscribed.remove(&id) {
-                            let (keep, drop_): (Vec<_>, Vec<_>) =
-                                state.subs.drain(..).partition(|(n, _)| *n != id);
-                            state.subs = keep;
-                            drop_
-                        } else {
-                            Vec::new()
+                        let mut acc = Vec::new();
+                        for id in torn {
+                            if state.subscribed.remove(&id) {
+                                let (keep, drop_): (Vec<_>, Vec<_>) =
+                                    state.subs.drain(..).partition(|(n, _)| *n != id);
+                                state.subs = keep;
+                                acc.extend(drop_);
+                            }
                         }
+                        acc
                     };
                     for (n, s) in to_unsub {
                         cf.unsubscribe(n, s);

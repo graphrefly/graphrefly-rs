@@ -3544,6 +3544,41 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
 
 ### D246 record-and-skip (running list — flags where the D246 pattern genuinely does NOT apply; report at session end)
 
+> **⭐ S4 RESOLUTION (2026-05-19, D250/D251) — closes the S4-tagged
+> entries below.** S4 landed (see `migration-status.md` § "D246 S4 —
+> LANDED"); the D246 S-sequence is complete. The following
+> record-and-skip entries are now **RESOLVED** (kept below as the audit
+> trail; do not re-action):
+> - **§7 cross-thread group tests + `lock_discipline::concurrent_subscribe…`**
+>   → rebuilt as actor-model **one-Core-per-worker** (each worker builds
+>   its own `!Send` Core inside the spawned closure);
+>   `concurrent_subscribe…` rebuilt single-owner via in-wave
+>   `mailbox.post_defer`→`cf.subscribe`. **No longer `#[ignore]`.**
+> - **`lock_released::late_subscriber…`** → β-rebuilt (D246 r6/D233/D249):
+>   in-wave trigger sink posts a `Send` `Defer` that builds the `!Send`
+>   late sink INSIDE the closure + `cf.subscribe` (the prior
+>   "`!Send`-capture / needs producer-harness" record-and-skip is
+>   **dissolved** — the build-sink-inside-Send-closure pattern needs no
+>   core-harness surgery). **No longer `#[ignore]`.**
+> - **`lock_released::fn_can_reenter_core_pause_resume…`,
+>   `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
+>   `slice_f_corrections::a6_set_deps…`** → **retired as deleted-model
+>   (D250)**: `#[ignore = "retired (D250)…"]`, intent preserved, the
+>   `ReentrantOnFiringNode` guard code stays live (defensive). These
+>   stay `#[ignore]` permanently *by decision* — NOT an open item.
+> - **`floor_compare`/`group_scaling`/`profile_disjoint_*`** → rebuilt
+>   as actor-model independent-per-worker-Core bench/profilers;
+>   `profile_st_emit` was already correct.
+> - **D246 rule 8** → landed as the **reusable coalescing slot**
+>   (D251 — D246-r8's "typed `MailboxOp` / fuse-with-mailbox-reshape"
+>   premise was stale post-D249; reconciled within r8's "(or a reusable
+>   slot)" latitude).
+> - **S3→S4 deleted-§7-machinery comment sweep** → done (node.rs +
+>   batch.rs `wave_owner`/`ReentrantMutex`/stale-`Send` corrected).
+> Still genuinely open / NOT S4: the `attach_storage`
+> re-ship-on-shrink smell (pre-existing, dedicated structures/storage
+> slice) and the standalone non-S entries below.
+
 - [storage] **RESOLVED (keystone, 2026-05-18)** — `graphrefly-graph` now
   exposes `pub fn Graph::snapshot_full(&self, core: &dyn CoreFull)`
   (delegates to the `pub(crate)` `snapshot_of`); `graph_integration.rs:657`

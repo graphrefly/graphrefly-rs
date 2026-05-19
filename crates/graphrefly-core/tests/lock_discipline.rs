@@ -72,9 +72,11 @@ fn sink_can_reenter_core_via_emit() {
 }
 
 #[test]
-#[ignore = "D246 record-and-skip: sink→Core pause/resume re-entry has NO β-valid seam — pause/resume are absent from CoreFull (the MailboxOp::Defer surface) and are not MailboxOp variants; the deleted synchronous shared-Core mechanism is the only path. Invariant (an in-wave sink can pause/resume) stays live → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
+#[ignore = "retired (D250, S4): synchronous in-wave-sink re-entry into Core pause/resume was only reachable via the deleted shared-Core mechanism (D221/D246 single-owner). A sink synchronously driving pause/resume is the imperative-from-reactive-layer anti-pattern design invariant #2 forbids; the β-valid path is reactive (sink posts an Emit → controller node → owner-side pause/resume) and the live mailbox-reentry sink tests below (sink_can_complete_another_node_from_callback etc.) cover the in-wave-sink-reenters-Core invariant. Intent preserved, never deleted. No CoreFull/MailboxOp pause/resume widening (zero consumer; D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
 fn sink_can_reenter_core_via_pause_and_resume() {
-    // No β-valid expression: pause/resume not on CoreFull/MailboxOp. → S4.
+    // Retired (D250): no β-valid actor-model trigger; the reactive
+    // equivalent (sink Emit → controller → owner-side pause/resume) is
+    // the spec-correct path, covered by the live sink-reentry tests.
 }
 
 #[test]
@@ -231,16 +233,108 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
     );
 }
 
+/// Subscribe-during-emit observes Start-first + monotonic post-subscribe
+/// DATA (S4 β-valid rebuild, D233/D246 r6/D249).
+///
+/// The original asserted a *cross-thread* race (two threads, one shared
+/// Core) — structurally deleted by D248/D249 single-owner. The live
+/// invariant ("a subscribe that lands while a node is mid-emit observes
+/// `Start` before any DATA, then a monotonic post-subscribe DATA tail —
+/// never a stale/out-of-order value") is single-owner-expressible: an
+/// in-wave sink posts a `Send` `Defer` that installs the late
+/// subscriber via `cf.subscribe` mid-wave (same vehicle as
+/// `late_subscriber…` in `lock_released.rs`). The late sink joins while
+/// `s` is being driven through a monotonic sequence and must observe
+/// `Start` then strictly-increasing DATA ending at the last emit.
 #[test]
-#[ignore = "D246/D249 record-and-skip: genuinely-deleted §7 cross-thread model. `thread::spawn(move || rt_emit…)` shares `Arc<TestRuntime>` across threads, requiring `OwnedCore: Send+Sync`. D248/D249 single-owner made `Core`/`OwnedCore` `!Send+!Sync` (sinks relaxed off `Send+Sync`; the only cross-thread bridge is `Arc<CoreMailbox>` id-posts). Concurrent two-thread Core driving is the deleted model — rebuild as one-Core-per-worker at S4 (migration-status S4 'convert the 6 §7 #[ignore] tests'). See porting-deferred § D246 record-and-skip."]
 fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
-    // D246/D249 record-and-skip stub: the original two-thread
-    // `thread::spawn` body shares `Arc<TestRuntime>` cross-thread
-    // (requires `OwnedCore: Send+Sync`, deleted under D248/D249
-    // single-owner). The invariant (a concurrent subscribe during emit
-    // observes Start-first + monotonic post-subscribe DATA) stays live;
-    // it is rebuilt as a **one-Core-per-worker** scenario at S4
-    // (migration-status S4 "convert the 6 §7 #[ignore] tests"). No
-    // β-valid single-owner expression of a *cross-thread* race exists
-    // pre-S4. → S4.
+    #[derive(Debug, PartialEq, Clone)]
+    enum Ev {
+        Start,
+        Data(i64),
+        Other,
+    }
+
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+
+    let late: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let s_id = s.id;
+    let late_for_defer = Arc::clone(&late);
+    let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trigger: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+        for m in msgs {
+            if matches!(m, Message::Data(_))
+                && posted
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+            {
+                let binding = binding.clone();
+                let late = Arc::clone(&late_for_defer);
+                let _ = mailbox.post_defer(Box::new(move |cf: &dyn graphrefly_core::CoreFull| {
+                    let b = binding.clone();
+                    let buf = Arc::clone(&late);
+                    let late_sink: graphrefly_core::Sink = Arc::new(move |ms: &[Message]| {
+                        let mut g = buf.lock().unwrap();
+                        for m in ms {
+                            match m {
+                                Message::Start => g.push(Ev::Start),
+                                Message::Data(h) => match b.deref(*h) {
+                                    TestValue::Int(n) => g.push(Ev::Data(n)),
+                                    _ => g.push(Ev::Other),
+                                },
+                                _ => g.push(Ev::Other),
+                            }
+                        }
+                    });
+                    let _ = cf.subscribe(s_id, late_sink);
+                }));
+            }
+        }
+    });
+    let trig_sub = rt.track_subscribe(d, trigger);
+
+    // Drive `s` through a strictly-increasing sequence; the late
+    // subscriber joins mid-wave on the first emit's cascade.
+    for k in 1..=5 {
+        s.set(TestValue::Int(k));
+        rt.drain_mailbox();
+    }
+
+    let got = late.lock().unwrap().clone();
+    assert_eq!(
+        got.first(),
+        Some(&Ev::Start),
+        "late sink observes Start first"
+    );
+    let data: Vec<i64> = got
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Data(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert!(!data.is_empty(), "late sink received post-subscribe DATA");
+    assert!(
+        data.windows(2).all(|w| w[0] < w[1]),
+        "post-subscribe DATA is strictly monotonic (no stale/out-of-order): {data:?}"
+    );
+    assert_eq!(
+        *data.last().unwrap(),
+        5,
+        "monotonic tail converges to the final emit"
+    );
+    assert!(
+        data.iter().all(|n| (1..=5).contains(n)),
+        "no foreign values: {data:?}"
+    );
+    rt.unsubscribe(d, trig_sub);
 }

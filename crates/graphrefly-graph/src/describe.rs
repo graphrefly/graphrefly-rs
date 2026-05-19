@@ -333,17 +333,31 @@ pub(crate) fn describe_reactive_in(
     // fine: this topo sink is `!Send` (D248) and fires owner-side.
     let deferred = core.defer_queue();
     let sink_topo = sink.clone();
+    // D246 rule 8 (S4): reusable coalescing slot. Re-snapshot is
+    // idempotent at drain time (`describe_of` reads current state), so
+    // N `DepsChanged` in one wave need only ONE deferred re-snapshot,
+    // not N boxed closures. `scheduled` (owner-thread-only `Cell`) gates
+    // a single `Box` post per drain; the closure clears it so the next
+    // wave re-arms. Behaviour-equivalent (deferred-snapshot acceptable,
+    // D243/D244) — one alloc + one snapshot per wave, not per emission.
+    let scheduled = Rc::new(std::cell::Cell::new(false));
     let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
         if matches!(event, TopologyEvent::DepsChanged { .. }) {
+            if scheduled.get() {
+                return; // already armed for this drain — coalesce.
+            }
             let Some(arc_inner) = weak_inner_topo.upgrade() else {
                 return;
             };
             let s = sink_topo.clone();
+            let sched = Rc::clone(&scheduled);
+            sched.set(true);
             // The Defer closure captures no `HandleId` (only an
             // `Arc<sink>` + a `Weak`-upgraded inner) — if the Core
             // is gone (`false`) the snapshot simply won't fire;
             // nothing to release (D235 P8 pattern).
             let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
+                sched.set(false);
                 s(&describe_of(cf, &arc_inner, None));
             }));
         }

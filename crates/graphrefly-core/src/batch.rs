@@ -62,42 +62,30 @@ use crate::node::{Core, CoreState, EqualsMode, OperatorOp, Sink, TerminalKind};
 
 // Slice G (R1.3.2.d / R1.3.3.a) per-thread tier-3-emit tracker.
 //
-// **Wave scope = thread-local.** GraphReFly's wave-engine guarantees
-// that every emit at a given node within a single wave runs on the
-// same thread (the thread that holds the partition's `wave_owner`
-// `parking_lot::ReentrantMutex` — cross-thread emits at a node BLOCK
-// on that mutex and so always land in the OTHER thread's wave). A
-// wave is bounded above by the outermost `BatchGuard` drop on its
-// originating thread. Together this means a per-thread
-// `AHashSet<NodeId>` is the natural placement for "has node X already
-// emitted a tier-3 message in this wave?" — the set's lifetime
-// exactly matches the wave's, with no cross-thread or cross-wave
-// contamination.
+// **Wave scope = the owner thread (S4, D246/D248/D249).** `Core` is
+// single-owner `!Send + !Sync`: every emit in a wave runs on the one
+// owner thread, and a wave is one uninterrupted owner-side drain
+// bounded above by the outermost `BatchGuard` drop. A per-thread
+// `AHashSet<NodeId>` is therefore the natural placement for "has node
+// X already emitted a tier-3 message in this wave?" — its lifetime
+// matches the wave's, with no cross-thread or cross-wave contamination
+// (there is no other thread driving this Core; the deleted
+// `wave_owner` `ReentrantMutex` / cross-thread-BLOCK model is gone
+// with S2c's §7 machinery).
 //
-// **History (D1 patch, 2026-05-09):** previously placed on
-// `crate::subgraph::SubgraphLockBox::state` per-partition (Q3 v1).
-// That placement was robust to per-partition wave parallelism but
-// vulnerable to mid-wave cross-thread `set_deps` partition splits:
-// thread A is mid-wave on partition P (wave_owner held) but between
-// fn fires (`currently_firing` empty); thread B's `set_deps` acquires
-// the state lock, P13's `currently_firing.is_empty()` check
-// short-circuits, the split proceeds, and X migrates from P to a
-// fresh orphan-side partition with an empty
-// `tier3_emitted_this_wave`. Thread A's subsequent emit at X then
-// mis-detects "first emit" and queues a Resolved alongside the prior
-// Data — R1.3.3.a violation. Thread-local placement is immune to this
-// hazard: thread B's split doesn't touch thread A's thread-local at
-// all.
+// **History:** placed per-partition on `SubgraphLockBox::state` (Q3
+// v1), moved to a per-thread thread-local by the D1 patch
+// (2026-05-09) to survive mid-wave cross-thread `set_deps` partition
+// splits — a hazard that only existed under the now-deleted
+// shared-Core cross-thread model. Post-S4 the thread-local placement
+// is simply the owner thread's wave-scoped set.
 //
 // **Lifecycle:** populated by `Core::commit_emission` /
 // `Core::commit_emission_verbatim`; cleared at the OUTERMOST
-// `BatchGuard` drop on this thread (both success and panic-discard
-// paths). Re-entrant nested waves on the same thread share the set —
-// inner-wave emits add to the same set; the outermost drop is the
-// canonical clear point. Cross-thread emits NEVER touch this thread's
-// set (they serialize on the partition wave_owner; the cross-thread
-// emit happens in the OTHER thread's emit-loop and uses the OTHER
-// thread's tier3 thread-local).
+// `BatchGuard` drop on the owner thread (both success and
+// panic-discard paths). Re-entrant nested waves on the same Core+
+// thread share the set — inner-wave emits add to the same set; the
+// outermost drop is the canonical clear point.
 thread_local! {
     static TIER3_EMITTED_THIS_WAVE: RefCell<AHashSet<NodeId>> = RefCell::new(AHashSet::new());
 }
@@ -116,12 +104,14 @@ thread_local! {
 //   mutex acquire overhead. Moving the four wave-scoped fields to a
 //   per-thread thread_local eliminates the bounce point entirely.
 //
-// **Wave scope = thread, same as `TIER3_EMITTED_THIS_WAVE`:** every emit
-// in a wave runs on the thread that holds the partition wave_owner;
-// cross-thread emits BLOCK on wave_owner and so always land in the OTHER
-// thread's wave context with the OTHER thread's WAVE_STATE. Mid-wave
-// cross-thread `set_deps` partition splits don't touch this thread's
-// thread-local at all (D1 lesson, applied here).
+// **Wave scope = the owner thread (S4, D246/D248/D249):** `Core` is
+// single-owner `!Send + !Sync` — exactly one owner thread drives a
+// given `Core`, and a wave is **one uninterrupted owner-side drain**
+// (the deleted cross-thread `wave_owner` `ReentrantMutex` / "cross-thread
+// emits BLOCK" model is gone with S2c's §7 machinery). There is no
+// cross-thread interleave to defend against; the only cross-`Core`
+// concurrency is host-native via *independent* per-worker Cores
+// (actor model), each with its own `WAVE_STATE`.
 //
 // **Lifecycle:** populated by `Core::commit_emission` /
 // `Core::queue_notify` / etc.; mostly drained mid-wave by the auto-resolve
@@ -140,36 +130,33 @@ thread_local! {
 // must run the drain. Replaces the former Core-global `CoreState::in_tick`
 // bool.
 //
-// **Why per-(Core, thread).** The flag must jointly satisfy three
-// constraints that no single-scope placement can:
-//   - **Cross-Core isolation (/qa F1).** A thread holding a live
-//     `BatchGuard` on Core-A and then entering a wave on Core-B must not
-//     see Core-A's flag. Keying by `Core::generation` (a process-monotonic
-//     id, never reused) gives each Core a distinct slot. A purely
-//     thread-local bool failed here (Core-A's `in_tick` leaked to Core-B
-//     on the same OS thread → Core-B non-owning → its writes drained by
-//     Core-A's binding).
-//   - **Disjoint-partition drain correctness.** Two threads running waves
-//     on disjoint partitions of ONE Core run truly parallel (separate
-//     `wave_owner`s — they do not block each other). A Core-global flag
-//     made thread B observe thread A's `in_tick=true`, wrongly classify
-//     its independent wave as nested, and no-op its drop — so B's wave
-//     never drained (leaked payload retains, undelivered sink batches;
-//     caught late by `wave_state_clear_outermost`). A per-thread slot
-//     makes each thread own and drain its own disjoint wave.
-//   - **Nested same-(Core, thread) re-entry (/qa EC#3).** A nested
-//     `run_wave` / `actions.up` on the same Core and thread MUST observe
-//     ownership so its drop no-ops and the outer wave drains. A shared
-//     slot within one (Core, thread) preserves this.
+// **Why keyed by `Core::generation` (S4, D246/D248/D249).** Post-S2c
+// `Core` is single-owner `!Send + !Sync`: one owner thread per Core, a
+// wave is one uninterrupted owner-side drain. The set must still satisfy
+// two LIVE constraints (the third — disjoint-partition cross-thread
+// drain — is **deleted-model**: it required two threads driving disjoint
+// partitions of ONE shared Core via separate `wave_owner`s, which D248
+// structurally removed):
+//   - **Cross-Core isolation (/qa F1, LIVE).** One owner thread may
+//     hold a live `BatchGuard` on Core-A and, owner-side (e.g. a
+//     `DeferQueue` closure or the embedder pump driving another Core),
+//     enter a wave on Core-B. Core-B must not see Core-A's flag. Keying
+//     by `Core::generation` (process-monotonic, never reused) gives each
+//     Core a distinct slot — a single thread-local bool would leak
+//     Core-A's `in_tick` to Core-B on the same owner thread (the /qa F1
+//     bug). This is why it stays an `AHashSet<u64>` (≥2 entries during
+//     owner-side cross-Core nesting), NOT a bool.
+//   - **Nested same-(Core, thread) re-entry (/qa EC#3, LIVE).** A nested
+//     `run_wave` (mailbox-applied `Emit`/`Complete`, the §7-floor
+//     re-entry seam) on the same Core+thread MUST observe ownership so
+//     its drop no-ops and the outer wave drains. A shared slot per
+//     (Core, owner-thread) preserves this.
 //
-// **No lock required.** `in_tick` is only ever read or written by the
-// wave-owner thread: cross-thread same-partition emits BLOCK on the
-// partition `wave_owner`, and cross-partition cascades acquire every
-// touched partition upfront. So — unlike `currently_firing`, which the
-// cross-thread P13 set_deps check (/qa F2) requires be Core-global and
-// cross-thread-visible — `in_tick` has no cross-thread read requirement
-// and needs no shared-state lock. (`currently_firing` deliberately stays
-// on `CoreState`; see `node.rs`.)
+// **No lock required.** `in_tick` is only read/written by the one owner
+// thread (single-owner `!Sync` Core ⇒ no cross-thread reader). Unlike
+// `currently_firing` (kept on `CoreShared` for the D1 set_deps
+// reentrancy guard — see `node.rs`), `in_tick` has no cross-thread read
+// requirement and needs no shared-state lock.
 //
 // Stale slots: the owning `BatchGuard::drop` releases the generation on
 // every exit path — normal return, the closure-body-panic branch, AND
@@ -183,10 +170,14 @@ thread_local! {
 // on — not an unbounded leak under any normal or panic-recovery path.
 //
 // History: this flag lived briefly per-thread (Q-beyond sub-slice 3),
-// was reverted to Core-global (/qa F1+F2), and is now keyed per-(Core,
-// thread) — the placement that satisfies all three constraints at once.
-// See `docs/rust-port-decisions.md` and the `docs/porting-deferred.md`
-// Phase-J / "in_tick Core-global→per-(Core,thread)" entry (2026-05-15).
+// was reverted to Core-global (/qa F1+F2), keyed per-(Core, thread)
+// for the deleted disjoint-cross-thread model (D047, 2026-05-15), and
+// at S4 (D246/D248/D249) the disjoint-partition constraint was retired
+// with the §7 cross-thread machinery — the `Core::generation` keying
+// survives solely for the two LIVE constraints above (cross-Core
+// owner-side nesting + nested same-Core re-entry). See
+// `docs/rust-port-decisions.md` D047/D246 and `docs/migration-status.md`
+// § "D246 S4".
 thread_local! {
     static IN_TICK_OWNED: RefCell<AHashSet<u64>> = RefCell::new(AHashSet::new());
 }
@@ -198,10 +189,10 @@ thread_local! {
 /// `in_tick`, `deferred_flush_jobs`, `deferred_cleanup_hooks`,
 /// `pending_wipes`, `invalidate_hooks_fired_this_wave`, 2026-05-09).
 ///
-/// All fields are populated and drained within one wave on one thread.
-/// Cross-thread access is structurally impossible — cross-thread emits
-/// block on partition `wave_owner` and land in the OTHER thread's wave
-/// context.
+/// All fields are populated and drained within one wave on the one
+/// owner thread. Cross-thread access is structurally impossible —
+/// `Core` is single-owner `!Send + !Sync` (S4/D248); there is no
+/// other thread driving this Core.
 ///
 /// **Refcount discipline (load-bearing):** `wave_cache_snapshots`,
 /// `deferred_handle_releases`, and `pending_notify` hold binding-side
@@ -320,8 +311,8 @@ pub(crate) struct WaveState {
     //   visible) placement restores the D091 safety check (/qa F2).
     //
     // The other 11 wave-scoped fields stay per-thread because they're
-    // accessed only by the wave-owner thread under `wave_owner`
-    // discipline (cross-thread emits BLOCK on partition wave_owner).
+    // accessed only by the one owner thread (single-owner `!Send` Core,
+    // S4/D248 — no cross-thread emitter exists).
     /// Slice E2 (R1.3.9.b strict per D057): per-wave-per-node dedup
     /// for `OnInvalidate` cleanup hook firing. A node already in this
     /// set this wave has already had its `OnInvalidate` queued into
@@ -785,13 +776,14 @@ impl Core {
     /// acquire the state lock as they go.
     ///
     /// **Implementation:** delegates to [`Self::begin_batch`] for the
-    /// wave's RAII lifecycle. The returned `BatchGuard` holds the
-    /// `wave_owner` re-entrant mutex for the wave's duration (cross-thread
-    /// emits block; same-thread re-entry passes through), claims `in_tick`,
-    /// and on drop runs the drain + flush + sink-fire phases — OR, if the
-    /// closure panicked, the panic-discard path that restores cache
-    /// snapshots and clears in_tick. This unification gives `run_wave` the
-    /// same panic-safety guarantee as the user-facing `Core::batch`.
+    /// wave's RAII lifecycle. The returned `BatchGuard` claims `in_tick`
+    /// (`Core::generation`-keyed) and on drop runs the drain + flush +
+    /// sink-fire phases — OR, if the closure panicked, the
+    /// panic-discard path that restores cache snapshots and clears
+    /// in_tick. (S4/D248: the `wave_owner` re-entrant mutex is deleted —
+    /// single-owner `!Send` Core, one uninterrupted owner-side drain.)
+    /// This unification gives `run_wave` the same panic-safety
+    /// guarantee as the user-facing `Core::batch`.
     ///
     /// **Re-entrance:** a closure invoked from inside another wave — the
     /// inner `run_wave`'s `begin_batch` observes `in_tick=true`, the
@@ -800,11 +792,12 @@ impl Core {
     ///
     /// **Lock-release discipline (Slice A close, M1):** all binding-side
     /// callbacks except the subscribe-time handshake fire lock-released.
-    /// Sinks that re-enter Core run a nested wave; user fns that re-enter
-    /// Core run a nested wave; custom-equals oracles that re-enter Core
-    /// run a nested wave. Cross-thread emits block at `wave_owner` until
-    /// the in-flight wave's drain completes — preserving the user-facing
-    /// "emit returning means subscribers have observed" contract.
+    /// Sinks / user fns / custom-equals oracles that re-enter Core via
+    /// the owner-side mailbox/`DeferQueue` seam run a nested wave. The
+    /// one owner thread runs the in-flight drain to quiescence before
+    /// `emit` returns — preserving the user-facing "emit returning means
+    /// subscribers have observed" contract (no cross-thread lock needed;
+    /// there is no cross-thread emitter).
     /// Wave entry with a known `seed` node. Acquires only the partitions
     /// transitively touched from `seed` (downstream cascade via
     /// `s.children` + R1.3.9.d meta-companion cascade) instead of every
@@ -814,13 +807,13 @@ impl Core {
     /// / `Core::error` / `Core::teardown` / `Core::set_deps`'s
     /// push-on-subscribe).
     ///
-    /// Two threads with disjoint touched-partition sets run truly
-    /// parallel — they don't block each other on Core-global locks.
-    /// Same-thread re-entry passes through each partition's
-    /// `ReentrantMutex` transparently. Cross-thread emits on the SAME
-    /// partition (or any overlapping touched-partition set) serialize
-    /// per the per-partition `wave_owner` mutex, preserving the
-    /// "emit returning means subscribers have observed" contract.
+    /// S4/D248: single-owner `!Send + !Sync` Core — one uninterrupted
+    /// owner-side drain per wave; the deleted per-partition `wave_owner`
+    /// `ReentrantMutex` parallelism is replaced by host-native
+    /// concurrency across *independent per-worker Cores* (actor model).
+    /// The "emit returning means subscribers have observed" contract
+    /// holds because the one owner thread drains to quiescence before
+    /// returning.
     ///
     /// Slice Y1 / Phase E (2026-05-08).
     pub(crate) fn run_wave_for<F>(&self, seed: crate::handle::NodeId, op: F)
@@ -3400,38 +3393,26 @@ impl Core {
         self.begin_batch_with_guards()
     }
 
-    /// Begin a batch scoped to the partitions transitively touched from
-    /// `seed`. Walks `s.children` (downstream cascade) + `meta_companions`
-    /// (R1.3.9.d TEARDOWN cascade) starting at `seed`, collects every
-    /// reachable partition, and acquires each in ascending
-    /// [`crate::subgraph::SubgraphId`] order via
-    /// [`Core::partition_wave_owner_lock_arc`].
-    ///
-    /// Two threads with disjoint touched-partition sets run truly
-    /// parallel — the per-partition `wave_owner` mutexes don't block
-    /// each other. This is the canonical Y1 parallelism win for
-    /// per-seed wave-driving entry points (subscribe, emit, pause,
-    /// resume, invalidate, complete, error, teardown,
-    /// set_deps push-on-subscribe).
-    ///
-    /// **QA-fix #2 (2026-05-09):** retry-validate the touched-partition
-    /// set against the registry epoch — same protection as
-    /// [`Self::begin_batch`] but scoped to a per-seed touched set
-    /// rather than every partition. Conservative: any registry
-    /// mutation (even on a partition unrelated to seed's touched set)
-    /// triggers a retry. This avoids a precise "did MY touched set
-    /// change?" check at the cost of occasional spurious retries.
+    /// Begin a batch for a wave seeded at `seed`. Historically this
+    /// acquired the per-partition `wave_owner` `ReentrantMutex`es for
+    /// every partition transitively touched from `seed` (the Slice Y1
+    /// parallelism win). **S2c/D248 deleted that machinery:** `Core` is
+    /// single-owner `!Send + !Sync`, so a wave is one uninterrupted
+    /// owner-side drain with nothing to lock. This now delegates to the
+    /// infallible [`Self::try_begin_batch_for`], which acquires nothing
+    /// (the all-`None` single-owner floor); the `seed` parameter is
+    /// retained for the declared-group identity routing + D211
+    /// minimal-churn (callers compile unchanged). Cross-`Core`
+    /// parallelism is host-native via independent per-worker Cores
+    /// (actor model), not per-partition locks.
     ///
     /// # Panics
     ///
-    /// Panics if the registry-epoch retry-validate loop exceeds
-    /// [`crate::subgraph::MAX_LOCK_RETRIES`] iterations, OR if
-    /// [`Core::partition_wave_owner_lock_arc`] panics on an
-    /// unregistered seed. Both are unreachable in correct call paths
-    /// (P12 invariant guarantees registry membership matches
-    /// `s.nodes`).
+    /// Panics only if [`Self::try_begin_batch_for`] returns `Err` —
+    /// **unreachable**: it is now always `Ok` (scheduling groups are
+    /// static identity; no `PartitionOrderViolation`, no epoch retry).
     ///
-    /// Slice Y1 / Phase E (2026-05-08); QA-fix #2 (2026-05-09).
+    /// Slice Y1 / Phase E (2026-05-08); infallible-since S2c (D246).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<'_> {
         match self.try_begin_batch_for(seed) {

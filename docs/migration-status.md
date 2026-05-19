@@ -3208,6 +3208,98 @@ seam is pre-decided **D250** (`~/src/graphrefly-ts/docs/rust-port-decisions.md`)
 — retire the 3 imperative pause/resume/set_deps re-entry stubs as
 deleted-model (no new substrate surface).
 
+### D246 S4 — LANDED (2026-05-19; D250/D251) — closes the D246 S-sequence
+
+> **This is the current authoritative state for the S-sequence.** S4 is
+> the final D246 boundary; with it the D246 β-simplification
+> (boundary-1 → S2c → S3 → S4) is complete. **Single `/qa` over the
+> combined S3+S4 diff is now due** (D226 — deferred to after S4).
+
+**Gate:** `mise run gate` (fmt --check + clippy --all-targets +
+nextest --profile ci incl. `cascade_depth`) — GREEN (see the S4 commit;
+the previously-skipped §7/D250 stubs are now converted or retired).
+
+**What landed:**
+
+- **§7 cross-thread tests → actor-model one-Core-per-worker rebuilds.**
+  `tests/group_parallelism.rs` fully rewritten: the 3 `#[ignore]` §7
+  shared-Core stubs (`same_group…`/`disjoint_groups…`/`all_none_default…`)
+  become real one-Core-per-worker tests — each worker thread constructs
+  its OWN `!Send` `TestRuntime` *inside* the spawned closure (nothing
+  crosses the thread boundary), proving independent per-Core
+  serialization / disjoint independence / cascade integrity under real
+  concurrency. `lock_discipline::concurrent_subscribe_during_emit…`
+  rebuilt single-owner (the cross-thread race is deleted-model; the
+  live "subscribe-during-emit observes Start-first + monotonic
+  post-subscribe DATA" invariant is expressed via an in-wave
+  `mailbox.post_defer` → `cf.subscribe` mid-wave).
+- **`lock_released::late_subscriber…` → β rebuild (D246 r6 / D233 /
+  D249).** An in-wave trigger sink posts a **`Send`** `MailboxOp::Defer`
+  whose closure captures only `Send` state and **builds the late `!Send`
+  sink INSIDE** then `cf.subscribe` — exercising the Slice X4/D2
+  `subscribers_revision` PendingBatch freeze: the mid-wave subscriber
+  gets the cached handshake `Data(1)` exactly once (no double-receive)
+  + the post-subscribe `Data(2)`. (No core-harness surgery needed — the
+  build-sink-inside-Send-closure pattern resolved the prior
+  `!Send`-capture record-and-skip.)
+- **D250 — 3 imperative re-entry stubs retired as deleted-model.**
+  `lock_released::fn_can_reenter_core_pause_resume…`,
+  `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
+  `slice_f_corrections::a6_set_deps_from_firing_fn_rejected…` →
+  `#[ignore = "retired (D250)…"]`, intent preserved (never deleted —
+  same treatment as deleted-§7 tests). The
+  `SetDepsError::ReentrantOnFiringNode` guard *code* stays live as
+  defensive cover (node.rs `set_deps` `currently_firing` invariant
+  comment updated). No `CoreFull`/`MailboxOp` widening ⇒ **no
+  cross-track-ledger event**.
+- **Bench/example rebuilds (actor model = independent per-worker
+  Cores).** `benches/group_scaling.rs` = real W∈{1,2,4}-worker
+  independent-Core scaling instrument (the authoritative
+  "`group_scaling` re-measure (meaningful = independent Cores)" S4
+  deliverable); `benches/floor_compare.rs` = honest single-arm
+  single-owner identity-dedup floor; `examples/profile_disjoint_{fn_fire,
+  state_emit}.rs` rebuilt as independent-per-worker-Core samply
+  profilers. `profile_st_emit.rs` was already correct (single-owner).
+- **Wave-scope = one uninterrupted owner-side drain (the authoritative
+  "scope WaveState/IN_TICK to one uninterrupted drain" line).**
+  `batch.rs` `WAVE_STATE`/`IN_TICK_OWNED` doc reconciled: the deleted
+  cross-thread `wave_owner`-BLOCK / disjoint-partition-parallel
+  constraint #2 retired; `IN_TICK_OWNED`'s `AHashSet<u64>`
+  (`Core::generation`-keyed) **kept** for the two LIVE constraints
+  (owner-side cross-`Core` nesting + nested same-Core re-entry) — NOT
+  collapsed to a bool. No data-structure/behaviour change; the wave is
+  structurally one owner-side drain (single-owner `!Send` Core).
+- **Per-group `Send` runnable-wake finalized.** `CoreMailbox::runnable`
+  doc finalized: under the actor model one worker owns one Core, so the
+  Core-wide wake bit **is** that worker's per-group runnable-wake; a
+  finer per-`SchedulingGroupId` sub-bit has no consumer (M6 schedules
+  at the Core/worker grain) — speculative surface declined per
+  D196/D250-logic. M6 (the host executor consuming `is_runnable`)
+  remains a separate later slice.
+- **D246 rule-8 (D251) — reusable coalescing slot.** The 3 in-wave
+  observation defer paths (`graphrefly-graph` observe `NodeTornDown`
+  prune + reactive-describe re-snapshot; `graphrefly-storage`
+  `graph_integration` snapshot+persist) replaced per-emission
+  `deferred.post(Box::new(..))` with a per-handle owner-thread-only
+  `scheduled` slot: one `Box` + one snapshot/prune per wave instead of
+  per emission. Behaviour-equivalent (deferred-snapshot acceptable,
+  D243/D244; observe prune accumulates the torn-id set, drained as the
+  exact union). **D251 reconciles D246-r8's stale "typed `MailboxOp`
+  variants, fuse with the mailbox reshape" premise** — D249 already
+  split the queues, so these sites are `!Send` `DeferQueue` posts (not
+  `Send` `CoreMailbox` ops); a typed-variant on `CoreMailbox` does not
+  fit, so r8's own "(or a reusable slot)" latitude is taken. Internal
+  refactor, unchanged public API ⇒ no parity-surface widening.
+- **Stale §7-machinery comment sweep.** `node.rs` + `batch.rs`
+  `wave_owner`/`ReentrantMutex`/"cross-thread emits BLOCK"/"truly
+  parallel"/the stale `Core: Send` claims corrected to the post-S2c/D248
+  single-owner `!Send + !Sync` truth (folded from S3 per the
+  porting-deferred handoff).
+
+**Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D250
+(retire imperative re-entry stubs) + D251 (rule-8 = reusable slot;
+D246-r8 stale-premise reconciled post-D249).
+
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 
 > **2026-05-18 STATUS CORRECTION (D236, verify-before-greenfield).** The

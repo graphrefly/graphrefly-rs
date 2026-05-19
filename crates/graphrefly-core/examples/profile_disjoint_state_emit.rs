@@ -1,11 +1,12 @@
-//! Profile target — 4-thread disjoint **state-emit** (Regime A): the
-//! contention regime where `per_subgraph_parallelism` shows a 2.46x
-//! REGRESSION vs serial (not a speedup). Mirrors
-//! `benches/per_subgraph_parallelism.rs::bench_parallel_4t_disjoint`:
-//! 4 state nodes in disjoint partitions, each with a direct noop sink,
-//! 4 threads re-emitting a constant handle. No derived fn / no spin —
-//! so `wave_owner` is NOT released around an `invoke_fn`, and the
-//! global Core mutexes are on the hot path the whole wave.
+//! Profile target — actor-model disjoint **state-emit** scaling (S4
+//! rebuild). `THREADS` workers, each owning its OWN single-owner
+//! `Core` (constructed inside the worker — `Core` is `!Send`), each
+//! re-emitting a monotonic handle on a state node with a direct noop
+//! sink. No derived fn / no spin. The deleted version cloned ONE
+//! shared `Core` across threads on "disjoint §7 partitions"
+//! (`partition_of`/`LockedCell` — removed by S2c). Independent
+//! per-worker Cores is the actor-model substrate `benches/group_scaling.rs`
+//! benchmarks; this example is its profileable (samply/sample) sibling.
 //!
 //! Run:
 //!   cargo build --profile profiling --example profile_disjoint_state_emit -p graphrefly-core
@@ -14,10 +15,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 
-use graphrefly_core::{BindingBoundary, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink};
+use graphrefly_core::{
+    BindingBoundary, Core, DepBatch, FnId, FnResult, HandleId, Message, NodeId, Sink,
+};
 
-const EMITS_PER_THREAD: usize = 1_500_000;
+const EMITS_PER_THREAD: u64 = 1_500_000;
 const THREADS: usize = 4;
 
 struct WorkBinding {
@@ -48,24 +52,31 @@ fn noop_sink() -> Sink {
     Arc::new(|_: &[Message]| {})
 }
 
-// S2b/β /qa-2026-05-18 Blind #2: this profiler's premise — ONE
-// shared `Core` cloned across N threads emitting on "disjoint
-// partitions" (`core.partition_of`, the §7 union-find) — is exactly
-// the model the actor / work-stealing rewrite deletes (S2c removes
-// `partition_of`/`LockedCell`; `Core` is move-only `!Sync`). Disjoint
-// parallelism is re-measured at S4 via `benches/group_scaling.rs`
-// with the actor model (independent Cores per worker), not a
-// cloned-shared Core. Gutted to a deferred note so the example target
-// compiles; do NOT resurrect the cross-thread-shared-Core shape.
-#[allow(dead_code)]
-fn _superseded_uses(_b: fn() -> Arc<WorkBinding>, _s: fn() -> Sink) {}
+/// One worker owns its own `Core`; re-emits a monotonic handle on a
+/// state node with a direct noop sink.
+fn worker() {
+    let binding = WorkBinding::new();
+    let core = Core::new(binding as Arc<dyn BindingBoundary>);
+    let s = core.register_state(HandleId::new(1), false).unwrap();
+    let sub = core.subscribe(s, noop_sink());
+    for k in 0..EMITS_PER_THREAD {
+        core.emit(std::hint::black_box(s), HandleId::new(2 + k));
+    }
+    core.drain_mailbox();
+    core.unsubscribe(s, sub);
+}
 
 fn main() {
-    let _ = (WorkBinding::new, noop_sink, THREADS, EMITS_PER_THREAD);
+    let start = std::time::Instant::now();
+    let handles: Vec<_> = (0..THREADS).map(|_| thread::spawn(worker)).collect();
+    for h in handles {
+        h.join().expect("worker Core completed");
+    }
+    let dt = start.elapsed();
+    let total = EMITS_PER_THREAD * THREADS as u64;
     eprintln!(
-        "profile_disjoint_state_emit: superseded by the actor model \
-         (S2c deletes §7 partitioning; S4 re-measures disjoint \
-         parallelism via benches/group_scaling.rs with independent \
-         per-worker Cores). See porting-deferred § /qa-2026-05-18."
+        "profile_disjoint_state_emit: {THREADS}×{EMITS_PER_THREAD} emits \
+         (independent per-worker Cores) in {dt:?} = {:.1} ns/emit aggregate",
+        dt.as_nanos() as f64 / total as f64
     );
 }

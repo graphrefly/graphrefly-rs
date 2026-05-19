@@ -127,10 +127,24 @@ pub struct CoreMailbox {
     /// observing `true` from [`Self::post_emit`] is told to release its
     /// pending handle and bail (the old `Weak::upgrade() == None` path).
     closed: AtomicBool,
-    /// Per-group "this Core has queued work" wake bit (D227 full shape).
-    /// Set on every successful [`Self::post_emit`]; cleared by
-    /// [`Self::drain_into`] once the queue empties. S4 wires it to wave
-    /// drain-scoping + finalize; M6 reads it from the host executor.
+    /// "This Core has queued work" wake bit (D227 full shape;
+    /// **finalized at S4**). Set on every successful [`Self::post_op`];
+    /// cleared by [`Self::drain_into`]/[`Self::take_all`] once the queue
+    /// empties (under the `ops` lock — QA F-#4 lost-wakeup discipline).
+    ///
+    /// **Actor-model granularity (S4, D246/D248/D249).** `Core` is
+    /// single-owner `!Send + !Sync`; in the actor model one worker owns
+    /// exactly one `Core`, so this Core-wide bit **is** that worker's
+    /// per-group runnable-wake (the worker's Core hosts its declared
+    /// `SchedulingGroupId`(s); a finer per-`SchedulingGroupId` sub-bit
+    /// has no consumer — M6's per-binding group executor schedules at
+    /// the Core/worker grain — so adding one would be speculative
+    /// substrate surface, D196/D246-ignore-legacy, cf. D250). It is the
+    /// only cross-thread bridge into a `!Send` Core: timer/producer
+    /// tasks `post_*` + signal; the owner drains
+    /// ([`crate::node::Core::drain_mailbox`] / the in-wave
+    /// `BatchGuard`). M6 (deferred) reads [`Self::is_runnable`] from the
+    /// host executor to decide when to poll a worker's Core.
     runnable: AtomicBool,
 }
 

@@ -631,6 +631,17 @@ pub fn attach_snapshot_storage(
     // sink is `!Send` and fires owner-side.
     let deferred = core.defer_queue();
 
+    // D246 rule 8 (S4): reusable coalescing slot. The snapshot+persist
+    // is idempotent at drain time (`snapshot_full` reads current state),
+    // so N qualifying emissions in one wave need only ONE deferred
+    // snapshot+flush, not N boxed closures. `scheduled` (owner-thread-
+    // only `Cell`) gates a single `Box` post per drain; the closure
+    // clears it so the next wave re-arms. Behaviour-equivalent: the
+    // persisted state is the final wave state (deferred-snapshot
+    // acceptable, D243/D244) — one alloc + one snapshot+flush per wave
+    // instead of per emission.
+    let scheduled = std::rc::Rc::new(std::cell::Cell::new(false));
+
     // Wire observe_all_reactive so late-added nodes are also covered.
     let mut observe = graph.observe_all_reactive();
     observe.subscribe(core, move |path: &str, messages: &[Message]| {
@@ -650,13 +661,19 @@ pub fn attach_snapshot_storage(
             }
         }
 
+        if scheduled.get() {
+            return; // already armed for this drain — coalesce.
+        }
         let graph_for_defer = graph_for_sink.clone();
         let states_for_defer = states_for_sink.clone();
         let on_error = on_error.clone();
+        let sched = std::rc::Rc::clone(&scheduled);
+        sched.set(true);
         // Defer the snapshot + flush owner-side (D244). Core-gone
         // (`false`) ⇒ dropped unrun: nothing to persist on a
         // torn-down graph, no handles captured (no leak).
         let _ = deferred.post(Box::new(move |cf: &dyn CoreFull| {
+            sched.set(false);
             // Take a snapshot once, shared across all sync tiers.
             // D246: the in-wave facade `&dyn CoreFull` drives the
             // snapshot through the one public `Graph` type (Core-free,

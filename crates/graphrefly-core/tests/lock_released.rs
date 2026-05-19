@@ -132,10 +132,11 @@ fn fn_can_reenter_core_invalidate_during_invoke_fn() {
 }
 
 #[test]
-#[ignore = "D246 record-and-skip: pause/resume re-entry from a fn-fire has NO β-valid seam — CoreFull (the MailboxOp::Defer surface) exposes emit/complete/error/teardown/invalidate/subscribe/register + reads, but NOT pause/resume; and invoke_fn carries no &Core. The synchronous binding-holds-Core trigger is structurally deleted by the actor model. Invariant (a fn-fire can re-enter pause/resume) stays live → S4 owner-side seam. See porting-deferred § D246 record-and-skip."]
+#[ignore = "retired (D250, S4): synchronous fn-fire re-entry into Core pause/resume was only ever reachable via the binding-holds-cloned-Core mechanism, structurally deleted by D221/D246 single-owner. A fn synchronously driving pause/resume is the imperative-from-reactive-layer anti-pattern design invariant #2 forbids; the β-valid path is reactive (emit → controller node → owner-side pause/resume) and is covered by the live mailbox-reentry tests in this file (sink_can_complete_another_node_from_callback / custom_equals_can_reenter_core_during_emission). Intent preserved, never deleted. Adding pause/resume to CoreFull/MailboxOp purely to keep this stub alive would spend substrate/FFI surface for zero consumer (contradicts D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
 fn fn_can_reenter_core_pause_resume_during_invoke_fn() {
-    // No β-valid expression: pause/resume absent from CoreFull/MailboxOp;
-    // the deleted mechanism was binding-clones-Core. → S4.
+    // Retired (D250): no β-valid actor-model trigger; the reactive
+    // equivalent (emit → controller → owner-side pause/resume) is the
+    // spec-correct path and is covered by the live re-entry tests here.
 }
 
 // ---------------------------------------------------------------------------
@@ -239,13 +240,126 @@ fn handshake_tier_split_cached_state_two_calls() {
 // Late-subscriber-during-wave: sink-snapshot-on-first-touch race fix
 // ---------------------------------------------------------------------------
 
+/// Mid-wave late-subscribe (S4 β-valid rebuild, D233/D246 r6/D249).
+///
+/// Original scaffold posted the late-subscribe `Defer` from a fn-fire
+/// capturing a `!Send` `Sink` (impossible post-D248 — see the prior
+/// `#[ignore]` history in git). The β-valid vehicle: an in-wave sink
+/// posts a **`Send`** `MailboxOp::Defer` whose closure captures only
+/// `Send` state (`Arc<TestBinding>` + a `Send` events buffer + the
+/// `NodeId`) and **builds the late `!Send` sink INSIDE the closure**,
+/// then `cf.subscribe(s, late)` via the owner-side `&dyn CoreFull`
+/// (D233). The owner drain applies it in-wave, so the subscribe lands
+/// *after* `s`'s first emit opened its `PendingBatch`. Invariant
+/// (Slice X4 / D2 `subscribers_revision` freeze): the late sink gets
+/// the cached handshake `Data(1)` **exactly once** (handshake replay,
+/// NOT also the frozen pre-subscribe flush) + the post-subscribe
+/// `Data(2)` — never a double `Data(1)`.
 #[test]
-#[ignore = "D246/D248/D249 record-and-skip: β-valid rewrite needed (still-live invariant; NOT a deleted model). The scaffold posts the late-subscribe Defer from a plain `derived` *fn*-fire capturing a `Sink`. Under D248 `Sink` is `!Send`, so the Defer closure is `!Send` ⇒ it must use the owner-only `DeferQueue`, not the `Send` `CoreMailbox::post_defer`. But a plain fn is stored in the `Send+Sync` `BindingBoundary` (FFI trait, unchanged by D248), so it cannot capture the `!Send` `Rc<DeferQueue>`. The β-valid owner-side re-entrant-subscribe vehicle is a **producer node** (gets `&dyn CoreFull`/emitter at fire, per D246 r6) — the test must be rebuilt producer-based. Invariant (late subscriber to an already-cached node gets the cached handshake exactly once, no double-receive) stays live & is partially covered by other subscribe tests. Systematic producer-rewrite of fn-posts-owner-side-!Send-Defer scaffolds: porting-deferred § D246 record-and-skip."]
 fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_data() {
-    // β-rewrite-needed stub — see #[ignore]. The owner-side re-entrant
-    // late-subscribe must be driven by a producer node (CoreFull at
-    // fire), not a plain `derived` fn capturing a `!Send` Sink into a
-    // Defer. → producer-based β rewrite (record-and-skip).
+    #[derive(Debug, PartialEq)]
+    enum Ev {
+        Start,
+        Data(i64),
+        Other,
+    }
+
+    let rt = TestRuntime::new();
+    let s = rt.state(Some(TestValue::Int(0)));
+    let d = rt.derived(&[s.id], |deps| Some(deps[0].clone()));
+
+    let late: std::sync::Arc<std::sync::Mutex<Vec<Ev>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // In-wave trigger sink on `d`: on the FIRST Data, post exactly one
+    // Send Defer that installs the late subscriber on `s` mid-wave.
+    let mailbox = rt.mailbox();
+    let binding = rt.binding.clone();
+    let s_id = s.id;
+    let late_for_defer = std::sync::Arc::clone(&late);
+    let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trigger: graphrefly_core::Sink =
+        std::sync::Arc::new(move |msgs: &[graphrefly_core::Message]| {
+            for m in msgs {
+                if matches!(m, graphrefly_core::Message::Data(_))
+                    && posted
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok()
+                {
+                    let binding = binding.clone();
+                    let late = std::sync::Arc::clone(&late_for_defer);
+                    // Send closure: captures Arc<TestBinding> + Send events
+                    // buffer + NodeId only; builds the !Send sink INSIDE.
+                    let _ =
+                        mailbox.post_defer(Box::new(move |cf: &dyn graphrefly_core::CoreFull| {
+                            let b = binding.clone();
+                            let buf = std::sync::Arc::clone(&late);
+                            let late_sink: graphrefly_core::Sink =
+                                std::sync::Arc::new(move |ms: &[graphrefly_core::Message]| {
+                                    let mut g = buf.lock().unwrap();
+                                    for m in ms {
+                                        match m {
+                                            graphrefly_core::Message::Start => g.push(Ev::Start),
+                                            graphrefly_core::Message::Data(h) => {
+                                                match b.deref(*h) {
+                                                    TestValue::Int(n) => g.push(Ev::Data(n)),
+                                                    _ => g.push(Ev::Other),
+                                                }
+                                            }
+                                            _ => g.push(Ev::Other),
+                                        }
+                                    }
+                                });
+                            let _ = cf.subscribe(s_id, late_sink);
+                        }));
+                }
+            }
+        });
+    let trig_sub = rt.track_subscribe(d, trigger);
+
+    // Wave 1: `s` emits 1 → `d` fires → trigger posts the defer →
+    // owner drain applies it in-wave → late subscribes after `s`'s
+    // PendingBatch opened. Late handshake = [Start, Data(1)] exactly.
+    s.set(TestValue::Int(1));
+    rt.drain_mailbox();
+    // Wave 2: post-subscribe emit → late gets Data(2) once.
+    s.set(TestValue::Int(2));
+    rt.drain_mailbox();
+
+    let got = late.lock().unwrap();
+    // Start observed first (handshake ordering). Incidental lifecycle
+    // messages (Resolved/Dirty/etc.) may interleave — the invariant is
+    // about DATA: the cached handshake Data(1) appears EXACTLY ONCE (no
+    // double-receive via the frozen pre-subscribe PendingBatch flush),
+    // then the post-subscribe Data(2). Assert on the DATA projection so
+    // an incidental protocol message doesn't false-fail the contract.
+    assert_eq!(
+        got.first(),
+        Some(&Ev::Start),
+        "late subscriber observes Start first; got {:?}",
+        &*got
+    );
+    let data: Vec<i64> = got
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Data(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        data,
+        vec![1, 2],
+        "cached handshake Data(1) delivered EXACTLY ONCE (no \
+         double-receive), then post-subscribe Data(2); full stream {:?}",
+        &*got
+    );
+    drop(got);
+    rt.unsubscribe(d, trig_sub);
 }
 
 // ---------------------------------------------------------------------------
