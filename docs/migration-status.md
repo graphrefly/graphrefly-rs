@@ -2992,6 +2992,53 @@ remain **separate, explicitly-approved future batches**.
     bankable; S2b/S2c correctly out of scope (deferred, design-locked
     D221–D225).
 
+### D246 β-simplification — BOUNDARY-1 LANDED + GATE-GREEN + COMMITTED (`b2dacec`, 2026-05-18)
+
+> **This is the current authoritative state.** Everything in the
+> S2b/D236–D245 boxes below is **historical** (the superseded β shape /
+> consumer-site inventory D246 replaced). D246 (canonical:
+> `~/src/graphrefly-ts/docs/rust-port-decisions.md` D246) executed
+> boundary-1 backwards across the S's:
+>
+> - **graphrefly-core keystone:** `OwnedCore` (the one Core-ownership
+>   keystone — owns move-only Core + tracks subs + owner-thread
+>   Drop-teardown; replaces TestRuntime/StructuresRuntime/operators-
+>   runtime triplication, D246 r4). `CoreFull` consolidated as the one
+>   object-safe facade (mutation+inspection+serialize+mailbox, D246 r5;
+>   folds D243/D244/D245). D245 folded via
+>   `BindingBoundary::invoke_fn_with_core(&dyn CoreFull)` (default
+>   delegates → zero churn for non-producer bindings).
+> - **graphrefly-graph fully reshaped (D246 r1/r2/r3):** one Core-free
+>   `Graph` type; `SubgraphRef<'g>`/`GraphOps`/`NamespaceHandle`/`'g`/
+>   `SnapshotOps`/`MountError::CoreMismatch` **deleted**; `&Core`
+>   explicit on every Core-touching op; no RAII `Drop` below the binding
+>   (observe/describe → owner-invoked `detach(&Core)`; eliminates the
+>   Blind #4 deadlock class).
+> - **5-crate cascade:** structures Blind #3 owner-sync `&Core` emit
+>   (D246 r6; in-wave sinks → `SinkEmitter` mailbox); storage; all test
+>   harnesses → `OwnedCore`; F2/F3/P7 stubs → real β-valid coverage.
+>   **invariant #1 preserved (zero `unsafe`).** §7 deleted-model
+>   artifacts (`group_scaling` bench, `profile_disjoint_*` examples)
+>   gutted to superseded notes → rebuilt at S4.
+> - **Gate:** `mise run gate` (fmt --check + clippy --all-targets +
+>   nextest --profile ci incl. `cascade_depth`) **GREEN — 826 passed,
+>   6 skipped** (the 6 genuinely-deleted-model §7 cross-thread tests
+>   `#[ignore]`→S4, exactly per D246). Committed `b2dacec`.
+>
+> **REMAINING D246 boundaries (each its own gate+commit per D226;
+> single `/qa` at end):**
+> - **S2c** — drop `Mutex<GraphInner>`→`RefCell`/owner-`&mut`; delete
+>   `groups.rs`/`LockedCell`; collapse `StateCell` (remove the `C`
+>   generic — pervasive across the core; ~128 `StateCell`/`LockedCell`/
+>   `SingleThreadCell` refs + 45 `Mutex<GraphInner>` refs). Independent
+>   large boundary; **not started** (clean — no WIP).
+> - **S3** — `SerializationGroupId`→`SchedulingGroupId` (~59 refs).
+> - **S4** — wave-scope drain + per-group `Send` wake on `CoreMailbox`;
+>   rebuild `benches/group_scaling.rs` with independent per-worker
+>   Cores (actor-model re-measure); convert the 6 §7 `#[ignore]` tests.
+> - Record-and-skip running list: `porting-deferred.md` §
+>   "D246 record-and-skip" (reported at session end).
+
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 
 > **2026-05-18 STATUS CORRECTION (D236, verify-before-greenfield).** The
