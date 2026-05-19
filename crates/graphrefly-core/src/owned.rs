@@ -131,19 +131,38 @@ impl<C: StateCell> Drop for OwnedCore<C> {
         // unsubscribe is sound (D225 owner-invoked shape, NOT the
         // retired relocating-Core RAII). Topology subs first so a
         // topo fire mid-teardown can't re-enter a half-removed sink.
-        let topo: Vec<TopologySubscriptionId> = std::mem::take(
-            &mut *self
-                .topo_subs
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        for id in topo {
+        //
+        // QA-A2: pop-one-at-a-time (re-lock per item, lock released
+        // across `core.unsubscribe`) rather than take-then-iterate.
+        // `Core::unsubscribe` runs the lock-released deactivation
+        // chain (`OnDeactivation` cleanup, `producer_deactivate`,
+        // `wipe_ctx`) which can fire sinks synchronously and re-enter
+        // this same `OwnedCore` via `track_subscribe*`. A drained
+        // snapshot would silently drop any sub registered during
+        // teardown; the pop-loop observes those and tears them down
+        // too (the lock is never held across `core.unsubscribe`, so
+        // no self-deadlock). This is the single canonical teardown
+        // keystone — re-entrancy-safety matters more than the
+        // micro-cost of per-item re-locking on a cold drop path.
+        while let Some(id) = pop(&self.topo_subs) {
             self.core.unsubscribe_topology(id);
         }
-        let subs: Vec<(NodeId, SubscriptionId)> =
-            std::mem::take(&mut *self.subs.lock().unwrap_or_else(PoisonError::into_inner));
-        for (node_id, sub_id) in subs {
+        while let Some((node_id, sub_id)) = pop(&self.subs) {
             self.core.unsubscribe(node_id, sub_id);
         }
     }
 }
+
+#[inline]
+fn pop<T>(m: &Mutex<Vec<T>>) -> Option<T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner).pop()
+}
+
+// QA-A4: lock the D246 invariant — `OwnedCore` (default cell) must stay
+// `Send + Sync + 'static` so embedders/bindings can hold it across the
+// host executor. A future non-Send/Sync field fails the build here, at
+// the cause, not far downstream.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<OwnedCore<LockedCell>>();
+};

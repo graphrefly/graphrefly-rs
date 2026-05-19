@@ -113,8 +113,11 @@ impl GraphObserveOne {
 
 /// All-nodes observe handle. Subscriptions are tied to the set of
 /// nodes named at `subscribe()` call time. D246: no RAII `Drop` —
-/// call [`Self::detach`] (owner-invoked) or rely on `OwnedCore`.
-#[must_use = "GraphObserveAll holds subscriptions; detach() (or OwnedCore drop) unsubscribes them"]
+/// You MUST call [`Self::detach`]`(core)` (owner-invoked) — these Core
+/// subscriptions are opened via raw `core.subscribe` and are NOT
+/// `OwnedCore`-tracked, so dropping the handle without `detach` leaks
+/// them for the `Core` lifetime.
+#[must_use = "GraphObserveAll holds Core subscriptions NOT tracked by OwnedCore; you MUST call detach(core) or they leak"]
 pub struct GraphObserveAll {
     graph: Graph,
     subs: Vec<(NodeId, SubscriptionId)>,
@@ -177,8 +180,12 @@ struct ObserveAllReactiveInner {
 /// nodes via the Core topology sub (the prune `unsubscribe` is
 /// `MailboxOp::Defer`'d since `NodeTornDown` fires in-wave — D246 r6).
 /// D246 rule 3: no RAII `Drop`; teardown is the owner-invoked
-/// [`Self::detach`].
-#[must_use = "GraphObserveAllReactive holds subscriptions; detach() (or OwnedCore drop) unsubscribes them"]
+/// [`Self::detach`]`(core)` — owner-invoked, REQUIRED. The ns-sink is
+/// collected by `graph.destroy(core)`; the Core topology sub + fan-out
+/// subs are opened via raw `core.subscribe*` and are NOT
+/// `OwnedCore`-tracked, so `detach(core)` is the only thing that
+/// collects them (dropping the handle without it leaks them).
+#[must_use = "GraphObserveAllReactive holds a Core topology sub + fan-out subs NOT tracked by OwnedCore; you MUST call detach(core) or they leak"]
 pub struct GraphObserveAllReactive {
     graph: Graph,
     ns_sink_id: Option<u64>,

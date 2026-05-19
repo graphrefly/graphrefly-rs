@@ -346,19 +346,6 @@ impl<'a> ProducerCtx<'a> {
         }
     }
 
-    /// Construct from the full object-safe Core facade (D246 r5 /
-    /// D245). Identical to [`Self::new`] — kept as a named entry point
-    /// for call sites that hold a `&dyn CoreFull` (the
-    /// `invoke_fn_with_core` producer-build path) and want the intent
-    /// explicit at the construction site.
-    pub fn for_corefull(
-        node_id: NodeId,
-        core: &'a dyn CoreFull,
-        storage: &'a ProducerStorage,
-    ) -> Self {
-        Self::new(node_id, core, storage)
-    }
-
     /// The producer node's id.
     #[must_use]
     pub fn node_id(&self) -> NodeId {

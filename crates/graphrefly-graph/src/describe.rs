@@ -275,8 +275,11 @@ pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput) + Send + Sync>;
 /// D246 rule 3: Core-free (`Send`), **no RAII `Drop`** — teardown is
 /// the owner-invoked synchronous [`Self::detach`]. This eliminates the
 /// "unsubscribe in `Drop`" deadlock class. The embedder's
-/// [`graphrefly_core::OwnedCore`] is the one RAII boundary.
-#[must_use = "ReactiveDescribeHandle holds the subscription; detach() (or OwnedCore drop) unsubscribes"]
+/// Teardown is the owner-invoked [`Self::detach`]`(core)` — REQUIRED.
+/// The ns-sink is also collected by `graph.destroy(core)`; the Core
+/// topology sub is opened via raw `core.subscribe_topology` and is NOT
+/// `OwnedCore`-tracked, so only `detach(core)` collects it.
+#[must_use = "ReactiveDescribeHandle holds a Core topology sub NOT tracked by OwnedCore; you MUST call detach(core) or it leaks"]
 pub struct ReactiveDescribeHandle {
     inner: Arc<Mutex<GraphInner>>,
     ns_sink_id: u64,

@@ -1150,7 +1150,7 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // `has_fired_once` is captured here for the Slice E2 OnRerun gate
         // (Phase 1.5 below): the cleanup hook only fires when the fn has
         // run at least once already in this activation cycle.
-        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, bool, bool)> = {
+        let prep: Option<(crate::handle::FnId, Vec<DepBatch>, bool, bool, bool)> = {
             let s = self.lock_state();
             // Q-beyond Sub-slice 2 (D108, 2026-05-09): pending_fires lives
             // on per-thread WaveState. Removed via with_wave_state — no
@@ -1184,11 +1184,17 @@ impl<C: crate::state_cell::StateCell> Core<C> {
                             },
                         })
                         .collect();
-                    (fn_id, dep_batches, rec.is_dynamic, rec.has_fired_once)
+                    (
+                        fn_id,
+                        dep_batches,
+                        rec.is_dynamic,
+                        rec.has_fired_once,
+                        rec.is_producer(),
+                    )
                 })
             }
         };
-        let Some((fn_id, dep_batches, is_dynamic, has_fired_once)) = prep else {
+        let Some((fn_id, dep_batches, is_dynamic, has_fired_once, is_producer)) = prep else {
             return;
         };
 
@@ -1214,19 +1220,25 @@ impl<C: crate::state_cell::StateCell> Core<C> {
         // state lock by then. Drop on the guard pops the stack even if
         // invoke_fn panics, keeping `currently_firing` balanced.
         //
-        // D246 rule 5 / D245 — hand the binding the owner-side full `Core`
-        // facade. `self: &Core<C>` unsized-coerces to `&dyn CoreFull` in
-        // arg position (`Core<C>: CoreFull` via the blanket impl), so a
-        // producer-building binding can construct its `ProducerCtx` from a
-        // real Core surface here WITHOUT a thread-local / `Core` clone /
-        // stored back-reference (all β-invalid under the actor model). The
-        // `BindingBoundary::invoke_fn_with_core` default forwards to the
-        // parameterless `invoke_fn`, so derived/dynamic/state dispatch and
-        // every non-producer binding are behaviour-identical.
+        // D246 rule 5 / D245 (QA D1) — the owner-side full-`Core` facade
+        // hand-off is needed ONLY by producer-building bindings (to
+        // construct `ProducerCtx` from a real Core surface here without a
+        // thread-local / `Core` clone / stored back-ref — all β-invalid
+        // under the actor model). Branch on node kind so the hot
+        // derived/dynamic/state path keeps the single parameterless
+        // `invoke_fn` virtual call it always had (no `&dyn CoreFull`
+        // fat-pointer coercion, no default-body re-dispatch) — byte-
+        // identical to pre-D246, zero §7-floor regression. Only the rare
+        // producer-build fire pays the facade hand-off. `self: &Core<C>`
+        // unsized-coerces to `&dyn CoreFull` (`Core<C>: CoreFull`).
         let result = {
             let _firing = FiringGuard::new(self, node_id);
-            self.binding
-                .invoke_fn_with_core(node_id, fn_id, &dep_batches, self)
+            if is_producer {
+                self.binding
+                    .invoke_fn_with_core(node_id, fn_id, &dep_batches, self)
+            } else {
+                self.binding.invoke_fn(node_id, fn_id, &dep_batches)
+            }
         };
 
         // Phase 3: apply result under the lock — defensive terminal check

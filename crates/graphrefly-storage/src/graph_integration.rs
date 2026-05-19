@@ -526,9 +526,11 @@ impl StorageHandle {
 
 // D246 r3: no `impl Drop` — teardown is owner-invoked
 // ([`StorageHandle::detach`]); a parameterless `Drop` cannot reach
-// `&Core`. Dropping a `StorageHandle` without calling `detach` leaves
-// the observe subscription live until the graph is destroyed
-// (`graph.destroy(core)`) or the owning `OwnedCore` drops.
+// `&Core`. The observe subscription is opened via raw `core.subscribe`
+// and is NOT `OwnedCore`-tracked: you MUST call `detach(core)` —
+// dropping a `StorageHandle` without it (and without a subsequent
+// `graph.destroy(core)`) leaks the subscription for the `Core`
+// lifetime. `OwnedCore` drop does NOT collect it.
 
 /// Wire an observe subscription on `graph` that persists node changes
 /// to the provided snapshot+WAL tier pairs.

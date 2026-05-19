@@ -314,7 +314,7 @@ impl BindingBoundary for InnerBinding {
         // no thread-local / `Core` clone / stored back-reference.
         let build = self.state.lock().producer_builds.get(&fn_id).cloned();
         if let Some(build) = build {
-            let ctx = ProducerCtx::for_corefull(node_id, core, &self.producer_storage);
+            let ctx = ProducerCtx::new(node_id, core, &self.producer_storage);
             build(ctx);
             return graphrefly_core::FnResult::Noop { tracked: None };
         }

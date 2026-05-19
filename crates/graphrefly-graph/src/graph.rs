@@ -831,7 +831,18 @@ pub(crate) fn destroy_subtree(core: &Core, inner_arc: &Arc<Mutex<GraphInner>>) {
         inner.names_inverse.clear();
         inner.children.clear();
     }
+    // Fire the final namespace change (reactive describe/observe see the
+    // emptied graph) BEFORE dropping the sinks — so observers get the
+    // destroy notification, then the sinks are released.
     fire_ns(core, inner_arc);
+    // QA-A1: clear the namespace-change sinks on destroy. Without this a
+    // reactive describe/observe ns-sink (registered via
+    // `register_ns_sink`, NOT an `OwnedCore`-tracked Core sub) would
+    // outlive `destroy()` for the whole `GraphInner` lifetime — the
+    // documented `graph.destroy(core)` teardown fallback must actually
+    // collect it. (The handle's Core *topology* sub is still owner-
+    // detach-only — see the corrected `#[must_use]` text.)
+    inner_arc.lock().namespace_sinks.clear();
 }
 
 /// Tree-wide gather for `signal_pause`/`resume`/`complete`/`error`
@@ -976,3 +987,12 @@ pub(crate) fn edges_in(
     }
     result
 }
+
+// QA-A4: lock the central D246 invariant — the one Core-free `Graph` is
+// `Send + Sync + 'static` (the whole point: capturable into long-lived
+// sinks / `MailboxOp::Defer` closures). A future `Rc`/`RefCell`/`&Core`
+// field fails the build here, at the cause.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<Graph>();
+};

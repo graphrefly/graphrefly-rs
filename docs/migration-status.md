@@ -3025,19 +3025,49 @@ remain **separate, explicitly-approved future batches**.
 >   6 skipped** (the 6 genuinely-deleted-model §7 cross-thread tests
 >   `#[ignore]`→S4, exactly per D246). Committed `b2dacec`.
 >
+> **boundary-1 QA pass (2026-05-18, `/qa`):** 3 adversarial reviewers
+> (Blind / Edge / Simplification). Applied: **D1** branch-on-kind so
+> non-producer fn-fires keep the single parameterless `invoke_fn`
+> (zero §7-floor regression; only producer-build pays the `&dyn
+> CoreFull` hand-off); **A1** `destroy_subtree` now clears
+> `namespace_sinks` + corrected the false "(or OwnedCore drop)" docs
+> (reactive describe/observe/storage Core subs are raw `core.subscribe*`,
+> NOT `OwnedCore`-tracked — `detach(core)` is REQUIRED); **A2**
+> `OwnedCore::Drop` re-entrancy-safe pop-loop; **A3** deleted the
+> redundant `ProducerCtx::for_corefull` synonym; **A4** compile-time
+> `Send+Sync+'static` assertions for `Graph` + `OwnedCore`. **A5**
+> reconsidered → declined (a hard `#[must_use]` on
+> `OwnedCore::track_subscribe*` is a false leak-signal — `Drop`
+> auto-collects; satisfied by existing doc). Committed as the QA-fix
+> commit on top of `b2dacec`/`5e7d21f`.
+>
 > **REMAINING D246 boundaries (each its own gate+commit per D226;
-> single `/qa` at end):**
-> - **S2c** — drop `Mutex<GraphInner>`→`RefCell`/owner-`&mut`; delete
->   `groups.rs`/`LockedCell`; collapse `StateCell` (remove the `C`
->   generic — pervasive across the core; ~128 `StateCell`/`LockedCell`/
->   `SingleThreadCell` refs + 45 `Mutex<GraphInner>` refs). Independent
->   large boundary; **not started** (clean — no WIP).
+> single `/qa` at end) — THIS IS THE NEXT `/porting-to-rs` BATCH:**
+> - **S2c** — drop `Mutex<GraphInner>`→`RefCell`/owner-`&mut`; **AND
+>   `OwnedCore.subs`/`topo_subs` `Mutex<Vec>`→`RefCell`/`Vec`** (QA-A6
+>   F1: same single-owner⇒drop-the-Mutex logic, was orphaned from this
+>   bullet); delete `groups.rs`/`LockedCell`; collapse `StateCell`
+>   (remove the `C` generic — pervasive across the core; ~128
+>   `StateCell`/`LockedCell`/`SingleThreadCell` refs + 45
+>   `Mutex<GraphInner>` refs). Independent large boundary; **not
+>   started** (clean — no WIP).
 > - **S3** — `SerializationGroupId`→`SchedulingGroupId` (~59 refs).
 > - **S4** — wave-scope drain + per-group `Send` wake on `CoreMailbox`;
->   rebuild `benches/group_scaling.rs` with independent per-worker
->   Cores (actor-model re-measure); convert the 6 §7 `#[ignore]` tests.
+>   **+ D246 rule 8 (QA-A6): typed `MailboxOp` snapshot/prune variants
+>   (or reusable slot) replacing `post_defer(Box<dyn FnOnce>)` per
+>   emission on observe/describe/`graph_integration.rs` — fuse with the
+>   `CoreMailbox` per-group-wake reshape (don't churn the mailbox
+>   twice)**; rebuild `benches/group_scaling.rs` with independent
+>   per-worker Cores (actor-model re-measure); convert the 6 §7
+>   `#[ignore]` tests + the 2 core-tests pause/resume + a6-set_deps
+>   re-entry stubs.
+> - **Standalone (NOT S2c/S3/S4):** pre-existing `attach_storage`
+>   re-ship-on-shrink duplication smell (QA Blind #4) — dedicated
+>   structures/storage slice; tracked in `porting-deferred.md` §
+>   "D246 record-and-skip".
 > - Record-and-skip running list: `porting-deferred.md` §
->   "D246 record-and-skip" (reported at session end).
+>   "D246 record-and-skip" (reported at session end; QA-A6 entries
+>   appended).
 
 ### Actor-model S2b — CORE+OPERATORS CHECKPOINT COMMITTED (`2494dea`); graph + tests REMAIN (premise-corrected 2026-05-18, D236)
 

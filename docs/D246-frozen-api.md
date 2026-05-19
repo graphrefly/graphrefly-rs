@@ -102,8 +102,13 @@ owner-invoked, synchronous:
   `NodeFactory = Box<dyn Fn(&Core,&Graph,&str,&NodeSlice,&[NodeId])->Result<NodeId,SnapshotError>>`.
 
 In tests, replace RAII-drop reliance: keep the handle bound and call
-`.detach(rt.core())` at end-of-scope (or rely on `OwnedCore` drop for
-the Core-level subs it tracked + `graph.destroy(core)` for ns sinks).
+`.detach(rt.core())` at end-of-scope. **`detach(core)` is REQUIRED for
+reactive describe/observe + storage handles** — their Core message/
+topology subscriptions are opened via raw `core.subscribe*` and are
+**not** `OwnedCore`-tracked, so `OwnedCore` drop does NOT collect them
+(only subs opened via `OwnedCore::track_subscribe` are). `graph.destroy
+(core)` collects the namespace-change sinks (QA-A1); the Core
+topology/message subs still need explicit `detach(core)`.
 
 ## graphrefly_structures (Blind #3 — D246 rule 6: mutation = owner-sync)
 

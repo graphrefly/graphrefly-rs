@@ -3702,6 +3702,45 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   green) in an environment where Rust test binaries can start — purely
   a confirmation step; no code change pending.
 
+- **[D246 rule 8 — DEFERRED to S4, recorded per QA-A6 2026-05-18]**
+  what: `post_defer(Box::new(move |cf: &dyn CoreFull| …))` heap-allocs
+  a closure **per emission** on the three observation paths D246 r8
+  names — `graphrefly-graph/src/observe.rs` (`NodeTornDown` prune),
+  `graphrefly-graph/src/describe.rs` (reactive-describe re-snapshot),
+  and the hottest, `graphrefly-storage/src/graph_integration.rs:~652`
+  (snapshot+persist, fires on every observed-node DATA). why-deferred:
+  r8's "typed mailbox variants / reusable slot" is a `CoreMailbox`-
+  layer reshape; **S4 already reshapes `CoreMailbox`** for the
+  per-group `Send` runnable wake — typed `MailboxOp` snapshot/prune
+  variants fuse naturally there, and doing it now would churn the
+  mailbox twice. source: QA Simplification reviewer F4 (boundary-1 QA,
+  2026-05-18). NOT non-applicable — a real perf/memory item, correctly
+  fused with S4's mailbox work (see migration-status S4 bullet).
+
+- **[`owned.rs` `Mutex<Vec>` → single-owner — rides S2c, recorded per
+  QA-A6]** what: `OwnedCore.subs`/`topo_subs` are `Mutex<Vec<…>>` +
+  `PoisonError::into_inner` ceremony, but `OwnedCore` is single-owner
+  by construction (owns `Core` by value, drops on owner thread) — an
+  uncontended lock per `track_subscribe`. why-deferred: identical
+  single-owner⇒drop-the-Mutex logic as D246 r7's `Mutex<GraphInner>`
+  → `RefCell`; belongs in the **same S2c single-owner pass** (it was
+  orphaned from the explicit S2c bullet which only named
+  `Mutex<GraphInner>`/`groups.rs`/`LockedCell`/`StateCell`). source:
+  QA Simplification reviewer F1. Added to the S2c bullet below.
+
+- **[pre-existing smell, NOT D246-introduced — `attach_storage`
+  re-ship-on-shrink]** what:
+  `graphrefly-structures/src/reactive.rs:~678` post-`trim_head`/`clear`
+  (`data.len() < *del`) does `sink.append_entries(&data)` — re-appends
+  the surviving prefix to the append-only storage sink as if new, so a
+  trim/clear cycle accumulates duplicates in the persisted log (the
+  append-only sink trait has no truncation signal). why-deferred:
+  pre-existing in the pre-D246 code (the D246 diff only threaded
+  `&Core` through this path — not introduced/blessed by boundary-1's
+  design); a storage-sink-protocol fix (truncation/snapshot signal),
+  out of D246 scope. source: QA Blind Hunter #4 (boundary-1 QA). Track
+  for a dedicated structures/storage slice (NOT S2c/S3/S4).
+
 ### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
 
 `2494dea fix: s2b` = **checkpoint of `graphrefly-core`+`graphrefly-operators`
