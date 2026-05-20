@@ -12,7 +12,16 @@ export declare class BenchCheckpointSnapshotTier {
 }
 
 export declare class BenchCore {
-  /** Construct a fresh `BenchCore` wired to a Rust-side value registry. */
+  /**
+   * Construct a fresh `BenchCore` wired to a Rust-side value registry.
+   *
+   * **S6/D255:** the actor's worker thread spawns inside
+   * `CoreActor::spawn(binding)` and constructs the `Core` on the
+   * worker (Core is `!Send`, so it must be born on the thread that
+   * owns it). This constructor returns immediately; the worker is
+   * ready to receive closures by the time any subsequent napi
+   * method's first `actor.run(...)` resolves.
+   */
   constructor()
   /**
    * Intern an i32 value; returns its HandleId. Used by JS-side
@@ -64,6 +73,19 @@ export declare class BenchCore {
   /**
    * Subscribe a noop sink. Activation may fire fns (including
    * JS-callback operators), so this MUST be async.
+   *
+   * **S6 / D241+D255 reconciled:** Core::subscribe now returns a
+   * `SubscriptionId` (D241) — the substrate-level RAII `Subscription`
+   * type was deleted in D225. We post the subscribe through the
+   * actor and record the `(NodeId, SubscriptionId)` pair so the
+   * matching unsubscribe in `BenchCore::unsubscribe` / `dispose` /
+   * `Drop` can call `Core::unsubscribe(node_id, sub_id)` explicitly.
+   *
+   * **D248 sink-shape note:** `graphrefly_core::Sink =
+   * Arc<dyn Fn(&[Message])>` (without `Send + Sync`) — owner-thread-
+   * only. We build the sink *inside* the actor closure, on the
+   * worker thread, so the `!Send` Sink never has to cross the
+   * actor channel.
    */
   subscribeNoop(nodeId: number): Promise<number>
   /**
@@ -75,12 +97,18 @@ export declare class BenchCore {
    *
    * **Sync-bridge semantics:** the returned Promise resolves AFTER
    * the subscribe-time handshake fires AND the JS sink callback
-   * completes (per `bridge_sync_unit` blocking the tokio thread on
+   * completes (per `bridge_sync_unit` blocking the actor worker on
    * a sync_channel until JS responds via libuv pump). JS code
    * MUST `await` this method — synchronous calling deadlocks.
    *
    * `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
    * async work runs inside `env.spawn_future(async move { ... })`.
+   *
+   * **D248 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into the
+   * actor closure IS `Send + Sync` (`ThreadsafeFunction` is
+   * Send+Sync by napi-rs design); the `Sink = Arc<dyn Fn(&[Message])>`
+   * that wraps it is `!Send`, so we build it on the worker thread
+   * inside the actor closure.
    */
   subscribeWithTsfn(nodeId: number, sinkCallback: (arg: Array<number>) => void): Promise<number>
   /**
@@ -93,24 +121,26 @@ export declare class BenchCore {
   setReleaseCallback(callback: (arg: number) => void): void
   /**
    * Drop the subscription at `idx` (releases activation refcount).
-   * Async because Subscription's Drop locks Core's mutex; running
-   * on a tokio blocking thread keeps the JS thread free during any
-   * terminal-cascade work the unsubscribe triggers.
+   * Posts the unsubscribe through the actor so the JS thread stays
+   * free to pump libuv if the unsubscribe triggers terminal-cascade
+   * work that fires TSFN-backed sinks.
+   *
+   * **S6 / D241+D255 reconciled:** explicit `Core::unsubscribe(node,
+   * sub_id)` replaces the deleted `impl Drop for Subscription`
+   * (D225).
    */
   unsubscribe(idx: number): Promise<void>
   /**
-   * Drain all retained subscriptions on a tokio blocking thread —
-   * JS code MUST `await core.dispose()` before letting `BenchCore`
-   * drop. Closes the BenchCore::Drop deadlock vector (Slice Y):
-   * without `dispose`, GC of the napi instance runs `Drop` on the
-   * JS thread; each `Subscription::Drop` blocks on `Core`'s mutex;
-   * if a tokio blocking-pool thread is mid-wave (parked in a TSFN
-   * bridge waiting for libuv to pump a JS-callback result), the JS
-   * thread waiting for the mutex stalls libuv → TSFN never
-   * delivers → tokio thread blocks forever. Calling `dispose` first
-   * ships the subscription drop work onto a tokio blocking thread
-   * (which is allowed to block on the mutex while the JS thread
-   * stays free to pump libuv).
+   * Drain all retained subscriptions through the actor — JS code
+   * MUST `await core.dispose()` before letting `BenchCore` drop.
+   * Closes the BenchCore::Drop deadlock vector (Slice Y): without
+   * `dispose`, GC of the napi instance runs `Drop` on the JS thread;
+   * each unsubscribe would post to the actor and *not* be able to
+   * `.await` (Drop is sync). The actor's worker thread would still
+   * run the work fire-and-forget, but the JS thread would have
+   * already moved on without ensuring terminal-cascade TSFNs
+   * flushed. Calling `dispose` first guarantees the JS thread waits
+   * for the cascade to settle.
    *
    * Idempotent: subsequent calls are no-ops once the vec is drained.
    */
@@ -199,6 +229,14 @@ export declare class BenchCore {
    * u64s (the namespace lives at the Graph layer; an unattached
    * node has no names — the JS wrapper renders them as
    * `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
+   *
+   * **S6/D255 — actor-routed sync:** under the actor model `&Core`
+   * is owner-thread-only, so the read accessors execute on the
+   * actor worker thread via [`CoreActor::run_sync`]. The libuv
+   * thread blocks briefly on the reply (microseconds for the 5
+   * read accessors). The safe-use contract (read-only, no
+   * TSFN-active wave interleave) is met by `describe_node`'s
+   * inspection-only usage — see `CoreActor::run_sync` docs.
    */
   describeNode(nodeId: number): string
   /**
@@ -209,54 +247,62 @@ export declare class BenchCore {
    * SHA-256, and Core forbids a tokio runtime (CLAUDE.md invariant 4
    * / D070 / D077). Async-everywhere is a *binding-contract* shape
    * (`Impl.sha256Hex` is `Promise<string>`), so the async wrapping
-   * lives only here at the napi boundary. We still route through
-   * `run_blocking` so the (cheap) hash never runs on the libuv
-   * thread, consistent with every other async napi method.
+   * lives only here at the napi boundary. **Hashing is Core-free**
+   * — it does NOT touch the actor / `Core` / WORKER_EXTRAS. We
+   * route through `napi::bindgen_prelude::spawn_blocking` (the
+   * generic tokio blocking pool, NOT the actor's pinned worker)
+   * just to keep the (potentially large) input hashing off the
+   * libuv thread. (QA fix 2026-05-20 m4: doc previously claimed
+   * "we route through the actor" — false; corrected to match the
+   * actual `spawn_blocking` body.)
    */
   sha256Hex(input: Uint8Array): Promise<string>
 }
 
 /**
- * RAII handle for a reactive describe subscription. JS code SHOULD
- * `await dispose()` before letting it drop — that path runs the
- * unsubscribe on a tokio blocking thread, keeping the JS thread free
- * to pump libuv. As defense-in-depth (Slice X3 /qa A), the `Drop`
- * impl ALSO ships the inner-drop to a tokio blocking thread
- * fire-and-forget, so a forgotten `dispose()` doesn't deadlock the
- * JS thread on Graph's namespace_sinks mutex.
+ * Handle for a reactive describe subscription. JS code MUST `await
+ * dispose()` before letting it drop — D246 r3 owner-invoked detach
+ * (no RAII below the binding). `Drop` is a defense-in-depth
+ * fire-and-forget detach via `dispatch_detached`.
  */
 export declare class BenchDescribeReactiveHandle {
   /**
-   * Drop the inner subscription on a tokio blocking thread.
-   * Idempotent — subsequent calls are no-ops.
+   * Owner-invoked synchronous detach (D246 r3). Idempotent —
+   * subsequent calls find no entry in `WORKER_EXTRAS` and no-op.
    */
   dispose(): Promise<void>
 }
 
 /**
- * JS-facing wrapper around a `graphrefly_graph::Graph`. Each
- * `BenchGraph` shares its `BenchCore`'s value registry + binding so
- * nodes registered through `BenchGraph::state(...)` are visible to
- * `BenchOperators::register_*(...)` and vice-versa.
+ * JS-facing wrapper around a `graphrefly_graph::Graph` (S6/D255).
  *
- * **`binding` field redundancy** (Slice X3 / Phase E /qa F14): the
- * `binding: Arc<BenchBinding>` field carries the same allocation as
- * `core.binding: Arc<dyn BindingBoundary>` — they're upcasts of the
- * same `Arc<BenchBinding>`. The typed field is retained because
- * `BenchGraph::derived` needs the concrete `BenchBinding` to access
- * `binding.registry.lock()` for fn registration; recovering the
- * concrete type from the trait-erased `core.binding` would require
- * `Arc::downcast` (not available on `dyn Trait` without `Any` bound).
- * `from_core` enforces the invariant via a debug-build pointer-equality
- * assert so the field can't drift from `core`'s view.
+ * Each `BenchGraph` shares its `BenchCore`'s `Arc<CoreActor>` + value
+ * registry + binding so nodes registered through `BenchGraph::state(...)`
+ * are visible to `BenchOperators::register_*(...)` and vice-versa.
+ * The actual `Graph` instance (which is `!Send + !Sync`) lives in
+ * the actor's `WORKER_EXTRAS` thread-local on the worker thread,
+ * keyed by [`Self::graph_key`].
  */
 export declare class BenchGraph {
   /**
    * Construct a fresh root graph wired to a `BenchCore`'s binding +
-   * Core (D074). The BenchGraph SHARES the BenchCore's Core via
-   * `Graph::with_existing_core` (added in this slice to graphrefly-
-   * graph), so nodes registered through `BenchGraph::state(...)`
-   * are visible to operator factories on the same `BenchCore`.
+   * actor (D074 + D255). The BenchGraph SHARES the BenchCore's
+   * actor — nodes registered through `BenchGraph::state(...)` are
+   * visible to operator factories on the same `BenchCore`.
+   *
+   * **Note:** this constructor blocks the JS thread briefly (one
+   * sync_channel round-trip with the actor) to install the Graph
+   * in `WORKER_EXTRAS`. The work is trivial (one `Graph::new` +
+   * HashMap insert); blocking is acceptable for a one-shot factory
+   * call.
+   *
+   * **F14 invariant (restored 2026-05-20 QA F9/m12, preserved by
+   * construction):** the `binding: Arc<BenchBinding>` field and
+   * the actor's Core's `BindingBoundary` upcast come from the
+   * SAME `Arc<BenchBinding>` — both `core.actor_arc()` and
+   * `core.binding_arc()` clone fields owned by the supplied
+   * `BenchCore`. `BenchCore::new` is the single construction path
+   * for that Arc; no public API mints a divergent binding.
    */
   static fromCore(core: BenchCore, name: string): BenchGraph
   name(): string
@@ -288,8 +334,20 @@ export declare class BenchGraph {
   /**
    * Register an existing node (e.g., from `BenchOperators::register_map`)
    * under `name` in this graph's namespace.
+   *
+   * **Async** at the napi boundary (QA fix 2026-05-20, Edge Case
+   * Hunter F4 / Blind Hunter M7): `Graph::add` fires
+   * `NamespaceChangeSink`s synchronously, and an active
+   * `observe_all_reactive` / `attach_snapshot_storage` handle's
+   * sink calls `core.subscribe(new_node, sink)`. Under the prior
+   * sync `run_sync` shape that subscribe would push the
+   * handshake's START to a TSFN-backed sink while libuv is blocked
+   * on the actor reply — at best a queue-full silent drop
+   * (`NonBlocking max_queue_size=8`), at worst a 3-way deadlock
+   * if any sink uses `bridge_sync`. `actor.run` keeps libuv free
+   * to pump TSFN microtasks during the await.
    */
-  add(name: string, nodeId: number): number
+  add(name: string, nodeId: number): Promise<number>
   setByName(name: string, handle: number): Promise<void>
   getByName(name: string): Promise<number>
   invalidateByName(name: string): Promise<void>
@@ -305,14 +363,17 @@ export declare class BenchGraph {
    * the same `MSG_CODE_*` table as `batch_emit_handle_messages`,
    * but rejects everything except INVALIDATE / PAUSE / RESUME — the
    * only kinds canonical §3.7.1 supports for graph-wide broadcast.
-   * DATA / RESOLVED / COMPLETE / ERROR / TEARDOWN return a typed
-   * `napi::Error` BEFORE any signal fires (legacy parity:
-   * `g.signal([[DATA, ...]])` throws synchronously).
    */
   signalBatch(encoded: Array<number>): Promise<void>
   /**
    * Mount a fresh empty subgraph under `name`; returns a new
-   * `BenchGraph` sharing this graph's Core/binding/registry.
+   * `BenchGraph` sharing this graph's actor + binding.
+   *
+   * Uses [`crate::core_actor::with_extra_try_install_child`] to
+   * read the parent + install the child Graph in a SINGLE
+   * `WORKER_EXTRAS` `borrow_mut` — avoids the F2-style nested-
+   * borrow panic the prior `with_extra` + `install_extra` shape
+   * triggered (Edge Case Hunter F2 / Blind Hunter M5, 2026-05-20).
    */
   mountNew(name: string): Promise<BenchGraph>
   /** Detach a previously-mounted subgraph by name. */
@@ -321,67 +382,55 @@ export declare class BenchGraph {
   /**
    * Static edges snapshot — `Vec<(from_name, to_name)>` flattened to
    * alternating `Vec<String>` for napi marshaling.
+   *
+   * Sync at the napi boundary (preserves `Impl.edges(opts) ->
+   * Array<[string, string]>` contract); blocks libuv briefly on the
+   * actor reply. Pure read accessor — see [`CoreActor::run_sync`]
+   * safe-use contract; the wrapper.js parity-tests usage doesn't
+   * interleave with TSFN-active waves.
    */
   edges(recursive: boolean): Array<string>
   /**
    * JSON-serialized describe snapshot. JS adapter parses with
-   * `JSON.parse`. Static — for reactive describe, see follow-on
-   * slice (out of scope per D074).
+   * `JSON.parse`. Static — for reactive describe, see
+   * `describe_reactive`.
+   *
+   * Sync at the napi boundary (preserves `Impl.describe() ->
+   * unknown` contract); same `run_sync` safe-use as `edges`.
    */
   describeJson(): string
   /**
    * Subscribe to live topology snapshots (canonical R3.6.1
-   * `describe({ reactive: true })`). The JS callback receives a
-   * JSON-serialized [`graphrefly_graph::GraphDescribeOutput`] on
-   * each fire; first fire is the push-on-subscribe initial
-   * snapshot, subsequent fires are post-change snapshots.
-   *
-   * Returns a [`BenchDescribeReactiveHandle`] napi class. JS code
-   * MUST `await handle.dispose()` before letting the handle drop —
-   * the unsubscribe runs on a tokio blocking thread to avoid the
-   * JS-thread / Core-mutex deadlock vector that `BenchCore::dispose`
-   * closes for subscriptions.
+   * `describe({ reactive: true })`). Returns a
+   * [`BenchDescribeReactiveHandle`]; JS code MUST `await
+   * handle.dispose()` (D246 r3 — owner-invoked detach).
    */
   describeReactive(sink: (arg: string) => void): Promise<BenchDescribeReactiveHandle>
   /**
    * Subscribe to all-named-nodes message stream with auto-subscribe
    * on late-added nodes (canonical R3.6.2 `observe(undefined, {
-   * reactive: true })`). The JS callback receives `(name,
-   * encoded_msgs)` per emission — `encoded_msgs` is the same flat
-   * `[code_0, payload_0, ...]` shape that `subscribe_with_tsfn`
-   * uses, decoded JS-side via the `MSG_CODE_*` table.
-   *
-   * Returns a [`BenchObserveReactiveHandle`] napi class.
-   * `await handle.dispose()` unsubscribes everything (the inner
-   * `GraphObserveAllReactive` clears all fan-out subs + the
-   * namespace-change listener).
+   * reactive: true })`).
    */
   observeAllReactive(sink: (arg0: string, arg1: Array<number>) => void): Promise<BenchObserveReactiveHandle>
   /**
    * Sink-style observe of a single node (canonical R3.6.2 default
-   * mode `observe(path)`). Returns a subscription index into a
-   * `BenchObserveReactiveHandle` slot that mirrors `BenchCore`'s
-   * subscriptions vec semantics. Provided for canonical-spec
-   * completeness — most parity scenarios use the reactive variant.
-   *
-   * `path` resolves via `Graph::node(path)`; panics if unknown.
+   * mode `observe(path)`). When `path` is `None`, fan-out snapshot
+   * across all named nodes (no auto-subscribe).
    */
   observeSubscribe(path: string | undefined | null, sink: (arg0: string, arg1: Array<number>) => void): Promise<BenchObserveReactiveHandle>
 }
 
-/**
- * RAII handle for `ReactiveLog::attach`. `dispose()` stops the attachment
- * deterministically; dropping the object does the same (RAII fallback for
- * the non-deterministic-GC case).
- */
 export declare class BenchLogSubscription {
-  dispose(): void
+  /**
+   * Owner-invoked detach (D246 r3). Idempotent — second call finds
+   * no inner ReactiveSub and no-ops. Async to keep the JS thread
+   * free during the actor round-trip; `&self` (not `&mut self`)
+   * because napi-rs 3 rejects `async fn(&mut self)` without
+   * explicit `unsafe`. Interior mutability via `Mutex<Option<…>>`.
+   */
+  dispose(): Promise<void>
 }
 
-/**
- * RAII handle for `ReactiveLog::view`. Dropping disposes the view's
- * subscriptions. JS subscribes to `node_id` via `BenchCore.subscribeWithTsfn`.
- */
 export declare class BenchLogView {
   get nodeId(): number
 }
@@ -396,12 +445,9 @@ export declare class BenchMemoryBackend {
 }
 
 /**
- * RAII handle for an observe subscription (single-node, all-nodes
+ * Handle for an observe subscription (single-node, all-nodes
  * snapshot, or all-nodes reactive auto-subscribe). JS code SHOULD
- * `await dispose()` (runs unsubscribe on tokio); as defense-in-depth
- * (Slice X3 /qa A) the `Drop` impl ALSO ships the inner drop to
- * tokio fire-and-forget so a forgotten `dispose()` doesn't deadlock
- * the JS thread on Core's mutex via `Subscription::Drop`.
+ * `await dispose()` — D246 r3 owner-invoked detach.
  */
 export declare class BenchObserveReactiveHandle {
   dispose(): Promise<void>
@@ -412,6 +458,14 @@ export declare class BenchOperators {
    * Build a `BenchOperators` companion that shares the supplied
    * `BenchCore`'s value registry + Core. Registrations on either
    * class are visible to the other.
+   *
+   * **F14 invariant (restored 2026-05-20 QA F9/m12, preserved by
+   * construction):** the `binding: Arc<BenchBinding>` field and
+   * the actor's Core's `BindingBoundary` upcast come from the
+   * SAME `Arc<BenchBinding>` — both `core.actor_arc()` and
+   * `core.binding_arc()` clone fields owned by the supplied
+   * `BenchCore`. `BenchCore::new` is the single construction path
+   * for that Arc; no public API mints a divergent binding.
    */
   static fromCore(core: BenchCore): BenchOperators
   /**
@@ -510,27 +564,31 @@ export declare class BenchOperators {
 }
 
 export declare class BenchReactiveIndex {
+  /**
+   * **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+   * — `ReactiveIndex::new` is a topology mutation safe under
+   * `run_sync` *only* because no subscribers exist for the
+   * freshly-created node (lifecycle precondition).
+   */
   static create(core: BenchCore, packer: (arg: Array<number>) => number): BenchReactiveIndex
   get nodeId(): number
   get size(): number
   has(primary: number): boolean
   get(primary: number): number
-  /**
-   * `secondary` is a sort-key string (not a handle). `numeric_key`
-   * (F20/D205, optional trailing arg) records this row in the numeric
-   * range mirror so `range_by_primary` can query by user key.
-   */
   upsert(primary: number, secondary: string, value: number, numericKey?: number | undefined | null): Promise<boolean>
   delete(primary: number, numericKey?: number | undefined | null): Promise<void>
-  /**
-   * F20/D205: values whose numeric primary sorts within `[start, end)`
-   * (inclusive start, exclusive end), ascending by primary key.
-   */
+  /** F20/D205: values whose numeric primary sorts within `[start, end)`. */
   rangeByPrimary(start: number, end: number): Array<number>
   clear(): Promise<void>
 }
 
 export declare class BenchReactiveList {
+  /**
+   * **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+   * — `ReactiveList::new` is a topology mutation safe under
+   * `run_sync` *only* because no subscribers exist for the
+   * freshly-created node (lifecycle precondition).
+   */
   static create(core: BenchCore, packer: (arg: Array<number>) => number): BenchReactiveList
   get nodeId(): number
   get size(): number
@@ -544,8 +602,21 @@ export declare class BenchReactiveList {
 
 export declare class BenchReactiveLog {
   /**
-   * Create from a BenchCore + packer callback. Sync factory — lightweight
-   * Core mutex operation (same risk profile as BenchOperators::from_core).
+   * Create from a BenchCore + packer callback. Constructor runs
+   * `ReactiveLog::new(&core, …)` on the actor's worker thread via
+   * `run_sync` (briefly blocks libuv on the one-shot factory call).
+   *
+   * **`run_sync` safety, lifecycle-precondition framing
+   * (QA 2026-05-20 F7):** `ReactiveLog::new` is a Core *topology
+   * mutation* (`core.register_state(...)`), not a read-only op.
+   * It is safe under `run_sync` because **no subscribers exist
+   * yet for this newly-created node** — no TSFN-backed sink can
+   * fire during construction → no `bridge_sync` libuv-busy
+   * hazard. The invariant is the *lifecycle precondition* (the
+   * node is freshly created, no `subscribe` could have been
+   * called yet), NOT the substrate operation being side-effect-
+   * free. A future change that wires construction-time
+   * subscribers would invalidate this analysis.
    */
   static create(core: BenchCore, packer: (arg: Array<number>) => number, maxSize?: number | undefined | null): BenchReactiveLog
   get nodeId(): number
@@ -555,62 +626,69 @@ export declare class BenchReactiveLog {
   clear(): Promise<void>
   at(index: number): number
   trimHead(n: number): Promise<void>
-  /**
-   * `view({ tail: n })` — last `n` entries. `packer` mirrors `create`'s
-   * snapshot packer: `(handles: u32[]) → u32`. Sync method + spawned
-   * Promise: `Function` is `!Send` and lifetime-bound to `env`, so it
-   * can't cross an `.await`; the TSFN is built sync (napi thread), the
-   * blocking subscribe runs off-thread (`env.spawn_future` →
-   * `run_blocking`). Mirrors `OperatorBindings::register_map`.
-   */
   viewTail(packer: (arg: Array<number>) => number, n: number): Promise<BenchLogView>
-  /**
-   * `view({ slice: [start, stop] })` — `[start..stop)`; `stop` defaults
-   * to log length when `None`.
-   */
   viewSlice(packer: (arg: Array<number>) => number, start: number, stop?: number | undefined | null): Promise<BenchLogView>
-  /**
-   * `view({ fromCursor })` — entries from a cursor node's position
-   * onward. `read_cursor` is a JS callback `(cursorHandle: u32[1]) →
-   * u32` returning the cursor position; it fires inside Core waves on
-   * the blocking pool, so its `bridge_sync` is safe.
-   */
   viewFromCursor(packer: (arg: Array<number>) => number, cursorNodeId: number, readCursor: (arg: Array<number>) => number): Promise<BenchLogView>
-  /**
-   * `scan(seed, folder)` — running aggregate. `seed` is a handle; the
-   * JS `folder` is `([acc, value]: u32[2]) → u32` (accumulator handle).
-   */
   scan(seed: number, folder: (arg: Array<number>) => number): Promise<BenchScanHandle>
-  /**
-   * `attach(upstream)` — append every upstream DATA handle into this
-   * log. Handle-opaque: `read_value` retains so `at()` can't read a
-   * wave-released slot (release-on-trim is a known bounded leak — see
-   * porting-deferred.md, parallels the terminal-slot retain note).
-   */
   attach(upstreamNodeId: number): Promise<BenchLogSubscription>
 }
 
 export declare class BenchReactiveMap {
+  /**
+   * **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+   * — `ReactiveMap::new` is a topology mutation safe under
+   * `run_sync` *only* because no subscribers exist for the
+   * freshly-created node (lifecycle precondition).
+   */
   static create(core: BenchCore, packer: (arg: Array<number>) => number, maxSize?: number | undefined | null, defaultTtl?: number | undefined | null): BenchReactiveMap
   get nodeId(): number
   get size(): number
-  has(key: number): boolean
-  get(key: number): number
+  /**
+   * `async fn` at the napi boundary (QA fix 2026-05-20, Edge Case
+   * Hunter F3 / Blind Hunter C2): `ReactiveMap::has` is NOT
+   * read-only — when TTL is configured, an expired-key check
+   * triggers `prune_expired_inner` + `self.emitter.emit(core,
+   * snapshot)` (see `crates/graphrefly-structures/src/reactive.rs`
+   * `has` body). The emission fires subscribers; if any subscriber
+   * uses `bridge_sync` (Blocking TSFN call), libuv must be free to
+   * pump the TSFN microtask — under the prior sync `run_sync`
+   * shape libuv was blocked on the actor reply → 3-way deadlock.
+   * `actor.run` keeps libuv free during the await.
+   *
+   * **Public-API change:** `Impl.ImplReactiveMap.has(key)` is
+   * `Promise<boolean>` (was `boolean`); `parity-tests/impls/
+   * types.ts` widened correspondingly. See cross-track-ledger.md
+   * §1 row 2026-05-20 (F3).
+   */
+  has(key: number): Promise<boolean>
+  /**
+   * `async fn` at the napi boundary — same rationale as `has`
+   * (TTL-prune side-effect emits a snapshot, can deadlock libuv
+   * under sync `run_sync`).
+   */
+  get(key: number): Promise<number>
   set(key: number, value: number, ttl?: number | undefined | null): Promise<void>
   delete(key: number): Promise<void>
   clear(): Promise<void>
 }
 
-/**
- * RAII handle for `ReactiveLog::scan`. Dropping disposes the scan
- * subscription. JS subscribes to `node_id` for accumulator snapshots.
- */
 export declare class BenchScanHandle {
   get nodeId(): number
 }
 
+/**
+ * JS-facing handle for storage detach. Stores `Arc<CoreActor>` +
+ * `handle_key: u64` keying into the actor's `WORKER_EXTRAS`.
+ * `StorageHandle` is `!Send` (holds a `Rc<RefCell<GraphInner>>`
+ * via its `GraphObserveAllReactive` field) so it lives on the
+ * worker thread; `dispose()` posts a `take_extra` + `detach(core)`
+ * closure through the actor.
+ */
 export declare class BenchStorageHandle {
-  /** Explicitly dispose (stop persistence, unsubscribe sinks). */
+  /**
+   * Explicitly dispose (full owner-invoked teardown). Idempotent
+   * — second call finds no entry in `WORKER_EXTRAS` and no-ops.
+   */
   dispose(): Promise<void>
 }
 

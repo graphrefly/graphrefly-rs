@@ -3538,6 +3538,358 @@ D252 (IN_TICK collapse + hard invariant), D253 (SchedulingGroupId
 delete), D254 (Tier A bundle + process memory), D254-AUDIT (inline
 in D254 — #7 TimerEmit not added; `MailboxOp::Defer` survives).
 
+### S6 — LANDED 2026-05-19 — napi bindings reconciliation against post-S2c `!Send` Core (D255/D256/D257/D258)
+
+> S6 lands the α/γ-converged actor model on the napi bindings, closing
+> the post-S2c reconciliation gap. The CI `bindings-js` +
+> `napi-build-matrix` jobs are restored from `if: false` to the prior
+> bot/release condition; `cargo build -p graphrefly-bindings-js
+> --features full` (54 errors → 0), `cargo clippy` (0 errors,
+> pre-existing pedantic warnings), `cargo fmt --check`, and
+> `pnpm build` (cdylib via napi 3.x) are all GREEN. `#![deny(unsafe_code)]`
+> preserved; `#![forbid(unsafe_code)]` preserved on the 5
+> default-members crates. Default-members `mise run gate` unaffected
+> (no substrate change).
+
+**What landed (matches the D255/D256/D257/D258 locked scope):**
+
+1. **D255 — α/γ-converged actor (`core_actor.rs`, ~310 LOC NEW).**
+   `CoreActor { sender: crossbeam_channel::Sender<CoreClosure>, join:
+   Mutex<Option<JoinHandle<()>>>, generation: u64 }` owns `Core` on
+   a dedicated `std::thread::spawn`-ed worker thread. `Arc<CoreActor>::
+   run<F, R>(f)` posts a `FnOnce(&Core) -> R + Send + 'static`
+   closure and awaits a `std::sync::mpsc::sync_channel(1)` reply
+   (bridged into async via `napi::bindgen_prelude::spawn_blocking`).
+   `run_sync` is the sync variant for `#[napi] fn` (not `async fn`)
+   methods — used by `BenchCore::describe_node` (D207 read-side
+   projection) + the sync `Bench*` factory constructors. Worker
+   thread cleanly joins on last-`Arc<CoreActor>` drop (channel close
+   → `recv` Err → loop exits → Core drops on worker stack).
+
+2. **D256 reconciled — `BindingBoundary::invoke_fn_with_core` override**
+   (`core_bindings.rs:330+`). D245/D246-r5 had already added
+   `invoke_fn_with_core(node_id, fn_id, dep_data, &dyn CoreFull)` to
+   the substrate with a default delegating impl; the pre-D245
+   `CURRENT_CORE` thread-local + `CoreThreadGuard` + `current_core()`
+   plumbing was deleted entirely. `BenchBinding` now overrides
+   `invoke_fn_with_core` to build a `ProducerCtx` against the passed
+   `&dyn CoreFull` directly — zero thread-local indirection. No
+   substrate change; no other-binding impacts (every other `impl
+   BindingBoundary` keeps the default delegating shape).
+
+3. **`Subscription` → `(NodeId, SubscriptionId)` rename** (D241/D246-r3).
+   Three import sites + `Vec<Option<Subscription>>` storage + RAII
+   Drop semantics → explicit owner-invoked `core.unsubscribe(nid,
+   sub_id)` through the actor. `BenchCore::dispose` posts the entire
+   drain as one actor closure (one round-trip, not one per
+   subscription).
+
+4. **D257 — `GLOBAL_CORE: OnceLock<Arc<BenchCore>>` kept.** New
+   `BenchCore` (Arc<CoreActor> + Arc<Mutex<…>> + Arc<BenchBinding>)
+   is Send+Sync by construction; the singleton works unchanged. 6
+   `global_*` napi entry points preserved.
+
+5. **`!Send` worker-extras registry** (`core_actor.rs` —
+   `thread_local!(WORKER_EXTRAS: RefCell<HashMap<u64, Box<dyn Any>>>)`
+   + `alloc_worker_key`/`install_extra`/`with_extra`/`take_extra`).
+   `Graph` (`!Send + !Sync`, `Rc<RefCell<GraphInner>>`),
+   `StorageHandle` (`!Send` — owns `GraphObserveAllReactive` which
+   holds an `Rc<RefCell<GraphInner>>`), reactive `LogView`/
+   `ScanHandle`/`ReactiveSub`/`ObserveReactiveInner` all live in
+   `WORKER_EXTRAS` keyed by `worker_key: u64`. `BenchGraph`,
+   `BenchStorageHandle`, `BenchObserveReactiveHandle`,
+   `BenchDescribeReactiveHandle` store
+   `actor: Arc<CoreActor> + handle_key: u64` (both Send+Sync); their
+   `Drop` posts `dispatch_detached(|core| take_extra(...))` for
+   owner-thread detach (D246 r3 — no RAII below the binding).
+
+6. **`Sink: !Send + !Sync` (post-D248).** Every Sink construction
+   moved INSIDE the actor closure (where the `Send` bound doesn't
+   apply). TSFNs (Arc<SinkTsfn> — Send+Sync) cross the channel; the
+   `Sink = Arc<dyn Fn(&[Message])>` wrapper is built on the worker
+   thread. `noop_sink()` reverted from the M9 `OnceLock<Sink>`
+   optimization to per-call `Arc::new(|_| {})` (OnceLock requires
+   T: Sync; Sink is !Sync post-D248).
+
+7. **`BenchLogSubscription::dispose(&self)`** — was `&mut self
+   async fn` (rejected by napi-rs 3 without `unsafe`); reshaped to
+   `&self async fn` with interior mutability via
+   `Arc<parking_lot::Mutex<Option<ReactiveSub>>>`.
+
+8. **CI gates restored** (`.github/workflows/ci.yml` lines 151,
+   199): `bindings-js` + `napi-build-matrix` flipped from `if: false`
+   back to the prior bot/release `if:` condition.
+
+**File deltas (LOC):**
+
+- `crates/graphrefly-bindings-js/src/core_actor.rs`: **+345** (NEW).
+- `crates/graphrefly-bindings-js/src/core_bindings.rs`: 1860 → ~1820
+  (delete `CURRENT_CORE`/`CoreThreadGuard`/`current_core`/`run_blocking`;
+  add `dispatch_non_producer_fn` helper + `invoke_fn_with_core`
+  override; route 67 `core.clone()` sites through `self.actor.run`).
+- `crates/graphrefly-bindings-js/src/operator_bindings.rs`: ~66155
+  bytes (91 `self.core.clone()` + 46 `run_blocking` sites
+  transformed via sed; no logic changes).
+- `crates/graphrefly-bindings-js/src/graph_bindings.rs`: 849 → ~830
+  (full rewrite: BenchGraph holds `graph_key: u64` into
+  WORKER_EXTRAS; reactive handle classes rebuilt around the actor).
+- `crates/graphrefly-bindings-js/src/storage_bindings.rs`: ~647
+  (BenchStorageHandle moved to WORKER_EXTRAS — `StorageHandle` is
+  `!Send` via its GraphObserveAllReactive field).
+- `crates/graphrefly-bindings-js/src/structures_bindings.rs`: 825 →
+  ~830 (full rewrite; structures themselves are Send+Sync, but
+  `LogView`/`ScanHandle`/`ReactiveSub` are detached via actor in
+  Drop).
+- `crates/graphrefly-bindings-js/Cargo.toml`: +crossbeam-channel
+  workspace dep under the `tracing` feature.
+- `.github/workflows/ci.yml`: gates restored.
+
+**Gate result (S6 implementation):**
+
+- `cargo check -p graphrefly-bindings-js --features full` → GREEN (0
+  errors; 2 trivial unused-import warnings fixed).
+- `cargo build -p graphrefly-bindings-js --features full` → GREEN.
+- `cargo clippy -p graphrefly-bindings-js --features full` → 0
+  errors, pre-existing pedantic warnings (informational per the CI
+  `continue-on-error` flag).
+- `cargo fmt --check` → clean.
+- `cd crates/graphrefly-bindings-js && pnpm build` (napi 3.x
+  release-mode cdylib) → GREEN.
+- Default-members `cargo fmt --check` + `cargo clippy --all-targets`
+  → GREEN (no substrate regressions; pre-existing pedantic warnings
+  unchanged).
+- Default-members `cargo nextest run --profile ci` → GREEN **810
+  passed / 0 skipped / 0 failed** in 6.8s. (Was 810/3/0 — the 3
+  D250-retired `#[ignore]` stubs were DELETED at S6 close per the
+  "no legacy" directive; see the D250-AMEND section below.)
+- `#![deny(unsafe_code)]` preserved on `graphrefly-bindings-js`;
+  `#![forbid(unsafe_code)]` preserved on the 5 default-members
+  crates.
+
+**Cleanup — D250 retired stubs DELETED (S6 close, 2026-05-20):**
+
+User pushback at S6 close — "why do we still keep the tests if we
+retired stubs?" — surfaced the D250 "intent preserved, never
+deleted" hedge as a `feedback_no_backward_compat` violation. The
+three `#[ignore]`-marked stubs in
+`crates/graphrefly-core/tests/{lock_discipline,lock_released,slice_f_corrections}.rs`
+(`sink_can_reenter_core_via_pause_and_resume`,
+`fn_can_reenter_core_pause_resume_during_invoke_fn`,
+`a6_set_deps_from_firing_fn_rejected_with_reentrant_error`) were
+**deleted outright**. The β-valid actor-model paths are covered
+by the live mailbox-reentry tests in the same files
+(`sink_can_complete_another_node_from_callback`,
+`custom_equals_can_reenter_core_during_emission`,
+`handshake_sink_can_reenter_core_emit_on_other_node`); the
+`SetDepsError::ReentrantOnFiringNode` guard code stays live in
+`node.rs` as defensive cover for a future owner-side seam, with
+an inline comment at the guard site explaining no test exercises
+it today. Doc updates: `docs/porting-deferred.md` D246 record-and-
+skip entries marked DELETED; `~/src/graphrefly-ts/docs/rust-port-
+decisions.md` D250 amended with the "no-legacy" reasoning. If a
+future slice widens `CoreFull`/`MailboxOp` with `pause`/`resume`/
+`set_deps` for a real consumer, write FRESH tests — don't
+resurrect the deleted stubs.
+
+**S6 /qa — LANDED 2026-05-20 (16 fixes; 3 critical + 3 high + 10 auto-applicable)**
+
+> Single `/qa` over the S6 + cleanup diff (boundary-1 → S2c → S3 →
+> S4 → S5 → S6 + 3 D250-stub deletions). Two review subagents
+> (Blind Hunter + Edge Case Hunter) ran in parallel; both converged
+> on the same critical findings — strong signal that the prior "GREEN
+> mise run gate" claim was insufficient because the gate doesn't
+> exercise the napi surface.
+
+**Process learning surfaced by /qa:** the post-S6 "GREEN gate" claim
+was substrate-only. The actual coverage gate for binding-layer
+slices is `pnpm test:parity` (graphrefly-ts), which exercises the
+napi surface end-to-end. The 3 critical findings (RefCell
+reentrant-borrow panic in `mount_new`/`describe_reactive`/
+`observe_all_reactive`/`observe_subscribe`/`bench_attach_snapshot_storage`;
+`ObserveReactiveInner::detach` leak of `GraphObserveAll`/`Reactive`
+fan-out subs; `BenchReactiveMap::has`/`get` libuv-deadlock vector
+via TTL-prune emit) were all reachable from the parity-test
+runtime, none from `cargo nextest`. **Captured as a memory
+addendum** in `feedback_pre_design_full_decision_set.md`: a green
+`mise run gate` for a bindings-related slice is **insufficient**;
+the parity-test runtime is the actual coverage gate.
+
+**Critical fixes (3) — all converged from both subagents:**
+
+- **F1 / C1** — `ObserveReactiveInner::detach` `AllSubs`/`All`
+  arms now call `.detach(core)` (was: silent drop). The substrate
+  `GraphObserveAll`/`GraphObserveAllReactive` types are
+  `#[must_use = "you MUST call detach(core) or they leak"]` and
+  expose explicit `detach(&mut self, &Core)`. Without this fix,
+  every `observe_all_reactive` / `observe_subscribe(None, …)`
+  caller leaked per-name fan-out subs + the namespace-change sink
+  + (for the Reactive variant) the topology sub for the entire
+  Core lifetime.
+- **F2 / M5** — `install_extra` calls nested inside `with_extra`
+  closures triggered `std::cell::RefCell::BorrowMutError` on first
+  call. **All 5 reactive/storage handle factories** were affected:
+  `mount_new`, `describe_reactive`, `observe_all_reactive`,
+  `observe_subscribe`, `bench_attach_snapshot_storage`. Fixed by
+  adding `with_extra_install_child` / `with_extra_try_install_child`
+  helpers to `core_actor.rs` that hold a single `borrow_mut`
+  across "read parent + install child" — structurally avoiding
+  the nested-borrow panic. All 5 sites refactored. Invariant
+  documented inline at the helper + at `with_extra*` / `install_extra`.
+- **F3 / C2** — `BenchReactiveMap::has`/`get` converted from sync
+  `run_sync` to async `actor.run` (libuv-deadlock vector via the
+  TTL-prune `emitter.emit(core, snapshot)` side-effect). Public-
+  API change: `Impl.ImplReactiveMap.has`/`get` widened to
+  `Promise<…>` at the parity contract (`packages/parity-tests/
+  impls/types.ts`); pure-ts reference arm + `reactive-map.test.ts`
+  scenario callsites + native wrapper.js consumer all updated.
+  Cross-track-ledger.md §1 row added 2026-05-20.
+
+**High-priority fixes (3):**
+
+- **F4 / M7** — `BenchGraph::add` converted from `run_sync` to
+  `async fn`. Pre-fix the sync shape was a deadlock vector when
+  any active `observe_all_reactive` handle's `NamespaceChangeSink`
+  fired during `Graph::add`, synchronously calling `core.subscribe`
+  for the newly-named node with a TSFN-backed sink while libuv
+  was blocked on the actor reply.
+- **F5** — `crates/graphrefly-bindings-js/wrapper.js:1310`
+  `sub.dispose()` was fire-and-forget; the UnsubFn resolved
+  before the actor's detach completed (parity contract `UnsubFn =
+  () => Promise<void>` violated). Fixed by adding `await`.
+- **M1** — `CoreActor` worker loop wrapped each closure in
+  `std::panic::catch_unwind(AssertUnwindSafe(|| closure(&core)))`.
+  Pre-fix a single closure panic (JS-throw via `bridge_sync`, an
+  `.expect("graph entry missing")` miss, etc.) terminated the
+  worker thread → bricked the BenchCore for subsequent calls.
+
+**Auto-applicable batch (10 items):**
+
+- **M2** — `BenchGraph::node_count` returns Err on overflow
+  instead of saturating at u32::MAX.
+- **F7** — Reactive-structure `create()` factory docs rewritten
+  with lifecycle-precondition framing: "safe under `run_sync`
+  because no subscribers exist yet for the freshly-created
+  node — NOT because the substrate op is side-effect-free."
+- **F6 / M6** — `with_extra*` / `install_extra` / `take_extra`
+  rustdoc updated with the explicit "do not call from inside
+  the closure" invariant.
+- **M3 (Blind)** — `take_extra` now panics on type-mismatch
+  instead of silently putting the entry back; programming-error
+  key collisions fail-loud (the M1 `catch_unwind` wrap surfaces
+  the panic to the JS caller as `"worker panicked"` instead of
+  silently leaking the resource).
+- **F8** — `BenchGraph::Drop` rustdoc documents the caller
+  obligation: dispose every derived handle (`BenchDescribeReactiveHandle`,
+  `BenchObserveReactiveHandle`, `BenchStorageHandle`) BEFORE
+  dropping the parent BenchGraph.
+- **F9 / m12** — `BenchGraph::from_core` + `BenchOperators::from_core`
+  F14 binding-pointer-equality invariant doc restored (the
+  S6-refactored docs had dropped it).
+- **m4** — `BenchCore::sha256_hex` rustdoc corrected: hashing is
+  Core-free; routes through `spawn_blocking`, NOT the actor.
+- **m10** — `crates/graphrefly-core/src/node.rs` `set_deps`
+  `ReentrantOnFiringNode` guard comment strengthened: "Guard
+  preserved for future owner-side mid-wave self-rewire seam; do
+  NOT delete as dead code."
+- **F10** — `CoreActor::Drop` comment condensed from 50 lines
+  (including a retracted hypothesis) to a 7-line summary.
+- **m6** — `CoreActor::spawn` / `spawn_with` annotated with
+  `#[must_use = "dropping the only Arc<CoreActor> immediately
+  spawns then kills the worker"]`.
+
+**Verified safe (rejected as findings):** D255 single-owner Core
+(never crosses threads); D248 Sink shape (all construction inside
+actor closures on the worker); D258/D252 gap (a) structurally
+resolved; D245/D256 producer dispatch correctly feature-gated;
+explicit owner-invoked unsubscribes per D241; Cargo.lock minimal
+(crossbeam-channel only); `#![forbid/deny(unsafe_code)]` preserved;
+no new substrate symbols (D196 honored); no actor self-reentry
+deadlock; TS-side D255–D258 + ledger row internally consistent;
+test deletions clean (no orphans); CI workflow `if:` expressions
+correct.
+
+**Gate result (post-/qa, 2026-05-20):**
+
+- `mise run gate` (full default-members, fmt+clippy+nextest
+  --profile ci) → ✅ **810 passed / 0 skipped / 0 failed** in 47s
+  (full elapsed 211s; sentinel exit=0/reason=ok at
+  `~/src/graphrefly-rs/.gate/gate-full-20260520-064739.log`).
+- `cargo build -p graphrefly-bindings-js --features full` → ✅ 0 errors.
+- `cargo clippy -p graphrefly-bindings-js --features full` → ✅ 0
+  errors (pre-existing pedantic warnings only).
+- `cargo fmt --check` → ✅ clean.
+- `cd crates/graphrefly-bindings-js && pnpm build` (napi 3.x
+  release-mode cdylib, 5-target matrix) → ✅ green.
+- `#![deny/forbid(unsafe_code)]` preserved across all 6 crates.
+
+**Parity-test runtime (`pnpm test:parity` rust-via-napi arm) —
+CARRIED to S7 follow-on slice:**
+
+- Pure-ts arm: ✅ all pass.
+- Rust-via-napi arm: ❌ **35 failures across 6 scenario files** —
+  all using `bridge_sync`/`bridge_sync_unit` (Blocking TSFN
+  dispatch from the actor's worker thread to JS):
+  - `operators/control` (5/18 fail), `operators/subscription`
+    (12/32), `operators/higher-order` (6/18), `operators/stratify`
+    (6/14), `operators/buffer` (2/4), `messaging/subscription`
+    (4/10).
+- Failure pattern uniform: "emissions lost" (all or last 1-3).
+  Substrate gate green; binding crate builds + clippy clean.
+
+**Carry rationale:** the 35 failures are NOT a QA-induced
+regression. They're a **S2c→S6 cumulative carry** — the last
+verified-green parity-arm state was Option C close (D206/D207,
+2026-05-15: "30 files / 330 passed"). The substrate work
+S2c+S3+S4+S5 reshaped Core to `!Send + !Sync` (CI bindings job
+gated `if: false`); S6 (this session) is the first rebuild atop
+post-S2c; the QA pass (2026-05-20) is the first end-to-end
+`pnpm test:parity` exercise of that rebuild. The 16 QA patches
+addressed half the surface (RefCell panic, ObserveAll leak,
+ReactiveMap deadlock, async surface mismatch, panic isolation,
+test-stub cleanup); the operator-TSFN regression is its own
+debug slice. Tracked as **S7** in
+`~/src/graphrefly-rs/docs/porting-deferred.md` § "S7 follow-on —
+TSFN-bridged operator scenarios fail" with hypotheses + tracing
+plan. User-locked decision 2026-05-20 ("Close QA now; carry
+parity regression as S7 follow-on slice").
+
+**Process learning (captured in memory):** added
+`~/.claude/projects/-Users-davidchenallio-src-graphrefly-ts/memory/feedback_pre_design_full_decision_set.md`
+rule #5 — "for bindings-layer slices, `mise run gate` is
+INSUFFICIENT — the parity-test runtime is the actual coverage
+gate." S6's "GREEN gate" close was substrate-only; the napi
+surface only got exercised end-to-end during this QA pass. Any
+future bindings-layer slice must include `pnpm test:parity` in
+the closing checklist.
+
+**Carried forward / superseded:**
+
+- D258 (post-S6 follow-on slice): the two D252 binding-layer items
+  (cfg(napi) panic-message softening + pre-claim handle-leak fix)
+  stay in `porting-deferred.md` for a separate `/porting-to-rs`
+  slice. The pre-claim handle-leak is now structurally impossible
+  in-tree (each BenchCore has its own actor thread; no cross-Core
+  same-thread nesting path exists), so the deferred entry's "fold
+  into S6" wording rolls forward to "fold into S7" where the
+  remaining concern is the JS-side panic-message clarity.
+- Storage-parity durability+reject+rollback follow-up (cross-track-
+  ledger.md §2 post-2026-05-16) — same status; no S6 work touched
+  the storage tier semantics, only the napi facade.
+- N1/D5 set_deps/addDep/removeDep napi surface (cross-track-ledger.md
+  §1 D5 row): TS side landed 2026-05-18; the native-side
+  `#[napi]`-export still pending as a separate slice (NEXT BATCH
+  item). S6 didn't widen the napi surface beyond what was already
+  there.
+
+**Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+D255 (α/γ actor), D256 (`invoke_fn_with_core` override; reconciled
+inline from the original "keep thread_local" lock once the
+premise-check surfaced D245's pre-existing trait widening), D257
+(GLOBAL_CORE kept), D258 (D252 fold-in → separate S7 slice).
+
+> _Original S6 PLANNED block (pre-implementation, locked 2026-05-19)
+> preserved below for historical traceability._
+
 ### S6 — PLANNED (locked 2026-05-19) — napi bindings reconciliation against post-S2c `!Send` Core
 
 > **Path B from the CI-failure exchange (2026-05-19).** Locked as a

@@ -76,14 +76,6 @@ fn sink_can_reenter_core_via_emit() {
 }
 
 #[test]
-#[ignore = "retired (D250, S4): synchronous in-wave-sink re-entry into Core pause/resume was only reachable via the deleted shared-Core mechanism (D221/D246 single-owner). A sink synchronously driving pause/resume is the imperative-from-reactive-layer anti-pattern design invariant #2 forbids; the β-valid path is reactive (sink posts an Emit → controller node → owner-side pause/resume) and the live mailbox-reentry sink tests below (sink_can_complete_another_node_from_callback etc.) cover the in-wave-sink-reenters-Core invariant. Intent preserved, never deleted. No CoreFull/MailboxOp pause/resume widening (zero consumer; D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
-fn sink_can_reenter_core_via_pause_and_resume() {
-    // Retired (D250): no β-valid actor-model trigger; the reactive
-    // equivalent (sink Emit → controller → owner-side pause/resume) is
-    // the spec-correct path, covered by the live sink-reentry tests.
-}
-
-#[test]
 fn sink_can_complete_another_node_from_callback() {
     // LIVE invariant: an in-wave sink may `complete` another node.
     // β-valid via `MailboxOp::Complete` (D246 rule 6); owner drain

@@ -91,26 +91,6 @@ fn a4_user_supplied_low_lock_id_does_not_collide_with_alloc() {
 }
 
 // =====================================================================
-// A6 — D1 reentrancy guard: set_deps from firing fn rejected
-// =====================================================================
-
-// D1 reentrancy guard (`SetDepsError::ReentrantOnFiringNode`): the
-// β-invalid `D1Binding { ..: Mutex<..>, captured_result }` helper —
-// a binding holding a cloned relocating `Core` to re-enter
-// `set_deps(n)` synchronously from inside `n`'s own `invoke_fn` — is
-// DELETED (the exact actor-model-forbidden mechanism). See the
-// record-and-skip note on the stub below for why this one specific
-// invariant has no β-valid expression yet.
-
-#[test]
-#[ignore = "retired (D250, S4): the `SetDepsError::ReentrantOnFiringNode` guard *code* stays LIVE (node.rs `currently_firing.contains(&n)` — defensive against an owner-side mid-wave self-rewire), but its ONLY synchronous trigger (calling `set_deps(n)` from inside `n`'s own fn-fire) was reachable only via the binding-holds-cloned-Core mechanism, structurally deleted by D221/D246: `invoke_fn` carries no `&Core`; `set_deps` is not on `CoreFull` and is not a `MailboxOp`; a Defer runs owner-side AFTER the wave settles (`currently_firing` empty). A firing fn synchronously rewiring itself is the imperative-from-reactive anti-pattern; no actor-model path produces it. Test intent preserved, never deleted; the guard remains covered structurally by the unit assertions on the `currently_firing` set. Adding set_deps to CoreFull/MailboxOp purely to keep this stub alive = substrate surface for zero consumer (D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
-fn a6_set_deps_from_firing_fn_rejected_with_reentrant_error() {
-    // Retired (D250): no β-valid actor-model trigger. The guard code
-    // stays live (defensive); see node.rs set_deps `currently_firing`
-    // ReentrantOnFiringNode comment.
-}
-
-// =====================================================================
 // A7 — handshake-panic catch_unwind: panicking sink removed from subscribers
 // =====================================================================
 

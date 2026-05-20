@@ -7,40 +7,51 @@
 //!
 //! # Scope (this slice)
 //!
-//! - **Namespace ops**: `state`, `derived`, `dynamic`, `add`, `node`,
-//!   `try_resolve`, `name_of`, `node_count`, `node_names`,
-//!   `child_names`, `is_destroyed`.
+//! - **Namespace ops**: `state`, `derived`, `dynamic` (placeholder),
+//!   `add`, `node`, `try_resolve`, `name_of`, `node_count`,
+//!   `node_names`, `child_names`, `is_destroyed`.
 //! - **Lifecycle**: `set`, `get`, `invalidate_by_name`,
 //!   `complete_by_name`, `error_by_name`, `remove`, `destroy`.
 //! - **Mount tree**: `mount_new` (returns a fresh BenchGraph wrapping
 //!   the child).
 //! - **Signal broadcast**: `signal_invalidate`, `signal_pause`,
 //!   `signal_resume` (per-kind; JS adapter decomposes batches).
-//! - **Static observe**: `observe_node_by_path` returns a NodeId for
-//!   the path; subscribe via `BenchCore::subscribe_with_tsfn`.
 //! - **Static describe**: `describe_json` returns a JSON-serialized
 //!   snapshot.
 //! - **Edges (static)**: `edges(recursive)` returns a flat
 //!   `Vec<(String, String)>` list.
+//! - **Reactive describe / observe**: `describe_reactive`,
+//!   `observe_all_reactive`, `observe_subscribe`. Each returns a
+//!   napi handle whose `dispose()` posts the owner-invoked detach
+//!   through the actor (D246 r3 — no RAII below the binding).
 //!
-//! # Out of scope (carry forward)
+//! # S6/D255 actor model
 //!
-//! - Reactive describe (`describe_reactive`) — requires producer node
-//!   wiring through `subscribe_namespace_change`.
-//! - Reactive `observe_all_reactive` — same shape.
-//! - Reactive `edges({ reactive: true })` — same shape.
+//! The `Graph` is `!Send + !Sync` post-D246 (`Rc<RefCell<GraphInner>>`,
+//! no Core stored inside; every method takes `&Core` explicitly), so
+//! `BenchGraph` CANNOT store `Graph` directly. Instead, each
+//! `BenchGraph` instance allocates a `graph_key: u64` and inserts its
+//! `Graph` into the actor's [`crate::core_actor::WORKER_EXTRAS`]
+//! registry on the worker thread. Every method then dispatches a
+//! closure that looks the `Graph` up by key.
 //!
-//! These will surface as Rust-port-only divergences in the parity-tests
-//! triage pass; gated with `test.runIf(impl.name !== "rust-via-napi")`.
+//! Reactive handles (`BenchDescribeReactiveHandle`,
+//! `BenchObserveReactiveHandle`) follow the same pattern: the inner
+//! `!Send` resource (`ReactiveDescribeHandle` / `GraphObserveAll{,
+//! Reactive}`, plus the one-node `(NodeId, SubscriptionId)` pair for
+//! sink-style observe) is stored in `WORKER_EXTRAS` keyed by
+//! `handle_key`. `dispose()` posts an actor closure that takes the
+//! entry out and calls the resource's `detach(core)` (or
+//! `core.unsubscribe(...)` for the one-node case).
 
 use std::sync::Arc;
 
 use graphrefly_core::{
-    BindingBoundary, Core, EqualsMode, FnId, HandleId, LockId, Message, NodeId, Sink, Subscription,
+    BindingBoundary, EqualsMode, FnId, HandleId, LockId, Message, NodeId, Sink, SubscriptionId,
 };
 use graphrefly_graph::{
-    DescribeSink, Graph, GraphObserveAllReactive, NameError, ReactiveDescribeHandle, RemoveError,
-    SignalKind,
+    DescribeSink, Graph, GraphObserveAll, GraphObserveAllReactive, NameError,
+    ReactiveDescribeHandle, RemoveError, SignalKind,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -48,114 +59,145 @@ use napi::threadsafe_function::{
 };
 use napi::{Env, Error as NapiError, Status};
 use napi_derive::napi;
-use parking_lot::Mutex;
 
+use crate::core_actor::{
+    alloc_worker_key, install_extra, take_extra, with_extra, with_extra_install_child,
+    with_extra_try_install_child, CoreActor,
+};
 use crate::core_bindings::{
-    run_blocking, BenchBinding, BenchCore, BuiltinFn, MSG_CODE_COMPLETE, MSG_CODE_DATA,
-    MSG_CODE_DIRTY, MSG_CODE_ERROR, MSG_CODE_INVALIDATE, MSG_CODE_PAUSE, MSG_CODE_RESOLVED,
-    MSG_CODE_RESUME, MSG_CODE_START, MSG_CODE_TEARDOWN,
+    BenchBinding, BenchCore, BuiltinFn, MSG_CODE_COMPLETE, MSG_CODE_DATA, MSG_CODE_DIRTY,
+    MSG_CODE_ERROR, MSG_CODE_INVALIDATE, MSG_CODE_PAUSE, MSG_CODE_RESOLVED, MSG_CODE_RESUME,
+    MSG_CODE_START, MSG_CODE_TEARDOWN,
 };
 
-/// JS-facing wrapper around a `graphrefly_graph::Graph`. Each
-/// `BenchGraph` shares its `BenchCore`'s value registry + binding so
-/// nodes registered through `BenchGraph::state(...)` are visible to
-/// `BenchOperators::register_*(...)` and vice-versa.
+/// JS-facing wrapper around a `graphrefly_graph::Graph` (S6/D255).
 ///
-/// **`binding` field redundancy** (Slice X3 / Phase E /qa F14): the
-/// `binding: Arc<BenchBinding>` field carries the same allocation as
-/// `core.binding: Arc<dyn BindingBoundary>` — they're upcasts of the
-/// same `Arc<BenchBinding>`. The typed field is retained because
-/// `BenchGraph::derived` needs the concrete `BenchBinding` to access
-/// `binding.registry.lock()` for fn registration; recovering the
-/// concrete type from the trait-erased `core.binding` would require
-/// `Arc::downcast` (not available on `dyn Trait` without `Any` bound).
-/// `from_core` enforces the invariant via a debug-build pointer-equality
-/// assert so the field can't drift from `core`'s view.
+/// Each `BenchGraph` shares its `BenchCore`'s `Arc<CoreActor>` + value
+/// registry + binding so nodes registered through `BenchGraph::state(...)`
+/// are visible to `BenchOperators::register_*(...)` and vice-versa.
+/// The actual `Graph` instance (which is `!Send + !Sync`) lives in
+/// the actor's `WORKER_EXTRAS` thread-local on the worker thread,
+/// keyed by [`Self::graph_key`].
 #[napi]
 pub struct BenchGraph {
-    pub(crate) graph: Graph,
+    pub(crate) actor: Arc<CoreActor>,
     pub(crate) binding: Arc<BenchBinding>,
-    pub(crate) core: Core,
+    /// Identifier into the actor's `WORKER_EXTRAS` registry where this
+    /// graph's `Graph` instance lives. The `Drop` impl posts a
+    /// `dispatch_detached` closure that removes the entry, dropping
+    /// the `!Send` Graph on the worker stack.
+    pub(crate) graph_key: u64,
 }
 
 #[napi]
 impl BenchGraph {
     /// Construct a fresh root graph wired to a `BenchCore`'s binding +
-    /// Core (D074). The BenchGraph SHARES the BenchCore's Core via
-    /// `Graph::with_existing_core` (added in this slice to graphrefly-
-    /// graph), so nodes registered through `BenchGraph::state(...)`
-    /// are visible to operator factories on the same `BenchCore`.
+    /// actor (D074 + D255). The BenchGraph SHARES the BenchCore's
+    /// actor — nodes registered through `BenchGraph::state(...)` are
+    /// visible to operator factories on the same `BenchCore`.
+    ///
+    /// **Note:** this constructor blocks the JS thread briefly (one
+    /// sync_channel round-trip with the actor) to install the Graph
+    /// in `WORKER_EXTRAS`. The work is trivial (one `Graph::new` +
+    /// HashMap insert); blocking is acceptable for a one-shot factory
+    /// call.
+    ///
+    /// **F14 invariant (restored 2026-05-20 QA F9/m12, preserved by
+    /// construction):** the `binding: Arc<BenchBinding>` field and
+    /// the actor's Core's `BindingBoundary` upcast come from the
+    /// SAME `Arc<BenchBinding>` — both `core.actor_arc()` and
+    /// `core.binding_arc()` clone fields owned by the supplied
+    /// `BenchCore`. `BenchCore::new` is the single construction path
+    /// for that Arc; no public API mints a divergent binding.
     #[napi(factory)]
-    #[must_use]
-    pub fn from_core(core: &BenchCore, name: String) -> Self {
-        let core_clone = core.core_clone();
+    pub fn from_core(core: &BenchCore, name: String) -> Result<Self> {
+        let actor = core.actor_arc();
         let binding = core.binding_arc();
-        let graph = Graph::with_existing_core(name, core_clone.clone());
-        // F14 (Slice X3): the typed `binding` field and `core_clone.binding`
-        // (trait-erased) come from the SAME `Arc<BenchBinding>` upcast —
-        // both `core.core_clone()` and `core.binding_arc()` clone the
-        // single allocation owned by the BenchCore. A debug-build
-        // pointer-equality assert would confirm this, but `core.binding`
-        // is `pub(crate)` in graphrefly-core (different crate) so the
-        // assert can't be expressed without widening Core's API.
-        // `BenchCore::new` is the single construction path; the invariant
-        // is preserved by construction.
-        Self {
-            graph,
+        let graph_key = alloc_worker_key();
+        actor.run_sync(move |_core| {
+            install_extra::<Graph>(graph_key, Graph::new(name));
+        })?;
+        Ok(Self {
+            actor,
             binding,
-            core: core_clone,
-        }
+            graph_key,
+        })
     }
 
     // -------------------------------------------------------------------
-    // Namespace introspection (sync — no Core wave).
+    // Namespace introspection (worker-thread access, sync from JS).
     // -------------------------------------------------------------------
 
     #[napi]
-    #[must_use]
-    pub fn name(&self) -> String {
-        self.graph.name()
+    pub fn name(&self) -> Result<String> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.name()).expect("BenchGraph: graph entry missing")
+        })
     }
 
     #[napi]
-    #[must_use]
-    pub fn node_count(&self) -> u32 {
-        u32::try_from(self.graph.node_count()).unwrap_or(u32::MAX)
+    pub fn node_count(&self) -> Result<u32> {
+        let key = self.graph_key;
+        let n = self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.node_count())
+                .expect("BenchGraph: graph entry missing")
+        })?;
+        // QA fix 2026-05-20 (Blind Hunter M2): fail-loud on >u32::MAX
+        // nodes instead of saturating silently. Matches the (correct)
+        // overflow-on-Err pattern used everywhere else in this file.
+        u32::try_from(n).map_err(|_| NapiError::from_reason("node_count exceeds u32"))
     }
 
     #[napi]
-    #[must_use]
-    pub fn node_names(&self) -> Vec<String> {
-        self.graph.node_names()
+    pub fn node_names(&self) -> Result<Vec<String>> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.node_names())
+                .expect("BenchGraph: graph entry missing")
+        })
     }
 
     #[napi]
-    #[must_use]
-    pub fn child_names(&self) -> Vec<String> {
-        self.graph.child_names()
+    pub fn child_names(&self) -> Result<Vec<String>> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.child_names())
+                .expect("BenchGraph: graph entry missing")
+        })
     }
 
     #[napi]
-    #[must_use]
-    pub fn is_destroyed(&self) -> bool {
-        self.graph.is_destroyed()
+    pub fn is_destroyed(&self) -> Result<bool> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.is_destroyed())
+                .expect("BenchGraph: graph entry missing")
+        })
     }
 
     /// Resolve a path to a NodeId; returns 0 (NO_NODE) if missing.
     #[napi]
-    #[must_use]
-    pub fn try_resolve(&self, path: String) -> u32 {
-        self.graph
-            .try_resolve(&path)
-            .map_or(0, |id| u32::try_from(id.raw()).unwrap_or(0))
+    pub fn try_resolve(&self, path: String) -> Result<u32> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| {
+                g.try_resolve(&path)
+                    .map_or(0, |id| u32::try_from(id.raw()).unwrap_or(0))
+            })
+            .expect("BenchGraph: graph entry missing")
+        })
     }
 
     /// Reverse lookup: returns the local name for a NodeId, or None
     /// if unnamed in this graph.
     #[napi]
-    #[must_use]
-    pub fn name_of(&self, node_id: u32) -> Option<String> {
-        self.graph.name_of(NodeId::new(u64::from(node_id)))
+    pub fn name_of(&self, node_id: u32) -> Result<Option<String>> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |_core| {
+            with_extra::<Graph, _>(key, |g| g.name_of(NodeId::new(u64::from(node_id))))
+                .expect("BenchGraph: graph entry missing")
+        })
     }
 
     // -------------------------------------------------------------------
@@ -167,14 +209,18 @@ impl BenchGraph {
     /// `BenchCore::alloc_external_handle`; ownership transfers here.
     #[napi]
     pub async fn state(&self, name: String, initial_handle: Option<u32>) -> Result<u32> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || -> Result<u32> {
-            let h = initial_handle.map(|h| HandleId::new(u64::from(h)));
-            let id = graph.state(name, h).map_err(name_error_to_napi)?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let h = initial_handle.map(|h| HandleId::new(u64::from(h)));
+                with_extra::<Graph, _>(key, move |g| {
+                    let id = g.state(core, name, h).map_err(name_error_to_napi)?;
+                    u32::try_from(id.raw())
+                        .map_err(|_| NapiError::from_reason("node id exceeds u32"))
+                })
+                .expect("BenchGraph: graph entry missing")
+            })
+            .await?
     }
 
     /// `derived(name, deps, builtin)` — uses a built-in fn from
@@ -189,58 +235,84 @@ impl BenchGraph {
         dep_ids: Vec<u32>,
         builtin: BuiltinFn,
     ) -> Result<u32> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
+        let key = self.graph_key;
         let binding = Arc::clone(&self.binding);
-        run_blocking(core, move || -> Result<u32> {
-            // Register fn binding-side (mirrors BenchCore::register_derived).
-            let fn_impl: Arc<
-                dyn Fn(
-                        &[crate::core_bindings::BenchValue],
-                    ) -> Option<crate::core_bindings::BenchValue>
-                    + Send
-                    + Sync,
-            > = match builtin {
-                BuiltinFn::Identity => {
-                    Arc::new(|deps: &[crate::core_bindings::BenchValue]| deps.first().cloned())
-                }
-                BuiltinFn::AddOne => Arc::new(
-                    |deps: &[crate::core_bindings::BenchValue]| match deps.first() {
-                        Some(crate::core_bindings::BenchValue::Int(n)) => {
-                            Some(crate::core_bindings::BenchValue::Int(n + 1))
-                        }
-                        _ => None,
-                    },
-                ),
-            };
-            let fn_id = {
-                let mut reg = binding.registry.lock();
-                let id = FnId::new(reg.next_fn_id);
-                reg.next_fn_id += 1;
-                reg.fns.insert(id, fn_impl);
-                id
-            };
-            let deps: Vec<NodeId> = dep_ids
-                .into_iter()
-                .map(|i| NodeId::new(u64::from(i)))
-                .collect();
-            let id = graph
-                .derived(name, &deps, fn_id, EqualsMode::Identity)
-                .map_err(name_error_to_napi)?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                // Register fn binding-side (mirrors BenchCore::register_derived).
+                let fn_impl: Arc<
+                    dyn Fn(
+                            &[crate::core_bindings::BenchValue],
+                        ) -> Option<crate::core_bindings::BenchValue>
+                        + Send
+                        + Sync,
+                > = match builtin {
+                    BuiltinFn::Identity => {
+                        Arc::new(|deps: &[crate::core_bindings::BenchValue]| deps.first().cloned())
+                    }
+                    BuiltinFn::AddOne => {
+                        Arc::new(
+                            |deps: &[crate::core_bindings::BenchValue]| match deps.first() {
+                                Some(crate::core_bindings::BenchValue::Int(n)) => {
+                                    Some(crate::core_bindings::BenchValue::Int(n + 1))
+                                }
+                                _ => None,
+                            },
+                        )
+                    }
+                };
+                let fn_id = {
+                    let mut reg = binding.registry.lock();
+                    let id = FnId::new(reg.next_fn_id);
+                    reg.next_fn_id += 1;
+                    reg.fns.insert(id, fn_impl);
+                    id
+                };
+                let deps: Vec<NodeId> = dep_ids
+                    .into_iter()
+                    .map(|i| NodeId::new(u64::from(i)))
+                    .collect();
+                with_extra::<Graph, _>(key, move |g| {
+                    let id = g
+                        .derived(core, name, &deps, fn_id, EqualsMode::Identity)
+                        .map_err(name_error_to_napi)?;
+                    u32::try_from(id.raw())
+                        .map_err(|_| NapiError::from_reason("node id exceeds u32"))
+                })
+                .expect("BenchGraph: graph entry missing")
+            })
+            .await?
     }
 
     /// Register an existing node (e.g., from `BenchOperators::register_map`)
     /// under `name` in this graph's namespace.
+    ///
+    /// **Async** at the napi boundary (QA fix 2026-05-20, Edge Case
+    /// Hunter F4 / Blind Hunter M7): `Graph::add` fires
+    /// `NamespaceChangeSink`s synchronously, and an active
+    /// `observe_all_reactive` / `attach_snapshot_storage` handle's
+    /// sink calls `core.subscribe(new_node, sink)`. Under the prior
+    /// sync `run_sync` shape that subscribe would push the
+    /// handshake's START to a TSFN-backed sink while libuv is blocked
+    /// on the actor reply — at best a queue-full silent drop
+    /// (`NonBlocking max_queue_size=8`), at worst a 3-way deadlock
+    /// if any sink uses `bridge_sync`. `actor.run` keeps libuv free
+    /// to pump TSFN microtasks during the await.
     #[napi]
-    pub fn add(&self, name: String, node_id: u32) -> Result<u32> {
-        let id = self
-            .graph
-            .add(NodeId::new(u64::from(node_id)), name)
-            .map_err(name_error_to_napi)?;
-        u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+    pub async fn add(&self, name: String, node_id: u32) -> Result<u32> {
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| -> Result<u32> {
+                with_extra::<Graph, _>(key, move |g| {
+                    let id = g
+                        .add(core, NodeId::new(u64::from(node_id)), name)
+                        .map_err(name_error_to_napi)?;
+                    u32::try_from(id.raw())
+                        .map_err(|_| NapiError::from_reason("node id exceeds u32"))
+                })
+                .expect("BenchGraph: graph entry missing")
+            })
+            .await?
     }
 
     // -------------------------------------------------------------------
@@ -249,57 +321,78 @@ impl BenchGraph {
 
     #[napi]
     pub async fn set_by_name(&self, name: String, handle: u32) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.set(&name, HandleId::new(u64::from(handle)));
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.set(core, &name, HandleId::new(u64::from(handle)));
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn get_by_name(&self, name: String) -> Result<u32> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        let h = run_blocking(core, move || graph.get(&name)).await?;
+        let key = self.graph_key;
+        let h = self
+            .actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.get(core, &name))
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await?;
         u32::try_from(h.raw()).map_err(|_| NapiError::from_reason("handle exceeds u32"))
     }
 
     #[napi]
     pub async fn invalidate_by_name(&self, name: String) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.invalidate_by_name(&name);
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.invalidate_by_name(core, &name);
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn complete_by_name(&self, name: String) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.complete_by_name(&name);
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.complete_by_name(core, &name);
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn error_by_name(&self, name: String, error_handle: u32) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.error_by_name(&name, HandleId::new(u64::from(error_handle)));
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.error_by_name(core, &name, HandleId::new(u64::from(error_handle)));
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn remove(&self, name: String) -> Result<RemoveAuditJs> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        let audit = run_blocking(core, move || graph.remove(&name))
+        let key = self.graph_key;
+        let audit = self
+            .actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.remove(core, &name))
+                    .expect("BenchGraph: graph entry missing")
+            })
             .await?
             .map_err(remove_error_to_napi)?;
         Ok(RemoveAuditJs {
@@ -314,29 +407,39 @@ impl BenchGraph {
 
     #[napi]
     pub async fn signal_invalidate(&self) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || graph.signal(SignalKind::Invalidate)).await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.signal(core, SignalKind::Invalidate))
+                    .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn signal_pause(&self, lock_id: u32) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.signal(SignalKind::Pause(LockId::new(u64::from(lock_id))));
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.signal(core, SignalKind::Pause(LockId::new(u64::from(lock_id))));
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     #[napi]
     pub async fn signal_resume(&self, lock_id: u32) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            graph.signal(SignalKind::Resume(LockId::new(u64::from(lock_id))));
-        })
-        .await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    g.signal(core, SignalKind::Resume(LockId::new(u64::from(lock_id))));
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     /// Atomic-ish signal broadcast over a flat (code, payload) batch
@@ -344,9 +447,6 @@ impl BenchGraph {
     /// the same `MSG_CODE_*` table as `batch_emit_handle_messages`,
     /// but rejects everything except INVALIDATE / PAUSE / RESUME — the
     /// only kinds canonical §3.7.1 supports for graph-wide broadcast.
-    /// DATA / RESOLVED / COMPLETE / ERROR / TEARDOWN return a typed
-    /// `napi::Error` BEFORE any signal fires (legacy parity:
-    /// `g.signal([[DATA, ...]])` throws synchronously).
     #[napi]
     pub async fn signal_batch(&self, encoded: Vec<u32>) -> Result<()> {
         if encoded.len() % 2 != 0 {
@@ -355,7 +455,6 @@ impl BenchGraph {
                 encoded.len()
             )));
         }
-        // Up-front validation — bad input MUST NOT fire any partial broadcast.
         for chunk in encoded.chunks_exact(2) {
             let code = chunk[0];
             match code {
@@ -383,25 +482,28 @@ impl BenchGraph {
             }
         }
 
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            for chunk in encoded.chunks_exact(2) {
-                let code = chunk[0];
-                let payload = chunk[1];
-                match code {
-                    MSG_CODE_INVALIDATE => graph.signal(SignalKind::Invalidate),
-                    MSG_CODE_PAUSE => {
-                        graph.signal(SignalKind::Pause(LockId::new(u64::from(payload))));
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    for chunk in encoded.chunks_exact(2) {
+                        let code = chunk[0];
+                        let payload = chunk[1];
+                        match code {
+                            MSG_CODE_INVALIDATE => g.signal(core, SignalKind::Invalidate),
+                            MSG_CODE_PAUSE => {
+                                g.signal(core, SignalKind::Pause(LockId::new(u64::from(payload))));
+                            }
+                            MSG_CODE_RESUME => {
+                                g.signal(core, SignalKind::Resume(LockId::new(u64::from(payload))));
+                            }
+                            _ => unreachable!("validated up-front"),
+                        }
                     }
-                    MSG_CODE_RESUME => {
-                        graph.signal(SignalKind::Resume(LockId::new(u64::from(payload))));
-                    }
-                    _ => unreachable!("validated up-front"),
-                }
-            }
-        })
-        .await
+                })
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -409,28 +511,49 @@ impl BenchGraph {
     // -------------------------------------------------------------------
 
     /// Mount a fresh empty subgraph under `name`; returns a new
-    /// `BenchGraph` sharing this graph's Core/binding/registry.
+    /// `BenchGraph` sharing this graph's actor + binding.
+    ///
+    /// Uses [`crate::core_actor::with_extra_try_install_child`] to
+    /// read the parent + install the child Graph in a SINGLE
+    /// `WORKER_EXTRAS` `borrow_mut` — avoids the F2-style nested-
+    /// borrow panic the prior `with_extra` + `install_extra` shape
+    /// triggered (Edge Case Hunter F2 / Blind Hunter M5, 2026-05-20).
     #[napi]
     pub async fn mount_new(&self, name: String) -> Result<BenchGraph> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        let binding = Arc::clone(&self.binding);
-        let child_graph = run_blocking(core.clone(), move || graph.mount_new(name))
-            .await?
-            .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+        let parent_key = self.graph_key;
+        let child_key = alloc_worker_key();
+        self.actor
+            .run(move |core| -> Result<()> {
+                with_extra_try_install_child::<Graph, Graph, (), _, _>(
+                    parent_key,
+                    child_key,
+                    move |parent| -> std::result::Result<(Graph, ()), NapiError> {
+                        let child = parent
+                            .mount_new(core, name)
+                            .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                        Ok((child, ()))
+                    },
+                )
+                .expect("BenchGraph: graph entry missing")
+            })
+            .await??;
         Ok(BenchGraph {
-            graph: child_graph,
-            binding,
-            core,
+            actor: Arc::clone(&self.actor),
+            binding: Arc::clone(&self.binding),
+            graph_key: child_key,
         })
     }
 
     /// Detach a previously-mounted subgraph by name.
     #[napi]
     pub async fn unmount(&self, name: String) -> Result<RemoveAuditJs> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        let audit = run_blocking(core, move || graph.unmount(&name))
+        let key = self.graph_key;
+        let audit = self
+            .actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.unmount(core, &name))
+                    .expect("BenchGraph: graph entry missing")
+            })
             .await?
             .map_err(|e| NapiError::from_reason(format!("{e}")))?;
         Ok(RemoveAuditJs {
@@ -445,9 +568,13 @@ impl BenchGraph {
 
     #[napi]
     pub async fn destroy(&self) -> Result<()> {
-        let graph = self.graph.clone();
-        let core = self.core.clone();
-        run_blocking(core, move || graph.destroy()).await
+        let key = self.graph_key;
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.destroy(core))
+                    .expect("BenchGraph: graph entry missing");
+            })
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -456,48 +583,55 @@ impl BenchGraph {
 
     /// Static edges snapshot — `Vec<(from_name, to_name)>` flattened to
     /// alternating `Vec<String>` for napi marshaling.
+    ///
+    /// Sync at the napi boundary (preserves `Impl.edges(opts) ->
+    /// Array<[string, string]>` contract); blocks libuv briefly on the
+    /// actor reply. Pure read accessor — see [`CoreActor::run_sync`]
+    /// safe-use contract; the wrapper.js parity-tests usage doesn't
+    /// interleave with TSFN-active waves.
     #[napi]
-    pub fn edges(&self, recursive: bool) -> Vec<String> {
-        let edges = self.graph.edges(recursive);
-        let mut flat: Vec<String> = Vec::with_capacity(edges.len() * 2);
-        for (from, to) in edges {
-            flat.push(from);
-            flat.push(to);
-        }
-        flat
+    pub fn edges(&self, recursive: bool) -> Result<Vec<String>> {
+        let key = self.graph_key;
+        self.actor.run_sync(move |core| {
+            with_extra::<Graph, _>(key, move |g| {
+                let edges = g.edges(core, recursive);
+                let mut flat: Vec<String> = Vec::with_capacity(edges.len() * 2);
+                for (from, to) in edges {
+                    flat.push(from);
+                    flat.push(to);
+                }
+                flat
+            })
+            .expect("BenchGraph: graph entry missing")
+        })
     }
 
     /// JSON-serialized describe snapshot. JS adapter parses with
-    /// `JSON.parse`. Static — for reactive describe, see follow-on
-    /// slice (out of scope per D074).
+    /// `JSON.parse`. Static — for reactive describe, see
+    /// `describe_reactive`.
+    ///
+    /// Sync at the napi boundary (preserves `Impl.describe() ->
+    /// unknown` contract); same `run_sync` safe-use as `edges`.
     #[napi]
     pub fn describe_json(&self) -> Result<String> {
-        let snapshot = self.graph.describe();
+        let key = self.graph_key;
+        let snapshot = self.actor.run_sync(move |core| {
+            with_extra::<Graph, _>(key, move |g| g.describe(core))
+                .expect("BenchGraph: graph entry missing")
+        })?;
         serde_json::to_string(&snapshot)
             .map_err(|e| NapiError::from_reason(format!("describe serialization failed: {e}")))
     }
 
     // -------------------------------------------------------------------
-    // Reactive surfaces (Slice X2 — Phase E2 BenchGraph reactive)
-    //
-    // Canonical R3.6.1 / R3.6.2: `g.describe({ reactive: true })` and
-    // `g.observe(path?, { reactive: true })`. Sink delivery uses TSFN
-    // (NonBlocking — push-on-change, no bridge_sync needed). All TSFNs
-    // use `callee_handled::<false>()` per Slice Y convention so JS
-    // callbacks match the typed `Function<'_, T, R>` declaration.
+    // Reactive surfaces (Slice X2 — Phase E2 BenchGraph reactive,
+    // S6/D255 actor-routed).
     // -------------------------------------------------------------------
 
     /// Subscribe to live topology snapshots (canonical R3.6.1
-    /// `describe({ reactive: true })`). The JS callback receives a
-    /// JSON-serialized [`graphrefly_graph::GraphDescribeOutput`] on
-    /// each fire; first fire is the push-on-subscribe initial
-    /// snapshot, subsequent fires are post-change snapshots.
-    ///
-    /// Returns a [`BenchDescribeReactiveHandle`] napi class. JS code
-    /// MUST `await handle.dispose()` before letting the handle drop —
-    /// the unsubscribe runs on a tokio blocking thread to avoid the
-    /// JS-thread / Core-mutex deadlock vector that `BenchCore::dispose`
-    /// closes for subscriptions.
+    /// `describe({ reactive: true })`). Returns a
+    /// [`BenchDescribeReactiveHandle`]; JS code MUST `await
+    /// handle.dispose()` (D246 r3 — owner-invoked detach).
     #[napi]
     pub fn describe_reactive<'env>(
         &self,
@@ -505,40 +639,40 @@ impl BenchGraph {
         sink: Function<'_, String, ()>,
     ) -> Result<PromiseRaw<'env, BenchDescribeReactiveHandle>> {
         let tsfn = build_describe_tsfn(sink)?;
-        let graph = self.graph.clone();
-        let core = self.core.clone();
+        let graph_key = self.graph_key;
+        let handle_key = alloc_worker_key();
+        let actor = Arc::clone(&self.actor);
         env.spawn_future(async move {
-            let core_for_blocking = core.clone();
-            let rdh = run_blocking(core_for_blocking, move || -> ReactiveDescribeHandle {
-                let describe_sink: DescribeSink = Arc::new(move |snapshot| {
-                    // JSON-serialize the snapshot per Q2; on serde failure
-                    // we silently skip this fire (sink can't propagate
-                    // errors back to the producer per the R3.6.1 contract).
-                    if let Ok(json) = serde_json::to_string(snapshot) {
-                        let _status = tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                });
-                graph.describe_reactive(describe_sink)
-            })
-            .await?;
+            let actor_for_handle = Arc::clone(&actor);
+            actor
+                .run(move |core| {
+                    with_extra_install_child::<Graph, ReactiveDescribeHandle, _, _>(
+                        graph_key,
+                        handle_key,
+                        move |g| {
+                            let describe_sink: DescribeSink = Arc::new(move |snapshot| {
+                                if let Ok(json) = serde_json::to_string(snapshot) {
+                                    let _status =
+                                        tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+                                }
+                            });
+                            let rdh = g.describe_reactive(core, describe_sink);
+                            (rdh, ())
+                        },
+                    )
+                    .expect("BenchGraph: graph entry missing");
+                })
+                .await?;
             Ok(BenchDescribeReactiveHandle {
-                inner: Arc::new(Mutex::new(Some(rdh))),
-                core,
+                actor: actor_for_handle,
+                handle_key,
             })
         })
     }
 
     /// Subscribe to all-named-nodes message stream with auto-subscribe
     /// on late-added nodes (canonical R3.6.2 `observe(undefined, {
-    /// reactive: true })`). The JS callback receives `(name,
-    /// encoded_msgs)` per emission — `encoded_msgs` is the same flat
-    /// `[code_0, payload_0, ...]` shape that `subscribe_with_tsfn`
-    /// uses, decoded JS-side via the `MSG_CODE_*` table.
-    ///
-    /// Returns a [`BenchObserveReactiveHandle`] napi class.
-    /// `await handle.dispose()` unsubscribes everything (the inner
-    /// `GraphObserveAllReactive` clears all fan-out subs + the
-    /// namespace-change listener).
+    /// reactive: true })`).
     #[napi]
     pub fn observe_all_reactive<'env>(
         &self,
@@ -546,39 +680,41 @@ impl BenchGraph {
         sink: Function<'_, FnArgs<(String, Vec<u32>)>, ()>,
     ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
         let tsfn = build_observe_all_tsfn(sink)?;
-        let graph = self.graph.clone();
-        let core = self.core.clone();
+        let graph_key = self.graph_key;
+        let handle_key = alloc_worker_key();
+        let actor = Arc::clone(&self.actor);
         env.spawn_future(async move {
-            let core_for_blocking = core.clone();
-            let handle = run_blocking(core_for_blocking, move || -> GraphObserveAllReactive {
-                let mut handle = graph.observe_all_reactive();
-                handle.subscribe(move |name: &str, msgs: &[Message]| {
-                    let payload = encode_messages(msgs);
-                    let _status = tsfn.call(
-                        FnArgs::from((name.to_string(), payload)),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                });
-                handle
-            })
-            .await?;
-            // Inner mutex needs `&mut` access but napi class fields are
-            // `&self` — wrap in Mutex<Option<_>> so dispose can take
-            // ownership.
+            let actor_for_handle = Arc::clone(&actor);
+            actor
+                .run(move |core| {
+                    with_extra_install_child::<Graph, ObserveReactiveInner, _, _>(
+                        graph_key,
+                        handle_key,
+                        move |g| {
+                            let mut handle = g.observe_all_reactive();
+                            handle.subscribe(core, move |name: &str, msgs: &[Message]| {
+                                let payload = encode_messages(msgs);
+                                let _status = tsfn.call(
+                                    FnArgs::from((name.to_string(), payload)),
+                                    ThreadsafeFunctionCallMode::NonBlocking,
+                                );
+                            });
+                            (ObserveReactiveInner::All(handle), ())
+                        },
+                    )
+                    .expect("BenchGraph: graph entry missing");
+                })
+                .await?;
             Ok(BenchObserveReactiveHandle {
-                inner: Arc::new(Mutex::new(Some(ObserveReactiveInner::All(handle)))),
-                core,
+                actor: actor_for_handle,
+                handle_key,
             })
         })
     }
 
     /// Sink-style observe of a single node (canonical R3.6.2 default
-    /// mode `observe(path)`). Returns a subscription index into a
-    /// `BenchObserveReactiveHandle` slot that mirrors `BenchCore`'s
-    /// subscriptions vec semantics. Provided for canonical-spec
-    /// completeness — most parity scenarios use the reactive variant.
-    ///
-    /// `path` resolves via `Graph::node(path)`; panics if unknown.
+    /// mode `observe(path)`). When `path` is `None`, fan-out snapshot
+    /// across all named nodes (no auto-subscribe).
     #[napi]
     pub fn observe_subscribe<'env>(
         &self,
@@ -586,181 +722,223 @@ impl BenchGraph {
         path: Option<String>,
         sink: Function<'_, FnArgs<(String, Vec<u32>)>, ()>,
     ) -> Result<PromiseRaw<'env, BenchObserveReactiveHandle>> {
-        // Sink-style "observe()" — when no path given, fan-out across
-        // all named nodes at call time (snapshot semantics, no
-        // auto-subscribe — see observe_all_reactive for that). When a
-        // path IS given, single-node sink-style.
         let tsfn = build_observe_all_tsfn(sink)?;
-        let graph = self.graph.clone();
-        let core = self.core.clone();
+        let graph_key = self.graph_key;
+        let handle_key = alloc_worker_key();
+        let actor = Arc::clone(&self.actor);
         env.spawn_future(async move {
-            let core_for_blocking = core.clone();
-            let inner = run_blocking(core_for_blocking, move || -> ObserveReactiveInner {
-                if let Some(path) = path {
-                    let one = graph.observe(&path);
-                    let path_owned = path;
-                    let sink: Sink = Arc::new(move |msgs: &[Message]| {
-                        let payload = encode_messages(msgs);
-                        let _status = tsfn.call(
-                            FnArgs::from((path_owned.clone(), payload)),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
-                    });
-                    let sub = one.subscribe(sink);
-                    ObserveReactiveInner::OneSub(sub)
-                } else {
-                    // observe() — sink-style snapshot fan-out across
-                    // named nodes (NOT auto-subscribe; canonical
-                    // GraphObserveAll default).
-                    let mut all = graph.observe_all();
-                    all.subscribe(move |name: &str, msgs: &[Message]| {
-                        let payload = encode_messages(msgs);
-                        let _status = tsfn.call(
-                            FnArgs::from((name.to_string(), payload)),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
-                    });
-                    ObserveReactiveInner::AllSubs(all)
-                }
-            })
-            .await?;
+            let actor_for_handle = Arc::clone(&actor);
+            actor
+                .run(move |core| {
+                    with_extra_install_child::<Graph, ObserveReactiveInner, _, _>(
+                        graph_key,
+                        handle_key,
+                        move |g| {
+                            let inner = if let Some(path) = path {
+                                let one = g.observe(&path);
+                                let path_owned = path;
+                                let sink: Sink = Arc::new(move |msgs: &[Message]| {
+                                    let payload = encode_messages(msgs);
+                                    let _status = tsfn.call(
+                                        FnArgs::from((path_owned.clone(), payload)),
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                });
+                                // R3.6.2 sink-style observe: resolve to
+                                // a node id, subscribe via Core, retain
+                                // the (NodeId, SubscriptionId) pair for
+                                // detach in dispose / Drop.
+                                let node_id = one.node_id();
+                                let sub_id = core.subscribe(node_id, sink);
+                                ObserveReactiveInner::OneSub(node_id, sub_id)
+                            } else {
+                                let mut all = g.observe_all();
+                                all.subscribe(core, move |name: &str, msgs: &[Message]| {
+                                    let payload = encode_messages(msgs);
+                                    let _status = tsfn.call(
+                                        FnArgs::from((name.to_string(), payload)),
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                });
+                                ObserveReactiveInner::AllSubs(all)
+                            };
+                            (inner, ())
+                        },
+                    )
+                    .expect("BenchGraph: graph entry missing");
+                })
+                .await?;
             Ok(BenchObserveReactiveHandle {
-                inner: Arc::new(Mutex::new(Some(inner))),
-                core,
+                actor: actor_for_handle,
+                handle_key,
             })
         })
     }
 }
 
+impl Drop for BenchGraph {
+    /// Post a fire-and-forget closure to the actor that removes this
+    /// BenchGraph's Graph from `WORKER_EXTRAS`, dropping the `!Send`
+    /// Graph on the worker stack. If the actor has already shut down
+    /// (the broader BenchCore lifetime is over), the dispatch is a
+    /// no-op — the worker thread already terminated and dropped its
+    /// entire WORKER_EXTRAS map along with all Graph entries.
+    ///
+    /// **Caller obligation (QA fix 2026-05-20 F8):** JS callers MUST
+    /// `await dispose()` on every derived handle (BenchDescribeReactiveHandle,
+    /// BenchObserveReactiveHandle, BenchStorageHandle) BEFORE
+    /// dropping the parent BenchGraph. This Drop only releases the
+    /// Graph entry — derived handles live in `WORKER_EXTRAS` under
+    /// their own keys and hold `Rc<RefCell<GraphInner>>` clones; they
+    /// keep the GraphInner alive (and their ns_sinks/topology subs
+    /// active) until each handle's own Drop fires later. Without an
+    /// explicit dispose order, the substrate's `#[must_use]` detach
+    /// contract is honored on a per-handle basis but the timing is
+    /// non-deterministic relative to the parent Graph's intended
+    /// lifetime.
+    fn drop(&mut self) {
+        let key = self.graph_key;
+        let _ = self.actor.dispatch_detached(move |_core| {
+            let _ = take_extra::<Graph>(key);
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Reactive describe handle (Slice X2)
+// Reactive describe handle (Slice X2 — S6/D255 actor-routed)
 // ---------------------------------------------------------------------------
 
-/// RAII handle for a reactive describe subscription. JS code SHOULD
-/// `await dispose()` before letting it drop — that path runs the
-/// unsubscribe on a tokio blocking thread, keeping the JS thread free
-/// to pump libuv. As defense-in-depth (Slice X3 /qa A), the `Drop`
-/// impl ALSO ships the inner-drop to a tokio blocking thread
-/// fire-and-forget, so a forgotten `dispose()` doesn't deadlock the
-/// JS thread on Graph's namespace_sinks mutex.
+/// Handle for a reactive describe subscription. JS code MUST `await
+/// dispose()` before letting it drop — D246 r3 owner-invoked detach
+/// (no RAII below the binding). `Drop` is a defense-in-depth
+/// fire-and-forget detach via `dispatch_detached`.
 #[napi]
 pub struct BenchDescribeReactiveHandle {
-    inner: Arc<Mutex<Option<ReactiveDescribeHandle>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
+    handle_key: u64,
 }
 
 #[napi]
 impl BenchDescribeReactiveHandle {
-    /// Drop the inner subscription on a tokio blocking thread.
-    /// Idempotent — subsequent calls are no-ops.
+    /// Owner-invoked synchronous detach (D246 r3). Idempotent —
+    /// subsequent calls find no entry in `WORKER_EXTRAS` and no-op.
     #[napi]
     pub async fn dispose(&self) -> Result<()> {
-        let taken = self.inner.lock().take();
-        if let Some(handle) = taken {
-            let core = self.core.clone();
-            run_blocking(core, move || drop(handle)).await?;
-        }
-        Ok(())
+        let key = self.handle_key;
+        self.actor
+            .run(move |core| {
+                if let Some(rdh) = take_extra::<ReactiveDescribeHandle>(key) {
+                    rdh.detach(core);
+                }
+            })
+            .await
     }
 }
 
 impl Drop for BenchDescribeReactiveHandle {
     fn drop(&mut self) {
-        // Slice X3 /qa A — defense-in-depth against forgotten dispose.
-        // Take the inner option; if Some, ship to tokio blocking pool
-        // fire-and-forget. The JoinHandle is dropped (detaches the
-        // task; runs to completion regardless). If no tokio runtime
-        // is active (process shutdown), the spawn_blocking call may
-        // panic; we accept that — at shutdown, libuv is winding down
-        // anyway and the deadlock vector is moot.
-        let taken = self.inner.lock().take();
-        if let Some(handle) = taken {
-            let _ = spawn_blocking(move || drop(handle));
-        }
+        // Defense-in-depth: if `dispose()` wasn't called, post the
+        // detach fire-and-forget. If the actor is already shut down
+        // (e.g., BenchCore dropped), the dispatch is a no-op and the
+        // worker thread already dropped WORKER_EXTRAS with everything
+        // inside.
+        let key = self.handle_key;
+        let _ = self.actor.dispatch_detached(move |core| {
+            if let Some(rdh) = take_extra::<ReactiveDescribeHandle>(key) {
+                rdh.detach(core);
+            }
+        });
     }
 }
 
-// Send + Sync compile-time assertion (inner type, per Slice X3 /qa).
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<BenchDescribeReactiveHandle>();
-    assert_send_sync::<ReactiveDescribeHandle>();
-};
-
 // ---------------------------------------------------------------------------
-// Reactive / sink-style observe handle (Slice X2)
+// Reactive / sink-style observe handle (Slice X2 — S6/D255 actor-routed)
 //
 // Single napi class with an internal enum so the JS adapter can
 // dispose any observe variant (one-sub / all-subs / all-reactive)
 // uniformly.
 // ---------------------------------------------------------------------------
 
-// Variants are never read — they are RAII guards held purely for their
-// `Drop` side-effect (keeps the underlying observe subscription alive
-// until `dispose()` / `Drop` ships the inner drop to tokio).
 #[allow(dead_code)]
 enum ObserveReactiveInner {
-    OneSub(Subscription),
-    AllSubs(graphrefly_graph::GraphObserveAll),
+    /// Single-node sink-style observe — pairs a NodeId with the
+    /// SubscriptionId returned by `Core::subscribe`. Detach calls
+    /// `core.unsubscribe(node_id, sub_id)`.
+    OneSub(NodeId, SubscriptionId),
+    /// All-nodes snapshot fan-out — `GraphObserveAll` (no auto-sub).
+    AllSubs(GraphObserveAll),
+    /// All-nodes reactive (auto-subscribe on late additions).
     All(GraphObserveAllReactive),
 }
 
-/// RAII handle for an observe subscription (single-node, all-nodes
+impl ObserveReactiveInner {
+    /// Owner-invoked detach. All three variants carry Core
+    /// subscriptions that the substrate's `#[must_use]` contract
+    /// requires to be released via an explicit `detach(&Core)` call
+    /// (D246 r3 — no RAII below the binding):
+    ///
+    /// - `OneSub(node_id, sub_id)` → `core.unsubscribe(node_id, sub_id)`.
+    /// - `AllSubs(GraphObserveAll)` → `a.detach(core)` releases every
+    ///   per-name fan-out sub it accumulated. Without this,
+    ///   `Vec<(NodeId, SubscriptionId)>` leaks for the Core lifetime
+    ///   (substrate doc: "you MUST call detach(core) or they leak"
+    ///   at `crates/graphrefly-graph/src/observe.rs`).
+    /// - `All(GraphObserveAllReactive)` → `r.detach(core)` releases
+    ///   the topology sub, the namespace-change sink, AND every fan-
+    ///   out sub the auto-subscribe path opened. Same `#[must_use]`
+    ///   contract.
+    ///
+    /// QA fix 2026-05-20 (Edge Case Hunter F1 + Blind Hunter C1):
+    /// the prior implementation dropped the `AllSubs`/`All` arms
+    /// silently with a comment that misread the substrate contract.
+    fn detach(self, core: &graphrefly_core::Core) {
+        match self {
+            Self::OneSub(node_id, sub_id) => core.unsubscribe(node_id, sub_id),
+            Self::AllSubs(mut a) => a.detach(core),
+            Self::All(mut r) => r.detach(core),
+        }
+    }
+}
+
+/// Handle for an observe subscription (single-node, all-nodes
 /// snapshot, or all-nodes reactive auto-subscribe). JS code SHOULD
-/// `await dispose()` (runs unsubscribe on tokio); as defense-in-depth
-/// (Slice X3 /qa A) the `Drop` impl ALSO ships the inner drop to
-/// tokio fire-and-forget so a forgotten `dispose()` doesn't deadlock
-/// the JS thread on Core's mutex via `Subscription::Drop`.
+/// `await dispose()` — D246 r3 owner-invoked detach.
 #[napi]
 pub struct BenchObserveReactiveHandle {
-    inner: Arc<Mutex<Option<ObserveReactiveInner>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
+    handle_key: u64,
 }
 
 #[napi]
 impl BenchObserveReactiveHandle {
     #[napi]
     pub async fn dispose(&self) -> Result<()> {
-        let taken = self.inner.lock().take();
-        if let Some(inner) = taken {
-            let core = self.core.clone();
-            run_blocking(core, move || drop(inner)).await?;
-        }
-        Ok(())
+        let key = self.handle_key;
+        self.actor
+            .run(move |core| {
+                if let Some(inner) = take_extra::<ObserveReactiveInner>(key) {
+                    inner.detach(core);
+                }
+            })
+            .await
     }
 }
 
 impl Drop for BenchObserveReactiveHandle {
     fn drop(&mut self) {
-        // Slice X3 /qa A — defense-in-depth (see BenchDescribeReactiveHandle).
-        let taken = self.inner.lock().take();
-        if let Some(inner) = taken {
-            let _ = spawn_blocking(move || drop(inner));
-        }
+        let key = self.handle_key;
+        let _ = self.actor.dispatch_detached(move |core| {
+            if let Some(inner) = take_extra::<ObserveReactiveInner>(key) {
+                inner.detach(core);
+            }
+        });
     }
 }
 
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<BenchObserveReactiveHandle>();
-    assert_send_sync::<ObserveReactiveInner>();
-};
-
 // ---------------------------------------------------------------------------
 // TSFN builders for reactive surfaces (Slice X2)
-//
-// Both use `callee_handled::<false>()` per the Slice Y convention —
-// JS callbacks receive `(value)` directly (no err-first wire shape),
-// matching the typed `Function<'_, T, R>` declaration.
 // ---------------------------------------------------------------------------
 
-// Slice X3 /qa C: `MaxQueueSize=8` for reactive sinks. Operator TSFNs
-// use `=1` because they're sync-bridged (one in-flight call at a time);
-// reactive describe/observe TSFNs are NonBlocking notification streams
-// where back-pressure-from-JS-thread shouldn't silently drop snapshots
-// (Status::QueueFull return is unrecoverable — the sink misses a fire).
-// 8 is a defensive cushion for typical bursty namespace-mutation
-// patterns; if real workloads need more, lift via porting-deferred entry.
 type DescribeTsfn = ThreadsafeFunction<String, (), String, Status, false, false, 8>;
 type ObserveAllTsfn = ThreadsafeFunction<
     FnArgs<(String, Vec<u32>)>,
@@ -795,14 +973,6 @@ fn build_observe_all_tsfn(
 /// Encode a `&[Message]` batch into the flat `[code_0, payload_0,
 /// code_1, payload_1, ...]` shape that `subscribe_with_tsfn` and the
 /// JS-side `MSG_CODE_*` decoder use.
-///
-/// Slice X3 /qa Group 2 #5: skips `Message::Start` at encode time.
-/// `Start` is the per-subscription handshake (R1.3.5.a) — user sinks
-/// don't observe it; legacy filters it out before the user sink. The
-/// JS-side `decodeMessages` already skipped `MSG_CODE_START`; filtering
-/// at the encoder saves the wire round-trip and avoids JS-side noise
-/// on auto-subscribe-late observe variants where every late-added node
-/// would otherwise emit a wasted START + 0 pair on every fire.
 fn encode_messages(msgs: &[Message]) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::with_capacity(msgs.len() * 2);
     for m in msgs {

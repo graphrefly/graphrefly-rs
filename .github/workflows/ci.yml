@@ -131,29 +131,21 @@ jobs:
   # (the binding's tests are JS-side and live in graphrefly-ts's
   # bench harness). The build verifies the cdylib link works.
   #
-  # GATED 2026-05-19 (Path A — pending S6 napi reconciliation):
-  # post-S2c (D247/D248/D249) `Core` is `!Send + !Sync` (substrate
-  # `Sink`/`TopologySink` dropped `Send+Sync`); `impl Clone for Core`
-  # is deleted (D221/D246); `Subscription` was renamed
-  # `SubscriptionId` (D241/D246 r3). `crates/graphrefly-bindings-js/
-  # src/core_bindings.rs` (~1800 LOC) still uses the pre-S2c shape
-  # (`BenchCore { core: Core }` + `self.core.clone()` + `spawn_blocking`
-  # captures + `OnceLock<Arc<BenchCore>>`) and fails to compile (54
-  # errors). This was explicitly scoped OUT of the D226 default-members
-  # gate ("bindings excluded from the default-members gate ... napi-
-  # side D248/D249 reconciliation is the D080/D206-Option-C slice" —
-  # `migration-status.md` S2c block + `cross-track-ledger.md` §2). The
-  # CI step was running ahead of the scope decision. Gate flipped to
-  # `false` until **S6 — napi bindings reconciliation against post-S2c
-  # `!Send` Core** lands. To re-enable: flip back to the prior bot/
-  # release `if:` condition (preserved in this diff's git history).
+  # S6 reconciled 2026-05-19 (D255/D256/D257/D258 — α/γ-converged actor
+  # model). `crates/graphrefly-bindings-js/src/core_actor.rs` owns
+  # `Core` on a dedicated worker thread; `Bench*` napi classes store
+  # `Arc<CoreActor>` (Send+Sync) instead of `Core` by value; the
+  # `invoke_fn_with_core` (D245/D246-r5) override threads `&dyn
+  # CoreFull` to producer build closures; `Subscription` → owner-
+  # invoked `(NodeId, SubscriptionId)`-pair detach. `!Send` resources
+  # (Graph, StorageHandle, LogView/ScanHandle/ReactiveSub) live in
+  # the actor's `WORKER_EXTRAS` thread-local registry. Gate restored
+  # to the prior bot/release condition; the post-S6 binding compiles
+  # green against the post-S2c substrate.
   # ---------------------------------------------------------------------
   bindings-js:
     name: napi-rs binding (cdylib build + clippy)
-    # TODO(S6 / D080/D206 Option C): re-enable after napi reconciliation.
-    # Prior condition (preserved for the flip):
-    #   "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
-    if: false
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -198,16 +190,10 @@ jobs:
   # ---------------------------------------------------------------------
   napi-build-matrix:
     name: napi build (${{ matrix.target }})
-    # GATED 2026-05-19 (Path A — pending S6 napi reconciliation): see
-    # the `bindings-js` job comment above. This matrix runs the
-    # cross-platform `napi build` which compiles the same crate via
-    # `cargo` under the hood and fails identically with 54 errors
-    # against the post-S2c `!Send` Core. Re-enables together with
-    # `bindings-js` when S6 lands.
-    # TODO(S6 / D080/D206 Option C): re-enable after napi reconciliation.
-    # Prior condition (preserved for the flip):
-    #   "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
-    if: false
+    # S6 reconciled 2026-05-19 — see the `bindings-js` job comment
+    # above. This matrix builds the cross-platform `.node` artifacts
+    # against the post-S6 binding.
+    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
     needs: bindings-js
     strategy:
       fail-fast: false

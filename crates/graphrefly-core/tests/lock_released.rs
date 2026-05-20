@@ -131,14 +131,6 @@ fn fn_can_reenter_core_invalidate_during_invoke_fn() {
     );
 }
 
-#[test]
-#[ignore = "retired (D250, S4): synchronous fn-fire re-entry into Core pause/resume was only ever reachable via the binding-holds-cloned-Core mechanism, structurally deleted by D221/D246 single-owner. A fn synchronously driving pause/resume is the imperative-from-reactive-layer anti-pattern design invariant #2 forbids; the β-valid path is reactive (emit → controller node → owner-side pause/resume) and is covered by the live mailbox-reentry tests in this file (sink_can_complete_another_node_from_callback / custom_equals_can_reenter_core_during_emission). Intent preserved, never deleted. Adding pause/resume to CoreFull/MailboxOp purely to keep this stub alive would spend substrate/FFI surface for zero consumer (contradicts D196 + D246 ignore-legacy). Canonical: ~/src/graphrefly-ts/docs/rust-port-decisions.md D250; porting-deferred § D246 record-and-skip."]
-fn fn_can_reenter_core_pause_resume_during_invoke_fn() {
-    // Retired (D250): no β-valid actor-model trigger; the reactive
-    // equivalent (emit → controller → owner-side pause/resume) is the
-    // spec-correct path and is covered by the live re-entry tests here.
-}
-
 // ---------------------------------------------------------------------------
 // custom_equals re-entrance via the mailbox
 // ---------------------------------------------------------------------------

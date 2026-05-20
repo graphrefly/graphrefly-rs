@@ -14,7 +14,6 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi::Error as NapiError;
 use napi_derive::napi;
-use parking_lot::Mutex;
 use serde_json::Value;
 
 use graphrefly_storage::error::{RestoreError, StorageError};
@@ -431,8 +430,11 @@ pub fn bench_replay_order() -> Vec<String> {
 #[cfg(feature = "graph-codec")]
 mod graph_fns {
     use super::*;
-    use crate::core_bindings::run_blocking;
+    use crate::core_actor::{
+        alloc_worker_key, take_extra, with_extra, with_extra_install_child, CoreActor,
+    };
     use crate::graph_bindings::BenchGraph;
+    use graphrefly_graph::Graph;
 
     use graphrefly_storage::graph_integration::{
         attach_snapshot_storage, restore_snapshot, AttachOptions, AttachTierPair, RestoreOptions,
@@ -523,34 +525,45 @@ mod graph_fns {
         }
     }
 
-    // ── Storage handle (RAII) ────────────────────────────────────────
+    // ── Storage handle (S6/D255 actor-routed; worker-extras hosted) ──
 
+    /// JS-facing handle for storage detach. Stores `Arc<CoreActor>` +
+    /// `handle_key: u64` keying into the actor's `WORKER_EXTRAS`.
+    /// `StorageHandle` is `!Send` (holds a `Rc<RefCell<GraphInner>>`
+    /// via its `GraphObserveAllReactive` field) so it lives on the
+    /// worker thread; `dispose()` posts a `take_extra` + `detach(core)`
+    /// closure through the actor.
     #[napi]
     pub struct BenchStorageHandle {
-        inner: Arc<Mutex<Option<StorageHandle>>>,
-        core: graphrefly_core::Core,
+        actor: Arc<CoreActor>,
+        handle_key: u64,
     }
 
     #[napi]
     impl BenchStorageHandle {
-        /// Explicitly dispose (stop persistence, unsubscribe sinks).
+        /// Explicitly dispose (full owner-invoked teardown). Idempotent
+        /// — second call finds no entry in `WORKER_EXTRAS` and no-ops.
         #[napi]
         pub async fn dispose(&self) -> Result<()> {
-            let taken = self.inner.lock().take();
-            if let Some(handle) = taken {
-                let core = self.core.clone();
-                run_blocking(core, move || handle.dispose()).await?;
-            }
-            Ok(())
+            let key = self.handle_key;
+            self.actor
+                .run(move |core| {
+                    if let Some(handle) = take_extra::<StorageHandle>(key) {
+                        handle.detach(core);
+                    }
+                })
+                .await
         }
     }
 
     impl Drop for BenchStorageHandle {
         fn drop(&mut self) {
-            let taken = self.inner.lock().take();
-            if let Some(handle) = taken {
-                let _ = spawn_blocking(move || handle.dispose());
-            }
+            let key = self.handle_key;
+            let _ = self.actor.dispatch_detached(move |core| {
+                if let Some(handle) = take_extra::<StorageHandle>(key) {
+                    handle.detach(core);
+                }
+            });
         }
     }
 
@@ -563,25 +576,38 @@ mod graph_fns {
         snapshot_tier: &BenchCheckpointSnapshotTier,
         wal_tier: Option<&BenchWalKvTier>,
     ) -> Result<BenchStorageHandle> {
-        let graph_clone = graph.graph.clone();
-        let core = graph.core.clone();
+        let actor = graph.actor.clone();
+        let actor_for_handle = actor.clone();
+        let graph_key = graph.graph_key;
+        let handle_key = alloc_worker_key();
         let snap = Arc::clone(&snapshot_tier.inner);
         let wal = wal_tier.map(|t| Arc::clone(&t.inner));
 
-        let handle = run_blocking(core.clone(), move || {
-            let pair = AttachTierPair {
-                snapshot: Box::new(SharedCheckpointSnapshotTier(snap)),
-                wal: wal.map(|w| {
-                    Box::new(SharedWalKvTier(w)) as Box<dyn KvStorageTier<WALFrame<Value>>>
-                }),
-            };
-            attach_snapshot_storage(&graph_clone, vec![pair], AttachOptions::default())
-        })
-        .await?;
+        actor
+            .run(move |core| {
+                with_extra_install_child::<Graph, StorageHandle, _, _>(
+                    graph_key,
+                    handle_key,
+                    move |g| {
+                        let pair = AttachTierPair {
+                            snapshot: Box::new(SharedCheckpointSnapshotTier(snap)),
+                            wal: wal.map(|w| {
+                                Box::new(SharedWalKvTier(w))
+                                    as Box<dyn KvStorageTier<WALFrame<Value>>>
+                            }),
+                        };
+                        let handle =
+                            attach_snapshot_storage(core, g, vec![pair], AttachOptions::default());
+                        (handle, ())
+                    },
+                )
+                .expect("BenchGraph: graph entry missing");
+            })
+            .await?;
 
         Ok(BenchStorageHandle {
-            inner: Arc::new(Mutex::new(Some(handle))),
-            core,
+            actor: actor_for_handle,
+            handle_key,
         })
     }
 
@@ -594,24 +620,28 @@ mod graph_fns {
         wal_tier: &BenchWalKvTier,
         target_seq: Option<u32>,
     ) -> Result<String> {
-        let graph_clone = graph.graph.clone();
-        let core = graph.core.clone();
+        let actor = graph.actor.clone();
+        let graph_key = graph.graph_key;
         let snap = Arc::clone(&snapshot_tier.inner);
         let wal = Arc::clone(&wal_tier.inner);
 
-        let result = run_blocking(core, move || -> std::result::Result<_, RestoreError> {
-            let snap_ref = SharedCheckpointSnapshotTier(snap);
-            let wal_ref = SharedWalKvTier(wal);
-            let opts = RestoreOptions {
-                snapshot_tier: &snap_ref,
-                wal_tier: &wal_ref,
-                target_seq: target_seq.map(u64::from),
-                on_torn_write: None,
-            };
-            restore_snapshot(&graph_clone, &opts)
-        })
-        .await?
-        .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+        let result = actor
+            .run(move |core| -> std::result::Result<_, RestoreError> {
+                with_extra::<Graph, _>(graph_key, move |g| {
+                    let snap_ref = SharedCheckpointSnapshotTier(snap);
+                    let wal_ref = SharedWalKvTier(wal);
+                    let opts = RestoreOptions {
+                        snapshot_tier: &snap_ref,
+                        wal_tier: &wal_ref,
+                        target_seq: target_seq.map(u64::from),
+                        on_torn_write: None,
+                    };
+                    restore_snapshot(core, g, &opts)
+                })
+                .expect("BenchGraph: graph entry missing")
+            })
+            .await?
+            .map_err(|e| NapiError::from_reason(format!("{e}")))?;
 
         to_json(&result)
     }
@@ -619,9 +649,14 @@ mod graph_fns {
     /// Take a graph snapshot (JSON-serialized `GraphPersistSnapshot`).
     #[napi]
     pub async fn bench_graph_snapshot(graph: &BenchGraph) -> Result<String> {
-        let graph_clone = graph.graph.clone();
-        let core = graph.core.clone();
-        let snap = run_blocking(core, move || graph_clone.snapshot()).await?;
+        let actor = graph.actor.clone();
+        let graph_key = graph.graph_key;
+        let snap = actor
+            .run(move |core| {
+                with_extra::<Graph, _>(graph_key, move |g| g.snapshot(core))
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await?;
         to_json(&snap)
     }
 }

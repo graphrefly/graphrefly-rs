@@ -364,7 +364,13 @@ class NativeGraph {
 
   async add(name, node) {
     const id = node.inner;
-    this.bench.add(name, id);
+    // S6 QA fix 2026-05-20: bench.add() is now async (Promise<u32>) —
+    // pre-S6 it was sync via `run_sync`, which deadlocked when an
+    // active observe_all_reactive sink fired core.subscribe with a
+    // TSFN-backed callback (libuv blocked on the actor reply). The
+    // outer `async add` already returns a Promise; the await chains
+    // the actor round-trip in.
+    await this.bench.add(name, id);
     this.nodesByName.set(name, node);
     return node;
   }
@@ -1307,7 +1313,14 @@ function buildStructures(native, state, wrapNode) {
           const sub = await log.attach(upstream.inner);
           keepAlive.push(sub);
           return async () => {
-            sub.dispose();
+            // S6 QA fix 2026-05-20: BenchLogSubscription.dispose is
+            // now async (was sync pre-S6). Pre-S6 the sync `sub.dispose()`
+            // returned undefined immediately; post-S6 it returns a
+            // Promise — without await, the UnsubFn resolves before
+            // the underlying ReactiveSub::detach actually completes
+            // (parity contract: `UnsubFn = () => Promise<void>` from
+            // `packages/parity-tests/impls/types.ts`).
+            await sub.dispose();
           };
         },
       };
@@ -1394,17 +1407,21 @@ function buildStructures(native, state, wrapNode) {
           state.registry.set(vh, value);
           await map.set(kh, vh, null);
         },
-        get(key) {
+        // S6 QA fix 2026-05-20 (F3): map.get/has are now async at the
+        // napi surface (TTL-prune emits a snapshot → libuv deadlock
+        // vector under prior sync `run_sync` shape). Outer wrappers
+        // become async to match the parity Impl contract.
+        async get(key) {
           const kh = keyHandles.get(key);
           if (kh == null) return undefined;
-          const vh = map.get(kh);
+          const vh = await map.get(kh);
           if (vh === 0) return undefined;
           return state.registry.get(vh);
         },
-        has(key) {
+        async has(key) {
           const kh = keyHandles.get(key);
           if (kh == null) return false;
-          return map.has(kh);
+          return await map.has(kh);
         },
         async delete(key) {
           const kh = keyHandles.get(key);

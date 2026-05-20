@@ -56,6 +56,119 @@ Add a per-item entry only if a bench surfaces the cost.
 per user direction — individual entries were prior-art noise relative to "do
 not pre-optimize." §10.13 and pick_next_fire resolved in Slice U (2026-05-12).
 
+### S6 follow-up — bench evidence for `BenchReactiveMap::has`/`get` async conversion (2026-05-20)
+
+- **What:** S6 QA F3 widened `BenchReactiveMap::has`/`get` from sync
+  (`actor.run_sync`) to `async fn` (`actor.run`) because the substrate's
+  `ReactiveMap::has`/`get` are NOT read-only when TTL is configured — TTL-
+  expired-key checks fire `prune_expired_inner` + `self.emitter.emit(core,
+  snapshot)`, creating a libuv-deadlock vector under the prior sync shape if
+  any subscriber to the map's snapshot node uses `bridge_sync`. The fix is
+  **correctness-driven, not perf-driven**: parity contract `ImplReactiveMap.has/get`
+  widened to `Promise<…>` (cross-track-ledger.md §1 row 2026-05-20).
+- **Perf concern (deferred for bench evidence):** the async path adds one
+  actor round-trip per `has`/`get` call (channel send + sync_channel reply +
+  `napi::bindgen_prelude::spawn_blocking` for the async bridge). For
+  "hot-path lookup" workloads (e.g. a memo:Re cache-hit check in an inner
+  loop) the round-trip overhead could be measurable vs the pre-S6 sync shape.
+- **Why deferred:** zero consumer pressure today; the parity-tests scenarios
+  in `~/src/graphrefly-ts/packages/parity-tests/scenarios/structures/reactive-map.test.ts`
+  are correctness-focused, not perf-focused. The async-fix-first decision is
+  decision-consistent with D196 + D248 (correctness wins over perf without
+  evidence).
+- **Re-look trigger:** if a real workload (memo:Re hot-path? high-frequency
+  map-lookup scenario surfaced by a downstream consumer) shows a >X%
+  slowdown vs the TS arm (pure-ts has no actor round-trip), evaluate **Option
+  B′** as the perf-driven follow-on: add a substrate-side `has_no_prune` /
+  `get_no_prune` variant that emits the prune snapshot via the owner-side
+  `DeferQueue` (decoupling the prune-emit from the calling thread's
+  observable timing), then have the binding's `has`/`get` use the
+  non-emitting variant under `run_sync`. **Bench gate first** — don't
+  pre-optimize.
+- **Source:** S6 QA F3 (Edge Case Hunter + Blind Hunter, 2026-05-20).
+  Canonical: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §1 row
+  2026-05-20 (S6 QA F3).
+
+### S7 follow-on — TSFN-bridged operator scenarios fail in rust-via-napi parity arm (2026-05-20)
+
+- **What:** Post-S6 + post-QA `pnpm test:parity` against the freshly-
+  built `@graphrefly/native` exposes **35 failures across 6
+  scenario files**, all using `bridge_sync` / `bridge_sync_unit`
+  (Blocking TSFN dispatch from the actor's worker thread to JS):
+  - `scenarios/operators/control.test.ts` — 5/18 fail (tap, rescue×2, valve, repeat)
+  - `scenarios/operators/subscription.test.ts` — 12/32 fail (zip×3, concat, race, …)
+  - `scenarios/operators/higher-order.test.ts` — 6/18 fail
+  - `scenarios/operators/stratify.test.ts` — 6/14 fail (multi-branch, terminal forwarding, reactive rules)
+  - `scenarios/messaging/subscription.test.ts` — 4/10 fail (F18 ReactiveLog view/scan)
+  - `scenarios/operators/buffer.test.ts` — 2/4 fail (buffer, bufferCount)
+
+  Pure-ts arm passes uniformly across all 35 of these. Substrate
+  gate (`mise run gate`) is **810/0/0 GREEN**; binding crate
+  builds + clippy clean; napi cdylib builds. The 29 non-affected
+  scenario files (storage-wal, graph, core, structures, transform,
+  combine, etc.) pass cross-arm.
+
+  **Failure pattern is uniform "emissions lost":**
+  - `expected [42] to deeply equal []` (all lost)
+  - `expected [[1,10], [2,20]] to deeply equal [[1,10]]` (last lost)
+  - `expected 12 to be 15` (scan missing the last addition)
+
+- **Why deferred:** debugging requires hands-on tracing in
+  `BindingBoundary::invoke_tap_fn` / `bridge_sync` / `Core::emit`
+  wave path; 1-2 cycles of rebuild + retest. Substrate-side gate
+  is green and the 16 S6/QA patches are sound — separating the
+  TSFN-interaction debug into its own slice keeps the substrate +
+  QA fixes commitable without blocking on a deeper investigation.
+  User-locked decision 2026-05-20 ("Close QA now; carry parity
+  regression as S7 follow-on slice").
+
+- **Last known good parity-arm state:** Option C close (D206/D207,
+  2026-05-15) — "30 files / 330 passed / 2 skipped / 0 failed."
+  Substrate work S2c+S3+S4+S5 (2026-05-19) reshaped Core to
+  `!Send + !Sync`; bindings broke; CI bindings jobs gated `if:
+  false` (commit `6f86b90` Path A). S6 (2026-05-19) rebuilt the
+  binding atop the post-S2c substrate. **The QA pass (2026-05-20)
+  is the first end-to-end exercise of that rebuild.** The 35
+  failures are NOT a QA regression — they're a S2c→S6 cumulative
+  carry surfaced by exercising the parity-test runtime (which the
+  user explicitly flagged as the actual coverage gate for binding-
+  layer slices — memory `feedback_pre_design_full_decision_set.md`
+  rule #5).
+
+- **Hypotheses to investigate:**
+  1. **M1 `catch_unwind` silently swallowing a recurring panic.**
+     Temporarily revert M1 (worker loop without `catch_unwind`)
+     to see if a louder panic surfaces — would tell us whether
+     this is a JS-throw, a `bridge_sync` panic, or an actor-side
+     bug (RefCell or other). M1 itself is correct; this is just
+     a debug technique.
+  2. **`std::thread::spawn` worker + Blocking TSFN dispatch
+     interaction.** `bridge_sync` enqueues TSFN with `max_queue_size=1`,
+     blocks actor thread on `sync_channel::recv`. Libuv pumps
+     the TSFN (libuv IS free during the outer napi `await`).
+     Should work; something is dropping emissions. Add `println!`
+     traces in `invoke_tap_fn` (binding-side), `bridge_sync_unit`,
+     `Core::emit`, `Core::commit_emission` to map the loss point.
+  3. **TSFN queue saturation under nested actor + libuv.** A
+     subsequent emission's TSFN dispatch may hit
+     `ThreadsafeFunctionCallMode::Blocking` queue-full state
+     and lose due to a race with the prior call's cleanup.
+  4. **Sink building inside actor closure** (D248 sink-shape) —
+     verify the captured Arc<SinkTsfn> survives across waves
+     and isn't dropped between subscribe and the next emit.
+
+- **Where it lives:** `crates/graphrefly-bindings-js/src/operator_bindings.rs`
+  (bridge_sync, invoke_*_fn paths), `crates/graphrefly-bindings-js/src/core_bindings.rs`
+  (bridge_sync_unit, build_tsfn_sink), `crates/graphrefly-core/src/batch.rs`
+  (invoke_tap_fn dispatch sites at lines 2593/2633).
+- **Re-look trigger:** S7 debug slice — when a real consumer
+  pushes the rust parity arm or memo:Re premium-backend native
+  swap surfaces the regression. Pre-resolution: drop the
+  rust-arm gate from PR-blocking CI (the cross-arm `describe.each`
+  parameterization handles graceful degradation).
+- **Source:** S6 QA `pnpm test:parity` run (2026-05-20). Output
+  log at `/tmp/s6-qa-parity.log` (session-local).
+
 ### Slice U known limitations (2026-05-12)
 
 - **`topo_rank` not propagated to consumers on `set_deps`.** When a node's deps change via `set_deps`, its own `topo_rank` is recomputed, but downstream consumers' ranks are not cascaded. Correct re-ranking would require a transitive walk of all reachable consumers. Acceptable for v1: `set_deps` is an experimental Phase 13.8 API, rarely called in practice, and the worst case is a temporarily suboptimal pick order (one extra no-op fire that settles on the next wave). Fix if `set_deps` becomes hot-path.
@@ -148,15 +261,15 @@ per fn-fire).
 - **Lift point:** widen the `BindingBoundary` trait's `release_handle` rustdoc to make the leaf-operation requirement a HARD contract (currently it reads more like an implementation hint). Add a `release_handle_lock_held: bool` capability flag if a future binding genuinely needs Core re-entrance during refcount paths. Until then, defer.
 - **Source:** /qa F2 / M1 (2026-05-10 A/B/D/E/F batch review). Pre-existing for Phase 3/5; expanded for Phase 3b + Drop drain via D-α.
 
-### D252 record-and-skip — napi BenchCore cross-Core same-thread panic + pre-claim handle-leak (binding-layer; /qa M5+F3 2026-05-19)
+### D252 record-and-skip — napi BenchCore cross-Core panic message (binding-layer; partially resolved by S6, 2026-05-19)
 
-- **What:** D252 (S5) locks "one Core per OS thread" as a hard invariant — `BatchGuard::claim_in_tick` panics fail-loud if it observes a foreign nonzero `Core::generation` in the `IN_TICK_OWNED` slot (`crates/graphrefly-core/src/batch.rs:3458–3493`). Under D248 single-owner Core no in-tree consumer can produce cross-Core nesting (a `DeferFn` driving a *second* `&Core` on the same thread is structurally absent across `graphrefly-core` / `graphrefly-operators` / `graphrefly-graph` / `graphrefly-storage` / `graphrefly-structures` — independently verified by Edge Case Hunter at /qa). **Out-of-tree (napi BenchCore consumers) is unconstrained:** a JS user instantiating two `BenchCore`s on one Node main thread + synchronously dispatching cross-Core under D070's `bridge_sync` would hit the panic with a diagnostic that says "see `docs/rust-port-decisions.md` D252" — internal Rust docs the JS user cannot easily access. Two related gaps:
-  - **(a) Pre-claim handle-leak.** A handle passed to a foreign `Core::emit` is intern'd by the caller, but `Core::emit` panics in `claim_in_tick` *before* the handle ownership transfers to Core-B's cache slot — the caller's intern is never released. Today's `cross_core_same_thread_batchguard_panics_on_claim` test exercises the panic + recovery but leaks the intern (test-only, masked). A real-world consumer panicking on `claim_in_tick` would leak every retain in flight.
-  - **(b) Bindings-friendly diagnostic.** The panic message refers users to internal Rust docs. Under `cfg(feature = "napi")` (or equivalent binding feature), the panic could soften the message to mention `BenchCore` and link to a JS-side doc.
-- **Why deferred (S5 /qa user-locked Option A 2026-05-19):** Core itself shouldn't decide who owns a handle pre-claim — the binding does the retain; Core didn't take ownership yet. Reversing the binding's retain inside Core's panic path would introduce lock-released cleanup discipline duplicating the canonical `discard_wave_cleanup` seam. Friendly diagnostic under `cfg(napi)` is real but not blocking — the panic body itself is correct and structurally enforces the D252 invariant; the message text is a polishing-pass concern. Both gaps fold naturally into the **S6 napi reconciliation slice** (locked 2026-05-19; binding-side D248/D249/D252 reconciliation post-S2c `!Send` Core).
-- **Where it lives:** `crates/graphrefly-core/src/batch.rs:3458–3493` (`claim_in_tick`); `crates/graphrefly-bindings-js/src/core_bindings.rs:944` (per-`BenchCore` `Core::new`); deferred S6 napi reconciliation (`migration-status.md` § "S6 — PLANNED").
-- **Re-look trigger:** S6 napi-reconciliation slice landing (panic-path softening under `cfg(napi)` + binding-layer pre-claim handle-tracking should be folded in). Earlier trigger: a parity-tests scenario in `~/src/graphrefly-ts/packages/parity-tests/scenarios/core/` that exercises two BenchCores on one libuv thread.
-- **Source:** /qa M5 + F3 (Blind Hunter + Edge Case Hunter parallel review, 2026-05-19). User-locked Option A 2026-05-19. `~/src/graphrefly-ts/docs/rust-port-decisions.md` D252.
+- **What:** D252 (S5) locks "one Core per OS thread" as a hard invariant — `BatchGuard::claim_in_tick` panics fail-loud if it observes a foreign nonzero `Core::generation` in the `IN_TICK_OWNED` slot (`crates/graphrefly-core/src/batch.rs:3458–3493`). Under D248 single-owner Core no in-tree consumer can produce cross-Core nesting; **post-S6 each `BenchCore` has its own dedicated actor thread**, so cross-Core same-thread nesting from the napi surface is now structurally impossible too (a JS user instantiating two `BenchCore`s gets two independent actor worker threads, each owning its `Core` privately). The pre-claim handle-leak gap (a) is therefore **structurally resolved by S6**; only gap (b) remains:
+  - ~~(a) Pre-claim handle-leak.~~ **RESOLVED 2026-05-19 by S6/D255 (α/γ-converged actor model).** Each `BenchCore` spawns its own actor thread; cross-`BenchCore` same-thread `Core::emit` cannot arise from the napi surface (the two Cores live on disjoint threads by construction). The substrate `claim_in_tick` panic invariant still guards the in-tree contract but its "out-of-tree consumer" trigger path is gone.
+  - **(b) Bindings-friendly diagnostic** (UNRESOLVED, deferred to S7). The substrate panic message at `batch.rs:3458–3493` refers users to `docs/rust-port-decisions.md` D252 — internal Rust docs the JS user cannot easily access. Under `cfg(feature = "napi")` (or equivalent binding feature), the panic could soften the message to mention `BenchCore` and link to a JS-side doc. **Note:** since gap (a) is now structurally resolved, gap (b)'s trigger condition is much rarer (a future binding misuse, not a "two BenchCores on one libuv thread" mistake any user could make). Folded into the deferred **S7 follow-on slice** (D258 lock).
+- **Why deferred to S7 (D258):** S6's scope was already substantial (~5900 LOC touched + new `core_actor.rs` + `WORKER_EXTRAS` registry); folding D252's panic-message polish into the same commit would conflate "substrate reconciliation" with "binding-layer hardening." User-locked Option B (separate slice) 2026-05-19. Trigger when a real consumer surfaces the panic; until then no urgency.
+- **Where it lives:** `crates/graphrefly-core/src/batch.rs:3458–3493` (`claim_in_tick`); `crates/graphrefly-bindings-js/src/core_actor.rs` (per-`BenchCore` actor thread).
+- **Re-look trigger:** S7 follow-on slice (panic-path softening under `cfg(napi)`). Earlier trigger: any consumer report of the panic with the current message.
+- **Source:** /qa M5 + F3 (Blind Hunter + Edge Case Hunter parallel review, 2026-05-19). Gap (a) closed by S6/D255 2026-05-19; gap (b) carried to S7. `~/src/graphrefly-ts/docs/rust-port-decisions.md` D252 + D255 + D258.
 
 ### Actor-model (D221/D222) — S0 V3: bench-harness `GLOBAL_CORE` must not back production multi-Core
 
@@ -1110,7 +1223,7 @@ sequencing rationale, and risks discussion.**
 
 ### ~~Set_deps from inside firing node's fn corrupts Dynamic `tracked` indices (D1)~~ — RESOLVED 2026-05-07 (Slice F A6)
 
-`set_deps(N, ...)` from inside `N`'s own `invoke_fn` now returns `SetDepsError::ReentrantOnFiringNode` via the thread-local "currently firing" stack (`CoreState::currently_firing` + `FiringGuard` RAII at `crates/graphrefly-core/src/batch.rs:99`). The corrupt-tracked-indices scenario is unreachable. Verified by `tests/slice_f_corrections.rs::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`. Originally believed deferred at Slice A close (2026-05-05); fix actually shipped in Slice F (2026-05-07).
+`set_deps(N, ...)` from inside `N`'s own `invoke_fn` now returns `SetDepsError::ReentrantOnFiringNode` via the thread-local "currently firing" stack (`CoreState::currently_firing` + `FiringGuard` RAII at `crates/graphrefly-core/src/batch.rs:99`). The corrupt-tracked-indices scenario is unreachable. **Test deleted at S6 (2026-05-20, "no legacy" cleanup) — the only synchronous trigger (binding-holds-cloned-Core) was structurally removed by D221/D246, so the test couldn't be driven; the guard code stays live in `node.rs` as defensive cover for a future owner-side seam.** Originally believed deferred at Slice A close (2026-05-05); fix actually shipped in Slice F (2026-05-07).
 
 ### Original D1 entry (kept for archive)
 
@@ -3597,10 +3710,14 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
 >   core-harness surgery). **No longer `#[ignore]`.**
 > - **`lock_released::fn_can_reenter_core_pause_resume…`,
 >   `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
->   `slice_f_corrections::a6_set_deps…`** → **retired as deleted-model
->   (D250)**: `#[ignore = "retired (D250)…"]`, intent preserved, the
->   `ReentrantOnFiringNode` guard code stays live (defensive). These
->   stay `#[ignore]` permanently *by decision* — NOT an open item.
+>   `slice_f_corrections::a6_set_deps…`** → **DELETED 2026-05-20 (S6
+>   "no legacy" cleanup)**. Originally retired as deleted-model
+>   (D250) and kept `#[ignore]` "by decision," but per the
+>   `feedback_no_backward_compat` directive the stubs were dead test
+>   code with no β-valid actor-model trigger — deleted outright. The
+>   `ReentrantOnFiringNode` guard code stays live in `node.rs`
+>   (defensive against a future owner-side seam); the live mailbox-
+>   reentry tests in the same files cover the structural invariant.
 > - **`floor_compare`/`group_scaling`/`profile_disjoint_*`** → rebuilt
 >   as actor-model independent-per-worker-Core bench/profilers;
 >   `profile_st_emit` was already correct.
@@ -3648,44 +3765,26 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   `subscribe(core, …)`) are complete and compile; this is the single
   blocked unit (E0308 at `graph_integration.rs:657`).
 
-- [core-tests] `lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`
-  + `lock_discipline::sink_can_reenter_core_via_pause_and_resume` —
-  fn-fire / in-wave-sink re-entry into Core `pause`/`resume`
-  / **why D246 doesn't fit**: the β-valid mid-fire re-entry seam is the
-  mailbox (`MailboxOp::Emit`/`Complete`/`Error` fast paths +
-  `MailboxOp::Defer(Box<dyn FnOnce(&dyn CoreFull)>)`). `CoreFull`
-  (`crates/graphrefly-core/src/node.rs` `pub trait CoreFull`) exposes
-  emit/complete/error/teardown/invalidate/subscribe/register + reads
-  but **not** `pause`/`resume`, and there is no `Pause`/`Resume`
-  `MailboxOp` variant. `invoke_fn`/the sink closure carry no `&Core`.
-  The only historical trigger was the deleted binding-holds-cloned-Core
-  mechanism (`ReentrantBinding { core_slot: Mutex<Option<Core>> }`),
-  structurally removed by the move-only single-owner Core (D221/D246).
-  The *invariant* (a fn/sink can re-enter pause/resume) stays LIVE.
-  / **proposed handling**: S4 owner-side seam — when the owner-driven
-  pause/resume re-entry point lands (or `CoreFull`/`MailboxOp` is
-  widened with pause/resume), convert these two `#[ignore]` stubs to
-  real tests mirroring the emit/invalidate/complete β-valid rewrites
-  already landed in `lock_released.rs`/`lock_discipline.rs`.
-
-- [core-tests] `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
-  — D1 `SetDepsError::ReentrantOnFiringNode` guard
-  / **why D246 doesn't fit**: the guard
-  (`node.rs` `set_deps` → `if s.shared.currently_firing.contains(&n)`)
-  fires **only** when `set_deps(n)` is called while `n ∈
-  currently_firing`, i.e. synchronously from inside `n`'s own fn-fire.
-  Under the actor model: `invoke_fn` has no `&Core`; `set_deps` is NOT
-  on `CoreFull` and is NOT a `MailboxOp` variant; and a
-  `MailboxOp::Defer` runs owner-side AFTER the wave drains, when
-  `currently_firing` is empty — so the mailbox seam can never put a
-  node into `currently_firing` and call `set_deps` on it. The
-  synchronous binding-holds-Core trigger is structurally deleted
-  (D221/D246). The guard code stays LIVE (still rejects an owner-side
-  mid-wave self-rewire the S4 owner-side seam could attempt).
-  / **proposed handling**: S4 owner-side seam — once the owner can
-  re-enter `set_deps` synchronously inside a wave (or a
-  `set_deps`-equivalent lands on `CoreFull`/`MailboxOp`), convert this
-  `#[ignore]` stub to a real test asserting `ReentrantOnFiringNode`.
+- ~~[core-tests] `lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`
+  + `lock_discipline::sink_can_reenter_core_via_pause_and_resume`
+  + `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
+  — D250 retired stubs.~~
+  **DELETED 2026-05-20 (S6 cleanup, "no legacy" directive).** All three
+  `#[ignore]`-stubs were dead test code: the synchronous binding-holds-
+  cloned-Core trigger is structurally deleted (D221/D246/D248 single-
+  owner Core), no β-valid actor-model path produces the scenario, and
+  the live mailbox-reentry tests in the same files
+  (`sink_can_complete_another_node_from_callback`,
+  `custom_equals_can_reenter_core_during_emission`,
+  `handshake_sink_can_reenter_core_emit_on_other_node`) cover the
+  *structural* invariant (mid-fire / in-wave-sink can re-enter Core
+  via the mailbox seam). The `SetDepsError::ReentrantOnFiringNode`
+  guard code stays LIVE in `node.rs` (defensive against a future
+  owner-side mid-wave self-rewire seam); no test exercises it today,
+  documented inline at the guard site. If a future slice widens
+  `CoreFull`/`MailboxOp` with pause/resume or set_deps for a real
+  consumer, write FRESH tests for the new seam — don't resurrect the
+  deleted stubs.
 
 - [core-tests] §7 shared-Core cross-thread group tests —
   `group_parallelism::{same_group_cross_thread_emits_serialize_without_deadlock,
@@ -3874,18 +3973,23 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   rename). Source: S3 slice (2026-05-19). NOT non-applicable — a real
   comment-accuracy item correctly fused with S4.
 
-- **[D250 — S4 re-entry-stub disposition LOCKED (pre-decided, NOT a
-  skip)]** The 3 still-`#[ignore]` "invariant stays LIVE" stubs
+- **[D250 — S4 re-entry-stub disposition LOCKED → S6 DELETED]** The 3
+  `#[ignore]` "invariant stays LIVE" stubs
   (`lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`,
   `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
   `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`)
-  are **retired as deleted-model** at S4 per **D250**
-  (`~/src/graphrefly-ts/docs/rust-port-decisions.md`): the only
-  historical trigger (binding-holds-cloned-`Core` synchronous re-entry)
-  is structurally deleted by D221/D246; a synchronous fn/sink re-entry
-  into `pause`/`resume`/`set_deps` is the imperative-from-reactive-layer
-  anti-pattern design invariant #2 forbids; the β-valid reactive path
-  (emit → controller → owner-side op) already exists & is tested.
+  were originally retired as deleted-model at S4 per D250
+  (`~/src/graphrefly-ts/docs/rust-port-decisions.md`). **DELETED
+  2026-05-20 at S6 close** (user-locked, `feedback_no_backward_compat`):
+  the only historical trigger (binding-holds-cloned-`Core` synchronous
+  re-entry) is structurally deleted by D221/D246; the β-valid reactive
+  path (emit → controller → owner-side op) is already covered by the
+  live mailbox-reentry tests in the same files
+  (`sink_can_complete_another_node_from_callback`,
+  `custom_equals_can_reenter_core_during_emission`,
+  `handshake_sink_can_reenter_core_emit_on_other_node`). The
+  `ReentrantOnFiringNode` guard code stays live in `node.rs` as
+  defensive cover.
   Disposition at S4: `#[ignore = "retired (D250): …"]` with intent
   preserved (never deleted — same treatment as the §7 cross-thread
   group tests); the `SetDepsError::ReentrantOnFiringNode` guard *code*

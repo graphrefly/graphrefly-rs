@@ -9,11 +9,20 @@
 //! at construction time — this becomes the `InternFn<Vec<HandleId>>` that
 //! converts snapshots to a single packed handle for Core emission.
 //!
-//! Threading model: structures wrap `parking_lot::Mutex` internally; napi
-//! methods that mutate run on the tokio blocking pool via `run_blocking`
-//! (same as `BenchCore` / `BenchGraph`). Factory methods are sync since
-//! `ReactiveLog::new` etc. are lightweight Core mutex operations (same
-//! risk profile as `BenchOperators::from_core`).
+//! # S6/D255 actor model
+//!
+//! Each `BenchReactive*` struct stores an `Arc<CoreActor>` (Send+Sync,
+//! shared with the parent BenchCore + companion classes). The inner
+//! `Arc<Mutex<ReactiveLog>>` etc. ARE Send+Sync. Every structure
+//! method now takes `&Core` explicitly (D246/D231), so we route
+//! through `actor.run(move |core| inner.lock().method(core, …))`.
+//!
+//! View / scan / attach handles (`LogView`, `ScanHandle`, `ReactiveSub`)
+//! are themselves Send+Sync (post-D246 they hold only
+//! `Vec<(NodeId, SubscriptionId)>` for owner-invoked detach). They live
+//! on the JS-side `BenchLogView` / `BenchScanHandle` / `BenchLogSubscription`
+//! napi classes, which post detach via `actor.dispatch_detached` in
+//! `Drop` (D246 r3 — the binding is the `Drop` owner).
 
 use std::sync::Arc;
 
@@ -24,14 +33,16 @@ use napi::threadsafe_function::{
 use napi_derive::napi;
 
 use graphrefly_core::handle::HandleId;
-use graphrefly_core::{Core, NodeId, Subscription};
+use graphrefly_core::NodeId;
 
 use graphrefly_structures::{
     InternFn, LogView, ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions,
-    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, ScanHandle, ViewSpec,
+    ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, ReactiveSub, ScanHandle,
+    ViewSpec,
 };
 
-use crate::core_bindings::{run_blocking, BenchBinding, BenchCore};
+use crate::core_actor::CoreActor;
+use crate::core_bindings::{BenchBinding, BenchCore};
 
 // ── Shared TSFN infrastructure ──────────────────────────────────────────
 
@@ -47,8 +58,8 @@ fn build_pack_tsfn(callback: Function<'_, Vec<u32>, u32>) -> Result<PackTsfn> {
     Ok(Arc::new(tsfn))
 }
 
-/// Same bridge_sync pattern as operator_bindings — blocks tokio thread
-/// on sync_channel while TSFN pumps through libuv.
+/// Same bridge_sync pattern as operator_bindings — blocks the calling
+/// (worker) thread on a sync_channel while TSFN pumps through libuv.
 fn bridge_sync<T, R>(tsfn: &Arc<Tsfn<T, R>>, arg: T) -> R
 where
     T: 'static + Send + JsValuesTupleIntoVec,
@@ -95,9 +106,7 @@ fn make_intern_fn(
     })
 }
 
-/// Identity intern for `scan` (TAcc = HandleId). The JS folder already
-/// returns a registry-allocated handle; this validates + retains it so the
-/// scan-node emission keeps it alive (mirrors `make_intern_fn`'s retain).
+/// Identity intern for `scan` (TAcc = HandleId).
 fn make_identity_intern_fn(binding: std::sync::Weak<BenchBinding>) -> InternFn<HandleId> {
     Arc::new(move |acc: HandleId| -> HandleId {
         if let Some(b) = binding.upgrade() {
@@ -113,7 +122,6 @@ fn make_identity_intern_fn(binding: std::sync::Weak<BenchBinding>) -> InternFn<H
 }
 
 /// Build an `InternFn<Vec<(HandleId, HandleId)>>` for ReactiveMap snapshots.
-/// Flattens `[(k, v), ...]` into `[k, v, k, v, ...]` before passing to JS.
 fn make_map_intern_fn(
     tsfn: PackTsfn,
     binding: std::sync::Weak<BenchBinding>,
@@ -149,8 +157,6 @@ fn make_index_intern_fn(
 ) -> InternFn<Vec<graphrefly_structures::IndexRow<HandleId, HandleId>>> {
     Arc::new(
         move |rows: Vec<graphrefly_structures::IndexRow<HandleId, HandleId>>| -> HandleId {
-            // Flatten to [primary, value, primary, value, ...] — JS packer
-            // decodes by stride-2. Secondary strings dropped (internal sort key).
             let arg: Vec<u32> = rows
                 .iter()
                 .flat_map(|row| {
@@ -180,15 +186,28 @@ fn make_index_intern_fn(
 #[napi]
 pub struct BenchReactiveLog {
     inner: Arc<parking_lot::Mutex<ReactiveLog<HandleId>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
     binding_weak: std::sync::Weak<BenchBinding>,
 }
 
 #[napi]
 impl BenchReactiveLog {
-    /// Create from a BenchCore + packer callback. Sync factory — lightweight
-    /// Core mutex operation (same risk profile as BenchOperators::from_core).
+    /// Create from a BenchCore + packer callback. Constructor runs
+    /// `ReactiveLog::new(&core, …)` on the actor's worker thread via
+    /// `run_sync` (briefly blocks libuv on the one-shot factory call).
+    ///
+    /// **`run_sync` safety, lifecycle-precondition framing
+    /// (QA 2026-05-20 F7):** `ReactiveLog::new` is a Core *topology
+    /// mutation* (`core.register_state(...)`), not a read-only op.
+    /// It is safe under `run_sync` because **no subscribers exist
+    /// yet for this newly-created node** — no TSFN-backed sink can
+    /// fire during construction → no `bridge_sync` libuv-busy
+    /// hazard. The invariant is the *lifecycle precondition* (the
+    /// node is freshly created, no `subscribe` could have been
+    /// called yet), NOT the substrate operation being side-effect-
+    /// free. A future change that wires construction-time
+    /// subscribers would invalidate this analysis.
     #[napi(factory)]
     pub fn create(
         core: &BenchCore,
@@ -196,19 +215,19 @@ impl BenchReactiveLog {
         max_size: Option<u32>,
     ) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
-        let c = core.core_clone();
+        let actor = core.actor_arc();
         let binding_weak = Arc::downgrade(&core.binding_arc());
         let intern = make_intern_fn(tsfn, binding_weak.clone());
         let opts = ReactiveLogOptions {
             max_size: max_size.map(|n| n as usize),
             ..Default::default()
         };
-        let log = ReactiveLog::new(&c, intern, opts);
+        let log = actor.run_sync(move |c| ReactiveLog::new(c, intern, opts))?;
         let node_id_raw = u32::try_from(log.node_id.raw())
             .map_err(|_| Error::from_reason("node id exceeds u32"))?;
         Ok(Self {
             inner: Arc::new(parking_lot::Mutex::new(log)),
-            core: c,
+            actor,
             node_id_raw,
             binding_weak,
         })
@@ -227,39 +246,36 @@ impl BenchReactiveLog {
     #[napi]
     pub async fn append(&self, handle: u32) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let h = HandleId::new(u64::from(handle));
-        run_blocking(core, move || {
-            inner.lock().append(h);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().append(core, h);
+            })
+            .await
     }
 
     #[napi]
     pub async fn append_many(&self, handles: Vec<u32>) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let hs: Vec<HandleId> = handles
             .into_iter()
             .map(|h| HandleId::new(u64::from(h)))
             .collect();
-        run_blocking(core, move || {
-            inner.lock().append_many(hs);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().append_many(core, hs);
+            })
+            .await
     }
 
     #[napi]
     pub async fn clear(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            inner.lock().clear();
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().clear(core);
+            })
+            .await
     }
 
     #[napi]
@@ -274,31 +290,15 @@ impl BenchReactiveLog {
     #[napi]
     pub async fn trim_head(&self, n: u32) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            inner.lock().trim_head(n as usize);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().trim_head(core, n as usize);
+            })
+            .await
     }
 
     // ── F18: view / scan / attach ──────────────────────────────────────
-    //
-    // These register a node + `core.subscribe`, and Rust `Core::subscribe`
-    // fires the push-on-subscribe handshake sink SYNCHRONOUSLY. For a
-    // view/scan that sink calls the snapshot `intern`, which `bridge_sync`s
-    // back to a JS packer TSFN. So the subscribe MUST run off the libuv
-    // thread (via `run_blocking` on the tokio blocking pool, like `append`)
-    // — otherwise the napi thread blocks on a TSFN it must itself pump =
-    // deadlock. TSFN construction (`Function` is not `Send`) stays on the
-    // napi thread, before the `run_blocking` boundary.
 
-    /// `view({ tail: n })` — last `n` entries. `packer` mirrors `create`'s
-    /// snapshot packer: `(handles: u32[]) → u32`. Sync method + spawned
-    /// Promise: `Function` is `!Send` and lifetime-bound to `env`, so it
-    /// can't cross an `.await`; the TSFN is built sync (napi thread), the
-    /// blocking subscribe runs off-thread (`env.spawn_future` →
-    /// `run_blocking`). Mirrors `OperatorBindings::register_map`.
     #[napi]
     pub fn view_tail<'env>(
         &self,
@@ -310,8 +310,6 @@ impl BenchReactiveLog {
         self.spawn_view(env, tsfn, ViewSpec::Tail { n: n as usize })
     }
 
-    /// `view({ slice: [start, stop] })` — `[start..stop)`; `stop` defaults
-    /// to log length when `None`.
     #[napi]
     pub fn view_slice<'env>(
         &self,
@@ -331,10 +329,6 @@ impl BenchReactiveLog {
         )
     }
 
-    /// `view({ fromCursor })` — entries from a cursor node's position
-    /// onward. `read_cursor` is a JS callback `(cursorHandle: u32[1]) →
-    /// u32` returning the cursor position; it fires inside Core waves on
-    /// the blocking pool, so its `bridge_sync` is safe.
     #[napi]
     pub fn view_from_cursor<'env>(
         &self,
@@ -367,20 +361,22 @@ impl BenchReactiveLog {
     ) -> Result<PromiseRaw<'env, BenchLogView>> {
         let intern = make_intern_fn(tsfn, self.binding_weak.clone());
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
+        let actor = self.actor.clone();
+        let actor_for_handle = actor.clone();
         env.spawn_future(async move {
-            let view = run_blocking(core, move || inner.lock().view(spec, intern)).await?;
+            let view = actor
+                .run(move |core| inner.lock().view(core, spec, intern))
+                .await?;
             let node_id_raw = u32::try_from(view.node_id.raw())
                 .map_err(|_| Error::from_reason("view node id exceeds u32"))?;
             Ok(BenchLogView {
-                _view: view,
+                view: Some(view),
+                actor: actor_for_handle,
                 node_id_raw,
             })
         })
     }
 
-    /// `scan(seed, folder)` — running aggregate. `seed` is a handle; the
-    /// JS `folder` is `([acc, value]: u32[2]) → u32` (accumulator handle).
     #[napi]
     pub fn scan<'env>(
         &self,
@@ -399,22 +395,22 @@ impl BenchReactiveLog {
         let intern = make_identity_intern_fn(self.binding_weak.clone());
         let seed_h = HandleId::new(u64::from(seed));
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
+        let actor = self.actor.clone();
+        let actor_for_handle = actor.clone();
         env.spawn_future(async move {
-            let scan = run_blocking(core, move || inner.lock().scan(seed_h, step, intern)).await?;
+            let scan = actor
+                .run(move |core| inner.lock().scan(core, seed_h, step, intern))
+                .await?;
             let node_id_raw = u32::try_from(scan.node_id.raw())
                 .map_err(|_| Error::from_reason("scan node id exceeds u32"))?;
             Ok(BenchScanHandle {
-                _scan: scan,
+                scan: Some(scan),
+                actor: actor_for_handle,
                 node_id_raw,
             })
         })
     }
 
-    /// `attach(upstream)` — append every upstream DATA handle into this
-    /// log. Handle-opaque: `read_value` retains so `at()` can't read a
-    /// wave-released slot (release-on-trim is a known bounded leak — see
-    /// porting-deferred.md, parallels the terminal-slot retain note).
     #[napi]
     pub async fn attach(&self, upstream_node_id: u32) -> Result<BenchLogSubscription> {
         let binding = self.binding_weak.clone();
@@ -425,22 +421,26 @@ impl BenchReactiveLog {
             h
         });
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        let sub = run_blocking(core, move || {
-            inner
-                .lock()
-                .attach(NodeId::new(u64::from(upstream_node_id)), read_value)
+        let actor = self.actor.clone();
+        let actor_for_sub = actor.clone();
+        let sub = actor
+            .run(move |core| {
+                inner
+                    .lock()
+                    .attach(core, NodeId::new(u64::from(upstream_node_id)), read_value)
+            })
+            .await?;
+        Ok(BenchLogSubscription {
+            sub: Arc::new(parking_lot::Mutex::new(Some(sub))),
+            actor: actor_for_sub,
         })
-        .await?;
-        Ok(BenchLogSubscription { sub: Some(sub) })
     }
 }
 
-/// RAII handle for `ReactiveLog::view`. Dropping disposes the view's
-/// subscriptions. JS subscribes to `node_id` via `BenchCore.subscribeWithTsfn`.
 #[napi]
 pub struct BenchLogView {
-    _view: LogView,
+    view: Option<LogView>,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
 }
 
@@ -452,11 +452,18 @@ impl BenchLogView {
     }
 }
 
-/// RAII handle for `ReactiveLog::scan`. Dropping disposes the scan
-/// subscription. JS subscribes to `node_id` for accumulator snapshots.
+impl Drop for BenchLogView {
+    fn drop(&mut self) {
+        if let Some(mut view) = self.view.take() {
+            let _ = self.actor.dispatch_detached(move |core| view.detach(core));
+        }
+    }
+}
+
 #[napi]
 pub struct BenchScanHandle {
-    _scan: ScanHandle,
+    scan: Option<ScanHandle>,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
 }
 
@@ -468,19 +475,43 @@ impl BenchScanHandle {
     }
 }
 
-/// RAII handle for `ReactiveLog::attach`. `dispose()` stops the attachment
-/// deterministically; dropping the object does the same (RAII fallback for
-/// the non-deterministic-GC case).
+impl Drop for BenchScanHandle {
+    fn drop(&mut self) {
+        if let Some(mut scan) = self.scan.take() {
+            let _ = self.actor.dispatch_detached(move |core| scan.detach(core));
+        }
+    }
+}
+
 #[napi]
 pub struct BenchLogSubscription {
-    sub: Option<Subscription>,
+    sub: Arc<parking_lot::Mutex<Option<ReactiveSub>>>,
+    actor: Arc<CoreActor>,
 }
 
 #[napi]
 impl BenchLogSubscription {
+    /// Owner-invoked detach (D246 r3). Idempotent — second call finds
+    /// no inner ReactiveSub and no-ops. Async to keep the JS thread
+    /// free during the actor round-trip; `&self` (not `&mut self`)
+    /// because napi-rs 3 rejects `async fn(&mut self)` without
+    /// explicit `unsafe`. Interior mutability via `Mutex<Option<…>>`.
     #[napi]
-    pub fn dispose(&mut self) {
-        self.sub = None;
+    pub async fn dispose(&self) -> Result<()> {
+        let taken = self.sub.lock().take();
+        if let Some(mut sub) = taken {
+            self.actor.run(move |core| sub.detach(core)).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BenchLogSubscription {
+    fn drop(&mut self) {
+        let taken = self.sub.lock().take();
+        if let Some(mut sub) = taken {
+            let _ = self.actor.dispatch_detached(move |core| sub.detach(core));
+        }
     }
 }
 
@@ -489,25 +520,29 @@ impl BenchLogSubscription {
 #[napi]
 pub struct BenchReactiveList {
     inner: Arc<parking_lot::Mutex<ReactiveList<HandleId>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
 }
 
 #[napi]
 impl BenchReactiveList {
+    /// **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+    /// — `ReactiveList::new` is a topology mutation safe under
+    /// `run_sync` *only* because no subscribers exist for the
+    /// freshly-created node (lifecycle precondition).
     #[napi(factory)]
     pub fn create(core: &BenchCore, packer: Function<'_, Vec<u32>, u32>) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
-        let c = core.core_clone();
+        let actor = core.actor_arc();
         let binding_weak = Arc::downgrade(&core.binding_arc());
         let intern = make_intern_fn(tsfn, binding_weak);
         let opts = ReactiveListOptions::default();
-        let list = ReactiveList::new(&c, intern, opts);
+        let list = actor.run_sync(move |c| ReactiveList::new(c, intern, opts))?;
         let node_id_raw = u32::try_from(list.node_id.raw())
             .map_err(|_| Error::from_reason("node id exceeds u32"))?;
         Ok(Self {
             inner: Arc::new(parking_lot::Mutex::new(list)),
-            core: c,
+            actor,
             node_id_raw,
         })
     }
@@ -525,68 +560,65 @@ impl BenchReactiveList {
     #[napi]
     pub async fn append(&self, handle: u32) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let h = HandleId::new(u64::from(handle));
-        run_blocking(core, move || {
-            inner.lock().append(h);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().append(core, h);
+            })
+            .await
     }
 
     #[napi]
     pub async fn append_many(&self, handles: Vec<u32>) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let hs: Vec<HandleId> = handles
             .into_iter()
             .map(|h| HandleId::new(u64::from(h)))
             .collect();
-        run_blocking(core, move || {
-            inner.lock().append_many(hs);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().append_many(core, hs);
+            })
+            .await
     }
 
     #[napi]
     pub async fn insert(&self, index: u32, handle: u32) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let h = HandleId::new(u64::from(handle));
-        run_blocking(core, move || {
-            inner
-                .lock()
-                .insert(index as usize, h)
-                .map_err(|e| Error::from_reason(format!("insert out of range: {e}")))?;
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<()> {
+                inner
+                    .lock()
+                    .insert(core, index as usize, h)
+                    .map_err(|e| Error::from_reason(format!("insert out of range: {e}")))?;
+                Ok(())
+            })
+            .await?
     }
 
     #[napi]
     pub async fn pop(&self, index: Option<i32>) -> Result<u32> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            let h = inner
-                .lock()
-                .pop(i64::from(index.unwrap_or(-1)))
-                .ok_or_else(|| Error::from_reason("pop on empty list"))?;
-            u32::try_from(h.raw()).map_err(|_| Error::from_reason("HandleId exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let h = inner
+                    .lock()
+                    .pop(core, i64::from(index.unwrap_or(-1)))
+                    .ok_or_else(|| Error::from_reason("pop on empty list"))?;
+                u32::try_from(h.raw()).map_err(|_| Error::from_reason("HandleId exceeds u32"))
+            })
+            .await?
     }
 
     #[napi]
     pub async fn clear(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            inner.lock().clear();
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().clear(core);
+            })
+            .await
     }
 
     #[napi]
@@ -604,12 +636,16 @@ impl BenchReactiveList {
 #[napi]
 pub struct BenchReactiveMap {
     inner: Arc<parking_lot::Mutex<ReactiveMap<HandleId, HandleId>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
 }
 
 #[napi]
 impl BenchReactiveMap {
+    /// **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+    /// — `ReactiveMap::new` is a topology mutation safe under
+    /// `run_sync` *only* because no subscribers exist for the
+    /// freshly-created node (lifecycle precondition).
     #[napi(factory)]
     pub fn create(
         core: &BenchCore,
@@ -618,7 +654,7 @@ impl BenchReactiveMap {
         default_ttl: Option<f64>,
     ) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
-        let c = core.core_clone();
+        let actor = core.actor_arc();
         let binding_weak = Arc::downgrade(&core.binding_arc());
         let intern = make_map_intern_fn(tsfn, binding_weak);
         let opts = ReactiveMapOptions {
@@ -626,13 +662,14 @@ impl BenchReactiveMap {
             max_size: max_size.map(|n| n as usize),
             ..Default::default()
         };
-        let map = ReactiveMap::new(&c, intern, opts)
+        let map_result = actor.run_sync(move |c| ReactiveMap::new(c, intern, opts))?;
+        let map = map_result
             .map_err(|e| Error::from_reason(format!("ReactiveMap::new failed: {e:?}")))?;
         let node_id_raw = u32::try_from(map.node_id.raw())
             .map_err(|_| Error::from_reason("node id exceeds u32"))?;
         Ok(Self {
             inner: Arc::new(parking_lot::Mutex::new(map)),
-            core: c,
+            actor,
             node_id_raw,
         })
     }
@@ -647,56 +684,77 @@ impl BenchReactiveMap {
         self.inner.lock().size() as u32
     }
 
+    /// `async fn` at the napi boundary (QA fix 2026-05-20, Edge Case
+    /// Hunter F3 / Blind Hunter C2): `ReactiveMap::has` is NOT
+    /// read-only — when TTL is configured, an expired-key check
+    /// triggers `prune_expired_inner` + `self.emitter.emit(core,
+    /// snapshot)` (see `crates/graphrefly-structures/src/reactive.rs`
+    /// `has` body). The emission fires subscribers; if any subscriber
+    /// uses `bridge_sync` (Blocking TSFN call), libuv must be free to
+    /// pump the TSFN microtask — under the prior sync `run_sync`
+    /// shape libuv was blocked on the actor reply → 3-way deadlock.
+    /// `actor.run` keeps libuv free during the await.
+    ///
+    /// **Public-API change:** `Impl.ImplReactiveMap.has(key)` is
+    /// `Promise<boolean>` (was `boolean`); `parity-tests/impls/
+    /// types.ts` widened correspondingly. See cross-track-ledger.md
+    /// §1 row 2026-05-20 (F3).
     #[napi]
-    pub fn has(&self, key: u32) -> bool {
+    pub async fn has(&self, key: u32) -> Result<bool> {
         let k = HandleId::new(u64::from(key));
-        self.inner.lock().has(&k)
+        let inner = Arc::clone(&self.inner);
+        self.actor.run(move |core| inner.lock().has(core, &k)).await
     }
 
+    /// `async fn` at the napi boundary — same rationale as `has`
+    /// (TTL-prune side-effect emits a snapshot, can deadlock libuv
+    /// under sync `run_sync`).
     #[napi]
-    pub fn get(&self, key: u32) -> u32 {
+    pub async fn get(&self, key: u32) -> Result<u32> {
         let k = HandleId::new(u64::from(key));
-        self.inner
-            .lock()
-            .get(&k)
-            .map(|h| u32::try_from(h.raw()).unwrap_or(0))
-            .unwrap_or(0)
+        let inner = Arc::clone(&self.inner);
+        self.actor
+            .run(move |core| {
+                inner
+                    .lock()
+                    .get(core, &k)
+                    .map(|h| u32::try_from(h.raw()).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .await
     }
 
     #[napi]
     pub async fn set(&self, key: u32, value: u32, ttl: Option<f64>) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let k = HandleId::new(u64::from(key));
         let v = HandleId::new(u64::from(value));
-        run_blocking(core, move || {
-            inner.lock().set_with_ttl(k, v, ttl);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().set_with_ttl(core, k, v, ttl);
+            })
+            .await
     }
 
     #[napi]
     pub async fn delete(&self, key: u32) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let k = HandleId::new(u64::from(key));
-        run_blocking(core, move || {
-            inner.lock().delete(&k);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().delete(core, &k);
+            })
+            .await
     }
 
     #[napi]
     pub async fn clear(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
-        run_blocking(core, move || {
-            inner.lock().clear();
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().clear(core);
+            })
+            .await
     }
 }
 
@@ -705,31 +763,31 @@ impl BenchReactiveMap {
 #[napi]
 pub struct BenchReactiveIndex {
     inner: Arc<parking_lot::Mutex<ReactiveIndex<HandleId, HandleId>>>,
-    core: Core,
+    actor: Arc<CoreActor>,
     node_id_raw: u32,
-    /// F20/D205: numeric-primary → value-handle mirror. The core
-    /// `ReactiveIndex::range_by_primary` is `K: Ord`-correct and covered by
-    /// the `index_range_by_primary_d205` cargo test; the parity arm ranges
-    /// over a user-meaningful `i64` key (never opaque `HandleId` order) per
-    /// D205. `BTreeMap` range iteration is naturally ascending.
+    /// F20/D205: numeric-primary → value-handle mirror.
     keyed: Arc<parking_lot::Mutex<std::collections::BTreeMap<i64, u32>>>,
 }
 
 #[napi]
 impl BenchReactiveIndex {
+    /// **`run_sync` safety:** see [`BenchReactiveLog::create`]'s doc
+    /// — `ReactiveIndex::new` is a topology mutation safe under
+    /// `run_sync` *only* because no subscribers exist for the
+    /// freshly-created node (lifecycle precondition).
     #[napi(factory)]
     pub fn create(core: &BenchCore, packer: Function<'_, Vec<u32>, u32>) -> Result<Self> {
         let tsfn = build_pack_tsfn(packer)?;
-        let c = core.core_clone();
+        let actor = core.actor_arc();
         let binding_weak = Arc::downgrade(&core.binding_arc());
         let intern = make_index_intern_fn(tsfn, binding_weak);
         let opts = ReactiveIndexOptions::default();
-        let index = ReactiveIndex::new(&c, intern, opts);
+        let index = actor.run_sync(move |c| ReactiveIndex::new(c, intern, opts))?;
         let node_id_raw = u32::try_from(index.node_id.raw())
             .map_err(|_| Error::from_reason("node id exceeds u32"))?;
         Ok(Self {
             inner: Arc::new(parking_lot::Mutex::new(index)),
-            core: c,
+            actor,
             node_id_raw,
             keyed: Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new())),
         })
@@ -761,9 +819,6 @@ impl BenchReactiveIndex {
             .unwrap_or(0)
     }
 
-    /// `secondary` is a sort-key string (not a handle). `numeric_key`
-    /// (F20/D205, optional trailing arg) records this row in the numeric
-    /// range mirror so `range_by_primary` can query by user key.
     #[napi]
     pub async fn upsert(
         &self,
@@ -773,32 +828,31 @@ impl BenchReactiveIndex {
         numeric_key: Option<i64>,
     ) -> Result<bool> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let p = HandleId::new(u64::from(primary));
         let v = HandleId::new(u64::from(value));
         if let Some(nk) = numeric_key {
             self.keyed.lock().insert(nk, value);
         }
-        run_blocking(core, move || Ok(inner.lock().upsert(p, secondary, v))).await?
+        self.actor
+            .run(move |core| inner.lock().upsert(core, p, secondary, v))
+            .await
     }
 
     #[napi]
     pub async fn delete(&self, primary: u32, numeric_key: Option<i64>) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         let k = HandleId::new(u64::from(primary));
         if let Some(nk) = numeric_key {
             self.keyed.lock().remove(&nk);
         }
-        run_blocking(core, move || {
-            inner.lock().delete(&k);
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().delete(core, &k);
+            })
+            .await
     }
 
-    /// F20/D205: values whose numeric primary sorts within `[start, end)`
-    /// (inclusive start, exclusive end), ascending by primary key.
+    /// F20/D205: values whose numeric primary sorts within `[start, end)`.
     #[napi]
     pub fn range_by_primary(&self, start: i64, end: i64) -> Vec<u32> {
         if start >= end {
@@ -814,12 +868,11 @@ impl BenchReactiveIndex {
     #[napi]
     pub async fn clear(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let core = self.core.clone();
         self.keyed.lock().clear();
-        run_blocking(core, move || {
-            inner.lock().clear();
-            Ok(())
-        })
-        .await?
+        self.actor
+            .run(move |core| {
+                inner.lock().clear(core);
+            })
+            .await
     }
 }

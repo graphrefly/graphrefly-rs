@@ -606,6 +606,7 @@ name = "graphrefly-bindings-js"
 version = "0.0.6"
 dependencies = [
  "ahash",
+ "crossbeam-channel",
  "graphrefly-core",
  "graphrefly-graph",
  "graphrefly-operators",

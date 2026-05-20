@@ -4958,8 +4958,16 @@ impl Core {
         // live so a future owner-side mid-wave self-rewire seam (or any
         // re-entry that lands an owner inside the firing set) is
         // rejected fail-loud rather than corrupting tracked indices. The
-        // `a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
-        // test is retired (D250) — no actor-model trigger to drive it.
+        // **Guard preserved for future owner-side mid-wave self-rewire
+        // seam** (S4-horizon work). No test exercises this code path
+        // today — the pre-D221 binding-holds-cloned-Core trigger was
+        // deleted in D246 and the test stub was removed at S6
+        // (2026-05-20). **Do NOT delete this guard as "dead code"**:
+        // removing it weakens the invariant that protects
+        // `dep_records` indices against a future seam that lands an
+        // owner inside `currently_firing`. If `CoreFull`/`MailboxOp`
+        // is ever widened with a `set_deps`-equivalent for a real
+        // consumer, write a FRESH test against the new seam.
         // `currently_firing` lives on `CoreShared`, read under the
         // already-held state lock (under D246/D248 single-owner the
         // borrow is *structural* rather than concurrency-required —

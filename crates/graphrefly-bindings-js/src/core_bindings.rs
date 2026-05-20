@@ -3,21 +3,36 @@
 //! Build profile: only enabled with the `tracing` feature (default), which
 //! pulls in `graphrefly-core`.
 //!
-//! # Design notes — Option E (post-QA refactor 2026-05-07)
+//! # Design notes — α/γ-converged actor model (S6/D255, 2026-05-19)
+//!
+//! Post-S2c (D247/D248/D249) `Core` is `!Send + !Sync` (substrate `Sink`/
+//! `TopologySink` dropped `Send + Sync`); `impl Clone for Core` is deleted
+//! (D221/D246). The previous `Bench* { core: Core }` + `self.core.clone()`
+//! + `napi::tokio_runtime::spawn_blocking(move || { core... })` shape
+//! fails to compile against the post-S2c substrate.
+//!
+//! - **`Bench*` wrappers store `Arc<CoreActor>`** (S6/D255). The actor
+//!   owns `Core` on a dedicated `std::thread::spawn`-ed worker thread
+//!   for the actor's lifetime; napi methods send `FnOnce(&Core) + Send
+//!   + 'static` closures into the actor's [`crossbeam_channel`] inbox
+//!   and await a `sync_channel(1)` oneshot reply (mirrors the existing
+//!   `operator_bindings::bridge_sync` style). See [`crate::core_actor`].
 //!
 //! - **Async napi methods.** Every `#[napi]` method that touches Core is
 //!   `async fn`, returning a JS `Promise` automatically via napi-rs's
-//!   `tokio_rt` integration. Inside, the body uses
-//!   [`napi::tokio_runtime::spawn_blocking`] to run Core's sync wave
-//!   engine on a tokio blocking-pool thread. The JS thread stays free
-//!   to pump libuv during `await`, so TSFN-backed JS callbacks (in
-//!   [`crate::operator_bindings`]) can be delivered without deadlock.
+//!   `tokio_rt` integration. Inside, the body posts a closure to the
+//!   actor via `self.actor.run(move |core| { ... }).await`. The JS
+//!   thread stays free to pump libuv during `await`, so TSFN-backed JS
+//!   callbacks (in [`crate::operator_bindings`]) can be delivered
+//!   without deadlock.
 //!
-//! - **Rust core stays sync.** The `tokio::task::spawn_blocking` boundary
-//!   is the ONLY place tokio enters; everything inside the closure (and
-//!   thus all of `graphrefly-core` / `graphrefly-operators` /
-//!   `graphrefly-graph`) runs synchronously. CLAUDE.md invariant 4
-//!   ("no async runtime in Core") preserved.
+//! - **Rust core stays sync.** The actor's worker thread runs the
+//!   closure synchronously; tokio enters ONLY at the napi boundary (to
+//!   bridge the sync `sync_channel::recv()` reply into the async
+//!   context). Everything inside the closure (and thus all of
+//!   `graphrefly-core` / `graphrefly-operators` / `graphrefly-graph`)
+//!   runs synchronously. CLAUDE.md invariant 4 ("no async runtime in
+//!   Core") preserved.
 //!
 //! - **Value registry on the Rust side.** Same as before — primitives
 //!   intern via `Registry`. Switched to `parking_lot::Mutex` (M1 fix:
@@ -27,20 +42,29 @@
 //!   Real JS-callback fns live on `BenchOperators` (TSFN-backed; M3
 //!   napi-rs operator parity).
 //!
-//! - **Thread-local Core for producer dispatch.** [`CURRENT_CORE`] is
-//!   set inside each `spawn_blocking` closure via a RAII guard so
-//!   `BindingBoundary::invoke_fn`'s producer-dispatch branch can build a
-//!   `ProducerCtx` against the calling thread's `Core` clone. Replaces
-//!   the old `worker::WORKER_CORE` thread-local.
+//! - **Producer dispatch via `invoke_fn_with_core` (D245/D246-r5 / D256
+//!   reconciled).** `BindingBoundary::invoke_fn_with_core` was added to
+//!   the substrate in D245 with a default delegating impl. `BenchBinding`
+//!   overrides it to receive `&dyn CoreFull` directly when Core fires a
+//!   producer build closure. The pre-D245 `CURRENT_CORE` thread-local
+//!   + `CoreThreadGuard` plumbing was legacy that nobody had reason to
+//!   delete until S6; deleted in this slice — no thread-local, no
+//!   stored Core back-reference, no `current_core()` clone.
 
-use std::cell::RefCell;
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use graphrefly_core::{
-    BindingBoundary, Core, DepBatch, EqualsMode, FnEmission, FnId, FnResult, HandleId, LockId,
-    Message, NodeId, Sink, Subscription,
+    BindingBoundary, DepBatch, EqualsMode, FnEmission, FnId, FnResult, HandleId, LockId, Message,
+    NodeId, Sink, SubscriptionId,
 };
+// `CoreFull` is only referenced by the `invoke_fn_with_core` override
+// signature, which is itself feature-gated on `operators` (producer
+// dispatch lives there). Gating the import too keeps the
+// tracing-only / operators-off build clean.
+#[cfg(feature = "operators")]
+use graphrefly_core::CoreFull;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
     ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
@@ -55,72 +79,16 @@ use graphrefly_operators::producer::{
     default_producer_deactivate, ProducerCtx, ProducerNodeState, ProducerStorage,
 };
 
-// ---------------------------------------------------------------------------
-// Thread-local Core (replaces worker::WORKER_CORE)
-//
-// Set inside each `spawn_blocking` closure; cleared by the RAII guard at
-// scope exit. `BindingBoundary::invoke_fn`'s producer-dispatch branch
-// reads it to construct `ProducerCtx::new(node_id, &core, &storage)`
-// without forcing the binding to hold its own `Core` clone (which would
-// create an Arc cycle with `Core.binding`).
-// ---------------------------------------------------------------------------
+use crate::core_actor::CoreActor;
 
-thread_local! {
-    static CURRENT_CORE: RefCell<Option<Core>> = const { RefCell::new(None) };
-}
-
-/// Returns a clone of the current thread's `Core`, if one was installed
-/// via [`CoreThreadGuard::set`]. Returns `None` if called from outside a
-/// `spawn_blocking` closure (e.g., directly from the JS thread).
-#[cfg(feature = "operators")]
-pub(crate) fn current_core() -> Option<Core> {
-    CURRENT_CORE.with(|c| c.borrow().clone())
-}
-
-/// RAII guard for the thread-local `Core`. Sets on construction; clears
-/// on Drop. Use at the top of every `spawn_blocking` closure that runs
-/// Core operations to make `current_core()` valid for the duration of
-/// the closure.
-pub(crate) struct CoreThreadGuard;
-
-impl CoreThreadGuard {
-    #[must_use]
-    pub(crate) fn set(core: Core) -> Self {
-        CURRENT_CORE.with(|c| *c.borrow_mut() = Some(core));
-        Self
-    }
-}
-
-impl Drop for CoreThreadGuard {
-    fn drop(&mut self) {
-        CURRENT_CORE.with(|c| *c.borrow_mut() = None);
-    }
-}
-
-/// Static no-op sink shared across all `subscribe_noop` calls (M9 fix
-/// — was per-call `Arc::new(|_| {})` allocation).
+/// Build a fresh no-op sink. Pre-S6 (D248) this was a `OnceLock<Sink>`
+/// shared across calls (M9), but post-D248 `Sink = Arc<dyn Fn(&[Message])>`
+/// is `!Send + !Sync` — `OnceLock<T>` requires `T: Sync` to share across
+/// threads. Per-call allocation is acceptable: `Arc::new(|_| {})` is
+/// one heap allocation per `subscribe_noop` call, called rarely (only
+/// in bench paths that don't observe sink messages).
 fn noop_sink() -> graphrefly_core::Sink {
-    static NOOP: OnceLock<graphrefly_core::Sink> = OnceLock::new();
-    NOOP.get_or_init(|| Arc::new(|_| {})).clone()
-}
-
-/// Spawn a sync closure on the napi-rs tokio runtime's blocking pool,
-/// installing the thread-local `Core` for the duration. Returns the
-/// closure's result via the awaited JoinHandle.
-///
-/// Centralizes (a) the `CoreThreadGuard` install, (b) the `JoinError`
-/// → `napi::Error` conversion, (c) the `Result<T>` flattening.
-pub(crate) async fn run_blocking<F, R>(core: Core, f: F) -> Result<R>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    spawn_blocking(move || {
-        let _guard = CoreThreadGuard::set(core);
-        f()
-    })
-    .await
-    .map_err(|e| NapiError::from_reason(format!("worker thread panicked: {e}")))
+    Arc::new(|_| {})
 }
 
 // ---------------------------------------------------------------------------
@@ -176,9 +144,12 @@ pub(crate) struct Registry {
     pub(crate) packers: ahash::AHashMap<FnId, Arc<dyn Fn(&[HandleId]) -> HandleId + Send + Sync>>,
     pub(crate) higher_order_projectors:
         ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> NodeId + Send + Sync>>,
-    /// Producer build closures, looked up by `BenchBinding::invoke_fn`
-    /// when a producer node fires. The closure receives a `ProducerCtx`
-    /// built against the thread-local `current_core()`.
+    /// Producer build closures, looked up by
+    /// [`BenchBinding::invoke_fn_with_core`] (D245/D246-r5) when a
+    /// producer node fires. The closure receives a `ProducerCtx`
+    /// built against the `&dyn CoreFull` Core hands the binding —
+    /// no thread-local indirection (S6/D256 reconciled: the pre-D245
+    /// `current_core()` plumbing was deleted in this slice).
     #[cfg(feature = "operators")]
     pub(crate) producer_builds: ahash::AHashMap<FnId, Arc<dyn Fn(ProducerCtx<'_>) + Send + Sync>>,
     // Control operator closure registries (Slice U napi parity).
@@ -352,34 +323,14 @@ impl BenchBinding {
             )),
         })
     }
-}
 
-impl BindingBoundary for BenchBinding {
-    /// Spec: R5.7 (operator-fn dispatch shape) + R1.3.6.b (multi-emit
-    /// batch via `FnResult::Batch`). Producer dispatch (D031) checked
-    /// FIRST when `feature = "operators"` is on, so producer fn_ids
-    /// don't fall through to the batch_fns / fns lookups.
-    fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
-        // Producer dispatch (Slice D, D031) — try first since producer
-        // nodes have empty dep_data and the build closure is keyed by
-        // FnId. Only relevant when the operators feature is on.
-        #[cfg(feature = "operators")]
-        {
-            let build = {
-                let reg = self.registry.lock();
-                reg.producer_builds.get(&fn_id).cloned()
-            };
-            if let Some(build) = build {
-                let core = current_core().expect(
-                    "invariant: producer fn fires from inside a `spawn_blocking` closure that \
-                     installed the thread-local Core via CoreThreadGuard — current_core() must be Some",
-                );
-                let ctx = ProducerCtx::new(_node_id, &core, &self.producer_storage);
-                build(ctx);
-                return FnResult::Noop { tracked: None };
-            }
-        }
-
+    /// Shared non-producer dispatch — batch fn, then single-emission fn.
+    /// Used by both `invoke_fn` (legacy path / non-producer dispatch) and
+    /// `invoke_fn_with_core` (after the producer branch misses). Factored
+    /// out so the producer-path doc stays clean and so we never accidentally
+    /// drift between the two callers (they share the same fn-id lookup
+    /// table — `Registry::{fns, batch_fns}`).
+    fn dispatch_non_producer_fn(&self, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
         // Try batch fns first (single-emission path follows).
         let batch_f = {
             let reg = self.registry.lock();
@@ -429,6 +380,66 @@ impl BindingBoundary for BenchBinding {
             None => FnResult::Noop { tracked: None },
         }
     }
+}
+
+impl BindingBoundary for BenchBinding {
+    /// Spec: R5.7 (operator-fn dispatch shape) + R1.3.6.b (multi-emit
+    /// batch via `FnResult::Batch`). Non-producer fast path — Core
+    /// dispatches operator/batch/single fns here; the producer-build
+    /// path goes through [`Self::invoke_fn_with_core`] (D245/D246-r5)
+    /// which receives the `&dyn CoreFull` facade Core construct a
+    /// `ProducerCtx` against.
+    ///
+    /// **S6/D256 reconciled (2026-05-19):** the producer-dispatch
+    /// branch that previously read a `CURRENT_CORE` thread-local was
+    /// removed. Under the actor model `Core` cannot be cloned/stored,
+    /// and D245 already wired the `invoke_fn_with_core` override path
+    /// for exactly this purpose. The unused `_node_id` parameter is
+    /// preserved at the substrate trait signature.
+    fn invoke_fn(&self, _node_id: NodeId, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        self.dispatch_non_producer_fn(fn_id, dep_data)
+    }
+
+    /// Spec: D245 / D246-r5 — producer-build dispatch with `&dyn
+    /// CoreFull` from Core. Overrides the substrate's default
+    /// delegating impl ([`crates/graphrefly-core/src/boundary.rs:230`])
+    /// to construct a `ProducerCtx` against the passed Core facade,
+    /// then fall through to non-producer dispatch on cache miss.
+    ///
+    /// This is the post-S2c replacement for the pre-D245 `CURRENT_CORE`
+    /// thread-local + `CoreThreadGuard` plumbing — the actor's worker
+    /// loop runs `closure(&core)`, Core's batch dispatcher calls
+    /// `invoke_fn_with_core(self as &dyn CoreFull)`, and the producer
+    /// build closure receives `ctx.core() -> &dyn CoreFull` directly
+    /// without any thread-local indirection.
+    #[cfg(feature = "operators")]
+    fn invoke_fn_with_core(
+        &self,
+        node_id: NodeId,
+        fn_id: FnId,
+        dep_data: &[DepBatch],
+        core: &dyn CoreFull,
+    ) -> FnResult {
+        // Producer dispatch (Slice D, D031) — try first since producer
+        // nodes have empty dep_data and the build closure is keyed by
+        // FnId.
+        let build = {
+            let reg = self.registry.lock();
+            reg.producer_builds.get(&fn_id).cloned()
+        };
+        if let Some(build) = build {
+            let ctx = ProducerCtx::new(node_id, core, &self.producer_storage);
+            build(ctx);
+            return FnResult::Noop { tracked: None };
+        }
+        // Not a producer fn — fall through to the parameterless path.
+        self.dispatch_non_producer_fn(fn_id, dep_data)
+    }
+
+    // (operator feature off: invoke_fn_with_core's default delegating
+    // impl in graphrefly-core forwards to invoke_fn — no override
+    // needed; the producer branch is unreachable when operators is
+    // off, since no producer build can be registered.)
 
     /// Spec: R5.5 (custom-equals semantics) + R1.3.2.d (per-wave
     /// equals coalescing — Slice G). Falls back to identity-equals
@@ -878,50 +889,53 @@ pub struct BatchEmissionJs {
 // ---------------------------------------------------------------------------
 // JS-facing API: `BenchCore` napi class.
 //
-// Per Option E (post-QA refactor 2026-05-07), every method that touches
-// Core is `async fn`. Inside, `run_blocking` (a `napi::tokio_runtime
-// ::spawn_blocking` wrapper) installs the thread-local `Core` via
-// `CoreThreadGuard` and runs the sync work on tokio's blocking pool.
-// JS sees a Promise; libuv on the JS thread is free to drain TSFN ticks
-// fired by operator callbacks during the wave.
+// Per S6/D255 (2026-05-19), every `#[napi] async fn` that touches Core
+// routes through the actor model: `self.actor.run(move |core| { ... }).
+// await`. The actor's worker thread owns Core by value for its
+// lifetime; the worker runs each closure synchronously with the
+// worker-owned `&Core`. The JS thread stays free to pump libuv during
+// `await`, so TSFN-backed JS callbacks (in [`crate::operator_bindings`])
+// can be delivered without deadlock — same end-to-end discipline as
+// the pre-S6 `spawn_blocking`-based shape, just with thread affinity
+// guaranteed.
 // ---------------------------------------------------------------------------
 
 #[napi]
 pub struct BenchCore {
-    /// Subscriptions retained for activation lifetimes. `None` slots
-    /// represent unsubscribed entries (we don't compact to keep indices
-    /// stable). Drop happens on whatever tokio thread last touches the
-    /// slot; safe because `parking_lot` is non-poisoning.
+    /// Per-node subscription bookkeeping. Each entry pairs the node id
+    /// with the substrate `SubscriptionId` returned by `Core::subscribe`;
+    /// `None` slots represent unsubscribed entries (we don't compact to
+    /// keep JS-side indices stable).
     ///
-    /// **Arc-wrapped (D077, Phase E)** — `subscribe_with_tsfn` returns
-    /// a `PromiseRaw` whose `spawn_future` closure outlives `&self`;
-    /// Arc lets the closure capture a clone for storing the
-    /// Subscription after the blocking task resolves.
+    /// **D241/D246-r3 reconciled (S6):** the pre-D225 RAII `Subscription`
+    /// type was deleted from the substrate — unsubscribe is now owner-
+    /// invoked via `Core::unsubscribe(node_id, sub_id)`. We store the
+    /// `(NodeId, SubscriptionId)` pair so `BenchCore::unsubscribe` /
+    /// `dispose` / `Drop` can post the explicit unsubscribe call to the
+    /// actor.
     ///
-    /// **Drop-order discipline (Phase E /qa F8 — was m26):** with the
-    /// Arc wrapper, Rust's field-drop order no longer guarantees
-    /// `Subscription::Drop` runs strictly BEFORE `core` — any in-flight
-    /// `subscribe_with_tsfn` future that hasn't been polled to
-    /// completion holds a clone of this Arc, so the Vec can outlive
-    /// `BenchCore::core` if the JS side drops the Promise. This is
-    /// SAFE because `Subscription` holds a `Weak<Mutex<CoreState>>`
-    /// (not a strong `Arc<Core>`) — when the Vec finally drops, each
-    /// `Subscription::Drop` either upgrades the Weak (Core still
-    /// alive) and releases activation, or no-ops (Core gone, state
-    /// already cleaned by the matching binding-side
-    /// `producer_deactivate` cascade). The field declaration stays
-    /// FIRST in struct order so the COMMON case (no in-flight
-    /// futures) drops subscriptions before `core` deterministically.
-    pub(crate) subscriptions: Arc<Mutex<Vec<Option<Subscription>>>>,
+    /// **Arc-wrapped** — `subscribe_with_tsfn` returns a `PromiseRaw`
+    /// whose `spawn_future` closure outlives `&self`; Arc lets the
+    /// closure capture a clone for storing the SubscriptionId after the
+    /// actor closure resolves.
+    pub(crate) subscriptions: Arc<Mutex<Vec<Option<(NodeId, SubscriptionId)>>>>,
     pub(crate) binding: Arc<BenchBinding>,
-    pub(crate) core: Core,
+    /// Single-thread Core owner. The actor's worker thread holds the
+    /// `Core` for the actor's lifetime; this `Arc<CoreActor>` is the
+    /// only handle into it. Cloning the Arc clones the actor handle
+    /// (shared with `BenchOperators` / `BenchGraph` / `BenchStorage*` /
+    /// `BenchReactive*` companion classes that route through the same
+    /// `Core`); the inner worker thread + `Core` are uniquely owned by
+    /// the actor.
+    pub(crate) actor: Arc<CoreActor>,
 }
 
 impl BenchCore {
-    /// Internal accessor — `BenchOperators::from_core` clones the Core
-    /// + binding so the companion class drives the same instance.
-    pub(crate) fn core_clone(&self) -> Core {
-        self.core.clone()
+    /// Share the actor handle with a companion class (`BenchOperators::
+    /// from_core`, `BenchGraph::from_core`, etc.). All companions
+    /// driving the same Core route through this one `Arc<CoreActor>`.
+    pub(crate) fn actor_arc(&self) -> Arc<CoreActor> {
+        Arc::clone(&self.actor)
     }
 
     pub(crate) fn binding_arc(&self) -> Arc<BenchBinding> {
@@ -929,7 +943,7 @@ impl BenchCore {
     }
 
     /// Clone the subscriptions Arc for capture into futures (D077).
-    pub(crate) fn subscriptions_arc(&self) -> Arc<Mutex<Vec<Option<Subscription>>>> {
+    pub(crate) fn subscriptions_arc(&self) -> Arc<Mutex<Vec<Option<(NodeId, SubscriptionId)>>>> {
         Arc::clone(&self.subscriptions)
     }
 }
@@ -937,16 +951,23 @@ impl BenchCore {
 #[napi]
 impl BenchCore {
     /// Construct a fresh `BenchCore` wired to a Rust-side value registry.
+    ///
+    /// **S6/D255:** the actor's worker thread spawns inside
+    /// `CoreActor::spawn(binding)` and constructs the `Core` on the
+    /// worker (Core is `!Send`, so it must be born on the thread that
+    /// owns it). This constructor returns immediately; the worker is
+    /// ready to receive closures by the time any subsequent napi
+    /// method's first `actor.run(...)` resolves.
     #[napi(constructor)]
     #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         let binding = BenchBinding::new();
-        let core = Core::new(binding.clone() as Arc<dyn BindingBoundary>);
+        let actor = CoreActor::spawn(binding.clone() as Arc<dyn BindingBoundary>);
         Self {
             subscriptions: Arc::new(Mutex::new(Vec::new())),
             binding,
-            core,
+            actor,
         }
     }
 
@@ -1010,15 +1031,15 @@ impl BenchCore {
     /// consumed by the state node's initial cache slot.
     #[napi]
     pub async fn register_state_with_handle(&self, initial_handle: u32) -> Result<u32> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> Result<u32> {
-            let h = HandleId::new(u64::from(initial_handle));
-            let id = core
-                .register_state(h, false)
-                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let h = HandleId::new(u64::from(initial_handle));
+                let id = core
+                    .register_state(h, false)
+                    .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
     }
 
     /// Emit a JS-allocated handle on a node. JS adapter must have
@@ -1027,14 +1048,14 @@ impl BenchCore {
     /// handle into the cache slot).
     #[napi]
     pub async fn emit_handle(&self, node_id: u32, handle: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.emit(
-                NodeId::new(u64::from(node_id)),
-                HandleId::new(u64::from(handle)),
-            );
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.emit(
+                    NodeId::new(u64::from(node_id)),
+                    HandleId::new(u64::from(handle)),
+                );
+            })
+            .await
     }
 
     /// Read a node's current cache as a HandleId. Returns 0
@@ -1042,11 +1063,10 @@ impl BenchCore {
     /// in its mirror map.
     #[napi]
     pub async fn cache_handle(&self, node_id: u32) -> Result<u32> {
-        let core = self.core.clone();
-        let h = run_blocking(core.clone(), move || {
-            core.cache_of(NodeId::new(u64::from(node_id)))
-        })
-        .await?;
+        let h = self
+            .actor
+            .run(move |core| core.cache_of(NodeId::new(u64::from(node_id))))
+            .await?;
         u32::try_from(h.raw()).map_err(|_| NapiError::from_reason("handle exceeds u32"))
     }
 
@@ -1058,86 +1078,108 @@ impl BenchCore {
     #[napi]
     pub async fn register_state_int(&self, initial: i32) -> Result<u32> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> Result<u32> {
-            let handle = binding.registry.lock().intern(BenchValue::Int(initial));
-            let id = core
-                .register_state(handle, false)
-                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let handle = binding.registry.lock().intern(BenchValue::Int(initial));
+                let id = core
+                    .register_state(handle, false)
+                    .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
     }
 
     /// Register a state node with sentinel cache (no initial value).
     #[napi]
     pub async fn register_state_sentinel(&self) -> Result<u32> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> Result<u32> {
-            let id = core
-                .register_state(graphrefly_core::NO_HANDLE, false)
-                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let id = core
+                    .register_state(graphrefly_core::NO_HANDLE, false)
+                    .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
     }
 
     /// Register a derived node with a built-in fn shape.
     #[napi]
     pub async fn register_derived(&self, dep_ids: Vec<u32>, builtin: BuiltinFn) -> Result<u32> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> Result<u32> {
-            let fn_impl: Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync> =
-                match builtin {
-                    BuiltinFn::Identity => Arc::new(|deps: &[BenchValue]| deps.first().cloned()),
-                    BuiltinFn::AddOne => Arc::new(|deps: &[BenchValue]| match deps.first() {
-                        Some(BenchValue::Int(n)) => Some(BenchValue::Int(n + 1)),
-                        _ => None,
-                    }),
-                };
-            let mut reg = binding.registry.lock();
-            let fn_id = FnId::new(reg.next_fn_id);
-            reg.next_fn_id += 1;
-            reg.fns.insert(fn_id, fn_impl);
-            drop(reg);
-            let deps: Vec<NodeId> = dep_ids
-                .into_iter()
-                .map(|id| NodeId::new(u64::from(id)))
-                .collect();
-            let id = core
-                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let fn_impl: Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync> =
+                    match builtin {
+                        BuiltinFn::Identity => {
+                            Arc::new(|deps: &[BenchValue]| deps.first().cloned())
+                        }
+                        BuiltinFn::AddOne => Arc::new(|deps: &[BenchValue]| match deps.first() {
+                            Some(BenchValue::Int(n)) => Some(BenchValue::Int(n + 1)),
+                            _ => None,
+                        }),
+                    };
+                let mut reg = binding.registry.lock();
+                let fn_id = FnId::new(reg.next_fn_id);
+                reg.next_fn_id += 1;
+                reg.fns.insert(fn_id, fn_impl);
+                drop(reg);
+                let deps: Vec<NodeId> = dep_ids
+                    .into_iter()
+                    .map(|id| NodeId::new(u64::from(id)))
+                    .collect();
+                let id = core
+                    .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+                    .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
     }
 
     /// Subscribe a noop sink. Activation may fire fns (including
     /// JS-callback operators), so this MUST be async.
+    ///
+    /// **S6 / D241+D255 reconciled:** Core::subscribe now returns a
+    /// `SubscriptionId` (D241) — the substrate-level RAII `Subscription`
+    /// type was deleted in D225. We post the subscribe through the
+    /// actor and record the `(NodeId, SubscriptionId)` pair so the
+    /// matching unsubscribe in `BenchCore::unsubscribe` / `dispose` /
+    /// `Drop` can call `Core::unsubscribe(node_id, sub_id)` explicitly.
+    ///
+    /// **D248 sink-shape note:** `graphrefly_core::Sink =
+    /// Arc<dyn Fn(&[Message])>` (without `Send + Sync`) — owner-thread-
+    /// only. We build the sink *inside* the actor closure, on the
+    /// worker thread, so the `!Send` Sink never has to cross the
+    /// actor channel.
     #[napi]
     pub async fn subscribe_noop(&self, node_id: u32) -> Result<u32> {
-        let core = self.core.clone();
-        // Subscriptions live on `BenchCore`'s `subscriptions` Mutex; we
-        // can't move that ref into spawn_blocking (it's tied to &self).
-        // Instead, build the Subscription inside the closure, ship it
-        // back, and store on the JS-thread side after the spawn_blocking
-        // returns. Subscription is `Send` so this is fine.
-        //
-        // M9 fix: noop sink is a static `OnceLock<Sink>` shared across
-        // all subscribe_noop calls — was per-call `Arc::new(|_| {})`.
-        let sub = run_blocking(core.clone(), move || -> Subscription {
-            core.subscribe(NodeId::new(u64::from(node_id)), noop_sink())
-        })
-        .await?;
+        let nid = NodeId::new(u64::from(node_id));
+        let sub_id = self
+            .actor
+            .run(move |core| {
+                // M9 fix: noop sink is a static `OnceLock<Sink>` shared
+                // across all subscribe_noop calls — was per-call
+                // `Arc::new(|_| {})`. Built on the worker (D248 — Sink
+                // is `!Send`).
+                core.subscribe(nid, noop_sink())
+            })
+            .await?;
         let mut subs = self.subscriptions.lock();
-        // Phase E /qa F7 (2026-05-08): validate idx BEFORE push so
-        // overflow drops `sub` (auto-unsubscribes via Drop) instead of
-        // leaking a Subscription into a slot that no JS caller can
-        // address.
-        let idx_u32 = u32::try_from(subs.len())
-            .map_err(|_| NapiError::from_reason("subscription index exceeds u32"))?;
-        subs.push(Some(sub));
+        // Phase E /qa F7 (2026-05-08): validate idx BEFORE push so an
+        // overflow path doesn't strand a recorded SubscriptionId in a
+        // slot no JS caller can address. If validate fails we
+        // explicitly unsubscribe before returning the error.
+        let idx = subs.len();
+        let idx_u32 = match u32::try_from(idx) {
+            Ok(n) => n,
+            Err(_) => {
+                drop(subs);
+                let _ = self
+                    .actor
+                    .dispatch_detached(move |core| core.unsubscribe(nid, sub_id));
+                return Err(NapiError::from_reason("subscription index exceeds u32"));
+            }
+        };
+        subs.push(Some((nid, sub_id)));
         Ok(idx_u32)
     }
 
@@ -1149,12 +1191,18 @@ impl BenchCore {
     ///
     /// **Sync-bridge semantics:** the returned Promise resolves AFTER
     /// the subscribe-time handshake fires AND the JS sink callback
-    /// completes (per `bridge_sync_unit` blocking the tokio thread on
+    /// completes (per `bridge_sync_unit` blocking the actor worker on
     /// a sync_channel until JS responds via libuv pump). JS code
     /// MUST `await` this method — synchronous calling deadlocks.
     ///
     /// `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
     /// async work runs inside `env.spawn_future(async move { ... })`.
+    ///
+    /// **D248 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into the
+    /// actor closure IS `Send + Sync` (`ThreadsafeFunction` is
+    /// Send+Sync by napi-rs design); the `Sink = Arc<dyn Fn(&[Message])>`
+    /// that wraps it is `!Send`, so we build it on the worker thread
+    /// inside the actor closure.
     #[napi]
     pub fn subscribe_with_tsfn<'env>(
         &self,
@@ -1163,20 +1211,32 @@ impl BenchCore {
         sink_callback: Function<'_, Vec<u32>, ()>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_sink_tsfn(sink_callback)?;
-        let sink = build_tsfn_sink(tsfn);
-        let core = self.core.clone();
+        let actor = self.actor_arc();
         let subs = self.subscriptions_arc();
         env.spawn_future(async move {
-            let core_for_blocking = core.clone();
-            let sub = run_blocking(core, move || -> Subscription {
-                core_for_blocking.subscribe(NodeId::new(u64::from(node_id)), sink)
-            })
-            .await?;
+            let nid = NodeId::new(u64::from(node_id));
+            let sub_id = actor
+                .run(move |core| {
+                    // Build the Sink on the worker thread — `Sink` is
+                    // `Arc<dyn Fn(&[Message])>` (`!Send + !Sync` per
+                    // D248). `tsfn` (Arc<SinkTsfn>) IS `Send + Sync`
+                    // so it crossed the channel fine.
+                    let sink = build_tsfn_sink(tsfn);
+                    core.subscribe(nid, sink)
+                })
+                .await?;
             let mut s = subs.lock();
             // Phase E /qa F7: validate-before-push (see subscribe_noop).
-            let idx_u32 = u32::try_from(s.len())
-                .map_err(|_| NapiError::from_reason("subscription index exceeds u32"))?;
-            s.push(Some(sub));
+            let idx = s.len();
+            let idx_u32 = match u32::try_from(idx) {
+                Ok(n) => n,
+                Err(_) => {
+                    drop(s);
+                    let _ = actor.dispatch_detached(move |core| core.unsubscribe(nid, sub_id));
+                    return Err(NapiError::from_reason("subscription index exceeds u32"));
+                }
+            };
+            s.push(Some((nid, sub_id)));
             Ok(idx_u32)
         })
     }
@@ -1198,53 +1258,57 @@ impl BenchCore {
     }
 
     /// Drop the subscription at `idx` (releases activation refcount).
-    /// Async because Subscription's Drop locks Core's mutex; running
-    /// on a tokio blocking thread keeps the JS thread free during any
-    /// terminal-cascade work the unsubscribe triggers.
+    /// Posts the unsubscribe through the actor so the JS thread stays
+    /// free to pump libuv if the unsubscribe triggers terminal-cascade
+    /// work that fires TSFN-backed sinks.
+    ///
+    /// **S6 / D241+D255 reconciled:** explicit `Core::unsubscribe(node,
+    /// sub_id)` replaces the deleted `impl Drop for Subscription`
+    /// (D225).
     #[napi]
     pub async fn unsubscribe(&self, idx: u32) -> Result<()> {
-        // Take the Subscription out of the slot on the calling thread,
-        // ship it into spawn_blocking for drop. This way the actual
-        // Drop happens on a tokio blocking thread (which is allowed to
-        // block on Core's mutex).
-        let sub = {
+        let entry = {
             let mut subs = self.subscriptions.lock();
             subs.get_mut(idx as usize).and_then(Option::take)
         };
-        if let Some(sub) = sub {
-            let core = self.core.clone();
-            run_blocking(core, move || drop(sub)).await?;
+        if let Some((nid, sub_id)) = entry {
+            self.actor
+                .run(move |core| core.unsubscribe(nid, sub_id))
+                .await?;
         }
         Ok(())
     }
 
-    /// Drain all retained subscriptions on a tokio blocking thread —
-    /// JS code MUST `await core.dispose()` before letting `BenchCore`
-    /// drop. Closes the BenchCore::Drop deadlock vector (Slice Y):
-    /// without `dispose`, GC of the napi instance runs `Drop` on the
-    /// JS thread; each `Subscription::Drop` blocks on `Core`'s mutex;
-    /// if a tokio blocking-pool thread is mid-wave (parked in a TSFN
-    /// bridge waiting for libuv to pump a JS-callback result), the JS
-    /// thread waiting for the mutex stalls libuv → TSFN never
-    /// delivers → tokio thread blocks forever. Calling `dispose` first
-    /// ships the subscription drop work onto a tokio blocking thread
-    /// (which is allowed to block on the mutex while the JS thread
-    /// stays free to pump libuv).
+    /// Drain all retained subscriptions through the actor — JS code
+    /// MUST `await core.dispose()` before letting `BenchCore` drop.
+    /// Closes the BenchCore::Drop deadlock vector (Slice Y): without
+    /// `dispose`, GC of the napi instance runs `Drop` on the JS thread;
+    /// each unsubscribe would post to the actor and *not* be able to
+    /// `.await` (Drop is sync). The actor's worker thread would still
+    /// run the work fire-and-forget, but the JS thread would have
+    /// already moved on without ensuring terminal-cascade TSFNs
+    /// flushed. Calling `dispose` first guarantees the JS thread waits
+    /// for the cascade to settle.
     ///
     /// Idempotent: subsequent calls are no-ops once the vec is drained.
     #[napi]
     pub async fn dispose(&self) -> Result<()> {
         // Take the entire Vec out on the calling thread (cheap — Vec
-        // pointer swap). Ship into spawn_blocking for drop so each
-        // Subscription's Drop runs on a tokio thread that can block
-        // on Core's mutex without stalling libuv.
-        let subs: Vec<Option<Subscription>> = {
+        // pointer swap). Post the entire drain as one actor closure so
+        // we don't pay one round-trip per subscription.
+        let subs: Vec<Option<(NodeId, SubscriptionId)>> = {
             let mut guard = self.subscriptions.lock();
             std::mem::take(&mut *guard)
         };
         if !subs.is_empty() {
-            let core = self.core.clone();
-            run_blocking(core, move || drop(subs)).await?;
+            self.actor
+                .run(move |core| {
+                    for entry in subs.into_iter().flatten() {
+                        let (nid, sub_id) = entry;
+                        core.unsubscribe(nid, sub_id);
+                    }
+                })
+                .await?;
         }
         Ok(())
     }
@@ -1253,50 +1317,50 @@ impl BenchCore {
     #[napi]
     pub async fn emit_int(&self, node_id: u32, value: i32) -> Result<()> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let handle = binding.registry.lock().intern(BenchValue::Int(value));
-            core.emit(NodeId::new(u64::from(node_id)), handle);
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                let handle = binding.registry.lock().intern(BenchValue::Int(value));
+                core.emit(NodeId::new(u64::from(node_id)), handle);
+            })
+            .await
     }
 
     /// Read a state node's current cache as i32.
     #[napi]
     pub async fn cache_int(&self, node_id: u32) -> Result<i32> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> i32 {
-            let h = core.cache_of(NodeId::new(u64::from(node_id)));
-            if h == graphrefly_core::NO_HANDLE {
-                return -1;
-            }
-            let reg = binding.registry.lock();
-            match reg.deref(h) {
-                Some(BenchValue::Int(n)) => n,
-                _ => -1,
-            }
-        })
-        .await
+        self.actor
+            .run(move |core| -> i32 {
+                let h = core.cache_of(NodeId::new(u64::from(node_id)));
+                if h == graphrefly_core::NO_HANDLE {
+                    return -1;
+                }
+                let reg = binding.registry.lock();
+                match reg.deref(h) {
+                    Some(BenchValue::Int(n)) => n,
+                    _ => -1,
+                }
+            })
+            .await
     }
 
     /// Tight loop: emit `n` times on a state node, no JS call between.
     #[napi]
     pub async fn rust_emit_loop(&self, node_id: u32, n: u32) -> Result<()> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let nid = NodeId::new(u64::from(node_id));
-            let mut reg = binding.registry.lock();
-            let handles: Vec<HandleId> = (0..n)
-                .map(|i| reg.intern(BenchValue::Int(i as i32)))
-                .collect();
-            drop(reg);
-            for h in handles {
-                core.emit(nid, h);
-            }
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                let nid = NodeId::new(u64::from(node_id));
+                let mut reg = binding.registry.lock();
+                let handles: Vec<HandleId> = (0..n)
+                    .map(|i| reg.intern(BenchValue::Int(i as i32)))
+                    .collect();
+                drop(reg);
+                for h in handles {
+                    core.emit(nid, h);
+                }
+            })
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -1305,8 +1369,10 @@ impl BenchCore {
 
     #[napi]
     pub async fn alloc_lock_id(&self) -> Result<u32> {
-        let core = self.core.clone();
-        let raw = run_blocking(core.clone(), move || core.alloc_lock_id().raw()).await?;
+        let raw = self
+            .actor
+            .run(move |core| core.alloc_lock_id().raw())
+            .await?;
         u32::try_from(raw).map_err(|_| {
             NapiError::from_reason(
                 "alloc_lock_id exceeded u32 range — restart BenchCore or migrate to BigInt",
@@ -1316,36 +1382,37 @@ impl BenchCore {
 
     #[napi]
     pub async fn set_pause_buffer_cap(&self, cap: Option<u32>) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.set_pause_buffer_cap(cap.map(|c| c as usize));
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.set_pause_buffer_cap(cap.map(|c| c as usize));
+            })
+            .await
     }
 
     #[napi]
     pub async fn pause(&self, node_id: u32, lock_id: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.pause(
-                NodeId::new(u64::from(node_id)),
-                LockId::new(u64::from(lock_id)),
-            )
-        })
-        .await?
-        .map_err(|e| NapiError::from_reason(format!("{e}")))
+        self.actor
+            .run(move |core| {
+                core.pause(
+                    NodeId::new(u64::from(node_id)),
+                    LockId::new(u64::from(lock_id)),
+                )
+            })
+            .await?
+            .map_err(|e| NapiError::from_reason(format!("{e}")))
     }
 
     #[napi]
     pub async fn resume(&self, node_id: u32, lock_id: u32) -> Result<Option<ResumeReportJs>> {
-        let core = self.core.clone();
-        let result = run_blocking(core.clone(), move || {
-            core.resume(
-                NodeId::new(u64::from(node_id)),
-                LockId::new(u64::from(lock_id)),
-            )
-        })
-        .await?;
+        let result = self
+            .actor
+            .run(move |core| {
+                core.resume(
+                    NodeId::new(u64::from(node_id)),
+                    LockId::new(u64::from(lock_id)),
+                )
+            })
+            .await?;
         result
             .map(|opt| {
                 opt.map(|r| ResumeReportJs {
@@ -1358,53 +1425,50 @@ impl BenchCore {
 
     #[napi]
     pub async fn is_paused(&self, node_id: u32) -> Result<bool> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.is_paused(NodeId::new(u64::from(node_id)))
-        })
-        .await
+        self.actor
+            .run(move |core| core.is_paused(NodeId::new(u64::from(node_id))))
+            .await
     }
 
     /// Number of pause locks currently held. Returns Err on overflow
     /// instead of saturating silently (M8 fix — matches `alloc_lock_id`).
     #[napi]
     pub async fn pause_lock_count(&self, node_id: u32) -> Result<u32> {
-        let core = self.core.clone();
-        let count = run_blocking(core.clone(), move || {
-            core.pause_lock_count(NodeId::new(u64::from(node_id)))
-        })
-        .await?;
+        let count = self
+            .actor
+            .run(move |core| core.pause_lock_count(NodeId::new(u64::from(node_id))))
+            .await?;
         u32::try_from(count).map_err(|_| NapiError::from_reason("pause_lock_count exceeds u32"))
     }
 
     #[napi]
     pub async fn holds_pause_lock(&self, node_id: u32, lock_id: u32) -> Result<bool> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.holds_pause_lock(
-                NodeId::new(u64::from(node_id)),
-                LockId::new(u64::from(lock_id)),
-            )
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.holds_pause_lock(
+                    NodeId::new(u64::from(node_id)),
+                    LockId::new(u64::from(lock_id)),
+                )
+            })
+            .await
     }
 
     #[napi]
     pub async fn invalidate(&self, node_id: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.invalidate(NodeId::new(u64::from(node_id)));
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.invalidate(NodeId::new(u64::from(node_id)));
+            })
+            .await
     }
 
     #[napi]
     pub async fn complete(&self, node_id: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.complete(NodeId::new(u64::from(node_id)));
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.complete(NodeId::new(u64::from(node_id)));
+            })
+            .await
     }
 
     /// Emit ERROR with a JS-allocated handle (D076 parity — non-i32 error
@@ -1413,100 +1477,99 @@ impl BenchCore {
     /// Core's error path.
     #[napi]
     pub async fn error_handle(&self, node_id: u32, handle: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.error(
-                NodeId::new(u64::from(node_id)),
-                HandleId::new(u64::from(handle)),
-            );
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.error(
+                    NodeId::new(u64::from(node_id)),
+                    HandleId::new(u64::from(handle)),
+                );
+            })
+            .await
     }
 
     #[napi]
     pub async fn error_int(&self, node_id: u32, err_code: i32) -> Result<()> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let h = binding.registry.lock().intern(BenchValue::Int(err_code));
-            core.error(NodeId::new(u64::from(node_id)), h);
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                let h = binding.registry.lock().intern(BenchValue::Int(err_code));
+                core.error(NodeId::new(u64::from(node_id)), h);
+            })
+            .await
     }
 
     #[napi]
     pub async fn teardown(&self, node_id: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.teardown(NodeId::new(u64::from(node_id)));
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.teardown(NodeId::new(u64::from(node_id)));
+            })
+            .await
     }
 
     #[napi]
     pub async fn add_meta_companion(&self, parent: u32, companion: u32) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.add_meta_companion(
-                NodeId::new(u64::from(parent)),
-                NodeId::new(u64::from(companion)),
-            );
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.add_meta_companion(
+                    NodeId::new(u64::from(parent)),
+                    NodeId::new(u64::from(companion)),
+                );
+            })
+            .await
     }
 
     #[napi]
     pub async fn set_resubscribable(&self, node_id: u32, resubscribable: bool) -> Result<()> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.set_resubscribable(NodeId::new(u64::from(node_id)), resubscribable);
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                core.set_resubscribable(NodeId::new(u64::from(node_id)), resubscribable);
+            })
+            .await
     }
 
     #[napi]
     pub async fn batch_emit_ints(&self, node_id: u32, values: Vec<i32>) -> Result<()> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let nid = NodeId::new(u64::from(node_id));
-            let handles: Vec<HandleId> = {
-                let mut reg = binding.registry.lock();
-                values
-                    .into_iter()
-                    .map(|v| reg.intern(BenchValue::Int(v)))
-                    .collect()
-            };
-            let _guard = core.begin_batch();
-            for h in handles {
-                core.emit(nid, h);
-            }
-        })
-        .await
+        self.actor
+            .run(move |core| {
+                let nid = NodeId::new(u64::from(node_id));
+                let handles: Vec<HandleId> = {
+                    let mut reg = binding.registry.lock();
+                    values
+                        .into_iter()
+                        .map(|v| reg.intern(BenchValue::Int(v)))
+                        .collect()
+                };
+                let _guard = core.begin_batch();
+                for h in handles {
+                    core.emit(nid, h);
+                }
+            })
+            .await
     }
 
     #[napi]
     pub async fn set_deps(&self, node_id: u32, new_dep_ids: Vec<u32>) -> Result<()> {
-        let core = self.core.clone();
-        let result = run_blocking(core.clone(), move || {
-            let n = NodeId::new(u64::from(node_id));
-            let new_deps: Vec<NodeId> = new_dep_ids
-                .into_iter()
-                .map(|id| NodeId::new(u64::from(id)))
-                .collect();
-            core.set_deps(n, &new_deps)
-        })
-        .await?;
+        let result = self
+            .actor
+            .run(move |core| {
+                let n = NodeId::new(u64::from(node_id));
+                let new_deps: Vec<NodeId> = new_dep_ids
+                    .into_iter()
+                    .map(|id| NodeId::new(u64::from(id)))
+                    .collect();
+                core.set_deps(n, &new_deps)
+            })
+            .await?;
         result.map_err(|e| NapiError::from_reason(format!("{e}")))
     }
 
     #[napi]
     pub async fn has_fired_once(&self, node_id: u32) -> Result<bool> {
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            core.has_fired_once(NodeId::new(u64::from(node_id)))
-        })
-        .await
+        self.actor
+            .run(move |core| core.has_fired_once(NodeId::new(u64::from(node_id))))
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -1522,9 +1585,9 @@ impl BenchCore {
         builtin: BuiltinBatchFn,
     ) -> Result<u32> {
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || -> Result<u32> {
-            let fn_impl: BatchFnImpl = match builtin {
+        self.actor
+            .run(move |core| -> Result<u32> {
+                let fn_impl: BatchFnImpl = match builtin {
                 BuiltinBatchFn::MapAddOneBatch => Arc::new(|deps: &[DepBatch], reg: &Registry| {
                     let mut emissions = Vec::new();
                     if let Some(d) = deps.first() {
@@ -1566,21 +1629,21 @@ impl BenchCore {
                     })
                 }
             };
-            let mut reg = binding.registry.lock();
-            let fn_id = FnId::new(reg.next_fn_id);
-            reg.next_fn_id += 1;
-            reg.batch_fns.insert(fn_id, fn_impl);
-            drop(reg);
-            let deps: Vec<NodeId> = dep_ids
-                .into_iter()
-                .map(|id| NodeId::new(u64::from(id)))
-                .collect();
-            let id = core
-                .register_derived(&deps, fn_id, EqualsMode::Identity, false)
-                .map_err(|e| NapiError::from_reason(format!("{e}")))?;
-            u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
-        })
-        .await?
+                let mut reg = binding.registry.lock();
+                let fn_id = FnId::new(reg.next_fn_id);
+                reg.next_fn_id += 1;
+                reg.batch_fns.insert(fn_id, fn_impl);
+                drop(reg);
+                let deps: Vec<NodeId> = dep_ids
+                    .into_iter()
+                    .map(|id| NodeId::new(u64::from(id)))
+                    .collect();
+                let id = core
+                    .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+                    .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                u32::try_from(id.raw()).map_err(|_| NapiError::from_reason("node id exceeds u32"))
+            })
+            .await?
     }
 
     /// Batch-dispatch a handle-encoded message sequence atomically (Phase E
@@ -1631,38 +1694,38 @@ impl BenchCore {
             }
         }
 
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let nid = NodeId::new(u64::from(node_id));
-            core.batch(|| {
-                for chunk in encoded.chunks_exact(2) {
-                    let code = chunk[0];
-                    let payload = chunk[1];
-                    match code {
-                        MSG_CODE_DIRTY => { /* Core auto-emits; no-op */ }
-                        MSG_CODE_DATA => {
-                            core.emit(nid, HandleId::new(u64::from(payload)));
+        self.actor
+            .run(move |core| {
+                let nid = NodeId::new(u64::from(node_id));
+                core.batch(|| {
+                    for chunk in encoded.chunks_exact(2) {
+                        let code = chunk[0];
+                        let payload = chunk[1];
+                        match code {
+                            MSG_CODE_DIRTY => { /* Core auto-emits; no-op */ }
+                            MSG_CODE_DATA => {
+                                core.emit(nid, HandleId::new(u64::from(payload)));
+                            }
+                            MSG_CODE_INVALIDATE => core.invalidate(nid),
+                            MSG_CODE_PAUSE => {
+                                // Ignore PauseError — matches `RustNode.pause` shape;
+                                // explicit pause errors surface via direct napi calls.
+                                let _ = core.pause(nid, LockId::new(u64::from(payload)));
+                            }
+                            MSG_CODE_RESUME => {
+                                let _ = core.resume(nid, LockId::new(u64::from(payload)));
+                            }
+                            MSG_CODE_COMPLETE => core.complete(nid),
+                            MSG_CODE_ERROR => {
+                                core.error(nid, HandleId::new(u64::from(payload)));
+                            }
+                            MSG_CODE_TEARDOWN => core.teardown(nid),
+                            _ => unreachable!("validated up-front"),
                         }
-                        MSG_CODE_INVALIDATE => core.invalidate(nid),
-                        MSG_CODE_PAUSE => {
-                            // Ignore PauseError — matches `RustNode.pause` shape;
-                            // explicit pause errors surface via direct napi calls.
-                            let _ = core.pause(nid, LockId::new(u64::from(payload)));
-                        }
-                        MSG_CODE_RESUME => {
-                            let _ = core.resume(nid, LockId::new(u64::from(payload)));
-                        }
-                        MSG_CODE_COMPLETE => core.complete(nid),
-                        MSG_CODE_ERROR => {
-                            core.error(nid, HandleId::new(u64::from(payload)));
-                        }
-                        MSG_CODE_TEARDOWN => core.teardown(nid),
-                        _ => unreachable!("validated up-front"),
                     }
-                }
-            });
-        })
-        .await
+                });
+            })
+            .await
     }
 
     #[napi]
@@ -1692,29 +1755,29 @@ impl BenchCore {
         }
 
         let binding = Arc::clone(&self.binding);
-        let core = self.core.clone();
-        run_blocking(core.clone(), move || {
-            let nid = NodeId::new(u64::from(node_id));
-            core.batch(|| {
-                for m in msgs {
-                    match m.kind.as_str() {
-                        "data" => {
-                            let v = m.value.expect("validated up-front");
-                            let h = binding.registry.lock().intern(BenchValue::Int(v));
-                            core.emit(nid, h);
+        self.actor
+            .run(move |core| {
+                let nid = NodeId::new(u64::from(node_id));
+                core.batch(|| {
+                    for m in msgs {
+                        match m.kind.as_str() {
+                            "data" => {
+                                let v = m.value.expect("validated up-front");
+                                let h = binding.registry.lock().intern(BenchValue::Int(v));
+                                core.emit(nid, h);
+                            }
+                            "complete" => core.complete(nid),
+                            "error" => {
+                                let v = m.value.expect("validated up-front");
+                                let h = binding.registry.lock().intern(BenchValue::Int(v));
+                                core.error(nid, h);
+                            }
+                            _ => unreachable!("validated up-front"),
                         }
-                        "complete" => core.complete(nid),
-                        "error" => {
-                            let v = m.value.expect("validated up-front");
-                            let h = binding.registry.lock().intern(BenchValue::Int(v));
-                            core.error(nid, h);
-                        }
-                        _ => unreachable!("validated up-front"),
                     }
-                }
-            });
-        })
-        .await
+                });
+            })
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -1742,49 +1805,58 @@ impl BenchCore {
     /// u64s (the namespace lives at the Graph layer; an unattached
     /// node has no names — the JS wrapper renders them as
     /// `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
+    ///
+    /// **S6/D255 — actor-routed sync:** under the actor model `&Core`
+    /// is owner-thread-only, so the read accessors execute on the
+    /// actor worker thread via [`CoreActor::run_sync`]. The libuv
+    /// thread blocks briefly on the reply (microseconds for the 5
+    /// read accessors). The safe-use contract (read-only, no
+    /// TSFN-active wave interleave) is met by `describe_node`'s
+    /// inspection-only usage — see `CoreActor::run_sync` docs.
     #[napi]
-    #[must_use]
-    pub fn describe_node(&self, node_id: u32) -> String {
+    pub fn describe_node(&self, node_id: u32) -> Result<String> {
         let nid = NodeId::new(u64::from(node_id));
-        let kind = self.core.kind_of(nid);
-        let Some(kind) = kind else {
-            // Unknown node — absence over panic (mirrors the Core
-            // read-side "Option/empty for unknown ids" discipline).
-            return "null".to_string();
-        };
-        let type_str = match kind {
-            graphrefly_core::NodeKind::State => "state",
-            graphrefly_core::NodeKind::Producer => "producer",
-            graphrefly_core::NodeKind::Derived => "derived",
-            graphrefly_core::NodeKind::Dynamic => "dynamic",
-            graphrefly_core::NodeKind::Operator(_) => "operator",
-        };
-        let status = match self.core.is_terminal(nid) {
-            Some(graphrefly_core::TerminalKind::Complete) => "complete",
-            Some(graphrefly_core::TerminalKind::Error(_)) => "error",
-            None => {
-                if self.core.has_fired_once(nid) {
-                    "active"
-                } else {
-                    "sentinel"
+        self.actor.run_sync(move |core| -> String {
+            let kind = core.kind_of(nid);
+            let Some(kind) = kind else {
+                // Unknown node — absence over panic (mirrors the Core
+                // read-side "Option/empty for unknown ids" discipline).
+                return "null".to_string();
+            };
+            let type_str = match kind {
+                graphrefly_core::NodeKind::State => "state",
+                graphrefly_core::NodeKind::Producer => "producer",
+                graphrefly_core::NodeKind::Derived => "derived",
+                graphrefly_core::NodeKind::Dynamic => "dynamic",
+                graphrefly_core::NodeKind::Operator(_) => "operator",
+            };
+            let status = match core.is_terminal(nid) {
+                Some(graphrefly_core::TerminalKind::Complete) => "complete",
+                Some(graphrefly_core::TerminalKind::Error(_)) => "error",
+                None => {
+                    if core.has_fired_once(nid) {
+                        "active"
+                    } else {
+                        "sentinel"
+                    }
                 }
-            }
-        };
-        let deps: Vec<u64> = self.core.deps_of(nid).iter().map(|d| d.raw()).collect();
-        let cache = self.core.cache_of(nid);
-        let cache_raw = if cache == graphrefly_core::NO_HANDLE {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::from(cache.raw())
-        };
-        let projection = serde_json::json!({
-            "type": type_str,
-            "status": status,
-            "deps": deps,
-            "valueHandle": cache_raw,
-            "sentinel": cache == graphrefly_core::NO_HANDLE,
-        });
-        projection.to_string()
+            };
+            let deps: Vec<u64> = core.deps_of(nid).iter().map(|d| d.raw()).collect();
+            let cache = core.cache_of(nid);
+            let cache_raw = if cache == graphrefly_core::NO_HANDLE {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::from(cache.raw())
+            };
+            let projection = serde_json::json!({
+                "type": type_str,
+                "status": status,
+                "deps": deps,
+                "valueHandle": cache_raw,
+                "sentinel": cache == graphrefly_core::NO_HANDLE,
+            });
+            projection.to_string()
+        })
     }
 
     /// Hex SHA-256 (N1 `sha256Hex`).
@@ -1794,16 +1866,19 @@ impl BenchCore {
     /// SHA-256, and Core forbids a tokio runtime (CLAUDE.md invariant 4
     /// / D070 / D077). Async-everywhere is a *binding-contract* shape
     /// (`Impl.sha256Hex` is `Promise<string>`), so the async wrapping
-    /// lives only here at the napi boundary. We still route through
-    /// `run_blocking` so the (cheap) hash never runs on the libuv
-    /// thread, consistent with every other async napi method.
+    /// lives only here at the napi boundary. **Hashing is Core-free**
+    /// — it does NOT touch the actor / `Core` / WORKER_EXTRAS. We
+    /// route through `napi::bindgen_prelude::spawn_blocking` (the
+    /// generic tokio blocking pool, NOT the actor's pinned worker)
+    /// just to keep the (potentially large) input hashing off the
+    /// libuv thread. (QA fix 2026-05-20 m4: doc previously claimed
+    /// "we route through the actor" — false; corrected to match the
+    /// actual `spawn_blocking` body.)
     #[napi]
     pub async fn sha256_hex(&self, input: Uint8Array) -> Result<String> {
-        let core = self.core.clone();
-        run_blocking(core, move || -> String {
-            graphrefly_core::sha256_hex(input.as_ref())
-        })
-        .await
+        spawn_blocking(move || -> String { graphrefly_core::sha256_hex(input.as_ref()) })
+            .await
+            .map_err(|e| NapiError::from_reason(format!("sha256_hex worker panicked: {e}")))
     }
 }
 

@@ -27,6 +27,15 @@ graphrefly-structures = { workspace = true, optional = true }
 # `operators` feature is on.
 parking_lot           = { workspace = true, optional = true }
 
+# Used by `CoreActor` (S6/D255) — the α/γ-converged actor that owns
+# `Core` on a dedicated worker thread. `crossbeam-channel::unbounded`
+# is the FIFO inbox into which every napi method posts a
+# `FnOnce(&Core) + Send + 'static` closure; the dedicated worker thread
+# loops on `recv()` and runs closures with the locally-owned `Core`.
+# Replies use `std::sync::mpsc::sync_channel(1)` (already in std; no
+# extra dep) — same shape as `operator_bindings::bridge_sync`.
+crossbeam-channel     = { workspace = true, optional = true }
+
 # Used to construct `FnResult::Batch` emissions for the batch-fn binding
 # surface. SmallVec inline-2 mirrors the Core's `FnResult::Batch.emissions`
 # shape so building a batch doesn't heap-alloc on the common case.
@@ -84,7 +93,7 @@ default  = ["tracing"]
 # BindingBoundary::serialize_handle/deserialize_value (diff-engine
 # value identity), which is compiled in every profile — so the base
 # `tracing` feature must pull it, not just storage/graph-codec.
-tracing  = ["dep:graphrefly-core", "dep:ahash", "dep:parking_lot", "dep:serde_json"]
+tracing  = ["dep:graphrefly-core", "dep:ahash", "dep:parking_lot", "dep:serde_json", "dep:crossbeam-channel"]
 
 # `standard` = typical agent harness use; @graphrefly/standard.
 standard = ["tracing", "graph-codec", "operators"]
