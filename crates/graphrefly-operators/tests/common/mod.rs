@@ -732,26 +732,27 @@ impl OpRuntime {
         self.op_binding.register_packer(packer)
     }
 
-    /// B sub-slice (2026-05-10): execute `f` inside a `core.batch()`
-    /// scope that pre-acquires every CURRENTLY-EXISTING partition's
-    /// wave_owner. Sources registered BEFORE the helper call are
-    /// pre-held; subscribing to them yields `SubscribeOutcome::Dead`
-    /// SYNCHRONOUSLY when terminal + non-resubscribable (vs the
-    /// `SubscribeOutcome::Deferred` path under Phase H+ STRICT).
+    /// B sub-slice (2026-05-10; S2c/D248 single-owner update):
+    /// execute `f` inside a `core.batch()` scope on the one owner
+    /// thread. Sources registered BEFORE the helper call are visible
+    /// inside the owner's wave; subscribing to them yields
+    /// `SubscribeOutcome::Dead` SYNCHRONOUSLY when terminal +
+    /// non-resubscribable (vs the `SubscribeOutcome::Deferred` path
+    /// under Phase H+ STRICT).
     ///
     /// This unblocks F2 end-to-end Dead-path tests: pre-D-α the
     /// existing test workarounds (using meta-companion partitions)
     /// hit the Phase H+ Deferred path instead of the immediate-Dead
     /// path, so per-op Dead handlers couldn't be exercised end-to-end.
     ///
-    /// Why holding all partitions works: `try_subscribe(source)`
-    /// inside the producer's activation wave acquires `source`'s
-    /// partition lock. Because the outer `batch()` already holds it
-    /// (via the parking_lot::ReentrantMutex), same-thread re-acquire
-    /// is free; the Phase H+ ascending-order check passes because all
-    /// partitions are already held by this thread. The subscribe
-    /// path then sees the source's `resubscribable=false +
-    /// terminal=Some(...)` state and returns
+    /// Why a single owner-side `batch()` works post-D248: the per-
+    /// partition `wave_owner` `ReentrantMutex`es are deleted (one
+    /// owner thread, no cross-thread interleaving wave to serialize).
+    /// `try_subscribe(source)` inside the producer's activation wave
+    /// runs owner-side; the Phase H+ ascending-order check passes
+    /// against the owner's wave; the subscribe path then sees the
+    /// source's `resubscribable=false + terminal=Some(...)` state and
+    /// returns
     /// `SubscribeError::TornDown`, which `ProducerCtx::subscribe_to`
     /// surfaces as `SubscribeOutcome::Dead`.
     ///

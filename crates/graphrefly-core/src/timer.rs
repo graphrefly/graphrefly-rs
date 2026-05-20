@@ -20,9 +20,14 @@
 //!
 //! Operators send [`TimerCmd`] from their sync fn-fire to schedule,
 //! cancel, or cancel-all timers. The task manages deadlines via
-//! `tokio::time` and calls `Core::emit()` when a timer fires, which
-//! enters the wave engine via the normal cross-thread emit path
-//! (partition `wave_owner` serializes).
+//! `tokio::time` and, when a timer fires, posts an `Emit` request to
+//! the cross-thread `Arc<CoreMailbox>` (D223/D227/D230). The owner
+//! drains the mailbox via `Core::drain_mailbox`, applying each emit
+//! via the sync `Core::emit`. Under S2c/D248 single-owner `Core` this
+//! is the only cross-thread bridge into the otherwise `!Send` Core;
+//! the prior partition `wave_owner` serialization machinery is
+//! deleted (one owner thread, no cross-thread interleaving wave to
+//! serialize).
 //!
 //! Timer sources (fromTimer, interval) use the producer substrate +
 //! this module: the producer's build closure spawns a timer task on

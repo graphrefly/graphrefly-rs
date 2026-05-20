@@ -49,6 +49,11 @@ indexmap    = { version = "2.6" }
 thiserror   = { version = "1" }
 tracing     = { version = "0.1" }
 
+# Compile-time invariant assertions — e.g., locking `!Send + !Sync` on
+# owner-thread-only types so a future field change can't silently widen
+# the trait bounds. Build-time-only; zero runtime cost.
+static_assertions = { version = "1.1" }
+
 # Serialization stack — graph + storage + structures
 serde                 = { version = "1",   features = ["derive"] }
 serde_ipld_dagcbor    = { version = "0.6" }

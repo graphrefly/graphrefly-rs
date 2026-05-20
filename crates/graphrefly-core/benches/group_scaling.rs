@@ -1,10 +1,15 @@
-//! Actor-model scaling bench (S4 rebuild — D238/D246).
+//! Actor-model scaling bench (S4 rebuild — D238/D246; D253 (S5)
+//! `SchedulingGroupId`-surface deletion).
 //!
 //! The pre-actor-model `group_scaling` drove N threads on ONE shared
-//! `Core` (cloned across threads) with disjoint `SchedulingGroupId`s,
+//! `Core` (cloned across threads) with disjoint scheduling-group ids,
 //! asking "do disjoint groups run in parallel?". D221/D246 made `Core`
 //! move-only `!Send + !Sync` and S2c deleted the §7 group-lock
-//! machinery, so that premise is structurally gone.
+//! machinery, so that premise is structurally gone. D253 further
+//! deletes the declared-group identity surface; this bench was already
+//! rebuilt to characterise independent-Core scaling regardless of
+//! group identity (the bench fn never declared any group), so D253 is
+//! a no-op for it beyond label honesty.
 //!
 //! Under the actor model, cross-`Core` parallelism is **host-native via
 //! independent per-worker `Core`s**. This bench measures exactly that:
@@ -85,6 +90,11 @@ fn worker() {
 }
 
 fn group_scaling(c: &mut Criterion) {
+    // D253 (S5): label kept as `group_scaling/independent_cores` (the
+    // bench fn never used a group id; "group" in the label is historical
+    // — it characterises *worker* scaling). A rename without a redirect
+    // would break baseline comparison, and the bench's perf premise is
+    // unchanged.
     let mut g = c.benchmark_group("group_scaling/independent_cores");
     for workers in [1usize, 2, 4] {
         g.throughput(criterion::Throughput::Elements(

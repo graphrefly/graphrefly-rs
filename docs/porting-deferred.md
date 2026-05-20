@@ -148,6 +148,16 @@ per fn-fire).
 - **Lift point:** widen the `BindingBoundary` trait's `release_handle` rustdoc to make the leaf-operation requirement a HARD contract (currently it reads more like an implementation hint). Add a `release_handle_lock_held: bool` capability flag if a future binding genuinely needs Core re-entrance during refcount paths. Until then, defer.
 - **Source:** /qa F2 / M1 (2026-05-10 A/B/D/E/F batch review). Pre-existing for Phase 3/5; expanded for Phase 3b + Drop drain via D-α.
 
+### D252 record-and-skip — napi BenchCore cross-Core same-thread panic + pre-claim handle-leak (binding-layer; /qa M5+F3 2026-05-19)
+
+- **What:** D252 (S5) locks "one Core per OS thread" as a hard invariant — `BatchGuard::claim_in_tick` panics fail-loud if it observes a foreign nonzero `Core::generation` in the `IN_TICK_OWNED` slot (`crates/graphrefly-core/src/batch.rs:3458–3493`). Under D248 single-owner Core no in-tree consumer can produce cross-Core nesting (a `DeferFn` driving a *second* `&Core` on the same thread is structurally absent across `graphrefly-core` / `graphrefly-operators` / `graphrefly-graph` / `graphrefly-storage` / `graphrefly-structures` — independently verified by Edge Case Hunter at /qa). **Out-of-tree (napi BenchCore consumers) is unconstrained:** a JS user instantiating two `BenchCore`s on one Node main thread + synchronously dispatching cross-Core under D070's `bridge_sync` would hit the panic with a diagnostic that says "see `docs/rust-port-decisions.md` D252" — internal Rust docs the JS user cannot easily access. Two related gaps:
+  - **(a) Pre-claim handle-leak.** A handle passed to a foreign `Core::emit` is intern'd by the caller, but `Core::emit` panics in `claim_in_tick` *before* the handle ownership transfers to Core-B's cache slot — the caller's intern is never released. Today's `cross_core_same_thread_batchguard_panics_on_claim` test exercises the panic + recovery but leaks the intern (test-only, masked). A real-world consumer panicking on `claim_in_tick` would leak every retain in flight.
+  - **(b) Bindings-friendly diagnostic.** The panic message refers users to internal Rust docs. Under `cfg(feature = "napi")` (or equivalent binding feature), the panic could soften the message to mention `BenchCore` and link to a JS-side doc.
+- **Why deferred (S5 /qa user-locked Option A 2026-05-19):** Core itself shouldn't decide who owns a handle pre-claim — the binding does the retain; Core didn't take ownership yet. Reversing the binding's retain inside Core's panic path would introduce lock-released cleanup discipline duplicating the canonical `discard_wave_cleanup` seam. Friendly diagnostic under `cfg(napi)` is real but not blocking — the panic body itself is correct and structurally enforces the D252 invariant; the message text is a polishing-pass concern. Both gaps fold naturally into the **S6 napi reconciliation slice** (locked 2026-05-19; binding-side D248/D249/D252 reconciliation post-S2c `!Send` Core).
+- **Where it lives:** `crates/graphrefly-core/src/batch.rs:3458–3493` (`claim_in_tick`); `crates/graphrefly-bindings-js/src/core_bindings.rs:944` (per-`BenchCore` `Core::new`); deferred S6 napi reconciliation (`migration-status.md` § "S6 — PLANNED").
+- **Re-look trigger:** S6 napi-reconciliation slice landing (panic-path softening under `cfg(napi)` + binding-layer pre-claim handle-tracking should be folded in). Earlier trigger: a parity-tests scenario in `~/src/graphrefly-ts/packages/parity-tests/scenarios/core/` that exercises two BenchCores on one libuv thread.
+- **Source:** /qa M5 + F3 (Blind Hunter + Edge Case Hunter parallel review, 2026-05-19). User-locked Option A 2026-05-19. `~/src/graphrefly-ts/docs/rust-port-decisions.md` D252.
+
 ### Actor-model (D221/D222) — S0 V3: bench-harness `GLOBAL_CORE` must not back production multi-Core
 
 - **What:** `static GLOBAL_CORE: OnceLock<Arc<BenchCore>>` +
@@ -3543,6 +3553,31 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   going; report the full list at session end.
 
 ### D246 record-and-skip (running list — flags where the D246 pattern genuinely does NOT apply; report at session end)
+
+> **⭐ S5 RESOLUTION (2026-05-19, D252/D253/D254) — S3 rename
+> SUPERSEDED.** S5 landed (see `migration-status.md` § "S5 — LANDED").
+> S3 (`SerializationGroupId → SchedulingGroupId` rename, ~59 refs) is
+> **superseded by D253**: the entire `SchedulingGroupId` API surface
+> (newtype, `node_group` index, `set_scheduling_group` /
+> `partition_of` / `group_of`, `NodeOpts.scheduling_group`,
+> `SetGroupError`, the dep-component-consistency `GroupInconsistent`
+> variants on `RegisterError` / `SetDepsError`, the `add_meta_companion`
+> §7 invariant check, the `walk_undirected_dep_graph` +
+> `component_is_group_consistent` helpers) is deleted until M6
+> re-introduces it with M6's actual scheduling needs in view (D196
+> consumer-pressure rule). Test files `scheduling_groups.rs` (~21) +
+> `group_sharding.rs` (~14) moved to `tests/TRASH/` with TRASH-FILES.md
+> entries; `group_parallelism.rs` rebuilt without the
+> `g: SchedulingGroupId` param (the actor-model invariants tested
+> never needed it). Net code REMOVED. D254 also relaxed `DeferQueue`'s
+> `parking_lot::Mutex` / `AtomicBool` to `RefCell` / `Cell` (D254 #1+#2;
+> owner-thread-only by D248/D249 construction). D254 #7 (typed
+> `MailboxOp::TimerEmit`) audit found zero surviving emit-only
+> `SendDeferFn`s → recorded as D254-AUDIT inline; no code delta.
+> D252 collapsed `IN_TICK_OWNED` to `Cell<u64>` + locks "one Core per
+> OS thread" as a hard invariant (cross-Core same-thread nesting now
+> panics fail-loud). Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+> D252/D253/D254/D254-AUDIT + this file's audit-trail entries below.
 
 > **⭐ S4 RESOLUTION (2026-05-19, D250/D251) — closes the S4-tagged
 > entries below.** S4 landed (see `migration-status.md` § "D246 S4 —

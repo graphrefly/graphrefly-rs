@@ -1050,48 +1050,69 @@ fn batch_fn_result_propagates_to_grandchild() {
     );
 }
 
-/// Cross-Core isolation (/qa F1) under the per-(Core, thread) `in_tick`
-/// keying: a thread holding a live `BatchGuard` on Core-A and then
-/// running a full wave on a SEPARATE Core-B (same OS thread) must have
-/// Core-B's wave be OWNING and fully drain — Core-A's ownership must not
-/// leak into Core-B.
+/// D252 (S5, 2026-05-19): one Core per OS thread is a **hard
+/// invariant**. The pre-D252 contract (per-(Core, thread) `in_tick`
+/// keying via `AHashSet<u64>`) allowed an OS thread to hold a live
+/// `BatchGuard` on Core-A and *also* enter a wave on Core-B on the
+/// same thread; D252 reverses that — the [`IN_TICK_OWNED`] slot is
+/// `Cell<u64>` holding a single active `Core::generation`, and any
+/// attempt to start a wave on a different Core while the slot holds
+/// a foreign generation panics fail-loud at
+/// `BatchGuard::claim_in_tick`. Under D248 single-owner `Core` the
+/// cross-Core same-thread nesting case has no in-tree consumer (would
+/// require an owner-side `DeferFn` to drive a *second* `&Core`), so
+/// the invariant is real and the panic is structural — locking in the
+/// actor-model "one worker = one Core" framing rather than relying on
+/// convention.
 ///
-/// This is the exact regression that forced `in_tick` off a pure
-/// thread-local originally. The (Core, thread) key (keyed by
-/// `Core::generation`) must preserve it: Core-A's set slot is a
-/// different key than Core-B's, so Core-B's `begin_batch` sees itself
-/// as outermost and drains. If isolation regressed, Core-B's wave would
-/// be wrongly nested and its subscriber would never see the value.
+/// (Renamed from `cross_core_same_thread_batchguard_isolation`, the
+/// pre-D252 regression test for the deleted /qa F1 isolation
+/// behavior.)
 #[test]
-fn cross_core_same_thread_batchguard_isolation() {
+fn cross_core_same_thread_batchguard_panics_on_claim() {
+    use std::panic;
     let rt_a = TestRuntime::new();
     let rt_b = TestRuntime::new();
 
     let s_b = rt_b.state(Some(TestValue::Int(0)));
-    let d_b = rt_b.derived(&[s_b.id], |deps| Some(deps[0].clone()));
-    let rec_b = rt_b.subscribe_recorder(d_b);
+    let _d_b = rt_b.derived(&[s_b.id], |deps| Some(deps[0].clone()));
 
-    let s_a = rt_a.state(Some(TestValue::Int(0)));
-
-    // Hold a live, OWNING BatchGuard on Core-A (sets Core-A's per-(Core,
-    // thread) in_tick slot).
+    // Hold a live, OWNING BatchGuard on Core-A (claims Core-A's
+    // generation in the one-Core-per-OS-thread `IN_TICK_OWNED` slot).
     let guard_a = rt_a.core().begin_batch();
 
-    // Same thread, while Core-A's guard is alive: a full wave on Core-B.
-    // Must be owning + drain (Core-B's key is distinct from Core-A's).
-    let h = rt_b.binding.intern(TestValue::Int(7));
-    rt_b.core().emit(s_b.id, h);
-
+    // Same thread, while Core-A's guard is alive: starting a wave on
+    // Core-B must panic per D252 — cross-Core same-thread nesting is
+    // structurally forbidden under the "one Core per OS thread"
+    // invariant.
+    let core_b = rt_b.core();
+    let binding_b = rt_b.binding.clone();
+    let sid_b = s_b.id;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let h = binding_b.intern(TestValue::Int(7));
+        // `Core::emit` enters a `BatchGuard` internally; the panic
+        // fires from `claim_in_tick` when it observes Core-A's
+        // foreign generation in the slot.
+        core_b.emit(sid_b, h);
+    }));
+    let payload = result.expect_err(
+        "D252 invariant: emitting on Core-B while Core-A's BatchGuard is \
+         live on the same OS thread must panic at claim_in_tick",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
     assert!(
-        rec_b.data_values().contains(&TestValue::Int(7)),
-        "Core-B's wave must drain despite a live Core-A BatchGuard on the \
-         same thread (cross-Core isolation / qa F1); got {:?}",
-        rec_b.data_values()
+        msg.contains("cross-Core wave nesting") || msg.contains("D252"),
+        "expected the D252 cross-Core panic diagnostic; got: {msg}"
     );
 
-    // Releasing Core-A's guard drains/clears Core-A's slot; Core-A still
+    // Releasing Core-A's guard clears Core-A's slot to 0; Core-A still
     // works normally afterward.
     drop(guard_a);
+    let s_a = rt_a.state(Some(TestValue::Int(0)));
     let d_a = rt_a.derived(&[s_a.id], |deps| Some(deps[0].clone()));
     let rec_a = rt_a.subscribe_recorder(d_a);
     s_a.set(TestValue::Int(99));
@@ -1155,5 +1176,61 @@ fn panic_in_drain_phase_releases_wave_ownership_for_next_wave() {
         "after a drain-phase panic, the next wave on the same (Core, \
          thread) must own + drain normally; got {:?}",
         rec.data_values()
+    );
+}
+
+/// D252 (/qa F4 + Blind M1, 2026-05-19): the `IN_TICK_OWNED` doc at
+/// `batch.rs:147–166` promises that a leaked `BatchGuard`'s stale slot
+/// is "surfaced loudly, not silently masked" — i.e., the NEXT Core's
+/// `claim_in_tick` on the same OS thread panics fail-loud. This test
+/// locks the documented promise so a future refactor that accidentally
+/// adds a defensive slot-clear at `begin_batch_with_guards` outermost
+/// entry (which would WEAKEN the D252 invariant by silently overwriting
+/// a foreign nonzero generation) fails loud here.
+///
+/// **Test-only:** the production behavior assumed by the rest of the
+/// dispatcher is that `BatchGuard::drop` always runs and clears the
+/// slot; `mem::forget` bypasses Drop and is contract-violating
+/// (`#[must_use]` is meant to surface it). This test exercises the
+/// recovery diagnostic, NOT a supported call pattern.
+#[test]
+fn d252_leaked_batchguard_poisons_next_core_claim_on_same_thread() {
+    use std::panic;
+
+    // Phase 1: leak a BatchGuard on Core-A → IN_TICK_OWNED slot holds
+    // rt_a.core().generation, never cleared.
+    let rt_a = TestRuntime::new();
+    let guard_a = rt_a.core().begin_batch();
+    std::mem::forget(guard_a);
+    // Phase 2: construct Core-B on the same OS thread, attempt an
+    // operation that enters a BatchGuard internally → claim observes
+    // the foreign nonzero generation and panics per D252.
+    let rt_b = TestRuntime::new();
+    let s_b = rt_b.state(Some(TestValue::Int(0)));
+    let _d_b = rt_b.derived(&[s_b.id], |deps| Some(deps[0].clone()));
+
+    let core_b = rt_b.core();
+    let binding_b = rt_b.binding.clone();
+    let sid_b = s_b.id;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let h = binding_b.intern(TestValue::Int(1));
+        core_b.emit(sid_b, h);
+    }));
+    let payload = result.expect_err(
+        "D252 invariant: a leaked BatchGuard's stale generation in \
+         IN_TICK_OWNED must surface loudly on the next Core's claim — \
+         silent recovery would weaken the structural \"one Core per OS \
+         thread\" lock and is a regression target. The test exercises \
+         the documented diagnostic (`batch.rs:147–166`), not a \
+         supported call pattern.",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("cross-Core wave nesting") || msg.contains("D252"),
+        "expected the D252 cross-Core panic diagnostic; got: {msg}"
     );
 }

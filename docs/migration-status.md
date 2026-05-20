@@ -3300,95 +3300,243 @@ the previously-skipped §7/D250 stubs are now converted or retired).
 (retire imperative re-entry stubs) + D251 (rule-8 = reusable slot;
 D246-r8 stale-premise reconciled post-D249).
 
-### S5 — PLANNED (locked 2026-05-19 post-S4 honest reflection) — accretion-mass cleanup
+### S5 — LANDED 2026-05-19 — accretion-mass cleanup (D252/D253/D254)
 
-> **Locked next `/porting-to-rs` batch.** User directive: "ignore legacy
-> or backward compat; clean/correct/simple/performant/memory-efficient/
-> less-maintenance-burden." Three decisions (D252/D253/D254 in
-> `~/src/graphrefly-ts/docs/rust-port-decisions.md`) fully locked; zero
-> open design forks. Execution: single gated commit per D226; single
-> `/qa` over the S5 diff after.
+> Single gated commit per D226; single `/qa` to follow over the S5 diff.
+> User directive: "ignore legacy or backward compat; clean/correct/
+> simple/performant/memory-efficient/less-maintenance-burden." Three
+> decisions D252/D253/D254 (in
+> `~/src/graphrefly-ts/docs/rust-port-decisions.md`) fully locked at S5
+> start; zero open design forks. One in-slice audit reconciliation
+> recorded inline as **D254-AUDIT** (#7 `MailboxOp::TimerEmit` audit —
+> zero surviving emit-only `SendDeferFn`s; `MailboxOp::Defer` survives
+> as the legitimate escape hatch; same shape as D251's reconciliation
+> within D246-r8's "keep audit honest" latitude).
 
-**Scope:**
+**Landed (matches the user-locked scope):**
 
 1. **D252 — `IN_TICK_OWNED` collapse + "one Core per OS thread" hard
-   invariant.** Replace `thread_local!(RefCell<AHashSet<u64>>)` with
+   invariant.** `thread_local!(RefCell<AHashSet<u64>>)` →
    `thread_local!(Cell<u64>)` (0 = no active Core; nonzero = active
-   `Core::generation`). `BatchGuard` claim-time guard panics
-   fail-loud if a non-matching non-zero generation is observed —
-   locking in the stronger "no cross-Core same-thread nesting"
-   contract. Documents the invariant in the `IN_TICK_OWNED` /
-   `BatchGuard` module docs. Reverses the D047 per-(Core,thread)
-   keying (which itself was a fix for the now-deleted shared-Core
-   cross-thread model).
-2. **D253 — DELETE `SchedulingGroupId` API surface entirely.** Until
-   M6 actually consumes per-group scheduling (post-1.0). Delete:
-   `SchedulingGroupId` newtype (`crates/graphrefly-core/src/handle.rs`),
-   `CoreShared.node_group: HashMap<NodeId, SchedulingGroupId>`
-   (`node.rs`), `Core::set_scheduling_group` /
-   `Core::partition_of` / `Core::group_of` methods,
-   `NodeOpts.scheduling_group: Option<SchedulingGroupId>` field,
-   the dep-component-consistency `RegisterError::GroupComponentInconsistent`
-   variant + the dispatch check at `register`/`set_deps`, the
-   `pub use` from `lib.rs`, the
-   `crates/graphrefly-core/tests/scheduling_groups.rs` test file,
-   the `crates/graphrefly-core/tests/group_sharding.rs` test file
-   (it tests the deleted cross-shard routing — model is gone), the
-   `g: SchedulingGroupId` parameter on `group_parallelism.rs`'s
-   `run_grouped_cascade` helper (replace with a plain
-   `state → derived` cascade — workers don't need group ids; the
-   test characterises independent-Core serialisation, not group
-   identity). Plus every `SchedulingGroupId` import + the
-   `scheduling_group: Some(g)` setter in `NodeOpts`-constructing
-   tests (`operators/tests/flow.rs`, etc.). Re-introduce in M6
-   with M6's actual scheduling needs in view. Reverses S3.
-3. **D254 — Tier A bundle:**
-   - **`DeferQueue` `parking_lot::Mutex` → `RefCell<VecDeque<DeferFn>>` +
-     `AtomicBool` → `Cell<bool>`.** Owner-thread-only by D248
-     construction; the lock + atomic are unused capacity. Drops a
-     `parking_lot::Mutex` acquire on every owner-side defer
-     post/drain (the hottest D251 path).
-   - **Typed `MailboxOp::TimerEmit(NodeId, HandleId)` variant.**
-     Audit `crates/graphrefly-operators/src/temporal.rs` + every
-     `mailbox.post_defer(SendDeferFn)` call site. For `Send`-defers
-     whose body is `core.emit(n, h)`, introduce the typed variant
-     and `CoreMailbox::post_timer_emit(NodeId, HandleId)`. The
-     timer task uses it. `MailboxOp::Defer(SendDeferFn)` stays only
-     if the audit finds non-emit `Send` closures that survive; if
-     none, drop the variant entirely. Saves a `Box` alloc + dyn
-     dispatch per timer fire.
-   - **Test-file module-doc sweep.** `lock_discipline.rs:1-27`
-     still asserts "Core::subscribe acquires wave_owner (re-entrant)
-     first / Cross-thread emits block on wave_owner until the
-     subscribe scope ends." Grep all test files + `_internal`
-     module docs for residual `wave_owner` / `partition_wave_owner`
-     / "Cross-thread emits block" prose; fix to the post-S2c/D248
-     single-owner truth.
+   `Core::generation`). `BatchGuard::claim_in_tick` panics fail-loud if
+   a foreign nonzero generation is observed — locking in the stronger
+   "no cross-Core same-thread nesting" contract structurally rather
+   than relying on convention. Module + struct docs (`batch.rs`
+   `IN_TICK_OWNED` block + `WaveState`/`BatchGuard` headers; `node.rs`
+   `CoreState` placement note + `Core::generation` field doc + the
+   "Wave execution = one uninterrupted owner-side drain" header)
+   updated to the post-D252 truth. Reverses D047's per-(Core,thread)
+   keying (which itself was the fix for the now-deleted shared-Core
+   cross-thread model). Regression test:
+   `tests/batch.rs::cross_core_same_thread_batchguard_panics_on_claim`
+   (rewrite of the pre-D252
+   `cross_core_same_thread_batchguard_isolation` /qa F1 test — the
+   isolation-via-distinct-key contract is gone; the new panic-fail-
+   loud contract is asserted via `catch_unwind`).
+2. **D253 — DELETE `SchedulingGroupId` API surface entirely.** Removed:
+   `SchedulingGroupId` newtype + `lib.rs` re-export; `CoreShared.node_group`
+   HashMap; `Core::partition_count` / `partition_of` / `group_of` /
+   `set_scheduling_group`; `NodeOpts.scheduling_group` field;
+   `SetGroupError` enum; `RegisterError::GroupInconsistent` +
+   `SetDepsError::GroupInconsistent`; the dep-component-consistency
+   check at `register` / `set_deps`; the `add_meta_companion`
+   §7-invariant check; the `walk_undirected_dep_graph` +
+   `component_is_group_consistent` helpers (no remaining callers).
+   Deleted test files: `tests/scheduling_groups.rs` (~21 tests),
+   `tests/group_sharding.rs` (~14 tests) → moved to
+   `tests/TRASH/` with TRASH-FILES.md entries. Rebuilt
+   `tests/group_parallelism.rs` to drop the `g: SchedulingGroupId`
+   parameter from `run_grouped_cascade` (renamed to `run_cascade`); the
+   actor-model invariants tested (independent-Core in-order delivery,
+   no deadlock, cascade integrity under real concurrency) never
+   needed the group id. `benches/group_scaling.rs` label preserved
+   (`group_scaling/independent_cores`) for baseline comparison — the
+   bench fn never used a group id; "group" in the label is historical.
+   `operators/tests/flow.rs` header reframed: the single-owner
+   contract is now structural via `Core: !Send + !Sync`, not asserted
+   by a deleted test file. Re-introduce in M6 with M6's actual
+   scheduling needs in view (D196 consumer-pressure rule). Reverses S3.
+3. **D254 Tier A:**
+   - **#1+#2 `DeferQueue` Mutex/Atomic relaxation.**
+     `parking_lot::Mutex<VecDeque<DeferFn>>` → `RefCell<VecDeque<DeferFn>>`;
+     `AtomicBool runnable` + `AtomicBool closed` → `Cell<bool>` +
+     `Cell<bool>`. Owner-thread-only by D248/D249 construction; lock +
+     atomics were unused capacity. Drops a `parking_lot::Mutex::lock`
+     acquire on every owner-side defer post/drain (the hottest D251
+     path). Module docstring updated; drain-loop shape preserved
+     (borrow-released before applying each closure so re-`post`
+     during apply doesn't nested-borrow).
+   - **#7 → D254-AUDIT (NO TimerEmit added).** Audit of every
+     `em.defer(...)` / `mailbox.post_defer(...)` site in
+     `graphrefly-operators` + `graphrefly-graph` + `graphrefly-storage`
+     found ZERO surviving `SendDeferFn` payloads whose body is a
+     static `core.emit(n, h)`: per-timer-tick DATA emits already
+     take the typed `MailboxOp::Emit` fast path via
+     `em.emit_or_defer(pid, h)`. Surviving `Defer`s are multi-op /
+     dynamic-routing / topology-mutation closures (window rotation,
+     unsubscribe, invalidate, teardown, subscribe, error-retain) —
+     the legitimate escape hatch the design predicted. Per D254's own
+     "keep audit honest" gate (user-confirmed at S5 HALT): no
+     `MailboxOp::TimerEmit` / `post_timer_emit` added;
+     `MailboxOp::Defer(SendDeferFn)` survives. Audit recorded inline
+     as D254-AUDIT in `~/src/graphrefly-ts/docs/rust-port-decisions.md`.
+   - **#10 doc sweep (scope a + b).** Present-tense
+     "acquires/holds/blocks on `wave_owner`/ReentrantMutex" rewritten
+     in: test-file headers + `_internal` docs
+     (`tests/lock_discipline.rs:1-27` + the `handshake_sink_can_reenter_*`
+     test body), operator src comments (`producer.rs::activate_with_subscribe`
+     Phase H+ note, `timer.rs` module doc); operator-side test
+     headers (`higher_order.rs`, `dead_source_e2e.rs`,
+     `operators/tests/common/mod.rs::with_all_partitions_held`); and
+     `node.rs` "subscribe install-before-drop" comment. Past-tense
+     "deleted by D246/S2c" history-prose left intact per user
+     direction (distinguishing rule: rewrite present-tense; leave
+     past-tense alone).
 4. **Process-discipline memory (DONE in the planning session,
-   2026-05-19):** `~/.claude/projects/.../memory/feedback_pre_design_full_decision_set.md`
-   captures the lessons from S2c-S4: pre-design FULL decision-set
-   before slicing (avoid the D232→D232-AMEND→…→D251 mid-flight
-   amendment chain); design facade traits' full surface once (avoid
-   `CoreFull` accretion across D243-D245); cite spec rule IDs in
-   test expectation vectors (S4's first-commit 4-of-4 failures were
-   intuition-anchored, missed R1.3.5.a / push-on-subscribe cached-
-   initial replay); audit user-visible semantics at design time
-   (M2 `compact_every` cadence regression masked by D251's
-   "internal refactor" framing).
+   2026-05-19; verified at S5 implementation):**
+   `~/.claude/projects/-Users-davidchenallio-src-graphrefly-ts/memory/feedback_pre_design_full_decision_set.md`
+   captures S2c-S4 lessons (pre-design FULL decision-set; design facade
+   traits' full surface once; cite spec R-IDs in test expectations;
+   audit user-visible semantics at design time).
 
-**Gate expectations:**
+**Gate result (S5 implementation):** `mise run gate` GREEN — **809
+passed / 3 skipped / 0 failed** in 37s on the cache-warm run (baseline
+830 / 3 / 0; net delta −21 = `scheduling_groups.rs` (~21) +
+`group_sharding.rs` (~14) deleted, plus 1 new D252 panic regression
+test, minus some shared test-helper rebuild). `cargo fmt --check`,
+`cargo clippy --all-targets`, `cargo nextest run --profile ci` all
+clean. 3 skipped preserved unchanged (D250 retired stubs).
 
-- Test count drops by 2 test files (`scheduling_groups.rs` ~25 tests
-  + `group_sharding.rs` ~15 tests) — 830 → ~790 passed, still 3
-  skipped (D250).
-- `mise run gate` GREEN required before commit; single `/qa` after.
-- **No napi / cross-track-ledger event** (`SchedulingGroupId` was
-  never bound; the rest is internal).
-- `#![forbid(unsafe_code)]` preserved.
+### S5 /qa — LANDED 2026-05-19
+
+> Single `/qa` over the S5 diff per D226's "single /qa at end of S-sequence"
+> lock. Two review subagents (Blind Hunter + Edge Case Hunter) ran in
+> parallel; ~15 findings triaged: **NO CRITICAL findings**, 3
+> needs-decision (user-locked Option A on all three), 4
+> auto-applicable approved (user chose Option C scope: type-level +
+> dead-code only — skipped the F1/F2/F7/M6 doc-sweep batch), rest
+> rejected as positive confirmations / informational / cosmetic.
+
+**Verified positive at /qa:**
+- D254-AUDIT honesty — Edge Case Hunter independently grep'd all 20
+  surviving `em.defer(...)` / `mailbox.post_defer(...)` call sites
+  across `graphrefly-operators` + `graphrefly-graph` + `graphrefly-storage`;
+  zero fit the `core.emit(STATIC_NODE_ID, h)` shape that
+  `MailboxOp::TimerEmit` would optimize. Confirms D254-AUDIT's "no
+  TimerEmit added; `MailboxOp::Defer` survives" decision.
+- D252 panic guard for in-tree — zero owner-side cross-Core nesting
+  paths verified via grep across all 5 default-members crates. The
+  panic invariant is structurally sound for in-tree code.
+- D253 deletion is clean — no surviving callers pattern-match
+  `RegisterError::GroupInconsistent` / `SetDepsError::GroupInconsistent`
+  outside the deleted tests; no spec rule lost (the §7 declared-
+  identity invariant was a Rust-port-side strict-consistency check,
+  re-introducing in M6 with M6's actual scheduling needs in view).
+- D254 `DeferQueue` `RefCell` shape is re-entry safe (drain pops with
+  borrow released; `is_runnable` is `Cell::get` outside any borrow).
+- Parity-tests delta — none expected; D196 (no consumer pressure for
+  `SchedulingGroupId`-side parity) confirmed (zero hits for
+  `scheduling_group` / `partition_of` / `SchedulingGroup` in
+  `packages/parity-tests/impls/*.ts`).
+
+**/qa fixes applied (M1+F4 + M5+F3 + M3 + M4 + m1 + m3 + m4):**
+
+- **M1+F4 (D252 leaked-guard regression test).** Added
+  `tests/batch.rs::d252_leaked_batchguard_poisons_next_core_claim_on_same_thread`
+  — `mem::forget(BatchGuard)`s on Core-A, constructs Core-B on the same
+  OS thread, asserts the next `Core::emit` panics fail-loud per D252.
+  Locks the documented "surfaced loudly, not silently masked" promise
+  at `batch.rs:147–166` so a future refactor that accidentally adds a
+  defensive slot-clear at `begin_batch_with_guards` outermost entry
+  (which would weaken the invariant) fails loud here. Test-only;
+  `mem::forget(guard)` is contract-violating (`#[must_use]` surfaces it).
+- **M5+F3 (binding-layer cross-Core panic + handle-leak).** Recorded
+  in `docs/porting-deferred.md` § "D252 record-and-skip — napi
+  BenchCore cross-Core same-thread panic + pre-claim handle-leak
+  (binding-layer; /qa M5+F3 2026-05-19)". Two related gaps: (a)
+  pre-claim handle-leak (caller's intern is never released because
+  `Core::emit` panics in `claim_in_tick` BEFORE the handle ownership
+  transfers to Core-B's cache slot); (b) bindings-friendly diagnostic
+  under `cfg(napi)`. Both fold naturally into S6 (napi reconciliation
+  slice); no Core change in S5.
+- **M3 (`runnable` clear on `apply(f)` panic).** Added RAII guards
+  `MailboxRunnableClearOnPanic` + `DeferRunnableClearOnPanic` in
+  `mailbox.rs`. On panic unwind from inside `apply(f)`, the guard's
+  `Drop` checks whether the queue is empty and clears `runnable` if so.
+  Preserves the QA F-#4 lost-wakeup discipline (non-empty unwind ⇒
+  leave `runnable=true` so next drain picks up the work).
+- **M4 (`!Send + !Sync` static assertion on `DeferQueue`).** Added
+  `static_assertions = { workspace = true }` dep on `graphrefly-core`
+  (build-time-only, zero runtime cost). `mailbox.rs` now contains
+  `static_assertions::assert_not_impl_any!(DeferQueue: Send, Sync)` —
+  locks the actor-model "owner-thread-only" invariant in the type
+  system so a future field change that silently widens the trait
+  bounds (e.g., swapping `RefCell` for `Mutex` "for safety") breaks
+  the build.
+- **m1 (delete vestigial `SetDepsError::PartitionMigrationDuringFire`).**
+  Removed; D253 deleted the entire scheduling-group identity surface,
+  so the partition-migration concept is gone. No surviving caller
+  pattern-matches the variant (only reference was a TRASH/
+  scheduling_groups.rs comment).
+- **m3 (`#[must_use]` on `DeferQueue::post`).** `false` is the
+  load-bearing signal that the caller's closure was dropped unrun;
+  ignoring it can mask teardown races.
+- **m4 (`#[must_use]` on `is_runnable`).** Both `DeferQueue::is_runnable`
+  and `CoreMailbox::is_runnable` — pure-read predicates; discarding
+  loses the scheduling/drain-gate signal.
+
+**Skipped at user direction (Option C scope on /qa Group 2):** F1
+(`mailbox.rs:142–157` forward-looking `SchedulingGroupId` references),
+F2 (`CoreMailbox.runnable` vs `DeferQueue.runnable` doc asymmetry),
+F7 (`node.rs:67` present-tense `wave_owner` clause), M6
+(`DeferQueue::drain_into` panic-vs-deadlock doc clarification — but
+the latter still got added inline in the M3 patch because the RAII
+guard's doc-comment block touches the surrounding context). The
+skipped doc residue is low-impact cosmetic; can fold into a later
+slice if rustdoc generation surfaces the broken intra-doc links.
+
+**Rejected as no-action:**
+- Blind M2 (panic-on-mismatch in re-entrant context) — trace shows
+  it's actually safe: claim panics BEFORE any Core mutation; outer
+  guard cleanup respects slot invariants via `debug_assert`.
+- F5 (test consolidation) — the two `group_parallelism.rs` tests
+  exercise different scenarios (`independent_cores_each_serialize_…`
+  = 4-worker serialization; `independent_cores_both_complete` =
+  2-worker disjoint completion).
+- F6 (`add_meta_companion` rollback affordance) — informational only.
+- F8/F9 — positive confirmations of D254-AUDIT honesty and
+  parity-tests scope.
+- Blind m2 (`NonZeroU64` for `Core::generation`) — counter starts at
+  1; field already nonzero-safe by construction.
+- Blind m5 (bench label rename) — explicit baseline-preservation
+  comment in the diff already justifies keeping the label.
+
+**Gate result (/qa, 2026-05-19, [.gate/gate-full-20260519-203341.log](.gate/gate-full-20260519-203341.log)):**
+`mise run gate` GREEN — **810 passed / 3 skipped / 0 failed** in 140s
+(+1 from S5's 809 = the new
+`d252_leaked_batchguard_poisons_next_core_claim_on_same_thread`
+regression). `cargo fmt --check`, `cargo clippy --all-targets`,
+`cargo nextest run --profile ci` all clean. `#![forbid(unsafe_code)]`
+preserved on all 5 crates.
+
+**Surface (post-/qa unchanged):** No napi / cross-track-ledger event
+(`SchedulingGroupId` was never bound; `IN_TICK_OWNED` + `DeferQueue`
+are internal; `static_assertions` is a build-time-only dep with no
+runtime/public-API impact).
+
+**Carried forward / superseded:**
+- S3 closing block (`SerializationGroupId → SchedulingGroupId` rename,
+  ~59 refs) is **superseded by D253** — the renamed surface has been
+  deleted. The rename itself was reverted by ~60 lines of deletion;
+  net code REMOVED.
+- napi BenchCore cross-Core same-thread panic + pre-claim handle-leak
+  → carried into S6 (napi reconciliation slice) as a deferred entry
+  in `porting-deferred.md` § "D252 record-and-skip".
 
 **Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md`
 D252 (IN_TICK collapse + hard invariant), D253 (SchedulingGroupId
-delete), D254 (Tier A bundle + process memory).
+delete), D254 (Tier A bundle + process memory), D254-AUDIT (inline
+in D254 — #7 TimerEmit not added; `MailboxOp::Defer` survives).
 
 ### S6 — PLANNED (locked 2026-05-19) — napi bindings reconciliation against post-S2c `!Send` Core
 

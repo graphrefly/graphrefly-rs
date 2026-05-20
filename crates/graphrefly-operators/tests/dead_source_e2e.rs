@@ -10,11 +10,15 @@
 //! path instead.
 //!
 //! [`OpRuntime::with_all_partitions_held`] (B sub-slice helper) bridges
-//! the gap — it wraps `f` in a `core.batch()` scope that acquires every
-//! currently-existing partition's wave_owner. The producer's
-//! activation `try_subscribe(source)` then sees a re-entrantly held
-//! partition lock, the H+ STRICT ascending-order check passes, and
-//! the source's `resubscribable=false + terminal=Some(...)` state
+//! the gap — historically it wrapped `f` in a `core.batch()` scope that
+//! acquired every currently-existing partition's `wave_owner`
+//! `ReentrantMutex`. Under S2c/D248 single-owner `Core` the per-
+//! partition `wave_owner` machinery is deleted (one owner thread, no
+//! cross-thread interleaving wave to serialize), so the helper now
+//! reduces to entering a `BatchGuard` scope on the one owner. The
+//! producer's activation `try_subscribe(source)` runs owner-side, the
+//! H+ STRICT ascending-order check passes against the owner's wave,
+//! and the source's `resubscribable=false + terminal=Some(...)` state
 //! surfaces as `SubscribeError::TornDown` → `SubscribeOutcome::Dead`
 //! synchronously.
 //!

@@ -2,12 +2,14 @@
 //! / concatMap / mergeMap.
 //!
 //! Tests use the realistic CACHED-inner pattern (`state(Some(v))`)
-//! enabled by the Slice E lock-released handshake rework. Subscribing
-//! to a cached state node fires `[Start, Data(cache)]` lock-released
-//! with `wave_owner` held; the inner sink's `Core::emit(producer_id,
-//! h)` re-enters Core via `wave_owner`'s reentrant mutex (same-thread
-//! pass-through), so cached inner deliveries flow through to the
-//! producer's emit + downstream sinks transparently.
+//! enabled by the Slice E lock-released handshake rework (S2c/D248
+//! single-owner update). Subscribing to a cached state node fires
+//! `[Start, Data(cache)]` lock-released; the inner sink's
+//! `Core::emit(producer_id, h)` re-enters Core via the owner-side seam
+//! (no `wave_owner` mutex post-D248 — `Core` is single-owner so same-
+//! thread re-entry simply re-borrows the state cell), so cached inner
+//! deliveries flow through to the producer's emit + downstream sinks
+//! transparently.
 
 mod common;
 

@@ -59,6 +59,7 @@
 //! `ProducerCtx` already lends it (D231). One queue, one drain loop, one
 //! `match`, one re-entry trait.
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -252,8 +253,27 @@ impl CoreMailbox {
     /// is bounded + panics here — decoupled from the fire counter so a
     /// legitimately large finite producer drain never false-trips the
     /// fire `cap`.
+    ///
+    /// /qa M3 (2026-05-19): a panic from `apply(f)` mid-drain previously
+    /// unwound out of this loop with `runnable` still `true` — under the
+    /// `parking_lot::Mutex` shape that was self-correcting (the next
+    /// drain pop would re-observe + clear), but downstream
+    /// `is_runnable()` gates would spuriously return `true` until then.
+    /// Wraps the empty-queue clear in a `RunnableClearGuard` so an
+    /// `apply` panic still clears `runnable` on unwind: if the queue is
+    /// empty at unwind time the cell is reset; if the queue is
+    /// non-empty the next post would re-set it anyway. Tightens the
+    /// scheduler-wakeup contract under panic.
     pub fn drain_into(&self, max_ops: u32, mut apply: impl FnMut(MailboxOp)) {
         let mut applied = 0u32;
+        // /qa M3 RAII: clear `runnable` on panic unwind if the queue
+        // drains empty during unwind. No-op on the normal exit path —
+        // the explicit `runnable.store(false)` below the empty `pop_front`
+        // still races-free under the `ops` lock (QA F-#4).
+        let _runnable_clear = MailboxRunnableClearOnPanic {
+            ops: &self.ops,
+            runnable: &self.runnable,
+        };
         loop {
             let op = {
                 let mut q = self.ops.lock();
@@ -278,8 +298,9 @@ impl CoreMailbox {
 
     /// Whether the mailbox currently holds queued work (the wake bit).
     /// Advisory pre-M6 (the embedder pump drains unconditionally); S4/M6
-    /// consumers gate scheduling on it.
-    #[must_use]
+    /// consumers gate scheduling on it. `#[must_use]` (/qa m4) — a
+    /// discarded result silently loses the scheduling signal.
+    #[must_use = "is_runnable is the scheduling wake-bit; ignoring it loses the signal"]
     pub fn is_runnable(&self) -> bool {
         self.runnable.load(Ordering::Acquire)
     }
@@ -344,7 +365,8 @@ const _: fn() = || {
 };
 
 /// Owner-only deferred-closure queue (D249/S2c — the minimal Defer
-/// split pulled out of [`CoreMailbox`]).
+/// split pulled out of [`CoreMailbox`]; D254 (S5) relaxed off cross-
+/// thread primitives).
 ///
 /// Under D248 full single-owner the substrate `Sink`/`TopologySink`
 /// dropped `Send + Sync`, so a [`DeferFn`] (which captures relaxed
@@ -357,17 +379,32 @@ const _: fn() = || {
 /// [`crate::node::Core::drain_mailbox`] (after the id-mailbox) and the
 /// in-wave `BatchGuard` drain.
 ///
+/// **Owner-thread-only by construction (D254 (S5), 2026-05-19).** The
+/// `Rc<DeferQueue>` is never sent across threads (the closures it holds
+/// are `!Send`), so the cross-thread primitives it used to carry —
+/// `parking_lot::Mutex<VecDeque<DeferFn>>` for `q` and `AtomicBool` for
+/// `runnable` — were unused capacity. D254 collapses them to
+/// `RefCell<VecDeque<DeferFn>>` + `Cell<bool>`, dropping the
+/// `parking_lot::Mutex::lock` acquire on every owner-side post/drain
+/// (the hottest D251 path). `closed` similarly drops to `Cell<bool>` —
+/// it is set by `Drop for Core` on the owner thread (the only `close()`
+/// call site) and read by `post`/`drain_into` on the same thread.
+///
 /// S4 still does the per-group-wake + typed snapshot/prune `MailboxOp`
 /// reshape (D246 rule 8) — D249 is the acknowledged minimal first
 /// touch that lets the D248 single-owner Sink relaxation land in S2c.
 pub struct DeferQueue {
-    q: parking_lot::Mutex<VecDeque<DeferFn>>,
-    closed: std::sync::atomic::AtomicBool,
+    q: RefCell<VecDeque<DeferFn>>,
+    /// Set by [`Self::close`] (owner-side, called from `Drop for Core`).
+    /// `Cell<bool>` (D254): owner-thread-only by D248/D249 construction,
+    /// no cross-thread reader.
+    closed: Cell<bool>,
     /// "Has queued work" bit — mirrors `CoreMailbox::runnable` so the
     /// in-wave `BatchGuard` drain gate (`is_runnable()`) also fires
     /// when only a `Defer` (no id-`MailboxOp`) was posted mid-wave
     /// (the reactive describe/observe `DepsChanged` path, D246 r6).
-    runnable: std::sync::atomic::AtomicBool,
+    /// `Cell<bool>` (D254): owner-thread-only — see the struct doc.
+    runnable: Cell<bool>,
 }
 
 impl DeferQueue {
@@ -375,31 +412,38 @@ impl DeferQueue {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            q: parking_lot::Mutex::new(VecDeque::new()),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            runnable: std::sync::atomic::AtomicBool::new(false),
+            q: RefCell::new(VecDeque::new()),
+            closed: Cell::new(false),
+            runnable: Cell::new(false),
         }
     }
 
     /// Whether the queue currently holds work (the in-wave drain gate).
-    #[must_use]
+    /// `#[must_use]` (/qa m4) — a discarded result silently loses the
+    /// drain-gate signal.
+    #[must_use = "is_runnable is the in-wave drain gate; ignoring it loses the signal"]
     pub fn is_runnable(&self) -> bool {
-        self.runnable.load(Ordering::Acquire)
+        self.runnable.get()
     }
 
     /// Enqueue an owner-side deferred closure. Returns `false` iff the
     /// owning `Core` has dropped ([`Self::close`]) — the caller's
     /// closure is dropped unrun (same contract as the old
-    /// `CoreMailbox::post_defer`). Mirrors `CoreMailbox::post_op`'s
-    /// under-lock `closed` check (TOCTOU-safe vs a concurrent `close`).
-    #[must_use]
+    /// `CoreMailbox::post_defer`). Owner-thread-only by D248/D249
+    /// construction — see the struct doc; no cross-thread TOCTOU
+    /// against `close` is possible because both run on the one owner
+    /// thread and never overlap.
+    ///
+    /// `#[must_use]` (/qa m3) — `false` is the load-bearing signal that
+    /// the caller's closure was dropped unrun; ignoring it can mask
+    /// teardown races where work was silently discarded.
+    #[must_use = "false means the queue is closed and the closure was dropped unrun"]
     pub fn post(&self, f: DeferFn) -> bool {
-        let mut q = self.q.lock();
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.get() {
             return false;
         }
-        q.push_back(f);
-        self.runnable.store(true, Ordering::Release);
+        self.q.borrow_mut().push_back(f);
+        self.runnable.set(true);
         true
     }
 
@@ -408,19 +452,47 @@ impl DeferQueue {
     /// it up). `max_ops` bounds one drain against a self-re-posting
     /// livelock (mirrors `CoreMailbox::drain_into`).
     ///
+    /// **Re-entry note (/qa M6).** Under the pre-D254
+    /// `parking_lot::Mutex<VecDeque<DeferFn>>` shape, an owner-thread
+    /// re-entrant `drain_into` from inside `apply(f)` would have
+    /// **deadlocked** at the inner lock acquire. Under the D254
+    /// `RefCell<VecDeque<DeferFn>>` shape it would **panic with
+    /// `BorrowMutError`** instead — different failure mode, same
+    /// fail-loud outcome. In practice the pre-D254 design never had any
+    /// in-tree re-entrant drain caller (the embedder pump's
+    /// `drain_mailbox` is never invoked recursively from within an
+    /// `apply` closure body — `drain_mailbox` is the embedder seam, not
+    /// a `DeferFn` capture target), so neither failure mode is
+    /// reachable from in-tree code. Documented for any future binding
+    /// that might construct one.
+    ///
     /// # Panics
     /// Panics if a single drain applies `max_ops` closures — a `Defer`
     /// closure re-posting itself every application (owner-side
     /// livelock), the defer-queue analogue of a fn that emits to itself.
     pub fn drain_into(&self, max_ops: u32, mut apply: impl FnMut(DeferFn)) {
         let mut applied = 0u32;
+        // /qa M3 RAII: clear `runnable` on panic unwind. Mirrors
+        // `CoreMailbox::drain_into`'s panic-aware clear shape, except
+        // the cell-based discipline lets the guard `Cell::set(false)`
+        // directly with no lock to acquire.
+        let _runnable_clear = DeferRunnableClearOnPanic {
+            q: &self.q,
+            runnable: &self.runnable,
+        };
         loop {
+            // Borrow `q` only to pop (closures must run with the borrow
+            // released — `apply(f)` may itself re-`post` on this same
+            // queue, requiring `borrow_mut()` again; nested mut borrow
+            // would panic). Mirrors the lock-release shape of the old
+            // `parking_lot::Mutex` version exactly.
             let f = {
-                let mut q = self.q.lock();
+                let mut q = self.q.borrow_mut();
                 let Some(f) = q.pop_front() else {
-                    // Clear `runnable` under the lock (same race
-                    // discipline as `CoreMailbox::drain_into` QA F-#4).
-                    self.runnable.store(false, Ordering::Release);
+                    // Clear `runnable` while we hold the borrow (owner-
+                    // thread-only ⇒ no concurrent `post` to race; this
+                    // pairs with `is_runnable` post-drain).
+                    self.runnable.set(false);
                     return;
                 };
                 f
@@ -436,8 +508,7 @@ impl DeferQueue {
         }
     }
 
-    /// Mark the owning `Core` gone. Idempotent; mutually exclusive with
-    /// [`Self::post`] (shared `q` lock).
+    /// Mark the owning `Core` gone. Idempotent.
     ///
     /// **Drop timing of queued closures (QA, 2026-05-19).** This method
     /// only flips `closed` so subsequent `post` calls drop their
@@ -451,13 +522,79 @@ impl DeferQueue {
     /// refcount purposes; callers MUST honour the no-`HandleId`-in-
     /// `DeferFn` discipline (see [`DeferFn`]'s doc) for this to hold.
     pub fn close(&self) {
-        let _q = self.q.lock();
-        self.closed.store(true, Ordering::Release);
+        self.closed.set(true);
     }
 }
 
 impl Default for DeferQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// /qa M4 (2026-05-19): `DeferQueue` MUST stay `!Send + !Sync` by
+// construction (owner-thread-only by D248/D249; the `Rc<DeferQueue>`
+// is never sent across threads, the closures it holds are `!Send`).
+// Lock the invariant in the type system so a future field that
+// silently widens the trait bounds (e.g., swapping `RefCell` for
+// `Mutex` "for safety") breaks the build instead of the actor-model
+// invariant.
+static_assertions::assert_not_impl_any!(DeferQueue: Send, Sync);
+
+/// RAII guard that clears [`CoreMailbox::runnable`] on panic unwind if
+/// the queue is empty at unwind time (/qa M3). Outside of unwind, the
+/// explicit `runnable.store(false, Release)` on the empty-pop path of
+/// [`CoreMailbox::drain_into`] handles the normal-exit clear under the
+/// `ops` lock (QA F-#4 lost-wakeup discipline). On panic unwind from
+/// inside `apply(f)`, this guard's `Drop` re-acquires the `ops` lock,
+/// checks whether the queue is empty, and clears `runnable` if so —
+/// if non-empty, leaves `runnable=true` so the next drain picks up the
+/// remaining work, matching the QA F-#4 race discipline.
+struct MailboxRunnableClearOnPanic<'a> {
+    ops: &'a parking_lot::Mutex<VecDeque<MailboxOp>>,
+    runnable: &'a AtomicBool,
+}
+
+impl Drop for MailboxRunnableClearOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let q = self.ops.lock();
+            if q.is_empty() {
+                self.runnable.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// RAII guard that clears [`DeferQueue::runnable`] on panic unwind if
+/// the queue is empty at unwind time (/qa M3). Owner-thread-only by
+/// D248/D249/D254 construction — no lock to acquire; the cell-based
+/// discipline lets the guard `Cell::set(false)` directly. Mirrors
+/// [`MailboxRunnableClearOnPanic`]'s shape against the relaxed
+/// `RefCell` + `Cell` primitives. If the queue is non-empty at unwind
+/// time, leaves `runnable=true` so the next drain picks up the work.
+struct DeferRunnableClearOnPanic<'a> {
+    q: &'a std::cell::RefCell<VecDeque<DeferFn>>,
+    runnable: &'a Cell<bool>,
+}
+
+impl Drop for DeferRunnableClearOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // `borrow` is safe even mid-panic — the only borrow_mut
+            // sites are this drain loop (which holds the borrow only
+            // for the pop), and `post` (which is on the same owner
+            // thread — single-thread `RefCell` ⇒ no concurrent borrow).
+            // If a closure body panicked DURING the `borrow_mut` scope
+            // (between `borrow_mut()` and the let-binding drop) the
+            // borrow is held; `try_borrow` returns Err and we skip the
+            // clear — safe (next post re-sets runnable; next drain
+            // pops + re-observes).
+            if let Ok(q) = self.q.try_borrow() {
+                if q.is_empty() {
+                    self.runnable.set(false);
+                }
+            }
+        }
     }
 }

@@ -468,9 +468,11 @@ impl<'a> ProducerCtx<'a> {
     /// **Phase H+ STRICT (D115, 2026-05-10):** uses `try_subscribe`
     /// to attempt the subscription. On partition order violation, the
     /// subscribe is deferred to wave-end via
-    /// `DeferredProducerOp::Callback` — the deferred callback runs
-    /// after all partition wave_owners are released (no partitions
-    /// held → safe to acquire any partition).
+    /// `DeferredProducerOp::Callback`. (S2c/D248 single-owner: the
+    /// per-partition `wave_owner` `ReentrantMutex`es are deleted —
+    /// there is no cross-thread interleaving wave to serialize — so
+    /// the deferred callback simply runs owner-side at wave-end with
+    /// no lock acquisition.)
     ///
     /// **R2.2.7.b (D118, 2026-05-10):** if the upstream is
     /// non-resubscribable AND already terminated, `try_subscribe`

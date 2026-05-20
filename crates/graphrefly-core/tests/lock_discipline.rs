@@ -7,13 +7,17 @@
 //! - **Wave-end flush** (Slice A-bigger): `flush_notifications` snapshots
 //!   sink-fire jobs under the lock, drops it, then fires lock-released.
 //!   Same-thread re-entry from sink callbacks works.
-//! - **Subscribe-time handshake** (Slice E rework): `Core::subscribe`
-//!   acquires `wave_owner` (re-entrant) first, installs the sink under
-//!   the state lock, drops the state lock, then fires the per-tier
-//!   handshake lock-released. Sink callbacks may re-enter Core; same-
-//!   thread re-entry passes through `wave_owner` transparently.
-//!   Cross-thread emits block on `wave_owner` until the subscribe scope
-//!   ends, preserving R1.3.5.a happens-after ordering.
+//! - **Subscribe-time handshake** (Slice E rework, S2c/D248 single-
+//!   owner update): `Core::subscribe` installs the sink under the state
+//!   lock, drops the state lock, then fires the per-tier handshake
+//!   lock-released. Sink callbacks may re-enter Core; same-thread
+//!   re-entry passes through cleanly. (`Core` is single-owner
+//!   `!Send + !Sync` post-D248 — there is no cross-thread emitter, no
+//!   `wave_owner` `ReentrantMutex` to acquire, and no cross-thread BLOCK
+//!   discipline; the R1.3.5.a happens-after contract holds structurally
+//!   via owner-side drain-to-quiescence + the `subscribers_revision`
+//!   `PendingBatch` snapshot — see `node.rs` "Wave execution = one
+//!   uninterrupted owner-side drain" header.)
 //!
 //! D246 (rule 6): a long-lived sink that fires IN-WAVE re-enters Core
 //! via the mailbox (`post_emit`/`post_complete`/`post_defer`), drained
@@ -190,13 +194,16 @@ fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
 // false-positive for this owner-only pattern.
 #[allow(clippy::arc_with_non_send_sync)]
 fn handshake_sink_can_reenter_core_emit_on_other_node() {
-    // Slice E rework: the handshake now fires LOCK-RELEASED with
-    // `wave_owner` held. A handshake-time sink callback can re-enter
-    // Core (`emit` on a different node, here) without deadlock or
-    // panic. Same-thread re-entry passes through `wave_owner`'s
-    // ReentrantMutex transparently. This unblocks the canonical
-    // higher-order operator pattern (subscribe to inner state with
-    // cache; sink re-enters via `Core::emit(producer_id, h)`).
+    // Slice E rework (S2c/D248 single-owner update): the handshake now
+    // fires LOCK-RELEASED. A handshake-time sink callback can re-enter
+    // Core (`emit` on a different node, here) without deadlock or panic
+    // — `Core` is single-owner so same-thread re-entry simply re-borrows
+    // the state cell after the lock-released fire returns. (The pre-S2c
+    // shape held a `wave_owner` `ReentrantMutex` to serialize cross-
+    // thread emits; D248 deleted both the lock and the cross-thread
+    // emit path.) This unblocks the canonical higher-order operator
+    // pattern (subscribe to inner state with cache; sink re-enters via
+    // `Core::emit(producer_id, h)`).
     use std::sync::Arc;
 
     let rt = Arc::new(TestRuntime::new());

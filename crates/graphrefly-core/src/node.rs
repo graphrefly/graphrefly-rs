@@ -46,7 +46,7 @@
 //! - **Wave-end sink fires** drop the state lock first. A subscriber's sink
 //!   that calls back into `Core::emit` / `pause` / `resume` / `invalidate` /
 //!   `complete` / `error` / `teardown` re-acquires the lock cleanly and runs
-//!   a nested wave (the per-(Core, thread) `in_tick` ownership slot is
+//!   a nested wave (the one-Core-per-OS-thread `in_tick` ownership slot is
 //!   cleared by the owning `BatchGuard::drop` before the deferred-fire
 //!   phase).
 //! - **`BindingBoundary::invoke_fn`** fires lock-released. The wave engine
@@ -391,12 +391,6 @@ pub struct NodeOpts {
     /// terminal slice). Only DATA is buffered; RESOLVED entries are NOT
     /// (R2.6.5 explicit "DATA only").
     pub replay_buffer: Option<usize>,
-    /// §7 concurrency scheduling group (D208–D211). `None` (default)
-    /// = single-threaded lock-free path. `Some(g)` registers the node
-    /// into scheduling group `g`. Subject to the strict
-    /// dep-component-consistency check in [`Core::register`] (all deps'
-    /// component must be all-`None` or all-`Some`).
-    pub scheduling_group: Option<crate::handle::SchedulingGroupId>,
 }
 
 impl Default for NodeOpts {
@@ -408,7 +402,6 @@ impl Default for NodeOpts {
             is_dynamic: false,
             pausable: PausableMode::Default,
             replay_buffer: None,
-            scheduling_group: None,
         }
     }
 }
@@ -1190,19 +1183,6 @@ pub enum RegisterError {
     /// emit on its first fire.
     #[error("register: operator seed must be a real handle (R2.5.3); got NO_HANDLE")]
     OperatorSeedSentinel,
-
-    /// §7 strict scheduling-group consistency (D208–D211): the new
-    /// node's dep-connected component would be **mixed** — some members
-    /// carry a [`crate::handle::SchedulingGroupId`] and some are
-    /// `None`. A component MUST be uniformly all-`None` (single-threaded
-    /// floor) or all-`Some` (grouped). Assign the node/its deps a group
-    /// (or none) consistently before registering. Checked at
-    /// topology-mutation time only; never on the hot path.
-    #[error(
-        "register: scheduling-group inconsistency — node's dep component \
-         mixes grouped and ungrouped nodes (must be uniformly all-None or all-Some)"
-    )]
-    GroupInconsistent,
 }
 
 /// Errors returnable by [`Core::set_pausable_mode`].
@@ -1411,17 +1391,6 @@ pub(crate) struct NodeRecord {
     /// Per-fire helpers retain the new value before releasing the old;
     /// `release_handles` releases the current shares at end-of-life.
     pub(crate) op_scratch: Option<Box<dyn crate::op_state::OperatorScratch>>,
-    /// §7 concurrency scheduling group (D208–D211, 2026-05-16; renamed
-    /// `Serialization`→`Scheduling` at S3). `None` = the node is its own
-    /// single serial scheduling unit on the lock-free floor. `Some(g)` =
-    /// the node is declared into scheduling unit `g` (identity only —
-    /// post-S2c single-owner `Core` has no in-`Core` group lock; the S4
-    /// per-group runnable-wake on `CoreMailbox` is keyed by `g`). Static
-    /// + user-declared; set at [`Core::register`] (via [`NodeOpts`]) or
-    /// [`Core::set_scheduling_group`]. The strict dep-component-
-    /// consistency invariant (all-`None` or all-`Some`) is enforced at
-    /// those topology-mutation points only, never on the hot path.
-    pub(crate) scheduling_group: Option<crate::handle::SchedulingGroupId>,
 }
 
 impl NodeRecord {
@@ -1540,8 +1509,8 @@ impl NodeRecord {
 // `CrossPartitionState` held for its `Drop` impl is no longer needed —
 // `BatchGuard` already holds a `Core` clone with the binding).
 
-/// Core-global state with NO per-[`crate::handle::SchedulingGroupId`]
-/// partition (Slice B-2 Step 1, D220-EXEC). Hoisted out of [`CoreState`]
+/// Core-global state with NO per-scheduling-group partition
+/// (Slice B-2 Step 1, D220-EXEC). Hoisted out of [`CoreState`]
 /// so that when Step 2 shards `nodes`/`children` per `ShardKey`, THESE
 /// remain singular: monotonic id counters, the topology-sink registry,
 /// the cross-shard-visible `currently_firing` reentrancy stack (P13 /
@@ -1566,15 +1535,6 @@ pub struct CoreShared {
     /// Topology-change sinks. Keyed by subscription id for O(1) removal.
     pub(crate) topology_sinks: HashMap<u64, crate::topology::TopologySink>,
     pub(crate) next_topology_id: u64,
-    /// **Node → declared scheduling-group index.** `Some(g)`
-    /// entries only — a node absent here is ungrouped. The authority
-    /// for `group_of(n)` / `partition_of(n)`. Maintained by
-    /// register-with-group + [`Core::set_scheduling_group`]. Empty
-    /// for an all-`None` graph. D246/S2c: single-owner ⇒ no placement
-    /// shard (the old `node_shard` index is deleted; one shard always).
-    /// S3 renames the concept to `SchedulingGroupId`; S4 wires the
-    /// per-group `Send` wake.
-    pub(crate) node_group: HashMap<NodeId, crate::handle::SchedulingGroupId>,
     /// Core-global cap on per-node pause replay buffer length. `None` means
     /// unbounded. Per the user direction (Q1, 2026-05-05): start core-global;
     /// per-node override can be added later as a pure addition without API
@@ -1698,11 +1658,13 @@ impl Drop for CoreShared {
 /// wave-scoped fields the same way. /qa F1+F2 (2026-05-10) reverted
 /// `in_tick` and `currently_firing` to CoreState; `currently_firing`
 /// stays here (cross-thread P13 set_deps check, /qa F2), but `in_tick`
-/// was later re-keyed per-(Core, thread) into the
-/// `crate::batch::IN_TICK_OWNED` thread_local (2026-05-15) — Core-global
-/// placement broke disjoint-partition drain ownership while per-thread
-/// broke cross-Core isolation; the (Core, thread) key satisfies both.
-/// See `docs/rust-port-decisions.md`.
+/// was re-keyed per-(Core, thread) into the
+/// `crate::batch::IN_TICK_OWNED` thread_local (D047, 2026-05-15) and
+/// then collapsed to a one-Core-per-OS-thread `Cell<u64>` slot
+/// (D252, S5, 2026-05-19) — the actor-model invariant locks
+/// "one Core per OS thread" so a single-generation slot suffices,
+/// with cross-Core same-thread nesting panicking fail-loud at
+/// `BatchGuard::claim_in_tick`. See `docs/rust-port-decisions.md`.
 ///
 /// The D1 patch (2026-05-09) moved Slice G's `tier3_emitted_this_wave`
 /// set to a per-thread thread-local in `crate::batch` (was briefly
@@ -1733,7 +1695,8 @@ pub struct CoreState {
     //   `invalidate_hooks_fired_this_wave` / `wave_cache_snapshots` /
     //   `pending_auto_resolve` / `pending_pause_overflow` →
     //   per-thread [`crate::batch::WaveState`] (D108 Sub-slices 1–3).
-    // - `in_tick` → per-(Core, thread) [`crate::batch::IN_TICK_OWNED`].
+    // - `in_tick` → one-Core-per-OS-thread [`crate::batch::IN_TICK_OWNED`]
+    //   (D252; cross-Core same-thread nesting panics fail-loud).
     // - tier3-emitted-this-wave → per-thread
     //   [`crate::batch::TIER3_EMITTED_THIS_WAVE`] (Slice G / D1).
     // Core-global non-shard state (`next_*`, `topology_sinks`,
@@ -1761,9 +1724,10 @@ pub struct CoreState {
 //
 // - Same-thread / same-Core re-entrance (a user fn or in-wave sink
 //   re-entering via the owner-side mailbox/`DeferQueue` seam) runs as a
-//   nested wave: the inner `run_wave` sees `in_tick = true` (keyed by
-//   `Core::generation`, `batch::IN_TICK_OWNED`) and skips its own drain
-//   — the outer drain picks the queued op up to quiescence.
+//   nested wave: the inner `run_wave` sees `in_tick = true` (the
+//   one-Core-per-OS-thread `batch::IN_TICK_OWNED` slot holds this
+//   Core's `generation`, D252) and skips its own drain — the outer
+//   drain picks the queued op up to quiescence.
 // - Cross-`Core` concurrency is host-native: independent per-worker
 //   Cores (actor model). The only cross-thread bridge into a `!Send`
 //   Core is the id-only `Arc<CoreMailbox>` (timer / producer `post_*` +
@@ -1784,8 +1748,8 @@ static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct Core {
     /// Core-global region (id counters, topology-sink registry,
-    /// `currently_firing`, the two caps, `node_group`, the
-    /// scratch-release queue). D246/S2c: single-owner ⇒ a plain
+    /// `currently_firing`, the two caps, the scratch-release queue).
+    /// D246/S2c: single-owner ⇒ a plain
     /// `RefCell` (the `parking_lot`/`StateCell`-generic split was
     /// shared-Core-era legacy; the actor model drives a `Core` from
     /// exactly one thread). D248 relaxed the substrate `Sink`/
@@ -1816,8 +1780,12 @@ pub struct Core {
     pub(crate) deferred: std::rc::Rc<crate::mailbox::DeferQueue>,
     pub(crate) binding: Arc<dyn BindingBoundary>,
     /// Unique generation ID for this Core instance. Assigned from
-    /// [`CORE_GENERATION`] at construction. Keys the per-(Core, thread)
-    /// `crate::batch::IN_TICK_OWNED` re-entrance slot.
+    /// [`CORE_GENERATION`] at construction; nonzero (the counter starts
+    /// at 1 so `0` can serve as the [`crate::batch::IN_TICK_OWNED`]
+    /// "no active Core" sentinel under D252). Stored in the one-Core-
+    /// per-OS-thread `IN_TICK_OWNED` slot while this Core owns the
+    /// thread's wave; cross-Core same-thread nesting panics fail-loud
+    /// at `BatchGuard::claim_in_tick`.
     pub(crate) generation: u64,
 }
 
@@ -2237,11 +2205,6 @@ impl Core {
                 max_batch_drain_iterations: 10_000,
                 topology_sinks: HashMap::new(),
                 next_topology_id: 1,
-                // Declared scheduling-group identity (S3 renames
-                // this to `SchedulingGroupId`; S4 wires per-group
-                // wake). S2c keeps the identity; the cross-thread
-                // wave-lock registry + placement-shard map are gone.
-                node_group: HashMap::new(),
                 pending_scratch_release: Vec::new(),
                 binding: binding.clone(),
             }),
@@ -2274,7 +2237,7 @@ impl Core {
 
     /// Run `f` with mutable access to the [`CoreShared`] region ONLY
     /// (id counters, topology-sink registry, `currently_firing`, the
-    /// two caps, `node_group`, the scratch-release queue). Pure-shared
+    /// two caps, the scratch-release queue). Pure-shared
     /// ops (id alloc, topology) take only this borrow.
     pub(crate) fn with_shared<R>(&self, f: impl FnOnce(&mut CoreShared) -> R) -> R {
         f(&mut self.shared.borrow_mut())
@@ -2441,46 +2404,14 @@ impl Core {
         Arc::clone(&self.binding)
     }
 
-    /// Number of distinct scheduling groups currently declared.
-    /// Inspection / acceptance-bar only. An all-`None` graph reports
-    /// `0`. D246/S2c: single-owner ⇒ no wave-lock registry; the
-    /// `node_group` index is the authority (S3 renames the concept to
-    /// `SchedulingGroupId`; S4 wires per-group wake).
-    #[must_use]
-    pub fn partition_count(&self) -> usize {
-        self.with_shared(|sh| {
-            let mut seen: HashSet<crate::handle::SchedulingGroupId> = HashSet::default();
-            seen.extend(sh.node_group.values().copied());
-            seen.len()
-        })
-    }
-
-    /// Resolve `node`'s declared scheduling group. Returns `None`
-    /// for unregistered nodes **and** for registered nodes with no
-    /// group assigned (the two are distinguished via [`Self::kind_of`]
-    /// if needed). Pure `node_group` index lookup.
-    #[must_use]
-    pub fn partition_of(&self, node: NodeId) -> Option<crate::handle::SchedulingGroupId> {
-        self.group_of(node)
-    }
-
-    /// `node`'s declared group — the `CoreShared.node_group` index is
-    /// the authority (maintained by register-with-group +
-    /// `set_scheduling_group`). Unregistered & registered-ungrouped
-    /// both → absent → `None`.
-    #[must_use]
-    pub(crate) fn group_of(&self, node: NodeId) -> Option<crate::handle::SchedulingGroupId> {
-        self.with_shared(|sh| sh.node_group.get(&node).copied())
-    }
-
     /// Execute a producer-pattern op. §7: the union-find ascending-order
     /// constraint that motivated *deferring* these is deleted (groups
     /// are static identity only — S2c removed the group-lock machinery,
     /// so there is no `PartitionOrderViolation` to dodge). The op runs
     /// **immediately** — re-entrant execution on the single owner thread
-    /// is absorbed by the in-flight wave drain (`IN_TICK_OWNED`,
-    /// `Core::generation`-keyed), exactly as the deferred drain used to
-    /// run it at wave-end. The `deferred_producer_ops` queue +
+    /// is absorbed by the in-flight wave drain (one-Core-per-OS-thread
+    /// `IN_TICK_OWNED` slot, D252), exactly as the deferred drain used
+    /// to run it at wave-end. The `deferred_producer_ops` queue +
     /// `drain_deferred_producer_ops` are deleted; this shim is retained
     /// so `graphrefly-operators` compiles unchanged (D211 minimal-churn).
     ///
@@ -2521,141 +2452,18 @@ impl Core {
     // `acquire_touched_group_guards` / `acquire_all_group_guards` /
     // `with_global_wave_fallback`) is **deleted** — single-owner ⇒ a
     // `Core` is driven by exactly one thread, so there are no
-    // interleaving waves to serialize. The declared-group identity
-    // (`node_group` / `partition_of`) survives for S3
-    // (`SchedulingGroupId` rename) + S4 (per-group `Send` wake).
+    // interleaving waves to serialize. D253 (S5) further deletes the
+    // declared-group identity surface (`SchedulingGroupId`,
+    // `node_group`, `partition_of`/`group_of`/`set_scheduling_group`,
+    // and `NodeOpts.scheduling_group`) — re-introduce in M6 with M6's
+    // actual scheduling needs in view.
 }
 
-/// Walk the undirected dep-edge graph from `start`, optionally
-/// skipping ONE edge in both directions, and optionally treating
-/// additional edges as if present. Returns every reachable
-/// [`NodeId`].
-///
-/// Implementation note: uses a stack (`pop()` on a `SmallVec`) — i.e.
-/// DFS traversal order. For pure reachability the order doesn't
-/// matter (the visited set is identical to BFS); the function is
-/// named "walk" rather than "BFS" to avoid implying that traversal
-/// distance is meaningful (QA-fix group 2 — earlier name
-/// `bfs_undirected_dep_graph` was misleading).
-///
-/// **Edge convention:** the dep edge `parent → child` represents
-/// data flow from `parent` (a dep) to `child` (the consumer). It
-/// appears in `s.children[parent]` as `child`, and in
-/// `s.nodes[child].dep_records` as `parent`. `skip_edge =
-/// Some((parent, child))` skips both forward (`parent → child`) and
-/// backward (`child → parent`) traversals of that edge. Each
-/// `(p, c)` pair in `extra_edges` is treated as if `c ∈
-/// s.children[p]` and `p ∈ s.nodes[c].dep_records` — used for
-/// "what would connectivity look like if THESE edges were also
-/// present?" lookahead.
-///
-/// Used by Slice Y1 / Phase F (D3 split-eager, 2026-05-09):
-/// - **P13 widening (pre-removal connectivity):** call with
-///   `skip_edge = Some((removed_parent, removed_child))` AND
-///   `extra_edges = added_edges_in_set_deps_call` so a `set_deps`
-///   that simultaneously removes one edge AND adds another path
-///   isn't falsely flagged as disconnecting (QA-fix #4 2026-05-09 —
-///   without `extra_edges`, the pre-mutation BFS doesn't see the
-///   would-be-added edges and rejects the conservative case).
-/// - **Actual split execution (post-removal):** call with
-///   `skip_edge = None` and `extra_edges = &[]`; the visited set is
-///   the keep-side of the split (the side containing `start`).
-pub(crate) fn walk_undirected_dep_graph(
-    s: &CoreState,
-    start: NodeId,
-    skip_edge: Option<(NodeId, NodeId)>,
-    extra_edges: &[(NodeId, NodeId)],
-) -> HashSet<NodeId> {
-    // QA F2 / point-3 (2026-05-16): the component is defined over deps
-    // **+ children + meta** — ONE unified connectivity relation, reused
-    // by register / set_deps / add_meta_companion / set_scheduling_group
-    // so the strict all-`None`|all-`Some` invariant and the wave cascade
-    // agree on what "the component" is. Meta edges are directional
-    // (`parent.meta_companions ∋ companion`); for undirected reachability
-    // we traverse them both ways. Reverse-meta needs a scan, built once
-    // here (declare-time only — never the hot path, per the §7 invariant).
-    let mut meta_parents: HashMap<NodeId, SmallVec<[NodeId; 2]>> = HashMap::default();
-    for (&p, rec) in &s.nodes {
-        for &comp in &rec.meta_companions {
-            meta_parents.entry(comp).or_default().push(p);
-        }
-    }
-    let mut visited: HashSet<NodeId> = HashSet::default();
-    let mut queue: SmallVec<[NodeId; 32]> = SmallVec::new();
-    queue.push(start);
-    while let Some(cur) = queue.pop() {
-        if !visited.insert(cur) {
-            continue;
-        }
-        if let Some(consumers) = s.children.get(&cur) {
-            for &c in consumers {
-                let is_skipped = skip_edge.is_some_and(|(sp, sc)| cur == sp && c == sc);
-                if !is_skipped && !visited.contains(&c) {
-                    queue.push(c);
-                }
-            }
-        }
-        if let Some(rec) = s.nodes.get(&cur) {
-            for d in rec.dep_records.iter().map(|r| r.node) {
-                let is_skipped = skip_edge.is_some_and(|(sp, sc)| cur == sc && d == sp);
-                if !is_skipped && !visited.contains(&d) {
-                    queue.push(d);
-                }
-            }
-            // Forward meta: cur → its companions.
-            for &comp in &rec.meta_companions {
-                if !visited.contains(&comp) {
-                    queue.push(comp);
-                }
-            }
-        }
-        // Reverse meta: any parent that lists cur as a companion.
-        if let Some(parents) = meta_parents.get(&cur) {
-            for &p in parents {
-                if !visited.contains(&p) {
-                    queue.push(p);
-                }
-            }
-        }
-        // Virtual extra edges (e.g. would-be-added edges in
-        // pre-mutation BFS).
-        for &(ep, ec) in extra_edges {
-            if cur == ep && !visited.contains(&ec) {
-                queue.push(ec);
-            }
-            if cur == ec && !visited.contains(&ep) {
-                queue.push(ep);
-            }
-        }
-    }
-    visited
-}
-
-/// The ONE strict-consistency guard (QA F2 / point-3, 2026-05-16): is
-/// `node`'s full dep+children+meta component uniformly all-`None` or
-/// all-`Some`? Reused by `register`, `set_deps`, `add_meta_companion`
-/// and `set_scheduling_group` so every topology-mutation entry point
-/// enforces the §7 invariant against the *same* component definition
-/// (closing the prior hole where register/set_deps used a deps-only
-/// inductive shortcut that meta edges could bypass). Declare-time only —
-/// the walk never runs on the hot path.
-#[must_use]
-pub(crate) fn component_is_group_consistent(s: &CoreState, node: NodeId) -> bool {
-    let component = walk_undirected_dep_graph(s, node, None, &[]);
-    let mut saw_some = false;
-    let mut saw_none = false;
-    for m in component {
-        if s.nodes.get(&m).and_then(|r| r.scheduling_group).is_some() {
-            saw_some = true;
-        } else {
-            saw_none = true;
-        }
-        if saw_some && saw_none {
-            return false;
-        }
-    }
-    true
-}
+// `walk_undirected_dep_graph` + `component_is_group_consistent`: deleted
+// by D253 (S5). They existed solely to validate `scheduling_group`'s
+// dep+children+meta-component invariant at topology-mutation time. With
+// the declared-group identity surface deleted, the component walk has no
+// remaining caller — re-introduce alongside M6's scheduling work.
 
 impl Core {
     /// Internal inspection helper: number of `PendingBatch`es queued
@@ -2965,7 +2773,6 @@ impl Core {
             is_dynamic,
             pausable,
             replay_buffer,
-            scheduling_group,
         } = opts;
 
         // Derive the field shape from fn_or_op + deps.
@@ -3009,23 +2816,6 @@ impl Core {
         // order is reverse declaration order, so the `MutexGuard` drops
         // first on any return path.
         let scratch_guard = ScratchReleaseGuard::new(scratch, &*self.binding);
-
-        // Step 2b-ii-B (D220-EXEC): §7 invariant is "all-`None` OR
-        // all-`Some`" (NOT all-same-group — a component MAY span
-        // distinct `Some` groups). (1) Shard-agnostic None/Some-mix
-        // rejection via the `node_group` index (a grouped dep lives in
-        // its own shard, so the post-insert same-shard walk can't see
-        // it — it'd misreport `UnknownDep`; the index is the
-        // cross-shard authority for the *declared group*). (2)
-        // §7 group-consistency: a dep-connected component is uniformly
-        // all-`None` or all-grouped. D246/S2c: single-owner ⇒ no
-        // placement shard (one shard always); only the declared
-        // `node_group` identity is maintained (S3/S4).
-        for &dep in &deps {
-            if scheduling_group.is_none() != self.group_of(dep).is_none() {
-                return Err(RegisterError::GroupInconsistent);
-            }
-        }
 
         // Phase 3 — state-lock-required validation, FOLDED with insertion
         // under a single `lock_state()` acquisition per /qa F1. The
@@ -3111,57 +2901,11 @@ impl Core {
             received_mask: 0,
             involved_mask: 0,
             op_scratch: installed_scratch,
-            scheduling_group,
         };
         s.nodes.insert(id, rec);
         s.children.insert(id, HashSet::new());
         for &dep in &deps {
             s.children.entry(dep).or_default().insert(id);
-        }
-        // Maintain the declared-group index (`partition_of` authority;
-        // S3 `SchedulingGroupId` rename / S4 per-group wake). Absent ⇒
-        // `None` (ungrouped).
-        if let Some(g) = scheduling_group {
-            s.shared.node_group.insert(id, g);
-        }
-        // Slice Y1 (D3 / D090 — P12 fix, 2026-05-08): maintain partition
-        // membership BEFORE dropping the state lock. Closes the
-        // eventual-consistency window where a concurrent thread observed
-        // the new node in `s.nodes` / new edges in `s.children` but the
-        // registry hadn't unioned the partition yet. Today benign
-        // (`partition_of` is debug-only); under Y1's wave engine
-        // migration `lock_for(node)` consumes registry state on the hot
-        // path, and the window means `lock_for` could resolve to a
-        // partition that's been topologically unioned in `s.children`
-        // but not yet in `registry`.
-        //
-        // **Lock-discipline invariant:** `state lock → registry mutex`
-        // (one-way; never registry → state). Registry mutex is
-        // uncontended in the X5 substrate — the only acquisition sites
-        // are this one + `Core::set_deps` + the read-only accessors
-        // `partition_count`/`partition_of` and (Y1+) `lock_for` — none
-        // of which take the state lock — so the inner critical section
-        // adds negligible latency.
-        // §7 strict scheduling-group consistency (D208–D211; QA F2 /
-        // point-3 unified the guard 2026-05-16). The node is already
-        // inserted with its deps wired into `s.children` / `dep_records`,
-        // so the merged component is fully walkable: the ONE guard
-        // (`component_is_group_consistent`, deps + children + meta) decides
-        // it. Topology-mutation time only — never the hot path.
-        if !component_is_group_consistent(&s, id) {
-            // Roll back the partial insert before returning — incl.
-            // the `node_group` index (else a stale entry would leak +
-            // wrongly report `partition_of`).
-            s.nodes.remove(&id);
-            s.children.remove(&id);
-            s.shared.node_group.remove(&id);
-            for &dep in &deps {
-                if let Some(c) = s.children.get_mut(&dep) {
-                    c.remove(&id);
-                }
-            }
-            drop(s);
-            return Err(RegisterError::GroupInconsistent);
         }
         drop(s);
         self.fire_topology_event(&crate::topology::TopologyEvent::NodeRegistered(id));
@@ -3627,9 +3371,13 @@ impl Core {
                 tier_slices.push(vec![Message::Data(*h)]);
             }
 
-            // Install sink BEFORE dropping state lock so any thread that
-            // subsequently acquires `wave_owner` (after our scope ends)
-            // sees the sink already registered.
+            // Install sink BEFORE dropping state lock so any subsequent
+            // owner-side wave (after our scope ends) sees the sink
+            // already registered. (Pre-S2c the comment referenced
+            // acquiring `wave_owner` for cross-thread serialization;
+            // post-D248 single-owner there is no cross-thread emitter
+            // and no `wave_owner` lock — the rule is just "install
+            // before drop so future waves see the sink.")
             //
             // Slice X4 / D2: bump `subscribers_revision` alongside the
             // insert so a pending_notify entry opened earlier in the same
@@ -4669,36 +4417,14 @@ impl Core {
     /// # Panics
     ///
     /// Panics if either node id is unknown, or if `parent == companion`
-    /// (a node cannot be its own meta companion — would loop on TEARDOWN),
-    /// or if attaching `companion` would make `parent`'s dep+children+meta
-    /// component **group-inconsistent** (mix `None` and `Some` —
-    /// §7 strict invariant; QA F2 / point-3, 2026-05-16). The meta edge is
-    /// a component-joining edge just like a dep edge, so it is guarded by
-    /// the same ONE `component_is_group_consistent` check the deleted
-    /// deps-only inductive shortcut used to bypass. Panic (not `Result`)
-    /// matches this API's existing assert-based contract style; a
-    /// differently-grouped companion is a wiring error, like a cycle.
+    /// (a node cannot be its own meta companion — would loop on TEARDOWN).
     pub fn add_meta_companion(&self, parent: NodeId, companion: NodeId) {
         assert!(parent != companion, "node cannot be its own meta companion");
-        // /qa A(i)/D (Slice B-2 Step 2b-ii): a meta edge joins
-        // `companion` into `parent`'s component. If the two resolve to
-        // DIFFERENT placement shards, the resulting component would
-        // span shards — either a §7 `None`/`Some` mix OR a distinct-
-        // `Some`-group component (the latter is an unsupported v1
-        // residual: multi-`Some`-group component construction needs
-        // the multi-shard-per-wave / component-uniform-migration the
-        // parallelism work also needs — see `porting-deferred.md`).
-        // Reject loudly with the §7 diagnostic here, NOT the
-        // misleading `assert!(contains_key(companion))` "unknown
-        // companion" panic — that fired first (the pre-`lock_state`
-        // route to `parent`'s shard cannot see a cross-shard
-        // companion), leaving the documented rollback/diagnostic path
-        // below DEAD for every cross-shard companion (Edge#2).
         // D246/S2c: single-owner ⇒ ONE shard; the prior cross-shard
         // `shard_of(parent) == shard_of(companion)` assert is vacuous
-        // and deleted. The post-insert `component_is_group_consistent`
-        // check below is the authority for the §7 all-None/all-Some
-        // invariant.
+        // and deleted. D253 (S5) further deletes the §7 group-
+        // consistency invariant on this edge (the `SchedulingGroupId`
+        // surface is gone until M6 re-introduces it).
         let mut s = self.lock_state();
         assert!(s.nodes.contains_key(&parent), "unknown parent {parent:?}");
         assert!(
@@ -4710,20 +4436,6 @@ impl Core {
             return;
         }
         metas.push(companion);
-        if !component_is_group_consistent(&s, parent) {
-            // Roll back the meta edge before failing — keep the graph in
-            // the pre-call consistent state.
-            let metas = &mut s.require_node_mut(parent).meta_companions;
-            if let Some(pos) = metas.iter().position(|&c| c == companion) {
-                metas.swap_remove(pos);
-            }
-            panic!(
-                "add_meta_companion({parent:?}, {companion:?}): would make \
-                 the component mix grouped and ungrouped nodes \
-                 (§7 strict invariant — must be uniformly all-None or \
-                 all-Some; reassign the component via set_scheduling_group)"
-            );
-        }
     }
 }
 
@@ -5161,161 +4873,26 @@ pub enum SetDepsError {
          Schedule the rewire outside this fire scope."
     )]
     ReentrantOnFiringNode { n: NodeId },
-
-    /// `set_deps(n, ...)` would trigger a partition migration (union or
-    /// split in the per-subgraph union-find registry) that affects the
-    /// partition of a node currently mid-fire on this thread. Distinct
-    /// from [`Self::ReentrantOnFiringNode`]: that variant rejects
-    /// `set_deps(n, ...)` where `n` itself is firing; this variant
-    /// rejects `set_deps(n, ...)` on some OTHER node whose union/split
-    /// shifts a firing node's partition root mid-wave.
-    ///
-    /// Why this matters: Y1's wave engine holds an
-    /// [`Arc<crate::subgraph::SubgraphLockBox>`] for the firing node's
-    /// partition for the wave's duration. A union mid-wave swaps the
-    /// box-identity for one of the two affected partitions; a split
-    /// (Y1+ post-Phase-F) extracts a fresh box for the orphan side.
-    /// Either way the held Arc would diverge from the registry's
-    /// current root for that partition, so the wave would lose
-    /// serialization against the box's true partition mid-flight.
-    ///
-    /// Per [`SESSION-rust-port-d3-per-subgraph-parallelism.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md)
-    /// Q3 = (a-strict): mid-wave migration is rejected at edge-mutation
-    /// time. If a real consumer surfaces pressure to support mid-wave
-    /// migration, lift via state-migration logic in a follow-up — but
-    /// the v1 contract is "the partition a wave runs in cannot change
-    /// shape mid-flight."
-    ///
-    /// `n` is the node whose `set_deps` was rejected; `firing` is the
-    /// concretely-identified firing node whose partition would be
-    /// migrated. Workaround: schedule the rewire outside the wave
-    /// (e.g. emit a state-change that triggers `set_deps` from a sink
-    /// callback running post-flush).
-    ///
-    /// Slice Y1 (D3 / D091, 2026-05-08).
-    /// **Vestigial (§7, D208–D211).** scheduling groups are static
-    /// and user-declared, so `set_deps` never migrates a node's group;
-    /// this is never returned post-§7. Retained only so downstream
-    /// `Err(_)` match arms compile unchanged (D211); removal is a
-    /// tracked downstream-churn follow-on.
-    #[error("vestigial PartitionMigrationDuringFire (never returned post-§7)")]
-    PartitionMigrationDuringFire { n: NodeId, firing: NodeId },
-
-    /// §7 strict scheduling-group consistency (D208–D211): the
-    /// rewired dep set would make node `n`'s component **mixed**
-    /// (grouped + ungrouped members). A component must be uniformly
-    /// all-`None` or all-`Some`. Checked at topology-mutation time only.
-    #[error(
-        "set_deps({n:?}, ...): scheduling-group inconsistency — the new \
-         dep set mixes grouped and ungrouped nodes in n's component \
-         (must be uniformly all-None or all-Some)"
-    )]
-    GroupInconsistent { n: NodeId },
-}
-
-/// Errors returnable by [`Core::set_scheduling_group`] (§7, D208–D211).
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum SetGroupError {
-    /// The node id is not registered.
-    #[error("set_scheduling_group: unknown node {0:?}")]
-    UnknownNode(NodeId),
-
-    /// **Unreachable since QA point-3 (2026-05-16):**
-    /// [`Core::set_scheduling_group`] now assigns the group to the
-    /// node's *entire* dep+children+meta component atomically, so the
-    /// result is consistent by construction. Retained (pre-1.0, no
-    /// removal churn) for the impossible-by-construction arm and any
-    /// future per-node variant. Was: "assigning would make the component
-    /// mix grouped and ungrouped nodes."
-    #[error(
-        "set_scheduling_group({node:?}): component-mixed (unreachable since \
-         point-3 component-wide assignment; report as a bug if observed)"
-    )]
-    ComponentInconsistent { node: NodeId },
-
-    /// `set_scheduling_group` was called on a node that is currently
-    /// firing its fn (the §7 cross-shard component migration would
-    /// move a record out from under an in-flight `invoke_fn` →
-    /// `unknown node` panic). Mirrors
-    /// [`SetDepsError::ReentrantOnFiringNode`] (Slice B-2 Step 2b-ii
-    /// /qa B). The migration is a topology-mutation op and MUST be
-    /// externally excluded from concurrent Core access to the
-    /// component (see `porting-deferred.md` "set_scheduling_group
-    /// concurrency precondition"); this guard catches the in-fire
-    /// case loudly rather than corrupting state.
-    #[error("set_scheduling_group({node:?}): node is currently firing its fn")]
-    ReentrantOnFiringNode { node: NodeId },
+    // /qa m1 (2026-05-19): the vestigial `PartitionMigrationDuringFire`
+    // variant — kept across §7/D208–D211 + D253 (S5) as a downstream-
+    // churn courtesy for `Err(_)` match arms — is now deleted. D253
+    // removed the entire scheduling-group identity surface
+    // (`SchedulingGroupId`, `node_group` index,
+    // `set_scheduling_group`/`partition_of`/`group_of`), so the
+    // partition-migration concept is gone too. No surviving caller
+    // pattern-matches the variant (verified by grep; the only
+    // reference was a TRASH/scheduling_groups.rs comment).
 }
 
 // D246/S2c: `MigrationRollback` + `MovedComponent` deleted — there is
 // no cross-shard extract→reinsert (single shard always under
-// single-owner). `set_scheduling_group` now mutates the declared
-// group in place under one borrow; nothing to roll back.
+// single-owner). D253 (S5) further deletes `SetGroupError` +
+// `Core::set_scheduling_group` entirely — the declared-group identity
+// surface (`SchedulingGroupId`, `node_group`, `partition_of`/`group_of`)
+// is removed until M6 re-introduces it with M6's actual scheduling
+// needs in view.
 
 impl Core {
-    /// §7 (D208–D211; QA point-3 made it component-wide, 2026-05-16):
-    /// assign (or clear, with `None`) the [`crate::handle::SchedulingGroupId`]
-    /// for `node`'s **entire** dep+children+meta component.
-    ///
-    /// This is the **retroactive regrouping** primitive: because
-    /// `set_deps` / mount / unmount can merge previously-separate
-    /// components, and the strict invariant forbids a mixed component, a
-    /// *per-node* setter could never legally transition an all-`None`
-    /// component to all-`Some` (every intermediate single-node state
-    /// would be mixed → rejected — a chicken-and-egg). Assigning the
-    /// whole component in one atomic call removes that: the result is
-    /// uniformly `group` by construction, so the invariant always holds
-    /// and [`SetGroupError::ComponentInconsistent`] is unreachable.
-    ///
-    /// The component is the ONE unified relation (deps + children + meta)
-    /// — the same one `register` / `set_deps` / `add_meta_companion`
-    /// enforce, so regrouping after a topology change is coherent. The
-    /// walk runs at this topology-mutation call only — never the hot path.
-    ///
-    /// Groups are static: this does not re-fire any node or move an
-    /// in-flight wave; it only changes which wave-lock future waves
-    /// touching the component will acquire.
-    pub fn set_scheduling_group(
-        &self,
-        node: NodeId,
-        group: Option<crate::handle::SchedulingGroupId>,
-    ) -> Result<(), SetGroupError> {
-        // /qa B: in-fire reject — mirrors `set_deps`'s
-        // `ReentrantOnFiringNode`. Reassigning a firing node's group
-        // mid-`invoke_fn` would mutate state out from under it;
-        // rejecting loudly beats corrupting it. (Pure `CoreShared`,
-        // pre-lock — no `St` held yet.)
-        if self.with_shared(|sh| sh.currently_firing.contains(&node)) {
-            return Err(SetGroupError::ReentrantOnFiringNode { node });
-        }
-
-        // D246/S2c: single-owner ⇒ ONE shard. There is no
-        // extract→reinsert migration and nothing to roll back — the
-        // component's records never move. Walk the component once and
-        // homogenise the declared group in place: every member's
-        // `NodeRecord.scheduling_group` and the `node_group` index
-        // both ⇒ `group` (or cleared for `None`). The component is
-        // single-group-or-all-`None` by construction, so the result is
-        // uniform and `SetGroupError::ComponentInconsistent` is
-        // unreachable.
-        let mut s = self.lock_state();
-        if !s.nodes.contains_key(&node) {
-            return Err(SetGroupError::UnknownNode(node));
-        }
-        let component = walk_undirected_dep_graph(&s, node, None, &[]);
-        for m in &component {
-            if let Some(rec) = s.nodes.get_mut(m) {
-                rec.scheduling_group = group;
-            }
-            if let Some(g) = group {
-                s.shared.node_group.insert(*m, g);
-            } else {
-                s.shared.node_group.remove(m);
-            }
-        }
-        Ok(())
-    }
-
     /// Atomic dep mutation — change a node's upstream deps without TEARDOWN
     /// cascading and without losing cache.
     ///
@@ -5394,33 +4971,6 @@ impl Core {
         if new_deps.contains(&n) {
             return Err(SetDepsError::SelfDependency { n });
         }
-        // Step 2b-ii-B (D220-EXEC): §7 None/Some-mix rejection, BEFORE
-        // the new-dep existence loop below. A grouped new-dep lives in
-        // ITS shard, not `n`'s, so `s.nodes.contains_key(dep)` (n's
-        // shard) would miss it and wrongly report `UnknownNode(dep)`
-        // instead of `GroupInconsistent` (the dep DOES exist — it's a
-        // mix, not unknown). Read the declared-group class from the
-        // shard-agnostic `CoreShared.node_group` index via the
-        // already-held `s.shared` guard (NO re-lock; `contains_key` ⇔
-        // `Some`). Endpoint check `{n} ∪ new_deps`; early return ⇒
-        // topology unchanged on reject. Precedence:
-        // Reentrant > SelfDependency > GroupInconsistent > UnknownDep
-        // > Cycle (all-`None` ⇒ no entries ⇒ falls through unchanged).
-        {
-            let node_some = s.shared.node_group.contains_key(&n);
-            let mut saw_some = node_some;
-            let mut saw_none = !node_some;
-            for &d in new_deps {
-                if s.shared.node_group.contains_key(&d) {
-                    saw_some = true;
-                } else {
-                    saw_none = true;
-                }
-            }
-            if saw_some && saw_none {
-                return Err(SetDepsError::GroupInconsistent { n });
-            }
-        }
         // Validate all new deps exist.
         for &d in new_deps {
             if !s.nodes.contains_key(&d) {
@@ -5460,17 +5010,9 @@ impl Core {
         // P13 check accordingly.
         let removed: HashSet<NodeId> = current_deps.difference(&new_deps_set).copied().collect();
 
-        // §7 strict scheduling-group consistency (D208–D211; QA F2 /
-        // point-3): the `{n} ∪ new_deps` None/Some-mix endpoint check
-        // is HOISTED above (Step 2b-ii-B) — before the new-dep
-        // existence loop, so a grouped cross-shard dep yields
-        // `GroupInconsistent` (it exists, in its own shard) rather than
-        // `UnknownNode`. Soundness unchanged: every component is
-        // internally consistent (register / add_meta_companion /
-        // set_scheduling_group enforce the unified guard), so
-        // merging is consistent iff `{n} ∪ new_deps` is not mixed.
-        // Idempotent fast-path. Now safe to short-circuit since the P13
-        // check above already considered both `added` and `removed`.
+        // Idempotent fast-path: no add/remove ⇒ no-op. D253 (S5) deletes
+        // the prior §7 None/Some-mix endpoint check that lived above —
+        // the declared-group identity surface is gone until M6.
         if added.is_empty() && removed.is_empty() {
             return Ok(());
         }

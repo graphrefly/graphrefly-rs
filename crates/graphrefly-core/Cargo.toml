@@ -17,6 +17,12 @@ indexmap    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 serde_json  = { workspace = true }
+# Compile-time `!Send + !Sync` assertions on owner-thread-only types
+# (D254 — `DeferQueue` MUST stay `!Send + !Sync` by construction; a
+# future field that silently widens the trait bounds breaks the actor-
+# model "one owner thread per Core" invariant. Build-time-only; zero
+# runtime cost).
+static_assertions = { workspace = true }
 # Sync SHA-256 for the `hash` module (no tokio — Core stays synchronous;
 # the async-everywhere wrapping is applied only at the napi boundary).
 sha2        = { workspace = true }

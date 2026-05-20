@@ -538,7 +538,9 @@ fn take_after_skip_produces_window() {
 // owner-only `Rc<DeferQueue>`). The prior
 // `flow_registration_is_send_and_sync` assertion was shared-Core-era
 // legacy and is deleted — the single-owner contract ("owned & driven
-// on one thread") is asserted canonically in `scheduling_groups.rs`.
+// on one thread") used to be asserted by the deleted `scheduling_groups.rs`
+// test file (D253 (S5) deleted the `SchedulingGroupId` surface entirely;
+// the single-owner contract is now structural via `Core: !Send + !Sync`).
 #[test]
 fn flow_registration_type_touch() {
     let _ = core::marker::PhantomData::<graphrefly_operators::flow::FlowRegistration>;
