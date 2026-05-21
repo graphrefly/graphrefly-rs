@@ -100,18 +100,20 @@ fn opt_in_terminal_opens_gate_for_fire_fn() {
 }
 
 // ---------------------------------------------------------------------------
-// partial=true bypasses the gate entirely regardless of the flag.
+// partial=true ALONE does NOT skip auto-cascade — canonical-spec §5.4 / R5.4
+// locks `partial` to first-run-gate-bypass ONLY. The dep COMPLETE still
+// auto-cascades the consumer to terminal without firing the fn. (QA D1 fix
+// post-/qa, 2026-05-21: original test asserted the wider semantic that
+// also skipped cascade for partial; that was a behavioral change beyond
+// D263's locked scope.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn partial_bypasses_gate_regardless_of_flag() {
+fn partial_alone_does_not_skip_auto_cascade() {
     let rt = TestRuntime::new();
     let s = rt.state(None);
     let fn_id = make_constant_fn(&rt, TestValue::Int(7));
 
-    // partial=true, terminal_as_real_input=false — partial alone bypasses
-    // the gate AND skips auto-cascade (D263 — `skips_auto_cascade` returns
-    // true when `partial || terminal_as_real_input`).
     let derived = rt
         .core()
         .register(NodeRegistration {
@@ -128,10 +130,54 @@ fn partial_bypasses_gate_regardless_of_flag() {
 
     rt.core().complete(s.id);
 
+    // No DATA — auto-cascade took the consumer straight to COMPLETE.
+    let data: Vec<TestValue> = rec.data_values();
+    assert!(
+        data.is_empty(),
+        "partial=true alone must NOT skip auto-cascade — got {data:?}"
+    );
+    // The consumer received COMPLETE via cascade.
+    let completes = rec.count(|e| matches!(e, RecordedEvent::Complete));
+    assert_eq!(
+        completes, 1,
+        "partial=true with COMPLETE-only dep: consumer auto-cascades to COMPLETE"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Combined `partial=true, terminal_as_real_input=true` IS the way to get
+// fire-on-COMPLETE in partial mode. `terminal_as_real_input` provides the
+// cascade-skip + gate-counts-terminal-as-real-input; `partial` adds gate-
+// bypass on top (so sentinel-non-terminal deps don't hold either). The fn
+// body must explicitly handle SENTINEL slots (R5.4).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_plus_terminal_as_real_input_fires_on_complete() {
+    let rt = TestRuntime::new();
+    let s = rt.state(None);
+    let fn_id = make_constant_fn(&rt, TestValue::Int(7));
+
+    let derived = rt
+        .core()
+        .register(NodeRegistration {
+            deps: vec![s.id],
+            fn_or_op: Some(NodeFnOrOp::Fn(fn_id)),
+            opts: NodeOpts {
+                partial: true,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+        })
+        .unwrap();
+    let rec = rt.subscribe_recorder(derived);
+
+    rt.core().complete(s.id);
+
     let data: Vec<TestValue> = rec.data_values();
     assert_eq!(
         data,
         vec![TestValue::Int(7)],
-        "partial=true: gate bypassed; fn fires on dep COMPLETE even with terminal_as_real_input=false"
+        "partial=true + terminal_as_real_input=true: fn fires on dep COMPLETE"
     );
 }

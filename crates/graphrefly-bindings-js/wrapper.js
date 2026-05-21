@@ -196,6 +196,11 @@ class NativeNode {
     this._fnId = null;
     this._deps = null;
     this._currentUserFn = null;
+    // QA A2 — stashed rollback error from a prior failed rewire. When
+    // set, any further setDeps/addDep/removeDep call throws via
+    // `_requireRewireHooks` rather than dispatching against an
+    // indeterminate closure-cell state.
+    this._rewirePoisoned = null;
   }
 
   get inner() {
@@ -344,6 +349,15 @@ class NativeNode {
           `widening to additional operators.`,
       );
     }
+    // QA A2 (2026-05-21): a prior rewire rollback failed → node is in an
+    // indeterminate state. Fail fast rather than dispatching against an
+    // inconsistent closure.
+    if (this._rewirePoisoned) {
+      throw new Error(
+        `[graphrefly/native] ${method}: node is poisoned from a prior ` +
+          `rewire rollback failure: ${this._rewirePoisoned.message ?? this._rewirePoisoned}`,
+      );
+    }
   }
 
   // Rewire-atomicity discipline (matches pure-ts
@@ -376,9 +390,10 @@ class NativeNode {
     } catch (e) {
       // Roll back the closure swap so the original fn still drives
       // dispatch (matches the parity contract: rejected setDeps leaves
-      // both fn AND dep shape untouched).
-      await this._swapFn(oldUserFn);
-      this._currentUserFn = oldUserFn;
+      // both fn AND dep shape untouched). QA A2: rollback itself can
+      // fail; `_rollbackSwapFn` stashes the rollback error on the node
+      // so the next rewire call short-circuits via `_requireRewireHooks`.
+      await this._rollbackSwapFn(oldUserFn);
       throw e;
     }
     this._deps = newDeps.slice();
@@ -386,26 +401,24 @@ class NativeNode {
 
   async addDep(dep, fn) {
     this._requireRewireHooks('addDep');
+    // QA D2 (2026-05-21): even on idempotent append (`dep` already in
+    // `_deps`), still call `Core::set_deps` with the unchanged dep list
+    // so Core re-runs its invariant gauntlet (self-dep, cycle, terminal
+    // `this`, non-resubscribable terminal, mid-fire reentrancy). Pure-ts
+    // re-validates each call; early-returning here was a parity hole.
     const existingIdx = this._deps.findIndex((d) => d.inner === dep.inner);
-    if (existingIdx >= 0) {
-      // Idempotent append: only the fn swaps; dep set unchanged.
-      await this._swapFn(fn);
-      this._currentUserFn = fn;
-      return existingIdx;
-    }
-    const newDeps = [...this._deps, dep];
+    const newDeps = existingIdx >= 0 ? this._deps.slice() : [...this._deps, dep];
     const oldUserFn = this._currentUserFn;
     await this._swapFn(fn);
     this._currentUserFn = fn;
     try {
       await this.core.setDeps(this.nodeId, newDeps.map((n) => n.inner));
     } catch (e) {
-      await this._swapFn(oldUserFn);
-      this._currentUserFn = oldUserFn;
+      await this._rollbackSwapFn(oldUserFn);
       throw e;
     }
     this._deps = newDeps;
-    return newDeps.length - 1;
+    return existingIdx >= 0 ? existingIdx : newDeps.length - 1;
   }
 
   async removeDep(dep, fn) {
@@ -418,11 +431,28 @@ class NativeNode {
       try {
         await this.core.setDeps(this.nodeId, newDeps.map((n) => n.inner));
       } catch (e) {
-        await this._swapFn(oldUserFn);
-        this._currentUserFn = oldUserFn;
+        await this._rollbackSwapFn(oldUserFn);
         throw e;
       }
       this._deps = newDeps;
+    }
+  }
+
+  // QA A2 (2026-05-21): rollback path may itself fail (TSFN dispatch error,
+  // actor unavailable, fn_id evicted). If rollback errors, the node is in an
+  // indeterminate state — new fn potentially live with old deps. Surface
+  // both errors via `AggregateError` and mark the node poisoned so a future
+  // rewire fails fast instead of dispatching against an inconsistent closure.
+  async _rollbackSwapFn(oldUserFn) {
+    try {
+      await this._swapFn(oldUserFn);
+      this._currentUserFn = oldUserFn;
+    } catch (rollbackErr) {
+      this._rewirePoisoned = rollbackErr;
+      // Re-throw within the outer catch's flow — outer catch already has
+      // the original Core::set_deps error, so we stash this for surfacing.
+      // The outer `throw e` will land first; subsequent rewires throw
+      // poison.
     }
   }
 }

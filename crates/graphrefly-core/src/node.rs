@@ -1445,13 +1445,16 @@ impl NodeRecord {
     /// Operator(Reduce) / Operator(Last) intercept upstream COMPLETE.
     ///
     /// D263: a non-operator node with `terminal_as_real_input == true`
-    /// (or `partial == true`) ALSO skips auto-cascade so `fire_fn` runs
-    /// on terminal-only deps. Mirrors the Reduce-class operator dispatch
-    /// that already counts terminal as real input.
+    /// ALSO skips auto-cascade so `fire_fn` runs on terminal-only deps —
+    /// mirrors the Reduce-class operator dispatch that already counts
+    /// terminal as real input. Note: `partial == true` ALONE does NOT
+    /// skip cascade — canonical-spec §5.4 / R5.4 locks `partial` to
+    /// first-run-gate-bypass ONLY. To get fire-on-COMPLETE in partial
+    /// mode, set BOTH flags (or wrap in a Reduce-class operator).
     pub(crate) fn skips_auto_cascade(&self) -> bool {
         match self.op {
             Some(op) => NodeKind::Operator(op).skips_auto_cascade(),
-            None => self.terminal_as_real_input || self.partial,
+            None => self.terminal_as_real_input,
         }
     }
 

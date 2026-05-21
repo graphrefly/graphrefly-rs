@@ -324,17 +324,23 @@ impl BenchOperators {
         callback: Function<'_, Vec<Vec<u32>>, Vec<u32>>,
     ) -> Result<PromiseRaw<'env, Vec<u32>>> {
         let tsfn = build_vec_vec_to_vec_tsfn(callback)?;
-        let user_closure = closure_user_derived(tsfn);
+        let user_closure = closure_user_derived(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let actor = Arc::clone(&self.actor);
         env.spawn_future(async move {
             actor
                 .run(move |core| -> Result<Vec<u32>> {
+                    // QA A1 (2026-05-21): mint fn_id but DO NOT insert the
+                    // closure yet — if `register_derived` errors (cycle, bad
+                    // dep, terminated dep, etc.) we'd otherwise leak both the
+                    // fn_id slot AND its TSFN libuv retain (TSFN keeps libuv
+                    // alive until its last Arc drops; an orphan slot prevents
+                    // process shutdown). Insert AFTER `register_derived`
+                    // succeeds.
                     let fn_id = {
                         let mut reg = binding.registry.lock();
                         let id = FnId::new(reg.next_fn_id);
                         reg.next_fn_id += 1;
-                        reg.user_derived_fns.insert(id, Arc::from(user_closure));
                         id
                     };
                     let deps: Vec<NodeId> = dep_ids
@@ -344,6 +350,13 @@ impl BenchOperators {
                     let node_id = core
                         .register_derived(&deps, fn_id, EqualsMode::Identity, false)
                         .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                    // Success — now publish the closure into the registry.
+                    // `user_closure` is the only owner so far; inserting
+                    // transfers it to the Arc-keyed map.
+                    {
+                        let mut reg = binding.registry.lock();
+                        reg.user_derived_fns.insert(fn_id, Arc::from(user_closure));
+                    }
                     let node_u32 = u32::try_from(node_id.raw())
                         .map_err(|_| NapiError::from_reason("node id exceeds u32"))?;
                     let fn_u32 = u32::try_from(fn_id.raw())
@@ -376,7 +389,7 @@ impl BenchOperators {
         callback: Function<'_, Vec<Vec<u32>>, Vec<u32>>,
     ) -> Result<PromiseRaw<'env, u32>> {
         let tsfn = build_vec_vec_to_vec_tsfn(callback)?;
-        let user_closure = closure_user_derived(tsfn);
+        let user_closure = closure_user_derived(tsfn, Arc::downgrade(&self.binding));
         let binding = Arc::clone(&self.binding);
         let fid = FnId::new(u64::from(fn_id));
         env.spawn_future(async move {
@@ -1729,8 +1742,19 @@ fn closure_hh_to_bool(
 /// are minted via `core.allocExternalHandle` (retain=1 at allocation
 /// time), so we do NOT call `validate_and_retain` here — Core takes
 /// ownership of the share by storing the handle in its emission queue.
+///
+/// QA A3 (2026-05-21) defense-in-depth: each returned handle is checked
+/// to be a `JsAllocated` marker in the registry (i.e. minted via
+/// `BenchCore::allocExternalHandle`). A buggy/malicious JS fn returning
+/// a handle from `deps[i]` input (a different binding's handle, an
+/// already-released handle, etc.) panics here rather than silently
+/// emitting a use-after-free Data slot to subscribers. The check is
+/// pure-read (no refcount bump) so it does not break the
+/// alloc-external-handle retain contract that Core's consume relies on.
+/// Mirrors the `closure_packer` panic at :1781 — same JS-bug class.
 fn closure_user_derived(
     tsfn: Arc<Tsfn<Vec<Vec<u32>>, Vec<u32>>>,
+    binding: Weak<BenchBinding>,
 ) -> Box<dyn Fn(&[DepBatch]) -> Vec<HandleId> + Send + Sync> {
     Box::new(move |deps: &[DepBatch]| -> Vec<HandleId> {
         // Pre-allocate per-dep handle arrays for this wave. Each dep's
@@ -1746,9 +1770,29 @@ fn closure_user_derived(
             })
             .collect();
         let ret: Vec<u32> = bridge_sync(&tsfn, arg);
-        ret.into_iter()
+        let out: Vec<HandleId> = ret
+            .into_iter()
             .map(|h| HandleId::new(u64::from(h)))
-            .collect()
+            .collect();
+        // QA A3: defense-in-depth on the alloc-external-handle contract.
+        // Skip the check if the binding has been dropped (e.g. Core
+        // teardown is racing the closure call — graceful no-op).
+        if let Some(binding) = binding.upgrade() {
+            let reg = binding.registry.lock();
+            for h in &out {
+                assert!(
+                    reg.is_js_allocated(*h),
+                    "user-derived fn returned HandleId({}) that was not minted via \
+                     BenchCore::allocExternalHandle. The JS adapter must allocate \
+                     each output handle via `core.allocExternalHandle()` + \
+                     `registry.set(handle, value)`. Returning an input dep's handle, \
+                     a foreign handle, or a previously-released handle is a \
+                     JS-side bug.",
+                    h.raw()
+                );
+            }
+        }
+        out
     })
 }
 
