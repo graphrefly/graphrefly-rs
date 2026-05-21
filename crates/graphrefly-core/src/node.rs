@@ -391,6 +391,17 @@ pub struct NodeOpts {
     /// terminal slice). Only DATA is buffered; RESOLVED entries are NOT
     /// (R2.6.5 explicit "DATA only").
     pub replay_buffer: Option<usize>,
+    /// D263 — when `true`, the `fire_fn` first-run gate (R2.5.3) treats a
+    /// terminal dep as "real input" so the node fires even if the only
+    /// signal a dep ever delivered was a `COMPLETE` (no DATA). Mirrors the
+    /// unconditional `fire_operator` semantics (`fire_operator`'s gate
+    /// already counts dep terminals as real input — e.g. for `Reduce`).
+    /// Default `false` preserves the historical gate (sentinel deps hold
+    /// the node until they deliver real DATA). NOT yet widened onto the
+    /// `Impl` parity contract per D196 + the parity-tests comment
+    /// ("NOT widened onto Impl"); kept substrate-internal until a
+    /// cross-arm scenario surfaces.
+    pub terminal_as_real_input: bool,
 }
 
 impl Default for NodeOpts {
@@ -402,6 +413,7 @@ impl Default for NodeOpts {
             is_dynamic: false,
             pausable: PausableMode::Default,
             replay_buffer: None,
+            terminal_as_real_input: false,
         }
     }
 }
@@ -1352,6 +1364,14 @@ pub(crate) struct NodeRecord {
     /// State/Derived/Dynamic nodes the field is settable but the gated
     /// path remains the typical caller default.
     pub(crate) partial: bool,
+    /// D263 — when `true`, `fire_fn`'s first-run gate (R2.5.3) counts a
+    /// terminal dep as "real input" so the node can fire on a
+    /// COMPLETE-without-DATA from any single dep. Mirrors `fire_operator`'s
+    /// unconditional `dr.terminal.is_some()` clause (gated here on the
+    /// per-node opt-in so existing `fire_fn` consumers preserve the
+    /// historical sentinel-hold behaviour by default). Substrate-internal
+    /// per D263 — not surfaced on the `Impl` parity contract yet.
+    pub(crate) terminal_as_real_input: bool,
     /// Topological rank — 1 + max dep rank. Nodes with no deps have rank 0.
     /// Used by `pick_next_fire` for O(|pending_fires|) scheduling instead
     /// of O(V) transitive BFS. Computed at registration; recomputed on
@@ -1423,10 +1443,15 @@ impl NodeRecord {
 
     /// True iff this node opts OUT of Lock 2.B auto-cascade —
     /// Operator(Reduce) / Operator(Last) intercept upstream COMPLETE.
+    ///
+    /// D263: a non-operator node with `terminal_as_real_input == true`
+    /// (or `partial == true`) ALSO skips auto-cascade so `fire_fn` runs
+    /// on terminal-only deps. Mirrors the Reduce-class operator dispatch
+    /// that already counts terminal as real input.
     pub(crate) fn skips_auto_cascade(&self) -> bool {
         match self.op {
             Some(op) => NodeKind::Operator(op).skips_auto_cascade(),
-            None => false,
+            None => self.terminal_as_real_input || self.partial,
         }
     }
 
@@ -2773,6 +2798,7 @@ impl Core {
             is_dynamic,
             pausable,
             replay_buffer,
+            terminal_as_real_input,
         } = opts;
 
         // Derive the field shape from fn_or_op + deps.
@@ -2897,6 +2923,7 @@ impl Core {
             resubscribable: false,
             meta_companions: Vec::new(),
             partial,
+            terminal_as_real_input,
             topo_rank,
             received_mask: 0,
             involved_mask: 0,

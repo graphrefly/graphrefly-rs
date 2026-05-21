@@ -469,6 +469,34 @@ export declare class BenchOperators {
    */
   static fromCore(core: BenchCore): BenchOperators
   /**
+   * `register_user_derived(deps, fn)` — register a derived node whose
+   * fn is a generic JS callback of shape
+   * `(deps: number[][]) => number[]`. Each input `deps[i]` is the
+   * array of DATA handles delivered for dep `i` this wave (may be
+   * empty for a dep that did not deliver). Each output handle becomes
+   * one `FnEmission::Data` in this wave. Output handles MUST be minted
+   * via `BenchCore.allocExternalHandle` so the JS-side adapter owns
+   * the share that Core takes ownership of.
+   */
+  registerUserDerived(depIds: Array<number>, callback: (arg: Array<Array<number>>) => Array<number>): Promise<Array<number>>
+  /**
+   * Rebind the TSFN closure backing an existing `register_user_derived`
+   * node so a subsequent `Core::set_deps` lands against the new fn.
+   * Used by `NativeNode.setDeps`/`addDep`/`removeDep` to atomically
+   * swap the operator fn alongside the dep-shape change (D264).
+   *
+   * Returns the same `fn_id` (passed back as the same `u32`) that the
+   * node was registered with — JS doesn't need it since the rewire
+   * surface threads the binding through the node-id ↔ fn-id mapping
+   * it keeps in the wrapper, but exposing it keeps the surface
+   * debug-friendly.
+   *
+   * # Errors
+   *
+   * Returns `Err` if `fn_id` is not a known user-derived fn.
+   */
+  rebindUserDerived(fnId: number, callback: (arg: Array<Array<number>>) => Array<number>): Promise<number>
+  /**
    * `map(src, project)` — JS callback `(handle: number) => number`
    * returns the new HandleId (typically built via
    * `BenchCore::intern_int(...)` from inside the callback).

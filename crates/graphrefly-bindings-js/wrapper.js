@@ -180,6 +180,22 @@ class NativeNode {
     this.nodeId = nodeId;
     this.registry = registry;
     this.cacheValue = undefined;
+    // D263/D264 — user-derived rewire surface. Populated only for
+    // nodes built via `impl.map`'s `register_user_derived` reroute;
+    // setDeps/addDep/removeDep throw on nodes without these fields.
+    // - _operators: BenchOperators handle (needed for rebind_user_derived).
+    // - _fnId: the FnId Core was told to dispatch when this node fires.
+    // - _deps: the current ordered array of NativeNode deps; mirrors
+    //   what `Core::set_deps` sees Rust-side. Tracked JS-side so
+    //   addDep/removeDep can compute the new slice without re-querying.
+    // - _userFnAdapter: the wrapper-side adapter factory that turns a
+    //   user fn into the `(deps: number[][]) => number[]` shape Core
+    //   wants. Captured so addDep/removeDep can rebuild the closure
+    //   for the changed dep-shape.
+    this._operators = null;
+    this._fnId = null;
+    this._deps = null;
+    this._currentUserFn = null;
   }
 
   get inner() {
@@ -304,6 +320,142 @@ class NativeNode {
   async hasFiredOnce() {
     return this.core.hasFiredOnce(this.nodeId);
   }
+
+  // -------------------------------------------------------------------
+  // D263/D264 — `setDeps`/`addDep`/`removeDep` rewire trio. Available
+  // only on nodes built via `impl.map`'s generic user-derived path
+  // (`register_user_derived`); other operators keep their OperatorOp
+  // dispatch and have no fn-rebind hook. Composed JS-side as
+  // `rebind_user_derived(fnId, batchFn) + Core::set_deps(node, deps)`
+  // per D264 P1 — no new `add_dep`/`remove_dep` napi on BenchCore.
+  //
+  // The user fn shape matches the parity `Impl` contract — multi-dep
+  // batch: `(data: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>`.
+  // -------------------------------------------------------------------
+
+  _requireRewireHooks(method) {
+    if (this._fnId === null || this._operators === null) {
+      throw new Error(
+        `[graphrefly/native] ${method}: node was not built via a user-derived ` +
+          `path (impl.map). Only impl.map currently reroutes through ` +
+          `register_user_derived; other operators keep their OperatorOp ` +
+          `dispatch and have no fn-rebind hook. Per D264 P1 the rewire ` +
+          `surface is confined to impl.map until a parity scenario forces ` +
+          `widening to additional operators.`,
+      );
+    }
+  }
+
+  // Rewire-atomicity discipline (matches pure-ts
+  // `wave_protocol_rewire_MC`): setDeps/addDep/removeDep must look
+  // atomic to subscribers — new fn + new dep shape land together,
+  // OR neither lands if Core rejects (self-dep, cycle, terminal,
+  // non-resub-terminal dep, mid-fire). Sequence:
+  //   1. Rebind the JS closure cell FIRST so any handshake-triggered
+  //      fire inside `Core::set_deps` (e.g. new dep delivers cached
+  //      DATA via the subscribe-handshake) dispatches through the new
+  //      fn.
+  //   2. Call `Core::set_deps`. On Err — roll back the JS closure
+  //      swap, then propagate.
+  // The (briefly swapped, then rolled-back) window between (1) and a
+  // failing (2) is safe: rewire happens outside any active fire (A6
+  // reentrancy guard already rejects mid-fire set_deps), so no other
+  // wave's dispatch can race the swap on the actor thread.
+  async _swapFn(newFn) {
+    const batchFn = makeUserDerivedAdapter(this.core, this.registry, newFn);
+    await this._operators.rebindUserDerived(this._fnId, batchFn);
+  }
+
+  async setDeps(newDeps, fn) {
+    this._requireRewireHooks('setDeps');
+    const oldUserFn = this._currentUserFn;
+    await this._swapFn(fn);
+    this._currentUserFn = fn;
+    try {
+      await this.core.setDeps(this.nodeId, newDeps.map((n) => n.inner));
+    } catch (e) {
+      // Roll back the closure swap so the original fn still drives
+      // dispatch (matches the parity contract: rejected setDeps leaves
+      // both fn AND dep shape untouched).
+      await this._swapFn(oldUserFn);
+      this._currentUserFn = oldUserFn;
+      throw e;
+    }
+    this._deps = newDeps.slice();
+  }
+
+  async addDep(dep, fn) {
+    this._requireRewireHooks('addDep');
+    const existingIdx = this._deps.findIndex((d) => d.inner === dep.inner);
+    if (existingIdx >= 0) {
+      // Idempotent append: only the fn swaps; dep set unchanged.
+      await this._swapFn(fn);
+      this._currentUserFn = fn;
+      return existingIdx;
+    }
+    const newDeps = [...this._deps, dep];
+    const oldUserFn = this._currentUserFn;
+    await this._swapFn(fn);
+    this._currentUserFn = fn;
+    try {
+      await this.core.setDeps(this.nodeId, newDeps.map((n) => n.inner));
+    } catch (e) {
+      await this._swapFn(oldUserFn);
+      this._currentUserFn = oldUserFn;
+      throw e;
+    }
+    this._deps = newDeps;
+    return newDeps.length - 1;
+  }
+
+  async removeDep(dep, fn) {
+    this._requireRewireHooks('removeDep');
+    const newDeps = this._deps.filter((d) => d.inner !== dep.inner);
+    const oldUserFn = this._currentUserFn;
+    await this._swapFn(fn);
+    this._currentUserFn = fn;
+    if (newDeps.length !== this._deps.length) {
+      try {
+        await this.core.setDeps(this.nodeId, newDeps.map((n) => n.inner));
+      } catch (e) {
+        await this._swapFn(oldUserFn);
+        this._currentUserFn = oldUserFn;
+        throw e;
+      }
+      this._deps = newDeps;
+    }
+  }
+}
+
+// D263/D264 — turn a user fn of shape
+//   `(data: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>`
+// into the wire-shape Rust expects for `register_user_derived` /
+// `rebind_user_derived`:
+//   `(depsHandles: number[][]) => number[]`
+// The closure dereferences each per-dep handle to a value, runs the
+// user fn, then allocates JS-side handles (`allocExternalHandle` —
+// retain=1) for each output. Core takes ownership of those shares as
+// it stores them in the emission queue.
+function makeUserDerivedAdapter(core, registry, userFn) {
+  return (depsHandles) => {
+    const data = new Array(depsHandles.length);
+    for (let i = 0; i < depsHandles.length; i++) {
+      const slot = depsHandles[i];
+      const values = new Array(slot.length);
+      for (let j = 0; j < slot.length; j++) {
+        values[j] = registry.get(slot[j]);
+      }
+      data[i] = values;
+    }
+    const out = userFn(data) || [];
+    const handles = new Array(out.length);
+    for (let i = 0; i < out.length; i++) {
+      const h = core.allocExternalHandle();
+      registry.set(h, out[i]);
+      handles[i] = h;
+    }
+    return handles;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -726,8 +878,34 @@ function createNativeImpl() {
     },
 
     // Transform.
+    // D263/D264 — `impl.map` reroutes through the generic
+    // `register_user_derived` path so the resulting node carries the
+    // rewire hooks (`setDeps`/`addDep`/`removeDep`). Other operators
+    // (filter/scan/combine/etc.) keep their OperatorOp paths — they
+    // have no parity-scenario forcing function for setDeps yet (D264
+    // P1: scope confined to map).
     async map(src, fn) {
-      return wrapNode(await state.operators.registerMap(unwrap(src), makeProjector(fn)));
+      // The user's `(x: T) => U` is adapted to the batch shape that
+      // `register_user_derived` expects: deps[0] is the wave's DATA
+      // handles from the (single) source dep; we emit one output per
+      // handle.
+      const initialUserFn = (data) => {
+        const out = [];
+        const slot = data[0] || [];
+        for (const v of slot) out.push(fn(v));
+        return out;
+      };
+      const batchFn = makeUserDerivedAdapter(state.core, state.registry, initialUserFn);
+      const [nodeId, fnId] = await state.operators.registerUserDerived(
+        [unwrap(src)],
+        batchFn,
+      );
+      const node = wrapNode(nodeId);
+      node._operators = state.operators;
+      node._fnId = fnId;
+      node._deps = [src];
+      node._currentUserFn = initialUserFn;
+      return node;
     },
     async filter(src, predicate) {
       return wrapNode(

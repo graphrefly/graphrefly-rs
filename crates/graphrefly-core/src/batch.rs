@@ -1157,7 +1157,16 @@ impl Core {
             let rec = s.require_node(node_id);
             // Skip: terminal, first-run-gate-closed (R2.5.3 / R5.4 — partial
             // mode opts out of the gate per D011), or stateless.
-            if rec.terminal.is_some() || (!rec.partial && rec.has_sentinel_deps()) {
+            //
+            // D263: when `terminal_as_real_input == true`, a terminal dep
+            // counts as "real input" so the gate opens on COMPLETE-without-
+            // DATA from any dep (mirrors `fire_operator`'s unconditional
+            // terminal-aware clause; gated here per-node so the historical
+            // sentinel-hold behaviour stays the default for `fire_fn`).
+            let has_real_input = !rec.has_sentinel_deps()
+                || (rec.terminal_as_real_input
+                    && rec.dep_records.iter().any(|dr| dr.terminal.is_some()));
+            if rec.terminal.is_some() || (!rec.partial && !has_real_input) {
                 None
             } else {
                 rec.fn_id.map(|fn_id| {

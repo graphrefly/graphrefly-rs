@@ -37,7 +37,7 @@
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Weak};
 
-use graphrefly_core::{FnId, HandleId, NodeId};
+use graphrefly_core::{DepBatch, EqualsMode, FnId, HandleId, NodeId};
 use graphrefly_operators::{
     binding::OperatorBinding,
     buffer,
@@ -291,6 +291,104 @@ impl BenchOperators {
             actor: core.actor_arc(),
             binding: core.binding_arc(),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // D263/D264 — generic user-derived TSFN registration (parity slice
+    // for the `setDeps`/`addDep`/`removeDep` rewire surface). The JS
+    // callback receives the per-dep wave handle arrays
+    // (`(deps: number[][]) => number[]`) and returns a flat list of
+    // output handles (each becomes one `FnEmission::Data` in this
+    // wave). JS-side handles are minted via `core.allocExternalHandle`
+    // (retain=1) so no retain-bump is needed Rust-side — the closure
+    // forwards each returned handle straight to `FnEmission::Data` and
+    // Core takes ownership of the share. Used by `wrapper.js`'s
+    // `impl.map` reroute so `NativeNode.setDeps`/`addDep`/`removeDep`
+    // can rebind the JS closure cell + call `Core::set_deps` without
+    // a substrate widening (D264 P1).
+    // -----------------------------------------------------------------
+
+    /// `register_user_derived(deps, fn)` — register a derived node whose
+    /// fn is a generic JS callback of shape
+    /// `(deps: number[][]) => number[]`. Each input `deps[i]` is the
+    /// array of DATA handles delivered for dep `i` this wave (may be
+    /// empty for a dep that did not deliver). Each output handle becomes
+    /// one `FnEmission::Data` in this wave. Output handles MUST be minted
+    /// via `BenchCore.allocExternalHandle` so the JS-side adapter owns
+    /// the share that Core takes ownership of.
+    #[napi]
+    pub fn register_user_derived<'env>(
+        &self,
+        env: &'env Env,
+        dep_ids: Vec<u32>,
+        callback: Function<'_, Vec<Vec<u32>>, Vec<u32>>,
+    ) -> Result<PromiseRaw<'env, Vec<u32>>> {
+        let tsfn = build_vec_vec_to_vec_tsfn(callback)?;
+        let user_closure = closure_user_derived(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let actor = Arc::clone(&self.actor);
+        env.spawn_future(async move {
+            actor
+                .run(move |core| -> Result<Vec<u32>> {
+                    let fn_id = {
+                        let mut reg = binding.registry.lock();
+                        let id = FnId::new(reg.next_fn_id);
+                        reg.next_fn_id += 1;
+                        reg.user_derived_fns.insert(id, Arc::from(user_closure));
+                        id
+                    };
+                    let deps: Vec<NodeId> = dep_ids
+                        .into_iter()
+                        .map(|d| NodeId::new(u64::from(d)))
+                        .collect();
+                    let node_id = core
+                        .register_derived(&deps, fn_id, EqualsMode::Identity, false)
+                        .map_err(|e| NapiError::from_reason(format!("{e}")))?;
+                    let node_u32 = u32::try_from(node_id.raw())
+                        .map_err(|_| NapiError::from_reason("node id exceeds u32"))?;
+                    let fn_u32 = u32::try_from(fn_id.raw())
+                        .map_err(|_| NapiError::from_reason("fn id exceeds u32"))?;
+                    Ok(vec![node_u32, fn_u32])
+                })
+                .await?
+        })
+    }
+
+    /// Rebind the TSFN closure backing an existing `register_user_derived`
+    /// node so a subsequent `Core::set_deps` lands against the new fn.
+    /// Used by `NativeNode.setDeps`/`addDep`/`removeDep` to atomically
+    /// swap the operator fn alongside the dep-shape change (D264).
+    ///
+    /// Returns the same `fn_id` (passed back as the same `u32`) that the
+    /// node was registered with — JS doesn't need it since the rewire
+    /// surface threads the binding through the node-id ↔ fn-id mapping
+    /// it keeps in the wrapper, but exposing it keeps the surface
+    /// debug-friendly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `fn_id` is not a known user-derived fn.
+    #[napi]
+    pub fn rebind_user_derived<'env>(
+        &self,
+        env: &'env Env,
+        fn_id: u32,
+        callback: Function<'_, Vec<Vec<u32>>, Vec<u32>>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let tsfn = build_vec_vec_to_vec_tsfn(callback)?;
+        let user_closure = closure_user_derived(tsfn);
+        let binding = Arc::clone(&self.binding);
+        let fid = FnId::new(u64::from(fn_id));
+        env.spawn_future(async move {
+            let mut reg = binding.registry.lock();
+            if !reg.user_derived_fns.contains_key(&fid) {
+                return Err(NapiError::from_reason(format!(
+                    "rebind_user_derived: unknown fn_id {fn_id}",
+                )));
+            }
+            reg.user_derived_fns.insert(fid, Arc::from(user_closure));
+            Ok(fn_id)
+        })
     }
 
     // -----------------------------------------------------------------
@@ -1495,6 +1593,19 @@ fn build_vec_to_h_tsfn(callback: Function<'_, Vec<u32>, u32>) -> Result<Arc<Tsfn
     Ok(Arc::new(tsfn))
 }
 
+/// D263/D264 — generic user-derived TSFN. Input is `Vec<Vec<u32>>`
+/// (per-dep wave handles), output is `Vec<u32>` (emit-as-DATA handles).
+fn build_vec_vec_to_vec_tsfn(
+    callback: Function<'_, Vec<Vec<u32>>, Vec<u32>>,
+) -> Result<Arc<Tsfn<Vec<Vec<u32>>, Vec<u32>>>> {
+    let tsfn = callback
+        .build_threadsafe_function::<Vec<Vec<u32>>>()
+        .max_queue_size::<1>()
+        .callee_handled::<false>()
+        .build_callback(|ctx: ThreadsafeCallContext<Vec<Vec<u32>>>| Ok(ctx.value))?;
+    Ok(Arc::new(tsfn))
+}
+
 // Slice U napi parity — tap/rescue callback shapes.
 
 fn build_h_to_unit_tsfn(callback: Function<'_, u32, ()>) -> Result<Arc<Tsfn<u32, ()>>> {
@@ -1609,6 +1720,35 @@ fn closure_hh_to_bool(
         let a_u32 = u32::try_from(a.raw()).expect("HandleId exceeds u32");
         let b_u32 = u32::try_from(b.raw()).expect("HandleId exceeds u32");
         bridge_sync::<FnArgs<(u32, u32)>, bool>(&tsfn, FnArgs::from((a_u32, b_u32)))
+    })
+}
+
+/// D263/D264 — generic user-derived closure. Builds the per-dep handle
+/// arrays from `DepBatch` slices, invokes the TSFN, and returns the
+/// output handles for `FnEmission::Data` dispatch. JS-side handles
+/// are minted via `core.allocExternalHandle` (retain=1 at allocation
+/// time), so we do NOT call `validate_and_retain` here — Core takes
+/// ownership of the share by storing the handle in its emission queue.
+fn closure_user_derived(
+    tsfn: Arc<Tsfn<Vec<Vec<u32>>, Vec<u32>>>,
+) -> Box<dyn Fn(&[DepBatch]) -> Vec<HandleId> + Send + Sync> {
+    Box::new(move |deps: &[DepBatch]| -> Vec<HandleId> {
+        // Pre-allocate per-dep handle arrays for this wave. Each dep's
+        // `data` is the SmallVec of DATA handles delivered this wave
+        // (empty when a dep was not involved or only RESOLVED/terminal).
+        let arg: Vec<Vec<u32>> = deps
+            .iter()
+            .map(|db| {
+                db.data
+                    .iter()
+                    .map(|h| u32::try_from(h.raw()).expect("HandleId exceeds u32"))
+                    .collect::<Vec<u32>>()
+            })
+            .collect();
+        let ret: Vec<u32> = bridge_sync(&tsfn, arg);
+        ret.into_iter()
+            .map(|h| HandleId::new(u64::from(h)))
+            .collect()
     })
 }
 

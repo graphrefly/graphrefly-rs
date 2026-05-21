@@ -35,6 +35,30 @@ export interface NativeNode<T> {
   allocLockId(): Promise<number>;
   setResubscribable(value: boolean): Promise<void>;
   hasFiredOnce(): Promise<boolean>;
+  /** D263/D264 — atomically replace the full upstream dep set AND the
+   * transform fn. Mirrors pure-ts `Node.setDeps`. Available only on
+   * nodes built via `impl.map` (the only operator wired through the
+   * generic `register_user_derived` path per D264 P1); calling on
+   * other nodes throws. Self-dep and cycle rejection happens Core-side
+   * via `Core::set_deps`. */
+  setDeps(
+    newDeps: ReadonlyArray<NativeNode<unknown>>,
+    fn: (data: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>,
+  ): Promise<void>;
+  /** D263/D264 — append one dep, replacing the fn for the grown shape.
+   * Returns the new dep's index (or the existing index if already
+   * present). Same scope rules as {@link setDeps}. */
+  addDep(
+    dep: NativeNode<unknown>,
+    fn: (data: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>,
+  ): Promise<number>;
+  /** D263/D264 — remove one dep, replacing the fn for the shrunk shape.
+   * Idempotent (fn swap still applies when `dep` is absent). Same
+   * scope rules as {@link setDeps}. */
+  removeDep(
+    dep: NativeNode<unknown>,
+    fn: (data: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>,
+  ): Promise<void>;
   readonly inner: unknown;
 }
 

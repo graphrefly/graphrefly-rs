@@ -3538,6 +3538,36 @@ D252 (IN_TICK collapse + hard invariant), D253 (SchedulingGroupId
 delete), D254 (Tier A bundle + process memory), D254-AUDIT (inline
 in D254 — #7 TimerEmit not added; `MailboxOp::Defer` survives).
 
+### S7 follow-on — LANDED 2026-05-20 — `setDeps`/`addDep`/`removeDep` napi+wrapper trio + `terminal_as_real_input` substrate flag (D263/D264/D265)
+
+> Closes cross-track-ledger §1 D5 row (`setDeps`/`addDep`/`removeDep`
+> native side) AND the DS-2.7.A row's Rust flag-surfacing residual,
+> in one slice. Both forcing functions: D5 had an existing
+> `skipIf(nativePending)`-gated cross-arm scenario; DS-2.7.A had the
+> "Promoting it to a flag on Rust NodeOptions is a thin follow-on
+> slice (no semantic change for the existing dispatch)" handoff. Per
+> D265 the commit is held local (no push / no `@graphrefly/native`
+> republish trigger). Per D263 + parity-tests comment, `NodeOpts.
+> terminal_as_real_input` is NOT widened onto the `Impl` parity
+> contract (D196 consumer-pressure gate — kept substrate-internal
+> until a cross-arm scenario surfaces).
+
+**What landed:**
+
+- **Slice A — `setDeps`/`addDep`/`removeDep` napi+wrapper trio (D264 P1).**
+  - **New napi:** `BenchOperators::register_user_derived(deps, fn) -> (node_id, fn_id)` in [`crates/graphrefly-bindings-js/src/operator_bindings.rs`](../crates/graphrefly-bindings-js/src/operator_bindings.rs) — TSFN-backed generic batch-shape derived registration. Mirrors `register_batch_derived`'s shape (`BatchFnImpl = Arc<dyn Fn(&[DepBatch], &Registry) -> Vec<BenchEmission>>`) but invokes JS via `bridge_sync` instead of dispatching by `BuiltinBatchFn` enum. Companion `rebind_user_derived(fn_id, new_fn) -> ()` napi for closure-cell rebinding under `setDeps`.
+  - **Wrapper.js reroute:** `impl.map` (and only `impl.map` per D264 narrow scope) now routes through `register_user_derived` with a JS-side `_fnCell` closure cell on the resulting `NativeNode`. The batch-shape closure wraps the user's `(x) => U` projector, iterating `deps[0]` values.
+  - **`NativeNode` rewire trio:** `setDeps(newDeps, fn)`, `addDep(dep, fn) -> idx`, `removeDep(dep, fn)` added to [`crates/graphrefly-bindings-js/wrapper.js`](../crates/graphrefly-bindings-js/wrapper.js) + [`wrapper.d.ts`](../crates/graphrefly-bindings-js/wrapper.d.ts). They reorder operations per Phase-13.8 / `wave_protocol_rewire_MC`: rebind JS closure cell FIRST (visible to any sink that fires inside `Core::set_deps`), THEN call `Core::set_deps`, with rollback on Err. `addDep`/`removeDep` compose on `Core::set_deps` JS-side (no new `#[napi]` `add_dep`/`remove_dep` on `BenchCore` — minimal substrate surface). JS-side tracks current deps in `_deps` array for delta computation. `_requireRewireHooks` throws on nodes built via other-operator paths (non-`register_user_derived`).
+  - **Parity wiring:** `~/src/graphrefly-ts/packages/parity-tests/impls/rust.ts` `ImplNode.setDeps/.addDep/.removeDep` delegate to the new `NativeNode` methods. `~/src/graphrefly-ts/packages/parity-tests/scenarios/core/set-deps.test.ts` — `skipIf(nativePending)` gate dropped; 3 tests run cross-arm.
+- **Slice B — `terminal_as_real_input` substrate flag (D263).**
+  - **`NodeOpts.terminal_as_real_input: bool`** field added in [`crates/graphrefly-core/src/node.rs`](../crates/graphrefly-core/src/node.rs) (default `false`). Threaded through `NodeRegistration` → `Core::register` → `NodeRecord` plumbing.
+  - **`fire_fn` predicate updated** at [`crates/graphrefly-core/src/batch.rs:1160`](../crates/graphrefly-core/src/batch.rs): treats a terminal dep as "real input" when the flag is set (mirrors `fire_operator`'s unconditional terminal-aware clause at `:1795`, gated per-node so the historical sentinel-hold behaviour is preserved by default for existing `fire_fn` callers).
+  - **Cargo test** at [`crates/graphrefly-core/tests/d263_terminal_as_real_input.rs`](../crates/graphrefly-core/tests/d263_terminal_as_real_input.rs) (3 tests): default-mode-holds, opt-in-fires, `partial:true`-bypasses-regardless.
+  - **NO napi/Impl wiring** — substrate-only per D263 + the parity-tests `first-run-gate.test.ts` header comment ("NOT widened onto Impl"). A future widening rides whenever a cross-arm scenario forces it (D196).
+- **NEXT-BATCH item resolution.** The `set_deps` napi-surface follow-on block in the NEXT-BATCH ⏳ list above this section is now CLOSED. (Note: that block claimed `set_deps` was non-`#[napi]`; that was stale — it IS `#[napi]` since pre-S7 at `core_bindings.rs:1552`. The actual gap was the `wrapper.d.ts` `NativeNode` exposure + the surrounding rewire trio (`addDep`/`removeDep`) + the `fn`-replacement strategy, which this slice resolved.)
+
+**Decisions:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D263 (slice scope = A+B together), D264 (P1 fn-replacement = generic TSFN user-derived + `impl.map` reroute; substrate unchanged), D265 (hold local, no push).
+
 ### S7 — LANDED 2026-05-20 — wave-end + handshake-boundary mailbox drain (D260/D261/D258 fold-in)
 
 > Closes the **35 rust-via-napi parity-arm failures** carried from S6

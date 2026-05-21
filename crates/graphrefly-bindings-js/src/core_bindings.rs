@@ -124,6 +124,14 @@ pub(crate) enum BenchEmission {
 
 type SingleFnImpl = Arc<dyn Fn(&[BenchValue]) -> Option<BenchValue> + Send + Sync>;
 type BatchFnImpl = Arc<dyn Fn(&[DepBatch], &Registry) -> Vec<BenchEmission> + Send + Sync>;
+/// D263/D264 — TSFN-backed generic user-derived fn: receives the raw
+/// per-dep handle slices for this wave and returns a flat list of
+/// output `HandleId`s (each becomes one `FnEmission::Data`). The
+/// closure is responsible for `validate_and_retain` on each returned
+/// handle BEFORE returning it (caller-side discipline in `wrapper.js`'s
+/// `makeUserDerived` adapter — JS-side handles are minted via
+/// `core.allocExternalHandle` which already retains).
+type UserDerivedFnImpl = Arc<dyn Fn(&[DepBatch]) -> Vec<HandleId> + Send + Sync>;
 
 pub(crate) struct Registry {
     next_handle: u64,
@@ -132,6 +140,9 @@ pub(crate) struct Registry {
     pub(crate) refcounts: ahash::AHashMap<HandleId, u64>,
     pub(crate) fns: ahash::AHashMap<FnId, SingleFnImpl>,
     pub(crate) batch_fns: ahash::AHashMap<FnId, BatchFnImpl>,
+    /// D263/D264 — generic TSFN-backed user-derived fns. Dispatched
+    /// before `fns`/`batch_fns` in `dispatch_non_producer_fn`.
+    pub(crate) user_derived_fns: ahash::AHashMap<FnId, UserDerivedFnImpl>,
     pub(crate) next_fn_id: u64,
     pub(crate) projectors: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> HandleId + Send + Sync>>,
     pub(crate) predicates: ahash::AHashMap<FnId, Arc<dyn Fn(HandleId) -> bool + Send + Sync>>,
@@ -180,6 +191,7 @@ impl Registry {
             refcounts: ahash::AHashMap::new(),
             fns: ahash::AHashMap::new(),
             batch_fns: ahash::AHashMap::new(),
+            user_derived_fns: ahash::AHashMap::new(),
             next_fn_id: 1,
             projectors: ahash::AHashMap::new(),
             predicates: ahash::AHashMap::new(),
@@ -331,6 +343,26 @@ impl BenchBinding {
     /// drift between the two callers (they share the same fn-id lookup
     /// table — `Registry::{fns, batch_fns}`).
     fn dispatch_non_producer_fn(&self, fn_id: FnId, dep_data: &[DepBatch]) -> FnResult {
+        // D263/D264 — generic TSFN-backed user-derived fn (parity slice
+        // for the `setDeps`/`addDep`/`removeDep` rewire surface). The
+        // closure already operates on raw `HandleId`s and retains its
+        // own outputs (JS-side `core.allocExternalHandle` does the
+        // retain at allocation time), so we wrap each output as
+        // `FnEmission::Data` directly without re-interning.
+        let user_f = {
+            let reg = self.registry.lock();
+            reg.user_derived_fns.get(&fn_id).cloned()
+        };
+        if let Some(f) = user_f {
+            let out_handles = f(dep_data);
+            let converted: SmallVec<[FnEmission; 2]> =
+                out_handles.into_iter().map(FnEmission::Data).collect();
+            return FnResult::Batch {
+                emissions: converted,
+                tracked: None,
+            };
+        }
+
         // Try batch fns first (single-emission path follows).
         let batch_f = {
             let reg = self.registry.lock();
