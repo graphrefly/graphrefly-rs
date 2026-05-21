@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.6...graphrefly-core-v0.0.7) - 2026-05-21
+
+### Added
+
+- *(D263/D264)* setDeps/addDep/removeDep napi+wrapper trio + terminal_as_real_input substrate flag
+- *(D246)* S4 — actor-model test rebuilds + rule-8 coalescing + wave-scope doc reconciliation
+- *(D246)* S3 — SerializationGroupId → SchedulingGroupId rename
+- *(D246)* S2c — StateCell collapse + single-owner !Send Core (D247/D248/D249)
+- *(D246)* boundary-1 β-simplification — Core-free Graph + OwnedCore + one facade
+- B-2 Step 2b-ii — correct cross-shard routing infra (parallelism gate UNMET; finding banked)
+- B-2 Step 2b-i — per-ShardKey shard map + lock_arc (behaviour-identical; floor preserved)
+- B-2 Step 2a — hoist CoreShared to its own lock (combined-guard, behaviour-identical)
+
+### Fixed
+
+- napi binding
+- fix switchMap
+- s7
+- s6
+- s5
+- s2b qa
+- s2b again
+- s2b
+- s2a
+- *(core)* R2.6.0 — Default-mode leaf source self-emit delivers immediately while self-paused
+- Slice B-2 /qa — A(i)+B(i) fixes, exact-count tests, deferrals banked
+- B-3 — delete vestigial per_subgraph_parallelism.rs (CI-red fixed); reassess §7-B/symbol defer
+- B-2 Step 1 — CoreShared sub-struct extraction (behaviour-identical)
+- B-1
+- nextest and reduce per wave
+- fix parallelism
+
+### Other
+
+- *(D246 S2c+S3+S4)* M1 cross-queue contract + M2 compact_every per-emission + F1-F12 hygiene
+- *(core)* R2.6.0 QA B1 — Default-mode lock-arithmetic + cross-node-isolation coverage
+
 ## [0.0.6](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.5...graphrefly-core-v0.0.6) - 2026-05-16
 
 ### Added

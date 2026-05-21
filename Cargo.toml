@@ -14,7 +14,7 @@ default-members = [
 # for wasm.
 
 [workspace.package]
-version      = "0.0.6"
+version      = "0.0.7"
 edition      = "2021"
 rust-version = "1.95"
 license      = "MIT OR Apache-2.0"
@@ -29,11 +29,11 @@ authors      = ["David Chen<clfhhc@gmail.com>"]
 
 [workspace.dependencies]
 # In-workspace crates (path deps; bumped together pre-1.0)
-graphrefly-core       = { path = "crates/graphrefly-core", version = "0.0.6" }
-graphrefly-graph      = { path = "crates/graphrefly-graph", version = "0.0.6" }
-graphrefly-operators  = { path = "crates/graphrefly-operators", version = "0.0.6" }
-graphrefly-storage    = { path = "crates/graphrefly-storage", version = "0.0.6" }
-graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.6" }
+graphrefly-core       = { path = "crates/graphrefly-core", version = "0.0.7" }
+graphrefly-graph      = { path = "crates/graphrefly-graph", version = "0.0.7" }
+graphrefly-operators  = { path = "crates/graphrefly-operators", version = "0.0.7" }
+graphrefly-storage    = { path = "crates/graphrefly-storage", version = "0.0.7" }
+graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.7" }
 
 # Concurrency primitives
 # `arc_lock` enables `Arc<ReentrantMutex<()>>::lock_arc()` returning an
