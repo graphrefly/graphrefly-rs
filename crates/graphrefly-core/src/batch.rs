@@ -3486,14 +3486,37 @@ impl Core {
                 // thread — structurally forbidden under D248 single-
                 // owner (a `DeferFn` driving a second `&Core` on the
                 // same owner thread). Panic before nesting silently.
+                //
+                // D258 (S7, 2026-05-20) — message softened to be useful
+                // for both in-tree Rust devs and JS `@graphrefly/native`
+                // consumers (the only common path that surfaces this
+                // panic is `BenchCore` misuse). Each `BenchCore` spawns
+                // its own dedicated actor worker thread; this panic
+                // means TWO `BenchCore` instances are sharing one
+                // actor thread (out-of-tree only — in-tree the actor
+                // model prevents it by construction, per D255). No
+                // `cfg(napi)` gate is needed — the substrate panic is
+                // already only reachable from a binding-layer
+                // misconfiguration.
                 panic!(
-                    "BatchGuard::claim_in_tick: cross-Core wave nesting \
-                     detected on a single OS thread (this Core's generation \
-                     {self_gen}, observed foreign generation {cur}). The \
-                     D252 actor-model invariant is one Core per OS thread; \
-                     a `DeferFn` or owner-side seam appears to be driving \
-                     a *second* `&Core` mid-wave. See \
-                     `docs/rust-port-decisions.md` D252.",
+                    "GraphReFly invariant violated — cross-Core wave nesting \
+                     on a single OS thread (this Core's generation {self_gen}, \
+                     observed foreign generation {cur}). One Core per OS \
+                     thread (D248/D252). \
+                     \n\
+                     Rust callers: a `DeferFn` or owner-side seam appears to \
+                     be driving a *second* `&Core` mid-wave; the substrate \
+                     does not support cross-Core same-thread nesting. \
+                     \n\
+                     `@graphrefly/native` (BenchCore) callers: two BenchCore \
+                     instances are sharing one actor worker thread — each \
+                     `BenchCore` MUST own its dedicated actor thread (the \
+                     S6/D255 invariant). Verify you constructed each \
+                     `BenchCore` via the supported factories (which spawn \
+                     a per-instance worker). \
+                     \n\
+                     Internal reference: `docs/rust-port-decisions.md` \
+                     D248/D252/D255/D258.",
                     self_gen = self.generation,
                 );
             }
@@ -3786,68 +3809,196 @@ impl Drop for BatchGuard<'_> {
             self.core.clear_in_tick();
             return;
         }
-        if let Err(payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.core.drain_and_flush()))
-        {
-            self.discard_wave_cleanup();
-            self.core.clear_in_tick();
-            std::panic::resume_unwind(payload);
-        }
-        // Wave cleanup + extract deferred jobs under the lock.
-        let (jobs, releases, cleanup_hooks, pending_wipes, snapshot_releases) = {
-            let mut s = self.core.lock_state();
-            // Q-beyond Sub-slice 1 + 3 (D108, 2026-05-09): WaveState
-            // borrowed alongside state for wave-end cleanup. Per-thread;
-            // independent of state. Sub-slice 3 moved deferred_* drains
-            // into WaveState. /qa F1+F2 (2026-05-10) reverted in_tick +
-            // currently_firing back to CoreState — clear via
-            // CoreState::clear_wave_state under the held state lock.
-            let result = with_wave_state(|ws| {
-                s.clear_wave_state(ws);
-                // Step 2a (D220-EXEC): defensive `currently_firing`
-                // clear, relocated here from `CoreState::clear_wave_state`
-                // (the field moved to the separate `CoreShared` region;
-                // `St`'s `.shared` reaches it, a `&mut CoreState` can't).
-                // Same wave-end point; `FiringGuard` RAII already
-                // balances push/pop — this is the belt-and-suspenders
-                // net for a future guard-bypassing path.
-                s.shared.currently_firing.clear();
-                ws.clear_wave_state();
-                // /qa A1 (2026-05-09) discipline preserved: drain snapshot
-                // retains under lock, release lock-released below to avoid
-                // binding re-entrance under held mutex / borrow.
-                let snapshot_releases = Core::drain_wave_cache_snapshots(ws);
-                // `drain_deferred` takes `deferred_flush_jobs` +
-                // `deferred_handle_releases` (incl. rotation releases pushed
-                // by `clear_wave_state` above) + Slice E2
-                // `deferred_cleanup_hooks` + Slice E2 /qa Q2(b)
-                // `pending_wipes` — all from WaveState post-Sub-slice-3.
-                let (jobs, releases, hooks, wipes) = Core::drain_deferred(&mut s, ws);
-                (jobs, releases, hooks, wipes, snapshot_releases)
-            });
-            // Release wave ownership now — AFTER drain + WaveState
-            // cleanup, BEFORE `fire_deferred` below. Load-bearing: a sink
-            // re-entering Core from a flush callback must observe
-            // `in_tick` clear so its emit runs as a fresh owning wave.
-            // (Mirrors the placement of the pre-D047 `s.in_tick = false`;
-            // the drain-phase-panic window that placement had is closed
-            // by the `catch_unwind` above.)
-            self.core.clear_in_tick();
-            result
-        };
-        // Lock dropped — fire deferred sinks + release retains + fire
-        // cleanup hooks (Slice E2 OnInvalidate, D060 catch_unwind drain)
-        // + fire eager wipes (D069).
-        self.core
-            .fire_deferred(jobs, releases, cleanup_hooks, pending_wipes);
-        // /qa A1 fix (2026-05-09): release wave_cache_snapshots retains
-        // lock-released. Pre-A1 these were released inside the held
-        // state + cross_partition locks; binding finalizers re-entering
-        // Core would deadlock against either mutex. Drained earlier
-        // under the lock; released here after both mutexes dropped and
-        // sinks have fired.
-        for h in snapshot_releases {
-            self.core.binding.release_handle(h);
+        // D260 / S7 (2026-05-20): wave-end drain-to-quiescence past
+        // `fire_deferred`. The S2b/D232-AMEND contract is "the drain
+        // loop applies mailbox/DeferQueue ops **in-wave, immediately**";
+        // pre-D260 the BatchGuard ended after one `fire_deferred` pass,
+        // so posts made by sinks firing **inside** `fire_deferred`
+        // (post-`drain_and_flush`-exit) were stranded until the next
+        // external wave entry. D260 completes the D232-AMEND promise:
+        // loops the full drain → extract → clear-in_tick → fire_deferred
+        // → release cycle until BOTH `mailbox` AND `deferred` quiesce.
+        //
+        // **Primary same-thread case (the actual bug surface).** Post-
+        // S2b/S2c, producer-build sinks (e.g. `graphrefly_operators::
+        // buffer::buffer`'s `notifier_sink`, the reactive-log `view`'s
+        // internal sink) capture `MailboxEmitter` / `SinkEmitter` and
+        // emit via `mailbox.post_emit(...)` instead of the pre-S2b
+        // `core.emit_or_defer(...)` direct-call. The post is supposed
+        // to be drained by the wave's `drain_and_flush` loop (top-of-
+        // iteration `is_runnable()` check), but `fire_deferred` runs
+        // AFTER `drain_and_flush` exits. Same-thread same-wave: a
+        // producer-build sink in `fire_deferred` posts to mailbox →
+        // stranded → 35 parity failures (buffer / stratify / higher-
+        // order / zip / control / messaging — all uniform "emissions
+        // lost"). The cross-thread autonomous-timer-task case (D227/
+        // D230) is the secondary motivation for `MailboxEmitter`'s
+        // `Send + Sync` shape, but the in-tree bug surface was the
+        // same-thread sink case D260 plugs.
+        //
+        // **Why iteration not nested recursion.** Pre-S2b, sinks
+        // captured `Core` directly and `core.emit_or_defer` ran a
+        // *nested wave* per emit (recursive RAII; depth-first). D260's
+        // iteration at the wave-end frontier coalesces all post-
+        // `fire_deferred` mailbox ops into one outer wave (breadth-
+        // first at the boundary; fewer nested-wave entries; identical
+        // quiescence semantics).
+        //
+        // **Canonical timing convergence (A3, user-locked 2026-05-20).**
+        // Rust IS the canonical for this drain-to-quiescence shape;
+        // TS/PY MUST converge if/when they expose an equivalent
+        // mailbox-posting sink seam. Pure-ts today implements the same
+        // observable behavior via a direct-call sink path (no mailbox
+        // indirection → no "stranded post" hazard → naturally quiescent
+        // at wave end); cross-arm parity scenarios (buffer, view(slice),
+        // stratify, ...) verify the observable agreement empirically.
+        //
+        // **Bounded-iteration:** D260's outer loop is capped at
+        // `D260_MAX_REDRAIN_PASSES` (32) — realistic legitimate
+        // cascades stay ≤3 (each iteration drains a fresh post produced
+        // by the previous fire_deferred); 32 gives 10× headroom and
+        // panics loudly on a real emit-loop. Per-iteration
+        // `drain_and_flush` is independently capped by
+        // `max_batch_drain_iterations` (configurable via
+        // `Core::set_max_batch_drain_iterations`). A user sink that
+        // emit-loops forever was a stack overflow pre-S2b — same
+        // hazard, now iteration-shaped (no stack growth, bounded by
+        // the cap, fail-loud).
+        const D260_MAX_REDRAIN_PASSES: u32 = 32;
+        let mut redrain_passes: u32 = 0;
+        loop {
+            redrain_passes += 1;
+            assert!(
+                redrain_passes <= D260_MAX_REDRAIN_PASSES,
+                "D260: wave-end drain-to-quiescence loop did not converge in \
+                 {D260_MAX_REDRAIN_PASSES} passes (mailbox_runnable={mb}, \
+                 deferred_runnable={df}). A producer-build sink is likely \
+                 in an emit-loop: each `fire_deferred` pass posts a fresh \
+                 `MailboxOp` that retriggers another `fire_deferred` pass. \
+                 Pre-S2b this would have been a stack overflow; D260 \
+                 iteration-shapes the hazard with this cap. Investigate \
+                 the producer-build sink that consumes its own output.",
+                mb = self.core.mailbox.is_runnable(),
+                df = self.core.deferred.is_runnable(),
+            );
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.core.drain_and_flush()
+            })) {
+                self.discard_wave_cleanup();
+                self.core.clear_in_tick();
+                std::panic::resume_unwind(payload);
+            }
+            // Wave cleanup + extract deferred jobs under the lock.
+            let (jobs, releases, cleanup_hooks, pending_wipes, snapshot_releases) = {
+                let mut s = self.core.lock_state();
+                // Q-beyond Sub-slice 1 + 3 (D108, 2026-05-09): WaveState
+                // borrowed alongside state for wave-end cleanup. Per-thread;
+                // independent of state. Sub-slice 3 moved deferred_* drains
+                // into WaveState. /qa F1+F2 (2026-05-10) reverted in_tick +
+                // currently_firing back to CoreState — clear via
+                // CoreState::clear_wave_state under the held state lock.
+                let result = with_wave_state(|ws| {
+                    s.clear_wave_state(ws);
+                    // Step 2a (D220-EXEC): defensive `currently_firing`
+                    // clear, relocated here from `CoreState::clear_wave_state`
+                    // (the field moved to the separate `CoreShared` region;
+                    // `St`'s `.shared` reaches it, a `&mut CoreState` can't).
+                    // Same wave-end point; `FiringGuard` RAII already
+                    // balances push/pop — this is the belt-and-suspenders
+                    // net for a future guard-bypassing path.
+                    s.shared.currently_firing.clear();
+                    ws.clear_wave_state();
+                    // /qa A1 (2026-05-09) discipline preserved: drain snapshot
+                    // retains under lock, release lock-released below to avoid
+                    // binding re-entrance under held mutex / borrow.
+                    let snapshot_releases = Core::drain_wave_cache_snapshots(ws);
+                    // `drain_deferred` takes `deferred_flush_jobs` +
+                    // `deferred_handle_releases` (incl. rotation releases pushed
+                    // by `clear_wave_state` above) + Slice E2
+                    // `deferred_cleanup_hooks` + Slice E2 /qa Q2(b)
+                    // `pending_wipes` — all from WaveState post-Sub-slice-3.
+                    let (jobs, releases, hooks, wipes) = Core::drain_deferred(&mut s, ws);
+                    (jobs, releases, hooks, wipes, snapshot_releases)
+                });
+                // Release wave ownership now — AFTER drain + WaveState
+                // cleanup, BEFORE `fire_deferred` below. Load-bearing: a sink
+                // re-entering Core from a flush callback must observe
+                // `in_tick` clear so its emit runs as a fresh owning wave.
+                // (Mirrors the placement of the pre-D047 `s.in_tick = false`;
+                // the drain-phase-panic window that placement had is closed
+                // by the `catch_unwind` above.)
+                self.core.clear_in_tick();
+                result
+            };
+            // Lock dropped — fire deferred sinks + release retains + fire
+            // cleanup hooks (Slice E2 OnInvalidate, D060 catch_unwind drain)
+            // + fire eager wipes (D069).
+            //
+            // D260 /qa P1 (2026-05-20): wrap `fire_deferred` in `catch_unwind`
+            // so a sink panic inside this iteration (`fire_deferred`'s own
+            // `last_panic` + `resume_unwind`-at-end discipline propagates a
+            // panic out) doesn't bypass the per-iteration post-`fire_deferred`
+            // cleanup (snapshot_releases at line ~3910, plus the outer
+            // wave-end `tier3_clear` + `drain_deferred_producer_ops` after
+            // the loop). Mirrors the L3844 drain-phase wrap. On panic:
+            // release the queued `snapshot_releases` defensively
+            // lock-released, run the outer wave-end finalization
+            // (`tier3_clear` + `drain_deferred_producer_ops` — even though
+            // the latter is a D211 no-op shim today, it's part of the
+            // documented wave-end contract), then `resume_unwind` so the
+            // caller observes the panic.
+            let fire_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.core
+                    .fire_deferred(jobs, releases, cleanup_hooks, pending_wipes);
+            }));
+            // /qa A1 fix (2026-05-09): release wave_cache_snapshots retains
+            // lock-released. Pre-A1 these were released inside the held
+            // state + cross_partition locks; binding finalizers re-entering
+            // Core would deadlock against either mutex. Drained earlier
+            // under the lock; released here after both mutexes dropped and
+            // sinks have fired. Runs even on `fire_deferred` panic — these
+            // retains were lifted out of the wave state already and need
+            // releasing regardless.
+            for h in snapshot_releases {
+                self.core.binding.release_handle(h);
+            }
+            if let Err(payload) = fire_result {
+                // /qa P1: run wave-end finalization defensively before
+                // propagating the panic. tier3_clear avoids stale-entry
+                // leakage across cargo's thread-reuse (mirrors the
+                // wave-start defensive clear in `begin_batch_with_guards`).
+                // drain_deferred_producer_ops is a D211 no-op shim today
+                // but is part of the documented wave-end contract.
+                tier3_clear();
+                self.core.drain_deferred_producer_ops();
+                std::panic::resume_unwind(payload);
+            }
+            // D260: check if `fire_deferred` posted new work to mailbox/
+            // deferred. Quiescent ⇒ done. Else: re-claim `in_tick` (cleared
+            // above, before `fire_deferred`) and loop the full sequence.
+            if !self.core.mailbox.is_runnable() && !self.core.deferred.is_runnable() {
+                break;
+            }
+            // Re-claim wave ownership for the secondary drain pass. The
+            // previous iteration's `clear_in_tick` ran before its
+            // `fire_deferred`, so the slot is `0` here. `claim_in_tick`
+            // panics fail-loud on cross-Core mismatch (D252); a
+            // same-thread same-Core re-claim must succeed-outermost.
+            let owns = self.core.claim_in_tick();
+            debug_assert!(
+                owns,
+                "D260: secondary drain pass should always succeed-outermost \
+                 (in_tick was cleared by the previous iteration's pre-fire_deferred clear)"
+            );
+            // /qa P2 (release-build safety): if `claim_in_tick` silently
+            // returned `false` (slot already held — should be impossible
+            // by-construction under D255 single-owner / D248 actor model,
+            // but defense-in-depth), break the loop cleanly rather than
+            // running `drain_and_flush` without ownership. A subsequent
+            // outer wave entry will catch the still-runnable mailbox.
+            if !owns {
+                break;
+            }
         }
         // D1 patch (2026-05-09): clear the per-thread Slice G tier3
         // tracker at outermost wave-end (success path). Mirrors the

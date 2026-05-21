@@ -30,6 +30,74 @@ group; if a group grows past ~5 items, split it.
 
 ---
 
+## Behavioral timing observations verified by existing parity scenarios
+
+### Wave-end mailbox-quiescence timing — VERIFIED CONVERGED (D260 / D261 / D262 S7 /qa, 2026-05-20)
+
+- **What:** D260 (`BatchGuard::Drop` wave-end re-drain loop) + D261
+  (`Core::try_subscribe` post-handshake-fire mailbox drain) made a
+  `MailboxOp::Emit` posted by a sink firing inside `fire_deferred` (or
+  inside `try_subscribe`'s handshake-fire phase) drain within the same
+  outer wave / before `try_subscribe`-return, rather than sitting
+  stranded until the next external wave entry. Late subscribers (via
+  Defer or via push-on-subscribe replay) now observe the wave's cache
+  AT THE MOMENT THE DEFER APPLIES (post-D260), not at the moment of a
+  later wave's drain (pre-D260's stranded-mailbox artifact).
+- **The /qa A2 question (D262):** was this a Rust-internal bug fix
+  (Rust converging to canonical / matching pure-ts), or a Rust
+  semantic shift introducing a TS↔Rust divergence to record?
+- **Answer (verified empirically):** **CONVERGENCE, not divergence.**
+  D260 is the **structural completion** of D232-AMEND's "drain-to-
+  quiescence in-wave, immediately" contract — Rust under-delivered
+  pre-D260; Rust IS now spec-compliant. Pure-ts implements the same
+  observable behavior via a direct-call sink path (no mailbox
+  indirection → naturally quiescent at wave end → no "stranded post"
+  hazard). The `lock_released.rs` test rewrite `[1, 2] → [0, 1, 2]`
+  reflects the post-D260 spec-compliant timing; the OLD test
+  expectation encoded the BUG, not a cross-impl contract.
+- **Empirical evidence (no new test needed):** post-D260 + post-D261,
+  34/35 parity scenario files flipped rust-via-napi-arm-failing →
+  cross-arm-passing — `scenarios/operators/{buffer,control,
+  subscription,higher-order,stratify}.test.ts`,
+  `scenarios/messaging/subscription.test.ts` (incl. `view(slice)`),
+  `scenarios/operators/buffer.test.ts`. All these tests exercise
+  producer-build sinks / push-on-subscribe replay paths that internally
+  use `MailboxEmitter` / `SinkEmitter` — they pass cross-arm because
+  TS pure-ts (direct-call) and Rust post-D260+D261 (mailbox + wave-end
+  re-drain) converge on the same observable shape.
+- **Why no dedicated parity scenario (`scenarios/core/
+  late_subscribe_during_fire_deferred.test.ts`) authored:** the
+  Defer-driven late-subscribe-during-fire_deferred pattern is a
+  Rust-internal seam (`lock_released.rs` test uses raw
+  `mailbox.post_defer(Box::new(move |cf: &dyn CoreFull| {
+  cf.subscribe(s, late_sink); }))`); the public `Impl` contract at
+  `packages/parity-tests/impls/types.ts` doesn't expose `postDefer`
+  (and exposing it would be a D196-violating surface widening with no
+  consumer demand). The user-visible observable shape — producer-build
+  sinks reaching their subscribers within the same outer wave — IS
+  covered by the producer-build operator scenarios above.
+- **Re-look trigger:** if a future parity scenario asserts on
+  late-subscribe-during-fire_deferred timing in a way that diverges
+  cross-arm, capture the verified divergence in
+  `~/src/graphrefly-ts/archive/optimizations/cross-language-notes.jsonl`
+  as `divergence-late-subscribe-fire_deferred-timing` with the
+  observed timing per arm and the spec-correctness verdict; **only
+  then** consider a cross-track-ledger row (D260 itself doesn't
+  widen the `Impl` contract).
+- **No cross-track-ledger row added** (D260 doesn't widen any
+  surface — the contract surface is unchanged; this is a Rust-
+  internal bug fix). **No `divergence-*` entry added** (no verified
+  divergence; pre-emptive `divergence-*` entries pollute the standing
+  Edge-Case-Hunter "drop findings matching existing divergence-*
+  entries" rule). **No preventative parity-test skip-marker added**
+  (D196 — skips need consumer-driven reasons, not preemptive
+  hypothesized divergences).
+- **Source:** S7 /qa (D262, 2026-05-20), user counter-proposal A2.alt
+  (locked). Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+  D262 + D260 + D261.
+
+---
+
 ## Performance — §10 simplifications deferred until evidence-driven
 
 The session doc Part 11 directive: "do not pre-optimize hot paths before
@@ -89,85 +157,26 @@ not pre-optimize." §10.13 and pick_next_fire resolved in Slice U (2026-05-12).
   Canonical: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §1 row
   2026-05-20 (S6 QA F3).
 
-### S7 follow-on — TSFN-bridged operator scenarios fail in rust-via-napi parity arm (2026-05-20)
+### ~~S7 follow-on — TSFN-bridged operator scenarios fail in rust-via-napi parity arm~~ — RESOLVED 2026-05-20 (D260 + D261 + D258 fold-in)
 
-- **What:** Post-S6 + post-QA `pnpm test:parity` against the freshly-
-  built `@graphrefly/native` exposes **35 failures across 6
-  scenario files**, all using `bridge_sync` / `bridge_sync_unit`
-  (Blocking TSFN dispatch from the actor's worker thread to JS):
-  - `scenarios/operators/control.test.ts` — 5/18 fail (tap, rescue×2, valve, repeat)
-  - `scenarios/operators/subscription.test.ts` — 12/32 fail (zip×3, concat, race, …)
-  - `scenarios/operators/higher-order.test.ts` — 6/18 fail
-  - `scenarios/operators/stratify.test.ts` — 6/14 fail (multi-branch, terminal forwarding, reactive rules)
-  - `scenarios/messaging/subscription.test.ts` — 4/10 fail (F18 ReactiveLog view/scan)
-  - `scenarios/operators/buffer.test.ts` — 2/4 fail (buffer, bufferCount)
+**Closed 2026-05-20.** All 35 rust-via-napi parity failures resolved by `/porting-to-rs` S7 slice:
 
-  Pure-ts arm passes uniformly across all 35 of these. Substrate
-  gate (`mise run gate`) is **810/0/0 GREEN**; binding crate
-  builds + clippy clean; napi cdylib builds. The 29 non-affected
-  scenario files (storage-wal, graph, core, structures, transform,
-  combine, etc.) pass cross-arm.
+- **D260** (`BatchGuard::Drop` wave-end re-drain loop, [`crates/graphrefly-core/src/batch.rs`](../crates/graphrefly-core/src/batch.rs)): fixed 34/35. Root cause: producer-build sinks (e.g. `graphrefly_operators::buffer::buffer`'s `notifier_sink`) fire INSIDE `fire_deferred` (post-`drain_and_flush`) and emit via `MailboxEmitter::emit_or_defer` / `SinkEmitter::emit` → mailbox post stranded past the wave engine's exit. D260 loops `drain_and_flush → fire_deferred` after the first pass until `mailbox + deferred` quiesce. Diagnosis path: Phase A instrumentation (`GRAPHREFLY_S7_TRACE=1` env-gated `eprintln!`s at `bridge_sync`/`bridge_sync_unit`/`build_tsfn_sink`/`actor.run`/`fire_deferred`) ruled out H1–H4 (M1 `catch_unwind` swallowing, TSFN queue saturation, sink Arc lifetime, BatchGuard panic-discard) and surfaced H5 — mailbox post in fire_deferred stranded.
 
-  **Failure pattern is uniform "emissions lost":**
-  - `expected [42] to deeply equal []` (all lost)
-  - `expected [[1,10], [2,20]] to deeply equal [[1,10]]` (last lost)
-  - `expected 12 to be 15` (scan missing the last addition)
+- **D261** (`Core::try_subscribe` post-handshake-fire mailbox drain, [`crates/graphrefly-core/src/node.rs`](../crates/graphrefly-core/src/node.rs)): fixed 1/1 remaining (`scenarios/messaging/subscription.test.ts > view(slice)`). Same root mechanism at a different boundary: `try_subscribe`'s handshake-fire phase fires sinks lock-released outside any `BatchGuard`, so a sink that posts via mailbox during push-on-subscribe replay was stranded. D261 enters a brief `BatchGuard` at `try_subscribe`'s tail (gated on `mailbox.is_runnable() || deferred.is_runnable()`) — the guard's Drop runs D260's loop.
 
-- **Why deferred:** debugging requires hands-on tracing in
-  `BindingBoundary::invoke_tap_fn` / `bridge_sync` / `Core::emit`
-  wave path; 1-2 cycles of rebuild + retest. Substrate-side gate
-  is green and the 16 S6/QA patches are sound — separating the
-  TSFN-interaction debug into its own slice keeps the substrate +
-  QA fixes commitable without blocking on a deeper investigation.
-  User-locked decision 2026-05-20 ("Close QA now; carry parity
-  regression as S7 follow-on slice").
+- **D258** (S6 QA fold-in, batch.rs `claim_in_tick` panic-message softening, [`batch.rs:3490`](../crates/graphrefly-core/src/batch.rs)): rewrote the D252 hard-invariant panic message for clarity. **S7 /qa correction (D262, 2026-05-20):** the original "useful for both Rust devs and `@graphrefly/native` consumers" framing is **overstated** — `core_actor.rs:354-357`'s M1 `catch_unwind(...)` swallows the panic value (`let _ = ...`); the polished message reaches Rust's panic hook (stderr) but never crosses the napi boundary. JS callers observe a sync_channel disconnect / actor reply error, not the message text. D258's actual value-add is **Rust-dev clarity only**; binding-friendly framing is aspirational pending a future panic→JS bridge slice (not committed). Gap (a) (pre-claim handle-leak) is structurally resolved by D255's per-`BenchCore` actor thread; that part of D258 stands.
 
-- **Last known good parity-arm state:** Option C close (D206/D207,
-  2026-05-15) — "30 files / 330 passed / 2 skipped / 0 failed."
-  Substrate work S2c+S3+S4+S5 (2026-05-19) reshaped Core to
-  `!Send + !Sync`; bindings broke; CI bindings jobs gated `if:
-  false` (commit `6f86b90` Path A). S6 (2026-05-19) rebuilt the
-  binding atop the post-S2c substrate. **The QA pass (2026-05-20)
-  is the first end-to-end exercise of that rebuild.** The 35
-  failures are NOT a QA regression — they're a S2c→S6 cumulative
-  carry surfaced by exercising the parity-test runtime (which the
-  user explicitly flagged as the actual coverage gate for binding-
-  layer slices — memory `feedback_pre_design_full_decision_set.md`
-  rule #5).
+**Regression test:** [`crates/graphrefly-core/tests/d260_d261_wave_end_mailbox_drain.rs`](../crates/graphrefly-core/tests/d260_d261_wave_end_mailbox_drain.rs) — 2 tests pinning the D260 fire_deferred re-drain + D261 handshake-fire drain invariants. Also updated [`lock_released.rs`](../crates/graphrefly-core/tests/lock_released.rs) `late_subscriber_installed_after_first_queue_notify_does_not_double_receive_data` to reflect D260's in-wave Defer-application timing (the test's pre-D260 expected list `[1, 2]` was incidentally tied to the mailbox-stranded artifact; the load-bearing X4/D2 freeze invariant — no DUPLICATE Data values — is preserved with the new expected `[0, 1, 2]` + a defensive `.dedup() == .len()` assertion).
 
-- **Hypotheses to investigate:**
-  1. **M1 `catch_unwind` silently swallowing a recurring panic.**
-     Temporarily revert M1 (worker loop without `catch_unwind`)
-     to see if a louder panic surfaces — would tell us whether
-     this is a JS-throw, a `bridge_sync` panic, or an actor-side
-     bug (RefCell or other). M1 itself is correct; this is just
-     a debug technique.
-  2. **`std::thread::spawn` worker + Blocking TSFN dispatch
-     interaction.** `bridge_sync` enqueues TSFN with `max_queue_size=1`,
-     blocks actor thread on `sync_channel::recv`. Libuv pumps
-     the TSFN (libuv IS free during the outer napi `await`).
-     Should work; something is dropping emissions. Add `println!`
-     traces in `invoke_tap_fn` (binding-side), `bridge_sync_unit`,
-     `Core::emit`, `Core::commit_emission` to map the loss point.
-  3. **TSFN queue saturation under nested actor + libuv.** A
-     subsequent emission's TSFN dispatch may hit
-     `ThreadsafeFunctionCallMode::Blocking` queue-full state
-     and lose due to a race with the prior call's cleanup.
-  4. **Sink building inside actor closure** (D248 sink-shape) —
-     verify the captured Arc<SinkTsfn> survives across waves
-     and isn't dropped between subscribe and the next emit.
+**Final gate state (2026-05-20):**
+- `mise run gate` → ✅ **812 passed / 0 skipped / 0 failed** (810 pre-S7 + 2 new D260/D261 regression tests) in 16s.
+- `pnpm test:parity` (rust-via-napi arm) → ✅ **34/35 scenario files green** (35 → 1 file with 1 failing test). The 1 remaining is `scenarios/operators/higher-order.test.ts > switchMap completes when outer completes with no active inner — pure-ts` arm; **rust passes the same test**. This is a pre-existing pure-ts higher-order bug masked by the 35 rust-arm failures pre-S7, surfaced as those cleared. Carried out-of-scope to next `/dev-dispatch` (memory `project_next_optimizations_batch.md` item ③ + spawned session); NOT in `/porting-to-rs` scope.
+- `cargo clippy -p graphrefly-core --all-targets` → 1 pre-existing warning in `tests/lock_discipline.rs` (unrelated to S7 changes; the `Arc<{closure}: !Send + !Sync>` lint was there before).
+- `cargo fmt --check` → clean.
+- `#![forbid(unsafe_code)]` preserved in graphrefly-core; `#![deny(unsafe_code)]` preserved in graphrefly-bindings-js.
 
-- **Where it lives:** `crates/graphrefly-bindings-js/src/operator_bindings.rs`
-  (bridge_sync, invoke_*_fn paths), `crates/graphrefly-bindings-js/src/core_bindings.rs`
-  (bridge_sync_unit, build_tsfn_sink), `crates/graphrefly-core/src/batch.rs`
-  (invoke_tap_fn dispatch sites at lines 2593/2633).
-- **Re-look trigger:** S7 debug slice — when a real consumer
-  pushes the rust parity arm or memo:Re premium-backend native
-  swap surfaces the regression. Pre-resolution: drop the
-  rust-arm gate from PR-blocking CI (the cross-arm `describe.each`
-  parameterization handles graceful degradation).
-- **Source:** S6 QA `pnpm test:parity` run (2026-05-20). Output
-  log at `/tmp/s6-qa-parity.log` (session-local).
+**Canonical decisions:** [`~/src/graphrefly-ts/docs/rust-port-decisions.md`](../../graphrefly-ts/docs/rust-port-decisions.md) D259 (debug-slice shape), D260 (wave-end re-drain), D261 (handshake-fire drain).
 
 ### Slice U known limitations (2026-05-12)
 

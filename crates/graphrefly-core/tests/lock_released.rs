@@ -314,22 +314,35 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
         });
     let trig_sub = rt.track_subscribe(d, trigger);
 
-    // Wave 1: `s` emits 1 → `d` fires → trigger posts the defer →
-    // owner drain applies it in-wave → late subscribes after `s`'s
-    // PendingBatch opened. Late handshake = [Start, Data(1)] exactly.
+    // Wave A — activation of `d` on first `track_subscribe(d, trigger)`:
+    // `d` fires its fn (deps[0]=0 initial), commits 0; `fire_deferred`
+    // fires `trigger` with `Data(0)`; `trigger` posts the `Defer` →
+    // **D260's wave-end re-drain loop** applies the Defer in-wave at the
+    // end of the activation wave's `fire_deferred` (post-S2b/D260 timing
+    // matches pre-S2b's nested-wave-during-fire_deferred timing; the
+    // pre-D260 "mailbox stranded → applies at next wave entry" behaviour
+    // was the *bug* this test inadvertently encoded). Late subscribes
+    // with `s.cache == Int(0)` → late handshake = `[Start, Data(0)]`.
+    //
+    // Wave 1 (`s.set(1)`): `s` emits 1 → late (now a real subscriber on
+    // `s`) gets `Data(1)` via the wave's `fire_deferred`. The X4/D2
+    // freeze invariant guarantees the previous activation-wave
+    // PendingBatch (which froze a sinks-snapshot before `late`
+    // installed) did NOT re-deliver to `late` — so `Data(1)` appears
+    // EXACTLY ONCE despite installing mid-activation-wave.
     s.set(TestValue::Int(1));
     rt.drain_mailbox();
-    // Wave 2: post-subscribe emit → late gets Data(2) once.
+    // Wave 2 (`s.set(2)`): post-subscribe emit → late gets `Data(2)` once.
     s.set(TestValue::Int(2));
     rt.drain_mailbox();
 
     let got = late.lock().unwrap();
     // Start observed first (handshake ordering). Incidental lifecycle
-    // messages (Resolved/Dirty/etc.) may interleave — the invariant is
-    // about DATA: the cached handshake Data(1) appears EXACTLY ONCE (no
-    // double-receive via the frozen pre-subscribe PendingBatch flush),
-    // then the post-subscribe Data(2). Assert on the DATA projection so
-    // an incidental protocol message doesn't false-fail the contract.
+    // messages (Resolved/Dirty/etc.) may interleave — the load-bearing
+    // X4/D2 invariant is "no DUPLICATE Data values": each emitted value
+    // appears EXACTLY ONCE in the data projection (no double-receive via
+    // the frozen pre-subscribe PendingBatch flush AND the new sub's
+    // handshake replay).
     assert_eq!(
         got.first(),
         Some(&Ev::Start),
@@ -343,12 +356,35 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
             _ => None,
         })
         .collect();
+    // D260 (2026-05-20) shifted the deferred-subscribe timing from
+    // "next external wave entry" (pre-S2b mailbox-stranded artifact) to
+    // "end of activation wave's fire_deferred" (canonical in-wave
+    // semantics). Late now sees `Data(0)` from its OWN handshake
+    // replay (`s.cache == 0` at late's subscribe time) plus the
+    // expected `Data(1)`/`Data(2)` from the post-install waves. The
+    // X4/D2 freeze invariant (no double-receive) is preserved: each
+    // value appears EXACTLY ONCE.
     assert_eq!(
         data,
-        vec![1, 2],
-        "cached handshake Data(1) delivered EXACTLY ONCE (no \
-         double-receive), then post-subscribe Data(2); full stream {:?}",
+        vec![0, 1, 2],
+        "each Data value delivered EXACTLY ONCE (no double-receive): \
+         `Data(0)` from late's handshake replay (D260 in-wave Defer \
+         timing), then `Data(1)`/`Data(2)` from post-subscribe emits; \
+         full stream {:?}",
         &*got
+    );
+    // Defensive: explicitly assert no value appears twice (the strict
+    // X4/D2 freeze invariant — survives any future timing shift).
+    let mut sorted = data.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        data.len(),
+        "X4/D2 freeze invariant: every Data value appears EXACTLY ONCE; \
+         got data projection {:?} (duplicates after dedup: {:?})",
+        data,
+        sorted
     );
     drop(got);
     rt.unsubscribe(d, trig_sub);

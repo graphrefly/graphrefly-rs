@@ -3456,6 +3456,47 @@ impl Core {
             }
         }
 
+        // D261 / S7: drain mailbox if the handshake-fire phase posted to
+        // it. The per-tier handshake slices above fire sinks LOCK-RELEASED
+        // outside any `BatchGuard`; a sink that posts via
+        // `MailboxEmitter`/`SinkEmitter` (e.g. `graphrefly_structures::
+        // reactive::SinkEmitter::emit`'s `mailbox.post_emit`) would
+        // otherwise leave the post stranded until the next external wave
+        // entry. Without this drain, push-on-subscribe replay for an
+        // operator whose internal sink re-emits via the mailbox
+        // (`reactive_log.view(slice/tail/fromCursor)`'s internal sinks)
+        // never lands on the operator's output node by subscribe-time, so
+        // the **next** `core.subscribe(operator_node, …)` sees `cache ==
+        // NO_HANDLE` and emits an empty `[Data]` slice — same root
+        // mechanism as D260 (mailbox post stranded past a sink-fire
+        // boundary), different boundary (handshake-fire vs fire_deferred).
+        // The `BatchGuard` here is a wave-scoped RAII handle; **its
+        // `Drop`** (not its construction) runs `drain_and_flush` (applies
+        // the queued mailbox/DeferQueue ops) + D260's post-`fire_deferred`
+        // re-drain loop until both queues quiesce. The brief lifetime
+        // — opened then dropped at the end of the `if` block, before
+        // activation — is the entire purpose of the binding.
+        //
+        // Cheap on the no-post path: one `runnable` atomic load per
+        // subscribe; on a positive load, one `BatchGuard` open+drop
+        // round-trip that drains whatever post the handshake produced.
+        //
+        // **Nested-subscribe note.** If `try_subscribe` is called from
+        // inside an already-owning wave (e.g. a Defer closure calling
+        // `cf.subscribe`), `begin_batch_for` → `claim_in_tick` returns
+        // `false` (already owned) → the `BatchGuard` is non-owning →
+        // its `Drop` is a no-op (early-return at the `!owns_tick` guard
+        // in `BatchGuard::Drop`). The outer wave's drain loop catches
+        // the post at its next `is_runnable()` top-of-loop check. Cheap
+        // and correct in both cases.
+        if self.mailbox.is_runnable() || self.deferred.is_runnable() {
+            // Use the same single-owner batch entry as `try_emit` — seed
+            // is the node we just subscribed to (the partition-touch hint
+            // is vestigial post-S2c per `try_begin_batch_for` doc, but
+            // the seed is retained for D211 minimal-churn).
+            let _drain = self.begin_batch_for(node_id);
+        }
+
         // Run activation if needed. `run_wave_for(node_id)` acquires
         // only the partitions transitively touched from `node_id`
         // (downstream cascade + meta-companion teardown reach) — same-
