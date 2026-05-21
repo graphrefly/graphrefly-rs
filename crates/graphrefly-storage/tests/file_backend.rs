@@ -297,7 +297,7 @@ fn file_append_log_accumulates_and_loads() {
         },
     ];
     tier.append_entries(&entries).unwrap();
-    let loaded: Vec<Snap> = tier.load_entries(None).unwrap();
+    let loaded: Vec<Snap> = tier.load_entries_all(None).unwrap();
     assert_eq!(loaded, entries);
 }
 

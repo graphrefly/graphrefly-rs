@@ -213,6 +213,13 @@ impl GraphObserveAllReactive {
     ///
     /// Panics if called more than once on the same handle (single-shot
     /// wiring; rebuild via `observe_all_reactive`).
+    //
+    // Single load-bearing subscribe path: wires initial-snapshot taps for
+    // every named node PLUS a namespace-change sink that wires late
+    // additions. Splitting mechanically would interleave shared state
+    // (sink Arc, weak inner, ns_sink_id) across helpers without clarifying
+    // intent — keep cohesive.
+    #[allow(clippy::too_many_lines)]
     pub fn subscribe<F>(&mut self, core: &Core, sink: F) -> usize
     where
         F: Fn(&str, &[Message]) + 'static,

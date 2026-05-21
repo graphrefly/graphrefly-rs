@@ -30,6 +30,11 @@
 //! and custom-equals re-entrance use the same mailbox seam — see
 //! `tests/lock_released.rs`.
 
+// D248: substrate is structurally `!Send + !Sync` post-S2c. Sinks use
+// `Arc<dyn Fn>` (no `+ Send + Sync` bound); the lint is correct that
+// `Rc` would suffice but the type alias is intentional. Allow at test root.
+#![allow(clippy::arc_with_non_send_sync)]
+
 mod common;
 
 use std::sync::{Arc, Mutex};

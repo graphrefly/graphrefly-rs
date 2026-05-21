@@ -1,6 +1,9 @@
 //! Mount / unmount / ancestors / destroy / signal_invalidate
 //! (canonical spec §3.4 + §3.7).
 
+// D248: substrate is structurally `!Send + !Sync` post-S2c.
+#![allow(clippy::arc_with_non_send_sync)]
+
 mod common;
 
 use std::sync::{Arc, Mutex};

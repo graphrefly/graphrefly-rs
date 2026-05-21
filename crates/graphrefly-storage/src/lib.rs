@@ -73,7 +73,10 @@ pub use redb::{
     redb_append_log, redb_append_log_default, redb_backend, redb_kv, redb_kv_default,
     redb_snapshot, redb_snapshot_default, RedbBackend,
 };
-pub use tier::{AppendLogStorageTier, BaseStorageTier, KvStorageTier, SnapshotStorageTier};
+pub use tier::{
+    AppendCursor, AppendLoadResult, AppendLogMode, AppendLogStorageTier, BaseStorageTier,
+    KvStorageTier, LoadEntriesOpts, SnapshotStorageTier,
+};
 pub use wal::{
     graph_wal_prefix, verify_wal_frame_checksum, wal_frame_checksum, wal_frame_key, ChecksumError,
     WALFrame, WalTag, REPLAY_ORDER, WAL_FRAME_SEQ_PAD, WAL_KEY_SEGMENT,

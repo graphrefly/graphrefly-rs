@@ -133,6 +133,65 @@ where
 
 // ── Layer 2 — Append-log tier ─────────────────────────────────────────────
 
+/// **D269 — Persistence mode (memo:Re P1 parity).** Mirrors TS
+/// `AppendLogStorageOptions.mode`. `Append` (default) reads existing
+/// bucket bytes, decodes, merges new entries, encodes, writes back —
+/// the M4.B behavior. `Overwrite` skips the read/merge entirely and
+/// snapshots the current batch as the bucket's full contents. Used
+/// for callers that ship full snapshots per wave (e.g. WAL replay
+/// drivers) rather than deltas. Feeding deltas into an `Overwrite`
+/// tier silently truncates the log to the last batch — `attach_storage`
+/// rejects overwrite sinks at attachment time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppendLogMode {
+    /// Read existing bucket, merge new entries, write back. M4.B default.
+    #[default]
+    Append,
+    /// Replace bucket contents with the current batch (no read-merge).
+    Overwrite,
+}
+
+/// **D269 — Opaque cursor for windowed `load_entries` pagination
+/// (memo:Re loadEntries-pagination parity).** Mirrors TS `AppendCursor`.
+/// `position` is a forward-only offset into the flattened, lex-ASC-by-
+/// key, entry-order-within-key sequence. `tag` is reserved for future
+/// stable-iteration tokens; currently always `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendCursor {
+    pub position: u64,
+    pub tag: Option<u64>,
+}
+
+impl AppendCursor {
+    #[must_use]
+    pub const fn from_position(position: u64) -> Self {
+        Self {
+            position,
+            tag: None,
+        }
+    }
+}
+
+/// **D269** — Options for [`AppendLogStorageTier::load_entries`].
+#[derive(Debug, Clone, Default)]
+pub struct LoadEntriesOpts<'a> {
+    pub cursor: Option<AppendCursor>,
+    pub page_size: Option<u32>,
+    pub key_filter: Option<&'a str>,
+}
+
+/// **D269** — Result of a paginated [`AppendLogStorageTier::load_entries`].
+/// `cursor.is_none()` ⇒ no more entries (consumer should stop). Returning
+/// the whole tail with `cursor.is_none()` matches the back-compat shape
+/// (bare `load_entries(LoadEntriesOpts::default())` is byte-for-byte the
+/// pre-D269 behavior).
+#[must_use = "AppendLoadResult.cursor must be threaded into the next load_entries call; ignoring it voids the pagination contract"]
+#[derive(Debug, Clone)]
+pub struct AppendLoadResult<T> {
+    pub entries: Vec<T>,
+    pub cursor: Option<AppendCursor>,
+}
+
 /// Append-log tier — bulk-friendly entry persistence with optional
 /// partitioning via `key_of`. Mirrors TS `AppendLogStorageTier<T>`.
 ///
@@ -147,9 +206,34 @@ where
     /// tier's `key_of` closure). Honors `compact_every` cadence.
     fn append_entries(&self, entries: &[T]) -> Result<(), StorageError>;
 
-    /// Load all entries across all known keys (or filtered by `key_filter`).
-    /// Eager — for paginated reads, a future cursor-based API can be added.
-    fn load_entries(&self, key_filter: Option<&str>) -> Result<Vec<T>, StorageError>;
+    /// D269: persistence mode (`Append` default — read-merge; `Overwrite` —
+    /// replace bucket per flush). Exposed so delta-shipping consumers like
+    /// `ReactiveLog::attach_storage` can reject `Overwrite` tiers at
+    /// attach time.
+    fn mode(&self) -> AppendLogMode {
+        AppendLogMode::Append
+    }
+
+    /// D269 — windowed cursor pagination (memo:Re loadEntries-pagination
+    /// parity). With `LoadEntriesOpts::default()` returns the whole log
+    /// (back-compat shape) and `cursor: None`. With `page_size = Some(n)`
+    /// returns `[start, start+n)` of the flattened (lex-ASC-by-key,
+    /// entry-order-within-key) sequence and a forward-only cursor
+    /// (`None` ⇒ no more). Pre-D269 callers using
+    /// `load_entries_legacy(key_filter)` get the old signature.
+    fn load_entries(&self, opts: LoadEntriesOpts<'_>) -> Result<AppendLoadResult<T>, StorageError>;
+
+    /// Pre-D269 convenience: load all entries (no pagination, no cursor).
+    /// Equivalent to `load_entries(LoadEntriesOpts { key_filter, .. })`.
+    fn load_entries_all(&self, key_filter: Option<&str>) -> Result<Vec<T>, StorageError> {
+        Ok(self
+            .load_entries(LoadEntriesOpts {
+                cursor: None,
+                page_size: None,
+                key_filter,
+            })?
+            .entries)
+    }
 }
 
 // ── Layer 2 — KV tier ─────────────────────────────────────────────────────

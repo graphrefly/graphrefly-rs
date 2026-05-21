@@ -19,6 +19,9 @@
 //! `transform::*` factories, and assert on recorded events.
 
 #![allow(dead_code)]
+// D248: substrate is structurally `!Send + !Sync` post-S2c. Test helpers
+// mirror that shape (sinks via `Arc<dyn Fn>` w/o `Send + Sync`).
+#![allow(clippy::arc_with_non_send_sync)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

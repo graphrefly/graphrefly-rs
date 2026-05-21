@@ -383,6 +383,20 @@ impl AttachStorageHandle {
     }
 }
 
+/// **D270 — `AttachOptions { skip_cached_replay }` (memo:Re P2 parity).**
+/// Mirrors TS `ReactiveLogBundle.attach(upstream, opts?)`: when
+/// `skip_cached_replay = true` AND the upstream has a cached value
+/// (`Core::cache_of(upstream)` non-sentinel), drop the FIRST DATA-
+/// bearing batch the attach sink receives — i.e. the subscribe-
+/// handshake replay. Subsequent live emissions still land. A cold
+/// upstream's first live emit is NOT dropped (the `cache_of` check
+/// gates the suppression). The flag has no effect when the upstream's
+/// cache is sentinel (no replay to skip).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttachOptions {
+    pub skip_cached_replay: bool,
+}
+
 impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
     /// Create a reactive view of this log. Returns a [`LogView`] whose
     /// `node_id` emits `Vec<T>` snapshots on every log mutation.
@@ -590,6 +604,20 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         upstream: NodeId,
         read_value: Arc<dyn Fn(HandleId) -> T + Send + Sync>,
     ) -> ReactiveSub {
+        self.attach_with_options(core, upstream, read_value, AttachOptions::default())
+    }
+
+    /// D270 — variant of [`Self::attach`] accepting [`AttachOptions`].
+    /// Use when you need `skip_cached_replay` or future attach knobs;
+    /// the no-option `attach` delegates here with `AttachOptions::default()`
+    /// for back-compat callers.
+    pub fn attach_with_options(
+        &self,
+        core: &Core,
+        upstream: NodeId,
+        read_value: Arc<dyn Fn(HandleId) -> T + Send + Sync>,
+        opts: AttachOptions,
+    ) -> ReactiveSub {
         let inner = Arc::clone(&self.inner);
         // β/D232-AMEND: the long-lived attach sink re-enters Core to
         // emit; it captures the `Send + Sync` `Arc<CoreMailbox>` and
@@ -599,9 +627,36 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         let node_id = self.node_id;
         let intern = Arc::clone(&self.emitter.intern);
 
+        // D270: gate the "skip first DATA-bearing batch" decision on
+        // the upstream having a cached value at attach time. The flag
+        // is one-shot — once a DATA batch arrives and is dropped, the
+        // sink delivers normally for all subsequent batches.
+        let suppress = if opts.skip_cached_replay {
+            let cache = core.cache_of(upstream);
+            cache != graphrefly_core::NO_HANDLE
+        } else {
+            false
+        };
+        let skip_state = Arc::new(parking_lot::Mutex::new(suppress));
+
         let sub = core.subscribe(
             upstream,
             Arc::new(move |msgs| {
+                // D270: check-and-clear the skip flag if THIS batch
+                // carries DATA. Locks-then-clears in one atomic step
+                // so the next batch (live emission) is not skipped.
+                let should_skip = {
+                    let mut s = skip_state.lock();
+                    let has_data = msgs.iter().any(|m| matches!(m, Message::Data(_)));
+                    let do_skip = *s && has_data;
+                    if do_skip {
+                        *s = false;
+                    }
+                    do_skip
+                };
+                if should_skip {
+                    return;
+                }
                 for m in msgs {
                     if let Message::Data(h) = m {
                         let value = read_value(*h);

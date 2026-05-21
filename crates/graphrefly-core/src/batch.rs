@@ -2957,8 +2957,7 @@ impl Core {
             //     immediately. Fallthrough.
             let mode_buffers_tier3 = match rec.pausable {
                 crate::node::PausableMode::ResumeAll => true,
-                crate::node::PausableMode::Default => false,
-                crate::node::PausableMode::Off => false,
+                crate::node::PausableMode::Default | crate::node::PausableMode::Off => false,
             };
             if buffered_tier && mode_buffers_tier3 && rec.pause_state.is_paused() {
                 if let Some(h) = msg.payload_handle() {
@@ -3777,6 +3776,11 @@ impl BatchGuard<'_> {
     }
 }
 
+/// D260: cap on the outer wave-end drain-to-quiescence loop. Realistic
+/// legitimate cascades stay ≤3 passes; 32 gives 10× headroom and
+/// panics loudly on a real emit-loop. See [`Drop for BatchGuard`] body.
+const D260_MAX_REDRAIN_PASSES: u32 = 32;
+
 impl Drop for BatchGuard<'_> {
     fn drop(&mut self) {
         if !self.owns_tick {
@@ -3873,7 +3877,6 @@ impl Drop for BatchGuard<'_> {
         // emit-loops forever was a stack overflow pre-S2b — same
         // hazard, now iteration-shaped (no stack growth, bounded by
         // the cap, fail-loud).
-        const D260_MAX_REDRAIN_PASSES: u32 = 32;
         let mut redrain_passes: u32 = 0;
         loop {
             redrain_passes += 1;
@@ -3891,7 +3894,7 @@ impl Drop for BatchGuard<'_> {
                 df = self.core.deferred.is_runnable(),
             );
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.core.drain_and_flush()
+                self.core.drain_and_flush();
             })) {
                 self.discard_wave_cleanup();
                 self.core.clear_in_tick();

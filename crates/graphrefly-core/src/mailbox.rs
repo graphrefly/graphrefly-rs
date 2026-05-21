@@ -264,6 +264,14 @@ impl CoreMailbox {
     /// empty at unwind time the cell is reset; if the queue is
     /// non-empty the next post would re-set it anyway. Tightens the
     /// scheduler-wakeup contract under panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `max_ops` ops are applied in one drain — that
+    /// indicates a producer / `Defer` op re-posting itself every
+    /// application (livelock guard). The default cap is sized for
+    /// realistic cascades; bump via the corresponding setter if your
+    /// workload has evidence it needs more.
     pub fn drain_into(&self, max_ops: u32, mut apply: impl FnMut(MailboxOp)) {
         let mut applied = 0u32;
         // /qa M3 RAII: clear `runnable` on panic unwind if the queue

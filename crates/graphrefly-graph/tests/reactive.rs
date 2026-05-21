@@ -4,6 +4,7 @@ mod common;
 
 use common::graph;
 use graphrefly_core::{HandleId, Message};
+use graphrefly_graph::DescribeSink;
 use std::sync::{Arc, Mutex};
 
 fn h(n: u64) -> HandleId {
@@ -21,12 +22,10 @@ fn describe_reactive_pushes_initial_snapshot() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     // P7 — push-on-subscribe per canonical R3.6.1 / §2.5.2.
     {
@@ -42,12 +41,10 @@ fn describe_reactive_fires_on_new_node() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     // 1 fire from the initial empty snapshot.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
@@ -71,12 +68,10 @@ fn describe_reactive_fires_on_remove() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     // Initial snapshot fires synchronously.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
@@ -107,12 +102,10 @@ fn describe_reactive_stops_on_detach() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     g.state(rt.core(), "a", Some(h(1))).unwrap();
     // Initial empty + post-add = 2 snapshots.
@@ -130,12 +123,10 @@ fn describe_reactive_accumulates_nodes() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     g.state(rt.core(), "a", Some(h(1))).unwrap();
     g.state(rt.core(), "b", Some(h(2))).unwrap();
@@ -253,12 +244,10 @@ fn describe_reactive_fires_on_mount_new() {
     let (rt, g) = graph("root");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     // Initial snapshot fires synchronously.
     assert_eq!(snapshots.lock().unwrap().len(), 1);
@@ -282,12 +271,10 @@ fn describe_reactive_fires_on_unmount() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let handle = g.describe_reactive(
-        rt.core(),
-        Arc::new(move |output| {
-            snapshots_clone.lock().unwrap().push(output.clone());
-        }),
-    );
+    let sink: DescribeSink = Arc::new(move |output| {
+        snapshots_clone.lock().unwrap().push(output.clone());
+    });
+    let handle = g.describe_reactive(rt.core(), &sink);
 
     // Initial snapshot includes "child".
     assert_eq!(snapshots.lock().unwrap().len(), 1);

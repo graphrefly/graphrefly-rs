@@ -230,15 +230,15 @@ export declare class BenchCore {
    * node has no names — the JS wrapper renders them as
    * `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
    *
-   * **S6/D255 — actor-routed sync:** under the actor model `&Core`
-   * is owner-thread-only, so the read accessors execute on the
-   * actor worker thread via [`CoreActor::run_sync`]. The libuv
-   * thread blocks briefly on the reply (microseconds for the 5
-   * read accessors). The safe-use contract (read-only, no
-   * TSFN-active wave interleave) is met by `describe_node`'s
-   * inspection-only usage — see `CoreActor::run_sync` docs.
+   * **D267 — async** (was `run_sync`). The `run_sync` shape would
+   * deadlock if a JS sink callback (already blocking the actor
+   * worker via TSFN Blocking) called `impl.describeNode(node)` to
+   * project a mid-wave snapshot. `actor.run` keeps libuv free to
+   * pump the actor reply during the await. The parity `Impl
+   * .describeNode` contract is widened to `T | Promise<T>` so the
+   * pure-ts arm returns its sync projection unchanged.
    */
-  describeNode(nodeId: number): string
+  describeNode(nodeId: number): Promise<string>
   /**
    * Hex SHA-256 (N1 `sha256Hex`).
    *
@@ -305,18 +305,18 @@ export declare class BenchGraph {
    * for that Arc; no public API mints a divergent binding.
    */
   static fromCore(core: BenchCore, name: string): BenchGraph
-  name(): string
-  nodeCount(): number
-  nodeNames(): Array<string>
-  childNames(): Array<string>
-  isDestroyed(): boolean
+  name(): Promise<string>
+  nodeCount(): Promise<number>
+  nodeNames(): Promise<Array<string>>
+  childNames(): Promise<Array<string>>
+  isDestroyed(): Promise<boolean>
   /** Resolve a path to a NodeId; returns 0 (NO_NODE) if missing. */
-  tryResolve(path: string): number
+  tryResolve(path: string): Promise<number>
   /**
    * Reverse lookup: returns the local name for a NodeId, or None
    * if unnamed in this graph.
    */
-  nameOf(nodeId: number): string | null
+  nameOf(nodeId: number): Promise<string | null>
   /**
    * `state(name, initial_handle?)`. `None` → sentinel cache.
    * Caller (JS adapter) holds the handle's refcount via
@@ -383,22 +383,21 @@ export declare class BenchGraph {
    * Static edges snapshot — `Vec<(from_name, to_name)>` flattened to
    * alternating `Vec<String>` for napi marshaling.
    *
-   * Sync at the napi boundary (preserves `Impl.edges(opts) ->
-   * Array<[string, string]>` contract); blocks libuv briefly on the
-   * actor reply. Pure read accessor — see [`CoreActor::run_sync`]
-   * safe-use contract; the wrapper.js parity-tests usage doesn't
-   * interleave with TSFN-active waves.
+   * **D267 — async** (was `run_sync`). The parity `Impl.edges`
+   * contract is widened to `T | Promise<T>` so the pure-ts arm
+   * returns sync values unchanged; rust arm returns a Promise.
+   * Eliminates the sink-callback deadlock class — see the
+   * "Namespace introspection" block above for the full rationale.
    */
-  edges(recursive: boolean): Array<string>
+  edges(recursive: boolean): Promise<Array<string>>
   /**
    * JSON-serialized describe snapshot. JS adapter parses with
    * `JSON.parse`. Static — for reactive describe, see
    * `describe_reactive`.
    *
-   * Sync at the napi boundary (preserves `Impl.describe() ->
-   * unknown` contract); same `run_sync` safe-use as `edges`.
+   * **D267 — async** (was `run_sync`). See `edges` above.
    */
-  describeJson(): string
+  describeJson(): Promise<string>
   /**
    * Subscribe to live topology snapshots (canonical R3.6.1
    * `describe({ reactive: true })`). Returns a
@@ -658,7 +657,13 @@ export declare class BenchReactiveLog {
   viewSlice(packer: (arg: Array<number>) => number, start: number, stop?: number | undefined | null): Promise<BenchLogView>
   viewFromCursor(packer: (arg: Array<number>) => number, cursorNodeId: number, readCursor: (arg: Array<number>) => number): Promise<BenchLogView>
   scan(seed: number, folder: (arg: Array<number>) => number): Promise<BenchScanHandle>
-  attach(upstreamNodeId: number): Promise<BenchLogSubscription>
+  /**
+   * D270 — `skip_cached_replay` (memo:Re P2 parity). When true AND
+   * the upstream has a cached value, the subscribe-handshake DATA
+   * replay is suppressed; subsequent live emissions still land.
+   * Default `false` preserves push-on-subscribe semantics.
+   */
+  attach(upstreamNodeId: number, skipCachedReplay?: boolean | undefined | null): Promise<BenchLogSubscription>
 }
 
 export declare class BenchReactiveMap {
@@ -721,11 +726,27 @@ export declare class BenchStorageHandle {
 }
 
 export declare class BenchValueAppendLogTier {
-  static create(backend: BenchMemoryBackend, name?: string | undefined | null, compactEvery?: number | undefined | null, debounceMs?: number | undefined | null): BenchValueAppendLogTier
+  /**
+   * D269 — `mode_str` accepts "append" (default) or "overwrite".
+   * `null` ⇒ "append".
+   */
+  static create(backend: BenchMemoryBackend, name?: string | undefined | null, compactEvery?: number | undefined | null, debounceMs?: number | undefined | null, modeStr?: string | undefined | null): BenchValueAppendLogTier
   /** Append entries (JSON array). */
   appendEntries(entriesJson: string): void
-  /** Load all entries (returns JSON array). */
-  loadEntries(keyFilter?: string | undefined | null): string
+  /**
+   * Load all entries (returns JSON array).
+   *
+   * **D269 — pagination napi widening (memo:Re loadEntries-pagination
+   * parity).** When `page_size_json` is non-null, returns
+   * `{ "entries": [...], "cursor": { "position": N } | null }` as a
+   * JSON object instead of a bare entries array, mirroring TS
+   * `AppendLoadResult<T>`. Bare `load_entries(null, null, null)` is
+   * byte-for-byte the pre-D269 behavior (returns the entries array
+   * directly).
+   */
+  loadEntries(keyFilter?: string | undefined | null, cursorPosition?: number | undefined | null, pageSize?: number | undefined | null): string
+  /** **D269** — mode accessor. Returns `"append"` or `"overwrite"`. */
+  get mode(): string
   flush(): void
   rollback(): void
   get name(): string

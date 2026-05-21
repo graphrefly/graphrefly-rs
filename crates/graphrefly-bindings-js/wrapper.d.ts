@@ -63,8 +63,12 @@ export interface NativeNode<T> {
 }
 
 export interface NativeGraph {
-  tryResolve(path: string): NativeNode<unknown> | undefined;
-  nameOf(node: NativeNode<unknown>): string | undefined;
+  // D267 — `tryResolve`/`nameOf`/`edges`/`describe` are async on the
+  // native arm (was sync; deadlocked when called from inside a TSFN
+  // sink callback). The parity `Impl` contract is widened to `T |
+  // Promise<T>` so the pure-ts arm keeps its sync shape unchanged.
+  tryResolve(path: string): Promise<NativeNode<unknown> | undefined>;
+  nameOf(node: NativeNode<unknown>): Promise<string | undefined>;
   state<T>(name: string, initial?: T): Promise<NativeNode<T>>;
   derived<T>(
     name: string,
@@ -88,8 +92,8 @@ export interface NativeGraph {
   unmount(name: string): Promise<{ nodeCount: number; mountCount: number }>;
   destroy(): Promise<void>;
   destroyAsync(): Promise<void>;
-  edges(opts?: { recursive?: boolean }): Array<[string, string]>;
-  describe(): unknown;
+  edges(opts?: { recursive?: boolean }): Promise<Array<[string, string]>>;
+  describe(): Promise<unknown>;
   describe(opts: { reactive: true }): Promise<ReactiveDescribeHandle>;
   observe(): Promise<ObserveSubscription>;
   observe(path: string): Promise<ObserveSubscription>;
@@ -269,7 +273,8 @@ export interface NativeImpl {
   // ── N1 substrate-infra surface (D203 item 8 / D206-D207) ────────────
   RingBuffer: new <T>(capacity: number) => NativeRingBuffer<T>;
   ResettableTimer: new () => NativeResettableTimer;
-  describeNode(node: NativeNode<unknown>): unknown;
+  // D267 — `describeNode` async (was sync; sink-callback deadlock).
+  describeNode(node: NativeNode<unknown>): Promise<unknown>;
   sha256Hex(input: string | Uint8Array): Promise<string>;
   sourceOpts(opts?: Record<string, unknown>): Record<string, unknown>;
 

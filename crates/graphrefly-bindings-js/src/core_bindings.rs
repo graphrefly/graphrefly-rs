@@ -1838,57 +1838,59 @@ impl BenchCore {
     /// node has no names — the JS wrapper renders them as
     /// `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
     ///
-    /// **S6/D255 — actor-routed sync:** under the actor model `&Core`
-    /// is owner-thread-only, so the read accessors execute on the
-    /// actor worker thread via [`CoreActor::run_sync`]. The libuv
-    /// thread blocks briefly on the reply (microseconds for the 5
-    /// read accessors). The safe-use contract (read-only, no
-    /// TSFN-active wave interleave) is met by `describe_node`'s
-    /// inspection-only usage — see `CoreActor::run_sync` docs.
+    /// **D267 — async** (was `run_sync`). The `run_sync` shape would
+    /// deadlock if a JS sink callback (already blocking the actor
+    /// worker via TSFN Blocking) called `impl.describeNode(node)` to
+    /// project a mid-wave snapshot. `actor.run` keeps libuv free to
+    /// pump the actor reply during the await. The parity `Impl
+    /// .describeNode` contract is widened to `T | Promise<T>` so the
+    /// pure-ts arm returns its sync projection unchanged.
     #[napi]
-    pub fn describe_node(&self, node_id: u32) -> Result<String> {
+    pub async fn describe_node(&self, node_id: u32) -> Result<String> {
         let nid = NodeId::new(u64::from(node_id));
-        self.actor.run_sync(move |core| -> String {
-            let kind = core.kind_of(nid);
-            let Some(kind) = kind else {
-                // Unknown node — absence over panic (mirrors the Core
-                // read-side "Option/empty for unknown ids" discipline).
-                return "null".to_string();
-            };
-            let type_str = match kind {
-                graphrefly_core::NodeKind::State => "state",
-                graphrefly_core::NodeKind::Producer => "producer",
-                graphrefly_core::NodeKind::Derived => "derived",
-                graphrefly_core::NodeKind::Dynamic => "dynamic",
-                graphrefly_core::NodeKind::Operator(_) => "operator",
-            };
-            let status = match core.is_terminal(nid) {
-                Some(graphrefly_core::TerminalKind::Complete) => "complete",
-                Some(graphrefly_core::TerminalKind::Error(_)) => "error",
-                None => {
-                    if core.has_fired_once(nid) {
-                        "active"
-                    } else {
-                        "sentinel"
+        self.actor
+            .run(move |core| -> String {
+                let kind = core.kind_of(nid);
+                let Some(kind) = kind else {
+                    // Unknown node — absence over panic (mirrors the Core
+                    // read-side "Option/empty for unknown ids" discipline).
+                    return "null".to_string();
+                };
+                let type_str = match kind {
+                    graphrefly_core::NodeKind::State => "state",
+                    graphrefly_core::NodeKind::Producer => "producer",
+                    graphrefly_core::NodeKind::Derived => "derived",
+                    graphrefly_core::NodeKind::Dynamic => "dynamic",
+                    graphrefly_core::NodeKind::Operator(_) => "operator",
+                };
+                let status = match core.is_terminal(nid) {
+                    Some(graphrefly_core::TerminalKind::Complete) => "complete",
+                    Some(graphrefly_core::TerminalKind::Error(_)) => "error",
+                    None => {
+                        if core.has_fired_once(nid) {
+                            "active"
+                        } else {
+                            "sentinel"
+                        }
                     }
-                }
-            };
-            let deps: Vec<u64> = core.deps_of(nid).iter().map(|d| d.raw()).collect();
-            let cache = core.cache_of(nid);
-            let cache_raw = if cache == graphrefly_core::NO_HANDLE {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::from(cache.raw())
-            };
-            let projection = serde_json::json!({
-                "type": type_str,
-                "status": status,
-                "deps": deps,
-                "valueHandle": cache_raw,
-                "sentinel": cache == graphrefly_core::NO_HANDLE,
-            });
-            projection.to_string()
-        })
+                };
+                let deps: Vec<u64> = core.deps_of(nid).iter().map(|d| d.raw()).collect();
+                let cache = core.cache_of(nid);
+                let cache_raw = if cache == graphrefly_core::NO_HANDLE {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::from(cache.raw())
+                };
+                let projection = serde_json::json!({
+                    "type": type_str,
+                    "status": status,
+                    "deps": deps,
+                    "valueHandle": cache_raw,
+                    "sentinel": cache == graphrefly_core::NO_HANDLE,
+                });
+                projection.to_string()
+            })
+            .await
     }
 
     /// Hex SHA-256 (N1 `sha256Hex`).

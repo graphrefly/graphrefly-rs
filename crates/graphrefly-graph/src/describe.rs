@@ -1,8 +1,17 @@
+// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
+// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
+// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
+// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
+// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
+// over-conservative but correct, and this file's Arc<Sink> sites cite
+// the deliberate D248 relaxation, not a missed Send+Sync bound.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
 //! D246: describe logic is a free fn [`describe_of`] over
 //! `(&dyn CoreFull, &Rc<RefCell<GraphInner>>)` so the one [`Graph`]
-//! (crate::Graph) reuses it, AND so the in-wave reactive-describe
+//! (`crate::Graph`) reuses it, AND so the in-wave reactive-describe
 //! `MailboxOp::Defer` closure (D246 rule 6) can run it through the
 //! `&dyn CoreFull` it is handed (the one facade carries read-only
 //! inspection). `ReactiveDescribeHandle` holds ids only (Core-free,
@@ -308,7 +317,7 @@ impl ReactiveDescribeHandle {
 pub(crate) fn describe_reactive_in(
     core: &Core,
     inner: &Rc<RefCell<GraphInner>>,
-    sink: DescribeSink,
+    sink: &DescribeSink,
 ) -> ReactiveDescribeHandle {
     // Push-on-subscribe (no lock held).
     sink(&describe_of(core, inner, None));

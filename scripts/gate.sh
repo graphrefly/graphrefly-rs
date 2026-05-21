@@ -65,8 +65,9 @@
 #                          swap-used is a poor "about to thrash" signal —
 #                          free-memory-% is the real precheck; opt in only
 #                          if you want a hard ceiling)
-#   GATE_CLIPPY_DENY=1     pass `-- -D warnings` to clippy (default off, to
-#                          match the project's warn-by-default convention)
+#   GATE_CLIPPY_DENY=0     opt-out of `-- -D warnings` (clippy default IS
+#                          deny-warnings to match CI; only opt out when
+#                          a slice intentionally lands warnings).
 #   GATE_LOG=<path>        override the log file path
 set -u
 
@@ -271,7 +272,15 @@ rl_start_watchdog "$GATE_TIMEOUT"
 # 3.2). `${arr[@]+"${arr[@]}"}` is the portable guard — expands to nothing
 # when the array is empty/unset, to the quoted elements otherwise.
 CLIPPY_DENY=()
-[ "${GATE_CLIPPY_DENY:-0}" = 1 ] && CLIPPY_DENY=(-- -D warnings)
+# Default-on so the local gate catches what CI catches. Opt-out via
+# GATE_CLIPPY_DENY=0 for slices that need to land warnings deliberately.
+# Accept "0" or "false"/"no" as opt-out; any other value (including the
+# default "1") enables deny-warnings. /qa-fix 2026-05-21: was previously
+# `!= 0` which silently accepted typos like "fasle" as opt-in.
+case "${GATE_CLIPPY_DENY:-1}" in
+  0|false|no|FALSE|NO) ;;
+  *) CLIPPY_DENY=(-- -D warnings) ;;
+esac
 
 # Step 1 — formatting (fast; fail before any expensive compile).
 rl_run "rustfmt --check" \

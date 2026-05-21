@@ -1,6 +1,19 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-14 (Layer-boundary slice: F24 + D171 + stratify + parity scenarios)
+last_updated: 2026-05-21 (D266-D270 cross-track-ledger closure batch)
+---
+
+## D266-D270 follow-on deferrals (2026-05-21)
+
+The cross-track-ledger closure batch landed substrate-level support for all 5 open native-pending rows. The following sub-items were deferred to keep the slice scoped:
+
+- **`ReactiveLog::attach_storage` rejection of `Overwrite` sinks (D269 part).** TS `attachStorage` throws when handed an `Overwrite` tier (delta-shipping into overwrite silently truncates). The Rust substrate `ReactiveLog::attach_storage(core, sinks, preload)` doesn't currently inspect each sink's `mode()` to reject. The rejection point shifts when the binding-layer napi for `attach_storage` lands (F18 — still deferred per D196 no-consumer-scenario gate). When F18 ships, add the mode check at both the substrate API and the binding boundary.
+- **`AttachOptions` cross-arm sub-cases (D270 part).** Cross-arm parity scenarios for `skipCachedReplay` with `(b) replayBuffer:N` and `(d) attach inside batch()` not covered. Rationale: (b) Rust substrate has no `replayBuffer` shape (the TS pre-handshake replay buffer is a JS-side construct; Rust's handshake is single-handle cache replay only); (d) `attach` from inside a Core `batch()` would require additional substrate support to defer the handshake to wave-end. Both are observation-layer concerns, not substrate correctness — capture if a real consumer surfaces.
+- **`graphrefly-storage::tier::AppendLogMode` serde derive.** Currently no `#[derive(Serialize, Deserialize)]` on the enum — was attempted with `#[cfg_attr(feature = "serde-support", ...)]` but `graphrefly-storage` doesn't expose a `serde-support` feature (the warning was authentic). If a future graph-snapshot WAL replay needs to carry the mode through serialized state, add a derive then; today no caller needs it.
+- **Cross-arm parity scenarios for D268/D269/D270.** Substrate cargo tests cover the Rust side (31 tier tests + 3 reactive-log skipCachedReplay tests). Cross-arm parity scenarios `scenarios/storage-wal/durability+mode+pagination.test.ts` + `scenarios/messaging/skip-cached-replay.test.ts` are NOT yet authored — the structural pieces (Impl widening, pure-ts arm wiring, rust arm wiring through the napi) ARE in place. Author scenarios in a follow-on pass; the current parity gate stays green at 36/36 since the new shapes are additive (TS callers continue working via the old API).
+- **F9 reactive-timer-driven debounce-flush driver inside `attach_storage` (D268 part).** TS `attachStorage` drives each debounced tier's `flush()` from a reactive timer source (`fromTimer(d,{period:d})`) plus a final drain on detach/teardown. The Rust substrate currently leaves the driver to the caller — explicitly documented as "callers drive `flush()` from `graphrefly_operators::temporal::interval`," same shape as the existing `attach_snapshot_storage` precedent. A built-in driver inside the substrate's `attach_storage` would need tokio runtime integration in `graphrefly-storage` (D171 lift point — already on the action-items queue for the M4 storage reactive-timer wiring slice). Until that lands, callers must wire the timer subgraph themselves. The F9 obligation from cross-track-ledger §2 P0(b) is met *as a caller-driven pattern*, not as a built-in driver — captured here so the gap is explicit. Lift point: when D171 lands the substrate `attach_storage` debounce wiring (or earlier if F18 `attach_storage` napi materializes a consumer scenario).
+- **`AppendLogStorage::flush` retry under concurrent rollback may re-resurrect cleared entries.** When the per-bucket epoch check at the top of the loop passes but encode or backend.write subsequently fails AND `rollback()` runs in the interleaving window, the error-restore path unconditionally inserts the new-entries bucket back into `pending` — even though the epoch has advanced. On the next flush the bucket goes through again unless the caller separately re-rolls-back. This is a minor race: the rolled-back-then-write-error window is narrow and the silent-drop semantic under rollback is already documented as best-effort. A defensive fix would re-check `rollback_epoch` inside the error paths before inserting; deferred until a real-world race surfaces (the existing 3 cargo tests cover the happy path + the in-loop epoch abort; a fault-injecting rollback-mid-write test would be the regression gate).
+
 ---
 
 # Porting flags & deferred concerns
@@ -261,6 +274,12 @@ per fn-fire).
 ---
 
 ## v1 dispatcher limitations (intentional, with planned lift points)
+
+### Arc → Rc cleanup for post-D248 `!Send + !Sync` sites (2026-05-21)
+
+- **What:** Per-file `#![allow(clippy::arc_with_non_send_sync)]` applied 2026-05-21 to: `graphrefly-graph/src/describe.rs` + `graphrefly-operators/src/{buffer,control,higher_order,ops_impl,stratify,temporal}.rs`. D248 dropped `Send + Sync` from `Sink`/`TopologySink` callbacks (single-owner Core); `Arc` became over-conservative for those sites.
+- **Why deferred:** `Rc` would suffice and is the architecturally correct type, but switching cascades through type signatures + many call sites (estimated >40 LOC across the affected crates + bindings/parity reconciliation).
+- **Lift point:** schedule when an unrelated `Sink`-shape touch coincides, or when Rust 1.97+ tightens the lint further.
 
 ### `release_handles` / `release_handle` called lock-held during `reset_for_fresh_lifecycle` (Phase 3 + 3b + 5) — established pattern, expanded by D-α
 

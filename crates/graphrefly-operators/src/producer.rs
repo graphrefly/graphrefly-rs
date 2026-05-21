@@ -364,7 +364,6 @@ pub struct SubGuard {
 impl SubGuard {
     /// Track `sub` (returned by `CoreFull::try_subscribe` on `node`) so
     /// dropping this guard unsubscribes it.
-    #[must_use]
     pub fn new(node: NodeId, sub: SubscriptionId, em: ProducerEmitter) -> Self {
         Self { node, sub, em }
     }

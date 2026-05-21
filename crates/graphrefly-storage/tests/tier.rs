@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use graphrefly_storage::{
     append_log_storage, kv_storage, memory_append_log, memory_backend, memory_kv, memory_snapshot,
-    snapshot_storage, AppendLogStorage, AppendLogStorageOptions, AppendLogStorageTier,
-    BaseStorageTier, KvStorage, KvStorageOptions, KvStorageTier, MemoryBackend, SnapshotStorage,
-    SnapshotStorageOptions, SnapshotStorageTier, StorageBackend,
+    snapshot_storage, AppendCursor, AppendLogMode, AppendLogStorage, AppendLogStorageOptions,
+    AppendLogStorageTier, BaseStorageTier, KvStorage, KvStorageOptions, KvStorageTier,
+    LoadEntriesOpts, MemoryBackend, SnapshotStorage, SnapshotStorageOptions, SnapshotStorageTier,
+    StorageBackend, StorageError,
 };
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -295,7 +296,7 @@ fn append_log_accumulates_then_loads() {
     });
     log.append_entries(&[1, 2, 3]).unwrap();
     log.append_entries(&[4, 5]).unwrap();
-    let mut all = log.load_entries(None).unwrap();
+    let mut all = log.load_entries_all(None).unwrap();
     all.sort_unstable();
     assert_eq!(all, vec![1, 2, 3, 4, 5]);
 }
@@ -320,7 +321,7 @@ fn append_log_key_of_partitions_entries() {
     let keys = backend.list("").unwrap();
     assert!(keys.contains(&"alpha".to_string()));
     assert!(keys.contains(&"beta".to_string()));
-    let alpha_entries = log.load_entries(Some("alpha")).unwrap();
+    let alpha_entries = log.load_entries_all(Some("alpha")).unwrap();
     assert_eq!(alpha_entries.len(), 2);
 }
 
@@ -328,8 +329,347 @@ fn append_log_key_of_partitions_entries() {
 fn append_log_empty_entries_is_noop() {
     let log = memory_append_log::<u32, _>(AppendLogStorageOptions::default());
     log.append_entries(&[]).unwrap();
-    assert_eq!(log.load_entries(None).unwrap(), Vec::<u32>::new());
+    assert_eq!(log.load_entries_all(None).unwrap(), Vec::<u32>::new());
 }
+
+// D269 — mode + pagination (memo:Re P1 + loadEntries-pagination parity).
+
+#[test]
+fn append_log_overwrite_mode_replaces_bucket_per_flush() {
+    let backend = memory_backend();
+    let log = append_log_storage(
+        Arc::clone(&backend),
+        AppendLogStorageOptions::<u32, _> {
+            name: Some("snap".into()),
+            mode: AppendLogMode::Overwrite,
+            ..Default::default()
+        },
+    );
+    log.append_entries(&[1, 2, 3]).unwrap();
+    assert_eq!(log.load_entries_all(None).unwrap(), vec![1, 2, 3]);
+    // Second batch in Overwrite mode REPLACES the bucket (no read-merge).
+    log.append_entries(&[10, 20]).unwrap();
+    assert_eq!(log.load_entries_all(None).unwrap(), vec![10, 20]);
+}
+
+#[test]
+fn append_log_mode_accessor_reports_configured_mode() {
+    let log_a = memory_append_log::<u32, _>(AppendLogStorageOptions {
+        mode: AppendLogMode::Append,
+        ..Default::default()
+    });
+    assert_eq!(log_a.mode(), AppendLogMode::Append);
+    let log_o = memory_append_log::<u32, _>(AppendLogStorageOptions {
+        mode: AppendLogMode::Overwrite,
+        ..Default::default()
+    });
+    assert_eq!(log_o.mode(), AppendLogMode::Overwrite);
+}
+
+#[test]
+fn append_log_load_entries_page_size_returns_window_and_cursor() {
+    let log = memory_append_log::<u32, _>(AppendLogStorageOptions {
+        name: Some("evts".into()),
+        ..Default::default()
+    });
+    log.append_entries(&[10, 20, 30, 40, 50]).unwrap();
+    let r = log
+        .load_entries(LoadEntriesOpts {
+            page_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r.entries, vec![10, 20]);
+    let c = r.cursor.expect("cursor should advance after window");
+    assert_eq!(c.position, 2);
+
+    let r2 = log
+        .load_entries(LoadEntriesOpts {
+            cursor: Some(c),
+            page_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r2.entries, vec![30, 40]);
+    let c2 = r2.cursor.expect("cursor should advance again");
+    assert_eq!(c2.position, 4);
+
+    let r3 = log
+        .load_entries(LoadEntriesOpts {
+            cursor: Some(c2),
+            page_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r3.entries, vec![50]);
+    assert!(r3.cursor.is_none(), "no more entries ⇒ cursor=None");
+}
+
+#[test]
+fn append_log_load_entries_default_returns_whole_log_back_compat() {
+    let log = memory_append_log::<u32, _>(AppendLogStorageOptions::default());
+    log.append_entries(&[1, 2, 3]).unwrap();
+    let r = log.load_entries(LoadEntriesOpts::default()).unwrap();
+    assert_eq!(r.entries, vec![1, 2, 3]);
+    assert!(
+        r.cursor.is_none(),
+        "no page_size ⇒ whole tail + cursor=None"
+    );
+}
+
+#[test]
+fn append_log_load_entries_cursor_past_end_returns_empty_page() {
+    let log = memory_append_log::<u32, _>(AppendLogStorageOptions::default());
+    log.append_entries(&[1, 2]).unwrap();
+    let r = log
+        .load_entries(LoadEntriesOpts {
+            cursor: Some(AppendCursor::from_position(99)),
+            page_size: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r.entries, Vec::<u32>::new());
+    assert!(r.cursor.is_none());
+}
+
+// D268 — rollback epoch (memo:Re P0(d) parity).
+
+#[test]
+fn append_log_rollback_clears_pending_so_subsequent_flush_is_empty() {
+    let backend = memory_backend();
+    let log = append_log_storage(
+        Arc::clone(&backend),
+        AppendLogStorageOptions::<u32, _> {
+            name: Some("events".into()),
+            debounce_ms: Some(50), // buffer pending
+            ..Default::default()
+        },
+    );
+    log.append_entries(&[1, 2, 3]).unwrap();
+    // Sequential rollback then flush — the buffered entries must not
+    // be persisted. Pre-D268 this already worked (rollback cleared
+    // pending; flush saw empty). D268 preserves this invariant.
+    log.rollback().unwrap();
+    log.flush().unwrap();
+    assert_eq!(log.load_entries_all(None).unwrap(), Vec::<u32>::new());
+}
+
+#[test]
+fn append_log_rollback_during_concurrent_flush_aborts_remaining_writes() {
+    // D268: concurrent rollback bumps the epoch; flush captures the
+    // initial epoch and aborts before any further per-bucket write.
+    //
+    // We construct this scenario with a backend whose `write` blocks
+    // on a barrier so we can deterministically interleave rollback
+    // BETWEEN flushes' per-bucket writes (after at least one write
+    // landed but before others). The first bucket gets persisted
+    // (already past the epoch check); the second is dropped.
+    use std::sync::Arc as StdArc;
+    use std::sync::Barrier;
+
+    struct BarrierBackend {
+        inner: StdArc<MemoryBackend>,
+        first_write_done: StdArc<Barrier>,
+        rollback_done: StdArc<Barrier>,
+        write_count: parking_lot::Mutex<u32>,
+    }
+    impl StorageBackend for BarrierBackend {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.read(key)
+        }
+        fn write(&self, key: &str, bytes: &[u8]) -> Result<(), StorageError> {
+            let was_first = {
+                let mut n = self.write_count.lock();
+                *n += 1;
+                *n == 1
+            };
+            self.inner.write(key, bytes)?;
+            if was_first {
+                // Signal the rollback thread that the first write landed.
+                self.first_write_done.wait();
+                // Wait for rollback to complete BEFORE returning so the
+                // outer flush loop sees the bumped epoch on its next
+                // per-bucket check.
+                self.rollback_done.wait();
+            }
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix)
+        }
+    }
+    let inner = memory_backend();
+    let first_write_done = StdArc::new(Barrier::new(2));
+    let rollback_done = StdArc::new(Barrier::new(2));
+    let backend = StdArc::new(BarrierBackend {
+        inner: StdArc::clone(&inner),
+        first_write_done: StdArc::clone(&first_write_done),
+        rollback_done: StdArc::clone(&rollback_done),
+        write_count: parking_lot::Mutex::new(0),
+    });
+    let log = StdArc::new(append_log_storage(
+        StdArc::clone(&backend) as Arc<dyn StorageBackend>,
+        AppendLogStorageOptions::<(String, u32), _> {
+            name: Some("evts".into()),
+            debounce_ms: Some(50),
+            key_of: Some(Box::new(|(k, _)| k.clone())),
+            ..Default::default()
+        },
+    ));
+    log.append_entries(&[("alpha".to_string(), 1), ("beta".to_string(), 2)])
+        .unwrap();
+
+    let log_for_flush = StdArc::clone(&log);
+    let flush_thread = std::thread::spawn(move || log_for_flush.flush());
+
+    // Wait for the first per-bucket write to land.
+    first_write_done.wait();
+    // Now rollback — bumps epoch. Flush thread's next epoch check
+    // will see the bump and abort the remaining bucket.
+    log.rollback().unwrap();
+    rollback_done.wait();
+    flush_thread.join().unwrap().unwrap();
+
+    // Exactly ONE of the two buckets was persisted (first to land).
+    let all_keys = inner.list("").unwrap();
+    assert_eq!(
+        all_keys.len(),
+        1,
+        "expected exactly 1 persisted bucket (epoch aborted the second), got keys: {all_keys:?}",
+    );
+}
+
+/// Helper backend that delegates to an inner [`MemoryBackend`] but
+/// injects controllable faults on the Nth `write` (or every write).
+/// Used by the `append_log_*_failure_does_not_duplicate_on_retry`
+/// regression tests below.
+///
+/// /qa-fix 2026-05-21: caught a flush-error-restore regression where
+/// `bucket_backup` was bound and immediately discarded with
+/// `let _ = bucket_backup;` and the error paths restored
+/// `final_payload` (= existing-read-from-backend ⊕ new entries) into
+/// `pending`. On retry, `flush()` re-read existing from backend and
+/// merged again — silently DUPLICATING existing entries in storage.
+/// Cargo gate did not catch this because the existing rollback /
+/// merge tests never fault-inject a write failure.
+struct FaultBackend {
+    inner: std::sync::Arc<MemoryBackend>,
+    /// `true` → fault EVERY write (the encode-error test path uses
+    /// this only after the encode/write fault is observed; the
+    /// retry runs after `inject_write_fault.store(false, ...)`).
+    inject_write_fault: std::sync::atomic::AtomicBool,
+    write_count: parking_lot::Mutex<u32>,
+}
+
+impl FaultBackend {
+    fn new(inner: std::sync::Arc<MemoryBackend>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            inject_write_fault: std::sync::atomic::AtomicBool::new(false),
+            write_count: parking_lot::Mutex::new(0),
+        })
+    }
+}
+
+impl StorageBackend for FaultBackend {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.read(key)
+    }
+    fn write(&self, key: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        *self.write_count.lock() += 1;
+        if self
+            .inject_write_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StorageError::BackendError {
+                message: "injected write fault".into(),
+                source: None,
+            });
+        }
+        self.inner.write(key, bytes)
+    }
+    fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list(prefix)
+    }
+}
+
+#[test]
+fn append_log_append_mode_write_failure_does_not_duplicate_on_retry() {
+    // /qa regression — covers the D269 error-path restore semantic.
+    // Before the fix, a write failure on flush #1 caused flush #2 to
+    // re-read the (committed) existing bucket AND re-merge with
+    // `final_payload` (which contained the existing entries +
+    // the new entries), so existing entries silently DUPLICATED.
+    //
+    // Scenario:
+    //   1. tier with `Append` mode + a key with existing data [1, 2]
+    //   2. append [3, 4]; flush fails on write (fault injected)
+    //   3. flush retries (fault cleared); persisted bucket MUST be
+    //      [1, 2, 3, 4], NOT [1, 2, 1, 2, 3, 4].
+    let memory = std::sync::Arc::new(MemoryBackend::with_name("evts"));
+    let fault = FaultBackend::new(std::sync::Arc::clone(&memory));
+    let backend: Arc<dyn StorageBackend> = std::sync::Arc::clone(&fault) as _;
+
+    // Seed the existing bucket via a clean flush. `debounce_ms: Some(50)`
+    // disables the auto-flush-on-append fast path so we can control
+    // exactly when flush() runs (otherwise append_entries auto-flushes
+    // synchronously when debounce_ms is None — the seed write would then
+    // be the only write, and the fault would never bite).
+    let log = append_log_storage(
+        Arc::clone(&backend),
+        AppendLogStorageOptions::<u32, _> {
+            name: Some("evts".into()),
+            mode: AppendLogMode::Append,
+            debounce_ms: Some(50),
+            ..Default::default()
+        },
+    );
+    log.append_entries(&[1, 2]).unwrap();
+    log.flush().unwrap();
+    assert_eq!(log.load_entries_all(None).unwrap(), vec![1, 2]);
+
+    // Append new entries; fault the next write; flush returns Err.
+    log.append_entries(&[3, 4]).unwrap();
+    fault
+        .inject_write_fault
+        .store(true, std::sync::atomic::Ordering::Release);
+    let err = log.flush();
+    assert!(err.is_err(), "first flush should have failed: {err:?}");
+
+    // Retry: lift the fault and flush again.
+    fault
+        .inject_write_fault
+        .store(false, std::sync::atomic::Ordering::Release);
+    log.flush().unwrap();
+
+    // The bucket on the backend MUST be [1, 2, 3, 4] (no duplicates).
+    let loaded = log.load_entries_all(None).unwrap();
+    assert_eq!(
+        loaded,
+        vec![1, 2, 3, 4],
+        "Append-mode error-path must NOT duplicate existing entries on retry",
+    );
+}
+
+// NOTE: The companion encode-failure regression is intentionally not
+// written as a separate test — both the encode-error and write-error
+// arms in `AppendLogStorage::flush` use the same `restore_payload`
+// closure binding, so the write-failure test above locks the contract
+// for both. A custom-codec encode-fault test would require generic-
+// type plumbing on `AppendLogStorageOptions<u32, C>` that buys no
+// extra coverage.
 
 #[test]
 fn append_log_flush_merges_with_existing_backend_bucket() {
@@ -351,7 +691,7 @@ fn append_log_flush_merges_with_existing_backend_bucket() {
         },
     );
     log2.append_entries(&[3, 4]).unwrap();
-    let mut all = log2.load_entries(None).unwrap();
+    let mut all = log2.load_entries_all(None).unwrap();
     all.sort_unstable();
     assert_eq!(all, vec![1, 2, 3, 4]);
 }
@@ -532,7 +872,7 @@ fn append_log_compact_every_triggers_when_batch_jumps_boundary() {
         },
     );
     log.append_entries(&[1, 2, 3, 4, 5]).unwrap();
-    let entries = log.load_entries(None).unwrap();
+    let entries = log.load_entries_all(None).unwrap();
     assert_eq!(
         entries.len(),
         5,

@@ -210,22 +210,35 @@ pub struct BenchValueAppendLogTier {
 
 #[napi]
 impl BenchValueAppendLogTier {
+    /// D269 — `mode_str` accepts "append" (default) or "overwrite".
+    /// `null` ⇒ "append".
     #[napi(factory)]
     pub fn create(
         backend: &BenchMemoryBackend,
         name: Option<String>,
         compact_every: Option<u32>,
         debounce_ms: Option<u32>,
-    ) -> Self {
+        mode_str: Option<String>,
+    ) -> Result<Self> {
+        let mode = match mode_str.as_deref() {
+            None | Some("append") => graphrefly_storage::AppendLogMode::Append,
+            Some("overwrite") => graphrefly_storage::AppendLogMode::Overwrite,
+            Some(other) => {
+                return Err(napi::Error::from_reason(format!(
+                    "appendLogTier: unknown mode `{other}` (expected 'append' or 'overwrite')"
+                )));
+            }
+        };
         let opts = AppendLogStorageOptions {
             name,
             debounce_ms,
             compact_every,
+            mode,
             ..Default::default()
         };
-        Self {
+        Ok(Self {
             inner: Arc::new(append_log_storage(Arc::clone(&backend.inner), opts)),
-        }
+        })
     }
 
     /// Append entries (JSON array).
@@ -236,13 +249,52 @@ impl BenchValueAppendLogTier {
     }
 
     /// Load all entries (returns JSON array).
+    ///
+    /// **D269 — pagination napi widening (memo:Re loadEntries-pagination
+    /// parity).** When `page_size_json` is non-null, returns
+    /// `{ "entries": [...], "cursor": { "position": N } | null }` as a
+    /// JSON object instead of a bare entries array, mirroring TS
+    /// `AppendLoadResult<T>`. Bare `load_entries(null, null, null)` is
+    /// byte-for-byte the pre-D269 behavior (returns the entries array
+    /// directly).
     #[napi]
-    pub fn load_entries(&self, key_filter: Option<String>) -> Result<String> {
-        let entries = self
-            .inner
-            .load_entries(key_filter.as_deref())
-            .map_err(storage_err)?;
-        to_json(&entries)
+    pub fn load_entries(
+        &self,
+        key_filter: Option<String>,
+        cursor_position: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<String> {
+        let paginated = cursor_position.is_some() || page_size.is_some();
+        let opts = graphrefly_storage::LoadEntriesOpts {
+            cursor: cursor_position
+                .map(|p| graphrefly_storage::AppendCursor::from_position(u64::from(p))),
+            page_size,
+            key_filter: key_filter.as_deref(),
+        };
+        let result = self.inner.load_entries(opts).map_err(storage_err)?;
+        if paginated {
+            // Paginated shape: object with entries + cursor.
+            let cursor_json = result
+                .cursor
+                .map(|c| serde_json::json!({ "position": c.position }));
+            let obj = serde_json::json!({
+                "entries": &result.entries,
+                "cursor": cursor_json,
+            });
+            serde_json::to_string(&obj).map_err(|e| napi::Error::from_reason(format!("{e}")))
+        } else {
+            // Back-compat shape: bare entries array.
+            to_json(&result.entries)
+        }
+    }
+
+    /// **D269** — mode accessor. Returns `"append"` or `"overwrite"`.
+    #[napi(getter)]
+    pub fn mode(&self) -> String {
+        match self.inner.mode() {
+            graphrefly_storage::AppendLogMode::Append => "append".to_string(),
+            graphrefly_storage::AppendLogMode::Overwrite => "overwrite".to_string(),
+        }
     }
 
     #[napi]

@@ -411,8 +411,16 @@ impl BenchReactiveLog {
         })
     }
 
+    /// D270 — `skip_cached_replay` (memo:Re P2 parity). When true AND
+    /// the upstream has a cached value, the subscribe-handshake DATA
+    /// replay is suppressed; subsequent live emissions still land.
+    /// Default `false` preserves push-on-subscribe semantics.
     #[napi]
-    pub async fn attach(&self, upstream_node_id: u32) -> Result<BenchLogSubscription> {
+    pub async fn attach(
+        &self,
+        upstream_node_id: u32,
+        skip_cached_replay: Option<bool>,
+    ) -> Result<BenchLogSubscription> {
         let binding = self.binding_weak.clone();
         let read_value = Arc::new(move |h: HandleId| -> HandleId {
             if let Some(b) = binding.upgrade() {
@@ -423,11 +431,17 @@ impl BenchReactiveLog {
         let inner = Arc::clone(&self.inner);
         let actor = self.actor.clone();
         let actor_for_sub = actor.clone();
+        let opts = graphrefly_structures::AttachOptions {
+            skip_cached_replay: skip_cached_replay.unwrap_or(false),
+        };
         let sub = actor
             .run(move |core| {
-                inner
-                    .lock()
-                    .attach(core, NodeId::new(u64::from(upstream_node_id)), read_value)
+                inner.lock().attach_with_options(
+                    core,
+                    NodeId::new(u64::from(upstream_node_id)),
+                    read_value,
+                    opts,
+                )
             })
             .await?;
         Ok(BenchLogSubscription {

@@ -1733,12 +1733,6 @@ pub struct CoreState {
     // Step 1, D220-EXEC) — see its doc for each field's rationale.
 }
 
-/// The handle-protocol Core dispatcher.
-///
-/// Holds an [`Arc`] to the [`BindingBoundary`] and all dispatch state. Cheap
-/// to clone (the inner `Arc<Mutex<CoreState>>` is shared); pass `Core` by
-/// value to threads.
-///
 // # Wave execution = one uninterrupted owner-side drain (S4, D246/D248/D249)
 //
 // The state lock (`state: RefCell<CoreState>`) is **dropped** around
@@ -1774,6 +1768,11 @@ pub struct CoreState {
 /// increment per `Core::new`; negligible cost.
 static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// The handle-protocol Core dispatcher.
+///
+/// Holds an [`Arc`] to the [`BindingBoundary`] and all dispatch state. Cheap
+/// to clone (the inner `Arc<Mutex<CoreState>>` is shared); pass `Core` by
+/// value to threads.
 pub struct Core {
     /// Core-global region (id counters, topology-sink registry,
     /// `currently_firing`, the two caps, the scratch-release queue).
@@ -2313,6 +2312,12 @@ impl Core {
     /// mailbox. Re-entrant-safe: `emit` may cascade and a concurrent
     /// timer task may post again — the next drain picks it up (the
     /// `runnable` bit is re-set on every post).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the id-mailbox / defer-queue keep mutually re-posting
+    /// past the configured `max_batch_drain_iterations` cap — a livelock
+    /// signal that a `Defer`/`Emit` pair is consuming its own output.
     pub fn drain_mailbox(&self) {
         // Clone the Arc out so the drain closure can call `&self.*`
         // without aliasing `self.mailbox` through `&self`.
@@ -3217,6 +3222,14 @@ impl Core {
     /// node is a derived/dynamic compute, recursively activate deps so their
     /// cached handles fill our `dep_handles`.
     ///
+    /// # Returns
+    ///
+    /// Returns the [`SubscriptionId`]. Pair it with the `node_id` you
+    /// passed here and call [`Self::unsubscribe`] to deregister (S2b /
+    /// D225: core-level RAII retired — a binding-layer RAII wrapper over
+    /// `unsubscribe` provides drop-convenience where the holder co-owns
+    /// the `Core` on its affinity worker).
+    ///
     /// # Panics
     ///
     /// Panics if:
@@ -3224,11 +3237,6 @@ impl Core {
     ///   invariant ([`SubscribeError::PartitionOrderViolation`]).
     /// - The node is non-resubscribable AND has terminated
     ///   ([`SubscribeError::TornDown`], R2.2.7.b).
-    /// Returns the [`SubscriptionId`]. Pair it with the `node_id` you
-    /// passed here and call [`Self::unsubscribe`] to deregister (S2b /
-    /// D225: core-level RAII retired — a binding-layer RAII wrapper over
-    /// `unsubscribe` provides drop-convenience where the holder co-owns
-    /// the `Core` on its affinity worker).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
         match self.try_subscribe(node_id, sink) {

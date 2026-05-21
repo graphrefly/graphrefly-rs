@@ -250,27 +250,27 @@ impl Graph {
     /// changes and `set_deps`. D246 rule 3: returns an id-bearing
     /// handle with an explicit owner-invoked
     /// [`ReactiveDescribeHandle::detach`] — no RAII `Drop`.
-    #[must_use]
-    pub fn describe_reactive(&self, core: &Core, sink: DescribeSink) -> ReactiveDescribeHandle {
+    #[must_use = "dropping the handle without calling .detach(&core) leaks the topology sub"]
+    pub fn describe_reactive(&self, core: &Core, sink: &DescribeSink) -> ReactiveDescribeHandle {
         describe_reactive_in(core, &self.inner, sink)
     }
 
     /// Tap a single node's downstream message stream. Pure-namespace
     /// resolution; pass `&Core` to the returned handle's `subscribe`.
-    #[must_use]
+    #[must_use = "GraphObserveOne is only useful via .subscribe(...) — dropping it silently no-ops"]
     pub fn observe(&self, path: &str) -> GraphObserveOne {
         let id = self.node(path);
         GraphObserveOne::new(self.clone(), id)
     }
 
     /// Tap every named node in this graph (snapshot at `subscribe()`).
-    #[must_use]
+    #[must_use = "GraphObserveAll is only useful via .subscribe(...) — dropping it silently no-ops"]
     pub fn observe_all(&self) -> GraphObserveAll {
         GraphObserveAll::new(self.clone())
     }
 
     /// Tap every named node AND auto-subscribe late-added nodes.
-    #[must_use]
+    #[must_use = "GraphObserveAllReactive is only useful via .subscribe(...) — dropping it silently no-ops"]
     pub fn observe_all_reactive(&self) -> GraphObserveAllReactive {
         GraphObserveAllReactive::new(self.clone())
     }

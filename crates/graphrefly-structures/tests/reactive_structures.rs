@@ -949,6 +949,104 @@ fn log_attach_upstream() {
     sub.detach(rt.core());
 }
 
+// D270 — `AttachOptions { skip_cached_replay }` (memo:Re P2 parity).
+
+#[test]
+fn log_attach_with_skip_cached_replay_drops_handshake_data_when_upstream_cached() {
+    let rt = StructuresRuntime::new();
+
+    // Pre-seed the upstream with a cached value.
+    let upstream = rt
+        .core()
+        .register_state(rt.binding.intern(serde_json::json!(7)), false)
+        .unwrap();
+
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let binding = rt.binding.clone();
+    let read_value: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> i64 + Send + Sync> =
+        std::sync::Arc::new(move |h| binding.deref(h).as_i64().unwrap());
+
+    // D270: skip_cached_replay = true. The push-on-subscribe DATA(7)
+    // batch from the cached upstream is dropped; only subsequent live
+    // emissions land.
+    let mut sub = log.attach_with_options(
+        rt.core(),
+        upstream,
+        read_value,
+        graphrefly_structures::AttachOptions {
+            skip_cached_replay: true,
+        },
+    );
+
+    // After attach, the log should be EMPTY — replay was dropped.
+    assert_eq!(log.to_vec(), Vec::<i64>::new());
+
+    // Live emissions land normally.
+    let h = rt.binding.intern(serde_json::json!(42));
+    rt.core().emit(upstream, h);
+    assert_eq!(log.to_vec(), vec![42]);
+    sub.detach(rt.core());
+}
+
+#[test]
+fn log_attach_with_skip_cached_replay_no_op_when_upstream_cold() {
+    let rt = StructuresRuntime::new();
+
+    // SENTINEL upstream — no cached value.
+    let upstream = rt
+        .core()
+        .register_state(graphrefly_core::NO_HANDLE, false)
+        .unwrap();
+
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let binding = rt.binding.clone();
+    let read_value: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> i64 + Send + Sync> =
+        std::sync::Arc::new(move |h| binding.deref(h).as_i64().unwrap());
+
+    // D270: skip_cached_replay = true, but upstream is cold (sentinel),
+    // so the flag is a no-op — the first live DATA emit lands.
+    let mut sub = log.attach_with_options(
+        rt.core(),
+        upstream,
+        read_value,
+        graphrefly_structures::AttachOptions {
+            skip_cached_replay: true,
+        },
+    );
+
+    let h = rt.binding.intern(serde_json::json!(99));
+    rt.core().emit(upstream, h);
+    assert_eq!(
+        log.to_vec(),
+        vec![99],
+        "cold upstream's first live emit must land"
+    );
+    sub.detach(rt.core());
+}
+
+#[test]
+fn log_attach_with_skip_cached_replay_false_default_replays_cache() {
+    let rt = StructuresRuntime::new();
+
+    let upstream = rt
+        .core()
+        .register_state(rt.binding.intern(serde_json::json!(5)), false)
+        .unwrap();
+
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let binding = rt.binding.clone();
+    let read_value: std::sync::Arc<dyn Fn(graphrefly_core::HandleId) -> i64 + Send + Sync> =
+        std::sync::Arc::new(move |h| binding.deref(h).as_i64().unwrap());
+
+    // Default `attach` (no options) preserves push-on-subscribe replay.
+    let mut sub = log.attach(rt.core(), upstream, read_value);
+    assert_eq!(log.to_vec(), vec![5], "default attach replays cached DATA");
+    sub.detach(rt.core());
+}
+
 // ===========================================================================
 // M5.B: ReactiveLog attachStorage (A)
 // ===========================================================================

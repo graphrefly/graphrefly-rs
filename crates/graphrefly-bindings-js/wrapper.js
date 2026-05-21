@@ -498,21 +498,56 @@ class NativeGraph {
     this.core = core;
     this.registry = registry;
     this.nodesByName = nodesByName || new Map();
+    // D267: reverse cache `nodeId -> name`. Lets `nameOf` return sync
+    // when JS already knows the answer (the common case: the node was
+    // created via this Graph's `state`/`add`). Preserves the R3.7.3
+    // sync-observability of node names from inside a TEARDOWN sink
+    // cross-arm — the substrate keeps the name in its namespace until
+    // AFTER the cascade, and the JS-side cache mirrors that lifetime
+    // (cleared in `remove`/`destroy` AFTER `bench.remove/destroy`
+    // resolves, i.e. AFTER the cascade has settled). Cross-mount
+    // resolution (`child::inner`) and nodes JS doesn't own fall
+    // through to the async napi path — the Impl contract `T |
+    // Promise<T>` lets tests `await` regardless.
+    this.nodeIdToName = new Map();
     // Exposed for storage binding access (raw BenchGraph).
     this._bench = bench;
   }
 
+  // D267 — `tryResolve`/`nameOf` may be sync (JS cache hit) or async
+  // (cache miss / cross-mount path). The parity `Impl` contract is
+  // widened to `T | Promise<T>` so the pure-ts arm keeps its sync
+  // shape unchanged. Every parity scenario writes `await impl
+  // .tryResolve(...)` regardless of arm; TS resolves non-promise
+  // values immediately. The sync shape used to deadlock when a JS
+  // sink callback (already blocking the actor worker via TSFN
+  // Blocking) called these methods unconditionally — see
+  // graph_bindings.rs "Namespace introspection" block. Returning
+  // sync from the JS cache avoids re-entering the actor at all,
+  // which both fixes the deadlock AND preserves the R3.7.3 invariant
+  // ("name resolves during teardown cascade") cross-arm.
   tryResolve(path) {
-    const id = this.bench.tryResolve(path);
-    if (id === 0) return undefined;
-    const cached = this.nodesByName.get(path);
-    if (cached) return cached;
-    return new NativeNode(this.core, id, this.registry);
+    // Fast path: no cross-mount segment + JS cache hit.
+    if (!path.includes('::')) {
+      const cached = this.nodesByName.get(path);
+      if (cached) return cached;
+    }
+    // Slow path (cross-mount or cache miss): await napi.
+    return this.bench.tryResolve(path).then((id) => {
+      if (id === 0) return undefined;
+      const cached = !path.includes('::') ? this.nodesByName.get(path) : undefined;
+      if (cached) return cached;
+      return new NativeNode(this.core, id, this.registry);
+    });
   }
 
   nameOf(node) {
     const id = node.inner;
-    return this.bench.nameOf(id) ?? undefined;
+    // Fast path: JS reverse cache hit.
+    const cached = this.nodeIdToName.get(id);
+    if (cached !== undefined) return cached;
+    // Slow path: await napi (rare for tests; covers nodes JS doesn't own).
+    return this.bench.nameOf(id).then((n) => n ?? undefined);
   }
 
   async state(name, initial) {
@@ -527,6 +562,7 @@ class NativeGraph {
       node._updateCache(initial);
     }
     this.nodesByName.set(name, node);
+    this.nodeIdToName.set(id, name); // D267 reverse cache
     return node;
   }
 
@@ -554,6 +590,7 @@ class NativeGraph {
     // the actor round-trip in.
     await this.bench.add(name, id);
     this.nodesByName.set(name, node);
+    this.nodeIdToName.set(id, name); // D267 reverse cache
     return node;
   }
 
@@ -588,8 +625,16 @@ class NativeGraph {
   }
 
   async remove(name) {
+    // D267: capture id BEFORE bench.remove (which may invalidate the
+    // node via TEARDOWN cascade) so the post-cascade JS cache clear
+    // can also drop the reverse-map entry. Note: TEARDOWN sinks fire
+    // INSIDE `bench.remove`'s wave — `nodeIdToName` still has the
+    // entry at sink-fire time, preserving R3.7.3 sync nameOf
+    // observability.
+    const node = this.nodesByName.get(name);
     const audit = await this.bench.remove(name);
     this.nodesByName.delete(name);
+    if (node) this.nodeIdToName.delete(node.inner);
     return audit;
   }
 
@@ -620,6 +665,7 @@ class NativeGraph {
   async destroy() {
     await this.bench.destroy();
     this.nodesByName.clear();
+    this.nodeIdToName.clear(); // D267 reverse cache
   }
 
   async destroyAsync() {
@@ -627,10 +673,13 @@ class NativeGraph {
     // native-arm analogue of pure-ts's storage-disposer-awaiting variant.
     await this.bench.destroy();
     this.nodesByName.clear();
+    this.nodeIdToName.clear(); // D267 reverse cache
   }
 
-  edges(opts) {
-    const flat = this.bench.edges((opts && opts.recursive) ?? false);
+  // D267 — `edges`/`describe` are async on the native arm. See
+  // `tryResolve`/`nameOf` above for the rationale.
+  async edges(opts) {
+    const flat = await this.bench.edges((opts && opts.recursive) ?? false);
     const result = [];
     for (let i = 0; i < flat.length; i += 2) {
       result.push([flat[i], flat[i + 1]]);
@@ -642,7 +691,9 @@ class NativeGraph {
     if (opts && opts.reactive) {
       return this._describeReactive();
     }
-    return JSON.parse(this.bench.describeJson());
+    // Returns a Promise<unknown> on the native arm. Parity `Impl
+    // .describe()` is widened to `T | Promise<T>`.
+    return this.bench.describeJson().then((json) => JSON.parse(json));
   }
 
   async _describeReactive() {
@@ -703,9 +754,10 @@ class NativeGraph {
 // (NO Rust counterpart needed — types.ts: "thin TS over napi core, no
 // Rust"). Hand-written here so the surface is self-contained.
 // `describeNode` / `sha256Hex` route to the new napi fns
-// (`BenchCore.describeNode` sync — D207 reuse of the describe
-// projection; `BenchCore.sha256Hex` async at the boundary, sync hashing
-// in graphrefly-core).
+// (`BenchCore.describeNode` — D267 promoted to async to close the
+// sink-callback deadlock class; D207 reuse of the describe projection;
+// `BenchCore.sha256Hex` async at the boundary, sync hashing in
+// graphrefly-core).
 // ---------------------------------------------------------------------------
 
 /** Fixed-capacity ring buffer — drop-oldest / FIFO eviction. */
@@ -1177,8 +1229,8 @@ function createNativeImpl() {
     // ── N1 substrate-infra surface (D203 item 8 / D206-D207) ──────────
     RingBuffer,
     ResettableTimer,
-    describeNode(node) {
-      const json = state.core.describeNode(node.inner);
+    async describeNode(node) {
+      const json = await state.core.describeNode(node.inner);
       return JSON.parse(json);
     },
     async sha256Hex(input) {
@@ -1293,16 +1345,40 @@ function buildStorage(native, state) {
         (opts && opts.name) ?? null,
         (opts && opts.compactEvery) ?? null,
         (opts && opts.debounceMs) ?? null,
+        (opts && opts.mode) ?? null, // D269: 'append' (default) | 'overwrite'
       );
       return {
         get name() {
           return tier.name;
         },
+        get mode() {
+          // D269 — exposes the configured mode; delta-shipping consumers
+          // (e.g. reactiveLog.attachStorage) MUST reject overwrite tiers.
+          return tier.mode;
+        },
         appendEntries(entries) {
           tier.appendEntries(JSON.stringify(entries));
         },
+        // D269: back-compat shape — `loadEntries(keyFilter)` returns a
+        // bare entries array. For windowed-cursor pagination, use
+        // `loadEntriesPaged({ keyFilter, cursor, pageSize })`.
         async loadEntries(keyFilter) {
-          return JSON.parse(tier.loadEntries(keyFilter ?? null));
+          return JSON.parse(tier.loadEntries(keyFilter ?? null, null, null));
+        },
+        async loadEntriesPaged(loadOpts) {
+          const json = tier.loadEntries(
+            (loadOpts && loadOpts.keyFilter) ?? null,
+            (loadOpts && loadOpts.cursor && loadOpts.cursor.position) ?? null,
+            (loadOpts && loadOpts.pageSize) ?? null,
+          );
+          const parsed = JSON.parse(json);
+          // Paginated response is `{ entries, cursor }`.
+          return {
+            entries: parsed.entries,
+            cursor: parsed.cursor
+              ? { position: parsed.cursor.position, __brand: 'AppendCursor' }
+              : undefined,
+          };
         },
         flush() {
           tier.flush();
@@ -1517,8 +1593,12 @@ function buildStructures(native, state, wrapNode) {
           keepAlive.push(sc);
           return wrapNode(sc.nodeId);
         },
-        async attach(upstream) {
-          const sub = await log.attach(upstream.inner);
+        async attach(upstream, opts) {
+          const skipCachedReplay = opts && opts.skipCachedReplay === true;
+          // D270 (memo:Re P2 parity): pass skipCachedReplay through to
+          // the napi `attach`. When true, drops the subscribe-handshake
+          // DATA replay if the upstream has a cached value.
+          const sub = await log.attach(upstream.inner, skipCachedReplay);
           keepAlive.push(sub);
           return async () => {
             // S6 QA fix 2026-05-20: BenchLogSubscription.dispose is

@@ -1,6 +1,9 @@
 //! Tests for M2 Slice F port-coverage gap fills:
 //! R3.2.1 named-sugar wrappers, R3.7.1 signal(), R3.2.3 remove(), R3.3.1 edges().
 
+// D248: substrate is structurally `!Send + !Sync` post-S2c.
+#![allow(clippy::arc_with_non_send_sync)]
+
 mod common;
 
 use common::graph;

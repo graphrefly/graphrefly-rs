@@ -1,3 +1,12 @@
+// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
+// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
+// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
+// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
+// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
+// over-conservative but correct, and this file's Arc<Sink> sites cite
+// the deliberate D248 relaxation, not a missed Send+Sync bound.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! Control operators — side-effect, gating, error recovery, convergence.
 //!
 //! # Operators
@@ -739,24 +748,21 @@ pub fn repeat(
                             let storage_d = storage_inner.clone();
                             let state_d = state.clone();
                             let _ = core_sink.defer(move |c| {
-                                match c.try_subscribe(source, new_sink) {
-                                    Ok(sub) => {
-                                        storage_d
-                                            .lock()
-                                            .entry(pid)
-                                            .or_default()
-                                            .subs
-                                            .push((source, sub));
-                                    }
-                                    Err(_) => {
-                                        // Source dead / partition
-                                        // violation — terminal complete.
-                                        let mut s = state_d.lock();
-                                        if !s.terminated {
-                                            s.terminated = true;
-                                            drop(s);
-                                            c.complete(pid);
-                                        }
+                                if let Ok(sub) = c.try_subscribe(source, new_sink) {
+                                    storage_d
+                                        .lock()
+                                        .entry(pid)
+                                        .or_default()
+                                        .subs
+                                        .push((source, sub));
+                                } else {
+                                    // Source dead / partition
+                                    // violation — terminal complete.
+                                    let mut s = state_d.lock();
+                                    if !s.terminated {
+                                        s.terminated = true;
+                                        drop(s);
+                                        c.complete(pid);
                                     }
                                 }
                             });

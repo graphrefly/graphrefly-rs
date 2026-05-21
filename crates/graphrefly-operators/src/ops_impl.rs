@@ -1,3 +1,12 @@
+// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
+// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
+// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
+// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
+// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
+// over-conservative but correct, and this file's Arc<Sink> sites cite
+// the deliberate D248 relaxation, not a missed Send+Sync bound.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! Concrete implementations of the four subscription-managed combinators
 //! (zip / concat / race / takeUntil). Built on the
 //! [`super::producer::ProducerCtx`] substrate.

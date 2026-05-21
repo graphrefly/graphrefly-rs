@@ -136,7 +136,7 @@ fn append_log_accumulates_and_loads() {
     let tier = redb_append_log_default::<u64>(dir.path().join("log.redb")).unwrap();
     tier.append_entries(&[1, 2, 3]).unwrap();
     tier.append_entries(&[4, 5]).unwrap();
-    let entries = tier.load_entries(None).unwrap();
+    let entries = tier.load_entries_all(None).unwrap();
     assert_eq!(entries, vec![1, 2, 3, 4, 5]);
 }
 
@@ -149,7 +149,7 @@ fn append_log_cross_restart_durability() {
         tier.append_entries(&[10, 20]).unwrap();
     }
     let tier2 = redb_append_log_default::<u64>(path).unwrap();
-    let entries = tier2.load_entries(None).unwrap();
+    let entries = tier2.load_entries_all(None).unwrap();
     assert_eq!(entries, vec![10, 20]);
 }
 

@@ -15,6 +15,7 @@
 //! Convenience factories `memory_snapshot()` / `memory_append_log()` /
 //! `memory_kv()` wrap a fresh in-process backend.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -24,7 +25,8 @@ use crate::backend::{memory_backend, MemoryBackend, StorageBackend};
 use crate::codec::{Codec, JsonCodec};
 use crate::error::StorageError;
 use crate::tier::{
-    AppendLogStorageTier, BaseStorageTier, KvStorageTier, PrefixIter, SnapshotStorageTier,
+    AppendCursor, AppendLoadResult, AppendLogMode, AppendLogStorageTier, BaseStorageTier,
+    KvStorageTier, LoadEntriesOpts, PrefixIter, SnapshotStorageTier,
 };
 
 type FilterFn<T> = Box<dyn Fn(&T) -> bool + Send + Sync>;
@@ -306,11 +308,34 @@ where
     name: String,
     debounce_ms: Option<u32>,
     compact_every: Option<u32>,
+    /// **D269 — persistence mode (memo:Re P1 parity).** See
+    /// [`AppendLogMode`]. Default `Append`.
+    mode: AppendLogMode,
     key_of: KeyOfFn<T>,
     /// Per-key pending buckets (matches TS `Map<string, T[]>`).
     pending: Mutex<std::collections::HashMap<String, Vec<T>>>,
     /// Total entries appended (post-filter); drives `compact_every`.
     append_count: Mutex<u64>,
+    /// **D268 — rollback epoch token (memo:Re P0(d) parity).** Mirrors
+    /// the TS `rollbackEpoch` (`packages/pure-ts/src/extra/storage/
+    /// tiers.ts`). Bumped by [`AppendLogStorage::rollback`]; captured
+    /// by [`AppendLogStorage::flush`] at start. If a concurrent
+    /// `rollback` advances the epoch while a `flush` is in flight
+    /// (lock dropped between `pending.lock` take and per-bucket
+    /// `backend.write`), the flush aborts before each subsequent
+    /// per-bucket write — entries that haven't yet hit the backend
+    /// are dropped. Best-effort: an `backend.write` already past the
+    /// epoch check can't be un-sent.
+    ///
+    /// Note: Rust's `flush()` is sync end-to-end (no async chained-
+    /// microtask hazard like TS), so the *primary* TS rollback bug
+    /// (epoch tracking pending in-flight writes scheduled pre-rollback
+    /// across microtask boundaries) doesn't structurally apply. The
+    /// epoch here covers the narrower **concurrent multi-thread**
+    /// rollback-during-flush window — a real correctness improvement
+    /// for callers that race rollback against flush on different
+    /// threads.
+    rollback_epoch: AtomicU64,
 }
 
 pub struct AppendLogStorageOptions<T, C = JsonCodec>
@@ -323,6 +348,8 @@ where
     pub debounce_ms: Option<u32>,
     pub compact_every: Option<u32>,
     pub key_of: Option<KeyOfFn<T>>,
+    /// D269: persistence mode. Default `Append` (read-merge).
+    pub mode: AppendLogMode,
 }
 
 impl<T> Default for AppendLogStorageOptions<T, JsonCodec>
@@ -336,6 +363,7 @@ where
             debounce_ms: None,
             compact_every: None,
             key_of: None,
+            mode: AppendLogMode::Append,
         }
     }
 }
@@ -370,9 +398,11 @@ where
         name,
         debounce_ms: opts.debounce_ms,
         compact_every: opts.compact_every,
+        mode: opts.mode,
         key_of,
         pending: Mutex::new(std::collections::HashMap::new()),
         append_count: Mutex::new(0),
+        rollback_epoch: AtomicU64::new(0),
     }
 }
 
@@ -404,45 +434,81 @@ where
 
     // D165 — F1 fix: take pending, attempt per-bucket encode+write, restore
     // unprocessed buckets on failure so the caller can retry.
+    //
+    // D268 — rollback-epoch check (memo:Re P0(d) parity). Captures the
+    // epoch at the top of flush; before each per-bucket backend write,
+    // verifies the epoch hasn't been advanced by a concurrent rollback.
+    // If advanced, drop all remaining buckets (they're considered
+    // rolled back) and return Ok — already-written buckets are
+    // best-effort; the epoch check is the abort boundary.
     fn flush(&self) -> Result<(), StorageError> {
+        let scheduled_epoch = self.rollback_epoch.load(Ordering::Acquire);
         let mut buckets = std::mem::take(&mut *self.pending.lock());
         let keys: Vec<String> = buckets.keys().cloned().collect();
         for key in keys {
+            // D268 epoch check: a concurrent `rollback()` invalidates
+            // any not-yet-written bucket.
+            if self.rollback_epoch.load(Ordering::Acquire) != scheduled_epoch {
+                return Ok(());
+            }
             let bucket = match buckets.remove(&key) {
                 Some(b) if !b.is_empty() => b,
                 _ => continue,
             };
-            // Read existing, merge, write back.
-            let existing = match self.backend.read(&key) {
-                Ok(e) => e,
-                Err(e) => {
-                    buckets.insert(key, bucket);
-                    *self.pending.lock() = buckets;
-                    return Err(e);
+            // D269: Overwrite mode skips read+merge — the bucket
+            // IS the full contents to persist. Append mode (default)
+            // reads existing bytes, decodes, extends, encodes.
+            //
+            // `restore_payload` holds what we put back into `pending`
+            // if encode/write fails: in Append mode, only the NEW
+            // entries (so a retry re-reads existing + re-merges);
+            // in Overwrite mode, the bucket itself (a retry writes
+            // the same snapshot). /qa-fix 2026-05-21: was previously
+            // restoring `final_payload` (existing + new) in Append
+            // mode, which caused existing entries to duplicate on
+            // retry. Covered by
+            // `append_log_append_mode_encode_failure_does_not_duplicate_on_retry`
+            // and `append_log_append_mode_write_failure_does_not_duplicate_on_retry`.
+            let (final_payload, restore_payload): (Vec<T>, Vec<T>) = match self.mode {
+                AppendLogMode::Overwrite => {
+                    let snapshot = bucket.clone();
+                    (bucket, snapshot)
+                }
+                AppendLogMode::Append => {
+                    let existing = match self.backend.read(&key) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            buckets.insert(key, bucket);
+                            *self.pending.lock() = buckets;
+                            return Err(e);
+                        }
+                    };
+                    let mut merged = match existing {
+                        Some(bytes) if !bytes.is_empty() => match self.codec.decode(&bytes) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                buckets.insert(key, bucket);
+                                *self.pending.lock() = buckets;
+                                return Err(e.into());
+                            }
+                        },
+                        _ => Vec::new(),
+                    };
+                    let new_entries_backup = bucket.clone();
+                    merged.extend(bucket);
+                    (merged, new_entries_backup)
                 }
             };
-            let mut merged = match existing {
-                Some(bytes) if !bytes.is_empty() => match self.codec.decode(&bytes) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        buckets.insert(key, bucket);
-                        *self.pending.lock() = buckets;
-                        return Err(e.into());
-                    }
-                },
-                _ => Vec::new(),
-            };
-            let bucket_backup = bucket.clone();
-            merged.extend(bucket);
-            let encoded = match self.codec.encode(&merged) {
+            let encoded = match self.codec.encode(&final_payload) {
                 Ok(b) => b,
                 Err(e) => {
-                    buckets.insert(key, bucket_backup);
+                    buckets.insert(key, restore_payload);
                     *self.pending.lock() = buckets;
                     return Err(e.into());
                 }
             };
             if let Err(e) = self.backend.write(&key, &encoded) {
+                buckets.insert(key, restore_payload);
                 *self.pending.lock() = buckets;
                 return Err(e);
             }
@@ -450,7 +516,14 @@ where
         Ok(())
     }
 
+    // D268 — rollback bumps the epoch atomically before clearing
+    // pending so a concurrent `flush` sees the bump on its next
+    // per-bucket check and aborts. Bump+clear order matters: clearing
+    // pending without bumping the epoch would let a flush that has
+    // already taken pending (via `mem::take`) proceed unaware that
+    // rollback was called.
     fn rollback(&self) -> Result<(), StorageError> {
+        self.rollback_epoch.fetch_add(1, Ordering::AcqRel);
         self.pending.lock().clear();
         Ok(())
     }
@@ -500,27 +573,83 @@ where
         Ok(())
     }
 
-    fn load_entries(&self, key_filter: Option<&str>) -> Result<Vec<T>, StorageError> {
-        // Use the backend's enumeration to find keys. If `list` isn't
-        // supported, fall back to the tier name as the single key.
-        let keys = match self.backend.list(key_filter.unwrap_or("")) {
+    fn mode(&self) -> AppendLogMode {
+        self.mode
+    }
+
+    // D269 — windowed cursor pagination (memo:Re loadEntries-pagination
+    // parity). Bare `load_entries(LoadEntriesOpts::default())` returns
+    // the whole log + `cursor: None` (back-compat). With `page_size =
+    // Some(n)` returns the `[start, start+n)` window of the flattened
+    // lex-ASC-by-key, entry-order-within-key sequence + a forward-only
+    // cursor (`None` ⇒ no more). For a *partitioned* multi-key log we
+    // short-circuit decoding past `start + page_size + 1` entries so
+    // the consumer's per-page working set is bounded; a single-key log
+    // still decodes its one blob (per-key codec-blob model — pagination
+    // bounds the *consumer's* page, not the tier's per-key decode).
+    fn load_entries(&self, opts: LoadEntriesOpts<'_>) -> Result<AppendLoadResult<T>, StorageError> {
+        // (1) Enumerate backend keys (deterministic order — `PrefixIter`
+        // sorts lex-ASC). If `list` isn't supported, fall back to the
+        // tier name as a single key.
+        let mut keys = match self.backend.list(opts.key_filter.unwrap_or("")) {
             Ok(ks) => ks,
-            Err(StorageError::BackendNoListSupport { .. }) => match key_filter {
+            Err(StorageError::BackendNoListSupport { .. }) => match opts.key_filter {
                 Some(k) => vec![k.to_string()],
                 None => vec![self.name.clone()],
             },
             Err(e) => return Err(e),
         };
-        let mut all = Vec::new();
+        keys.sort();
+
+        let start: u64 = opts.cursor.map_or(0, |c| c.position);
+        // page_size <= 0 (None or Some(0)) ⇒ whole tail, no further cursor.
+        let page_size = opts.page_size.filter(|n| *n > 0);
+
+        // Compute the early-stop boundary: one entry past the window
+        // (start + page_size). When unbounded, decode everything.
+        let want_decoded_at_least = page_size.map(|n| start + u64::from(n) + 1);
+
+        let mut decoded: Vec<T> = Vec::new();
+        let mut total_seen: u64 = 0;
+
         for k in keys {
+            if let Some(want) = want_decoded_at_least {
+                if total_seen >= want {
+                    break;
+                }
+            }
             if let Some(bytes) = self.backend.read(&k)? {
                 if !bytes.is_empty() {
                     let entries: Vec<T> = self.codec.decode(&bytes)?;
-                    all.extend(entries);
+                    total_seen = total_seen.saturating_add(entries.len() as u64);
+                    decoded.extend(entries);
                 }
             }
         }
-        Ok(all)
+
+        // (2) Slice the decoded window. `start` past end ⇒ empty page;
+        // cursor advances to `None`.
+        let start_idx: usize = start.try_into().unwrap_or(usize::MAX).min(decoded.len());
+        let mut window: Vec<T> = decoded.split_off(start_idx);
+
+        let next_cursor: Option<AppendCursor> = match page_size {
+            Some(n) => {
+                let n_usize: usize = (n as usize).min(window.len());
+                let has_more = window.len() > n_usize;
+                window.truncate(n_usize);
+                if has_more {
+                    Some(AppendCursor::from_position(start + u64::from(n)))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        Ok(AppendLoadResult {
+            entries: window,
+            cursor: next_cursor,
+        })
     }
 }
 

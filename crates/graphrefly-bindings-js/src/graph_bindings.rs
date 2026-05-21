@@ -125,24 +125,43 @@ impl BenchGraph {
     }
 
     // -------------------------------------------------------------------
-    // Namespace introspection (worker-thread access, sync from JS).
+    // Namespace introspection (D267 — ALL async, post-deadlock-fix).
+    //
+    // Pre-D267 these used `actor.run_sync` (blocks libuv on the actor
+    // reply). That shape DEADLOCKS when a JS sink callback running on
+    // the libuv thread (dispatched from the actor worker via TSFN
+    // Blocking) calls one of these read methods: JS blocks libuv on
+    // the actor reply, but the actor worker is itself blocked on the
+    // TSFN sink reply → 3-way deadlock. This was the cross-track-ledger
+    // §2 `Graph::remove`/`destroy` deadlock root cause (R3.7.3
+    // `nameOf`-inside-TEARDOWN-sink test).
+    //
+    // D267 fix: every read method routes through `actor.run` (async).
+    // libuv stays free to pump the actor reply during the await. The
+    // parity `Impl` was widened to `T | Promise<T>` so the pure-ts
+    // arm returns sync values unchanged.
     // -------------------------------------------------------------------
 
     #[napi]
-    pub fn name(&self) -> Result<String> {
+    pub async fn name(&self) -> Result<String> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.name()).expect("BenchGraph: graph entry missing")
-        })
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.name()).expect("BenchGraph: graph entry missing")
+            })
+            .await
     }
 
     #[napi]
-    pub fn node_count(&self) -> Result<u32> {
+    pub async fn node_count(&self) -> Result<u32> {
         let key = self.graph_key;
-        let n = self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.node_count())
-                .expect("BenchGraph: graph entry missing")
-        })?;
+        let n = self
+            .actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.node_count())
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await?;
         // QA fix 2026-05-20 (Blind Hunter M2): fail-loud on >u32::MAX
         // nodes instead of saturating silently. Matches the (correct)
         // overflow-on-Err pattern used everywhere else in this file.
@@ -150,54 +169,64 @@ impl BenchGraph {
     }
 
     #[napi]
-    pub fn node_names(&self) -> Result<Vec<String>> {
+    pub async fn node_names(&self) -> Result<Vec<String>> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.node_names())
-                .expect("BenchGraph: graph entry missing")
-        })
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.node_names())
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await
     }
 
     #[napi]
-    pub fn child_names(&self) -> Result<Vec<String>> {
+    pub async fn child_names(&self) -> Result<Vec<String>> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.child_names())
-                .expect("BenchGraph: graph entry missing")
-        })
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.child_names())
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await
     }
 
     #[napi]
-    pub fn is_destroyed(&self) -> Result<bool> {
+    pub async fn is_destroyed(&self) -> Result<bool> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.is_destroyed())
-                .expect("BenchGraph: graph entry missing")
-        })
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.is_destroyed())
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await
     }
 
     /// Resolve a path to a NodeId; returns 0 (NO_NODE) if missing.
     #[napi]
-    pub fn try_resolve(&self, path: String) -> Result<u32> {
+    pub async fn try_resolve(&self, path: String) -> Result<u32> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| {
-                g.try_resolve(&path)
-                    .map_or(0, |id| u32::try_from(id.raw()).unwrap_or(0))
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| {
+                    g.try_resolve(&path)
+                        .map_or(0, |id| u32::try_from(id.raw()).unwrap_or(0))
+                })
+                .expect("BenchGraph: graph entry missing")
             })
-            .expect("BenchGraph: graph entry missing")
-        })
+            .await
     }
 
     /// Reverse lookup: returns the local name for a NodeId, or None
     /// if unnamed in this graph.
     #[napi]
-    pub fn name_of(&self, node_id: u32) -> Result<Option<String>> {
+    pub async fn name_of(&self, node_id: u32) -> Result<Option<String>> {
         let key = self.graph_key;
-        self.actor.run_sync(move |_core| {
-            with_extra::<Graph, _>(key, |g| g.name_of(NodeId::new(u64::from(node_id))))
-                .expect("BenchGraph: graph entry missing")
-        })
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, |g| g.name_of(NodeId::new(u64::from(node_id))))
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await
     }
 
     // -------------------------------------------------------------------
@@ -584,41 +613,45 @@ impl BenchGraph {
     /// Static edges snapshot — `Vec<(from_name, to_name)>` flattened to
     /// alternating `Vec<String>` for napi marshaling.
     ///
-    /// Sync at the napi boundary (preserves `Impl.edges(opts) ->
-    /// Array<[string, string]>` contract); blocks libuv briefly on the
-    /// actor reply. Pure read accessor — see [`CoreActor::run_sync`]
-    /// safe-use contract; the wrapper.js parity-tests usage doesn't
-    /// interleave with TSFN-active waves.
+    /// **D267 — async** (was `run_sync`). The parity `Impl.edges`
+    /// contract is widened to `T | Promise<T>` so the pure-ts arm
+    /// returns sync values unchanged; rust arm returns a Promise.
+    /// Eliminates the sink-callback deadlock class — see the
+    /// "Namespace introspection" block above for the full rationale.
     #[napi]
-    pub fn edges(&self, recursive: bool) -> Result<Vec<String>> {
+    pub async fn edges(&self, recursive: bool) -> Result<Vec<String>> {
         let key = self.graph_key;
-        self.actor.run_sync(move |core| {
-            with_extra::<Graph, _>(key, move |g| {
-                let edges = g.edges(core, recursive);
-                let mut flat: Vec<String> = Vec::with_capacity(edges.len() * 2);
-                for (from, to) in edges {
-                    flat.push(from);
-                    flat.push(to);
-                }
-                flat
+        self.actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| {
+                    let edges = g.edges(core, recursive);
+                    let mut flat: Vec<String> = Vec::with_capacity(edges.len() * 2);
+                    for (from, to) in edges {
+                        flat.push(from);
+                        flat.push(to);
+                    }
+                    flat
+                })
+                .expect("BenchGraph: graph entry missing")
             })
-            .expect("BenchGraph: graph entry missing")
-        })
+            .await
     }
 
     /// JSON-serialized describe snapshot. JS adapter parses with
     /// `JSON.parse`. Static — for reactive describe, see
     /// `describe_reactive`.
     ///
-    /// Sync at the napi boundary (preserves `Impl.describe() ->
-    /// unknown` contract); same `run_sync` safe-use as `edges`.
+    /// **D267 — async** (was `run_sync`). See `edges` above.
     #[napi]
-    pub fn describe_json(&self) -> Result<String> {
+    pub async fn describe_json(&self) -> Result<String> {
         let key = self.graph_key;
-        let snapshot = self.actor.run_sync(move |core| {
-            with_extra::<Graph, _>(key, move |g| g.describe(core))
-                .expect("BenchGraph: graph entry missing")
-        })?;
+        let snapshot = self
+            .actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.describe(core))
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await?;
         serde_json::to_string(&snapshot)
             .map_err(|e| NapiError::from_reason(format!("describe serialization failed: {e}")))
     }
@@ -656,7 +689,7 @@ impl BenchGraph {
                                         tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
                                 }
                             });
-                            let rdh = g.describe_reactive(core, describe_sink);
+                            let rdh = g.describe_reactive(core, &describe_sink);
                             (rdh, ())
                         },
                     )
