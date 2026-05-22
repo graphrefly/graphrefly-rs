@@ -3407,21 +3407,17 @@ impl Core {
     /// every partition transitively touched from `seed` (the Slice Y1
     /// parallelism win). **S2c/D248 deleted that machinery:** `Core` is
     /// single-owner `!Send + !Sync`, so a wave is one uninterrupted
-    /// owner-side drain with nothing to lock. This now delegates to the
-    /// infallible [`Self::try_begin_batch_for`], which acquires nothing
-    /// (the all-`None` single-owner floor); the `seed` parameter is
-    /// retained for the declared-group identity routing + D211
-    /// minimal-churn (callers compile unchanged). Cross-`Core`
-    /// parallelism is host-native via independent per-worker Cores
-    /// (actor model), not per-partition locks.
+    /// owner-side drain with nothing to lock. This now delegates
+    /// directly to [`Self::begin_batch_with_guards`] (the all-`None`
+    /// single-owner floor acquires nothing); the `seed` parameter is
+    /// retained for the declared-group identity routing only.
+    /// Cross-`Core` parallelism is host-native via independent
+    /// per-worker Cores (actor model), not per-partition locks. D274
+    /// (2026-05-21) deleted the always-`Ok` `try_begin_batch_for`
+    /// shim that this used to delegate through.
     ///
-    /// # Panics
-    ///
-    /// Panics only if [`Self::try_begin_batch_for`] returns `Err` —
-    /// **unreachable**: it is now always `Ok` (scheduling groups are
-    /// static identity; no `PartitionOrderViolation`, no epoch retry).
-    ///
-    /// Slice Y1 / Phase E (2026-05-08); infallible-since S2c (D246).
+    /// Slice Y1 / Phase E (2026-05-08); infallible-since S2c (D246);
+    /// shim-collapsed by D274 (2026-05-21).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<'_> {
         // D246/S2c: single-owner ⇒ no cross-thread wave serialization
@@ -3939,14 +3935,13 @@ impl Drop for BatchGuard<'_> {
             // `last_panic` + `resume_unwind`-at-end discipline propagates a
             // panic out) doesn't bypass the per-iteration post-`fire_deferred`
             // cleanup (snapshot_releases at line ~3910, plus the outer
-            // wave-end `tier3_clear` + `drain_deferred_producer_ops` after
-            // the loop). Mirrors the L3844 drain-phase wrap. On panic:
-            // release the queued `snapshot_releases` defensively
-            // lock-released, run the outer wave-end finalization
-            // (`tier3_clear` + `drain_deferred_producer_ops` — even though
-            // the latter is a D211 no-op shim today, it's part of the
-            // documented wave-end contract), then `resume_unwind` so the
-            // caller observes the panic.
+            // wave-end `tier3_clear` after the loop). Mirrors the L3844
+            // drain-phase wrap. On panic: release the queued
+            // `snapshot_releases` defensively lock-released, run the outer
+            // wave-end finalization (`tier3_clear`), then `resume_unwind` so
+            // the caller observes the panic. (D274 deleted the matching
+            // `drain_deferred_producer_ops()` call that pre-D274 ran here as
+            // a documented but no-op shim.)
             let fire_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.core
                     .fire_deferred(jobs, releases, cleanup_hooks, pending_wipes);
@@ -3967,8 +3962,9 @@ impl Drop for BatchGuard<'_> {
                 // propagating the panic. tier3_clear avoids stale-entry
                 // leakage across cargo's thread-reuse (mirrors the
                 // wave-start defensive clear in `begin_batch_with_guards`).
-                // drain_deferred_producer_ops is a D211 no-op shim today
-                // but is part of the documented wave-end contract.
+                // (D274 deleted `drain_deferred_producer_ops()` here — it
+                // was a no-op shim per D211; no producer-deferred queue
+                // remains to drain.)
                 tier3_clear();
                 std::panic::resume_unwind(payload);
             }

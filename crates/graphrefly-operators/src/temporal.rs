@@ -326,10 +326,11 @@ pub fn debounce(
 }
 
 // S2b/D230/D232-AMEND: takes a `ProducerEmitter` (was `WeakCore`).
-// `em.{emit,complete,error}_or_defer` post to the `Core`-owned mailbox
-// and internally release the payload handle if the `Core` is gone (F2,
+// `em.{emit,complete,error}` post to the `Core`-owned mailbox and
+// internally release the payload handle if the `Core` is gone (F2,
 // QA-hardened) — so every old `if let Some(c)=core.upgrade(){ c.X }
 // else { binding.release_handle(h) }` collapses to a direct `em.X`.
+// (D274 dropped the `_or_defer` suffix from these method names.)
 // `em.is_core_gone()` preserves the old teardown-promptness where the
 // `else` branch also `return`ed (not leak-load-bearing — the task also
 // exits on channel-close — only prompt shutdown).

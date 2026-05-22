@@ -177,10 +177,11 @@ pub trait ProducerBinding: BindingBoundary {
 /// `Core::{emit,complete,error}` (immediate, cascade-ordering-preserving
 /// — D232-AMEND).
 ///
-/// Method names mirror the old `Core::{emit,complete,error}_or_defer`
-/// so sink bodies are unchanged: only the captured handle's
-/// construction differs (`em = ctx.emitter()` instead of
-/// `core_s.clone()`).
+/// Method names are `emit`/`complete`/`error` (post-D274 — the
+/// `_or_defer` suffix was dropped together with `Core::{emit,complete,
+/// error}_or_defer` since groups are static identity post-D248/D253 and
+/// no deferral seam remains). Sink bodies route through these instead
+/// of cloning `&Core`: `em = ctx.emitter()` carries the mailbox handle.
 /// The **`Send + Sync` cross-thread** producer emit handle (D249/S2c).
 ///
 /// Holds only the id-only `Arc<CoreMailbox>` post side + the binding
@@ -335,8 +336,9 @@ impl ProducerEmitter {
     /// Whether the owning `Core` has dropped (mailbox closed). Lets a
     /// long-lived task stop promptly + release any handle it holds
     /// (preserves the old `WeakCore::upgrade() == None` promptness).
-    /// NOT required for leak-safety (`*_or_defer` already releases on a
-    /// closed post) — only for prompt task shutdown.
+    /// NOT required for leak-safety (`MailboxEmitter::{emit,error}`
+    /// already release the captured handle on a closed post) — only for
+    /// prompt task shutdown.
     #[must_use]
     pub fn is_core_gone(&self) -> bool {
         self.emitter.is_core_gone()
@@ -408,8 +410,10 @@ impl<'a> ProducerCtx<'a> {
     /// site, so existing `&Core`-holding call sites pass it directly
     /// (`ProducerCtx::new(node, &core, &storage)`). `ProducerCtx` only
     /// needs `subscribe`/`try_subscribe`/`register_*`/`emit`/`mailbox`/
-    /// `binding`/`*_or_defer` — all on `CoreFull` — so no concrete
-    /// `Core` / thread-local / stored back-reference is required.
+    /// `binding` — all on `CoreFull` — so no concrete `Core` /
+    /// thread-local / stored back-reference is required. (D274 deleted
+    /// the `*_or_defer` family the original docstring listed alongside
+    /// these methods.)
     pub fn new(node_id: NodeId, core: &'a dyn CoreFull, storage: &'a ProducerStorage) -> Self {
         Self {
             node_id,
@@ -429,8 +433,9 @@ impl<'a> ProducerCtx<'a> {
     /// the duration of the build call (the `Core` relocates; D231).
     /// Long-lived sinks must use [`Self::emitter`] instead. Carries
     /// everything a build closure uses (`subscribe`/`try_subscribe`/
-    /// `register_*`/`emit`/`binding`/`*_or_defer`) without naming the
-    /// concrete cell type.
+    /// `register_*`/`emit`/`binding`) without naming the concrete cell
+    /// type. (D274 deleted the `*_or_defer` family the original
+    /// docstring listed alongside these methods.)
     #[must_use]
     pub fn core(&self) -> &dyn CoreFull {
         self.core
@@ -491,7 +496,6 @@ impl<'a> ProducerCtx<'a> {
         // — the union-find ascending-order shim it dodged is gone (groups
         // are user-declared + static post-D248/D253; one Core per OS
         // thread per D252). The only remaining failure is `TornDown`.
-        let _ = sink.clone();
         match self.core.try_subscribe(source, sink) {
             Ok(sub) => {
                 // S2b/D229: record `(source, sub_id)` for explicit

@@ -683,7 +683,7 @@ impl BenchGraph {
                         graph_key,
                         handle_key,
                         move |g| {
-                            let describe_sink: DescribeSink = Arc::new(move |snapshot| {
+                            let describe_sink: DescribeSink = std::rc::Rc::new(move |snapshot| {
                                 if let Ok(json) = serde_json::to_string(snapshot) {
                                     let _status =
                                         tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
@@ -770,7 +770,7 @@ impl BenchGraph {
                             let inner = if let Some(path) = path {
                                 let one = g.observe(&path);
                                 let path_owned = path;
-                                let sink: Sink = Arc::new(move |msgs: &[Message]| {
+                                let sink: Sink = std::rc::Rc::new(move |msgs: &[Message]| {
                                     let payload = encode_messages(msgs);
                                     let _status = tsfn.call(
                                         FnArgs::from((path_owned.clone(), payload)),

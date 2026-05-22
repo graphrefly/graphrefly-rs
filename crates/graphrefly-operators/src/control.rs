@@ -460,7 +460,7 @@ pub fn valve(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let s = st_src.borrow_mut();
+                let s = st_src.borrow();
                 if s.terminated {
                     return;
                 }

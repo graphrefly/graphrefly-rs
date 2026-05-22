@@ -3144,12 +3144,12 @@ impl Core {
     ///
     /// # Panics
     ///
-    /// Panics if:
-    /// - Subscribing would violate the Phase H+ ascending partition-order
-    ///   invariant ([`SubscribeError::PartitionOrderViolation`]).
-    /// - The node is non-resubscribable AND has terminated
-    ///   ([`SubscribeError::TornDown`], R2.2.7.b).
-    #[allow(clippy::needless_pass_by_value)] // Sink is `Arc<dyn Fn>`; we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
+    /// Panics if the node is non-resubscribable AND has terminated
+    /// ([`SubscribeError::TornDown`], R2.2.7.b). (Pre-D274 a partition-
+    /// order violation was a second panic case; D274 deleted the
+    /// `PartitionOrderViolation` variant since groups are static
+    /// identity post-D248/D253 and the violation cannot fire.)
+    #[allow(clippy::needless_pass_by_value)] // Sink is `Rc<dyn Fn>` (D272); we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
         match self.try_subscribe(node_id, sink) {
             Ok(sub) => sub,
@@ -3459,10 +3459,9 @@ impl Core {
         }
 
         // D246/S2c: no group wave-locks to drop (single-owner).
-
-        // Drain deferred producer ops now that no partitions are held
-        // on this thread. The drain is a loop because each deferred op
-        // may itself produce new deferred ops.
+        // D274 (2026-05-21): the orphan "drain deferred producer ops"
+        // call site was deleted along with the producer-defer queue
+        // itself (was a no-op shim per D211); no remaining work here.
 
         Ok(sub_id)
     }

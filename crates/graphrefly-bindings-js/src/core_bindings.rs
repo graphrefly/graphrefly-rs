@@ -1177,21 +1177,21 @@ impl BenchCore {
     /// matching unsubscribe in `BenchCore::unsubscribe` / `dispose` /
     /// `Drop` can call `Core::unsubscribe(node_id, sub_id)` explicitly.
     ///
-    /// **D248 sink-shape note:** `graphrefly_core::Sink =
-    /// Arc<dyn Fn(&[Message])>` (without `Send + Sync`) — owner-thread-
-    /// only. We build the sink *inside* the actor closure, on the
-    /// worker thread, so the `!Send` Sink never has to cross the
-    /// actor channel.
+    /// **D248/D272 sink-shape note:** `graphrefly_core::Sink =
+    /// Rc<dyn Fn(&[Message])>` (`!Send + !Sync`) — owner-thread-only.
+    /// We build the sink *inside* the actor closure, on the worker
+    /// thread, so the `!Send` Sink never has to cross the actor channel.
     #[napi]
     pub async fn subscribe_noop(&self, node_id: u32) -> Result<u32> {
         let nid = NodeId::new(u64::from(node_id));
         let sub_id = self
             .actor
             .run(move |core| {
-                // M9 fix: noop sink is a static `OnceLock<Sink>` shared
-                // across all subscribe_noop calls — was per-call
-                // `Arc::new(|_| {})`. Built on the worker (D248 — Sink
-                // is `!Send`).
+                // Per-call `Rc::new(|_| {})` (D272 — Sink is
+                // `Rc<dyn Fn>`, `!Send + !Sync`). The earlier M9 plan
+                // was a shared `OnceLock<Sink>` but that required
+                // `Sink: Sync` which D248 deliberately relaxed away.
+                // Built on the worker thread inside the actor closure.
                 core.subscribe(nid, noop_sink())
             })
             .await?;
@@ -1230,11 +1230,11 @@ impl BenchCore {
     /// `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
     /// async work runs inside `env.spawn_future(async move { ... })`.
     ///
-    /// **D248 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into the
-    /// actor closure IS `Send + Sync` (`ThreadsafeFunction` is
-    /// Send+Sync by napi-rs design); the `Sink = Arc<dyn Fn(&[Message])>`
-    /// that wraps it is `!Send`, so we build it on the worker thread
-    /// inside the actor closure.
+    /// **D248/D272 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into
+    /// the actor closure IS `Send + Sync` (`ThreadsafeFunction` is
+    /// Send+Sync by napi-rs design); the `Sink = Rc<dyn Fn(&[Message])>`
+    /// that wraps it is `!Send + !Sync`, so we build it on the worker
+    /// thread inside the actor closure.
     #[napi]
     pub fn subscribe_with_tsfn<'env>(
         &self,
@@ -1250,8 +1250,8 @@ impl BenchCore {
             let sub_id = actor
                 .run(move |core| {
                     // Build the Sink on the worker thread — `Sink` is
-                    // `Arc<dyn Fn(&[Message])>` (`!Send + !Sync` per
-                    // D248). `tsfn` (Arc<SinkTsfn>) IS `Send + Sync`
+                    // `Rc<dyn Fn(&[Message])>` (`!Send + !Sync` per
+                    // D248/D272). `tsfn` (Arc<SinkTsfn>) IS `Send + Sync`
                     // so it crossed the channel fine.
                     let sink = build_tsfn_sink(tsfn);
                     core.subscribe(nid, sink)

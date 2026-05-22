@@ -426,7 +426,7 @@ pub fn window(
                 // `if s.terminated { break }`) — a batched
                 // `[COMPLETE, DATA]` must NOT forward DATA after the
                 // COMPLETE (R2.6.4 / no-data-after-terminal).
-                if st.borrow_mut().terminated {
+                if st.borrow().terminated {
                     break;
                 }
                 match m.tier() {
@@ -520,7 +520,7 @@ pub fn window(
         let notifier_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
-                if st2.borrow_mut().terminated {
+                if st2.borrow().terminated {
                     break;
                 }
                 match m.tier() {
@@ -670,7 +670,7 @@ pub fn window_count(
         let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
-                if st.borrow_mut().terminated {
+                if st.borrow().terminated {
                     break;
                 }
                 match m.tier() {
