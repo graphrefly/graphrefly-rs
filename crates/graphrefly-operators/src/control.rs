@@ -67,17 +67,17 @@ pub fn tap(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, fn_i
                 match a {
                     Act::EmitAndTap(h) => {
                         bb.invoke_tap_fn(fn_id, h);
-                        core_sink.emit_or_defer(pid, h);
+                        core_sink.emit(pid, h);
                     }
-                    Act::Complete => core_sink.complete_or_defer(pid),
-                    Act::Error(h) => core_sink.error_or_defer(pid, h),
+                    Act::Complete => core_sink.complete(pid),
+                    Act::Error(h) => core_sink.error(pid, h),
                 }
             }
         });
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 
@@ -147,19 +147,19 @@ pub fn tap_observer(
                         if let Some(fid) = data_fn_id {
                             bb.invoke_tap_fn(fid, h);
                         }
-                        core_sink.emit_or_defer(pid, h);
+                        core_sink.emit(pid, h);
                     }
                     Act::Complete => {
                         if let Some(fid) = complete_fn_id {
                             bb.invoke_tap_complete_fn(fid);
                         }
-                        core_sink.complete_or_defer(pid);
+                        core_sink.complete(pid);
                     }
                     Act::Error(h) => {
                         if let Some(fid) = error_fn_id {
                             bb.invoke_tap_error_fn(fid, h);
                         }
-                        core_sink.error_or_defer(pid, h);
+                        core_sink.error(pid, h);
                     }
                 }
             }
@@ -170,7 +170,7 @@ pub fn tap_observer(
             if let Some(fid) = complete_fn_id {
                 binding_s.invoke_tap_complete_fn(fid);
             }
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 
@@ -245,18 +245,18 @@ pub fn on_first_data(
                 match a {
                     Act::EmitWithTap(h) => {
                         bb.invoke_tap_fn(fn_id, h);
-                        core_sink.emit_or_defer(pid, h);
+                        core_sink.emit(pid, h);
                     }
-                    Act::Emit(h) => core_sink.emit_or_defer(pid, h),
-                    Act::Complete => core_sink.complete_or_defer(pid),
-                    Act::Error(h) => core_sink.error_or_defer(pid, h),
+                    Act::Emit(h) => core_sink.emit(pid, h),
+                    Act::Complete => core_sink.complete(pid),
+                    Act::Error(h) => core_sink.error(pid, h),
                 }
             }
         });
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 
@@ -319,19 +319,19 @@ pub fn rescue(
             }
             for a in actions {
                 match a {
-                    Act::Emit(h) => core_sink.emit_or_defer(pid, h),
-                    Act::Complete => core_sink.complete_or_defer(pid),
+                    Act::Emit(h) => core_sink.emit(pid, h),
+                    Act::Complete => core_sink.complete(pid),
                     Act::TryRescue(err_h) => {
                         match bb.invoke_rescue_fn(fn_id, err_h) {
                             Ok(recovered_h) => {
                                 // Recovery succeeded — release original error,
                                 // emit recovered value as DATA.
                                 bb.release_handle(err_h);
-                                core_sink.emit_or_defer(pid, recovered_h);
+                                core_sink.emit(pid, recovered_h);
                             }
                             Err(()) => {
                                 // Recovery failed — forward original ERROR.
-                                core_sink.error_or_defer(pid, err_h);
+                                core_sink.error(pid, err_h);
                             }
                         }
                     }
@@ -341,7 +341,7 @@ pub fn rescue(
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 
@@ -438,7 +438,7 @@ pub fn valve(
                 }
             }
             if let Some(h) = error_action {
-                core_ctrl.error_or_defer(pid, h);
+                core_ctrl.error(pid, h);
             }
         });
 
@@ -489,9 +489,9 @@ pub fn valve(
             }
             for a in actions {
                 match a {
-                    Act::Emit(h) => core_src.emit_or_defer(pid, h),
-                    Act::Complete => core_src.complete_or_defer(pid),
-                    Act::Error(h) => core_src.error_or_defer(pid, h),
+                    Act::Emit(h) => core_src.emit(pid, h),
+                    Act::Complete => core_src.complete(pid),
+                    Act::Error(h) => core_src.error(pid, h),
                 }
             }
         });
@@ -502,7 +502,7 @@ pub fn valve(
             if !s.terminated {
                 s.terminated = true;
                 drop(s);
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
             }
         }
     });
@@ -608,16 +608,16 @@ pub fn settle(
             }
             for a in actions {
                 match a {
-                    Act::Emit(h) => core_sink.emit_or_defer(pid, h),
-                    Act::Complete | Act::SelfComplete => core_sink.complete_or_defer(pid),
-                    Act::Error(h) => core_sink.error_or_defer(pid, h),
+                    Act::Emit(h) => core_sink.emit(pid, h),
+                    Act::Complete | Act::SelfComplete => core_sink.complete(pid),
+                    Act::Error(h) => core_sink.error(pid, h),
                 }
             }
         });
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 
@@ -723,9 +723,9 @@ pub fn repeat(
             }
             for a in actions {
                 match a {
-                    Act::Emit(h) => core_sink.emit_or_defer(pid, h),
-                    Act::Error(h) => core_sink.error_or_defer(pid, h),
-                    Act::Complete => core_sink.complete_or_defer(pid),
+                    Act::Emit(h) => core_sink.emit(pid, h),
+                    Act::Error(h) => core_sink.error(pid, h),
+                    Act::Complete => core_sink.complete(pid),
                     Act::Resubscribe => {
                         // Get our own sink from the shared slot.
                         let maybe_sink = sink_slot_inner.borrow_mut().clone();
@@ -771,7 +771,7 @@ pub fn repeat(
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
             // Dead source (non-resubscribable + terminated) will stay
             // dead — resubscribing won't help. Complete immediately.
-            core_s.complete_or_defer(pid);
+            core_s.complete(pid);
         }
     });
 

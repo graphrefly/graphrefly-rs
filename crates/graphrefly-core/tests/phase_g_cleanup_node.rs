@@ -227,7 +227,6 @@ fn phase_g_preserves_terminal_slot_for_non_resubscribable_rejection() {
     let sink: Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!(
             "expected TornDown rejection — Phase G must NOT clear `rec.terminal` (D121); \
              non-resubscribable terminal node must continue to reject after Phase G ran"
@@ -333,7 +332,6 @@ fn r2_2_7_b_rejects_subscribe_between_complete_and_teardown_cascade() {
     let sink: Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { .. }) => {}
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!(
             "R2.2.7.b: non-resubscribable terminal node must reject subscribe \
              regardless of whether TEARDOWN already cascaded"

@@ -199,10 +199,10 @@ pub fn zip(
                             for h in &popped {
                                 binding_inner.release_handle(*h);
                             }
-                            core_inner.emit_or_defer(producer_id, tuple_h);
+                            core_inner.emit(producer_id, tuple_h);
                         }
-                        PostLockAction::Complete => core_inner.complete_or_defer(producer_id),
-                        PostLockAction::Error(h) => core_inner.error_or_defer(producer_id, h),
+                        PostLockAction::Complete => core_inner.complete(producer_id),
+                        PostLockAction::Error(h) => core_inner.error(producer_id, h),
                     }
                 }
             });
@@ -235,7 +235,7 @@ pub fn zip(
                     binding_dead.release_handle(h);
                 }
                 if should_complete {
-                    core_dead.complete_or_defer(producer_id);
+                    core_dead.complete(producer_id);
                 }
             }
         }
@@ -369,9 +369,9 @@ pub fn concat(
             }
             for action in actions {
                 match action {
-                    Action::Emit(h) => core_for_second.emit_or_defer(producer_id, h),
-                    Action::Complete => core_for_second.complete_or_defer(producer_id),
-                    Action::Error(h) => core_for_second.error_or_defer(producer_id, h),
+                    Action::Emit(h) => core_for_second.emit(producer_id, h),
+                    Action::Complete => core_for_second.complete(producer_id),
+                    Action::Error(h) => core_for_second.error(producer_id, h),
                 }
             }
         });
@@ -473,9 +473,9 @@ pub fn concat(
             }
             for action in actions {
                 match action {
-                    Action::Emit(h) => core_for_first.emit_or_defer(producer_id, h),
-                    Action::Complete => core_for_first.complete_or_defer(producer_id),
-                    Action::Error(h) => core_for_first.error_or_defer(producer_id, h),
+                    Action::Emit(h) => core_for_first.emit(producer_id, h),
+                    Action::Complete => core_for_first.complete(producer_id),
+                    Action::Error(h) => core_for_first.error(producer_id, h),
                 }
             }
         });
@@ -505,10 +505,10 @@ pub fn concat(
                 }
             }
             for h in pending_to_emit {
-                core_first_dead.emit_or_defer(producer_id, h);
+                core_first_dead.emit(producer_id, h);
             }
             if should_complete {
-                core_first_dead.complete_or_defer(producer_id);
+                core_first_dead.complete(producer_id);
             }
         }
     });
@@ -644,9 +644,9 @@ pub fn race(
                 }
                 for action in actions {
                     match action {
-                        Action::Emit(h) => core_inner.emit_or_defer(producer_id, h),
-                        Action::Complete => core_inner.complete_or_defer(producer_id),
-                        Action::Error(h) => core_inner.error_or_defer(producer_id, h),
+                        Action::Emit(h) => core_inner.emit(producer_id, h),
+                        Action::Complete => core_inner.complete(producer_id),
+                        Action::Error(h) => core_inner.error(producer_id, h),
                     }
                 }
             });
@@ -669,7 +669,7 @@ pub fn race(
                     }
                 }
                 if should_complete {
-                    core_dead.complete_or_defer(producer_id);
+                    core_dead.complete(producer_id);
                 }
             }
         }
@@ -766,9 +766,9 @@ pub fn take_until(
             }
             for action in actions {
                 match action {
-                    Action::Emit(h) => core_for_source.emit_or_defer(producer_id, h),
-                    Action::Complete => core_for_source.complete_or_defer(producer_id),
-                    Action::Error(h) => core_for_source.error_or_defer(producer_id, h),
+                    Action::Emit(h) => core_for_source.emit(producer_id, h),
+                    Action::Complete => core_for_source.complete(producer_id),
+                    Action::Error(h) => core_for_source.error(producer_id, h),
                 }
             }
         });
@@ -790,7 +790,7 @@ pub fn take_until(
                 }
             }
             if should_complete {
-                core_dead.complete_or_defer(producer_id);
+                core_dead.complete(producer_id);
             }
         }
 
@@ -842,8 +842,8 @@ pub fn take_until(
             }
             if let Some(a) = action {
                 match a {
-                    Action::Complete => core_for_notifier.complete_or_defer(producer_id),
-                    Action::Error(h) => core_for_notifier.error_or_defer(producer_id, h),
+                    Action::Complete => core_for_notifier.complete(producer_id),
+                    Action::Error(h) => core_for_notifier.error(producer_id, h),
                 }
             }
         });

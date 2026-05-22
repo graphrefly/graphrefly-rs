@@ -181,7 +181,7 @@ fn build_inner_sink(
         }
         for action in actions {
             match action {
-                Action::Emit(h) => em.emit_or_defer(producer_id, h),
+                Action::Emit(h) => em.emit(producer_id, h),
                 Action::Complete => on_inner_complete(),
                 Action::Error(h) => on_inner_error(h),
                 Action::Invalidate => {
@@ -419,24 +419,14 @@ pub fn switch_map(
                             // self-Complete trigger).
                             on_complete_for_dead();
                         }
-                        Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                            // Already inside the in-wave drain (no
-                            // partitions held the old way) — a violation
-                            // here is the substrate-invariant break the
-                            // old wave-end-drain guard caught.
-                            panic!(
-                                "switch_map inner subscribe: partition-order \
-                                 violation inside em.defer — substrate invariant broken"
-                            );
-                        }
                     }
                 });
             }
 
             if plan.self_complete {
-                em_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete(producer_id);
             } else if let Some(h) = plan.self_error {
-                em_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error(producer_id, h);
             }
         });
 
@@ -469,7 +459,7 @@ fn make_switch_on_complete(
         }
         drop(prev_inner); // SubGuard::Drop → deferred unsubscribe.
         if should_complete {
-            em.complete_or_defer(producer_id);
+            em.complete(producer_id);
         }
     })
 }
@@ -490,7 +480,7 @@ fn make_switch_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        em.error_or_defer(producer_id, h);
+        em.error(producer_id, h);
     })
 }
 
@@ -681,19 +671,13 @@ pub fn exhaust_map(
                         Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
                             on_complete_for_dead();
                         }
-                        Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                            panic!(
-                                "exhaust_map inner subscribe: partition-order \
-                                 violation inside em.defer — substrate invariant broken"
-                            );
-                        }
                     });
             }
 
             if plan.self_complete {
-                em_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete(producer_id);
             } else if let Some(h) = plan.self_error {
-                em_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error(producer_id, h);
             }
         });
 
@@ -729,7 +713,7 @@ fn make_exhaust_on_complete(
         }
         drop(prev_inner);
         if should_complete {
-            em.complete_or_defer(producer_id);
+            em.complete(producer_id);
         }
     })
 }
@@ -750,7 +734,7 @@ fn make_exhaust_on_error(
             prev_inner = s.inner_sub.take();
         }
         drop(prev_inner);
-        em.error_or_defer(producer_id, h);
+        em.error(producer_id, h);
     })
 }
 
@@ -924,11 +908,11 @@ pub fn merge_map_with_concurrency(
             }
 
             if let Some(h) = error_action {
-                em_for_outer.error_or_defer(producer_id, h);
+                em_for_outer.error(producer_id, h);
                 return;
             }
             if self_complete_now {
-                em_for_outer.complete_or_defer(producer_id);
+                em_for_outer.complete(producer_id);
                 return;
             }
 
@@ -1009,7 +993,7 @@ fn drain_merge_buffer(
 
         if should_self_complete {
             MERGE_DRAIN_ACTIVE.with(|f| f.set(false));
-            em.complete_or_defer(producer_id);
+            em.complete(producer_id);
             return;
         }
 
@@ -1074,12 +1058,6 @@ fn drain_merge_buffer(
                     // clears pending, and checks the self-Complete
                     // trigger (Dead-inner `s.active` leak fix).
                     on_complete_for_dead();
-                }
-                Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                    panic!(
-                        "merge_map inner subscribe: partition-order \
-                         violation inside em.defer — substrate invariant broken"
-                    );
                 }
             }
         });
@@ -1162,7 +1140,7 @@ fn make_merge_on_error(
         for h_b in buffered_to_release {
             binding.release_handle(h_b);
         }
-        em.error_or_defer(producer_id, h);
+        em.error(producer_id, h);
     })
 }
 

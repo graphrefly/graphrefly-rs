@@ -75,7 +75,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use parking_lot::Mutex;
 
 // D246/S2c: `WaveOwnerGuard` (the §7 per-group `parking_lot::ReentrantMutex`
 // wave-lock wrapper) is deleted — single-owner ⇒ no cross-thread wave
@@ -1046,48 +1045,26 @@ pub(crate) struct PendingPauseOverflow {
     pub(crate) lock_held_ns: u64,
 }
 
-/// Error returned when a same-thread partition acquire violates
-/// ascending order. Phase H+ STRICT variant (D115).
-///
-/// The ascending-order protocol prevents AB/BA deadlocks between
-/// threads. When this error surfaces, the caller should defer the
-/// operation to wave-end (when no partitions are held) and retry.
-/// **Vestigial (§7, D208–D211, 2026-05-16).** The union-find ascending-
-/// order acquisition discipline that this represented is deleted:
-/// scheduling groups are user-declared + static and the wave engine
-/// acquires the whole touched-group set sorted **upfront**, so there is
-/// no incremental mid-wave acquisition that could violate ordering.
-/// This type is **never constructed** post-§7. It is retained only so
-/// `SubscribeError::PartitionOrderViolation` and the `Err(_)` match arms
-/// in `graphrefly-operators` compile unchanged (D211 minimal-churn);
-/// removing the type + those arms is a tracked downstream-churn
-/// follow-on (`porting-deferred.md`).
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-#[error("vestigial PartitionOrderViolation (never constructed post-§7)")]
-pub struct PartitionOrderViolation {
-    /// Vestigial. Unused; retained for struct-shape stability only.
-    pub attempted: u64,
-    /// Vestigial. Unused; retained for struct-shape stability only.
-    pub max_held: u64,
-}
+// D274 (2026-05-21): `PartitionOrderViolation` struct was deleted — the
+// union-find ascending-order acquisition discipline it represented is
+// gone (groups are user-declared + static post-D248/D253; one Core per
+// OS thread per D252). The type was never constructed post-§7; it was
+// retained only so the downstream `Err(_)` match arms compiled (D211
+// minimal-churn). All those arms are deleted here too.
 
 /// Errors returnable by [`Core::try_subscribe`].
 ///
 /// `Core::subscribe` (the panic-on-error variant) panics on either
 /// case; `try_subscribe` returns these so operators (zip / concat /
 /// race / take_until / merge / switch_map / etc.) can match on the
-/// variant — defer for [`Self::PartitionOrderViolation`], skip the
-/// source for [`Self::TornDown`].
+/// variant — skip the source for [`Self::TornDown`].
 ///
 /// Per canonical spec R2.2.7.a / R2.2.7.b (D118, 2026-05-10).
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeError {
-    /// Phase H+ STRICT (D115): partition acquisition would violate the
-    /// ascending-order protocol. Caller should defer the subscribe to
-    /// wave-end via the producer-pattern deferred-op queue.
-    #[error(transparent)]
-    PartitionOrderViolation(#[from] PartitionOrderViolation),
-
+    // D274 (2026-05-21): `PartitionOrderViolation` variant was deleted —
+    // it was never constructed post-§7 (the union-find ascending-order
+    // shim is gone). Downstream `Err(_)` match arms are deleted too.
     /// R2.2.7.b (D118, 2026-05-10): the node is non-resubscribable AND
     /// has terminated (`[COMPLETE]` or `[ERROR, h]` was delivered).
     /// The stream is permanently over; subscribe is rejected.
@@ -1104,27 +1081,9 @@ pub enum SubscribeError {
     },
 }
 
-/// A producer-pattern operation deferred because it would have
-/// violated the ascending partition-order protocol (Phase H+ STRICT,
-/// D115). Drained by `BatchGuard::drop` after wave_guards are
-/// released (no partitions held → safe to acquire any partition).
-///
-/// Variants with `HandleId` fields hold a binding-side retain taken
-/// at defer time. The drain path releases this retain after the
-/// operation fires; the panic-discard path releases it without firing.
-pub enum DeferredProducerOp {
-    /// Deferred `Core::emit`. Retain held on `handle`.
-    Emit { node_id: NodeId, handle: HandleId },
-    /// Deferred `Core::complete`. No handle.
-    Complete { node_id: NodeId },
-    /// Deferred `Core::error`. Retain held on `handle`.
-    Error { node_id: NodeId, handle: HandleId },
-    /// Generic deferred callback (e.g., deferred subscribe from
-    /// producer build closure). The closure captures everything it
-    /// needs; `graphrefly-core` doesn't depend on operator-specific
-    /// types. The closure is responsible for its own retain discipline.
-    Callback(Box<dyn FnOnce() + Send>),
-}
+// D274 (2026-05-21): `DeferredProducerOp` enum was deleted — the
+// union-find ascending-order shim it deferred over is gone. Producer
+// sinks call `core.emit/complete/error` directly.
 
 /// Errors returnable by [`Core::pause`] and [`Core::resume`].
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -1944,20 +1903,14 @@ pub trait CoreFull {
     // (D245 Option A: `BindingBoundary::invoke_fn_with_core` hands the
     // binding `&dyn CoreFull`, from which it builds its `ProducerCtx`).
     // A build closure + its spawned sinks need the binding `Arc` (for
-    // `retain_handle`/`release_handle` around payload shares) and the
-    // build-side deferred-emit helpers — these mirror `Core`'s existing
-    // same-named methods, so `ProducerCtx::core()` over `&dyn CoreFull`
-    // keeps every producer factory compiling unchanged. Pure
-    // delegation; no `C`/`T` surfaced.
+    // `retain_handle`/`release_handle` around payload shares). D274
+    // (2026-05-21): the `*_or_defer` deferred-emit helpers were deleted
+    // — producer sinks call `core.emit/complete/error` directly via the
+    // owner-side actor model (no partition-order violation can fire
+    // post-D248/D255 actor model + D246 single-owner Core).
 
     /// See [`Core::binding`].
     fn binding(&self) -> Arc<dyn crate::boundary::BindingBoundary>;
-    /// See [`Core::emit_or_defer`].
-    fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId);
-    /// See [`Core::complete_or_defer`].
-    fn complete_or_defer(&self, node_id: NodeId);
-    /// See [`Core::error_or_defer`].
-    fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId);
 }
 
 impl CoreFull for Core {
@@ -2041,35 +1994,9 @@ impl CoreFull for Core {
     fn binding(&self) -> Arc<dyn crate::boundary::BindingBoundary> {
         Core::binding(self)
     }
-    // Inlined over the `try_*` + `push_deferred_producer_op`
-    // primitives (behaviour-identical to the public
-    // `Core::{emit,complete,error}_or_defer` wrappers).
-    #[inline]
-    fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
-        if self.try_emit(node_id, new_handle).is_err() {
-            self.binding.retain_handle(new_handle);
-            self.push_deferred_producer_op(DeferredProducerOp::Emit {
-                node_id,
-                handle: new_handle,
-            });
-        }
-    }
-    #[inline]
-    fn complete_or_defer(&self, node_id: NodeId) {
-        if self.try_complete(node_id).is_err() {
-            self.push_deferred_producer_op(DeferredProducerOp::Complete { node_id });
-        }
-    }
-    #[inline]
-    fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
-        if self.try_error(node_id, error_handle).is_err() {
-            self.binding.retain_handle(error_handle);
-            self.push_deferred_producer_op(DeferredProducerOp::Error {
-                node_id,
-                handle: error_handle,
-            });
-        }
-    }
+    // D274 (2026-05-21): the trait `*_or_defer` methods were deleted.
+    // Producer sinks call `core.emit/complete/error` directly via the
+    // owner-side actor model.
 }
 
 /// RAII guard that owns an [`OperatorScratch`] until either (a) the
@@ -2445,48 +2372,14 @@ impl Core {
         Arc::clone(&self.binding)
     }
 
-    /// Execute a producer-pattern op. §7: the union-find ascending-order
-    /// constraint that motivated *deferring* these is deleted (groups
-    /// are static identity only — S2c removed the group-lock machinery,
-    /// so there is no `PartitionOrderViolation` to dodge). The op runs
-    /// **immediately** — re-entrant execution on the single owner thread
-    /// is absorbed by the in-flight wave drain (one-Core-per-OS-thread
-    /// `IN_TICK_OWNED` slot, D252), exactly as the deferred drain used
-    /// to run it at wave-end. The `deferred_producer_ops` queue +
-    /// `drain_deferred_producer_ops` are deleted; this shim is retained
-    /// so `graphrefly-operators` compiles unchanged (D211 minimal-churn).
-    ///
-    /// For `Emit`/`Error` the caller retained the handle before
-    /// pushing (mirroring the old drain contract); we release it after
-    /// firing so refcount discipline is unchanged.
-    pub fn push_deferred_producer_op(&self, op: DeferredProducerOp) {
-        match op {
-            DeferredProducerOp::Emit { node_id, handle } => {
-                self.emit(node_id, handle);
-                self.binding.release_handle(handle);
-            }
-            DeferredProducerOp::Complete { node_id } => {
-                self.complete(node_id);
-            }
-            DeferredProducerOp::Error { node_id, handle } => {
-                self.error(node_id, handle);
-                self.binding.release_handle(handle);
-            }
-            DeferredProducerOp::Callback(f) => {
-                f();
-            }
-        }
-    }
-
-    /// §7: `drain_deferred_producer_ops` is **deleted** — there is no
-    /// `deferred_producer_ops` queue (the union-find ascending-order
-    /// constraint that required deferral is gone). Producer ops execute
-    /// immediately via [`Self::push_deferred_producer_op`]. The former
-    /// `BatchGuard::drop` / `try_subscribe` drain call sites become
-    /// no-ops. Kept as an empty inline fn so those call sites compile
-    /// unchanged (D211 minimal-churn); the optimizer elides it.
-    #[inline]
-    pub(crate) fn drain_deferred_producer_ops(&self) {}
+    // D274 (2026-05-21): `push_deferred_producer_op` /
+    // `drain_deferred_producer_ops` / `DeferredProducerOp` were deleted
+    // — the union-find ascending-order constraint they shimmed around
+    // is gone (groups are static identity only post-D248/D253; single-
+    // owner per Core post-D246; one Core per OS thread per D252). All
+    // producer-pattern sinks now call `core.emit/complete/error`
+    // directly via the owner-side actor model; partition-order
+    // violations cannot fire.
 
     // D246/S2c: the §7 cross-thread wave-lock acquisition
     // (`compute_touched_groups` / `all_groups_sorted` /
@@ -3559,7 +3452,6 @@ impl Core {
         // Drain deferred producer ops now that no partitions are held
         // on this thread. The drain is a loop because each deferred op
         // may itself produce new deferred ops.
-        self.drain_deferred_producer_ops();
 
         Ok(sub_id)
     }
@@ -3848,28 +3740,11 @@ impl Core {
     /// Panics if `node_id` is not a state node, or if `new_handle` is
     /// [`NO_HANDLE`] (per R1.2.4, sentinel is not a valid DATA payload).
     pub fn emit(&self, node_id: NodeId, new_handle: HandleId) {
-        match self.try_emit(node_id, new_handle) {
-            Ok(()) => {}
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    /// Fallible emit. Returns `Err` on partition order violation
-    /// (Phase H+ STRICT, D115). The public `emit` calls this and
-    /// unwraps; `emit_or_defer` calls this and defers on Err.
-    pub(crate) fn try_emit(
-        &self,
-        node_id: NodeId,
-        new_handle: HandleId,
-    ) -> Result<(), PartitionOrderViolation> {
-        // Step 2b-ii-B (D220-EXEC): route this whole entry point to the
-        // node's shard. Single-node public entry points do a pre-wave
-        // `lock_state().require_node(node)` BEFORE `try_run_wave_for`
-        // sets the ambient — a grouped node's record is in shard `g`,
-        // not `DEFAULT_SHARD`, so without this the validation panics
-        // `unknown node`. Held for the whole fn; the nested
-        // `try_run_wave_for(node_id)` re-derives the same key
-        // (no-op restore). `None`/all-`None` ⇒ behaviour-identical.
+        // D274 (2026-05-21): inlined `try_emit`. The
+        // `Result<(), PartitionOrderViolation>` wrapper is gone — groups
+        // are static identity only post-D248/D253, single-owner per Core
+        // per D246, one Core per OS thread per D252; partition-order
+        // violations cannot fire.
         assert!(
             new_handle != NO_HANDLE,
             "NO_HANDLE is not a valid DATA payload (R1.2.4)"
@@ -3904,7 +3779,7 @@ impl Core {
                 // cache. Released lock-released so the binding can't
                 // deadlock against an internal binding mutex.
                 self.binding.release_handle(new_handle);
-                return Ok(());
+                return;
             }
         }
         // Run the wave for `node_id`. Slice Y1 / Phase E: emit cascades
@@ -3914,21 +3789,7 @@ impl Core {
         // parallelism is host-native via independent per-worker Cores.
         self.try_run_wave_for(node_id, |this| {
             this.commit_emission(node_id, new_handle);
-        })?;
-        Ok(())
-    }
-
-    /// Emit or defer to wave-end on partition order violation.
-    /// For producer-pattern operator sinks. Retains `handle` on defer;
-    /// the drain releases it after firing (or on discard).
-    pub fn emit_or_defer(&self, node_id: NodeId, new_handle: HandleId) {
-        if self.try_emit(node_id, new_handle).is_err() {
-            self.binding.retain_handle(new_handle);
-            self.push_deferred_producer_op(DeferredProducerOp::Emit {
-                node_id,
-                handle: new_handle,
-            });
-        }
+        });
     }
 
     /// Read a node's current cache. Returns [`NO_HANDLE`] if sentinel.
@@ -4068,26 +3929,9 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn complete(&self, node_id: NodeId) {
-        match self.try_complete(node_id) {
-            Ok(()) => {}
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    /// Fallible complete. Returns `Err` on partition order violation.
-    pub(crate) fn try_complete(&self, node_id: NodeId) -> Result<(), PartitionOrderViolation> {
-        self.try_emit_terminal(node_id, TerminalKind::Complete)
-    }
-
-    /// Complete or defer to wave-end on partition order violation.
-    /// For producer-pattern operator sinks.
-    pub fn complete_or_defer(&self, node_id: NodeId) {
-        match self.try_complete(node_id) {
-            Ok(()) => {}
-            Err(_) => {
-                self.push_deferred_producer_op(DeferredProducerOp::Complete { node_id });
-            }
-        }
+        // D274 (2026-05-21): inlined `try_complete`. The
+        // `Result<(), PartitionOrderViolation>` wrapper was deleted.
+        self.try_emit_terminal(node_id, TerminalKind::Complete);
     }
 
     /// Emit `[ERROR, error_handle]` (R1.3.4) on `node_id`. `error_handle`
@@ -4100,23 +3944,13 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown or `error_handle == NO_HANDLE`.
     pub fn error(&self, node_id: NodeId, error_handle: HandleId) {
-        match self.try_error(node_id, error_handle) {
-            Ok(()) => {}
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    /// Fallible error. Returns `Err` on partition order violation.
-    pub(crate) fn try_error(
-        &self,
-        node_id: NodeId,
-        error_handle: HandleId,
-    ) -> Result<(), PartitionOrderViolation> {
+        // D274 (2026-05-21): inlined `try_error`. The
+        // `Result<(), PartitionOrderViolation>` wrapper was deleted.
         assert!(
             error_handle != NO_HANDLE,
             "NO_HANDLE is not a valid ERROR payload (R1.2.5)"
         );
-        self.try_emit_terminal(node_id, TerminalKind::Error(error_handle))?;
+        self.try_emit_terminal(node_id, TerminalKind::Error(error_handle));
         // The caller's intern share for `error_handle` is NOT transferred
         // to any slot — `terminate_node` takes its OWN retain for every
         // populated `terminal` and `dep_terminals` slot. Release the
@@ -4124,27 +3958,9 @@ impl Core {
         // release on terminal). Without this, every `error()` call leaks
         // one binding-side handle ref. Slice A-bigger /qa item D fix.
         self.binding.release_handle(error_handle);
-        Ok(())
     }
 
-    /// Error or defer to wave-end on partition order violation.
-    /// For producer-pattern operator sinks. Retains `handle` on defer;
-    /// the drain releases it after firing (or on discard).
-    pub fn error_or_defer(&self, node_id: NodeId, error_handle: HandleId) {
-        if self.try_error(node_id, error_handle).is_err() {
-            self.binding.retain_handle(error_handle);
-            self.push_deferred_producer_op(DeferredProducerOp::Error {
-                node_id,
-                handle: error_handle,
-            });
-        }
-    }
-
-    fn try_emit_terminal(
-        &self,
-        node_id: NodeId,
-        terminal: TerminalKind,
-    ) -> Result<(), PartitionOrderViolation> {
+    fn try_emit_terminal(&self, node_id: NodeId, terminal: TerminalKind) {
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
@@ -4156,7 +3972,7 @@ impl Core {
         self.try_run_wave_for(node_id, |this| {
             let mut s = this.lock_state();
             this.terminate_node(&mut s, node_id, terminal);
-        })
+        });
     }
 
     /// Set the node's terminal slot, queue the wire message, and cascade to
@@ -4353,36 +4169,19 @@ impl Core {
     ///
     /// Panics if `node_id` is unknown.
     pub fn teardown(&self, node_id: NodeId) {
-        match self.try_teardown(node_id) {
-            Ok(()) => {}
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    /// Teardown or defer to wave-end on partition order violation.
-    /// For producer-pattern operator sinks.
-    pub fn teardown_or_defer(&self, node_id: NodeId) {
-        match self.try_teardown(node_id) {
-            Ok(()) => {}
-            Err(_) => {
-                // S2b (D223): `Core` is no longer `Clone`. The old
-                // `DeferredProducerOp::Callback(move || core.teardown(..))`
-                // boxed a cloned `Core` only to have
-                // `push_deferred_producer_op` run it *immediately* (the
-                // deferred queue is a deleted D211 no-op shim). A direct
-                // owner-context call is behaviour-identical and drops the
-                // pointless `Send`-closure (which now needs `C: Sync`).
-                self.teardown(node_id);
-            }
-        }
-    }
-
-    fn try_teardown(&self, node_id: NodeId) -> Result<(), PartitionOrderViolation> {
+        // D274 (2026-05-21): inlined `try_teardown` + deleted the
+        // `teardown_or_defer` shim. The
+        // `Result<(), PartitionOrderViolation>` wrapper was deleted —
+        // single-owner per Core post-D246; partition-order violations
+        // cannot fire.
         {
             let s = self.lock_state();
             assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
         }
-        let torn_down: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
+        // D273 / Cat-3: single-owner — `Rc<RefCell<...>>` matches the
+        // wave-confined ownership shape exactly.
+        let torn_down: std::rc::Rc<std::cell::RefCell<Vec<NodeId>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let torn_down_for_wave = torn_down.clone();
         // TEARDOWN cascade follows `s.children` AND `meta_companions`
         // (R1.3.9.d) — meta-companions can cross partitions. Slice Y1 /
@@ -4392,16 +4191,15 @@ impl Core {
         self.try_run_wave_for(node_id, move |this| {
             let mut s = this.lock_state();
             let collected = this.teardown_inner(&mut s, node_id);
-            torn_down_for_wave.lock().extend(collected);
-        })?;
+            torn_down_for_wave.borrow_mut().extend(collected);
+        });
         // Fire NodeTornDown for every cascaded id (root + metas +
         // downstream consumers that auto-cascaded). Outside the state
         // lock, matching fire_topology_event discipline.
-        let ids = std::mem::take(&mut *torn_down.lock());
+        let ids = std::mem::take(&mut *torn_down.borrow_mut());
         for id in ids {
             self.fire_topology_event(&crate::topology::TopologyEvent::NodeTornDown(id));
         }
-        Ok(())
     }
 
     /// Iterative teardown walk (Slice A-bigger, M1-close).
@@ -4575,28 +4373,10 @@ impl Core {
         });
     }
 
-    /// Invalidate or defer to wave-end on partition order violation.
-    /// For producer-pattern operator sinks.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `node_id` is not registered in this Core.
-    pub fn invalidate_or_defer(&self, node_id: NodeId) {
-        {
-            let s = self.lock_state();
-            assert!(s.nodes.contains_key(&node_id), "unknown node {node_id:?}");
-        }
-        let result = self.try_run_wave_for(node_id, |this| {
-            let mut s = this.lock_state();
-            this.invalidate_inner(&mut s, node_id);
-        });
-        if result.is_err() {
-            // S2b (D223): direct owner-context call — see the identical
-            // rationale in `teardown_or_defer` (immediate-run no-op shim;
-            // no `Clone`, no pointless `Send` closure needing `C: Sync`).
-            self.invalidate(node_id);
-        }
-    }
+    // D274 (2026-05-21): `invalidate_or_defer` was deleted — it was an
+    // immediate-run no-op shim around `invalidate` whose `Err` path was
+    // never reachable post-D248/D253/D255. No external callers existed.
+    // Callers go directly to `Core::invalidate`.
 
     /// Iterative invalidate cascade (Slice A-bigger, M1-close).
     ///

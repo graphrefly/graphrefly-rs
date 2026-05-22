@@ -121,10 +121,10 @@ pub fn buffer(
                         for h in &handles {
                             bb.release_handle(*h);
                         }
-                        core_src.emit_or_defer(pid, packed);
+                        core_src.emit(pid, packed);
                     }
-                    Act::Complete => core_src.complete_or_defer(pid),
-                    Act::Error(h) => core_src.error_or_defer(pid, h),
+                    Act::Complete => core_src.complete(pid),
+                    Act::Error(h) => core_src.error(pid, h),
                     Act::Release(handles) => {
                         for h in handles {
                             bb.release_handle(h);
@@ -142,7 +142,7 @@ pub fn buffer(
                 s.source_completed = true;
                 // No buffered data yet at activation time.
                 drop(s);
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
                 return;
             }
         }
@@ -194,9 +194,9 @@ pub fn buffer(
                         for h in &handles {
                             bb2.release_handle(*h);
                         }
-                        core_n.emit_or_defer(pid, packed);
+                        core_n.emit(pid, packed);
                     }
-                    Act::Error(h) => core_n.error_or_defer(pid, h),
+                    Act::Error(h) => core_n.error(pid, h),
                     Act::Release(handles) => {
                         for h in handles {
                             bb2.release_handle(h);
@@ -322,10 +322,10 @@ pub fn buffer_count(
                         for h in &handles {
                             bb.release_handle(*h);
                         }
-                        core_src.emit_or_defer(pid, packed);
+                        core_src.emit(pid, packed);
                     }
-                    Act::Complete => core_src.complete_or_defer(pid),
-                    Act::Error(h) => core_src.error_or_defer(pid, h),
+                    Act::Complete => core_src.complete(pid),
+                    Act::Error(h) => core_src.error(pid, h),
                     Act::Release(handles) => {
                         for h in handles {
                             bb.release_handle(h);
@@ -341,7 +341,7 @@ pub fn buffer_count(
             if !s.terminated {
                 s.terminated = true;
                 drop(s);
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
             }
         }
     });
@@ -378,7 +378,7 @@ impl WindowState {
 ///
 /// - On activation: create first inner window node, emit it.
 /// - Source DATA: forward to current inner window via
-///   `core.emit_or_defer(inner_id, handle)`.
+///   `core.emit(inner_id, handle)`.
 /// - Notifier DATA: complete current window, create new window, emit it.
 /// - Source COMPLETE: complete current window, then complete self.
 /// - Either ERROR: error current window + error self.
@@ -405,7 +405,7 @@ pub fn window(
             let mut s = state.borrow_mut();
             s.inner_id = Some(first_inner.0);
         }
-        core_s.emit_or_defer(pid, first_inner.1);
+        core_s.emit(pid, first_inner.1);
 
         // --- source sink ---
         // D234: the inner-window selector `s.inner_id` MUST be read
@@ -496,9 +496,9 @@ pub fn window(
                 let inner = s.inner_id.take();
                 drop(s);
                 if let Some(inner_id) = inner {
-                    core_s.complete_or_defer(inner_id);
+                    core_s.complete(inner_id);
                 }
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
                 return;
             }
         }
@@ -651,7 +651,7 @@ pub fn window_count(
             s.inner_id = Some(first_inner.0);
             s.counter = 0;
         }
-        core_s.emit_or_defer(pid, first_inner.1);
+        core_s.emit(pid, first_inner.1);
 
         // --- source sink ---
         // D234: forward + count + window-roll are ONE owner-side defer
@@ -756,9 +756,9 @@ pub fn window_count(
                 let inner = s.inner_id.take();
                 drop(s);
                 if let Some(inner_id) = inner {
-                    core_s.complete_or_defer(inner_id);
+                    core_s.complete(inner_id);
                 }
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
             }
         }
     });

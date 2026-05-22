@@ -55,14 +55,14 @@ pub fn from_iter(
         for &h in &handles {
             // Retain for the emission — Core takes ownership of this share.
             binding_s.retain_handle(h);
-            core_s.emit_or_defer(pid, h);
+            core_s.emit(pid, h);
         }
         // Release the caller's original shares — ownership was
         // transferred to Core via the retain+emit above.
         for &h in &handles {
             binding_s.release_handle(h);
         }
-        core_s.complete_or_defer(pid);
+        core_s.complete(pid);
     });
 
     let fn_id = binding.register_producer_build(build);
@@ -81,7 +81,7 @@ pub fn of(core: &Core, binding: &Arc<dyn ProducerBinding>, handles: Vec<HandleId
 #[must_use]
 pub fn empty(core: &Core, binding: &Arc<dyn ProducerBinding>) -> NodeId {
     let build: ProducerBuildFn = Box::new(move |ctx: ProducerCtx<'_>| {
-        ctx.core().complete_or_defer(ctx.node_id());
+        ctx.core().complete(ctx.node_id());
     });
 
     let fn_id = binding.register_producer_build(build);
@@ -119,7 +119,7 @@ pub fn throw_error(
         let binding_s = ctx.core().binding();
         // Retain for the emission — Core takes ownership.
         binding_s.retain_handle(error_handle);
-        core_s.error_or_defer(ctx.node_id(), error_handle);
+        core_s.error(ctx.node_id(), error_handle);
         // Release the caller's original share.
         binding_s.release_handle(error_handle);
     });

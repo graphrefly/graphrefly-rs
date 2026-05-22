@@ -67,10 +67,9 @@ pub use hash::sha256_hex;
 pub use mailbox::{CoreMailbox, DeferFn, DeferQueue, MailboxOp, SendDeferFn};
 pub use message::{Message, Messages};
 pub use node::{
-    Core, CoreFull, DeferredProducerOp, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts,
-    NodeRegistration, OperatorOp, OperatorOpts, PausableMode, PauseError, RegisterError,
-    ResumeReport, SetDepsError, SetPausableModeError, Sink, SubscribeError, SubscriptionId,
-    TerminalKind, UpError,
+    Core, CoreFull, EqualsMode, NodeFnOrOp, NodeKind, NodeOpts, NodeRegistration, OperatorOp,
+    OperatorOpts, PausableMode, PauseError, RegisterError, ResumeReport, SetDepsError,
+    SetPausableModeError, Sink, SubscribeError, SubscriptionId, TerminalKind, UpError,
 };
 pub use owned::OwnedCore;
 pub use topology::{TopologyEvent, TopologySink, TopologySubscriptionId};

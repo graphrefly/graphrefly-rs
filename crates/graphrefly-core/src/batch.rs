@@ -826,21 +826,17 @@ impl Core {
         op(self);
     }
 
-    /// Fallible wave entry. Returns `Err` if partition acquire violates
-    /// ascending order (Phase H+ STRICT, D115). Used by `try_emit` /
-    /// `try_complete` / `try_error`; the public `run_wave_for` calls
-    /// `begin_batch_for` which panics on violation.
-    pub(crate) fn try_run_wave_for<F>(
-        &self,
-        seed: crate::handle::NodeId,
-        op: F,
-    ) -> Result<(), crate::node::PartitionOrderViolation>
+    /// Wave entry helper. D274 (2026-05-21): the
+    /// `Result<(), PartitionOrderViolation>` wrapper was deleted — groups
+    /// are static identity only post-D248/D253, single-owner per Core per
+    /// D246, one Core per OS thread per D252; partition-order violations
+    /// cannot fire.
+    pub(crate) fn try_run_wave_for<F>(&self, seed: crate::handle::NodeId, op: F)
     where
         F: FnOnce(&Self),
     {
-        let _guard = self.try_begin_batch_for(seed)?;
+        let _guard = self.begin_batch_for(seed);
         op(self);
-        Ok(())
     }
 
     /// Drain retains held by `wave_cache_snapshots` and return them so
@@ -3428,32 +3424,18 @@ impl Core {
     /// Slice Y1 / Phase E (2026-05-08); infallible-since S2c (D246).
     #[must_use = "BatchGuard drains the wave on drop; assign to a named binding"]
     pub fn begin_batch_for(&self, seed: crate::handle::NodeId) -> BatchGuard<'_> {
-        match self.try_begin_batch_for(seed) {
-            Ok(guard) => guard,
-            Err(e) => panic!("{e}"),
-        }
+        // D246/S2c: single-owner ⇒ no cross-thread wave serialization
+        // and no shard routing. `seed` is unused now — the §7 touched-
+        // group walk is deleted. D274 (2026-05-21): direct call to
+        // `begin_batch_with_guards`; the always-`Ok` `try_begin_batch_for`
+        // shim was deleted.
+        let _ = seed;
+        self.begin_batch_with_guards()
     }
 
-    /// §7: now-infallible variant of [`Self::begin_batch_for`]. The
-    /// `Result` is retained so existing callers (`try_run_wave_for`,
-    /// the `?`-using wave entry points) compile unchanged (D211); it is
-    /// **always `Ok`** — scheduling groups are static + user-declared
-    /// and the touched-group set is acquired sorted upfront, so there is
-    /// no `PartitionOrderViolation` and no epoch retry. For an
-    /// all-`None` cascade this acquires nothing (single-threaded floor).
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn try_begin_batch_for(
-        &self,
-        seed: crate::handle::NodeId,
-    ) -> Result<BatchGuard<'_>, crate::node::PartitionOrderViolation> {
-        // D246/S2c: single-owner ⇒ no cross-thread wave serialization
-        // and no shard routing. The `Result`/`seed` are retained so
-        // callers (`try_run_wave_for`, the `?`-using wave entry points)
-        // compile unchanged (D211); always `Ok`. `seed` is unused now —
-        // the §7 touched-group walk is deleted.
-        let _ = seed;
-        Ok(self.begin_batch_with_guards())
-    }
+    // D274 (2026-05-21): `try_begin_batch_for` was deleted (was an
+    // always-`Ok` shim). `begin_batch_for` calls `begin_batch_with_guards`
+    // directly now.
 
     /// Is this thread currently inside an owning wave on this Core?
     /// Reads the one-Core-per-thread [`IN_TICK_OWNED`] slot (D252) —
@@ -3982,7 +3964,6 @@ impl Drop for BatchGuard<'_> {
                 // drain_deferred_producer_ops is a D211 no-op shim today
                 // but is part of the documented wave-end contract.
                 tier3_clear();
-                self.core.drain_deferred_producer_ops();
                 std::panic::resume_unwind(payload);
             }
             // D260: check if `fire_deferred` posted new work to mailbox/
@@ -4025,6 +4006,5 @@ impl Drop for BatchGuard<'_> {
         // Phase H+ STRICT (D115): drain deferred producer ops at
         // wave-end (now a no-op shim — §7 deleted the deferred-producer
         // queue; retained so call sites compile unchanged, D211).
-        self.core.drain_deferred_producer_ops();
     }
 }

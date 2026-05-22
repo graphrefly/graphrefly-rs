@@ -135,7 +135,7 @@ impl Drop for StratifyState {
 ///   handle in the second tuple slot).
 ///
 /// Caller must hold `state` lock-released for `bb.release_handle` /
-/// `core.emit_or_defer` calls per leaf-op contract.
+/// `core.emit` calls per leaf-op contract.
 #[allow(clippy::option_option)]
 fn try_resolve(
     s: &mut StratifyState,
@@ -278,7 +278,7 @@ pub fn stratify_branch(
             for a in actions {
                 match a {
                     Act::ReleaseOldRules(h) | Act::Drop(h) => bb_rules.release_handle(h),
-                    Act::Emit(h) => core_rules.emit_or_defer(pid, h),
+                    Act::Emit(h) => core_rules.emit(pid, h),
                 }
             }
         });
@@ -425,10 +425,10 @@ pub fn stratify_branch(
             }
             for a in actions {
                 match a {
-                    Act::Emit(h) => core_src.emit_or_defer(pid, h),
+                    Act::Emit(h) => core_src.emit(pid, h),
                     Act::Drop(h) => bb_src.release_handle(h),
-                    Act::Complete => core_src.complete_or_defer(pid),
-                    Act::Error(h) => core_src.error_or_defer(pid, h),
+                    Act::Complete => core_src.complete(pid),
+                    Act::Error(h) => core_src.error(pid, h),
                     Act::Teardown => {
                         // D234: sink-side terminal forward via em.defer.
                         let _ = core_src.defer(move |c| c.teardown(pid));
@@ -443,7 +443,7 @@ pub fn stratify_branch(
             if !s.terminated {
                 s.terminated = true;
                 drop(s);
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
             }
         }
     });

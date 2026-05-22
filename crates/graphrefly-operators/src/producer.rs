@@ -201,20 +201,20 @@ pub struct MailboxEmitter {
 impl MailboxEmitter {
     /// Post an `Emit`. If the owning `Core` is gone, release `handle`
     /// (it held a retain for the would-be payload) — no leak.
-    pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
+    pub fn emit(&self, node_id: NodeId, handle: HandleId) {
         if !self.mailbox.post_emit(node_id, handle) {
             self.binding.release_handle(handle);
         }
     }
 
     /// Post a `Complete`. No payload handle; `Core`-gone is a no-op.
-    pub fn complete_or_defer(&self, node_id: NodeId) {
+    pub fn complete(&self, node_id: NodeId) {
         let _ = self.mailbox.post_complete(node_id);
     }
 
     /// Post an `Error`. If the owning `Core` is gone, release the error
     /// payload `handle` — no leak.
-    pub fn error_or_defer(&self, node_id: NodeId, handle: HandleId) {
+    pub fn error(&self, node_id: NodeId, handle: HandleId) {
         if !self.mailbox.post_error(node_id, handle) {
             self.binding.release_handle(handle);
         }
@@ -296,19 +296,19 @@ impl ProducerEmitter {
 
     /// Post an `Emit`. If the owning `Core` is gone, release `handle`
     /// (it held a retain for the would-be payload) — no leak.
-    pub fn emit_or_defer(&self, node_id: NodeId, handle: HandleId) {
-        self.emitter.emit_or_defer(node_id, handle);
+    pub fn emit(&self, node_id: NodeId, handle: HandleId) {
+        self.emitter.emit(node_id, handle);
     }
 
     /// Post a `Complete`. No payload handle; `Core`-gone is a no-op.
-    pub fn complete_or_defer(&self, node_id: NodeId) {
-        self.emitter.complete_or_defer(node_id);
+    pub fn complete(&self, node_id: NodeId) {
+        self.emitter.complete(node_id);
     }
 
     /// Post an `Error`. If the owning `Core` is gone, release the error
     /// payload `handle` — no leak.
-    pub fn error_or_defer(&self, node_id: NodeId, handle: HandleId) {
-        self.emitter.error_or_defer(node_id, handle);
+    pub fn error(&self, node_id: NodeId, handle: HandleId) {
+        self.emitter.error(node_id, handle);
     }
 
     /// Post an owner-side closure (D233) given the full object-safe
@@ -324,7 +324,7 @@ impl ProducerEmitter {
     /// this now surfaces the `Core`-gone signal (was a silent
     /// `let _ = …`) so a caller whose closure captured retained
     /// `HandleId`s can release them on `false` — mirroring the
-    /// `emit_or_defer` / `error_or_defer` release-on-`false` contract.
+    /// `emit` / `error` release-on-`false` contract.
     /// The not-yet-written windowing / higher-order callers MUST honour
     /// this (release captured payload handles when it returns `false`).
     #[must_use = "a `false` return means the Core is gone and the closure was dropped unrun; release any handles it captured"]
@@ -438,7 +438,7 @@ impl<'a> ProducerCtx<'a> {
 
     /// Sink-side emit handle (D232-AMEND/A′). Cheap-`Clone`; capture it
     /// into spawned sink closures and call
-    /// `emit_or_defer`/`complete_or_defer`/`error_or_defer` exactly as
+    /// `emit`/`complete`/`error` exactly as
     /// the old cloned-`Core` did — ops post to the `Core`-owned mailbox
     /// and are applied in-wave by the drain-to-quiescence loop.
     #[must_use]
@@ -486,7 +486,12 @@ impl<'a> ProducerCtx<'a> {
     /// would never advance, etc.). See [`SubscribeOutcome::Dead`] for
     /// per-operator guidance.
     pub fn subscribe_to(&self, source: NodeId, sink: Sink) -> SubscribeOutcome {
-        let sink_for_defer = sink.clone();
+        // D274 (2026-05-21): the
+        // `SubscribeError::PartitionOrderViolation` retry arm was deleted
+        // — the union-find ascending-order shim it dodged is gone (groups
+        // are user-declared + static post-D248/D253; one Core per OS
+        // thread per D252). The only remaining failure is `TornDown`.
+        let _ = sink.clone();
         match self.core.try_subscribe(source, sink) {
             Ok(sub) => {
                 // S2b/D229: record `(source, sub_id)` for explicit
@@ -498,44 +503,6 @@ impl<'a> ProducerCtx<'a> {
                     .subs
                     .push((source, sub));
                 SubscribeOutcome::Live
-            }
-            Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                // S2b (D223/D231): the old code boxed a cloned-`Core`
-                // `DeferredProducerOp::Callback` only for
-                // `push_deferred_producer_op` to run it *immediately*
-                // (the deferred queue is a deleted D211 no-op shim — see
-                // `node::push_deferred_producer_op`). `Core` is no longer
-                // `Clone`; an inline retry on `self.core` is
-                // behaviour-identical (the prior path was already
-                // immediate). F2 /qa: still `try_subscribe` (not the
-                // panicking `subscribe`) so a source that raced to
-                // non-resubscribable+terminal doesn't crash the boundary.
-                match self.core.try_subscribe(source, sink_for_defer) {
-                    Ok(sub) => {
-                        self.storage
-                            .lock()
-                            .entry(self.node_id)
-                            .or_default()
-                            .subs
-                            .push((source, sub));
-                    }
-                    Err(graphrefly_core::SubscribeError::TornDown { .. }) => {
-                        // Source became Dead during the (now-immediate)
-                        // retry — silently drop, as before.
-                    }
-                    Err(graphrefly_core::SubscribeError::PartitionOrderViolation(_)) => {
-                        // The original deferral existed to retry with no
-                        // partition held; the D211 shim already made it
-                        // immediate, so a second order violation here is
-                        // the same substrate-invariant break the old
-                        // wave-end-drain panic guarded.
-                        panic!(
-                            "producer-op subscribe retry: partition-order violation — \
-                             substrate invariant broken (wave_guards still held)"
-                        );
-                    }
-                }
-                SubscribeOutcome::Deferred
             }
             Err(graphrefly_core::SubscribeError::TornDown { node }) => {
                 SubscribeOutcome::Dead { node }

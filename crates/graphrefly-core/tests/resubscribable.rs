@@ -27,7 +27,6 @@ fn subscribe_to_non_resubscribable_completed_returns_torn_down_error() {
     let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
     }
 }
@@ -57,7 +56,6 @@ fn subscribe_to_non_resubscribable_errored_returns_torn_down_error() {
     let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
     }
 }
@@ -71,7 +69,6 @@ fn subscribe_to_non_resubscribable_torndown_returns_torn_down_error() {
     let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
     }
 }
@@ -288,7 +285,6 @@ fn subscribe_to_non_resubscribable_terminated_with_invalidated_cache_returns_tor
     let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
-        Err(e) => panic!("expected TornDown, got Err({e:?})"),
         Ok(_) => panic!("expected TornDown, got Ok(_)"),
     }
 }

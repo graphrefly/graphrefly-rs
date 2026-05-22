@@ -24,8 +24,8 @@
 //! Timer operators (debounce, throttle, delay, audit) spawn a **per-operator
 //! tokio task** that owns all pending state (handles, counters) exclusively.
 //! The sync sink callback sends [`TemporalCmd`] commands; the async task
-//! manages timers via `tokio::time` and calls `Core::emit_or_defer` /
-//! `complete_or_defer` / `error_or_defer` when ready. This avoids the
+//! manages timers via `tokio::time` and calls `Core::emit` /
+//! `complete` / `error` when ready. This avoids the
 //! double-ownership problem that would arise from tracking pending handles
 //! in both the operator's state mutex and the generic timer substrate.
 //!
@@ -164,7 +164,7 @@ pub fn sample(
             for a in actions {
                 match a {
                     Act::Release(h) => bb.release_handle(h),
-                    Act::Error(h) => core_src.error_or_defer(pid, h),
+                    Act::Error(h) => core_src.error(pid, h),
                 }
             }
         });
@@ -195,7 +195,7 @@ pub fn sample(
                         let h = s.latest.unwrap();
                         bb2.retain_handle(h);
                         drop(s);
-                        core_n.emit_or_defer(pid, h);
+                        core_n.emit(pid, h);
                         // Re-acquire lock and continue processing remaining
                         // batch messages (e.g. a trailing Complete).
                         s = st2.borrow_mut();
@@ -208,7 +208,7 @@ pub fn sample(
                             }
                             bb2.retain_handle(h);
                             drop(s);
-                            core_n.error_or_defer(pid, h);
+                            core_n.error(pid, h);
                             return;
                         }
                         // Notifier COMPLETE → self-complete.
@@ -217,7 +217,7 @@ pub fn sample(
                             bb2.release_handle(old);
                         }
                         drop(s);
-                        core_n.complete_or_defer(pid);
+                        core_n.complete(pid);
                         return;
                     }
                     _ => {}
@@ -234,7 +234,7 @@ pub fn sample(
                     binding_s.release_handle(old);
                 }
                 drop(s);
-                core_s.complete_or_defer(pid);
+                core_s.complete(pid);
             }
         }
     });
@@ -355,13 +355,13 @@ async fn debounce_task(
                         Some(TemporalCmd::Complete) => {
                             // Flush pending then complete (em releases
                             // `h` itself if the Core is gone).
-                            em.emit_or_defer(pid, h);
-                            em.complete_or_defer(pid);
+                            em.emit(pid, h);
+                            em.complete(pid);
                             return;
                         }
                         Some(TemporalCmd::Error(err_h)) => {
                             binding.release_handle(h);
-                            em.error_or_defer(pid, err_h);
+                            em.error(pid, err_h);
                             return;
                         }
                         None => {
@@ -373,7 +373,7 @@ async fn debounce_task(
                 }
                 () = tokio::time::sleep(delay) => {
                     // Timer fired — emit pending.
-                    em.emit_or_defer(pid, h);
+                    em.emit(pid, h);
                     if em.is_core_gone() {
                         return;
                     }
@@ -387,11 +387,11 @@ async fn debounce_task(
                     pending = Some(h);
                 }
                 Some(TemporalCmd::Complete) => {
-                    em.complete_or_defer(pid);
+                    em.complete(pid);
                     return;
                 }
                 Some(TemporalCmd::Error(err_h)) => {
-                    em.error_or_defer(pid, err_h);
+                    em.error(pid, err_h);
                     return;
                 }
                 None => return,
@@ -502,13 +502,13 @@ async fn audit_task(
                                         }
                                         Some(TemporalCmd::Complete) => {
                                             // Emit latest, then complete.
-                                            em.emit_or_defer(pid, latest);
-                                            em.complete_or_defer(pid);
+                                            em.emit(pid, latest);
+                                            em.complete(pid);
                                             return; // exits the async block
                                         }
                                         Some(TemporalCmd::Error(err_h)) => {
                                             binding.release_handle(latest);
-                                            em.error_or_defer(pid, err_h);
+                                            em.error(pid, err_h);
                                             return;
                                         }
                                         None => {
@@ -524,7 +524,7 @@ async fn audit_task(
                     }
                     () = tokio::time::sleep(delay) => {
                         // Timer fired — emit latest, window closes.
-                        em.emit_or_defer(pid, latest);
+                        em.emit(pid, latest);
                         if em.is_core_gone() {
                             return;
                         }
@@ -533,11 +533,11 @@ async fn audit_task(
                 }
             }
             Some(TemporalCmd::Complete) => {
-                em.complete_or_defer(pid);
+                em.complete(pid);
                 return;
             }
             Some(TemporalCmd::Error(err_h)) => {
-                em.error_or_defer(pid, err_h);
+                em.error(pid, err_h);
                 return;
             }
             None => return,
@@ -638,7 +638,7 @@ async fn delay_task(
                     Some(TemporalCmd::Complete) => {
                         complete_pending = true;
                         if queue.is_empty() {
-                            em.complete_or_defer(pid);
+                            em.complete(pid);
                             return;
                         }
                         // Wait for pending timers to drain.
@@ -648,7 +648,7 @@ async fn delay_task(
                         for (_, h) in queue.drain(..) {
                             binding.release_handle(h);
                         }
-                        em.error_or_defer(pid, err_h);
+                        em.error(pid, err_h);
                         return;
                     }
                     None => {
@@ -665,7 +665,7 @@ async fn delay_task(
                 while let Some(&(deadline, _)) = queue.front() {
                     if deadline <= now {
                         let (_, h) = queue.pop_front().unwrap();
-                        em.emit_or_defer(pid, h);
+                        em.emit(pid, h);
                         if em.is_core_gone() {
                             for (_, h2) in queue.drain(..) {
                                 binding.release_handle(h2);
@@ -677,7 +677,7 @@ async fn delay_task(
                     }
                 }
                 if complete_pending && queue.is_empty() {
-                    em.complete_or_defer(pid);
+                    em.complete(pid);
                     return;
                 }
             }
@@ -814,7 +814,7 @@ async fn throttle_task(
                             // Window open — start new window.
                             window_deadline = Some(tokio::time::Instant::now() + window);
                             if opts.leading {
-                                em.emit_or_defer(pid, h);
+                                em.emit(pid, h);
                                 if em.is_core_gone() {
                                     release_opt(&mut trailing_pending, &*binding);
                                     return;
@@ -837,14 +837,14 @@ async fn throttle_task(
                     }
                     Some(TemporalCmd::Complete) => {
                         if let Some(h) = trailing_pending.take() {
-                            em.emit_or_defer(pid, h);
+                            em.emit(pid, h);
                         }
-                        em.complete_or_defer(pid);
+                        em.complete(pid);
                         return;
                     }
                     Some(TemporalCmd::Error(err_h)) => {
                         release_opt(&mut trailing_pending, &*binding);
-                        em.error_or_defer(pid, err_h);
+                        em.error(pid, err_h);
                         return;
                     }
                     None => {
@@ -857,7 +857,7 @@ async fn throttle_task(
                 // Window expired — emit trailing if any, reopen window.
                 window_deadline = None;
                 if let Some(h) = trailing_pending.take() {
-                    em.emit_or_defer(pid, h);
+                    em.emit(pid, h);
                     if em.is_core_gone() {
                         return;
                     }
@@ -905,7 +905,7 @@ pub fn interval(core: &Core, binding: &Arc<dyn ProducerBinding>, period_ms: u64)
                 }
                 let h = HandleId::new(counter);
                 bb.retain_handle(h);
-                em_task.emit_or_defer(pid, h);
+                em_task.emit(pid, h);
                 counter += 1;
             }
         });
@@ -1044,18 +1044,18 @@ async fn timeout_task(
                     Some(TemporalCmd::Value(h)) => {
                         // DATA arrived — forward it and reset the timer
                         // (the next loop iteration restarts the sleep).
-                        em.emit_or_defer(pid, h);
+                        em.emit(pid, h);
                         if em.is_core_gone() {
                             return;
                         }
                         // Continue loop → resets the sleep timer.
                     }
                     Some(TemporalCmd::Complete) => {
-                        em.complete_or_defer(pid);
+                        em.complete(pid);
                         return;
                     }
                     Some(TemporalCmd::Error(err_h)) => {
-                        em.error_or_defer(pid, err_h);
+                        em.error(pid, err_h);
                         return;
                     }
                     None => return,
@@ -1066,7 +1066,7 @@ async fn timeout_task(
                 // (skip if the Core is gone — nothing to error into).
                 if !em.is_core_gone() {
                     binding.retain_handle(error_handle);
-                    em.error_or_defer(pid, error_handle);
+                    em.error(pid, error_handle);
                 }
                 return;
             }
@@ -1211,19 +1211,19 @@ async fn buffer_time_task(
                         // Flush remaining buffer then complete.
                         if !buf.is_empty() {
                             let packed = binding.pack_tuple(pack_fn_id, &buf);
-                            em.emit_or_defer(pid, packed);
+                            em.emit(pid, packed);
                             for h in buf.drain(..) {
                                 binding.release_handle(h);
                             }
                         }
-                        em.complete_or_defer(pid);
+                        em.complete(pid);
                         return;
                     }
                     Some(BufferTimeCmd::Error(err_h)) => {
                         for h in buf.drain(..) {
                             binding.release_handle(h);
                         }
-                        em.error_or_defer(pid, err_h);
+                        em.error(pid, err_h);
                         return;
                     }
                     None => {
@@ -1238,7 +1238,7 @@ async fn buffer_time_task(
             _ = ticker.tick() => {
                 if !buf.is_empty() {
                     let packed = binding.pack_tuple(pack_fn_id, &buf);
-                    em.emit_or_defer(pid, packed);
+                    em.emit(pid, packed);
                     for h in buf.drain(..) {
                         binding.release_handle(h);
                     }
@@ -1304,7 +1304,7 @@ pub fn window_time(
             .register_producer(noop_fn_id)
             .expect("window_time inner: register_producer failed");
         let first_handle = bb.intern_node(first_inner);
-        core_s.emit_or_defer(pid, first_handle);
+        core_s.emit(pid, first_handle);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_sink = tx.clone();
