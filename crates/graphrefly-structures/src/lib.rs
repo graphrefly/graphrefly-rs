@@ -46,8 +46,9 @@ pub use changeset::{
     BaseChange, DeleteReason, IndexChange, Lifecycle, ListChange, LogChange, MapChange, Version,
 };
 pub use reactive::{
-    AppendLogSink, AttachOptions, AttachStorageHandle, IndexEqualsFn, IndexOutOfBounds, InternFn,
-    LogView, MapConfigError, ReactiveIndex, ReactiveIndexOptions, ReactiveList,
-    ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions,
-    ReactiveSub, RetentionPolicy, ScanHandle, UpsertOptions, ViewSpec,
+    AppendLogMode, AppendLogSink, AttachOptions, AttachStorageError, AttachStorageHandle,
+    IndexEqualsFn, IndexOutOfBounds, InternFn, LogView, MapConfigError, ReactiveIndex,
+    ReactiveIndexOptions, ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions,
+    ReactiveMap, ReactiveMapOptions, ReactiveSub, RetentionPolicy, ScanHandle, UpsertOptions,
+    ViewSpec,
 };

@@ -12,9 +12,10 @@ mod common;
 
 use common::StructuresRuntime;
 use graphrefly_structures::{
-    AppendLogSink, DeleteReason, IndexChange, IndexEqualsFn, ListChange, LogChange, MapChange,
-    ReactiveIndex, ReactiveIndexOptions, ReactiveList, ReactiveListOptions, ReactiveLog,
-    ReactiveLogOptions, ReactiveMap, ReactiveMapOptions, RetentionPolicy, UpsertOptions, ViewSpec,
+    AppendLogMode, AppendLogSink, AttachStorageError, DeleteReason, IndexChange, IndexEqualsFn,
+    ListChange, LogChange, MapChange, ReactiveIndex, ReactiveIndexOptions, ReactiveList,
+    ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap, ReactiveMapOptions,
+    RetentionPolicy, UpsertOptions, ViewSpec,
 };
 
 // ===========================================================================
@@ -1079,7 +1080,9 @@ fn log_attach_storage_preload_and_delta() {
         stored: Mutex::new(vec![1, 2]),
     });
 
-    let mut handle = log.attach_storage(rt.core(), vec![sink.clone()], true);
+    let mut handle = log
+        .attach_storage(rt.core(), vec![sink.clone()], true)
+        .expect("attach_storage with Append-mode sink succeeds");
 
     // Pre-loaded entries should be in the log.
     assert_eq!(log.to_vec(), vec![1, 2]);
@@ -1090,6 +1093,245 @@ fn log_attach_storage_preload_and_delta() {
     // emissions. append(3) produces delta [3]. Sink: [1,2] + [3] = [1,2,3].
     assert_eq!(*sink.stored.lock().unwrap(), vec![1, 2, 3]);
     handle.detach(rt.core());
+}
+
+// ===========================================================================
+// C/D (next batch, 2026-05-21): AppendLogSink::mode + flush + flush_all
+// ===========================================================================
+
+/// **C — D269 part-2 parity.** `attach_storage` must reject any sink
+/// declaring `AppendLogMode::Overwrite`. Delta-shipping into an
+/// overwrite sink would silently truncate the log to the last batch
+/// (memo:Re P1 hazard class).
+#[test]
+fn log_attach_storage_rejects_overwrite_sink() {
+    use std::sync::{Arc, Mutex};
+
+    struct OverwriteSink {
+        stored: Mutex<Vec<i64>>,
+    }
+    impl AppendLogSink<i64> for OverwriteSink {
+        fn append_entries(
+            &self,
+            entries: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.stored.lock().unwrap().extend_from_slice(entries);
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+        fn mode(&self) -> AppendLogMode {
+            AppendLogMode::Overwrite
+        }
+    }
+
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let append_sink: Arc<dyn AppendLogSink<i64>> = Arc::new(OverwriteSink {
+        stored: Mutex::new(Vec::new()),
+    });
+    let result = log.attach_storage(rt.core(), vec![append_sink], false);
+
+    match result {
+        Err(AttachStorageError::OverwriteSinkRejected { sink_index: 0 }) => {}
+        Err(other) => panic!("expected sink_index: 0, got error: {other}"),
+        Ok(_) => panic!("expected Overwrite sink to be rejected, got Ok"),
+    }
+}
+
+/// **C** — multi-sink rejection identifies the FIRST offending sink.
+#[test]
+fn log_attach_storage_rejects_first_overwrite_in_mixed_sinks() {
+    use std::sync::{Arc, Mutex};
+
+    struct AppendOk(Mutex<Vec<i64>>);
+    impl AppendLogSink<i64> for AppendOk {
+        fn append_entries(
+            &self,
+            e: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().extend_from_slice(e);
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+    struct OverwriteBad;
+    impl AppendLogSink<i64> for OverwriteBad {
+        fn append_entries(
+            &self,
+            _: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+        fn mode(&self) -> AppendLogMode {
+            AppendLogMode::Overwrite
+        }
+    }
+
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let s0: Arc<dyn AppendLogSink<i64>> = Arc::new(AppendOk(Mutex::new(Vec::new())));
+    let s1: Arc<dyn AppendLogSink<i64>> = Arc::new(OverwriteBad);
+    let s2: Arc<dyn AppendLogSink<i64>> = Arc::new(AppendOk(Mutex::new(Vec::new())));
+
+    match log.attach_storage(rt.core(), vec![s0, s1, s2], false) {
+        Err(AttachStorageError::OverwriteSinkRejected { sink_index: 1 }) => {}
+        Err(other) => panic!("expected sink_index: 1, got error: {other}"),
+        Ok(_) => panic!("expected Overwrite sink at index 1 to be rejected, got Ok"),
+    }
+}
+
+/// **D — F9 parity (Option B per D171 precedent).** `flush_all` drives
+/// every sink's `flush()` synchronously. Callers wire this from a
+/// reactive timer subgraph (`graphrefly_operators::temporal::interval`);
+/// the handle owns no internal timer.
+#[test]
+fn log_attach_storage_flush_all_drives_each_sink_flush() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct BufferingSink {
+        buffer: Mutex<Vec<i64>>,
+        committed: Mutex<Vec<i64>>,
+        flush_calls: AtomicU32,
+    }
+    impl AppendLogSink<i64> for BufferingSink {
+        fn append_entries(
+            &self,
+            entries: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.buffer.lock().unwrap().extend_from_slice(entries);
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.committed.lock().unwrap().clone())
+        }
+        fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.flush_calls.fetch_add(1, Ordering::Relaxed);
+            let mut buf = self.buffer.lock().unwrap();
+            self.committed.lock().unwrap().append(&mut buf);
+            Ok(())
+        }
+    }
+
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let sink_a = Arc::new(BufferingSink {
+        buffer: Mutex::new(Vec::new()),
+        committed: Mutex::new(Vec::new()),
+        flush_calls: AtomicU32::new(0),
+    });
+    let sink_b = Arc::new(BufferingSink {
+        buffer: Mutex::new(Vec::new()),
+        committed: Mutex::new(Vec::new()),
+        flush_calls: AtomicU32::new(0),
+    });
+
+    let sinks: Vec<Arc<dyn AppendLogSink<i64>>> = vec![sink_a.clone() as _, sink_b.clone() as _];
+    let mut handle = log
+        .attach_storage(rt.core(), sinks, false)
+        .expect("Append-mode sinks accepted");
+
+    log.append(rt.core(), 1);
+    log.append(rt.core(), 2);
+
+    // Pre-flush_all: entries are in the sinks' buffers, NOT committed.
+    assert_eq!(*sink_a.buffer.lock().unwrap(), vec![1, 2]);
+    assert!(sink_a.committed.lock().unwrap().is_empty());
+    assert_eq!(sink_a.flush_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(sink_b.flush_calls.load(Ordering::Relaxed), 0);
+
+    handle
+        .flush_all()
+        .expect("flush_all succeeds with no errors");
+
+    // Post-flush_all: every sink saw exactly one flush; entries moved
+    // from buffer to committed.
+    assert_eq!(sink_a.flush_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(sink_b.flush_calls.load(Ordering::Relaxed), 1);
+    assert!(sink_a.buffer.lock().unwrap().is_empty());
+    assert!(sink_b.buffer.lock().unwrap().is_empty());
+    assert_eq!(*sink_a.committed.lock().unwrap(), vec![1, 2]);
+    assert_eq!(*sink_b.committed.lock().unwrap(), vec![1, 2]);
+
+    handle.detach(rt.core());
+}
+
+/// **D** — `flush_all` surfaces a per-sink error with an index prefix
+/// for diagnostics; subsequent sinks are NOT attempted after the first
+/// failure (matches `graphrefly_storage::StorageHandle::flush_all`).
+#[test]
+fn log_attach_storage_flush_all_surfaces_first_error_with_index() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    struct OkSink(AtomicU32);
+    impl AppendLogSink<i64> for OkSink {
+        fn append_entries(
+            &self,
+            _: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+        fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    struct FailSink;
+    impl AppendLogSink<i64> for FailSink {
+        fn append_entries(
+            &self,
+            _: &[i64],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_entries(&self) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+        fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("injected flush fault".into())
+        }
+    }
+
+    let rt = StructuresRuntime::new();
+    let log = ReactiveLog::new(rt.core(), rt.intern_vec_fn(), ReactiveLogOptions::default());
+
+    let s0 = Arc::new(OkSink(AtomicU32::new(0)));
+    let s1 = Arc::new(FailSink);
+    let s2 = Arc::new(OkSink(AtomicU32::new(0)));
+    let sinks: Vec<Arc<dyn AppendLogSink<i64>>> =
+        vec![s0.clone() as _, s1.clone() as _, s2.clone() as _];
+
+    let handle = log
+        .attach_storage(rt.core(), sinks, false)
+        .expect("Append-mode sinks accepted");
+
+    let err = handle
+        .flush_all()
+        .expect_err("flush_all should fail at sink[1]");
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("sink[1] flush:"),
+        "error should prefix the failing sink index, got: {msg}",
+    );
+    assert!(msg.contains("injected flush fault"));
+
+    // s0 was flushed before the failure; s2 was NOT (short-circuit semantic).
+    assert_eq!(s0.0.load(Ordering::Relaxed), 1);
+    assert_eq!(s2.0.load(Ordering::Relaxed), 0);
 }
 
 // ===========================================================================

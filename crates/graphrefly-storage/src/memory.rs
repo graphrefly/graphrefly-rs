@@ -469,6 +469,25 @@ where
             // retry. Covered by
             // `append_log_append_mode_encode_failure_does_not_duplicate_on_retry`
             // and `append_log_append_mode_write_failure_does_not_duplicate_on_retry`.
+            // D-B (next batch, 2026-05-21) — rollback-epoch check is also
+            // applied to the error-restore path. If a concurrent
+            // `rollback()` advances the epoch DURING a failing
+            // `backend.read` / `codec.decode` / `codec.encode` /
+            // `backend.write`, the bucket-restore is silently dropped
+            // (the user's rollback intent supersedes the failed write's
+            // restore intent — without this check, retry would re-
+            // resurrect the rolled-back bucket).
+            let restore_or_drop = |buckets: &mut std::collections::HashMap<String, Vec<T>>,
+                                   key: String,
+                                   payload: Vec<T>| {
+                if self.rollback_epoch.load(Ordering::Acquire) == scheduled_epoch {
+                    buckets.insert(key, payload);
+                    *self.pending.lock() = std::mem::take(buckets);
+                }
+                // else: epoch advanced — drop the bucket; the user's
+                // `rollback()` wins. Already-written buckets stay
+                // (best-effort, same as the in-loop epoch abort).
+            };
             let (final_payload, restore_payload): (Vec<T>, Vec<T>) = match self.mode {
                 AppendLogMode::Overwrite => {
                     let snapshot = bucket.clone();
@@ -478,8 +497,7 @@ where
                     let existing = match self.backend.read(&key) {
                         Ok(e) => e,
                         Err(e) => {
-                            buckets.insert(key, bucket);
-                            *self.pending.lock() = buckets;
+                            restore_or_drop(&mut buckets, key, bucket);
                             return Err(e);
                         }
                     };
@@ -487,8 +505,7 @@ where
                         Some(bytes) if !bytes.is_empty() => match self.codec.decode(&bytes) {
                             Ok(v) => v,
                             Err(e) => {
-                                buckets.insert(key, bucket);
-                                *self.pending.lock() = buckets;
+                                restore_or_drop(&mut buckets, key, bucket);
                                 return Err(e.into());
                             }
                         },
@@ -502,14 +519,12 @@ where
             let encoded = match self.codec.encode(&final_payload) {
                 Ok(b) => b,
                 Err(e) => {
-                    buckets.insert(key, restore_payload);
-                    *self.pending.lock() = buckets;
+                    restore_or_drop(&mut buckets, key, restore_payload);
                     return Err(e.into());
                 }
             };
             if let Err(e) = self.backend.write(&key, &encoded) {
-                buckets.insert(key, restore_payload);
-                *self.pending.lock() = buckets;
+                restore_or_drop(&mut buckets, key, restore_payload);
                 return Err(e);
             }
         }

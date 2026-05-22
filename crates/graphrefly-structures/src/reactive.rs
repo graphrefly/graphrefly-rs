@@ -355,11 +355,55 @@ impl ScanHandle {
     }
 }
 
+/// **Local mirror of `graphrefly_storage::AppendLogMode`** (next batch
+/// 2026-05-21). `graphrefly-storage` already depends on
+/// `graphrefly-structures` (for `BaseChange<T>`), so we can't forward
+/// the enum the other direction without creating a dep cycle. The two
+/// declarations are intentionally identical and pre-1.0 stable; if a
+/// third mode is ever added, both must move together (`Append` /
+/// `Overwrite` are the locked D269 vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppendLogMode {
+    /// Read existing bucket, merge new entries, write back. M4.B default.
+    #[default]
+    Append,
+    /// Replace bucket contents with the current batch (no read-merge).
+    /// `ReactiveLog::attach_storage` rejects sinks declaring this mode —
+    /// delta-shipping into an overwrite sink silently truncates the log
+    /// to the last batch (memo:Re P1 hazard class).
+    Overwrite,
+}
+
+/// **Error returned by [`ReactiveLog::attach_storage`]** (next batch
+/// 2026-05-21 — D269 part-2 parity with TS `attachStorage` throw).
+#[derive(Debug)]
+pub enum AttachStorageError {
+    /// A sink declared `AppendLogMode::Overwrite`. Delta-shipping into
+    /// an overwrite sink silently truncates the log to the last batch.
+    OverwriteSinkRejected { sink_index: usize },
+}
+
+impl std::fmt::Display for AttachStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OverwriteSinkRejected { sink_index } => write!(
+                f,
+                "attach_storage: sink[{sink_index}] declares AppendLogMode::Overwrite — \
+                 delta-shipping into an overwrite sink truncates; use an Append-mode sink",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttachStorageError {}
+
 /// Trait for append-log storage sinks used by [`ReactiveLog::attach_storage`].
 ///
 /// Implementors receive batches of entries and optionally support pre-loading.
-/// Methods return `Result` — errors are swallowed by `attach_storage` (matches
-/// TS try/catch semantics) so a failing tier doesn't break the reactive graph.
+/// `append_entries` / `load_entries` / `flush` errors are swallowed by
+/// `attach_storage`'s in-wave delivery sink (matches TS try/catch semantics) so
+/// a failing tier doesn't break the reactive graph. `mode` is consulted at
+/// attach time only.
 pub trait AppendLogSink<T>: Send + Sync {
     /// Append entries to persistent storage.
     fn append_entries(&self, entries: &[T])
@@ -367,19 +411,64 @@ pub trait AppendLogSink<T>: Send + Sync {
     /// Load previously stored entries (for pre-loading on startup).
     /// Returns an empty vec if no entries are stored.
     fn load_entries(&self) -> Result<Vec<T>, Box<dyn std::error::Error + Send + Sync>>;
+    /// **D269 part-2 parity** — sink's persistence mode. `attach_storage`
+    /// rejects `Overwrite` sinks at attach time. Default `Append` so
+    /// existing impls work unchanged.
+    fn mode(&self) -> AppendLogMode {
+        AppendLogMode::Append
+    }
+    /// **F9 parity (Option B per D171 precedent)** — flush any buffered
+    /// writes synchronously. Drives [`AttachStorageHandle::flush_all`],
+    /// which callers wire from a reactive timer subgraph
+    /// (`graphrefly_operators::temporal::interval`). Default no-op so
+    /// non-buffering sinks need no implementation.
+    fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 /// Handle to an attach-storage subscription. Call
 /// [`AttachStorageHandle::detach`] to dispose it (no RAII — D246 r3).
-pub struct AttachStorageHandle {
+///
+/// **Generic over `T`** (next batch 2026-05-21) — the handle retains
+/// shared references to the sinks so [`AttachStorageHandle::flush_all`]
+/// can drive their `flush()` methods. Callers wire
+/// `interval(debounce_ms) → handle.flush_all()` (Option B per D171
+/// precedent — mirrors `graphrefly_storage::StorageHandle::flush_all`).
+pub struct AttachStorageHandle<T> {
     sub: ReactiveSub,
+    sinks: Vec<Arc<dyn AppendLogSink<T>>>,
 }
 
-impl AttachStorageHandle {
+impl<T> AttachStorageHandle<T> {
     /// Synchronously dispose the attach-storage subscription.
     /// Owner-invoked.
     pub fn detach(&mut self, core: &Core) {
         self.sub.detach(core);
+    }
+    /// **F9 parity** — drive every sink's `flush()` synchronously.
+    /// Returns the first error encountered (with a `sink[N] flush:`
+    /// prefix for diagnostics); subsequent sinks are NOT attempted
+    /// after a failure (matches `graphrefly_storage::StorageHandle::flush_all`).
+    /// Callers wire this from a reactive timer subgraph; the handle
+    /// owns no internal timer (no tokio in `graphrefly-structures`).
+    ///
+    /// **Caller obligation (D271 QA EC-2):** callers MUST NOT hold a
+    /// lock that any sink's `flush()` impl might try to acquire.
+    /// `flush_all` calls each sink synchronously and holds no internal
+    /// lock during the call, so a sink that re-enters a caller-held
+    /// lock would deadlock. Real-world sinks (`graphrefly-storage`'s
+    /// `AppendLogStorage::flush` is the canonical example) take only
+    /// their own internal locks — wiring `flush_all` from a reactive
+    /// timer subgraph is therefore deadlock-free by construction.
+    #[must_use = "ignoring AttachStorageHandle::flush_all's Result swallows write errors"]
+    pub fn flush_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for (i, sink) in self.sinks.iter().enumerate() {
+            if let Err(e) = sink.flush() {
+                return Err(format!("sink[{i}] flush: {e}").into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -690,14 +779,26 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         core: &Core,
         sinks: Vec<Arc<dyn AppendLogSink<T>>>,
         preload: bool,
-    ) -> AttachStorageHandle {
+    ) -> Result<AttachStorageHandle<T>, AttachStorageError> {
+        // **D269 part-2 parity (next batch 2026-05-21)** — reject
+        // `Overwrite` sinks loud (TS `attachStorage` throws on the
+        // same shape). Delta-shipping into overwrite silently
+        // truncates the log to the last batch — the memo:Re P1
+        // hazard class.
+        for (sink_index, sink) in sinks.iter().enumerate() {
+            if sink.mode() == AppendLogMode::Overwrite {
+                return Err(AttachStorageError::OverwriteSinkRejected { sink_index });
+            }
+        }
+
         if sinks.is_empty() {
             let sub = core.subscribe(self.node_id, Arc::new(|_| {}));
-            return AttachStorageHandle {
+            return Ok(AttachStorageHandle {
                 sub: ReactiveSub {
                     subs: vec![(self.node_id, sub)],
                 },
-            };
+                sinks,
+            });
         }
 
         if preload {
@@ -720,7 +821,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             .collect();
 
         let inner = Arc::clone(&self.inner);
-        let sinks_arc = sinks;
+        let sinks_for_sink = sinks.clone();
         let delivered_arc = delivered;
 
         let sub = core.subscribe(
@@ -731,7 +832,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                     let data = guard.backend.to_vec();
                     drop(guard);
 
-                    for (i, sink) in sinks_arc.iter().enumerate() {
+                    for (i, sink) in sinks_for_sink.iter().enumerate() {
                         let mut del = delivered_arc[i].lock();
                         let result = match data.len().cmp(&*del) {
                             std::cmp::Ordering::Greater => sink.append_entries(&data[*del..]),
@@ -747,11 +848,12 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
             }),
         );
 
-        AttachStorageHandle {
+        Ok(AttachStorageHandle {
             sub: ReactiveSub {
                 subs: vec![(self.node_id, sub)],
             },
-        }
+            sinks,
+        })
     }
 }
 

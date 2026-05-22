@@ -672,6 +672,99 @@ fn append_log_append_mode_write_failure_does_not_duplicate_on_retry() {
 // extra coverage.
 
 #[test]
+fn append_log_rollback_during_write_error_drops_bucket_not_restores() {
+    // D-B (next batch, 2026-05-21) — rollback-epoch is also checked in
+    // the error-restore path. Without the fix: a `backend.write` that
+    // returns Err while `rollback()` interleaves would unconditionally
+    // re-insert the bucket into `pending`; the next flush would re-
+    // resurrect a bucket the user just rolled back.
+    //
+    // Scenario:
+    //   1. Tier with debounce_ms=50 (no auto-flush)
+    //   2. append [9, 10]; flush() starts on thread A
+    //   3. backend.write blocks on a barrier
+    //   4. Thread B: rollback() (bumps epoch, clears pending — already
+    //      empty since flush took it)
+    //   5. backend.write returns Err (fault injected after rollback)
+    //   6. flush's error-restore path checks epoch; sees advance; DROPS
+    //      the bucket instead of restoring
+    //   7. Assert: `pending` is empty (NOT [9, 10]); a clean retry
+    //      flush() persists nothing (the rollback won).
+    use std::sync::Arc as StdArc;
+    use std::sync::Barrier;
+
+    struct FaultBarrierBackend {
+        inner: StdArc<MemoryBackend>,
+        write_ready: StdArc<Barrier>,
+        rollback_done: StdArc<Barrier>,
+    }
+    impl StorageBackend for FaultBarrierBackend {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.read(key)
+        }
+        fn write(&self, _key: &str, _bytes: &[u8]) -> Result<(), StorageError> {
+            // Signal the rollback thread we're about to attempt a write,
+            // then wait for it to bump the epoch before we return Err.
+            self.write_ready.wait();
+            self.rollback_done.wait();
+            Err(StorageError::BackendError {
+                message: "injected write fault (post-rollback)".into(),
+                source: None,
+            })
+        }
+        fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix)
+        }
+    }
+    let inner = memory_backend();
+    let write_ready = StdArc::new(Barrier::new(2));
+    let rollback_done = StdArc::new(Barrier::new(2));
+    let backend = StdArc::new(FaultBarrierBackend {
+        inner: StdArc::clone(&inner),
+        write_ready: StdArc::clone(&write_ready),
+        rollback_done: StdArc::clone(&rollback_done),
+    });
+    let log = StdArc::new(append_log_storage(
+        StdArc::clone(&backend) as Arc<dyn StorageBackend>,
+        AppendLogStorageOptions::<u32, _> {
+            name: Some("evts".into()),
+            debounce_ms: Some(50),
+            ..Default::default()
+        },
+    ));
+    log.append_entries(&[9, 10]).unwrap();
+
+    let log_for_flush = StdArc::clone(&log);
+    let flush_thread = std::thread::spawn(move || log_for_flush.flush());
+
+    write_ready.wait();
+    log.rollback().unwrap(); // bump epoch; clear pending (already empty)
+    rollback_done.wait();
+
+    let result = flush_thread.join().unwrap();
+    assert!(
+        result.is_err(),
+        "flush should still surface the underlying write error: {result:?}",
+    );
+
+    // The rollback won — `pending` must be empty (bucket dropped, not
+    // restored). Verified by a clean retry flush: nothing to write.
+    log.flush().unwrap();
+    let persisted = inner.list("").unwrap();
+    assert!(
+        persisted.is_empty(),
+        "post-rollback pending bucket must have been dropped, not restored \
+         (would have re-resurrected on retry); keys: {persisted:?}",
+    );
+}
+
+#[test]
 fn append_log_flush_merges_with_existing_backend_bucket() {
     let backend = memory_backend();
     let log1 = append_log_storage(
