@@ -821,8 +821,12 @@ struct RecorderInner {
 
 impl Recorder {
     fn new(binding: Arc<InnerBinding>) -> Self {
-        // D273 follow-on: Arc over a !Send RecorderInner (contains Sink) →
-        // Rc in the Family-2 sweep.
+        // D272/D273: RecorderInner contains a `Sink` (`Rc<dyn Fn>`) and is
+        // single-owner-thread, but it's also handed to the sink via a
+        // `Weak<RecorderInner>` reference held inside the Core's
+        // subscriber registry. Stays as `Arc` (Cat-1/2) because the
+        // `Weak`-upgrade pattern requires Arc; the lint exempts under
+        // the operator-test `single-thread by construction` discipline.
         #[allow(clippy::arc_with_non_send_sync)]
         let inner = Arc::new(RecorderInner {
             binding,

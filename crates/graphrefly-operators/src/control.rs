@@ -11,10 +11,9 @@
 
 #![allow(clippy::too_many_lines, clippy::items_after_statements)]
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
@@ -205,7 +204,7 @@ pub fn on_first_data(
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
-        let state: Arc<Mutex<OnFirstState>> = Arc::new(Mutex::new(OnFirstState { fired: false }));
+        let state: Rc<RefCell<OnFirstState>> = Rc::new(RefCell::new(OnFirstState { fired: false }));
 
         let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
@@ -216,7 +215,7 @@ pub fn on_first_data(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = state.lock();
+                let mut s = state.borrow_mut();
                 for m in msgs {
                     match m.tier() {
                         3 => {
@@ -386,7 +385,7 @@ pub fn valve(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<ValveState>> = Arc::new(Mutex::new(ValveState {
+        let state: Rc<RefCell<ValveState>> = Rc::new(RefCell::new(ValveState {
             open: false,
             terminated: false,
         }));
@@ -400,7 +399,7 @@ pub fn valve(
             let mut should_cancel = false;
             let mut error_action: Option<HandleId> = None;
             {
-                let mut s = st_ctrl.lock();
+                let mut s = st_ctrl.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -461,7 +460,7 @@ pub fn valve(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let s = st_src.lock();
+                let s = st_src.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -499,7 +498,7 @@ pub fn valve(
 
         let src_outcome = ctx.subscribe_to(source, source_sink);
         if matches!(src_outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 drop(s);
@@ -546,7 +545,7 @@ pub fn settle(
         let pid = ctx.node_id();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
-        let state: Arc<Mutex<SettleState>> = Arc::new(Mutex::new(SettleState {
+        let state: Rc<RefCell<SettleState>> = Rc::new(RefCell::new(SettleState {
             wave_count: 0,
             quiet_count: 0,
             completed: false,
@@ -561,7 +560,7 @@ pub fn settle(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = state.lock();
+                let mut s = state.borrow_mut();
                 if s.completed {
                     return;
                 }
@@ -655,7 +654,7 @@ pub fn repeat(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<RepeatState>> = Arc::new(Mutex::new(RepeatState {
+        let state: Rc<RefCell<RepeatState>> = Rc::new(RefCell::new(RepeatState {
             remaining: count,
             terminated: false,
         }));
@@ -669,11 +668,9 @@ pub fn repeat(
         let storage = ctx.storage();
 
         // Build the sink closure. It needs to reference itself for
-        // resubscription, so we use a shared slot.
-        // D273 follow-on: Arc<Mutex<...>> over a !Send Sink → converted to
-        // Rc<RefCell<...>> in the workspace-wide Family-2 Cat-3 sweep.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let sink_slot: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
+        // resubscription, so we use a shared slot. Single-owner since
+        // D248/D272 (`Sink = Rc<dyn Fn>`); the slot is owner-thread-only.
+        let sink_slot: Rc<RefCell<Option<Sink>>> = Rc::new(RefCell::new(None));
         let sink_slot_inner = sink_slot.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
@@ -688,7 +685,7 @@ pub fn repeat(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = state.lock();
+                let mut s = state.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -731,7 +728,7 @@ pub fn repeat(
                     Act::Complete => core_sink.complete_or_defer(pid),
                     Act::Resubscribe => {
                         // Get our own sink from the shared slot.
-                        let maybe_sink = sink_slot_inner.lock().clone();
+                        let maybe_sink = sink_slot_inner.borrow_mut().clone();
                         if let Some(new_sink) = maybe_sink {
                             // D234: a long-lived sink can't hold `&Core`;
                             // route the re-subscribe through `em.defer`
@@ -753,7 +750,7 @@ pub fn repeat(
                                 } else {
                                     // Source dead / partition
                                     // violation — terminal complete.
-                                    let mut s = state_d.lock();
+                                    let mut s = state_d.borrow_mut();
                                     if !s.terminated {
                                         s.terminated = true;
                                         drop(s);
@@ -768,7 +765,7 @@ pub fn repeat(
         });
 
         // Store sink in the shared slot so resubscribe can access it.
-        *sink_slot.lock() = Some(source_sink.clone());
+        *sink_slot.borrow_mut() = Some(source_sink.clone());
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {

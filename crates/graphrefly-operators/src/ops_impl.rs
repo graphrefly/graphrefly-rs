@@ -12,9 +12,10 @@
 // machine logic across helpers without clear benefit.
 #![allow(clippy::too_many_lines)]
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use graphrefly_core::{Core, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
@@ -27,7 +28,7 @@ use super::producer::{ProducerBinding, ProducerCtx};
 // =====================================================================
 
 /// Per-zip-node state: one FIFO queue per source, plus a flag for each
-/// source's terminal. Lives behind `Arc<Mutex<_>>` captured by the
+/// source's terminal. Lives behind `Rc<RefCell<_>>` captured by the
 /// build + sink closures.
 struct ZipState {
     queues: Vec<VecDeque<HandleId>>,
@@ -102,7 +103,7 @@ pub fn zip(
         let binding_clone = ctx.core().binding();
         let em = ctx.emitter();
         // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
-        let state: Arc<Mutex<ZipState>> = Arc::new(Mutex::new(ZipState::new(n)));
+        let state: Rc<RefCell<ZipState>> = Rc::new(RefCell::new(ZipState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
             let state_inner = state.clone();
@@ -125,7 +126,7 @@ pub fn zip(
                 // drain queues on terminate to avoid handle leaks).
                 let mut to_release: SmallVec<[HandleId; 8]> = SmallVec::new();
                 {
-                    let mut s = state_inner.lock().unwrap();
+                    let mut s = state_inner.borrow_mut();
                     if s.terminated {
                         return;
                     }
@@ -218,7 +219,7 @@ pub fn zip(
                 let mut should_complete = false;
                 let mut to_release: SmallVec<[HandleId; 8]> = SmallVec::new();
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.borrow_mut();
                     if !s.terminated {
                         s.completed[idx] = true;
                         if s.queues[idx].is_empty() {
@@ -296,7 +297,7 @@ pub fn concat(
         let producer_id = ctx.node_id();
         let binding_clone = ctx.core().binding();
         let em = ctx.emitter();
-        let state: Arc<Mutex<ConcatState>> = Arc::new(Mutex::new(ConcatState::new()));
+        let state: Rc<RefCell<ConcatState>> = Rc::new(RefCell::new(ConcatState::new()));
 
         // Subscribe to second FIRST so phase-0 DATA buffering catches
         // synchronous initial emissions. Sinks capture strong refs cloned
@@ -313,7 +314,7 @@ pub fn concat(
             let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
             let mut to_release: SmallVec<[HandleId; 4]> = SmallVec::new();
             {
-                let mut s = state_for_second.lock().unwrap();
+                let mut s = state_for_second.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -382,7 +383,7 @@ pub fn concat(
             second_outcome,
             crate::producer::SubscribeOutcome::Dead { .. }
         ) {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             s.second_completed = true;
             // No additional action — the first-Complete path or first-Dead
             // path below will trigger producer-Complete.
@@ -404,7 +405,7 @@ pub fn concat(
             let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
             let mut to_release: SmallVec<[HandleId; 4]> = SmallVec::new();
             {
-                let mut s = state_for_first.lock().unwrap();
+                let mut s = state_for_first.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -491,7 +492,7 @@ pub fn concat(
             let mut should_complete = false;
             let mut pending_to_emit: Vec<HandleId> = Vec::new();
             {
-                let mut s = state.lock().unwrap();
+                let mut s = state.borrow_mut();
                 if !s.terminated && s.phase == 0 {
                     s.phase = 1;
                     // Drain pending second-DATA buffered during phase 0.
@@ -569,7 +570,7 @@ pub fn race(
         let binding_clone = ctx.core().binding();
         let em = ctx.emitter();
         // R5.7.x — n >= 1 guaranteed by factory-level empty-sources check.
-        let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::new(n)));
+        let state: Rc<RefCell<RaceState>> = Rc::new(RefCell::new(RaceState::new(n)));
 
         for (idx, &source) in sources.iter().enumerate() {
             let state_inner = state.clone();
@@ -583,7 +584,7 @@ pub fn race(
                 }
                 let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
                 {
-                    let mut s = state_inner.lock().unwrap();
+                    let mut s = state_inner.borrow_mut();
                     if s.terminated {
                         return;
                     }
@@ -658,7 +659,7 @@ pub fn race(
                 let core_dead = em.clone();
                 let mut should_complete = false;
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.borrow_mut();
                     if !s.terminated && s.winner.is_none() {
                         s.completed[idx] = true;
                         if s.completed.iter().all(|&c| c) {
@@ -715,7 +716,7 @@ pub fn take_until(
         let producer_id = ctx.node_id();
         let binding_clone = ctx.core().binding();
         let em = ctx.emitter();
-        let state: Arc<Mutex<TakeUntilState>> = Arc::new(Mutex::new(TakeUntilState::new()));
+        let state: Rc<RefCell<TakeUntilState>> = Rc::new(RefCell::new(TakeUntilState::new()));
 
         // Source sink: forward DATA, propagate terminals.
         let state_for_source = state.clone();
@@ -729,7 +730,7 @@ pub fn take_until(
             }
             let mut actions: SmallVec<[Action; 4]> = SmallVec::new();
             {
-                let mut s = state_for_source.lock().unwrap();
+                let mut s = state_for_source.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -782,7 +783,7 @@ pub fn take_until(
             let core_dead = em.clone();
             let mut should_complete = false;
             {
-                let mut s = state.lock().unwrap();
+                let mut s = state.borrow_mut();
                 if !s.terminated {
                     s.terminated = true;
                     should_complete = true;
@@ -804,7 +805,7 @@ pub fn take_until(
             }
             let mut action: Option<Action> = None;
             {
-                let mut s = state_for_notifier.lock().unwrap();
+                let mut s = state_for_notifier.borrow_mut();
                 if s.terminated {
                     return;
                 }

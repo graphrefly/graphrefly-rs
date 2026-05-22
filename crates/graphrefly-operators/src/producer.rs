@@ -115,7 +115,7 @@ pub type ProducerBuildFn = Box<dyn Fn(ProducerCtx<'_>) + Send + Sync>;
 /// Holds upstream `Subscription`s (auto-dropped on producer
 /// deactivation) plus an optional `Box<dyn Any>` slot for op-specific
 /// state shared across the build closure and its sink closures.
-/// (Most ops capture state via `Arc<Mutex<...>>` directly in closure
+/// (Most ops capture state via `Rc<RefCell<...>>` directly in closure
 /// captures; the `op_state` slot is reserved for ops that prefer
 /// trait-object storage.)
 #[derive(Default)]
@@ -136,9 +136,11 @@ pub struct ProducerNodeState {
 /// Storage shared between the [`ProducerBinding`] impl and the
 /// [`ProducerCtx`] passed to build closures. Keyed by producer NodeId.
 ///
-/// Access via `Arc<Mutex<_>>` so the binding's `producer_deactivate`
-/// hook can clear an entry while build/sink closures hold their own
-/// per-op state via separate Arc captures.
+/// Cat-1/2 (D273): `ProducerStorage` is held inside `Arc<dyn
+/// ProducerBinding>` (the binding side's aggregate), which is `Send +
+/// Sync` by trait bound. `Rc<RefCell<...>>` would violate that — stays
+/// `Arc<Mutex<...>>`. Per-op state on build/sink closures uses its own
+/// Cat-3 cells (see `higher_order.rs`/`buffer.rs`).
 pub type ProducerStorage = Arc<Mutex<HashMap<NodeId, ProducerNodeState>>>;
 
 /// Closure-registration interface for producer-shape operators —
@@ -451,7 +453,7 @@ impl<'a> ProducerCtx<'a> {
     /// `Arc<dyn ProducerBinding>` (only `ctx`'s borrowed `&Core` +
     /// `&ProducerStorage`), and a sink can't reach `ProducerBinding`
     /// either. The returned `ProducerStorage` is
-    /// `Arc<Mutex<…>>` — `'static` + cheap-`Clone`, so it can be
+    /// `Rc<RefCell<…>>` — `'static` + cheap-`Clone`, so it can be
     /// captured into long-lived sink closures (exactly how the old code
     /// captured `binding.producer_storage().clone()`).
     #[must_use]
@@ -589,7 +591,7 @@ pub fn default_producer_deactivate(
 // All four producer ops follow the same shape:
 //
 // 1. Operator factory captures `Core::clone()` + sources + per-op state
-//    (Arc<Mutex<...>>) into a build closure.
+//    (Rc<RefCell<...>>) into a build closure.
 // 2. `register_producer_build` returns a FnId.
 // 3. `Core::register_producer(fn_id)` creates the producer node.
 // 4. On first subscribe, Core fires invoke_fn → binding dispatches to

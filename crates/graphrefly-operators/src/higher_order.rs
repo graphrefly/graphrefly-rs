@@ -57,9 +57,10 @@
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
 
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use ahash::AHashMap;
 use graphrefly_core::{Core, FnId, HandleId, Message, NodeId, Sink};
@@ -258,9 +259,7 @@ pub fn switch_map(
             return;
         };
         let em = ctx.emitter();
-        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let state: Arc<Mutex<SwitchState>> = Arc::new(Mutex::new(SwitchState::new()));
+        let state: Rc<RefCell<SwitchState>> = Rc::new(RefCell::new(SwitchState::new()));
 
         let state_for_outer = state.clone();
         let em_for_outer = em.clone();
@@ -281,7 +280,7 @@ pub fn switch_map(
             }
             let mut plan = Plan::default();
             {
-                let mut s = state_for_outer.lock().unwrap();
+                let mut s = state_for_outer.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -357,7 +356,7 @@ pub fn switch_map(
                 // subscribe-defer is what actually invalidates a
                 // superseded-but-still-queued prior subscribe.
                 let my_epoch = {
-                    let mut s = state_for_outer.lock().unwrap();
+                    let mut s = state_for_outer.borrow_mut();
                     let prev = s.inner_sub.take();
                     s.epoch += 1;
                     let e = s.epoch;
@@ -405,7 +404,7 @@ pub fn switch_map(
                         Ok(sub) => {
                             let guard = SubGuard::new(inner_node, sub, em_guard);
                             let to_drop = {
-                                let mut s = state_sub.lock().unwrap();
+                                let mut s = state_sub.borrow_mut();
                                 if s.terminated || s.epoch != my_epoch {
                                     Some(guard)
                                 } else {
@@ -450,7 +449,7 @@ pub fn switch_map(
 }
 
 fn make_switch_on_complete(
-    state: Arc<Mutex<SwitchState>>,
+    state: Rc<RefCell<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Rc<dyn Fn()> {
@@ -458,7 +457,7 @@ fn make_switch_on_complete(
         let prev_inner;
         let mut should_complete = false;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -476,14 +475,14 @@ fn make_switch_on_complete(
 }
 
 fn make_switch_on_error(
-    state: Arc<Mutex<SwitchState>>,
+    state: Rc<RefCell<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Rc<dyn Fn(HandleId)> {
     Rc::new(move |h| {
         let prev_inner;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -554,9 +553,7 @@ pub fn exhaust_map(
             return;
         };
         let em = ctx.emitter();
-        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let state: Arc<Mutex<ExhaustState>> = Arc::new(Mutex::new(ExhaustState::new()));
+        let state: Rc<RefCell<ExhaustState>> = Rc::new(RefCell::new(ExhaustState::new()));
 
         let state_for_outer = state.clone();
         let em_for_outer = em.clone();
@@ -573,7 +570,7 @@ pub fn exhaust_map(
             }
             let mut plan = Plan::default();
             {
-                let mut s = state_for_outer.lock().unwrap();
+                let mut s = state_for_outer.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -672,7 +669,7 @@ pub fn exhaust_map(
                         Ok(sub) => {
                             let guard = SubGuard::new(inner_node, sub, em_guard);
                             let to_drop = {
-                                let mut s = state_sub.lock().unwrap();
+                                let mut s = state_sub.borrow_mut();
                                 if s.terminated {
                                     Some(guard)
                                 } else {
@@ -709,7 +706,7 @@ pub fn exhaust_map(
 }
 
 fn make_exhaust_on_complete(
-    state: Arc<Mutex<ExhaustState>>,
+    state: Rc<RefCell<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Rc<dyn Fn()> {
@@ -717,7 +714,7 @@ fn make_exhaust_on_complete(
         let prev_inner;
         let mut should_complete = false;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -738,14 +735,14 @@ fn make_exhaust_on_complete(
 }
 
 fn make_exhaust_on_error(
-    state: Arc<Mutex<ExhaustState>>,
+    state: Rc<RefCell<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
 ) -> Rc<dyn Fn(HandleId)> {
     Rc::new(move |h| {
         let prev_inner;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -870,9 +867,7 @@ pub fn merge_map_with_concurrency(
             return;
         };
         let em = ctx.emitter();
-        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let state: Arc<Mutex<MergeMapState>> = Arc::new(Mutex::new(MergeMapState::new()));
+        let state: Rc<RefCell<MergeMapState>> = Rc::new(RefCell::new(MergeMapState::new()));
 
         let state_for_outer = state.clone();
         let em_for_outer = em.clone();
@@ -886,7 +881,7 @@ pub fn merge_map_with_concurrency(
             let mut error_action: Option<HandleId> = None;
             let mut self_complete_now = false;
             {
-                let mut s = state_for_outer.lock().unwrap();
+                let mut s = state_for_outer.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -966,7 +961,7 @@ pub fn merge_map_with_concurrency(
 // `SubscriptionId` is wrapped in a `SubGuard` keyed in `inner_subs`
 // (its Drop schedules the unsubscribe).
 fn drain_merge_buffer(
-    state: &Arc<Mutex<MergeMapState>>,
+    state: &Rc<RefCell<MergeMapState>>,
     em: &ProducerEmitter,
     binding: &Arc<dyn HigherOrderBinding>,
     producer_binding: &Arc<dyn ProducerBinding>,
@@ -984,7 +979,7 @@ fn drain_merge_buffer(
         let h_and_id;
         let mut should_self_complete = false;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 MERGE_DRAIN_ACTIVE.with(|f| f.set(false));
                 return;
@@ -1063,7 +1058,7 @@ fn drain_merge_buffer(
                 Ok(sub) => {
                     let guard = SubGuard::new(inner_node, sub, em_guard);
                     let to_drop = {
-                        let mut s = state_sub.lock().unwrap();
+                        let mut s = state_sub.borrow_mut();
                         if s.terminated || !s.pending_inner_ids.remove(&inner_id) {
                             Some(guard)
                         } else {
@@ -1094,7 +1089,7 @@ fn drain_merge_buffer(
 }
 
 fn make_merge_on_complete(
-    state: Arc<Mutex<MergeMapState>>,
+    state: Rc<RefCell<MergeMapState>>,
     em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_binding: Arc<dyn ProducerBinding>,
@@ -1106,7 +1101,7 @@ fn make_merge_on_complete(
     Rc::new(move || {
         let removed_sub;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -1145,7 +1140,7 @@ fn make_merge_on_complete(
 /// inner-error before all buffered DATAs project would leak refcount
 /// shares.
 fn make_merge_on_error(
-    state: Arc<Mutex<MergeMapState>>,
+    state: Rc<RefCell<MergeMapState>>,
     em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_id: NodeId,
@@ -1154,7 +1149,7 @@ fn make_merge_on_error(
         let removed_subs;
         let buffered_to_release;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             if s.terminated {
                 return;
             }

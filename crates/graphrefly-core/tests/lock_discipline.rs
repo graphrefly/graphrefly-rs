@@ -191,9 +191,10 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
     // `Core::emit(producer_id, h)`).
     use std::sync::Arc;
 
-    // D273 follow-on: Arc<TestRuntime> over a !Send TestRuntime (post-D248
-    // `Sink = Rc<dyn Fn>` makes any sink-capturing handle !Send) — converted
-    // to Rc in the Family-2 sweep.
+    // D272/D273: `TestRuntime` is a !Send aggregate (its inner sinks are
+    // `Rc<dyn Fn>` post-D272). Test-side single-thread ownership uses
+    // `Arc` here because the test inspects the sink-captured handle
+    // across closure boundaries; lint allow is bounded to this test fn.
     #[allow(clippy::arc_with_non_send_sync)]
     let rt = Arc::new(TestRuntime::new());
     let s = rt.state(Some(TestValue::Int(0)));

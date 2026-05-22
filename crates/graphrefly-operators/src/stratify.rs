@@ -55,10 +55,10 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink, NO_HANDLE};
@@ -213,7 +213,7 @@ pub fn stratify_branch(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<StratifyState>> = Arc::new(Mutex::new(StratifyState {
+        let state: Rc<RefCell<StratifyState>> = Rc::new(RefCell::new(StratifyState {
             latest_rules: None,
             source_value: None,
             source_dirty: false,
@@ -235,7 +235,7 @@ pub fn stratify_branch(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = st_rules.lock();
+                let mut s = st_rules.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -295,7 +295,7 @@ pub fn stratify_branch(
         // `latestRules = rulesNode.cache` seeding.
         let pre_seed = core_s.cache_of(rules);
         if pre_seed != NO_HANDLE {
-            let already_set = state.lock().latest_rules.is_some();
+            let already_set = state.borrow_mut().latest_rules.is_some();
             if !already_set {
                 // Lock-released retain per leaf-op contract, then
                 // re-check (covers the race where the rules sink
@@ -303,7 +303,7 @@ pub fn stratify_branch(
                 // build closure's partition lock this race is not
                 // expected today).
                 binding_s.retain_handle(pre_seed);
-                let mut s = state.lock();
+                let mut s = state.borrow_mut();
                 if s.latest_rules.is_none() {
                     s.latest_rules = Some(pre_seed);
                 } else {
@@ -329,7 +329,7 @@ pub fn stratify_branch(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = st_src.lock();
+                let mut s = st_src.borrow_mut();
                 for m in msgs {
                     match m.tier() {
                         // Source DIRTY — gating signal. Skip if
@@ -439,7 +439,7 @@ pub fn stratify_branch(
 
         let src_outcome = ctx.subscribe_to(source, source_sink);
         if matches!(src_outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 drop(s);

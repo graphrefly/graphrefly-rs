@@ -7,10 +7,9 @@
 //! - [`window`] — notifier-triggered sub-node splitting.
 //! - [`window_count`] — count-based sub-node splitting.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 use graphrefly_core::{BindingBoundary, Core, FnId, HandleId, NodeId, Sink};
 use smallvec::SmallVec;
@@ -62,7 +61,7 @@ pub fn buffer(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<BufferState>> = Arc::new(Mutex::new(BufferState::new()));
+        let state: Rc<RefCell<BufferState>> = Rc::new(RefCell::new(BufferState::new()));
 
         // --- source sink ---
         let st = state.clone();
@@ -77,7 +76,7 @@ pub fn buffer(
             }
             let mut actions: SmallVec<[Act; 2]> = SmallVec::new();
             {
-                let mut s = st.lock();
+                let mut s = st.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -137,7 +136,7 @@ pub fn buffer(
 
         let src_outcome = ctx.subscribe_to(source, source_sink);
         if matches!(src_outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 s.source_completed = true;
@@ -160,7 +159,7 @@ pub fn buffer(
             }
             let mut actions: SmallVec<[Act; 2]> = SmallVec::new();
             {
-                let mut s = st2.lock();
+                let mut s = st2.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -261,7 +260,7 @@ pub fn buffer_count(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<BufferCountState>> = Arc::new(Mutex::new(BufferCountState::new()));
+        let state: Rc<RefCell<BufferCountState>> = Rc::new(RefCell::new(BufferCountState::new()));
 
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
@@ -275,7 +274,7 @@ pub fn buffer_count(
             }
             let mut actions: SmallVec<[Act; 4]> = SmallVec::new();
             {
-                let mut s = st.lock();
+                let mut s = st.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -338,7 +337,7 @@ pub fn buffer_count(
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 drop(s);
@@ -397,13 +396,13 @@ pub fn window(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<WindowState>> = Arc::new(Mutex::new(WindowState::new()));
+        let state: Rc<RefCell<WindowState>> = Rc::new(RefCell::new(WindowState::new()));
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
         // Create first inner window node and emit it.
         let first_inner = create_window_node(core_s, &*bb);
         {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             s.inner_id = Some(first_inner.0);
         }
         core_s.emit_or_defer(pid, first_inner.1);
@@ -427,7 +426,7 @@ pub fn window(
                 // `if s.terminated { break }`) — a batched
                 // `[COMPLETE, DATA]` must NOT forward DATA after the
                 // COMPLETE (R2.6.4 / no-data-after-terminal).
-                if st.lock().terminated {
+                if st.borrow_mut().terminated {
                     break;
                 }
                 match m.tier() {
@@ -437,7 +436,7 @@ pub fn window(
                             let st_c = st.clone();
                             let bb_c = bb_src.clone();
                             if !em_src.defer(move |c| {
-                                let inner = st_c.lock().inner_id;
+                                let inner = st_c.borrow_mut().inner_id;
                                 match inner {
                                     Some(i) => c.emit(i, h),
                                     None => bb_c.release_handle(h),
@@ -454,7 +453,7 @@ pub fn window(
                         // this, source-COMPLETE and notifier-ERROR each
                         // pass their fire-time check before either defer
                         // runs → double terminal on `pid`.
-                        let was = std::mem::replace(&mut st.lock().terminated, true);
+                        let was = std::mem::replace(&mut st.borrow_mut().terminated, true);
                         if was {
                             break;
                         }
@@ -464,7 +463,7 @@ pub fn window(
                             let st_c = st.clone();
                             let bb_c = bb_src.clone();
                             if !em_src.defer(move |c| {
-                                if let Some(i) = st_c.lock().inner_id.take() {
+                                if let Some(i) = st_c.borrow_mut().inner_id.take() {
                                     bb_c.retain_handle(h);
                                     c.error(i, h);
                                 }
@@ -476,7 +475,7 @@ pub fn window(
                             // COMPLETE — complete current window, then self.
                             let st_c = st.clone();
                             let _ = em_src.defer(move |c| {
-                                if let Some(i) = st_c.lock().inner_id.take() {
+                                if let Some(i) = st_c.borrow_mut().inner_id.take() {
                                     c.complete(i);
                                 }
                                 c.complete(pid);
@@ -491,7 +490,7 @@ pub fn window(
 
         let src_outcome = ctx.subscribe_to(source, source_sink);
         if matches!(src_outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 let inner = s.inner_id.take();
@@ -521,7 +520,7 @@ pub fn window(
         let notifier_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
-                if st2.lock().terminated {
+                if st2.borrow_mut().terminated {
                     break;
                 }
                 match m.tier() {
@@ -530,7 +529,7 @@ pub fn window(
                         let bb_c = bb_not.clone();
                         let _ = em_not.defer(move |c| {
                             let (new_id, new_handle) = create_window_node(c, &*bb_c);
-                            let old_inner = st_c.lock().inner_id.replace(new_id);
+                            let old_inner = st_c.borrow_mut().inner_id.replace(new_id);
                             // Degenerate `None` (unreachable when not
                             // terminated): there is no prior window to
                             // complete; just emit the new one.
@@ -545,7 +544,7 @@ pub fn window(
                             // Notifier ERROR — error current window + self.
                             // QA P1: atomic terminal-winner vs the source
                             // sink's COMPLETE/ERROR (no double-terminal).
-                            let was = std::mem::replace(&mut st2.lock().terminated, true);
+                            let was = std::mem::replace(&mut st2.borrow_mut().terminated, true);
                             if was {
                                 break;
                             }
@@ -553,7 +552,7 @@ pub fn window(
                             let st_c = st2.clone();
                             let bb_c = bb_not.clone();
                             if !em_not.defer(move |c| {
-                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                if let Some(inner) = st_c.borrow_mut().inner_id.take() {
                                     bb_c.retain_handle(h);
                                     c.error(inner, h);
                                 }
@@ -642,13 +641,13 @@ pub fn window_count(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<WindowCountState>> = Arc::new(Mutex::new(WindowCountState::new()));
+        let state: Rc<RefCell<WindowCountState>> = Rc::new(RefCell::new(WindowCountState::new()));
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
 
         // Create first inner window and emit it.
         let first_inner = create_window_node(core_s, &*bb);
         {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             s.inner_id = Some(first_inner.0);
             s.counter = 0;
         }
@@ -671,7 +670,7 @@ pub fn window_count(
         let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
-                if st.lock().terminated {
+                if st.borrow_mut().terminated {
                     break;
                 }
                 match m.tier() {
@@ -682,7 +681,7 @@ pub fn window_count(
                             let bb_c = bb_src.clone();
                             if !em_src.defer(move |c| {
                                 let (inner, roll) = {
-                                    let mut s = st_c.lock();
+                                    let mut s = st_c.borrow_mut();
                                     match s.inner_id {
                                         Some(inner) => {
                                             s.counter += 1;
@@ -700,7 +699,7 @@ pub fn window_count(
                                 if roll {
                                     let (new_id, new_handle) = create_window_node(c, &*bb_c);
                                     {
-                                        let mut s = st_c.lock();
+                                        let mut s = st_c.borrow_mut();
                                         s.inner_id = Some(new_id);
                                         s.counter = 0;
                                     }
@@ -714,7 +713,7 @@ pub fn window_count(
                     }
                     5 => {
                         // QA P1: atomic terminal-winner.
-                        let was = std::mem::replace(&mut st.lock().terminated, true);
+                        let was = std::mem::replace(&mut st.borrow_mut().terminated, true);
                         if was {
                             break;
                         }
@@ -724,7 +723,7 @@ pub fn window_count(
                             let st_c = st.clone();
                             let bb_c = bb_src.clone();
                             if !em_src.defer(move |c| {
-                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                if let Some(inner) = st_c.borrow_mut().inner_id.take() {
                                     bb_c.retain_handle(h);
                                     c.error(inner, h);
                                 }
@@ -736,7 +735,7 @@ pub fn window_count(
                             // COMPLETE.
                             let st_c = st.clone();
                             let _ = em_src.defer(move |c| {
-                                if let Some(inner) = st_c.lock().inner_id.take() {
+                                if let Some(inner) = st_c.borrow_mut().inner_id.take() {
                                     c.complete(inner);
                                 }
                                 c.complete(pid);
@@ -751,7 +750,7 @@ pub fn window_count(
 
         let outcome = ctx.subscribe_to(source, source_sink);
         if matches!(outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 let inner = s.inner_id.take();

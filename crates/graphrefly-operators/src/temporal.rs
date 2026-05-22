@@ -36,6 +36,7 @@
 //! time (first subscriber triggers the build closure, which calls
 //! `tokio::spawn`).
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -114,7 +115,7 @@ pub fn sample(
         let binding_s = ctx.core().binding();
         let em = ctx.emitter();
         let pid = ctx.node_id();
-        let state: Arc<Mutex<SampleState>> = Arc::new(Mutex::new(SampleState::default()));
+        let state: Rc<RefCell<SampleState>> = Rc::new(RefCell::new(SampleState::default()));
 
         // --- source sink ---
         let st = state.clone();
@@ -127,7 +128,7 @@ pub fn sample(
             }
             let mut actions: SmallVec<[Act; 2]> = SmallVec::new();
             {
-                let mut s = st.lock();
+                let mut s = st.borrow_mut();
                 if s.terminated {
                     return;
                 }
@@ -170,7 +171,7 @@ pub fn sample(
 
         let src_outcome = ctx.subscribe_to(source, source_sink);
         if matches!(src_outcome, SubscribeOutcome::Dead { .. }) {
-            state.lock().source_completed = true;
+            state.borrow_mut().source_completed = true;
         }
 
         // --- notifier sink ---
@@ -178,7 +179,7 @@ pub fn sample(
         let core_n = em.clone();
         let bb2: Arc<dyn BindingBoundary> = binding_s.clone();
         let notifier_sink: Sink = Rc::new(move |msgs| {
-            let mut s = st2.lock();
+            let mut s = st2.borrow_mut();
             if s.terminated {
                 return;
             }
@@ -197,7 +198,7 @@ pub fn sample(
                         core_n.emit_or_defer(pid, h);
                         // Re-acquire lock and continue processing remaining
                         // batch messages (e.g. a trailing Complete).
-                        s = st2.lock();
+                        s = st2.borrow_mut();
                     }
                     5 => {
                         if let Some(h) = m.payload_handle() {
@@ -226,7 +227,7 @@ pub fn sample(
 
         let not_outcome = ctx.subscribe_to(notifier, notifier_sink);
         if matches!(not_outcome, SubscribeOutcome::Dead { .. }) {
-            let mut s = state.lock();
+            let mut s = state.borrow_mut();
             if !s.terminated {
                 s.terminated = true;
                 if let Some(old) = s.latest.take() {
@@ -1378,7 +1379,7 @@ impl Drop for WindowTimeTaskGuard {
 // S2b/D230/D234: `WeakCore` → `ProducerEmitter`; the window rotation
 // does task-side topology mutation (`register_producer`) so it routes
 // through `em.defer` (`CoreFull`). `current_inner` (the routing
-// selector) becomes a shared `Arc<Mutex<NodeId>>` read INSIDE the
+// selector) becomes a shared `Rc<RefCell<NodeId>>` read INSIDE the
 // owner-serialized defer closures, so the FIFO mailbox order
 // (arrival order) keeps every forward routed to the window live at the
 // time it arrived — the D234 invariant (same as `window`).
@@ -1391,6 +1392,12 @@ async fn window_time_task(
     period: Duration,
     noop_fn_id: FnId,
 ) {
+    // Cat-1/2 (D273): the tokio-driven `WindowTimeCmd` loop posts deferred
+    // closures into `em.defer(move |c| ...)` which requires `Send + 'static`.
+    // The captured `current_inner` MUST be `Send + Sync` ⇒ stays as
+    // `Arc<Mutex<...>>` (compiler-enforced via the `Send + Sync` bound on
+    // `defer`'s `F`).
+    #[allow(clippy::arc_with_non_send_sync)]
     let current_inner = Arc::new(Mutex::new(initial_inner));
     let mut ticker = tokio::time::interval(period);
     ticker.tick().await; // First tick is immediate — skip it.
