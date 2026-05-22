@@ -42,6 +42,119 @@ Live tracker for the 6-milestone Rust port. Update after each milestone closes. 
 
 > **⏳ `set_deps` napi-surface follow-on — `@graphrefly/native` node-level dynamic rewire (handed off from graphrefly-ts cross-track-ledger §1 D5, 2026-05-18).** graphrefly-ts landed the **TS side** of the rewire trio: `_setDeps`/`_addDep`/`_removeDep` were promoted to **public** `setDeps`/`addDep`/`removeDep` on the `@graphrefly/pure-ts` substrate `Node` interface, and `ImplNode.{setDeps,addDep,removeDep}` were added to the `Impl` parity contract (`packages/parity-tests/impls/types.ts`). `packages/parity-tests/scenarios/core/set-deps.test.ts` is now a real 3-test scenario (rewire dep A→B + addDep/removeDep edge wiring + self-dep rejection) **`skipIf`-gated to the pure-ts arm**. **Native obligation (this follow-on, a separate `/porting-to-rs` slice — NOT auto-scheduled):** `Core::set_deps` is fully implemented in `graphrefly-core` (TLA+-verified `wave_protocol_rewire_MC`) and a non-`#[napi]` `async fn set_deps` already exists at `crates/graphrefly-bindings-js/src/core_bindings.rs:1489` — but it is **NOT exposed** on the napi node surface (`wrapper.d.ts` `NativeNode<T>` has no `setDeps`; deferred per `crates/graphrefly-bindings-js/src/lib.rs` "…set_deps, etc.) lands once v0 numbers justify it"). To close: (1) `#[napi]`-export `set_deps` (+ `add_dep`/`remove_dep` for the full trio) on the Bench node, mirroring the async-surface convention; (2) re-expose them on the hand-written `@graphrefly/native` wrapper (`wrapper.js`/`wrapper.d.ts` `NativeNode`); (3) wire `rust.ts`'s `ImplNode` through; (4) **drop the `skipIf(nativePending)` gate** in `set-deps.test.ts` so the existing 3-test scenario runs cross-arm unchanged; (5) republish `@graphrefly/native` (OIDC, user-gated). The scenario is the parity forcing function (D196-aligned: a real cross-arm scenario already exists and is waiting). Cross-ref: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §1 (D5 row → TS LANDED / native pending) + `optimizations.md` set_deps item + `project_rewire_gap`. Not blocking any TS work.
 
+### D272 + D273 + D274 + doc-hygiene + AMEND-D — decision-consistency cleanup batch (2026-05-21, `/porting-to-rs` 5-stage batch + /qa fix)
+
+User-locked 5-stage decision-consistency cleanup derived from the
+2026-05-21 audit (`docs/decision-audit-2026-05-21.md` — 12 findings,
+all triaged + landed). Same "clean/correct/simple/performant" framing
+as D271 but targeting **substrate** vestigial surface from the
+D246/D248/D253/D255 actor-model relaxations, NOT storage.
+
+Audit framing reclassification (memory
+`feedback_distinguish_vestigial_vs_speculative.md`): D196 governs
+ADDING new substrate surface in anticipation of a consumer; **removing
+surface made dead by an earlier locked relaxation is the opposite** —
+no consumer signal required, just the relaxation itself. Precedents:
+D253 (SchedulingGroupId delete) + D254-AUDIT.
+
+- **D272 — Family-1 sink Arc<dyn Fn> → Rc<dyn Fn>.** 4 sink type aliases
+  (`Sink`/`TopologySink`/`DescribeSink`/`NamespaceChangeSink`) converted
+  from `Arc<dyn Fn>` to `Rc<dyn Fn>`; the outer-Arc wrapper had become
+  vestigial post-D248 (callbacks were already `!Send + !Sync`). Added
+  `static_assertions::assert_not_impl_any!(...: Send, Sync)` lock-ins at
+  each alias site → D248 intent is now compiler-enforced. Dropped 12
+  per-file `#![allow(clippy::arc_with_non_send_sync)]` annotations and
+  the 8-line vestigial-rationale comment blocks above each. Net: 47
+  files, +227/−266 lines.
+- **D273 — Family-2 Cat-3 `Arc<Mutex<X>>` → `Rc<RefCell<X>>` sweep.**
+  Workspace-wide compiler-driven substitution; the compiler classified
+  Cat-1/2 (revert: Send+Sync required) vs Cat-3 (compiles: vestigial).
+  **Cat-3 (~30 conversions):** operator-internal state in
+  `buffer/control/higher_order/ops_impl/stratify/temporal.rs` —
+  `BufferState/WindowState/ZipState/SwitchState/SettleState/ValveState/
+  SampleState/`etc. **Cat-1/2 reverts (Arc<Mutex> kept):** producer.rs
+  `ProducerStorage` (held inside `Arc<dyn ProducerBinding>`),
+  temporal.rs `current_inner` (captured by `em.defer(move |c| ...)`
+  Send+'static bound), tests/common/mod.rs `RecorderInner`
+  (`Weak`-upgrade pattern), tests/lock_discipline.rs `TestRuntime`
+  (test sink-closure capture) — each gets a one-line `// Cat-1/2
+  (D273): ...` comment naming the Send+Sync source. Net: 9 files,
+  +129/−123 lines.
+- **D274 — Vestigial union-find + defer-shim deletion.** Audit L1-002
+  + L3-001 carrier. Deleted:
+  - `PartitionOrderViolation` struct + `SubscribeError` variant (never
+    constructed post-§7; D211 had retained as "minimal-churn").
+  - `*_or_defer` family on `Core` + `CoreFull` trait + impl +
+    `teardown_or_defer` + `invalidate_or_defer` shims.
+  - `try_emit`/`try_complete`/`try_error`/`try_emit_terminal`/`try_teardown`
+    + `BatchGuard::try_run_wave_for` Result wrapper +
+    `BatchGuard::try_begin_batch_for` always-Ok shim — inlined into the
+    public surfaces (drop `Result<(), PartitionOrderViolation>` from
+    ~7 signatures).
+  - `DeferredProducerOp` enum + `push_deferred_producer_op` +
+    `drain_deferred_producer_ops` empty shim + 3 callsite removals.
+  - operators `MailboxEmitter::*_or_defer` + `ProducerEmitter::*_or_defer`
+    renamed to `emit/complete/error` (6 wrappers in 2 emitter shapes).
+  - 9 dead `Err(SubscribeError::PartitionOrderViolation(_))` match arms
+    across operators + 2 test-side catch-all arms that became unreachable.
+  - **`BindingBoundary` trait UNTOUCHED** (Q2 reconciliation in
+    Phase-2 HALT thread — audit L2-009 confirms BindingBoundary is
+    clean; `*_or_defer` always lived on `CoreFull` at `node.rs:1869`,
+    NOT on `BindingBoundary` at `boundary.rs:188`).
+  - **Public surfaces preserved.** `Core::emit/complete/error/teardown/
+    invalidate` keep their pre-D274 signatures (no Result wrapper, no
+    napi widening, no `Impl`-parity contract change, no cross-track-
+    ledger row).
+  - Net: 13 files, +227/−529 lines (~300-line net deletion).
+- **Doc-hygiene CLEANUP commit.** Audit L4-001 (Core struct rustdoc
+  rewritten — pre-D221/D248 "Cheap to clone" line replaced) + L4-002
+  (describe.rs `GraphOps::describe` doclinks repointed to `Graph::describe`)
+  + L1-001 (`mailbox.rs:135-157` rustdoc reframed from `SchedulingGroupId`
+  (deleted by D253) to per-Core wake-bit framing) + L8-001 (porting-deferred
+  §7-B/§7-E/§7-F CLOSED as structurally resolved by D253/D255/D274) + L8-002
+  (porting-deferred D250 stub-deletion history collapsed) + L8-003
+  (`node.rs` `StateCell` references reframed as pre-D246 historical).
+- **AMEND-D commit.** L5-001 (`batch.rs:3480-3506` D258 cross-Core-nesting
+  panic inline comment reframed per D262/P4 downgrade — `core_actor.rs`
+  `catch_unwind` swallows the panic value before it crosses napi, so JS
+  callers see a sync_channel disconnect rather than the polished string;
+  comment now states "Rust-dev clarity only") + L6-001 (D267 wording
+  scope-narrowed to "drop run_sync on read-path bindings; factory
+  constructors retain it under lifecycle-precondition rationale" — the
+  5 surviving `actor.run_sync` sites at `from_core` / structures
+  `create` factories are documented at their construction) + L3-001
+  (porting-deferred §7-C framing reframe — already landed in the
+  doc-hygiene commit via the D274 RESOLVED block).
+- **/qa fix follow-up.** Adversarial review surfaced 10 patches: F1
+  CRITICAL (`graph_bindings.rs:686/773` Arc::new sites missed by D272 sed
+  — visible under `--features graph-codec` / `--features standard` only;
+  fixed); F2-F10 stale rustdoc / vestigial comments / read-only
+  `borrow_mut`-where-`borrow`-suffices / dead `let _ = sink.clone()`.
+  All 10 applied; gate stayed GREEN. 8 files, +69/−69 lines.
+
+**`Impl` / napi widening:** none across all 5 stages + /qa fix.
+Substrate-internal cleanup.
+
+**Cross-track-ledger row:** none. Per command-args: "None of the above
+touches Impl parity contract or cross-track-ledger. All substrate-
+internal."
+
+**Gate (full):** `mise run gate` GREEN at each stage — 832 tests pass,
+0 skip, fmt+clippy clean (`-D warnings`). `cargo check -p
+graphrefly-bindings-js --features graph-codec` verified post-/qa-fix.
+`#![forbid(unsafe_code)]` preserved at every crate root.
+
+**Total batch:** 6 graphrefly-rs commits (f32cd65 D272 → 9fe8f56 D273 →
+fae6782 D274 → c0ec1f1 doc-hygiene → 28e88e6 AMEND-D → 0aa89dd /qa fix)
++ 1 graphrefly-ts commit (ad309ab decision-log lock). Local-only per
+D265 publish-gate; user-gated tag push triggers `@graphrefly/native`
+republish.
+
+**Canonical:** `~/src/graphrefly-rs/docs/decision-audit-2026-05-21.md`
+(audit source of truth) + `~/src/graphrefly-ts/docs/rust-port-decisions.md`
+D272 / D273 / D274 + AMEND-D entries (D262/P4 + D267 scope-amend) +
+memory `feedback_distinguish_vestigial_vs_speculative.md`.
+
 ### D271 — Storage cleanup batch (2026-05-22, `/porting-to-rs` next-batch — substrate-only B+C+D bundle)
 
 User-locked bundle (B+C+D) addressing the 3 remaining `porting-deferred.md` entries with no forcing function — the cross-track-ledger §1+§2 went fully closed after D266-D270, so this is a clean substrate hygiene slice under the "clean/correct/simple/performant/less-maintenance-burden" directive.

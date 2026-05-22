@@ -278,11 +278,9 @@ per fn-fire).
 
 ## v1 dispatcher limitations (intentional, with planned lift points)
 
-### Arc → Rc cleanup for post-D248 `!Send + !Sync` sites (2026-05-21)
+### Arc → Rc cleanup for post-D248 `!Send + !Sync` sites — RESOLVED 2026-05-21 by D272/D273
 
-- **What:** Per-file `#![allow(clippy::arc_with_non_send_sync)]` applied 2026-05-21 to: `graphrefly-graph/src/describe.rs` + `graphrefly-operators/src/{buffer,control,higher_order,ops_impl,stratify,temporal}.rs`. D248 dropped `Send + Sync` from `Sink`/`TopologySink` callbacks (single-owner Core); `Arc` became over-conservative for those sites.
-- **Why deferred:** `Rc` would suffice and is the architecturally correct type, but switching cascades through type signatures + many call sites (estimated >40 LOC across the affected crates + bindings/parity reconciliation).
-- **Lift point:** schedule when an unrelated `Sink`-shape touch coincides, or when Rust 1.97+ tightens the lint further.
+> **2026-05-21 (/porting-to-rs 5-stage decision-consistency cleanup batch).** Closed by D272 + D273 + the /qa fix follow-up. D272 (Family-1): converted the 4 sink type aliases (`Sink`/`TopologySink`/`DescribeSink`/`NamespaceChangeSink`) `Arc<dyn Fn>` → `Rc<dyn Fn>`; added `static_assertions::assert_not_impl_any!(...: Send, Sync)` lock-ins at each alias site so D248 intent is now type-checked at build time; dropped 12 per-file `#![allow]` annotations. D273 (Family-2): workspace-wide compiler-driven `Arc<Mutex<X>>` → `Rc<RefCell<X>>` sweep — ~30 operator-internal Cat-3 conversions kept; 4 Cat-1/2 sites (`ProducerStorage`, `current_inner` in temporal, `RecorderInner`, `TestRuntime`) reverted with one-line `Send+Sync` source comments. /qa F1: caught the feature-gated `graph_bindings.rs:686/773` sites the original sweep missed (was failing under `--features graph-codec`). Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md` D272 + D273.
 
 ### `release_handles` / `release_handle` called lock-held during `reset_for_fresh_lifecycle` (Phase 3 + 3b + 5) — established pattern, expanded by D-α
 
