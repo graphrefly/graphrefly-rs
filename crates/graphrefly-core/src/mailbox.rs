@@ -139,22 +139,21 @@ pub struct CoreMailbox {
     /// **Actor-model granularity (S4, D246/D248/D249).** `Core` is
     /// single-owner `!Send + !Sync`; in the actor model one worker owns
     /// exactly one `Core`, so this Core-wide bit **is** that worker's
-    /// per-group runnable-wake (the worker's Core hosts its declared
-    /// `SchedulingGroupId`(s); a finer per-`SchedulingGroupId` sub-bit
-    /// has no consumer — M6's per-binding group executor schedules at
-    /// the Core/worker grain — so adding one would be speculative
-    /// substrate surface, D196/D246-ignore-legacy, cf. D250). It is the
-    /// only cross-thread bridge into a `!Send` Core: timer/producer
-    /// tasks `post_*` + signal; the owner drains
-    /// ([`crate::node::Core::drain_mailbox`] / the in-wave
+    /// per-Core runnable-wake. It is the only cross-thread bridge into
+    /// a `!Send` Core: timer/producer tasks `post_*` + signal; the
+    /// owner drains ([`crate::node::Core::drain_mailbox`] / the in-wave
     /// `BatchGuard`). M6 (deferred) reads [`Self::is_runnable`] from the
-    /// host executor to decide when to poll a worker's Core.
+    /// host executor to decide when to poll a worker's Core. The M6
+    /// scheduling-grain (per-Core vs finer) is TBD per the M6 design
+    /// pass; D253 deleted the `SchedulingGroupId` surface that the
+    /// pre-actor framing hung on.
     ///
-    /// QA F12 (2026-05-19): if a future per-`SchedulingGroupId` sub-bit
-    /// is ever added, it MUST be split in lockstep across BOTH this
-    /// `CoreMailbox.runnable` AND `DeferQueue.runnable` — the in-wave
-    /// drain gate (`BatchGuard::drain_and_flush`) ORs the two, and a
-    /// half-split would silently lose wakeups for the unsplit queue.
+    /// QA F12 (2026-05-19, amended D274 doc-hygiene 2026-05-21): if a
+    /// future per-Core sub-wake bit is ever split out (M6 design pass),
+    /// it MUST be split in lockstep across BOTH this `CoreMailbox.runnable`
+    /// AND `DeferQueue.runnable` — the in-wave drain gate
+    /// (`BatchGuard::drain_and_flush`) ORs the two, and a half-split
+    /// would silently lose wakeups for the unsplit queue.
     runnable: AtomicBool,
 }
 

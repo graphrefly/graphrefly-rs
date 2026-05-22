@@ -1519,10 +1519,12 @@ impl NodeRecord {
 /// then take only the shared guard (`with_shared`), shard ops the shard
 /// guard (`with_shard`), and when both are needed the deadlock-free
 /// rule is **shard guard OUTER, shared guard INNER** (D220-EXEC).
-// `pub` (not `pub(crate)`): appears in the public `StateCell` trait
-// surface (`from_parts` / `lock_shared`), same as `CoreState`. The
-// struct *name* is public but every field is `pub(crate)`, so it is an
-// opaque token outside the crate — no internal state is reachable.
+// `pub` (not `pub(crate)`): same as `CoreState`. The struct *name* is
+// public but every field is `pub(crate)`, so it is an opaque token
+// outside the crate — no internal state is reachable. (Pre-D246 this
+// was the shared region of a `StateCell`-generic sharded split; the
+// generic + shard map were collapsed when single-owner became the
+// substrate floor.)
 pub struct CoreShared {
     pub(crate) next_node_id: u64,
     pub(crate) next_subscription_id: u64,
@@ -1669,10 +1671,11 @@ impl Drop for CoreShared {
 /// closing summary). Q-beyond
 /// will continue the shape decomposition by sharding most of the
 /// remaining fields per-partition.
-// `pub` (not `pub(crate)`): appears in the public `StateCell` trait surface
-// (`Core<C: StateCell>` is public and `SingleThreadCell`/`LockedCell` are
-// exported). The struct *name* is public but every field stays `pub(crate)`,
-// so it is an opaque token outside the crate — no internal state is reachable.
+// `pub` (not `pub(crate)`): the struct *name* is public but every field
+// stays `pub(crate)`, so it is an opaque token outside the crate — no
+// internal state is reachable. (Pre-D246 this was a per-shard region
+// of a `StateCell`-generic split; the generic + shard map were
+// collapsed when single-owner became the substrate floor.)
 pub struct CoreState {
     pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     /// Inverted adjacency: `parent → children`. Updated on registration.
@@ -1737,16 +1740,24 @@ static CORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// The handle-protocol Core dispatcher.
 ///
-/// Holds an [`Arc`] to the [`BindingBoundary`] and all dispatch state. Cheap
-/// to clone (the inner `Arc<Mutex<CoreState>>` is shared); pass `Core` by
-/// value to threads.
+/// **Single-owner, `!Send + !Sync`** (D221/D246/D248). Holds an `Arc`
+/// to the [`BindingBoundary`] (the `Send + Sync` boundary aggregate)
+/// and all dispatch state in owner-thread-only `RefCell`s. **NOT
+/// `Clone`** (D223 deleted shared-Core), **NOT `Send`/`Sync`** (D248
+/// relaxed sinks off `Send + Sync` and the state cell follows). One
+/// `Core` is driven from exactly one OS thread (the actor model);
+/// cross-`Core` parallelism is independent per-worker Cores
+/// (M6-ready), reached from any thread via the `Send + Sync`
+/// [`crate::mailbox::CoreMailbox`] id-only bridge for autonomous
+/// timer/producer tasks. See `RefCell<CoreShared>` / `RefCell<CoreState>`
+/// field rustdoc below for the post-D246/D248 single-owner shape.
 pub struct Core {
     /// Core-global region (id counters, topology-sink registry,
     /// `currently_firing`, the two caps, the scratch-release queue).
-    /// D246/S2c: single-owner ⇒ a plain
-    /// `RefCell` (the `parking_lot`/`StateCell`-generic split was
-    /// shared-Core-era legacy; the actor model drives a `Core` from
-    /// exactly one thread). D248 relaxed the substrate `Sink`/
+    /// D246/S2c: single-owner ⇒ a plain `RefCell` (the pre-D246
+    /// `parking_lot`-Mutex + shard-generic split was shared-Core-era
+    /// legacy; the actor model drives a `Core` from exactly one
+    /// thread). D248 relaxed the substrate `Sink`/
     /// `TopologySink` off `Send + Sync`, so `CoreState` owns `!Send`
     /// sinks ⇒ **`Core` is `!Send + !Sync`** (one owner thread, never
     /// relocated cross-thread; the only cross-thread bridge is the
@@ -2066,8 +2077,8 @@ impl Drop for ScratchReleaseGuard<'_> {
 /// `s.binding` work) **and** exposes an inherent `shared` field (so
 /// `s.shared.<f>` works — inherent-field access is resolved before
 /// `Deref`). D246/S2c: single-owner ⇒ the two regions are plain
-/// `RefCell`s on [`Core`] (the `parking_lot`/`StateCell`-generic
-/// sharded split was shared-Core-era legacy). A re-entrant
+/// `RefCell`s on [`Core`] (the pre-D246 `parking_lot`-Mutex +
+/// shard-generic split was shared-Core-era legacy). A re-entrant
 /// double-borrow panics loudly — a dispatcher bug (a missing
 /// lock-released bracket around a binding callback), not a user error.
 pub(crate) struct St<'a> {
@@ -2132,8 +2143,8 @@ impl Core {
     #[must_use]
     pub fn new(binding: Arc<dyn BindingBoundary>) -> Self {
         Self {
-            // D246/S2c: single-owner ⇒ plain `RefCell` regions (no
-            // `StateCell` generic, no shard map). D248 relaxed the
+            // D246/S2c: single-owner ⇒ plain `RefCell` regions (the
+            // pre-D246 shard-generic + map were collapsed). D248 relaxed the
             // substrate `Sink` off `Send+Sync` ⇒ `Core` is `!Send +
             // !Sync` — the actor-model shape (D221/D223/D248); one
             // owner thread, cross-`Core` parallelism via independent

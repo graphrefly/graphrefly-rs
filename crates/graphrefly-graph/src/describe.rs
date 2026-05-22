@@ -67,9 +67,9 @@ pub struct NodeDescribe {
 /// without an enum tag.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DescribeValue {
-    /// Raw handle view (default for [`crate::GraphOps::describe`]).
+    /// Raw handle view (default for [`crate::Graph::describe`]).
     Handle(HandleId),
-    /// Binding-rendered view (from [`crate::GraphOps::describe_with_debug`]).
+    /// Binding-rendered view (from [`crate::Graph::describe_with_debug`]).
     Rendered(serde_json::Value),
 }
 

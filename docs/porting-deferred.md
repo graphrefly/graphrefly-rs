@@ -3149,47 +3149,55 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **Lift point:** Bench evidence that the contended-regime ~10% matters for a real workload, OR user direction to complete §7 literally.
 - **Source:** §7 item (1); §5b measurement; D209; this slice.
 
-### §7-B — Cross-component dynamic re-entry into an unheld serialization group
+### §7-B — Cross-component dynamic re-entry into an unheld serialization group — RESOLVED 2026-05-21 by D253/D255 (structurally impossible under actor model)
+
+> **2026-05-21 (doc-hygiene CLEANUP, audit L8-001).** Closed as structurally resolved. D253 (2026-05-19) deleted the `SchedulingGroupId` surface; D255 (2026-05-19) folded in the actor model (one Core per OS thread per D252; `Core` is `!Send + !Sync` single-owner). The ABBA-cycle precondition this entry described — "concurrent threads holding two different `ReentrantMutex` group locks" — is **structurally impossible** under D255: there is no cross-thread `ReentrantMutex` to acquire, and no shared lock the second thread could contend on. Cross-`Core` parallelism is independent per-worker Cores with no shared lock. Original analysis preserved below for the historical audit trail.
+
+<details>
+<summary>Pre-actor-model rationale (historical, no longer applies)</summary>
 
 - **What:** §7's wave acquisition collects the touched-group set via a bounded cascade walk (children + meta) from the seed and acquires it sorted upfront. A fn that, mid-fire, re-enters Core (`emit`/`complete`/…) on a node in a **different** component whose group was *not* in the seed's cascade will acquire that group's `ReentrantMutex` nested (not pre-sorted with the held set).
-- **Why acceptable in v1:** §7 deletes the old union-find defer machinery and does not specify a replacement for this case; the strict all-`None`/all-`Some` component-consistency invariant + static groups + the sorted upfront acquire cover the common topology-reachable cascade. Recorded honestly rather than re-inventing machinery §7 says to delete.
-- **Severity (QA F5, 2026-05-16 — strengthened from the original "missed serialization" wording):** the failure mode is **deadlock potential**, not merely a missed-serialization window. A fn holding group `G_hi` (in the seed cascade) that re-enters Core and emits into a *disjoint-component* node whose group `G_lo < G_hi` performs a **descending mid-wave acquisition**; concurrently another thread holding `G_lo` and re-entrantly acquiring `G_hi` forms a classic ABBA cycle. This is exactly what the deleted `held_partitions::check_and_acquire` ascending-order check + `PartitionOrderViolation` defer-to-wave-end existed to prevent. Reachability is still bounded: it requires cross-*component* (disjoint dep-graph) re-entrant emit under multi-thread grouped load — the producer-pattern common case keeps the target cascade-reachable (group already held → `ReentrantMutex` pass-through). But the consequence if hit is a hang, not just a torn update.
-- **Lift point:** If a real consumer hits cross-component dynamic re-entry under multi-thread grouped load, add a minimal "acquire-or-defer-to-wave-end if it would descend" guard (a much smaller mechanism than the deleted union-find defer). Until then, prefer keeping co-emitting nodes in one component (so the target group is in the seed cascade and pre-acquired sorted).
-- **Source:** §7 wave-acquisition spec; this slice.
+- **Severity (QA F5, 2026-05-16):** deadlock potential under multi-thread grouped load (descending mid-wave acquisition + symmetric pair on another thread = ABBA cycle).
 
-### §7-C — Vestigial union-find surface — RE-DISPOSITIONED 2026-05-16 (D216): absorbed into Slice B parallelism redesign
+</details>
 
-> **2026-05-16 (D216) update.** This is genuinely dead code (never constructed/taken) — it should be *deleted*, not kept as permanent vestigial noise. It was "not cheap" only as a *standalone* 166-ref/8-file `graphrefly-operators` slice. **Slice B** (the group-owned-shard parallelism redesign — `SerializationGroupId` owns an independent `CoreState` sub-store, replacing the bench-proven-worthless "ReentrantMutex on top of one global mutex") rewrites the *exact* group/lock layer these symbols live in ⇒ deleting them there is **free**, not standalone churn. **§7-F folds in with it** (the `where C: Send + Sync` cliff on `*_or_defer` disappears when that layer is rewritten). Scoped by the design session (D216 routing). Original rationale retained below.
+### §7-C — Vestigial union-find surface — RESOLVED 2026-05-21 by D274 (`PartitionOrderViolation` + defer-shim deleted)
 
+> **2026-05-21 (AMEND-D + doc-hygiene CLEANUP, audit L1-002 + L3-001).** Closed by D274 — the entire vestigial surface (`PartitionOrderViolation` struct + `SubscribeError` variant + `*_or_defer` family on Core/CoreFull/operators + `DeferredProducerOp` enum + `push_/drain_deferred_producer_ops` + the 9 dead `Err(SubscribeError::PartitionOrderViolation(_))` match arms) was deleted in a single focused commit. The framing reclassification from "deferred per D196" → "decision-consistency restoration" (precedent D253/D254-AUDIT/D272) is recorded in memory `feedback_distinguish_vestigial_vs_speculative`; the user-named anti-pattern (deferring vestigial-cleanup under D196 when the right gate is the earlier locked relaxation) was added to the decision-guard skill (value #14 + anti-pattern #11). Original rationale preserved below.
 
+<details>
+<summary>Pre-D274 rationale (historical, deferral framing was the audit finding)</summary>
 
-- **What:** To honor D211 (keep `graphrefly-graph`/`-operators`/`-storage`/`-structures` + napi compiling with zero churn), these now-dead symbols were kept as **vestigial, never-constructed** surface: `PartitionOrderViolation` (fields → `u64`, never produced), `SubscribeError::PartitionOrderViolation`, `SetDepsError::PartitionMigrationDuringFire`, `DeferredProducerOp` (+ `push_deferred_producer_op`, now immediate-exec), the `*_or_defer` methods (now thin aliases to the non-deferred ops), `Core::drain_deferred_producer_ops` (empty inline no-op). The `graphrefly-operators` `Err(SubscribeError::PartitionOrderViolation(_))` defer arms are now dead (never taken).
-- **Why deferred:** Removing them requires editing the matching `Err(_)` arms + call sites across `graphrefly-operators` (`producer.rs`, `higher_order.rs`) — a pure downstream-churn refactor disjoint from the Core rewrite. Pre-1.0, no compat constraint; it's a cleanup, not a correctness issue.
-- **Lift point:** A standalone `graphrefly-operators` cleanup slice (delete the dead defer arms + the vestigial Core symbols together).
-- **Source:** D211; this slice.
+D211 retained these as "vestigial, never-constructed" so downstream code compiled unchanged. The deferral was misframed under D196 (consumer-pressure) — the correct framing was decision-consistency restoration (the §7 group-lock layer that these symbols protected was already deleted by D246/D248/D253/D255). Audit L1-002 + L3-001, 2026-05-21.
+
+</details>
 
 ### §7-D — Throwaway perf-investigation scaffolding removed
 
 - **What:** The inert `bench_naive` / `bench_state_collapse` Cargo features + their `#[cfg(feature = ...)]` code blocks in `node.rs`/`batch.rs` (and the matching `cfg_attr`s) referenced the very union-find/lock-cycle machinery this slice deletes; the dead `cfg(bench_naive)` paths were stripped as part of the rewrite. `benches/minimal_handle_core.rs` + `examples/profile_disjoint_state_emit.rs` remain (they are the floor-measurement harness and stay useful as the §7 floor regression bench). The `bench_naive`/`bench_state_collapse` feature entries in `Cargo.toml` are now unused and should be removed in the docs/cleanup pass.
 - **Source:** `project_next_porting_batch.md` (throwaway artifacts, revert-before-release); §7 implementation.
 
-### §7-E — `GroupLockRegistry` never prunes (unbounded growth over a long-lived churning Core)
+### §7-E — `GroupLockRegistry` never prunes — RESOLVED 2026-05-21 by D253 (registry deleted)
 
-- **What:** `groups::GroupLockRegistry::lock_arc` is get-or-create and the map only grows; no teardown path prunes a `SerializationGroupId` whose nodes were all unmounted/destroyed. A long-lived `Core<LockedCell>` that churns through many distinct group ids leaks one `Arc<ReentrantMutex<()>>` + HashMap entry per id permanently, and closure-form `begin_batch` (`acquire_all_group_guards` → `all_groups_sorted`) acquires every *ever-touched* group lock, so its cost grows monotonically.
-- **Why deferred (QA F6, 2026-05-16):** groups are user-declared, static, and typically few + long-lived (the §7 model is "a handful of serialization domains," not per-node ids). The leak is bounded by *distinct group-id count over process lifetime*, not by node/wave count — negligible for the intended usage. Pruning needs a refcount of live nodes per group (or a sweep on unmount), which is extra machinery with no current consumer pressure.
-- **Lift point:** When a consumer creates unboundedly-many distinct groups, add per-group live-node refcounting (decrement on unmount/destroy; drop the registry entry at zero) or a periodic sweep keyed off `partition_of` membership.
-- **Source:** QA review (Blind Hunter §7 pass); this slice.
+> **2026-05-21 (doc-hygiene CLEANUP, audit L8-001).** Closed as structurally resolved. D253 (2026-05-19) deleted the `SchedulingGroupId` API + `GroupLockRegistry` itself; there is nothing to leak. The lift-point ("when a consumer creates unboundedly-many distinct groups") cannot fire — no groups, no registry. Original rationale preserved below.
 
-### §7-F — `*_or_defer` `where C: Send + Sync` cliff — RE-DISPOSITIONED 2026-05-16 (D216): folds into Slice B with §7-C
+<details>
+<summary>Pre-D253 rationale (historical, no longer applies)</summary>
 
-> **2026-05-16 (D216) update.** Folds into **Slice B** alongside §7-C (same group/lock layer rewrite). Original analysis below.
+`groups::GroupLockRegistry::lock_arc` was get-or-create, no prune path. Distinct group-id count over process lifetime bounded the leak — negligible for the intended "handful of serialization domains" usage. QA F6, 2026-05-16.
 
+</details>
 
+### §7-F — `*_or_defer` `where C: Send + Sync` cliff — RESOLVED 2026-05-21 by D253/D255/D274 (`*_or_defer` + StateCell generic deleted)
 
-- **What:** The vestigial `emit_or_defer`/`complete_or_defer`/… aliases (§7-C) retained a `where C: Send + Sync` bound. `SingleThreadCell` is `!Send + !Sync`, so producer-pattern operators (`stratify`/`control` and anything routing through `*_or_defer`) are not callable on the §7 floor substrate. Not a current break — `graphrefly-operators` is monomorphic over the default `Core<LockedCell>`, so the workspace compiles and all 825 tests pass.
-- **Why deferred (QA F7, 2026-05-16):** "operators on `Core<SingleThreadCell>`" is a future milestone (the floor today is the bench/regression harness + leaf substrate use, not the operator layer). Removing the bound requires the §7-C cleanup slice to also re-check that the immediate-exec `*_or_defer` bodies don't themselves need `Send + Sync` (they shouldn't post-rewrite — no closure is queued/sent anymore).
-- **Lift point:** Fold into the §7-C `graphrefly-operators` cleanup slice: drop the dead defer arms, drop the `Send + Sync` bound, make the operator layer generic over `C: StateCell`, add a `Core<SingleThreadCell>` + operators smoke test.
-- **Source:** QA review (Blind Hunter §7 pass); this slice.
+> **2026-05-21 (doc-hygiene CLEANUP, audit L8-001).** Closed as structurally resolved. D253 (2026-05-19) deleted the `StateCell`/`SingleThreadCell`/`LockedCell` generic; D255 (2026-05-19) folded in the actor model (`Core` is single-owner `!Send + !Sync`). D274 (2026-05-21) deleted the `*_or_defer` aliases themselves. There is no generic `C` to carry a `Send + Sync` bound, and no `*_or_defer` methods to gate. Original rationale preserved below.
+
+<details>
+<summary>Pre-D253/D274 rationale (historical, no longer applies)</summary>
+
+The vestigial `emit_or_defer`/etc. aliases carried `where C: Send + Sync`, blocking operator-layer instantiation over `Core<SingleThreadCell>`. QA F7, 2026-05-16.
+
+</details>
 
 ## Deferred infra — consolidate the 27 graphrefly-core integration-test binaries (D215)
 
@@ -3796,26 +3804,12 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   `subscribe(core, …)`) are complete and compile; this is the single
   blocked unit (E0308 at `graph_integration.rs:657`).
 
-- ~~[core-tests] `lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`
-  + `lock_discipline::sink_can_reenter_core_via_pause_and_resume`
-  + `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`
-  — D250 retired stubs.~~
-  **DELETED 2026-05-20 (S6 cleanup, "no legacy" directive).** All three
-  `#[ignore]`-stubs were dead test code: the synchronous binding-holds-
-  cloned-Core trigger is structurally deleted (D221/D246/D248 single-
-  owner Core), no β-valid actor-model path produces the scenario, and
-  the live mailbox-reentry tests in the same files
-  (`sink_can_complete_another_node_from_callback`,
-  `custom_equals_can_reenter_core_during_emission`,
-  `handshake_sink_can_reenter_core_emit_on_other_node`) cover the
-  *structural* invariant (mid-fire / in-wave-sink can re-enter Core
-  via the mailbox seam). The `SetDepsError::ReentrantOnFiringNode`
-  guard code stays LIVE in `node.rs` (defensive against a future
-  owner-side mid-wave self-rewire seam); no test exercises it today,
-  documented inline at the guard site. If a future slice widens
-  `CoreFull`/`MailboxOp` with pause/resume or set_deps for a real
-  consumer, write FRESH tests for the new seam — don't resurrect the
-  deleted stubs.
+- **[core-tests] D250 retired stubs — DELETED 2026-05-20.** RESOLVED.
+  See the "[D250 — S4 re-entry stubs DELETED 2026-05-20]" entry below
+  for the consolidated record. Structural coverage lives in
+  `sink_can_complete_another_node_from_callback` /
+  `custom_equals_can_reenter_core_during_emission` /
+  `handshake_sink_can_reenter_core_emit_on_other_node`.
 
 - [core-tests] §7 shared-Core cross-thread group tests —
   `group_parallelism::{same_group_cross_thread_emits_serialize_without_deadlock,
@@ -4004,30 +3998,17 @@ files / call-sites touch Core) — NOT as the design. The design is D246:
   rename). Source: S3 slice (2026-05-19). NOT non-applicable — a real
   comment-accuracy item correctly fused with S4.
 
-- **[D250 — S4 re-entry-stub disposition LOCKED → S6 DELETED]** The 3
-  `#[ignore]` "invariant stays LIVE" stubs
-  (`lock_released::fn_can_reenter_core_pause_resume_during_invoke_fn`,
-  `lock_discipline::sink_can_reenter_core_via_pause_and_resume`,
-  `slice_f_corrections::a6_set_deps_from_firing_fn_rejected_with_reentrant_error`)
-  were originally retired as deleted-model at S4 per D250
-  (`~/src/graphrefly-ts/docs/rust-port-decisions.md`). **DELETED
-  2026-05-20 at S6 close** (user-locked, `feedback_no_backward_compat`):
-  the only historical trigger (binding-holds-cloned-`Core` synchronous
-  re-entry) is structurally deleted by D221/D246; the β-valid reactive
-  path (emit → controller → owner-side op) is already covered by the
-  live mailbox-reentry tests in the same files
-  (`sink_can_complete_another_node_from_callback`,
-  `custom_equals_can_reenter_core_during_emission`,
-  `handshake_sink_can_reenter_core_emit_on_other_node`). The
-  `ReentrantOnFiringNode` guard code stays live in `node.rs` as
-  defensive cover.
-  Disposition at S4: `#[ignore = "retired (D250): …"]` with intent
-  preserved (never deleted — same treatment as the §7 cross-thread
-  group tests); the `SetDepsError::ReentrantOnFiringNode` guard *code*
-  stays live as defensive cover. **No `CoreFull`/`MailboxOp`/substrate
-  widening ⇒ no cross-track-ledger event.** This supersedes the prior
-  "S4 owner-side seam — when the seam lands" record-and-skip wording
-  for these 3 entries.
+- **[D250 — S4 re-entry stubs DELETED 2026-05-20]** RESOLVED. The 3
+  `#[ignore]` retired stubs were deleted outright at S6 close
+  (user-locked, `feedback_no_backward_compat`); structural coverage
+  lives in `sink_can_complete_another_node_from_callback`,
+  `custom_equals_can_reenter_core_during_emission`, and
+  `handshake_sink_can_reenter_core_emit_on_other_node` (mailbox-reentry
+  path is the β-valid replacement; the historical
+  binding-holds-cloned-Core trigger is structurally deleted by
+  D221/D246). `ReentrantOnFiringNode` guard code stays live in node.rs
+  as defensive cover. No substrate widening; no cross-track-ledger
+  event. Canonical: `~/src/graphrefly-ts/docs/rust-port-decisions.md` D250-AMENDED.
 
 ### S2b-finish slice — turnkey execution plan (premise-corrected 2026-05-18, D236–D241) [DESIGN SUPERSEDED by D246 — use as consumer-site inventory only]
 
