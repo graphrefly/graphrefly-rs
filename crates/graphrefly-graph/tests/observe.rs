@@ -11,7 +11,7 @@ use graphrefly_core::{HandleId, Message, Sink};
 fn recording_sink() -> (Arc<Mutex<Vec<Message>>>, Sink) {
     let log: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let log_for_sink = log.clone();
-    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+    let sink: Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         log_for_sink.lock().unwrap().extend_from_slice(msgs);
     });
     (log, sink)

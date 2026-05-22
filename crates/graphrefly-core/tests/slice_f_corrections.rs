@@ -102,7 +102,7 @@ fn a7_handshake_panic_removes_sink_and_does_not_re_fire_on_next_wave() {
     // Sink panics on Data delivery during handshake.
     let panicked = Arc::new(Mutex::new(false));
     let panicked_clone = panicked.clone();
-    let bad_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let bad_sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_)) {
                 *panicked_clone.lock().unwrap() = true;
@@ -122,7 +122,7 @@ fn a7_handshake_panic_removes_sink_and_does_not_re_fire_on_next_wave() {
     // following emit would re-panic on this thread.
     let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter_clone = counter.clone();
-    let good_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let good_sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for _ in msgs {
             counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -250,7 +250,7 @@ fn a3_pause_overflow_synthesizes_error_once_per_cycle() {
     let events = Arc::new(Mutex::new(Vec::<RecordedEvent>::new()));
     let events_clone = events.clone();
     let inner_clone = inner.clone();
-    let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         let mut g = events_clone.lock().unwrap();
         for m in msgs {
             g.push(match m {

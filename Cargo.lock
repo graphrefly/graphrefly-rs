@@ -683,6 +683,7 @@ dependencies = [
  "serde_ipld_dagcbor",
  "serde_json",
  "sha2",
+ "static_assertions",
  "thiserror",
  "tracing",
  "zstd",

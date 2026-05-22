@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! Higher-order operators (Slice E, D044) — operators whose project fn
 //! returns an inner [`NodeId`] for each outer DATA. Mirrors TS legacy
 //! `extra/operators/higher-order.ts` (`switchMap` / `exhaustMap` /
@@ -67,6 +58,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
 
 use ahash::AHashMap;
@@ -139,10 +131,10 @@ fn build_inner_sink(
     em: ProducerEmitter,
     producer_binding: Arc<dyn ProducerBinding>,
     producer_id: NodeId,
-    on_inner_complete: Arc<dyn Fn()>,
-    on_inner_error: Arc<dyn Fn(HandleId)>,
+    on_inner_complete: Rc<dyn Fn()>,
+    on_inner_error: Rc<dyn Fn(HandleId)>,
 ) -> Sink {
-    Arc::new(move |msgs: &[Message]| {
+    Rc::new(move |msgs: &[Message]| {
         enum Action {
             Emit(HandleId),
             Complete,
@@ -266,6 +258,8 @@ pub fn switch_map(
             return;
         };
         let em = ctx.emitter();
+        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
+        #[allow(clippy::arc_with_non_send_sync)]
         let state: Arc<Mutex<SwitchState>> = Arc::new(Mutex::new(SwitchState::new()));
 
         let state_for_outer = state.clone();
@@ -273,7 +267,7 @@ pub fn switch_map(
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
-        let outer_sink: Sink = Arc::new(move |msgs| {
+        let outer_sink: Sink = Rc::new(move |msgs| {
             // Phase 1: classify under state lock. Track whether we
             // performed a retain so phase 2 can safely release it
             // without underflow on `[Data(_), Error(_)]` same-batch
@@ -459,8 +453,8 @@ fn make_switch_on_complete(
     state: Arc<Mutex<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn()> {
-    Arc::new(move || {
+) -> Rc<dyn Fn()> {
+    Rc::new(move || {
         let prev_inner;
         let mut should_complete = false;
         {
@@ -485,8 +479,8 @@ fn make_switch_on_error(
     state: Arc<Mutex<SwitchState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId)> {
-    Arc::new(move |h| {
+) -> Rc<dyn Fn(HandleId)> {
+    Rc::new(move |h| {
         let prev_inner;
         {
             let mut s = state.lock().unwrap();
@@ -560,6 +554,8 @@ pub fn exhaust_map(
             return;
         };
         let em = ctx.emitter();
+        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
+        #[allow(clippy::arc_with_non_send_sync)]
         let state: Arc<Mutex<ExhaustState>> = Arc::new(Mutex::new(ExhaustState::new()));
 
         let state_for_outer = state.clone();
@@ -567,7 +563,7 @@ pub fn exhaust_map(
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
-        let outer_sink: Sink = Arc::new(move |msgs| {
+        let outer_sink: Sink = Rc::new(move |msgs| {
             #[derive(Default)]
             struct Plan {
                 first_outer_h: Option<HandleId>,
@@ -716,8 +712,8 @@ fn make_exhaust_on_complete(
     state: Arc<Mutex<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn()> {
-    Arc::new(move || {
+) -> Rc<dyn Fn()> {
+    Rc::new(move || {
         let prev_inner;
         let mut should_complete = false;
         {
@@ -745,8 +741,8 @@ fn make_exhaust_on_error(
     state: Arc<Mutex<ExhaustState>>,
     em: ProducerEmitter,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId)> {
-    Arc::new(move |h| {
+) -> Rc<dyn Fn(HandleId)> {
+    Rc::new(move |h| {
         let prev_inner;
         {
             let mut s = state.lock().unwrap();
@@ -874,6 +870,8 @@ pub fn merge_map_with_concurrency(
             return;
         };
         let em = ctx.emitter();
+        // D273 follow-on: Arc<Mutex<!Send>> → Rc<RefCell> in Family-2 sweep.
+        #[allow(clippy::arc_with_non_send_sync)]
         let state: Arc<Mutex<MergeMapState>> = Arc::new(Mutex::new(MergeMapState::new()));
 
         let state_for_outer = state.clone();
@@ -881,7 +879,7 @@ pub fn merge_map_with_concurrency(
         let binding_for_outer = binding_clone.clone();
         let producer_binding_for_outer = producer_binding.clone();
 
-        let outer_sink: Sink = Arc::new(move |msgs| {
+        let outer_sink: Sink = Rc::new(move |msgs| {
             // Phase 1: enqueue DATAs into the buffer (always — drain
             // loop dequeues + spawns up to cap), classify terminal
             // signals.
@@ -1104,8 +1102,8 @@ fn make_merge_on_complete(
     project_fn_id: FnId,
     this_inner_id: u64,
     concurrency: Option<u32>,
-) -> Arc<dyn Fn()> {
-    Arc::new(move || {
+) -> Rc<dyn Fn()> {
+    Rc::new(move || {
         let removed_sub;
         {
             let mut s = state.lock().unwrap();
@@ -1151,8 +1149,8 @@ fn make_merge_on_error(
     em: ProducerEmitter,
     binding: Arc<dyn HigherOrderBinding>,
     producer_id: NodeId,
-) -> Arc<dyn Fn(HandleId)> {
-    Arc::new(move |h| {
+) -> Rc<dyn Fn(HandleId)> {
+    Rc::new(move |h| {
         let removed_subs;
         let buffered_to_release;
         {

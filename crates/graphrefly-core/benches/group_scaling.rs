@@ -62,7 +62,7 @@ impl BindingBoundary for WorkBinding {
 }
 
 fn noop_sink() -> Sink {
-    Arc::new(|_: &[Message]| {})
+    std::rc::Rc::new(|_: &[Message]| {})
 }
 
 /// One worker: build its OWN `Core`, a `state → derived` cascade, then

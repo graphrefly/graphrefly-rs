@@ -1,9 +1,6 @@
 //! Mount / unmount / ancestors / destroy / signal_invalidate
 //! (canonical spec §3.4 + §3.7).
 
-// D248: substrate is structurally `!Send + !Sync` post-S2c.
-#![allow(clippy::arc_with_non_send_sync)]
-
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -15,7 +12,7 @@ use graphrefly_graph::MountError;
 fn recording_sink() -> (Arc<Mutex<Vec<Message>>>, Sink) {
     let log: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let log_for_sink = log.clone();
-    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+    let sink: Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         log_for_sink.lock().unwrap().extend_from_slice(msgs);
     });
     (log, sink)
@@ -244,7 +241,7 @@ fn destroy_preserves_namespace_during_teardown_cascade() {
     // D246: capture a `Graph` clone (Core-free, Send + Sync + 'static)
     // into the long-lived Sink.
     let ns_for_sink = g.clone();
-    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+    let sink: Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         if msgs.iter().any(|m| matches!(m, Message::Teardown)) {
             // Look up the node's name DURING the teardown cascade.
             *observed_for_sink.lock().unwrap() = ns_for_sink.name_of(s);
@@ -401,7 +398,7 @@ fn signal_invalidate_gather_does_not_hold_graph_lock_during_core_call() {
     let ns_for_sink = g.clone();
     let observed_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let observed_for_sink = observed_name.clone();
-    let sink: Sink = Arc::new(move |msgs: &[Message]| {
+    let sink: Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Invalidate) {
                 // Re-enter Graph layer mid-cascade. Pre-fix this would

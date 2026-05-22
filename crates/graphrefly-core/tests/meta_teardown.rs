@@ -32,7 +32,7 @@ impl OrderTracker {
     ) -> graphrefly_core::Sink {
         let next = self.next.clone();
         let events = self.events.clone();
-        Arc::new(move |msgs: &[graphrefly_core::Message]| {
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
             for msg in msgs {
                 if matches!(msg, graphrefly_core::Message::Teardown) {
                     let seq = {

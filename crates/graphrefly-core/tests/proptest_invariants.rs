@@ -359,7 +359,7 @@ fn capture_call_lengths_and_first_msg(
 ) -> Vec<CallShape> {
     let calls: Arc<std::sync::Mutex<Vec<CallShape>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls_inner = calls.clone();
-    let sink: graphrefly_core::Sink = Arc::new(move |msgs| {
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs| {
         let first = msgs.first().copied();
         calls_inner.lock().expect("lock").push((msgs.len(), first));
     });

@@ -47,7 +47,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ahash::AHashSet;
 use indexmap::map::Entry;
@@ -3188,7 +3188,7 @@ impl Core {
                                 continue;
                             }
                             let sinks_clone: Vec<Sink> =
-                                batch.sinks.iter().map(Arc::clone).collect();
+                                batch.sinks.iter().map(Rc::clone).collect();
                             jobs.push((sinks_clone, phase_msgs));
                         }
                     }

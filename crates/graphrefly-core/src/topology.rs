@@ -9,7 +9,7 @@
 //! graph to avoid circularity (registering an observer node
 //! would itself be a topology change).
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::handle::NodeId;
 
@@ -30,8 +30,13 @@ pub enum TopologyEvent {
 
 /// Callback for topology changes. D246/S2c/D248: single-owner ⇒ no
 /// `Send + Sync` (fires owner-side; the bound was shared-Core-era
-/// legacy).
-pub type TopologySink = Arc<dyn Fn(&TopologyEvent)>;
+/// legacy). D272 (2026-05-21): switched the outer container from
+/// `Arc` to `Rc` to match the single-owner-thread shape and drop the
+/// `clippy::arc_with_non_send_sync` lints. The `assert_not_impl_any!`
+/// below locks D248 intent at the type system.
+pub type TopologySink = Rc<dyn Fn(&TopologyEvent)>;
+
+static_assertions::assert_not_impl_any!(TopologySink: Send, Sync);
 
 /// Identifier for a topology subscription (S2b / D225). Returned by
 /// [`super::node::Core::subscribe_topology`]; pass it to

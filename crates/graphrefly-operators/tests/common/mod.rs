@@ -19,9 +19,6 @@
 //! `transform::*` factories, and assert on recorded events.
 
 #![allow(dead_code)]
-// D248: substrate is structurally `!Send + !Sync` post-S2c. Test helpers
-// mirror that shape (sinks via `Arc<dyn Fn>` w/o `Send + Sync`).
-#![allow(clippy::arc_with_non_send_sync)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -824,14 +821,16 @@ struct RecorderInner {
 
 impl Recorder {
     fn new(binding: Arc<InnerBinding>) -> Self {
-        Self {
-            inner: Arc::new(RecorderInner {
-                binding,
-                events: Mutex::new(Vec::new()),
-                sub: Mutex::new(None),
-                fire_count: AtomicU64::new(0),
-            }),
-        }
+        // D273 follow-on: Arc over a !Send RecorderInner (contains Sink) →
+        // Rc in the Family-2 sweep.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let inner = Arc::new(RecorderInner {
+            binding,
+            events: Mutex::new(Vec::new()),
+            sub: Mutex::new(None),
+            fire_count: AtomicU64::new(0),
+        });
+        Self { inner }
     }
 
     fn sink(&self) -> Sink {
@@ -847,7 +846,7 @@ impl Recorder {
         // matches the user's intent (they dropped the Recorder, so
         // they don't want events anymore).
         let inner_weak: std::sync::Weak<RecorderInner> = Arc::downgrade(&self.inner);
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             let Some(inner) = inner_weak.upgrade() else {
                 return;
             };

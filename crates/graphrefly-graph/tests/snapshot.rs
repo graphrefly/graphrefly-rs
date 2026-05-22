@@ -165,7 +165,7 @@ fn r3_8_snapshot_derived_with_deps() {
 
     // Subscribe to trigger fn fire.
     let doubled_id = g.node("doubled");
-    let sub = g.subscribe(rt.core(), doubled_id, Arc::new(|_| {}));
+    let sub = g.subscribe(rt.core(), doubled_id, std::rc::Rc::new(|_| {}));
 
     let snap = g.snapshot(rt.core());
     assert_eq!(snap.nodes.len(), 2);
@@ -528,7 +528,7 @@ fn r3_8_from_snapshot_auto_hydration_with_derived_factory() {
 
     // Subscribe to trigger derived computation.
     let times_ten = g.node("times_ten");
-    let sub = g.subscribe(rt.core(), times_ten, Arc::new(|_| {}));
+    let sub = g.subscribe(rt.core(), times_ten, std::rc::Rc::new(|_| {}));
 
     let cache = g.cache_of(rt.core(), times_ten);
     assert_ne!(cache, NO_HANDLE);
@@ -740,7 +740,7 @@ fn r3_8_restore_skips_derived_nodes() {
 
     // inc should recompute from x (10 + 1 = 11), NOT use the snapshot's 999.
     let inc_id = g.node("inc");
-    let sub = g.subscribe(rt.core(), inc_id, Arc::new(|_| {}));
+    let sub = g.subscribe(rt.core(), inc_id, std::rc::Rc::new(|_| {}));
     assert_eq!(
         binding.deref(g.cache_of(rt.core(), inc_id)),
         serde_json::json!(11)

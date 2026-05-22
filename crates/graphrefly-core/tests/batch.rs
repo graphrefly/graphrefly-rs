@@ -60,7 +60,7 @@ impl GlobalLog {
 
     fn sink_for(&self, node: NodeId) -> Sink {
         let inner = self.inner.clone();
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             let mut g = inner.lock().expect("global log");
             for m in msgs {
                 let tier = match m {

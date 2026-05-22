@@ -56,7 +56,7 @@ impl BindingBoundary for ProfBinding {
 }
 
 fn noop_sink() -> Sink {
-    Arc::new(|_: &[Message]| {})
+    std::rc::Rc::new(|_: &[Message]| {})
 }
 
 fn main() {

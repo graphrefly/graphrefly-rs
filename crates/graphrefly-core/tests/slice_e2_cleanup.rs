@@ -219,7 +219,7 @@ fn r2_4_5_on_deactivation_precedes_producer_deactivate() {
         },
     );
 
-    let sink: graphrefly_core::Sink = Arc::new(|_| {});
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(|_| {});
     let sub = core.subscribe(prod_id, sink);
     // D246 rule 3: `subscribe` returns a Copy `SubscriptionId`; the
     // last-sub-leaves OnDeactivation is driven by owner-invoked

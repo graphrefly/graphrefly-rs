@@ -113,7 +113,7 @@ impl Recorder {
 
     pub fn sink(&self, binding: Arc<StructuresTestBinding>) -> Sink {
         let events = self.events.clone();
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             let mut guard = events.lock().expect("recorder lock");
             for msg in msgs {
                 let recorded = match msg {

@@ -13,7 +13,7 @@ fn event_log() -> (
 ) {
     let log: Arc<Mutex<Vec<TopologyEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = log.clone();
-    let sink: graphrefly_core::TopologySink = Arc::new(move |event: &TopologyEvent| {
+    let sink: graphrefly_core::TopologySink = std::rc::Rc::new(move |event: &TopologyEvent| {
         log_clone.lock().unwrap().push(event.clone());
     });
     (sink, log)

@@ -271,7 +271,7 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
     let late_for_defer = std::sync::Arc::clone(&late);
     let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trigger: graphrefly_core::Sink =
-        std::sync::Arc::new(move |msgs: &[graphrefly_core::Message]| {
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
             for m in msgs {
                 if matches!(m, graphrefly_core::Message::Data(_))
                     && posted
@@ -292,7 +292,7 @@ fn late_subscriber_installed_after_first_queue_notify_does_not_double_receive_da
                             let b = binding.clone();
                             let buf = std::sync::Arc::clone(&late);
                             let late_sink: graphrefly_core::Sink =
-                                std::sync::Arc::new(move |ms: &[graphrefly_core::Message]| {
+                                std::rc::Rc::new(move |ms: &[graphrefly_core::Message]| {
                                     let mut g = buf.lock().unwrap();
                                     for m in ms {
                                         match m {

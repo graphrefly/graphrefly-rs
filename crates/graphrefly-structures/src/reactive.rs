@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -517,7 +518,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                 let emitter_c = Arc::clone(&view_emitter);
                 let sub = core.subscribe(
                     self.node_id,
-                    Arc::new(move |msgs| {
+                    Rc::new(move |msgs| {
                         if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
                             let guard = inner_c.lock();
                             let data = guard.backend.to_vec();
@@ -535,7 +536,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                 let emitter_c = Arc::clone(&view_emitter);
                 let sub = core.subscribe(
                     self.node_id,
-                    Arc::new(move |msgs| {
+                    Rc::new(move |msgs| {
                         if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
                             let guard = inner_c.lock();
                             let data = guard.backend.to_vec();
@@ -562,7 +563,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                 let read_cursor_c = Arc::clone(&read_cursor);
                 let sub_cursor = core.subscribe(
                     cursor_node,
-                    Arc::new(move |msgs| {
+                    Rc::new(move |msgs| {
                         for m in msgs {
                             if let Message::Data(h) = m {
                                 let pos = read_cursor_c(*h);
@@ -585,7 +586,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
                 let emitter_c2 = view_emitter;
                 let sub_log = core.subscribe(
                     self.node_id,
-                    Arc::new(move |msgs| {
+                    Rc::new(move |msgs| {
                         if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
                             let pos = *cursor_pos_c2.lock();
                             let guard = inner_c2.lock();
@@ -650,7 +651,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         let sub = core.subscribe(
             self.node_id,
-            Arc::new(move |msgs| {
+            Rc::new(move |msgs| {
                 if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
                     let mut ss = state.lock();
                     let guard = inner.lock();
@@ -730,7 +731,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         let sub = core.subscribe(
             upstream,
-            Arc::new(move |msgs| {
+            Rc::new(move |msgs| {
                 // D270: check-and-clear the skip flag if THIS batch
                 // carries DATA. Locks-then-clears in one atomic step
                 // so the next batch (live emission) is not skipped.
@@ -792,7 +793,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
         }
 
         if sinks.is_empty() {
-            let sub = core.subscribe(self.node_id, Arc::new(|_| {}));
+            let sub = core.subscribe(self.node_id, Rc::new(|_| {}));
             return Ok(AttachStorageHandle {
                 sub: ReactiveSub {
                     subs: vec![(self.node_id, sub)],
@@ -826,7 +827,7 @@ impl<T: Clone + Send + Sync + 'static> ReactiveLog<T> {
 
         let sub = core.subscribe(
             self.node_id,
-            Arc::new(move |msgs| {
+            Rc::new(move |msgs| {
                 if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
                     let guard = inner.lock();
                     let data = guard.backend.to_vec();

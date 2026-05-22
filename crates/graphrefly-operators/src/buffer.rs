@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! Buffer operators — collect and batch reactive values.
 //!
 //! # Operators
@@ -16,6 +7,7 @@
 //! - [`window`] — notifier-triggered sub-node splitting.
 //! - [`window_count`] — count-based sub-node splitting.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -76,7 +68,7 @@ pub fn buffer(
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Flush(Vec<HandleId>),
                 Complete,
@@ -160,7 +152,7 @@ pub fn buffer(
         let st2 = state.clone();
         let core_n = em.clone();
         let bb2: Arc<dyn BindingBoundary> = binding_s.clone();
-        let notifier_sink: Sink = Arc::new(move |msgs| {
+        let notifier_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Flush(Vec<HandleId>),
                 Error(HandleId),
@@ -274,7 +266,7 @@ pub fn buffer_count(
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Flush(Vec<HandleId>),
                 Complete,
@@ -429,7 +421,7 @@ pub fn window(
         let st = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
         let em_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate (restores the retired
                 // `if s.terminated { break }`) — a batched
@@ -526,7 +518,7 @@ pub fn window(
         let st2 = state.clone();
         let em_not = em.clone();
         let bb_not: Arc<dyn BindingBoundary> = binding_s.clone();
-        let notifier_sink: Sink = Arc::new(move |msgs| {
+        let notifier_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
                 if st2.lock().terminated {
@@ -676,7 +668,7 @@ pub fn window_count(
         let st = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
         let em_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 // QA P1: per-message terminal gate.
                 if st.lock().terminated {

@@ -799,15 +799,23 @@ pub(crate) fn unsubscribe_sink(core: &Core, node_id: NodeId, sub_id: Subscriptio
 // (which delegates to the shared `unsubscribe_sink` free fn below);
 // binding-layer RAII wraps it where the holder co-owns the Core.
 
-/// A subscriber callback. `Send + Sync` so the Core can fire it from any
-/// thread; `Fn` (not `FnMut`) so multiple references coexist — capture
-/// mutable state in `Mutex<T>` or atomics on the binding side.
+/// A subscriber callback. `Fn` (not `FnMut`) so multiple references coexist
+/// — capture mutable state in `RefCell<T>` (owner-side single-thread) or
+/// atomics on the binding side.
 // D246/S2c/D248: single-owner ⇒ sinks fire owner-side on the one
 // thread that drives the `Core`; the `Send + Sync` bound was
 // shared-Core-era legacy. Dropped — `Core` (which owns the subscriber
 // map) is consequently `!Send + !Sync`, the actor-model shape (the only
 // cross-thread bridge is `Arc<CoreMailbox>` for id-only timer posts).
-pub type Sink = Arc<dyn Fn(&[Message])>;
+// D272 (2026-05-21): the residual `Arc` over the `!Send !Sync` `dyn Fn`
+// was itself vestigial — `Rc` matches the single-owner-thread shape and
+// drops the `clippy::arc_with_non_send_sync` lints. The
+// `assert_not_impl_any!` below locks D248 intent at the type system —
+// any future change that re-introduces `Send`/`Sync` on the callback
+// fails this assert at build time.
+pub type Sink = std::rc::Rc<dyn Fn(&[Message])>;
+
+static_assertions::assert_not_impl_any!(Sink: Send, Sync);
 
 // ---------------------------------------------------------------------------
 // PAUSE/RESUME state — §10.2 of the rust-port session doc

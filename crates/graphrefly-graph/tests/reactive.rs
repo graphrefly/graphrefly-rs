@@ -22,7 +22,7 @@ fn describe_reactive_pushes_initial_snapshot() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -41,7 +41,7 @@ fn describe_reactive_fires_on_new_node() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -68,7 +68,7 @@ fn describe_reactive_fires_on_remove() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -102,7 +102,7 @@ fn describe_reactive_stops_on_detach() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -123,7 +123,7 @@ fn describe_reactive_accumulates_nodes() {
     let (rt, g) = graph("test");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -244,7 +244,7 @@ fn describe_reactive_fires_on_mount_new() {
     let (rt, g) = graph("root");
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);
@@ -271,7 +271,7 @@ fn describe_reactive_fires_on_unmount() {
 
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let snapshots_clone = snapshots.clone();
-    let sink: DescribeSink = Arc::new(move |output| {
+    let sink: DescribeSink = std::rc::Rc::new(move |output| {
         snapshots_clone.lock().unwrap().push(output.clone());
     });
     let handle = g.describe_reactive(rt.core(), &sink);

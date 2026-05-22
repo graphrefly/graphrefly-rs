@@ -791,7 +791,7 @@ impl Recorder {
         let events = self.events.clone();
         let call_boundaries = self.call_boundaries.clone();
         let call_count = self.call_count.clone();
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             let mut guard = events.lock().expect("recorder lock");
             for msg in msgs {
                 let recorded = match msg {

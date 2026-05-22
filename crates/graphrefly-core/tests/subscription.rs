@@ -26,13 +26,14 @@ fn data_counter(
 ) -> (Arc<AtomicU32>, graphrefly_core::SubscriptionId) {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_clone = counter.clone();
-    let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
-        for m in msgs {
-            if matches!(m, graphrefly_core::Message::Data(_)) {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
+    let sink: graphrefly_core::Sink =
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
+            for m in msgs {
+                if matches!(m, graphrefly_core::Message::Data(_)) {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                }
             }
-        }
-    });
+        });
     let sub = rt.core().subscribe(node_id, sink);
     (counter, sub)
 }

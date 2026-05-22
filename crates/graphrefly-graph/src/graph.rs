@@ -22,7 +22,6 @@
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 
 use graphrefly_core::{
     Core, EqualsMode, FnId, HandleId, LockId, NodeId, PauseError, ResumeReport, SetDepsError, Sink,
@@ -103,7 +102,9 @@ pub enum NameError {
 /// synchronously owner-side. (The in-wave `DepsChanged`/`NodeTornDown`
 /// re-entry path is the one that defers via `MailboxOp::Defer` — see
 /// `describe.rs`/`observe.rs`.)
-pub(crate) type NamespaceChangeSink = Arc<dyn Fn(&Core)>;
+pub(crate) type NamespaceChangeSink = Rc<dyn Fn(&Core)>;
+
+static_assertions::assert_not_impl_any!(NamespaceChangeSink: Send, Sync);
 
 /// Inner namespace + mount-tree state for one graph level. D246: holds
 /// **no `Core`** — purely the named namespace, the mounted children,

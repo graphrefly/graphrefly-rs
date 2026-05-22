@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! `Graph::describe()` — JSON form of canonical spec §3.6 + Appendix B.
 //!
 //! D246: describe logic is a free fn [`describe_of`] over
@@ -27,7 +18,6 @@
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 
 use graphrefly_core::{
     Core, CoreFull, HandleId, NodeId, NodeKind, OperatorOp, TerminalKind, TopologyEvent,
@@ -277,8 +267,12 @@ fn status_of(
 // Reactive describe (canonical §3.6.1 `reactive: true` mode)
 // -------------------------------------------------------------------
 
-/// Sink type for reactive describe.
-pub type DescribeSink = Arc<dyn Fn(&GraphDescribeOutput)>;
+/// Sink type for reactive describe. D272 (2026-05-21): single-owner-
+/// thread shape — `Rc<dyn Fn>` matches D248's `!Send + !Sync` Core. The
+/// `assert_not_impl_any!` below locks D248 intent at the type system.
+pub type DescribeSink = Rc<dyn Fn(&GraphDescribeOutput)>;
+
+static_assertions::assert_not_impl_any!(DescribeSink: Send, Sync);
 
 /// Id-bearing handle for a reactive describe subscription.
 ///
@@ -325,7 +319,7 @@ pub(crate) fn describe_reactive_in(
     // Namespace-change path (owner-side `&Core`, β/D231).
     let weak_inner: Weak<RefCell<GraphInner>> = Rc::downgrade(inner);
     let sink_ns = sink.clone();
-    let ns_sink: crate::graph::NamespaceChangeSink = Arc::new(move |c: &Core| {
+    let ns_sink: crate::graph::NamespaceChangeSink = Rc::new(move |c: &Core| {
         let Some(arc_inner) = weak_inner.upgrade() else {
             return;
         };
@@ -350,7 +344,7 @@ pub(crate) fn describe_reactive_in(
     // wave re-arms. Behaviour-equivalent (deferred-snapshot acceptable,
     // D243/D244) — one alloc + one snapshot per wave, not per emission.
     let scheduled = Rc::new(std::cell::Cell::new(false));
-    let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
+    let topo_sink: Rc<dyn Fn(&TopologyEvent)> = Rc::new(move |event: &TopologyEvent| {
         if matches!(event, TopologyEvent::DepsChanged { .. }) {
             if scheduled.get() {
                 return; // already armed for this drain — coalesce.

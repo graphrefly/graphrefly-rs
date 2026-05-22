@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! Control operators — side-effect, gating, error recovery, convergence.
 //!
 //! # Operators
@@ -20,6 +11,7 @@
 
 #![allow(clippy::too_many_lines, clippy::items_after_statements)]
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -46,7 +38,7 @@ pub fn tap(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, fn_i
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 EmitAndTap(HandleId),
                 Complete,
@@ -124,7 +116,7 @@ pub fn tap_observer(
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Complete,
@@ -215,7 +207,7 @@ pub fn on_first_data(
         let core_sink = em.clone();
         let state: Arc<Mutex<OnFirstState>> = Arc::new(Mutex::new(OnFirstState { fired: false }));
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 EmitWithTap(HandleId),
                 Emit(HandleId),
@@ -300,7 +292,7 @@ pub fn rescue(
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Complete,
@@ -404,7 +396,7 @@ pub fn valve(
         let bb_ctrl: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_ctrl = em.clone();
         let cancel_ctrl = cancel.clone();
-        let control_sink: Sink = Arc::new(move |msgs| {
+        let control_sink: Sink = Rc::new(move |msgs| {
             let mut should_cancel = false;
             let mut error_action: Option<HandleId> = None;
             {
@@ -461,7 +453,7 @@ pub fn valve(
         let st_src = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Complete,
@@ -560,7 +552,7 @@ pub fn settle(
             completed: false,
         }));
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Complete,
@@ -678,13 +670,16 @@ pub fn repeat(
 
         // Build the sink closure. It needs to reference itself for
         // resubscription, so we use a shared slot.
+        // D273 follow-on: Arc<Mutex<...>> over a !Send Sink → converted to
+        // Rc<RefCell<...>> in the workspace-wide Family-2 Cat-3 sweep.
+        #[allow(clippy::arc_with_non_send_sync)]
         let sink_slot: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let sink_slot_inner = sink_slot.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_sink = em.clone();
         let storage_inner = storage.clone();
 
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Error(HandleId),

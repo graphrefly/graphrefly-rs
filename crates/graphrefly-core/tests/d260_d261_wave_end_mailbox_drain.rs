@@ -64,7 +64,7 @@ fn d260_fire_deferred_sink_mailbox_post_drains_within_outer_wave() {
     let mailbox = rt.mailbox();
     let binding = rt.binding.clone();
     let side_id = side.id;
-    let trigger_sink: Sink = Arc::new(move |msgs| {
+    let trigger_sink: Sink = std::rc::Rc::new(move |msgs| {
         for m in msgs {
             if let Message::Data(_) = m {
                 let h = binding.intern(TestValue::Int(100));
@@ -135,7 +135,7 @@ fn d261_handshake_fire_sink_mailbox_post_drains_before_subscribe_returns() {
     let mailbox = rt.mailbox();
     let binding = rt.binding.clone();
     let target_id = target.id;
-    let source_sink: Sink = Arc::new(move |msgs| {
+    let source_sink: Sink = std::rc::Rc::new(move |msgs| {
         for m in msgs {
             if let Message::Data(_) = m {
                 source_sink_fires_c.fetch_add(1, Ordering::Relaxed);

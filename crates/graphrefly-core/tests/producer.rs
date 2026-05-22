@@ -144,7 +144,7 @@ fn make_runtime() -> (Core, Arc<ProducerBinding>) {
 }
 
 fn noop_sink() -> Sink {
-    Arc::new(|_| {})
+    std::rc::Rc::new(|_| {})
 }
 
 // =====================================================================
@@ -411,7 +411,7 @@ fn r_d031_producer_returning_data_emits_value() {
 
     let received: Arc<Mutex<Vec<HandleId>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
-    let sink: Sink = Arc::new(move |msgs| {
+    let sink: Sink = std::rc::Rc::new(move |msgs| {
         for m in msgs {
             if let graphrefly_core::Message::Data(h) = m {
                 received_clone.lock().unwrap().push(*h);

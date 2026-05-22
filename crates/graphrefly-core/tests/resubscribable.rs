@@ -24,7 +24,7 @@ fn subscribe_to_non_resubscribable_completed_returns_torn_down_error() {
     rt.core().complete(s.id);
 
     // try_subscribe returns Err(TornDown).
-    let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
@@ -54,7 +54,7 @@ fn subscribe_to_non_resubscribable_errored_returns_torn_down_error() {
     let err = rt.binding.intern(TestValue::Str("boom".into()));
     rt.core().error(s.id, err);
 
-    let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
@@ -68,7 +68,7 @@ fn subscribe_to_non_resubscribable_torndown_returns_torn_down_error() {
     let s = rt.state(Some(TestValue::Int(5)));
     rt.core().teardown(s.id);
 
-    let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
@@ -285,7 +285,7 @@ fn subscribe_to_non_resubscribable_terminated_with_invalidated_cache_returns_tor
     rt.core().invalidate(s.id); // clears cache to NO_HANDLE
     rt.core().complete(s.id);
 
-    let sink: graphrefly_core::Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: graphrefly_core::Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),

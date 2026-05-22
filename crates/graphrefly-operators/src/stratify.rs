@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! `stratify_branch` — substrate operator for classifier-routing.
 //!
 //! Substrate counterpart of TS `extra/composition/stratify.ts` (D199,
@@ -64,6 +55,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -235,7 +227,7 @@ pub fn stratify_branch(
         let st_rules = state.clone();
         let bb_rules: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_rules = em.clone();
-        let rules_sink: Sink = Arc::new(move |msgs| {
+        let rules_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 ReleaseOldRules(HandleId),
                 Emit(HandleId),
@@ -327,7 +319,7 @@ pub fn stratify_branch(
         let st_src = state.clone();
         let bb_src: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Emit(HandleId),
                 Drop(HandleId),

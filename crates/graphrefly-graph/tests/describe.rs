@@ -62,7 +62,7 @@ fn derived_node_status_settled_after_dep_fires() {
     // via stub binding) → has_fired_once = true.
     // Subscribe to trigger activation:
     let did = g.node("d");
-    let sub = g.subscribe(rt.core(), did, std::sync::Arc::new(|_msgs| {}));
+    let sub = g.subscribe(rt.core(), did, std::rc::Rc::new(|_msgs| {}));
     let d = g.describe(rt.core());
     let nd = d.nodes.get("d").unwrap();
     assert_eq!(nd.status, NodeStatus::Settled);

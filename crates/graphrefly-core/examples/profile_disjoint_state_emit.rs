@@ -49,7 +49,7 @@ impl BindingBoundary for WorkBinding {
 }
 
 fn noop_sink() -> Sink {
-    Arc::new(|_: &[Message]| {})
+    std::rc::Rc::new(|_: &[Message]| {})
 }
 
 /// One worker owns its own `Core`; re-emits a monotonic handle on a

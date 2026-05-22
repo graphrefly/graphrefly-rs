@@ -224,7 +224,7 @@ fn phase_g_preserves_terminal_slot_for_non_resubscribable_rejection() {
     rt.unsub_recorder(&rec); // Phase G runs.
 
     // R2.2.7.b: subscribe must reject because terminal slot preserved.
-    let sink: Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { node }) => assert_eq!(node, s.id),
         Err(e) => panic!("expected TornDown, got Err({e:?})"),
@@ -330,7 +330,7 @@ fn r2_2_7_b_rejects_subscribe_between_complete_and_teardown_cascade() {
     // threaded test. Late subscribe after complete must reject.
     rt.core().complete(s.id);
     rt.unsub_recorder(&rec);
-    let sink: Sink = std::sync::Arc::new(|_msgs| {});
+    let sink: Sink = std::rc::Rc::new(|_msgs| {});
     match rt.core().try_subscribe(s.id, sink) {
         Err(SubscribeError::TornDown { .. }) => {}
         Err(e) => panic!("expected TornDown, got Err({e:?})"),

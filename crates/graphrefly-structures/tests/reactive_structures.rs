@@ -714,16 +714,17 @@ fn subscriber_can_read_during_emission() {
     let count_clone = data_count.clone();
 
     let binding = rt.binding.clone();
-    let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
-        for msg in msgs {
-            if let graphrefly_core::Message::Data(h) = msg {
-                // Dereference the handle — proves Core delivered the message
-                // without the inner lock being held (P1 invariant).
-                let _ = binding.deref(*h);
-                *count_clone.lock().unwrap() += 1;
+    let sink: graphrefly_core::Sink =
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
+            for msg in msgs {
+                if let graphrefly_core::Message::Data(h) = msg {
+                    // Dereference the handle — proves Core delivered the message
+                    // without the inner lock being held (P1 invariant).
+                    let _ = binding.deref(*h);
+                    *count_clone.lock().unwrap() += 1;
+                }
             }
-        }
-    });
+        });
     // Tracked so OwnedCore's owner-thread Drop tears it down (D246 —
     // no core RAII).
     let _sub = rt.track_subscribe(log.node_id, sink);

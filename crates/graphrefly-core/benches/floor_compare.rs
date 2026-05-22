@@ -45,7 +45,7 @@ impl BindingBoundary for FloorBinding {
 }
 
 fn noop_sink() -> Sink {
-    Arc::new(|_: &[Message]| {})
+    std::rc::Rc::new(|_: &[Message]| {})
 }
 
 fn floor(c: &mut Criterion) {

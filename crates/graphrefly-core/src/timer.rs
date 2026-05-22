@@ -368,7 +368,7 @@ mod tests {
         let em = emitted.clone();
         let _sub = core.subscribe(
             node,
-            Arc::new(move |msgs| {
+            std::rc::Rc::new(move |msgs| {
                 for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);
@@ -439,7 +439,7 @@ mod tests {
         let em = emitted.clone();
         let _sub = core.subscribe(
             node,
-            Arc::new(move |msgs| {
+            std::rc::Rc::new(move |msgs| {
                 for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);
@@ -529,7 +529,7 @@ mod tests {
         let em = emitted.clone();
         let _sub = core.subscribe(
             node,
-            Arc::new(move |msgs| {
+            std::rc::Rc::new(move |msgs| {
                 for m in msgs {
                     if let crate::message::Message::Data(h) = m {
                         em.lock().push(*h);

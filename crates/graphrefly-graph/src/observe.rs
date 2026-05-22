@@ -147,7 +147,7 @@ impl GraphObserveAll {
         for (name, id) in names_to_ids {
             let sink_clone = sink_arc.clone();
             let owned_name = name;
-            let inner_sink: Sink = Arc::new(move |msgs: &[Message]| {
+            let inner_sink: Sink = Rc::new(move |msgs: &[Message]| {
                 sink_clone(&owned_name, msgs);
             });
             let sub_id = core.subscribe(id, inner_sink);
@@ -240,7 +240,7 @@ impl GraphObserveAllReactive {
         let weak_graph_inner: Weak<RefCell<GraphInner>> = Rc::downgrade(self.graph.inner_arc());
         let inner_for_ns = self.inner.clone();
         let sink_for_ns = sink_arc.clone();
-        let ns_sink: NamespaceChangeSink = Arc::new(move |core: &Core| {
+        let ns_sink: NamespaceChangeSink = Rc::new(move |core: &Core| {
             let Some(arc_inner) = weak_graph_inner.upgrade() else {
                 return;
             };
@@ -262,7 +262,7 @@ impl GraphObserveAllReactive {
                 if should {
                     let sink_clone = sink_for_ns.clone();
                     let owned_name = name;
-                    let msg_sink: Sink = Arc::new(move |msgs: &[Message]| {
+                    let msg_sink: Sink = Rc::new(move |msgs: &[Message]| {
                         sink_clone(&owned_name, msgs);
                     });
                     let sub_id = core.subscribe(id, msg_sink);
@@ -290,7 +290,7 @@ impl GraphObserveAllReactive {
         // is exactly the union, just batched into one deferred pass.
         let pending: Rc<RefCell<Vec<NodeId>>> = Rc::new(RefCell::new(Vec::new()));
         let scheduled = Rc::new(std::cell::Cell::new(false));
-        let topo_sink: Arc<dyn Fn(&TopologyEvent)> = Arc::new(move |event: &TopologyEvent| {
+        let topo_sink: Rc<dyn Fn(&TopologyEvent)> = Rc::new(move |event: &TopologyEvent| {
             if let TopologyEvent::NodeTornDown(id) = event {
                 // INVARIANT (QA, 2026-05-19): push BEFORE the
                 // `scheduled.get()` check so a fire arriving while a
@@ -355,7 +355,7 @@ impl GraphObserveAllReactive {
         };
         for (name, id) in to_subscribe {
             let sink_clone = sink_arc.clone();
-            let msg_sink: Sink = Arc::new(move |msgs: &[Message]| {
+            let msg_sink: Sink = Rc::new(move |msgs: &[Message]| {
                 sink_clone(&name, msgs);
             });
             let sub_id = core.subscribe(id, msg_sink);

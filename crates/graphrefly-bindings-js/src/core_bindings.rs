@@ -82,13 +82,13 @@ use graphrefly_operators::producer::{
 use crate::core_actor::CoreActor;
 
 /// Build a fresh no-op sink. Pre-S6 (D248) this was a `OnceLock<Sink>`
-/// shared across calls (M9), but post-D248 `Sink = Arc<dyn Fn(&[Message])>`
+/// shared across calls (M9), but post-D248/D272 `Sink = Rc<dyn Fn(&[Message])>`
 /// is `!Send + !Sync` — `OnceLock<T>` requires `T: Sync` to share across
-/// threads. Per-call allocation is acceptable: `Arc::new(|_| {})` is
+/// threads. Per-call allocation is acceptable: `Rc::new(|_| {})` is
 /// one heap allocation per `subscribe_noop` call, called rarely (only
 /// in bench paths that don't observe sink messages).
 fn noop_sink() -> graphrefly_core::Sink {
-    Arc::new(|_| {})
+    std::rc::Rc::new(|_| {})
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +885,7 @@ fn bridge_sync_unit(tsfn: &Arc<SinkTsfn>, payload: Vec<u32>) {
 /// Build a `Sink` closure that delivers each message batch to JS via
 /// the TSFN, blocking until JS finishes processing.
 fn build_tsfn_sink(tsfn: Arc<SinkTsfn>) -> Sink {
-    Arc::new(move |msgs: &[Message]| {
+    std::rc::Rc::new(move |msgs: &[Message]| {
         let mut payload: Vec<u32> = Vec::with_capacity(msgs.len() * 2);
         for m in msgs {
             let (code, arg) = encode_message(*m);

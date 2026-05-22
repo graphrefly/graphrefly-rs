@@ -390,7 +390,7 @@ async fn interval_emits_incrementing_counter() {
     let em = emitted.clone();
     let _sub = rt.core().subscribe(
         iv,
-        std::sync::Arc::new(move |msgs: &[graphrefly_core::Message]| {
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
             for &m in msgs {
                 if let graphrefly_core::Message::Data(h) = m {
                     em.lock().unwrap().push(h);

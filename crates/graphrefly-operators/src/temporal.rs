@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! Temporal operators — time-dependent transforms on reactive streams.
 //!
 //! # Operators
@@ -46,6 +37,7 @@
 //! `tokio::spawn`).
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +120,7 @@ pub fn sample(
         let st = state.clone();
         let bb: Arc<dyn BindingBoundary> = binding_s.clone();
         let core_src = em.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Act {
                 Release(HandleId),
                 Error(HandleId),
@@ -185,7 +177,7 @@ pub fn sample(
         let st2 = state.clone();
         let core_n = em.clone();
         let bb2: Arc<dyn BindingBoundary> = binding_s.clone();
-        let notifier_sink: Sink = Arc::new(move |msgs| {
+        let notifier_sink: Sink = Rc::new(move |msgs| {
             let mut s = st2.lock();
             if s.terminated {
                 return;
@@ -295,7 +287,7 @@ pub fn debounce(
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -441,7 +433,7 @@ pub fn audit(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -584,7 +576,7 @@ pub fn delay(core: &Core, binding: &Arc<dyn ProducerBinding>, source: NodeId, ms
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -757,7 +749,7 @@ pub fn throttle(
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -995,7 +987,7 @@ pub fn timeout(
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -1139,7 +1131,7 @@ pub fn buffer_time(
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {
@@ -1334,7 +1326,7 @@ pub fn window_time(
         }
 
         let bb_sink: Arc<dyn BindingBoundary> = binding_s.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             for m in msgs {
                 match m.tier() {
                     3 => {

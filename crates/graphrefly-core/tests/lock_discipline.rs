@@ -30,11 +30,6 @@
 //! and custom-equals re-entrance use the same mailbox seam — see
 //! `tests/lock_released.rs`.
 
-// D248: substrate is structurally `!Send + !Sync` post-S2c. Sinks use
-// `Arc<dyn Fn>` (no `+ Send + Sync` bound); the lint is correct that
-// `Rc` would suffice but the type alias is intentional. Allow at test root.
-#![allow(clippy::arc_with_non_send_sync)]
-
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -60,7 +55,7 @@ fn sink_can_reenter_core_via_emit() {
     let mailbox = rt.mailbox();
     let binding = rt.binding.clone();
     let other_id = other.id;
-    let reentrant_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let reentrant_sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_)) {
                 let h = binding.intern(TestValue::Int(55));
@@ -93,7 +88,7 @@ fn sink_can_complete_another_node_from_callback() {
 
     let mailbox = rt.mailbox();
     let target_id = target.id;
-    let completing_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let completing_sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_)) {
                 let _ = mailbox.post_complete(target_id);
@@ -131,7 +126,7 @@ fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
     let sink_node = rt.state(None);
     let order_w = order.clone();
     let binding_o = rt.binding.clone();
-    let order_sink: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let order_sink: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if let Message::Data(h) = m {
                 if let common::TestValue::Int(n) = binding_o.deref(*h) {
@@ -149,7 +144,7 @@ fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
     let binding = rt.binding.clone();
     let sink_id = sink_node.id;
     let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reentrant: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let reentrant: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_))
                 && !posted.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -183,13 +178,6 @@ fn p7_reentrant_drain_mailbox_applies_nested_waves_in_fifo_order() {
 }
 
 #[test]
-// D248/D249/S2c: `Arc<TestRuntime>` / `Arc<dyn Fn(&[Message])>` (the
-// relaxed `Sink`) are `!Send` under single-owner. The `Arc` is used
-// here for *single-thread* shared ownership (the sink captures a
-// runtime handle, dropped on the owner thread) — `Rc` would be more
-// precise but the `Sink` type alias is `Arc`-based; the lint is a
-// false-positive for this owner-only pattern.
-#[allow(clippy::arc_with_non_send_sync)]
 fn handshake_sink_can_reenter_core_emit_on_other_node() {
     // Slice E rework (S2c/D248 single-owner update): the handshake now
     // fires LOCK-RELEASED. A handshake-time sink callback can re-enter
@@ -203,6 +191,10 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
     // `Core::emit(producer_id, h)`).
     use std::sync::Arc;
 
+    // D273 follow-on: Arc<TestRuntime> over a !Send TestRuntime (post-D248
+    // `Sink = Rc<dyn Fn>` makes any sink-capturing handle !Send) — converted
+    // to Rc in the Family-2 sweep.
+    #[allow(clippy::arc_with_non_send_sync)]
     let rt = Arc::new(TestRuntime::new());
     let s = rt.state(Some(TestValue::Int(0)));
     let s_id = s.id;
@@ -214,15 +206,16 @@ fn handshake_sink_can_reenter_core_emit_on_other_node() {
     let other_rec = rt.subscribe_recorder(other_id);
 
     let rt_inner = Arc::clone(&rt);
-    let sink: graphrefly_core::Sink = Arc::new(move |msgs: &[graphrefly_core::Message]| {
-        // On the [Data(cache)] tier, re-enter Core to emit on `other`.
-        for m in msgs {
-            if matches!(m, graphrefly_core::Message::Data(_)) {
-                let h = rt_inner.binding.intern(TestValue::Int(99));
-                rt_inner.core().emit(other_id, h);
+    let sink: graphrefly_core::Sink =
+        std::rc::Rc::new(move |msgs: &[graphrefly_core::Message]| {
+            // On the [Data(cache)] tier, re-enter Core to emit on `other`.
+            for m in msgs {
+                if matches!(m, graphrefly_core::Message::Data(_)) {
+                    let h = rt_inner.binding.intern(TestValue::Int(99));
+                    rt_inner.core().emit(other_id, h);
+                }
             }
-        }
-    });
+        });
 
     // No panic; re-entrant emit lands on `other_rec`.
     let _sub = rt.core().subscribe(s_id, sink);
@@ -269,7 +262,7 @@ fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
     let s_id = s.id;
     let late_for_defer = Arc::clone(&late);
     let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let trigger: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let trigger: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_))
                 && posted
@@ -286,19 +279,20 @@ fn concurrent_subscribe_during_emit_observes_monotonic_post_subscribe_emits() {
                 let _ = mailbox.post_defer(Box::new(move |cf: &dyn graphrefly_core::CoreFull| {
                     let b = binding.clone();
                     let buf = Arc::clone(&late);
-                    let late_sink: graphrefly_core::Sink = Arc::new(move |ms: &[Message]| {
-                        let mut g = buf.lock().unwrap();
-                        for m in ms {
-                            match m {
-                                Message::Start => g.push(Ev::Start),
-                                Message::Data(h) => match b.deref(*h) {
-                                    TestValue::Int(n) => g.push(Ev::Data(n)),
+                    let late_sink: graphrefly_core::Sink =
+                        std::rc::Rc::new(move |ms: &[Message]| {
+                            let mut g = buf.lock().unwrap();
+                            for m in ms {
+                                match m {
+                                    Message::Start => g.push(Ev::Start),
+                                    Message::Data(h) => match b.deref(*h) {
+                                        TestValue::Int(n) => g.push(Ev::Data(n)),
+                                        _ => g.push(Ev::Other),
+                                    },
                                     _ => g.push(Ev::Other),
-                                },
-                                _ => g.push(Ev::Other),
+                                }
                             }
-                        }
-                    });
+                        });
                     let _ = cf.subscribe(s_id, late_sink);
                 }));
             }
@@ -383,7 +377,7 @@ fn cross_queue_order_mailbox_then_deferred() {
     // records "Emit" (via the recorder's data values). Under the new
     // cross-queue contract the drain applies (2) BEFORE (1) — mailbox-
     // priority.
-    let trigger: graphrefly_core::Sink = Arc::new(move |msgs: &[Message]| {
+    let trigger: graphrefly_core::Sink = std::rc::Rc::new(move |msgs: &[Message]| {
         for m in msgs {
             if matches!(m, Message::Data(_))
                 && !posted.swap(true, std::sync::atomic::Ordering::SeqCst)

@@ -77,7 +77,7 @@ impl BindingBoundary for BenchBinding {
 
 /// A noop sink — present to keep nodes activated; doesn't accumulate.
 fn noop_sink() -> Sink {
-    Arc::new(|_msgs: &[Message]| {})
+    std::rc::Rc::new(|_msgs: &[Message]| {})
 }
 
 // ---------------------------------------------------------------------------

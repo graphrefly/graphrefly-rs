@@ -1,12 +1,3 @@
-// D248: post-S2c the substrate is `!Send + !Sync` single-owner Core; the
-// Sink/TopologySink callbacks were deliberately relaxed to `Arc<dyn Fn>`
-// (dropped `+ Send + Sync`). Rc would suffice and is the architecturally
-// correct type for inherently single-owner sinks — the Arc→Rc cleanup is
-// a separate slice tracked in porting-deferred.md. Until then, `Arc` is
-// over-conservative but correct, and this file's Arc<Sink> sites cite
-// the deliberate D248 relaxation, not a missed Send+Sync bound.
-#![allow(clippy::arc_with_non_send_sync)]
-
 //! Concrete implementations of the four subscription-managed combinators
 //! (zip / concat / race / takeUntil). Built on the
 //! [`super::producer::ProducerCtx`] substrate.
@@ -22,6 +13,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use graphrefly_core::{Core, HandleId, NodeId, Sink};
@@ -119,7 +111,7 @@ pub fn zip(
             // can safely capture strong refs cloned from the upgraded weaks.
             let core_inner = em.clone();
             let binding_inner = binding_clone.clone();
-            let sink: Sink = Arc::new(move |msgs| {
+            let sink: Sink = Rc::new(move |msgs| {
                 // Phase 1 (lock held): mutate queues + collect actions.
                 // Phase 2 (lock released): pack tuples + re-enter Core.
                 enum PostLockAction {
@@ -312,7 +304,7 @@ pub fn concat(
         let state_for_second = state.clone();
         let core_for_second = em.clone();
         let binding_for_second = binding_clone.clone();
-        let second_sink: Sink = Arc::new(move |msgs| {
+        let second_sink: Sink = Rc::new(move |msgs| {
             enum Action {
                 Emit(HandleId),
                 Complete,
@@ -399,7 +391,7 @@ pub fn concat(
         let state_for_first = state.clone();
         let core_for_first = em.clone();
         let binding_for_first = binding_clone.clone();
-        let first_sink: Sink = Arc::new(move |msgs| {
+        let first_sink: Sink = Rc::new(move |msgs| {
             // first.Complete triggers the phase transition (handled
             // via `s.phase = 1` + draining pending into `actions`),
             // and may also self-complete the producer if `second`
@@ -583,7 +575,7 @@ pub fn race(
             let state_inner = state.clone();
             let core_inner = em.clone();
             let binding_inner = binding_clone.clone();
-            let sink: Sink = Arc::new(move |msgs| {
+            let sink: Sink = Rc::new(move |msgs| {
                 enum Action {
                     Emit(HandleId),
                     Complete,
@@ -729,7 +721,7 @@ pub fn take_until(
         let state_for_source = state.clone();
         let core_for_source = em.clone();
         let binding_for_source = binding_clone.clone();
-        let source_sink: Sink = Arc::new(move |msgs| {
+        let source_sink: Sink = Rc::new(move |msgs| {
             enum Action {
                 Emit(HandleId),
                 Complete,
@@ -805,7 +797,7 @@ pub fn take_until(
         let state_for_notifier = state.clone();
         let core_for_notifier = em.clone();
         let binding_for_notifier = binding_clone.clone();
-        let notifier_sink: Sink = Arc::new(move |msgs| {
+        let notifier_sink: Sink = Rc::new(move |msgs| {
             enum Action {
                 Complete,
                 Error(HandleId),

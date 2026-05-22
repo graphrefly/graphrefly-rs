@@ -1,9 +1,6 @@
 //! Tests for M2 Slice F port-coverage gap fills:
 //! R3.2.1 named-sugar wrappers, R3.7.1 signal(), R3.2.3 remove(), R3.3.1 edges().
 
-// D248: substrate is structurally `!Send + !Sync` post-S2c.
-#![allow(clippy::arc_with_non_send_sync)]
-
 mod common;
 
 use common::graph;
@@ -63,7 +60,7 @@ fn complete_by_name_terminates() {
     let sub = g.subscribe(
         rt.core(),
         s,
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
@@ -85,7 +82,7 @@ fn error_by_name_terminates_with_handle() {
     let sub = g.subscribe(
         rt.core(),
         s,
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
@@ -111,7 +108,7 @@ fn remove_node_sends_teardown_and_clears_namespace() {
     let sub = g.subscribe(
         rt.core(),
         s,
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             events_clone.lock().unwrap().extend_from_slice(msgs);
         }),
     );
@@ -167,7 +164,7 @@ fn remove_preserves_namespace_during_teardown_cascade() {
     let sub = g.subscribe(
         rt.core(),
         s,
-        Arc::new(move |msgs: &[Message]| {
+        std::rc::Rc::new(move |msgs: &[Message]| {
             for m in msgs {
                 if matches!(m, Message::Teardown) {
                     // Try to resolve "temp" mid-cascade. Pre-fix this
