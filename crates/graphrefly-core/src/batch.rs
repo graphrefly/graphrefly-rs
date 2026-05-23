@@ -238,6 +238,42 @@ pub(crate) struct WaveState {
     /// [`Core::queue_notify`] when the pause buffer first overflows;
     /// drained at wave-end after the lock-released call to
     /// `BindingBoundary::synthesize_pause_overflow_error`.
+    ///
+    /// # Panic-discard trade-off (deliberate; D280 doc-lock, 2026-05-22)
+    ///
+    /// Spec R1.3.8.c specifies the ERROR-synthesis contract for the
+    /// success path; it is silent on panic-discard semantics. The
+    /// [`Core::drain_and_flush`] success path drains this queue and
+    /// fires synthesis. The [`BatchGuard::drop`] panic-discard path
+    /// clears the queue WITHOUT firing synthesis (via
+    /// [`Self::clear_wave_state`] below), so a queued overflow ERROR
+    /// diagnostic for a wave that also panicked is silently dropped.
+    /// The consumer-visible `ResumeReport.dropped` count IS preserved
+    /// (lives on `PauseState`, not here); only the synthesized ERROR
+    /// with `{ nodeId, droppedCount, configuredMax, lockHeldDurationMs }`
+    /// is lost for that specific wave.
+    ///
+    /// This is the load-bearing [`BatchGuard`] atomicity invariant —
+    /// "the wave didn't happen" — applied uniformly to every
+    /// retain-holding / refcount-discipline field across the panic
+    /// path. Adding an asymmetric ERROR-surfacing exception here
+    /// would weaken atomicity for every other invariant that relies
+    /// on it (cache restoration, dep-mask reset,
+    /// `pending_auto_resolve` clear, etc.). The fn panic itself is
+    /// also louder than the missing diagnostic — a process-level
+    /// signal (panic hook → stderr) survives the wave-discard.
+    ///
+    /// # Lift point (future consumer pressure only)
+    ///
+    /// If a consumer surfaces a real need for overflow diagnostics
+    /// across panic boundaries, the correct shape is a
+    /// **panic-survivable diagnostic side channel** (e.g., a
+    /// Core-level `on_panic_diagnostic` hook or a binding-layer
+    /// callback that the panic-discard path invokes BEFORE clearing
+    /// retain-holding state) — NOT bolting a surviving-ERROR
+    /// exception onto [`BatchGuard::drop`]'s atomicity contract. Mint
+    /// as a separate D-number under the D196 consumer-pressure gate
+    /// when the scenario materializes.
     pub(crate) pending_pause_overflow: Vec<crate::node::PendingPauseOverflow>,
     /// Nodes whose fn we owe a fire to — drained by [`Core::run_wave`].
     ///
@@ -393,6 +429,11 @@ impl WaveState {
         // synthesis runs, BatchGuard::drop's panic path also clears it
         // explicitly. Pre-wave defensive clear in
         // `begin_batch_with_guards` makes this idempotent.
+        //
+        // D280 (2026-05-22): the deliberate trade-off — atomicity beats
+        // diagnostic on panic — is documented on the field declaration
+        // at `pending_pause_overflow`; lift-point (panic-survivable
+        // diagnostic side channel) gated on D196 consumer pressure.
         self.pending_pause_overflow.clear();
         // Sub-slice 2: pending_fires is intentionally NOT cleared
         // here. Two reasons:

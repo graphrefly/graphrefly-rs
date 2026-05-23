@@ -55,8 +55,44 @@ impl ObserveSub {
     }
 }
 
-/// Single-node observe handle (canonical §3.6.2). D246: holds a
-/// Core-free [`Graph`]; `&Core` is passed per call.
+/// Single-node observe handle (canonical §3.6.2).
+///
+/// D246: holds a Core-free [`Graph`]; `&Core` is passed per call.
+///
+/// # Deliberate divergence from canonical R3.6.2 `up(messages)` (D280 doc-lock)
+///
+/// Canonical R3.6.2 specifies a unified `up(messages: Messages)`
+/// upstream-injection API. This impl exposes the per-tier control
+/// methods [`Self::pause`] / [`Self::resume`] / [`Self::invalidate`]
+/// as separate methods rather than a single `up(messages)` shape.
+/// The split is deliberate, on two grounds:
+///
+/// 1. **Non-allocating ergonomics.** A unified
+///    `up(Vec<Message>)` forces a `Vec` allocation on every upstream
+///    call. The per-tier methods take their args by value and take a
+///    direct path into [`Core::pause`] / [`Core::resume`] /
+///    [`Core::invalidate`] — zero heap churn on the control plane.
+///
+/// 2. **Avoids re-exposing an imperative-shaped public surface.**
+///    The Rust port's collaboration directive (`feedback_no_imperative`
+///    user memory) is to expose reactive `NodeInput` shapes at the
+///    public surface, not imperative message-injection. The per-tier
+///    methods read as intent-named control calls (`pause(lock)`,
+///    `resume(lock)`, `invalidate()`); a unified `up([PAUSE, lock])`
+///    re-exposes the protocol-internal `Messages` shape and tier
+///    numbers as call-site vocabulary.
+///
+/// Cross-binding wrappers (napi-rs `BenchGraph`, future pyo3, etc.)
+/// may reassemble a unified `up(messages)` if a JS/Python idiomatic
+/// API needs it; the substrate-side split is the Rust public-surface
+/// contract.
+///
+/// # Lift point (only if needed)
+///
+/// If a Rust consumer surfaces a need for a unified `up(messages)` —
+/// e.g., a cross-impl parity scenario authored against the canonical
+/// R3.6.2 shape — add it alongside the per-tier methods (additive,
+/// non-breaking). Gated on D196 consumer pressure.
 #[must_use = "GraphObserveOne does nothing until you call subscribe()"]
 pub struct GraphObserveOne {
     graph: Graph,

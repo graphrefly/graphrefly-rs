@@ -400,6 +400,33 @@ fn restore_into(
 
 impl Graph {
     /// Serialize this graph's state into a portable snapshot.
+    ///
+    /// # Concurrent-mutation caveat (torn read; M4.E1 / D167)
+    ///
+    /// `snapshot()` is a **point-in-time best-effort capture**, not an
+    /// isolated read. The implementation holds the graph's inner lock
+    /// for the namespace walk (collect names + child mounts), then
+    /// drops it before per-node `core.cache_of` / `core.is_terminal`
+    /// queries. If another thread (or a re-entrant wave) mutates state
+    /// during the post-walk phase, the snapshot may capture a mix of
+    /// pre- and post-mutation values for different nodes — individual
+    /// node slices are internally consistent, but the cross-node
+    /// composition is not transaction-isolated.
+    ///
+    /// The TS impl has the same semantics. No user has requested
+    /// snapshot-level isolation. If you need a consistent cross-node
+    /// view, the supported pattern is:
+    ///
+    /// - Wrap the snapshot call in [`Core::batch`] (drains the wave
+    ///   before `snapshot()` returns; subsequent emissions wait).
+    /// - OR call `graph.signal(SignalKind::Pause(lock))` first, then
+    ///   `snapshot()`, then `Resume(lock)` — explicitly freezes the
+    ///   reactive layer for the duration.
+    ///
+    /// A future copy-on-write epoch / snapshot-under-lock would close
+    /// the torn-read window at the cost of holding the Core lock for
+    /// the full serialization walk; gated on D196 consumer-pressure
+    /// (no scenario today justifies the lock-contention trade).
     #[must_use]
     pub fn snapshot(&self, core: &Core) -> GraphPersistSnapshot {
         snapshot_of(core, &self.inner)
@@ -409,6 +436,8 @@ impl Graph {
     /// — for the storage in-wave `MailboxOp::Defer(|cf: &dyn CoreFull|)`
     /// path, which only has a `&dyn CoreFull` (not a concrete `&Core`).
     /// Read-only; `serialize_handle` delegates to the binding.
+    ///
+    /// Inherits the same concurrent-mutation caveat as [`Self::snapshot`].
     #[must_use]
     pub fn snapshot_full(&self, core: &dyn CoreFull) -> GraphPersistSnapshot {
         snapshot_of(core, &self.inner)

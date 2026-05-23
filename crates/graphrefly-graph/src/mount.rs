@@ -34,6 +34,28 @@ pub enum MountError {
 }
 
 /// Result of [`Graph::unmount`] / [`Graph::remove`].
+///
+/// # Best-effort under concurrent mutation
+///
+/// Counts are a **point-in-time best-effort snapshot** of the detached
+/// subtree, NOT a transaction-isolated tally. The unmount flow detaches
+/// the child from the parent BEFORE auditing, so the only writers that
+/// can race the count are threads holding a [`Graph`] clone of the
+/// detached child (e.g., calling `state(...)` / `mount_new(...)` on
+/// the child between detach and audit). [`audit_of`] recursively walks
+/// the subtree, dropping each level's inner lock before descending —
+/// concurrent mutation within that window may shift the tally by the
+/// number of nodes/mounts added or removed.
+///
+/// **Why deliberate v1:** the single-owner [`graphrefly_core::OwnedCore`]
+/// model (D248/D255 actor-thread) makes the "Graph clone on another
+/// thread" scenario possible but narrow; a single-locked walk would
+/// require a cross-graph lock-ordering pass (parent + every descendant)
+/// that composes against `state()` / `mount_new()` re-entry — overkill
+/// for diagnostic data the spec frames as best-effort. If a real
+/// consumer needs transaction-isolated audit counts, lift via either a
+/// cross-graph multi-level lock-ordering scheme OR a copy-on-write
+/// epoch on the subtree (gated on D196 consumer pressure).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphRemoveAudit {
     /// Number of nodes torn down (own + recursive into mounts).
@@ -184,6 +206,12 @@ pub(crate) fn ancestors(inner: &Rc<RefCell<GraphInner>>, include_self: bool) -> 
     chain
 }
 
+/// Recursive subtree audit. Best-effort under concurrent mutation — see
+/// [`GraphRemoveAudit`] doc for the race-window framing. Each recursion
+/// level drops its inner lock before descending into children; writers
+/// holding a [`Graph`] clone of any descendant can shift the tally
+/// during that window. The single-owner D248/D255 actor-thread model
+/// makes this narrow but not impossible.
 fn audit_of(inner_arc: &Rc<RefCell<GraphInner>>) -> GraphRemoveAudit {
     let inner = inner_arc.borrow_mut();
     let own = inner.names.len();

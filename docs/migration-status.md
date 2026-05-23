@@ -155,6 +155,28 @@ republish.
 D272 / D273 / D274 + AMEND-D entries (D262/P4 + D267 scope-amend) +
 memory `feedback_distinguish_vestigial_vs_speculative.md`.
 
+### D278 — E-i + E-ii + E-iv doc-hygiene batch (Commit 1 of 3; 2026-05-22, `/porting-to-rs` next-batch — substrate-only rustdoc)
+
+Commit 1 of the 13-item E-cluster slice ("can we do E-i + E-ii + E-iv?" user pickup post-D277). The user's anti-pattern-#4 framing (no autonomous decisions when spec answers; no preemptive hypothesized-divergence doc) + D196 consumer-pressure gate + value-#6 pre-design full decision-set resolved the 13 items into **4 fixes + 4 doc-only keeps + 5 drops/rejects** across three commits. This commit lands the 4 doc-only keeps; Commits 2 (snapshot/storage fixes) + 3 (R1.4.2 spec-compliance) follow.
+
+- **E-i.4 `pending_pause_overflow` panic-discard — Option A locked (keep current).** Spec R1.3.8.c is silent on panic-discard semantics; the lift IS a real Rust-impl design call. `BatchGuard` panic-discard atomicity ("the wave didn't happen") is uniformly load-bearing across every retain-holding field — asymmetrically surfacing ERROR on panic would weaken atomicity for every other invariant relying on it. `ResumeReport.dropped` count IS preserved; only the synthesized ERROR with `{ nodeId, droppedCount, configuredMax, lockHeldDurationMs }` is lost. Lift-point for future consumer pressure: panic-survivable diagnostic side channel (e.g. Core-level `on_panic_diagnostic` hook), NOT a BatchGuard-discard exception. Mint as a separate D-number under D196 gate when consumer surfaces. Rustdoc upgraded on the field declaration `crates/graphrefly-core/src/batch.rs` `WaveState::pending_pause_overflow` + the `clear_wave_state` clear site.
+
+- **E-ii.4 snapshot torn-read caveat — doc upgrade.** `Graph::snapshot` is a point-in-time best-effort capture, not transaction-isolated (TS impl has same semantics). Inner lock held for the namespace walk; per-node `core.cache_of` / `core.is_terminal` queries after lock drop can observe mid-wave state under concurrent mutation. Supported consistency pattern: wrap in `Core::batch` OR `graph.signal(SignalKind::Pause(lock))` + `snapshot()` + `Resume(lock)`. Lift-point (copy-on-write epoch / snapshot-under-lock) gated on D196 consumer pressure — no scenario today justifies the lock-contention trade. Rustdoc upgraded on `Graph::snapshot` + `Graph::snapshot_full` (`crates/graphrefly-graph/src/snapshot.rs`).
+
+- **E-iv.1 `audit_of` race — doc upgrade (best-effort framing).** `GraphRemoveAudit` counts are point-in-time best-effort, not transaction-isolated. The unmount flow detaches the child from the parent BEFORE auditing; the only writers that can race the count hold a `Graph` clone of the detached subtree (e.g., re-entrant `state(...)` / `mount_new(...)`). Single-owner D248/D255 actor-thread model makes the scenario narrow but possible. Single-locked walk would require cross-graph multi-level lock-ordering against `state()` / `mount_new()` re-entry — overkill for diagnostic data the spec frames as best-effort. Rustdoc upgraded on `GraphRemoveAudit` struct + `audit_of` fn (`crates/graphrefly-graph/src/mount.rs`).
+
+- **E-iv.2 `GraphObserveOne::up()` R3.6.2 divergence — doc upgrade (deliberate divergence).** Canonical R3.6.2 specifies a unified `up(messages: Messages)` upstream-injection API. The Rust port exposes per-tier `pause(lock)` / `resume(lock)` / `invalidate()` separate methods instead, on two grounds: (1) non-allocating ergonomics (unified `Vec<Message>` forces alloc per call; per-tier methods take args by value), (2) avoids re-exposing an imperative-shaped public surface (`feedback_no_imperative` user memory directs reactive `NodeInput` shapes at the public surface, not `Messages`-shape message injection). Cross-binding wrappers (napi-rs `BenchGraph`, future pyo3) may reassemble a unified `up(messages)` if a JS/Python idiomatic API needs it; the substrate-side split IS the Rust public-surface contract. Lift-point (Rust consumer surfacing the unified shape, e.g. via cross-impl parity scenario) gated on D196. Rustdoc upgraded on `GraphObserveOne` struct (`crates/graphrefly-graph/src/observe.rs`).
+
+**Dropped from this batch (left as-is in `porting-deferred.md`; doc-only changes deferred / rejected):** E-i.2 `commit_emission` no-op equals (pre-v0 design; evidence-gated review only — no preemptive rustdoc), E-i.3 `pending_notify` mid-wave teardown (niche path; tests cover common case). E-iv.3 `Message::Unmount` / `RemoveAudit.reason` (substantial substrate widening, D196 consumer pressure absent). E-iv.4 `tagFactory`/`resourceProfile` (D196 — needs parity-scenarios-authored-FIRST + separate `/dev-dispatch` + `/porting-to-rs` paired slice). E-iv.5 `edges()` cross-graph `_anon_<id>` (anti-pattern #4 preemptive hypothesized-divergence doc; same shape as `try_resolve` cross-graph deferral).
+
+**`Impl` / parity-tests / napi widening:** none. Rustdoc-only.
+
+**Cross-track-ledger row:** none. Substrate-internal documentation; no behavioral change.
+
+**Gate (full):** `mise run gate` GREEN — **850 tests passed, 0 skipped**, exit 0 (187s, sentinel `<<<RUN-LOGGED:DONE>>> exit=0 reason=ok`). fmt + clippy + nextest --profile ci all clean. `#![forbid(unsafe_code)]` preserved.
+
+**Canonical:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D278.
+
 ### D277 — §10.3 + §10.6 bench-evidence pass + D252 (b) panic-msg amend (2026-05-22, `/porting-to-rs` next-batch — substrate-only bundle)
 
 User-locked bundle from the HALT shortlist (options 3 + 4): bench-evidence pass for the two remaining §10 perf carries + D252 (b) panic-message polish. No `Impl` / parity-tests / napi widening; no cross-track-ledger row; substrate-only.
