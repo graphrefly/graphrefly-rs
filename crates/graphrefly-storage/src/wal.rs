@@ -166,6 +166,15 @@ pub enum ChecksumError {
     /// payload (e.g. a `Map` with non-string keys, an `f64::NAN`).
     #[error("canonical JSON encoding failed: {0}")]
     CanonicalJsonFailed(#[from] serde_json::Error),
+    /// Frame body contains content that cannot round-trip cross-impl through
+    /// canonical JSON. Specifically: non-ASCII object keys (JS sorts by UTF-16
+    /// code-unit order; Rust `BTreeMap` sorts by UTF-8 byte order — these
+    /// diverge for keys containing surrogate-pair code points), or subnormal
+    /// f64 values (JS `JSON.stringify` and Rust `serde_json` via `ryu` may
+    /// diverge on denormalized floats). Banned at the WAL encode boundary
+    /// (B1 — option a) rather than allowed-with-silent-divergence.
+    #[error("non-canonical content rejected by WAL encoder: {reason}")]
+    NonCanonicalContent { reason: String },
 }
 
 /// Body fields contributing to the checksum, in the shape TS computes over
@@ -185,9 +194,106 @@ struct ChecksumBody<'a, T: Serialize> {
 /// Routes through [`serde_json::Value`] so the resulting `serde_json::Map<
 /// String, Value>` (BTreeMap-backed by default) iterates in sorted-key order
 /// — byte-identical to TS `stableJsonString` on the WAL schema.
-fn canonical_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+///
+/// **Cross-impl encode guard (B1 — option a).** After conversion to
+/// [`serde_json::Value`], the tree is walked once and rejected via
+/// [`ChecksumError::NonCanonicalContent`] if it contains any input that
+/// cannot round-trip byte-identically through TS canonical JSON:
+///
+/// - **Non-ASCII object keys** — JS sorts by UTF-16 code-unit order; Rust
+///   `BTreeMap` sorts by UTF-8 byte order. For keys containing surrogate-pair
+///   code points (≥ U+10000) these diverge. WAL frame schema keys are ASCII
+///   by spec; user-supplied identifiers in `path` or `change.structure`
+///   are NOT — this guard surfaces the divergence at write time rather than
+///   letting checksums silently mismatch on cross-impl replay.
+/// - **Subnormal f64** — JS `JSON.stringify` and Rust `serde_json` (via `ryu`)
+///   may format denormalized floats differently; subnormals are vanishingly
+///   rare in graphrefly payloads (integer counters dominate) but the
+///   divergence is theoretical, so the strict guard refuses them.
+/// - **NaN / ±Infinity** — already rejected at `serde_json::Number::from_f64`
+///   conversion (returns `None`); the resulting `serde_json::Error` flows
+///   through the existing `CanonicalJsonFailed` variant.
+fn canonical_json<T: Serialize>(value: &T) -> Result<String, ChecksumError> {
     let v = serde_json::to_value(value)?;
-    serde_json::to_string(&v)
+    validate_canonical(&v, 0)?;
+    serde_json::to_string(&v).map_err(ChecksumError::from)
+}
+
+/// /qa G2.6 (2026-05-22): depth cap. graphrefly payloads are bounded
+/// (`BaseChange<T>` envelopes), but `serde_json::Value` is the escape
+/// hatch — a misbehaving binding could synthesize a deeply-nested tree
+/// and overflow the recursion stack inside this validator. 128 levels
+/// matches `serde_json::de::Deserializer`'s default recursion limit; a
+/// value tree exceeding it cannot have been parsed from JSON and is
+/// rejected at the canonical-encode boundary instead of crashing the
+/// process.
+const VALIDATE_CANONICAL_MAX_DEPTH: u32 = 128;
+
+/// Recursively validate a `Value` tree against the canonical-encode guard.
+/// See [`canonical_json`] for the rejection criteria.
+fn validate_canonical(v: &serde_json::Value, depth: u32) -> Result<(), ChecksumError> {
+    if depth > VALIDATE_CANONICAL_MAX_DEPTH {
+        return Err(ChecksumError::NonCanonicalContent {
+            reason: format!(
+                "JSON nesting depth exceeds {VALIDATE_CANONICAL_MAX_DEPTH} \
+                 (matches serde_json's default deserialization recursion limit; \
+                 deeper trees cannot round-trip through standard JSON parsers)"
+            ),
+        });
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                if !k.is_ascii() {
+                    return Err(ChecksumError::NonCanonicalContent {
+                        reason: format!(
+                            "non-ASCII object key {k:?} \
+                             (JS sorts UTF-16 code units, Rust sorts UTF-8 bytes — \
+                             divergent for code points ≥ U+10000)"
+                        ),
+                    });
+                }
+                validate_canonical(child, depth + 1)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .try_for_each(|child| validate_canonical(child, depth + 1)),
+        serde_json::Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                // `serde_json::Number::from_f64` already rejects NaN/Inf, so
+                // any f64 reaching this point is finite. Subnormals slip
+                // through finite checks but format-differ between TS and Rust.
+                //
+                // /qa G2.5 (2026-05-22): the prior guard `f != 0.0 && !f.is_normal()`
+                // accepted `-0.0` because `-0.0 == 0.0` is true — but
+                // `JSON.stringify(-0.0)` is `"0"` while `serde_json` emits
+                // `"-0.0"`. That is EXACTLY the divergence the guard exists
+                // to catch. Discriminate via the raw bit pattern: positive
+                // zero is `0x0000_0000_0000_0000`; any other bit pattern
+                // (including `0x8000_0000_0000_0000` for `-0.0` and all
+                // subnormals) is rejected.
+                let bits = f.to_bits();
+                if bits != 0 && !f.is_normal() {
+                    return Err(ChecksumError::NonCanonicalContent {
+                        reason: format!(
+                            "non-canonical f64 {f:e} (bits={bits:#018x}) \
+                             (rejects -0.0 + subnormals — JS `JSON.stringify` \
+                             and Rust `serde_json` may format these differently)"
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        // String values can carry arbitrary UTF-8 — the canonical-JSON rule
+        // only constrains *keys* (which control sort order); string values
+        // serialize identically across impls via `\uXXXX` for non-ASCII.
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            Ok(())
+        }
+    }
 }
 
 /// Compute the SHA-256 checksum over a frame's body (sans `checksum`),
@@ -623,6 +729,226 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         let deser: WALFrame<u64> = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.format_version, 2);
+    }
+
+    /// B1 (2026-05-22, /porting-to-rs storage-honest-error batch): the WAL
+    /// canonical-JSON encode guard rejects non-ASCII object keys with a
+    /// `ChecksumError::NonCanonicalContent` rather than silently producing
+    /// JSON that diverges from TS `stableJsonString` (UTF-16 vs UTF-8 sort
+    /// order for keys with code points ≥ U+10000). The frame's user-supplied
+    /// `change.structure` field carries arbitrary string content; this test
+    /// uses the structure field to inject a non-ASCII key into the encoded
+    /// `change` body via a nested map payload.
+    #[test]
+    fn canonical_json_rejects_non_ascii_object_keys() {
+        use serde_json::json;
+        // Carry a nested-object payload whose KEY (not value) contains a
+        // non-ASCII code point. The guard rejects at frame_checksum-encode
+        // time (before SHA-256), surfacing the divergence vector.
+        let frame: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                // Note the KEY contains "café" (non-ASCII 'é').
+                change: json!({ "café": 1 }),
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        let err = wal_frame_checksum(&frame).expect_err("B1 guard must reject");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ChecksumError::NonCanonicalContent { .. }),
+            "expected NonCanonicalContent, got: {err:?}"
+        );
+        assert!(
+            msg.contains("café"),
+            "diagnostic must name the offending key, got: {msg}"
+        );
+    }
+
+    /// B1 companion: subnormal f64 values are rejected. `serde_json::Number`
+    /// rejects NaN/Inf at construction (those flow through the
+    /// `CanonicalJsonFailed` variant), but subnormals (denormalized floats)
+    /// slip through finite checks while still formatting divergently between
+    /// JS `JSON.stringify` and Rust `serde_json` via `ryu` — so the guard
+    /// also rejects them at encode time.
+    #[test]
+    fn canonical_json_rejects_subnormal_f64() {
+        use serde_json::json;
+        // f64::MIN_POSITIVE.next_down() is in the subnormal range (smaller
+        // than the smallest normal positive f64). `is_normal()` returns
+        // false; `is_finite()` returns true. The guard rejects.
+        let subnormal: f64 = f64::MIN_POSITIVE / 2.0;
+        assert!(!subnormal.is_normal());
+        assert!(subnormal.is_finite());
+        let frame: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: json!({ "tiny": subnormal }),
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        let err = wal_frame_checksum(&frame).expect_err("B1 subnormal guard must reject");
+        assert!(
+            matches!(err, ChecksumError::NonCanonicalContent { .. }),
+            "expected NonCanonicalContent, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("subnormal"),
+            "diagnostic must mention subnormal, got: {err}"
+        );
+    }
+
+    /// B1 negative control: ASCII-only keys + normal f64 + integers pass
+    /// the guard unchanged (no regression on the existing happy path).
+    #[test]
+    fn canonical_json_guard_passes_ascii_and_normal_floats() {
+        use serde_json::json;
+        let frame: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: json!({ "ascii_key": 42, "float": 1.5, "zero": 0.0 }),
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        // Just assert it doesn't error — exact hash isn't load-bearing here.
+        wal_frame_checksum(&frame).expect("ASCII keys + normal floats must pass the guard");
+    }
+
+    /// /qa G2.5 (2026-05-22): `-0.0` is rejected because
+    /// `JSON.stringify(-0.0) === "0"` but Rust `serde_json` emits `-0.0` —
+    /// exactly the divergence the canonical-JSON guard is meant to catch.
+    /// The pre-/qa guard `f != 0.0 && !f.is_normal()` accepted `-0.0`
+    /// because `-0.0 == 0.0` is true; the bit-pattern discriminator added
+    /// in this /qa pass closes the gap.
+    #[test]
+    fn canonical_json_rejects_negative_zero() {
+        use serde_json::json;
+        // serde_json::Number won't deserialize -0.0 from `{ "z": -0.0 }`
+        // literals, but `Number::from_f64(-0.0)` succeeds — construct via
+        // the typed entry point.
+        let neg_zero = -0.0_f64;
+        assert_eq!(neg_zero.to_bits(), 0x8000_0000_0000_0000);
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "neg_zero".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from_f64(neg_zero).expect("finite")),
+        );
+        let frame: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: serde_json::Value::Object(map),
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        let err = wal_frame_checksum(&frame).expect_err("B1 / G2.5 guard must reject -0.0");
+        assert!(
+            matches!(err, ChecksumError::NonCanonicalContent { .. }),
+            "expected NonCanonicalContent, got: {err:?}"
+        );
+        // Positive zero stays accepted — sanity check that the bit-pattern
+        // discriminator didn't over-broaden into the legitimate zero case.
+        let frame_pos_zero: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: json!({ "pos_zero": 0.0 }),
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        wal_frame_checksum(&frame_pos_zero).expect("positive +0.0 must continue to pass the guard");
+    }
+
+    /// /qa G2.6 (2026-05-22): the validator's recursion is depth-capped
+    /// (128) so adversarial deeply-nested user payloads can't blow the
+    /// stack at WAL write time. A value tree exceeding the cap is
+    /// rejected as `NonCanonicalContent` (same channel as the other
+    /// divergence-class rejections) rather than crashing the process.
+    #[test]
+    fn canonical_json_rejects_excessive_nesting_depth() {
+        // Build a deeply-nested object tree programmatically (can't be
+        // parsed from JSON literals at this depth without serde's own
+        // recursion guard tripping first — exactly the point of the cap).
+        let mut deep = serde_json::Value::Number(serde_json::Number::from(0_u64));
+        for _ in 0..200 {
+            let mut map = serde_json::Map::new();
+            map.insert("n".to_owned(), deep);
+            deep = serde_json::Value::Object(map);
+        }
+        let frame: WALFrame<serde_json::Value> = WALFrame {
+            t: WalTag,
+            lifecycle: Lifecycle::Data,
+            path: "p".into(),
+            change: BaseChange {
+                structure: "s".into(),
+                version: Version::Counter(0),
+                t_ns: 0,
+                seq: None,
+                lifecycle: Lifecycle::Data,
+                change: deep,
+            },
+            frame_seq: 0,
+            frame_t_ns: 0,
+            checksum: String::new(),
+            format_version: 1,
+        };
+        let err = wal_frame_checksum(&frame).expect_err("G2.6 depth cap must reject");
+        assert!(
+            matches!(err, ChecksumError::NonCanonicalContent { .. }),
+            "expected NonCanonicalContent, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("depth"),
+            "diagnostic must mention depth, got: {err}"
+        );
     }
 
     /// /qa A10 (2026-05-10): canary detecting `serde_json/preserve_order`

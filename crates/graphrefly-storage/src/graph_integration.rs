@@ -897,13 +897,7 @@ pub fn restore_snapshot(
     let (verified, skipped) = verify_frames(collected, opts.on_torn_write.as_ref())?;
 
     // Phase 3: Lifecycle-scoped batch replay.
-    Ok(replay_by_lifecycle(
-        core,
-        graph,
-        &verified,
-        baseline_seq,
-        skipped,
-    ))
+    replay_by_lifecycle(core, graph, &verified, baseline_seq, skipped)
 }
 
 /// Phase 1: Load baseline from snapshot tier + apply to graph.
@@ -1032,7 +1026,7 @@ fn replay_by_lifecycle(
     verified: &[WALFrame<Value>],
     baseline_seq: u64,
     skipped: u64,
-) -> RestoreResult {
+) -> Result<RestoreResult, RestoreError> {
     let mut grouped: [Vec<WALFrame<Value>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for frame in verified {
         for (idx, lifecycle) in REPLAY_ORDER.iter().enumerate() {
@@ -1055,11 +1049,28 @@ fn replay_by_lifecycle(
         let frame_count = life_frames.len() as u64;
         let max_seq = life_frames.iter().map(|f| f.frame_seq).max().unwrap_or(0);
 
+        // /qa G1.2 (2026-05-22): `apply_wal_frame` now returns
+        // `Result<(), RestoreError>`. Thread per-frame errors out of the
+        // `graph.batch` closure via a `RefCell<Option<RestoreError>>` and
+        // surface the first failure after the batch drains. Matches the
+        // B1/B2 "honest error" theme — a failed mount/unmount during
+        // replay aborts the batch loudly rather than corrupting topology
+        // silently.
+        let batch_err: std::cell::RefCell<Option<RestoreError>> = std::cell::RefCell::new(None);
         graph.batch(core, || {
             for frame in life_frames {
-                apply_wal_frame(core, graph, frame);
+                if batch_err.borrow().is_some() {
+                    break;
+                }
+                if let Err(e) = apply_wal_frame(core, graph, frame) {
+                    *batch_err.borrow_mut() = Some(e);
+                    break;
+                }
             }
         });
+        if let Some(e) = batch_err.into_inner() {
+            return Err(e);
+        }
 
         replayed += frame_count;
         final_seq = final_seq.max(max_seq);
@@ -1069,12 +1080,40 @@ fn replay_by_lifecycle(
         });
     }
 
-    RestoreResult {
+    Ok(RestoreResult {
         replayed_frames: replayed,
         skipped_frames: skipped,
         final_seq,
         phases,
+    })
+}
+
+/// /qa G1.1 (2026-05-22): walk a multi-segment mount/unmount `path`
+/// (e.g. `"parent::child::nested"`) to find the OWNER GRAPH where the
+/// leaf mount actually lives, returning `(owner_graph, leaf_name)`.
+/// For a single-segment path returns `(graph, path)`. Returns `None`
+/// if any intermediate segment can't be resolved as a child mount.
+///
+/// TS `_collectSubgraphs` (`packages/pure-ts/src/graph/graph.ts:3486`)
+/// emits fully-qualified paths from root; the Rust storage replay must
+/// walk those segments to address the right owner graph before calling
+/// `mount_new` / `unmount`. Pre-/qa B4 the mount/unmount arms passed
+/// the multi-segment path straight to `graph.mount_new(core, path)`
+/// which rejects [`PATH_SEP`] in names — silently no-op'd via the
+/// `let _ = …` pattern.
+fn resolve_mount_parent<'a>(graph: &Graph, path: &'a str) -> Option<(Graph, &'a str)> {
+    if path.is_empty() {
+        return None;
     }
+    let mut current = graph.clone();
+    let mut segments = path.split("::");
+    let first = segments.next()?;
+    let mut prev = first;
+    for seg in segments {
+        current = current.child(prev)?;
+        prev = seg;
+    }
+    Some((current, prev))
 }
 
 /// Apply a single WAL frame to a graph. Mirrors TS `applyWalFrame`.
@@ -1082,63 +1121,161 @@ fn replay_by_lifecycle(
 /// D246: every Core-touching `graph.*` call takes the owner's `&Core`;
 /// binding access is `core.binding_ptr()` (the retired `Graph::core()`
 /// is gone — `Graph` is Core-free).
-fn apply_wal_frame(core: &Core, graph: &Graph, frame: &WALFrame<Value>) {
+///
+/// /qa G1.2 (2026-05-22): returns `Result<(), RestoreError>`. The
+/// pre-/qa silent `let _ = …` swallow on every arm regressed the
+/// B1/B2 "honest error" theme; this signature propagates per-frame
+/// errors up to `replay_by_lifecycle` so a failed mount/collision
+/// during replay aborts the batch loudly. Idempotent skips (already-
+/// present add, absent remove, etc.) continue to return `Ok(())`.
+fn apply_wal_frame(
+    core: &Core,
+    graph: &Graph,
+    frame: &WALFrame<Value>,
+) -> Result<(), RestoreError> {
     let change = &frame.change.change;
     let kind = change.get("kind").and_then(Value::as_str).unwrap_or("");
+    let frame_seq = frame.frame_seq;
+    let lifecycle = frame.lifecycle;
+    let phase_err = |message: String| RestoreError::PhaseFailed {
+        lifecycle,
+        frame_seq,
+        message,
+    };
 
     match frame.lifecycle {
-        Lifecycle::Spec => match kind {
-            "graph.add" => {
-                let node_id_str = change.get("nodeId").and_then(Value::as_str).unwrap_or("");
-                if node_id_str.is_empty() || graph.try_resolve(node_id_str).is_some() {
-                    return; // already present or invalid
-                }
-                // Only auto-create state nodes (matches TS behavior).
-                let slice = change.get("slice");
-                let node_type = slice
-                    .and_then(|s| s.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if node_type != "state" {
-                    return;
-                }
-                let initial_value = slice.and_then(|s| s.get("value")).cloned();
-                let handle = initial_value.map_or(graphrefly_core::NO_HANDLE, |v| {
-                    core.binding_ptr().deserialize_value(v)
-                });
-                let _ = graph.state(core, node_id_str, Some(handle));
-            }
-            "graph.remove" => {
-                let node_id_str = change.get("nodeId").and_then(Value::as_str).unwrap_or("");
-                if !node_id_str.is_empty() && graph.try_resolve(node_id_str).is_some() {
-                    let _ = graph.remove(core, node_id_str);
-                }
-            }
-            // graph.mount, graph.unmount — deferred (Phase 14.6+)
-            _ => {}
-        },
-        Lifecycle::Data => match kind {
-            "node.set" => {
-                let path = change.get("path").and_then(Value::as_str).unwrap_or("");
-                if let Some(value) = change.get("value") {
-                    if !path.is_empty() && graph.try_resolve(path).is_some() {
-                        let handle = core.binding_ptr().deserialize_value(value.clone());
-                        graph.set(core, path, handle);
-                    }
-                }
-            }
-            "node.invalidate" => {
-                let path = change.get("path").and_then(Value::as_str).unwrap_or("");
-                if !path.is_empty() {
-                    if let Some(id) = graph.try_resolve(path) {
-                        graph.invalidate(core, id);
-                    }
-                }
-            }
-            // node.versionBump — deferred (V0 versioning is internal)
-            _ => {}
-        },
+        Lifecycle::Spec => apply_spec_frame(core, graph, kind, change, &phase_err),
+        Lifecycle::Data => {
+            apply_data_frame(core, graph, kind, change);
+            Ok(())
+        }
         // Ownership lifecycle — deferred (Phase 13)
-        Lifecycle::Ownership => {}
+        Lifecycle::Ownership => Ok(()),
+    }
+}
+
+/// /qa G1.2 + `clippy::too_many_lines` (2026-05-22): extracted from
+/// `apply_wal_frame` so the parent fn fits under the 100-line cap.
+/// Per-arm semantics unchanged; each arm is idempotent on the
+/// already-applied case and propagates real errors as
+/// [`RestoreError::PhaseFailed`].
+fn apply_spec_frame(
+    core: &Core,
+    graph: &Graph,
+    kind: &str,
+    change: &Value,
+    phase_err: &impl Fn(String) -> RestoreError,
+) -> Result<(), RestoreError> {
+    match kind {
+        "graph.add" => {
+            let node_id_str = change.get("nodeId").and_then(Value::as_str).unwrap_or("");
+            if node_id_str.is_empty() || graph.try_resolve(node_id_str).is_some() {
+                return Ok(()); // already present or invalid path — idempotent
+            }
+            // Only auto-create state nodes (matches TS behavior).
+            let slice = change.get("slice");
+            let node_type = slice
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if node_type != "state" {
+                return Ok(());
+            }
+            let initial_value = slice.and_then(|s| s.get("value")).cloned();
+            let handle = initial_value.map_or(graphrefly_core::NO_HANDLE, |v| {
+                core.binding_ptr().deserialize_value(v)
+            });
+            graph
+                .state(core, node_id_str, Some(handle))
+                .map_err(|e| phase_err(format!("graph.add `{node_id_str}` failed: {e:?}")))?;
+            Ok(())
+        }
+        "graph.remove" => {
+            let node_id_str = change.get("nodeId").and_then(Value::as_str).unwrap_or("");
+            if node_id_str.is_empty() || graph.try_resolve(node_id_str).is_none() {
+                return Ok(()); // absent — idempotent
+            }
+            graph
+                .remove(core, node_id_str)
+                .map_err(|e| phase_err(format!("graph.remove `{node_id_str}` failed: {e:?}")))?;
+            Ok(())
+        }
+        "graph.mount" => {
+            // B4 (2026-05-22, /porting-to-rs storage-honest-error batch):
+            // mount the subgraph if absent. Idempotent on replay; emitted
+            // BEFORE any value-changes at the subgraph level so
+            // `node.set X.y` is guaranteed to find the mount.
+            //
+            // /qa G1.1 (2026-05-22): walk multi-segment paths via
+            // `resolve_mount_parent`. TS `_collectSubgraphs` emits
+            // `"parent::child::nested"` for nested mounts; the Rust replay
+            // must descend through `Graph::child` to find the owner of the
+            // leaf mount.
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                return Ok(());
+            }
+            let (parent_graph, leaf) = resolve_mount_parent(graph, path).ok_or_else(|| {
+                phase_err(format!(
+                    "graph.mount `{path}`: parent path segments do not resolve to a mounted subgraph"
+                ))
+            })?;
+            if parent_graph.child_names().iter().any(|n| n == leaf) {
+                return Ok(()); // already mounted; idempotent
+            }
+            parent_graph
+                .mount_new(core, leaf)
+                .map_err(|e| phase_err(format!("graph.mount `{path}` failed: {e:?}")))?;
+            Ok(())
+        }
+        "graph.unmount" => {
+            // B4 (2026-05-22): unmount if present.
+            // /qa G1.1 (2026-05-22): walk multi-segment paths (see
+            // `graph.mount` above).
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                return Ok(());
+            }
+            let Some((parent_graph, leaf)) = resolve_mount_parent(graph, path) else {
+                return Ok(()); // parent absent → leaf necessarily absent → idempotent
+            };
+            if !parent_graph.child_names().iter().any(|n| n == leaf) {
+                return Ok(()); // already absent; idempotent
+            }
+            parent_graph
+                .unmount(core, leaf)
+                .map_err(|e| phase_err(format!("graph.unmount `{path}` failed: {e:?}")))?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// /qa G1.2 + `clippy::too_many_lines` (2026-05-22): extracted from
+/// `apply_wal_frame`. `node.set` / `node.invalidate` arms — these never
+/// returned errors pre-/qa (each is best-effort against the current
+/// graph state) so the signature returns `Result` purely for symmetry
+/// with the spec-lifecycle arm.
+fn apply_data_frame(core: &Core, graph: &Graph, kind: &str, change: &Value) {
+    match kind {
+        "node.set" => {
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("");
+            if let Some(value) = change.get("value") {
+                if !path.is_empty() && graph.try_resolve(path).is_some() {
+                    let handle = core.binding_ptr().deserialize_value(value.clone());
+                    graph.set(core, path, handle);
+                }
+            }
+        }
+        "node.invalidate" => {
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("");
+            if !path.is_empty() {
+                if let Some(id) = graph.try_resolve(path) {
+                    graph.invalidate(core, id);
+                }
+            }
+        }
+        // node.versionBump — deferred (V0 versioning is internal)
+        _ => {}
     }
 }

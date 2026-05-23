@@ -76,6 +76,15 @@ harness = false
 name    = "group_scaling"
 harness = false
 
+# §10.5 wave-end notification buffer — isolates `pending_notify` hot-path
+# (IndexMap<NodeId, PendingPerNode>) after the SmallVec + recycle
+# hardening. Bench-evidence pass for the §10.5 disposition in
+# `docs/porting-deferred.md` (validate the proposed arena vs current
+# shape).
+[[bench]]
+name    = "notification_buffer"
+harness = false
+
 [features]
 default      = ["std", "tokio"]
 # `std` is the only supported configuration for now. Kept as a feature so

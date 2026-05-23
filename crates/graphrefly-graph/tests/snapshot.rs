@@ -747,3 +747,325 @@ fn r3_8_restore_skips_derived_nodes() {
     );
     g.unsubscribe(rt.core(), inc_id, sub);
 }
+
+// ---------------------------------------------------------------------------
+// D276 — cross-mount dep round-trip via owner-relative path encoding.
+// ---------------------------------------------------------------------------
+
+/// D276 (encode): a derived in a child mount whose dep lives in the
+/// parent graph must serialize with the owner-relative path `..::name`
+/// (pre-D276 the encoder fell through to `_anon_<rawid>` here, destroying
+/// the cross-mount reference at serialization time).
+#[test]
+fn d276_encode_child_to_parent_dep_emits_double_colon_dotdot() {
+    let binding = SnapshotBinding::new();
+    let initial = binding.intern(serde_json::json!(7));
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x + 100)
+    });
+    let (rt, root) = graph_with("root", binding.clone() as Arc<dyn BindingBoundary>);
+
+    // root.x  +  root.child.derived_in_child (deps on root.x — cross-mount upward).
+    let x = root.state(rt.core(), "x", Some(initial)).unwrap();
+    let child = root.mount_new(rt.core(), "child").unwrap();
+    child
+        .derived(rt.core(), "d", &[x], fn_id, EqualsMode::Identity)
+        .unwrap();
+
+    let snap = root.snapshot(rt.core());
+    let d = &snap.subgraphs["child"].nodes["d"];
+    assert_eq!(d.node_type, "derived");
+    // Pre-D276 this was `"_anon_<rawid>"`; post-D276 it is owner-relative.
+    assert_eq!(d.deps, vec!["..::x".to_owned()]);
+}
+
+/// D276 (encode): a derived in the parent whose dep lives in a mounted
+/// child graph must serialize with the owner-relative path `child::name`.
+/// (Snapshots produced by the pre-D276 encoder fell through to
+/// `_anon_<rawid>` for these too.)
+#[test]
+fn d276_encode_parent_to_child_dep_emits_child_double_colon() {
+    let binding = SnapshotBinding::new();
+    let initial = binding.intern(serde_json::json!(3));
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x * 10)
+    });
+    let (rt, root) = graph_with("root", binding.clone() as Arc<dyn BindingBoundary>);
+
+    // root.child.y  +  root.d (deps on root.child.y — cross-mount downward).
+    let child = root.mount_new(rt.core(), "child").unwrap();
+    let y = child.state(rt.core(), "y", Some(initial)).unwrap();
+    root.derived(rt.core(), "d", &[y], fn_id, EqualsMode::Identity)
+        .unwrap();
+
+    let snap = root.snapshot(rt.core());
+    let d = &snap.nodes["d"];
+    assert_eq!(d.node_type, "derived");
+    assert_eq!(d.deps, vec!["child::y".to_owned()]);
+}
+
+/// D276 (decode round-trip): a graph with a child-to-parent cross-mount
+/// derived dep round-trips through `snapshot() → from_snapshot()` and
+/// the derived fires correctly after restore (the tree-wide retry loop
+/// is what unblocks this: the parent's state node must be created
+/// BEFORE the child's derived in Pass 1 + Pass 2, even though the
+/// pre-D276 recursive `hydrate_subgraph` processed the child first
+/// and would have failed with UnresolvableDeps).
+#[test]
+fn d276_round_trip_child_to_parent_cross_mount_dep() {
+    let binding = SnapshotBinding::new();
+    let initial = binding.intern(serde_json::json!(7));
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x + 100)
+    });
+    let (rt, root) = graph_with("root", binding.clone() as Arc<dyn BindingBoundary>);
+
+    let x = root.state(rt.core(), "x", Some(initial)).unwrap();
+    let child = root.mount_new(rt.core(), "child").unwrap();
+    let d = child
+        .derived(rt.core(), "d", &[x], fn_id, EqualsMode::Identity)
+        .unwrap();
+
+    // Force `d` to fire so we can verify its restored output value.
+    let sub = child.subscribe(rt.core(), d, std::rc::Rc::new(|_| {}));
+    assert_eq!(
+        binding.deref(child.cache_of(rt.core(), d)),
+        serde_json::json!(107) // 7 + 100
+    );
+    child.unsubscribe(rt.core(), d, sub);
+
+    let snap = root.snapshot(rt.core());
+
+    // Restore into a fresh runtime with the same fn registered.
+    let binding2 = SnapshotBinding::new();
+    let fn_id2 = binding2.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x + 100)
+    });
+    let binding2_for_factory = binding2.clone();
+
+    let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
+    factories.insert(
+        "derived".to_owned(),
+        Box::new(
+            move |core: &graphrefly_core::Core,
+                  graph: &Graph,
+                  name: &str,
+                  _slice: &NodeSlice,
+                  dep_ids: &[NodeId]| {
+                graph
+                    .derived(core, name, dep_ids, fn_id2, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
+    );
+    // Reference binding2_for_factory so the `move` block keeps it alive
+    // for the test's subsequent subscribe + cache_of reads (factory
+    // captures fn_id only; the value-deref uses the binding directly).
+    let _kept = binding2_for_factory;
+
+    let rt2 = OwnedCore::new(binding2.clone() as Arc<dyn BindingBoundary>);
+    let restored = Graph::from_snapshot(rt2.core(), &snap, None, Some(factories)).unwrap();
+
+    let restored_d = restored.try_resolve("child::d").expect("child::d resolves");
+    let sub2 = restored.subscribe(rt2.core(), restored_d, std::rc::Rc::new(|_| {}));
+    let cache = restored.cache_of(rt2.core(), restored_d);
+    assert_ne!(cache, NO_HANDLE);
+    assert_eq!(binding2.deref(cache), serde_json::json!(107));
+    restored.unsubscribe(rt2.core(), restored_d, sub2);
+}
+
+/// D276 (decode round-trip): a graph with a parent-to-child cross-mount
+/// derived dep round-trips correctly. The pre-D276 ordering (subgraphs
+/// before parent) handled THIS direction correctly, but only via the
+/// `_anon_<rawid>` encoded shape — which the decode side then rejected
+/// because no factory could map `_anon_*` to a real NodeId. D276's
+/// owner-relative `child::name` encoding closes the loop.
+#[test]
+fn d276_round_trip_parent_to_child_cross_mount_dep() {
+    let binding = SnapshotBinding::new();
+    let initial = binding.intern(serde_json::json!(3));
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x * 10)
+    });
+    let (rt, root) = graph_with("root", binding.clone() as Arc<dyn BindingBoundary>);
+
+    let child = root.mount_new(rt.core(), "child").unwrap();
+    let y = child.state(rt.core(), "y", Some(initial)).unwrap();
+    let d = root
+        .derived(rt.core(), "d", &[y], fn_id, EqualsMode::Identity)
+        .unwrap();
+    let sub = root.subscribe(rt.core(), d, std::rc::Rc::new(|_| {}));
+    assert_eq!(
+        binding.deref(root.cache_of(rt.core(), d)),
+        serde_json::json!(30) // 3 * 10
+    );
+    root.unsubscribe(rt.core(), d, sub);
+
+    let snap = root.snapshot(rt.core());
+
+    // Restore.
+    let binding2 = SnapshotBinding::new();
+    let fn_id2 = binding2.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x * 10)
+    });
+    let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
+    factories.insert(
+        "derived".to_owned(),
+        Box::new(
+            move |core: &graphrefly_core::Core,
+                  graph: &Graph,
+                  name: &str,
+                  _slice: &NodeSlice,
+                  dep_ids: &[NodeId]| {
+                graph
+                    .derived(core, name, dep_ids, fn_id2, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
+    );
+
+    let rt2 = OwnedCore::new(binding2.clone() as Arc<dyn BindingBoundary>);
+    let restored = Graph::from_snapshot(rt2.core(), &snap, None, Some(factories)).unwrap();
+
+    let restored_d = restored.try_resolve("d").expect("d resolves at root");
+    let sub2 = restored.subscribe(rt2.core(), restored_d, std::rc::Rc::new(|_| {}));
+    let cache = restored.cache_of(rt2.core(), restored_d);
+    assert_ne!(cache, NO_HANDLE);
+    assert_eq!(binding2.deref(cache), serde_json::json!(30));
+    restored.unsubscribe(rt2.core(), restored_d, sub2);
+}
+
+/// D276 (decode round-trip): a 3-level mount tree where the deepest
+/// derived deps on a state two mount-levels up
+/// (`root.child.nested.d` deps on `root.x`). The encoder emits
+/// `..::..::x` for the dep, and the decoder's `try_resolve` walks
+/// twice up to the root then looks up `x`.
+#[test]
+fn d276_round_trip_deep_chain_across_three_mount_levels() {
+    let binding = SnapshotBinding::new();
+    let initial = binding.intern(serde_json::json!(5));
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x - 1)
+    });
+    let (rt, root) = graph_with("root", binding.clone() as Arc<dyn BindingBoundary>);
+
+    let x = root.state(rt.core(), "x", Some(initial)).unwrap();
+    let child = root.mount_new(rt.core(), "child").unwrap();
+    let nested = child.mount_new(rt.core(), "nested").unwrap();
+    nested
+        .derived(rt.core(), "d", &[x], fn_id, EqualsMode::Identity)
+        .unwrap();
+
+    let snap = root.snapshot(rt.core());
+    let d = &snap.subgraphs["child"].subgraphs["nested"].nodes["d"];
+    assert_eq!(d.deps, vec!["..::..::x".to_owned()]);
+
+    // Round-trip.
+    let binding2 = SnapshotBinding::new();
+    let fn_id2 = binding2.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x - 1)
+    });
+    let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
+    factories.insert(
+        "derived".to_owned(),
+        Box::new(
+            move |core: &graphrefly_core::Core,
+                  graph: &Graph,
+                  name: &str,
+                  _slice: &NodeSlice,
+                  dep_ids: &[NodeId]| {
+                graph
+                    .derived(core, name, dep_ids, fn_id2, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
+    );
+
+    let rt2 = OwnedCore::new(binding2.clone() as Arc<dyn BindingBoundary>);
+    let restored = Graph::from_snapshot(rt2.core(), &snap, None, Some(factories)).unwrap();
+
+    let restored_d = restored
+        .try_resolve("child::nested::d")
+        .expect("deep path resolves");
+    let sub = restored.subscribe(rt2.core(), restored_d, std::rc::Rc::new(|_| {}));
+    let cache = restored.cache_of(rt2.core(), restored_d);
+    assert_ne!(cache, NO_HANDLE);
+    assert_eq!(binding2.deref(cache), serde_json::json!(4)); // 5 - 1
+    restored.unsubscribe(rt2.core(), restored_d, sub);
+}
+
+/// D276 back-compat: a hand-constructed snapshot using ONLY bare local
+/// dep names (the pre-D276 shape) must continue to round-trip cleanly.
+/// This pins the contract that the D276 encoder collapses same-graph
+/// deps to bare names AND the D276 decoder resolves bare names
+/// owner-locally (via `try_resolve`'s single-segment path → local
+/// `names` lookup).
+#[test]
+fn d276_back_compat_bare_local_name_snapshot_still_restores() {
+    let binding = SnapshotBinding::new();
+    let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
+    let fn_id = binding.register_fn(|args| {
+        let x = args[0].as_i64().unwrap_or(0);
+        serde_json::json!(x + 1)
+    });
+
+    let mut factories: IndexMap<String, NodeFactory> = IndexMap::new();
+    factories.insert(
+        "derived".to_owned(),
+        Box::new(
+            move |core: &graphrefly_core::Core,
+                  graph: &Graph,
+                  name: &str,
+                  _slice: &NodeSlice,
+                  dep_ids: &[NodeId]| {
+                graph
+                    .derived(core, name, dep_ids, fn_id, EqualsMode::Identity)
+                    .map_err(|_| SnapshotError::UnknownNode(name.to_owned()))
+            },
+        ),
+    );
+
+    // Pre-D276-shape snapshot: bare local "x" dep name.
+    let snap = GraphPersistSnapshot {
+        name: "root".to_owned(),
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                "x".to_owned(),
+                NodeSlice {
+                    node_type: "state".to_owned(),
+                    value: Some(serde_json::json!(42)),
+                    status: NodeSnapshotStatus::Live,
+                    deps: vec![],
+                },
+            );
+            m.insert(
+                "plus_one".to_owned(),
+                NodeSlice {
+                    node_type: "derived".to_owned(),
+                    value: None,
+                    status: NodeSnapshotStatus::Live,
+                    deps: vec!["x".to_owned()],
+                },
+            );
+            m
+        },
+        subgraphs: IndexMap::new(),
+    };
+
+    let restored = Graph::from_snapshot(rt.core(), &snap, None, Some(factories)).unwrap();
+    let plus_one = restored.node("plus_one");
+    let sub = restored.subscribe(rt.core(), plus_one, std::rc::Rc::new(|_| {}));
+    let cache = restored.cache_of(rt.core(), plus_one);
+    assert_ne!(cache, NO_HANDLE);
+    assert_eq!(binding.deref(cache), serde_json::json!(43));
+    restored.unsubscribe(rt.core(), plus_one, sub);
+}

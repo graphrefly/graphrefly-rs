@@ -903,3 +903,210 @@ fn checkpoint_record_json_round_trip() {
     assert_eq!(parsed.seq, 42);
     assert_eq!(parsed.format_version, SNAPSHOT_VERSION);
 }
+
+// ---------------------------------------------------------------------------
+// B4 (2026-05-22, /porting-to-rs storage-honest-error batch) — apply_wal_frame
+// mount/unmount replay coverage.
+//
+// `decompose_diff_to_frames` already emits `graph.mount` / `graph.unmount`
+// frames for net subgraph adds/removes (lines 235-258 of graph_integration.rs).
+// Pre-B4 the `apply_wal_frame` `Lifecycle::Spec` match arms ignored them
+// (`// graph.mount, graph.unmount — deferred (Phase 14.6+)`), so a replay
+// could never reconstruct subgraph topology — only state nodes. B4 wires the
+// apply side so a baseline + WAL replay restores the full graph shape.
+//
+// TS counterpart (`packages/pure-ts/src/graph/graph.ts:6717`) has the same
+// gap pre-B4; Rust ships ahead per the cross-track-ledger handoff.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn restore_replays_mount_frame() {
+    // Author graph "g" with subgraph "child" mounted; baseline is empty.
+    // Diff(baseline, after) yields one `graph.mount` frame; replay onto a
+    // fresh empty graph "g" must reproduce the mounted subgraph.
+    let (_rt, g, _b) = make_graph("g");
+    g.mount_new(_rt.core(), "child").unwrap();
+    let after = g.snapshot(_rt.core());
+
+    let before = empty_snapshot("g");
+    let diff = diff_snapshots(&before, &after);
+    assert_eq!(diff.subgraphs_added, vec!["child"]);
+    let (frames, _) = decompose_diff_to_frames(&diff, 1000, 0).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].lifecycle, Lifecycle::Spec);
+
+    // Persist baseline (empty) + WAL frames.
+    let snap_backend = memory_backend();
+    let snap_tier = make_snap_tier(snap_backend, "g");
+    snap_tier
+        .save(GraphCheckpointRecord {
+            name: "g".to_owned(),
+            mode: "full".to_owned(),
+            snapshot: before,
+            seq: 0,
+            timestamp_ns: 1000,
+            format_version: SNAPSHOT_VERSION,
+        })
+        .unwrap();
+    snap_tier.flush().unwrap();
+
+    let wal_backend = memory_backend();
+    let wal_tier = make_wal_tier(wal_backend, "wal");
+    for frame in &frames {
+        let key = graphrefly_storage::wal_frame_key(
+            &graphrefly_storage::graph_wal_prefix("g"),
+            frame.frame_seq,
+        );
+        wal_tier.save(&key, frame.clone()).unwrap();
+    }
+    wal_tier.flush().unwrap();
+
+    // Replay onto a fresh empty graph.
+    let (rt2, g2, _b2) = make_graph("g");
+    assert_eq!(g2.child_names().len(), 0);
+    let result = restore_snapshot(
+        rt2.core(),
+        &g2,
+        &RestoreOptions {
+            snapshot_tier: &snap_tier,
+            wal_tier: &wal_tier,
+            target_seq: None,
+            on_torn_write: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.replayed_frames, 1);
+    assert_eq!(result.phases[0].lifecycle, Lifecycle::Spec);
+
+    // Verify subgraph "child" landed.
+    assert_eq!(g2.child_names(), vec!["child".to_owned()]);
+}
+
+#[test]
+fn restore_replays_unmount_frame() {
+    // Baseline has subgraph; after-snapshot doesn't. Diff produces an
+    // `graph.unmount` frame; replay onto a fresh graph that already has
+    // the subgraph (via baseline restore) must remove it.
+    let (rt, g, _b) = make_graph("g");
+    g.mount_new(rt.core(), "child").unwrap();
+    let baseline = g.snapshot(rt.core());
+
+    // After: subgraph removed.
+    let mut after = baseline.clone();
+    after.subgraphs.shift_remove("child");
+    let diff = diff_snapshots(&baseline, &after);
+    assert_eq!(diff.subgraphs_removed, vec!["child"]);
+    let (frames, _) = decompose_diff_to_frames(&diff, 2000, 0).unwrap();
+    assert_eq!(frames.len(), 1);
+
+    let snap_tier = make_snap_tier(memory_backend(), "g");
+    snap_tier
+        .save(GraphCheckpointRecord {
+            name: "g".to_owned(),
+            mode: "full".to_owned(),
+            snapshot: baseline, // baseline carries "child"
+            seq: 0,
+            timestamp_ns: 1000,
+            format_version: SNAPSHOT_VERSION,
+        })
+        .unwrap();
+    snap_tier.flush().unwrap();
+
+    let wal_tier = make_wal_tier(memory_backend(), "wal");
+    for frame in &frames {
+        let key = graphrefly_storage::wal_frame_key(
+            &graphrefly_storage::graph_wal_prefix("g"),
+            frame.frame_seq,
+        );
+        wal_tier.save(&key, frame.clone()).unwrap();
+    }
+    wal_tier.flush().unwrap();
+
+    // Replay onto a fresh graph that ALREADY has "child" mounted (mimics a
+    // baseline restore that hydrated the subgraph). The WAL frame should
+    // then remove it.
+    let (rt2, g2, _b2) = make_graph("g");
+    g2.mount_new(rt2.core(), "child").unwrap();
+    assert_eq!(g2.child_names(), vec!["child".to_owned()]);
+
+    let result = restore_snapshot(
+        rt2.core(),
+        &g2,
+        &RestoreOptions {
+            snapshot_tier: &snap_tier,
+            wal_tier: &wal_tier,
+            target_seq: None,
+            on_torn_write: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.replayed_frames, 1);
+    assert_eq!(g2.child_names().len(), 0);
+}
+
+#[test]
+fn apply_wal_frame_mount_is_idempotent() {
+    // Replaying the same mount frame onto a graph that already has the
+    // subgraph must be a no-op (no error, no duplicate mount). This guards
+    // the common case where a baseline snapshot already hydrated the
+    // subgraph topology and a tail WAL frame would otherwise attempt a
+    // duplicate mount.
+    let (rt, g, _b) = make_graph("g");
+    g.mount_new(rt.core(), "child").unwrap();
+    let snapshot = g.snapshot(rt.core());
+
+    let before = empty_snapshot("g");
+    let diff = diff_snapshots(&before, &snapshot);
+    let (frames, _) = decompose_diff_to_frames(&diff, 1000, 0).unwrap();
+
+    let snap_tier = make_snap_tier(memory_backend(), "g");
+    // Baseline ALREADY carries "child" (so post-baseline-restore the graph
+    // has it mounted; the WAL mount frame on tail would normally duplicate).
+    snap_tier
+        .save(GraphCheckpointRecord {
+            name: "g".to_owned(),
+            mode: "full".to_owned(),
+            snapshot,
+            seq: 0,
+            timestamp_ns: 1000,
+            format_version: SNAPSHOT_VERSION,
+        })
+        .unwrap();
+    snap_tier.flush().unwrap();
+
+    let wal_tier = make_wal_tier(memory_backend(), "wal");
+    for frame in &frames {
+        let key = graphrefly_storage::wal_frame_key(
+            &graphrefly_storage::graph_wal_prefix("g"),
+            frame.frame_seq,
+        );
+        wal_tier.save(&key, frame.clone()).unwrap();
+    }
+    wal_tier.flush().unwrap();
+
+    // The baseline carries "child" + the WAL has the historical mount frame.
+    // Realistic restore scenario: the embedder pre-builds the topology
+    // (subgraph mounts) before calling `restore_snapshot`, because
+    // baseline restore is strict about subgraph presence. The pre-existing
+    // mount + the replay's mount frame are the idempotency exercise.
+    let (rt2, g2, _b2) = make_graph("g");
+    g2.mount_new(rt2.core(), "child").unwrap();
+    assert_eq!(g2.child_names(), vec!["child".to_owned()]);
+
+    let result = restore_snapshot(
+        rt2.core(),
+        &g2,
+        &RestoreOptions {
+            snapshot_tier: &snap_tier,
+            wal_tier: &wal_tier,
+            target_seq: None,
+            on_torn_write: None,
+        },
+    )
+    .unwrap();
+    // The single mount frame was replayed; the idempotent skip in
+    // `apply_wal_frame` (B4) prevents a duplicate mount. Final state has
+    // exactly one "child" mount.
+    assert_eq!(result.replayed_frames, 1);
+    assert_eq!(g2.child_names(), vec!["child".to_owned()]);
+}

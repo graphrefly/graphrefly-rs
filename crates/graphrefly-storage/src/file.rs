@@ -21,11 +21,14 @@
 //!
 //! Cargo feature: gated behind `file` (default-on).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tempfile::NamedTempFile;
@@ -53,15 +56,28 @@ const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 /// per-key granularity (atomic rename via `tempfile`); concurrent writers
 /// to the SAME key race in unspecified-but-atomic fashion (last commit wins).
 ///
-/// # Filesystem portability
+/// # Filesystem portability (B2 — 2026-05-22, /porting-to-rs)
 ///
 /// Key→filename encoding preserves ASCII case: `Foo` and `foo` encode to
 /// `Foo.bin` and `foo.bin`. On case-insensitive filesystems (default macOS
-/// APFS, default Windows NTFS) these collide. graphrefly-internal keys
-/// (tier names, WAL frame paths) are case-consistent by construction, so
-/// the collision is only reachable with adversarial user-supplied keys.
-/// Lift documented in `porting-deferred.md` "M4.C `FileBackend`
-/// case-insensitive-filesystem key collision".
+/// APFS, default Windows NTFS) these collide silently — last `write` wins.
+///
+/// To surface this loudly rather than corrupting data, `FileBackend` probes
+/// the filesystem on first `write()` and rejects subsequent writes whose
+/// encoded filename differs from a previously-written key only in casing.
+/// The probe is per-instance and runs at most once.
+///
+/// - **Case-sensitive filesystems** (Linux ext4/tmpfs, macOS APFS configured
+///   case-sensitive at format time): no enforcement; both `Foo` and `foo`
+///   succeed and resolve to distinct files.
+/// - **Case-insensitive filesystems** (default macOS APFS, Windows NTFS):
+///   second of `Foo` / `foo` fails with [`StorageError::BackendError`] whose
+///   message names both the existing and would-collide keys for diagnosis.
+/// - Read / list / delete paths are zero-overhead — the probe runs only on
+///   `write`, since collisions are write-introduced.
+///
+/// Tests force the probe outcome via
+/// [`FileBackend::with_case_insensitive`] so they're FS-independent.
 ///
 /// # Example
 ///
@@ -78,6 +94,28 @@ pub struct FileBackend {
     dir: PathBuf,
     name: String,
     include_hidden: bool,
+    /// Case-sensitivity state, lazily initialized on first `write()`.
+    /// `None` until probed; `Some(false)` = case-sensitive (zero enforcement);
+    /// `Some(true)` = case-insensitive (track `seen_keys` and reject
+    /// case-divergent collisions).
+    case_state: OnceLock<CaseState>,
+    /// Probe-outcome override. `None` = probe naturally on first write;
+    /// `Some(b)` = skip probe and force `case_state` to `Some(b)`. Set via
+    /// [`Self::with_case_insensitive`] for FS-independent tests.
+    case_override: Option<bool>,
+}
+
+/// Resolved case-sensitivity classification + collision tracker.
+#[derive(Debug)]
+enum CaseState {
+    /// Filesystem distinguishes `Foo` from `foo`; no enforcement needed.
+    Sensitive,
+    /// Filesystem treats `Foo` and `foo` as the same file. Track the
+    /// canonical (lowercase) encoded filename → original encoded filename so
+    /// each subsequent write can detect cross-case collisions.
+    Insensitive {
+        seen: Mutex<HashMap<String, String>>,
+    },
 }
 
 impl FileBackend {
@@ -91,6 +129,8 @@ impl FileBackend {
             dir,
             name,
             include_hidden: false,
+            case_state: OnceLock::new(),
+            case_override: None,
         }
     }
 
@@ -107,6 +147,31 @@ impl FileBackend {
     #[must_use]
     pub fn with_include_hidden(mut self, include: bool) -> Self {
         self.include_hidden = include;
+        self
+    }
+
+    /// Override the filesystem case-sensitivity probe outcome (B2,
+    /// 2026-05-22). `Some(true)` forces case-insensitive enforcement;
+    /// `Some(false)` forces case-sensitive (skips enforcement). The natural
+    /// probe is bypassed when set.
+    ///
+    /// **Internal test hook only.** Gated behind `cfg(any(test,
+    /// feature = "test-hooks"))` so production callers cannot construct
+    /// a `FileBackend` with a misleading case-sensitivity classification
+    /// (e.g., `with_case_insensitive(false)` on an APFS volume would
+    /// re-introduce the silent-overwrite hazard B2 closes). The override
+    /// exists so unit tests can exercise both branches independently of
+    /// the host filesystem (macOS CI runners default to APFS case-
+    /// insensitive; Linux CI runners default to ext4/tmpfs case-sensitive).
+    ///
+    /// /qa G2.4 (2026-05-22): the original `pub` form was a public-API
+    /// expansion that escaped the porting-deferred close. Tightened to
+    /// test-only visibility.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_case_insensitive(mut self, forced: bool) -> Self {
+        self.case_override = Some(forced);
         self
     }
 
@@ -128,6 +193,171 @@ impl FileBackend {
         filename.push_str(FILE_SUFFIX);
         self.dir.join(filename)
     }
+
+    /// Encoded filename (sans dir) for a key — used by the case-collision
+    /// tracker for case-folded comparison.
+    fn filename_for(key: &str) -> String {
+        let mut filename = encode_key_to_filename(key);
+        filename.push_str(FILE_SUFFIX);
+        filename
+    }
+
+    /// Resolve `case_state`, running the filesystem probe lazily if needed.
+    /// Called from `write()` only — read / list / delete paths skip this so
+    /// they retain zero overhead. The probe runs at most once per
+    /// `FileBackend` instance.
+    fn ensure_case_state(&self) -> &CaseState {
+        self.case_state.get_or_init(|| {
+            // Respect the explicit override first (test-only hook).
+            if let Some(forced) = self.case_override {
+                return if forced {
+                    CaseState::Insensitive {
+                        seen: Mutex::new(HashMap::new()),
+                    }
+                } else {
+                    CaseState::Sensitive
+                };
+            }
+            match probe_case_sensitivity(&self.dir) {
+                Some(true) => CaseState::Insensitive {
+                    seen: Mutex::new(HashMap::new()),
+                },
+                Some(false) | None => CaseState::Sensitive,
+            }
+        })
+    }
+
+    /// On case-insensitive filesystems, ensure `key`'s encoded filename
+    /// doesn't collide with a previously-written key that differs only in
+    /// casing. Returns the encoded filename for atomic insertion by the
+    /// caller post-success.
+    ///
+    /// On case-sensitive filesystems, no-op.
+    fn check_case_collision(&self, key: &str) -> Result<(), StorageError> {
+        let CaseState::Insensitive { seen } = self.ensure_case_state() else {
+            return Ok(());
+        };
+        let filename = Self::filename_for(key);
+        let folded = filename.to_ascii_lowercase();
+        // Lock scope: short; the map is touched only on writes.
+        let mut guard = seen.lock().expect("case-collision tracker poisoned");
+        if let Some(existing) = guard.get(&folded) {
+            if existing != &filename {
+                return Err(StorageError::BackendError {
+                    message: format!(
+                        "case-insensitive filesystem collision: existing key \
+                         file {existing:?} and new key file {filename:?} \
+                         (encoded from {key:?}) map to the same on-disk path \
+                         when case-folded; FileBackend rejects to prevent \
+                         silent overwrite",
+                    ),
+                    source: None,
+                });
+            }
+        } else {
+            guard.insert(folded, filename);
+        }
+        Ok(())
+    }
+
+    /// Drop a key from the case-collision tracker (allows the casing to be
+    /// reused after `delete`). No-op on case-sensitive filesystems.
+    fn release_case_slot(&self, key: &str) {
+        // Read-only access to `case_state` — DO NOT trigger the probe here.
+        // `delete()` should not pay probe cost.
+        let Some(CaseState::Insensitive { seen }) = self.case_state.get() else {
+            return;
+        };
+        let filename = Self::filename_for(key);
+        let folded = filename.to_ascii_lowercase();
+        if let Ok(mut guard) = seen.lock() {
+            // Only release if the slot holds our exact casing — avoids
+            // accidentally clearing a slot held by another casing of the
+            // same key (which would itself have failed `check_case_collision`).
+            if guard.get(&folded) == Some(&filename) {
+                guard.remove(&folded);
+            }
+        }
+    }
+}
+
+/// Probe whether the directory's filesystem treats casing as significant.
+///
+/// Returns `Some(true)` for case-insensitive, `Some(false)` for case-sensitive.
+/// Returns `None` if the probe cannot complete (directory not creatable,
+/// permission errors, etc.) — caller defaults to case-sensitive (no
+/// enforcement) so the probe failure mode is "lose protection," never
+/// "spurious rejection."
+///
+/// Algorithm: write a uniquely-named probe file, attempt `fs::metadata` of
+/// the same path uppercased, delete the probe file. The same-length match
+/// indicates the upper-cased path resolved to the lower-cased probe file —
+/// case-insensitivity.
+/// /qa G2.2 (2026-05-22): process-wide monotonic nonce. Two
+/// `FileBackend`s probing the same directory in the same nanosecond on
+/// systems with a coarse `SystemTime` resolution would otherwise share
+/// a probe filename and race each other's results. The nonce
+/// guarantees a unique probe filename even on low-resolution clocks.
+static PROBE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// /qa G2.2 (2026-05-22): sweep orphan probe files left behind by
+/// SIGKILL'd or panicked prior runs. Probe files use the
+/// `.gr-case-probe-*` pattern; the leading `.` keeps them invisible to
+/// `list()` (D161 hidden filter), but they accumulate across crashes.
+/// Sweep runs at most once per process via the [`SWEPT`] `OnceLock`;
+/// any `.gr-case-probe-*` file is removed regardless of age — they are
+/// always short-lived and any survivor is by definition orphan.
+fn sweep_orphan_probe_files(dir: &Path) {
+    use std::collections::HashSet;
+    static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let swept = SWEPT.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut guard) = swept.lock() else {
+        return; // poisoned — skip the sweep, not load-bearing
+    };
+    if guard.contains(dir) {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with(".gr-case-probe-") || name_str.starts_with(".GR-CASE-PROBE-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    guard.insert(dir.to_path_buf());
+}
+
+fn probe_case_sensitivity(dir: &Path) -> Option<bool> {
+    fs::create_dir_all(dir).ok()?;
+    // /qa G2.2: sweep orphans first so a SIGKILL'd prior run can't leave
+    // residue that pollutes a future `list()` on this directory.
+    sweep_orphan_probe_files(dir);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let pid = std::process::id();
+    // /qa G2.2: process-wide monotonic nonce closes the
+    // two-backends-same-nanosecond race vector.
+    let nonce = PROBE_NONCE.fetch_add(1, Ordering::Relaxed);
+    // Single canonical filename: lower-case stem. Probe via upper-case lookup.
+    // Leading `.` keeps the probe file invisible to `list()` (D161 hidden filter).
+    let lower_name = format!(".gr-case-probe-{pid}-{nanos}-{nonce}-a.bin");
+    let upper_name = lower_name.to_ascii_uppercase();
+    let lower_path = dir.join(&lower_name);
+    let upper_path = dir.join(&upper_name);
+    let _ = fs::write(&lower_path, b"probe");
+    let result = fs::metadata(&upper_path).is_ok();
+    let _ = fs::remove_file(&lower_path);
+    // Best-effort: if the upper-case path was somehow created as a distinct
+    // file (theoretically impossible on a case-sensitive FS since we only
+    // wrote the lower-case path), clean it up too.
+    let _ = fs::remove_file(&upper_path);
+    Some(result)
 }
 
 /// Convenience constructor returning an `Arc<FileBackend>`. Use this when
@@ -154,6 +384,12 @@ impl StorageBackend for FileBackend {
 
     fn write(&self, key: &str, bytes: &[u8]) -> Result<(), StorageError> {
         fs::create_dir_all(&self.dir).map_err(|e| io_error("mkdir", &self.dir, e))?;
+        // B2 (2026-05-22): on case-insensitive filesystems, reject writes
+        // whose encoded filename differs from a previously-written key only
+        // in casing. Probe runs at most once per backend instance. Checked
+        // BEFORE the atomic-rename write so a rejected write leaves no
+        // tempfile residue.
+        self.check_case_collision(key)?;
         let target = self.path_for(key);
         let mut tmp =
             NamedTempFile::new_in(&self.dir).map_err(|e| io_error("tempfile", &self.dir, e))?;
@@ -165,9 +401,26 @@ impl StorageBackend for FileBackend {
     }
 
     fn delete(&self, key: &str) -> Result<(), StorageError> {
+        // B2 + /qa G2.3 (2026-05-22): on a case-insensitive filesystem,
+        // `path_for("Foo")` and `path_for("foo")` resolve to the SAME
+        // on-disk file. Releasing the case-collision slot BEFORE
+        // `fs::remove_file` opens a clobber race: thread A releases
+        // "Foo", thread B writes "foo" (passes case-check, becomes the
+        // canonical casing), thread A's `fs::remove_file` then removes
+        // thread B's just-written data. Sequence the ops so the slot
+        // release happens AFTER the on-disk delete succeeds.
         match fs::remove_file(self.path_for(key)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                self.release_case_slot(key);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // File never existed — still safe to drop the slot, but
+                // do it after the kind-check so a failing `remove_file`
+                // doesn't strand the tracker entry.
+                self.release_case_slot(key);
+                Ok(())
+            }
             Err(e) => Err(io_error("delete", &self.dir, e)),
         }
     }
@@ -435,6 +688,83 @@ mod tests {
             decode_filename_to_key("caf%C3%A9.bin").as_deref(),
             Some("café")
         );
+    }
+
+    // ── B2 (2026-05-22, /porting-to-rs storage-honest-error batch) ─────────
+    //
+    // Case-collision detection on case-insensitive filesystems.
+    //
+    // The tests use `FileBackend::with_case_insensitive(forced)` to bypass
+    // the natural filesystem probe — keeps outcomes deterministic across CI
+    // hosts (macOS APFS default = case-insensitive; Linux ext4 default =
+    // case-sensitive).
+
+    #[test]
+    fn case_insensitive_rejects_case_divergent_second_write() {
+        // Force case-insensitive enforcement regardless of the underlying
+        // filesystem. Then write `Foo` followed by `foo` and expect the
+        // second to fail with a clear diagnostic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).with_case_insensitive(true);
+        backend
+            .write("Foo", b"first")
+            .expect("first write must succeed");
+        let err = backend
+            .write("foo", b"second")
+            .expect_err("case-divergent second write must reject");
+        let StorageError::BackendError { message, .. } = err else {
+            panic!("expected StorageError::BackendError, got: {err:?}");
+        };
+        assert!(
+            message.contains("case-insensitive filesystem collision"),
+            "diagnostic must label the failure class, got: {message}"
+        );
+        assert!(
+            message.contains("Foo.bin") && message.contains("foo.bin"),
+            "diagnostic must name both colliding encoded filenames, got: {message}"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_same_casing_overwrites() {
+        // Writing the same key twice (same casing) is the normal overwrite
+        // case — must not be flagged as a collision.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).with_case_insensitive(true);
+        backend.write("Foo", b"first").expect("first write");
+        backend
+            .write("Foo", b"second")
+            .expect("same-casing overwrite must succeed");
+        let read = backend.read("Foo").expect("read").expect("present");
+        assert_eq!(read, b"second");
+    }
+
+    #[test]
+    fn case_insensitive_delete_releases_slot() {
+        // After deleting `Foo`, writing `foo` must succeed — the casing slot
+        // was released by the delete.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).with_case_insensitive(true);
+        backend.write("Foo", b"first").expect("write Foo");
+        backend.delete("Foo").expect("delete Foo");
+        backend.write("foo", b"new").expect("post-delete write foo");
+        let read = backend.read("foo").expect("read foo").expect("present");
+        assert_eq!(read, b"new");
+    }
+
+    #[test]
+    fn case_sensitive_allows_case_divergent_writes() {
+        // On a forced-sensitive backend, `Foo` and `foo` must both succeed
+        // and resolve to distinct files. We can't verify distinct on-disk
+        // files on a case-insensitive host (the second write would clobber
+        // the first), so we only assert the calls succeed and the
+        // collision tracker doesn't fire.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).with_case_insensitive(false);
+        backend.write("Foo", b"first").expect("write Foo");
+        backend
+            .write("foo", b"second")
+            .expect("forced-sensitive backend must not reject case-divergent keys");
     }
 
     #[test]

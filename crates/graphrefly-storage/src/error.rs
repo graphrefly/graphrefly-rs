@@ -54,11 +54,18 @@ pub enum StorageError {
 /// bubble through `?` at the tier-flush boundary without explicit mapping.
 /// `ChecksumError::CanonicalJsonFailed` was a `serde_json::Error` at root,
 /// which is a codec-encode failure — funnel through the `Codec` variant.
+/// `ChecksumError::NonCanonicalContent` (B1, 2026-05-22) is a writer-side
+/// rejection of cross-impl-divergent content (non-ASCII keys, subnormal
+/// floats); also routed through `Codec::Encode` since it's an encode-time
+/// failure surfaced from the same checksum codepath.
 impl From<ChecksumError> for StorageError {
     fn from(e: ChecksumError) -> Self {
         match e {
             ChecksumError::CanonicalJsonFailed(err) => {
                 StorageError::Codec(CodecError::Encode(err.to_string()))
+            }
+            ChecksumError::NonCanonicalContent { reason } => {
+                StorageError::Codec(CodecError::Encode(reason))
             }
         }
     }

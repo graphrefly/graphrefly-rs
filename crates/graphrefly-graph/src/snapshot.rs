@@ -16,6 +16,7 @@
 //! Per D169 edges are omitted (derived from deps via `edges()`).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use graphrefly_core::{BindingBoundary, Core, CoreFull, NodeId, NodeKind, Termina
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{resolve_checked, Graph, GraphInner};
+use crate::graph::{resolve_checked, Graph, GraphInner, PATH_SEP};
 
 /// Portable snapshot of a graph's state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,9 +99,135 @@ pub type SnapshotBuilder = Box<dyn FnOnce(&Core, &Graph)>;
 /// — `&dyn CoreFull` (the one facade) so the storage in-wave
 /// `MailboxOp::Defer` observe-sink can run it (read-only;
 /// `serialize_handle` delegates to the binding).
+///
+/// **D276 (cross-mount deps):** the encoder pre-computes a tree-wide
+/// `id_to_tree_path: HashMap<NodeId, String>` covering every named
+/// node in the snapshot tree. For each dep the encoder emits an
+/// **owner-relative path** using [`PATH_SEP`] (`"::"`) and `".."`
+/// segments — the same syntax accepted by [`Graph::try_resolve`]:
+///
+/// - same-graph dep → bare local name (back-compat with snapshots
+///   produced by callers that never crossed a mount boundary).
+/// - cross-mount dep down → `"child::name"` / `"child::nested::name"`.
+/// - cross-mount dep up → `"..::name"`, `"..::..::name"`, …
+/// - cross-mount sibling → `"..::sibling::name"`.
+///
+/// Pre-D276 the encoder fell through to `"_anon_<rawid>"` for any
+/// dep whose `NodeId` wasn't in the LOCAL graph's `names` map,
+/// destroying every cross-mount reference at serialization time.
+/// The new owner-relative encoding round-trips through
+/// `Graph::from_snapshot`'s tree-wide hydration; the decoder
+/// resolves dep names via [`Graph::try_resolve`] on the owner graph,
+/// reusing Slice V3's cross-subgraph path machinery.
 pub(crate) fn snapshot_of(
     core: &dyn CoreFull,
     inner_arc: &Rc<RefCell<GraphInner>>,
+) -> GraphPersistSnapshot {
+    let id_to_tree_path = build_id_to_tree_path(inner_arc);
+    snapshot_of_with_tree_paths(core, inner_arc, &id_to_tree_path, "")
+}
+
+/// D276: walk the entire mount tree under `root` and build a
+/// `NodeId → absolute_path` map. Absolute paths are **relative to
+/// the snapshot root** (no leading root name) and use [`PATH_SEP`]
+/// (`"::"`) — the same syntax accepted by [`Graph::try_resolve`].
+fn build_id_to_tree_path(root: &Rc<RefCell<GraphInner>>) -> HashMap<NodeId, String> {
+    let mut map = HashMap::new();
+    walk_tree_paths(root, "", &mut map);
+    map
+}
+
+fn walk_tree_paths(
+    inner_arc: &Rc<RefCell<GraphInner>>,
+    path_prefix: &str,
+    out: &mut HashMap<NodeId, String>,
+) {
+    let inner = inner_arc.borrow_mut();
+    let names: Vec<(String, NodeId)> = inner.names.iter().map(|(n, &id)| (n.clone(), id)).collect();
+    let children: Vec<(String, Rc<RefCell<GraphInner>>)> = inner
+        .children
+        .iter()
+        .map(|(n, g)| (n.clone(), g.clone()))
+        .collect();
+    drop(inner);
+    for (name, id) in &names {
+        let abs_path = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{path_prefix}{PATH_SEP}{name}")
+        };
+        out.insert(*id, abs_path);
+    }
+    for (child_name, child_inner) in &children {
+        let child_prefix = if path_prefix.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{path_prefix}{PATH_SEP}{child_name}")
+        };
+        walk_tree_paths(child_inner, &child_prefix, out);
+    }
+}
+
+/// D276 helper — convert a dep's absolute path to a path relative
+/// to the owner graph. Same-graph deps collapse to a bare local
+/// name (back-compat); cross-mount deps use `".."`/`"name"`
+/// segments separated by [`PATH_SEP`].
+///
+/// Examples (`owner_path` → `abs_path` → result):
+///
+/// - `""` → `"a"` → `"a"` (root local)
+/// - `"child"` → `"child::b"` → `"b"` (same-graph local)
+/// - `""` → `"child::b"` → `"child::b"` (descend)
+/// - `"child"` → `"a"` → `"..::a"` (ascend to root)
+/// - `"child::nested"` → `"a"` → `"..::..::a"` (ascend two)
+/// - `"child::a"` → `"other::b"` → `"..::other::b"` (sibling)
+fn absolute_to_owner_relative(owner_path: &str, abs_path: &str) -> String {
+    // /qa G2.7 (2026-05-22): self-dep guard. graphrefly rejects self-deps at
+    // registration (`SetDepsError::SelfDep`), so a healthy `Core::deps_of`
+    // never yields the owning node's own id. If a snapshot is hand-
+    // constructed pathologically OR an operator-internal NodeId is reused
+    // structurally as both owner and dep, computing `owner_path == abs_path`
+    // here would emit `""` — which `Graph::try_resolve("")` rejects with
+    // `PathError::Empty`, eventually surfacing as `UnresolvableDeps` from
+    // the decode retry loop. Catch it loudly at encode in debug builds.
+    debug_assert_ne!(
+        owner_path, abs_path,
+        "D276 invariant: self-deps are rejected at registration; \
+         encoding a dep whose absolute path equals the owner's would emit \
+         an empty relative path"
+    );
+    let owner_segs: Vec<&str> = if owner_path.is_empty() {
+        Vec::new()
+    } else {
+        owner_path.split(PATH_SEP).collect()
+    };
+    let abs_segs: Vec<&str> = if abs_path.is_empty() {
+        Vec::new()
+    } else {
+        abs_path.split(PATH_SEP).collect()
+    };
+    let mut common = 0;
+    while common < owner_segs.len()
+        && common < abs_segs.len()
+        && owner_segs[common] == abs_segs[common]
+    {
+        common += 1;
+    }
+    let up_count = owner_segs.len() - common;
+    let down_segs = &abs_segs[common..];
+    if up_count == 0 {
+        return down_segs.join(PATH_SEP);
+    }
+    let mut parts: Vec<&str> = vec![".."; up_count];
+    parts.extend(down_segs);
+    parts.join(PATH_SEP)
+}
+
+fn snapshot_of_with_tree_paths(
+    core: &dyn CoreFull,
+    inner_arc: &Rc<RefCell<GraphInner>>,
+    id_to_tree_path: &HashMap<NodeId, String>,
+    owner_path: &str,
 ) -> GraphPersistSnapshot {
     let (name, node_entries, children, id_to_name) = {
         let inner = inner_arc.borrow_mut();
@@ -152,14 +279,27 @@ pub(crate) fn snapshot_of(
             }
         };
 
+        // D276: dep-name encoding — 3 tiers, all owner-relative:
+        // (1) same-graph dep → bare local name (back-compat — pre-D276
+        //     snapshots used this shape exclusively).
+        // (2) cross-mount dep that IS named somewhere in the snapshot
+        //     tree → owner-relative path via [`PATH_SEP`] + `".."`
+        //     segments (resolves via `Graph::try_resolve` on decode).
+        // (3) anonymous dep (operator-internal NodeId with no name in
+        //     ANY graph) → `_anon_<rawid>` fallback (pre-D276 behavior,
+        //     unchanged; decode still fails with `UnresolvableDeps`
+        //     for these — not in M4.E1 scope).
         let dep_ids = core.deps_of(*node_id);
         let deps: Vec<String> = dep_ids
             .iter()
             .map(|dep_id| {
-                id_to_name
-                    .get(dep_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("_anon_{}", dep_id.raw()))
+                if let Some(local_name) = id_to_name.get(dep_id) {
+                    local_name.clone()
+                } else if let Some(tree_path) = id_to_tree_path.get(dep_id) {
+                    absolute_to_owner_relative(owner_path, tree_path)
+                } else {
+                    format!("_anon_{}", dep_id.raw())
+                }
             })
             .collect();
 
@@ -176,7 +316,15 @@ pub(crate) fn snapshot_of(
 
     let mut subgraphs = IndexMap::new();
     for (child_name, child_inner) in children {
-        subgraphs.insert(child_name, snapshot_of(core, &child_inner));
+        let child_owner_path = if owner_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{owner_path}{PATH_SEP}{child_name}")
+        };
+        subgraphs.insert(
+            child_name,
+            snapshot_of_with_tree_paths(core, &child_inner, id_to_tree_path, &child_owner_path),
+        );
     }
 
     GraphPersistSnapshot {
@@ -307,90 +455,207 @@ impl Graph {
         }
 
         let factories = factories.unwrap_or_default();
-        for (child_name, child_snapshot) in &snapshot.subgraphs {
-            let child = graph
-                .mount_new(core, child_name)
-                .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
-            hydrate_subgraph(core, &child, child_snapshot, &binding, &factories)?;
-        }
-        hydrate_nodes(core, &graph, snapshot, &binding, &factories)?;
+
+        // D276 tree-wide hydration — replaces the pre-D276 single-pass
+        // per-graph `hydrate_subgraph` / `hydrate_nodes` recursion.
+        // Four passes:
+        //
+        //   Pass 0 — mount tree: recursively `mount_new` every
+        //            subgraph; record `(absolute_path → Graph)` so
+        //            later passes can address each owning graph.
+        //   Pass 1 — state-first: walk tree creating ALL state nodes
+        //            (no deps to resolve). Each state node is
+        //            registered in its owner graph's `names`, so
+        //            subsequent passes can locate it via
+        //            [`Graph::try_resolve`].
+        //   Pass 2 — derived: collect ALL non-state nodes across the
+        //            tree into one queue. Run ONE shared retry loop;
+        //            dep names resolve via the owner graph's
+        //            `try_resolve`, which natively handles owner-
+        //            relative paths with `".."` and `"::"` segments
+        //            (Slice V3 cross-subgraph path machinery).
+        //   Pass 3 — status restore: walk tree, apply
+        //            `Completed` / `Errored` via the same
+        //            `try_resolve` lookup.
+        //
+        // Back-compat: snapshots produced by callers that never
+        // crossed a mount boundary use bare local names only; those
+        // resolve identically to the pre-D276 flat lookup (and
+        // identically to a one-segment `try_resolve` on the owner).
+        //
+        // See `~/src/graphrefly-ts/docs/rust-port-decisions.md` D276
+        // and the `docs/porting-deferred.md` M4.E1 closure block.
+
+        // Pass 0 — mount tree.
+        let mut graph_map: IndexMap<String, Graph> = IndexMap::new();
+        graph_map.insert(String::new(), graph.clone());
+        mount_subgraphs_recursive(core, &graph, snapshot, "", &mut graph_map)?;
+
+        // Pass 1 — state nodes tree-wide.
+        create_state_nodes_recursive(core, snapshot, "", &graph_map, &binding)?;
+
+        // Pass 2 — derived nodes tree-wide with shared retry loop.
+        let mut derived_queue: Vec<DerivedEntry> = Vec::new();
+        collect_derived_recursive(snapshot, "", &graph_map, &mut derived_queue);
+        create_derived_with_retry(core, &factories, derived_queue)?;
+
+        // Pass 3 — status restore.
+        apply_status_recursive(core, snapshot, "", &graph_map, &binding)?;
 
         Ok(graph)
     }
 }
 
-fn hydrate_subgraph(
-    core: &Core,
-    g: &Graph,
-    snapshot: &GraphPersistSnapshot,
-    binding: &Arc<dyn BindingBoundary>,
-    factories: &IndexMap<String, NodeFactory>,
-) -> Result<(), SnapshotError> {
-    for (child_name, child_snapshot) in &snapshot.subgraphs {
-        let child = g
-            .mount_new(core, child_name)
-            .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
-        hydrate_subgraph(core, &child, child_snapshot, binding, factories)?;
-    }
-    hydrate_nodes(core, g, snapshot, binding, factories)
+/// D276 auto-hydration: a non-state node awaiting derivation in
+/// Pass 2's shared retry loop. The owner graph is captured so the
+/// retry loop can call `owner_graph.try_resolve(dep_name)` against
+/// the right namespace (owner-relative paths walk via the owner's
+/// parent/child references in [`crate::graph::resolve_checked`]).
+struct DerivedEntry {
+    owner_graph: Graph,
+    name: String,
+    slice: NodeSlice,
 }
 
-fn hydrate_nodes(
+/// D276 Pass 0 — mount every subgraph under `parent` and accumulate
+/// each subgraph's absolute path → [`Graph`] handle into `graph_map`.
+fn mount_subgraphs_recursive(
     core: &Core,
-    g: &Graph,
-    snapshot: &GraphPersistSnapshot,
-    binding: &Arc<dyn BindingBoundary>,
-    factories: &IndexMap<String, NodeFactory>,
+    parent: &Graph,
+    snap: &GraphPersistSnapshot,
+    parent_path: &str,
+    graph_map: &mut IndexMap<String, Graph>,
 ) -> Result<(), SnapshotError> {
-    let mut created: IndexMap<String, NodeId> = IndexMap::new();
-    let mut remaining: Vec<(String, NodeSlice)> = snapshot
-        .nodes
-        .iter()
-        .map(|(n, s)| (n.clone(), s.clone()))
-        .collect();
+    for (child_name, child_snap) in &snap.subgraphs {
+        let child_graph = parent
+            .mount_new(core, child_name)
+            .map_err(|_| SnapshotError::UnknownSubgraph(child_name.clone()))?;
+        let child_path = if parent_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{parent_path}{PATH_SEP}{child_name}")
+        };
+        graph_map.insert(child_path.clone(), child_graph.clone());
+        mount_subgraphs_recursive(core, &child_graph, child_snap, &child_path, graph_map)?;
+    }
+    Ok(())
+}
 
+/// D276 Pass 1 — recursively create every state node in the tree
+/// (state nodes have no deps to resolve). Each new state node is
+/// registered in its owner graph's `names`; Pass 2/3 locate it via
+/// [`Graph::try_resolve`].
+fn create_state_nodes_recursive(
+    core: &Core,
+    snap: &GraphPersistSnapshot,
+    owner_path: &str,
+    graph_map: &IndexMap<String, Graph>,
+    binding: &Arc<dyn BindingBoundary>,
+) -> Result<(), SnapshotError> {
+    let owner_graph = graph_map
+        .get(owner_path)
+        .expect("D276 invariant: graph_map covers every subgraph mounted in Pass 0");
+    for (name, slice) in &snap.nodes {
+        if slice.node_type == "state" {
+            let initial = slice
+                .value
+                .as_ref()
+                .map(|v| binding.deserialize_value(v.clone()));
+            owner_graph
+                .state(core, name, initial)
+                .map_err(|_| SnapshotError::UnknownNode(name.clone()))?;
+        }
+    }
+    for (child_name, child_snap) in &snap.subgraphs {
+        let child_path = if owner_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{owner_path}{PATH_SEP}{child_name}")
+        };
+        create_state_nodes_recursive(core, child_snap, &child_path, graph_map, binding)?;
+    }
+    Ok(())
+}
+
+/// D276 Pass 2a — walk the entire tree collecting non-state nodes
+/// into one flat queue tagged with their owner graph + path. The
+/// queue is then run through [`create_derived_with_retry`] which
+/// can resolve deps that cross mount boundaries.
+fn collect_derived_recursive(
+    snap: &GraphPersistSnapshot,
+    owner_path: &str,
+    graph_map: &IndexMap<String, Graph>,
+    out: &mut Vec<DerivedEntry>,
+) {
+    let owner_graph = graph_map
+        .get(owner_path)
+        .expect("D276 invariant: graph_map covers every subgraph mounted in Pass 0");
+    for (name, slice) in &snap.nodes {
+        if slice.node_type != "state" {
+            out.push(DerivedEntry {
+                owner_graph: owner_graph.clone(),
+                name: name.clone(),
+                slice: slice.clone(),
+            });
+        }
+    }
+    for (child_name, child_snap) in &snap.subgraphs {
+        let child_path = if owner_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{owner_path}{PATH_SEP}{child_name}")
+        };
+        collect_derived_recursive(child_snap, &child_path, graph_map, out);
+    }
+}
+
+/// D276 Pass 2b — tree-wide retry loop for derived/dynamic/operator
+/// nodes. Each iteration resolves an entry's deps via the owner
+/// graph's [`Graph::try_resolve`], which natively understands the
+/// owner-relative path syntax emitted by the D276 encoder:
+///
+/// - bare name → local lookup in owner's `names` (pre-D276 shape).
+/// - `"child::name"` → descend into a mounted subgraph.
+/// - `"..::name"` → walk to parent.
+/// - `"..::sibling::name"` → walk to parent then descend into a sibling.
+///
+/// Loop terminates when (a) all entries created — success — or
+/// (b) one pass made no progress — `UnresolvableDeps` on the first
+/// stuck entry.
+fn create_derived_with_retry(
+    core: &Core,
+    factories: &IndexMap<String, NodeFactory>,
+    entries: Vec<DerivedEntry>,
+) -> Result<(), SnapshotError> {
+    let mut remaining = entries;
     loop {
         let before = remaining.len();
         let mut still_remaining = Vec::new();
 
-        for (name, slice) in remaining {
-            let deps_resolved: Option<Vec<NodeId>> = if slice.deps.is_empty() {
-                Some(Vec::new())
-            } else {
-                let mut resolved = Vec::with_capacity(slice.deps.len());
-                let mut all_ok = true;
-                for dep_name in &slice.deps {
-                    if let Some(&dep_id) = created.get(dep_name) {
-                        resolved.push(dep_id);
-                    } else {
-                        all_ok = false;
-                        break;
-                    }
-                }
-                if all_ok {
-                    Some(resolved)
+        for entry in remaining {
+            let mut resolved = Vec::with_capacity(entry.slice.deps.len());
+            let mut all_ok = true;
+            for dep_name in &entry.slice.deps {
+                if let Some(dep_id) = entry.owner_graph.try_resolve(dep_name) {
+                    resolved.push(dep_id);
                 } else {
-                    None
+                    all_ok = false;
+                    break;
                 }
-            };
-
-            if let Some(dep_ids) = deps_resolved {
-                let node_id = if slice.node_type == "state" {
-                    let initial = slice
-                        .value
-                        .as_ref()
-                        .map(|v| binding.deserialize_value(v.clone()));
-                    g.state(core, &name, initial)
-                        .map_err(|_| SnapshotError::UnknownNode(name.clone()))?
-                } else {
-                    let factory = factories.get(&slice.node_type).ok_or_else(|| {
-                        SnapshotError::MissingFactory(slice.node_type.clone(), name.clone())
-                    })?;
-                    factory(core, g, &name, &slice, &dep_ids)?
-                };
-                created.insert(name, node_id);
+            }
+            if all_ok {
+                let factory = factories.get(&entry.slice.node_type).ok_or_else(|| {
+                    SnapshotError::MissingFactory(entry.slice.node_type.clone(), entry.name.clone())
+                })?;
+                factory(
+                    core,
+                    &entry.owner_graph,
+                    &entry.name,
+                    &entry.slice,
+                    &resolved,
+                )?;
             } else {
-                still_remaining.push((name, slice));
+                still_remaining.push(entry);
             }
         }
 
@@ -399,30 +664,60 @@ fn hydrate_nodes(
             break;
         }
         if remaining.len() == before {
-            let (name, slice) = &remaining[0];
+            let entry = &remaining[0];
             return Err(SnapshotError::UnresolvableDeps(
-                name.clone(),
-                slice.deps.clone(),
+                entry.name.clone(),
+                entry.slice.deps.clone(),
             ));
         }
     }
+    Ok(())
+}
 
-    for (name, slice) in &snapshot.nodes {
-        if let Some(&node_id) = created.get(name) {
-            match &slice.status {
-                NodeSnapshotStatus::Completed => {
-                    g.complete(core, node_id);
-                }
-                NodeSnapshotStatus::Errored { error } => {
-                    if let Some(err_val) = error {
-                        let err_handle = binding.deserialize_value(err_val.clone());
-                        g.error(core, node_id, err_handle);
-                    }
-                }
-                NodeSnapshotStatus::Sentinel | NodeSnapshotStatus::Live => {}
+/// D276 Pass 3 — recursively apply each node's snapshot status
+/// (Completed / Errored) via the owner graph's [`Graph::try_resolve`].
+/// Sentinel / Live are no-ops (state nodes already received their
+/// cache during Pass 1's `Graph::state` initial-value path; derived
+/// recompute on first subscribe).
+fn apply_status_recursive(
+    core: &Core,
+    snap: &GraphPersistSnapshot,
+    owner_path: &str,
+    graph_map: &IndexMap<String, Graph>,
+    binding: &Arc<dyn BindingBoundary>,
+) -> Result<(), SnapshotError> {
+    let owner_graph = graph_map
+        .get(owner_path)
+        .expect("D276 invariant: graph_map covers every subgraph mounted in Pass 0");
+    for (name, slice) in &snap.nodes {
+        // /qa G2.1 (2026-05-22): mirror `restore_into:339` — a node listed
+        // in the snapshot that doesn't resolve via `try_resolve` is a
+        // structural inconsistency (Pass 1/Pass 2 should have created it).
+        // Silently dropping the status would mask a Pass-2 hydration bug
+        // as "successful restore with corrupted lifecycle state."
+        let node_id = owner_graph
+            .try_resolve(name)
+            .ok_or_else(|| SnapshotError::UnknownNode(name.clone()))?;
+        match &slice.status {
+            NodeSnapshotStatus::Completed => {
+                owner_graph.complete(core, node_id);
             }
+            NodeSnapshotStatus::Errored { error } => {
+                if let Some(err_val) = error {
+                    let err_handle = binding.deserialize_value(err_val.clone());
+                    owner_graph.error(core, node_id, err_handle);
+                }
+            }
+            NodeSnapshotStatus::Sentinel | NodeSnapshotStatus::Live => {}
         }
     }
-
+    for (child_name, child_snap) in &snap.subgraphs {
+        let child_path = if owner_path.is_empty() {
+            child_name.clone()
+        } else {
+            format!("{owner_path}{PATH_SEP}{child_name}")
+        };
+        apply_status_recursive(core, child_snap, &child_path, graph_map, binding)?;
+    }
     Ok(())
 }

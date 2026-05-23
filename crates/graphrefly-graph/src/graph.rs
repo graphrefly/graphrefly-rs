@@ -358,6 +358,26 @@ impl Graph {
         self.inner.borrow_mut().children.keys().cloned().collect()
     }
 
+    /// Look up an immediate child mount by name. Returns `None` when no
+    /// child mount with that exact name exists.
+    ///
+    /// /qa G1.1 (2026-05-22): added to support multi-segment-path
+    /// navigation in `apply_wal_frame` mount/unmount arms (`graph.ts`'s
+    /// `_collectSubgraphs` emits `"parent::child::nested"` paths; the
+    /// Rust storage replay must walk segments to reach the right
+    /// owner graph before calling `mount_new` / `unmount`). Reverse of
+    /// [`Self::child_names`]; combine with the segments of a
+    /// [`PATH_SEP`]-joined path to descend the mount tree.
+    #[must_use]
+    pub fn child(&self, name: &str) -> Option<Graph> {
+        self.inner
+            .borrow_mut()
+            .children
+            .get(name)
+            .cloned()
+            .map(Graph::from_inner)
+    }
+
     /// Returns `true` after [`Self::destroy`] has been called.
     #[must_use]
     pub fn is_destroyed(&self) -> bool {
