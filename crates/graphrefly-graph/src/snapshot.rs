@@ -87,8 +87,8 @@ pub enum SnapshotError {
     /// D279 (2026-05-22, E-ii.1): a state node in the snapshot collides
     /// with an existing child mount name on the owner graph at decode
     /// time. Raised by Pass 1's pre-validation BEFORE any Core mutation
-    /// — prevents the orphan-NodeId leak that pre-D279 occurred when
-    /// `Graph::state` registered a NodeId before the namespace `add`
+    /// — prevents the orphan-`NodeId` leak that pre-D279 occurred when
+    /// `Graph::state` registered a `NodeId` before the namespace `add`
     /// returned `NameError::Collision`. `graph_path` is the owner
     /// graph's tree-relative path (empty string for the root).
     #[error("snapshot decode: state node `{name}` at graph `{graph_path}` collides with an existing child mount of the same name")]

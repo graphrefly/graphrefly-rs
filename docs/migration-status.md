@@ -155,6 +155,26 @@ republish.
 D272 / D273 / D274 + AMEND-D entries (D262/P4 + D267 scope-amend) +
 memory `feedback_distinguish_vestigial_vs_speculative.md`.
 
+### D279 — E-ii.1 snapshot orphan-leak fix + E-ii.3 describe sentinel-shape converge-to-TS (Commit 2 of 3; 2026-05-22, `/porting-to-rs` next-batch)
+
+Commit 2 of the 13-item E-cluster slice. Originally scoped E-ii.1 + E-ii.2 + E-ii.3; **E-ii.2 re-deferred during HALT** (scope was 5-10× the initial estimate; refiled at `docs/optimizations.md` "🟠 E-ii.2 DEFERRED 2026-05-22" as a separate D-numbered future slice).
+
+- **E-ii.1 — `SnapshotError::NameCollision` pre-validate (concrete bug fix).** New `NameCollision { name, graph_path }` variant on `SnapshotError`. Pre-validation in `create_state_nodes_recursive` walks `snap.nodes` (state-only) vs `owner_graph.child_names()` BEFORE any `Graph::state` call — closes the pre-D279 orphan-`NodeId` leak (Core registered the NodeId via `register_state` before namespace `add` returned `NameError::Collision`, leaving an orphan handle). Now zero Core mutation on a doomed restore; dedicated typed error instead of the silent `UnknownNode` masquerade. 2 cargo regression tests covering root-graph collision + nested-subgraph collision with correct `graph_path`.
+
+- **E-ii.3 — `NodeDescribe` sentinel-vs-JSON-null disambiguation; Rust converges to TS shape.** Added `sentinel: Option<bool>` field with `#[serde(skip_serializing_if = "Option::is_none")]`; added `skip_serializing_if` to existing `value: Option<DescribeValue>` field. `describe_of` sets `sentinel = Some(true)` when `status == NodeStatus::Sentinel`. Now JSON-distinguishable: sentinel → `{ "sentinel": true }` (no `value` key); legitimate rendered JSON-null → `{ "value": null }` (no `sentinel` key). Matches TS `DescribeNodeOutput` shape (`packages/pure-ts/src/core/meta.ts:9-27` + `:303`) — TS already canonical, Rust catching up. Same pattern as D-WAL-fmt (TS converged toward Rust's pre-existing `format_version`). 2 cargo tests (one rewritten + one new) pin the disambiguation.
+
+- **E-ii.2 — RE-DEFERRED (NOT in this commit).** Original framing as B4-style `graph.teardown` arm was 5-10× off: snapshot+diff pipeline today doesn't detect torn-down nodes (they stay in the namespace with their existing terminal status), so widening the tier filter alone is a no-op. Real fix requires `NodeSnapshotStatus::TornDown` variant + diff detection + `apply_data_frame` arm + cross-arm coordination + restore-time semantic decision (R-ID side-quest required — `Core::mark_torn_down_silently` substrate widening vs audit-only no-op). User-locked: Path A architecturally correct (single source of truth; rejects Path B's dual-source per anti-pattern #5), but defer pending a real consumer + spec R-ID for WAL-restore semantics. Refiled at `~/src/graphrefly-ts/docs/optimizations.md` "🟠 E-ii.2 DEFERRED 2026-05-22".
+
+**`Impl` / parity-tests / napi widening:** none on the contract surface. `Graph::describe()` is not on the `Impl` interface; the JSON shape change is parity-coupled (cross-track-ledger §2 row authored FIRST) but not contract-coupled. `BenchGraph::describe_json` napi output shape changes transitively — observable to napi consumers, no parity scenario asserts on this shape today.
+
+**Cross-track-ledger row:** §2 row added for E-ii.3 only (E-ii.2 row NOT piggybacked — re-deferred). Documents TS-canonical, Rust-converging shape contract.
+
+**Gate (full):** `mise run gate` GREEN — **853 tests passed, 0 skipped**, exit 0 (201s, sentinel `<<<RUN-LOGGED:DONE>>> exit=0 reason=ok`). 853-850 baseline delta = +3 net (2 new E-ii.1 + 1 new E-ii.3; existing pre-D279 sentinel-value-null test rewritten in place). fmt + clippy + nextest --profile ci all clean. `#![forbid(unsafe_code)]` preserved. **/qa fix applied during gating:** `clippy::doc_markdown` flagged unticked `NodeId` in the new `SnapshotError::NameCollision` rustdoc; backticks added on first re-run.
+
+**D265 hold-local pattern preserved:** commits land locally; not pushed.
+
+**Canonical:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D279.
+
 ### D278 — E-i + E-ii + E-iv doc-hygiene batch (Commit 1 of 3; 2026-05-22, `/porting-to-rs` next-batch — substrate-only rustdoc)
 
 Commit 1 of the 13-item E-cluster slice ("can we do E-i + E-ii + E-iv?" user pickup post-D277). The user's anti-pattern-#4 framing (no autonomous decisions when spec answers; no preemptive hypothesized-divergence doc) + D196 consumer-pressure gate + value-#6 pre-design full decision-set resolved the 13 items into **4 fixes + 4 doc-only keeps + 5 drops/rejects** across three commits. This commit lands the 4 doc-only keeps; Commits 2 (snapshot/storage fixes) + 3 (R1.4.2 spec-compliance) follow.

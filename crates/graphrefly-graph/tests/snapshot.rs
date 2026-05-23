@@ -1112,7 +1112,7 @@ fn d279_from_snapshot_rejects_state_vs_child_mount_collision_without_orphan() {
         },
     };
 
-    let factories: HashMap<String, NodeFactory> = HashMap::new();
+    let factories: IndexMap<String, NodeFactory> = IndexMap::new();
     let result = Graph::from_snapshot(rt.core(), &snap, None, Some(factories));
 
     // Typed error: `NameCollision`, not the pre-D279 `UnknownNode`.
@@ -1179,7 +1179,7 @@ fn d279_from_snapshot_rejects_collision_in_nested_subgraph_with_correct_path() {
         },
     };
 
-    let factories: HashMap<String, NodeFactory> = HashMap::new();
+    let factories: IndexMap<String, NodeFactory> = IndexMap::new();
     let result = Graph::from_snapshot(rt.core(), &snap, None, Some(factories));
 
     match result {

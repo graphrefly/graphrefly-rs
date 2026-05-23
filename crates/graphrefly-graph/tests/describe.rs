@@ -289,19 +289,71 @@ mod debug_render {
     }
 
     #[test]
-    fn describe_with_debug_preserves_null_for_sentinel_cache() {
-        // Sentinel (no-initial state) → value: null in both modes.
+    fn d279_sentinel_cache_omits_value_key_and_sets_sentinel_flag() {
+        // D279 (2026-05-22, E-ii.3) — Rust converges to TS's
+        // `sentinel?: boolean` + optional `value?` shape:
+        //   sentinel cache → `"sentinel": true` present, `"value"` key absent
+        //   (was pre-D279: `"value": null`, no sentinel flag — same shape as
+        //   a legitimate rendered Value::Null, JSON-indistinguishable).
         let binding = DebugBinding::new();
         let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
         let g = Graph::new("system");
         g.state(rt.core(), "knob", None).unwrap();
 
         let rendered = g.describe_with_debug(rt.core(), binding.as_ref());
-        assert!(rendered.nodes.get("knob").unwrap().value.is_none());
+        let n = rendered.nodes.get("knob").unwrap();
+        assert!(n.value.is_none(), "sentinel: in-memory value is None");
+        assert_eq!(
+            n.sentinel,
+            Some(true),
+            "sentinel: explicit discriminator set"
+        );
+
+        let json = serde_json::to_string(&rendered).unwrap();
+        assert!(
+            !json.contains("\"value\""),
+            "sentinel: `value` key omitted via skip_serializing_if. JSON: {json}"
+        );
+        assert!(
+            json.contains("\"sentinel\":true"),
+            "sentinel: explicit `sentinel: true` flag present. JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn d279_rendered_value_null_keeps_value_key_and_omits_sentinel_flag() {
+        // D279 (E-ii.3) — disambiguation: a legitimate JSON-null user value
+        // (rendered via DebugBindingBoundary::handle_to_debug) must be
+        // JSON-distinguishable from a sentinel cache. Same shape as TS:
+        //   rendered null user value → `"value": null` present,
+        //   `"sentinel"` key absent.
+        let binding = DebugBinding::new();
+        let h_null = HandleId::new(7);
+        binding.register(h_null, serde_json::Value::Null);
+        let rt = OwnedCore::new(binding.clone() as Arc<dyn BindingBoundary>);
+        let g = Graph::new("system");
+        g.state(rt.core(), "nully", Some(h_null)).unwrap();
+
+        let rendered = g.describe_with_debug(rt.core(), binding.as_ref());
+        let n = rendered.nodes.get("nully").unwrap();
+        assert_eq!(
+            n.value,
+            Some(DescribeValue::Rendered(serde_json::Value::Null)),
+            "rendered null is a legitimate Some(Rendered(Null))"
+        );
+        assert!(
+            n.sentinel.is_none(),
+            "non-sentinel: sentinel flag is None (omitted from JSON)"
+        );
+
         let json = serde_json::to_string(&rendered).unwrap();
         assert!(
             json.contains("\"value\":null"),
-            "sentinel cache → value:null. JSON: {json}"
+            "rendered null: `value` key present with null. JSON: {json}"
+        );
+        assert!(
+            !json.contains("\"sentinel\""),
+            "rendered null: `sentinel` key omitted. JSON: {json}"
         );
     }
 
