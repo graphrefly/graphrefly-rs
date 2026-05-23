@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.7...graphrefly-core-v0.0.8) - 2026-05-23
+
+### Fixed
+
+- clean up
+- *(/qa)* D272-D274 cleanup — F1..F10 (build-break under graph-codec + stale doc residue)
+
+### Other
+
+- *(D278)* E-i+ii+iv doc-hygiene batch (Commit 1 of 3 — 4 keeps)
+- bench
+- *(AMEND-D)* D262/P4 inline comment + D267 scope narrowing (audit L5-001/L6-001)
+- doc-hygiene cleanup (audit L4-001/L4-002/L1-001/L8-001/L8-002/L8-003)
+- *(D274)* delete vestigial union-find + defer-shim surface
+- *(D273)* family-2 Cat-3 Arc<Mutex<X>> → Rc<RefCell<X>> sweep
+- *(D272)* family-1 sink Arc<dyn Fn> → Rc<dyn Fn> + drop 12 clippy-allow
+
 ## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-core-v0.0.6...graphrefly-core-v0.0.7) - 2026-05-21
 
 ### Added

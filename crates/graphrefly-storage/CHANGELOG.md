@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-storage-v0.0.7...graphrefly-storage-v0.0.8) - 2026-05-23
+
+### Fixed
+
+- clean up
+- reactive structure clean up
+
 ## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-storage-v0.0.6...graphrefly-storage-v0.0.7) - 2026-05-21
 
 ### Added
