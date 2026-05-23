@@ -84,6 +84,15 @@ pub enum SnapshotError {
     UnresolvableDeps(String, Vec<String>),
     #[error("auto-hydration: no factory registered for node type `{0}` (node `{1}`)")]
     MissingFactory(String, String),
+    /// D279 (2026-05-22, E-ii.1): a state node in the snapshot collides
+    /// with an existing child mount name on the owner graph at decode
+    /// time. Raised by Pass 1's pre-validation BEFORE any Core mutation
+    /// — prevents the orphan-NodeId leak that pre-D279 occurred when
+    /// `Graph::state` registered a NodeId before the namespace `add`
+    /// returned `NameError::Collision`. `graph_path` is the owner
+    /// graph's tree-relative path (empty string for the root).
+    #[error("snapshot decode: state node `{name}` at graph `{graph_path}` collides with an existing child mount of the same name")]
+    NameCollision { name: String, graph_path: String },
 }
 
 /// Factory for auto-hydration mode. D246: receives the embedder's
@@ -584,6 +593,28 @@ fn create_state_nodes_recursive(
     let owner_graph = graph_map
         .get(owner_path)
         .expect("D276 invariant: graph_map covers every subgraph mounted in Pass 0");
+
+    // D279 (2026-05-22, E-ii.1): pre-validate every state name against the
+    // owner graph's mount tree BEFORE any `register_state` call. Pre-D279,
+    // `Graph::state` called `core.register_state(...)` first (allocating a
+    // fresh NodeId + cache retention) THEN `add(name, ...)` — a name
+    // collision against a child mount populated by Pass 0 left an orphan
+    // NodeId in Core's registry with no path to teardown, and the surfaced
+    // error (`UnknownNode` via `map_err(|_| ...)`) discarded the real
+    // collision cause. Pre-validation closes both bugs at once: zero Core
+    // mutation on a doomed restore, and a dedicated `NameCollision`
+    // diagnostic.
+    let child_mount_names: std::collections::HashSet<String> =
+        owner_graph.child_names().into_iter().collect();
+    for (name, slice) in &snap.nodes {
+        if slice.node_type == "state" && child_mount_names.contains(name) {
+            return Err(SnapshotError::NameCollision {
+                name: name.clone(),
+                graph_path: owner_path.to_owned(),
+            });
+        }
+    }
+
     for (name, slice) in &snap.nodes {
         if slice.node_type == "state" {
             let initial = slice

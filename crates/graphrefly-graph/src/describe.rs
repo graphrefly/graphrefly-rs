@@ -43,6 +43,30 @@ pub struct GraphDescribeOutput {
 }
 
 /// Per-node descriptor.
+///
+/// # JSON-shape disambiguation (D279, 2026-05-22, E-ii.3 — Rust ↔ TS parity)
+///
+/// Sentinel-vs-JSON-null disambiguation matches the TS `describeNode`
+/// shape (`packages/pure-ts/src/core/meta.ts`
+/// `DescribeNodeOutput { value?: unknown, sentinel?: boolean }`):
+///
+/// - Sentinel cache (`cache == NO_HANDLE` AND `status ==
+///   NodeStatus::Sentinel`) → `value` key omitted from JSON;
+///   `sentinel: true` present.
+/// - Legitimate JSON-null user value (`DescribeValue::Rendered(Value::Null)`
+///   under [`crate::Graph::describe_with_debug`]) → `"value": null`
+///   present; `sentinel` key omitted.
+/// - Any other value → `"value": <v>` present; `sentinel` key omitted.
+///
+/// Pre-D279 the Rust shape diverged: `value: None` (sentinel) and
+/// `value: Some(DescribeValue::Rendered(Value::Null))` (rendered null)
+/// both serialized to `"value": null` — JSON-indistinguishable.
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on both `value`
+/// and `sentinel` enforces the converged TS-shape. Rust additionally
+/// always emits `status` (TS makes it optional via `includeFields`);
+/// the `sentinel` flag is redundant for Rust consumers that check
+/// `status == "sentinel"`, but its presence preserves cross-impl
+/// shape parity (cross-track-ledger §2 row 2026-05-22).
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeDescribe {
     /// `"state"` / `"derived"` / `"dynamic"` / `"producer"`.
@@ -50,8 +74,16 @@ pub struct NodeDescribe {
     pub r#type: NodeTypeStr,
     /// Lifecycle status (canonical Appendix B enum).
     pub status: NodeStatus,
-    /// Current cache value. `None` when sentinel (`NO_HANDLE`).
+    /// Current cache value. `None` when sentinel (`NO_HANDLE`);
+    /// omitted from serialized JSON via `skip_serializing_if` (D279).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<DescribeValue>,
+    /// D279 (2026-05-22): explicit sentinel discriminator matching
+    /// TS's `sentinel?: boolean` field. `Some(true)` when `status ==
+    /// NodeStatus::Sentinel`; `None` otherwise (omitted from JSON via
+    /// `skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentinel: Option<bool>,
     /// Dep names in declaration order (`_anon_<NodeId>` for unnamed).
     pub deps: Vec<String>,
     /// Operator discriminant (e.g. `"map"`); `None` for non-operators.
@@ -175,12 +207,22 @@ pub(crate) fn describe_of(
             NodeKind::Operator(op) => Some(operator_op_name(op)),
             _ => None,
         };
+        let status = status_of(kind, cache, terminal, dirty, fired);
+        // D279 (2026-05-22, E-ii.3): explicit sentinel discriminator to
+        // match TS's `sentinel?: boolean` shape. Only set when status is
+        // `Sentinel`; `None` otherwise (omitted from JSON).
+        let sentinel = if status == NodeStatus::Sentinel {
+            Some(true)
+        } else {
+            None
+        };
         nodes.insert(
             name.clone(),
             NodeDescribe {
                 r#type: type_str_of(kind),
-                status: status_of(kind, cache, terminal, dirty, fired),
+                status,
                 value,
+                sentinel,
                 deps: dep_names,
                 operator_kind,
                 meta: None,

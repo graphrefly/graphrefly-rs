@@ -1069,3 +1069,125 @@ fn d276_back_compat_bare_local_name_snapshot_still_restores() {
     assert_eq!(binding.deref(cache), serde_json::json!(43));
     restored.unsubscribe(rt.core(), plus_one, sub);
 }
+
+// D279 (E-ii.1) — pre-validate state-name vs child-mount collision in
+// `Graph::from_snapshot` BEFORE any `register_state` call. Pre-D279,
+// `Graph::state` registered a NodeId in Core, then the namespace `add`
+// failed silently (mapped to `UnknownNode`), leaving the NodeId orphaned
+// in Core for its lifetime.
+#[test]
+fn d279_from_snapshot_rejects_state_vs_child_mount_collision_without_orphan() {
+    let binding = SnapshotBinding::new();
+    let (rt, _g) = graph_with("root", binding as Arc<dyn BindingBoundary>);
+
+    // Construct a snapshot where the root has BOTH a state node `x` AND
+    // a child mount also named `x`. Pass 0 mounts the child; Pass 1's
+    // pre-validation must reject before `Graph::state` runs.
+    let snap = GraphPersistSnapshot {
+        name: "root".to_owned(),
+        nodes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                "x".to_owned(),
+                NodeSlice {
+                    node_type: "state".to_owned(),
+                    value: Some(serde_json::json!(42)),
+                    status: NodeSnapshotStatus::Live,
+                    deps: vec![],
+                },
+            );
+            m
+        },
+        subgraphs: {
+            let mut m = IndexMap::new();
+            m.insert(
+                "x".to_owned(),
+                GraphPersistSnapshot {
+                    name: "x".to_owned(),
+                    nodes: IndexMap::new(),
+                    subgraphs: IndexMap::new(),
+                },
+            );
+            m
+        },
+    };
+
+    let factories: HashMap<String, NodeFactory> = HashMap::new();
+    let result = Graph::from_snapshot(rt.core(), &snap, None, Some(factories));
+
+    // Typed error: `NameCollision`, not the pre-D279 `UnknownNode`.
+    match result {
+        Err(SnapshotError::NameCollision { name, graph_path }) => {
+            assert_eq!(name, "x");
+            assert_eq!(graph_path, ""); // root graph
+        }
+        Err(other) => panic!("expected NameCollision, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+// D279 (E-ii.1) — same pre-validation runs at every level of the
+// snapshot tree. A state-vs-child-mount collision in a nested subgraph
+// surfaces the right `graph_path`.
+#[test]
+fn d279_from_snapshot_rejects_collision_in_nested_subgraph_with_correct_path() {
+    let binding = SnapshotBinding::new();
+    let (rt, _g) = graph_with("root", binding as Arc<dyn BindingBoundary>);
+
+    // Tree:
+    //   root
+    //   └── outer (mounted)
+    //       ├── nested (state — collides!)
+    //       └── nested (mounted child)
+    let snap = GraphPersistSnapshot {
+        name: "root".to_owned(),
+        nodes: IndexMap::new(),
+        subgraphs: {
+            let mut m = IndexMap::new();
+            m.insert(
+                "outer".to_owned(),
+                GraphPersistSnapshot {
+                    name: "outer".to_owned(),
+                    nodes: {
+                        let mut n = IndexMap::new();
+                        n.insert(
+                            "nested".to_owned(),
+                            NodeSlice {
+                                node_type: "state".to_owned(),
+                                value: None,
+                                status: NodeSnapshotStatus::Sentinel,
+                                deps: vec![],
+                            },
+                        );
+                        n
+                    },
+                    subgraphs: {
+                        let mut s = IndexMap::new();
+                        s.insert(
+                            "nested".to_owned(),
+                            GraphPersistSnapshot {
+                                name: "nested".to_owned(),
+                                nodes: IndexMap::new(),
+                                subgraphs: IndexMap::new(),
+                            },
+                        );
+                        s
+                    },
+                },
+            );
+            m
+        },
+    };
+
+    let factories: HashMap<String, NodeFactory> = HashMap::new();
+    let result = Graph::from_snapshot(rt.core(), &snap, None, Some(factories));
+
+    match result {
+        Err(SnapshotError::NameCollision { name, graph_path }) => {
+            assert_eq!(name, "nested");
+            assert_eq!(graph_path, "outer"); // owner-relative path
+        }
+        Err(other) => panic!("expected NameCollision, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
