@@ -85,6 +85,23 @@ harness = false
 name    = "notification_buffer"
 harness = false
 
+# §10.3 diamond resolution bookkeeping — isolates the fan-in cost of the
+# wave-scoped `pending_fires: AHashSet<NodeId>` set plus the sink's
+# "all deps settled" check at fire time. Bench-evidence pass for §10.3
+# (validate the proposed `WaveTracker { settled, all_deps_mask }`
+# bitmask vs current shape; D277, 2026-05-22).
+[[bench]]
+name    = "diamond_resolution"
+harness = false
+
+# §10.6 sink iteration — isolates the per-emit `flush_notifications`
+# walk of `NodeRecord.subscribers: HashMap<SubscriptionId, Sink>`.
+# Bench-evidence pass for §10.6 (validate the proposed epoch/snapshot-
+# spread TS-style refactor vs current shape; D277, 2026-05-22).
+[[bench]]
+name    = "sink_iteration"
+harness = false
+
 [features]
 default      = ["std", "tokio"]
 # `std` is the only supported configuration for now. Kept as a feature so

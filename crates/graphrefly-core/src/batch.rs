@@ -3473,23 +3473,19 @@ impl Core {
                 // owner (a `DeferFn` driving a second `&Core` on the
                 // same owner thread). Panic before nesting silently.
                 //
-                // D258 (S7, 2026-05-20) — message kept polished for
-                // in-tree Rust devs. D262/P4 amended this framing
-                // (2026-05-20 /qa): the JS `@graphrefly/native` consumer
-                // does NOT see the message text. `core_actor.rs` M1's
-                // `catch_unwind(...)` swallows the panic value before
-                // it crosses napi → JS callers observe a sync_channel
-                // disconnect, not this string. The polished message
-                // reaches Rust's panic hook → stderr only; JS-friendly
-                // framing is aspirational pending a panic→JS bridge
-                // slice (NOT committed — see porting-deferred §panic-
-                // bridge). The text below is therefore "Rust-dev clarity
-                // only"; the `@graphrefly/native` consumer line stays
-                // as a hint for future readers of the panic hook log,
-                // not as a runtime user-visible message. AMEND-D
-                // 2026-05-21 attaches this comment to D262/P4's
-                // affects-list (was missing the inline comment in the
-                // original P4 patch).
+                // Audience: **Rust-dev clarity only.** The
+                // `@graphrefly/native` JS consumer does NOT see this
+                // text — `core_actor.rs` M1's `catch_unwind(...)`
+                // swallows the panic value before it crosses napi (JS
+                // callers observe a sync_channel disconnect). The
+                // polished message reaches Rust's panic hook → stderr
+                // only. The BenchCore line below is preserved as a
+                // hint for future readers of the panic-hook log; a
+                // JS-friendly framing is aspirational pending a
+                // panic→JS bridge slice (NOT committed — see
+                // porting-deferred §panic-bridge). D258 (S7,
+                // 2026-05-20) / D262/P4 amend / AMEND-D 2026-05-21 /
+                // D277 (2026-05-22) text-shape consolidation.
                 panic!(
                     "GraphReFly invariant violated — cross-Core wave nesting \
                      on a single OS thread (this Core's generation {self_gen}, \
@@ -3499,13 +3495,8 @@ impl Core {
                      Rust callers: a `DeferFn` or owner-side seam appears to \
                      be driving a *second* `&Core` mid-wave; the substrate \
                      does not support cross-Core same-thread nesting. \
-                     \n\
-                     `@graphrefly/native` (BenchCore) callers: two BenchCore \
-                     instances are sharing one actor worker thread — each \
-                     `BenchCore` MUST own its dedicated actor thread (the \
-                     S6/D255 invariant). Verify you constructed each \
-                     `BenchCore` via the supported factories (which spawn \
-                     a per-instance worker). \
+                     (BenchCore: each instance MUST own its dedicated actor \
+                     thread — the S6/D255 invariant.) \
                      \n\
                      Internal reference: `docs/rust-port-decisions.md` \
                      D248/D252/D255/D258.",
