@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-graph-v0.0.7...graphrefly-graph-v0.0.8) - 2026-05-23
+
+### Fixed
+
+- snapshots
+- clean up
+
+### Other
+
+- *(D278)* E-i+ii+iv doc-hygiene batch (Commit 1 of 3 — 4 keeps)
+- doc-hygiene cleanup (audit L4-001/L4-002/L1-001/L8-001/L8-002/L8-003)
+- *(D272)* family-1 sink Arc<dyn Fn> → Rc<dyn Fn> + drop 12 clippy-allow
+
 ## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-graph-v0.0.6...graphrefly-graph-v0.0.7) - 2026-05-21
 
 ### Added
