@@ -155,6 +155,30 @@ republish.
 D272 / D273 / D274 + AMEND-D entries (D262/P4 + D267 scope-amend) +
 memory `feedback_distinguish_vestigial_vs_speculative.md`.
 
+### D281 — E-i.1 `Core::up(Invalidate)` R1.4.2 plain-forward (Commit 3 of 3; 2026-05-22, `/porting-to-rs` next-batch — Rust spec-compliance)
+
+Commit 3 of the 13-item E-cluster slice. **Rust-arm-only spec-compliance fix; no cross-track-ledger row** (TS pure-ts `Node.up()` was already R1.4.2-conformant — verified in side-quest 1 during the Commit 2 planning HALT).
+
+- **What:** `Core::up(node, Message::Invalidate)` arm at `crates/graphrefly-core/src/node.rs` previously called `self.invalidate(dep_id)` for each dep, which IS the downstream-cascade entry — it clears the dep's cache AND cascades INVALIDATE to the dep's children. That is exactly the two prohibitions canonical-spec §1.4.2 lists ("Upstream: plain forward — does not self-process INVALIDATE on intermediate or terminal nodes (no `_emit`, no cache clear at source). Cache-clearing semantics apply downstream side only."). Fix: replace with `let _ = self.up(dep_id, Message::Invalidate);` — recursive plain-forward via `Core::up` itself. Recursion bottoms out at leaf sources where the `for dep_id in dep_ids` iteration is empty.
+
+- **Cross-arm verification (side-quest, completed in Commit 2 HALT):** TS `Node.up()` at `packages/pure-ts/src/core/node.ts:1333-1344` is pure recursive forward to deps' own `up()`; no `_emit`, no cache touch; at a leaf source (`this._deps.length === 0`) the call returns immediately (line 1334). **Matches R1.4.2 plain-forward exactly.** TS is already canonical; Rust is the divergent arm being fixed unilaterally.
+
+- **Pre-D281 regression-pin test deleted.** `crates/graphrefly-core/tests/slice_f_corrections.rs::f2_up_invalidate_clears_dep_cache` (pre-D281) explicitly asserted the divergent contract ("up(n, INVALIDATE) routes to invalidate(s) for each dep s → s's cache cleared"). Removed during gate convergence; replaced by 2 spec-conformant regression-pins at `crates/graphrefly-core/tests/invalidate.rs`:
+  - `r1_4_2_up_invalidate_does_not_clear_dep_cache_or_cascade` — full diamond (state `a` → derived `b`) settles, then `up(b, Invalidate)` asserted to NOT clear `a.cache`, NOT cascade back to `b`, and NEITHER subscriber sees INVALIDATE events.
+  - `r1_4_2_up_invalidate_at_leaf_source_is_noop` — leaf-source `up(a, Invalidate)` recurses into empty dep list and bottoms out; cache untouched, no events delivered. Mirrors TS `node.ts:1334` leaf-source no-op.
+
+- **`Impl` / parity-tests / napi widening:** none. `Core::up` is on the substrate trait but not promoted to the `Impl` parity contract. The behavior change is spec-conformance, not surface widening.
+
+- **Cross-track-ledger row:** none. TS is pre-conformant; this is Rust converging to existing spec contract. (Contrast with D279/E-ii.3 where the row was warranted because the describe-output shape is cross-arm-observable JSON.)
+
+**Gate (full):** `mise run gate` GREEN — **854 tests passed, 0 skipped**, exit 0 (56s, sentinel `<<<RUN-LOGGED:DONE>>> exit=0 reason=ok`). 854-853 = net +1 (2 new D281 tests in `invalidate.rs` minus 1 deleted pre-D281 pinning test in `slice_f_corrections.rs`). fmt + clippy + nextest --profile ci all clean. `#![forbid(unsafe_code)]` preserved.
+
+**Convergence-round-trip note:** /qa-style fixes were applied during gating: (1) `E0716 temporary value dropped while borrowed` on `rec.snapshot()[...]` indexing — fixed by `let snap = rec.snapshot();` binding pattern (mirrors existing tests' idiom). (2) Pre-existing `f2_up_invalidate_clears_dep_cache` test pinned the divergent contract → deleted with back-pointer comment to the new D281 invalidate.rs pins. Both fixes landed pre-commit.
+
+**D265 hold-local pattern preserved:** commit lands locally; not pushed.
+
+**Canonical:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D281.
+
 ### D279 — E-ii.1 snapshot orphan-leak fix + E-ii.3 describe sentinel-shape converge-to-TS (Commit 2 of 3; 2026-05-22, `/porting-to-rs` next-batch)
 
 Commit 2 of the 13-item E-cluster slice. Originally scoped E-ii.1 + E-ii.2 + E-ii.3; **E-ii.2 re-deferred during HALT** (scope was 5-10× the initial estimate; refiled at `docs/optimizations.md` "🟠 E-ii.2 DEFERRED 2026-05-22" as a separate D-numbered future slice).

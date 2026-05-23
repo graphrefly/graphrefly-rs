@@ -265,3 +265,101 @@ fn invalidate_unknown_node_panics() {
     let bogus = graphrefly_core::NodeId::new(99_999);
     rt.core().invalidate(bogus);
 }
+
+// D281 (2026-05-22, E-i.1) — `Core::up(node, Invalidate)` is R1.4.2
+// plain-forward: it must NOT self-process at intermediate/source nodes
+// (no `_emit`, no cache clear at source), and the cache-clearing
+// semantic applies downstream-side only via the separate
+// `Core::invalidate(node_id)` entry. Pre-D281 the arm called
+// `self.invalidate(dep_id)` which is the downstream-cascade entry —
+// it cleared the dep's cache + cascaded INVALIDATE to the dep's
+// children. Cross-arm verified: TS pure-ts `Node.up()` was already
+// plain-forward (recursive walk to leaves, no self-process); Rust was
+// the divergent arm. The fix mirrors TS by recursively calling
+// `Core::up(dep_id, Message::Invalidate)` — the recursion bottoms out
+// at leaf sources where `dep_ids_vec()` is empty.
+#[test]
+fn r1_4_2_up_invalidate_does_not_clear_dep_cache_or_cascade() {
+    use graphrefly_core::Message;
+
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(10)));
+    let b = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(n * 2)),
+        _ => panic!("type"),
+    });
+    let rec_a = rt.subscribe_recorder(a.id);
+    let rec_b = rt.subscribe_recorder(b);
+    assert_eq!(rt.cache_value(a.id), Some(TestValue::Int(10)));
+    assert_eq!(rt.cache_value(b), Some(TestValue::Int(20)));
+    let baseline_a = rec_a.snapshot().len();
+    let baseline_b = rec_b.snapshot().len();
+
+    // Up-direction INVALIDATE from `b` to its dep `a`. Per R1.4.2 plain-
+    // forward: no self-process at `a`, no cache clear at `a`, no
+    // downstream cascade back to `b`.
+    rt.core().up(b, Message::Invalidate).expect("known node");
+
+    // Caches unchanged — no self-process, no cache clear at the source
+    // (or at the intermediate that was originally targeted).
+    assert_eq!(
+        rt.cache_value(a.id),
+        Some(TestValue::Int(10)),
+        "R1.4.2: up-direction INVALIDATE must NOT clear dep `a`'s cache"
+    );
+    assert_eq!(
+        rt.cache_value(b),
+        Some(TestValue::Int(20)),
+        "R1.4.2: no downstream cascade — `b`'s cache stays settled"
+    );
+
+    // Neither subscriber sees an INVALIDATE message.
+    let snap_a = rec_a.snapshot();
+    let snap_b = rec_b.snapshot();
+    let a_post: Vec<&RecordedEvent> = snap_a[baseline_a..].iter().collect();
+    let b_post: Vec<&RecordedEvent> = snap_b[baseline_b..].iter().collect();
+    assert!(
+        !a_post
+            .iter()
+            .any(|e| matches!(e, RecordedEvent::Invalidate)),
+        "R1.4.2: `a` subscriber must NOT see INVALIDATE (no self-process). got: {a_post:?}"
+    );
+    assert!(
+        !b_post
+            .iter()
+            .any(|e| matches!(e, RecordedEvent::Invalidate)),
+        "R1.4.2: `b` subscriber must NOT see INVALIDATE (no downstream cascade). got: {b_post:?}"
+    );
+}
+
+// D281 (E-i.1) — `Core::up(leaf, Invalidate)` at a leaf source (no deps)
+// is a true no-op. The recursion bottoms out at the leaf where
+// `dep_ids_vec()` is empty; cache stays populated, no events delivered.
+// Mirrors TS leaf-source no-op at `node.ts:1334` (`if (this._deps.length
+// === 0) return;`).
+#[test]
+fn r1_4_2_up_invalidate_at_leaf_source_is_noop() {
+    use graphrefly_core::Message;
+
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(42)));
+    let rec_a = rt.subscribe_recorder(a.id);
+    let baseline = rec_a.snapshot().len();
+
+    // `a` is a leaf source — no deps. `up(a, Invalidate)` recurses into
+    // an empty dep list and bottoms out without effect.
+    rt.core().up(a.id, Message::Invalidate).expect("known node");
+
+    assert_eq!(
+        rt.cache_value(a.id),
+        Some(TestValue::Int(42)),
+        "R1.4.2: leaf-source up(Invalidate) leaves cache untouched"
+    );
+    let snap = rec_a.snapshot();
+    let post: Vec<&RecordedEvent> = snap[baseline..].iter().collect();
+    assert_eq!(
+        post.len(),
+        0,
+        "R1.4.2: leaf-source up(Invalidate) emits nothing. got: {post:?}"
+    );
+}

@@ -705,25 +705,20 @@ fn f2_up_rejects_tier5_error() {
     ));
 }
 
-#[test]
-fn f2_up_invalidate_clears_dep_cache() {
-    let rt = TestRuntime::new();
-    let s = rt.state(Some(TestValue::Int(7)));
-    let n = rt.derived(&[s.id], |deps| match deps[0] {
-        TestValue::Int(v) => Some(TestValue::Int(v * 2)),
-        _ => None,
-    });
-    let _rec = rt.subscribe_recorder(n);
-
-    // s has cached value pre-up.
-    assert_ne!(rt.core().cache_of(s.id), HandleId::new(0));
-
-    // up(n, INVALIDATE) routes to invalidate(s) for each dep s.
-    rt.core().up(n, Message::Invalidate).expect("up ok");
-
-    // s's cache cleared.
-    assert_eq!(rt.core().cache_of(s.id), HandleId::new(0));
-}
+// `f2_up_invalidate_clears_dep_cache` DELETED 2026-05-22 by D281 (E-i.1
+// R1.4.2 plain-forward fix). The original Slice F test pinned the
+// pre-D281 divergent Rust contract — "up(n, INVALIDATE) routes to
+// invalidate(s) for each dep s → s's cache cleared" — which is exactly
+// the two prohibitions canonical-spec §1.4.2 lists ("plain forward —
+// does not self-process INVALIDATE on intermediate or terminal nodes;
+// no `_emit`, no cache clear at source"). Cross-arm verified: TS
+// pure-ts `Node.up()` was already R1.4.2-conformant (recursive walk to
+// leaves, no self-process). Rust was the divergent arm; this test
+// pinned the divergence. Replaced by spec-conformant regression-pins
+// in `tests/invalidate.rs`:
+//   - `r1_4_2_up_invalidate_does_not_clear_dep_cache_or_cascade`
+//   - `r1_4_2_up_invalidate_at_leaf_source_is_noop`
+// See D281 in `~/src/graphrefly-ts/docs/rust-port-decisions.md`.
 
 #[test]
 fn f2_up_pause_routes_to_each_dep() {

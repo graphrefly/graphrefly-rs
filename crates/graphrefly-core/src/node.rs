@@ -2610,7 +2610,29 @@ impl Core {
                     let _ = self.resume(dep_id, lock);
                 }
                 Message::Invalidate => {
-                    self.invalidate(dep_id);
+                    // D281 / R1.4.2 plain-forward (2026-05-22):
+                    // canonical-spec §1.4.2 "Upstream INVALIDATE: plain
+                    // forward — does not self-process INVALIDATE on
+                    // intermediate or terminal nodes (no `_emit`, no
+                    // cache clear at source). Cache-clearing semantics
+                    // apply downstream side only."
+                    //
+                    // Mirrors TS `Node.up()` (`packages/pure-ts/src/
+                    // core/node.ts:1333-1344`) which recursively
+                    // forwards `up(messages)` to each dep's own `up()`
+                    // and no-ops at leaf sources (empty `_deps`). The
+                    // recursive walk bottoms out at leaves where the
+                    // `for dep_id in dep_ids` iteration above is empty.
+                    //
+                    // Pre-D281 this arm called `self.invalidate(dep_id)`,
+                    // which IS the downstream-cascade entry — it clears
+                    // the dep's cache AND cascades INVALIDATE to the
+                    // dep's children. That is exactly the two
+                    // prohibitions R1.4.2 lists (self-process + cache
+                    // clear at source). Cross-arm verified: TS pure-ts
+                    // was already R1.4.2-conformant; Rust was the
+                    // divergent arm.
+                    let _ = self.up(dep_id, Message::Invalidate);
                 }
                 Message::Teardown => {
                     self.teardown(dep_id);
