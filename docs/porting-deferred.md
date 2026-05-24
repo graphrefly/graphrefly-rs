@@ -1673,11 +1673,27 @@ These canonical-spec methods are tracked for parity. Items marked
 - ~~**`graph.edges(opts?)` (R3.3.1)**~~ — **RESOLVED in Slice F.**
   `Graph::edges(recursive: bool) -> Vec<(String, String)>` with
   recursive mount-walking and `_anon_<id>` for unnamed deps.
-- **`graph.tagFactory(factory, factoryArgs)` (R3.1.2)** — provenance
-  annotation for `describe()` / snapshot replay. Deferred.
-- **`graph.resourceProfile()` (R3.6.3)** — runtime profile
-  (subscriber counts, fan-in/out). Used by debugging utilities.
-  Deferred.
+- ~~**`graph.tagFactory(factory, factoryArgs)` (R3.1.2)**~~ —
+  **RESOLVED 2026-05-24 (D285 substrate; D286 napi).**
+  `Graph::tag_factory(factory, factory_args)` lands on the Rust
+  substrate; `GraphDescribeOutput` surfaces `factory` + camelCase
+  `factoryArgs` keys (skip-if-none); QA F8 invariant (second call
+  without args clears stale args) preserved; cross-arm JSON shape
+  matches pure-ts `graph.ts:3508-3509` byte-for-byte. Lifts D004 R3.1.2
+  per cross-track-ledger §1 D283 row. 5 cargo regression tests in
+  `crates/graphrefly-graph/tests/tag_factory.rs`.
+- ~~**`graph.resourceProfile()` (R3.6.3)**~~ —
+  **RESOLVED 2026-05-24 (D285 substrate; D286 napi).**
+  `Graph::resource_profile(core, opts?) -> GraphProfileResult` lands
+  on the Rust substrate with the narrower post-D284 shape (no
+  `valueSizeBytes` per node, no `totalValueSizeBytes` aggregate, no
+  `hotspots.byValueSize` — pre-design caught these as pure-ts-inferred
+  fields the canonical spec doesn't mandate; closing the field class
+  instead of forcing a `BindingBoundary::value_size_of` FFI widening
+  per D196 / value-#6). New `CoreFull::sink_count_of(node_id) -> usize`
+  trait widening for per-node subscriber count. 6 cargo regression
+  tests in `crates/graphrefly-graph/tests/resource_profile.rs`. Lifts
+  D004 R3.6.3 per cross-track-ledger §1 D283 row.
 - **`graph.setVersioning(level)` (R3.2.4)** — bulk versioning level
   apply. Waits on §7 Node Versioning port. Deferred.
 - **napi-rs `BenchGraph` class** — Graph API bindings for JS

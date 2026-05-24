@@ -1888,6 +1888,16 @@ pub trait CoreFull {
     fn is_terminal(&self, node_id: NodeId) -> Option<TerminalKind>;
     /// See [`Core::is_dirty`].
     fn is_dirty(&self, node_id: NodeId) -> bool;
+    /// Subscriber count for `node_id` — number of live external sinks
+    /// (NOT counting downstream node-fn fan-out, which is tracked
+    /// internally via `consumers`). Used by
+    /// `graphrefly_graph::resource_profile` (R3.6.3 / D285 / D286) to
+    /// compute per-node `subscriberCount` and the
+    /// `hotspots.bySubscriberCount` ranking without needing a separate
+    /// substrate widening. Returns 0 for unknown / torn-down nodes
+    /// (consistent with the other `*_of` accessors' "unknown ⇒ default"
+    /// stance). Pure read; no `C`/`T` surfaced.
+    fn sink_count_of(&self, node_id: NodeId) -> usize;
 
     /// Serialize a node's cached `HandleId` via the binding (S2b/β
     /// D244). Delegates to `binding_ptr().serialize_handle` — needed so
@@ -1988,6 +1998,10 @@ impl CoreFull for Core {
     #[inline]
     fn is_dirty(&self, node_id: NodeId) -> bool {
         Core::is_dirty(self, node_id)
+    }
+    #[inline]
+    fn sink_count_of(&self, node_id: NodeId) -> usize {
+        Core::sink_count_of(self, node_id)
     }
     #[inline]
     fn serialize_handle(&self, handle: HandleId) -> Option<serde_json::Value> {
@@ -3905,6 +3919,25 @@ impl Core {
             .nodes
             .get(&node_id)
             .is_some_and(|r| r.dirty)
+    }
+
+    /// External sink count for `node_id` — number of live subscribers
+    /// added via [`Self::subscribe`] / [`Self::try_subscribe`] that
+    /// haven't been removed via [`Self::unsubscribe`] yet (NOT counting
+    /// downstream node-fn fan-out tracked via `consumers`). Returns 0
+    /// for unknown / torn-down nodes (consistent with the other `*_of`
+    /// accessors' "unknown ⇒ default" stance).
+    ///
+    /// Used by `graphrefly_graph::resource_profile` (R3.6.3 / D285) to
+    /// compute per-node `subscriberCount` + `hotspots.bySubscriberCount`
+    /// + orphan classification (zero-subscriber non-state nodes ⇒
+    ///   `idle-derived` / `idle-producer` / `orphan-effect`).
+    #[must_use]
+    pub fn sink_count_of(&self, node_id: NodeId) -> usize {
+        self.lock_state()
+            .nodes
+            .get(&node_id)
+            .map_or(0, |r| r.subscribers.len())
     }
 
     /// Snapshot of `parent`'s meta companion list (R1.3.9.d / R2.3.3 —

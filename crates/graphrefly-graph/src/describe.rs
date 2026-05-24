@@ -30,6 +30,20 @@ use crate::debug::DebugBindingBoundary;
 use crate::graph::{register_ns_sink, unregister_ns_sink, GraphInner};
 
 /// Top-level `describe()` output (canonical Appendix B JSON schema).
+///
+/// # `factory` + `factoryArgs` (R3.1.2, D285)
+///
+/// `factory` / `factory_args` are populated from
+/// [`crate::graph::GraphInner::factory`] / `factory_args` (set via
+/// [`crate::Graph::tag_factory`]). Both use `skip_serializing_if =
+/// "Option::is_none"` to match the pure-ts spread-conditional shape at
+/// `packages/pure-ts/src/graph/graph.ts:3508-3509` — a cold `describe()`
+/// before any `tag_factory` call OMITS the `factory` / `factoryArgs`
+/// keys entirely (not serializes them as `null`). The pure-ts arm
+/// pins this via the `"factoryArgs" in desc` assertion in
+/// `scenarios/graph/tag-factory.test.ts:70` (QA-A2 invariant); the
+/// Rust JSON shape converges via `skip_serializing_if` + `rename =
+/// "factoryArgs"` for the camelCase key parity.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphDescribeOutput {
     /// Graph name as set at construction / mount.
@@ -40,6 +54,20 @@ pub struct GraphDescribeOutput {
     pub edges: Vec<EdgeDescribe>,
     /// Mounted child names.
     pub subgraphs: Vec<String>,
+    /// R3.1.2 factory provenance — name set via
+    /// [`crate::Graph::tag_factory`]. Omitted from JSON when `None`
+    /// (matches pure-ts spread-conditional shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory: Option<String>,
+    /// R3.1.2 factory args — paired with [`Self::factory`]. Omitted
+    /// from JSON when `None`. Serialized as the `factoryArgs` camelCase
+    /// key to match pure-ts output byte-for-byte.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "factoryArgs"
+    )]
+    pub factory_args: Option<serde_json::Value>,
 }
 
 /// Per-node descriptor.
@@ -154,7 +182,7 @@ pub(crate) fn describe_of(
     inner_arc: &Rc<RefCell<GraphInner>>,
     debug: Option<&dyn DebugBindingBoundary>,
 ) -> GraphDescribeOutput {
-    let (graph_name, local_names, subgraphs, names_iter) = {
+    let (graph_name, local_names, subgraphs, names_iter, factory, factory_args) = {
         let inner = inner_arc.borrow_mut();
         let graph_name = inner.name.clone();
         let local_names: IndexMap<NodeId, String> = inner
@@ -165,7 +193,20 @@ pub(crate) fn describe_of(
         let subgraphs: Vec<String> = inner.children.keys().cloned().collect();
         let names_iter: Vec<(String, NodeId)> =
             inner.names.iter().map(|(n, id)| (n.clone(), *id)).collect();
-        (graph_name, local_names, subgraphs, names_iter)
+        // R3.1.2 (D285): read fresh on every describe call so a
+        // subsequent topology event observes the latest tag without
+        // needing a `_topologyVersion`-equivalent cache invalidation
+        // field. Parity test `tag-factory.test.ts:96-140` covers this.
+        let factory = inner.factory.clone();
+        let factory_args = inner.factory_args.clone();
+        (
+            graph_name,
+            local_names,
+            subgraphs,
+            names_iter,
+            factory,
+            factory_args,
+        )
     };
 
     let mut nodes: IndexMap<String, NodeDescribe> = IndexMap::new();
@@ -235,6 +276,8 @@ pub(crate) fn describe_of(
         nodes,
         edges,
         subgraphs,
+        factory,
+        factory_args,
     }
 }
 

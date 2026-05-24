@@ -132,6 +132,18 @@ pub struct GraphInner {
     /// after the inner lock is dropped. Keyed by subscription id.
     pub(crate) namespace_sinks: IndexMap<u64, NamespaceChangeSink>,
     pub(crate) next_ns_sink_id: u64,
+    /// R3.1.2 — factory provenance set via [`Graph::tag_factory`]. `None`
+    /// when not tagged. Surfaces at the top of [`describe()`] output as
+    /// `factory` + `factoryArgs` keys (cross-track-ledger §1 D283;
+    /// D285 substrate landing 2026-05-24).
+    pub(crate) factory: Option<String>,
+    /// R3.1.2 — factory args paired with [`Self::factory`]. Stored as
+    /// `serde_json::Value` so the JSON shape round-trips through
+    /// `describe()` byte-identically to the pure-ts arm. `None` when
+    /// no args were supplied (or when `tag_factory(name)` was called
+    /// without args after a prior tag — pure-ts QA F8 invariant: a
+    /// second call without args MUST clear stale args).
+    pub(crate) factory_args: Option<serde_json::Value>,
 }
 
 /// Graph container — the one Core-free namespace + mount-tree handle
@@ -185,8 +197,45 @@ impl Graph {
                 destroyed: false,
                 namespace_sinks: IndexMap::new(),
                 next_ns_sink_id: 0,
+                factory: None,
+                factory_args: None,
             })),
         }
+    }
+
+    /// R3.1.2 — annotate the graph with the factory function name + args
+    /// used to construct it. Provenance for [`describe()`], snapshot
+    /// replay, and debugging. Surfaces at the top of `describe()` output
+    /// as `factory` + `factoryArgs` keys.
+    ///
+    /// **Invariant (pure-ts QA F8, [`graph.ts:1686-1689`](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/pure-ts/src/graph/graph.ts)):**
+    /// a second call WITHOUT `factory_args` MUST clear stale args
+    /// (re-assignment to `None`, not a no-op) — otherwise
+    /// `tag_factory("a", {...})` then `tag_factory("b")` would pair
+    /// `"b"` with `{...}` and report mismatched provenance.
+    ///
+    /// **Cross-arm spec citation:** canonical R3.1.2 at
+    /// `docs/implementation-plan-13.6-canonical-spec.md:768`
+    /// (graphrefly-ts). Drops the spec's `this`-chain return per the
+    /// D267 / D282 async-everywhere `Impl` convention — every dispatcher-
+    /// touching parity method returns the post-call observable shape, not
+    /// a chainable handle.
+    ///
+    /// **No reactive emission.** Pure-ts bumps `_topologyVersion` for
+    /// SPEC-PERSISTENCE bookkeeping (DS-14.5.A Q1), but explicitly emits
+    /// no `TopologyEvent`. Rust has no equivalent bookkeeping field —
+    /// since `describe()` reads `factory` / `factory_args` fresh on every
+    /// call, subsequent topology events observe the latest tag
+    /// automatically (no cache invalidation needed). Parity test
+    /// `tag-factory.test.ts:96-140` pins this contract cross-arm.
+    pub fn tag_factory(&self, factory: impl Into<String>, factory_args: Option<serde_json::Value>) {
+        let mut inner = self.inner.borrow_mut();
+        inner.factory = Some(factory.into());
+        // QA F8: always re-assign — second call without args clears stale
+        // args (otherwise `tag_factory("a", Some({...}))` then
+        // `tag_factory("b", None)` would keep `{...}` paired with `"b"`,
+        // which is mismatched provenance).
+        inner.factory_args = factory_args;
     }
 
     /// Wrap an existing inner level as a `Graph` handle (mount/ancestors).

@@ -48,6 +48,7 @@ mod describe;
 mod graph;
 mod mount;
 mod observe;
+mod profile;
 mod snapshot;
 
 pub use debug::DebugBindingBoundary;
@@ -58,6 +59,7 @@ pub use describe::{
 pub use graph::{Graph, GraphInner, NameError, PathError, RemoveError, SignalKind};
 pub use mount::{GraphRemoveAudit, MountError};
 pub use observe::{GraphObserveAll, GraphObserveAllReactive, GraphObserveOne, ObserveSub};
+pub use profile::{GraphProfileOptions, GraphProfileResult, Hotspots, NodeProfile, OrphanKind};
 pub use snapshot::{
     GraphPersistSnapshot, NodeFactory, NodeSlice, NodeSnapshotStatus, SnapshotBuilder,
     SnapshotError,

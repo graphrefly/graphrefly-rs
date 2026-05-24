@@ -85,6 +85,8 @@ fn new_child_inner(name: String, parent: Weak<RefCell<GraphInner>>) -> Rc<RefCel
         destroyed: false,
         namespace_sinks: indexmap::IndexMap::new(),
         next_ns_sink_id: 0,
+        factory: None,
+        factory_args: None,
     }))
 }
 
