@@ -745,6 +745,30 @@ class NativeGraph {
       },
     };
   }
+
+  // D286 (cross-track-ledger §1 D283 native landing).
+  //
+  // R3.1.2 — tag the graph with factory provenance. `factoryArgs` is
+  // JSON.stringify'd at the wrapper boundary because the napi shape
+  // takes `Option<String>` (avoids a full JS→Rust value bridge for a
+  // metadata-only field). `undefined` ⇒ `null` over the wire, which
+  // the Rust side maps to `None` → clears stale args per the QA F8
+  // invariant.
+  async tagFactory(factory, factoryArgs) {
+    const json = factoryArgs === undefined ? null : JSON.stringify(factoryArgs);
+    await this.bench.tagFactory(factory, json);
+  }
+
+  // R3.6.3 — runtime profile. Returns a fresh snapshot per call (not
+  // reactive). The napi side returns JSON-serialized
+  // `GraphProfileResult` (D284-narrowed: no value-size fields); the
+  // wrapper parses with JSON.parse to match the
+  // `ImplGraphProfileResult` shape pure-ts callers expect.
+  async resourceProfile(opts) {
+    const topN = opts && typeof opts.topN === "number" ? opts.topN : null;
+    const json = await this.bench.resourceProfile(topN);
+    return JSON.parse(json);
+  }
 }
 
 // ---------------------------------------------------------------------------

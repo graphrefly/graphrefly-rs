@@ -209,3 +209,60 @@ fn d284_amendment_no_value_size_fields_in_serde_output() {
         "D284 amendment: no by_value_size hotspot, got: {json_str}"
     );
 }
+
+#[test]
+fn d286_napi_camel_case_json_keys() {
+    // D286 napi: the JSON wire shape MUST use camelCase keys to match
+    // the ImplGraphProfileResult contract (cross-arm parity scenarios
+    // assert on `subscriberCount` / `depCount` / `isOrphanEffect` /
+    // `orphanKind` / `nodeCount` / `edgeCount` / `subgraphCount` /
+    // `bySubscriberCount` / `byDepCount` / `orphanEffects`). Snake-case
+    // keys would silently false-pass the Rust cargo tests but break
+    // cross-arm parity. Pin the positive shape here.
+    let (rt, g) = graph("root");
+    let a = g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+    g.derived(rt.core(), "d", &[a], FnId::new(1), EqualsMode::Identity)
+        .unwrap();
+
+    let profile = g.resource_profile(rt.core(), None);
+    let json_str = serde_json::to_string(&profile).unwrap();
+
+    // Aggregate keys.
+    assert!(json_str.contains("\"nodeCount\""), "got: {json_str}");
+    assert!(json_str.contains("\"edgeCount\""), "got: {json_str}");
+    assert!(json_str.contains("\"subgraphCount\""), "got: {json_str}");
+    assert!(json_str.contains("\"orphanEffects\""), "got: {json_str}");
+    // Hotspot dimension keys.
+    assert!(
+        json_str.contains("\"bySubscriberCount\""),
+        "got: {json_str}"
+    );
+    assert!(json_str.contains("\"byDepCount\""), "got: {json_str}");
+    // Per-node keys (idle_d is an orphan → appears in orphans + nodes).
+    assert!(json_str.contains("\"subscriberCount\""), "got: {json_str}");
+    assert!(json_str.contains("\"depCount\""), "got: {json_str}");
+    assert!(json_str.contains("\"isOrphanEffect\""), "got: {json_str}");
+    assert!(json_str.contains("\"orphanKind\""), "got: {json_str}");
+    // OrphanKind variant is kebab-case (matches Impl
+    // `"orphan-effect" | "idle-derived" | "idle-producer"`).
+    assert!(json_str.contains("\"idle-derived\""), "got: {json_str}");
+
+    // Negative: no snake_case keys leaked through.
+    for snake in [
+        "\"node_count\"",
+        "\"edge_count\"",
+        "\"subgraph_count\"",
+        "\"subscriber_count\"",
+        "\"dep_count\"",
+        "\"is_orphan_effect\"",
+        "\"orphan_kind\"",
+        "\"by_subscriber_count\"",
+        "\"by_dep_count\"",
+        "\"orphan_effects\"",
+    ] {
+        assert!(
+            !json_str.contains(snake),
+            "snake_case key {snake} leaked: {json_str}"
+        );
+    }
+}

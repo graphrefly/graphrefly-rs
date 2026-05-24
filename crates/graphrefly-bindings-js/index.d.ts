@@ -81,11 +81,10 @@ export declare class BenchCore {
    * matching unsubscribe in `BenchCore::unsubscribe` / `dispose` /
    * `Drop` can call `Core::unsubscribe(node_id, sub_id)` explicitly.
    *
-   * **D248 sink-shape note:** `graphrefly_core::Sink =
-   * Arc<dyn Fn(&[Message])>` (without `Send + Sync`) — owner-thread-
-   * only. We build the sink *inside* the actor closure, on the
-   * worker thread, so the `!Send` Sink never has to cross the
-   * actor channel.
+   * **D248/D272 sink-shape note:** `graphrefly_core::Sink =
+   * Rc<dyn Fn(&[Message])>` (`!Send + !Sync`) — owner-thread-only.
+   * We build the sink *inside* the actor closure, on the worker
+   * thread, so the `!Send` Sink never has to cross the actor channel.
    */
   subscribeNoop(nodeId: number): Promise<number>
   /**
@@ -104,11 +103,11 @@ export declare class BenchCore {
    * `pub fn` (not `async fn`) because `Function<'_, >` is `!Send`; the
    * async work runs inside `env.spawn_future(async move { ... })`.
    *
-   * **D248 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into the
-   * actor closure IS `Send + Sync` (`ThreadsafeFunction` is
-   * Send+Sync by napi-rs design); the `Sink = Arc<dyn Fn(&[Message])>`
-   * that wraps it is `!Send`, so we build it on the worker thread
-   * inside the actor closure.
+   * **D248/D272 sink-shape:** the `tsfn: Arc<SinkTsfn>` we move into
+   * the actor closure IS `Send + Sync` (`ThreadsafeFunction` is
+   * Send+Sync by napi-rs design); the `Sink = Rc<dyn Fn(&[Message])>`
+   * that wraps it is `!Send + !Sync`, so we build it on the worker
+   * thread inside the actor closure.
    */
   subscribeWithTsfn(nodeId: number, sinkCallback: (arg: Array<number>) => void): Promise<number>
   /**
@@ -398,6 +397,37 @@ export declare class BenchGraph {
    * **D267 — async** (was `run_sync`). See `edges` above.
    */
   describeJson(): Promise<string>
+  /**
+   * R3.1.2 — `Graph::tag_factory(factory, factory_args?)` provenance
+   * annotation (D286 napi; D285 substrate). Args are passed as a
+   * pre-stringified JSON string from the wrapper (`undefined` ⇒
+   * `None`); `factoryArgs` round-trips through describe() byte-for-
+   * byte vs the pure-ts arm.
+   *
+   * QA F8 invariant preserved: a second call with `factory_args_json
+   * = None` MUST clear stale args (mirrors pure-ts re-assignment
+   * semantic). Drops the spec's `this`-chain return per the D267 /
+   * D282 async-everywhere `Impl` convention.
+   *
+   * Closes D004 R3.1.2 deferral (`docs/rust-port-decisions.md:32`)
+   * per cross-track-ledger §1 D283 row.
+   */
+  tagFactory(factory: string, factoryArgsJson?: string | undefined | null): Promise<void>
+  /**
+   * R3.6.3 — `Graph::resource_profile(opts?)` snapshot-based runtime
+   * profile (D286 napi; D285 substrate). Returns JSON-serialized
+   * `GraphProfileResult`; JS adapter parses with `JSON.parse`.
+   *
+   * D284 amendment: the returned JSON does NOT carry
+   * `value_size_bytes` per node, `total_value_size_bytes` aggregate,
+   * or `hotspots.by_value_size` — these were pure-ts-inferred fields
+   * the canonical R3.6.3 spec does NOT mandate. See
+   * `crates/graphrefly-graph/src/profile.rs` module docstring for
+   * the full rationale (D196 / value-#6 pre-design win).
+   *
+   * Closes D004 R3.6.3 deferral per cross-track-ledger §1 D283 row.
+   */
+  resourceProfile(topN?: number | undefined | null): Promise<string>
   /**
    * Subscribe to live topology snapshots (canonical R3.6.1
    * `describe({ reactive: true })`). Returns a

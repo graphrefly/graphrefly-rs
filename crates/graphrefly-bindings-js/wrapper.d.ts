@@ -98,6 +98,51 @@ export interface NativeGraph {
   observe(): Promise<ObserveSubscription>;
   observe(path: string): Promise<ObserveSubscription>;
   observe(path: string | undefined, opts: { reactive: true }): Promise<ObserveSubscription>;
+  /**
+   * R3.1.2 — annotate the graph with factory provenance for
+   * `describe({ detail: "spec" })`, snapshot replay, debugging. D286.
+   * Surfaces at the top of `describe()` output as `factory` +
+   * `factoryArgs` keys. A second call with `factoryArgs === undefined`
+   * MUST clear stale args (QA F8 invariant). Drops the spec's
+   * `this`-chain return per the D267/D282 async-everywhere convention.
+   */
+  tagFactory(factory: string, factoryArgs?: unknown): Promise<void>;
+  /**
+   * R3.6.3 — snapshot-based runtime profile (per-node subscriber
+   * counts + dep counts, top-N hotspots by subscriber/dep count,
+   * orphan classification). D286.
+   *
+   * D284 amendment: the returned object does NOT carry
+   * `valueSizeBytes` per node, `totalValueSizeBytes` aggregate, or
+   * `hotspots.byValueSize` — these were pure-ts-inferred fields the
+   * canonical spec doesn't mandate (see `wrapper.js` D286 comment).
+   */
+  resourceProfile(opts?: { topN?: number }): Promise<NativeGraphProfileResult>;
+}
+
+/** D284-narrowed per-node profile (matches `ImplNodeProfile`). */
+export interface NativeNodeProfile {
+  path: string;
+  type: string;
+  status: string;
+  subscriberCount: number;
+  depCount: number;
+  isOrphanEffect: boolean;
+  orphanKind: "orphan-effect" | "idle-derived" | "idle-producer" | null;
+}
+
+/** D284-narrowed aggregate profile (matches `ImplGraphProfileResult`). */
+export interface NativeGraphProfileResult {
+  nodeCount: number;
+  edgeCount: number;
+  subgraphCount: number;
+  nodes: NativeNodeProfile[];
+  hotspots: {
+    bySubscriberCount: NativeNodeProfile[];
+    byDepCount: NativeNodeProfile[];
+  };
+  orphans: NativeNodeProfile[];
+  orphanEffects: NativeNodeProfile[];
 }
 
 export interface ReactiveDescribeHandle {

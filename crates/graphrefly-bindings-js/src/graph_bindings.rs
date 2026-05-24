@@ -656,6 +656,73 @@ impl BenchGraph {
             .map_err(|e| NapiError::from_reason(format!("describe serialization failed: {e}")))
     }
 
+    /// R3.1.2 — `Graph::tag_factory(factory, factory_args?)` provenance
+    /// annotation (D286 napi; D285 substrate). Args are passed as a
+    /// pre-stringified JSON string from the wrapper (`undefined` ⇒
+    /// `None`); `factoryArgs` round-trips through describe() byte-for-
+    /// byte vs the pure-ts arm.
+    ///
+    /// QA F8 invariant preserved: a second call with `factory_args_json
+    /// = None` MUST clear stale args (mirrors pure-ts re-assignment
+    /// semantic). Drops the spec's `this`-chain return per the D267 /
+    /// D282 async-everywhere `Impl` convention.
+    ///
+    /// Closes D004 R3.1.2 deferral (`docs/rust-port-decisions.md:32`)
+    /// per cross-track-ledger §1 D283 row.
+    #[napi]
+    pub async fn tag_factory(
+        &self,
+        factory: String,
+        factory_args_json: Option<String>,
+    ) -> Result<()> {
+        // Parse JSON args on the libuv thread BEFORE the actor hop —
+        // serde_json errors surface as napi errors immediately rather
+        // than panicking in the actor closure.
+        let factory_args: Option<serde_json::Value> = match factory_args_json {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+                NapiError::from_reason(format!("tag_factory: invalid JSON for factory_args: {e}"))
+            })?),
+            None => None,
+        };
+        let key = self.graph_key;
+        self.actor
+            .run(move |_core| {
+                with_extra::<Graph, _>(key, move |g| g.tag_factory(factory, factory_args))
+                    .expect("BenchGraph: graph entry missing");
+            })
+            .await
+    }
+
+    /// R3.6.3 — `Graph::resource_profile(opts?)` snapshot-based runtime
+    /// profile (D286 napi; D285 substrate). Returns JSON-serialized
+    /// `GraphProfileResult`; JS adapter parses with `JSON.parse`.
+    ///
+    /// D284 amendment: the returned JSON does NOT carry
+    /// `value_size_bytes` per node, `total_value_size_bytes` aggregate,
+    /// or `hotspots.by_value_size` — these were pure-ts-inferred fields
+    /// the canonical R3.6.3 spec does NOT mandate. See
+    /// `crates/graphrefly-graph/src/profile.rs` module docstring for
+    /// the full rationale (D196 / value-#6 pre-design win).
+    ///
+    /// Closes D004 R3.6.3 deferral per cross-track-ledger §1 D283 row.
+    #[napi]
+    pub async fn resource_profile(&self, top_n: Option<u32>) -> Result<String> {
+        let key = self.graph_key;
+        let opts = top_n.map(|n| graphrefly_graph::GraphProfileOptions {
+            top_n: Some(n as usize),
+        });
+        let profile = self
+            .actor
+            .run(move |core| {
+                with_extra::<Graph, _>(key, move |g| g.resource_profile(core, opts))
+                    .expect("BenchGraph: graph entry missing")
+            })
+            .await?;
+        serde_json::to_string(&profile).map_err(|e| {
+            NapiError::from_reason(format!("resource_profile serialization failed: {e}"))
+        })
+    }
+
     // -------------------------------------------------------------------
     // Reactive surfaces (Slice X2 — Phase E2 BenchGraph reactive,
     // S6/D255 actor-routed).

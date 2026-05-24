@@ -52,7 +52,13 @@ pub enum OrphanKind {
 /// Per-node profile entry. Mirrors the post-D284 narrower
 /// [`packages/parity-tests/impls/types.ts`](../../../../../../graphrefly-ts/packages/parity-tests/impls/types.ts)
 /// `ImplNodeProfile` shape exactly (no `valueSizeBytes`).
+///
+/// JSON field names are camelCase to match the cross-arm parity wire
+/// contract (`subscriberCount` / `depCount` / `isOrphanEffect` /
+/// `orphanKind`) — the parity scenarios in
+/// `scenarios/graph/resource-profile.test.ts` assert on those keys.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeProfile {
     /// Qualified path within the graph (local — recursive mount-walking
     /// is not in scope per R3.6.3's snapshot framing).
@@ -83,8 +89,10 @@ pub struct NodeProfile {
 /// the post-D284 narrower
 /// [`packages/parity-tests/impls/types.ts`](../../../../../../graphrefly-ts/packages/parity-tests/impls/types.ts)
 /// `ImplGraphProfileResult` shape (no `totalValueSizeBytes`, no
-/// `hotspots.byValueSize`).
+/// `hotspots.byValueSize`). JSON keys are camelCase to match the
+/// cross-arm parity wire contract.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GraphProfileResult {
     /// Total local node count (NOT recursive into mounted children).
     pub node_count: usize,
@@ -108,8 +116,11 @@ pub struct GraphProfileResult {
 
 /// Top-N hotspots returned by [`GraphProfileResult::hotspots`]. D284
 /// dropped the `by_value_size` ranking (see [`crate::profile`] module
-/// docstring for the rationale).
+/// docstring for the rationale). JSON keys are camelCase
+/// (`bySubscriberCount` / `byDepCount`) to match the cross-arm parity
+/// wire contract.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Hotspots {
     /// Top nodes by external subscriber count, descending.
     pub by_subscriber_count: Vec<NodeProfile>,
