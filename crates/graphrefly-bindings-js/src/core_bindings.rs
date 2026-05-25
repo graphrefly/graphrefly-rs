@@ -851,6 +851,8 @@ fn build_sink_tsfn(callback: Function<'_, Vec<u32>, ()>) -> Result<Arc<SinkTsfn>
 ///
 /// Symmetric with `operator_bindings::bridge_sync` but for `()` return.
 fn bridge_sync_unit(tsfn: &Arc<SinkTsfn>, payload: Vec<u32>) {
+    // D289 / D288 Q2 tripwire — see `batch_bindings::assert_no_batch_handle`.
+    crate::batch_bindings::assert_no_batch_handle("core_bindings::bridge_sync_unit");
     let (tx, rx) = sync_channel::<Result<()>>(1);
     // CalleeHandled=false → plain `T` arg (no Result wrapping).
     let status = tsfn.call_with_return_value(

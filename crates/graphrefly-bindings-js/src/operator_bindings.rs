@@ -213,6 +213,11 @@ where
     T: 'static + Send + JsValuesTupleIntoVec,
     R: FromNapiValue + Send + 'static,
 {
+    // D289 / D288 Q2 tripwire — fail-loud if a BenchBatchContext is
+    // open on this (actor) thread. R4.3.1/R4.3.2 defer sink fires to
+    // commit; a TSFN call during the held-guard window 3-way
+    // deadlocks. See `batch_bindings::assert_no_batch_handle`.
+    crate::batch_bindings::assert_no_batch_handle("operator_bindings::bridge_sync");
     let (tx, rx) = sync_channel::<Result<R>>(1);
     // CalleeHandled=false → call_with_return_value takes plain `T`
     // (no Result wrapping). JS-throw delivery via the cb's `Result<R>`

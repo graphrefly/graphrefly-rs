@@ -11,7 +11,12 @@ homepage.workspace     = true
 authors.workspace      = true
 
 [lib]
-crate-type = ["cdylib"]   # napi-rs requires cdylib output
+# `cdylib` is required for the napi-rs `.node` build target (Node.js
+# loads it via dlopen). `rlib` is added so cargo builds a test binary
+# for inline `#[cfg(test)] mod tests` (D289 / D288 — batch_bindings
+# cargo regressions). Without `rlib`, `cargo nextest run -p
+# graphrefly-bindings-js` reports "does not have a test target".
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 graphrefly-core       = { workspace = true, optional = true }
@@ -102,8 +107,16 @@ standard = ["tracing", "graph-codec", "operators"]
 full     = ["standard", "storage", "structures"]
 
 # Capability features — composable; usually selected via a profile above.
-graph-codec = ["dep:graphrefly-graph", "dep:serde_json"]
-operators   = ["dep:graphrefly-operators"]
+# Each capability feature implies `tracing` because `operator_bindings` /
+# `structures_bindings` / `graph_bindings` all invoke
+# `crate::batch_bindings::assert_no_batch_handle(...)` at their
+# `bridge_sync*` entry points (Q2 tripwire — D289 / D288 Q2). The
+# `batch_bindings` module is `#[cfg(feature = "tracing")]`-gated, so a
+# capability without `tracing` would compile a `bridge_sync` site that
+# references an undefined module → build error. Mirrors the existing
+# `storage`/`structures` pattern.
+graph-codec = ["tracing", "dep:graphrefly-graph", "dep:serde_json"]
+operators   = ["tracing", "dep:graphrefly-operators"]
 storage     = ["tracing", "dep:graphrefly-storage", "dep:serde", "dep:serde_json", "dep:parking_lot"]
 structures  = ["tracing", "dep:graphrefly-structures", "dep:parking_lot"]
 

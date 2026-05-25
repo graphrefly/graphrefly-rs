@@ -2,6 +2,36 @@
 
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
+## Track-status snapshot — substrate-complete (2026-05-25)
+
+**Where the Rust port sits today.** M1 lifecycle, M2 Slice F operator base, M3 (Slices E1/F/G/H + U/V/W + Slice 3e/3f cold sources + U-napi), M4 storage (A/B/C/D/E1/E2/F), and M5 reactive structures + bindings have all landed and are gate-GREEN. `@graphrefly/native@0.0.7` published 2026-05-21 via OIDC trusted publishing (per-platform `.node` binaries for 5 targets). The D266–D270 cross-track-ledger closure batch + D271 storage cleanup + D272–D274 Arc→Rc / vestigial-surface sweep + D276–D281 storage-honest-error / perf / describe / `Core::up(Invalidate)` R1.4.2 convergence + D283–D287 `Impl.tagFactory` / `Impl.resourceProfile` paired-batch are all in. **2026-05-25 — D289 paired `/porting-to-rs` slice landed (binding-only, graphrefly-rs):** `BenchBatchContext` napi + parked-actor `BatchOp` loop + `Cell<bool>` tripwire (D288 Path D); +5 new cargo tests in `graphrefly-bindings-js` (first cargo tests in that crate). Cross-track-ledger §1 D282 row narrows to "native LANDED via D289; TS `/dev-dispatch` slice pending". Cross-arm parity gate unchanged at 445/17 until the paired TS slice drops the D282 carve-out.
+
+| Track | Status | Notes |
+|---|---|---|
+| M1 — lifecycle | ✅ done | |
+| M2 — Slice F | ✅ done (2026-05-06) | |
+| M3 — operators + Slices E1/F/G/H + U/V/W | ✅ done (2026-05-13) | |
+| M4 — storage A/B/C/D/E1/E2/F | ✅ done (2026-05-22 with D276/D277/D278/D279 closing) | |
+| M5 — reactive structures + bindings | ✅ done (2026-05-15) | D204/D205 napi binding parity |
+| Native ship | ✅ done (2026-05-15) | D203 + D204/D205 + D206/D207 Option C async public surface |
+| Cross-track-ledger §1+§2 closure | ✅ done (2026-05-24) | D266–D270 + D281 + D283–D287; §1 D283 row CLOSED, §1 D282 row REFRAMED |
+| D282 — `Impl.batch` shape | 🟡 native LANDED 2026-05-25 via D289; TS `/dev-dispatch` slice pending | D288 (2026-05-24) locked Path D + Q1–Q5 sub-decisions. D289 (2026-05-25, this slice) shipped the binding mechanism: `BenchBatchContext` napi + parked-actor `BatchOp` loop + `Cell<bool>` tripwire + 5 cargo regressions. Full row closure waits for the paired TS `/dev-dispatch` slice (`Impl.batch(fn: (ctx) => void)` widening + scenario rebase + `runIf` gate drops). |
+| M6 — Python (pyo3) bindings | ⏸ post-1.0 | Per migration plan, out of pre-1.0 scope. |
+| `@graphrefly/wasm` sibling | ⏸ deferred per D196 | Consumer-pressure gate — adds when a browser-Rust consumer surfaces. Until then `@graphrefly/pure-ts` is the universal fallback. |
+| Async-everywhere presentation rebase | ⏸ D080 / deferred | Re-opens on memo:Re premium-backend native swap blocking (post-M5/DS-14.7-napi) or a D196 consumer. |
+
+**Real `/porting-to-rs` options remaining (none are blockers):**
+
+- **A** — Arc→Rc cleanup tail (partial recovery via D272/D273; ~remaining sites in `graphrefly-graph/src/describe.rs` + `graphrefly-operators/{buffer,control,higher_order,ops_impl,stratify,temporal}.rs` + bindings/parity reconciliation). Drops the `#![allow(clippy::arc_with_non_send_sync)]` band-aids post-D248. Bounded, architecturally correct, no API change.
+- **B** — M6 (Python/pyo3 bindings). Post-1.0 per migration plan.
+- **C** — Deeper §10 perf simplifications (10.3 diamond bitmask + 10.5 wave-end notification arena validated NOT wins via D277 bench-evidence; 10.5 wave-end arena candidate remains, criterion bench reproducer required).
+- **D** — `BenchGraph` arbitrary-fn `g.derived(name, deps, fn)` widening (TSFN-backed user-fn dispatch on `BenchGraph` mirroring existing `register_user_derived` on `BenchCore`). Would lift the D287 carve-out on `resource-profile.test.ts` test #1. Not a forcing function — the carve-out is documented and in-place.
+- **E** — Open `porting-deferred.md` items (mostly v1 limitations the user accepted at design time; each has its own lift-point note).
+
+**Open findings (audit dashboard `docs/audit/site/`):** 6 — F001 (pause-overflow panic-unwind, leave open conservatively per D278 E-i.4 "Option A locked: keep current"), F003 (perf opp — Phase 3 dep-walk), F005 (Graph wrapper `UnknownNode` asymmetric error surface), F008 (TS `PausableMode` port-back to pure-ts — graphrefly-ts follow-on, not graphrefly-rs), F009 (node.rs at 5459 LOC — splitting candidate), F010 (rule-citation density 18/266 = 93% gap). Closed in 2026-05-24 sweep: F002 (D281), F004 (rustdoc contract upgrade), F006 (Slice E2 landed R2.4.5/R2.4.6 hooks), F007 (D203 native-ship + D266–D270 closure). Roll-up: `docs/audit/data/reviews.jsonl` `rev-2026-05-24-track-completion-sweep`.
+
+**Canonical decision log:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` (D193–D289 in scope for the current Rust track).
+
 ## Layering — substrate vs presentation predicate (locked 2026-05-14)
 
 **Single source of truth:** [`CLAUDE.md`](../CLAUDE.md) § "Layering predicate — substrate vs presentation". This section is a pointer + Rust-port operational addendum; do NOT duplicate the predicate text here.
@@ -154,6 +184,57 @@ republish.
 (audit source of truth) + `~/src/graphrefly-ts/docs/rust-port-decisions.md`
 D272 / D273 / D274 + AMEND-D entries (D262/P4 + D267 scope-amend) +
 memory `feedback_distinguish_vestigial_vs_speculative.md`.
+
+### D289 — D288 paired `/porting-to-rs` slice: native `BenchBatchContext` napi + parked-actor BatchOp loop + `Cell<bool>` tripwire (2026-05-25, binding-only — paired TS `/dev-dispatch` slice still pending)
+
+Closes the Rust-side half of cross-track-ledger §1 D282. Substrate was already conformant via `BatchGuard::discard_wave_cleanup` + `restore_wave_cache_snapshots` (R4.3.2); this slice ships the napi binding mechanism D288 locked under Path D (sync `BenchBatchContext` handle extending α-shape's parked-thread + sync-channel pattern to the per-batch-frame scope).
+
+- **D288 (2026-05-24, design-session lock, graphrefly-ts).** Path D + Q1–Q5 sub-decisions locked in `archive/docs/SESSION-DS-D288-native-batch-path-D.md` + `docs/rust-port-decisions.md` D288 entry. Design-unblocked the paired `/porting-to-rs` slice.
+
+- **D289 (2026-05-25, paired `/porting-to-rs` slice, graphrefly-rs `<commit pending>`).** Binding-only landing. NEW `crates/graphrefly-bindings-js/src/batch_bindings.rs` (~970 LOC incl. tests): `BatchMessage` enum (5 tiers), `BatchOp` envelope (Q1: outer crossbeam channel + per-op `sync_channel<R>(1)` reply carried in envelope), `BatchContextInner` pure-Rust mechanism + `BenchBatchContext` `#[napi]` class with full Message-tier surface (10 `down_*` methods + `commit` + `rollback`), `DURING_BATCH_HANDLE: Cell<bool>` thread_local + `BatchHandleGuard` RAII + `assert_no_batch_handle(callsite)` tripwire (Q2: `Cell<bool>` not `AtomicBool` per D248 / D252 / D254 Tier A precedent), parked-actor inner loop `run_batch_loop` (commit → drop guard, rollback → ack-first then `resume_unwind` → `BatchGuard::Drop` panic-branch runs `discard_wave_cleanup`), `BenchCore::open_batch()` sync napi factory using `actor.dispatch_detached(...)`. Tripwires wired at the 3 `bridge_sync*` sites (`operator_bindings:211`, `structures_bindings:63`, `core_bindings:854`). Cargo.toml `crate-type` widened to `["cdylib", "rlib"]` + `build.rs` emits `dynamic_lookup` (macOS) / `--unresolved-symbols=ignore-all` (Linux) for the test binary so cargo can build the inline `#[cfg(test)] mod tests`.
+
+  Per-frame lifetime contract (Q3): `BatchContextInner::Drop` posts a best-effort `Rollback` if neither commit/rollback was called; post-close `ctx.down_*(...)` returns `"BenchBatchContext used after batch closed"` (Sender::send returns SendError after actor exits inner loop). Q4: D080 forward-compat — Path D's sync-handle mechanism is explicitly NOT a precedent for future callback-bearing primitives (compact JSDoc note pending in the paired TS slice). Q5: pure-ts substrate API unchanged — the parity adapter is the 3-line wrapper.
+
+  Bindings-js cargo regression tests (5 total, all green):
+  - `sink_fire_zero_during_handle_then_drained_on_commit` — R4.3.1/R4.3.2 + R4.3.5 invariants: substrate Sink (no TSFN — JS env-free) observes 0 new fires + 0 new DATA messages during the held-guard window; after commit, exactly 3 new DATA messages delivered for 3 same-node emissions (coalesced).
+  - `rollback_parity_with_substrate_r4_3_2` — pre/post cache snapshot equality on rollback (R4.3.2 `discard_wave_cleanup` parity); bench-still-usable after rollback (actor not bricked by the resume_unwind).
+  - `post_frame_ctx_throws` — Q3 lifetime contract: post-commit AND post-rollback `ctx.down_*` returns the closed-batch error; same for double-commit/double-rollback.
+  - `commit_fires_pending_notify_exactly_once_per_tier` — R4.3.5 coalescing for N=5 emissions: exactly 5 DATA messages, ≤2 sink calls (DIRTY tier + DATA tier per R1.3.1.b two-phase push, never N=5 per-emission fires).
+  - `assert_no_batch_handle_panics_when_flag_set` — Q2 tripwire mechanism: flag-clear → counter increments + no panic; flag-set → panic (caught via `catch_unwind`), RAII Drop clears flag on unwind.
+
+  **What this slice does NOT do (paired TS `/dev-dispatch` slice scope):** `Impl.batch(fn: (ctx) => void)` widening at `packages/parity-tests/impls/types.ts`; `BatchCtx` cross-arm type + `impls/pure-ts.ts` adapter wrapper; `impls/rust.ts` Proxy trap rewire (currently throws stub); rewriting the 12 `batch-throw-rollback.test.ts` scenarios + dropping `runIf(impl.name === "pure-ts")` gates; `wrapper.js` `Impl.batch` JS-side wrap.
+
+**Test count:** 866/866 cargo nextest default-members (`cargo tc` ci profile) — unchanged from D287 (binding-layer tests don't enter default-members because `graphrefly-bindings-js` is excluded per Cargo workspace config). **+5 new tests in `graphrefly-bindings-js`** (the first cargo tests in the bindings crate; run via `cargo nextest run -p graphrefly-bindings-js`). Cross-arm parity gate unchanged at 445/17 — moves to 445/16 (or similar) when the paired TS `/dev-dispatch` slice drops the D282 carve-out. Clippy + fmt clean on the touched files.
+
+**QA pass (2026-05-25):** `/qa` parallel adversarial review surfaced 12 minor patches (Drop-driven Rollback panic-message distinguishment, `assert_no_batch_handle_panics_when_flag_set` panic-assertion hardening, `down_pause`/`down_resume` lock-pattern consistency, `run_batch_loop` RecvError-branch `assert!` fail-loud over silent success-drain, `operators`/`graph-codec` features now `imply "tracing"` to close brittle dep-gate, `#[must_use]` on `BatchHandleGuard::new()`, softer error string for closed-channel-during-rollback, drop-order load-bearing comment, Drop comment accuracy, test #2 comment honest pass) + 1 DS-doc AMEND-D288 subsection recording the `BatchOp` envelope widening to PAUSE/RESUME + 1 deferred CI-grep-tripwire-guard added to [porting-deferred.md](porting-deferred.md) (QA F2). All 12 patches applied + re-gated GREEN. One QA follow-on deferred. Subagent triage memo: 0 critical, 0 major-post-triage, 12 minor patches landed, 1 deferred.
+
+**Test count (post-QA):** 866/866 cargo nextest default-members (`cargo tc` ci profile) — unchanged from D287. **5/5 batch_bindings tests pass** in `graphrefly-bindings-js`. Clippy `-p graphrefly-bindings-js --all-targets` clean on touched files (batch_bindings.rs has zero remaining warnings). `cargo fmt --check` clean. `#![forbid(unsafe_code)]` preserved on all 5 substrate crates (`graphrefly-{core,graph,operators,storage,structures}/src/lib.rs`); `graphrefly-bindings-js` retains the documented `#![deny(unsafe_code)]` carve-out for napi-derive's macro-generated allows (no hand-written unsafe).
+
+**D265 hold-local pattern preserved:** graphrefly-rs commits for D289 are LOCAL ONLY; not pushed. User-gated tag push triggers OIDC `@graphrefly/native` republish.
+
+**Canonical:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D289 (slice landing) + D288 (design-session lock) + D282 (original mint) + R4.3.1/R4.3.2; cross-track-ledger `§1 D282` row (status narrowed to "native LANDED; TS pending"); `archive/docs/SESSION-DS-D288-native-batch-path-D.md` (sub-decision walk + AMEND-D288 envelope widening note).
+
+### D283–D287 — `Impl.tagFactory` + `Impl.resourceProfile` paired-batch + D282 reframe (2026-05-23/24, `/porting-to-rs` paired Impl-widening + substrate + napi + parity-lift)
+
+Paired-batch closing the last cross-track-ledger §1 row that had pure-ts-only `runIf` gates. Empties `NOT_ON_NATIVE_GRAPH_METHODS` registry; lands 7-of-8 parity scenarios cross-arm; documents the one carve-out and the structural D282 reframe.
+
+- **D283 — TS-side Impl widening + parity scenarios (2026-05-23, graphrefly-ts).** `ImplGraph.tagFactory` + `ImplGraph.resourceProfile` + `ImplNodeProfile` + `ImplGraphProfileResult` widened on the `Impl` contract. 8 parity scenarios authored under `packages/parity-tests/scenarios/graph/{tag-factory,resource-profile}.test.ts` gated `runIf(impl.name === "pure-ts")` waiting for paired Rust substrate.
+
+- **D284 — Impl amend (2026-05-24, graphrefly-ts ace23ed).** Pre-design pass before authoring Rust substrate caught `valueSizeBytes` / `totalValueSizeBytes` / `hotspots.byValueSize` as pure-ts-inferred fields the canonical R3.6.3 spec (`docs/implementation-plan-13.6-canonical-spec.md:984` — *"runtime profile (subscriber counts, fan-in/out, etc.)"*) does NOT mandate. User-locked **Option 3 — omit** over Option 1 (dishonest "return 0" on Rust) or Option 2 (speculative `BindingBoundary::value_size_of` FFI widening, D196 fail). Pure-ts keeps computing internally; parity wrapper strips via `projectToImplProfile`. Logged as **value-#6 (pre-design) win**.
+
+- **D285 — Rust substrate (2026-05-24, graphrefly-rs `1f68c85`).** `Graph::tag_factory(factory, factory_args)` mutator + `GraphInner.factory` / `factory_args` fields + `GraphDescribeOutput.factory` / camelCase `factoryArgs` JSON keys (skip-if-none, byte-for-byte parity with pure-ts `graph.ts:3508-3509`). `Graph::resource_profile(core, opts?) -> GraphProfileResult` in new `crates/graphrefly-graph/src/profile.rs` (post-D284 narrower shape). New `CoreFull::sink_count_of(node_id) -> usize` trait widening (substrate-internal per D243; NOT on `Impl`). 11 cargo regression tests (5 `tag_factory` + 6 `resource_profile`). Gate delta: 865 → 876.
+
+- **D286 — napi binding + wrapper (2026-05-24, graphrefly-rs `7b43719`).** `BenchGraph::tag_factory(factory, factory_args_json)` + `BenchGraph::resource_profile(top_n)` async napi methods (mirror existing `describe_json` `actor.run` pattern, post-D267 deadlock-fix). `wrapper.js` `NativeGraph.tagFactory` / `NativeGraph.resourceProfile` exposure (`JSON.stringify` args at boundary; `JSON.parse` profile return). Critical: `GraphProfileResult` / `NodeProfile` / `Hotspots` serde structs gain `#[serde(rename_all = "camelCase")]` to match cross-arm wire contract; new `d286_napi_camel_case_json_keys` cargo regression pin (positive + negative shape). Gate: 866/866.
+
+- **D287 — parity lift + cross-track-ledger updates (2026-05-24, graphrefly-ts `66b93e5`).** 7 of 8 D283 `runIf` gates dropped (test #1 carve-out preserved). `NOT_ON_NATIVE_GRAPH_METHODS` registry emptied (but the helper pattern stays for future port-coverage widenings — E-iv.4 design-review Phase 2). Cross-track-ledger §1 D283 row CLOSED; §1 D282 row REFRAMED (below). Cross-arm gate: 445/17.
+
+- **D282 — REFRAMED 2026-05-24 (not a code commit).** The locked `Impl.batch(fn: () => void): Promise<void>` shape has a structural problem on the native arm uncovered during pre-design. The 12 parity scenarios use sync internal pure-ts API (`(src.inner as { down(msgs): void }).down(...)`) inside the fn body. On native: `src.inner` is `nodeId: number` (not a `NodeImpl` with `.down()`), AND post-D267 every Core mutation routes through `actor.run` (async) to avoid TSFN deadlocks → a sync `() => void` fn body cannot await actor calls. Three resolution paths (D282-B "scripted batch" / D282-C async fn body widening / D282-D sync `BenchBatchContext` napi handle) all require non-trivial design rebases. User-locked: defer to DS-14 or D080 (async-everywhere) rather than picking in isolation. Rust substrate stays conformant via `discard_wave_cleanup` + `restore_wave_cache_snapshots`.
+
+**Test count:** 866/866 Rust + 445/17 cross-arm parity (17 skips = 15 storage-arm + 1 D282 batch carve-out + 1 D287 `resource-profile` test #1 carve-out). Clippy + fmt clean.
+
+**D265 hold-local pattern preserved:** graphrefly-rs commits `1f68c85` + `7b43719` are LOCAL ONLY; not pushed. User-gated tag push triggers OIDC `@graphrefly/native` republish.
+
+**Canonical:** `~/src/graphrefly-ts/docs/rust-port-decisions.md` D283 + D284 + D285 + D286 + D287. Cross-track: `~/src/graphrefly-ts/docs/cross-track-ledger.md` §1 D283 (CLOSED) + §1 D282 (REFRAMED).
 
 ### D281 — E-i.1 `Core::up(Invalidate)` R1.4.2 plain-forward (Commit 3 of 3; 2026-05-22, `/porting-to-rs` next-batch — Rust spec-compliance)
 

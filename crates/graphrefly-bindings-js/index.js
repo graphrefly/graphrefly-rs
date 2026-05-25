@@ -576,6 +576,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.BenchBatchContext = nativeBinding.BenchBatchContext
 module.exports.BenchCheckpointSnapshotTier = nativeBinding.BenchCheckpointSnapshotTier
 module.exports.BenchCore = nativeBinding.BenchCore
 module.exports.BenchDescribeReactiveHandle = nativeBinding.BenchDescribeReactiveHandle

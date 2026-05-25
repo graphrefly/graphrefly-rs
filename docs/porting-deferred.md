@@ -1,6 +1,14 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-22 (D271 substrate cleanup — B+C+D bundle landed)
+last_updated: 2026-05-25 (D289 native batch binding landed — paired `/porting-to-rs` slice for D288; one QA follow-on deferral added below — CI grep guard for `bridge_sync*` tripwire wiring)
+---
+
+## D289 follow-on deferrals (2026-05-25)
+
+The D289 `/porting-to-rs` slice landed the `BenchBatchContext` napi + parked-actor `BatchOp` loop + `Cell<bool>` tripwire. QA surfaced one follow-on for a future hygiene slice:
+
+- **CI grep guard for `bridge_sync*` tripwire wiring (QA F2).** The Q2 invariant ("no sink fire during handle dispatch") is enforced by `assert_no_batch_handle(callsite)` calls at the top of every `bridge_sync*` function in the bindings crate (`operator_bindings::bridge_sync` at `:215`, `structures_bindings::bridge_sync` at `:67`, `core_bindings::bridge_sync_unit` at `:854`). The wiring is best-effort: a future operator that adds a new `bridge_sync*` site and forgets the tripwire silently re-breaks the Q2 contract, invisible until exercised inside a held-batch window. **Defer-rationale:** the current 3 sites are correctly wired and pinned by the `assert_no_batch_handle_panics_when_flag_set` cargo test (verifies the panic mechanism itself); a CI grep smoke-check (`every fn bridge_sync* in crates/graphrefly-bindings-js/src/*.rs must contain assert_no_batch_handle`) would mechanically pin the wiring across future bindings additions, but the cost is low only if there's a clear hook point in the existing CI scripts. Lift when a new `bridge_sync*` site lands (then the cost amortizes), or sooner if a hygiene-pass slice surfaces. **Source:** QA Edge-Case-Hunter F2 (2026-05-25, this slice's `/qa` pass).
+
 ---
 
 ## D266-D270 follow-on deferrals (2026-05-21)

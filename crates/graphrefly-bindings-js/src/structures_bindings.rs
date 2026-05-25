@@ -65,6 +65,8 @@ where
     T: 'static + Send + JsValuesTupleIntoVec,
     R: FromNapiValue + Send + 'static,
 {
+    // D289 / D288 Q2 tripwire — see `batch_bindings::assert_no_batch_handle`.
+    crate::batch_bindings::assert_no_batch_handle("structures_bindings::bridge_sync");
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<R>>(1);
     let status = tsfn.call_with_return_value(
         arg,

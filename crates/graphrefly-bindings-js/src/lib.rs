@@ -35,6 +35,14 @@ mod core_actor;
 #[allow(unreachable_pub)] // napi-rs #[napi] items are pub for JS, not Rust-visible.
 mod core_bindings;
 
+// `BenchBatchContext` napi + parked-actor BatchOp loop (D289 / D288
+// Path D). The tripwire (`assert_no_batch_handle`) is invoked from the
+// three `bridge_sync*` entry points in operator_bindings,
+// structures_bindings, and core_bindings (bridge_sync_unit).
+#[cfg(feature = "tracing")]
+#[allow(unreachable_pub)] // napi-rs #[napi] items are pub for JS, not Rust-visible.
+mod batch_bindings;
+
 #[cfg(feature = "operators")]
 mod operator_bindings;
 
