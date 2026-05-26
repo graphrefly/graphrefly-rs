@@ -269,6 +269,29 @@ pub(crate) struct WaveState {
     /// to `None`; ERROR-tier handles taken from the slot are released
     /// lock-released.
     pub(crate) wave_dep_terminal_snapshots: AHashSet<(NodeId, NodeId)>,
+    /// D297: nodes that transitioned `has_received_teardown: false → true`
+    /// during this wave (via [`Core::teardown_inner`]'s `Action::Visit`
+    /// arm). Mirrors [`Self::wave_terminal_snapshots`] for the R2.6.4 /
+    /// Lock 6.F idempotency flag — restored to `false` on panic-discard so
+    /// a retry of `teardown(node)` post-rollback isn't silently no-op'd by
+    /// the idempotency guard at [`Core::teardown_inner`] `Action::Visit`.
+    ///
+    /// Closes the R2.2.7.a + R4.3.2 atomicity gap surfaced by the D297
+    /// HALT premise check (the original D291 deferred-scope Item 1 framing
+    /// of "academic" was wrong — post-rollback the node was left in a
+    /// contradictory state `terminal=None` ∧ `has_received_teardown=true`
+    /// that the public surface couldn't reset).
+    ///
+    /// Bilateral convergence direction: pure-ts has been conformant on
+    /// this field since D282 — `_preBatchSnapshot.teardownDone`
+    /// ([`packages/pure-ts/src/core/node.ts:3993`] +
+    /// `:4136` for restore). Rust catches up here.
+    ///
+    /// **Refcount discipline:** the set holds no handles. Restore on
+    /// panic-discard just sets the boolean back to `false` for each
+    /// snapshotted node; the wire `Teardown` message (no payload) was
+    /// already cleared by the existing `pending_notify` drop.
+    pub(crate) wave_teardown_snapshots: AHashSet<NodeId>,
     /// Nodes that need an auto-Resolved at wave end if they don't receive
     /// a tier-3+ message from their own commit_emission. Populated by
     /// the RESOLVED child propagation in `commit_emission`. Drained by
@@ -446,6 +469,11 @@ impl WaveState {
             // success + panic-discard paths drain.
             wave_terminal_snapshots: AHashSet::new(),
             wave_dep_terminal_snapshots: AHashSet::new(),
+            // D297: empty by construction at outermost wave start; both
+            // success + panic-discard paths drain via
+            // `drain_wave_terminal_snapshots` /
+            // `restore_wave_teardown_snapshots`.
+            wave_teardown_snapshots: AHashSet::new(),
             pending_auto_resolve: AHashSet::new(),
             pending_pause_overflow: Vec::new(),
             pending_fires: AHashSet::new(),
@@ -585,6 +613,22 @@ fn wave_state_clear_outermost() {
             "wave_state_clear_outermost: wave_dep_terminal_snapshots non-empty \
              at outermost wave start ({} entries). See D291.",
             ws.wave_dep_terminal_snapshots.len()
+        );
+        // D297: same invariant for the teardown-flag snapshots. The set
+        // holds no handles, but its drain triggers
+        // `has_received_teardown = false` resets via
+        // `restore_wave_teardown_snapshots`; stale entries would either
+        // silently clear an unrelated node's flag on the next wave
+        // (corrupting R2.6.4 idempotency) or no-op (leaking the lift).
+        // Outermost `BatchGuard::drop` drains on success (via
+        // [`Core::drain_wave_terminal_snapshots`]) and panic (via
+        // [`Core::restore_wave_teardown_snapshots`] from
+        // [`Self::discard_wave_cleanup`]).
+        debug_assert!(
+            ws.wave_teardown_snapshots.is_empty(),
+            "wave_state_clear_outermost: wave_teardown_snapshots non-empty \
+             at outermost wave start ({} entries). See D297.",
+            ws.wave_teardown_snapshots.len()
         );
         debug_assert!(
             ws.deferred_handle_releases.is_empty(),
@@ -1017,6 +1061,13 @@ impl Core {
         // is O(1) — the prior `is_empty()` guards were dead pre-checks.
         ws.wave_terminal_snapshots.clear();
         ws.wave_dep_terminal_snapshots.clear();
+        // D297: same success-path clear for the teardown-flag snapshots.
+        // On commit, the wave's `has_received_teardown = true` mutations
+        // are kept (the R2.6.4 idempotency guard is the load-bearing
+        // contract for committed teardowns); the snapshot set just
+        // tracked "which nodes need rollback on panic," nothing on
+        // commit.
+        ws.wave_teardown_snapshots.clear();
     }
 
     /// D291: panic-path restore for `wave_terminal_snapshots` +
@@ -1067,10 +1118,10 @@ impl Core {
                     releases.push(h);
                 }
                 // R2.6.4 (Lock 6.F) auto-COMPLETE pre-pend semantics —
-                // see [`Core::teardown_inner`]. `has_received_teardown` is
-                // NOT snapshotted in this slice (D291 scope is the
-                // `terminal` slot per Case 5). Lift point: porting-deferred
-                // §"D291 deferred-scope".
+                // see [`Core::teardown_inner`]. The `has_received_teardown`
+                // flag is rolled back by D297's sibling restore method
+                // [`Core::restore_wave_teardown_snapshots`] — called from
+                // the same `discard_wave_cleanup` site as this one.
             }
         }
         if !ws.wave_dep_terminal_snapshots.is_empty() {
@@ -1103,6 +1154,50 @@ impl Core {
             }
         }
         releases
+    }
+
+    /// D297: panic-path restore for `wave_teardown_snapshots`. Mirrors
+    /// [`Self::restore_wave_terminal_snapshots`] for the R2.6.4 / Lock 6.F
+    /// `has_received_teardown` idempotency flag. Drains the snapshot set,
+    /// resets `rec.has_received_teardown = false` for each snapshotted
+    /// node so a retry of `teardown(node)` post-rollback re-runs the
+    /// auto-COMPLETE prepend + queue Teardown path (not silently no-op'd
+    /// by [`Core::teardown_inner`]'s `Action::Visit` idempotency guard).
+    ///
+    /// The set holds no handles; this method takes nothing to release.
+    /// Returns `()` (vs `restore_wave_terminal_snapshots`'s `Vec<HandleId>`)
+    /// to make the contrast at call sites obvious — the existing wire
+    /// `Teardown` message (no payload, tier 6) was already cleared by the
+    /// `pending_notify` drop in the same `discard_wave_cleanup` block.
+    ///
+    /// A snapshotted entry whose `rec` no longer exists (orphaned by a
+    /// torn-down node) is silently skipped (no flag to reset). Mirrors the
+    /// D291 /qa F6 invariant — no in-tree code path tears down a node
+    /// mid-wave after its teardown flag was snapshotted; a debug_assert
+    /// guards against future seams.
+    ///
+    /// Source: D297 (2026-05-26) — closes D291 deferred-scope Item 1
+    /// `has_received_teardown` flag rollback. Bilateral convergence on
+    /// pure-ts's pre-existing `_preBatchSnapshot.teardownDone` capture
+    /// (`packages/pure-ts/src/core/node.ts:3993` + `:4136`), landed via
+    /// D282.
+    pub(crate) fn restore_wave_teardown_snapshots(&self, s: &mut CoreState, ws: &mut WaveState) {
+        if ws.wave_teardown_snapshots.is_empty() {
+            return;
+        }
+        let snapshots = std::mem::take(&mut ws.wave_teardown_snapshots);
+        for node_id in snapshots {
+            let Some(rec) = s.nodes.get_mut(&node_id) else {
+                debug_assert!(
+                    false,
+                    "D297 invariant: snapshotted node {node_id:?} was torn down \
+                     mid-wave — `has_received_teardown` flag can't be reset. \
+                     Mirrors D291 /qa F6."
+                );
+                continue;
+            };
+            rec.has_received_teardown = false;
+        }
     }
 
     /// Drain pending fires until quiescent, then flush wave-end notifications
@@ -3900,6 +3995,16 @@ impl BatchGuard<'_> {
                 // retains pre-restore, so restore_terminal transfers
                 // ownership into this vec.
                 let restored_terminal = self.core.restore_wave_terminal_snapshots(&mut s, ws);
+                // D297: roll back `has_received_teardown` flags set during
+                // this wave so a retry of `teardown(node)` post-rollback
+                // re-runs the auto-COMPLETE prepend + queue Teardown path.
+                // The set holds no handles; nothing to release lock-released
+                // (the `Teardown` wire message — no payload — was already
+                // cleared by the `pending_notify` drop above). Called
+                // alongside `restore_wave_terminal_snapshots` since both
+                // close R4.3.2 atomicity gaps for `teardown_inner`'s state
+                // mutations.
+                self.core.restore_wave_teardown_snapshots(&mut s, ws);
                 // clear_wave_state pushes batch-handle releases into
                 // ws.deferred_handle_releases, so take ws's queue AFTER
                 // the clear.

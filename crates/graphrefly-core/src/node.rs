@@ -4376,6 +4376,29 @@ impl Core {
                     if s.require_node(id).has_received_teardown {
                         continue; // Idempotent (R2.6.4).
                     }
+                    // D297: snapshot the pre-transition `false` state for
+                    // wave-rollback (R4.3.2 + R2.2.7.a atomicity completeness
+                    // for the `has_received_teardown` flag). Mirrors D291's
+                    // `wave_terminal_snapshots.insert(id)` pattern. The
+                    // idempotent guard above means we only reach here on a
+                    // `false → true` transition; the snapshot set records
+                    // "this node's teardown flag mutated this wave," and
+                    // `restore_wave_teardown_snapshots` (called from
+                    // `BatchGuard::drop`'s panic-discard path) sets the
+                    // flag back to `false`, so a retry of `teardown(node)`
+                    // post-rollback re-runs the auto-COMPLETE prepend +
+                    // queue Teardown path (not silently no-op'd by this
+                    // very idempotency guard).
+                    //
+                    // Gated on `in_tick`: outside a wave (e.g. shutdown
+                    // teardown) no rollback is possible and the snapshot
+                    // machinery is unused. Mirrors the D291 `in_tick` gate
+                    // in `terminate_node`.
+                    if self.in_tick() {
+                        crate::batch::with_wave_state(|ws| {
+                            ws.wave_teardown_snapshots.insert(id);
+                        });
+                    }
                     s.require_node_mut(id).has_received_teardown = true;
                     // Push order: children first (pop LAST), then
                     // EmitTeardown(id), then metas (pop FIRST). Reverse
