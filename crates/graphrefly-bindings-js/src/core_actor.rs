@@ -464,6 +464,21 @@ impl CoreActor {
     /// channel. `F: FnOnce(&Core) -> R + Send + 'static` because the
     /// closure crosses the caller→worker channel.
     ///
+    /// # D292 D.2 R2 — sync-channel waits MUST use `spawn_blocking`
+    ///
+    /// **Do not call `rx.recv()` (or any blocking sync op) inside an
+    /// `actor.run` closure body.** D255 α-shape locks single-worker-
+    /// per-Core; a blocked closure serializes every subsequent
+    /// `actor.run` against the same Core until the block resolves —
+    /// for a `rx.recv()` waiting on the parked-batch actor (which IS
+    /// the Core's worker), that's an immediate self-deadlock. Use
+    /// [`napi::bindgen_prelude::spawn_blocking`] for sync-channel
+    /// waits (offloads to tokio's blocking pool — Core actor stays
+    /// free) and `tokio::sync` primitives for async waits.
+    ///
+    /// Reference: D292 D.2 R2 refinement; pattern landed in
+    /// `BenchBatchContext::commit` / `rollback` (`batch_bindings.rs`).
+    ///
     /// # Errors
     ///
     /// Returns a `napi::Error` if (a) the worker thread has already

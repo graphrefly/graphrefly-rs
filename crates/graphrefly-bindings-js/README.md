@@ -116,6 +116,42 @@ test("my reactive scenario", async () => {
   out of the box. On older Node, the Symbol-keyed property is silently
   ignored — use the explicit `await impl.close()` pattern.
 
+### When to opt in to `autoCloseOnBeforeExit`
+
+The default surface (`createNativeImpl()`) does NOT register a
+`process.on('beforeExit', () => impl.close())` safety net — you call
+`close()` explicitly (or use `await using` on Node 22+). Opt in to
+`createNativeImpl({ autoCloseOnBeforeExit: true })` ONLY when ALL three
+apply:
+
+1. **Your runtime fires `beforeExit` reliably.** **NOT** under: jest
+   worker pools with `isolate: false`; deno; browser (wasm);
+   `process.exit()` paths; long-lived servers (`beforeExit` only fires
+   when the event loop is genuinely empty).
+2. **You can't sequence an explicit `await impl.close()` at the right
+   place** (e.g., your code creates a NativeImpl as a module-level
+   singleton with no natural teardown hook).
+3. **You accept that `beforeExit` runs synchronously** — close-drain
+   semantics (the close-waits-for-in-flight contract) may block process
+   exit beyond expected timing.
+
+If any of the three doesn't hold, prefer `await using` (Node 22+) or
+explicit `try/finally`.
+
+```js
+// Opt in:
+const impl = createNativeImpl({ autoCloseOnBeforeExit: true });
+// ...use impl across module scope; no need to explicitly close.
+// Node exits → beforeExit fires → impl.close() drains + shuts down.
+```
+
+If a `close()` failure happens inside the `beforeExit` handler (storage
+tier timeout, async-commit panic propagation, etc.) it surfaces via
+`console.error('[graphrefly/native] close() during beforeExit failed:',
+err)` — the rejection cannot reject a Promise contract because
+`beforeExit` handlers don't have one, so console-error is the canonical
+surfacing path for unhandled cleanup-path errors.
+
 ### Escape hatch: `process.exit()`
 
 If you want the Node process to terminate without explicit `close()` —
@@ -134,21 +170,32 @@ process.exit(0);  // skip cleanup, kill process now
 `close()` is the structured alternative — same outcome (process exits
 cleanly), without bypassing other cleanup paths.
 
-## What ships in v0.0.8
+## What ships in v0.1.0 (D292)
 
-- `BenchCore::close()` async napi (drains subs + shuts down actor).
-- `Symbol.asyncDispose` on `NativeImpl` for ES2024 `await using`.
-- `_dispose` parity-harness hook aliased to `close()` (semantic change
-  pre-1.0: `_dispose` now also kills the actor — verified safe by grep
-  for all `_dispose` callers).
+- `BenchCore::close()` async napi (drains subs + shuts down actor) — D293.
+- `Symbol.asyncDispose` on `NativeImpl` for ES2024 `await using` — D293.
 - Post-close error message broadened to "(actor is shut down or shutting
-  down)" so consumers can recognize shutdown-class failures uniformly.
+  down)" so consumers can recognize shutdown-class failures uniformly — D293.
+- **D292 D.1 — `BenchGraph.derived(name, deps, fn)`** arbitrary-fn
+  widening via TSFN reroute (lifts the prior throw on JS-callback derived
+  nodes; closure-cell eviction auto-wired to `graph.remove`/`destroy`).
+- **D292 D.2 — Async `BenchBatchContext::commit` + `rollback`** via
+  `tokio::task::spawn_blocking` so libuv stays free during the sink-fire
+  drain; symmetric `catch_unwind` on both commit + rollback surfaces sink
+  panics as rejected Promises (closes the BH15 sink-panic-hang class).
+- **D292 D.3 Item 1 — `FinalizationRegistry`-driven async shutdown** off
+  the libuv thread (GC of a `NativeImpl` no longer blocks the JS event
+  loop while the worker joins).
+- **D292 D.3 Item 2 — `impl.close()` rejects on actor errors** (no
+  silent swallow; matches Promise contract).
+- **D292 D.3 Item 5 — `autoCloseOnBeforeExit` opt-in safety net** (see
+  "When to opt in to `autoCloseOnBeforeExit`" above for the 3-condition
+  rubric).
+- **F4 — `_dispose` parity-harness alias dropped** (pre-1.0 cleanup;
+  callers use the public `close()`).
 
-## What's coming in v0.1.0 (D292)
+## Deferred to a future minor bump
 
-- `FinalizationRegistry` GC fallback so missing `close()` is at most a
-  delayed exit (not a hang).
-- `process.on('beforeExit')` safety net for auto-cleanup.
 - `Symbol.asyncDispose` on nested handles (`Graph`, `Subscription`,
   `BenchBatchContext`).
 - Async commit/rollback on `BenchBatchContext` (closes a separate

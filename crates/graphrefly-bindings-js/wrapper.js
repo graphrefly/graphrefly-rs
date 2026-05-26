@@ -493,7 +493,7 @@ function makeUserDerivedAdapter(core, registry, userFn) {
 // ---------------------------------------------------------------------------
 
 class NativeGraph {
-  constructor(bench, core, registry, nodesByName) {
+  constructor(bench, core, registry, nodesByName, operators) {
     this.bench = bench;
     this.core = core;
     this.registry = registry;
@@ -510,6 +510,20 @@ class NativeGraph {
     // through to the async napi path — the Impl contract `T |
     // Promise<T>` lets tests `await` regardless.
     this.nodeIdToName = new Map();
+    // D292 D.1: BenchOperators handle (needed for `derived(name, deps,
+    // fn)` to reroute through `registerUserDerived`). Optional — child
+    // graphs mounted via `mount(name)` inherit from the parent.
+    this.operators = operators || null;
+    // D292 D.1 + F3 (cross-cutting closure-cell registry teardown):
+    // per-name map of arbitrary-fn derived nodes' closure cells. The
+    // cell IS the node — eviction must fire on the same paths the
+    // substrate tears the node down on. Today (D292): `remove(name)`,
+    // `destroy()`, and `impl.close()` cascade. **R1 anti-pattern #5
+    // watch:** if substrate teardown ever evolves outside these three
+    // paths (e.g., a future GC-driven sweep, a `Core::trim_dead_nodes`
+    // primitive), update eviction wiring HERE — silently leaving the
+    // cell alive past the substrate node IS the foot-gun.
+    this.closureCells = new Map();
     // Exposed for storage binding access (raw BenchGraph).
     this._bench = bench;
   }
@@ -566,14 +580,60 @@ class NativeGraph {
     return node;
   }
 
-  async derived(_name, _deps, _fn) {
-    // `BenchGraph.derived` only supports built-in fns; JS-callback
-    // derived nodes go through the operator factories + `add`.
-    throw new Error(
-      '[graphrefly/native] graph.derived(name, deps, fn) with arbitrary fn is ' +
-        'not supported by the BenchGraph surface; use the operator factories ' +
-        '(impl.map / impl.filter / ...) plus graph.add().',
+  /**
+   * D292 D.1 — arbitrary-fn derived node, async via D263's
+   * `registerUserDerived` TSFN reroute + `bench.add`.
+   *
+   * Shape mirrors pure-ts's `Graph.derived(name, deps, fn)`:
+   *   fn: (batches: ReadonlyArray<ReadonlyArray<unknown>>) => ReadonlyArray<unknown>
+   * where `batches[i]` is the wave's accumulated DATA values for `deps[i]`.
+   *
+   * **2 napi crossings per call** (`registerUserDerived` + `bench.add`).
+   * The fused single-crossing variant (D292 Option C) is deferred per
+   * D196 consumer-pressure gate; non-breaking widening to add later.
+   *
+   * **CLOSURE-CELL LIFETIME (R1 anti-pattern #5 watch):** the user `fn`
+   * is retained in `this.closureCells` keyed by `name`. The cell is
+   * evicted ONLY when the substrate tears the node down, which today
+   * happens via `graph.remove(name)` or `graph.destroy()` cascading
+   * into `Core::teardown_node` (R2.6.4), AND on `impl.close()`'s
+   * actor shutdown (F3 cross-cutting closure-cell registry teardown).
+   * If substrate teardown ever evolves to fire outside those three
+   * paths (e.g., a future GC-driven sweep, a `Core::trim_dead_nodes`
+   * primitive, etc.), update the eviction wiring HERE — silently
+   * leaving the closure cell alive past the substrate node IS the
+   * foot-gun.
+   *
+   * **Trade-off vs OperatorOp paths:** arbitrary-fn derived nodes go
+   * through `registerUserDerived` (TSFN-backed user closure) and lose
+   * `OperatorOp::Map`/`Filter`/etc. optimizations. Same trade-off
+   * `impl.map` already takes per D263; this method extends it to
+   * `graph.derived(name, deps, fn)`.
+   */
+  async derived(name, deps, fn) {
+    if (!this.operators) {
+      throw new Error(
+        '[graphrefly/native] graph.derived(name, deps, fn) requires an ' +
+          'operators handle on this NativeGraph instance. Mounted child ' +
+          'graphs inherit operators from the parent; if you see this on ' +
+          'a parent Graph, the createNativeImpl() wiring is broken.',
+      );
+    }
+    const adapter = makeUserDerivedAdapter(this.core, this.registry, fn);
+    const [nodeId, fnId] = await this.operators.registerUserDerived(
+      deps.map((d) => d.inner),
+      adapter,
     );
+    await this.bench.add(name, nodeId);
+    const node = new NativeNode(this.core, nodeId, this.registry);
+    node._operators = this.operators;
+    node._fnId = fnId;
+    node._deps = deps.slice();
+    node._currentUserFn = fn;
+    this.nodesByName.set(name, node);
+    this.nodeIdToName.set(nodeId, name); // D267 reverse cache
+    this.closureCells.set(name, { fnId, fn }); // D292 D.1 / F3
+    return node;
   }
 
   async dynamic(name, deps, fn) {
@@ -635,6 +695,12 @@ class NativeGraph {
     const audit = await this.bench.remove(name);
     this.nodesByName.delete(name);
     if (node) this.nodeIdToName.delete(node.inner);
+    // D292 D.1 / F3: evict closure cell AFTER the substrate teardown
+    // resolves. The TEARDOWN cascade has fully settled at this point
+    // (mirrors `nodesByName` eviction timing — the sink callbacks above
+    // could still observe the cell via `node._currentUserFn`, but the
+    // cell is no longer load-bearing for any future fn fire).
+    this.closureCells.delete(name);
     return audit;
   }
 
@@ -655,7 +721,10 @@ class NativeGraph {
       );
     }
     const childBench = await this.bench.mountNew(name);
-    return new NativeGraph(childBench, this.core, this.registry);
+    // D292 D.1: propagate operators handle to child graphs so
+    // `child.derived(name, deps, fn)` reroutes through the same
+    // `registerUserDerived` TSFN dispatch as the parent.
+    return new NativeGraph(childBench, this.core, this.registry, undefined, this.operators);
   }
 
   async unmount(name) {
@@ -666,6 +735,7 @@ class NativeGraph {
     await this.bench.destroy();
     this.nodesByName.clear();
     this.nodeIdToName.clear(); // D267 reverse cache
+    this.closureCells.clear(); // D292 D.1 / F3
   }
 
   async destroyAsync() {
@@ -885,9 +955,57 @@ function sourceOpts(opts) {
 // Each call constructs a fresh BenchCore + JSValueRegistry + operators
 // handle and returns an `Impl`-shaped object. Direct consumers call this
 // once; the parity harness calls it per test (with disposal).
+//
+// D292 D.3 Item 5: options bag with `autoCloseOnBeforeExit` opt-in.
+// See README "Closing a NativeImpl" → "When to opt in to
+// `autoCloseOnBeforeExit`" for the 3-condition rubric (R5 refinement).
 // ---------------------------------------------------------------------------
 
-function createNativeImpl() {
+// D292 D.3 Item 1 — FinalizationRegistry-driven off-libuv async shutdown.
+//
+// When a `NativeImpl` is GC'd without an explicit `await impl.close()`,
+// Node fires this finalizer ON THE LIBUV THREAD. If we called the
+// underlying `BenchCore::close()` here (async napi → blocks libuv until
+// the actor reply lands), we'd block the JS event loop on `handle.join()`
+// — visually indistinguishable from the "process never exits" hang D293
+// closed (the D292 WATCH (i) hazard).
+//
+// `BenchCore::finalize_async()` (new in D292) is a SYNC napi method that
+// posts the shutdown work to tokio's blocking pool via
+// `napi::bindgen_prelude::spawn_blocking`. The libuv thread returns
+// immediately; the join completes off-thread on the tokio runtime.
+//
+// **Why a module-level singleton:** FinalizationRegistry instances are
+// cheap, but sharing one across all `createNativeImpl()` calls means
+// the GC only walks one registry, not N.
+//
+// **Why we don't `register` Graph/Subscription:** D.3 Item 3 (nested
+// `Symbol.asyncDispose`) is deferred per D196 — same logic applies to
+// nested finalizers. The top-level NativeImpl finalizer cascades into
+// all sub-surfaces via the actor shutdown.
+//
+// **Held value:** the BenchCore napi handle (`state.core`). It survives
+// past the JS `impl` object because the finalizer holds it. The
+// FinalizationRegistry doesn't keep the GC target alive — it only
+// holds the heldValue across the finalization boundary.
+const _coreFinalizer = new FinalizationRegistry((coreHandle) => {
+  // Best-effort: a coreHandle that's already shut down (explicit
+  // close() ran before GC) treats this as a no-op via the
+  // `actor.shutdown()` idempotency flag. No error to handle —
+  // finalize_async is sync void.
+  try {
+    coreHandle.finalizeAsync();
+  } catch (e) {
+    // The handle should never throw — `finalize_async` is `pub fn`
+    // returning unit. If it does (napi binding mismatch, dropped
+    // .node, etc.), surface via console.error per F2's
+    // unhandled-cleanup-path convention.
+    console.error('[graphrefly/native] FinalizationRegistry cleanup failed:', e);
+  }
+});
+
+function createNativeImpl(opts) {
+  opts = opts || {};
   if (!nativeBinding) {
     throw new Error(
       `[graphrefly/native] napi binding not loaded — build it with ` +
@@ -979,7 +1097,10 @@ function createNativeImpl() {
     Graph: class extends NativeGraph {
       constructor(name) {
         const bench = native.BenchGraph.fromCore(state.core, name);
-        super(bench, state.core, state.registry);
+        // D292 D.1: pass operators handle so `graph.derived(name, deps, fn)`
+        // can reroute through `registerUserDerived` (TSFN-backed user
+        // closures). Without this the derived() method throws.
+        super(bench, state.core, state.registry, undefined, state.operators);
       }
     },
 
@@ -1373,29 +1494,85 @@ function createNativeImpl() {
   // Modern (Node 22+): `await using impl = createNativeImpl();`
   // auto-calls close() at block exit via Symbol.asyncDispose.
   //
-  // D292 WATCH: the `.catch(() => {})` swallows actor errors silently
-  // for backward-compat with the parity harness's prior `_dispose`
-  // shape (afterEach ignored errors). For the new PUBLIC `close()`
-  // surface this loses error visibility — a future close() failure
-  // (network-attached storage tier timeout, async-commit panic
-  // propagation) is hidden from the JS caller. D292's lifecycle
-  // design session should lock whether `impl.close()` rejects on
-  // actor errors (cleaner; matches Promise contract) or stays
-  // swallow-silent (safer for cleanup paths). Until then this
-  // preserves the no-throw cleanup contract every existing caller
-  // relies on.
+  // D292 D.3 Item 2 + F2 (cross-cutting panic-propagation contract):
+  // reject on actor errors. Pre-D292 a `.catch(() => {})` swallowed
+  // actor errors for backward-compat with the parity harness's prior
+  // `_dispose` afterEach shape; with F4's `_dispose` removal, the
+  // swallow has no justification. Users who want silent cleanup wrap
+  // in `try { await impl.close(); } catch { /* swallow */ }`. Every
+  // napi method that posts to the actor MUST surface actor panics as
+  // rejected Promises with a payload-string error message (F2);
+  // `wrapper.js` MUST NOT `.catch(() => {})` any actor error.
+  //
+  // D292 D.3 Item 4 (close-waits / drain): close awaits the actor
+  // shutdown which internally takes the join lock. In-flight async
+  // ops (commit/rollback, async describes, etc.) resolve before the
+  // worker thread exits because the actor's op queue is FIFO — any
+  // op posted before shutdown is processed before the worker breaks
+  // out of its loop. **R4 caveat:** a stuck user closure inside an
+  // in-flight op blocks the drain; wrap in `Promise.race([impl.close(),
+  // timeoutMs])` if bounded close time matters.
+  //
+  // D292 D.3 Item 1: also unregister from the FinalizationRegistry
+  // so a GC after explicit close doesn't trigger a second shutdown
+  // attempt (which would be an idempotent no-op via actor.shutdown's
+  // flag swap, but cleaner to unregister than rely on idempotency).
   impl.close = async () => {
-    await state.core.close().catch(() => {});
+    _coreFinalizer.unregister(impl);
+    await state.core.close();
   };
   // Symbol.asyncDispose wiring (Node 22+; older Node silently
   // ignores Symbol-keyed properties on a plain object).
   impl[Symbol.asyncDispose] = impl.close;
-  // Internal disposal hook for the parity harness (per-test fresh
-  // Core). `_dispose` is an alias for `close()` per D293 Q1b — the
-  // semantic change (`_dispose` now also kills the actor) is safe
-  // because all prior `_dispose` callers were test-end / lifecycle-
-  // end patterns (verified by grep, D293 /qa pre-lock).
-  impl._dispose = impl.close;
+  // D292 F4 (value #1, pre-1.0): `_dispose` parity-only alias dropped.
+  // The parity harness now calls `close()` directly (see
+  // `~/src/graphrefly-ts/packages/parity-tests/impls/rust.ts` afterEach).
+
+  // D292 D.3 Item 1 — register with the FinalizationRegistry so a GC
+  // of `impl` without explicit close() routes shutdown off-libuv
+  // via `BenchCore::finalize_async`. The held value is the raw
+  // `state.core` napi handle — it survives the JS impl's GC because
+  // the finalizer captures it. The `unregisterToken` is `impl` itself
+  // so an explicit close() can unregister (avoid double-fire).
+  _coreFinalizer.register(impl, state.core, impl);
+
+  // D292 D.3 Item 5: `autoCloseOnBeforeExit` opt-in safety net. Default
+  // is OFF (respects user agency; pre-1.0 semantic stays unlocked;
+  // opt-in is non-breaking to widen later if consumer pressure
+  // surfaces). README's "Closing a NativeImpl" section documents the
+  // 3-condition rubric (R5 refinement) for when to enable this.
+  //
+  // Detach the handler on explicit `close()` so `await impl.close()`
+  // followed by process exit doesn't double-fire (idempotent shutdown
+  // makes the double-fire harmless, but the listener detach is cleaner
+  // — keeps the process listener-count audit clean for callers that
+  // monitor process events).
+  if (opts.autoCloseOnBeforeExit) {
+    const userClose = impl.close;
+    const handler = () => {
+      // `beforeExit` is sync; the close Promise drains async on the
+      // tokio runtime. Node holds the process open until in-flight
+      // microtasks complete, so this Promise IS awaited even though
+      // we don't return it from the handler.
+      userClose().catch((e) => {
+        // R5/F2 carve-out: beforeExit is a safety-net path, NOT a
+        // user-initiated close. A rejection here MUST surface
+        // (console.error) — silent swallow would defeat F2's whole
+        // point — but it cannot reject the Promise contract because
+        // beforeExit handlers don't have one. console.error is the
+        // canonical surfacing for unhandled cleanup-path errors.
+        console.error('[graphrefly/native] close() during beforeExit failed:', e);
+      });
+    };
+    process.on('beforeExit', handler);
+    impl.close = async () => {
+      process.removeListener('beforeExit', handler);
+      await userClose();
+    };
+    // Refresh the Symbol.asyncDispose binding so `await using` runs
+    // the handler-detaching close, not the raw one.
+    impl[Symbol.asyncDispose] = impl.close;
+  }
 
   return impl;
 }

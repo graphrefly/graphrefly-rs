@@ -1396,20 +1396,70 @@ impl BenchCore {
         Ok(())
     }
 
-    /// **D293 (2026-05-25): renamed to [`Self::close`]; this is a
-    /// deprecated alias preserved for the parity harness's
-    /// `_dispose` hook and existing test cleanup callsites.** The
-    /// alias semantics are identical to `close()` (Q1b lock): both
-    /// drain subscriptions AND shut down the actor. Q1b verified
-    /// safe by grep — all 3 prior `dispose()` callers are test-end /
-    /// lifecycle-end patterns; none do dispose-then-use.
+    /// **D292 D.3 Item 1 — FinalizationRegistry-driven off-libuv
+    /// async shutdown.**
     ///
-    /// To be removed in D292's v0.1.0 minor bump (the `_dispose`
-    /// rename was always queued; D293 ships `close()` ahead so this
-    /// alias period is bounded).
+    /// JS-side `FinalizationRegistry` callbacks fire on the libuv
+    /// thread when `NativeImpl` is GC'd without an explicit `close()`.
+    /// Calling [`Self::close`] from that path would block the JS
+    /// event loop on `handle.join()` until the worker's current
+    /// closure completes (the D292 WATCH (i) hazard — visually
+    /// indistinguishable from the "process never exits" hang D293
+    /// closed). This method posts the entire shutdown work
+    /// (subscription drain + `actor.shutdown()`) to tokio's blocking
+    /// pool via [`napi::bindgen_prelude::spawn_blocking`] so the
+    /// libuv thread returns immediately and the join happens off-
+    /// thread.
+    ///
+    /// **Sync-fn-on-purpose:** FinalizationRegistry handlers should
+    /// not await (Node's finalizer machinery doesn't await Promises
+    /// returned from finalizer callbacks); returning unit here gives
+    /// the JS side a fire-and-forget hook.
+    ///
+    /// **Idempotency:** the underlying `actor.shutdown()` is
+    /// idempotent (D293) — a `finalize_async()` followed by an
+    /// explicit `close()` is a no-op on the actor side. The
+    /// subscription drain inside this method races with any prior
+    /// `close()` — that's fine because `subscriptions` is held under
+    /// a `parking_lot::Mutex` and `mem::take` is atomic: only one
+    /// caller wins the drain, the other observes the empty Vec.
+    ///
+    /// **Cargo regression:** `d292_finalize_async_off_libuv` pins
+    /// that calling `finalize_async` does NOT block (verified by
+    /// timing the sync return + observing the actor shutdown
+    /// completing asynchronously thereafter).
     #[napi]
-    pub async fn dispose(&self) -> Result<()> {
-        self.close().await
+    pub fn finalize_async(&self) {
+        // Clone the Arcs we need to move into the spawn closure.
+        // Mirrors `Self::close`'s drain pattern but routes through
+        // spawn_blocking instead of awaiting in-line.
+        let actor = Arc::clone(&self.actor);
+        let subs = Arc::clone(&self.subscriptions);
+        napi::bindgen_prelude::spawn_blocking(move || {
+            // Same drain shape as `close()` but synchronous — we're
+            // already on tokio's blocking pool, the actor.run inside
+            // a sync context needs a one-shot wait. Use the actor's
+            // sync surface to keep this self-contained.
+            let drained: Vec<Option<(NodeId, SubscriptionId)>> = {
+                let mut guard = subs.lock();
+                std::mem::take(&mut *guard)
+            };
+            if !drained.is_empty() {
+                // Best-effort: if the actor is already mid-shutdown
+                // (e.g., explicit `close()` raced), `run_sync` returns
+                // an error we ignore — the shutdown below still
+                // completes idempotently.
+                let _ = actor.run_sync(move |core| {
+                    for entry in drained.into_iter().flatten() {
+                        let (nid, sub_id) = entry;
+                        core.unsubscribe(nid, sub_id);
+                    }
+                });
+            }
+            // Idempotent — first caller does the work; concurrent
+            // shutdowns return early on the flag swap.
+            actor.shutdown();
+        });
     }
 
     /// Emit an i32 value on a state node.

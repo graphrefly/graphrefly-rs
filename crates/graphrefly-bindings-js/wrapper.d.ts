@@ -79,6 +79,29 @@ export interface NativeGraph {
   tryResolve(path: string): Promise<NativeNode<unknown> | undefined>;
   nameOf(node: NativeNode<unknown>): Promise<string | undefined>;
   state<T>(name: string, initial?: T): Promise<NativeNode<T>>;
+  /**
+   * **D292 D.1** — arbitrary-fn derived node via TSFN-backed
+   * `registerUserDerived` reroute + `bench.add`. The user `fn` receives
+   * the wave's per-dep batches and returns the wave's per-output values.
+   *
+   * **CLOSURE-CELL LIFETIME (R1 anti-pattern #5 watch):** the `fn` is
+   * retained in the graph's per-name closure-cell map. Eviction is wired
+   * to `graph.remove(name)`, `graph.destroy()`, and `impl.close()`
+   * cascade (F3 cross-cutting closure-cell registry teardown). **If
+   * substrate teardown ever evolves to fire outside those three paths**
+   * (e.g., a future GC-driven sweep, a `Core::trim_dead_nodes` primitive,
+   * etc.), update eviction wiring on the JS side — silently leaving the
+   * closure cell alive past the substrate node IS the foot-gun.
+   *
+   * **Trade-off vs OperatorOp paths:** arbitrary-fn derived nodes go
+   * through the generic TSFN dispatch and lose `OperatorOp::Map` /
+   * `Filter` / etc. optimizations. Same trade-off `impl.map` already
+   * takes per D263; this method extends it to `graph.derived(...)`.
+   *
+   * **2 napi crossings per call** (`registerUserDerived` + `bench.add`).
+   * The fused single-crossing variant (D292 Option C) is deferred per
+   * D196 consumer-pressure gate; non-breaking widening to add later.
+   */
   derived<T>(
     name: string,
     deps: ReadonlyArray<NativeNode<unknown>>,
@@ -379,19 +402,44 @@ export interface NativeImpl {
    * the `await using` block. Identical to {@link close}.
    */
   [Symbol.asyncDispose](): Promise<void>;
+}
+
+/**
+ * Options bag for {@link createNativeImpl} (D292 D.3 Item 5).
+ *
+ * All fields optional. Default behavior matches the pre-D292 surface:
+ * no `process.on('beforeExit')` safety net; users call `close()`
+ * explicitly (or use `await using` on Node 22+).
+ */
+export interface CreateNativeImplOptions {
   /**
-   * @internal Parity-harness disposal hook (per-test fresh Core).
+   * **D292 D.3 Item 5 (locked = B, default off):** when `true`,
+   * register a `process.on('beforeExit', () => impl.close())` safety
+   * net. Default `false`.
    *
-   * **D293 (2026-05-25):** alias for {@link close} per Q1b — both
-   * drain subscriptions AND shut down the actor. Preserved for
-   * existing `_dispose` callers (parity afterEach + 1 test cleanup);
-   * removed in D292's v0.1.0 minor bump.
+   * **See README "Closing a NativeImpl" → "When to opt in to
+   * `autoCloseOnBeforeExit`"** for the 3-condition rubric (R5
+   * refinement). Opt in ONLY when ALL three apply:
+   *
+   * 1. Your runtime fires `beforeExit` reliably (NOT under jest worker
+   *    pools with `isolate: false`, deno, browser/wasm, `process.exit()`
+   *    paths, or long-lived servers).
+   * 2. You can't sequence an explicit `await impl.close()` at the
+   *    right place (e.g., module-level singleton with no natural
+   *    teardown hook).
+   * 3. You accept that close-drain (Item 4) may block process exit
+   *    beyond expected timing.
+   *
+   * If any of the three doesn't hold, prefer `await using` (Node 22+)
+   * or explicit `try/finally`.
    */
-  _dispose?: () => Promise<void>;
+  autoCloseOnBeforeExit?: boolean;
 }
 
 /**
  * Construct a fresh async substrate surface (own BenchCore + registry).
  * Direct consumers call once; the parity harness calls per-test.
+ *
+ * @param opts See {@link CreateNativeImplOptions}.
  */
-export declare function createNativeImpl(): NativeImpl;
+export declare function createNativeImpl(opts?: CreateNativeImplOptions): NativeImpl;
