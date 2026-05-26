@@ -346,7 +346,47 @@ export interface NativeImpl {
   sha256Hex(input: string | Uint8Array): Promise<string>;
   sourceOpts(opts?: Record<string, unknown>): Record<string, unknown>;
 
-  /** @internal Parity-harness disposal hook (per-test fresh Core). */
+  /**
+   * **D293 (2026-05-25):** end-of-life surface — shuts down the Rust
+   * worker thread + frees the Node process to exit naturally.
+   *
+   * After `await impl.close()` returns:
+   * - The Rust worker thread has exited; `Core` has dropped.
+   * - The Node process is free to exit (no non-daemon thread blocking).
+   * - Subsequent method calls on this `impl` (or sub-surfaces — Graph,
+   *   Subscription) reject with `Error: CoreActor#N: worker thread
+   *   dropped before closure dispatch (actor is shut down or shutting
+   *   down)`.
+   *
+   * Idempotent: subsequent `close()` calls are best-effort no-ops.
+   *
+   * **JS-side ergonomics:**
+   * - Modern (Node 22+): `await using impl = createNativeImpl();`
+   *   auto-calls `close()` at block exit via [Symbol.asyncDispose].
+   * - Compat: `const impl = createNativeImpl(); try { ... } finally {
+   *   await impl.close(); }`.
+   *
+   * **Why required:** the napi binding spawns one non-daemon Rust
+   * worker thread per `BenchCore`; `std::thread::spawn` has no daemon
+   * concept on POSIX, so the thread blocks Node's process exit
+   * indefinitely without `close()` (test frameworks, CLI scripts,
+   * serverless cold-start, Lambda all hit this).
+   */
+  close(): Promise<void>;
+  /**
+   * **D293 (2026-05-25):** ES2024 explicit-resource-management
+   * (`await using`) wiring — Node 22+ auto-calls this at the end of
+   * the `await using` block. Identical to {@link close}.
+   */
+  [Symbol.asyncDispose](): Promise<void>;
+  /**
+   * @internal Parity-harness disposal hook (per-test fresh Core).
+   *
+   * **D293 (2026-05-25):** alias for {@link close} per Q1b — both
+   * drain subscriptions AND shut down the actor. Preserved for
+   * existing `_dispose` callers (parity afterEach + 1 test cleanup);
+   * removed in D292's v0.1.0 minor bump.
+   */
   _dispose?: () => Promise<void>;
 }
 

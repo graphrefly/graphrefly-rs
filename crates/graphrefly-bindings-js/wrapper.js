@@ -1361,10 +1361,41 @@ function createNativeImpl() {
     sourceOpts,
   };
 
-  // Internal disposal hook for the parity harness (per-test fresh Core).
-  impl._dispose = async () => {
-    await state.core.dispose().catch(() => {});
+  // D293 (2026-05-25): public end-of-life surface for ALL napi
+  // consumers — closes the "process never exits" hang for test
+  // frameworks (vitest/jest/mocha), CLI scripts, serverless cold-start,
+  // and AWS Lambda. After `await impl.close()` returns, the Rust
+  // worker thread has exited and the Node process is free to exit
+  // naturally. Subsequent method calls on this `impl` (or any sub-
+  // surface — Graph, Subscription, etc.) reject with a clear
+  // "worker thread dropped" Error. See README "Closing a NativeImpl".
+  //
+  // Modern (Node 22+): `await using impl = createNativeImpl();`
+  // auto-calls close() at block exit via Symbol.asyncDispose.
+  //
+  // D292 WATCH: the `.catch(() => {})` swallows actor errors silently
+  // for backward-compat with the parity harness's prior `_dispose`
+  // shape (afterEach ignored errors). For the new PUBLIC `close()`
+  // surface this loses error visibility — a future close() failure
+  // (network-attached storage tier timeout, async-commit panic
+  // propagation) is hidden from the JS caller. D292's lifecycle
+  // design session should lock whether `impl.close()` rejects on
+  // actor errors (cleaner; matches Promise contract) or stays
+  // swallow-silent (safer for cleanup paths). Until then this
+  // preserves the no-throw cleanup contract every existing caller
+  // relies on.
+  impl.close = async () => {
+    await state.core.close().catch(() => {});
   };
+  // Symbol.asyncDispose wiring (Node 22+; older Node silently
+  // ignores Symbol-keyed properties on a plain object).
+  impl[Symbol.asyncDispose] = impl.close;
+  // Internal disposal hook for the parity harness (per-test fresh
+  // Core). `_dispose` is an alias for `close()` per D293 Q1b — the
+  // semantic change (`_dispose` now also kills the actor) is safe
+  // because all prior `_dispose` callers were test-end / lifecycle-
+  // end patterns (verified by grep, D293 /qa pre-lock).
+  impl._dispose = impl.close;
 
   return impl;
 }

@@ -78,7 +78,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -305,6 +305,25 @@ pub(crate) struct CoreActor {
     /// because `Arc::get_mut` is not generally callable on the last
     /// surviving Arc inside `Drop`.
     join: Mutex<Option<JoinHandle<()>>>,
+    /// D293 (2026-05-25): explicit-shutdown flag, checked by the worker
+    /// loop at the top of each iteration. Set to `true` exactly once by
+    /// [`Self::shutdown`] (or by [`Drop`]'s sender-swap path via the
+    /// channel close); the worker observes the flag (or `Err` from
+    /// `recv()`), breaks the loop, drops `Core` on its stack, and
+    /// exits. Wrapped in `Arc` because the worker holds its own clone.
+    ///
+    /// **Why a flag in addition to the existing sender-drop trigger?**
+    /// The sender-drop trigger only fires when the LAST `Arc<CoreActor>`
+    /// drops — JS-side GC of `BenchCore` is non-deterministic, so a
+    /// short-lived napi consumer (test framework, CLI script, serverless
+    /// cold-start) hangs the Node process indefinitely on the
+    /// non-daemon worker thread (`std::thread::spawn` has no daemon
+    /// concept on POSIX). The flag lets `BenchCore::close()` /
+    /// `Symbol.asyncDispose` trigger the same orderly shutdown that
+    /// `Drop` already performs, WITHOUT requiring the Arc to drop.
+    /// Closes the cross-track-ledger §1 "process never exits" hazard
+    /// for every napi consumer (D293 mint; v0.0.8).
+    shutdown_flag: Arc<AtomicBool>,
     /// Unique per-actor identity. Diagnostic only.
     generation: u64,
 }
@@ -319,6 +338,8 @@ impl CoreActor {
     pub(crate) fn spawn(binding: Arc<dyn BindingBoundary>) -> Arc<Self> {
         let (sender, receiver) = unbounded::<CoreClosure>();
         let generation = ACTOR_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&shutdown_flag);
         let join = std::thread::Builder::new()
             .name(format!("graphrefly-core-actor-{generation}"))
             .spawn(move || {
@@ -351,18 +372,31 @@ impl CoreActor {
                 // substrate's responsibility, and the substrate
                 // already discards partially-applied waves via the
                 // `BatchGuard` panic path (D065).
+                //
+                // D293 (2026-05-25): the `worker_flag` check at the
+                // top of each iteration is the explicit-shutdown gate.
+                // [`Self::shutdown`] sets the flag + sends a no-op
+                // wake closure; the worker pops the wake, observes the
+                // flag, breaks. Same exit path as the existing
+                // channel-disconnect (recv() Err) path — `core` drops
+                // on this stack, thread terminates, JoinHandle joins.
                 while let Ok(closure) = receiver.recv() {
+                    if worker_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                     let _ =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closure(&core)));
                 }
-                // Channel closed: all `Arc<CoreActor>` handles dropped.
-                // `core` drops here, on the worker's stack — single-
-                // owner invariant preserved.
+                // Channel closed OR shutdown flag observed: all
+                // `Arc<CoreActor>` handles dropped, OR an explicit
+                // shutdown was triggered. `core` drops here, on the
+                // worker's stack — single-owner invariant preserved.
             })
             .expect("CoreActor: failed to spawn worker thread");
         Arc::new(Self {
             sender,
             join: Mutex::new(Some(join)),
+            shutdown_flag,
             generation,
         })
     }
@@ -384,13 +418,19 @@ impl CoreActor {
     {
         let (sender, receiver) = unbounded::<CoreClosure>();
         let generation = ACTOR_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&shutdown_flag);
         let join = std::thread::Builder::new()
             .name(format!("graphrefly-core-actor-{generation}"))
             .spawn(move || {
                 let core = make_core();
                 // Panic isolation (QA fix 2026-05-20, Blind Hunter M1)
-                // — see `spawn` above for the rationale.
+                // + D293 (2026-05-25) shutdown-flag gate — see `spawn`
+                // above for the rationale.
                 while let Ok(closure) = receiver.recv() {
+                    if worker_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                     let _ =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closure(&core)));
                 }
@@ -399,6 +439,7 @@ impl CoreActor {
         Arc::new(Self {
             sender,
             join: Mutex::new(Some(join)),
+            shutdown_flag,
             generation,
         })
     }
@@ -443,9 +484,16 @@ impl CoreActor {
             let _ = tx.send(result);
         });
         self.sender.send(closure).map_err(|_| {
+            // D293 (2026-05-25): error parenthetical broadened from
+            // "(actor shutdown raced with napi call)" to "(actor is
+            // shut down or shutting down)" — covers both the original
+            // race (Drop trigger) AND the new explicit-shutdown path
+            // ([`Self::shutdown`]) introduced by D293. Both produce
+            // the same observable behavior at this layer (channel
+            // disconnect), so one message covers both.
             napi::Error::from_reason(format!(
                 "CoreActor#{generation}: worker thread dropped before closure dispatch \
-                 (actor shutdown raced with napi call)"
+                 (actor is shut down or shutting down)"
             ))
         })?;
         // Bridge the sync `Receiver::recv()` into the async context via
@@ -505,9 +553,11 @@ impl CoreActor {
             let _ = tx.send(result);
         });
         self.sender.send(closure).map_err(|_| {
+            // D293 (2026-05-25): broadened parenthetical — see
+            // [`Self::run`] above for the same edit's rationale.
             napi::Error::from_reason(format!(
                 "CoreActor#{generation}: worker thread dropped before sync closure dispatch \
-                 (actor shutdown raced with napi call)"
+                 (actor is shut down or shutting down)"
             ))
         })?;
         rx.recv().map_err(|_| {
@@ -546,28 +596,130 @@ impl CoreActor {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// D293 (2026-05-25): explicit, idempotent shutdown of the worker
+    /// thread. Used by [`BenchCore::close`] to terminate the worker
+    /// WITHOUT requiring the last `Arc<CoreActor>` to drop — companion
+    /// classes (`BenchGraph`, `BenchOperators`, `BenchStorage*`,
+    /// `BenchReactive*`) hold their own clones, so Arc-refcount-zero
+    /// is non-deterministic and often "never" in short-lived consumers
+    /// (test frameworks, CLI scripts, serverless cold-start). Without
+    /// this, the non-daemon worker thread keeps the Node process alive
+    /// indefinitely (cross-track-ledger §1 "process never exits"
+    /// hazard).
+    ///
+    /// **Mechanism (deliberately mirrors `Drop`'s shape):**
+    /// 1. Set the [`Self::shutdown_flag`] (swap-and-check makes this
+    ///    idempotent — only the FIRST caller does the work; subsequent
+    ///    callers return early).
+    /// 2. Post a no-op wake closure so the worker, which is typically
+    ///    parked in `receiver.recv()`, returns from `recv()` and
+    ///    observes the flag at the top of its next iteration.
+    /// 3. Take + join the `JoinHandle` so this method only returns
+    ///    after the worker has actually exited (and `core` has dropped
+    ///    on the worker's stack).
+    ///
+    /// **Post-shutdown behavior:**
+    /// - Subsequent [`Self::run`] / [`Self::run_sync`] /
+    ///   [`Self::dispatch_detached`] calls observe the receiver-drop
+    ///   via `sender.send(...)` returning `SendError` →
+    ///   `napi::Error::from_reason("CoreActor#N: worker thread dropped
+    ///   before closure dispatch (actor is shut down or shutting
+    ///   down)")`. The error type is plain `napi::Error`; the parity
+    ///   `Impl` contract surfaces it as a JS-side `Error` rejection.
+    /// - `Drop for CoreActor` is idempotent against a prior
+    ///   `shutdown()` — the flag swap returns true, the join handle is
+    ///   `None`, and the sender-swap-and-drop becomes a no-op
+    ///   (channel already disconnected via the worker exit).
+    ///
+    /// # D292 WATCH items (out of scope for D293)
+    /// - **Drop-running-join on the libuv thread.** Today `Drop` (and
+    ///   therefore this `shutdown`) calls `handle.join()`
+    ///   synchronously. If `BenchCore` is GC'd on the libuv JS thread,
+    ///   `Drop for CoreActor` blocks the event loop until the worker's
+    ///   current closure completes. D292's lifecycle design session
+    ///   should consider async-shutdown-from-finalizer (e.g.,
+    ///   `FinalizationRegistry`-driven `napi::bindgen_prelude::spawn`
+    ///   of the join).
+    /// - **Idempotency race on join.** If TWO callers race
+    ///   `shutdown()`, the second observes `swap → true` and returns
+    ///   IMMEDIATELY — even though the first caller's `handle.join()`
+    ///   may still be in flight. For BenchCore's call pattern this is
+    ///   fine (only one BenchCore instance drives shutdown), but a
+    ///   future caller wanting "wait for shutdown to fully complete"
+    ///   would need a separate `Condvar` / one-shot signal. Tracked
+    ///   for D292.
+    pub(crate) fn shutdown(&self) {
+        // Idempotency check: first caller advances the flag false →
+        // true and does the work; subsequent callers observe the prior
+        // value as true and return early. `AcqRel` ordering pairs with
+        // the worker's `Acquire` load + the join's release semantics.
+        if self.shutdown_flag.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Wake the worker out of `receiver.recv()` so it observes the
+        // flag at the top of the next loop iteration and exits. The
+        // no-op closure does nothing if the worker happens to be
+        // executing a closure right now (the post is buffered; worker
+        // pops it after the current closure returns, checks the flag,
+        // breaks). If the send itself fails (worker already exited via
+        // some other path), the join below still completes — the wake
+        // is a best-effort optimization, not a correctness requirement.
+        let _ = self.sender.send(Box::new(|_| {}));
+        // Take + join the worker. This is what makes `shutdown()` a
+        // synchronous "the thread is dead and `core` has dropped"
+        // promise. `parking_lot::Mutex` is non-poisoning so `lock().
+        // take()` is safe even if a prior `shutdown()` panicked.
+        if let Some(handle) = self.join.lock().take() {
+            // Best-effort: a thread-level panic indicates a Rust bug
+            // (every closure is wrapped in `catch_unwind` per the
+            // worker loop above), not a misuse. Surfacing it here
+            // would force callers to handle a panic during a cleanup
+            // path — unhelpful.
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Drop for CoreActor {
     fn drop(&mut self) {
-        // Replace `sender` with a sender from a brand-new disconnected
-        // channel — the original Sender drops immediately, closing the
-        // worker's receive side; the worker's `recv()` returns `Err`,
-        // the loop exits, `core` drops on the worker stack, and the
-        // thread terminates. Field-destructor order (sender → join)
-        // would join BEFORE closing the channel (infinite block);
-        // explicit swap-and-drop sidesteps that. Then `join` for a
-        // deterministic shutdown (no zombie worker outliving the
-        // actor's JS-visible lifetime). `parking_lot::Mutex` is
-        // non-poisoning so `lock().take()` is safe inside `Drop`.
+        // D293 (2026-05-25): delegate to the explicit `shutdown()`
+        // path. `shutdown()` is idempotent — if `BenchCore::close()`
+        // already ran it, this is a no-op (the swap returns true, the
+        // JoinHandle is None). If it didn't, this `Drop` is the only
+        // shutdown trigger (the pre-D293 behavior). Either way the
+        // worker exits cleanly and `core` drops on the worker's stack.
+        //
+        // **Why ALSO drop the sender via the swap-and-drop pattern?**
+        // The `shutdown()` flag + wake-closure mechanism is the
+        // primary trigger, but a defensive sender-drop guarantees the
+        // worker exits even if (a) the wake-closure send fails
+        // somehow, or (b) a future refactor moves the flag-check
+        // somewhere the worker can't observe. The sender-swap pattern
+        // (replace with a throwaway, then let the old sender drop)
+        // avoids the field-destructor-order trap that would otherwise
+        // join BEFORE the channel closes.
+        //
+        // # D292 WATCH — Drop-running-join on libuv thread
+        // If `BenchCore` is GC'd on the libuv JS thread (a real path
+        // — napi-rs invokes the `napi_class` finalizer on libuv when
+        // the JS object is collected), this `Drop` blocks the JS
+        // event loop on `handle.join()` until the worker's current
+        // closure completes. For long-running closures (a stuck JS
+        // packer callback inside `bridge_sync`, a deep wave drain)
+        // this surfaces as a frozen UI / unresponsive Node process
+        // — visually indistinguishable from the very hang D293 is
+        // trying to fix. D292's lifecycle design session should lock
+        // an async-shutdown-from-finalizer pattern (e.g., FRegistry
+        // → `napi::bindgen_prelude::spawn`) so finalizers post the
+        // shutdown work off-thread.
+        self.shutdown();
         let (throwaway, _) = unbounded::<CoreClosure>();
         drop(std::mem::replace(&mut self.sender, throwaway));
+        // `shutdown()` already took + joined the handle. If a future
+        // refactor changes that, this defensive take-and-join is the
+        // safety net. Today this is a guaranteed no-op (None).
         if let Some(handle) = self.join.lock().take() {
-            // Best-effort: a worker panic was already surfaced via the
-            // outstanding `run()` reply-channel error (post-M1 the
-            // worker loop's catch_unwind isolates each closure; a
-            // thread-level panic indicates a Rust bug, not a JS
-            // misuse).
             let _ = handle.join();
         }
     }
@@ -575,11 +727,13 @@ impl Drop for CoreActor {
 
 // `CoreActor` MUST be Send + Sync — it's stored inside `Arc<...>` on
 // the `Bench*` napi wrappers, which napi-rs requires `Send + Sync` for
-// (the JS object can be referenced from any tokio worker). Both fields
+// (the JS object can be referenced from any tokio worker). All fields
 // satisfy: `crossbeam_channel::Sender<T> where T: Send` is Send + Sync;
 // `parking_lot::Mutex<Option<JoinHandle<()>>>` is Send + Sync;
-// `u64` is Send + Sync. The auto-derived bounds hold; no manual impl
-// needed. Compile-time check below:
+// `Arc<AtomicBool>` is Send + Sync (D293, 2026-05-25 — the
+// shutdown_flag is shared with the worker thread); `u64` is Send +
+// Sync. The auto-derived bounds hold; no manual impl needed.
+// Compile-time check below:
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<CoreActor>();

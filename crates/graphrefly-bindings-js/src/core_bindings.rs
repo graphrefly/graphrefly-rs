@@ -1313,38 +1313,103 @@ impl BenchCore {
         Ok(())
     }
 
-    /// Drain all retained subscriptions through the actor — JS code
-    /// MUST `await core.dispose()` before letting `BenchCore` drop.
-    /// Closes the BenchCore::Drop deadlock vector (Slice Y): without
-    /// `dispose`, GC of the napi instance runs `Drop` on the JS thread;
-    /// each unsubscribe would post to the actor and *not* be able to
-    /// `.await` (Drop is sync). The actor's worker thread would still
-    /// run the work fire-and-forget, but the JS thread would have
-    /// already moved on without ensuring terminal-cascade TSFNs
-    /// flushed. Calling `dispose` first guarantees the JS thread waits
-    /// for the cascade to settle.
+    /// **D293 (2026-05-25):** the canonical end-of-life method for
+    /// `BenchCore`. Drains all retained subscriptions through the
+    /// actor, THEN shuts the actor down (joins the worker thread).
+    /// After `close()` returns:
     ///
-    /// Idempotent: subsequent calls are no-ops once the vec is drained.
+    /// - The Rust worker thread has exited; `Core` has dropped on its
+    ///   stack.
+    /// - The Node process is free to exit (no non-daemon thread
+    ///   blocking).
+    /// - Subsequent method calls on this `BenchCore` (or any companion
+    ///   class sharing the same `Arc<CoreActor>`) return a napi
+    ///   `Error` with text `"CoreActor#N: worker thread dropped before
+    ///   closure dispatch (actor is shut down or shutting down)"` —
+    ///   surfaced as a JS `Error` rejection to `await` callers.
+    ///
+    /// Idempotent: subsequent `close()` calls are best-effort no-ops
+    /// (the subscriptions vec is already empty; `CoreActor::shutdown`
+    /// returns immediately on the second call).
+    ///
+    /// **JS-side ergonomics:**
+    /// - Modern (Node 22+): `await using impl = createNativeImpl();`
+    ///   auto-calls `close()` at block exit via the
+    ///   `[Symbol.asyncDispose]` wired up in the JS wrapper.
+    /// - Compat: `const impl = createNativeImpl(); try { ... } finally
+    ///   { await impl.close(); }`.
+    ///
+    /// **Why `close()` is required, not optional:** the napi binding
+    /// spawns one non-daemon worker thread per `BenchCore` (via
+    /// [`crate::core_actor::CoreActor::spawn`]); Rust's
+    /// `std::thread::spawn` has no daemon concept on POSIX, so the
+    /// thread blocks Node's process exit until either (a) the last
+    /// `Arc<CoreActor>` drops (non-deterministic JS GC; often
+    /// "never" in short-lived consumers), or (b) `close()` is called
+    /// explicitly. Test frameworks (vitest/jest/mocha), CLI scripts,
+    /// serverless cold-start, and AWS Lambda all hit this without
+    /// `close()`.
+    ///
+    /// # D292 WATCH (out of scope for D293)
+    /// - **Drop-running-join on libuv thread.** See
+    ///   [`crate::core_actor::CoreActor::shutdown`]'s doc comment for
+    ///   the full context. D292's lifecycle design should consider
+    ///   async-shutdown-from-finalizer so libuv-thread GC of
+    ///   `BenchCore` doesn't block the event loop on the worker join.
+    /// - **Wrapper-side silent error swallow.** The `wrapper.js`
+    ///   `impl.close` does `.catch(() => {})` on the underlying
+    ///   `state.core.close()` promise — preserves backward-compat
+    ///   with the prior `_dispose` shape (parity harness already
+    ///   ignored errors) but loses error visibility for the new
+    ///   public `close()` surface. D292 should decide whether
+    ///   `impl.close()` rejects on actor errors (cleaner) or stays
+    ///   swallow-silent (safer for cleanup paths).
     #[napi]
-    pub async fn dispose(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         // Take the entire Vec out on the calling thread (cheap — Vec
         // pointer swap). Post the entire drain as one actor closure so
-        // we don't pay one round-trip per subscription.
+        // we don't pay one round-trip per subscription. Drain BEFORE
+        // shutdown so the unsubscribes actually fire (post-shutdown
+        // the actor would reject the closure with the channel-disconnect
+        // error and the subs would leak).
         let subs: Vec<Option<(NodeId, SubscriptionId)>> = {
             let mut guard = self.subscriptions.lock();
             std::mem::take(&mut *guard)
         };
         if !subs.is_empty() {
-            self.actor
+            // Best-effort: if the actor is already mid-shutdown (race
+            // with a prior `close()` from a companion class), ignore
+            // the error and proceed to ensure shutdown completes.
+            let _ = self
+                .actor
                 .run(move |core| {
                     for entry in subs.into_iter().flatten() {
                         let (nid, sub_id) = entry;
                         core.unsubscribe(nid, sub_id);
                     }
                 })
-                .await?;
+                .await;
         }
+        // Shut down the actor: drops sender, joins worker thread,
+        // `core` drops on the worker stack. Idempotent.
+        self.actor.shutdown();
         Ok(())
+    }
+
+    /// **D293 (2026-05-25): renamed to [`Self::close`]; this is a
+    /// deprecated alias preserved for the parity harness's
+    /// `_dispose` hook and existing test cleanup callsites.** The
+    /// alias semantics are identical to `close()` (Q1b lock): both
+    /// drain subscriptions AND shut down the actor. Q1b verified
+    /// safe by grep — all 3 prior `dispose()` callers are test-end /
+    /// lifecycle-end patterns; none do dispose-then-use.
+    ///
+    /// To be removed in D292's v0.1.0 minor bump (the `_dispose`
+    /// rename was always queued; D293 ships `close()` ahead so this
+    /// alias period is bounded).
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        self.close().await
     }
 
     /// Emit an i32 value on a state node.
