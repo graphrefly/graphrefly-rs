@@ -3925,10 +3925,36 @@ impl BatchGuard<'_> {
                 // Slice E2 /qa Q2(b) (D069): same panic-discard discipline
                 // for the eager-wipe queue. A panic-discarded wave drops
                 // queued `wipe_ctx` fires silently; the binding-side
-                // `NodeCtxState` entry remains until the next successful
-                // terminate-with-no-subs cycle (or until `Core` drops).
-                // This mirrors D061's external-resource-cleanup gap and
-                // is documented similarly.
+                // `NodeCtxState` entry remains across the rolled-back
+                // batch.
+                //
+                // **D296 (2026-05-26) — dropping the queue here is the
+                // CORRECT behavior post-D291, NOT a leak.** When a
+                // batch panics:
+                //
+                // 1. `restore_wave_terminal_snapshots` (above, D291)
+                //    resets `rec.terminal = None` — the lifecycle did
+                //    NOT end; the terminal was rolled back.
+                // 2. Per **R2.4.6**, `wipe_ctx` fires "on resubscribable
+                //    terminal RESET" — when a terminal lifecycle
+                //    COMPLETES, not when one was attempted-and-aborted.
+                // 3. Per **R4.3.2** atomicity (post-rollback observable
+                //    state ≡ pre-batch observable state), the binding's
+                //    `NodeCtxState` entry is the pre-batch lifecycle
+                //    that CONTINUES post-rollback — firing `wipe_ctx`
+                //    here would violate the cross-side R4.3.2 contract.
+                //
+                // The D291 deferred-scope's original framing of this as
+                // a D061-style leak was reframed by the D296 HALT
+                // premise check; the existing `mem::take` was already
+                // honest under R2.4.6 + R4.3.2. D296 ships
+                // [`tests/d296_pending_wipes_rollback.rs`] as a
+                // regression pin so a future refactor of
+                // `Core::terminate_node` / this discard path /
+                // `wave_terminal_snapshots` can't silently break the
+                // wipe-NOT-fired + ctx-preserved symmetry. See also
+                // [`crates/graphrefly-core/src/boundary.rs`]
+                // `BindingBoundary::wipe_ctx` (R2.4.6 contract).
                 let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
                 (
                     pending,
