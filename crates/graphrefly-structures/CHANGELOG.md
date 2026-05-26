@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-structures-v0.0.7...graphrefly-structures-v0.0.8) - 2026-05-26
+
+### Fixed
+
+- update batch binding
+- reactive structure clean up
+
+### Other
+
+- *(D272)* family-1 sink Arc<dyn Fn> → Rc<dyn Fn> + drop 12 clippy-allow
+
 ## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-structures-v0.0.6...graphrefly-structures-v0.0.7) - 2026-05-21
 
 ### Added

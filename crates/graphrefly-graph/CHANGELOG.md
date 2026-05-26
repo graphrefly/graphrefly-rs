@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-graph-v0.0.7...graphrefly-graph-v0.0.8) - 2026-05-26
+
+### Added
+
+- *(bindings-js)* D286 — BenchGraph::tag_factory + ::resource_profile napi + wrapper exposure
+- *(graph)* D285 — Graph::tag_factory + Graph::resource_profile substrate (R3.1.2 + R3.6.3)
+
+### Fixed
+
+- update batch binding
+- *(D279)* snapshot orphan-leak fix + describe sentinel-shape converge-to-TS
+- snapshots
+- clean up
+
+### Other
+
+- *(D278)* E-i+ii+iv doc-hygiene batch (Commit 1 of 3 — 4 keeps)
+- doc-hygiene cleanup (audit L4-001/L4-002/L1-001/L8-001/L8-002/L8-003)
+- *(D272)* family-1 sink Arc<dyn Fn> → Rc<dyn Fn> + drop 12 clippy-allow
+
 ## [0.0.7](https://github.com/graphrefly/graphrefly-rs/compare/graphrefly-graph-v0.0.6...graphrefly-graph-v0.0.7) - 2026-05-21
 
 ### Added
