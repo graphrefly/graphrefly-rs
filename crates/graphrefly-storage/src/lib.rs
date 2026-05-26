@@ -6,32 +6,16 @@
 //! lands here via [`redb`](https://docs.rs/redb), which provides
 //! pure-Rust ACID transactions without a C dependency.
 //!
-//! # Status (M4.D — 2026-05-11)
+//! # Status
 //!
-//! - [`wal`] — WAL frame substrate + canonical-JSON SHA-256 checksum
-//!   (DS-14-storage Q1 + Q5 locks).
-//! - [`error`] — [`StorageError`] / [`RestoreError`] / [`RestoreResult`].
-//! - [`codec`] — [`Codec`] trait + [`JsonCodec`] (canonical-JSON encoding,
-//!   parity with TS `jsonCodec`).
-//! - [`backend`] — [`StorageBackend`] trait + [`MemoryBackend`] +
-//!   [`memory_backend`] factory.
-//! - [`tier`] — [`BaseStorageTier`] + typed sub-traits ([`SnapshotStorageTier`],
-//!   [`AppendLogStorageTier`], [`KvStorageTier`]).
-//! - [`memory`] — concrete generic structs `SnapshotStorage` / `AppendLogStorage`
-//!   / `KvStorage` + factories `memory_snapshot` / `memory_append_log` /
-//!   `memory_kv`.
-//! - [`file`] (feature `file`) — [`FileBackend`] + [`file_backend`] factory +
-//!   atomic-rename `write` via `tempfile` + percent-encoded filenames
-//!   (byte-identical to TS `fileBackend`).
-//! - [`redb`] (feature `redb-store`) — [`RedbBackend`] + [`redb_backend`]
-//!   factory + ACID per-write transactions via [`redb::Database`]. Structurally
-//!   closes F1 (pending retry-safety at tier level) + F3 (concurrent flush
-//!   race).
+//! M4 complete: tier dispatch, WAL, codecs, memory + file backends,
+//! `attach_storage` reactive flush driver, durability/error/rollback
+//! contracts (D268–D270). See `docs/migration-status.md` and
+//! `docs/porting-deferred.md` for remaining storage follow-ons.
 //!
-//! - [`graph_integration`] — Graph-level storage integration (M4.E2):
-//!   `attach_snapshot_storage`, `restore_snapshot`, snapshot diff engine,
-//!   `GraphCheckpointRecord`. Free functions (D170) because `graphrefly-graph`
-//!   does not depend on this crate.
+//! Key modules: [`wal`], [`tier`], [`memory`], [`file`] (feature `file`),
+//! [`redb`] (feature `redb-store`), [`graph_integration`] (snapshot attach /
+//! restore — consumed from `graphrefly-graph`).
 
 #![warn(rust_2018_idioms, unreachable_pub)]
 #![warn(clippy::pedantic)]

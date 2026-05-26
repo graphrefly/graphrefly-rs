@@ -3181,10 +3181,7 @@ impl Core {
     /// # Panics
     ///
     /// Panics if the node is non-resubscribable AND has terminated
-    /// ([`SubscribeError::TornDown`], R2.2.7.b). (Pre-D274 a partition-
-    /// order violation was a second panic case; D274 deleted the
-    /// `PartitionOrderViolation` variant since groups are static
-    /// identity post-D248/D253 and the violation cannot fire.)
+    /// ([`SubscribeError::TornDown`], R2.2.7.b).
     #[allow(clippy::needless_pass_by_value)] // Sink is `Rc<dyn Fn>` (D272); we clone for the subscribers map and call it directly. Taking by value matches the ergonomics callers expect.
     pub fn subscribe(&self, node_id: NodeId, sink: Sink) -> SubscriptionId {
         match self.try_subscribe(node_id, sink) {
@@ -3909,6 +3906,34 @@ impl Core {
             .and_then(|r| r.terminal)
     }
 
+    /// Returns the per-dep terminal slot for `child_id`'s dep at the
+    /// given dep `NodeId` — `Some(kind)` if cascaded-terminal, `None`
+    /// if live or if the dep isn't in `child_id`'s dep list. Mirrors
+    /// [`Self::is_terminal`] for the cascade-side state (`rec
+    /// .dep_records[idx].terminal`).
+    ///
+    /// **Visibility:** `#[doc(hidden)] pub` — D291 /qa A7 (2026-05-25).
+    /// Marked `pub` ONLY so the `d291_terminal_rollback.rs` integration
+    /// test (a separate compilation unit per Rust's `tests/` model)
+    /// can pin the per-dep slot directly — observing the downstream
+    /// re-fire effect alone wouldn't close the F2/BH11 gap. `#[doc(hidden)]`
+    /// flags it as NOT part of the public API surface; rustdoc skips
+    /// it, and no parity-tests `Impl` contract method shadows it (per
+    /// D196's consumer-pressure gate — there's no `nodeDepTerminalOf`
+    /// equivalent on `ImplNode`). The original intent was `pub(crate)`
+    /// (mirror [`Self::in_tick`]), but `pub(crate)` is inaccessible to
+    /// integration tests; if a future Impl widening adds the read API,
+    /// convert to plain `pub` (no breaking change, just drop the
+    /// `#[doc(hidden)]`).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dep_terminal_of(&self, child_id: NodeId, dep_node_id: NodeId) -> Option<TerminalKind> {
+        let state = self.lock_state();
+        let rec = state.nodes.get(&child_id)?;
+        let idx = rec.dep_index_of(dep_node_id)?;
+        rec.dep_records[idx].terminal
+    }
+
     /// Whether the node has wave-scoped DIRTY pending (a tier-1 message
     /// queued but the matching tier-3 settle has not yet flushed).
     /// `false` for unknown ids. Mostly useful for `describe()` status
@@ -4052,6 +4077,24 @@ impl Core {
             if s.require_node(id).terminal.is_some() {
                 continue; // Idempotent — already terminal.
             }
+            // D291: snapshot the terminal slot's `None` state for
+            // wave-rollback (R4.3.2 status-snapshot completeness). The
+            // idempotent guard above means we only reach here on a
+            // `None → Some(_)` transition; the snapshot set just records
+            // "this node's terminal slot mutated this wave," and
+            // `restore_wave_terminal_snapshots` (called from
+            // `BatchGuard::drop`'s panic-discard path) sets the slot back
+            // to `None`, releasing the ERROR-handle retain we take below
+            // (if any) lock-released.
+            //
+            // Gated on `in_tick`: outside a wave (e.g. shutdown teardown)
+            // no rollback is possible and the snapshot machinery is
+            // unused. Mirrors the `commit_emission` gate.
+            if self.in_tick() {
+                crate::batch::with_wave_state(|ws| {
+                    ws.wave_terminal_snapshots.insert(id);
+                });
+            }
             // Take a refcount share for the terminal slot so the error
             // handle outlives the binding-side intern's transient share.
             if let TerminalKind::Error(h) = t {
@@ -4132,19 +4175,45 @@ impl Core {
             for child_id in child_ids {
                 let dep_idx = s.require_node(child_id).dep_index_of(id);
                 let Some(idx) = dep_idx else { continue };
-                // Mark this child's per-dep terminal slot. Take a retain on
-                // the error handle for the slot share.
-                {
-                    let child = s.require_node_mut(child_id);
-                    if child.dep_records[idx].terminal.is_some() {
-                        // Idempotent — child already saw this dep terminate.
-                        continue;
-                    }
-                    child.dep_records[idx].terminal = Some(t);
+                // D291 /qa D1 (2026-05-25): order cascade-slot mutations
+                // `snapshot → retain → assign` to match the entry-block
+                // discipline at the top of this loop (lines ~4067-4090).
+                // Pre-fix the order was `assign → snapshot → retain`,
+                // which had two latent panic-edge hazards: (a) if the
+                // `with_wave_state` AHashSet insert panicked AFTER the
+                // slot was already `Some(t)`, restore would silently
+                // fail to revert (terminal-stuck); (b) if `retain_handle`
+                // panicked AFTER both, the snapshot would record "release
+                // h on restore" for a handle that was never retained,
+                // double-releasing the binding-side share. The atomic
+                // order is: idempotent guard → snapshot (records intent
+                // to restore) → retain (takes the binding-side share) →
+                // assign (slot owns the share). Any panic between steps
+                // leaves a consistent invariant.
+                //
+                // D291 /qa D2 (2026-05-25): key the snapshot on
+                // `(child_id, id)` — the dep's NodeId, NOT the dep_idx.
+                // A mid-batch `Core::set_deps(child_id, …)` regenerates
+                // `dep_records` and invalidates positional indexes;
+                // re-keying on dep NodeId lets restore re-resolve the
+                // (possibly-new) index via `child.dep_index_of(id)`.
+                // Pre-fix a set_deps-mid-batch + cascade-rollback would
+                // silently zero the WRONG dep's terminal slot (or skip
+                // via the `get_mut(idx) → None` branch).
+                let already_terminal = s.require_node(child_id).dep_records[idx].terminal.is_some();
+                if already_terminal {
+                    // Idempotent — child already saw this dep terminate.
+                    continue;
+                }
+                if self.in_tick() {
+                    crate::batch::with_wave_state(|ws| {
+                        ws.wave_dep_terminal_snapshots.insert((child_id, id));
+                    });
                 }
                 if let TerminalKind::Error(h) = t {
                     self.binding.retain_handle(h);
                 }
+                s.require_node_mut(child_id).dep_records[idx].terminal = Some(t);
                 // Auto-cascade gating: if all deps now terminal, push child
                 // onto the work queue with the chosen terminal.
                 //

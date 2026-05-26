@@ -1,4 +1,4 @@
-//! `GraphReFly` reactive data structures (M5.A — D177/D178/D179).
+//! `GraphReFly` reactive data structures (M5 — D177/D178/D179).
 //!
 //! Four reactive structures backed by pluggable backends, integrated at
 //! the Core level (no Graph dependency required):
@@ -17,6 +17,12 @@
 //!
 //! CRDT-backed variants (yrs / automerge / loro / diamond-types) are
 //! post-1.0 work, gated behind feature flags.
+//!
+//! # Status
+//!
+//! M5 complete (core + napi `BenchReactive*` parity). See
+//! `docs/migration-status.md` and `docs/porting-deferred.md` (F18/F19
+//! follow-ons).
 
 #![warn(rust_2018_idioms, unreachable_pub)]
 #![warn(clippy::pedantic)]

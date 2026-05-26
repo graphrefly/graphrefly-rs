@@ -983,6 +983,103 @@ function createNativeImpl() {
       }
     },
 
+    // D282 / D288 Path D / D289 / D290 — sync-handle batch with per-frame ctx.
+    //
+    // Opens a `BenchBatchContext` via `BenchCore::open_batch` (D289 napi);
+    // builds a JS-side `ctx` that dispatches `ctx.down(node, msg)` by tier
+    // into the corresponding `BenchBatchContext.down_*` method, reusing
+    // the existing handle-encoding helpers (`allocExternalHandle` +
+    // `registry.set`) so no encoding-logic dual-source-of-truth with
+    // `NativeNode.down`. On normal return: `benchCtx.commit()` flushes
+    // R4.3.5 drain + `fire_deferred`. On throw: `benchCtx.rollback()`
+    // runs `discard_wave_cleanup` + `restore_wave_cache_snapshots`
+    // (R4.3.2), then re-throws.
+    //
+    // **Per-frame lifetime (D288 Q3 / D290 QA F2 lock).** `closed` flips
+    // in an OUTER `finally` so it fires AFTER substrate cleanup
+    // (commit/rollback) regardless of throw path — mirrors pure-ts
+    // adapter's `try { legacy.batch(...) } finally { closed = true; }`
+    // shape. Every ctx method checks `closed` FIRST so a stashed-and-
+    // fired-late `ctx.down(...)` throws cleanly even if `benchCtx.commit()`
+    // itself threw. Pinned by Case 15a/15b `post-frame-ctx-throws`
+    // regressions.
+    async batch(fn) {
+      const benchCtx = state.core.openBatch();
+      let closed = false;
+      const ctx = {
+        down(node, msg) {
+          if (closed) throw new Error('BatchCtx used after batch frame closed');
+          const nodeId = node.inner;
+          const tier = msg[0];
+          if (tier === DATA) {
+            const h = state.core.allocExternalHandle();
+            state.registry.set(h, msg[1]);
+            benchCtx.downHandle(nodeId, h);
+          } else if (tier === COMPLETE) {
+            benchCtx.downComplete(nodeId);
+          } else if (tier === ERROR) {
+            const payload = msg[1];
+            if (typeof payload === 'number' && Number.isInteger(payload)) {
+              benchCtx.downErrorInt(nodeId, payload);
+            } else if (typeof payload === 'string') {
+              benchCtx.downErrorStr(nodeId, payload);
+            } else {
+              throw new Error(
+                `BatchCtx.down: ERROR payload must be i32 or string on native arm; ` +
+                  `got ${typeof payload} (D289 BenchBatchContext exposes downErrorInt / ` +
+                  `downErrorStr only — no downErrorHandle. Widen if a parity scenario needs it.)`,
+              );
+            }
+          } else if (tier === INVALIDATE) {
+            // QA F10 (D290): do NOT eager-update the JS-side cache
+            // mirror here. Inside batch, substrate buffers the INVALIDATE
+            // op until commit; on commit, the subscribe sink's TSFN
+            // callback fires the `_updateCache(undefined)` on its own
+            // (`wrapper.js:235-237`). On rollback, the substrate discards
+            // the op; no sink fires; the JS-side cacheValue must stay at
+            // the pre-batch value. Eagerly clearing it here broke rollback
+            // cache restoration even for subscribed nodes.
+            benchCtx.downInvalidate(nodeId);
+          } else if (tier === TEARDOWN) {
+            benchCtx.downTeardown(nodeId);
+          } else if (tier === PAUSE) {
+            benchCtx.downPause(nodeId, msg[1]);
+          } else if (tier === RESUME) {
+            benchCtx.downResume(nodeId, msg[1]);
+          } else if (tier === DIRTY || tier === RESOLVED) {
+            // Substrate-internal — DIRTY is queue plumbing, RESOLVED is
+            // what derived fns emit via FnResult; neither has a public
+            // emit API on BenchBatchContext (per D289 / index.d.ts).
+            throw new Error(
+              `BatchCtx.down: tier ${String(tier)} is substrate-internal on native arm; ` +
+                `no BenchBatchContext.down_* method exists (wrapper.js batch() ctx.down).`,
+            );
+          } else {
+            throw new Error(
+              `BatchCtx.down: unmapped tier ${String(tier)} ` +
+                `(wrapper.js batch() ctx.down — add a branch here if a new spec tier surfaces).`,
+            );
+          }
+        },
+      };
+      // QA F2 (D290): close-flag flips in outer `finally` so it fires
+      // AFTER substrate cleanup (commit/rollback) regardless of throw
+      // path. Mirrors pure-ts adapter shape; commit-throw (D289 tripwire)
+      // and rollback-throw both still set `closed=true` for stashed-ctx
+      // safety.
+      try {
+        try {
+          fn(ctx);
+        } catch (e) {
+          benchCtx.rollback();
+          throw e;
+        }
+        benchCtx.commit();
+      } finally {
+        closed = true;
+      }
+    },
+
     // Transform.
     // D263/D264 — `impl.map` reroutes through the generic
     // `register_user_derived` path so the resulting node carries the

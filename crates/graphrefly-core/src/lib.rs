@@ -12,13 +12,11 @@
 //! `EqualsMode::Identity` is a `u64` compare with zero FFI; user-fn
 //! invocation is the only mandatory boundary crossing per fn fire.
 //!
-//! # Status (2026-05-03)
+//! # Status
 //!
-//! M1 first slice — warm-up modules ([`message`], [`handle`], [`clock`],
-//! [`boundary`]). The dispatcher itself, batch engine, PAUSE/RESUME, and
-//! `set_deps` follow incrementally. See
-//! `~/src/graphrefly-ts/docs/implementation-plan.md` Phase 13.7 for the
-//! full slice plan; reference impl at
+//! M1 complete (dispatcher, batch/wave engine, PAUSE/RESUME, `set_deps`,
+//! lifecycle, partitioned concurrency). Track progress in
+//! `docs/migration-status.md`. TS reference prototype:
 //! `~/src/graphrefly-ts/src/__experiments__/handle-core/`.
 //!
 //! # Safety

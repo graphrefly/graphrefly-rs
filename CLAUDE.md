@@ -6,7 +6,7 @@
 
 | Repo | Path | Role |
 |------|------|------|
-| **graphrefly-rs** | this repo | **Future canonical implementation.** Cargo workspace + per-language bindings (napi-rs, pyo3, wasm-bindgen). Currently scaffold only. |
+| **graphrefly-rs** | this repo | **Rust substrate implementation** (M1–M5 complete). Cargo workspace + bindings: napi-rs (`@graphrefly/native`, published), pyo3 + wasm-bindgen scaffolds (M6 / deferred). Live tracker: `docs/migration-status.md`. |
 | **graphrefly** (spec) | `~/src/graphrefly` | `GRAPHREFLY-SPEC.md`, `COMPOSITION-GUIDE-*.md`, `formal/wave_protocol.tla`. **Behavior + protocol authority.** |
 | **graphrefly-ts** | `~/src/graphrefly-ts` | **Currently canonical TS impl.** Operational docs, roadmap, optimizations, skills, audit prep all live here. Migrates to a thin shim over napi-rs binding once Rust port reaches parity. |
 | **graphrefly-py** | `~/src/graphrefly-py` | Currently canonical PY impl. Migrates to a thin shim over pyo3 binding once Rust port reaches parity. |
@@ -114,13 +114,9 @@ Default `cargo build` excludes the bindings crates (they need their own toolchai
 
 ## Migration status
 
-Currently: **scaffold complete**, awaiting Phase 13.6 + Phase 14 lock-down in graphrefly-ts before M1 begins. See `docs/migration-status.md` for milestone tracking.
+**Substrate-complete (2026-05-25):** M1–M5 landed; `@graphrefly/native` published (hand-written async `createNativeImpl()` over napi `Bench*`); cross-arm parity active in graphrefly-ts. **Open:** M6 pyo3 (post-1.0), wasm-bindgen (consumer-pressure), D080 presentation async rebase, and items in `docs/porting-deferred.md`.
 
-The agreed sequence:
-1. Lock 13.6.A (spec amendments) in graphrefly-ts
-2. Lock Phase 14 design (DS-14 audit) in graphrefly-ts
-3. Skip 13.6.B + Phase 14 implementation in TS — fold into Rust port
-4. **Start M1 here** in graphrefly-rs
+**Do not duplicate milestone tables here** — see `docs/migration-status.md` (track-status snapshot at top) and `~/src/graphrefly-ts/docs/rust-port-decisions.md` (D193+).
 
 ## Design invariants (cross-language, non-negotiable)
 
@@ -234,7 +230,7 @@ These principles guide all sessions on this repo. They are **not** duplicated as
 
 ## Working with this repo
 
-- **Phase 13.6 audit** is in flight in graphrefly-ts. Do NOT pre-empt it by feeding handle-protocol artifacts into the audit session. After the audit closes, use the audit-input doc as a second-pass comparison.
+- **Phase 13.6.A** spec audit output is canonical in graphrefly-ts (`docs/implementation-plan-13.6-canonical-spec.md`). Rust port work uses `docs/research/handle-protocol-audit-input.md` as the core-vs-binding layer key; do not fork spec text here.
 - **Spec amendments** land in `~/src/graphrefly/GRAPHREFLY-SPEC.md` and `COMPOSITION-GUIDE-*.md` — never in this repo. Reference them; don't fork them.
 - **Optimization decisions** land in `~/src/graphrefly-ts/docs/optimizations.md` and `archive/optimizations/*.jsonl`. Cross-reference; don't duplicate.
 - **Session docs** for design discussions land in `~/src/graphrefly-ts/archive/docs/SESSION-*.md` with an entry in `archive/docs/design-archive-index.jsonl`. Same convention applies if a discussion solely concerns this repo's internals — but most strategic discussions span both repos and belong in graphrefly-ts.

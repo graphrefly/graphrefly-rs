@@ -4,12 +4,12 @@ Contributions welcome. This file is a brief pointer; the substantive setup and a
 
 ## Status before contributing
 
-graphrefly-rs is currently a **scaffold**. Active implementation is gated on Phase 13.6 (rules audit) and Phase 14 (op-log changesets) decision lock-down completing in [graphrefly-ts](https://github.com/graphrefly/graphrefly-ts). See [`docs/migration-status.md`](docs/migration-status.md) for milestone status.
+The **M1–M5 substrate** is implemented; [`@graphrefly/native`](crates/graphrefly-bindings-js/) is the published napi-rs package. **pyo3** (`graphrefly-bindings-py`) and **wasm-bindgen** (`graphrefly-bindings-wasm`) remain scaffolds until M6 / consumer pressure. See [`docs/migration-status.md`](docs/migration-status.md) for the live tracker and [`docs/porting-deferred.md`](docs/porting-deferred.md) for open follow-ons.
 
-If you want to help before M1 begins, the highest-leverage work is:
-- Reviewing the migration plan: [`SESSION-rust-port-architecture.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md)
-- Cross-checking the [TLA+ refinement](https://github.com/graphrefly/graphrefly-ts/blob/main/docs/research/handle-protocol.tla) against the canonical [`wave_protocol.tla`](https://github.com/graphrefly/graphrefly/blob/main/formal/wave_protocol.tla)
-- Filing Rust-port-specific concerns as issues against this repo
+High-leverage contribution paths today:
+- Closing a [`porting-deferred.md`](docs/porting-deferred.md) item with a parity scenario + napi binding (D196)
+- Cross-arm fixes surfaced by `pnpm test:parity` in [graphrefly-ts](https://github.com/graphrefly/graphrefly-ts)
+- Audit-dashboard findings in [`docs/audit/`](docs/audit/) (see migration-status open-findings roll-up)
 
 ## Quick start
 
@@ -20,7 +20,7 @@ cd graphrefly-rs
 # Install the toolchain (mise reads .mise.toml; rustup honors rust-toolchain.toml)
 mise trust && mise install
 
-# Verify the scaffold compiles
+# Verify the workspace compiles
 cargo check --workspace
 cargo nextest run --profile ci     # full suite incl. cascade_depth guards
 cargo clippy --workspace --all-targets

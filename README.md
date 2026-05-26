@@ -2,13 +2,13 @@
 
 Rust implementation of the [GraphReFly](https://graphrefly.dev) reactive graph protocol.
 
-**Status:** Scaffold (2026-05-03). Active implementation is pending the close of Phase 13.6 (rules audit) and Phase 14 (op-log changesets) decision lock-down in [graphrefly-ts](https://github.com/graphrefly/graphrefly-ts). See `archive/docs/SESSION-rust-port-architecture.md` in graphrefly-ts for the full migration plan.
+**Status:** Substrate-complete (2026-05-25). M1–M5 crates are implemented and gate-green; [`@graphrefly/native`](crates/graphrefly-bindings-js/) ships the async JS substrate (`createNativeImpl()`). Milestone tracker: [`docs/migration-status.md`](docs/migration-status.md). Migration plan: [`SESSION-rust-port-architecture.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) in graphrefly-ts.
 
 ## Architectural premise
 
 The Core operates entirely on opaque `HandleId` integers. Per-language SDK harnesses (napi-rs for JS, pyo3 for Python, wasm-bindgen for browser/edge) own the value-to-handle registry. Equals-substitution under `equals: 'identity'` is a u64 compare with zero FFI; user-fn invocation is the only mandatory boundary crossing per fn fire.
 
-This split is what makes the Rust port viable without losing language ergonomics. See `~/src/graphrefly-ts/docs/research/handle-protocol.tla` and the companion TS prototype at `src/__experiments__/handle-core/` for the validated cleaving plane.
+This split is what makes the Rust port viable without losing language ergonomics. See `~/src/graphrefly/formal/wave_protocol.tla` (canonical TLA+ spec) and `~/src/graphrefly-ts/docs/research/handle-protocol-audit-input.md` for the validated cleaving plane.
 
 ## Workspace layout
 
@@ -24,18 +24,20 @@ crates/
 └── graphrefly-bindings-wasm/     # WASM target (browser, Cloudflare Workers, Deno, Bun)
 ```
 
-## Distribution variants (planned)
+## Distribution
 
-Single source tree, multiple build profiles via Cargo features:
+**Published today:** `@graphrefly/native` (single Node-only package; per-platform `.node` binaries via napi-rs OIDC trusted publishing). All M1–M5 substrate features (core, graph, operators, storage, structures) are baked into one binary; the cargo `lite` / `standard` / `full` feature gates in `crates/graphrefly-bindings-js/Cargo.toml` exist for future split-bundle builds but no `@graphrefly/lite|standard|full` package ships yet.
+
+**Future bundle splits (deferred per D196 consumer-pressure gate):**
 
 | Variant | npm package | Approx size | Use case |
 |---|---|---:|---|
-| lite | `@graphrefly/lite` | ~400 KB / platform | Tracing injection, instrumentation, edge runtimes (via WASM) |
-| standard | `@graphrefly/standard` | ~1.4 MB / platform | Typical agent harnesses |
-| full | `@graphrefly/full` | ~3.5 MB / platform | Heavy server workloads with persistence + structures |
-| WASM lite/standard | `@graphrefly/lite-wasm`, `@graphrefly/standard-wasm` | ~250 KB / ~900 KB | Edge runtimes, browser |
+| lite | `@graphrefly/lite` *(not yet published)* | ~400 KB / platform | Tracing injection, instrumentation, edge runtimes (via WASM) |
+| standard | `@graphrefly/standard` *(not yet published)* | ~1.4 MB / platform | Typical agent harnesses |
+| full | `@graphrefly/full` *(not yet published)* | ~3.5 MB / platform | Heavy server workloads with persistence + structures |
+| WASM | `@graphrefly/wasm` *(deferred until a browser-Rust consumer surfaces)* | ~250–900 KB | Edge runtimes, browser |
 
-PyPI uses extras syntax: `pip install graphrefly[full]`.
+Python bindings (`graphrefly-bindings-py`, pyo3) are scaffolded but post-1.0 per the migration plan; no PyPI artifact yet.
 
 ## Setup
 
@@ -109,9 +111,10 @@ cd crates/graphrefly-bindings-wasm && wasm-pack build
 ## Spec sources
 
 - `~/src/graphrefly/GRAPHREFLY-SPEC.md` — protocol spec (canonical)
-- `~/src/graphrefly/COMPOSITION-GUIDE-{PROTOCOL,GRAPH,PATTERNS,SOLUTIONS}.md` — composition guides
-- `~/src/graphrefly/formal/wave_protocol.tla` — TLA+ spec; this workspace's invariants must verify against the same model
-- `~/src/graphrefly-ts/docs/research/handle-protocol.tla` — handle-protocol refinement of wave_protocol
+- `~/src/graphrefly/COMPOSITION-GUIDE.md` + `COMPOSITION-GUIDE-{PROTOCOL,GRAPH,PATTERNS,SOLUTIONS}.md` — composition guides (single + per-layer splits)
+- `~/src/graphrefly/formal/wave_protocol.tla` + `wave_protocol_MC.tla` (+ `_bufferall`, `_custom_equals`, `_equals_false` variants) — TLA+ spec; this workspace's invariants must verify against the same model
+- `~/src/graphrefly-ts/docs/research/handle-protocol-audit-input.md` — handle-protocol cleaving rationale (companion to the canonical TLA+ spec)
+- `~/src/graphrefly-ts/docs/cross-track-ledger.md` — single source of truth for any `Impl`-contract widening that couples this workspace to graphrefly-ts
 
 ## License
 

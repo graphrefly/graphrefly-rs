@@ -282,6 +282,13 @@ case "${GATE_CLIPPY_DENY:-1}" in
   *) CLIPPY_DENY=(-- -D warnings) ;;
 esac
 
+# Step 0 — D288 Q2 / D289 QA F2 tripwire-wiring hygiene check (fast;
+# fail before any expensive compile). Every `fn bridge_sync*` in the
+# bindings-js crate MUST call `assert_no_batch_handle(...)` somewhere
+# in its body. See `scripts/check-tripwire-wiring.sh` for rationale.
+rl_run "tripwire-wiring hygiene (D288 Q2 / D289 QA F2)" \
+  bash "$ROOT/scripts/check-tripwire-wiring.sh" || exit $?
+
 # Step 1 — formatting (fast; fail before any expensive compile).
 rl_run "rustfmt --check" \
   cargo fmt --all --check || exit $?

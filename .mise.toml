@@ -72,3 +72,18 @@ run = "scripts/gate.sh core"
 [tasks.run-logged]
 description = "Run ANY long command with a direct log + guaranteed terminal sentinel + self-timeout diagnostic. Usage: mise run run-logged -- <cmd>"
 run = "scripts/run-logged.sh"
+
+# ─── hygiene checks (fast, fail-loud, run as gate pre-steps) ────────
+# `check:tripwire-wiring` enforces the D288 Q2 invariant ("no sink fire
+# during BenchBatchContext handle dispatch") at the *wiring* level:
+# every `fn bridge_sync*` in `crates/graphrefly-bindings-js/src/*.rs`
+# MUST call `assert_no_batch_handle(...)` somewhere in its body. The
+# runtime invariant is pinned by the `assert_no_batch_handle_panics_
+# when_flag_set` cargo test; this catches the case where a future
+# binding adds a NEW bridge_sync* site and FORGETS the tripwire call —
+# silently invisible until exercised inside a held-batch window.
+# Rationale: D291 / D289 QA F2; see `docs/porting-deferred.md`.
+
+[tasks."check:tripwire-wiring"]
+description = "D288 Q2 / D289 QA F2: every fn bridge_sync* in bindings-js must call assert_no_batch_handle(...)"
+run = "scripts/check-tripwire-wiring.sh"

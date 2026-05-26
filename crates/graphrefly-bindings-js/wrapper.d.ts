@@ -22,6 +22,15 @@ export type Message<T = unknown> =
 export type UnsubFn = () => Promise<void>;
 export type SinkFn<T> = (msgs: ReadonlyArray<Message<T>>) => void;
 
+/**
+ * Per-frame batch context surfaced to `NativeImpl.batch`'s `fn` argument
+ * (D288 Q3 lock, D289 binding). Single-msg shape; do NOT stash — post-
+ * frame `down(...)` throws.
+ */
+export interface NativeBatchCtx {
+  down<T>(node: NativeNode<T>, msg: Message<T>): void;
+}
+
 export interface NativeNode<T> {
   subscribe(cb: SinkFn<T>): Promise<UnsubFn>;
   down(msgs: ReadonlyArray<Message<T>>): Promise<void>;
@@ -242,6 +251,20 @@ export interface NativeImpl {
   ): Promise<NativeNode<T>>;
 
   Graph: new (name: string) => NativeGraph;
+
+  /**
+   * Run `fn` inside an explicit batch frame (D282 / D288 Path D / D289).
+   *
+   * Opens a `BenchBatchContext` via `BenchCore::open_batch` and supplies
+   * a per-frame {@link NativeBatchCtx}. Successful return → `commit()`
+   * (R4.3.5 drain + `fire_deferred`); throw → `rollback()`
+   * (R4.3.2 `discard_wave_cleanup` + `restore_wave_cache_snapshots`),
+   * then re-throw.
+   *
+   * **Per-frame lifetime (D288 Q3 lock):** do NOT stash `ctx`. Post-frame
+   * `ctx.down(...)` throws `"BatchCtx used after batch frame closed"`.
+   */
+  batch(fn: (ctx: NativeBatchCtx) => void): Promise<void>;
 
   map<T, U>(src: NativeNode<T>, fn: (x: T) => U): Promise<NativeNode<U>>;
   filter<T>(src: NativeNode<T>, predicate: (x: T) => boolean): Promise<NativeNode<T>>;

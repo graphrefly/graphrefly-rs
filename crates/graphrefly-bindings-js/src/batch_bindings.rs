@@ -289,18 +289,34 @@ const _: () = {
 // the closure, breaking the per-frame-lifetime contract (Q3 lock).
 #[allow(clippy::needless_pass_by_value)]
 fn run_batch_loop(core: &Core, op_rx: Receiver<BatchOp>) {
-    // DECL ORDER LOAD-BEARING (D288 Q2 — closes Edge-Case-Hunter F5):
-    // `_handle_guard` MUST be declared BEFORE `guard_holder` so that on a
-    // Rollback-path panic, Rust's reverse-declaration drop order runs:
+    // DECL ORDER LOAD-BEARING for the ROLLBACK path (D288 Q2 — closes
+    // Edge-Case-Hunter F5): `handle_guard` MUST be declared BEFORE
+    // `guard_holder` so that on a Rollback-path panic, Rust's
+    // reverse-declaration drop order runs:
     //   1. `guard_holder` (substrate `BatchGuard`) drops first → takes
     //      the `std::thread::panicking()` branch of `BatchGuard::Drop`
     //      (`batch.rs:3832`) → `discard_wave_cleanup` (R4.3.2).
-    //   2. Then `_handle_guard` drops → clears `DURING_BATCH_HANDLE`.
-    // Reversing this would clear the tripwire BEFORE the substrate's
-    // panic-cleanup runs, leaving a window where a sink hook fired
-    // during `discard_wave_cleanup` could pass the tripwire check —
+    //   2. Then `handle_guard` drops → clears `DURING_BATCH_HANDLE`.
+    // Reversing the decl order would clear the tripwire BEFORE the
+    // substrate's panic-cleanup runs, leaving a window where a sink hook
+    // fired during `discard_wave_cleanup` could pass the tripwire check —
     // which is exactly the deadlock surface Q2 closes.
-    let _handle_guard = BatchHandleGuard::new();
+    //
+    // COMMIT PATH does the OPPOSITE — D291 (closes D290 Case 15a). On a
+    // successful commit, `BatchGuard::Drop`'s success path runs
+    // `drain_and_flush` + `fire_deferred` → TSFN-backed sinks (built via
+    // `subscribe_with_tsfn` → `bridge_sync_unit` at `core_bindings.rs:854`)
+    // → `assert_no_batch_handle(...)` tripwire. The tripwire's
+    // load-bearing surface is the ROLLBACK path's `discard_wave_cleanup`
+    // (a sink hook fired there is the deadlock vector); on the COMMIT
+    // path, sinks SHOULD fire (R4.3.5 coalescing) AND must not trip.
+    // We resolve this by explicit-dropping `handle_guard` BEFORE
+    // `guard_holder.take()` in `BatchOp::Commit` (see below) so
+    // `DURING_BATCH_HANDLE` is clear when `BatchGuard::Drop`'s success
+    // path fires sinks. The rollback path still relies on the decl-order
+    // reverse-drop because rollback never reaches the explicit-drop site
+    // (it `resume_unwind`s instead).
+    let handle_guard = BatchHandleGuard::new();
     let mut guard_holder = Some(core.begin_batch());
     while let Ok(op) = op_rx.recv() {
         match op {
@@ -328,11 +344,43 @@ fn run_batch_loop(core: &Core, op_rx: Receiver<BatchOp>) {
                 let _ = reply.send(result);
             }
             BatchOp::Commit { reply } => {
-                // Drop the guard → BatchGuard::Drop runs the success
-                // path (drain + fire_deferred + redrain-to-quiescence
-                // + clear_in_tick). After return, the BatchHandleGuard
-                // RAII (above) clears DURING_BATCH_HANDLE on this
-                // thread.
+                // D291 (closes D290 Case 15a): clear DURING_BATCH_HANDLE
+                // BEFORE dropping the BatchGuard so the success-path
+                // `fire_deferred` (R4.3.5 coalescing) doesn't trip the
+                // tripwire on TSFN-backed sinks routed through
+                // `bridge_sync_unit`. The tripwire's load-bearing surface
+                // is the ROLLBACK path's `discard_wave_cleanup` (reached
+                // via `resume_unwind` from `BatchOp::Rollback` or an
+                // unhandled inner-op panic) — that path still gets the
+                // tripwire armed because rollback never reaches this
+                // explicit drop site (it `resume_unwind`s; the decl-order
+                // reverse-drop in `run_batch_loop` ensures `guard_holder`
+                // drops first under unwind, with `handle_guard` still
+                // armed).
+                drop(handle_guard);
+                // D291 /qa A3 (2026-05-25): the parked-batch closure
+                // owns `guard_holder` until exactly one terminal arm
+                // (Commit or Rollback) consumes it; Rollback unwinds
+                // via `resume_unwind` and never reaches this site, so
+                // by construction `guard_holder.is_some()` here. A
+                // refactor that double-consumes via another path would
+                // silently no-op the drop → BatchGuard::Drop wouldn't
+                // run → success-path drain + `fire_deferred` skipped →
+                // silent data loss for the wave's pending DATA. Catch
+                // in debug.
+                debug_assert!(
+                    guard_holder.is_some(),
+                    "D288 Q3 / D291 /qa A3: BatchOp::Commit reached with \
+                     `guard_holder` already taken — invariant violated. \
+                     Each parked batch frame consumes its BatchGuard via \
+                     exactly ONE of {{Commit, Rollback}}; another arm \
+                     racing through (or a future refactor double-consuming) \
+                     would skip BatchGuard::Drop and silently drop the \
+                     wave's pending DATA."
+                );
+                // Now drop guard → BatchGuard::Drop runs the success path
+                // (drain + fire_deferred + redrain-to-quiescence +
+                // clear_in_tick) with DURING_BATCH_HANDLE clear.
                 drop(guard_holder.take());
                 let _ = reply.send(());
                 break;
@@ -1195,4 +1243,115 @@ mod tests {
             "BatchHandleGuard::Drop must clear the flag on panic"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Test 6 — D291 (closes D290 Case 15a): commit-path tripwire
+    // ordering. Pre-fix: `run_batch_loop`'s `BatchOp::Commit` arm did
+    // `drop(guard_holder.take())` with `_handle_guard` still alive →
+    // `BatchGuard::Drop` success path fires sinks via `fire_deferred`
+    // while `DURING_BATCH_HANDLE` is still set. The D289 acceptance
+    // test `sink_fire_zero_during_handle_then_drained_on_commit`
+    // PASSED because its Rust `Rc` sink does NOT route through
+    // `bridge_sync_unit` (where `assert_no_batch_handle` lives); the
+    // parity arm's TSFN-backed sinks exposed the divergence at
+    // `scenarios/core/batch-throw-rollback.test.ts` Case 15a.
+    //
+    // D291 fix: explicit `drop(handle_guard)` BEFORE
+    // `drop(guard_holder.take())` in the commit arm so the flag is
+    // clear when `fire_deferred` runs. Rollback path still arms the
+    // tripwire (decl-order reverse-drop on `resume_unwind`).
+    //
+    // This test pins the structural guarantee from the Rust side:
+    // install a substrate `Rc` sink that READS `DURING_BATCH_HANDLE`
+    // when fired and stashes the observed bool. After a clean commit,
+    // the sink MUST have observed `DURING_BATCH_HANDLE == false`.
+    // Pre-fix the flag would be `true` during the fire (and the parity
+    // arm's TSFN sink would have panicked through
+    // `assert_no_batch_handle`).
+    // -----------------------------------------------------------------
+    #[test]
+    fn d291_commit_path_clears_during_batch_handle_before_sinks_fire() {
+        let (bench, node) = make_bench_with_state(0);
+
+        // Install a sink that snapshots DURING_BATCH_HANDLE on every
+        // fire. The flag is a thread_local on the actor worker thread;
+        // the sink runs on that same thread, so the read is
+        // well-defined.
+        let observed_flag: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_sink = Arc::clone(&observed_flag);
+        bench
+            .actor
+            .run_sync(move |core| {
+                let sink: Sink = Rc::new(move |_msgs: &[graphrefly_core::Message]| {
+                    let flag = DURING_BATCH_HANDLE.with(Cell::get);
+                    observed_for_sink.lock().push(flag);
+                });
+                core.subscribe(NodeId::new(u64::from(node)), sink);
+            })
+            .expect("run_sync subscribe");
+        // Drain handshake fire (the subscribe handshake fires the sink
+        // once on the initial cached DATA pre-batch; that fire happens
+        // OUTSIDE any batch handle, so the snapshot is `false` — which
+        // is the post-fix invariant, but it's pre-batch noise we want
+        // to drop from the assertion window).
+        observed_flag.lock().clear();
+
+        // Open + drive + commit. Pre-fix: `BatchGuard::Drop`'s success
+        // path runs `fire_deferred` while `DURING_BATCH_HANDLE` is
+        // still set → snapshot records `true`. Post-fix: explicit
+        // `drop(handle_guard)` BEFORE `drop(guard_holder.take())` →
+        // snapshot records `false`.
+        let ctx = bench.open_batch().expect("open_batch");
+        ctx.down_int(node, 1).expect("down 1");
+        ctx.commit().expect("commit");
+
+        let snapshots = observed_flag.lock().clone();
+        assert!(
+            !snapshots.is_empty(),
+            "D291 sanity: sink must have fired at least once on the commit path"
+        );
+        for (i, flag) in snapshots.iter().enumerate() {
+            assert!(
+                !*flag,
+                "D291 violated: commit-path sink fire #{i} observed \
+                 DURING_BATCH_HANDLE == true. Pre-fix: `_handle_guard` \
+                 dropped AFTER `guard_holder.take()` left the flag set \
+                 across `BatchGuard::Drop`'s success-path `fire_deferred`, \
+                 panicking through `bridge_sync_unit::assert_no_batch_handle` \
+                 in the parity arm's TSFN-backed sinks. Snapshots: {snapshots:?}"
+            );
+        }
+
+        // Sanity — the substrate state mutation landed.
+        assert_eq!(cache_int(&bench, node), 1);
+    }
+
+    // NOTE — D291 rollback-path invariant ("DURING_BATCH_HANDLE stays
+    // armed across `BatchGuard::Drop`'s panic branch") is NOT pinned by
+    // its own cargo test. A direct test would need to observe the flag
+    // from inside `BatchGuard::Drop`'s panic-discard work, but:
+    //   - `std::panic::resume_unwind` (used by `BatchOp::Rollback`)
+    //     does NOT invoke the panic hook (stdlib contract), so the
+    //     hook-based snapshot mechanism that worked for Test 6 doesn't
+    //     fit here.
+    //   - `discard_wave_cleanup` deliberately does NOT fire sinks
+    //     (that's the whole point), so a substrate `Sink` can't observe
+    //     the rollback-path window.
+    //   - `OnInvalidate` cleanup hooks are panic-discarded silently
+    //     (D061), so a hook-side flag read never executes during
+    //     rollback.
+    // The invariant IS structurally pinned by:
+    //   1. The `DECL ORDER LOAD-BEARING` doc-comment in
+    //      `run_batch_loop` documenting why `handle_guard` is declared
+    //      BEFORE `guard_holder` (decl-order reverse-drop).
+    //   2. The commit-path explicit drop only clears the flag on the
+    //      commit branch; rollback's `resume_unwind` doesn't reach the
+    //      explicit drop.
+    //   3. The `assert_no_batch_handle_panics_when_flag_set` mechanism
+    //      test (above) verifies the Q2 tripwire's panic shape — so
+    //      any future refactor that accidentally clears the flag on
+    //      both branches would surface via the parity arm's TSFN sinks
+    //      panicking through `bridge_sync_unit::assert_no_batch_handle`
+    //      on the rollback-discard path (the exact deadlock surface Q2
+    //      closes).
 }

@@ -39,8 +39,8 @@
 //!   no poisoning; matches `producer_storage`'s flavor).
 //!
 //! - **Pre-baked derived fns.** `BuiltinFn` / `BuiltinBatchFn` enums.
-//!   Real JS-callback fns live on `BenchOperators` (TSFN-backed; M3
-//!   napi-rs operator parity).
+//!   User JS callbacks route through `BenchOperators` (TSFN-backed; M3
+//!   operator napi surface) or `register_user_derived` for dynamic rewire.
 //!
 //! - **Producer dispatch via `invoke_fn_with_core` (D245/D246-r5 / D256
 //!   reconciled).** `BindingBoundary::invoke_fn_with_core` was added to

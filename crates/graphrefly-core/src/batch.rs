@@ -229,6 +229,46 @@ pub(crate) struct WaveState {
     /// retains released. On wave abort, each cache slot is restored from
     /// the snapshot and the original retain transfers to the cache slot.
     pub(crate) wave_cache_snapshots: HashMap<NodeId, HandleId>,
+    /// D291: nodes whose `rec.terminal` slot transitioned `None → Some(_)`
+    /// during this wave (via [`Core::terminate_node`]). The set is the
+    /// snapshot — no payload because the idempotent guard in `terminate_node`
+    /// (`if rec.terminal.is_some() { continue; }`) means the only valid
+    /// transition is `None → Some`, so restore is unconditionally
+    /// `rec.terminal = None`. ERROR-tier `TerminalKind::Error(h)` retains
+    /// are released lock-released on restore (matches the
+    /// `wave_cache_snapshots` discipline — slot owns the retain, restore
+    /// transfers ownership to the releases vec).
+    ///
+    /// Closes the R4.3.2 status-snapshot completeness gap for terminal
+    /// tiers (cross-track-ledger §1 D282 row, D290 follow-on "Case 5"):
+    /// pre-D291 a `ctx.down(src, [COMPLETE])` inside `batch()` + throw
+    /// would clear the wave's pending DATA/COMPLETE messages via
+    /// [`Self::discard_wave_cleanup`] but leave `rec.terminal = Some(_)`,
+    /// silently rejecting any post-rollback emit on the same node
+    /// (substrate's terminal-state guard).
+    ///
+    /// **Refcount discipline:** the set itself holds no handles. On
+    /// restore, the pre-transition `rec.terminal` slot's owned handle
+    /// (`Some(TerminalKind::Error(h))` only — `Complete` has no payload)
+    /// is taken out of the slot and pushed into the releases vec; the
+    /// caller releases it after dropping the state lock.
+    pub(crate) wave_terminal_snapshots: AHashSet<NodeId>,
+    /// D291: per-dep terminal slots that transitioned `None → Some(_)`
+    /// during this wave. Mirrors [`Self::wave_terminal_snapshots`] for
+    /// the cascade-to-children case in [`Core::terminate_node`]
+    /// (`child.dep_records[idx].terminal = Some(t)`, same idempotent
+    /// guard at the dep-record level).
+    ///
+    /// **D291 /qa D2 (2026-05-25): keyed on `(child_id, dep_node_id)`**,
+    /// NOT `(child_id, dep_idx)`. A mid-batch `Core::set_deps(child_id,
+    /// …)` regenerates `dep_records` and invalidates positional
+    /// indexes; re-keying on the dep's `NodeId` lets restore re-resolve
+    /// the (possibly-new) index via `child.dep_index_of(dep_node_id)`.
+    /// Pre-fix a set_deps-mid-batch + cascade-rollback would silently
+    /// zero the WRONG dep's terminal slot. Restore sets the slot back
+    /// to `None`; ERROR-tier handles taken from the slot are released
+    /// lock-released.
+    pub(crate) wave_dep_terminal_snapshots: AHashSet<(NodeId, NodeId)>,
     /// Nodes that need an auto-Resolved at wave end if they don't receive
     /// a tier-3+ message from their own commit_emission. Populated by
     /// the RESOLVED child propagation in `commit_emission`. Drained by
@@ -402,6 +442,10 @@ impl WaveState {
         Self {
             deferred_handle_releases: Vec::new(),
             wave_cache_snapshots: HashMap::new(),
+            // D291: empty by construction at outermost wave start; both
+            // success + panic-discard paths drain.
+            wave_terminal_snapshots: AHashSet::new(),
+            wave_dep_terminal_snapshots: AHashSet::new(),
             pending_auto_resolve: AHashSet::new(),
             pending_pause_overflow: Vec::new(),
             pending_fires: AHashSet::new(),
@@ -518,6 +562,29 @@ fn wave_state_clear_outermost() {
              bypassed the drain (would leak retains into next wave's \
              binding). See /qa F4 (2026-05-10).",
             ws.wave_cache_snapshots.len()
+        );
+        // D291: same invariant for the terminal-slot snapshots. The set
+        // holds no handles directly, but its drain triggers ERROR-handle
+        // releases via `restore_wave_terminal_snapshots`; stale entries
+        // would either silently restore `rec.terminal = None` on an
+        // unrelated next wave (corrupting state) or skip a real release
+        // (leaking refcounts). Outermost `BatchGuard::drop` drains both
+        // on success (via [`Core::drain_wave_terminal_snapshots`]) and
+        // panic (via [`Core::restore_wave_terminal_snapshots`] from
+        // [`Self::discard_wave_cleanup`]).
+        debug_assert!(
+            ws.wave_terminal_snapshots.is_empty(),
+            "wave_state_clear_outermost: wave_terminal_snapshots non-empty \
+             at outermost wave start ({} entries) — prior BatchGuard::drop \
+             bypassed the drain (would corrupt next wave's terminal slots). \
+             See D291.",
+            ws.wave_terminal_snapshots.len()
+        );
+        debug_assert!(
+            ws.wave_dep_terminal_snapshots.is_empty(),
+            "wave_state_clear_outermost: wave_dep_terminal_snapshots non-empty \
+             at outermost wave start ({} entries). See D291.",
+            ws.wave_dep_terminal_snapshots.len()
         );
         debug_assert!(
             ws.deferred_handle_releases.is_empty(),
@@ -933,6 +1000,106 @@ impl Core {
             let current = std::mem::replace(&mut rec.cache, old_handle);
             if current != NO_HANDLE {
                 releases.push(current);
+            }
+        }
+        releases
+    }
+
+    /// D291: success-path drain for `wave_terminal_snapshots` +
+    /// `wave_dep_terminal_snapshots`. Called from [`BatchGuard::drop`]'s
+    /// success path (via the same wave-end drain that handles
+    /// [`Self::drain_wave_cache_snapshots`]). On commit the wave's
+    /// terminal mutations are kept, so this just clears the snapshot
+    /// sets without touching `rec.terminal` / dep-record slots — those
+    /// slots already own their ERROR-handle retains.
+    pub(crate) fn drain_wave_terminal_snapshots(ws: &mut WaveState) {
+        // D291 /qa A1 (2026-05-25): `AHashSet::clear()` on an empty set
+        // is O(1) — the prior `is_empty()` guards were dead pre-checks.
+        ws.wave_terminal_snapshots.clear();
+        ws.wave_dep_terminal_snapshots.clear();
+    }
+
+    /// D291: panic-path restore for `wave_terminal_snapshots` +
+    /// `wave_dep_terminal_snapshots`. Mirrors
+    /// [`Self::restore_wave_cache_snapshots`]: drains each snapshot,
+    /// resets the corresponding slot to `None`, and returns the
+    /// ERROR-tier `HandleId`s the caller must release lock-released.
+    ///
+    /// For each snapshotted node / `(node, dep_idx)`:
+    /// 1. Take the current `Option<TerminalKind>` value (expected
+    ///    `Some(_)` because the snapshot was inserted at the
+    ///    `None → Some(_)` transition).
+    /// 2. Set the slot back to `None`.
+    /// 3. If the taken value was `TerminalKind::Error(h)`, push `h`
+    ///    into the releases vec so the caller can drop the slot's
+    ///    retain after the state lock is released.
+    ///
+    /// A snapshotted entry whose `rec` no longer exists (orphaned by a
+    /// torn-down node) is silently skipped — no slot to restore.
+    pub(crate) fn restore_wave_terminal_snapshots(
+        &self,
+        s: &mut CoreState,
+        ws: &mut WaveState,
+    ) -> Vec<HandleId> {
+        let mut releases: Vec<HandleId> = Vec::new();
+        if !ws.wave_terminal_snapshots.is_empty() {
+            let snapshots = std::mem::take(&mut ws.wave_terminal_snapshots);
+            releases.reserve(snapshots.len());
+            for node_id in snapshots {
+                let Some(rec) = s.nodes.get_mut(&node_id) else {
+                    // D291 /qa A10 (2026-05-25): fail-loud in debug
+                    // builds — no in-tree code path tears down a node
+                    // mid-wave after its terminal slot was snapshotted,
+                    // so an orphaned snapshot indicates either a future
+                    // in-wave node-drop seam (currently absent) or a
+                    // missed refcount transfer in a future slice.
+                    // Silent skip would leak the ERROR retain held by
+                    // the (now-gone) slot.
+                    debug_assert!(
+                        false,
+                        "D291 invariant: snapshotted node {node_id:?} was torn down \
+                         mid-wave — restore can't release the ERROR retain held by \
+                         the slot. /qa F6."
+                    );
+                    continue;
+                };
+                if let Some(TerminalKind::Error(h)) = rec.terminal.take() {
+                    releases.push(h);
+                }
+                // R2.6.4 (Lock 6.F) auto-COMPLETE pre-pend semantics —
+                // see [`Core::teardown_inner`]. `has_received_teardown` is
+                // NOT snapshotted in this slice (D291 scope is the
+                // `terminal` slot per Case 5). Lift point: porting-deferred
+                // §"D291 deferred-scope".
+            }
+        }
+        if !ws.wave_dep_terminal_snapshots.is_empty() {
+            let snapshots = std::mem::take(&mut ws.wave_dep_terminal_snapshots);
+            releases.reserve(snapshots.len());
+            for (child_id, dep_node_id) in snapshots {
+                // D291 /qa D2 (2026-05-25): re-resolve the dep index by
+                // dep `NodeId` so a mid-batch `set_deps(child_id, …)`
+                // that regenerated `dep_records` doesn't zero the wrong
+                // slot. `dep_index_of` returns `None` if the dep has
+                // been removed entirely (rewire dropped it before
+                // rollback) — that's fine, no slot to restore;
+                // `set_deps`'s own refcount discipline already released
+                // the slot's retain when the dep was removed.
+                let Some(rec) = s.nodes.get_mut(&child_id) else {
+                    debug_assert!(
+                        false,
+                        "D291 invariant: snapshotted child {child_id:?} was torn down \
+                         mid-wave (dep {dep_node_id:?}) — restore can't release the \
+                         ERROR retain held by the slot. /qa F6."
+                    );
+                    continue;
+                };
+                let Some(idx) = rec.dep_index_of(dep_node_id) else {
+                    continue;
+                };
+                if let Some(TerminalKind::Error(h)) = rec.dep_records[idx].terminal.take() {
+                    releases.push(h);
+                }
             }
         }
         releases
@@ -3482,7 +3649,7 @@ impl Core {
     /// loses the ownership/nesting decision (a classic predicate-misuse
     /// bug).
     #[must_use]
-    fn in_tick(&self) -> bool {
+    pub(crate) fn in_tick(&self) -> bool {
         IN_TICK_OWNED.with(|s| s.get() == self.generation)
     }
 
@@ -3691,7 +3858,13 @@ impl BatchGuard<'_> {
     /// `fire_deferred` (so a re-entrant sink emit runs as a fresh owning
     /// wave).
     fn discard_wave_cleanup(&self) {
-        let (pending, pending_recycle, deferred_releases, restored_releases) = {
+        let (
+            pending,
+            pending_recycle,
+            deferred_releases,
+            restored_releases,
+            restored_terminal_releases,
+        ) = {
             let mut s = self.core.lock_state();
             // WaveState borrowed alongside state for panic-discard
             // cleanup. The WaveState borrow is per-thread, independent of
@@ -3720,6 +3893,13 @@ impl BatchGuard<'_> {
                 let _: DeferredJobs = std::mem::take(&mut ws.deferred_flush_jobs);
                 ws.pending_fires.clear();
                 let restored = self.core.restore_wave_cache_snapshots(&mut s, ws);
+                // D291: restore terminal slots that transitioned during
+                // this wave (closes Case 5 — R4.3.2 status-snapshot
+                // completeness). Returns ERROR-tier handles for
+                // lock-released release; the terminal slots own those
+                // retains pre-restore, so restore_terminal transfers
+                // ownership into this vec.
+                let restored_terminal = self.core.restore_wave_terminal_snapshots(&mut s, ws);
                 // clear_wave_state pushes batch-handle releases into
                 // ws.deferred_handle_releases, so take ws's queue AFTER
                 // the clear.
@@ -3750,7 +3930,13 @@ impl BatchGuard<'_> {
                 // This mirrors D061's external-resource-cleanup gap and
                 // is documented similarly.
                 let _: Vec<crate::handle::NodeId> = std::mem::take(&mut ws.pending_wipes);
-                (pending, pending_recycle, deferred_releases, restored)
+                (
+                    pending,
+                    pending_recycle,
+                    deferred_releases,
+                    restored,
+                    restored_terminal,
+                )
             })
         };
         // Lock dropped — release retains lock-released so the binding
@@ -3777,6 +3963,12 @@ impl BatchGuard<'_> {
             self.core.binding.release_handle(h);
         }
         for h in restored_releases {
+            self.core.binding.release_handle(h);
+        }
+        // D291: release ERROR-tier handles transferred out of restored
+        // terminal slots. Same lock-released discipline as
+        // `restored_releases` above.
+        for h in restored_terminal_releases {
             self.core.binding.release_handle(h);
         }
         // D1 patch (2026-05-09): clear the per-thread Slice G tier3
@@ -3853,7 +4045,7 @@ impl Drop for BatchGuard<'_> {
         // buffer::buffer`'s `notifier_sink`, the reactive-log `view`'s
         // internal sink) capture `MailboxEmitter` / `SinkEmitter` and
         // emit via `mailbox.post_emit(...)` instead of the pre-S2b
-        // `core.emit_or_defer(...)` direct-call. The post is supposed
+        // pre-S2b direct `Core::emit` (no mailbox). The post is supposed
         // to be drained by the wave's `drain_and_flush` loop (top-of-
         // iteration `is_runnable()` check), but `fire_deferred` runs
         // AFTER `drain_and_flush` exits. Same-thread same-wave: a
@@ -3866,7 +4058,7 @@ impl Drop for BatchGuard<'_> {
         // same-thread sink case D260 plugs.
         //
         // **Why iteration not nested recursion.** Pre-S2b, sinks
-        // captured `Core` directly and `core.emit_or_defer` ran a
+        // captured `Core` directly and synchronous emit ran a
         // *nested wave* per emit (recursive RAII; depth-first). D260's
         // iteration at the wave-end frontier coalesces all post-
         // `fire_deferred` mailbox ops into one outer wave (breadth-
@@ -3940,6 +4132,14 @@ impl Drop for BatchGuard<'_> {
                     // retains under lock, release lock-released below to avoid
                     // binding re-entrance under held mutex / borrow.
                     let snapshot_releases = Core::drain_wave_cache_snapshots(ws);
+                    // D291: success-path drain for terminal-slot snapshot
+                    // sets. The snapshot sets hold NO retains (slot owns
+                    // the ERROR-handle retain pre-snapshot AND post-commit
+                    // — the slot keeps it across the wave on commit); we
+                    // just clear the bookkeeping sets so the next wave
+                    // starts clean. Mirrors the placement of
+                    // `drain_wave_cache_snapshots`.
+                    Core::drain_wave_terminal_snapshots(ws);
                     // `drain_deferred` takes `deferred_flush_jobs` +
                     // `deferred_handle_releases` (incl. rotation releases pushed
                     // by `clear_wave_state` above) + Slice E2
