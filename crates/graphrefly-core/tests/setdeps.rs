@@ -510,3 +510,153 @@ fn dynamic_rewire_to_sentinel_dep_holds_until_dep_emits() {
     assert!(*calls.lock().unwrap() > calls_at_setup);
     assert_eq!(rt.cache_value(n), Some(TestValue::Int(50)));
 }
+
+// =====================================================================
+// D300 — topo_rank consumer cascade on set_deps (Q3, 2026-05-26)
+// =====================================================================
+//
+// Pre-D300: set_deps recomputed only n's own topo_rank; downstream
+// consumers carried stale ranks → pick_next_fire's O(|pending_fires|)
+// min-scan by topo_rank ordered them incorrectly (one extra no-op fire
+// settling on the next wave). Per Q3 user-locked Option 1 override of
+// D196 + the prior Slice U "set_deps is rarely called; lift if hot
+// path" defer-rationale, D300 BFS-walks s.children and recomputes
+// each visited consumer's topo_rank; cascades further if it changed.
+
+#[test]
+fn d300_set_deps_cascades_topo_rank_to_downstream_consumers() {
+    // Build chain a (rank 0) → b (rank 1) → c (rank 2) → d (rank 3).
+    // Build alt path a (rank 0) → x (rank 1) → y (rank 2) → z (rank 3).
+    // Rewire c from {b} to {z}: c.rank becomes max(z=3) + 1 = 4.
+    // d depends on c → d.rank MUST cascade from 3 to 5.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(1)));
+    let b = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let c = rt.derived(&[b], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let d = rt.derived(&[c], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+
+    let x = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let y = rt.derived(&[x], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let z = rt.derived(&[y], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+
+    // Pre-rewire ranks pinned.
+    assert_eq!(rt.core().topo_rank_of(a.id), Some(0));
+    assert_eq!(rt.core().topo_rank_of(b), Some(1));
+    assert_eq!(rt.core().topo_rank_of(c), Some(2));
+    assert_eq!(rt.core().topo_rank_of(d), Some(3));
+    assert_eq!(rt.core().topo_rank_of(z), Some(3));
+
+    // Rewire c from {b} to {z}.
+    rt.core().set_deps(c, &[z]).expect("rewire ok");
+
+    // n's own rank (c) recomputed by set_deps' existing line 5142.
+    assert_eq!(rt.core().topo_rank_of(c), Some(4));
+    // D300 cascade: d's rank should NOW be 5 (was 3 pre-cascade).
+    assert_eq!(
+        rt.core().topo_rank_of(d),
+        Some(5),
+        "D300 cascade: d's topo_rank must follow c's rank-change"
+    );
+}
+
+#[test]
+fn d300_set_deps_no_cascade_when_root_rank_unchanged() {
+    // Chain a (0) → b (1) → c (2). Alt: m (1) — same rank as b.
+    // Rewire c from {b} to {b, m}: c.rank = max(1, 1) + 1 = 2 — UNCHANGED.
+    // No downstream consumers, so no cascade either way; this test pins
+    // the early-exit when old_topo_rank == new_topo_rank.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(1)));
+    let b = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let c = rt.derived(&[b], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let m = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+
+    let c_rank_before = rt.core().topo_rank_of(c);
+    assert_eq!(c_rank_before, Some(2));
+
+    // Rewire c to depend on BOTH b and m (both rank 1).
+    rt.core().set_deps(c, &[b, m]).expect("rewire ok");
+
+    // c's rank unchanged.
+    assert_eq!(rt.core().topo_rank_of(c), Some(2));
+}
+
+#[test]
+fn d300_cascade_stops_at_consumer_whose_other_dep_dominates() {
+    // Chain: a (0), b (derived from a, rank 1), c (derived from b, rank 2).
+    // Alt:   z (derived from a, rank 1), w (derived from z, rank 2),
+    //        v (derived from w, rank 3).
+    // d depends on BOTH c (rank 2) AND v (rank 3) → d.rank = 4.
+    //
+    // Rewire c from {b} to {a}: c.rank becomes max(a=0) + 1 = 1
+    // (drops from 2 to 1).
+    //
+    // D300 cascade visits d. d's new rank = max(c=1, v=3) + 1 = 4 —
+    // UNCHANGED because v still dominates. Cascade stops; no further
+    // children of d need recomputing.
+    let rt = TestRuntime::new();
+    let a = rt.state(Some(TestValue::Int(1)));
+    let b = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let c = rt.derived(&[b], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let z = rt.derived(&[a.id], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let w = rt.derived(&[z], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let v = rt.derived(&[w], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+    let d = rt.derived(&[c, v], |deps| match &deps[0] {
+        TestValue::Int(n) => Some(TestValue::Int(*n)),
+        _ => None,
+    });
+
+    assert_eq!(rt.core().topo_rank_of(c), Some(2));
+    assert_eq!(rt.core().topo_rank_of(v), Some(3));
+    assert_eq!(rt.core().topo_rank_of(d), Some(4));
+
+    // Rewire c to depend on a directly: c.rank drops from 2 to 1.
+    rt.core().set_deps(c, &[a.id]).expect("rewire ok");
+
+    assert_eq!(rt.core().topo_rank_of(c), Some(1));
+    // d's new rank = max(c=1, v=3) + 1 = 4 — unchanged. Cascade
+    // recomputed but didn't propagate further.
+    assert_eq!(rt.core().topo_rank_of(d), Some(4));
+}

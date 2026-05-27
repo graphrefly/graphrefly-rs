@@ -3965,6 +3965,18 @@ impl Core {
             .map_or(0, |r| r.subscribers.len())
     }
 
+    /// Topological depth of `node_id` (1 + max dep `topo_rank`; 0 for
+    /// leaf state nodes / no deps; `None` for unknown ids).
+    ///
+    /// Used by [`Self::pick_next_fire`] for O(|pending_fires|)
+    /// glitch-free scheduling. Exposed publicly so consumers (and
+    /// integration tests) can verify the cascade behavior after
+    /// [`Self::set_deps`] (D300 / Q3, 2026-05-26 — consumer cascade).
+    #[must_use]
+    pub fn topo_rank_of(&self, node_id: NodeId) -> Option<u32> {
+        self.lock_state().nodes.get(&node_id).map(|r| r.topo_rank)
+    }
+
     /// Snapshot of `parent`'s meta companion list (R1.3.9.d / R2.3.3 —
     /// the companions added via [`Self::add_meta_companion`]). Empty
     /// for unknown ids or for nodes with no companions registered.
@@ -5133,9 +5145,11 @@ impl Core {
                 .saturating_add(1)
         };
         let fire_set_deps_on_rerun;
+        let old_topo_rank;
         {
             let rec = s.require_node_mut(n);
             fire_set_deps_on_rerun = rec.is_dynamic && rec.has_fired_once;
+            old_topo_rank = rec.topo_rank;
             rec.dep_records = new_dep_records;
             rec.topo_rank = new_topo_rank;
             // §10.13 perf (D047): recompute received_mask from new dep_records.
@@ -5179,6 +5193,73 @@ impl Core {
         }
         for &added_dep in &added {
             s.children.entry(added_dep).or_default().insert(n);
+        }
+
+        // 2b. (D300, Q3 — 2026-05-26) topo_rank consumer cascade. When
+        // n's topo_rank changes via set_deps, downstream consumers
+        // inherit a stale rank — `pick_next_fire`'s O(|pending_fires|)
+        // min-scan by `topo_rank` (Slice U) would order them
+        // incorrectly, producing one extra no-op fire that settles on
+        // the next wave. BFS through s.children, recompute each
+        // visited consumer's `topo_rank` from its current deps; cascade
+        // further if it changed. Worst case O(V) for the connected
+        // downstream component; common case bounded by topology depth.
+        //
+        // Per the verbatim `/porting-to-rs clear all the perf items
+        // and the deferred items. regardless if they need a valid
+        // consumer demand` directive (user-locked 2026-05-26 override
+        // of D196 + the prior Slice U "set_deps is rarely called; lift
+        // if hot path" defer-rationale at `porting-deferred.md` Slice
+        // U known limitations).
+        if old_topo_rank != new_topo_rank {
+            // Seed with direct children of n. Self-edges are
+            // structurally rejected at register / set_deps, so we
+            // don't need an explicit self-loop guard (mirrors the
+            // n's-own-rank computation above which uses the same
+            // `filter(|&&d| d != n)` pattern as defense-in-depth).
+            let mut worklist: VecDeque<NodeId> = s
+                .children
+                .get(&n)
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
+            let mut visited: HashSet<NodeId> = HashSet::default();
+            while let Some(child_id) = worklist.pop_front() {
+                if !visited.insert(child_id) {
+                    continue;
+                }
+                // Read child's current deps + old rank.
+                let (child_new_rank, child_old_rank) = {
+                    let Some(child_rec) = s.nodes.get(&child_id) else {
+                        continue;
+                    };
+                    let new_rank = child_rec
+                        .dep_records
+                        .iter()
+                        .filter(|dr| dr.node != child_id)
+                        .filter_map(|dr| s.nodes.get(&dr.node).map(|r| r.topo_rank))
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    (new_rank, child_rec.topo_rank)
+                };
+                if child_new_rank != child_old_rank {
+                    if let Some(child_rec) = s.nodes.get_mut(&child_id) {
+                        child_rec.topo_rank = child_new_rank;
+                    }
+                    // Cascade to grandchildren — only when rank actually
+                    // changed (early-exit prunes the BFS on the common
+                    // case where downstream ranks were already correct
+                    // because n's change was absorbed by another dep
+                    // with equal-or-greater rank).
+                    if let Some(grandchildren) = s.children.get(&child_id) {
+                        for &gc in grandchildren {
+                            if !visited.contains(&gc) {
+                                worklist.push_back(gc);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 3. Push-on-subscribe for added deps with cached DATA. Wraps in a

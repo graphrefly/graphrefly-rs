@@ -512,7 +512,17 @@ redb per-write ACID transactions (D163) serialize concurrent writers by MVCC des
 
 > **2026-05-26 doc-closure sweep.** D279 (M4.E1 follow-on, 2026-05-22) landed the pre-validation path per lift-option (a). `crates/graphrefly-graph/src/snapshot.rs:586-616` `create_state_nodes_recursive` now pre-validates every state name against `owner_graph.child_names()` and returns `SnapshotError::NameCollision` BEFORE any `register_state` call — no Core mutation on doomed restore. The original deferred entry was preserved in the active backlog by oversight (entry was added 2026-05-22 on M4.E1 close, but the immediate D279 fix should have struck it in the same pass); struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
-### `DescribeValue::Rendered(Value::Null)` is JSON-indistinguishable from `Option::None` (sentinel cache)
+### ~~`DescribeValue::Rendered(Value::Null)` is JSON-indistinguishable from `Option::None` (sentinel cache)~~ — RESOLVED 2026-05-22 (D279, E-ii.3)
+
+> **2026-05-26 doc-closure sweep follow-on (was missed in initial Stage 1 — surfaced by D299 premise check, no-op closure).** D279 (M4.E1 / E-ii.3, 2026-05-22) already landed the sentinel-companion shape matching TS pure-ts (`packages/pure-ts/src/core/meta.ts:14-17, 303`). `crates/graphrefly-graph/src/describe.rs:98-114` `NodeDescribe` has both `value: Option<DescribeValue>` (skip_serializing_if Option::is_none) AND `sentinel: Option<bool>` (skip_serializing_if Option::is_none). Population logic emits `sentinel: Some(true)` when `status == NodeStatus::Sentinel` and `None` otherwise. JSON shape:
+>
+> - Sentinel cache → `"sentinel": true` present, `"value"` key absent.
+> - Legitimate JSON-null user value → `"value": null` present, `"sentinel"` key absent.
+> - Any other value → `"value": <v>` present, `"sentinel"` key absent.
+>
+> Two cargo regression tests in `crates/graphrefly-graph/tests/describe.rs` pin the wire-shape (`d279_sentinel_cache_omits_value_key_and_sets_sentinel_flag`, `d279_rendered_value_null_keeps_value_key_and_omits_sentinel_flag`). The D299 (Q2) decision was a no-op closure — re-verifying-rather-than-implementing. Cross-track-ledger §2 row was added at D279 landing. Q2 Phase 1 premise verification (subagent 2 item 4) MISSED the D279 closure already documented in the file's rustdoc (`describe.rs:75-97`) — calibration class same as the user-flagged "stale-premise propagation" anti-pattern (caught during D296/D297 premise checks too). Original entry preserved below for the audit trail.
+
+### Original entry (kept for archive — pre-D279)
 
 - **What:** [crates/graphrefly-graph/src/describe.rs](../crates/graphrefly-graph/src/describe.rs) `NodeDescribe.value: Option<DescribeValue>` serializes:
   - `None` (sentinel cache, `NO_HANDLE`) → `"value":null`
