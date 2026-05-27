@@ -105,7 +105,16 @@ fn edges_emitted_in_dep_order_per_consumer() {
 }
 
 #[test]
-fn unnamed_dep_surfaces_as_anon_name() {
+fn unnamed_dep_surfaces_as_empty_string_per_d301() {
+    // D301 (Q4 user-locked Option B, 2026-05-26): unnamed deps render
+    // as empty string `""` for cross-impl wire-shape parity with TS
+    // pure-ts (`packages/pure-ts/src/core/meta.ts:257` —
+    // `node.name ?? ""`). Pre-D301 emitted `_anon_<NodeId.raw()>`.
+    // Loses Rust within-describe anon-dep disambiguation; no verified
+    // consumer at lock time (no parity scenario asserts deps[] equality
+    // cross-arm). Snapshot encode retains the `_anon_<rawid>` marker
+    // for decode-time diagnostic fidelity (D301 B.b persistence-vs-
+    // presentation distinction; see snapshot.rs:310 rustdoc).
     let (rt, g) = graph("system");
     // Register an anonymous Core node (no namespace entry).
     let raw = rt.core().register_state(HandleId::new(5), false).unwrap();
@@ -121,13 +130,17 @@ fn unnamed_dep_surfaces_as_anon_name() {
     .unwrap();
     let d = g.describe(rt.core());
     let nd = d.nodes.get("d").unwrap();
-    assert_eq!(nd.deps[0], format!("_anon_{}", raw.raw()));
+    assert_eq!(
+        nd.deps[0], "",
+        "D301 B: unnamed dep renders as empty string"
+    );
     assert_eq!(nd.deps[1], "named");
-    // The anon dep also surfaces in edges.
-    assert!(d
-        .edges
-        .iter()
-        .any(|e| e.from == format!("_anon_{}", raw.raw()) && e.to == "d"));
+    // The anon dep also surfaces in edges with empty-string `from`.
+    assert!(
+        d.edges.iter().any(|e| e.from.is_empty() && e.to == "d"),
+        "D301 B: edges() unnamed-dep `from` is empty string (both render \
+         sites converged: describe.rs:229 + graph.rs:1055)"
+    );
 }
 
 #[test]

@@ -279,7 +279,9 @@ fn edges_recursive_into_mounts() {
 }
 
 #[test]
-fn edges_cross_graph_dep_shows_as_anon() {
+fn edges_cross_graph_dep_shows_as_empty_string_per_d301() {
+    // D301 (Q4 user-locked Option B, 2026-05-26): unnamed deps render
+    // as `""` cross-arm. Pre-D301 emitted `_anon_<NodeId.raw()>`.
     let (rt, g) = graph("test");
     // Register a node through Core without naming it.
     let anon = rt.core().register_state(h(1), false).unwrap();
@@ -288,7 +290,7 @@ fn edges_cross_graph_dep_shows_as_anon() {
 
     let edges = g.edges(rt.core(), false);
     assert_eq!(edges.len(), 1);
-    assert!(edges[0].0.starts_with("_anon_"));
+    assert_eq!(edges[0].0, "", "D301 B: unnamed dep `from` is empty string");
     assert_eq!(edges[0].1, "d");
 }
 

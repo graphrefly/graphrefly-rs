@@ -87,8 +87,18 @@ pub enum NameError {
     Collision(String),
     #[error("Graph: name `{0}` may not contain the `::` path separator")]
     InvalidName(String),
-    #[error("Graph: name `{0}` uses the reserved `_anon_` prefix (collides with anonymous node describe format)")]
-    ReservedPrefix(String),
+    // D301 B.a (Q4 sub-decision, user-locked 2026-05-26): the
+    // `ReservedPrefix` variant rejecting user names starting with
+    // `_anon_` was dropped. Under D301 B's empty-string convergence,
+    // unnamed deps render as `""` (TS-conformant; pure-ts has no
+    // reserved prefix); the guard was vestigial — it had no
+    // functional purpose post-B because empty-string can't collide
+    // with any user name. Value #14 vestigial-cleanup precedent
+    // (D253/D266/D267 lineage) + value #10 spec authority (TS-
+    // conformant convergence). Under the explicit override of D196
+    // per `/porting-to-rs clear all the perf items and the deferred
+    // items. regardless if they need a valid consumer demand`
+    // directive.
     #[error("Graph: graph has been destroyed; further registration refused")]
     Destroyed,
 }
@@ -250,9 +260,15 @@ impl Graph {
     }
 
     /// Whether `name` is a legal local node/subgraph name.
+    ///
+    /// D301 B.a (Q4 sub-decision, 2026-05-26): the `_anon_` reserved-
+    /// prefix check was dropped along with [`NameError::ReservedPrefix`].
+    /// Empty-string render for unnamed deps (D301 B) can't collide
+    /// with any user name; the guard is vestigial. Mirrors pure-ts
+    /// (no reserved prefix).
     #[must_use]
     pub fn is_valid_name(name: &str) -> bool {
-        !name.contains(PATH_SEP) && !name.starts_with("_anon_")
+        !name.contains(PATH_SEP)
     }
 
     /// The graph's name as set at construction (or via `mount`).
@@ -806,10 +822,13 @@ impl Graph {
 // =====================================================================
 
 fn validate_name(name: &str) -> Result<(), NameError> {
+    // D301 B.a (Q4 sub-decision, 2026-05-26): `_anon_` reserved-prefix
+    // check dropped. Empty-string render for unnamed deps (D301 B)
+    // can't collide; the guard was vestigial. Mirrors pure-ts (no
+    // reserved prefix). See [`NameError`] doc-comment for the
+    // value-#14 / value-#10 rationale.
     if name.contains(PATH_SEP) {
         Err(NameError::InvalidName(name.to_owned()))
-    } else if name.starts_with("_anon_") {
-        Err(NameError::ReservedPrefix(name.to_owned()))
     } else {
         Ok(())
     }
@@ -1049,10 +1068,13 @@ pub(crate) fn edges_in(
     for (to_name, id) in &qualified {
         let dep_ids = core.deps_of(*id);
         for dep_id in dep_ids {
-            let from_name = names_map
-                .get(&dep_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{prefix}_anon_{}", dep_id.raw()));
+            // D301 (Q4 user-locked Option B, 2026-05-26): unnamed deps
+            // render as empty string (TS-conformant; pure-ts
+            // core/meta.ts:257 `node.name ?? ""`). Prefix is irrelevant
+            // for unnamed deps — bare `""` regardless of subgraph
+            // nesting. Both render sites (describe.rs:229 +
+            // graph.rs:1055) converge together per the D301 lock text.
+            let from_name = names_map.get(&dep_id).cloned().unwrap_or_default();
             result.push((from_name, to_name.clone()));
         }
     }

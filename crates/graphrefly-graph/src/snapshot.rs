@@ -298,6 +298,23 @@ fn snapshot_of_with_tree_paths(
         //     ANY graph) → `_anon_<rawid>` fallback (pre-D276 behavior,
         //     unchanged; decode still fails with `UnresolvableDeps`
         //     for these — not in M4.E1 scope).
+        //
+        // D301 B.b (Q4 sub-decision, 2026-05-26): persistence-vs-
+        // presentation distinction — snapshot encode KEEPS the
+        // `_anon_<rawid>` marker while describe (`describe.rs:229`,
+        // `graph.rs:1055`) converges to empty-string for TS parity.
+        // Rationale: the marker carries real consumer value at decode
+        // time. `SnapshotError::UnresolvableDeps` (snapshot.rs:84)
+        // formats as `"unresolvable deps for node `{0}` (deps: {1:?})"`
+        // — `{1:?}` is Debug-format of `Vec<String>`, preserving each
+        // `_anon_<rawid>` verbatim. Converging snapshot to `""` would
+        // degrade the diagnostic to `(deps: ["", ""])` — indistinguish-
+        // able collisions for multiple unresolvable anon deps.
+        // Describe is a presentation surface (cross-arm wire-shape
+        // parity matters more than per-NodeId disambiguation); snapshot
+        // is a persistence surface (decode-time diagnostic fidelity
+        // matters more than wire-shape parity to TS — which has its
+        // own analogous gap on the TS-snapshot side).
         let dep_ids = core.deps_of(*node_id);
         let deps: Vec<String> = dep_ids
             .iter()

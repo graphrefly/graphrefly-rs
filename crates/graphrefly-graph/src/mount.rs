@@ -68,7 +68,7 @@ impl From<NameError> for MountError {
     fn from(err: NameError) -> Self {
         match err {
             NameError::Collision(n) => Self::NodeNameCollision(n),
-            NameError::InvalidName(n) | NameError::ReservedPrefix(n) => Self::InvalidName(n),
+            NameError::InvalidName(n) => Self::InvalidName(n),
             NameError::Destroyed => Self::Destroyed,
         }
     }
