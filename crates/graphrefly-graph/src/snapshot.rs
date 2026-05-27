@@ -295,26 +295,40 @@ fn snapshot_of_with_tree_paths(
         //     tree → owner-relative path via [`PATH_SEP`] + `".."`
         //     segments (resolves via `Graph::try_resolve` on decode).
         // (3) anonymous dep (operator-internal NodeId with no name in
-        //     ANY graph) → `_anon_<rawid>` fallback (pre-D276 behavior,
-        //     unchanged; decode still fails with `UnresolvableDeps`
-        //     for these — not in M4.E1 scope).
+        //     ANY graph) → marker fallback; decode still fails with
+        //     `UnresolvableDeps` for these — not in M4.E1 scope.
         //
         // D301 B.b (Q4 sub-decision, 2026-05-26): persistence-vs-
-        // presentation distinction — snapshot encode KEEPS the
-        // `_anon_<rawid>` marker while describe (`describe.rs:229`,
-        // `graph.rs:1055`) converges to empty-string for TS parity.
-        // Rationale: the marker carries real consumer value at decode
-        // time. `SnapshotError::UnresolvableDeps` (snapshot.rs:84)
-        // formats as `"unresolvable deps for node `{0}` (deps: {1:?})"`
-        // — `{1:?}` is Debug-format of `Vec<String>`, preserving each
-        // `_anon_<rawid>` verbatim. Converging snapshot to `""` would
-        // degrade the diagnostic to `(deps: ["", ""])` — indistinguish-
-        // able collisions for multiple unresolvable anon deps.
-        // Describe is a presentation surface (cross-arm wire-shape
-        // parity matters more than per-NodeId disambiguation); snapshot
-        // is a persistence surface (decode-time diagnostic fidelity
-        // matters more than wire-shape parity to TS — which has its
-        // own analogous gap on the TS-snapshot side).
+        // presentation distinction — snapshot encode KEEPS a marker
+        // while describe (`NodeDescribe.deps` render site +
+        // `edges_in` render site, both in `graphrefly-graph::graph`)
+        // converges to empty-string for TS parity. Rationale: the
+        // marker carries real consumer value at decode time.
+        // [`SnapshotError::UnresolvableDeps`] formats as
+        // `"unresolvable deps for node `{0}` (deps: {1:?})"` — `{1:?}`
+        // is Debug-format of `Vec<String>`, preserving each marker
+        // verbatim. Converging snapshot to `""` would degrade the
+        // diagnostic to `(deps: ["", ""])` — indistinguishable
+        // collisions for multiple unresolvable anon deps. Describe is
+        // a presentation surface (cross-arm wire-shape parity matters
+        // more than per-NodeId disambiguation); snapshot is a
+        // persistence surface (decode-time diagnostic fidelity matters
+        // more than wire-shape parity to TS — which has its own
+        // analogous gap on the TS-snapshot side).
+        //
+        // **Marker format (post-QA, 2026-05-26):** `_anon::<{rawid}>`.
+        // The `::` is the canonical [`PATH_SEP`] which [`validate_name`]
+        // rejects → user-named nodes CANNOT register names containing
+        // `::`, so the marker is **structurally impossible** as a user
+        // node name. Pre-QA the marker was `_anon_<rawid>`, but D301
+        // B.a deleted [`NameError::ReservedPrefix`] (the guard that
+        // rejected user names starting with `_anon_`), creating an
+        // ambiguity where a user-named node `_anon_42` was
+        // indistinguishable from an unresolvable dep with
+        // `NodeId(42)` in `UnresolvableDeps` Debug-format. The
+        // canonical post-QA format restores marker uniqueness without
+        // re-adding the user-name guard (B.a's "true convergence"
+        // story preserved).
         let dep_ids = core.deps_of(*node_id);
         let deps: Vec<String> = dep_ids
             .iter()
@@ -324,7 +338,12 @@ fn snapshot_of_with_tree_paths(
                 } else if let Some(tree_path) = id_to_tree_path.get(dep_id) {
                     absolute_to_owner_relative(owner_path, tree_path)
                 } else {
-                    format!("_anon_{}", dep_id.raw())
+                    // D301 B.b post-QA marker format (2026-05-26): `::`
+                    // makes the marker structurally impossible as a
+                    // user node name (rejected by `validate_name`).
+                    // See the block comment above for the
+                    // B.a/B.b interaction rationale.
+                    format!("_anon::<{}>", dep_id.raw())
                 }
             })
             .collect();

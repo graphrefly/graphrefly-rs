@@ -114,14 +114,15 @@ pub struct NodeDescribe {
     pub sentinel: Option<bool>,
     /// Dep names in declaration order. **D301 (Q4 user-locked Option
     /// B, 2026-05-26):** unnamed deps render as the empty string `""`
-    /// matching TS pure-ts `Node._deps.map(d => d.node.name ?? "")`
-    /// (`packages/pure-ts/src/core/meta.ts:257`) — cross-impl wire-
+    /// matching TS pure-ts [`describeNode`]'s
+    /// `node._deps.map(d => d.node.name ?? "")` — cross-impl wire-
     /// shape parity. Pre-D301 Rust emitted `_anon_<NodeId>` which
-    /// leaked `NodeId`s + diverged from TS; the marker is retained at
-    /// the persistence surface (`snapshot.rs:310`) where decode-time
-    /// diagnostic fidelity (`SnapshotError::UnresolvableDeps`)
-    /// outweighs wire-shape parity. See D301 B.b decision-log entry
-    /// for the persistence-vs-presentation rationale.
+    /// leaked `NodeId`s + diverged from TS; a marker is retained at
+    /// the persistence surface ([`crate::snapshot::snapshot_of`])
+    /// where decode-time diagnostic fidelity
+    /// ([`crate::SnapshotError::UnresolvableDeps`]) outweighs
+    /// wire-shape parity. See D301 B.b decision-log entry for the
+    /// persistence-vs-presentation rationale.
     pub deps: Vec<String>,
     /// Operator discriminant (e.g. `"map"`); `None` for non-operators.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "operator")]
@@ -236,13 +237,13 @@ pub(crate) fn describe_of(
                 // D301 (Q4 user-locked Option B, 2026-05-26): unnamed
                 // deps render as empty string for cross-impl shape
                 // parity with TS pure-ts `Node._deps.map(d => d.node.name
-                // ?? "")` (packages/pure-ts/src/core/meta.ts:257). Pre-
-                // D301 Rust emitted `_anon_<NodeId>` which (a) leaked
-                // NodeIds into the wire shape and (b) diverged from TS.
-                // Loses Rust within-describe anon-dep disambiguation;
-                // no verified consumer at lock time. Upgrade to a
-                // bilateral monotonic counter or structured form
-                // remains forward-compatible non-breaking widening.
+                // ?? "")` in `describeNode`. Pre-D301 Rust emitted
+                // `_anon_<NodeId>` which (a) leaked NodeIds into the
+                // wire shape and (b) diverged from TS. Loses Rust
+                // within-describe anon-dep disambiguation; no verified
+                // consumer at lock time. Upgrade to a bilateral
+                // monotonic counter or structured form remains
+                // forward-compatible non-breaking widening.
                 local_names.get(d).cloned().unwrap_or_default()
             })
             .collect();

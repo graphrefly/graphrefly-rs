@@ -1606,7 +1606,11 @@ Closed 2026-05-06.
   `signal_invalidate_gather_does_not_hold_graph_lock_during_core_call`.
 - **Source:** Slice E+ (2026-05-05); tightened by D130 (A/B/D/E/F batch, 2026-05-10).
 
-### Anonymous Core nodes surface as `_anon_<NodeId>` strings in describe deps
+### ~~Anonymous Core nodes surface as `_anon_<NodeId>` strings in describe deps~~ — RESOLVED 2026-05-26 (D301 B + B.b — empty-string render + snapshot persistence-marker split)
+
+> **2026-05-26 doc-closure follow-on (QA Edge Case Hunter F2, missed in initial Stage 1 sweep — surfaced by D301 /qa).** D301 (Q4 user-locked Option B, 2026-05-26) **changed the format itself**: describe surfaces unnamed deps as the empty string `""` (TS-conformant; pure-ts `Node._deps.map(d => d.node.name ?? "")`). The pre-D301 `_anon_<NodeId>` render no longer exists. D301 B.b retains a `_anon::<rawid>` marker (post-QA format pinning, structurally rejected as a user-name via the `::` PATH_SEP guard) ONLY at the snapshot encoding surface (`snapshot.rs` `snapshot_of`) for `SnapshotError::UnresolvableDeps` Debug-format diagnostic fidelity. The original "lift point" (`describe({ include_anon: true })` mode) is now obsolete — there are no `_anon_<id>` entries to synthesize at the describe layer because unnamed deps render as `""`. Original entry preserved below for the audit trail.
+
+### Original entry (kept for archive — pre-D301)
 
 - **What:** when a named node depends on a Core-registered node that
   has no namespace entry (e.g. registered via `Graph::core().register_state(...)`
@@ -1696,11 +1700,13 @@ Closed 2026-05-06.
   the wave.
 - **Source:** Slice E+ /qa Edge Case Hunter F6 (2026-05-05).
 
-### ~~`_anon_<id>` deps could collide with a user-named node `_anon_<id>`~~ — RESOLVED 2026-05-13 (Slice V3)
+### ~~`_anon_<id>` deps could collide with a user-named node `_anon_<id>`~~ — RESOLVED 2026-05-13 (Slice V3); RESOLUTION MECHANISM SUPERSEDED 2026-05-26 (D301 B + B.a + B.b /qa)
 
-- **Resolution:** `Graph::validate_name` now rejects names starting with `_anon_` via `NameError::ReservedPrefix`. `Graph::is_valid_name` also checks the prefix. The `_anon_<id>` format is reserved for anonymous-node describe output; user-named nodes cannot collide.
-- **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `validate_name`, `is_valid_name`, `NameError::ReservedPrefix`. Mount layer `From<NameError> for MountError` updated to map `ReservedPrefix` → `InvalidName`.
-- **Source:** Slice E+ /qa Blind Hunter (2026-05-05); resolved Slice V3 (2026-05-13).
+- **Resolution (original, Slice V3, 2026-05-13):** `Graph::validate_name` now rejects names starting with `_anon_` via `NameError::ReservedPrefix`. `Graph::is_valid_name` also checks the prefix. The `_anon_<id>` format is reserved for anonymous-node describe output; user-named nodes cannot collide.
+- **Where it landed (original):** `crates/graphrefly-graph/src/graph.rs` — `validate_name`, `is_valid_name`, `NameError::ReservedPrefix`. Mount layer `From<NameError> for MountError` updated to map `ReservedPrefix` → `InvalidName`.
+
+- **2026-05-26 supersession note (D301 /qa):** The Slice V3 resolution mechanism (`NameError::ReservedPrefix` + `_anon_` prefix guards in `validate_name`/`is_valid_name`) was **DELETED** in D301 B.a (Q4 sub-decision, 2026-05-26). Pre-D301 the describe surface emitted `_anon_<id>` for unnamed deps — the guard was load-bearing. Post-D301 B describe emits `""` (TS-conformant); the guard became vestigial (empty-string can't collide with any user name). The underlying invariant (user-name vs marker non-collision) **is preserved by a different mechanism**: D301 B.b's snapshot encode marker is now `_anon::<rawid>` (post-QA format pinning) — the `::` is the canonical `PATH_SEP` which `validate_name` STILL rejects, so user-named nodes CANNOT register names containing `::` and the marker remains structurally impossible as a user name. The Slice V3 collision-prevention invariant holds; the mechanism changed.
+- **Source:** Slice E+ /qa Blind Hunter (2026-05-05); resolved Slice V3 (2026-05-13); mechanism superseded D301 /qa (2026-05-26).
 
 ### ~~`ancestors()` cycle insurance~~ — RESOLVED 2026-05-13 (Slice V3)
 
@@ -1877,15 +1883,19 @@ Landed 2026-05-12 as part of the Slice U §10 perf batch.
 QA pass on Slice F surfaced these v1 limitations / divergences. Each
 is acceptable for the M2 close but worth tracking for future slices.
 
-### D1 — `edges()` cross-graph deps surface as `_anon_<id>` for sibling-graph nodes
+### D1 — `edges()` cross-graph deps surface as empty string for sibling-graph nodes
 
 - **What:** [crates/graphrefly-graph/src/graph.rs](../crates/graphrefly-graph/src/graph.rs)
-  `edges_inner` builds `names_map` from the local namespace only.
+  `edges_in` builds `names_map` from the local namespace only.
   Two graphs sharing a Core (parent + mounted child OR siblings under
   a common ancestor) can have cross-graph dep edges (a node in Graph A
   depends on a node in Graph B). When `edges(false)` is called on A,
-  the dep id is not in A's namespace → emitted as `_anon_<id>`,
-  even though it IS named in B.
+  the dep id is not in A's namespace → emitted as the empty string
+  `""`, even though it IS named in B.
+- **2026-05-26 D301 /qa wording update:** the namespace-scoping concern
+  is unchanged; the render format changed in D301 B (Q4 user-locked
+  Option B). Pre-D301 the fallback was `_anon_<id>`; post-D301 the
+  fallback is `""` (TS-conformant; cross-impl wire-shape parity).
 - **Why deferred:** v1 acceptable behavior for the namespace-scoped
   edges accessor. The `recursive: true` walk also misses sibling
   references (it only descends into mounted children of the calling
@@ -1896,7 +1906,8 @@ is acceptable for the M2 close but worth tracking for future slices.
   `edges_in_core(opts)` accessor or a `Graph::root().edges(true)`
   walk that builds a unified id→qualified-name map across the entire
   shared-Core mount tree.
-- **Source:** Slice F /qa Blind Hunter + Edge Case Hunter (2026-05-06).
+- **Source:** Slice F /qa Blind Hunter + Edge Case Hunter (2026-05-06);
+  D301 /qa wording update (2026-05-26).
 
 ### ~~D2 — `GraphObserveAllReactive::subscribed` HashSet grows unboundedly~~ — RESOLVED 2026-05-13 (Slice V3)
 

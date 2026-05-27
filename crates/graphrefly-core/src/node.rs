@@ -5205,6 +5205,18 @@ impl Core {
         // further if it changed. Worst case O(V) for the connected
         // downstream component; common case bounded by topology depth.
         //
+        // **Invariant scope (QA-locked 2026-05-26, Blind #5):** the
+        // cascade heals only staleness introduced by THIS `set_deps`
+        // call — one-set-deps-at-a-time, NOT global-after-every-call.
+        // Pre-D300 set_deps calls that left consumers with stale ranks
+        // are NOT healed by the next post-D300 set_deps unless n's own
+        // rank changes (the cascade is gated on
+        // `old_topo_rank != new_topo_rank`). In practice this is
+        // unreachable on a clean main-branch where D300 lands fresh; a
+        // debug-only full-scan invariant assert was considered and
+        // rejected (speculative defensive scaffold for an unreachable
+        // case; D196 + value #11).
+        //
         // Per the verbatim `/porting-to-rs clear all the perf items
         // and the deferred items. regardless if they need a valid
         // consumer demand` directive (user-locked 2026-05-26 override
@@ -5227,19 +5239,42 @@ impl Core {
                 if !visited.insert(child_id) {
                     continue;
                 }
+                // (QA G2.6, Blind #8): self-edge symmetric defense.
+                // The inner recompute filters `dr.node != child_id`;
+                // make the seed step symmetric so a hypothetical
+                // n-in-its-own-children-set (precluded by
+                // register/set_deps self-loop rejection but worth
+                // defense-in-depth) cannot cause n's just-set rank to
+                // be overwritten by a stale dep-max computation.
+                if child_id == n {
+                    continue;
+                }
                 // Read child's current deps + old rank.
                 let (child_new_rank, child_old_rank) = {
                     let Some(child_rec) = s.nodes.get(&child_id) else {
                         continue;
                     };
-                    let new_rank = child_rec
+                    // (QA G2.7, Blind #6): debug-only canary for
+                    // saturating overflow. `unwrap_or(0).saturating_add(1)`
+                    // silently caps at `u32::MAX` — practically
+                    // unreachable on real graphs (would require a
+                    // ~4B-deep dep chain) but worth catching in test
+                    // builds rather than silently downgrading the
+                    // glitch-free scheduling guarantee.
+                    let max_dep_rank = child_rec
                         .dep_records
                         .iter()
                         .filter(|dr| dr.node != child_id)
                         .filter_map(|dr| s.nodes.get(&dr.node).map(|r| r.topo_rank))
                         .max()
-                        .unwrap_or(0)
-                        .saturating_add(1);
+                        .unwrap_or(0);
+                    debug_assert!(
+                        max_dep_rank < u32::MAX,
+                        "D300 G2.7: topo_rank saturating_add overflow — \
+                         dep chain reached u32::MAX (~4B deep, practically \
+                         unreachable; pinned in debug for early canary)"
+                    );
+                    let new_rank = max_dep_rank.saturating_add(1);
                     (new_rank, child_rec.topo_rank)
                 };
                 if child_new_rank != child_old_rank {

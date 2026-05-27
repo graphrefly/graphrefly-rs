@@ -180,9 +180,12 @@ fn resource_profile_of(
     let mut profiles: Vec<NodeProfile> = Vec::with_capacity(names_to_id.len());
 
     for (path, node_id) in &names_to_id {
-        // describe()'s `_anon_<id>` fallback path: a name that exists
-        // in `names` but somehow missed describe — skip. Invariant-
-        // unreachable for the post-D279 describe shape.
+        // describe-shape invariant skip: a name that exists in
+        // `names` but missed describe (post-D279 invariant-
+        // unreachable). Post-D301 the unnamed-dep render is the
+        // empty string, not `_anon_<id>` — this skip refers strictly
+        // to the post-D279 describe invariant, not the (now-deleted)
+        // `_anon_<id>` fallback shape.
         let Some(node_desc) = desc.nodes.get(path) else {
             continue;
         };

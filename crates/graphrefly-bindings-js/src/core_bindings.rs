@@ -1952,8 +1952,14 @@ impl BenchCore {
     /// JS wrapper parses (same marshaling convention as
     /// `BenchGraph::describe_json`). Dep ids surface as raw `NodeId`
     /// u64s (the namespace lives at the Graph layer; an unattached
-    /// node has no names — the JS wrapper renders them as
-    /// `_anon_<id>`, matching `describe_inner`'s unnamed-dep rule).
+    /// node has no names). **D301 (Q4 user-locked Option B,
+    /// 2026-05-26):** the JS wrapper's unnamed-dep rendering converges
+    /// to TS pure-ts's empty-string shape (`""`) to match `Node._deps
+    /// .map(d => d.node.name ?? "")` — pre-D301 emitted `_anon_<id>`.
+    /// Snapshot encode (separate persistence surface) retains a
+    /// `_anon::<rawid>` marker for `UnresolvableDeps` diagnostic
+    /// fidelity (D301 B.b). See `graphrefly-graph::describe::NodeDescribe`
+    /// rustdoc for the persistence-vs-presentation split.
     ///
     /// **D267 — async** (was `run_sync`). The `run_sync` shape would
     /// deadlock if a JS sink callback (already blocking the actor

@@ -1070,10 +1070,11 @@ pub(crate) fn edges_in(
         for dep_id in dep_ids {
             // D301 (Q4 user-locked Option B, 2026-05-26): unnamed deps
             // render as empty string (TS-conformant; pure-ts
-            // core/meta.ts:257 `node.name ?? ""`). Prefix is irrelevant
-            // for unnamed deps — bare `""` regardless of subgraph
-            // nesting. Both render sites (describe.rs:229 +
-            // graph.rs:1055) converge together per the D301 lock text.
+            // `describeNode` uses `node.name ?? ""`). Prefix is
+            // irrelevant for unnamed deps — bare `""` regardless of
+            // subgraph nesting. Both render sites (this `edges_in`
+            // qualified-path resolution + `crate::describe::NodeDescribe.deps`)
+            // converge together per the D301 lock text.
             let from_name = names_map.get(&dep_id).cloned().unwrap_or_default();
             result.push((from_name, to_name.clone()));
         }
