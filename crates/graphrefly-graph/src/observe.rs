@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use graphrefly_core::{
     Core, CoreFull, LockId, Message, NodeId, PauseError, ResumeReport, Sink, SubscriptionId,
-    TopologyEvent, TopologySubscriptionId,
+    TopologyEvent, TopologySubscriptionId, UpError,
 };
 
 use crate::graph::{register_ns_sink, Graph, GraphInner, NamespaceChangeSink};
@@ -59,40 +59,49 @@ impl ObserveSub {
 ///
 /// D246: holds a Core-free [`Graph`]; `&Core` is passed per call.
 ///
-/// # Deliberate divergence from canonical R3.6.2 `up(messages)` (D280 doc-lock)
+/// # Two coexisting message-injection shapes (D298, 2026-05-26)
 ///
-/// Canonical R3.6.2 specifies a unified `up(messages: Messages)`
-/// upstream-injection API. This impl exposes the per-tier control
-/// methods [`Self::pause`] / [`Self::resume`] / [`Self::invalidate`]
-/// as separate methods rather than a single `up(messages)` shape.
-/// The split is deliberate, on two grounds:
+/// This impl exposes BOTH the canonical `up(messages)` open-vocab
+/// shape AND per-tier typed methods. **They have different semantics
+/// and are NOT sugar wrappers for each other.** Both shapes are
+/// supported as first-class public API; users pick based on intent.
 ///
-/// 1. **Non-allocating ergonomics.** A unified
-///    `up(Vec<Message>)` forces a `Vec` allocation on every upstream
-///    call. The per-tier methods take their args by value and take a
-///    direct path into [`Core::pause`] / [`Core::resume`] /
-///    [`Core::invalidate`] — zero heap churn on the control plane.
+/// 1. **Canonical R3.6.2 — [`Self::up`]`(messages)`** — send messages
+///    UPSTREAM toward the observed node's sources. Routes through
+///    [`Core::up`], which iterates each dep and dispatches the
+///    message-specific upstream action (`Pause` → pause each dep;
+///    `Resume` → resume each dep; `Invalidate` → recursive plain-
+///    forward to leaves per R1.4.2; `Teardown` → teardown each dep).
+///    For a leaf node with no deps (e.g., a state node), `up()` is a
+///    no-op — there is no upstream. Open message vocabulary mirrors
+///    pure-ts `Node.up(messages)` (`core/node.ts:1430`).
 ///
-/// 2. **Avoids re-exposing an imperative-shaped public surface.**
-///    The Rust port's collaboration directive (`feedback_no_imperative`
-///    user memory) is to expose reactive `NodeInput` shapes at the
-///    public surface, not imperative message-injection. The per-tier
-///    methods read as intent-named control calls (`pause(lock)`,
-///    `resume(lock)`, `invalidate()`); a unified `up([PAUSE, lock])`
-///    re-exposes the protocol-internal `Messages` shape and tier
-///    numbers as call-site vocabulary.
+/// 2. **Direct typed methods — [`Self::pause`] / [`Self::resume`] /
+///    [`Self::invalidate`]** — mutate the OBSERVED NODE directly
+///    (not its upstream). `observer.pause(lock)` calls
+///    [`Core::pause`]`(self.node_id, lock)` and pauses the observed
+///    node itself; for a leaf state node, this DOES pause it.
+///    Rust-idiomatic typed-arg shortcuts for the common
+///    "pause/resume/invalidate the thing I'm observing" pattern.
+///    Non-allocating (no `Vec<Message>` heap churn on the control
+///    plane). The collaboration directive in
+///    `feedback_no_imperative` user memory favors these
+///    intent-named typed calls over message-injection vocabulary
+///    when the operation IS "act on this node directly."
 ///
-/// Cross-binding wrappers (napi-rs `BenchGraph`, future pyo3, etc.)
-/// may reassemble a unified `up(messages)` if a JS/Python idiomatic
-/// API needs it; the substrate-side split is the Rust public-surface
-/// contract.
+/// Use `up(messages)` for canonical upstream-injection (matches TS
+/// pure-ts wire shape; required for cross-impl parity scenarios
+/// asserting canonical R3.6.2 behavior). Use typed methods for
+/// direct-node ergonomic mutation. Same `GraphObserveOne` handle
+/// exposes both.
 ///
-/// # Lift point (only if needed)
+/// # Decision provenance
 ///
-/// If a Rust consumer surfaces a need for a unified `up(messages)` —
-/// e.g., a cross-impl parity scenario authored against the canonical
-/// R3.6.2 shape — add it alongside the per-tier methods (additive,
-/// non-breaking). Gated on D196 consumer pressure.
+/// - Q1 user-locked Option 2 (canonical primary + typed sugar
+///   coexisting). Override of D196 (consumer-pressure gate) per the
+///   `/porting-to-rs clear all the perf items and the deferred items.
+///   regardless if they need a valid consumer demand` directive.
+/// - D298 (`~/src/graphrefly-ts/docs/rust-port-decisions.md`).
 #[must_use = "GraphObserveOne does nothing until you call subscribe()"]
 pub struct GraphObserveOne {
     graph: Graph,
@@ -139,6 +148,44 @@ impl GraphObserveOne {
     /// Send `[INVALIDATE]` upstream.
     pub fn invalidate(&self, core: &Core) {
         core.invalidate(self.node_id);
+    }
+
+    /// Send messages upstream toward the observed node's sources
+    /// (canonical R3.6.2 `up(messages)` shape — D298, 2026-05-26).
+    ///
+    /// Each message is dispatched via [`Core::up`] to the observed
+    /// node, which then forwards per the tier-specific upstream
+    /// routing:
+    ///
+    /// - `Message::Pause(lock)` → [`Core::pause`] on each dep.
+    /// - `Message::Resume(lock)` → [`Core::resume`] on each dep.
+    /// - `Message::Invalidate` → recursive plain-forward to leaf
+    ///   sources per R1.4.2 (no self-process at intermediates).
+    /// - `Message::Teardown` → [`Core::teardown`] cascade on each
+    ///   dep.
+    /// - `Message::Start` / `Message::Dirty` → no-op upstream per
+    ///   the routing table in [`Core::up`].
+    ///
+    /// For a leaf node (no deps — e.g., a state node) `up()` is a
+    /// no-op. Use the typed [`Self::pause`] / [`Self::resume`] /
+    /// [`Self::invalidate`] methods if the intent is to mutate the
+    /// observed node directly.
+    ///
+    /// Fails on the first message that errors; subsequent messages
+    /// are NOT dispatched. Empty `messages` is `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// - [`UpError::UnknownNode`] — observed node not registered
+    ///   (only reachable if `teardown` removed it after `observe()`).
+    /// - [`UpError::TierForbidden`] — `messages` contains a
+    ///   tier-3 (`Data`/`Resolved`) or tier-5 (`Complete`/`Error`)
+    ///   variant; these are downstream-only per R1.4.1.
+    pub fn up(&self, core: &Core, messages: &[Message]) -> Result<(), UpError> {
+        for &msg in messages {
+            core.up(self.node_id, msg)?;
+        }
+        Ok(())
     }
 
     /// The backing graph handle.

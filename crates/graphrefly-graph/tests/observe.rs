@@ -6,7 +6,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use common::graph;
-use graphrefly_core::{HandleId, Message, Sink};
+use graphrefly_core::{EqualsMode, FnId, HandleId, LockId, Message, Sink, UpError};
 
 fn recording_sink() -> (Arc<Mutex<Vec<Message>>>, Sink) {
     let log: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
@@ -144,4 +144,161 @@ fn detaching_observe_all_unsubscribes_all_sinks() {
     assert!(!log
         .iter()
         .any(|m| matches!(m, Message::Data(h) if *h == HandleId::new(99))));
+}
+
+// =====================================================================
+// D298 — GraphObserveOne::up(messages) canonical R3.6.2 shape
+// =====================================================================
+//
+// Per Q1 user-locked Option 2 (canonical primary + typed sugar
+// coexisting): `up(messages)` dispatches messages UPSTREAM to the
+// observed node's deps via [`Core::up`]. Distinct semantic from the
+// typed `pause`/`resume`/`invalidate` methods which act on the
+// observed node directly. See observe.rs rustdoc on
+// `GraphObserveOne` for the two-shape rationale.
+//
+// Tests pin:
+//   (a) up([Pause]) on a derived node pauses each dep (not the obs)
+//   (b) up([Pause]) on a leaf state node is a no-op (no upstream)
+//   (c) up([Invalidate]) recursively plain-forwards to leaves
+//       (R1.4.2 — does not self-process at intermediates)
+//   (d) up rejects tier-3 (Data/Resolved) with TierForbidden
+//   (e) up rejects tier-5 (Complete/Error) with TierForbidden
+//   (f) empty messages slice is Ok(())
+
+#[test]
+fn d298_up_pause_pauses_deps_not_observed_node() {
+    // Build: a (state) → b (derived from a). Observe b; up([Pause])
+    // should pause `a` (the dep), NOT `b` (the observed).
+    let (rt, g) = graph("system");
+    let a = g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+    let b = g
+        .derived(rt.core(), "b", &[a], FnId::new(0), EqualsMode::Identity)
+        .unwrap();
+    let lock = LockId::new(1);
+
+    let observer = g.observe("b");
+    observer.up(rt.core(), &[Message::Pause(lock)]).unwrap();
+
+    // Dep was paused (canonical upstream semantic).
+    assert!(rt.core().is_paused(a));
+    // Observed node was NOT paused (the divergence from the typed
+    // `observer.pause(lock)` semantic — that would pause `b`).
+    assert!(!rt.core().is_paused(b));
+}
+
+#[test]
+fn d298_up_pause_on_leaf_state_node_is_noop() {
+    // A state node has no deps — `up()` has nothing to forward to.
+    // Distinct from typed `observer.pause(lock)` which WOULD pause
+    // the state node directly.
+    let (rt, g) = graph("system");
+    let a = g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+    let lock = LockId::new(1);
+
+    let observer = g.observe("a");
+    observer.up(rt.core(), &[Message::Pause(lock)]).unwrap();
+
+    // State node a was NOT paused — leaf has no upstream to forward to.
+    assert!(!rt.core().is_paused(a));
+}
+
+#[test]
+fn d298_up_invalidate_plain_forwards_to_leaves_per_r1_4_2() {
+    // Build a → b → c (state → derived → derived). Emit a value into
+    // `b`'s cache (via emit on `a`, which propagates). Then observe
+    // `c` and `up([Invalidate])` — per R1.4.2 plain-forward, the
+    // invalidate walks up through `b` to `a`. State node `a` is the
+    // leaf; the walk bottoms out there (no deps to recurse into).
+    let (rt, g) = graph("system");
+    let a = g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+    let b = g
+        .derived(rt.core(), "b", &[a], FnId::new(0), EqualsMode::Identity)
+        .unwrap();
+    let _c = g
+        .derived(rt.core(), "c", &[b], FnId::new(0), EqualsMode::Identity)
+        .unwrap();
+
+    // Activate b + c (subscribe) so their caches are populated.
+    let (_log_b, sink_b) = recording_sink();
+    let (_log_c, sink_c) = recording_sink();
+    let _sub_b = g.observe("b").subscribe(rt.core(), sink_b);
+    let _sub_c = g.observe("c").subscribe(rt.core(), sink_c);
+
+    // up([Invalidate]) on `c` plain-forwards to `b` (then to `a`,
+    // a leaf). Per R1.4.2 it does NOT self-process at `b` or `c`
+    // (no cache clear at the source). The forwarding reaches the
+    // leaf state node `a` whose cache is `NO_HANDLE`-rendered when
+    // invalidated downstream — but the upstream-forwarded
+    // INVALIDATE itself bottoms out at leaves without further effect.
+    let observer = g.observe("c");
+    observer.up(rt.core(), &[Message::Invalidate]).unwrap();
+
+    // `a` is a state node — leaf in the upstream walk. INVALIDATE
+    // forwarded via `up` is plain-forward only; it does not clear
+    // the leaf's cache (the downstream cascade from Core::invalidate
+    // is what clears caches, and that path is NOT taken by Core::up's
+    // plain-forward arm). So `a.cache` remains Data(1).
+    assert_eq!(g.cache_of(rt.core(), a), HandleId::new(1));
+}
+
+#[test]
+fn d298_up_rejects_tier_3_data() {
+    let (rt, g) = graph("system");
+    g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+
+    let observer = g.observe("a");
+    let err = observer
+        .up(rt.core(), &[Message::Data(HandleId::new(42))])
+        .unwrap_err();
+    assert!(matches!(err, UpError::TierForbidden { tier: 3 }));
+}
+
+#[test]
+fn d298_up_rejects_tier_5_complete() {
+    let (rt, g) = graph("system");
+    g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+
+    let observer = g.observe("a");
+    let err = observer.up(rt.core(), &[Message::Complete]).unwrap_err();
+    assert!(matches!(err, UpError::TierForbidden { tier: 5 }));
+}
+
+#[test]
+fn d298_up_empty_messages_slice_is_ok() {
+    let (rt, g) = graph("system");
+    g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+
+    let observer = g.observe("a");
+    observer.up(rt.core(), &[]).unwrap();
+    // No side-effect; just no error.
+}
+
+#[test]
+fn d298_up_stops_dispatch_on_first_error() {
+    // Per the rustdoc contract: "Fails on the first message that
+    // errors; subsequent messages are NOT dispatched." We can't easily
+    // observe that the SECOND message wasn't dispatched (we'd need an
+    // observable side-effect to assert absence), so this test pins
+    // the surface contract: a tier-3 in position 0 short-circuits
+    // before any of the subsequent tier-allowed messages run.
+    let (rt, g) = graph("system");
+    let a = g.state(rt.core(), "a", Some(HandleId::new(1))).unwrap();
+    let _b = g
+        .derived(rt.core(), "b", &[a], FnId::new(0), EqualsMode::Identity)
+        .unwrap();
+    let lock = LockId::new(1);
+
+    let observer = g.observe("b");
+    // Tier-3 first → reject. Tier-2 Pause second → would have paused
+    // `a` if dispatched.
+    let err = observer
+        .up(
+            rt.core(),
+            &[Message::Data(HandleId::new(99)), Message::Pause(lock)],
+        )
+        .unwrap_err();
+    assert!(matches!(err, UpError::TierForbidden { tier: 3 }));
+    // Verify the subsequent Pause was NOT dispatched (short-circuit).
+    assert!(!rt.core().is_paused(a));
 }
