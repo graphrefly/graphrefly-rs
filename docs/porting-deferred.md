@@ -1,6 +1,6 @@
 ---
 title: Porting flags & deferred concerns
-last_updated: 2026-05-25 (D292 LANDED via D295 paired-batch slice — `@graphrefly/native@0.1.0` lifecycle batch CLOSED: D.1 BenchGraph.derived TSFN reroute + D.2 async commit/rollback via spawn_blocking + R3 symmetric catch_unwind + D.3 FinalizationRegistry + reject-on-actor-errors + autoCloseOnBeforeExit opt-in + F4 _dispose drop + 5 cargo regressions. graphrefly-rs gate GREEN 869/869 substrate + 12/12 bindings-js. D293→D292 carries CLOSED + D291→D292 carry CLOSED below. Cross-arm parity activation on rust arm pending user-gated tag push per D265 hold-local. Prior 2026-05-25: D291 Bucket A — Case 5 + F2 CI guard CLOSED cross-arm; Case 15a substrate fix landed but cross-arm lift blocked by libuv-async-commit deadlock — NOW CLOSED by D292 D.2; D291 deferred-scope sub-items remain open per their consumer-pressure gates.)
+last_updated: 2026-05-26 (Stage 1 doc-closure sweep — `/porting-to-rs next batch. clear all the perf items and the deferred items. regardless if they need a valid consumer demand` directive — explicit override of D196 for this sweep). **26 entries closed** via consistent strikethrough + closing block + decision citation. Style: unified — every closed entry uses `### ~~Original heading~~ — DISPOSITION (citation)` shape, regardless of whether the disposition is RESOLVED (issue closed by later commit) or INTENTIONAL (locked as-is by design call). **22 RESOLVED-but-not-struck closures:** F5 Graph::from_snapshot orphan NodeId (D279); F7 predicate_each release-mode assert (Slice V2); F9 WeakCore partial-drop (D241/D246/D255 actor model); F10 BenchGraph::derived lock-order (actor-model sequential acquisition); F12/Slice F audit Core::up(INVALIDATE) (D281/commit `602cd1b` R1.4.2 plain-forward); F13 Graph::set_deps D1 hazard wider surface (Slice F A6 Core-level guard inherits); F16 OperatorOpts.equals no-op (already routes through commit_emission); F17 closure-builder Arc-cycle (Slice Y `Weak<BenchBinding>` capture confirmed); Graph.mount CoreMismatch (removed in actor-model rebase); MP1-MP4 parity-test fragility (all cross-arm parameterized + passing); Graph.derived arbitrary JS fn (D292 D.1 / D295); Graph.mount foreign-child (actor model — duplicate-track of CoreMismatch closure); Cross-platform `.node` artifacts (D203 5-platform publish landed); F25 HandleId Display (Slice U-napi S4 self-classified as resolved); 5 × Slice B-2 pre-actor-model items (Multi-distinct-Some-group, set_serialization_group, Combined-guard CoreShared, SingleThreadCell two-region split, Nested cross-shard wave — all DELETED by D246/D253). **4 INTENTIONAL reclassifications:** `pending_pause_overflow` panic-discard (D280 lock); `Core::up` from fn-fire (doc-only false-positive verification record); `audit_of` racy (narrow under D248/D255 single-owner); Unmount-vs-destroy not-distinguishable (cross-impl convergence, no canonical mandate). No code changes; pure docs sweep. Prior 2026-05-25 (D292 LANDED via D295 paired-batch slice — `@graphrefly/native@0.1.0` lifecycle batch CLOSED: D.1 BenchGraph.derived TSFN reroute + D.2 async commit/rollback via spawn_blocking + R3 symmetric catch_unwind + D.3 FinalizationRegistry + reject-on-actor-errors + autoCloseOnBeforeExit opt-in + F4 _dispose drop + 5 cargo regressions. graphrefly-rs gate GREEN 869/869 substrate + 12/12 bindings-js. D293→D292 carries CLOSED + D291→D292 carry CLOSED below. Cross-arm parity activation on rust arm pending user-gated tag push per D265 hold-local. Prior 2026-05-25: D291 Bucket A — Case 5 + F2 CI guard CLOSED cross-arm; Case 15a substrate fix landed but cross-arm lift blocked by libuv-async-commit deadlock — NOW CLOSED by D292 D.2; D291 deferred-scope sub-items remain open per their consumer-pressure gates.)
 ---
 
 ## D293 → D292 carries — ✅ CLOSED 2026-05-25 (D295 paired-batch implementation slice)
@@ -508,12 +508,9 @@ redb per-write ACID transactions (D163) serialize concurrent writers by MVCC des
 - ~~**Lift point:** either (a) ban non-ASCII keys + non-finite floats at the WAL encode boundary (loud error on attempt — closes the divergence by construction); OR (b) write a custom canonical-JSON serializer that emits UTF-16-code-unit sort order + IEEE-754-shortest-round-trip number formatting matching JS exactly. (a) is ~10 LOC + clear failure mode; (b) is ~150 LOC with subtle parity drift risk.~~ **LIFTED 2026-05-22 with option (a).**
 - **Source:** D138 / M4.A slice 2026-05-10; closure B1 (2026-05-22). Inline rustdoc at `wal.rs canonical_json` documents the rejected content classes.
 
-### `Graph::from_snapshot` Pass 1 state-node creation leaks an orphan `NodeId` on namespace collision with an existing child mount
+### ~~`Graph::from_snapshot` Pass 1 state-node creation leaks an orphan `NodeId` on namespace collision with an existing child mount~~ — RESOLVED 2026-05-22 (D279, E-ii.1)
 
-- **What:** [`crates/graphrefly-graph/src/snapshot.rs`](../crates/graphrefly-graph/src/snapshot.rs) `create_state_nodes_recursive` calls `owner_graph.state(core, name, initial)` for each state node in the snapshot tree. `Graph::state` internally calls `Core::register_state` FIRST (which allocates a fresh `NodeId` + deserializes the initial handle into Core's cache table) and only THEN calls `add(name, ...)` which validates against the namespace. If `name` collides with an existing CHILD MOUNT name in `owner_graph.children` (already mounted by D276 Pass 0), `add` returns `NameError::Collision` — but the `NodeId` registered in Core is never torn down. The `from_snapshot` call surfaces `SnapshotError::UnknownNode` (the `.map_err(|_| UnknownNode)?` at snapshot.rs:550 discards the real `NameError::Collision` variant); Core retains the orphan NodeId + its handle for the lifetime of the Core.
-- **Why deferred to v1:** the trigger (a snapshot whose state-node name collides with a previously-mounted child name) requires either (a) a hand-constructed snapshot with shadowing names, or (b) a snapshot produced by a different impl with different namespace rules. graphrefly itself rejects mount-vs-state name collisions at production time (`Graph::mount` checks both maps), so a snapshot produced by a healthy `graph.snapshot()` cannot trigger this. Cross-impl divergence (TS allows shadowing? unlikely but unverified) would be the only realistic trigger. Bounded leak: 1 orphan NodeId + 1 handle retain per pathological state-node. The `UnknownNode` surface is misleading but not data-corrupting.
-- **Lift point:** EITHER (a) pre-validate the snapshot's namespace shape before any Core mutation — walk `snap.nodes` vs `graph_map[owner_path].child_names()` to detect collisions and raise a dedicated `SnapshotError::NameCollision { name, graph_path }` before Pass 1 enters `Graph::state`; OR (b) preserve the `NameError::Collision` variant via a new `SnapshotError::NameCollision` and accept the orphan NodeId leak as a documented cost (less invasive). (a) is the cleaner shape — no Core mutation on a doomed restore — but ~10 LOC more.
-- **Source:** /qa Edge Case Hunter F2 (2026-05-22, M4.E1 / D276 review). User-locked **Defer** disposition per the /qa HALT for G1.3. Re-look trigger: a real cross-impl snapshot consumer that emits shadowing names, OR a TS-side D276 mirror that surfaces this on its own decoder path first.
+> **2026-05-26 doc-closure sweep.** D279 (M4.E1 follow-on, 2026-05-22) landed the pre-validation path per lift-option (a). `crates/graphrefly-graph/src/snapshot.rs:586-616` `create_state_nodes_recursive` now pre-validates every state name against `owner_graph.child_names()` and returns `SnapshotError::NameCollision` BEFORE any `register_state` call — no Core mutation on doomed restore. The original deferred entry was preserved in the active backlog by oversight (entry was added 2026-05-22 on M4.E1 close, but the immediate D279 fix should have struck it in the same pass); struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
 ### `DescribeValue::Rendered(Value::Null)` is JSON-indistinguishable from `Option::None` (sentinel cache)
 
@@ -1629,7 +1626,9 @@ Closed 2026-05-06.
 - **Where it landed:** `crates/graphrefly-graph/src/graph.rs` — `try_resolve_checked`, `PathError` enum. `crates/graphrefly-graph/src/lib.rs` — re-export.
 - **Source:** Slice E+ /qa Blind Hunter + Edge Case Hunter F9 (2026-05-05); resolved Slice V3 (2026-05-13).
 
-### `audit_of` recursive node/mount counts are racy under concurrent mutation
+### ~~`audit_of` recursive node/mount counts are racy under concurrent mutation~~ — INTENTIONAL (locked under D248/D255 single-owner narrowing)
+
+> **2026-05-26 doc-closure sweep.** Post-D248/D255 single-owner `Core` (`!Send + !Sync`), the only writers that can race the audit are threads holding a `Graph` clone of the child being audited mid-`unmount`. `crates/graphrefly-graph/src/mount.rs:211-216` rustdoc explicitly notes "best-effort under concurrent mutation" + the actor-model narrowing. Multi-level lock-ordering pass for transaction-isolated audit is overkill for the diagnostic best-effort `RemoveAudit` shape. **No code change; classified as INTENTIONAL (narrow window, documented best-effort)**. Original entry preserved below for the audit trail.
 
 - **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
   `audit_of` snapshots `inner.children.values()` then drops the lock
@@ -1644,18 +1643,9 @@ Closed 2026-05-06.
   parent + descendants) is overkill for the current usage.
 - **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
 
-### `Graph::set_deps` exposes the D1 (set_deps-from-firing-fn) hazard at a wider surface
+### ~~`Graph::set_deps` exposes the D1 (set_deps-from-firing-fn) hazard at a wider surface~~ — RESOLVED in Slice F A6 (Core-level guard applies)
 
-- **What:** Pre-Slice-E+, hitting D1 (Dynamic `tracked` corruption
-  from re-entrant `set_deps`) required reaching through `.core()`.
-  `Graph::set_deps` is now public sugar at the namespace layer,
-  widening the surface.
-- **Why deferred:** the structural fix (thread-local "currently
-  firing" stack rejecting `SetDepsError::ReentrantOnFiringNode`)
-  belongs with the broader D1 work, not bolted on at the Graph
-  layer. For now, `Graph::set_deps`'s rustdoc carries a `# Hazards`
-  block cross-referencing D1.
-- **Source:** Slice E+ /qa Edge Case Hunter F7 (2026-05-05).
+> **2026-05-26 doc-closure sweep.** The structural fix landed in Slice F A6: `SetDepsError::ReentrantOnFiringNode` guard lives in `Core::set_deps` at `crates/graphrefly-core/src/node.rs:4999-5001` (`if s.shared.currently_firing.contains(&n)`). `Graph::set_deps` at `crates/graphrefly-graph/src/graph.rs:672-679` is a thin pass-through that inherits the guard automatically — no Graph-level reentrancy gap. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
 ### `GraphObserveOne::up()` decomposed into `pause` / `resume` / `invalidate` methods (R3.6.2 divergence)
 
@@ -1681,7 +1671,9 @@ Closed 2026-05-06.
   changeset variants land (which need per-call accounting).
 - **Source:** Slice E+ /qa Blind Hunter (2026-05-05).
 
-### Unmount-vs-destroy not distinguishable on the reactive stream
+### ~~Unmount-vs-destroy not distinguishable on the reactive stream~~ — INTENTIONAL (cross-impl convergence; no canonical mandate)
+
+> **2026-05-26 doc-closure sweep.** Verified cross-impl convergence: TS pure-ts `TopologyEvent` (`packages/pure-ts/src/graph/graph.ts:716-732`) collapses both unmount and destroy into `kind: "removed"`; Rust `TopologyEvent::NodeTornDown` does the same per `crates/graphrefly-core/src/topology.rs:18-29, 80-81`. Canonical R3.5 + R3.6.2 don't mandate the distinction. Both arms agree; no spec deviation. **No code change; classified as INTENTIONAL (cross-impl convergence; no canonical mandate)**. Original entry preserved below for the audit trail.
 
 - **What:** Observers see `[Complete, Teardown]` whether the user
   called `parent.unmount("p")` or `child.destroy()` directly. Only
@@ -1752,7 +1744,11 @@ These canonical-spec methods are tracked for parity. Items marked
 - **Source:** Slice E+ /qa Edge Case Hunter port-coverage gap audit
   (2026-05-05); updated 2026-05-06 (Slice F close).
 
-### Cross-Core (multi-binding) mount rejected with `MountError::CoreMismatch`
+### ~~Cross-Core (multi-binding) mount rejected with `MountError::CoreMismatch`~~ — STRUCTURALLY RESOLVED 2026-05-19 (actor model)
+
+> **2026-05-26 doc-closure sweep.** Post-D246/D255 actor model: `Core` is `!Send + !Sync` single-owner, so cross-Core mount is structurally impossible at the type level. `MountError::CoreMismatch` was deleted in the actor-model rebase — `crates/graphrefly-graph/src/mount.rs:7-8` comment explicitly states "old `SubgraphRef`/`same_dispatcher`/`CoreMismatch` machinery is [removed]". Cross-graph ownership is enforced by single-Core construction, not a typed error. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive — pre-actor-model)
 
 - **What:** [crates/graphrefly-graph/src/mount.rs](../crates/graphrefly-graph/src/mount.rs)
   `mount(name, child)` rejects when `parent.core` and `child.core`
@@ -1781,7 +1777,11 @@ These canonical-spec methods are tracked for parity. Items marked
 - **Why deferred:** M6 is gated by M5 (structures); operators surface there is naturally part of the M6 milestone.
 - **Source:** Slice C-1 close (2026-05-06).
 
-### `OperatorOpts.equals` is currently a no-op for transform operators
+### ~~`OperatorOpts.equals` is currently a no-op for transform operators~~ — RESOLVED (equals routes through commit_emission)
+
+> **2026-05-26 doc-closure sweep.** `crates/graphrefly-core/src/node.rs:3133` forwards `opts.equals` into `NodeOpts.equals`, which is stored on `NodeRecord.equals` (line 1258, written at register line 2883). `commit_emission` reads it at `crates/graphrefly-core/src/batch.rs:1717` (`(rec.cache, rec.equals)`) and feeds it into `handles_equal_lock_released` at line 1745. Operator emissions go through `commit_emission`, so `equals` IS consulted for transform operators. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive)
 
 - **What:** `Core::register_operator(deps, op, opts)` accepts `opts.equals: EqualsMode` and stores it on `NodeRecord.equals`. But all transform operators emit via `commit_emission_verbatim`, which skips equals substitution (R1.3.2.d / R1.3.3.c). `opts.equals` therefore has no observable effect for the current Slice C-1 operators.
 - **Why deferred:** the field is reserved for future operators that explicitly want wire-level cache-vs-new equals dedup (e.g., a "distinctOutput" variant that combines distinctUntilChanged's prev-comparison with cache-substitution semantics). v1 ergonomics: keep the field in the struct so future callers don't break.
@@ -1849,12 +1849,9 @@ Landed 2026-05-12 as part of the Slice U §10 perf batch.
 - **Resolution:** Inherited from Slice C-1 resolution. All flow-variant `OperatorOp` discriminants (`Take`, `Skip`, `TakeWhile`, `Last`) now surface in `NodeDescribe.operator_kind` as `"take"`, `"skip"`, `"takeWhile"`, `"last"` respectively.
 - **Source:** Slice C-3 close (2026-05-06); resolved Slice V5 (2026-05-13).
 
-### `predicate_each` length-mismatch silently truncates `take_while` in release builds (Slice C-3 /qa D1)
+### ~~`predicate_each` length-mismatch silently truncates `take_while` in release builds (Slice C-3 /qa D1)~~ — RESOLVED in Slice V2 (release-mode assert)
 
-- **What:** [`fire_op_take_while`](../crates/graphrefly-core/src/batch.rs) loops over `inputs` and reads `pass.get(i).copied().unwrap_or(false)` (`batch.rs` ~1382). A `debug_assert!` catches `pass.len() != inputs.len()` in debug builds. In release builds, a binding-side bug returning a too-short `Vec<bool>` causes `unwrap_or(false)` to read missing entries as `false` → first-false short-circuit → `done` + `self.complete()`. Silent self-completion. The same defect class affects `fire_op_filter`, but there it just silently drops items without terminating — less catastrophic.
-- **Why deferred:** binding contract violation; no production binding (napi-rs / pyo3 / wasm-bindgen) should violate the contract. Promoting `debug_assert!` to `assert!` would crash release builds on a misbehaving binding rather than silently truncate; that's a defensible tradeoff for v1 but not blocking. A unified `binding_contract_check_pass_len(pass, inputs)` helper that asserts in all builds is the cleaner long-term fix.
-- **Lift point:** when bench evidence shows operator dispatch is hot enough to warrant pre-validation cost, OR when a real binding bug shows up in production. Until then, defensive `unwrap_or(false)` is acceptable.
-- **Source:** Slice C-3 /qa Edge Case Hunter (2026-05-06).
+> **2026-05-26 doc-closure sweep.** Slice V2 promoted the `debug_assert!` to release-mode `assert!`. `crates/graphrefly-core/src/batch.rs` `fire_op_take_while` (and mirrors at lines 2229-2234, 2273, 2326, 2769-2774) now hard-fails in release builds on `pass.len() != inputs.len()`. The `pass.get(i).copied().unwrap_or(false)` read (line 2782) is now structurally protected by the upstream length assert. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
 ### Future napi-rs `last(src, opts?)` adapter must accept `{ defaultValue: T }` shape (Slice C-3 /qa D2)
 
@@ -1926,7 +1923,11 @@ in-batch because (a) at the time `rustImpl` was still `null` (no observable dive
 yet), and (b) tightening would require either spec-citation amendments or
 shape-adapter design that's better addressed in a follow-up slice.
 
-### MP1 — `describe-reactive` parity tests assume synchronous flush outside `batch()`
+### ~~MP1 — `describe-reactive` parity tests assume synchronous flush outside `batch()`~~ — RESOLVED 2026-05-15 (cross-arm parameterized, both arms passing)
+
+> **2026-05-26 doc-closure sweep.** `packages/parity-tests/scenarios/graph/describe-reactive.test.ts` is `describe.each(impls)` unconditional (line 17); both arms run when `@graphrefly/native` is loadable. Test header (lines 5-10) explicitly states "un-skipped now that `BenchGraph::describe_reactive` is wired through the JS adapter on both arms". The fragility-audit framing predates `rustImpl` activation; post-activation the test has been passing cross-arm. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive — pre-activation)
 
 - **What:** [packages/parity-tests/scenarios/graph/describe-reactive.test.ts](https://github.com/graphrefly/graphrefly-ts/blob/main/packages/parity-tests/scenarios/graph/describe-reactive.test.ts)
   "emits a fresh snapshot when a node is added/removed" tests call
@@ -1943,7 +1944,11 @@ shape-adapter design that's better addressed in a follow-up slice.
 - **Source:** Slice B+C+D /qa Blind Hunter #8 + Edge Case Hunter #11
   (2026-05-06).
 
-### MP2 — `sugar.test.ts` derived-fn data shape may not match across impls
+### ~~MP2 — `sugar.test.ts` derived-fn data shape may not match across impls~~ — RESOLVED 2026-05-15 (cross-arm parameterized, both arms passing)
+
+> **2026-05-26 doc-closure sweep.** `packages/parity-tests/scenarios/graph/sugar.test.ts` is `describe.each(impls)` unconditional (line 13). Comment line 94 explicitly notes "scenario runs against both impls". 10 tests passing cross-arm; the dep-batch-shape concern was speculative pre-activation and didn't materialize. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive — pre-activation)
 
 - **What:** the "g.set chained through derived produces propagated DATA"
   test passes a `(data) => result[]` fn where `data[0]` is treated as
@@ -1960,7 +1965,11 @@ shape-adapter design that's better addressed in a follow-up slice.
   document the canonical batch shape contract in scenario docstring.
 - **Source:** Slice B+C+D /qa Blind Hunter #10 (2026-05-06).
 
-### MP3 — `signal.test.ts` tier-3 rejection assumes synchronous throw
+### ~~MP3 — `signal.test.ts` tier-3 rejection assumes synchronous throw~~ — RESOLVED 2026-05-15 (cross-arm parameterized, both arms passing)
+
+> **2026-05-26 doc-closure sweep.** `packages/parity-tests/scenarios/graph/signal.test.ts` is `describe.each(impls)` unconditional (line 17); 6 tests passing cross-arm. Tier-3 rejection (`g.signal([[impl.DATA, 99]])` throw) is covered by R3.7.1's typed-broadcast contract — both arms reject. The pre-activation concern that "Rust's typed `SignalKind` enum can't map to the test's open `Messages` shape" was speculative; cross-arm test exercises the public surface, not the internal enum. Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive — pre-activation)
 
 - **What:** `expect(() => g.signal([[impl.DATA, 99]])).toThrow();` requires
   the impl to validate synchronously inside the call. TS legacy's
@@ -1976,7 +1985,11 @@ shape-adapter design that's better addressed in a follow-up slice.
 - **Source:** Slice B+C+D /qa Blind Hunter #15 + Edge Case Hunter #9
   (2026-05-06).
 
-### MP4 — `observe-all-reactive.test.ts` unsubscribe test conflates deactivation with sink-list-clear
+### ~~MP4 — `observe-all-reactive.test.ts` unsubscribe test conflates deactivation with sink-list-clear~~ — RESOLVED 2026-05-15 (cross-arm parameterized, both arms passing)
+
+> **2026-05-26 doc-closure sweep.** `packages/parity-tests/scenarios/graph/observe-all-reactive.test.ts` is `describe.each(impls)` unconditional (line 16); comment lines 4-5 explicitly state "un-skipped now that `BenchGraph::observe_all_reactive` is wired through the JS adapter on both arms". 6 tests passing cross-arm. The deactivation-vs-sink-clear divergence the entry hypothesized never surfaced as observable on the public surface — both arms produce the same external behavior (no further events post-unsub). Original deferred entry preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
+
+### Original entry (kept for archive — pre-activation)
 
 - **What:** the "unsubscribe stops further events" test calls `unsub()`
   then asserts no further events. TS legacy achieves this via single-
@@ -2054,25 +2067,13 @@ preserved for single-emit). All 411 tests pass with F1 active.
 
 ## QA-surfaced divergences (Slice F audit follow-on QA, 2026-05-07)
 
-### `Core::up(INVALIDATE)` cascades through dep instead of R1.4.2 plain-forward
+### ~~`Core::up(INVALIDATE)` cascades through dep instead of R1.4.2 plain-forward~~ — RESOLVED 2026-05-22 (D281, commit `602cd1b`)
 
-- **What:** Canonical R1.4.2 says upstream INVALIDATE is "plain forward —
-  does not self-process INVALIDATE on intermediate or terminal nodes."
-  Rust v1's [`Core::up`](../crates/graphrefly-core/src/node.rs)
-  Tier-4 routing delegates to `self.invalidate(dep_id)` per dep, which
-  DOES clear the dep's cache and cascade INVALIDATE downstream.
-- **Why divergent:** consumer-friendly v1 simplification. Calling
-  `core.up(node, Invalidate)` to "nudge deps to invalidate" actively
-  wipes their caches; users expecting plain-forward semantics get
-  surprise sibling-subgraph invalidation.
-- **Lift point:** when a real consumer hits the divergence, lift to a
-  plain-forward path (queue `Message::Invalidate` to dep's subscribers
-  without `Core::invalidate`) OR add `up_with_options` for
-  per-call control.
-- **Source:** Slice F audit follow-on /qa Edge Case Hunter (2026-05-07);
-  user decision D2=(a).
+> **2026-05-26 doc-closure sweep.** D281 landed the R1.4.2 plain-forward fix in commit `602cd1b` ("fix(D281): Core::up(Invalidate) R1.4.2 plain-forward (Commit 3 of 3)"). `crates/graphrefly-core/src/node.rs:2602-2660` `Core::up`'s `Message::Invalidate` arm now recurses with `self.up(dep_id, Message::Invalidate)` (plain forward — no `_emit`, no cache clear at source) per R1.4.2; cache-clearing semantics apply downstream side only via the existing cascade. Inline doc-comment cites R1.4.2 conformance with TS pure-ts. The original deferred entry was preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
-### `pending_pause_overflow` cleared on panic-unwind silently drops queued ERROR
+### ~~`pending_pause_overflow` cleared on panic-unwind silently drops queued ERROR~~ — INTENTIONAL (locked by D280, 2026-05-22)
+
+> **2026-05-26 doc-closure sweep.** D280 user-locked Option A ("keep current"): the panic-discard path's `mem::take` of `pending_pause_overflow` is correct under R4.3.2 atomicity. The Drop's structural guarantee ("the wave didn't happen") would be violated by re-queueing overflow events across the rollback boundary. The pause buffer's `dropped` counter IS preserved (consumers polling `ResumeReport.dropped` post-resume see the count); only the diagnostic ERROR with `lockHeldDurationMs` etc. is lost for that specific wave. F001 remains open in the audit dashboard with the locked rationale. **No code change; classified as INTENTIONAL (locked by D280)**. Original entry preserved below for the audit trail.
 
 - **What:** [`clear_wave_state`](../crates/graphrefly-core/src/node.rs)
   unconditionally clears `pending_pause_overflow` on every wave-end,
@@ -2095,7 +2096,9 @@ preserved for single-emit). All 411 tests pass with F1 active.
 - **Source:** Slice F audit follow-on /qa Edge Case Hunter
   (2026-05-07); user decision D4=(a).
 
-### `Core::up` from inside fn-fire — composition note (false-positive defense)
+### ~~`Core::up` from inside fn-fire — composition note (false-positive defense)~~ — INTENTIONAL (doc-only verification record, locked 2026-05-07)
+
+> **2026-05-26 doc-closure sweep.** Entry is a documentation-only verification record, not a deferred fix. The original /qa flag was verified false-positive at the time of authoring (Slice F audit follow-on /qa Edge Case Hunter EC#3, 2026-05-07; user decision D1=(c) doc-only). No code action; classified as INTENTIONAL doc-only verification record. Original entry preserved below for the audit trail.
 
 - **What:** Initially flagged by /qa as a hazard ("nested run_wave
   resets wave-state mid-outer-wave"). Confirmed FALSE POSITIVE: nested
@@ -2684,19 +2687,13 @@ in the same slice (D046) — recorded here for traceability.
 - **Lift point:** restore single-pass via `&mut IndexMap` accumulator threaded through `edges_inner`. Build names_map AS we walk, propagate up via the accumulator. ~30 LOC refactor. Add a bench or fast-check property if reactive describe under namespace-thrash shows up in a profile.
 - **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F9.
 
-### `BenchGraph::derived` registry-then-Core lock-ordering hazard
+### ~~`BenchGraph::derived` registry-then-Core lock-ordering hazard~~ — STRUCTURALLY RESOLVED 2026-05-19 (actor model — sequential lock acquisition)
 
-- **What:** `BenchGraph::derived` does `binding.registry.lock() → core.register_derived(...)` which acquires `Core::state::lock()`. Concurrent paths that lock in the OPPOSITE order — e.g., a tokio thread mid-wave that holds Core state + calls back into `BindingBoundary::retain_handle` (which locks `binding.registry`) — deadlock by AB-BA lock ordering.
-- **Why deferred:** parity-tests are single-threaded; not exercised today. Slice Y's harness/multi-agent use case explicitly drives concurrent registration but the parity-tests stop short of cross-thread register-vs-emit scenarios.
-- **Lift point:** document `registry < core_state` as the canonical lock order; either restructure `BenchGraph::derived` to release `registry` lock before calling into Core, OR add a debug-build lock-order tracker. The single-LOC `Core::binding_ptr()` accessor (F14 lift-point) would also enable per-call invariant checks.
-- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F14.
+> **2026-05-26 doc-closure sweep.** Post-D255 actor model: `BenchGraph::derived` (`crates/graphrefly-bindings-js/src/graph_bindings.rs:261-313`) now routes through `self.actor.run(move |core| ...)`. The `binding.registry.lock()` (line 294) is acquired inside a scoped block that ends at line 299 — fully released BEFORE `g.derived(core, ...)` at line 306. Sequential, not nested → no AB-BA cycle possible. The actor's single-owner Core (`!Send + !Sync` per D248/D255) further prevents any cross-thread re-entrance. The original deferred entry was preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
-### `WeakCore::upgrade` partial-drop window across 3 independent Arcs
+### ~~`WeakCore::upgrade` partial-drop window across 3 independent Arcs~~ — STRUCTURALLY RESOLVED 2026-05-19 (D241/D246/D255 actor model)
 
-- **What:** `WeakCore { state: Weak, binding: Weak, wave_owner: Weak }` upgrades each independently. `BenchCore::Drop` drops fields in declaration order (`subscriptions`, `binding`, `core`). Between dropping `binding` and `core`, a producer-build closure firing concurrently from another thread could see `state.upgrade().is_some()` and `binding.upgrade().is_none()` — `WeakCore::upgrade` returns `None` correctly here, so it's not a corruption risk. But the converse: a closure that already cloned `Core` from a prior successful upgrade holds 3 strong Arcs across an unwind path that drops one Arc independently could see misaligned references.
-- **Why deferred:** theoretical race; the Drop ordering and clone-from-upgrade pattern make actual misalignment hard to construct. Bench / parity-tests don't trigger it.
-- **Lift point:** restructure to `Arc<CoreInner>` (single allocation holding state + binding + wave_owner) and `Weak<CoreInner>` for one-step upgrade. Larger refactor (touches every `Core` clone site); requires `state`, `binding`, `wave_owner` field access through a single Arc. ~100 LOC.
-- **Source:** Slice X1+Y+X2+X3 /qa (2026-05-08), Edge Case Hunter F6.
+> **2026-05-26 doc-closure sweep.** `WeakCore` no longer exists. D241 / D246 / D255 (actor model, 2026-05-19) replaced the three-`Weak` design with single-owner `Core` (`!Send + !Sync`) plus per-`BenchCore` actor thread in `crates/graphrefly-bindings-js/src/core_actor.rs`. The producer-build closure path that motivated `WeakCore` is now an `Arc<CoreActor>` + `Arc<BenchBinding>` pair on `BenchCore` (`core_bindings.rs:938-965`); no multi-`Weak` upgrade window can fire. `grep -r WeakCore crates/graphrefly-bindings-js/src/` returns zero hits. The original deferred entry was preserved in the active backlog by oversight; struck through during the 2026-05-26 doc-closure sweep. Source: Phase-1 verification under `/porting-to-rs next batch. clear all the perf items and the deferred items` directive.
 
 ### F14 `Core::binding_ptr()` accessor for cross-crate invariant assert
 
@@ -2800,7 +2797,12 @@ User direction 2026-05-08: "Fix this in this batch because otherwise parity test
 
 **Empirical validation:** the rustImpl parity arm activated for the first time (`pnpm --filter @graphrefly/native build` produced `graphrefly-native.darwin-arm64.node`; `pnpm --filter @graphrefly/parity-tests test` ran 138 tests). Result: **118 passed, 0 failed, 16 skipped, 4 todo.** All operator scenarios (transform 16, combine 12, flow 22, higher-order 18, subscription 32) pass against rustImpl AND pureTsImpl. The 4 originally-failing `g.derived(name, deps, fn)` sites are now `test.runIf(impl.name !== "rust-via-napi")` gated per the F9 carry-forward.
 
-### Closure-builder Arc-cycle (binding-side production parallel of producer-build cycle)
+### ~~Closure-builder Arc-cycle (binding-side production parallel of producer-build cycle)~~ — RESOLVED 2026-05-08 (Slice Y); confirmed-stable 2026-05-26
+
+> **2026-05-26 doc-closure sweep.** Slice Y discipline confirmed holding across `crates/graphrefly-bindings-js/src/operator_bindings.rs`: `closure_h_to_h` (line 1669), `closure_hh_to_h` (line 1711), `closure_packer` (line 1804), `closure_packer_v2` (line 1850) all take `binding: Weak<BenchBinding>`. Call sites in `register_map` (line 427), `register_scan` (lines 479, 507), `register_combine` (line 613), and other registers (lines 583, 646, 834, 1271, 1302, 1392) all pass `Arc::downgrade(&self.binding)`. No cycle-leak hazard remains. Original entry preserved below for the audit trail (Slice Y discovery context); the original wasn't strikethrough'd because the Slice Y close note absorbed it into the main close section but never struck the local copy.
+
+<details>
+<summary>Slice Y discovery (historical, fix landed 2026-05-08)</summary>
 
 Slice Y discovered (during the broader cycle audit prompted by user's "harness use case" question) that **3 closure builders in `operator_bindings.rs` had the same cycle pattern as producer-builds**, on top of the 7 producer-build sites already fixed:
 
@@ -2812,11 +2814,7 @@ Each captured `binding: Arc<BenchBinding>` strong, creating cycle: `BenchBinding
 
 **Fix:** change closure builder signatures from `binding: Arc<BenchBinding>` to `binding: Weak<BenchBinding>` and upgrade-on-fire (defensive `panic!` on dangling weak — unreachable in practice since closure storage lives inside the binding's own registry). All 7 call sites changed from `Arc::clone(&self.binding)` to `Arc::downgrade(&self.binding)`.
 
-**Why it didn't surface in tests pre-Slice-Y:** the rustImpl parity arm wasn't activated, and the bench's `OpRuntime::Drop` happens at process exit so the leak doesn't accumulate across test runs.
-
-`closure_h_to_bool` / `closure_hh_to_bool` / `closure_h_to_nodeid` don't capture binding — no cycle, no fix needed.
-
-(Continued under main Slice Y close section.)
+</details>
 
 ### ~~Phase E — `parity-tests/impls/rust.ts` activation deferred~~ — RESOLVED 2026-05-21+
 
@@ -3034,7 +3032,11 @@ JS adapter widened `Impl.Graph` with unified `observe(path?, opts?)` per canonic
   }` matching the legacy shape; (4) re-enable the skipped scenarios.
 - **Source:** Phase E close (2026-05-07).
 
-### `Graph.derived(name, deps, fn)` with arbitrary JS fn
+### ~~`Graph.derived(name, deps, fn)` with arbitrary JS fn~~ — RESOLVED 2026-05-25 (D292 D.1 / D295 paired-batch slice)
+
+> **2026-05-26 doc-closure sweep.** D292 D.1 (locked) + D295 implementation slice landed the TSFN-backed `BenchGraph::derived(name, deps, fn)` widening — `BenchGraph::derived` now accepts arbitrary JS callbacks via the D263 `register_user_derived` TSFN reroute, with JS-side closure-cell map keyed by `fnId` and eviction wired into `graph.remove`/`destroy` cascade. Lifts the D287 carve-out on `scenarios/graph/resource-profile.test.ts` test #1 cross-arm. Pre-`@graphrefly/native@0.1.0` republish, host-built `.node` exercises the path. Original deferred entry preserved below for the audit trail.
+
+### Original entry (kept for archive — pre-D292)
 
 - **What:** `BenchGraph::derived` only accepts the built-in `BuiltinFn`
   enum (`Identity` / `AddOne`). Tests calling `g.derived(name, deps,
@@ -3055,7 +3057,11 @@ JS adapter widened `Impl.Graph` with unified `observe(path?, opts?)` per canonic
   factory + `g.add` pattern.
 - **Source:** Phase E close (2026-05-07).
 
-### `Graph.mount(name, child)` with pre-built foreign child
+### ~~`Graph.mount(name, child)` with pre-built foreign child~~ — STRUCTURALLY RESOLVED 2026-05-19 (actor model)
+
+> **2026-05-26 doc-closure sweep.** Post-D246/D255 actor model: `Core` is `!Send + !Sync` single-owner, so cross-Core mount is structurally impossible at the type level (you can't even construct two `BenchCore` instances on the same thread that would interoperate). The `MountError::CoreMismatch` machinery was deleted in the actor-model rebase (`crates/graphrefly-graph/src/mount.rs:7-8` comment). Single-Core mount via `mount_new` covers every real consumer scenario. Duplicate-track of the closure already applied above at "Cross-Core (multi-binding) mount rejected" entry. Original entry preserved below for the audit trail.
+
+### Original entry (kept for archive — pre-actor-model)
 
 - **What:** `BenchGraph::mount_new(name)` creates a child sharing the
   same Core. Mounting a pre-built foreign child (`g.mount(name,
@@ -3101,7 +3107,11 @@ JS adapter widened `Impl.Graph` with unified `observe(path?, opts?)` per canonic
 - **Lift point:** triage individual scenarios as they surface.
 - **Source:** Phase E close (2026-05-07).
 
-### Cross-platform `.node` artifacts not built / published
+### ~~Cross-platform `.node` artifacts not built / published~~ — RESOLVED 2026-05-15 (D203 native-publish milestone)
+
+> **2026-05-26 doc-closure sweep.** D203 native-publish milestone closed 2026-05-15 (`@graphrefly/native@0.0.1` then progression to `0.0.3` latest on npm); 5-platform CI matrix landed (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`) per `migration-status.md` "Track-status snapshot" + `~/src/graphrefly-ts/docs/rust-port-decisions.md` D203. OIDC trusted publishing wired; `native-v*` tag triggers republish. musl variants tracked separately (F10 entry below — different artifact class, gated on Alpine support). Original entry preserved below for the audit trail.
+
+### Original entry (kept for archive — pre-D203)
 
 - **What:** This slice ships the `@graphrefly/native` package shape,
   napi-cli config, and `package.json` declaring the per-platform
@@ -3251,7 +3261,9 @@ The shipped wrapper (`crates/graphrefly-bindings-js/wrapper.js`) closes NEXT-BAT
 - **Test counts (post-rebuild):** 52 structures parity scenarios pass (26 × 2 arms). All other parity tests still pass: pure-ts 3011/3011; parity 315/316 + 1 skipped.
 - **Source:** Slice U-napi S4 (2026-05-12, original deferral); Layer-boundary code-slice (2026-05-14, resolution).
 
-### F25 — HandleId Display impl added for ReactiveIndex K bound
+### ~~F25 — HandleId Display impl added for ReactiveIndex K bound~~ — RESOLVED 2026-05-12 (Slice U-napi S4, in-slice fix)
+
+> **2026-05-26 doc-closure sweep.** Entry was self-classified as "Not a deferral — this is a resolved concern" but never struck. `HandleId` gained `impl Display` in `crates/graphrefly-core/src/handle.rs` during Slice U-napi S4 (2026-05-12) to satisfy `ReactiveIndex<K,V>` requiring `K: ToString`. Display output is a debug-quality `HandleId(42)` format — sufficient for substrate use; future human-readable handle rendering can revisit if a UX surface demands it. Original entry preserved below for the audit trail.
 
 - **What:** `HandleId` gained `impl Display` (`HandleId(N)` format) in `graphrefly-core/src/handle.rs` to satisfy `ReactiveIndex<K,V>` requiring `K: ToString`. Previously only `Debug` was derived.
 - **Why noted:** Not a deferral — this is a resolved concern. The Display output is a debug-quality string (`HandleId(42)`), not a user-facing representation. If a future surface needs human-readable handle rendering, the Display impl may need revisiting.
@@ -3345,7 +3357,12 @@ Slice B (918c28c→a67fa0b). Findings A(i)/B(i) FIXED in-/qa; the rest
 deferred here. (QA #0 — an incomplete B-3 commit that left `Cargo.toml`
 pointing at a moved bench — was fixed by amend, HEAD now consistent.)
 
-### Multi-distinct-`Some`-group component construction — UNSUPPORTED v1 (spec divergence)
+### ~~Multi-distinct-`Some`-group component construction — UNSUPPORTED v1 (spec divergence)~~ — STRUCTURALLY DELETED 2026-05-19 (D246/D253 actor model)
+
+> **2026-05-26 doc-closure sweep.** Post-D246/D253 actor model: the entire `SchedulingGroupId` API surface (the `Some`-group concept itself) is **deleted**. There is no "single-dep distinct-`Some` chain" vs "≥2 deps in distinct `Some` shards" distinction to violate — Cores are single-owner `!Send + !Sync`, with no shard/group routing. The §7 invariant the divergence was measured against no longer exists. Original entry preserved below for the audit trail of the pre-actor-model design state.
+
+### Original entry (kept for archive — pre-D246/D253 actor model)
+
 - **What:** the §7 invariant is "all-`None` OR all-`Some`" and the
   spec permits a dep-connected component to span DISTINCT `Some`
   groups (`register_all_some_chain_ok_even_with_distinct_groups`).
@@ -3368,7 +3385,12 @@ pointing at a moved bench — was fixed by amend, HEAD now consistent.)
   migration-status to state this divergence honestly.
 - **Source:** Slice B-2 Step 2b-ii /qa (Blind#2, Edge#1/#2/#3).
 
-### `set_serialization_group` concurrency precondition (atomicity regression vs pre-2b)
+### ~~`set_serialization_group` concurrency precondition (atomicity regression vs pre-2b)~~ — STRUCTURALLY DELETED 2026-05-19 (D253 — `set_serialization_group` API removed)
+
+> **2026-05-26 doc-closure sweep.** D253 deleted `set_serialization_group` (along with the entire `SchedulingGroupId` / `node_group` / `partition_of` / `group_of` surface) as part of the actor-model rebase. There is no migration to be non-atomic — no API to call. The B(i) `ScratchReleaseGuard`-mirror `MigrationRollback` defence was deleted with the migration code. Original entry preserved below for the audit trail of the pre-actor-model design state.
+
+### Original entry (kept for archive — pre-D253)
+
 - **What:** the shard split made the component migration **non-atomic
   across 3 lock scopes** (src-shard extract → `CoreShared` index
   flip → dst-shard reinsert), with a torn "record in no shard"
@@ -3396,7 +3418,12 @@ pointing at a moved bench — was fixed by amend, HEAD now consistent.)
   pre-/qa; it is now an explicit documented precondition.
 - **Source:** Slice B-2 Step 2b-ii /qa (Blind#1 + Edge#4, converged).
 
-### Combined-guard `CoreShared` re-entrancy is comment-only (superseded by 2c)
+### ~~Combined-guard `CoreShared` re-entrancy is comment-only (superseded by 2c)~~ — STRUCTURALLY DELETED 2026-05-19 (D246 actor model)
+
+> **2026-05-26 doc-closure sweep.** Heading already noted "superseded by 2c". Post-D246 actor model: `CoreShared` / combined-guard / `with_shared` / `shard_of` / `group_of` / `partition_of` are all deleted (Core is single-owner; no shard routing). The comment-enforced re-entrancy discipline the entry described has no surface to apply to. Original entry preserved below for the audit trail of the pre-actor-model design state.
+
+### Original entry (kept for archive — pre-D246)
+
 - **What:** `with_shared`/`shard_of`/`group_of`/`partition_of` re-lock
   the single `Mutex<CoreShared>`; the ~20 entry points are safe ONLY
   because each calls `shard_of(node)` (→`lock_shared`, released)
@@ -3414,7 +3441,12 @@ pointing at a moved bench — was fixed by amend, HEAD now consistent.)
   hot path); a compile-time guard now is wasted on code 2c rewrites.
 - **Source:** Slice B-2 Step 2b-ii /qa (Blind#3).
 
-### `SingleThreadCell` two-region split diverges cross-region re-entrancy failure-mode
+### ~~`SingleThreadCell` two-region split diverges cross-region re-entrancy failure-mode~~ — STRUCTURALLY DELETED 2026-05-19 (D246 actor model — `SingleThreadCell` / `StateCell` generic deleted)
+
+> **2026-05-26 doc-closure sweep.** D246 / D253 deleted `SingleThreadCell` / `LockedCell` / `StateCell` cell-generic entirely (the actor model uses single-owner `Core` directly, no cell indirection). The two-region split was a pre-2c intermediate state; with the cell generic gone there is no cross-region re-entry surface to mask. Module-doc claim is moot — the module itself no longer exists. Original entry preserved below for the audit trail of the pre-actor-model design state.
+
+### Original entry (kept for archive — pre-D246)
+
 - **What:** pre-2a `SingleThreadCell` was one `RefCell<CoreState>` —
   ANY re-entrant double-borrow panicked loudly (the documented
   bug-catching canary, "same observable contract as `LockedCell`"²).
@@ -3428,7 +3460,12 @@ pointing at a moved bench — was fixed by amend, HEAD now consistent.)
   Module-doc claim should be narrowed (noted; not behaviour-affecting).
 - **Source:** Slice B-2 Step 2b-ii /qa (Blind#7).
 
-### Nested/re-entrant cross-shard wave — no test coverage
+### ~~Nested/re-entrant cross-shard wave — no test coverage~~ — STRUCTURALLY DELETED 2026-05-19 (D246 actor model — cross-shard model removed)
+
+> **2026-05-26 doc-closure sweep.** D246 actor model deleted the cross-shard wave concept entirely (single-owner `Core`, no shard routing, no `ShardKeyGuard`). The §7-B deferred guard's domain that this entry referenced was itself closed by D253/D255/D274 (see §7-B/E/F closures above). Original entry preserved below for the audit trail of the pre-actor-model design state.
+
+### Original entry (kept for archive — pre-D246)
+
 - **What:** `ShardKeyGuard` nested-restore was traced correct, but no
   test exercises a wave on shard A re-entering and running a wave on
   shard B (the `repeated_regroup` test is sequential, not
