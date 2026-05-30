@@ -44,10 +44,10 @@
 //! inspection are later per-language phases (CSP-2-rs equivalents) and are NOT in
 //! this skeleton. See `CLEAN-SLATE.md` for the conformance target map.
 //!
-//! > **Skeleton status:** [`protocol`] carries the decision-locked data types
-//! > concretely; [`node`], [`dispatcher`], [`ctx`], [`batch`] are documented
-//! > contract stubs whose bodies are the CSP-5 implementation work (drive each
-//! > conformance scenario green per `CLEAN-SLATE.md`).
+//! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
+//! > (kernel + control/terminal slice — C-3/C-5/C-6 green); [`batch`] is still a
+//! > contract stub, and LocalAsync/rewire are later slices. See `CLEAN-SLATE.md`
+//! > for the per-module status + conformance target map.
 
 #![forbid(unsafe_code)]
 

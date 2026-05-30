@@ -46,13 +46,19 @@ impl From<&str> for LockId {
 
 /// A pool-relative pool callback handle — **pure data, no methods** (D7).
 ///
-/// `(pool_id, handle_id)`. Serializable / snapshotable / wire-transferable. A
-/// node is NOT a handle (a node carries `up`/`down`); a handle is inert routing
-/// data the dispatcher resolves back to a pending pool callback.
+/// `(pool_id, handle_id)` per D7/DR-2; the Rust pool adds a local `generation`
+/// (B32) so a recycled slotmap slot can be told apart from a stale handle (the
+/// pool frees a dropped node's fn slot and reuses it). `generation` is a
+/// PER-LANGUAGE impl detail (D24), NOT part of the protocol/IDL Handle — it is
+/// wire-meaningless and is dropped at the wire boundary (a wired handle is
+/// re-resolved against the remote pool). User-approved Handle-widening 2026-05-29
+/// (see `CLEAN-SLATE.md`). A node is NOT a handle; a handle is inert routing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle {
     pub pool_id: u32,
     pub handle_id: u32,
+    /// Local slotmap generation (B32, per-language) — NOT in the protocol IDL.
+    pub generation: u32,
 }
 
 /// The cross-language "top" error type — error is **unknown** (D31).

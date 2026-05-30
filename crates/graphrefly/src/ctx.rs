@@ -4,9 +4,10 @@
 //! `actions.emit/forward/backward`, the whole surface unifies on `up`/`down`.
 //! Values cross erased as [`AnyValue`]; the typed `data`/`emit` helpers downcast.
 //!
-//! Slice scope: `down` (DATA/DIRTY/RESOLVED), typed `data`/`emit`, `state`, and
-//! the cleanup-hook registration. `up` validates control-only (R-ctx-up) but its
-//! INVALIDATE/PAUSE terminus actions are deferred. See `CLEAN-SLATE.md`.
+//! Slice scope: `down` (DATA/DIRTY/RESOLVED/INVALIDATE/terminal), typed `data`/
+//! `emit`, `state`, and the cleanup hooks (`on_deactivation` + `on_invalidate`).
+//! `up` validates control-only (R-ctx-up) and self-handles PAUSE/RESUME; the
+//! INVALIDATE-at-depless-source terminus (D38, C-7) is deferred. See `CLEAN-SLATE.md`.
 
 use std::rc::Rc;
 
@@ -96,8 +97,15 @@ impl Ctx {
         self.node.set_state_persist(on);
     }
 
-    /// Release external resources on deactivation (R-cleanup-hooks / D28).
+    /// Release external resources on deactivation (R-cleanup-hooks / D28). Fires once.
     pub fn on_deactivation(&self, f: impl FnOnce() + 'static) {
         self.node.register_on_deactivation(Box::new(f));
+    }
+
+    /// Flush external state on INVALIDATE (R-cleanup-hooks / D28). Re-callable: fires
+    /// once per INVALIDATE wave. INVALIDATE is lifecycle-continue (R-ctx-state / D29) —
+    /// it does NOT wipe `ctx.state`, so any internal reset must be done here.
+    pub fn on_invalidate(&self, f: impl Fn() + 'static) {
+        self.node.register_on_invalidate(Rc::new(f));
     }
 }
