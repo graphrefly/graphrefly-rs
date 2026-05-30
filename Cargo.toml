@@ -1,20 +1,36 @@
+# =============================================================================
+# graphrefly-rs — clean-slate workspace
+#
+# Authority: ~/src/graphrefly (branch clean-slate). The protocol spec, decisions
+# (D#), formal model, and conformance scenarios live there — that repo wins on
+# any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
+#
+# D32: each language is ONE self-contained package (no cross-language peer-deps).
+# The Rust clean-slate package is the single crate `graphrefly`. The previous
+# port-model crates (graphrefly-core / -graph / -operators / -storage /
+# -structures + the 3 bindings) are FROZEN as read-only reference (D41 analogue)
+# and `exclude`d below — they no longer build against this workspace and are
+# deleted once `graphrefly` reaches intent-parity.
+# =============================================================================
+
 [workspace]
 resolver = "2"
-members  = ["crates/*"]
-default-members = [
+members  = ["crates/graphrefly"]
+exclude  = [
+    # Frozen port-model reference (D41 analogue) — read-only, retired by the
+    # clean-slate pivot. Source-as-reference during re-derivation; delete at
+    # intent-parity. These intentionally no longer build in this workspace.
     "crates/graphrefly-core",
     "crates/graphrefly-graph",
     "crates/graphrefly-operators",
     "crates/graphrefly-storage",
     "crates/graphrefly-structures",
+    "crates/graphrefly-bindings-js",
+    "crates/graphrefly-bindings-py",
+    "crates/graphrefly-bindings-wasm",
 ]
-# Bindings crates (js / py / wasm) excluded from default-members because they
-# require napi-rs / maturin / wasm-pack toolchains. Build them via their own
-# tooling: `pnpm build` for js, `maturin develop` for py, `wasm-pack build`
-# for wasm.
 
 [workspace.package]
-version      = "0.0.9"
 edition      = "2021"
 rust-version = "1.95"
 license      = "MIT OR Apache-2.0"
@@ -23,101 +39,51 @@ homepage     = "https://graphrefly.dev"
 authors      = ["David Chen<clfhhc@gmail.com>"]
 
 # ---------------------------------------------------------------------------
-# Shared dependencies — child crates inherit via `workspace = true` and
-# enable feature subsets per-crate. One place to bump versions.
+# Shared dependencies — the clean-slate substrate is sync-core (F-SYNC-CORE)
+# and single-thread (D22), so it carries NO concurrency primitives. The async
+# pool (LocalAsync, D20) lands later behind a `tokio` feature. The old deep
+# storage/CID/serde stack belongs to the frozen upper-layer crates and is
+# re-introduced per-phase if/when those subsystems are re-derived (CSP-2.8-rs).
 # ---------------------------------------------------------------------------
-
 [workspace.dependencies]
-# In-workspace crates (path deps; bumped together pre-1.0)
-graphrefly-core       = { path = "crates/graphrefly-core", version = "0.0.9" }
-graphrefly-graph      = { path = "crates/graphrefly-graph", version = "0.0.9" }
-graphrefly-operators  = { path = "crates/graphrefly-operators", version = "0.0.9" }
-graphrefly-storage    = { path = "crates/graphrefly-storage", version = "0.0.9" }
-graphrefly-structures = { path = "crates/graphrefly-structures", version = "0.0.9" }
-
-# Concurrency primitives
-# `arc_lock` enables `Arc<ReentrantMutex<()>>::lock_arc()` returning an
-# owned `ArcReentrantMutexGuard` (Slice A close /qa wave-owner mutex).
-parking_lot = { version = "0.12", default-features = false, features = ["arc_lock"] }
-ahash       = { version = "0.8" }
+# Errors / logging
+thiserror   = { version = "1" }
+tracing     = { version = "0.1" }
 
 # Small-collection primitives
 smallvec    = { version = "1.13", features = ["union", "const_new"] }
 indexmap    = { version = "2.6" }
 
-# Errors / logging
-thiserror   = { version = "1" }
-tracing     = { version = "0.1" }
-
-# Compile-time invariant assertions — e.g., locking `!Send + !Sync` on
-# owner-thread-only types so a future field change can't silently widen
-# the trait bounds. Build-time-only; zero runtime cost.
+# Compile-time invariant assertions — lock the substrate to !Send + !Sync so a
+# future field change can't silently widen the bounds (D22 single-thread).
 static_assertions = { version = "1.1" }
 
-# Serialization stack — graph + storage + structures
-serde                 = { version = "1",   features = ["derive"] }
-serde_ipld_dagcbor    = { version = "0.6" }
-ciborium              = { version = "0.2" }
-serde_json            = { version = "1"   }
-bincode               = { version = "1.3" }
-
-# Content addressing — V1–V3 CIDs
-cid                   = { version = "0.11" }
-multihash             = { version = "0.19" }
-multibase             = { version = "0.9" }
-blake3                = { version = "1.5" }
-sha2                  = { version = "0.10" }
-hex                   = { version = "0.4"  }
-
-# Compression — DagCborZstdCodec
-zstd                  = { version = "0.13" }
-
-# Async runtime — timer substrate (feature-gated in core, always-on in storage/bindings)
-tokio                 = { version = "1", default-features = false }
-tokio-util            = { version = "0.7" }
-
-# Persistent collections — Phase 14 op-log substrate
-imbl                  = { version = "3"    }
-
-# Storage backend — replaces sqliteStorage for ACID per-tier transactions
-redb                  = { version = "2"    }
+# Async runtime — LocalAsync pool timer substrate, feature-gated (added in CSP-5
+# when the async pool arm lands). Declared here so the version is pinned now.
+tokio       = { version = "1", default-features = false }
 
 # Test-only
-proptest              = { version = "1"    }
-criterion             = { version = "0.5"  }
-loom                  = { version = "0.7"  }
-# Bench-only — used for the lock-strategy microbench (compares parking_lot
-# Mutex / RwLock / dashmap / thread_local / crossbeam MPSC under realistic
-# dispatcher access patterns). Not used by the core dispatcher itself.
-dashmap               = { version = "6"    }
-crossbeam-channel     = { version = "0.5"  }
+proptest    = { version = "1" }
+criterion   = { version = "0.5" }
 
 # ---------------------------------------------------------------------------
 # Build profiles
 # ---------------------------------------------------------------------------
-
 [profile.release]
 lto           = true
 codegen-units = 1
 strip         = "symbols"
 
-# WASM target: optimize for size over speed (matters for browser/edge
-# binary download size; speed gap vs. opt-level=3 is small in practice).
-[profile.release.package.graphrefly-bindings-wasm]
-opt-level = "z"
-
-# Mild optimization for dependencies in dev so test runs are fast.
-# Our own crates stay opt-level=0 for fast incremental compiles.
+# Mild optimization for dependencies in dev so test runs are fast; our own crate
+# stays opt-level=0 for fast incremental compiles.
 [profile.dev.package."*"]
 opt-level = 1
 
-# Profiling profile: release-optimized but keeps debug symbols + frame
-# pointers so samply / Instruments can produce readable backtraces.
-# Build with: `cargo build --profile profiling --example profile_*`
-# Profile with: `samply record -- ./target/profiling/examples/profile_*`
+# Profiling profile: release-optimized but keeps debug symbols + frame pointers
+# so samply / Instruments produce readable backtraces. F-PERF discipline.
 [profile.profiling]
 inherits      = "release"
-debug         = true       # full debuginfo for symbols
+debug         = true
 strip         = "none"
-lto           = false      # disable LTO so call frames stay intact
+lto           = false
 codegen-units = 1

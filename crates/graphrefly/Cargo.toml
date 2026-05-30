@@ -1,0 +1,22 @@
+[package]
+name        = "graphrefly"
+version     = "0.0.0"          # fresh clean-slate; port-model history is on `main`
+description  = "GraphReFly — reactive universal reduction layer (Rust clean-slate substrate)"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+authors      = { workspace = true }
+
+[dependencies]
+# Substrate is sync-core (F-SYNC-CORE) + single-thread (D22): deliberately
+# dependency-light. Uncomment per-module as CSP-5 fills the skeleton.
+# thiserror.workspace         = true
+# tracing.workspace           = true
+# smallvec.workspace          = true
+# indexmap.workspace          = true
+# static_assertions.workspace = true   # !Send/!Sync lock once Node<T> lands (D22)
+
+[dev-dependencies]
+# proptest.workspace = true     # cross-impl property tests (D14 / F-PROTO-SPEC)
