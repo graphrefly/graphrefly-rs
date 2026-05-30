@@ -45,9 +45,10 @@
 //! this skeleton. See `CLEAN-SLATE.md` for the conformance target map.
 //!
 //! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
-//! > (kernel + control/terminal slice — C-3/C-5/C-6 green); [`batch`] is still a
-//! > contract stub, and LocalAsync/rewire are later slices. See `CLEAN-SLATE.md`
-//! > for the per-module status + conformance target map.
+//! > (kernel + control/terminal + async + rewire + dep-terminal + `ctx.rewire_next`
+//! > slices). The Rust conformance arm is **green C-2..C-15**; only **C-1** remains
+//! > (wire-bridge-blocked, post-1.0). [`batch`] is still a contract stub. See
+//! > `CLEAN-SLATE.md` for the per-module status + conformance target map.
 
 #![forbid(unsafe_code)]
 
@@ -57,7 +58,7 @@ pub mod dispatcher;
 pub mod node;
 pub mod protocol;
 
-pub use ctx::{Ctx, DeferredCtx, DepRecord};
+pub use ctx::{Ctx, DeferredCtx, DepRecord, DepTerminal};
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};

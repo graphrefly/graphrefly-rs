@@ -11,8 +11,26 @@
 
 use std::rc::Rc;
 
-use crate::node::Core;
+use crate::node::{Core, RewireRequest};
 use crate::protocol::{AnyValue, Message, Wave};
+
+/// A dep's terminal state, visible to the fn via [`DepRecord::terminal`]
+/// (R-deps-terminal / C-15). `None` ⇔ the dep is live; `Some(..)` ⇔ it COMPLETEd
+/// or ERRORed. Read by `terminalAsRealInput` operators (rescue/reduce/*Map) that
+/// treat an inner terminal as a real input rather than an absorbed settle.
+///
+/// `Error` carries the dep's error **message** (an `Rc<str>`), not the original
+/// [`GraphError`]: `Box<dyn Error>` is not `Clone`, and a message crosses a dep
+/// subscription as a borrow (`&Message`), so the concrete error type cannot be
+/// preserved into this per-wave-cloneable record. Per-language (D24, D31
+/// error=unknown — the top type); the message survives, the downcast does not.
+#[derive(Clone)]
+pub enum DepTerminal {
+    /// The dep emitted COMPLETE.
+    Complete,
+    /// The dep emitted ERROR; carries its `Display` message (see type doc).
+    Error(Rc<str>),
+}
 
 /// Per-dependency record visible to a node fn (R-fn-contract). One per declared
 /// dep, a snapshot of this wave's view (values erased — downcast via [`Ctx::data`]).
@@ -27,6 +45,9 @@ pub struct DepRecord {
     pub latest: Option<AnyValue>,
     /// Tier of this dep's most recent message in the current wave (0 if none).
     pub tier: u8,
+    /// The dep's terminal state (R-deps-terminal). `None` ⇔ live. A
+    /// `terminalAsRealInput` fn reads this to react to an inner COMPLETE/ERROR.
+    pub terminal: Option<DepTerminal>,
 }
 
 /// The single argument to a node fn. All emission is explicit via [`Ctx::down`] /
@@ -107,6 +128,31 @@ impl Ctx {
     /// it does NOT wipe `ctx.state`, so any internal reset must be done here.
     pub fn on_invalidate(&self, f: impl Fn() + 'static) {
         self.node.register_on_invalidate(Rc::new(f));
+    }
+
+    /// Request a deferred self-rewire ADD at the committed wave boundary (R-rewire-deferred /
+    /// D47): add `dep` (and swap the fn) AFTER the current wave settles — never in place, so
+    /// this is NOT the D37 mid-fn reject. Higher-order operators (*Map) use this to wire
+    /// runtime-created inner nodes as VISIBLE self-deps. `f` re-pairs the deps (SD-1 pairing).
+    pub fn rewire_next_add<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+        self.node
+            .request_rewire_next(RewireRequest::Add(dep, Rc::new(f)));
+    }
+
+    /// Request a deferred self-rewire REMOVE (R-rewire-deferred): remove `dep` + swap the fn at
+    /// the boundary. removeDep DRAINS the dep's edge + tears down its source on last-subscriber
+    /// (onDeactivation) = the switchMap/abortInFlight cancellation + memory bounding (D47 beta).
+    pub fn rewire_next_remove<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+        self.node
+            .request_rewire_next(RewireRequest::Remove(dep, Rc::new(f)));
+    }
+
+    /// Request a deferred self-rewire SET (R-rewire-deferred): replace the whole dep set + swap
+    /// the fn at the boundary (the switch-variant — removes-before-adds keeps the tracked inner
+    /// list aligned across boundary waves).
+    pub fn rewire_next_set<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) {
+        self.node
+            .request_rewire_next(RewireRequest::Set(deps, Rc::new(f)));
     }
 
     /// Obtain an owned, `'static` deferred-emit handle for **async-pool** late emission

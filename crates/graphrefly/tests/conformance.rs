@@ -30,7 +30,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use graphrefly::{
-    AnyValue, DeferredCtx, LockId, Message, Node, NodeOpts, Pausable, PoolKind, Status,
+    AnyValue, Core, Ctx, DeferredCtx, DepTerminal, LockId, Message, Node, NodeOpts, Pausable,
+    PoolKind, Status,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -48,6 +49,406 @@ fn record<T: 'static>(node: &Node<T>) -> (Log, Unsub) {
 
 fn kinds(log: &Log) -> Vec<String> {
     log.borrow().clone()
+}
+
+/// Subscribe a recorder that captures DATA **values** (downcast to `i32`), for the
+/// occurrence-counting scenarios (C-12). Keep the unsub alive.
+fn record_data_i32(node: &Node<i32>) -> (Rc<RefCell<Vec<i32>>>, Unsub) {
+    let vals: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+    let v = vals.clone();
+    let unsub = node.subscribe(move |m: &Message<AnyValue>| {
+        if let Message::Data(a) = m {
+            if let Ok(rc) = a.clone().downcast::<i32>() {
+                v.borrow_mut().push(*rc);
+            }
+        }
+    });
+    (vals, unsub)
+}
+
+/// Count occurrences of a message kind in a recorded log.
+fn count_kind(log: &Log, kind: &str) -> usize {
+    log.borrow().iter().filter(|k| *k == kind).count()
+}
+
+/// The shared self-fn type for a self-referential operator (the rewire fn re-pairs the deps,
+/// SD-1). `NodeFn` is a per-language impl detail (not exported); the test re-declares it.
+type OpFn = Rc<dyn Fn(&Ctx)>;
+
+/// A leaf-source inner (the *Map runtime-created node) whose activation + deactivation are
+/// OBSERVABLE (cancellation visible). Emits its `seed` on activation; later emits/complete go
+/// through a stashed [`DeferredCtx`] (an owned late-emit handle — `&Ctx` can't outlive invoke).
+struct Inner {
+    node: Node<i32>,
+    dctx: Rc<RefCell<Option<DeferredCtx>>>,
+    activated: Rc<Cell<bool>>,
+    deactivated: Rc<Cell<bool>>,
+}
+impl Inner {
+    fn emit(&self, v: i32) {
+        self.dctx
+            .borrow()
+            .as_ref()
+            .expect("inner activated")
+            .emit(v);
+    }
+    fn is_activated(&self) -> bool {
+        self.activated.get()
+    }
+    fn is_deactivated(&self) -> bool {
+        self.deactivated.get()
+    }
+    fn core(&self) -> Core {
+        self.node.erased()
+    }
+}
+
+fn make_inner(seed: Option<i32>) -> Inner {
+    let dctx: Rc<RefCell<Option<DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let activated = Rc::new(Cell::new(false));
+    let deactivated = Rc::new(Cell::new(false));
+    let (dc, act, deact) = (dctx.clone(), activated.clone(), deactivated.clone());
+    let node = Node::<i32>::producer(move |ctx| {
+        act.set(true);
+        let d = deact.clone();
+        ctx.on_deactivation(move || d.set(true));
+        *dc.borrow_mut() = Some(ctx.defer());
+        if let Some(s) = seed {
+            ctx.emit(s);
+        }
+    });
+    Inner {
+        node,
+        dctx,
+        activated,
+        deactivated,
+    }
+}
+
+/// C-11 — a node fn's SELF-triggered dep-set mutation via `ctx.rewire_next` is DEFERRED to the
+/// committed wave boundary and applied as a fresh wave (R-rewire-deferred / D47). Distinct from
+/// C-8 (external/immediate rewire between waves) — C-11 is self-triggered/deferred-at-boundary,
+/// the substrate prerequisite for the higher-order *Map operators. Mirrors the TS arm's facets.
+/// The Rust arm has no *Map sugar yet, so the operators are substrate-expressed (self-ref fns).
+#[test]
+fn c11_higher_order_inner_rewire_at_wave_boundary() {
+    // ── (steps 1-3) addDep deferred to the boundary; the added cached inner pushes
+    //    [DIRTY,DATA]; the first-run gate is NOT re-armed (S alone re-drives the fn). ──
+    {
+        let s = Node::<i32>::state_empty();
+        let inners: Rc<RefCell<Vec<Inner>>> = Rc::new(RefCell::new(Vec::new()));
+        let op_runs = Rc::new(Cell::new(0usize));
+        let deferred_ok = Rc::new(Cell::new(false));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let (inners, op_runs, deferred_ok, cell) = (
+                inners.clone(),
+                op_runs.clone(),
+                deferred_ok.clone(),
+                cell.clone(),
+            );
+            Rc::new(move |ctx: &Ctx| {
+                op_runs.set(op_runs.get() + 1);
+                let self_fn = cell.borrow().clone().expect("op fn installed");
+                // forward any inner DATA (dep i >= 1).
+                for i in 1..ctx.dep_records().len() {
+                    if let Some(b) = &ctx.dep_records()[i].batch {
+                        for v in b {
+                            if let Ok(rc) = v.clone().downcast::<i32>() {
+                                ctx.emit(*rc);
+                            }
+                        }
+                    }
+                }
+                // on S DATA (dep 0): spawn + REQUEST add an inner (seed = S * 10).
+                if let Some(b) = &ctx.dep_records()[0].batch {
+                    if let Some(last) = b.last() {
+                        let sv = *last.clone().downcast::<i32>().unwrap();
+                        let inner = make_inner(Some(sv * 10));
+                        let core = inner.core();
+                        let act = inner.activated.clone();
+                        inners.borrow_mut().push(inner);
+                        let sf = self_fn.clone();
+                        ctx.rewire_next_add(core, move |c| sf(c));
+                        // mid-run: the add is DEFERRED — the inner is NOT wired/activated yet.
+                        deferred_ok.set(!act.get());
+                    }
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let cf = cell.clone();
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
+        );
+        let (log, _u) = record(&op);
+        let (vals, _u2) = record_data_i32(&op);
+
+        s.set(1); // request addDep(innerA) → boundary drain wires it → innerA's seed forwarded
+        assert!(
+            deferred_ok.get(),
+            "addDep was deferred (inner not activated mid-run)"
+        );
+        assert!(
+            inners.borrow()[0].is_activated(),
+            "boundary drain activated the inner"
+        );
+        assert!(kinds(&log).contains(&"DIRTY".to_string())); // the boundary wave is two-phase
+        assert_eq!(*vals.borrow(), vec![10]); // innerA's seed (1*10) forwarded as DATA
+
+        // S alone re-drives the op fn after the rewire AND adds innerB — i.e. addDep did NOT re-arm
+        // the gate to re-wait for all deps. (That gate property is the shared R-rewire path covered by
+        // C-8; here we observe the operator stays live + re-drivable post-rewire.)
+        op_runs.set(0);
+        s.set(2);
+        assert!(op_runs.get() > 0, "S re-drives the op fn after the rewire");
+        assert_eq!(inners.borrow().len(), 2); // …and innerB was spawned (the rewire path is live)
+    }
+
+    // ── (step 7) an inner COMPLETE removes it (bounding); OP stays live while S is live. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let inners: Rc<RefCell<Vec<Inner>>> = Rc::new(RefCell::new(Vec::new()));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let (inners, cell) = (inners.clone(), cell.clone());
+            Rc::new(move |ctx: &Ctx| {
+                let self_fn = cell.borrow().clone().expect("op fn installed");
+                // Collect completed inners as (tracking-index, core) — do NOT mutate `inners`
+                // mid-loop (a splice would shift later indices and desync the read for ≥2 inners).
+                let mut removals: Vec<(usize, Core)> = Vec::new();
+                for i in 1..ctx.dep_records().len() {
+                    if let Some(b) = &ctx.dep_records()[i].batch {
+                        for v in b {
+                            if let Ok(rc) = v.clone().downcast::<i32>() {
+                                ctx.emit(*rc);
+                            }
+                        }
+                    }
+                    if matches!(ctx.dep_records()[i].terminal, Some(DepTerminal::Complete)) {
+                        removals.push((i - 1, inners.borrow()[i - 1].core()));
+                    }
+                }
+                if let Some(b) = &ctx.dep_records()[0].batch {
+                    if let Some(last) = b.last() {
+                        let sv = *last.clone().downcast::<i32>().unwrap();
+                        let inner = make_inner(Some(sv * 10));
+                        let core = inner.core();
+                        inners.borrow_mut().push(inner); // appends at the end → earlier indices stay valid
+                        let sf = self_fn.clone();
+                        ctx.rewire_next_add(core, move |c| sf(c));
+                    }
+                }
+                // Splice the completed inners out of the tracking list in DESCENDING index order
+                // (so each removal keeps the not-yet-removed lower indices valid) + request removeDep,
+                // keeping `inners` aligned with the op's deps[1..].
+                for (idx, core) in removals.into_iter().rev() {
+                    inners.borrow_mut().remove(idx);
+                    let sf = self_fn.clone();
+                    ctx.rewire_next_remove(core, move |c| sf(c));
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let cf = cell.clone();
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
+        );
+        let (log, _u) = record(&op);
+        let (vals, _u2) = record_data_i32(&op);
+
+        s.set(5); // add innerA (seed 50 forwarded at the boundary)
+        assert!(vals.borrow().contains(&50));
+        let inner_a = inners.borrow()[0].node.clone();
+        let _ia_act = inners.borrow()[0].activated.clone();
+        let ia_deact = inners.borrow()[0].deactivated.clone();
+
+        inner_a.down(vec![Message::Complete]); // innerA COMPLETEs → OP removes it (bounding)
+        assert!(
+            ia_deact.get(),
+            "the completed inner is removed → deactivated (input torn down)"
+        );
+        assert_ne!(op.status(), Status::Completed); // OP stays live (S live, cwdc:false)
+        assert!(!kinds(&log).contains(&"COMPLETE".to_string()));
+    }
+
+    // ── (steps 4-6, switch) setDeps tears down the SUPERSEDED inner's source + forwards only
+    //    the new one; the superseded inner is DRAINED (a stale emit does not survive). ──
+    {
+        let s = Node::<i32>::state_empty();
+        let inner_a = make_inner(Some(10));
+        let inner_b = make_inner(Some(20));
+        let a_core = inner_a.core();
+        let b_core = inner_b.core();
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let (s2, a_core, b_core, cell) =
+                (s.erased(), a_core.clone(), b_core.clone(), cell.clone());
+            Rc::new(move |ctx: &Ctx| {
+                let self_fn = cell.borrow().clone().expect("op fn installed");
+                for i in 1..ctx.dep_records().len() {
+                    if let Some(b) = &ctx.dep_records()[i].batch {
+                        for v in b {
+                            if let Ok(rc) = v.clone().downcast::<i32>() {
+                                ctx.emit(*rc);
+                            }
+                        }
+                    }
+                }
+                if let Some(b) = &ctx.dep_records()[0].batch {
+                    if let Some(last) = b.last() {
+                        let sv = *last.clone().downcast::<i32>().unwrap();
+                        let current = if sv == 1 {
+                            a_core.clone()
+                        } else {
+                            b_core.clone()
+                        };
+                        let sf = self_fn.clone();
+                        ctx.rewire_next_set(vec![s2.clone(), current], move |c| sf(c));
+                    }
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let cf = cell.clone();
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
+        );
+        let (_log, _u) = record(&op);
+        let (vals, _u2) = record_data_i32(&op);
+
+        s.set(1); // → innerA live (seed 10 forwarded)
+        assert!(vals.borrow().contains(&10));
+        assert!(inner_a.is_activated());
+        vals.borrow_mut().clear();
+
+        s.set(2); // switch → innerB; innerA's SOURCE is torn down (not merely masked)
+        assert!(inner_b.is_activated());
+        assert!(
+            inner_a.is_deactivated(),
+            "the superseded inner's source is deactivated"
+        );
+        assert_eq!(*vals.borrow(), vec![20]); // ONLY the current inner forwarded
+        vals.borrow_mut().clear();
+
+        inner_a.emit(999); // the superseded inner is DRAINED — no stale forward survives
+        assert_eq!(*vals.borrow(), Vec::<i32>::new());
+    }
+
+    // ── (variant) an IMMEDIATE in-fn self-rewire is the D37 feedback cycle → ERROR (NOT
+    //    ctx.rewire_next). The immediate add_dep mid-run panics → wave-owner catch → ERROR. ──
+    {
+        let a = Node::<i32>::state(1);
+        let x = Node::<i32>::state(9);
+        let op_cell: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
+        let cf = op_cell.clone();
+        let xc = x.erased();
+        let op = Node::<i32>::derived(vec![a.erased()], move |ctx| {
+            let op = cf.borrow().clone().expect("op installed");
+            // IMMEDIATE self-rewire mid-run (not ctx.rewire_next) → D37 reject panics.
+            op.add_dep(xc.clone(), |c| {
+                c.emit(c.data::<i32>(0).map(|r| *r).unwrap_or(0))
+            });
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        });
+        *op_cell.borrow_mut() = Some(op.clone());
+
+        // The substrate panic must be CAUGHT by the wave-owner (D30), not escape subscribe.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _u = op.subscribe(|_| {});
+        }));
+        assert!(
+            result.is_ok(),
+            "the D37 reject is converted to ERROR, not escaped"
+        );
+        assert_eq!(op.status(), Status::Errored);
+    }
+
+    // ── (variant) a terminal OP discards its pending rewireNext queue. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let inner = make_inner(Some(1));
+        let inner_core = inner.core();
+        let inner_act = inner.activated.clone();
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let (inner_core, cell) = (inner_core.clone(), cell.clone());
+            Rc::new(move |ctx: &Ctx| {
+                if ctx.dep_records()[0].batch.is_some() {
+                    let sf = cell.borrow().clone().expect("op fn");
+                    ctx.rewire_next_add(inner_core.clone(), move |c| sf(c)); // queued…
+                    ctx.down(vec![Message::Complete]); // …then OP goes terminal THIS wave
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let cf = cell.clone();
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
+        );
+        let _u = op.subscribe(|_| {});
+        s.set(1);
+        assert_eq!(op.status(), Status::Completed);
+        assert!(
+            !inner_act.get(),
+            "the queued addDep was discarded (terminal)"
+        );
+    }
+
+    // ── (variant) a no-net-change rewireNext is a no-op (no drain loop). ──
+    {
+        let a = Node::<i32>::state(1);
+        let runs = Rc::new(Cell::new(0usize));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let (a2, runs, cell) = (a.erased(), runs.clone(), cell.clone());
+            Rc::new(move |ctx: &Ctx| {
+                runs.set(runs.get() + 1);
+                if runs.get() < 5 {
+                    let sf = cell.borrow().clone().expect("op fn");
+                    // identical dep set every run → no net change → no fresh wave → no loop.
+                    ctx.rewire_next_set(vec![a2.clone()], move |c| sf(c));
+                }
+                ctx.emit(*ctx.data::<i32>(0).unwrap());
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let cf = cell.clone();
+        let op = Node::<i32>::derived(vec![a.erased()], move |ctx| {
+            (cf.borrow().clone().expect("op fn"))(ctx)
+        });
+        let (_log, _u) = record(&op);
+        assert_eq!(
+            runs.get(),
+            1,
+            "the idempotent setDeps changes nothing → no loop"
+        );
+        assert_eq!(op.cache(), Some(1));
+    }
 }
 
 /// C-3 — INVALIDATE cascades exactly once, fires `onInvalidate`, preserves `ctx.state`
@@ -424,6 +825,7 @@ fn c9_pausable_false_async_source_ignores_pause() {
             NodeOpts {
                 pool: PoolKind::Async,
                 pausable: Pausable::False,
+                ..NodeOpts::default()
             },
             move |ctx| {
                 *st.borrow_mut() = Some(ctx.defer());
@@ -579,4 +981,242 @@ fn c8_rewire_on_terminal_node_rejected() {
     d.set_deps(vec![a.erased()], |ctx| {
         ctx.emit(*ctx.data::<i32>(0).unwrap())
     }); // → panic
+}
+
+/// C-15 — a dep's TERMINAL (COMPLETE/ERROR) RELEASES its outstanding in-wave DIRTY
+/// contribution (R-terminal-settles-dirty / B35) — the exactly-one-settle invariant — so a
+/// DIRTY-then-terminal-without-DATA dep never strands the join node's `pending` and wedges
+/// it. The terminal analogue of the INVALIDATE wedge-guard. Mirrors the TS arm a/b/c/d.
+#[test]
+fn c15_dep_terminal_settles_dirty() {
+    fn sum2(ctx: &Ctx) {
+        let b = ctx.data::<i32>(0).map(|r| *r).unwrap_or(0);
+        let c = ctx.data::<i32>(1).map(|r| *r).unwrap_or(0);
+        ctx.emit(b + c);
+    }
+
+    // (a) COMPLETE-mid-dirty: B dirties D; C delivers a value; B COMPLETEs with NO DATA →
+    //     B's dirty is released, D joins EXACTLY once on the live leg (no wedge, no glitch).
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11)); // first join (activation): 1 + 10
+        log.borrow_mut().clear();
+
+        b.down(vec![Message::Dirty]); // B signals a change → D dirty, pending=1
+        assert_eq!(d.status(), Status::Dirty);
+        c.set(20); // C delivers a real value, but D is gated on B's pending
+        assert_eq!(d.cache(), Some(11)); // not yet (B still dirty)
+        b.down(vec![Message::Complete]); // B COMPLETEs no-DATA → releases B's dirty → D joins on C
+
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]); // joined exactly once, glitch-free, no wedge
+        assert_eq!(d.cache(), Some(21)); // B's last value (1) + C's new value (20)
+        assert_ne!(d.status(), Status::Completed); // C still live (completeWhenDepsComplete:false)
+    }
+
+    // (b) sole-dirty: B is the only dirty contributor; its COMPLETE drains `pending` → D
+    //     un-dirties via a synthesized RESOLVED (no fabricated DATA), cache preserved.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11));
+        log.borrow_mut().clear();
+
+        b.down(vec![Message::Dirty]); // B the SOLE dirty contributor (C unchanged this wave)
+        b.down(vec![Message::Complete]); // COMPLETEs with no value → no occurrence → undirty RESOLVED
+
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]); // un-dirtied, NOT a fabricated DATA
+        assert_eq!(d.cache(), Some(11)); // cache preserved (a terminal, unlike INVALIDATE, keeps it)
+        assert_eq!(d.status(), Status::Resolved); // undirty-RESOLVED convention, not "settled"
+    }
+
+    // (c) rescue: an absorbed ERROR releases the dirty + the fn READS the terminal
+    //     (terminal_as_real_input, error_when_deps_error:false) — not propagated, no wedge.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                error_when_deps_error: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            |ctx| {
+                // rescue B's value to 0 when it errored; else read its latest (R-deps-terminal).
+                let bv = if matches!(ctx.dep_records()[0].terminal, Some(DepTerminal::Error(_))) {
+                    0
+                } else {
+                    ctx.data::<i32>(0).map(|r| *r).unwrap_or(0)
+                };
+                let cv = ctx.data::<i32>(1).map(|r| *r).unwrap_or(0);
+                ctx.emit(bv + cv);
+            },
+        );
+        let (_log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11));
+
+        b.down(vec![Message::Dirty]); // B dirties D
+        b.down(vec![Message::Error("boom".into())]); // rescued → fn reads the terminal
+
+        assert_ne!(d.status(), Status::Errored); // NOT propagated — rescued
+        assert_eq!(d.cache(), Some(10)); // B rescued to 0 + C(10); released dirty, no stranded pending
+    }
+
+    // (d) gate-holds: a dirtied dep completing-empty on a PRE-first-run multi-dep node
+    //     un-dirties via RESOLVED, never wedges (the QA gate-holds corner — B has DATA but
+    //     the first-run gate STILL holds since C never delivered + terminal_as_real_input:false).
+    {
+        let runs = Rc::new(Cell::new(0usize));
+        let b = Node::<i32>::state_empty();
+        let c = Node::<i32>::state_empty();
+        let d = {
+            let r = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                NodeOpts {
+                    complete_when_deps_complete: false,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    r.set(r.get() + 1);
+                    let bv = ctx.data::<i32>(0).map(|x| *x).unwrap_or(0);
+                    let cv = ctx.data::<i32>(1).map(|x| *x).unwrap_or(0);
+                    ctx.emit(bv + cv);
+                },
+            )
+        };
+        let (log, _u) = record(&d);
+        assert_eq!(runs.get(), 0); // gate holds — neither dep delivered yet
+        log.borrow_mut().clear();
+
+        c.down(vec![Message::Dirty]); // C signals a change → D dirty, broadcasts DIRTY (pending=1)
+        b.set(5); // B delivers a value, but the gate still needs C → D gated
+        assert_eq!(runs.get(), 0);
+        c.down(vec![Message::Complete]); // C COMPLETEs no-value → releases dirty; gate STILL holds
+
+        assert_eq!(runs.get(), 0); // fn never ran (C never delivered, terminal_as_real_input:false)
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]); // un-dirtied downstream, NOT wedged
+        assert_eq!(d.cache(), None); // never produced a value
+    }
+}
+
+/// C-12 — every value-OCCURRENCE stays DATA (no equals-substitution); RESOLVED is the
+/// substrate-synthesized UNDIRTY settle only; dedup is OPT-IN at the operator layer
+/// (R-resolved-undirty / D49, supersedes D15/R-equals). The Rust arm has no operator
+/// library yet, so take / distinctUntilChanged are expressed as inline `ctx.state` derived
+/// nodes (per-language, D6/D24) — the substrate property under test is language-neutral.
+#[test]
+fn c12_occurrences_stay_data_resolved_is_undirty_only() {
+    // (a) a repeated value is THREE distinct occurrences — never collapsed to RESOLVED.
+    {
+        let src = Node::<i32>::producer(|ctx| {
+            ctx.emit(1);
+            ctx.emit(1);
+            ctx.emit(1);
+            ctx.down(vec![Message::Complete]);
+        });
+        let (log, _u) = record(&src);
+        assert_eq!(
+            count_kind(&log, "DATA"),
+            3,
+            "three occurrences, all DATA (got {:?})",
+            kinds(&log)
+        );
+        assert_eq!(
+            count_kind(&log, "RESOLVED"),
+            0,
+            "no equals-substitution (got {:?})",
+            kinds(&log)
+        );
+    }
+
+    // (b) a take(3)-style derived (ctx.state counter) counts OCCURRENCES, not distinct values:
+    //     fromIter([1,1,1,1]) → take(3) → [1,1,1].
+    {
+        let src = Node::<i32>::producer(|ctx| {
+            for _ in 0..4 {
+                ctx.emit(1);
+            }
+            ctx.down(vec![Message::Complete]);
+        });
+        let taken = Node::<i32>::derived(vec![src.erased()], |ctx| {
+            let n = ctx.state_get::<i32>().map(|r| *r).unwrap_or(0);
+            if n < 3 {
+                let v = *ctx.data::<i32>(0).expect("a value occurred");
+                ctx.state_set(n + 1);
+                ctx.emit(v);
+                if n + 1 == 3 {
+                    ctx.down(vec![Message::Complete]);
+                }
+            }
+        });
+        let (vals, _u) = record_data_i32(&taken);
+        assert_eq!(*vals.borrow(), vec![1, 1, 1]); // counts occurrences, NOT collapsed to one
+    }
+
+    // (c) a filter that REJECTS (fn returns without emitting) makes the substrate SYNTHESIZE
+    //     one undirty RESOLVED per rejected wave — no DATA, no wedge; an accepted value is DATA.
+    {
+        let src = Node::<i32>::state_empty();
+        let filtered = Node::<i32>::derived(vec![src.erased()], |ctx| {
+            let v = *ctx.data::<i32>(0).unwrap();
+            if v % 2 == 0 {
+                ctx.emit(v); // accept evens; reject odds (no emit → undirty RESOLVED)
+            }
+        });
+        let (log, _u) = record(&filtered);
+        src.set(3); // odd → reject → synthesized undirty RESOLVED (no wedge)
+        src.set(4); // even → DATA(4) (an occurrence)
+        src.set(5); // odd → RESOLVED
+        assert_eq!(
+            kinds(&log),
+            vec!["START", "DIRTY", "RESOLVED", "DIRTY", "DATA", "DIRTY", "RESOLVED"]
+        );
+    }
+
+    // (d) dedup is OPT-IN at the operator layer: a distinctUntilChanged-style derived (its
+    //     own eq via ctx.state) suppresses an unchanged value → [1,1,2] emits [1,2]; the
+    //     suppressed repeat is an undirty RESOLVED (the substrate did NOT dedup it for us).
+    {
+        let src = Node::<i32>::state_empty();
+        let distinct = Node::<i32>::derived(vec![src.erased()], |ctx| {
+            let v = *ctx.data::<i32>(0).unwrap();
+            let last = ctx.state_get::<i32>().map(|r| *r);
+            if last != Some(v) {
+                ctx.state_set(v);
+                ctx.emit(v);
+            } // else unchanged → no emit → substrate synthesizes the undirty RESOLVED
+        });
+        let (vals, _u) = record_data_i32(&distinct);
+        let (log, _u2) = record(&distinct);
+        src.set(1); // new → DATA(1)
+        src.set(1); // same → deduped by the OPERATOR → RESOLVED, not a dropped/collapsed DATA
+        src.set(2); // new → DATA(2)
+        assert_eq!(*vals.borrow(), vec![1, 2]); // dedup is opt-in (operator), not substrate
+        assert_eq!(
+            count_kind(&log, "RESOLVED"),
+            1,
+            "the deduped repeat is an undirty RESOLVED"
+        );
+        assert_eq!(count_kind(&log, "DATA"), 2);
+    }
 }

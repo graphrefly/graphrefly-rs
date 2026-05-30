@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
-use crate::ctx::{Ctx, DepRecord};
+use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Wave};
 
@@ -101,19 +101,57 @@ pub enum Pausable {
 }
 
 /// Node construction options (substrate-level). Sugar/operator opts are the graph layer
-/// (D6/D24); this is the minimal substrate surface needed to select a pool (D20) and a
-/// pause mode (R-pause-modes).
-#[derive(Debug, Clone, Copy, Default)]
+/// (D6/D24); this is the minimal substrate surface needed to select a pool (D20), a
+/// pause mode (R-pause-modes), and the dep-terminal propagation policy (R-deps-terminal).
+#[derive(Debug, Clone, Copy)]
 pub struct NodeOpts {
     /// The dispatch pool (default LocalSync, R-sync-core).
     pub pool: PoolKind,
     /// The pause mode (default `true`, R-pause-modes).
     pub pausable: Pausable,
+    /// Auto-emit COMPLETE when ALL deps complete (default `true`; combineLatest
+    /// semantics — ALL not ANY). last/reduce/*Map set `false` to ABSORB inner
+    /// terminals (R-deps-terminal).
+    pub complete_when_deps_complete: bool,
+    /// Auto-emit ERROR when ANY dep errors (default `true`). rescue/catch set `false`.
+    pub error_when_deps_error: bool,
+    /// A dep's terminal is a REAL INPUT the fn reads (rescue/reduce/*Map) rather than an
+    /// absorbed settle — when set, the fn re-runs on a dep terminal and the first-run
+    /// gate treats a terminated dep as settled (R-deps-terminal). Default `false`.
+    pub terminal_as_real_input: bool,
+}
+
+/// Defaults: COMPLETE/ERROR auto-cascade ON (combineLatest-style), terminal-as-input OFF
+/// — the plain derived/effect behavior. (A manual impl, not `#[derive(Default)]`, so the
+/// two cascade flags default to `true`, not `false`.)
+impl Default for NodeOpts {
+    fn default() -> Self {
+        Self {
+            pool: PoolKind::default(),
+            pausable: Pausable::default(),
+            complete_when_deps_complete: true,
+            error_when_deps_error: true,
+            terminal_as_real_input: false,
+        }
+    }
 }
 
 type Msg = Message<AnyValue>;
 type Sink = Rc<dyn Fn(&Msg)>;
 type Unsub = Box<dyn FnOnce()>;
+
+/// A deferred self-rewire request (R-rewire-deferred / D47), issued via `ctx.rewire_next`
+/// and applied at the committed wave boundary. The new dep set is computed at APPLY time (so
+/// multiple requests in one wave compose against the live deps), then the surgical R-rewire
+/// (D42) runs as a fresh wave. The fn re-pairs the deps (SD-1 fn-deps pairing).
+pub(crate) enum RewireRequest {
+    /// Add a dep (idempotent if already present) + swap the fn.
+    Add(Core, NodeFn),
+    /// Remove a dep (idempotent if absent) + swap the fn.
+    Remove(Core, NodeFn),
+    /// Replace the whole dep set + swap the fn.
+    Set(Vec<Core>, NodeFn),
+}
 
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
 /// reentrant engine lives on [`Core`].
@@ -191,12 +229,38 @@ struct NodeInner {
     /// Terminal-is-forever (D17): once COMPLETE/ERROR has been emitted the node is
     /// final — it ignores further upstream messages and re-emits no terminal.
     terminal: bool,
+
+    // ── dep-terminal propagation (R-deps-terminal / R-terminal-settles-dirty, C-15) ──
+    /// Per-dep terminal state (parallel array, indexed by dep position): `None` ⇔ the
+    /// dep is live; `Some(..)` ⇔ it COMPLETEd/ERRORed. Read by the fn via
+    /// `ctx.dep_records()[i].terminal` for `terminal_as_real_input` operators.
+    dep_terminal: Vec<Option<DepTerminal>>,
+    /// Auto-emit COMPLETE when ALL deps complete (default true). last/reduce/*Map set
+    /// false to ABSORB inner terminals (R-deps-terminal).
+    complete_when_deps_complete: bool,
+    /// Auto-emit ERROR when ANY dep errors (default true). rescue/catch set false.
+    error_when_deps_error: bool,
+    /// A dep's terminal is a real input the fn reads (rescue/reduce/*Map), not an
+    /// absorbed settle (R-deps-terminal).
+    terminal_as_real_input: bool,
 }
 
 impl NodeInner {
-    /// First-run gate predicate: every declared dep has delivered ≥1 DATA.
+    /// First-run gate predicate: every declared dep has delivered ≥1 DATA. A
+    /// `terminal_as_real_input` node (rescue/reduce/*Map) also treats a TERMINATED dep
+    /// as settled, so the fn may run when an inner terminates without ever delivering
+    /// DATA (R-deps-terminal / R-first-run-gate).
     fn all_deps_settled(&self) -> bool {
-        self.dep_has_data.iter().all(|&h| h)
+        for i in 0..self.dep_has_data.len() {
+            if self.dep_has_data[i] {
+                continue;
+            }
+            if self.terminal_as_real_input && self.dep_terminal[i].is_some() {
+                continue;
+            }
+            return false;
+        }
+        true
     }
 }
 
@@ -355,7 +419,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
     });
     let result = catch_unwind(AssertUnwindSafe(body));
     let scope = WAVE.with(|w| w.borrow_mut().take());
-    match result {
+    let ret = match result {
         Ok(r) => r,
         Err(payload) => {
             // The scope is taken (we are outside the wave again). Recover every node
@@ -377,6 +441,69 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             }));
             on_error()
         }
+    };
+    // Committed wave boundary (R-rewire-deferred / D47): drain any `ctx.rewire_next` queued
+    // during this wave, each applied as a FRESH wave. Runs on BOTH paths (like the TS
+    // `exitWave` in a finally) so a queued self-rewire is not stranded by a caught panic.
+    // The DRAINING guard makes a drained thunk's own wave-owner exit a no-op, so this
+    // outermost exit owns the loop.
+    drain_deferred_rewires();
+    ret
+}
+
+thread_local! {
+    /// FIFO of deferred self-rewires (`ctx.rewire_next`), drained at the committed wave
+    /// boundary (R-rewire-deferred / D47). Single-thread (D22) ⇒ thread-local, like [`WAVE`].
+    static DEFERRED_REWIRE: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
+    /// `true` while [`drain_deferred_rewires`] is running, so a drained thunk's own
+    /// wave-owner exit does not re-enter the drain (the outermost drain owns the loop).
+    static DRAINING_REWIRE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Queue a deferred self-rewire (R-rewire-deferred / D47). Applied at the committed wave
+/// boundary by [`drain_deferred_rewires`], never in place.
+fn defer_rewire(thunk: Box<dyn FnOnce()>) {
+    DEFERRED_REWIRE.with(|q| q.borrow_mut().push(thunk));
+}
+
+/// Drain the deferred-rewire FIFO at the committed boundary. Each thunk applies one queued
+/// self-rewire as a FRESH wave (its own wave-owner) which may enqueue MORE — appended and
+/// drained by this same loop (DrainExactlyOnce). A single global FIFO yields the drain order
+/// for free: issue order during a synchronous cascade IS causal order (a dep settles before
+/// its dependent's fn runs), so global-FIFO == per-node FIFO + causal-node order. Per-thunk
+/// isolation: a thunk that panics does NOT abandon the rest of the queue (which would strand
+/// thunks to mis-fire at an unrelated later wave); the first escape re-surfaces once the
+/// queue is empty. Process-global is correct per D22 (one sync cascade per causal domain;
+/// cross-domain is the async wire bridge, which never shares this stack — same basis as the
+/// module-global `batch.active`).
+fn drain_deferred_rewires() {
+    if DRAINING_REWIRE.with(|d| d.get()) {
+        return; // a nested wave-owner exit during the drain — the outer loop owns draining
+    }
+    if DEFERRED_REWIRE.with(|q| q.borrow().is_empty()) {
+        return; // F-PERF: one empty-queue check per outermost wave when unused (behavior-neutral)
+    }
+    DRAINING_REWIRE.with(|d| d.set(true));
+    let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
+    loop {
+        let thunk = DEFERRED_REWIRE.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        });
+        let Some(thunk) = thunk else { break };
+        if let Err(e) = catch_unwind(AssertUnwindSafe(thunk)) {
+            if escaped.is_none() {
+                escaped = Some(e);
+            }
+        }
+    }
+    DRAINING_REWIRE.with(|d| d.set(false));
+    if let Some(e) = escaped {
+        std::panic::resume_unwind(e);
     }
 }
 
@@ -423,6 +550,12 @@ impl Core {
             paused_dep_wave_occurred: false,
             pause_buffer: Vec::new(),
             terminal: false,
+            dep_terminal: vec![None; n],
+            // Defaults: plain derived/effect — auto-cascade COMPLETE/ERROR, terminal not
+            // an input. derived_opts overrides from NodeOpts for last/reduce/rescue/*Map.
+            complete_when_deps_complete: true,
+            error_when_deps_error: true,
+            terminal_as_real_input: false,
         };
         // R-initial: a provided initial pre-populates the cache.
         if let Some(v) = initial {
@@ -560,6 +693,7 @@ impl Core {
                 n.dep_has_data[i] = false;
                 n.dep_dirty[i] = false;
                 n.dep_tier[i] = 0;
+                n.dep_terminal[i] = None;
             }
             n.pending = 0;
             n.emitted_dirty_this_wave = false;
@@ -678,11 +812,132 @@ impl Core {
                 }
                 self.maybe_run();
             }
-            // Deferred: dep COMPLETE/ERROR/TEARDOWN propagation (operator-layer:
-            // completeWhenDepsComplete / terminalAsRealInput) + PAUSE/RESUME are never
-            // delivered to a dep-subscriber (a node is paused via its own up(), not by
-            // an upstream dep).
+            Message::Complete => {
+                {
+                    let mut n = self.0.borrow_mut();
+                    n.dep_terminal[idx] = Some(DepTerminal::Complete);
+                }
+                // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding
+                // in-wave DIRTY contribution (the exactly-one-settle invariant) — exactly as
+                // DATA/RESOLVED/INVALIDATE do; a dirty-then-COMPLETE-without-DATA dep would
+                // otherwise strand `pending` and wedge the node (the INVALIDATE arm's guard,
+                // generalized to terminals).
+                self.release_dep_dirty(idx);
+                let (auto_complete, tari) = {
+                    let n = self.0.borrow();
+                    (n.complete_when_deps_complete, n.terminal_as_real_input)
+                };
+                if auto_complete && self.all_deps_complete() {
+                    // combineLatest semantics (R-deps-terminal): COMPLETE only when ALL deps
+                    // complete (not ANY). The node itself goes terminal (pending moot).
+                    self.down(vec![Message::Complete]);
+                } else if tari {
+                    // rescue/reduce/*Map: the fn reads ctx.dep_records()[idx].terminal.
+                    self.maybe_run();
+                } else {
+                    // absorbed terminal, NOT an input: the dep's signalled change did not
+                    // materialise (no DATA) → un-dirty downstream, keep cache.
+                    self.settle_after_absorbed_terminal();
+                }
+            }
+            Message::Error(e) => {
+                {
+                    let mut n = self.0.borrow_mut();
+                    // Box<dyn Error> is not Clone and `msg` is a borrow, so store the error's
+                    // Display message (the concrete type is not preserved — per-language, D31).
+                    n.dep_terminal[idx] = Some(DepTerminal::Error(format!("{e}").into()));
+                }
+                self.release_dep_dirty(idx); // R-terminal-settles-dirty (B35), as COMPLETE
+                let (auto_error, tari) = {
+                    let n = self.0.borrow();
+                    (n.error_when_deps_error, n.terminal_as_real_input)
+                };
+                if auto_error {
+                    // Auto-cascade ERROR (R-deps-terminal): forward a FRESH Box rebuilt from the
+                    // message (Box<dyn Error> isn't Clone). The node goes terminal.
+                    self.down(vec![Message::Error(format!("{e}").into())]);
+                } else if tari {
+                    self.maybe_run(); // rescue/catch: the fn reads the dep's terminal (the error)
+                } else {
+                    self.settle_after_absorbed_terminal();
+                }
+            }
+            // TEARDOWN propagation is a later slice (B33); PAUSE/RESUME are never delivered to
+            // a dep-subscriber (a node is paused via its own up(), not by an upstream dep).
             _ => {}
+        }
+    }
+
+    /// R-terminal-settles-dirty (B35): release a dep's outstanding in-wave DIRTY
+    /// contribution. A settle-class event for that dep (DATA/RESOLVED inline above,
+    /// INVALIDATE, and now COMPLETE/ERROR) clears its dirty flag + decrements `pending`.
+    /// No-op if the dep already settled this wave — so the normal DATA-then-COMPLETE flow
+    /// is unaffected. Makes the exactly-one-settle invariant a single shared step.
+    fn release_dep_dirty(&self, idx: usize) {
+        let mut n = self.0.borrow_mut();
+        if n.dep_dirty[idx] {
+            n.dep_dirty[idx] = false;
+            n.pending -= 1;
+        }
+    }
+
+    /// True iff EVERY dep has COMPLETEd (combineLatest semantics, R-deps-terminal). An
+    /// ERRORed dep is NOT complete → false. A node with no deps is never auto-complete.
+    fn all_deps_complete(&self) -> bool {
+        let n = self.0.borrow();
+        if n.deps.is_empty() {
+            return false;
+        }
+        n.dep_terminal
+            .iter()
+            .all(|t| matches!(t, Some(DepTerminal::Complete)))
+    }
+
+    /// R-terminal-settles-dirty (B35): settle a node whose dirtied dep was released by an
+    /// ABSORBED terminal that is NOT a real input (a plain derived/effect — one of several
+    /// deps completing while others stay live). Runs only when the release drained `pending`
+    /// while the node still owes a downstream settle (it broadcast DIRTY this wave):
+    ///   - some OTHER dep delivered real DATA this wave → recompute (→ DATA);
+    ///   - else no value materialised (or the recompute is gated) → one undirty RESOLVED
+    ///     (R-resolved-undirty), keeping the cache (a terminal, unlike INVALIDATE, leaves it).
+    fn settle_after_absorbed_terminal(&self) {
+        {
+            let n = self.0.borrow();
+            if n.pending != 0 || !n.emitted_dirty_this_wave {
+                return;
+            }
+        }
+        // A real value occurred this wave (some OTHER dep delivered DATA) → recompute.
+        // maybe_run runs the fn ONLY if ungated (gate open, not paused); it may emit DATA, a
+        // fn-synthesized undirty RESOLVED, or nothing (gated / gate still holds).
+        let saw_data = self
+            .0
+            .borrow()
+            .dep_batch
+            .iter()
+            .any(|b| b.as_ref().is_some_and(|v| !v.is_empty()));
+        if saw_data {
+            self.maybe_run();
+        }
+        // If the node STILL owes a downstream settle (no DATA occurred, OR the recompute was
+        // gated — e.g. the first-run gate holds because the terminated dep never delivered and
+        // terminal_as_real_input is false), balance the broadcast DIRTY with one undirty
+        // RESOLVED, keeping the cache. Without this fallback a DIRTY-then-terminal-without-DATA
+        // dep on a pre-first-run multi-dep node strands the DIRTY → downstream wedged (the B35
+        // gate-holds corner, C-15(d)). Bare emit mirrors the INVALIDATE receive-arm; the
+        // terminal×pause/batch coalescing is backlog B39.
+        let still_owes = self.0.borrow().emitted_dirty_this_wave;
+        if still_owes {
+            {
+                let mut n = self.0.borrow_mut();
+                n.emitted_dirty_this_wave = false;
+                n.status = if n.has_data {
+                    Status::Resolved
+                } else {
+                    Status::Sentinel
+                };
+            }
+            self.emit_to_subs(&Message::Resolved);
         }
     }
 
@@ -814,6 +1069,59 @@ impl Core {
         with_wave_owner(self, move || core.rewire_apply(new_deps, fn_), || {});
     }
 
+    // ── deferred self-rewire (R-rewire-deferred / D47): ctx.rewire_next ──
+
+    /// Enqueue a deferred self-rewire (`ctx.rewire_next`). Applied at the committed wave
+    /// boundary by the wave-owner drain, NEVER in place — the immediate `set_deps`/`add_dep`/
+    /// `remove_dep` still panics mid-fn (D37/R-reentrancy). The drain runs each as a fresh
+    /// wave; this is the substrate affordance the higher-order *Map operators wire inners with.
+    pub(crate) fn request_rewire_next(&self, req: RewireRequest) {
+        let node = self.clone();
+        defer_rewire(Box::new(move || node.apply_rewire_next(req)));
+    }
+
+    /// Apply one queued self-rewire at the boundary (a drain thunk). A node that went TERMINAL
+    /// during the wave DISCARDS its queued requests (R-rewire-deferred). The dep set is composed
+    /// against the LIVE deps at apply time (so several requests in one wave compose). A rewire
+    /// reject (cycle/self/non-resubscribable terminal dep) panics — caught here and surfaced as
+    /// `[[ERROR,e]]` on this node (D30-consistent) so it does not strand the rest of the drain.
+    fn apply_rewire_next(&self, req: RewireRequest) {
+        if self.0.borrow().terminal {
+            return; // terminal discards the queue
+        }
+        let (new_deps, fn_) = match req {
+            RewireRequest::Set(deps, f) => (deps, f),
+            RewireRequest::Add(dep, f) => {
+                let mut next = self.0.borrow().deps.clone();
+                if !next.iter().any(|d| Rc::ptr_eq(&d.0, &dep.0)) {
+                    next.push(dep);
+                }
+                (next, f)
+            }
+            RewireRequest::Remove(dep, f) => {
+                let next: Vec<Core> = self
+                    .0
+                    .borrow()
+                    .deps
+                    .iter()
+                    .filter(|d| !Rc::ptr_eq(&d.0, &dep.0))
+                    .cloned()
+                    .collect();
+                (next, f)
+            }
+        };
+        // rewire() dedups + validates + applies under its own wave-owner (a fn-panic during the
+        // apply becomes ERROR on the blamed node there). Only the PRE-apply validation rejects
+        // panic OUT of rewire() — caught here → ERROR on this node, via owned_down (a fresh
+        // wave-owner; the drain runs outside any live wave).
+        let core = self.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(move || core.rewire(new_deps, fn_)));
+        if let Err(payload) = outcome {
+            let err = panic_to_error(payload);
+            self.owned_down(vec![Message::Error(err)]);
+        }
+    }
+
     /// The surgical Option-C mutation + atomic settle (D42), run under a wave-owner. Kept
     /// deps keep their subscription + per-dep state + idx-box (rerouted O(1)); removed deps
     /// drain (box→-1, unsub) + drop their dirty contribution; added deps fresh-subscribe
@@ -900,6 +1208,7 @@ impl Core {
             let mut new_has = vec![false; n];
             let mut new_dirty = vec![false; n];
             let mut new_tier = vec![0u8; n];
+            let mut new_terminal: Vec<Option<DepTerminal>> = vec![None; n];
             let mut new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
             let mut new_boxes: Vec<Rc<Cell<i64>>> =
                 (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
@@ -910,6 +1219,7 @@ impl Core {
                     new_has[j] = nn.dep_has_data[old_idx];
                     new_dirty[j] = nn.dep_dirty[old_idx];
                     new_tier[j] = nn.dep_tier[old_idx];
+                    new_terminal[j] = nn.dep_terminal[old_idx].clone();
                     if let Some(slot) = nn.dep_unsubs.get_mut(old_idx) {
                         new_unsubs[j] = slot.take();
                     }
@@ -925,6 +1235,7 @@ impl Core {
             nn.dep_has_data = new_has;
             nn.dep_dirty = new_dirty;
             nn.dep_tier = new_tier;
+            nn.dep_terminal = new_terminal;
             nn.dep_unsubs = new_unsubs;
             nn.dep_idx_boxes = new_boxes;
         }
@@ -1043,6 +1354,7 @@ impl Core {
                         prev_data: n.dep_prev[i].clone(),
                         latest,
                         tier: n.dep_tier[i],
+                        terminal: n.dep_terminal[i].clone(),
                     }
                 })
                 .collect();
@@ -1083,7 +1395,15 @@ impl Core {
                       // (R-async-paused / C-4). The eventual deferred emit carries its own DIRTY balance.
         let undirty = {
             let n = self.0.borrow();
-            n.emitted_dirty_this_wave && !n.emitted_tier3_this_wave && !Self::inner_is_async(&n)
+            // EXEMPT a TERMINAL wave (the fn emitted COMPLETE/ERROR): the terminal IS the settle,
+            // and R-terminal-settles-dirty releases the downstream dirty — synthesizing an undirty
+            // RESOLVED here would overwrite the terminal status + emit a spurious post-terminal
+            // RESOLVED (mirrors the TS `_terminal === undefined` guard, node.ts). Pre-existing
+            // parity gap surfaced by C-11 (a fn emitting a bare COMPLETE).
+            n.emitted_dirty_this_wave
+                && !n.emitted_tier3_this_wave
+                && !n.terminal
+                && !Self::inner_is_async(&n)
         };
         if undirty {
             {
@@ -1479,6 +1799,10 @@ impl Core {
         for i in 0..n.deps.len() {
             n.dep_batch[i] = None;
             n.dep_dirty[i] = false;
+            // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
+            // (the dep really did COMPLETE/ERROR — terminal-is-forever, D17), not a wave-transient
+            // like `dep_dirty`/`dep_batch`. `deactivate`/`rewire_apply` refresh it on a fresh
+            // lifecycle; a panic-aborted wave must leave a terminated dep marked terminal.
         }
     }
 
@@ -1608,6 +1932,7 @@ impl<T: 'static> Node<T> {
             NodeOpts {
                 pool: PoolKind::Async,
                 pausable: Pausable::True,
+                ..NodeOpts::default()
             },
             f,
         )
@@ -1643,19 +1968,29 @@ impl<T: 'static> Node<T> {
             NodeOpts {
                 pool: PoolKind::Async,
                 pausable: Pausable::True,
+                ..NodeOpts::default()
             },
             f,
         )
     }
 
-    /// A derived node with explicit [`NodeOpts`] (pool + pause mode).
+    /// A derived node with explicit [`NodeOpts`] (pool + pause mode + dep-terminal policy).
     pub fn derived_opts<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, opts: NodeOpts, f: F) -> Node<T> {
         let disp = default_dispatcher();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
-        Node {
+        let node = Node {
             core: Core::new(deps, Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
+        };
+        {
+            // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
+            // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
+            let mut n = node.core.0.borrow_mut();
+            n.complete_when_deps_complete = opts.complete_when_deps_complete;
+            n.error_when_deps_error = opts.error_when_deps_error;
+            n.terminal_as_real_input = opts.terminal_as_real_input;
         }
+        node
     }
 
     /// Push a new value from a state node (one DATA wave). Always emits DATA — the
@@ -2082,6 +2417,7 @@ mod tests {
                 NodeOpts {
                     pool: PoolKind::Sync,
                     pausable: Pausable::ResumeAll,
+                    ..NodeOpts::default()
                 },
                 move |ctx| {
                     r.set(r.get() + 1);
@@ -2390,14 +2726,26 @@ mod tests {
     #[test]
     fn rewire_panic_in_added_dep_activation_does_not_wedge_node() {
         // QA-F1 regression: adding a dep whose ACTIVATION fn panics. The wave-owner catch
-        // blames the added producer (its fn ran) → ERROR lands on IT, so the rewiring node `d`
-        // survives NON-terminal. Without the DepMutationGuard, `d` would be left
-        // in_dep_mutation=true forever → every future maybe_run defers (never recomputes) +
-        // every future rewire is rejected as reentrant. With the guard `d` recovers cleanly.
+        // blames the added producer (its fn ran) → ERROR lands on IT. Without the
+        // DepMutationGuard, `d` would be left in_dep_mutation=true forever → every future
+        // maybe_run defers (never recomputes) + every future rewire is rejected as reentrant.
+        // With the guard `d` recovers cleanly.
+        //
+        // `d` ABSORBS a dep error (errorWhenDepsError:false) so this test isolates the QA-F1
+        // GUARD concern (in_dep_mutation cleared on the unwind, observed via the recompute
+        // below) from the orthogonal R-deps-terminal auto-error-cascade (C-15): under the
+        // default errorWhenDepsError:true, boom's activation-panic→ERROR would correctly
+        // cascade and TERMINATE d, making "d recovers" un-observable. The guard fires on the
+        // unwind identically either way; absorbing just keeps d alive to prove it.
         let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
+        let d: Node<i32> = Node::derived_opts(
+            vec![a.erased()],
+            NodeOpts {
+                error_when_deps_error: false,
+                ..NodeOpts::default()
+            },
+            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        );
         let (_log, sink) = recorder();
         let _u = d.subscribe(sink);
         assert_eq!(d.cache(), Some(1));
@@ -2406,11 +2754,12 @@ mod tests {
         let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
         d.add_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
 
-        // The ERROR landed on the added producer, not on d — d is NOT terminal.
+        // d ABSORBED boom's error → d is NOT terminal; the QA-F1 guard cleared
+        // in_dep_mutation on the unwind so d is not wedged.
         assert_ne!(
             d.status(),
             Status::Errored,
-            "blame lands on the added producer; d survives"
+            "d absorbs the dep error (errorWhenDepsError:false) and survives the rewire panic"
         );
 
         // NOT WEDGED: d still recomputes from its live dep a (in_dep_mutation was cleared by
