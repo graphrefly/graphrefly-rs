@@ -108,4 +108,63 @@ impl Ctx {
     pub fn on_invalidate(&self, f: impl Fn() + 'static) {
         self.node.register_on_invalidate(Rc::new(f));
     }
+
+    /// Obtain an owned, `'static` deferred-emit handle for **async-pool** late emission
+    /// (R-sync-core / R-no-raw-async: async lives in the fn body; the emit serializes
+    /// back onto the single thread). The Rust analogue of the TS async fn capturing its
+    /// `ctx` — here `&Ctx` is a borrow that cannot outlive `invoke`, so an async fn must
+    /// stash this owned handle and call [`DeferredCtx::emit`] / [`DeferredCtx::down`]
+    /// later. Carries the wave's dep snapshot so a deferred read sees this wave's view
+    /// (matches the TS per-invocation async ctx snapshot).
+    pub fn defer(&self) -> DeferredCtx {
+        DeferredCtx {
+            node: self.node.clone(),
+            dep_records: self.dep_records.clone(),
+        }
+    }
+}
+
+/// An owned, `'static` late-emit handle obtained via [`Ctx::defer`] — the async-pool
+/// boundary. An async node fn stashes one and emits LATER (the deferred result of
+/// async work). The emit re-enters the wave engine as a FRESH external wave (its own
+/// wave-owner / D30 catch boundary; the leading DIRTY is synthesized like any external
+/// tier-3 emit, R-dirty-before-data). Holds the node handle ([`Core`] = an `Rc`) + the
+/// dep snapshot at defer time.
+pub struct DeferredCtx {
+    node: Core,
+    dep_records: Vec<DepRecord>,
+}
+
+impl DeferredCtx {
+    /// The per-dep wave snapshot captured at defer time (R-fn-contract).
+    pub fn dep_records(&self) -> &[DepRecord] {
+        &self.dep_records
+    }
+
+    /// Typed read of dep `i`'s latest DATA at defer time (SENTINEL → `None`).
+    pub fn data<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
+        self.dep_records
+            .get(i)
+            .and_then(|r| r.latest.clone())
+            .and_then(|a| a.downcast::<U>().ok())
+    }
+
+    /// Typed read of dep `i`'s prior-wave DATA at defer time.
+    pub fn prev<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
+        self.dep_records
+            .get(i)
+            .and_then(|r| r.prev_data.clone())
+            .and_then(|a| a.downcast::<U>().ok())
+    }
+
+    /// Emit one typed DATA downstream as the deferred async result.
+    pub fn emit<T: 'static>(&self, v: T) {
+        self.node.owned_down(vec![Message::Data(Rc::new(v))]);
+    }
+
+    /// Emit a raw wave downstream as the deferred async result (the ctx-level power
+    /// surface, DR-1).
+    pub fn down(&self, msgs: Wave<AnyValue>) {
+        self.node.owned_down(msgs);
+    }
 }

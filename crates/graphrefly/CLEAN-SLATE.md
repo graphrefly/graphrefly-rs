@@ -59,17 +59,35 @@ silent no-op, never a recycled-slot misfire. Rust-only; B15 is the TS sibling
 | Module | State |
 |---|---|
 | `protocol` | **concrete** — `Tier` (D34), `Message`/`Wave` (D8/D9, kind-only `Debug`), `Handle` (D7), `LockId` (D10), `GraphError` (D31), `AnyValue`. |
-| `node` | **kernel + control/terminal impl** — `Core` (erased wave engine) + typed `Node<T>` (state/state_empty/producer/derived; `up`/`down` public per R-node-iface; `Clone` handle). Two-phase DIRTY→DATA, diamond pending-join (R-diamond/R-two-phase), first-run gate (R-first-run-gate), **every occurrence is DATA + substrate-synthesized undirty RESOLVED (R-resolved-undirty / D49)**, push-on-subscribe (R-push-subscribe), lazy activation, ROM/RAM (R-rom-ram), `Drop` cleanup (D1). **+INVALIDATE (idempotent `!has_data`, `dep_prev`→SENTINEL, dirty un-wedge, same-wave merge — C-3)**, **+PAUSE/RESUME lockset + default-mode coalesce (C-5)**, **+COMPLETE/ERROR terminal (terminal-is-forever, D17)**, **+the D30 catch boundary** = `catch_unwind` at the wave-owner converting a panic (Rust throw analogue) → `[[ERROR,e]]` on the blamed cycle node (C-6), with the **`WaveScope` touched-set** whole-cascade wave-flag recovery (**B25 closed**). |
-| `dispatcher` | **impl** — `Dispatcher` + LocalSync **slotmap pool** (`register`/`unregister`/`invoke`, clone-out-before-invoke, generation-checked); `Handle` widened with a local `generation` (B32, per-language); thread-local default (D26). |
-| `ctx` | **impl** — `Ctx` (`down`/`emit`/typed `data`/`prev`/`state`/`on_deactivation`/**`on_invalidate`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. |
+| `node` | **kernel + control/terminal impl** — `Core` (erased wave engine) + typed `Node<T>` (state/state_empty/producer/derived; `up`/`down` public per R-node-iface; `Clone` handle). Two-phase DIRTY→DATA, diamond pending-join (R-diamond/R-two-phase), first-run gate (R-first-run-gate), **every occurrence is DATA + substrate-synthesized undirty RESOLVED (R-resolved-undirty / D49)**, push-on-subscribe (R-push-subscribe), lazy activation, ROM/RAM (R-rom-ram), `Drop` cleanup (D1). **+INVALIDATE (idempotent `!has_data`, `dep_prev`→SENTINEL, dirty un-wedge, same-wave merge — C-3)**, **+PAUSE/RESUME lockset + default-mode coalesce (C-5)**, **+COMPLETE/ERROR terminal (terminal-is-forever, D17)**, **+the D30 catch boundary** = `catch_unwind` at the wave-owner converting a panic (Rust throw analogue) → `[[ERROR,e]]` on the blamed cycle node (C-6), with the **`WaveScope` touched-set** whole-cascade wave-flag recovery (**B25 closed**). **+Slice A (async):** `producer_async`/`derived_async`/`*_opts` constructors + `Pausable {True\|ResumeAll\|False}` + `pause_buffer` + `should_buffer_on_pause` (async COMPUTE buffers in `true`, leaf source immediate, `resumeAll` buffers own production) + `on_resume` drain/replay + `owned_down` (the DeferredCtx late-emit boundary) + the async-pool undirty-RESOLVED exemption (C-2/C-4/C-9/C-10). |
+| `dispatcher` | **impl** — `Dispatcher` + LocalSync **and LocalAsync slotmap pools** (`pools: Vec<Pool>` by `pool_id`; `register`/`register_async`/`unregister`/`invoke`/`pool_kind`, clone-out-before-invoke, generation-checked); the async `invoke` is still **sync void** (R-sync-core) — async is a node-kind label. `Handle` widened with a local `generation` (B32, per-language); thread-local default (D26). |
+| `ctx` | **impl** — `Ctx` (`down`/`emit`/typed `data`/`prev`/`state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
 | `batch` | contract stub — `TODO` (deferred slice). |
 
-**15 tests green** (clippy clean, fmt clean, `#![forbid(unsafe_code)]`): 12 unit
-(push-on-subscribe, D49 occurrence-stays-DATA, D49 filter no-emit→undirty RESOLVED,
-producer activation-exemption, first-run gate, diamond exactly-once two-phase,
-ROM/RAM deactivation, D1 drop cleanup) + **3 conformance** in `tests/conformance.rs`
-(**C-3** INVALIDATE×state×onInvalidate, **C-5** PAUSE lockset multi-source, **C-6**
-sync feedback cycle→ERROR incl. the B25 recovery regression, teeth-verified).
+**28 unit + 12 conformance tests green** (clippy `-D warnings` clean, fmt clean,
+`#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
+PAUSE lockset multi-source, **C-6** sync feedback cycle→ERROR (+B25 recovery), **C-13**
+INVALIDATE×PAUSE precedence, **C-14** per-run cleanup hooks (control/terminal slice),
+**C-2 / C-4 / C-9 / C-10** (Slice A async), **C-7** up-at-source, **C-8** intra-graph
+rewire. Unit tests add the Slice A `resumeAll` buffer+replay case + 12 rewire cases.
+Teeth-verified: Slice A (async-compute buffer / async undirty exemption), C-7 (terminus
+INVALIDATE), C-8 (idx-box reroute / atomic multi-add defer), QA-F1 (DepMutationGuard).
+
+**/qa 2026-05-30 (3 review arms: blind / spec / borrow-unwind).** FIXED **QA-F1**
+(critical, consensus): a user fn panicking mid-`rewire_apply` (an added dep's activation
+fn, or a removed dep's `onDeactivation` hook) left the node permanently
+`in_dep_mutation=true` (the wave-owner catch's `reset_wave_flags` doesn't cover it) →
+every future recompute deferred + every future rewire rejected reentrant. Fix = a
+`DepMutationGuard` RAII clearing the flag on unwind (mirrors the TS `finally`);
+regression test teeth-verified (disable → the node stays wedged). DEFERRED: **B16** widened
+to `lang:all` (the half-installed-subscription + half-applied-arrays leftover on a
+rewire-internal panic — parity-consistent, only reachable via such a panic); **B37** new
+(`DeferredCtx` holds a strong `Core` → over-retention if an async result is abandoned —
+strong-vs-`Weak` decision deferred to the async runner, B1). Confirmed clean: idx-box
+reroute identity, parallel-array rebuild, `pending` accounting, borrow discipline,
+`Weak` upgrade, fn-swap GC, `with_wave_owner` nesting. Below-threshold notes: cycle DFS
+is O(V²) vs spec O(V+E) (per-language perf nit); an async filter-reject has no escape
+hatch (parity-consistent with the C-4 deferred≠rejected exemption).
 
 **D30 catch + B25 (per-language impl, D24 — like the `AnyValue` value-rep decision;
 no spec-amend / no D#):** Rust has no graph layer yet, so the catch lives at the
@@ -83,11 +101,28 @@ from `blamed` (the innermost fn that ran = a node ON the cycle). This `WaveScope
 the same committed wave boundary that **batch (D12)** and **`ctx.rewire_next` (D47)**
 will reuse.
 
-**Deferred to later slices** (per the agreed sequencing): TEARDOWN, the
-resumeAll/false pause modes + async-paused buffering (C-2/C-9/C-10, need the async
-pool), up-at-source INVALIDATE terminus (C-7/D38), batch, LocalAsync/async, rewire
-(C-8), `ctx.rewire_next`/C-11. Still open (not pre-committed): pool callback/handle
-resolution for async, async-pool re-entry onto the single thread.
+**Async slice (Slice A, LANDED 2026-05-30 — /dev-dispatch):** LocalAsync pool
+(dispatcher `Vec<Pool>` + `register_async` + `pool_kind`; the async `invoke` is still
+sync void — async is a node-kind label, the fn defers via a stashed `ctx.defer()`),
+`DeferredCtx` (owned `'static` late-emit, the Rust analogue of the TS async fn
+capturing `ctx`; `&Ctx` cannot outlive `invoke`), and the node pause modes (`Pausable
+{True|ResumeAll|False}` + `pause_buffer` + `should_buffer_on_pause` + `on_resume`
+drain) + the async-pool undirty-RESOLVED exemption (a deferred no-emit ≠ reject, C-4).
+Drives **C-2 / C-4 / C-9 / C-10** green. `resumeAll` is at the TS partial (B9) level
+(own-production buffer+replay; no pre-pause baseline-equals fidelity; node.rs unit
+test, no conformance scenario). Both new mechanisms teeth-verified.
+
+**Up-at-source + rewire slices (LANDED 2026-05-30 — /dev-dispatch):** C-7 (D38 —
+`Core::up` terminus/forward) and C-8 (D42 — `setDeps`/`addDep`/`removeDep` + `Core::rewire`,
+the per-dep dispatch refactored to a shared `Rc<Cell<i64>>` CURRENT-index box for the
+surgical Option-C reroute/drain, fn-swap GC, atomic multi-add settle, Q6 auto-settle).
+
+**Deferred to later slices** (per the agreed sequencing): TEARDOWN, batch,
+`ctx.rewire_next`/C-11 (BLOCKED until the TS C-11 arm is green + `R-rewire-deferred`
+flips active). Still open (not pre-committed): a real async-pool runner (callback/handle
+resolution) once a consumer needs genuine wall-clock async beyond the deterministic
+deferred-emit boundary; the rewire-mid-batch / rewire×async-late-ctx edges (TS backlog
+B17–B19) once batch lands.
 
 ## Floor (cite, never violate)
 
@@ -110,12 +145,12 @@ resolution for async, async-pool re-entry onto the single thread.
 | 1 | **C-3** | INVALIDATE × ctx.state × onInvalidate | ✅ **GREEN** 2026-05-29 (pure sync + lifecycle hooks) |
 | 1 | **C-5** | PAUSE lockset multi-source | ✅ **GREEN** 2026-05-29 (default-mode lockset correctness) |
 | 3 | **C-6** | sync feedback cycle → ERROR | ✅ **GREEN** 2026-05-29 (D37 reject + D30 wave-owner catch + B25 recovery) |
-| 2 | **C-2** | async result at paused node | LocalAsync pool + buffer/replay |
-| 2 | **C-4** | mixed sync/async diamond | async serializes onto the single thread (R-graph-domain) |
-| 2 | **C-9** | `pausable:false` async source ignores PAUSE | D44 outer gate |
-| 2 | **C-10** | `true`-mode async leaf source delivers own production | D44 carve-out |
-| 3 | **C-7** | upstream control at a depless source | D38 terminus honor/drop |
-| 4 | **C-8** | intra-graph runtime rewire | D42 substrate rewire (setDeps/addDep/removeDep) |
+| 2 | **C-2** | async result at paused node | ✅ **GREEN** 2026-05-30 (Slice A — async COMPUTE node buffers, on_resume replays) |
+| 2 | **C-4** | mixed sync/async diamond | ✅ **GREEN** 2026-05-30 (Slice A — deferred async leg, undirty-RESOLVED exemption) |
+| 2 | **C-9** | `pausable:false` async source ignores PAUSE | ✅ **GREEN** 2026-05-30 (Slice A — D44 outer gate) |
+| 2 | **C-10** | `true`-mode async leaf source delivers own production | ✅ **GREEN** 2026-05-30 (Slice A — D44 leaf carve-out) |
+| 3 | **C-7** | upstream control at a depless source | ✅ **GREEN** 2026-05-30 (D38 — depless terminus honors INVALIDATE, drops DIRTY/TEARDOWN; intermediate forwards) |
+| 4 | **C-8** | intra-graph runtime rewire | ✅ **GREEN** 2026-05-30 (D42 — setDeps/addDep/removeDep; Rc<Cell<i64>> idx-box reroute/drain; atomic multi-add settle) |
 | 5 | **C-1** | cross-graph diamond coalesce | needs wire bridge (B2, post-1.0); in-process core only for now |
 | **last** | **C-11** | higher-order inner rewire at the wave boundary | D47 `ctx.rewire_next`; spec `R-rewire-deferred` is DRAFT; B15 (fn-swap handle GC) hard prereq; do AFTER TS drives C-11 green |
 

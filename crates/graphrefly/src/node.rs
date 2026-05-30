@@ -44,7 +44,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
 use crate::ctx::{Ctx, DepRecord};
-use crate::dispatcher::{default_dispatcher, Dispatcher};
+use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Wave};
 
 /// Node lifecycle status (R-status-enum) — the source of truth for cache freshness.
@@ -80,6 +80,37 @@ impl Status {
     }
 }
 
+/// PAUSE/RESUME backpressure mode (R-pause-modes). The OUTER gate over async-paused
+/// buffering (D44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pausable {
+    /// Default. Skip dep-driven fn recompute while paused, fire once on final-lock
+    /// RESUME with the latest dep values. A leaf source's (depless) OWN production —
+    /// sync or async — is NOT gated (delivered immediately); an async COMPUTE node's
+    /// (deps>0) in-flight result buffers (R-async-paused / C-2).
+    #[default]
+    True,
+    /// Production-gating: buffer the node's own tier-3/4 settle slice (sync OR async)
+    /// while paused and replay it on final-lock RESUME. B9 pre-pause baseline-equals
+    /// fidelity is deferred (same partial level as the TS arm).
+    ResumeAll,
+    /// Ignore PAUSE/RESUME ENTIRELY (timer/interval-class sources that must keep
+    /// producing): the lockset is never consulted, nothing is gated or buffered (D44,
+    /// resolves B20).
+    False,
+}
+
+/// Node construction options (substrate-level). Sugar/operator opts are the graph layer
+/// (D6/D24); this is the minimal substrate surface needed to select a pool (D20) and a
+/// pause mode (R-pause-modes).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeOpts {
+    /// The dispatch pool (default LocalSync, R-sync-core).
+    pub pool: PoolKind,
+    /// The pause mode (default `true`, R-pause-modes).
+    pub pausable: Pausable,
+}
+
 type Msg = Message<AnyValue>;
 type Sink = Rc<dyn Fn(&Msg)>;
 type Unsub = Box<dyn FnOnce()>;
@@ -112,12 +143,25 @@ struct NodeInner {
     /// undirty-RESOLVED synthesis (R-resolved-undirty).
     emitted_tier3_this_wave: bool,
     inside_run_wave: bool,
+    /// R-rewire (D42): a setDeps/addDep/removeDep is in flight. While set, an added
+    /// cached dep's push-on-subscribe defers the fn-run (rewire_run_pending) so the
+    /// settle is ONE atomic two-phase wave after every added dep is wired (P2 — never
+    /// fire on a partially-populated added-dep view); also the reentrant-rewire guard.
+    in_dep_mutation: bool,
+    /// A rewire warrants exactly one post-mutation atomic settle (an added dep delivered
+    /// data, or the sole dirty contributor was removed) — drained after the guard clears.
+    rewire_run_pending: bool,
 
     // subscribers + activation
     subscribers: Vec<(u64, Sink)>,
     next_sub_id: u64,
     activated: bool,
     dep_unsubs: Vec<Option<Unsub>>,
+    /// Per-dep CURRENT-index boxes (R-rewire Option-C / D42): each dep's subscribe
+    /// callback reads its index from a shared `Cell` (O(1)), so a surgical rewire that
+    /// reorders kept deps just updates the box — no re-subscribe, no per-message scan. A
+    /// removed dep's box is set to -1 so a stale in-flight callback drops (drain).
+    dep_idx_boxes: Vec<Rc<Cell<i64>>>,
 
     // ctx.state + cleanup hooks
     state: Option<AnyValue>,
@@ -129,14 +173,21 @@ struct NodeInner {
     on_invalidate: Vec<Rc<dyn Fn()>>,
 
     // control + terminal
+    /// Pause mode (R-pause-modes / D44). `true` coalesces dep-driven recompute; `false`
+    /// ignores PAUSE entirely; `resumeAll` buffers+replays the own settle slice.
+    pausable: Pausable,
     /// PAUSE lockset (R-pause-lockset). Paused ⇔ non-empty; same-id PAUSE is
     /// idempotent (Set); RESUME of an unknown id is a no-op. Default ("true") mode:
     /// a dep wave that lands while paused is coalesced and fired once on final-lock
-    /// RESUME (the resumeAll/false modes + async-paused buffering land with the
-    /// async pool — C-2/C-9/C-10).
+    /// RESUME.
     pause_lockset: HashSet<LockId>,
-    /// A dep wave was skipped while paused — re-run the fn once on final-lock RESUME.
+    /// A dep wave was skipped while paused — re-run the fn once on final-lock RESUME
+    /// (default "true" mode coalesce).
     paused_dep_wave_occurred: bool,
+    /// Buffered tier-3/4 settle slices held while paused (resumeAll, and an async
+    /// COMPUTE node's in-flight result in `true` mode — R-async-paused / D44). Replayed
+    /// in arrival order on final-lock RESUME; discarded on terminal/deactivate (BH3).
+    pause_buffer: Vec<Wave<AnyValue>>,
     /// Terminal-is-forever (D17): once COMPLETE/ERROR has been emitted the node is
     /// final — it ignores further upstream messages and re-emits no terminal.
     terminal: bool,
@@ -199,6 +250,21 @@ struct WaveGuard(Core);
 impl Drop for WaveGuard {
     fn drop(&mut self) {
         self.0 .0.borrow_mut().inside_run_wave = false;
+    }
+}
+
+/// Clear `in_dep_mutation` on scope exit — including a panic unwind during a rewire
+/// (QA-F1). A user fn can panic mid-rewire (an added dep's activation fn, or a removed
+/// dep's onDeactivation hook); the wave-owner catch's [`Core::reset_wave_flags`] does NOT
+/// cover `in_dep_mutation` (and may not include the rewiring node in its touched-set), so
+/// without this RAII a caught rewire panic would wedge the node forever (every future
+/// recompute deferred + every future rewire rejected as reentrant). Mirrors the TS arm's
+/// `try { … } finally { _inDepMutation = false }`. `rewire_run_pending` needs no unwind
+/// reset — it is reread/cleared at the start of the next `rewire` and has no other consumer.
+struct DepMutationGuard(Core);
+impl Drop for DepMutationGuard {
+    fn drop(&mut self) {
+        self.0 .0.borrow_mut().in_dep_mutation = false;
     }
 }
 
@@ -320,6 +386,7 @@ impl Core {
         handle: Option<Handle>,
         dispatcher: Dispatcher,
         initial: Option<AnyValue>,
+        pausable: Pausable,
     ) -> Core {
         let n = deps.len();
         let mut inner = NodeInner {
@@ -340,16 +407,21 @@ impl Core {
             emitted_dirty_this_wave: false,
             emitted_tier3_this_wave: false,
             inside_run_wave: false,
+            in_dep_mutation: false,
+            rewire_run_pending: false,
             subscribers: Vec::new(),
             next_sub_id: 0,
             activated: false,
             dep_unsubs: Vec::new(),
+            dep_idx_boxes: Vec::new(),
             state: None,
             state_persist: false,
             on_deactivation: Vec::new(),
             on_invalidate: Vec::new(),
+            pausable,
             pause_lockset: HashSet::new(),
             paused_dep_wave_occurred: false,
+            pause_buffer: Vec::new(),
             terminal: false,
         };
         // R-initial: a provided initial pre-populates the cache.
@@ -424,6 +496,11 @@ impl Core {
             let mut n = self.0.borrow_mut();
             n.activated = true;
             n.dep_unsubs = (0..n.deps.len()).map(|_| None).collect();
+            // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
+            // real box its callback captures.
+            n.dep_idx_boxes = (0..n.deps.len())
+                .map(|_| Rc::new(Cell::new(-1i64)))
+                .collect();
             n.deps.clone()
         };
         for (i, dep) in deps.iter().enumerate() {
@@ -441,15 +518,25 @@ impl Core {
 
     fn subscribe_dep(&self, idx: usize, dep: &Core) {
         let weak: Weak<RefCell<NodeInner>> = Rc::downgrade(&self.0);
+        // R-rewire Option-C: the callback reads the dep's CURRENT index from a shared box
+        // so a surgical reorder reroutes in O(1); -1 means the dep was removed (drain).
+        let idx_box: Rc<Cell<i64>> = Rc::new(Cell::new(idx as i64));
+        let cb_box = idx_box.clone();
         let sink: Sink = Rc::new(move |msg: &Msg| {
+            let i = cb_box.get();
+            if i < 0 {
+                return; // dep removed — stale in-flight callback drops (drain)
+            }
             if let Some(rc) = weak.upgrade() {
-                Core(rc).receive_from_dep(idx, msg);
+                Core(rc).receive_from_dep(i as usize, msg);
             }
         });
         // dep.subscribe synchronously pushes START (+ cached DATA) into the sink,
         // re-entering receive_from_dep — done before we re-borrow self below.
         let unsub = dep.subscribe(sink);
-        self.0.borrow_mut().dep_unsubs[idx] = Some(unsub);
+        let mut n = self.0.borrow_mut();
+        n.dep_unsubs[idx] = Some(unsub);
+        n.dep_idx_boxes[idx] = idx_box;
     }
 
     fn deactivate(&self) {
@@ -457,6 +544,7 @@ impl Core {
             let mut n = self.0.borrow_mut();
             n.activated = false;
             let unsubs: Vec<Unsub> = n.dep_unsubs.drain(..).flatten().collect();
+            n.dep_idx_boxes.clear();
             let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut n.on_deactivation);
             // RAM: a compute node (fn and/or deps) clears its cache on deactivation;
             // a depless state node retains it (ROM).
@@ -481,6 +569,7 @@ impl Core {
             n.on_invalidate.clear();
             n.pause_lockset.clear();
             n.paused_dep_wave_occurred = false;
+            n.pause_buffer.clear();
             if !n.state_persist {
                 n.state = None;
             }
@@ -614,11 +703,19 @@ impl Core {
     }
 
     fn maybe_run(&self) {
-        // R-pause-modes (default/"true" mode): while paused, skip dep-driven fn
-        // re-execution and coalesce — fire once with the latest dep values on
-        // final-lock RESUME. (resumeAll/false modes + async-paused buffering land
-        // with the async pool — C-2/C-9/C-10.)
-        if self.is_paused() {
+        // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
+        // Defer the fn-run to ONE atomic settle after every added dep is wired (P2 — the
+        // fn never fires on a partially-populated added-dep view).
+        if self.0.borrow().in_dep_mutation {
+            self.0.borrow_mut().rewire_run_pending = true;
+            return;
+        }
+        // R-pause-modes: only the default "true" mode coalesces dep-driven recompute
+        // (skip the fn while any lock is held → fire once with the latest dep values on
+        // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers its output
+        // (down → should_buffer_on_pause); `false` runs + emits immediately (ignores
+        // PAUSE). D44: pause mode is the outer gate.
+        if matches!(self.0.borrow().pausable, Pausable::True) && self.is_paused() {
             self.0.borrow_mut().paused_dep_wave_occurred = true;
             return;
         }
@@ -664,6 +761,258 @@ impl Core {
         if let Some(v) = v {
             self.down(vec![Message::Data(v)]);
         }
+    }
+
+    // ── runtime topology rewire (R-rewire / D42, C-8) ──
+
+    /// Runtime topology rewire — the public substrate entry (called by `Node::set_deps`/
+    /// `add_dep`/`remove_dep`). The validation REJECTS run first and panic: called
+    /// EXTERNALLY (no wave in flight) the panic propagates to the caller (idiomatic
+    /// error); called MID-FN (inside a wave) the panic is caught by the running wave-owner
+    /// → `[[ERROR,e]]` (R-reentrancy/D37 — a fn mutating its own topology mid-wave is the
+    /// feedback cycle). The surgical Option-C mutation + atomic settle then run under a
+    /// FRESH wave-owner so a user-fn panic during dep-activation/settle becomes ERROR
+    /// (D30). INTRA-graph only (D22). Requires an explicit fn (SD-1 fn-deps pairing).
+    pub(crate) fn rewire(&self, new_deps: Vec<Core>, fn_: NodeFn) {
+        let new_deps = dedup_cores(new_deps);
+        {
+            let n = self.0.borrow();
+            assert!(
+                !n.terminal,
+                "rewire: node is terminal (completed/errored) — cannot rewire (R-rewire / D42)"
+            );
+            assert!(
+                !n.inside_run_wave,
+                "rewire: mid-fn topology mutation — a fn mutating its own deps mid-wave is the feedback cycle (R-rewire / D37)"
+            );
+            assert!(
+                !n.in_dep_mutation,
+                "rewire: reentrant dep mutation — another setDeps/addDep/removeDep is in flight (R-rewire)"
+            );
+        }
+        assert!(
+            !new_deps.iter().any(|d| Rc::ptr_eq(&d.0, &self.0)),
+            "rewire: self-dependency rejected (R-rewire / D42)"
+        );
+        let old_deps: Vec<Core> = self.0.borrow().deps.clone();
+        for d in new_deps
+            .iter()
+            .filter(|d| !old_deps.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)))
+        {
+            assert!(
+                !reachable_upstream(d, self),
+                "rewire: would create a cycle — dep already transitively depends on this node (R-rewire / D42)"
+            );
+            // Rust has no resubscribable-terminal opt-in yet (R-terminal, later slice) ⇒
+            // ALL terminal deps are non-resubscribable → adding any terminal dep is rejected.
+            assert!(
+                !d.0.borrow().terminal,
+                "rewire: cannot add a non-resubscribable terminal dep — would wedge (R-rewire / D42)"
+            );
+        }
+        let core = self.clone();
+        with_wave_owner(self, move || core.rewire_apply(new_deps, fn_), || {});
+    }
+
+    /// The surgical Option-C mutation + atomic settle (D42), run under a wave-owner. Kept
+    /// deps keep their subscription + per-dep state + idx-box (rerouted O(1)); removed deps
+    /// drain (box→-1, unsub) + drop their dirty contribution; added deps fresh-subscribe
+    /// (push-on-subscribe). The first-run gate + cache are PRESERVED (Q2/Q7). One atomic
+    /// settle if any added dep delivered data or the sole dirty contributor was removed.
+    fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
+        let old_deps: Vec<Core> = self.0.borrow().deps.clone();
+        let n = new_deps.len();
+        let added: Vec<Core> = new_deps
+            .iter()
+            .filter(|d| !old_deps.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)))
+            .cloned()
+            .collect();
+        let removed: Vec<Core> = old_deps
+            .iter()
+            .filter(|d| !new_deps.iter().any(|nd| Rc::ptr_eq(&nd.0, &d.0)))
+            .cloned()
+            .collect();
+
+        {
+            let mut nn = self.0.borrow_mut();
+            nn.in_dep_mutation = true;
+            nn.rewire_run_pending = false;
+        }
+        // QA-F1 (critical): clear `in_dep_mutation` on EVERY exit incl. a panic unwind during
+        // the mutation. A user fn CAN panic in this window — an added dep's activation fn
+        // (subscribe_dep → dep.activate → run_wave) or a removed dep's onDeactivation hook
+        // (u() → deactivate → user closure). The wave-owner catch (with_wave_owner) then runs
+        // reset_wave_flags, which does NOT cover in_dep_mutation and may not even include `self`
+        // in `touched` — so without this guard a caught rewire panic leaves the node permanently
+        // in_dep_mutation=true: every future maybe_run defers (never recomputes) + every future
+        // rewire is rejected as reentrant. Mirrors the TS `finally { _inDepMutation = false }`.
+        let _mut_guard = DepMutationGuard(self.clone());
+        let activated = self.0.borrow().activated;
+        let mut zero_dep_undirty = false;
+
+        // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister the
+        // old handle so the rewired-away closure (and its captures) is freed and its slot
+        // reused. Register-first keeps `handle` never pointing at a freed slot.
+        {
+            let (old_handle, disp) = {
+                let nn = self.0.borrow();
+                (nn.handle, nn.dispatcher.clone())
+            };
+            let kind = old_handle
+                .map(|h| disp.pool_kind(h.pool_id))
+                .unwrap_or(PoolKind::Sync);
+            let new_handle = register_with(&disp, kind, fn_);
+            self.0.borrow_mut().handle = Some(new_handle);
+            if let Some(oh) = old_handle {
+                disp.unregister(oh);
+            }
+        }
+
+        // removed deps: clear dirty contribution + drain (box→-1, unsubscribe the edge).
+        let mut removed_dirty_contributor = false;
+        for d in &removed {
+            let old_idx = old_deps
+                .iter()
+                .position(|o| Rc::ptr_eq(&o.0, &d.0))
+                .expect("removed dep was in old_deps");
+            let unsub = {
+                let mut nn = self.0.borrow_mut();
+                if nn.dep_dirty[old_idx] {
+                    removed_dirty_contributor = true;
+                    nn.pending -= 1;
+                }
+                if let Some(b) = nn.dep_idx_boxes.get(old_idx) {
+                    b.set(-1); // drain: any stale in-flight callback drops
+                }
+                nn.dep_unsubs.get_mut(old_idx).and_then(|u| u.take())
+            };
+            if let Some(u) = unsub {
+                u(); // stops the removed dep's edge — no further delivery
+            }
+        }
+
+        // rebuild the per-dep parallel arrays in new order; kept deps carry their state +
+        // subscription + idx-box (rerouted to the new index), added deps start fresh.
+        {
+            let mut nn = self.0.borrow_mut();
+            let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
+            let mut new_prev: Vec<Option<AnyValue>> = vec![None; n];
+            let mut new_has = vec![false; n];
+            let mut new_dirty = vec![false; n];
+            let mut new_tier = vec![0u8; n];
+            let mut new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
+            let mut new_boxes: Vec<Rc<Cell<i64>>> =
+                (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
+            for (j, dep) in new_deps.iter().enumerate() {
+                if let Some(old_idx) = old_deps.iter().position(|o| Rc::ptr_eq(&o.0, &dep.0)) {
+                    new_batch[j] = nn.dep_batch[old_idx].take();
+                    new_prev[j] = nn.dep_prev[old_idx].clone();
+                    new_has[j] = nn.dep_has_data[old_idx];
+                    new_dirty[j] = nn.dep_dirty[old_idx];
+                    new_tier[j] = nn.dep_tier[old_idx];
+                    if let Some(slot) = nn.dep_unsubs.get_mut(old_idx) {
+                        new_unsubs[j] = slot.take();
+                    }
+                    if let Some(b) = nn.dep_idx_boxes.get(old_idx) {
+                        b.set(j as i64); // O(1) reroute of the kept dep's callback index
+                        new_boxes[j] = b.clone();
+                    }
+                }
+            }
+            nn.deps = new_deps.clone();
+            nn.dep_batch = new_batch;
+            nn.dep_prev = new_prev;
+            nn.dep_has_data = new_has;
+            nn.dep_dirty = new_dirty;
+            nn.dep_tier = new_tier;
+            nn.dep_unsubs = new_unsubs;
+            nn.dep_idx_boxes = new_boxes;
+        }
+
+        // subscribe added deps — push-on-subscribe delivers a cached dep's DATA (driving
+        // maybe_run, which DEFERS to the atomic settle via in_dep_mutation); a SENTINEL dep
+        // delivers START only. Only when activated (else activation will subscribe later).
+        if activated {
+            for d in &added {
+                let idx = new_deps
+                    .iter()
+                    .position(|nd| Rc::ptr_eq(&nd.0, &d.0))
+                    .expect("added dep present in new_deps");
+                self.subscribe_dep(idx, d);
+            }
+        }
+
+        // Q6 auto-settle: removing the sole dirty contributor closes the wave. With deps
+        // remaining → request the atomic settle; with zero deps → just un-dirty downstream
+        // (degenerate fn-no-deps). Cache is preserved either way (Q7).
+        {
+            let nn = self.0.borrow();
+            if removed_dirty_contributor && nn.pending == 0 && nn.status == Status::Dirty {
+                if new_deps.is_empty() {
+                    zero_dep_undirty = true;
+                } else {
+                    drop(nn);
+                    self.0.borrow_mut().rewire_run_pending = true;
+                }
+            }
+        }
+
+        self.0.borrow_mut().in_dep_mutation = false;
+
+        // Atomic post-mutation settle (a fresh wave): ONE two-phase DIRTY→DATA if an added
+        // dep delivered data or a sole-dirty dep was removed; else the zero-dep un-dirty.
+        let run_pending = {
+            let mut nn = self.0.borrow_mut();
+            std::mem::take(&mut nn.rewire_run_pending)
+        };
+        if run_pending {
+            self.settle_rewire();
+        } else if zero_dep_undirty {
+            let emitted = self.0.borrow().emitted_dirty_this_wave;
+            if emitted {
+                self.down(vec![Message::Resolved]); // un-dirty downstream (pause/batch-safe)
+            } else {
+                let mut nn = self.0.borrow_mut();
+                nn.status = if nn.has_data {
+                    Status::Settled
+                } else {
+                    Status::Sentinel
+                };
+            }
+        }
+    }
+
+    /// R-rewire atomic settle (D42 + the D1 /qa fix): emit ONE proper two-phase
+    /// DIRTY→DATA wave after a rewire that warrants a recompute. Mirrors `try_run`'s
+    /// pause + gate + pending guards, then injects the phase-1 DIRTY the added dep's
+    /// [START,DATA] handshake did not carry (R-dirty-before-data).
+    fn settle_rewire(&self) {
+        if matches!(self.0.borrow().pausable, Pausable::True) && self.is_paused() {
+            self.0.borrow_mut().paused_dep_wave_occurred = true;
+            return;
+        }
+        let (pending, has_handle, has_called, partial, all_settled) = {
+            let n = self.0.borrow();
+            (
+                n.pending,
+                n.handle.is_some(),
+                n.has_called_fn_once,
+                n.partial,
+                n.all_deps_settled(),
+            )
+        };
+        if pending > 0 {
+            return;
+        }
+        if !has_handle {
+            self.passthrough_emit();
+            return;
+        }
+        if !(has_called || partial || all_settled) {
+            return; // first-run gate still holds
+        }
+        self.mark_dirty(); // phase 1 (no-op if already dirty, e.g. removeDep auto-settle)
+        self.run_wave(); // phase 2: fn → DATA / undirty RESOLVED
     }
 
     fn run_wave(&self) {
@@ -728,9 +1077,13 @@ impl Core {
                       // fn) emits exactly one balancing RESOLVED to clear the downstream
                       // dirty — the substrate synthesizes it so the operator body stays
                       // clean (R-primary-api-clean).
+                      // EXEMPT async-pool nodes: an async fn that returns WITHOUT emitting has DEFERRED
+                      // its result (it emits later via a stashed DeferredCtx), NOT rejected — synthesizing
+                      // an undirty RESOLVED here would prematurely settle a still-pending diamond leg
+                      // (R-async-paused / C-4). The eventual deferred emit carries its own DIRTY balance.
         let undirty = {
             let n = self.0.borrow();
-            n.emitted_dirty_this_wave && !n.emitted_tier3_this_wave
+            n.emitted_dirty_this_wave && !n.emitted_tier3_this_wave && !Self::inner_is_async(&n)
         };
         if undirty {
             {
@@ -795,6 +1148,33 @@ impl Core {
                     true
                 }
             });
+        }
+
+        // R-pause-modes / R-async-paused (D44): while paused, defer the tier-3/4 settle
+        // slice (DATA/RESOLVED/INVALIDATE) into the pause buffer; tier<3 (DIRTY/PAUSE/
+        // RESUME) and tier-5/6 (terminal/TEARDOWN) bypass so control + end-of-stream
+        // always reach observers. Replayed in arrival order on final-lock RESUME
+        // (on_resume). MUST run before the tier-3 counting + DIRTY synthesis below so a
+        // buffered wave emits nothing while paused (matches the TS ordering).
+        if self.should_buffer_on_pause() {
+            let (buffered, rest): (Vec<Msg>, Vec<Msg>) = sorted
+                .into_iter()
+                .partition(|m| matches!(m.tier().as_u8(), 3 | 4));
+            if !buffered.is_empty() {
+                let mut n = self.0.borrow_mut();
+                // A buffered tier-3 IS a produced settle — mark emitted_tier3 so run_wave
+                // does NOT synthesize a spurious undirty RESOLVED for a fn whose DATA was
+                // merely deferred into the buffer (per-language correctness, D24: TS sets
+                // this flag only in the post-buffer emit loop, leaving a resumeAll recompute
+                // prone to that spurious RESOLVED; recognizing the settle at buffer time is
+                // the more-correct reading of R-resolved-undirty).
+                n.emitted_tier3_this_wave = true;
+                n.pause_buffer.push(buffered);
+            }
+            sorted = rest;
+            if sorted.is_empty() {
+                return;
+            }
         }
 
         let mut data_count = 0usize;
@@ -898,6 +1278,17 @@ impl Core {
         }
     }
 
+    /// External deferred emit — the async-pool late-emit path used by
+    /// [`crate::ctx::DeferredCtx`] (R-sync-core: async lives in the fn body, the emit
+    /// serializes back onto the single thread). Establishes a FRESH wave-owner boundary
+    /// (like [`Node::down`]) so a panic in the cascade becomes `[[ERROR,e]]` (D30) and the
+    /// leading DIRTY is synthesized (`inside_run_wave` is false here). Nested under a live
+    /// wave-owner (e.g. a deferred emit fired during a RESUME cascade) it just runs.
+    pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
+        let core = self.clone();
+        with_wave_owner(self, move || core.down(msgs), || {});
+    }
+
     fn emit_dirty_once(&self) {
         let emit = {
             let mut n = self.0.borrow_mut();
@@ -930,9 +1321,17 @@ impl Core {
     }
 
     /// Emit upstream toward deps — control tiers only (R-ctx-up). PAUSE/RESUME act on
-    /// this node's own lockset (R-pause-lockset). The depless-source INVALIDATE
-    /// terminus honor + intermediate forward (D38/R-up-at-source, C-7) is a later
-    /// slice (Order 3) — non-PAUSE/RESUME control is dropped here for now.
+    /// this node's own lockset (R-pause-lockset). For the other up-allowed kinds
+    /// (INVALIDATE/DIRTY/TEARDOWN) a node is either the TERMINUS (depless source) or a
+    /// pass-through INTERMEDIATE (R-up-at-source / D38, C-7):
+    /// - depless source = terminus: INVALIDATE → HONOR (route through `down` → clear
+    ///   cache to SENTINEL, fire onInvalidate, broadcast INVALIDATE downstream); routing
+    ///   through `down` (not a direct `invalidate()`) keeps it batch/pause-consistent with
+    ///   a downstream-originated INVALIDATE. DIRTY/TEARDOWN → DROP (no coherent terminus
+    ///   action: self-DIRTY would wedge downstream awaiting a settle that never comes;
+    ///   source lifecycle is source/graph-owned).
+    /// - dep-bearing intermediate: forward toward deps only, never self-act (the source
+    ///   is the single actor, the down-cascade is the effect).
     pub(crate) fn up(&self, msgs: Vec<Msg>) {
         for m in &msgs {
             assert!(
@@ -940,11 +1339,27 @@ impl Core {
                 "ctx.up: {m:?} is down-only; up carries control tiers only (R-ctx-up)"
             );
         }
+        let is_depless = self.0.borrow().deps.is_empty();
         for m in msgs {
             match m {
                 Message::Pause(lock) => self.pause_acquire(lock),
                 Message::Resume(lock) => self.pause_release(lock),
-                _ => {} // INVALIDATE/DIRTY/TEARDOWN terminus → C-7 (deferred).
+                // R-up-at-source (D38): INVALIDATE/DIRTY/TEARDOWN.
+                other if is_depless => {
+                    // terminus: honor INVALIDATE, drop DIRTY/TEARDOWN.
+                    if matches!(other, Message::Invalidate) {
+                        self.down(vec![Message::Invalidate]);
+                    }
+                }
+                other => {
+                    // dep-bearing intermediate: forward toward deps (reconstruct the
+                    // payload-free control kind — Msg is not Clone, but only the unit
+                    // control kinds reach here per is_up_allowed minus PAUSE/RESUME).
+                    let deps = self.0.borrow().deps.clone();
+                    for dep in &deps {
+                        dep.up(vec![dup_control(&other)]);
+                    }
+                }
             }
         }
     }
@@ -974,20 +1389,60 @@ impl Core {
     }
 
     fn on_resume(&self) {
-        // terminal-is-forever: a node that terminated while paused never recomputes.
+        // terminal-is-forever: a node that terminated while paused discards its buffer
+        // and never replays/recomputes (BH3).
         if self.0.borrow().terminal {
-            self.0.borrow_mut().paused_dep_wave_occurred = false;
+            let mut n = self.0.borrow_mut();
+            n.paused_dep_wave_occurred = false;
+            n.pause_buffer.clear();
             return;
         }
-        // Default mode: a dep wave skipped while paused fires the fn once now, with the
-        // latest dep values. (The resumeAll/async pause-buffer drain lands with the
-        // async pool — C-2/C-9/C-10.)
+        // Drain buffered settle slices (resumeAll / async-at-paused, R-async-paused). The
+        // lockset is already empty (pause_release removed the final lock before calling
+        // us), so each replayed wave emits normally — DIRTY synth + DATA, no longer
+        // buffered. Drain BEFORE the default-mode recompute (matches the TS arm order).
+        let buf = {
+            let mut n = self.0.borrow_mut();
+            std::mem::take(&mut n.pause_buffer)
+        };
+        for wave in buf {
+            self.down(wave);
+        }
+        // Default ("true") mode: a dep wave skipped while paused fires the fn once now,
+        // with the latest dep values.
         let fire = {
             let mut n = self.0.borrow_mut();
             std::mem::take(&mut n.paused_dep_wave_occurred)
         };
         if fire {
             self.try_run();
+        }
+    }
+
+    /// Async-pool check that takes an existing borrow (avoids a re-borrow when the caller
+    /// already holds `NodeInner`). The pool kind is a dispatcher property of the handle.
+    fn inner_is_async(n: &NodeInner) -> bool {
+        match n.handle {
+            Some(h) => n.dispatcher.pool_kind(h.pool_id) == PoolKind::Async,
+            None => false,
+        }
+    }
+
+    /// Should an outgoing settle slice be deferred into the pause buffer? `pausable` mode
+    /// is the OUTER gate over R-async-paused buffering (D44).
+    fn should_buffer_on_pause(&self) -> bool {
+        let n = self.0.borrow();
+        match n.pausable {
+            // false: ignore PAUSE/RESUME ENTIRELY — never buffer, keep producing (B20).
+            Pausable::False => false,
+            _ if n.pause_lockset.is_empty() => false,
+            // resumeAll: production-gating — buffer the own (sync/async) settle slice too.
+            Pausable::ResumeAll => true,
+            // true (default): PAUSE gates recomputation/propagation, NOT a leaf source's
+            // own production. An async COMPUTE node's (deps>0) in-flight result buffers
+            // (C-2); a depless async leaf source delivers immediately (C-10). The
+            // leaf-vs-compute discriminator is deps.is_empty().
+            Pausable::True => !n.inside_run_wave && Self::inner_is_async(&n) && !n.deps.is_empty(),
         }
     }
 
@@ -1046,6 +1501,62 @@ impl Core {
     }
 }
 
+/// Reconstruct a payload-free upstream control message for forwarding toward deps
+/// (R-up-at-source / D38). [`Msg`] is not `Clone` (the `Error` variant carries a
+/// non-clonable `GraphError`), but the only kinds that reach the intermediate-forward
+/// path are the unit control kinds DIRTY/INVALIDATE/TEARDOWN (per `is_up_allowed`, minus
+/// PAUSE/RESUME which self-handle), so a fresh copy is always constructible.
+fn dup_control(m: &Msg) -> Msg {
+    match m {
+        Message::Dirty => Message::Dirty,
+        Message::Invalidate => Message::Invalidate,
+        Message::Teardown => Message::Teardown,
+        other => unreachable!("up forwards only DIRTY/INVALIDATE/TEARDOWN, got {other:?}"),
+    }
+}
+
+/// Is `target` reachable upstream from `from` (following deps)? The rewire cycle-
+/// prevention DFS (R-rewire / D42). Node identity = `Rc::ptr_eq` on the inner.
+fn reachable_upstream(from: &Core, target: &Core) -> bool {
+    let mut seen: Vec<Core> = Vec::new();
+    let mut stack: Vec<Core> = vec![from.clone()];
+    while let Some(n) = stack.pop() {
+        if Rc::ptr_eq(&n.0, &target.0) {
+            return true;
+        }
+        if seen.iter().any(|s| Rc::ptr_eq(&s.0, &n.0)) {
+            continue;
+        }
+        seen.push(n.clone());
+        for d in n.0.borrow().deps.iter() {
+            stack.push(d.clone());
+        }
+    }
+    false
+}
+
+/// Dedup a dep list by node identity (`Rc::ptr_eq`), preserving first-seen order — a dep
+/// appearing twice in a rewire collapses to one (Option-C; matches the TS `_dedupDeps`).
+fn dedup_cores(deps: Vec<Core>) -> Vec<Core> {
+    let mut out: Vec<Core> = Vec::with_capacity(deps.len());
+    for d in deps {
+        if !out.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Register a fn into the pool selected by `pool` (R-dispatch-all). The async pool's
+/// invoke is still sync void (R-sync-core); the pool kind only labels the node's
+/// deferred-emit / pause-buffering behavior.
+fn register_with(disp: &Dispatcher, pool: PoolKind, f: NodeFn) -> Handle {
+    match pool {
+        PoolKind::Sync => disp.register(f),
+        PoolKind::Async => disp.register_async(f),
+    }
+}
+
 /// The typed facade over the erased substrate node (D5). Re-types the boundary:
 /// `cache()`/`set()` downcast to `T`; deps are erased via [`Node::erased`].
 ///
@@ -1061,7 +1572,13 @@ impl<T: 'static> Node<T> {
     /// (R-initial). Manual source — push new values with [`Node::set`].
     pub fn state(initial: T) -> Node<T> {
         Node {
-            core: Core::new(vec![], None, default_dispatcher(), Some(Rc::new(initial))),
+            core: Core::new(
+                vec![],
+                None,
+                default_dispatcher(),
+                Some(Rc::new(initial)),
+                Pausable::True,
+            ),
             _t: PhantomData,
         }
     }
@@ -1069,17 +1586,39 @@ impl<T: 'static> Node<T> {
     /// A SENTINEL state node — no value until the first [`Node::set`].
     pub fn state_empty() -> Node<T> {
         Node {
-            core: Core::new(vec![], None, default_dispatcher(), None),
+            core: Core::new(vec![], None, default_dispatcher(), None, Pausable::True),
             _t: PhantomData,
         }
     }
 
     /// A producer node (fn, no deps): runs once on activation, emits via `ctx.emit`.
     pub fn producer<F: Fn(&Ctx) + 'static>(f: F) -> Node<T> {
+        Self::producer_opts(NodeOpts::default(), f)
+    }
+
+    /// A producer on the LocalAsync pool (D20): the fn runs once on activation and may
+    /// DEFER its emission — stash `ctx.defer()` and emit later via the [`DeferredCtx`]
+    /// (the async source pattern, R-sync-core / R-no-raw-async). Default pause mode
+    /// (`true`); a depless leaf source's own production is delivered immediately even
+    /// while paused (R-pause-modes / C-10).
+    ///
+    /// [`DeferredCtx`]: crate::ctx::DeferredCtx
+    pub fn producer_async<F: Fn(&Ctx) + 'static>(f: F) -> Node<T> {
+        Self::producer_opts(
+            NodeOpts {
+                pool: PoolKind::Async,
+                pausable: Pausable::True,
+            },
+            f,
+        )
+    }
+
+    /// A producer with explicit [`NodeOpts`] (pool + pause mode).
+    pub fn producer_opts<F: Fn(&Ctx) + 'static>(opts: NodeOpts, f: F) -> Node<T> {
         let disp = default_dispatcher();
-        let handle = disp.register(Rc::new(f));
+        let handle = register_with(&disp, opts.pool, Rc::new(f));
         Node {
-            core: Core::new(vec![], Some(handle), disp, None),
+            core: Core::new(vec![], Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
         }
     }
@@ -1090,10 +1629,31 @@ impl<T: 'static> Node<T> {
     /// emitting (filter-reject) makes the substrate synthesize an undirty RESOLVED
     /// (D49 / R-resolved-undirty).
     pub fn derived<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, f: F) -> Node<T> {
+        Self::derived_opts(deps, NodeOpts::default(), f)
+    }
+
+    /// A derived node on the LocalAsync pool (D20): the fn may DEFER its emission (stash
+    /// `ctx.defer()`, emit later). An async COMPUTE node (deps>0) that returns without
+    /// emitting has DEFERRED (not rejected) — no undirty RESOLVED is synthesized, and its
+    /// in-flight result buffers if the node is paused (R-async-paused / C-2/C-4). Default
+    /// pause mode (`true`).
+    pub fn derived_async<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, f: F) -> Node<T> {
+        Self::derived_opts(
+            deps,
+            NodeOpts {
+                pool: PoolKind::Async,
+                pausable: Pausable::True,
+            },
+            f,
+        )
+    }
+
+    /// A derived node with explicit [`NodeOpts`] (pool + pause mode).
+    pub fn derived_opts<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, opts: NodeOpts, f: F) -> Node<T> {
         let disp = default_dispatcher();
-        let handle = disp.register(Rc::new(f));
+        let handle = register_with(&disp, opts.pool, Rc::new(f));
         Node {
-            core: Core::new(deps, Some(handle), disp, None),
+            core: Core::new(deps, Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
         }
     }
@@ -1168,6 +1728,51 @@ impl<T: 'static> Node<T> {
                 None => Box::new(|| {}) as Unsub,
             },
         )
+    }
+
+    /// R-rewire (D42): replace this node's deps atomically (surgical Option-C). Kept deps
+    /// keep their subscription + per-dep state; only removed deps unsubscribe + drain, only
+    /// added deps fresh-subscribe (push-on-subscribe for an added cached dep). The first-run
+    /// gate + cache are PRESERVED. Requires an explicit fn (SD-1 fn-deps pairing — user fns
+    /// read deps positionally). INTRA-graph only (D22). Deps are erased ([`Core`]).
+    ///
+    /// Rejects (R-rewire): self-dep, a cycle, a terminal `self`, a (non-resubscribable)
+    /// terminal added dep, a reentrant rewire — these panic (propagate to the caller). A
+    /// mid-fn rewire (during this node's own fn run) is the D37 feedback cycle → caught by
+    /// the running wave-owner as `[[ERROR,e]]`, not a propagated panic.
+    pub fn set_deps<F: Fn(&Ctx) + 'static>(&self, new_deps: Vec<Core>, f: F) {
+        self.core.rewire(new_deps, Rc::new(f));
+    }
+
+    /// Add one dep (special case of [`Node::set_deps`]); returns its index. fn required (SD-1).
+    pub fn add_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
+        let mut next = self.core.0.borrow().deps.clone();
+        if !next.iter().any(|d| Rc::ptr_eq(&d.0, &dep.0)) {
+            next.push(dep.clone());
+        }
+        self.core.rewire(next, Rc::new(f));
+        self.core
+            .0
+            .borrow()
+            .deps
+            .iter()
+            .position(|d| Rc::ptr_eq(&d.0, &dep.0))
+            .expect("added dep present after rewire")
+    }
+
+    /// Remove one dep (special case of [`Node::set_deps`]); idempotent if absent (the fn
+    /// swap still applies). fn required (SD-1).
+    pub fn remove_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+        let next: Vec<Core> = self
+            .core
+            .0
+            .borrow()
+            .deps
+            .iter()
+            .filter(|d| !Rc::ptr_eq(&d.0, &dep.0))
+            .cloned()
+            .collect();
+        self.core.rewire(next, Rc::new(f));
     }
 
     /// The erased core, for wiring this node as a dep of a `derived` node.
@@ -1458,6 +2063,374 @@ mod tests {
         assert!(
             fn_dropped.get(),
             "a dropped node unregisters its fn from the pool, releasing the fn's captures (B32)"
+        );
+    }
+
+    #[test]
+    fn resumeall_buffers_each_recompute_and_replays_all_on_resume() {
+        // R-pause-modes resumeAll (D44): unlike `true` (coalesce → fire ONCE on resume),
+        // resumeAll RUNS the fn on each dep wave while paused and BUFFERS the output,
+        // replaying every buffered settle in arrival order on final-lock RESUME. No
+        // conformance scenario covers resumeAll (TS is also only B9-partial — the pre-pause
+        // baseline-equals fidelity is deferred); this pins the buffer+replay property.
+        let runs = Rc::new(Cell::new(0usize));
+        let src = Node::<i32>::state(1);
+        let doubled = {
+            let r = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![src.erased()],
+                NodeOpts {
+                    pool: PoolKind::Sync,
+                    pausable: Pausable::ResumeAll,
+                },
+                move |ctx| {
+                    r.set(r.get() + 1);
+                    ctx.emit(*ctx.data::<i32>(0).unwrap() * 2);
+                },
+            )
+        };
+        let (log, sink) = recorder();
+        let _u = doubled.subscribe(sink); // activation (not paused): 1*2 = 2, delivered
+        assert_eq!(doubled.cache(), Some(2));
+        runs.set(0);
+
+        let l = LockId::new("p");
+        doubled.up(vec![Message::Pause(l.clone())]);
+        log.borrow_mut().clear();
+
+        src.set(5); // recompute (10) while paused → fn RUNS, output buffered
+        src.set(6); // recompute (12) → buffered
+        src.set(7); // recompute (14) → buffered
+        let data_while_paused = log.borrow().iter().filter(|k| *k == "DATA").count();
+        assert_eq!(
+            runs.get(),
+            3,
+            "resumeAll runs the fn on each dep wave (NOT coalesced to one like `true`)"
+        );
+        assert_eq!(
+            data_while_paused, 0,
+            "no DATA delivered while paused (output buffered)"
+        );
+        assert_eq!(doubled.cache(), Some(2), "cache not advanced while paused");
+
+        doubled.up(vec![Message::Resume(l)]); // replay all three buffered settles in order
+        let data_after_resume = log.borrow().iter().filter(|k| *k == "DATA").count();
+        assert_eq!(
+            data_after_resume, 3,
+            "all three buffered settles replay on final-lock RESUME (arrival order)"
+        );
+        assert_eq!(doubled.cache(), Some(14)); // last replayed value (7 * 2)
+    }
+
+    // ── rewire (R-rewire / D42, C-8) ──
+
+    #[test]
+    fn rewire_adddep_sentinel_dep_does_not_rearm_gate() {
+        // Q2: adding a never-emitted (SENTINEL) dep delivers START only — no recompute — and
+        // does NOT re-arm the first-run gate (a alone re-drives d, not waiting for b).
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state_empty(); // SENTINEL, never emits
+        let runs = Rc::new(Cell::new(0usize));
+        let d = {
+            let r = runs.clone();
+            Node::<i32>::derived(vec![a.erased()], move |ctx| {
+                r.set(r.get() + 1);
+                ctx.emit(*ctx.data::<i32>(0).unwrap() * 10);
+            })
+        };
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        assert_eq!(d.cache(), Some(10));
+        runs.set(0);
+
+        let r2 = runs.clone();
+        d.add_dep(b.erased(), move |ctx| {
+            r2.set(r2.get() + 1);
+            let bv = ctx.data::<i32>(1).map(|v| *v).unwrap_or(0); // SENTINEL guard
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10 + bv);
+        });
+        assert_eq!(
+            runs.get(),
+            0,
+            "a SENTINEL added dep delivers START only — no recompute"
+        );
+
+        a.set(2); // gate NOT re-armed: a alone re-drives d
+        assert_eq!(runs.get(), 1);
+        assert_eq!(d.cache(), Some(20)); // 2*10 + 0 (b still SENTINEL)
+    }
+
+    #[test]
+    fn rewire_removedep_drains_and_preserves_cache() {
+        // Q3/Q7: removeDep of a non-dirty dep preserves cache (no recompute) + drains the
+        // removed edge (it no longer drives the node); the swapped fn runs on the next wave.
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
+        });
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        assert_eq!(d.cache(), Some(3));
+
+        d.remove_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+        assert_eq!(d.cache(), Some(3)); // preserved (removeDep of a non-dirty dep: no recompute)
+
+        b.set(99); // drained — must NOT drive d
+        assert_eq!(d.cache(), Some(3));
+
+        a.set(5); // d recomputes with the swapped a-only fn
+        assert_eq!(d.cache(), Some(5));
+    }
+
+    #[test]
+    fn rewire_removedep_to_zero_deps_is_inert() {
+        // SD-3: removeDep to zero deps → degenerate fn-no-deps, cache preserved, no auto-fire.
+        let a = Node::<i32>::state(7);
+        let runs = Rc::new(Cell::new(0usize));
+        let d = {
+            let r = runs.clone();
+            Node::<i32>::derived(vec![a.erased()], move |ctx| {
+                r.set(r.get() + 1);
+                ctx.emit(*ctx.data::<i32>(0).unwrap());
+            })
+        };
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        assert_eq!(d.cache(), Some(7));
+        runs.set(0);
+
+        let r2 = runs.clone();
+        d.remove_dep(a.erased(), move |ctx| {
+            r2.set(r2.get() + 1);
+            ctx.emit(-1i32);
+        });
+        assert_eq!(d.cache(), Some(7)); // preserved
+        assert_eq!(runs.get(), 0); // inert — does not fire
+
+        a.set(8); // a is no longer a dep
+        assert_eq!(d.cache(), Some(7));
+        assert_eq!(runs.get(), 0);
+    }
+
+    #[test]
+    fn rewire_setdeps_reorders_kept_deps() {
+        // Option-C / DepRecord-ref dispatch: reorder kept deps without losing state; a kept
+        // dep's callback reroutes to its new index via the shared idx-box (O(1)).
+        fn combine(ctx: &Ctx) {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * 100 + *ctx.data::<i32>(1).unwrap());
+        }
+        let a = Node::<i32>::state(10);
+        let b = Node::<i32>::state(20);
+        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], combine);
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        assert_eq!(d.cache(), Some(1020)); // dep0=a=10, dep1=b=20
+
+        d.set_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
+        a.set(11); // a is now dep1; reroutes correctly
+        assert_eq!(d.cache(), Some(2011)); // dep0=b=20, dep1=a=11 → 20*100+11
+    }
+
+    #[test]
+    fn rewire_atomic_multi_add_settles_once() {
+        // P2: adding ≥2 cached deps in ONE setDeps settles ATOMICALLY — the fn fires once,
+        // never on a partial view (an added dep still SENTINEL at invocation = the bug).
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(10);
+        let c = Node::<i32>::state(100);
+        let runs = Rc::new(Cell::new(0usize));
+        let saw_partial = Rc::new(Cell::new(false));
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        runs.set(0);
+
+        let r = runs.clone();
+        let sp = saw_partial.clone();
+        d.set_deps(vec![a.erased(), b.erased(), c.erased()], move |ctx| {
+            r.set(r.get() + 1);
+            if ctx.data::<i32>(1).is_none() || ctx.data::<i32>(2).is_none() {
+                sp.set(true);
+            }
+            ctx.emit(
+                *ctx.data::<i32>(0).unwrap()
+                    + *ctx.data::<i32>(1).unwrap()
+                    + *ctx.data::<i32>(2).unwrap(),
+            );
+        });
+        assert_eq!(
+            runs.get(),
+            1,
+            "ONE atomic settle, not one fire per added dep"
+        );
+        assert!(
+            !saw_partial.get(),
+            "never fired with an added dep still SENTINEL"
+        );
+        assert_eq!(d.cache(), Some(111)); // 1 + 10 + 100
+    }
+
+    #[test]
+    fn rewire_settle_emits_dirty_before_data() {
+        // D1 / R-dirty-before-data: a rewire-triggered settle is a wave — DIRTY precedes DATA.
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(100);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let (log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        log.borrow_mut().clear(); // isolate the rewire wave
+
+        d.add_dep(b.erased(), |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
+        });
+        assert_eq!(*log.borrow(), vec!["DIRTY", "DATA"]); // glitch-free two-phase
+        assert_eq!(d.cache(), Some(101));
+    }
+
+    #[test]
+    #[should_panic(expected = "self-dependency")]
+    fn rewire_rejects_self_dep() {
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+        d.set_deps(vec![d.erased()], |_| {}); // self-dep → panic
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn rewire_rejects_cycle() {
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let e: Node<i32> = Node::derived(vec![d.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = e.subscribe(|_| {}); // e depends on d (→ a)
+        d.add_dep(e.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap())); // would close d→e→d
+    }
+
+    #[test]
+    #[should_panic(expected = "terminal dep")]
+    fn rewire_rejects_adding_terminal_dep() {
+        let term: Node<i32> = Node::producer(|ctx| ctx.down(vec![Message::Complete]));
+        let _ut = term.subscribe(|_| {}); // activate → producer completes
+        assert_eq!(term.status(), Status::Completed);
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+        d.add_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap())); // terminal dep → panic
+    }
+
+    #[test]
+    fn rewire_midfn_becomes_error_not_panic() {
+        // A fn mutating its OWN deps mid-wave is the D37 feedback cycle. The Rust substrate
+        // bundles the D30 catch at the wave-owner, so this surfaces as [[ERROR,e]] on the node
+        // (R-reentrancy), NOT a propagated panic (the externally-called rejects DO panic).
+        let a = Node::<i32>::state(1);
+        let x = Node::<i32>::state(9);
+        let slot: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
+        let slot2 = slot.clone();
+        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
+            if let Some(dh) = slot2.borrow().as_ref() {
+                // mid-fn self-rewire — illegal (R-rewire / D37)
+                dh.add_dep(x.erased(), |c| c.emit(*c.data::<i32>(0).unwrap()));
+            }
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        });
+        *slot.borrow_mut() = Some(d.clone());
+        let (log, sink) = recorder();
+        let _u = d.subscribe(sink); // activate → fn → mid-fn add_dep → reject → wave-owner → ERROR
+        assert_eq!(d.status(), Status::Errored);
+        assert!(
+            log.borrow().iter().any(|k| k == "ERROR"),
+            "mid-fn rewire surfaces as ERROR (got {:?})",
+            *log.borrow()
+        );
+    }
+
+    #[test]
+    fn rewire_fnswap_frees_old_fn_handle() {
+        // B32 (rewire fn-swap GC): a rewire re-registers the fn → a new handle and
+        // unregisters the OLD handle, freeing the rewired-away closure + its captures.
+        struct DropFlag(Rc<Cell<bool>>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let old_fn_dropped = Rc::new(Cell::new(false));
+        let a = Node::<i32>::state(1);
+        let guard = DropFlag(old_fn_dropped.clone());
+        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
+            let _hold = &guard; // the OLD fn captures the guard
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        });
+        let _u = d.subscribe(|_| {});
+        assert!(!old_fn_dropped.get(), "old fn is live before the swap");
+
+        d.set_deps(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        }); // fn swap
+        assert!(
+            old_fn_dropped.get(),
+            "the rewired-away fn (and its capture) is freed on swap (B32)"
+        );
+    }
+
+    #[test]
+    fn rewire_panic_in_added_dep_activation_does_not_wedge_node() {
+        // QA-F1 regression: adding a dep whose ACTIVATION fn panics. The wave-owner catch
+        // blames the added producer (its fn ran) → ERROR lands on IT, so the rewiring node `d`
+        // survives NON-terminal. Without the DepMutationGuard, `d` would be left
+        // in_dep_mutation=true forever → every future maybe_run defers (never recomputes) +
+        // every future rewire is rejected as reentrant. With the guard `d` recovers cleanly.
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let (_log, sink) = recorder();
+        let _u = d.subscribe(sink);
+        assert_eq!(d.cache(), Some(1));
+
+        // boom: a producer whose activation fn panics — added as a dep of d.
+        let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
+        d.add_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+
+        // The ERROR landed on the added producer, not on d — d is NOT terminal.
+        assert_ne!(
+            d.status(),
+            Status::Errored,
+            "blame lands on the added producer; d survives"
+        );
+
+        // NOT WEDGED: d still recomputes from its live dep a (in_dep_mutation was cleared by
+        // the guard on the unwind). Without the guard this stays Some(1) (deferred forever).
+        a.set(5);
+        assert_eq!(
+            d.cache(),
+            Some(5),
+            "d recovers and recomputes — a stuck in_dep_mutation would have deferred this"
+        );
+
+        // And a follow-up rewire is NOT rejected as reentrant (the flag is clear).
+        d.set_deps(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * 2)
+        });
+        a.set(3);
+        assert_eq!(
+            d.cache(),
+            Some(6),
+            "a later rewire works (not 'reentrant'-rejected)"
         );
     }
 }

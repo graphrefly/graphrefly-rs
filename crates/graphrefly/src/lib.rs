@@ -57,7 +57,7 @@ pub mod dispatcher;
 pub mod node;
 pub mod protocol;
 
-pub use ctx::{Ctx, DepRecord};
-pub use dispatcher::{default_dispatcher, Dispatcher};
-pub use node::{Core, Node, Status};
+pub use ctx::{Ctx, DeferredCtx, DepRecord};
+pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
+pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
