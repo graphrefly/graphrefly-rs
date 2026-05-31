@@ -45,7 +45,7 @@ use std::rc::{Rc, Weak};
 
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
-use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Wave};
+use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 
 /// Node lifecycle status (R-status-enum) — the source of truth for cache freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -812,53 +812,52 @@ impl Core {
                 }
                 self.maybe_run();
             }
-            Message::Complete => {
+            // Tier 5 (D34): COMPLETE | ERROR — ONE arm routed by the CENTRAL tier
+            // (`Message::tier() == Tier::Terminal`), not per-variant. The shared terminal
+            // bookkeeping (record the terminal + release the in-wave DIRTY) runs for ANY tier-5;
+            // only the COMPLETE-vs-ERROR cascade differs, discriminated by the type within.
+            m if m.tier() == Tier::Terminal => {
+                // Box<dyn Error> is not Clone and `m` is a borrow (D31): keep the error as its
+                // Display message in the DepTerminal record (Rc<str>, which IS Clone).
+                let dep_term = match m {
+                    Message::Error(e) => DepTerminal::Error(format!("{e}").into()),
+                    _ => DepTerminal::Complete,
+                };
+                let is_error = matches!(dep_term, DepTerminal::Error(_));
                 {
                     let mut n = self.0.borrow_mut();
-                    n.dep_terminal[idx] = Some(DepTerminal::Complete);
+                    n.dep_terminal[idx] = Some(dep_term.clone());
                 }
-                // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding
-                // in-wave DIRTY contribution (the exactly-one-settle invariant) — exactly as
-                // DATA/RESOLVED/INVALIDATE do; a dirty-then-COMPLETE-without-DATA dep would
-                // otherwise strand `pending` and wedge the node (the INVALIDATE arm's guard,
-                // generalized to terminals).
+                // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding in-wave
+                // DIRTY contribution (the exactly-one-settle invariant) — exactly as DATA/RESOLVED/
+                // INVALIDATE do; a dirty-then-terminal-without-DATA dep would otherwise strand
+                // `pending` and wedge the node (the INVALIDATE arm's guard, generalized to terminals).
                 self.release_dep_dirty(idx);
-                let (auto_complete, tari) = {
+                let (auto_error, auto_complete, tari) = {
                     let n = self.0.borrow();
-                    (n.complete_when_deps_complete, n.terminal_as_real_input)
+                    (
+                        n.error_when_deps_error,
+                        n.complete_when_deps_complete,
+                        n.terminal_as_real_input,
+                    )
                 };
-                if auto_complete && self.all_deps_complete() {
-                    // combineLatest semantics (R-deps-terminal): COMPLETE only when ALL deps
-                    // complete (not ANY). The node itself goes terminal (pending moot).
-                    self.down(vec![Message::Complete]);
+                if is_error && auto_error {
+                    // Auto-cascade ERROR (R-deps-terminal): forward the error's message. Node terminal.
+                    if let DepTerminal::Error(s) = &dep_term {
+                        self.down(vec![Message::Error(s.to_string().into())]);
+                    }
                 } else if tari {
-                    // rescue/reduce/*Map: the fn reads ctx.dep_records()[idx].terminal.
+                    // rescue/reduce/catch/*Map: the fn reads ctx.dep_records()[idx].terminal.
                     self.maybe_run();
+                } else if auto_complete && self.all_deps_terminal() {
+                    // R-deps-terminal auto-COMPLETE + B42: COMPLETE once ALL deps are TERMINAL (each
+                    // COMPLETE or an absorbed ERROR) — so an absorbed-error dep terminating LAST still
+                    // fires the cascade. `tari` is checked FIRST so a rescue recovers via maybe_run
+                    // rather than being preempted (no node sets both complete_when_deps_complete + tari).
+                    self.down(vec![Message::Complete]);
                 } else {
-                    // absorbed terminal, NOT an input: the dep's signalled change did not
-                    // materialise (no DATA) → un-dirty downstream, keep cache.
-                    self.settle_after_absorbed_terminal();
-                }
-            }
-            Message::Error(e) => {
-                {
-                    let mut n = self.0.borrow_mut();
-                    // Box<dyn Error> is not Clone and `msg` is a borrow, so store the error's
-                    // Display message (the concrete type is not preserved — per-language, D31).
-                    n.dep_terminal[idx] = Some(DepTerminal::Error(format!("{e}").into()));
-                }
-                self.release_dep_dirty(idx); // R-terminal-settles-dirty (B35), as COMPLETE
-                let (auto_error, tari) = {
-                    let n = self.0.borrow();
-                    (n.error_when_deps_error, n.terminal_as_real_input)
-                };
-                if auto_error {
-                    // Auto-cascade ERROR (R-deps-terminal): forward a FRESH Box rebuilt from the
-                    // message (Box<dyn Error> isn't Clone). The node goes terminal.
-                    self.down(vec![Message::Error(format!("{e}").into())]);
-                } else if tari {
-                    self.maybe_run(); // rescue/catch: the fn reads the dep's terminal (the error)
-                } else {
+                    // absorbed terminal, NOT an input: the dep's signalled change did not materialise
+                    // (no DATA) → un-dirty downstream, keep cache.
                     self.settle_after_absorbed_terminal();
                 }
             }
@@ -881,16 +880,17 @@ impl Core {
         }
     }
 
-    /// True iff EVERY dep has COMPLETEd (combineLatest semantics, R-deps-terminal). An
-    /// ERRORed dep is NOT complete → false. A node with no deps is never auto-complete.
-    fn all_deps_complete(&self) -> bool {
+    /// B42 (R-deps-terminal): true iff EVERY dep is TERMINAL — COMPLETE *or* an absorbed ERROR
+    /// (errorWhenDepsError:false). Block only on a LIVE dep (`dep_terminal[i]` is None); an errored
+    /// dep COUNTS as terminal-done (was `matches!(.., Complete)`, which wedged a node whose
+    /// errorWhenDepsError:false dep ERRORed — it never auto-completed even after every other dep
+    /// completed). A node with no deps never auto-completes. combineLatest semantics (all, not any).
+    fn all_deps_terminal(&self) -> bool {
         let n = self.0.borrow();
         if n.deps.is_empty() {
             return false;
         }
-        n.dep_terminal
-            .iter()
-            .all(|t| matches!(t, Some(DepTerminal::Complete)))
+        n.dep_terminal.iter().all(|t| t.is_some())
     }
 
     /// R-terminal-settles-dirty (B35): settle a node whose dirtied dep was released by an

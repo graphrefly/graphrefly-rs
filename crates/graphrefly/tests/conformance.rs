@@ -1119,6 +1119,69 @@ fn c15_dep_terminal_settles_dirty() {
     }
 }
 
+/// C-17 (R-deps-terminal / B42): an ABSORBED error (error_when_deps_error:false) counts as
+/// TERMINAL for the complete_when_deps_complete auto-COMPLETE cascade — order-independent
+/// (whichever terminal lands last fires it). The COMPLETION analogue of C-15's dirty-release;
+/// NOT hit by the landed operators (which use complete_when_deps_complete:false). Mirrors TS a/b/c.
+#[test]
+fn c17_absorbed_error_counts_terminal_for_auto_complete() {
+    fn fwd(ctx: &Ctx) {
+        let v = ctx.data::<i32>(0).map(|r| *r).unwrap_or(0);
+        ctx.emit(v);
+    }
+
+    // (a) error-then-complete: C errors (absorbed), then B completes → D auto-COMPLETEs.
+    {
+        let b = Node::<i32>::state_empty();
+        let c = Node::<i32>::state_empty();
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                error_when_deps_error: false, // absorbs C's error, stays live
+                ..NodeOpts::default()
+            },
+            fwd,
+        );
+        let (_log, _u) = record(&d);
+        c.down(vec![Message::Error("boom".into())]); // absorbed; B still live → not yet all-terminal
+        assert_ne!(d.status(), Status::Completed);
+        assert_ne!(d.status(), Status::Errored); // error_when_deps_error:false → no auto-ERROR
+        b.set(1);
+        b.down(vec![Message::Complete]); // B terminal → ALL deps terminal (C errored) → COMPLETE
+        assert_eq!(d.status(), Status::Completed);
+    }
+
+    // (b) complete-then-error: B completes, then C errors LAST → still auto-COMPLETEs (ERROR-arm mirror).
+    {
+        let b = Node::<i32>::state_empty();
+        let c = Node::<i32>::state_empty();
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                error_when_deps_error: false,
+                ..NodeOpts::default()
+            },
+            fwd,
+        );
+        let (_log, _u) = record(&d);
+        b.set(1);
+        b.down(vec![Message::Complete]); // B terminal; C still live → not yet all-terminal
+        assert_ne!(d.status(), Status::Completed);
+        c.down(vec![Message::Error("boom".into())]); // C absorbed-error LANDS LAST → all terminal → COMPLETE
+        assert_eq!(d.status(), Status::Completed); // ERROR-absorbed arm mirrors the COMPLETE arm (B42)
+    }
+
+    // (c) default error_when_deps_error:true → auto-ERRORs on a dep error (absorbed path gated off).
+    {
+        let b = Node::<i32>::state_empty();
+        let c = Node::<i32>::state_empty();
+        let d = Node::<i32>::derived_opts(vec![b.erased(), c.erased()], NodeOpts::default(), fwd);
+        let (_log, _u) = record(&d);
+        c.down(vec![Message::Error("boom".into())]); // auto-cascade → ERROR before any complete-check
+        assert_eq!(d.status(), Status::Errored);
+    }
+}
+
 /// C-12 — every value-OCCURRENCE stays DATA (no equals-substitution); RESOLVED is the
 /// substrate-synthesized UNDIRTY settle only; dedup is OPT-IN at the operator layer
 /// (R-resolved-undirty / D49, supersedes D15/R-equals). The Rust arm has no operator
