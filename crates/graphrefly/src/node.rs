@@ -175,6 +175,7 @@ struct NodeId(usize);
 struct GraphCore {
     slots: Vec<Option<NodeInner>>,
     edge_slots: Vec<Option<DepEdges>>,
+    aux_slots: Vec<Option<NodeAux>>,
     free: Vec<usize>,
 }
 
@@ -183,20 +184,24 @@ impl GraphCore {
         Self {
             slots: Vec::new(),
             edge_slots: Vec::new(),
+            aux_slots: Vec::new(),
             free: Vec::new(),
         }
     }
 
     fn alloc(&mut self, inner: NodeInner) -> NodeId {
         let edges = DepEdges::new(inner.deps.len());
+        let aux = NodeAux::new();
         if let Some(id) = self.free.pop() {
             self.slots[id] = Some(inner);
             self.edge_slots[id] = Some(edges);
+            self.aux_slots[id] = Some(aux);
             NodeId(id)
         } else {
             let id = self.slots.len();
             self.slots.push(Some(inner));
             self.edge_slots.push(Some(edges));
+            self.aux_slots.push(Some(aux));
             NodeId(id)
         }
     }
@@ -229,15 +234,60 @@ impl GraphCore {
         (n, e)
     }
 
+    fn get_node_edges_aux_mut(
+        &mut self,
+        id: NodeId,
+    ) -> (&mut NodeInner, &mut DepEdges, &mut NodeAux) {
+        let slots = &mut self.slots;
+        let edge_slots = &mut self.edge_slots;
+        let aux_slots = &mut self.aux_slots;
+        let n = slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot");
+        let e = edge_slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore edge slot");
+        let a = aux_slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore aux slot");
+        (n, e, a)
+    }
+
+    fn get_node_aux_mut(&mut self, id: NodeId) -> (&mut NodeInner, &mut NodeAux) {
+        let slots = &mut self.slots;
+        let aux_slots = &mut self.aux_slots;
+        let n = slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot");
+        let a = aux_slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore aux slot");
+        (n, a)
+    }
+
+    fn get_aux(&self, id: NodeId) -> &NodeAux {
+        self.aux_slots
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore aux slot")
+    }
+
     fn is_live(&self, id: NodeId) -> bool {
         self.slots.get(id.0).is_some_and(Option::is_some)
             && self.edge_slots.get(id.0).is_some_and(Option::is_some)
+            && self.aux_slots.get(id.0).is_some_and(Option::is_some)
     }
 
-    fn take_live(&mut self, id: NodeId) -> Option<(NodeInner, DepEdges)> {
+    fn take_live(&mut self, id: NodeId) -> Option<(NodeInner, DepEdges, NodeAux)> {
         let inner = self.slots.get_mut(id.0)?.take()?;
         let edges = self.edge_slots.get_mut(id.0)?.take()?;
-        Some((inner, edges))
+        let aux = self.aux_slots.get_mut(id.0)?.take()?;
+        Some((inner, edges, aux))
     }
 }
 
@@ -329,6 +379,45 @@ impl DepEdges {
     }
 }
 
+/// Node-local sidecars that are NOT part of dep-slot wave bookkeeping. Keeping these
+/// in a side-table continues the B49 thinning path without changing observable behavior.
+struct NodeAux {
+    subscribers: Vec<(u64, Sink)>,
+    next_sub_id: u64,
+    activated: bool,
+    state: Option<AnyValue>,
+    state_persist: bool,
+    on_deactivation: Vec<Box<dyn FnOnce()>>,
+    on_invalidate: Vec<Rc<dyn Fn()>>,
+    /// A demand arrived but cannot yet fire because a dep is still pending or an
+    /// external pause lock is held. Drained when the node is settle-ready.
+    pull_demand_owed: bool,
+    /// PAUSE lockset (R-pause-lockset). Paused iff non-empty.
+    pause_lockset: HashSet<LockId>,
+    /// A dep wave was skipped while paused; default true mode fires once on resume.
+    paused_dep_wave_occurred: bool,
+    /// Buffered tier-3/4 settle slices held while paused.
+    pause_buffer: Vec<Wave<AnyValue>>,
+}
+
+impl NodeAux {
+    fn new() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            next_sub_id: 0,
+            activated: false,
+            state: None,
+            state_persist: false,
+            on_deactivation: Vec::new(),
+            on_invalidate: Vec::new(),
+            pull_demand_owed: false,
+            pause_lockset: HashSet::new(),
+            paused_dep_wave_occurred: false,
+            pause_buffer: Vec::new(),
+        }
+    }
+}
+
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
 /// reentrant engine lives on [`Core`].
 struct NodeInner {
@@ -345,20 +434,6 @@ struct NodeInner {
     status: Status,
     has_called_fn_once: bool,
 
-    // subscribers + activation
-    subscribers: Vec<(u64, Sink)>,
-    next_sub_id: u64,
-    activated: bool,
-
-    // ctx.state + cleanup hooks
-    state: Option<AnyValue>,
-    state_persist: bool,
-    on_deactivation: Vec<Box<dyn FnOnce()>>,
-    /// Flush-on-INVALIDATE hooks (R-cleanup-hooks / D28). Unlike `on_deactivation`
-    /// these are **re-callable** (fire once per INVALIDATE wave, persist across
-    /// invalidates), so `Rc<dyn Fn()>` not `Box<dyn FnOnce()>`. Cleared on deactivate.
-    on_invalidate: Vec<Rc<dyn Fn()>>,
-
     // control + terminal
     /// Pause mode (R-pause-modes / D44). `true` coalesces dep-driven recompute; `false`
     /// ignores PAUSE entirely; `resumeAll` buffers+replays the own settle slice.
@@ -366,21 +441,6 @@ struct NodeInner {
     /// Pull-mode id (R-pull / D59). `Some(id)` means quiet-by-default; demand is a
     /// cone-routed RESUME(id), matched by id equality in Rust's per-language representation.
     pull_id: Option<LockId>,
-    /// A demand arrived but cannot yet fire because a dep is still pending or an
-    /// external pause lock is held. Drained when the node is settle-ready.
-    pull_demand_owed: bool,
-    /// PAUSE lockset (R-pause-lockset). Paused ⇔ non-empty; same-id PAUSE is
-    /// idempotent (Set); RESUME of an unknown id is a no-op. Default ("true") mode:
-    /// a dep wave that lands while paused is coalesced and fired once on final-lock
-    /// RESUME.
-    pause_lockset: HashSet<LockId>,
-    /// A dep wave was skipped while paused — re-run the fn once on final-lock RESUME
-    /// (default "true" mode coalesce).
-    paused_dep_wave_occurred: bool,
-    /// Buffered tier-3/4 settle slices held while paused (resumeAll, and an async
-    /// COMPUTE node's in-flight result in `true` mode — R-async-paused / D44). Replayed
-    /// in arrival order on final-lock RESUME; discarded on terminal/deactivate (BH3).
-    pause_buffer: Vec<Wave<AnyValue>>,
     /// Terminal-is-forever (D17): once COMPLETE/ERROR has been emitted the node is
     /// final — it ignores further upstream messages and re-emits no terminal.
     terminal: bool,
@@ -418,11 +478,11 @@ impl NodeInner {
 /// recursively deactivating up the DAG (terminates); idempotent with `deactivate`
 /// (which already drained both vecs, so this is then a no-op).
 impl NodeInner {
-    fn cleanup_before_free(&mut self, edges: &mut DepEdges) {
+    fn cleanup_before_free(&mut self, edges: &mut DepEdges, aux: &mut NodeAux) {
         for u in edges.unsubs.drain(..).flatten() {
             u();
         }
-        for h in std::mem::take(&mut self.on_deactivation) {
+        for h in std::mem::take(&mut aux.on_deactivation) {
             h();
         }
         // B32: free this node's fn slot so the dispatcher pool no longer holds the fn —
@@ -463,16 +523,19 @@ impl Core {
         RefMut::map(self.graph.borrow_mut(), |g| g.get_mut(self.id))
     }
 
-    fn try_borrow_mut(&self) -> Result<RefMut<'_, NodeInner>, std::cell::BorrowMutError> {
-        self.graph
-            .try_borrow_mut()
-            .map(|g| RefMut::map(g, |graph| graph.get_mut(self.id)))
-    }
-
     fn with_inner_edges_mut<R>(&self, f: impl FnOnce(&mut NodeInner, &mut DepEdges) -> R) -> R {
         let mut g = self.graph.borrow_mut();
         let (n, e) = g.get_node_and_edges_mut(self.id);
         f(n, e)
+    }
+
+    fn with_inner_edges_aux_mut<R>(
+        &self,
+        f: impl FnOnce(&mut NodeInner, &mut DepEdges, &mut NodeAux) -> R,
+    ) -> R {
+        let mut g = self.graph.borrow_mut();
+        let (n, e, a) = g.get_node_edges_aux_mut(self.id);
+        f(n, e, a)
     }
 
     fn with_inner_edges<R>(&self, f: impl FnOnce(&NodeInner, &DepEdges) -> R) -> R {
@@ -484,6 +547,30 @@ impl Core {
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore edge slot");
         f(n, e)
+    }
+
+    fn with_aux<R>(&self, f: impl FnOnce(&NodeAux) -> R) -> R {
+        let g = self.graph.borrow();
+        f(g.get_aux(self.id))
+    }
+
+    fn with_aux_mut<R>(&self, f: impl FnOnce(&mut NodeAux) -> R) -> R {
+        let mut g = self.graph.borrow_mut();
+        let a = g
+            .aux_slots
+            .get_mut(self.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore aux slot");
+        f(a)
+    }
+
+    fn try_with_inner_aux_mut<R>(
+        &self,
+        f: impl FnOnce(&mut NodeInner, &mut NodeAux) -> R,
+    ) -> Option<R> {
+        let mut g = self.graph.try_borrow_mut().ok()?;
+        let (n, a) = g.get_node_aux_mut(self.id);
+        Some(f(n, a))
     }
 
     fn downgrade(&self) -> CoreWeak {
@@ -513,7 +600,7 @@ impl Drop for Core {
         }
         self.refs.set(0);
         let graph_ref = self.graph.clone();
-        let (mut inner, mut edges) = {
+        let (mut inner, mut edges, mut aux) = {
             let mut graph = graph_ref.borrow_mut();
             let Some(pair) = graph.take_live(self.id) else {
                 return;
@@ -537,7 +624,7 @@ impl Drop for Core {
             id: self.id.0,
             armed: true,
         };
-        inner.cleanup_before_free(&mut edges);
+        inner.cleanup_before_free(&mut edges, &mut aux);
         free_slot.armed = false;
         graph_ref.borrow_mut().free.push(self.id.0);
     }
@@ -828,19 +915,8 @@ impl Core {
             has_data: false,
             status: Status::Sentinel,
             has_called_fn_once: false,
-            subscribers: Vec::new(),
-            next_sub_id: 0,
-            activated: false,
-            state: None,
-            state_persist: false,
-            on_deactivation: Vec::new(),
-            on_invalidate: Vec::new(),
             pausable,
             pull_id: None,
-            pull_demand_owed: false,
-            pause_lockset: HashSet::new(),
-            paused_dep_wave_occurred: false,
-            pause_buffer: Vec::new(),
             terminal: false,
             // Defaults: plain derived/effect — auto-cascade COMPLETE/ERROR, terminal not
             // an input. derived_opts overrides from NodeOpts for last/reduce/rescue/*Map.
@@ -866,9 +942,10 @@ impl Core {
 
     fn configure_pull(&self, pull_id: Option<LockId>) {
         if let Some(id) = pull_id {
-            let mut n = self.borrow_mut();
-            n.pause_lockset.insert(id.clone());
-            n.pull_id = Some(id);
+            self.with_inner_edges_aux_mut(|n, _e, a| {
+                a.pause_lockset.insert(id.clone());
+                n.pull_id = Some(id);
+            });
         }
     }
 
@@ -882,29 +959,30 @@ impl Core {
     /// reconstructs the real unsub from `id_out`) — no orphaned subscriber.
     fn subscribe_recording_id(&self, sink: Sink, id_out: &Cell<Option<u64>>) -> Unsub {
         let (id, push) = {
-            let mut n = self.borrow_mut();
-            let id = n.next_sub_id;
-            n.next_sub_id += 1;
-            n.subscribers.push((id, sink.clone()));
-            let push = if n.pull_id.is_some() {
-                None
-            } else if n.has_data {
-                Some(Message::Data(
-                    n.cache.clone().expect("has_data ⇒ cache present"),
-                ))
-            } else if n.status == Status::Dirty {
-                Some(Message::Dirty)
-            } else {
-                None
-            };
-            (id, push)
+            self.with_inner_edges_aux_mut(|n, _e, a| {
+                let id = a.next_sub_id;
+                a.next_sub_id += 1;
+                a.subscribers.push((id, sink.clone()));
+                let push = if n.pull_id.is_some() {
+                    None
+                } else if n.has_data {
+                    Some(Message::Data(
+                        n.cache.clone().expect("has_data ⇒ cache present"),
+                    ))
+                } else if n.status == Status::Dirty {
+                    Some(Message::Dirty)
+                } else {
+                    None
+                };
+                (id, push)
+            })
         };
         id_out.set(Some(id));
         sink(&Message::Start);
         if let Some(m) = push {
             sink(&m);
         }
-        if !self.borrow().activated {
+        if !self.with_aux(|a| a.activated) {
             self.activate();
         }
         let core = self.clone();
@@ -912,12 +990,11 @@ impl Core {
     }
 
     fn unsubscribe(&self, id: u64) {
-        let became_empty = {
-            let mut n = self.borrow_mut();
-            let before = n.subscribers.len();
-            n.subscribers.retain(|(sid, _)| *sid != id);
-            n.subscribers.len() < before && n.subscribers.is_empty()
-        };
+        let became_empty = self.with_aux_mut(|a| {
+            let before = a.subscribers.len();
+            a.subscribers.retain(|(sid, _)| *sid != id);
+            a.subscribers.len() < before && a.subscribers.is_empty()
+        });
         if became_empty {
             self.deactivate();
         }
@@ -926,10 +1003,10 @@ impl Core {
     // ── activation / deactivation (lazy; R-rom-ram) ──
 
     fn activate(&self) {
-        let deps = self.with_inner_edges_mut(|n, e| {
-            n.activated = true;
+        let deps = self.with_inner_edges_aux_mut(|n, e, a| {
+            a.activated = true;
             if let Some(id) = n.pull_id.clone() {
-                n.pause_lockset.insert(id);
+                a.pause_lockset.insert(id);
             }
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
@@ -992,11 +1069,11 @@ impl Core {
     }
 
     fn deactivate(&self) {
-        let (unsubs, hooks) = self.with_inner_edges_mut(|n, e| {
-            n.activated = false;
+        let (unsubs, hooks) = self.with_inner_edges_aux_mut(|n, e, a| {
+            a.activated = false;
             let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
             e.idx_boxes.clear();
-            let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut n.on_deactivation);
+            let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut a.on_deactivation);
             // RAM: a compute node (fn and/or deps) clears its cache on deactivation;
             // a depless state node retains it (ROM).
             let is_compute = n.handle.is_some() || !n.deps.is_empty();
@@ -1018,13 +1095,13 @@ impl Core {
             n.has_called_fn_once = false;
             // Control + INVALIDATE hooks are fresh-lifecycle (R-cleanup-hooks / D28):
             // the next activation re-registers them from the fn body.
-            n.on_invalidate.clear();
-            n.pause_lockset.clear();
-            n.pull_demand_owed = false;
-            n.paused_dep_wave_occurred = false;
-            n.pause_buffer.clear();
-            if !n.state_persist {
-                n.state = None;
+            a.on_invalidate.clear();
+            a.pause_lockset.clear();
+            a.pull_demand_owed = false;
+            a.paused_dep_wave_occurred = false;
+            a.pause_buffer.clear();
+            if !a.state_persist {
+                a.state = None;
             }
             (unsubs, hooks)
         });
@@ -1053,7 +1130,7 @@ impl Core {
             Message::Invalidate => {
                 // The dep's value is gone — drop our view of it (prev_data → SENTINEL so
                 // the never-emitted detector reads correctly, C-3) and cascade idempotently.
-                let (had_data, undirty_no_settle) = self.with_inner_edges_mut(|n, e| {
+                let (had_data, undirty_no_settle) = self.with_inner_edges_aux_mut(|n, e, a| {
                     e.state.prev[idx] = None;
                     e.state.has_data[idx] = false;
                     e.state.batch[idx] = None;
@@ -1071,8 +1148,8 @@ impl Core {
                     // INVALIDATE; a RESUME must not recompute against a now-SENTINEL dep —
                     // attributed cancellation). A surviving dep keeps it set; a later DATA
                     // re-arms it ([DATA, INVALIDATE, DATA2] → recompute with DATA2).
-                    if n.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
-                        n.paused_dep_wave_occurred = false;
+                    if a.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
+                        a.paused_dep_wave_occurred = false;
                     }
                     (
                         n.has_data,
@@ -1289,7 +1366,7 @@ impl Core {
         // (down → should_buffer_on_pause); `false` runs + emits immediately (ignores
         // PAUSE). D44: pause mode is the outer gate.
         if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
-            self.borrow_mut().paused_dep_wave_occurred = true;
+            self.with_aux_mut(|a| a.paused_dep_wave_occurred = true);
             return;
         }
         self.try_run();
@@ -1491,7 +1568,7 @@ impl Core {
         // in_dep_mutation=true: every future maybe_run defers (never recomputes) + every future
         // rewire is rejected as reentrant. Mirrors the TS `finally { _inDepMutation = false }`.
         let _mut_guard = DepMutationGuard(self.clone());
-        let activated = self.borrow().activated;
+        let activated = self.with_aux(|a| a.activated);
         let mut zero_dep_undirty = false;
 
         // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister the
@@ -1640,7 +1717,7 @@ impl Core {
     /// [START,DATA] handshake did not carry (R-dirty-before-data).
     fn settle_rewire(&self) {
         if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
-            self.borrow_mut().paused_dep_wave_occurred = true;
+            self.with_aux_mut(|a| a.paused_dep_wave_occurred = true);
             return;
         }
         let (pending, has_handle, has_called, partial, all_settled) =
@@ -1704,7 +1781,7 @@ impl Core {
                 Ctx::new(self.clone(), dep_records),
             )
         });
-        let (old_on_invalidate, old_on_deactivation) = self.with_inner_edges_mut(|n, e| {
+        let (old_on_invalidate, old_on_deactivation) = self.with_inner_edges_aux_mut(|n, e, a| {
             n.has_called_fn_once = true;
             e.wave.inside_run_wave = true;
             e.wave.emitted_tier3_this_wave = false;
@@ -1714,8 +1791,8 @@ impl Core {
             // prior run's, discarded WITHOUT firing (no fire-on-rerun; onRerun stays cut).
             // Fixes the push-only accumulation (K stale hooks fired after K runs).
             (
-                std::mem::take(&mut n.on_invalidate),
-                std::mem::take(&mut n.on_deactivation),
+                std::mem::take(&mut a.on_invalidate),
+                std::mem::take(&mut a.on_deactivation),
             )
         });
         // Dropping user hooks may drop captured `Core`s. Do that after releasing the
@@ -1846,7 +1923,7 @@ impl Core {
                 .into_iter()
                 .partition(|m| matches!(m.tier().as_u8(), 3 | 4));
             if !buffered.is_empty() {
-                self.with_inner_edges_mut(|n, e| {
+                self.with_inner_edges_aux_mut(|_n, e, a| {
                     // A buffered tier-3 IS a produced settle — mark emitted_tier3 so run_wave
                     // does NOT synthesize a spurious undirty RESOLVED for a fn whose DATA was
                     // merely deferred into the buffer (per-language correctness, D24: TS sets
@@ -1854,7 +1931,7 @@ impl Core {
                     // prone to that spurious RESOLVED; recognizing the settle at buffer time is
                     // the more-correct reading of R-resolved-undirty).
                     e.wave.emitted_tier3_this_wave = true;
-                    n.pause_buffer.push(buffered);
+                    a.pause_buffer.push(buffered);
                 });
             }
             sorted = rest;
@@ -1931,17 +2008,17 @@ impl Core {
                 }
                 Message::Complete => {
                     let go = {
-                        let mut n = self.borrow_mut();
-                        if n.terminal {
-                            false
-                        } else {
+                        self.with_inner_edges_aux_mut(|n, _e, a| {
+                            if n.terminal {
+                                return false;
+                            }
                             n.terminal = true;
                             n.status = Status::Completed;
-                            n.pull_demand_owed = false;
-                            n.paused_dep_wave_occurred = false;
-                            n.pause_buffer.clear();
+                            a.pull_demand_owed = false;
+                            a.paused_dep_wave_occurred = false;
+                            a.pause_buffer.clear();
                             true
-                        }
+                        })
                     };
                     if go {
                         self.emit_to_subs(&Message::Complete);
@@ -1949,17 +2026,17 @@ impl Core {
                 }
                 Message::Error(e) => {
                     let go = {
-                        let mut n = self.borrow_mut();
-                        if n.terminal {
-                            false
-                        } else {
+                        self.with_inner_edges_aux_mut(|n, _edges, a| {
+                            if n.terminal {
+                                return false;
+                            }
                             n.terminal = true;
                             n.status = Status::Errored;
-                            n.pull_demand_owed = false;
-                            n.paused_dep_wave_occurred = false;
-                            n.pause_buffer.clear();
+                            a.pull_demand_owed = false;
+                            a.paused_dep_wave_occurred = false;
+                            a.pause_buffer.clear();
                             true
-                        }
+                        })
                     };
                     if go {
                         self.emit_to_subs(&Message::Error(e));
@@ -2036,12 +2113,8 @@ impl Core {
     fn emit_to_subs(&self, msg: &Msg) {
         // Clone the sink handles out, drop the borrow, then deliver — guards against
         // subscribe/unsubscribe (and any re-entry) during iteration.
-        let subs: Vec<Sink> = self
-            .borrow()
-            .subscribers
-            .iter()
-            .map(|(_, s)| s.clone())
-            .collect();
+        let subs: Vec<Sink> =
+            self.with_aux(|a| a.subscribers.iter().map(|(_, s)| s.clone()).collect());
         for s in subs {
             s(msg);
         }
@@ -2081,7 +2154,7 @@ impl Core {
                         if !route.mark_demand(&lock, self) {
                             self.on_demand();
                         }
-                    } else if self.borrow().pause_lockset.contains(&lock) {
+                    } else if self.with_aux(|a| a.pause_lockset.contains(&lock)) {
                         self.pause_release(lock);
                     } else {
                         self.forward_up(Message::Resume(lock), toward_dep, route);
@@ -2120,28 +2193,32 @@ impl Core {
     // ── PAUSE/RESUME lockset (R-pause-lockset) + default mode (R-pause-modes) ──
 
     fn is_paused(&self) -> bool {
-        !self.borrow().pause_lockset.is_empty()
+        !self.with_aux(|a| a.pause_lockset.is_empty())
     }
 
     fn is_pull_quiet(&self) -> bool {
-        let n = self.borrow();
-        n.pull_id
-            .as_ref()
-            .is_some_and(|id| n.pause_lockset.contains(id))
+        self.with_inner_edges_aux_mut(|n, _e, a| {
+            n.pull_id
+                .as_ref()
+                .is_some_and(|id| a.pause_lockset.contains(id))
+        })
     }
 
     fn pause_acquire(&self, lock: LockId) {
         // Set ⇒ a same-id repeat PAUSE is idempotent.
-        self.borrow_mut().pause_lockset.insert(lock);
+        self.with_aux_mut(|a| {
+            a.pause_lockset.insert(lock);
+        });
     }
 
     fn pause_release(&self, lock: LockId) {
-        let resumed = {
-            let mut n = self.borrow_mut();
-            if !n.pause_lockset.remove(&lock) {
-                return; // unknown id ⇒ no-op
+        let Some(resumed) = self.with_aux_mut(|a| {
+            if !a.pause_lockset.remove(&lock) {
+                return None; // unknown id ⇒ no-op
             }
-            n.pause_lockset.is_empty() // another lock still held ⇒ stay paused
+            Some(a.pause_lockset.is_empty()) // another lock still held ⇒ stay paused
+        }) else {
+            return;
         };
         if resumed {
             self.on_resume();
@@ -2150,23 +2227,26 @@ impl Core {
     }
 
     fn on_demand(&self) {
-        {
-            let mut n = self.borrow_mut();
+        let has_pull = self.with_inner_edges_aux_mut(|n, _e, a| {
             if n.pull_id.is_none() {
-                return;
+                return false;
             }
-            n.pull_demand_owed = true;
+            a.pull_demand_owed = true;
+            true
+        });
+        if !has_pull {
+            return;
         }
         self.fire_owed_demand_if_ready();
     }
 
     fn fire_owed_demand_if_ready(&self) {
-        let Some((pull_id, should_mark_dirty)) = self.with_inner_edges(|n, e| {
+        let Some((pull_id, should_mark_dirty)) = self.with_inner_edges_aux_mut(|n, e, a| {
             let id = n.pull_id.clone()?;
-            if n.terminal || !n.pull_demand_owed || e.state.pending != 0 {
+            if n.terminal || !a.pull_demand_owed || e.state.pending != 0 {
                 return None;
             }
-            if n.pause_lockset.iter().any(|held| held != &id) {
+            if a.pause_lockset.iter().any(|held| held != &id) {
                 return None;
             }
             if n.handle.is_some()
@@ -2176,15 +2256,14 @@ impl Core {
             {
                 return None;
             }
-            Some((id, n.paused_dep_wave_occurred))
+            Some((id, a.paused_dep_wave_occurred))
         }) else {
             return;
         };
-        {
-            let mut n = self.borrow_mut();
-            n.pull_demand_owed = false;
-            n.pause_lockset.remove(&pull_id);
-        }
+        self.with_aux_mut(|a| {
+            a.pull_demand_owed = false;
+            a.pause_lockset.remove(&pull_id);
+        });
         struct Requiet<'a> {
             core: &'a Core,
             id: Option<LockId>,
@@ -2192,11 +2271,11 @@ impl Core {
         impl Drop for Requiet<'_> {
             fn drop(&mut self) {
                 let Some(id) = self.id.take() else { return };
-                if let Ok(mut n) = self.core.try_borrow_mut() {
+                let _ = self.core.try_with_inner_aux_mut(|n, a| {
                     if !n.terminal && n.pull_id.as_ref() == Some(&id) {
-                        n.pause_lockset.insert(id);
+                        a.pause_lockset.insert(id);
                     }
-                }
+                });
             }
         }
         let _requiet = Requiet {
@@ -2213,28 +2292,23 @@ impl Core {
         // terminal-is-forever: a node that terminated while paused discards its buffer
         // and never replays/recomputes (BH3).
         if self.borrow().terminal {
-            let mut n = self.borrow_mut();
-            n.paused_dep_wave_occurred = false;
-            n.pause_buffer.clear();
+            self.with_aux_mut(|a| {
+                a.paused_dep_wave_occurred = false;
+                a.pause_buffer.clear();
+            });
             return;
         }
         // Drain buffered settle slices (resumeAll / async-at-paused, R-async-paused). The
         // lockset is already empty (pause_release removed the final lock before calling
         // us), so each replayed wave emits normally — DIRTY synth + DATA, no longer
         // buffered. Drain BEFORE the default-mode recompute (matches the TS arm order).
-        let buf = {
-            let mut n = self.borrow_mut();
-            std::mem::take(&mut n.pause_buffer)
-        };
+        let buf = { self.with_aux_mut(|a| std::mem::take(&mut a.pause_buffer)) };
         for wave in buf {
             self.down(wave);
         }
         // Default ("true") mode: a dep wave skipped while paused fires the fn once now,
         // with the latest dep values.
-        let fire = {
-            let mut n = self.borrow_mut();
-            std::mem::take(&mut n.paused_dep_wave_occurred)
-        };
+        let fire = { self.with_aux_mut(|a| std::mem::take(&mut a.paused_dep_wave_occurred)) };
         if fire {
             self.try_run();
         }
@@ -2255,7 +2329,7 @@ impl Core {
         self.with_inner_edges(|n, e| match n.pausable {
             // false: ignore PAUSE/RESUME ENTIRELY — never buffer, keep producing (B20).
             Pausable::False => false,
-            _ if n.pause_lockset.is_empty() => false,
+            _ if self.with_aux(|a| a.pause_lockset.is_empty()) => false,
             // resumeAll: production-gating — buffer the own (sync/async) settle slice too.
             Pausable::ResumeAll => true,
             // true (default): PAUSE gates recomputation/propagation, NOT a leaf source's
@@ -2273,14 +2347,18 @@ impl Core {
     /// already-reset are observationally equivalent — prevents double-cleanup).
     fn invalidate(&self) {
         let hooks = {
-            let mut n = self.borrow_mut();
-            if !n.has_data {
-                return; // idempotent no-op
-            }
-            n.cache = None;
-            n.has_data = false;
-            n.status = Status::Sentinel;
-            n.on_invalidate.clone() // re-callable; clone out so we fire borrow-free
+            self.with_inner_edges_aux_mut(|n, _e, a| {
+                if !n.has_data {
+                    return None; // idempotent no-op
+                }
+                n.cache = None;
+                n.has_data = false;
+                n.status = Status::Sentinel;
+                Some(a.on_invalidate.clone()) // re-callable; clone out so we fire borrow-free
+            })
+        };
+        let Some(hooks) = hooks else {
+            return;
         };
         for f in hooks {
             f();
@@ -2312,19 +2390,24 @@ impl Core {
     // ── ctx.state + hooks (called from Ctx) ──
 
     pub(crate) fn get_state(&self) -> Option<AnyValue> {
-        self.borrow().state.clone()
+        self.with_aux(|a| a.state.clone())
     }
     pub(crate) fn set_state(&self, v: AnyValue) {
-        self.borrow_mut().state = Some(v);
+        self.with_aux_mut(|a| a.state = Some(v));
     }
     pub(crate) fn set_state_persist(&self, on: bool) {
-        self.borrow_mut().state_persist = on;
+        self.with_aux_mut(|a| a.state_persist = on);
     }
     pub(crate) fn register_on_deactivation(&self, f: Box<dyn FnOnce()>) {
-        self.borrow_mut().on_deactivation.push(f);
+        self.with_aux_mut(|a| a.on_deactivation.push(f));
     }
     pub(crate) fn register_on_invalidate(&self, f: Rc<dyn Fn()>) {
-        self.borrow_mut().on_invalidate.push(f);
+        self.with_aux_mut(|a| a.on_invalidate.push(f));
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.with_aux(|a| a.subscribers.len())
     }
 }
 
@@ -3374,7 +3457,7 @@ mod tests {
         d.add_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
 
         assert_eq!(
-            boom.core.borrow().subscribers.len(),
+            boom.core.subscriber_count(),
             0,
             "failed added-dep activation rolls back the partially registered subscriber"
         );
