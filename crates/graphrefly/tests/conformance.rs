@@ -1,7 +1,7 @@
 //! Behavioral conformance — the **Rust arm** (CSP-6). Public-API-only, mirroring the
 //! TS arm's `packages/ts/src/__tests__/conformance.test.ts`. The scenarios are
 //! language-neutral (`~/src/graphrefly/spec/conformance.jsonl`); this file drives the
-//! Rust runtime to `runtimes.rust = pass` for the **control/terminal slice**:
+//! Rust runtime to `runtimes.rust = pass` for the substrate arm:
 //!
 //! - **C-3** INVALIDATE × ctx.state × onInvalidate (R-invalidate-idempotent /
 //!   R-ctx-state / R-cleanup-hooks)
@@ -23,15 +23,18 @@
 //! async fn stashes `ctx.defer()` into a shared cell, and the test fires the deferred
 //! emit manually — the dispatcher invoke stays sync void (R-sync-core).
 //!
+//! Later substrate slices in this same file cover up-at-source (C-7), rewire (C-8),
+//! rewire-deferred (C-11), pull/routed up (C-16/C-18), terminal/late-async edges
+//! (C-20/C-21), and batch boundaries (C-19/C-22). C-1 remains wire-bridge-blocked.
+//!
 //! Authority: `~/src/graphrefly/spec/conformance.jsonl` + `decisions/decisions.jsonl`.
-//! (C-7 = up-at-source, C-8 = rewire, C-11 = rewire-deferred — later slices.)
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use graphrefly::{
-    AnyValue, Core, Ctx, DeferredCtx, DepTerminal, LockId, Message, Node, NodeOpts, Pausable,
-    PoolKind, Status,
+    batch, AnyValue, Core, Ctx, DeferredCtx, DepTerminal, LockId, Message, Node, NodeOpts,
+    Pausable, PoolKind, Status,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -1528,6 +1531,204 @@ fn c21_late_async_ctx_uses_live_deps_after_rewire() {
 
     assert_eq!(a.cache(), Some(1));
     assert_eq!(b.cache(), None);
+}
+
+/// C-19 — an undirty RESOLVED that balances a previous DIRTY follows the normal
+/// delivery gates: resumeAll buffers until RESUME, and batch defers until commit.
+#[test]
+fn c19_undirty_resolved_timing_respects_resumeall_and_batch() {
+    fn sum2(ctx: &Ctx) {
+        let b = ctx.data::<i32>(0).map(|r| *r).unwrap_or(0);
+        let c = ctx.data::<i32>(1).map(|r| *r).unwrap_or(0);
+        ctx.emit(b + c);
+    }
+
+    // (a) resumeAll: B dirties the join, then completes without DATA. The balancing
+    // RESOLVED is buffered while paused and replays only on final RESUME (D64).
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                pausable: Pausable::ResumeAll,
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11));
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("resumeall");
+        d.up(vec![Message::Pause(pause.clone())]);
+        b.down(vec![Message::Dirty]);
+        b.down(vec![Message::Complete]);
+
+        assert_eq!(
+            kinds(&log),
+            vec!["DIRTY"],
+            "resumeAll buffers the undirty RESOLVED while paused"
+        );
+        d.up(vec![Message::Resume(pause)]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+    }
+
+    // (b) batch: B's terminal settle is committed after the batch body returns, so the
+    // downstream sees no RESOLVED on the uncommitted view.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11));
+        log.borrow_mut().clear();
+
+        batch(|_| {
+            b.down(vec![Message::Dirty]);
+            b.down(vec![Message::Complete]);
+            assert_eq!(
+                kinds(&log),
+                vec!["DIRTY"],
+                "batch defers the balancing RESOLVED until commit"
+            );
+        });
+
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+    }
+
+    // (c) resumeAll + INVALIDATE dirty-clear: D has not populated yet (C is SENTINEL),
+    // so B's INVALIDATE is a dirty-balance RESOLVED rather than a downstream INVALIDATE.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state_empty();
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                pausable: Pausable::ResumeAll,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), None);
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("resumeall-invalidate");
+        d.up(vec![Message::Pause(pause.clone())]);
+        b.down(vec![Message::Dirty]);
+        b.down(vec![Message::Invalidate]);
+
+        assert_eq!(
+            kinds(&log),
+            vec!["DIRTY"],
+            "resumeAll buffers the INVALIDATE dirty-clear RESOLVED while paused"
+        );
+        d.up(vec![Message::Resume(pause)]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+        assert_eq!(d.status(), Status::Sentinel);
+    }
+
+    // (d) batch + INVALIDATE dirty-clear: the INVALIDATE is committed after the body,
+    // and the balancing RESOLVED follows that committed boundary.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state_empty();
+        let d = Node::<i32>::derived(vec![b.erased(), c.erased()], sum2);
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), None);
+        log.borrow_mut().clear();
+
+        batch(|_| {
+            b.down(vec![Message::Dirty]);
+            b.down(vec![Message::Invalidate]);
+            assert_eq!(
+                kinds(&log),
+                vec!["DIRTY"],
+                "batch defers the INVALIDATE dirty-clear RESOLVED until commit"
+            );
+        });
+
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+        assert_eq!(d.status(), Status::Sentinel);
+    }
+
+    // (e) default true mode remains immediate, matching D50's default INVALIDATE
+    // precedence and the non-paused C-15 behavior.
+    {
+        let b = Node::<i32>::state(1);
+        let c = Node::<i32>::state(10);
+        let d = Node::<i32>::derived_opts(
+            vec![b.erased(), c.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            sum2,
+        );
+        let (log, _u) = record(&d);
+        assert_eq!(d.cache(), Some(11));
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("default");
+        d.up(vec![Message::Pause(pause)]);
+        b.down(vec![Message::Dirty]);
+        b.down(vec![Message::Complete]);
+
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+    }
+}
+
+/// C-22 — an immediate/external rewire requested while this node has an uncommitted
+/// batch settle is accepted but applied only after the batch commits the old shape.
+#[test]
+fn c22_batch_commit_precedes_rewire_requested_during_open_batch() {
+    let a = Node::<i32>::state(1);
+    let b = Node::<i32>::state(10);
+    let n = Node::<i32>::derived(vec![a.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap());
+    });
+    let (vals, _u) = record_data_i32(&n);
+    let (log, _u2) = record(&n);
+    assert_eq!(n.cache(), Some(1));
+    vals.borrow_mut().clear();
+    log.borrow_mut().clear();
+
+    batch(|_| {
+        n.down(vec![Message::Data(Rc::new(2i32))]); // N has an uncommitted old-shape DATA(2)
+        n.set_deps(vec![b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10);
+        });
+
+        assert_eq!(
+            *vals.borrow(),
+            Vec::<i32>::new(),
+            "the old-shape DATA is not visible before batch commit"
+        );
+        assert_eq!(n.cache(), Some(1));
+    });
+
+    assert_eq!(
+        *vals.borrow(),
+        vec![2, 100],
+        "commit N's old-shape batched value first, then apply rewire and settle fresh [B] shape"
+    );
+    assert_eq!(kinds(&log), vec!["DIRTY", "DATA", "DIRTY", "DATA"]);
+    assert_eq!(n.cache(), Some(100));
+
+    vals.borrow_mut().clear();
+    a.set(3);
+    assert_eq!(*vals.borrow(), Vec::<i32>::new(), "A was drained by rewire");
+    b.set(11);
+    assert_eq!(*vals.borrow(), vec![110], "B is the live post-batch dep");
 }
 
 /// C-17 (R-deps-terminal / B42): an ABSORBED error (error_when_deps_error:false) counts as

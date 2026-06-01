@@ -43,6 +43,9 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
+use crate::batch::{
+    boundary_drains_blocked, collecting_batch, defer_after_batch_for_target, defer_to_batch,
+};
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
@@ -197,6 +200,9 @@ struct NodeInner {
     /// A rewire warrants exactly one post-mutation atomic settle (an added dep delivered
     /// data, or the sole dirty contributor was removed) — drained after the guard clears.
     rewire_run_pending: bool,
+    /// A batch-deferred settle slice already emitted its immediate DIRTY and therefore
+    /// owes either a real commit settle or a rollback RESOLVED balance (D12/D49).
+    batch_dirty_owed: bool,
 
     // subscribers + activation
     subscribers: Vec<(u64, Sink)>,
@@ -457,11 +463,12 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         }
     };
     // Committed wave boundary (R-rewire-deferred / D47): drain any `ctx.rewire_next` queued
-    // during this wave, each applied as a FRESH wave. Runs on BOTH paths (like the TS
-    // `exitWave` in a finally) so a queued self-rewire is not stranded by a caught panic.
-    // The DRAINING guard makes a drained thunk's own wave-owner exit a no-op, so this
-    // outermost exit owns the loop.
-    drain_deferred_rewires();
+    // during this wave, each applied as a FRESH wave. Batch holds this drain until AFTER
+    // the outermost commit/rollback, so topology never mutates on an uncommitted view
+    // (R-rewire-batch-boundary / D67).
+    if !boundary_drains_blocked() {
+        drain_deferred_rewires();
+    }
     ret
 }
 
@@ -502,6 +509,18 @@ impl UpRouteState {
 /// boundary by [`drain_deferred_rewires`], never in place.
 fn defer_rewire(thunk: Box<dyn FnOnce()>) {
     DEFERRED_REWIRE.with(|q| q.borrow_mut().push(thunk));
+}
+
+pub(crate) fn defer_boundary_task(thunk: Box<dyn FnOnce()>) {
+    defer_rewire(thunk);
+}
+
+pub(crate) fn drain_committed_boundary() {
+    drain_deferred_rewires();
+}
+
+pub(crate) fn clear_deferred_boundary_tasks() {
+    DEFERRED_REWIRE.with(|q| q.borrow_mut().clear());
 }
 
 /// Drain the deferred-rewire FIFO at the committed boundary. Each thunk applies one queued
@@ -546,6 +565,10 @@ fn drain_deferred_rewires() {
 }
 
 impl Core {
+    pub(crate) fn ptr_eq(&self, other: &Core) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     fn new(
         deps: Vec<Core>,
         handle: Option<Handle>,
@@ -574,6 +597,7 @@ impl Core {
             inside_run_wave: false,
             in_dep_mutation: false,
             rewire_run_pending: false,
+            batch_dirty_owed: false,
             subscribers: Vec::new(),
             next_sub_id: 0,
             activated: false,
@@ -816,12 +840,10 @@ impl Core {
                                    // If we broadcast DIRTY this wave but produced no settle (never populated, so
                                    // the cascade was suppressed), un-dirty downstream with one RESOLVED.
                 if undirty_no_settle {
-                    let mut n = self.0.borrow_mut();
-                    n.emitted_dirty_this_wave = false;
                     if !had_data {
-                        n.status = Status::Sentinel;
-                        drop(n);
-                        self.emit_to_subs(&Message::Resolved);
+                        self.down(vec![Message::Resolved]);
+                    } else {
+                        self.0.borrow_mut().emitted_dirty_this_wave = false;
                     }
                 }
                 self.fire_owed_demand_if_ready();
@@ -988,20 +1010,11 @@ impl Core {
         // terminal_as_real_input is false), balance the broadcast DIRTY with one undirty
         // RESOLVED, keeping the cache. Without this fallback a DIRTY-then-terminal-without-DATA
         // dep on a pre-first-run multi-dep node strands the DIRTY → downstream wedged (the B35
-        // gate-holds corner, C-15(d)). Bare emit mirrors the INVALIDATE receive-arm; the
-        // terminal×pause/batch coalescing is backlog B39.
+        // gate-holds corner, C-15(d)). Route through `down` so D64/R-undirty-settle-timing
+        // honors resumeAll and batch timing.
         let still_owes = self.0.borrow().emitted_dirty_this_wave;
         if still_owes {
-            {
-                let mut n = self.0.borrow_mut();
-                n.emitted_dirty_this_wave = false;
-                n.status = if n.has_data {
-                    Status::Resolved
-                } else {
-                    Status::Sentinel
-                };
-            }
-            self.emit_to_subs(&Message::Resolved);
+            self.down(vec![Message::Resolved]);
         }
     }
 
@@ -1098,6 +1111,17 @@ impl Core {
 
     fn rewire_inner(&self, new_deps: Vec<Core>, fn_: NodeFn, allow_terminal_owner: bool) {
         let new_deps = dedup_cores(new_deps);
+        if !allow_terminal_owner {
+            let core = self.clone();
+            let deps = new_deps.clone();
+            let f = fn_.clone();
+            if defer_after_batch_for_target(
+                self,
+                Box::new(move || core.rewire_inner(deps, f, false)),
+            ) {
+                return;
+            }
+        }
         {
             let n = self.0.borrow();
             assert!(
@@ -1521,6 +1545,7 @@ impl Core {
         wave_register(self);
         let mut sorted = msgs;
         sorted.sort_by_key(|m| m.tier().as_u8()); // stable: preserves intra-tier order
+        let inside = self.0.borrow().inside_run_wave;
 
         // R-invalidate-idempotent: collapse repeated INVALIDATE in one wave so the
         // cleanup hook + downstream broadcast fire at most once.
@@ -1540,6 +1565,23 @@ impl Core {
                     true
                 }
             });
+        }
+
+        if !inside && collecting_batch() {
+            let (deferred, rest): (Vec<Msg>, Vec<Msg>) = sorted
+                .into_iter()
+                .partition(|m| m.tier().is_batch_deferred());
+            if !deferred.is_empty() && defer_to_batch(self, deferred) {
+                if !self.0.borrow().emitted_dirty_this_wave {
+                    self.emit_dirty_once();
+                }
+                self.0.borrow_mut().batch_dirty_owed = true;
+                return;
+            }
+            sorted = rest;
+            if sorted.is_empty() {
+                return;
+            }
         }
 
         // R-pause-modes / R-async-paused (D44): while paused, defer the tier-3/4 settle
@@ -1592,7 +1634,6 @@ impl Core {
             "down: a wave cannot mix DATA and RESOLVED (tier-3 exclusivity, R-resolved-undirty / D49)"
         );
 
-        let inside = self.0.borrow().inside_run_wave;
         // Synthesize a leading DIRTY for an EXTERNAL tier-3 emit. Inside run_wave the
         // DIRTY already propagated in phase 1 (or the wave is activation-exempt).
         if has_tier3 && !inside {
@@ -1615,10 +1656,16 @@ impl Core {
                 }
                 Message::Resolved => {
                     // Explicit operator escape hatch (D49); the substrate-synthesized
-                    // undirty RESOLVED goes through run_wave, not here.
+                    // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
+                    // that must honor pause/batch timing also route through here, so keep
+                    // the no-cache case at SENTINEL while still emitting RESOLVED.
                     {
                         let mut n = self.0.borrow_mut();
-                        n.status = Status::Resolved;
+                        n.status = if n.has_data {
+                            Status::Resolved
+                        } else {
+                            Status::Sentinel
+                        };
                         n.emitted_tier3_this_wave = true;
                     }
                     self.emit_to_subs(&Message::Resolved);
@@ -1693,6 +1740,26 @@ impl Core {
     pub(crate) fn owned_up(&self, msgs: Wave<AnyValue>, toward_dep: Option<usize>) {
         let core = self.clone();
         with_wave_owner(self, move || core.up(msgs, toward_dep), || {});
+    }
+
+    pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
+        self.0.borrow_mut().batch_dirty_owed = false;
+        self.owned_down(wave);
+    }
+
+    pub(crate) fn rollback_batched(&self) {
+        let should_balance = {
+            let mut n = self.0.borrow_mut();
+            if n.batch_dirty_owed {
+                n.batch_dirty_owed = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_balance {
+            self.owned_down(vec![Message::Resolved]);
+        }
     }
 
     fn emit_dirty_once(&self) {
@@ -2362,6 +2429,60 @@ mod tests {
         assert_eq!(*log.borrow(), vec!["START", "DATA", "DIRTY", "DATA"]);
         assert_eq!(s.cache(), Some(2));
         assert_eq!(s.status(), Status::Settled);
+    }
+
+    #[test]
+    fn batch_commits_last_settle_and_rollback_balances_dirty() {
+        let s = Node::<i32>::state(0);
+        let (log, sink) = recorder();
+        let _u = s.subscribe(sink);
+        log.borrow_mut().clear();
+
+        crate::batch::batch(|_| {
+            s.set(1);
+            s.set(2);
+            assert_eq!(*log.borrow(), vec!["DIRTY"]);
+            assert_eq!(s.cache(), Some(0));
+        });
+        assert_eq!(*log.borrow(), vec!["DIRTY", "DATA"]);
+        assert_eq!(s.cache(), Some(2));
+
+        log.borrow_mut().clear();
+        crate::batch::batch(|bctx| {
+            s.set(3);
+            bctx.rollback();
+            assert_eq!(*log.borrow(), vec!["DIRTY"]);
+        });
+        assert_eq!(*log.borrow(), vec!["DIRTY", "RESOLVED"]);
+        assert_eq!(s.cache(), Some(2));
+    }
+
+    #[test]
+    fn batch_rollback_resolved_respects_resumeall_pause() {
+        let n = Node::<i32>::producer_opts(
+            NodeOpts {
+                pausable: Pausable::ResumeAll,
+                ..NodeOpts::default()
+            },
+            |_| {},
+        );
+        let (log, sink) = recorder();
+        let _u = n.subscribe(sink);
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("rollback");
+        n.up(vec![Message::Pause(pause.clone())]);
+        crate::batch::batch(|bctx| {
+            n.down(vec![Message::Data(Rc::new(1i32))]);
+            bctx.rollback();
+            assert_eq!(*log.borrow(), vec!["DIRTY"]);
+        });
+
+        assert_eq!(*log.borrow(), vec!["DIRTY"]);
+        assert_eq!(n.cache(), None);
+        n.up(vec![Message::Resume(pause)]);
+        assert_eq!(*log.borrow(), vec!["DIRTY", "RESOLVED"]);
+        assert_eq!(n.status(), Status::Sentinel);
     }
 
     #[test]
