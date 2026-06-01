@@ -135,14 +135,17 @@ D49 — already in the substrate from CSP-5; take/distinctUntilChanged expressed
 thread-local FIFO + `DRAINING` re-entrancy guard, drained at the `with_wave_owner` committed
 boundary, **reusing the B25 `WaveScope`** = the Rust analogue of the TS `boundary.ts`;
 `request`/`apply_rewire_next` add/remove/set reuse the R-rewire surgical path (C-8),
-terminal-discards-queue, a per-apply reject→ERROR via `owned_down`; `Ctx::rewire_next_add/remove/set`).
+D62 terminal-drains-queued-topology, a per-apply reject→ERROR via `owned_down`;
+`Ctx::rewire_next_add/remove/set`).
 **Parity fix (Rust-only, pre-existing):** the `run_wave` undirty-RESOLVED synthesis now exempts a
 TERMINAL wave (`+ !n.terminal`, mirroring the TS `_terminal === undefined` guard) — surfaced by
 C-11 facet 5 (a fn emitting a bare COMPLETE). The B16 QA-F1 rewire-panic unit test was adapted
 to construct its node `error_when_deps_error:false` (the new auto-error-cascade correctly
 TERMINATES a consumer whose dep errors, so "d survives + recovers" is kept observable by
-absorbing). **The Rust conformance arm is now FULLY GREEN C-2..C-15 — only C-1 remains
-(wire-bridge B2, post-1.0); CSP-6 effectively complete.**
+absorbing). **Catch-up 2026-05-31:** C-11 was updated to D62 terminal-drains semantics,
+and C-16/C-18/C-20/C-21 are now green (pullId/routed RESUME/up_next, routed-demand
+diamond idempotence, terminal TEARDOWN relay, and late async ctx live-edge). Remaining
+Rust conformance todo: C-1 (wire-bridge B2, post-1.0) plus batch-dependent C-19/C-22.
 
 **Deferred to later slices** (per the agreed sequencing): TEARDOWN, batch. Still open (not
 pre-committed): a real async-pool runner (callback/handle resolution) once a consumer needs
@@ -180,15 +183,22 @@ rewire×async-late-ctx edges (TS backlog B17–B19) once batch lands; `ctx.rewir
 | 4 | **C-8** | intra-graph runtime rewire | ✅ **GREEN** 2026-05-30 (D42 — setDeps/addDep/removeDep; Rc<Cell<i64>> idx-box reroute/drain; atomic multi-add settle) |
 | 5 | **C-15** | a dep's terminal releases its in-wave DIRTY (no wedge) | ✅ **GREEN** 2026-05-30 (B35/R-deps-terminal — release + absorbed-terminal settle + terminal_as_real_input + auto-cascade; teeth-verified) |
 | 6 | **C-12** | occurrences stay DATA; RESOLVED undirty-only | ✅ **GREEN** 2026-05-30 (D49 already in substrate; take/distinctUntilChanged as inline ctx.state derived nodes) |
-| 7 | **C-11** | higher-order inner rewire at the wave boundary | ✅ **GREEN** 2026-05-30 (D47 `ctx.rewire_next` — DEFERRED_REWIRE FIFO drained at the WaveScope boundary; `R-rewire-deferred` active TS-side; Rust handle-GC B32 done) |
+| 7 | **C-11** | higher-order inner rewire at the wave boundary | ✅ **GREEN** 2026-05-31 (D47/D62 `ctx.rewire_next` — DEFERRED_REWIRE FIFO drained at the WaveScope boundary; terminal drains queued topology while sealing output) |
+| 8 | **C-16** | pull-mode node + routed RESUME demand | ✅ **GREEN** 2026-05-31 (`pull_id`, quiet absorb/no push-on-subscribe, directed/broadcast `up`, boundary-deferred `up_next`) |
+| 9 | **C-18** | routed pull demand over diamond fires holder once | ✅ **GREEN** 2026-05-31 (per-routed-wave holder idempotence) |
+| 10 | **C-20** | TEARDOWN relays through terminal intermediate | ✅ **GREEN** 2026-05-31 |
+| 11 | **C-21** | late async ctx emission uses live deps after rewire | ✅ **GREEN** 2026-05-31 |
+| later | **C-19** | undirty RESOLVED timing respects resumeAll and batch | batch-dependent; todo |
+| later | **C-22** | batch commit precedes rewire requested during open batch | batch-dependent; todo |
 | last | **C-1** | cross-graph diamond coalesce | needs wire bridge (B2, post-1.0); in-process core only for now |
 
-**Arm status:** C-2..C-15 all `rust:pass` — the Rust conformance arm is **fully green**;
-only **C-1** remains (wire-bridge-blocked, B2/post-1.0). CSP-6 effectively complete.
+**Arm status:** C-2..C-18 plus C-20/C-21 are `rust:pass`. Remaining Rust conformance
+todo: C-1 (wire bridge) and C-19/C-22 (batch boundary).
 
 ## Cross-track sequencing
 
-- **Python (CSP-7) deferred** until this Rust arm drives C-2..C-15 green (now done) — Rust's
+- **Python (CSP-7) deferred** until this Rust arm drives the non-batch substrate scenarios green
+  (now C-2..C-18 + C-20/C-21; C-19/C-22 await batch) — Rust's
   ownership/no-GC model is the high-signal second implementation that stress-tests
   the spec's language-neutrality; Py is GC + semantically close to TS, so opening
   it now adds low marginal hardening signal and triples redo risk against the still-

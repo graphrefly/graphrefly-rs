@@ -103,12 +103,18 @@ pub enum Pausable {
 /// Node construction options (substrate-level). Sugar/operator opts are the graph layer
 /// (D6/D24); this is the minimal substrate surface needed to select a pool (D20), a
 /// pause mode (R-pause-modes), and the dep-terminal propagation policy (R-deps-terminal).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NodeOpts {
     /// The dispatch pool (default LocalSync, R-sync-core).
     pub pool: PoolKind,
     /// The pause mode (default `true`, R-pause-modes).
     pub pausable: Pausable,
+    /// First-run gate override: allow fn execution with SENTINEL deps (graph-layer
+    /// partial combinators / pull consumers). Default false.
+    pub partial: bool,
+    /// Pull-mode node id (R-pull / D59). When present, the node starts quiet by
+    /// self-holding this lock; a routed RESUME of the same id demands one delivery.
+    pub pull_id: Option<LockId>,
     /// Auto-emit COMPLETE when ALL deps complete (default `true`; combineLatest
     /// semantics — ALL not ANY). last/reduce/*Map set `false` to ABSORB inner
     /// terminals (R-deps-terminal).
@@ -129,6 +135,8 @@ impl Default for NodeOpts {
         Self {
             pool: PoolKind::default(),
             pausable: Pausable::default(),
+            partial: false,
+            pull_id: None,
             complete_when_deps_complete: true,
             error_when_deps_error: true,
             terminal_as_real_input: false,
@@ -214,6 +222,12 @@ struct NodeInner {
     /// Pause mode (R-pause-modes / D44). `true` coalesces dep-driven recompute; `false`
     /// ignores PAUSE entirely; `resumeAll` buffers+replays the own settle slice.
     pausable: Pausable,
+    /// Pull-mode id (R-pull / D59). `Some(id)` means quiet-by-default; demand is a
+    /// cone-routed RESUME(id), matched by id equality in Rust's per-language representation.
+    pull_id: Option<LockId>,
+    /// A demand arrived but cannot yet fire because a dep is still pending or an
+    /// external pause lock is held. Drained when the node is settle-ready.
+    pull_demand_owed: bool,
     /// PAUSE lockset (R-pause-lockset). Paused ⇔ non-empty; same-id PAUSE is
     /// idempotent (Set); RESUME of an unknown id is a no-op. Default ("true") mode:
     /// a dep wave that lands while paused is coalesced and fired once on final-lock
@@ -460,6 +474,30 @@ thread_local! {
     static DRAINING_REWIRE: Cell<bool> = const { Cell::new(false) };
 }
 
+struct UpRouteState {
+    demand_fired: Vec<(LockId, Core)>,
+}
+
+impl UpRouteState {
+    fn new() -> Self {
+        Self {
+            demand_fired: Vec::new(),
+        }
+    }
+
+    fn mark_demand(&mut self, lock: &LockId, holder: &Core) -> bool {
+        if self
+            .demand_fired
+            .iter()
+            .any(|(l, h)| l == lock && Rc::ptr_eq(&h.0, &holder.0))
+        {
+            return true;
+        }
+        self.demand_fired.push((lock.clone(), holder.clone()));
+        false
+    }
+}
+
 /// Queue a deferred self-rewire (R-rewire-deferred / D47). Applied at the committed wave
 /// boundary by [`drain_deferred_rewires`], never in place.
 fn defer_rewire(thunk: Box<dyn FnOnce()>) {
@@ -546,6 +584,8 @@ impl Core {
             on_deactivation: Vec::new(),
             on_invalidate: Vec::new(),
             pausable,
+            pull_id: None,
+            pull_demand_owed: false,
             pause_lockset: HashSet::new(),
             paused_dep_wave_occurred: false,
             pause_buffer: Vec::new(),
@@ -564,6 +604,14 @@ impl Core {
             inner.status = Status::Settled;
         }
         Core(Rc::new(RefCell::new(inner)))
+    }
+
+    fn configure_pull(&self, pull_id: Option<LockId>) {
+        if let Some(id) = pull_id {
+            let mut n = self.0.borrow_mut();
+            n.pause_lockset.insert(id.clone());
+            n.pull_id = Some(id);
+        }
     }
 
     // ── subscription (R-push-subscribe) ──
@@ -587,7 +635,9 @@ impl Core {
             let id = n.next_sub_id;
             n.next_sub_id += 1;
             n.subscribers.push((id, sink.clone()));
-            let push = if n.has_data {
+            let push = if n.pull_id.is_some() {
+                None
+            } else if n.has_data {
                 Some(Message::Data(
                     n.cache.clone().expect("has_data ⇒ cache present"),
                 ))
@@ -628,6 +678,9 @@ impl Core {
         let deps = {
             let mut n = self.0.borrow_mut();
             n.activated = true;
+            if let Some(id) = n.pull_id.clone() {
+                n.pause_lockset.insert(id);
+            }
             n.dep_unsubs = (0..n.deps.len()).map(|_| None).collect();
             // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
             // real box its callback captures.
@@ -702,6 +755,7 @@ impl Core {
             // the next activation re-registers them from the fn body.
             n.on_invalidate.clear();
             n.pause_lockset.clear();
+            n.pull_demand_owed = false;
             n.paused_dep_wave_occurred = false;
             n.pause_buffer.clear();
             if !n.state_persist {
@@ -722,6 +776,9 @@ impl Core {
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
         // Terminal-is-forever (D17): a terminated node ignores further upstream messages.
         if self.0.borrow().terminal {
+            if matches!(msg, Message::Teardown) {
+                self.emit_to_subs(&Message::Teardown);
+            }
             return;
         }
         // B25: enroll in the wave touched-set so a panic-abort can reset our flags.
@@ -767,6 +824,7 @@ impl Core {
                         self.emit_to_subs(&Message::Resolved);
                     }
                 }
+                self.fire_owed_demand_if_ready();
             }
             Message::Dirty => {
                 let mark = {
@@ -780,7 +838,7 @@ impl Core {
                         false
                     }
                 };
-                if mark {
+                if mark && !self.is_pull_quiet() {
                     self.mark_dirty();
                 }
             }
@@ -800,6 +858,7 @@ impl Core {
                     }
                 }
                 self.maybe_run();
+                self.fire_owed_demand_if_ready();
             }
             Message::Resolved => {
                 {
@@ -811,6 +870,7 @@ impl Core {
                     }
                 }
                 self.maybe_run();
+                self.fire_owed_demand_if_ready();
             }
             // Tier 5 (D34): COMPLETE | ERROR — ONE arm routed by the CENTRAL tier
             // (`Message::tier() == Tier::Terminal`), not per-variant. The shared terminal
@@ -860,9 +920,13 @@ impl Core {
                     // (no DATA) → un-dirty downstream, keep cache.
                     self.settle_after_absorbed_terminal();
                 }
+                self.fire_owed_demand_if_ready();
             }
-            // TEARDOWN propagation is a later slice (B33); PAUSE/RESUME are never delivered to
-            // a dep-subscriber (a node is paused via its own up(), not by an upstream dep).
+            Message::Teardown => {
+                self.down(vec![Message::Complete, Message::Teardown]);
+            }
+            // PAUSE/RESUME are never delivered to a dep-subscriber (a node is paused via its
+            // own up(), not by an upstream dep).
             _ => {}
         }
     }
@@ -1029,11 +1093,15 @@ impl Core {
     /// FRESH wave-owner so a user-fn panic during dep-activation/settle becomes ERROR
     /// (D30). INTRA-graph only (D22). Requires an explicit fn (SD-1 fn-deps pairing).
     pub(crate) fn rewire(&self, new_deps: Vec<Core>, fn_: NodeFn) {
+        self.rewire_inner(new_deps, fn_, false);
+    }
+
+    fn rewire_inner(&self, new_deps: Vec<Core>, fn_: NodeFn, allow_terminal_owner: bool) {
         let new_deps = dedup_cores(new_deps);
         {
             let n = self.0.borrow();
             assert!(
-                !n.terminal,
+                allow_terminal_owner || !n.terminal,
                 "rewire: node is terminal (completed/errored) — cannot rewire (R-rewire / D42)"
             );
             assert!(
@@ -1080,15 +1148,17 @@ impl Core {
         defer_rewire(Box::new(move || node.apply_rewire_next(req)));
     }
 
-    /// Apply one queued self-rewire at the boundary (a drain thunk). A node that went TERMINAL
-    /// during the wave DISCARDS its queued requests (R-rewire-deferred). The dep set is composed
+    pub(crate) fn request_up_next(&self, msgs: Wave<AnyValue>, toward_dep: Option<usize>) {
+        let node = self.clone();
+        defer_rewire(Box::new(move || node.owned_up(msgs, toward_dep)));
+    }
+
+    /// Apply one queued self-rewire at the boundary (a drain thunk). D62: terminal seals output
+    /// but does NOT cancel queued topology intent. The dep set is composed
     /// against the LIVE deps at apply time (so several requests in one wave compose). A rewire
     /// reject (cycle/self/non-resubscribable terminal dep) panics — caught here and surfaced as
     /// `[[ERROR,e]]` on this node (D30-consistent) so it does not strand the rest of the drain.
     fn apply_rewire_next(&self, req: RewireRequest) {
-        if self.0.borrow().terminal {
-            return; // terminal discards the queue
-        }
         let (new_deps, fn_) = match req {
             RewireRequest::Set(deps, f) => (deps, f),
             RewireRequest::Add(dep, f) => {
@@ -1115,7 +1185,9 @@ impl Core {
         // panic OUT of rewire() — caught here → ERROR on this node, via owned_down (a fresh
         // wave-owner; the drain runs outside any live wave).
         let core = self.clone();
-        let outcome = catch_unwind(AssertUnwindSafe(move || core.rewire(new_deps, fn_)));
+        let outcome = catch_unwind(AssertUnwindSafe(move || {
+            core.rewire_inner(new_deps, fn_, true)
+        }));
         if let Err(payload) = outcome {
             let err = panic_to_error(payload);
             self.owned_down(vec![Message::Error(err)]);
@@ -1564,6 +1636,9 @@ impl Core {
                         } else {
                             n.terminal = true;
                             n.status = Status::Completed;
+                            n.pull_demand_owed = false;
+                            n.paused_dep_wave_occurred = false;
+                            n.pause_buffer.clear();
                             true
                         }
                     };
@@ -1579,6 +1654,9 @@ impl Core {
                         } else {
                             n.terminal = true;
                             n.status = Status::Errored;
+                            n.pull_demand_owed = false;
+                            n.paused_dep_wave_occurred = false;
+                            n.pause_buffer.clear();
                             true
                         }
                     };
@@ -1586,7 +1664,10 @@ impl Core {
                         self.emit_to_subs(&Message::Error(e));
                     }
                 }
-                // Deferred slices: TEARDOWN / PAUSE / RESUME (delivered, not stored, here).
+                Message::Teardown => {
+                    self.emit_to_subs(&Message::Teardown);
+                }
+                // PAUSE / RESUME are control-only and are delivered via up().
                 _ => {}
             }
         }
@@ -1607,6 +1688,11 @@ impl Core {
     pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
         let core = self.clone();
         with_wave_owner(self, move || core.down(msgs), || {});
+    }
+
+    pub(crate) fn owned_up(&self, msgs: Wave<AnyValue>, toward_dep: Option<usize>) {
+        let core = self.clone();
+        with_wave_owner(self, move || core.up(msgs, toward_dep), || {});
     }
 
     fn emit_dirty_once(&self) {
@@ -1652,7 +1738,12 @@ impl Core {
     ///   source lifecycle is source/graph-owned).
     /// - dep-bearing intermediate: forward toward deps only, never self-act (the source
     ///   is the single actor, the down-cascade is the effect).
-    pub(crate) fn up(&self, msgs: Vec<Msg>) {
+    pub(crate) fn up(&self, msgs: Vec<Msg>, toward_dep: Option<usize>) {
+        let mut route = UpRouteState::new();
+        self.up_route(msgs, toward_dep, &mut route);
+    }
+
+    fn up_route(&self, msgs: Vec<Msg>, toward_dep: Option<usize>, route: &mut UpRouteState) {
         for m in &msgs {
             assert!(
                 m.is_up_allowed(),
@@ -1663,7 +1754,18 @@ impl Core {
         for m in msgs {
             match m {
                 Message::Pause(lock) => self.pause_acquire(lock),
-                Message::Resume(lock) => self.pause_release(lock),
+                Message::Resume(lock) => {
+                    let is_pull_demand = self.0.borrow().pull_id.as_ref() == Some(&lock);
+                    if is_pull_demand {
+                        if !route.mark_demand(&lock, self) {
+                            self.on_demand();
+                        }
+                    } else if self.0.borrow().pause_lockset.contains(&lock) {
+                        self.pause_release(lock);
+                    } else {
+                        self.forward_up(Message::Resume(lock), toward_dep, route);
+                    }
+                }
                 // R-up-at-source (D38): INVALIDATE/DIRTY/TEARDOWN.
                 other if is_depless => {
                     // terminus: honor INVALIDATE, drop DIRTY/TEARDOWN.
@@ -1675,12 +1777,22 @@ impl Core {
                     // dep-bearing intermediate: forward toward deps (reconstruct the
                     // payload-free control kind — Msg is not Clone, but only the unit
                     // control kinds reach here per is_up_allowed minus PAUSE/RESUME).
-                    let deps = self.0.borrow().deps.clone();
-                    for dep in &deps {
-                        dep.up(vec![dup_control(&other)]);
-                    }
+                    self.forward_up(other, toward_dep, route);
                 }
             }
+        }
+    }
+
+    fn forward_up(&self, m: Msg, toward_dep: Option<usize>, route: &mut UpRouteState) {
+        let deps = self.0.borrow().deps.clone();
+        if let Some(i) = toward_dep {
+            if let Some(dep) = deps.get(i) {
+                dep.up_route(vec![m], None, route);
+            }
+            return;
+        }
+        for dep in &deps {
+            dep.up_route(vec![dup_control(&m)], None, route);
         }
     }
 
@@ -1688,6 +1800,13 @@ impl Core {
 
     fn is_paused(&self) -> bool {
         !self.0.borrow().pause_lockset.is_empty()
+    }
+
+    fn is_pull_quiet(&self) -> bool {
+        let n = self.0.borrow();
+        n.pull_id
+            .as_ref()
+            .is_some_and(|id| n.pause_lockset.contains(id))
     }
 
     fn pause_acquire(&self, lock: LockId) {
@@ -1706,6 +1825,62 @@ impl Core {
         if resumed {
             self.on_resume();
         }
+        self.fire_owed_demand_if_ready();
+    }
+
+    fn on_demand(&self) {
+        {
+            let mut n = self.0.borrow_mut();
+            if n.pull_id.is_none() {
+                return;
+            }
+            n.pull_demand_owed = true;
+        }
+        self.fire_owed_demand_if_ready();
+    }
+
+    fn fire_owed_demand_if_ready(&self) {
+        let (pull_id, should_mark_dirty) = {
+            let n = self.0.borrow();
+            let Some(id) = n.pull_id.clone() else { return };
+            if n.terminal || !n.pull_demand_owed || n.pending != 0 {
+                return;
+            }
+            if n.pause_lockset.iter().any(|held| held != &id) {
+                return;
+            }
+            if n.handle.is_some() && !n.has_called_fn_once && !n.partial && !n.all_deps_settled() {
+                return;
+            }
+            (id, n.paused_dep_wave_occurred)
+        };
+        {
+            let mut n = self.0.borrow_mut();
+            n.pull_demand_owed = false;
+            n.pause_lockset.remove(&pull_id);
+        }
+        struct Requiet<'a> {
+            core: &'a Core,
+            id: Option<LockId>,
+        }
+        impl Drop for Requiet<'_> {
+            fn drop(&mut self) {
+                let Some(id) = self.id.take() else { return };
+                if let Ok(mut n) = self.core.0.try_borrow_mut() {
+                    if !n.terminal && n.pull_id.as_ref() == Some(&id) {
+                        n.pause_lockset.insert(id);
+                    }
+                }
+            }
+        }
+        let _requiet = Requiet {
+            core: self,
+            id: Some(pull_id),
+        };
+        if should_mark_dirty {
+            self.mark_dirty();
+        }
+        self.on_resume();
     }
 
     fn on_resume(&self) {
@@ -1832,10 +2007,12 @@ impl Core {
 /// PAUSE/RESUME which self-handle), so a fresh copy is always constructible.
 fn dup_control(m: &Msg) -> Msg {
     match m {
+        Message::Pause(lock) => Message::Pause(lock.clone()),
+        Message::Resume(lock) => Message::Resume(lock.clone()),
         Message::Dirty => Message::Dirty,
         Message::Invalidate => Message::Invalidate,
         Message::Teardown => Message::Teardown,
-        other => unreachable!("up forwards only DIRTY/INVALIDATE/TEARDOWN, got {other:?}"),
+        other => unreachable!("up forwards only control messages, got {other:?}"),
     }
 }
 
@@ -1940,12 +2117,18 @@ impl<T: 'static> Node<T> {
 
     /// A producer with explicit [`NodeOpts`] (pool + pause mode).
     pub fn producer_opts<F: Fn(&Ctx) + 'static>(opts: NodeOpts, f: F) -> Node<T> {
+        assert!(
+            !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
+            "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
+        );
         let disp = default_dispatcher();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
-        Node {
+        let node = Node {
             core: Core::new(vec![], Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
-        }
+        };
+        node.core.configure_pull(opts.pull_id);
+        node
     }
 
     /// A derived node over erased deps. The fn reads deps positionally via
@@ -1976,6 +2159,10 @@ impl<T: 'static> Node<T> {
 
     /// A derived node with explicit [`NodeOpts`] (pool + pause mode + dep-terminal policy).
     pub fn derived_opts<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, opts: NodeOpts, f: F) -> Node<T> {
+        assert!(
+            !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
+            "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
+        );
         let disp = default_dispatcher();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
         let node = Node {
@@ -1986,10 +2173,12 @@ impl<T: 'static> Node<T> {
             // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
             let mut n = node.core.0.borrow_mut();
+            n.partial = opts.partial;
             n.complete_when_deps_complete = opts.complete_when_deps_complete;
             n.error_when_deps_error = opts.error_when_deps_error;
             n.terminal_as_real_input = opts.terminal_as_real_input;
         }
+        node.core.configure_pull(opts.pull_id);
         node
     }
 
@@ -2010,7 +2199,13 @@ impl<T: 'static> Node<T> {
     /// PAUSE/RESUME act on this node's lockset (R-pause-lockset).
     pub fn up(&self, msgs: Wave<AnyValue>) {
         let core = self.core.clone();
-        with_wave_owner(&self.core, move || core.up(msgs), || {});
+        with_wave_owner(&self.core, move || core.up(msgs, None), || {});
+    }
+
+    /// Directed upstream control along one declared dep edge (R-up-routing).
+    pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
+        let core = self.core.clone();
+        with_wave_owner(&self.core, move || core.up(msgs, Some(toward_dep)), || {});
     }
 
     /// The current cached value (downcast), or `None` for SENTINEL.
@@ -2029,6 +2224,10 @@ impl<T: 'static> Node<T> {
     /// The node's lifecycle status (R-status-enum).
     pub fn status(&self) -> Status {
         self.core.0.borrow().status
+    }
+
+    pub fn pull_id(&self) -> Option<LockId> {
+        self.core.0.borrow().pull_id.clone()
     }
 
     /// Subscribe a sink; returns an unsubscribe handle (call it to detach; the node

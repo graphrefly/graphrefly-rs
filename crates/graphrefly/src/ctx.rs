@@ -100,7 +100,24 @@ impl Ctx {
     /// Emit upstream toward deps — control tiers only (R-ctx-up). Validates the
     /// kind; the terminus actions (PAUSE lockset / INVALIDATE honor) are deferred.
     pub fn up(&self, msgs: Wave<AnyValue>) {
-        self.node.up(msgs);
+        self.node.up(msgs, None);
+    }
+
+    /// Directed upstream control along one declared dep edge (R-up-routing).
+    pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
+        self.node.up(msgs, Some(toward_dep));
+    }
+
+    /// Defer an upstream control wave to the committed wave boundary (R-rewire-deferred).
+    /// This is the self-demand path for pull nodes: `RESUME(pullId)` routes after the
+    /// current fn settles, avoiding D37 mid-wave re-entry.
+    pub fn up_next(&self, msgs: Wave<AnyValue>) {
+        self.node.request_up_next(msgs, None);
+    }
+
+    /// Directed form of [`Ctx::up_next`].
+    pub fn up_next_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
+        self.node.request_up_next(msgs, Some(toward_dep));
     }
 
     /// Read this node's private cross-wave state (R-ctx-state / D23), typed.
@@ -212,5 +229,15 @@ impl DeferredCtx {
     /// surface, DR-1).
     pub fn down(&self, msgs: Wave<AnyValue>) {
         self.node.owned_down(msgs);
+    }
+
+    /// Emit upstream through the node's LIVE topology at emission time (R-rewire-async-live-edge).
+    pub fn up(&self, msgs: Wave<AnyValue>) {
+        self.node.owned_up(msgs, None);
+    }
+
+    /// Directed form of [`DeferredCtx::up`].
+    pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
+        self.node.owned_up(msgs, Some(toward_dep));
     }
 }

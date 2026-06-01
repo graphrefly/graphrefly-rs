@@ -382,7 +382,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         assert_eq!(op.status(), Status::Errored);
     }
 
-    // ── (variant) a terminal OP discards its pending rewireNext queue. ──
+    // ── (variant) D62: terminal seals output but still drains queued topology. ──
     {
         let s = Node::<i32>::state_empty();
         let inner = make_inner(Some(1));
@@ -410,13 +410,15 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
             },
             move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
         );
-        let _u = op.subscribe(|_| {});
+        let (log, _u) = record(&op);
+        log.borrow_mut().clear();
         s.set(1);
         assert_eq!(op.status(), Status::Completed);
         assert!(
-            !inner_act.get(),
-            "the queued addDep was discarded (terminal)"
+            inner_act.get(),
+            "the queued addDep drained even though OP became terminal"
         );
+        assert_eq!(kinds(&log), vec!["DIRTY", "COMPLETE"]);
     }
 
     // ── (variant) a no-net-change rewireNext is a no-op (no drain loop). ──
@@ -1117,6 +1119,415 @@ fn c15_dep_terminal_settles_dirty() {
         assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]); // un-dirtied downstream, NOT wedged
         assert_eq!(d.cache(), None); // never produced a value
     }
+}
+
+/// C-16 — pull-mode node (R-pull / R-up-routing / D55,D59): quiet absorbs upstream
+/// DIRTY, routed RESUME(pullId) demands exactly one delivery, then the node re-quiets.
+#[test]
+fn c16_pull_mode_routed_demand() {
+    let psnap = LockId::new("snapshot");
+    let snap_fn = |ctx: &Ctx| {
+        if let Some(v) = ctx.data::<i32>(0) {
+            ctx.emit(*v);
+        }
+    };
+
+    {
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let (log, _u) = record(&snap);
+        assert_eq!(kinds(&log), vec!["START"]);
+        assert_eq!(snap.pull_id(), Some(psnap.clone()));
+        log.borrow_mut().clear();
+
+        acc.set(1);
+        acc.set(2);
+        assert_eq!(kinds(&log), Vec::<String>::new());
+
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
+        log.borrow_mut().clear();
+
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(kinds(&log), Vec::<String>::new());
+        acc.set(3);
+        assert_eq!(kinds(&log), Vec::<String>::new());
+    }
+
+    {
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let (log, u) = record(&snap);
+        log.borrow_mut().clear();
+
+        acc.set(1);
+        assert_eq!(kinds(&log), Vec::<String>::new());
+        u(); // RAM lifecycle: last unsubscribe deactivates the pull node.
+
+        let (log2, _u2) = record(&snap);
+        assert_eq!(kinds(&log2), vec!["START"]);
+        log2.borrow_mut().clear();
+        acc.set(2);
+        assert_eq!(
+            kinds(&log2),
+            Vec::<String>::new(),
+            "a reactivated pull node re-enters quiet mode before dep replay (R-pull)"
+        );
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(kinds(&log2), vec!["DIRTY", "DATA"]);
+    }
+
+    {
+        let a = Node::<i32>::state_empty();
+        let b = Node::<i32>::state_empty();
+        let runs = Rc::new(Cell::new(0usize));
+        let r = runs.clone();
+        let snap = Node::<i32>::derived_opts(
+            vec![a.erased(), b.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                r.set(r.get() + 1);
+                let x = *ctx.data::<i32>(0).unwrap();
+                let y = *ctx.data::<i32>(1).unwrap();
+                ctx.emit(x + y);
+            },
+        );
+        let (log, _u) = record(&snap);
+        log.borrow_mut().clear();
+
+        a.set(1);
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "demand before the first-run gate is satisfied must not emit a stranded DIRTY"
+        );
+        assert_eq!(runs.get(), 0);
+
+        b.set(2);
+        assert_eq!(runs.get(), 1);
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
+        assert_eq!(snap.cache(), Some(3));
+    }
+
+    {
+        let ext = LockId::new("external");
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let (log, _u) = record(&snap);
+        log.borrow_mut().clear();
+
+        acc.set(1);
+        snap.up(vec![Message::Pause(ext.clone())]);
+        snap.up(vec![Message::Resume(psnap.clone())]); // owed, but external pause still held
+        assert_eq!(kinds(&log), Vec::<String>::new());
+
+        acc.down(vec![Message::Complete]);
+        assert_eq!(
+            kinds(&log),
+            vec!["COMPLETE"],
+            "terminal-is-forever cancels owed pull demand without post-terminal DIRTY"
+        );
+    }
+
+    {
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                pausable: Pausable::ResumeAll,
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let (vals, _u) = record_data_i32(&snap);
+        acc.set(1);
+        acc.set(2);
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(*vals.borrow(), vec![0, 1, 2]);
+    }
+
+    {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _bad = Node::<i32>::derived_opts(
+                vec![],
+                NodeOpts {
+                    pull_id: Some(psnap.clone()),
+                    pausable: Pausable::False,
+                    ..NodeOpts::default()
+                },
+                |_| {},
+            );
+        }));
+        assert!(result.is_err());
+    }
+
+    {
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let stream = Node::<i32>::state_empty();
+        let received: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+        let rec = received.clone();
+        let pid = psnap.clone();
+        let c = Node::<i32>::derived_opts(
+            vec![stream.erased(), snap.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                if let Some(b) = &ctx.dep_records()[1].batch {
+                    for v in b {
+                        if let Ok(rc) = v.clone().downcast::<i32>() {
+                            rec.borrow_mut().push(*rc);
+                        }
+                    }
+                }
+                if ctx.dep_records()[0].batch.is_some() {
+                    ctx.up_next(vec![Message::Resume(pid.clone())]);
+                }
+            },
+        );
+        let (_log, _u) = record(&c);
+        acc.set(7);
+        assert_eq!(*received.borrow(), Vec::<i32>::new());
+        stream.set(1);
+        assert_eq!(*received.borrow(), vec![7]);
+    }
+
+    {
+        let pf = LockId::new("F");
+        let ph = LockId::new("H");
+        let acc_f = Node::<i32>::state(100);
+        let acc_h = Node::<i32>::state(200);
+        let f_snap = Node::<i32>::derived_opts(
+            vec![acc_f.erased()],
+            NodeOpts {
+                pull_id: Some(pf.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let h_snap = Node::<i32>::derived_opts(
+            vec![acc_h.erased()],
+            NodeOpts {
+                pull_id: Some(ph.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let fwd = |ctx: &Ctx| {
+            for r in ctx.dep_records() {
+                if let Some(b) = &r.batch {
+                    for v in b {
+                        if let Ok(rc) = v.clone().downcast::<i32>() {
+                            ctx.emit(*rc);
+                        }
+                    }
+                }
+            }
+        };
+        let g = Node::<i32>::derived_opts(
+            vec![f_snap.erased(), h_snap.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            fwd,
+        );
+        let (vals, _u) = record_data_i32(&g);
+
+        g.up(vec![Message::Resume(pf.clone())]);
+        assert_eq!(*vals.borrow(), vec![100]);
+        vals.borrow_mut().clear();
+
+        g.up(vec![Message::Resume(ph.clone())]);
+        assert_eq!(*vals.borrow(), vec![200]);
+        vals.borrow_mut().clear();
+
+        g.up_toward(1, vec![Message::Resume(pf.clone())]);
+        assert_eq!(*vals.borrow(), Vec::<i32>::new());
+        acc_f.set(101);
+        g.up_toward(0, vec![Message::Resume(pf)]);
+        assert_eq!(*vals.borrow(), vec![101]);
+    }
+
+    {
+        let acc = Node::<i32>::state(0);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            snap_fn,
+        );
+        let stream = Node::<i32>::state_empty();
+        let pid = psnap.clone();
+        let c = Node::<i32>::derived_opts(
+            vec![stream.erased(), snap.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                if ctx.dep_records()[0].batch.is_some() {
+                    ctx.up(vec![Message::Resume(pid.clone())]);
+                }
+            },
+        );
+        let (_log, _u) = record(&c);
+        acc.set(7);
+        stream.set(1);
+        assert_eq!(c.status(), Status::Errored);
+    }
+}
+
+/// C-18 — a broadcast routed RESUME through a diamond reaches the same pull holder
+/// through two paths, but the holder fires at most once for that routed wave.
+#[test]
+fn c18_routed_pull_demand_over_diamond_fires_once() {
+    let psnap = LockId::new("snapshot-diamond");
+    let acc = Node::<i32>::state(0);
+    let snap_runs = Rc::new(Cell::new(0usize));
+    let runs = snap_runs.clone();
+    let snap = Node::<i32>::derived_opts(
+        vec![acc.erased()],
+        NodeOpts {
+            pull_id: Some(psnap.clone()),
+            ..NodeOpts::default()
+        },
+        move |ctx| {
+            runs.set(runs.get() + 1);
+            if let Some(v) = ctx.data::<i32>(0) {
+                ctx.emit(*v);
+            }
+        },
+    );
+    let fwd = |ctx: &Ctx| {
+        for r in ctx.dep_records() {
+            if let Some(b) = &r.batch {
+                for v in b {
+                    if let Ok(rc) = v.clone().downcast::<i32>() {
+                        ctx.emit(*rc);
+                    }
+                }
+            }
+        }
+    };
+    let g1 = Node::<i32>::derived_opts(
+        vec![snap.erased()],
+        NodeOpts {
+            partial: true,
+            ..NodeOpts::default()
+        },
+        fwd,
+    );
+    let g2 = Node::<i32>::derived_opts(
+        vec![snap.erased()],
+        NodeOpts {
+            partial: true,
+            ..NodeOpts::default()
+        },
+        fwd,
+    );
+    let d = Node::<i32>::derived_opts(
+        vec![g1.erased(), g2.erased()],
+        NodeOpts {
+            partial: true,
+            ..NodeOpts::default()
+        },
+        fwd,
+    );
+    let (_vals, _u) = record_data_i32(&d);
+    acc.set(1);
+    d.up(vec![Message::Resume(psnap)]);
+    assert_eq!(snap_runs.get(), 1);
+}
+
+/// C-20 — terminal value output is sealed, but TEARDOWN still relays through the
+/// terminal intermediate so downstream bridge/lifecycle subscribers can unwind.
+#[test]
+fn c20_teardown_relays_through_terminal_intermediate() {
+    let s = Node::<i32>::state(1);
+    let mid = Node::<i32>::derived_opts(
+        vec![s.erased()],
+        NodeOpts {
+            complete_when_deps_complete: false,
+            ..NodeOpts::default()
+        },
+        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+    );
+    let (log, _u) = record(&mid);
+    mid.down(vec![Message::Complete]);
+    log.borrow_mut().clear();
+
+    s.down(vec![Message::Teardown]);
+    s.down(vec![Message::Teardown]);
+    assert_eq!(kinds(&log), vec!["TEARDOWN", "TEARDOWN"]);
+}
+
+/// C-21 — a deferred async ctx reads its invocation snapshot, but late up/down
+/// emissions route through the node's LIVE topology after rewire.
+#[test]
+fn c21_late_async_ctx_uses_live_deps_after_rewire() {
+    let captured: Rc<RefCell<Option<DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let cap = captured.clone();
+    let a = Node::<i32>::state(1);
+    let b = Node::<i32>::state(2);
+    let d = Node::<i32>::derived_opts(
+        vec![a.erased()],
+        NodeOpts {
+            pool: PoolKind::Async,
+            ..NodeOpts::default()
+        },
+        move |ctx| {
+            *cap.borrow_mut() = Some(ctx.defer());
+        },
+    );
+    let (_log, _u) = record(&d);
+
+    d.set_deps(vec![b.erased()], |_| {});
+    captured
+        .borrow()
+        .as_ref()
+        .expect("ctx captured")
+        .up(vec![Message::Invalidate]);
+
+    assert_eq!(a.cache(), Some(1));
+    assert_eq!(b.cache(), None);
 }
 
 /// C-17 (R-deps-terminal / B42): an ABSORBED error (error_when_deps_error:false) counts as

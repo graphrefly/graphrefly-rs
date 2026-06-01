@@ -46,8 +46,9 @@
 //!
 //! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
 //! > (kernel + control/terminal + async + rewire + dep-terminal + `ctx.rewire_next`
-//! > slices). The Rust conformance arm is **green C-2..C-15**; only **C-1** remains
-//! > (wire-bridge-blocked, post-1.0). [`batch`] is still a contract stub. See
+//! > slices, plus pull/routed-up and terminal/later-async catch-up). The Rust conformance
+//! > arm is green for **C-2..C-18, C-20, C-21**; **C-1** remains wire-bridge-blocked and
+//! > **C-19/C-22** remain batch-dependent. [`batch`] is still a contract stub. See
 //! > `CLEAN-SLATE.md` for the per-module status + conformance target map.
 
 #![forbid(unsafe_code)]
