@@ -1,0 +1,142 @@
+# graphrefly-rs — agent context (Rust implementation, clean-slate)
+
+**GraphReFly** — reactive universal reduction layer (high fan-in/out → information
+reduction → push; not LLM-limited, D1). This repo is the **Rust implementation**
+(`@graphrefly/rust`): a self-contained package (substrate → sugar → operators),
+**no cross-language peer-deps** (D32). Cross-language = a coarse wire bridge, never
+in-process.
+
+> **Clean-slate retired the port model.** The old `main` branch (M1–M5 milestones,
+> handle-protocol cleaving plane, `Arc<Mutex>` actor model, 8-crate workspace,
+> 3-digit D193–D301, parity `Impl` interface) is **history**. This branch
+> (`clean-slate`) rebuilds the substrate from the language-neutral spec. Do not
+> reach for port-model docs/decisions.
+
+> **This file points, it does not host.** The language-neutral authority — protocol
+> spec, decisions, conformance, formal model — lives in `~/src/graphrefly` (branch
+> `clean-slate`). When anything here disagrees with that repo, **that repo wins.**
+
+## Authority — where the truth lives (`~/src/graphrefly`)
+
+Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for the design.
+
+| Concern | Source of truth |
+|---|---|
+| **Decisions (why)** — unified D# log | `~/src/graphrefly/decisions/decisions.jsonl` |
+| **Design narrative** — L0–L6 locks, F-* constraints, spec-amendment list | `~/src/graphrefly/sessions/active/SESSION-clean-slate-redesign.md` (DS-1) |
+| **Protocol rules (宪法)** | `~/src/graphrefly/spec/rules.jsonl` (changed via `/spec-amend`) |
+| **Conformance scenarios (parity)** | `~/src/graphrefly/spec/conformance.jsonl` (driven via `/conformance`) |
+| **Formal model** | `~/src/graphrefly/formal/*.tla` (+ MC configs) |
+| **Sequencer / backlog / anti-patterns** | `~/src/graphrefly/plan/{phases,backlog,antipatterns}.jsonl` (this repo = CSP-5/CSP-6) |
+| **Rendered view** (progress / structure / gaps) | `~/src/graphrefly/dashboard/` (`node dashboard/build.mjs`) |
+
+Sibling self-contained packages: `@graphrefly/ts` (`~/src/graphrefly-ts`, the lead
+spec-hardening impl), `@graphrefly/py` (`~/src/graphrefly-py`).
+
+## Clean-slate floor (cite, never violate — full text in DS-1 / `rules.jsonl`)
+
+- **Sacred (L0.7):** topology declarative/serializable/inspectable · wave protocol is
+  a public spec · wave protocol impl is **sync** · all fn go through the dispatcher.
+- **8 verbs, closed set (D4):** `node` `graph` `batch` `state` + `producer` `derived`
+  `effect` `mount`. Operators are `node` sugar, per-language, never in parity (D6/D24).
+- **`ctx.up` / `ctx.down(msgs)` (D8):** one `msgs` array = one wave; may mix tiers.
+  `ctx.up` is **control-tier only** (DIRTY/PAUSE/RESUME/INVALIDATE/TEARDOWN); DATA/
+  RESOLVED/COMPLETE/ERROR are down-only (R-ctx-up). Handle = pure data
+  `(pool_id, handle_id)`, no methods (D7).
+- **7-tier const table (D34):** 0 START / 1 PAUSE·RESUME / 2 DIRTY / 3 DATA·RESOLVED /
+  4 INVALIDATE / 5 COMPLETE·ERROR / 6 TEARDOWN; immediate `<3`, batch-deferred `≥3`.
+  Closed set; adding a tier is a constitutional change.
+- **graph = single-thread causal/concurrency domain (D22):** parallelism via pool
+  callback or multi-graph + wire bridge; rewire intra-graph only. **The actor model
+  is dropped.**
+- **parity = behavioral conformance (D24):** only the substrate is in parity (driven
+  via `/conformance`); operators/sugar/sources/inspection are per-language, never parity.
+- **config dissolved (D26):** clock is graph-local (no global singleton); `messageTier`
+  is a compile-time const table; `onMessage`/`onSubscribe` are substrate-fixed (D19).
+- **Forced (F-*):** F-SYNC-CORE (`dispatcher.invoke` sync `()`; async only in pools /
+  wire bridge) · F-DISPATCH-ALL (no inline-fn bypass) · F-NO-IMPL-DEFINED (spec-locked
+  or explicitly undefined) · F-NO-WEDGE-CUT · F-NO-LLM-ONLY · F-GRAPH-FIRST-API · F-PERF.
+
+Durable values (memory `feedback_*`): no backward compat (pre-1.0) · no imperative
+triggers · single source of truth · **no autonomous decisions** (surface spec↔code
+conflicts, don't silently pick) · no implement without explicit approval · verify
+premise before greenfield.
+
+## Rust-specific floor (clean-slate)
+
+1. **Single-thread = `Rc<RefCell<…>>`, NOT `Arc<Mutex<…>>` (D22).** A graph is one
+   causal/concurrency domain; the substrate is `!Send + !Sync`. The actor model and
+   per-partition `ReentrantMutex` machinery of the old port are **gone** — they were
+   the ~9.5× concurrency tax (memory `project_rust_perf_value_investigation`). Lock the
+   `!Send`/`!Sync` boundary with `static_assertions` once types stabilize.
+2. **No async runtime in the core (F-SYNC-CORE).** `dispatcher.invoke` is sync. `tokio`
+   enters only behind the `LocalAsync` pool (D20) and the wire bridge.
+3. **No `unsafe`. Anywhere.** `#![forbid(unsafe_code)]` at the crate root. Find a safe
+   abstraction; if you truly cannot, escalate to spec-level discussion first.
+4. **Error = unknown, single value generic (D31).** `Node<T>` carries one value
+   generic; the error channel is `Box<dyn Error>` (`GraphError`). No typed-error
+   combinatorial explosion.
+5. **No `unwrap()`/`expect()` on user-facing paths.** `thiserror` enums for domain
+   errors; `unwrap` only in tests or genuinely-impossible-by-construction paths (with a
+   comment).
+6. **`#[must_use]` on value-returning public fns; `clippy::pedantic` warn-by-default.**
+   Allow per-need with a comment, never silently.
+7. **Public ids behind newtypes** (`LockId`, `Handle`, future `NodeId`) — never raw ints.
+
+## CSP-5 scope + layout
+
+This branch builds the **substrate only** (CSP-5): `protocol` + `node` + `dispatcher`
+(LocalSync + LocalAsync) + `ctx` + `batch` + rewire. The graph layer / 8-verb sugar /
+operators / sources / inspection are later per-language phases. The conformance arm is
+**CSP-6** (deps CSP-3 done + CSP-5). See **`crates/graphrefly/CLEAN-SLATE.md`** for the
+module status + the C-1..C-11 target map + cross-track sequencing.
+
+```
+crates/
+└── graphrefly/                # THE self-contained clean-slate package (D32)
+    └── src/{protocol,node,dispatcher,ctx,batch}.rs
+crates/graphrefly-{core,graph,operators,storage,structures,bindings-*}/
+                               # FROZEN port-model reference (D41 analogue) —
+                               # `exclude`d from the workspace, read-only, delete
+                               # at intent-parity. Do NOT develop against them.
+```
+
+## Workflow rules
+
+- **spec-first** (F-NO-IMPL-DEFINED): any protocol-behavior change → amend
+  `~/src/graphrefly` `spec/rules.jsonl` + `formal/*.tla` + `spec/conformance.jsonl`
+  **before** code (`/spec-amend`). The substrate must satisfy the conformance scenarios.
+- **decision-first**: any architectural lock → a `D#` in `decisions.jsonl` before code
+  (`/design-review` → user approval → append).
+- **consistency gate**: `node ~/src/graphrefly/dashboard/build.mjs --check` after
+  touching any spec/decision/plan jsonl.
+
+## Commands
+
+```bash
+# Toolchain is managed via `mise`; do NOT assume `cargo`/`rustc` is on PATH in agent shells.
+# Preferred:
+mise exec -- cargo test  -p graphrefly        # the clean-slate crate (the only workspace member)
+mise exec -- cargo build -p graphrefly
+mise exec -- cargo clippy -p graphrefly --all-targets
+mise exec -- cargo fmt --all
+
+# Fallback when `mise` is unavailable in a constrained shell:
+~/.cargo/bin/cargo test  -p graphrefly
+~/.cargo/bin/cargo build -p graphrefly
+~/.cargo/bin/cargo clippy -p graphrefly --all-targets
+~/.cargo/bin/cargo fmt --all
+
+# Long gates: as the crate grows, run via the sanctioned runner — NEVER `;`-chain
+# background cargo (memory feedback_no_chained_background_cargo / the Slice B-2
+# incident). scripts/run-logged.sh + the `<<<RUN-LOGGED:DONE>>>` sentinel survive
+# from the port era; rewire them to the single crate before relying on them.
+```
+
+## Memory principles (inherited; live in graphrefly-ts memory dir, not duplicated here)
+
+`~/.claude/projects/-Users-davidchenallio-src-graphrefly-ts/memory/` — esp.
+`feedback_no_autonomous_decisions`, `feedback_no_implement_without_approval`,
+`feedback_single_source_of_truth`, `feedback_long_command_observation`,
+`project_clean_slate_pivot`, `project_rust_clean_slate_kickoff`,
+`feedback_three_gate_substrate_convergence`.

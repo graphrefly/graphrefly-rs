@@ -115,11 +115,14 @@ pub(crate) fn defer_after_batch_for_target(target: &Core, f: Box<dyn FnOnce()>) 
             return false;
         }
         let committed = batch.committed.clone();
-        defer_boundary_task(Box::new(move || {
-            if committed.get() {
-                f();
-            }
-        }));
+        defer_boundary_task(
+            target,
+            Box::new(move || {
+                if committed.get() {
+                    f();
+                }
+            }),
+        );
         true
     })
 }
@@ -163,10 +166,40 @@ fn rollback(order: Vec<Core>) {
     }
 }
 
+fn boundary_graph_roots(order: &[Core], deferred: &[DeferredEntry]) -> Vec<Core> {
+    let mut roots: Vec<Core> = Vec::new();
+    let mut push_unique = |node: &Core| {
+        if roots.iter().any(|r| r.same_graph(node)) {
+            return;
+        }
+        roots.push(node.clone());
+    };
+    for node in order {
+        push_unique(node);
+    }
+    for (node, _) in deferred {
+        push_unique(node);
+    }
+    roots
+}
+
+fn clear_boundary_for_roots(roots: &[Core]) {
+    for root in roots {
+        clear_deferred_boundary_tasks(root);
+    }
+}
+
+fn drain_boundary_for_roots(roots: &[Core]) {
+    for root in roots {
+        drain_committed_boundary(root);
+    }
+}
+
 fn rollback_and_cleanup(order: Vec<Core>) -> std::thread::Result<()> {
+    let roots = boundary_graph_roots(&order, &[]);
     let result = catch_unwind(AssertUnwindSafe(|| rollback(order)));
     clear_active();
-    clear_deferred_boundary_tasks();
+    clear_boundary_for_roots(&roots);
     result
 }
 
@@ -191,6 +224,7 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     };
     let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
     let finish = take_for_finish();
+    let boundary_roots = boundary_graph_roots(&finish.order, &finish.deferred);
 
     match result {
         Ok(value) => {
@@ -202,12 +236,12 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
                 let commit_result = catch_unwind(AssertUnwindSafe(|| commit(finish.deferred)));
                 if let Err(payload) = commit_result {
                     clear_active();
-                    clear_deferred_boundary_tasks();
+                    clear_boundary_for_roots(&boundary_roots);
                     resume_unwind(payload);
                 }
                 finish.committed.set(true);
                 clear_active();
-                drain_committed_boundary();
+                drain_boundary_for_roots(&boundary_roots);
             }
             value
         }
