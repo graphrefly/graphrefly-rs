@@ -2,7 +2,8 @@
 //!
 //! Holds a fn handle + deps + the wave state machine; **zero inspection cruft**
 //! (naming/find/describe are the graph layer). Single-thread (D22) ⇒ the shared
-//! state lives behind `Rc<RefCell<NodeInner>>` ([`Core`]), `!Send + !Sync`.
+//! state lives in a graph-local arena behind `Rc<RefCell<GraphCore>>` ([`Core`] =
+//! graph handle + node id), `!Send + !Sync`.
 //!
 //! Values cross the substrate **erased** as [`AnyValue`] (`Rc<dyn Any>`) — the
 //! Rust analogue of TS's `unknown` (per-language impl, `CLEAN-SLATE.md`). A typed
@@ -37,7 +38,7 @@
 //! replay-buffer, the resumeAll/false pause modes + async-paused buffering
 //! (C-2/C-9/C-10), up-at-source INVALIDATE terminus (C-7).
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -164,6 +165,170 @@ pub(crate) enum RewireRequest {
     Set(Vec<Core>, NodeFn),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NodeId(usize);
+
+/// B49 / D71 first migration slice: graph-local arena for node bookkeeping. The
+/// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
+/// `Rc<RefCell<NodeInner>>`. This keeps the public API stable while moving ownership
+/// toward a GraphCore/PropagationEngine shape.
+struct GraphCore {
+    slots: Vec<Option<NodeInner>>,
+    edge_slots: Vec<Option<DepEdges>>,
+    free: Vec<usize>,
+}
+
+impl GraphCore {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            edge_slots: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, inner: NodeInner) -> NodeId {
+        let edges = DepEdges::new(inner.deps.len());
+        if let Some(id) = self.free.pop() {
+            self.slots[id] = Some(inner);
+            self.edge_slots[id] = Some(edges);
+            NodeId(id)
+        } else {
+            let id = self.slots.len();
+            self.slots.push(Some(inner));
+            self.edge_slots.push(Some(edges));
+            NodeId(id)
+        }
+    }
+
+    fn get(&self, id: NodeId) -> &NodeInner {
+        self.slots
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore slot")
+    }
+
+    fn get_mut(&mut self, id: NodeId) -> &mut NodeInner {
+        self.slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot")
+    }
+
+    fn get_node_and_edges_mut(&mut self, id: NodeId) -> (&mut NodeInner, &mut DepEdges) {
+        let n = self
+            .slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot");
+        let e = self
+            .edge_slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore edge slot");
+        (n, e)
+    }
+
+    fn is_live(&self, id: NodeId) -> bool {
+        self.slots.get(id.0).is_some_and(Option::is_some)
+            && self.edge_slots.get(id.0).is_some_and(Option::is_some)
+    }
+
+    fn take_live(&mut self, id: NodeId) -> Option<(NodeInner, DepEdges)> {
+        let inner = self.slots.get_mut(id.0)?.take()?;
+        let edges = self.edge_slots.get_mut(id.0)?.take()?;
+        Some((inner, edges))
+    }
+}
+
+thread_local! {
+    /// Until the Rust graph layer lands, public constructors allocate into the default
+    /// graph-local arena, mirroring the existing default dispatcher shape (D26). A later
+    /// graph-owned constructor can pass an explicit arena without changing [`Core`].
+    static DEFAULT_GRAPH_CORE: Rc<RefCell<GraphCore>> = Rc::new(RefCell::new(GraphCore::new()));
+}
+
+/// Per-dependency wave bookkeeping for one node slot.
+struct DepState {
+    batch: Vec<Option<Vec<AnyValue>>>,
+    prev: Vec<Option<AnyValue>>,
+    has_data: Vec<bool>,
+    dirty: Vec<bool>,
+    tier: Vec<u8>,
+    pending: i32,
+    terminal: Vec<Option<DepTerminal>>,
+}
+
+impl DepState {
+    fn new(dep_count: usize) -> Self {
+        Self {
+            batch: vec![None; dep_count],
+            prev: vec![None; dep_count],
+            has_data: vec![false; dep_count],
+            dirty: vec![false; dep_count],
+            tier: vec![0; dep_count],
+            pending: 0,
+            terminal: vec![None; dep_count],
+        }
+    }
+
+    fn all_settled(&self, terminal_as_real_input: bool) -> bool {
+        for i in 0..self.has_data.len() {
+            if self.has_data[i] {
+                continue;
+            }
+            if terminal_as_real_input && self.terminal[i].is_some() {
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+}
+
+/// Per-node transient wave/mutation flags.
+struct NodeWaveState {
+    emitted_dirty_this_wave: bool,
+    emitted_tier3_this_wave: bool,
+    inside_run_wave: bool,
+    in_dep_mutation: bool,
+    rewire_run_pending: bool,
+    batch_dirty_owed: bool,
+}
+
+impl NodeWaveState {
+    fn new() -> Self {
+        Self {
+            emitted_dirty_this_wave: false,
+            emitted_tier3_this_wave: false,
+            inside_run_wave: false,
+            in_dep_mutation: false,
+            rewire_run_pending: false,
+            batch_dirty_owed: false,
+        }
+    }
+}
+
+/// Per-dependency edge bookkeeping (subscription ownership + callback index indirection).
+/// Kept in GraphCore side-tables as part of the B49 migration path.
+struct DepEdges {
+    wave: NodeWaveState,
+    state: DepState,
+    unsubs: Vec<Option<Unsub>>,
+    idx_boxes: Vec<Rc<Cell<i64>>>,
+}
+
+impl DepEdges {
+    fn new(dep_count: usize) -> Self {
+        Self {
+            wave: NodeWaveState::new(),
+            state: DepState::new(dep_count),
+            unsubs: (0..dep_count).map(|_| None).collect(),
+            idx_boxes: (0..dep_count).map(|_| Rc::new(Cell::new(-1i64))).collect(),
+        }
+    }
+}
+
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
 /// reentrant engine lives on [`Core`].
 struct NodeInner {
@@ -174,46 +339,16 @@ struct NodeInner {
     /// SENTINEL per dep). Default false (R-first-run-gate).
     partial: bool,
 
-    // per-dep wave state (parallel arrays, indexed by dep position)
-    dep_batch: Vec<Option<Vec<AnyValue>>>,
-    dep_prev: Vec<Option<AnyValue>>,
-    dep_has_data: Vec<bool>,
-    dep_dirty: Vec<bool>,
-    dep_tier: Vec<u8>,
-    pending: i32,
-
     // own value + status
     cache: Option<AnyValue>,
     has_data: bool,
     status: Status,
     has_called_fn_once: bool,
-    emitted_dirty_this_wave: bool,
-    /// Did the fn emit a tier-3 (DATA/RESOLVED) this run? Drives the D49
-    /// undirty-RESOLVED synthesis (R-resolved-undirty).
-    emitted_tier3_this_wave: bool,
-    inside_run_wave: bool,
-    /// R-rewire (D42): a setDeps/addDep/removeDep is in flight. While set, an added
-    /// cached dep's push-on-subscribe defers the fn-run (rewire_run_pending) so the
-    /// settle is ONE atomic two-phase wave after every added dep is wired (P2 — never
-    /// fire on a partially-populated added-dep view); also the reentrant-rewire guard.
-    in_dep_mutation: bool,
-    /// A rewire warrants exactly one post-mutation atomic settle (an added dep delivered
-    /// data, or the sole dirty contributor was removed) — drained after the guard clears.
-    rewire_run_pending: bool,
-    /// A batch-deferred settle slice already emitted its immediate DIRTY and therefore
-    /// owes either a real commit settle or a rollback RESOLVED balance (D12/D49).
-    batch_dirty_owed: bool,
 
     // subscribers + activation
     subscribers: Vec<(u64, Sink)>,
     next_sub_id: u64,
     activated: bool,
-    dep_unsubs: Vec<Option<Unsub>>,
-    /// Per-dep CURRENT-index boxes (R-rewire Option-C / D42): each dep's subscribe
-    /// callback reads its index from a shared `Cell` (O(1)), so a surgical rewire that
-    /// reorders kept deps just updates the box — no re-subscribe, no per-message scan. A
-    /// removed dep's box is set to -1 so a stale in-flight callback drops (drain).
-    dep_idx_boxes: Vec<Rc<Cell<i64>>>,
 
     // ctx.state + cleanup hooks
     state: Option<AnyValue>,
@@ -250,11 +385,6 @@ struct NodeInner {
     /// final — it ignores further upstream messages and re-emits no terminal.
     terminal: bool,
 
-    // ── dep-terminal propagation (R-deps-terminal / R-terminal-settles-dirty, C-15) ──
-    /// Per-dep terminal state (parallel array, indexed by dep position): `None` ⇔ the
-    /// dep is live; `Some(..)` ⇔ it COMPLETEd/ERRORed. Read by the fn via
-    /// `ctx.dep_records()[i].terminal` for `terminal_as_real_input` operators.
-    dep_terminal: Vec<Option<DepTerminal>>,
     /// Auto-emit COMPLETE when ALL deps complete (default true). last/reduce/*Map set
     /// false to ABSORB inner terminals (R-deps-terminal).
     complete_when_deps_complete: bool,
@@ -270,17 +400,8 @@ impl NodeInner {
     /// `terminal_as_real_input` node (rescue/reduce/*Map) also treats a TERMINATED dep
     /// as settled, so the fn may run when an inner terminates without ever delivering
     /// DATA (R-deps-terminal / R-first-run-gate).
-    fn all_deps_settled(&self) -> bool {
-        for i in 0..self.dep_has_data.len() {
-            if self.dep_has_data[i] {
-                continue;
-            }
-            if self.terminal_as_real_input && self.dep_terminal[i].is_some() {
-                continue;
-            }
-            return false;
-        }
-        true
+    fn all_deps_settled(&self, dep: &DepState) -> bool {
+        dep.all_settled(self.terminal_as_real_input)
     }
 }
 
@@ -296,9 +417,9 @@ impl NodeInner {
 /// live borrow on `self`); each unsub touches a *dep* node (a different `RefCell`),
 /// recursively deactivating up the DAG (terminates); idempotent with `deactivate`
 /// (which already drained both vecs, so this is then a no-op).
-impl Drop for NodeInner {
-    fn drop(&mut self) {
-        for u in self.dep_unsubs.drain(..).flatten() {
+impl NodeInner {
+    fn cleanup_before_free(&mut self, edges: &mut DepEdges) {
+        for u in edges.unsubs.drain(..).flatten() {
             u();
         }
         for h in std::mem::take(&mut self.on_deactivation) {
@@ -317,12 +438,130 @@ impl Drop for NodeInner {
     }
 }
 
-/// A cloneable handle over a node's shared inner state (`Rc<RefCell<NodeInner>>`).
-/// The reentrant wave-engine methods live here; each manages its own short borrow
-/// scopes so calls into other nodes (or back into this one via `ctx.down`) are
-/// never made while a borrow is held.
-#[derive(Clone)]
-pub struct Core(Rc<RefCell<NodeInner>>);
+/// A cloneable handle over a node slot in a shared graph arena. The reentrant
+/// wave-engine methods live here; each manages its own short borrow scopes so calls
+/// into other nodes (or back into this one via `ctx.down`) are never made while a
+/// borrow is held.
+pub struct Core {
+    graph: Rc<RefCell<GraphCore>>,
+    id: NodeId,
+    /// Kept outside the arena so `Core::clone` can run while `GraphCore` is borrowed.
+    refs: Rc<Cell<usize>>,
+}
+
+impl Core {
+    fn from_parts(graph: Rc<RefCell<GraphCore>>, id: NodeId, refs: Rc<Cell<usize>>) -> Self {
+        refs.set(refs.get().checked_add(1).expect("Core refcount overflow"));
+        Self { graph, id, refs }
+    }
+
+    fn borrow(&self) -> Ref<'_, NodeInner> {
+        Ref::map(self.graph.borrow(), |g| g.get(self.id))
+    }
+
+    fn borrow_mut(&self) -> RefMut<'_, NodeInner> {
+        RefMut::map(self.graph.borrow_mut(), |g| g.get_mut(self.id))
+    }
+
+    fn try_borrow_mut(&self) -> Result<RefMut<'_, NodeInner>, std::cell::BorrowMutError> {
+        self.graph
+            .try_borrow_mut()
+            .map(|g| RefMut::map(g, |graph| graph.get_mut(self.id)))
+    }
+
+    fn with_inner_edges_mut<R>(&self, f: impl FnOnce(&mut NodeInner, &mut DepEdges) -> R) -> R {
+        let mut g = self.graph.borrow_mut();
+        let (n, e) = g.get_node_and_edges_mut(self.id);
+        f(n, e)
+    }
+
+    fn with_inner_edges<R>(&self, f: impl FnOnce(&NodeInner, &DepEdges) -> R) -> R {
+        let g = self.graph.borrow();
+        let n = g.get(self.id);
+        let e = g
+            .edge_slots
+            .get(self.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore edge slot");
+        f(n, e)
+    }
+
+    fn downgrade(&self) -> CoreWeak {
+        CoreWeak {
+            graph: Rc::downgrade(&self.graph),
+            id: self.id,
+            refs: Rc::downgrade(&self.refs),
+        }
+    }
+}
+
+impl Clone for Core {
+    fn clone(&self) -> Self {
+        Self::from_parts(self.graph.clone(), self.id, self.refs.clone())
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        let refs = self.refs.get();
+        if refs > 1 {
+            self.refs.set(refs - 1);
+            return;
+        }
+        if refs == 0 {
+            return;
+        }
+        self.refs.set(0);
+        let graph_ref = self.graph.clone();
+        let (mut inner, mut edges) = {
+            let mut graph = graph_ref.borrow_mut();
+            let Some(pair) = graph.take_live(self.id) else {
+                return;
+            };
+            pair
+        };
+        struct FreeSlotOnDrop {
+            graph: Rc<RefCell<GraphCore>>,
+            id: usize,
+            armed: bool,
+        }
+        impl Drop for FreeSlotOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.graph.borrow_mut().free.push(self.id);
+                }
+            }
+        }
+        let mut free_slot = FreeSlotOnDrop {
+            graph: graph_ref.clone(),
+            id: self.id.0,
+            armed: true,
+        };
+        inner.cleanup_before_free(&mut edges);
+        free_slot.armed = false;
+        graph_ref.borrow_mut().free.push(self.id.0);
+    }
+}
+
+struct CoreWeak {
+    graph: Weak<RefCell<GraphCore>>,
+    id: NodeId,
+    refs: Weak<Cell<usize>>,
+}
+
+impl CoreWeak {
+    fn upgrade(&self) -> Option<Core> {
+        let graph = self.graph.upgrade()?;
+        let refs = self.refs.upgrade()?;
+        if refs.get() == 0 {
+            return None;
+        }
+        if !graph.borrow().is_live(self.id) {
+            return None;
+        }
+        Some(Core::from_parts(graph, self.id, refs))
+    }
+}
 
 /// Reset `inside_run_wave` on scope exit — including unwind, so the feedback-cycle
 /// panic (D37) leaves the flag clean per frame (mirrors TS's try/finally around
@@ -333,7 +572,9 @@ pub struct Core(Rc<RefCell<NodeInner>>);
 struct WaveGuard(Core);
 impl Drop for WaveGuard {
     fn drop(&mut self) {
-        self.0 .0.borrow_mut().inside_run_wave = false;
+        self.0.with_inner_edges_mut(|_, e| {
+            e.wave.inside_run_wave = false;
+        });
     }
 }
 
@@ -348,7 +589,9 @@ impl Drop for WaveGuard {
 struct DepMutationGuard(Core);
 impl Drop for DepMutationGuard {
     fn drop(&mut self) {
-        self.0 .0.borrow_mut().in_dep_mutation = false;
+        self.0.with_inner_edges_mut(|_, e| {
+            e.wave.in_dep_mutation = false;
+        });
     }
 }
 
@@ -496,7 +739,7 @@ impl UpRouteState {
         if self
             .demand_fired
             .iter()
-            .any(|(l, h)| l == lock && Rc::ptr_eq(&h.0, &holder.0))
+            .any(|(l, h)| l == lock && h.ptr_eq(holder))
         {
             return true;
         }
@@ -566,7 +809,7 @@ fn drain_deferred_rewires() {
 
 impl Core {
     pub(crate) fn ptr_eq(&self, other: &Core) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Rc::ptr_eq(&self.graph, &other.graph) && self.id == other.id
     }
 
     fn new(
@@ -576,33 +819,18 @@ impl Core {
         initial: Option<AnyValue>,
         pausable: Pausable,
     ) -> Core {
-        let n = deps.len();
         let mut inner = NodeInner {
             deps,
             handle,
             dispatcher,
             partial: false,
-            dep_batch: vec![None; n],
-            dep_prev: vec![None; n],
-            dep_has_data: vec![false; n],
-            dep_dirty: vec![false; n],
-            dep_tier: vec![0; n],
-            pending: 0,
             cache: None,
             has_data: false,
             status: Status::Sentinel,
             has_called_fn_once: false,
-            emitted_dirty_this_wave: false,
-            emitted_tier3_this_wave: false,
-            inside_run_wave: false,
-            in_dep_mutation: false,
-            rewire_run_pending: false,
-            batch_dirty_owed: false,
             subscribers: Vec::new(),
             next_sub_id: 0,
             activated: false,
-            dep_unsubs: Vec::new(),
-            dep_idx_boxes: Vec::new(),
             state: None,
             state_persist: false,
             on_deactivation: Vec::new(),
@@ -614,7 +842,6 @@ impl Core {
             paused_dep_wave_occurred: false,
             pause_buffer: Vec::new(),
             terminal: false,
-            dep_terminal: vec![None; n],
             // Defaults: plain derived/effect — auto-cascade COMPLETE/ERROR, terminal not
             // an input. derived_opts overrides from NodeOpts for last/reduce/rescue/*Map.
             complete_when_deps_complete: true,
@@ -627,12 +854,19 @@ impl Core {
             inner.has_data = true;
             inner.status = Status::Settled;
         }
-        Core(Rc::new(RefCell::new(inner)))
+        DEFAULT_GRAPH_CORE.with(|graph| {
+            let id = graph.borrow_mut().alloc(inner);
+            Core {
+                graph: graph.clone(),
+                id,
+                refs: Rc::new(Cell::new(1)),
+            }
+        })
     }
 
     fn configure_pull(&self, pull_id: Option<LockId>) {
         if let Some(id) = pull_id {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             n.pause_lockset.insert(id.clone());
             n.pull_id = Some(id);
         }
@@ -640,22 +874,15 @@ impl Core {
 
     // ── subscription (R-push-subscribe) ──
 
-    /// A new sink receives START, then cached DATA (or DIRTY if dirty); the node
-    /// lazily activates on its first subscriber.
-    pub(crate) fn subscribe(&self, sink: Sink) -> Unsub {
-        let dummy = Cell::new(None);
-        self.subscribe_recording_id(sink, &dummy)
-    }
-
-    /// As [`Core::subscribe`], but records the new subscriber's id into `id_out`
-    /// **immediately after registration** — before the push + activation cascade that
-    /// may panic. The public [`Node::subscribe`] runs this under the wave-owner catch;
-    /// if `activate()` panics (a feedback cycle), the sink is already registered, so the
-    /// caller can still detach it (the error path reconstructs the real unsub from
-    /// `id_out`) — no orphaned subscriber.
+    /// Register a sink, push START/cached state, and lazily activate on first subscriber.
+    /// Records the new subscriber's id into `id_out` **immediately after registration**
+    /// — before the push + activation cascade that may panic. The public [`Node::subscribe`]
+    /// runs this under the wave-owner catch; if `activate()` panics (a feedback cycle),
+    /// the sink is already registered, so the caller can still detach it (the error path
+    /// reconstructs the real unsub from `id_out`) — no orphaned subscriber.
     fn subscribe_recording_id(&self, sink: Sink, id_out: &Cell<Option<u64>>) -> Unsub {
         let (id, push) = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             let id = n.next_sub_id;
             n.next_sub_id += 1;
             n.subscribers.push((id, sink.clone()));
@@ -677,7 +904,7 @@ impl Core {
         if let Some(m) = push {
             sink(&m);
         }
-        if !self.0.borrow().activated {
+        if !self.borrow().activated {
             self.activate();
         }
         let core = self.clone();
@@ -686,7 +913,7 @@ impl Core {
 
     fn unsubscribe(&self, id: u64) {
         let became_empty = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             let before = n.subscribers.len();
             n.subscribers.retain(|(sid, _)| *sid != id);
             n.subscribers.len() < before && n.subscribers.is_empty()
@@ -699,26 +926,25 @@ impl Core {
     // ── activation / deactivation (lazy; R-rom-ram) ──
 
     fn activate(&self) {
-        let deps = {
-            let mut n = self.0.borrow_mut();
+        let deps = self.with_inner_edges_mut(|n, e| {
             n.activated = true;
             if let Some(id) = n.pull_id.clone() {
                 n.pause_lockset.insert(id);
             }
-            n.dep_unsubs = (0..n.deps.len()).map(|_| None).collect();
+            e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
             // real box its callback captures.
-            n.dep_idx_boxes = (0..n.deps.len())
+            e.idx_boxes = (0..n.deps.len())
                 .map(|_| Rc::new(Cell::new(-1i64)))
                 .collect();
             n.deps.clone()
-        };
+        });
         for (i, dep) in deps.iter().enumerate() {
             self.subscribe_dep(i, dep);
         }
         // Depless producer (fn, no deps): run once on activation.
         let run = {
-            let n = self.0.borrow();
+            let n = self.borrow();
             n.deps.is_empty() && n.handle.is_some() && !n.has_called_fn_once
         };
         if run {
@@ -727,7 +953,7 @@ impl Core {
     }
 
     fn subscribe_dep(&self, idx: usize, dep: &Core) {
-        let weak: Weak<RefCell<NodeInner>> = Rc::downgrade(&self.0);
+        let weak = self.downgrade();
         // R-rewire Option-C: the callback reads the dep's CURRENT index from a shared box
         // so a surgical reorder reroutes in O(1); -1 means the dep was removed (drain).
         let idx_box: Rc<Cell<i64>> = Rc::new(Cell::new(idx as i64));
@@ -737,24 +963,39 @@ impl Core {
             if i < 0 {
                 return; // dep removed — stale in-flight callback drops (drain)
             }
-            if let Some(rc) = weak.upgrade() {
-                Core(rc).receive_from_dep(i as usize, msg);
+            if let Some(core) = weak.upgrade() {
+                core.receive_from_dep(i as usize, msg);
             }
         });
         // dep.subscribe synchronously pushes START (+ cached DATA) into the sink,
         // re-entering receive_from_dep — done before we re-borrow self below.
-        let unsub = dep.subscribe(sink);
-        let mut n = self.0.borrow_mut();
-        n.dep_unsubs[idx] = Some(unsub);
-        n.dep_idx_boxes[idx] = idx_box;
+        let dep_sub_id = Cell::new(None);
+        let subscribed = catch_unwind(AssertUnwindSafe(|| {
+            dep.subscribe_recording_id(sink, &dep_sub_id)
+        }));
+        let unsub = match subscribed {
+            Ok(unsub) => unsub,
+            Err(payload) => {
+                if let Some(id) = dep_sub_id.get() {
+                    if self.with_inner_edges(|_, e| e.wave.in_dep_mutation) {
+                        let dep = dep.clone();
+                        let _ = catch_unwind(AssertUnwindSafe(move || dep.unsubscribe(id)));
+                    }
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
+        self.with_inner_edges_mut(|_, e| {
+            e.unsubs[idx] = Some(unsub);
+            e.idx_boxes[idx] = idx_box;
+        });
     }
 
     fn deactivate(&self) {
-        let (unsubs, hooks) = {
-            let mut n = self.0.borrow_mut();
+        let (unsubs, hooks) = self.with_inner_edges_mut(|n, e| {
             n.activated = false;
-            let unsubs: Vec<Unsub> = n.dep_unsubs.drain(..).flatten().collect();
-            n.dep_idx_boxes.clear();
+            let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
+            e.idx_boxes.clear();
             let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut n.on_deactivation);
             // RAM: a compute node (fn and/or deps) clears its cache on deactivation;
             // a depless state node retains it (ROM).
@@ -765,15 +1006,15 @@ impl Core {
                 n.status = Status::Sentinel;
             }
             for i in 0..n.deps.len() {
-                n.dep_batch[i] = None;
-                n.dep_prev[i] = None;
-                n.dep_has_data[i] = false;
-                n.dep_dirty[i] = false;
-                n.dep_tier[i] = 0;
-                n.dep_terminal[i] = None;
+                e.state.batch[i] = None;
+                e.state.prev[i] = None;
+                e.state.has_data[i] = false;
+                e.state.dirty[i] = false;
+                e.state.tier[i] = 0;
+                e.state.terminal[i] = None;
             }
-            n.pending = 0;
-            n.emitted_dirty_this_wave = false;
+            e.state.pending = 0;
+            e.wave.emitted_dirty_this_wave = false;
             n.has_called_fn_once = false;
             // Control + INVALIDATE hooks are fresh-lifecycle (R-cleanup-hooks / D28):
             // the next activation re-registers them from the fn body.
@@ -786,7 +1027,7 @@ impl Core {
                 n.state = None;
             }
             (unsubs, hooks)
-        };
+        });
         for u in unsubs {
             u();
         }
@@ -799,7 +1040,7 @@ impl Core {
 
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
         // Terminal-is-forever (D17): a terminated node ignores further upstream messages.
-        if self.0.borrow().terminal {
+        if self.borrow().terminal {
             if matches!(msg, Message::Teardown) {
                 self.emit_to_subs(&Message::Teardown);
             }
@@ -812,17 +1053,16 @@ impl Core {
             Message::Invalidate => {
                 // The dep's value is gone — drop our view of it (prev_data → SENTINEL so
                 // the never-emitted detector reads correctly, C-3) and cascade idempotently.
-                let (had_data, undirty_no_settle) = {
-                    let mut n = self.0.borrow_mut();
-                    n.dep_prev[idx] = None;
-                    n.dep_has_data[idx] = false;
-                    n.dep_batch[idx] = None;
+                let (had_data, undirty_no_settle) = self.with_inner_edges_mut(|n, e| {
+                    e.state.prev[idx] = None;
+                    e.state.has_data[idx] = false;
+                    e.state.batch[idx] = None;
                     // Un-wedge the dirty bookkeeping if this dep had gone DIRTY first, so an
                     // INVALIDATE-before-DATA doesn't strand `pending` / downstream forever
                     // (R-invalidate-idempotent — the wedged-DIRTY deadlock guard).
-                    if n.dep_dirty[idx] {
-                        n.dep_dirty[idx] = false;
-                        n.pending -= 1;
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
                     }
                     // D50 / R-paused-invalidate: this INVALIDATE SUPERSEDES the dep's
                     // buffered paused dep-wave (dep_batch[idx] just cleared). Re-derive the
@@ -831,11 +1071,14 @@ impl Core {
                     // INVALIDATE; a RESUME must not recompute against a now-SENTINEL dep —
                     // attributed cancellation). A surviving dep keeps it set; a later DATA
                     // re-arms it ([DATA, INVALIDATE, DATA2] → recompute with DATA2).
-                    if n.paused_dep_wave_occurred && n.dep_batch.iter().all(|b| b.is_none()) {
+                    if n.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
                         n.paused_dep_wave_occurred = false;
                     }
-                    (n.has_data, n.pending == 0 && n.emitted_dirty_this_wave)
-                };
+                    (
+                        n.has_data,
+                        e.state.pending == 0 && e.wave.emitted_dirty_this_wave,
+                    )
+                });
                 self.invalidate(); // cascades INVALIDATE iff populated; no-op otherwise
                                    // If we broadcast DIRTY this wave but produced no settle (never populated, so
                                    // the cascade was suppressed), un-dirty downstream with one RESOLVED.
@@ -843,54 +1086,53 @@ impl Core {
                     if !had_data {
                         self.down(vec![Message::Resolved]);
                     } else {
-                        self.0.borrow_mut().emitted_dirty_this_wave = false;
+                        self.with_inner_edges_mut(|_, e| {
+                            e.wave.emitted_dirty_this_wave = false;
+                        });
                     }
                 }
                 self.fire_owed_demand_if_ready();
             }
             Message::Dirty => {
-                let mark = {
-                    let mut n = self.0.borrow_mut();
-                    if !n.dep_dirty[idx] {
-                        n.dep_dirty[idx] = true;
-                        n.pending += 1;
-                        n.dep_tier[idx] = 2;
+                let mark = self.with_inner_edges_mut(|_n, e| {
+                    if !e.state.dirty[idx] {
+                        e.state.dirty[idx] = true;
+                        e.state.pending += 1;
+                        e.state.tier[idx] = 2;
                         true
                     } else {
                         false
                     }
-                };
+                });
                 if mark && !self.is_pull_quiet() {
                     self.mark_dirty();
                 }
             }
             Message::Data(v) => {
-                {
-                    let mut n = self.0.borrow_mut();
-                    match &mut n.dep_batch[idx] {
+                self.with_inner_edges_mut(|_n, e| {
+                    match &mut e.state.batch[idx] {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
                     }
-                    n.dep_prev[idx] = Some(v.clone());
-                    n.dep_has_data[idx] = true;
-                    n.dep_tier[idx] = 3;
-                    if n.dep_dirty[idx] {
-                        n.dep_dirty[idx] = false;
-                        n.pending -= 1;
+                    e.state.prev[idx] = Some(v.clone());
+                    e.state.has_data[idx] = true;
+                    e.state.tier[idx] = 3;
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
                     }
-                }
+                });
                 self.maybe_run();
                 self.fire_owed_demand_if_ready();
             }
             Message::Resolved => {
-                {
-                    let mut n = self.0.borrow_mut();
-                    n.dep_tier[idx] = 3;
-                    if n.dep_dirty[idx] {
-                        n.dep_dirty[idx] = false;
-                        n.pending -= 1;
+                self.with_inner_edges_mut(|_n, e| {
+                    e.state.tier[idx] = 3;
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
                     }
-                }
+                });
                 self.maybe_run();
                 self.fire_owed_demand_if_ready();
             }
@@ -906,17 +1148,16 @@ impl Core {
                     _ => DepTerminal::Complete,
                 };
                 let is_error = matches!(dep_term, DepTerminal::Error(_));
-                {
-                    let mut n = self.0.borrow_mut();
-                    n.dep_terminal[idx] = Some(dep_term.clone());
-                }
+                self.with_inner_edges_mut(|_n, e| {
+                    e.state.terminal[idx] = Some(dep_term.clone());
+                });
                 // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding in-wave
                 // DIRTY contribution (the exactly-one-settle invariant) — exactly as DATA/RESOLVED/
                 // INVALIDATE do; a dirty-then-terminal-without-DATA dep would otherwise strand
                 // `pending` and wedge the node (the INVALIDATE arm's guard, generalized to terminals).
                 self.release_dep_dirty(idx);
                 let (auto_error, auto_complete, tari) = {
-                    let n = self.0.borrow();
+                    let n = self.borrow();
                     (
                         n.error_when_deps_error,
                         n.complete_when_deps_complete,
@@ -959,11 +1200,12 @@ impl Core {
     /// No-op if the dep already settled this wave — so the normal DATA-then-COMPLETE flow
     /// is unaffected. Makes the exactly-one-settle invariant a single shared step.
     fn release_dep_dirty(&self, idx: usize) {
-        let mut n = self.0.borrow_mut();
-        if n.dep_dirty[idx] {
-            n.dep_dirty[idx] = false;
-            n.pending -= 1;
-        }
+        self.with_inner_edges_mut(|_n, e| {
+            if e.state.dirty[idx] {
+                e.state.dirty[idx] = false;
+                e.state.pending -= 1;
+            }
+        });
     }
 
     /// B42 (R-deps-terminal): true iff EVERY dep is TERMINAL — COMPLETE *or* an absorbed ERROR
@@ -972,11 +1214,12 @@ impl Core {
     /// errorWhenDepsError:false dep ERRORed — it never auto-completed even after every other dep
     /// completed). A node with no deps never auto-completes. combineLatest semantics (all, not any).
     fn all_deps_terminal(&self) -> bool {
-        let n = self.0.borrow();
-        if n.deps.is_empty() {
-            return false;
-        }
-        n.dep_terminal.iter().all(|t| t.is_some())
+        self.with_inner_edges(|n, e| {
+            if n.deps.is_empty() {
+                return false;
+            }
+            e.state.terminal.iter().all(|t| t.is_some())
+        })
     }
 
     /// R-terminal-settles-dirty (B35): settle a node whose dirtied dep was released by an
@@ -987,21 +1230,18 @@ impl Core {
     ///   - else no value materialised (or the recompute is gated) → one undirty RESOLVED
     ///     (R-resolved-undirty), keeping the cache (a terminal, unlike INVALIDATE, leaves it).
     fn settle_after_absorbed_terminal(&self) {
-        {
-            let n = self.0.borrow();
-            if n.pending != 0 || !n.emitted_dirty_this_wave {
-                return;
-            }
+        if !self.with_inner_edges(|_, e| e.state.pending == 0 && e.wave.emitted_dirty_this_wave) {
+            return;
         }
         // A real value occurred this wave (some OTHER dep delivered DATA) → recompute.
         // maybe_run runs the fn ONLY if ungated (gate open, not paused); it may emit DATA, a
         // fn-synthesized undirty RESOLVED, or nothing (gated / gate still holds).
-        let saw_data = self
-            .0
-            .borrow()
-            .dep_batch
-            .iter()
-            .any(|b| b.as_ref().is_some_and(|v| !v.is_empty()));
+        let saw_data = self.with_inner_edges(|_n, e| {
+            e.state
+                .batch
+                .iter()
+                .any(|b| b.as_ref().is_some_and(|v| !v.is_empty()))
+        });
         if saw_data {
             self.maybe_run();
         }
@@ -1012,23 +1252,22 @@ impl Core {
         // dep on a pre-first-run multi-dep node strands the DIRTY → downstream wedged (the B35
         // gate-holds corner, C-15(d)). Route through `down` so D64/R-undirty-settle-timing
         // honors resumeAll and batch timing.
-        let still_owes = self.0.borrow().emitted_dirty_this_wave;
+        let still_owes = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
         if still_owes {
             self.down(vec![Message::Resolved]);
         }
     }
 
     fn mark_dirty(&self) {
-        let emit = {
-            let mut n = self.0.borrow_mut();
+        let emit = self.with_inner_edges_mut(|n, e| {
             n.status = Status::Dirty;
-            if !n.emitted_dirty_this_wave {
-                n.emitted_dirty_this_wave = true;
+            if !e.wave.emitted_dirty_this_wave {
+                e.wave.emitted_dirty_this_wave = true;
                 true
             } else {
                 false
             }
-        };
+        });
         if emit {
             self.emit_to_subs(&Message::Dirty);
         }
@@ -1038,8 +1277,10 @@ impl Core {
         // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
         // Defer the fn-run to ONE atomic settle after every added dep is wired (P2 — the
         // fn never fires on a partially-populated added-dep view).
-        if self.0.borrow().in_dep_mutation {
-            self.0.borrow_mut().rewire_run_pending = true;
+        if self.with_inner_edges(|_, e| e.wave.in_dep_mutation) {
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.rewire_run_pending = true;
+            });
             return;
         }
         // R-pause-modes: only the default "true" mode coalesces dep-driven recompute
@@ -1047,24 +1288,24 @@ impl Core {
         // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers its output
         // (down → should_buffer_on_pause); `false` runs + emits immediately (ignores
         // PAUSE). D44: pause mode is the outer gate.
-        if matches!(self.0.borrow().pausable, Pausable::True) && self.is_paused() {
-            self.0.borrow_mut().paused_dep_wave_occurred = true;
+        if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
+            self.borrow_mut().paused_dep_wave_occurred = true;
             return;
         }
         self.try_run();
     }
 
     fn try_run(&self) {
-        let (pending, has_handle, has_called, partial, all_settled) = {
-            let n = self.0.borrow();
-            (
-                n.pending,
-                n.handle.is_some(),
-                n.has_called_fn_once,
-                n.partial,
-                n.all_deps_settled(),
-            )
-        };
+        let (pending, has_handle, has_called, partial, all_settled) =
+            self.with_inner_edges(|n, e| {
+                (
+                    e.state.pending,
+                    n.handle.is_some(),
+                    n.has_called_fn_once,
+                    n.partial,
+                    n.all_deps_settled(&e.state),
+                )
+            });
         if pending > 0 {
             return;
         }
@@ -1084,12 +1325,11 @@ impl Core {
 
     fn passthrough_emit(&self) {
         // Single-dep wire (deps, no fn): relay dep 0's latest DATA downstream.
-        let v = {
-            let mut n = self.0.borrow_mut();
-            let v = n.dep_batch[0].as_ref().and_then(|b| b.last().cloned());
-            n.dep_batch[0] = None;
+        let v = self.with_inner_edges_mut(|_n, e| {
+            let v = e.state.batch[0].as_ref().and_then(|b| b.last().cloned());
+            e.state.batch[0] = None;
             v
-        };
+        });
         if let Some(v) = v {
             self.down(vec![Message::Data(v)]);
         }
@@ -1123,28 +1363,30 @@ impl Core {
             }
         }
         {
-            let n = self.0.borrow();
+            let (terminal, inside_run_wave, in_dep_mutation) = self.with_inner_edges(|n, e| {
+                (n.terminal, e.wave.inside_run_wave, e.wave.in_dep_mutation)
+            });
             assert!(
-                allow_terminal_owner || !n.terminal,
+                allow_terminal_owner || !terminal,
                 "rewire: node is terminal (completed/errored) — cannot rewire (R-rewire / D42)"
             );
             assert!(
-                !n.inside_run_wave,
+                !inside_run_wave,
                 "rewire: mid-fn topology mutation — a fn mutating its own deps mid-wave is the feedback cycle (R-rewire / D37)"
             );
             assert!(
-                !n.in_dep_mutation,
+                !in_dep_mutation,
                 "rewire: reentrant dep mutation — another setDeps/addDep/removeDep is in flight (R-rewire)"
             );
         }
         assert!(
-            !new_deps.iter().any(|d| Rc::ptr_eq(&d.0, &self.0)),
+            !new_deps.iter().any(|d| d.ptr_eq(self)),
             "rewire: self-dependency rejected (R-rewire / D42)"
         );
-        let old_deps: Vec<Core> = self.0.borrow().deps.clone();
+        let old_deps: Vec<Core> = self.borrow().deps.clone();
         for d in new_deps
             .iter()
-            .filter(|d| !old_deps.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)))
+            .filter(|d| !old_deps.iter().any(|o| o.ptr_eq(d)))
         {
             assert!(
                 !reachable_upstream(d, self),
@@ -1153,7 +1395,7 @@ impl Core {
             // Rust has no resubscribable-terminal opt-in yet (R-terminal, later slice) ⇒
             // ALL terminal deps are non-resubscribable → adding any terminal dep is rejected.
             assert!(
-                !d.0.borrow().terminal,
+                !d.borrow().terminal,
                 "rewire: cannot add a non-resubscribable terminal dep — would wedge (R-rewire / D42)"
             );
         }
@@ -1186,19 +1428,18 @@ impl Core {
         let (new_deps, fn_) = match req {
             RewireRequest::Set(deps, f) => (deps, f),
             RewireRequest::Add(dep, f) => {
-                let mut next = self.0.borrow().deps.clone();
-                if !next.iter().any(|d| Rc::ptr_eq(&d.0, &dep.0)) {
+                let mut next = self.borrow().deps.clone();
+                if !next.iter().any(|d| d.ptr_eq(&dep)) {
                     next.push(dep);
                 }
                 (next, f)
             }
             RewireRequest::Remove(dep, f) => {
                 let next: Vec<Core> = self
-                    .0
                     .borrow()
                     .deps
                     .iter()
-                    .filter(|d| !Rc::ptr_eq(&d.0, &dep.0))
+                    .filter(|d| !d.ptr_eq(&dep))
                     .cloned()
                     .collect();
                 (next, f)
@@ -1224,24 +1465,23 @@ impl Core {
     /// (push-on-subscribe). The first-run gate + cache are PRESERVED (Q2/Q7). One atomic
     /// settle if any added dep delivered data or the sole dirty contributor was removed.
     fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
-        let old_deps: Vec<Core> = self.0.borrow().deps.clone();
+        let old_deps: Vec<Core> = self.borrow().deps.clone();
         let n = new_deps.len();
         let added: Vec<Core> = new_deps
             .iter()
-            .filter(|d| !old_deps.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)))
+            .filter(|d| !old_deps.iter().any(|o| o.ptr_eq(d)))
             .cloned()
             .collect();
         let removed: Vec<Core> = old_deps
             .iter()
-            .filter(|d| !new_deps.iter().any(|nd| Rc::ptr_eq(&nd.0, &d.0)))
+            .filter(|d| !new_deps.iter().any(|nd| nd.ptr_eq(d)))
             .cloned()
             .collect();
 
-        {
-            let mut nn = self.0.borrow_mut();
-            nn.in_dep_mutation = true;
-            nn.rewire_run_pending = false;
-        }
+        self.with_inner_edges_mut(|_, e| {
+            e.wave.in_dep_mutation = true;
+            e.wave.rewire_run_pending = false;
+        });
         // QA-F1 (critical): clear `in_dep_mutation` on EVERY exit incl. a panic unwind during
         // the mutation. A user fn CAN panic in this window — an added dep's activation fn
         // (subscribe_dep → dep.activate → run_wave) or a removed dep's onDeactivation hook
@@ -1251,7 +1491,7 @@ impl Core {
         // in_dep_mutation=true: every future maybe_run defers (never recomputes) + every future
         // rewire is rejected as reentrant. Mirrors the TS `finally { _inDepMutation = false }`.
         let _mut_guard = DepMutationGuard(self.clone());
-        let activated = self.0.borrow().activated;
+        let activated = self.borrow().activated;
         let mut zero_dep_undirty = false;
 
         // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister the
@@ -1259,14 +1499,14 @@ impl Core {
         // reused. Register-first keeps `handle` never pointing at a freed slot.
         {
             let (old_handle, disp) = {
-                let nn = self.0.borrow();
+                let nn = self.borrow();
                 (nn.handle, nn.dispatcher.clone())
             };
             let kind = old_handle
                 .map(|h| disp.pool_kind(h.pool_id))
                 .unwrap_or(PoolKind::Sync);
             let new_handle = register_with(&disp, kind, fn_);
-            self.0.borrow_mut().handle = Some(new_handle);
+            self.borrow_mut().handle = Some(new_handle);
             if let Some(oh) = old_handle {
                 disp.unregister(oh);
             }
@@ -1277,18 +1517,19 @@ impl Core {
         for d in &removed {
             let old_idx = old_deps
                 .iter()
-                .position(|o| Rc::ptr_eq(&o.0, &d.0))
+                .position(|o| o.ptr_eq(d))
                 .expect("removed dep was in old_deps");
             let unsub = {
-                let mut nn = self.0.borrow_mut();
-                if nn.dep_dirty[old_idx] {
+                let mut graph = self.graph.borrow_mut();
+                let (_nn, edges) = graph.get_node_and_edges_mut(self.id);
+                if edges.state.dirty[old_idx] {
                     removed_dirty_contributor = true;
-                    nn.pending -= 1;
+                    edges.state.pending -= 1;
                 }
-                if let Some(b) = nn.dep_idx_boxes.get(old_idx) {
+                if let Some(b) = edges.idx_boxes.get(old_idx) {
                     b.set(-1); // drain: any stale in-flight callback drops
                 }
-                nn.dep_unsubs.get_mut(old_idx).and_then(|u| u.take())
+                edges.unsubs.get_mut(old_idx).and_then(|u| u.take())
             };
             if let Some(u) = unsub {
                 u(); // stops the removed dep's edge — no further delivery
@@ -1298,7 +1539,8 @@ impl Core {
         // rebuild the per-dep parallel arrays in new order; kept deps carry their state +
         // subscription + idx-box (rerouted to the new index), added deps start fresh.
         {
-            let mut nn = self.0.borrow_mut();
+            let mut graph = self.graph.borrow_mut();
+            let (nn, edges) = graph.get_node_and_edges_mut(self.id);
             let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
             let mut new_prev: Vec<Option<AnyValue>> = vec![None; n];
             let mut new_has = vec![false; n];
@@ -1309,31 +1551,31 @@ impl Core {
             let mut new_boxes: Vec<Rc<Cell<i64>>> =
                 (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
             for (j, dep) in new_deps.iter().enumerate() {
-                if let Some(old_idx) = old_deps.iter().position(|o| Rc::ptr_eq(&o.0, &dep.0)) {
-                    new_batch[j] = nn.dep_batch[old_idx].take();
-                    new_prev[j] = nn.dep_prev[old_idx].clone();
-                    new_has[j] = nn.dep_has_data[old_idx];
-                    new_dirty[j] = nn.dep_dirty[old_idx];
-                    new_tier[j] = nn.dep_tier[old_idx];
-                    new_terminal[j] = nn.dep_terminal[old_idx].clone();
-                    if let Some(slot) = nn.dep_unsubs.get_mut(old_idx) {
+                if let Some(old_idx) = old_deps.iter().position(|o| o.ptr_eq(dep)) {
+                    new_batch[j] = edges.state.batch[old_idx].take();
+                    new_prev[j] = edges.state.prev[old_idx].clone();
+                    new_has[j] = edges.state.has_data[old_idx];
+                    new_dirty[j] = edges.state.dirty[old_idx];
+                    new_tier[j] = edges.state.tier[old_idx];
+                    new_terminal[j] = edges.state.terminal[old_idx].clone();
+                    if let Some(slot) = edges.unsubs.get_mut(old_idx) {
                         new_unsubs[j] = slot.take();
                     }
-                    if let Some(b) = nn.dep_idx_boxes.get(old_idx) {
+                    if let Some(b) = edges.idx_boxes.get(old_idx) {
                         b.set(j as i64); // O(1) reroute of the kept dep's callback index
                         new_boxes[j] = b.clone();
                     }
                 }
             }
             nn.deps = new_deps.clone();
-            nn.dep_batch = new_batch;
-            nn.dep_prev = new_prev;
-            nn.dep_has_data = new_has;
-            nn.dep_dirty = new_dirty;
-            nn.dep_tier = new_tier;
-            nn.dep_terminal = new_terminal;
-            nn.dep_unsubs = new_unsubs;
-            nn.dep_idx_boxes = new_boxes;
+            edges.state.batch = new_batch;
+            edges.state.prev = new_prev;
+            edges.state.has_data = new_has;
+            edges.state.dirty = new_dirty;
+            edges.state.tier = new_tier;
+            edges.state.terminal = new_terminal;
+            edges.unsubs = new_unsubs;
+            edges.idx_boxes = new_boxes;
         }
 
         // subscribe added deps — push-on-subscribe delivers a cached dep's DATA (driving
@@ -1343,7 +1585,7 @@ impl Core {
             for d in &added {
                 let idx = new_deps
                     .iter()
-                    .position(|nd| Rc::ptr_eq(&nd.0, &d.0))
+                    .position(|nd| nd.ptr_eq(d))
                     .expect("added dep present in new_deps");
                 self.subscribe_dep(idx, d);
             }
@@ -1353,33 +1595,36 @@ impl Core {
         // remaining → request the atomic settle; with zero deps → just un-dirty downstream
         // (degenerate fn-no-deps). Cache is preserved either way (Q7).
         {
-            let nn = self.0.borrow();
-            if removed_dirty_contributor && nn.pending == 0 && nn.status == Status::Dirty {
+            let should_rewire_settle = self.with_inner_edges(|n, e| {
+                removed_dirty_contributor && e.state.pending == 0 && n.status == Status::Dirty
+            });
+            if should_rewire_settle {
                 if new_deps.is_empty() {
                     zero_dep_undirty = true;
                 } else {
-                    drop(nn);
-                    self.0.borrow_mut().rewire_run_pending = true;
+                    self.with_inner_edges_mut(|_, e| {
+                        e.wave.rewire_run_pending = true;
+                    });
                 }
             }
         }
 
-        self.0.borrow_mut().in_dep_mutation = false;
+        self.with_inner_edges_mut(|_, e| {
+            e.wave.in_dep_mutation = false;
+        });
 
         // Atomic post-mutation settle (a fresh wave): ONE two-phase DIRTY→DATA if an added
         // dep delivered data or a sole-dirty dep was removed; else the zero-dep un-dirty.
-        let run_pending = {
-            let mut nn = self.0.borrow_mut();
-            std::mem::take(&mut nn.rewire_run_pending)
-        };
+        let run_pending =
+            self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.rewire_run_pending));
         if run_pending {
             self.settle_rewire();
         } else if zero_dep_undirty {
-            let emitted = self.0.borrow().emitted_dirty_this_wave;
+            let emitted = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
             if emitted {
                 self.down(vec![Message::Resolved]); // un-dirty downstream (pause/batch-safe)
             } else {
-                let mut nn = self.0.borrow_mut();
+                let mut nn = self.borrow_mut();
                 nn.status = if nn.has_data {
                     Status::Settled
                 } else {
@@ -1394,20 +1639,20 @@ impl Core {
     /// pause + gate + pending guards, then injects the phase-1 DIRTY the added dep's
     /// [START,DATA] handshake did not carry (R-dirty-before-data).
     fn settle_rewire(&self) {
-        if matches!(self.0.borrow().pausable, Pausable::True) && self.is_paused() {
-            self.0.borrow_mut().paused_dep_wave_occurred = true;
+        if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
+            self.borrow_mut().paused_dep_wave_occurred = true;
             return;
         }
-        let (pending, has_handle, has_called, partial, all_settled) = {
-            let n = self.0.borrow();
-            (
-                n.pending,
-                n.handle.is_some(),
-                n.has_called_fn_once,
-                n.partial,
-                n.all_deps_settled(),
-            )
-        };
+        let (pending, has_handle, has_called, partial, all_settled) =
+            self.with_inner_edges(|n, e| {
+                (
+                    e.state.pending,
+                    n.handle.is_some(),
+                    n.has_called_fn_once,
+                    n.partial,
+                    n.all_deps_settled(&e.state),
+                )
+            });
         if pending > 0 {
             return;
         }
@@ -1426,7 +1671,7 @@ impl Core {
         // B25: enroll in the wave touched-set before any mutation so a panic-abort
         // can reset our flags.
         wave_register(self);
-        if self.0.borrow().inside_run_wave {
+        if self.with_inner_edges(|_, e| e.wave.inside_run_wave) {
             // R-reentrancy (D37): a fn re-driving its own dep mid-wave is the
             // synchronous feedback cycle. Reject by panicking (the Rust analogue of a
             // value-level throw) — the wave-owner's catch_unwind converts it to
@@ -1437,20 +1682,19 @@ impl Core {
             );
         }
         // build ctx (snapshot the per-dep wave view), reading under a short borrow.
-        let (handle, dispatcher, ctx) = {
-            let n = self.0.borrow();
+        let (handle, dispatcher, ctx) = self.with_inner_edges(|n, e| {
             let dep_records: Vec<DepRecord> = (0..n.deps.len())
                 .map(|i| {
-                    let latest = n.dep_batch[i]
+                    let latest = e.state.batch[i]
                         .as_ref()
                         .and_then(|b| b.last().cloned())
-                        .or_else(|| n.dep_prev[i].clone());
+                        .or_else(|| e.state.prev[i].clone());
                     DepRecord {
-                        batch: n.dep_batch[i].clone(),
-                        prev_data: n.dep_prev[i].clone(),
+                        batch: e.state.batch[i].clone(),
+                        prev_data: e.state.prev[i].clone(),
                         latest,
-                        tier: n.dep_tier[i],
-                        terminal: n.dep_terminal[i].clone(),
+                        tier: e.state.tier[i],
+                        terminal: e.state.terminal[i].clone(),
                     }
                 })
                 .collect();
@@ -1459,20 +1703,25 @@ impl Core {
                 n.dispatcher.clone(),
                 Ctx::new(self.clone(), dep_records),
             )
-        };
-        {
-            let mut n = self.0.borrow_mut();
+        });
+        let (old_on_invalidate, old_on_deactivation) = self.with_inner_edges_mut(|n, e| {
             n.has_called_fn_once = true;
-            n.inside_run_wave = true;
-            n.emitted_tier3_this_wave = false;
+            e.wave.inside_run_wave = true;
+            e.wave.emitted_tier3_this_wave = false;
             // R-cleanup-hooks per-run lifecycle (D28 clarification / C-14): clear BOTH
             // hook lists before the fn runs; the fn body re-registers the current run's
             // hooks. Only the latest run's registrations are live — a re-run supersedes the
             // prior run's, discarded WITHOUT firing (no fire-on-rerun; onRerun stays cut).
             // Fixes the push-only accumulation (K stale hooks fired after K runs).
-            n.on_invalidate.clear();
-            n.on_deactivation.clear();
-        }
+            (
+                std::mem::take(&mut n.on_invalidate),
+                std::mem::take(&mut n.on_deactivation),
+            )
+        });
+        // Dropping user hooks may drop captured `Core`s. Do that after releasing the
+        // graph-arena borrow, or the captured handle's `Drop` can re-enter `GraphCore`.
+        drop(old_on_invalidate);
+        drop(old_on_deactivation);
         // D30: this is the innermost node whose fn runs — blame it if the fn (or a
         // re-entry it triggers) panics, so the ERROR lands "nearest the throw" (C-6).
         wave_set_blamed(self);
@@ -1489,24 +1738,23 @@ impl Core {
                       // its result (it emits later via a stashed DeferredCtx), NOT rejected — synthesizing
                       // an undirty RESOLVED here would prematurely settle a still-pending diamond leg
                       // (R-async-paused / C-4). The eventual deferred emit carries its own DIRTY balance.
-        let undirty = {
-            let n = self.0.borrow();
+        let undirty = self.with_inner_edges(|n, e| {
             // EXEMPT a TERMINAL wave (the fn emitted COMPLETE/ERROR): the terminal IS the settle,
             // and R-terminal-settles-dirty releases the downstream dirty — synthesizing an undirty
             // RESOLVED here would overwrite the terminal status + emit a spurious post-terminal
             // RESOLVED (mirrors the TS `_terminal === undefined` guard, node.ts). Pre-existing
             // parity gap surfaced by C-11 (a fn emitting a bare COMPLETE).
-            n.emitted_dirty_this_wave
-                && !n.emitted_tier3_this_wave
+            e.wave.emitted_dirty_this_wave
+                && !e.wave.emitted_tier3_this_wave
                 && !n.terminal
-                && !Self::inner_is_async(&n)
-        };
+                && !Self::inner_is_async(n)
+        });
         if undirty {
             {
                 // status reflects cache freshness: a carried-over value → Resolved
                 // (fresh, no new occurrence); never-valued → Sentinel. The RESOLVED
                 // message clears the downstream dirty either way.
-                let mut n = self.0.borrow_mut();
+                let mut n = self.borrow_mut();
                 n.status = if n.has_data {
                     Status::Resolved
                 } else {
@@ -1516,12 +1764,13 @@ impl Core {
             self.emit_to_subs(&Message::Resolved);
         }
         // roll wave-local state forward.
-        let mut n = self.0.borrow_mut();
-        for b in n.dep_batch.iter_mut() {
-            *b = None;
-        }
-        n.emitted_dirty_this_wave = false;
-        n.emitted_tier3_this_wave = false;
+        self.with_inner_edges_mut(|_n, e| {
+            for b in e.state.batch.iter_mut() {
+                *b = None;
+            }
+            e.wave.emitted_dirty_this_wave = false;
+            e.wave.emitted_tier3_this_wave = false;
+        });
     }
 
     // ── downstream emission (the unified waist) ──
@@ -1538,14 +1787,14 @@ impl Core {
         // Terminal-is-forever (D17 / R-terminal): a terminated node emits nothing
         // further — including a self-emit DATA via `set()` / `ctx.down`. (The
         // COMPLETE/ERROR arms below also self-guard against a double terminal.)
-        if self.0.borrow().terminal {
+        if self.borrow().terminal {
             return;
         }
         // B25: enroll in the wave touched-set before any mutation.
         wave_register(self);
         let mut sorted = msgs;
         sorted.sort_by_key(|m| m.tier().as_u8()); // stable: preserves intra-tier order
-        let inside = self.0.borrow().inside_run_wave;
+        let inside = self.with_inner_edges(|_, e| e.wave.inside_run_wave);
 
         // R-invalidate-idempotent: collapse repeated INVALIDATE in one wave so the
         // cleanup hook + downstream broadcast fire at most once.
@@ -1572,10 +1821,12 @@ impl Core {
                 .into_iter()
                 .partition(|m| m.tier().is_batch_deferred());
             if !deferred.is_empty() && defer_to_batch(self, deferred) {
-                if !self.0.borrow().emitted_dirty_this_wave {
+                if !self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave) {
                     self.emit_dirty_once();
                 }
-                self.0.borrow_mut().batch_dirty_owed = true;
+                self.with_inner_edges_mut(|_, e| {
+                    e.wave.batch_dirty_owed = true;
+                });
                 return;
             }
             sorted = rest;
@@ -1595,15 +1846,16 @@ impl Core {
                 .into_iter()
                 .partition(|m| matches!(m.tier().as_u8(), 3 | 4));
             if !buffered.is_empty() {
-                let mut n = self.0.borrow_mut();
-                // A buffered tier-3 IS a produced settle — mark emitted_tier3 so run_wave
-                // does NOT synthesize a spurious undirty RESOLVED for a fn whose DATA was
-                // merely deferred into the buffer (per-language correctness, D24: TS sets
-                // this flag only in the post-buffer emit loop, leaving a resumeAll recompute
-                // prone to that spurious RESOLVED; recognizing the settle at buffer time is
-                // the more-correct reading of R-resolved-undirty).
-                n.emitted_tier3_this_wave = true;
-                n.pause_buffer.push(buffered);
+                self.with_inner_edges_mut(|n, e| {
+                    // A buffered tier-3 IS a produced settle — mark emitted_tier3 so run_wave
+                    // does NOT synthesize a spurious undirty RESOLVED for a fn whose DATA was
+                    // merely deferred into the buffer (per-language correctness, D24: TS sets
+                    // this flag only in the post-buffer emit loop, leaving a resumeAll recompute
+                    // prone to that spurious RESOLVED; recognizing the settle at buffer time is
+                    // the more-correct reading of R-resolved-undirty).
+                    e.wave.emitted_tier3_this_wave = true;
+                    n.pause_buffer.push(buffered);
+                });
             }
             sorted = rest;
             if sorted.is_empty() {
@@ -1646,11 +1898,12 @@ impl Core {
                 Message::Data(v) => {
                     // D49: every occurrence is DATA — no equals-substitution.
                     {
-                        let mut n = self.0.borrow_mut();
-                        n.cache = Some(v.clone());
-                        n.has_data = true;
-                        n.status = Status::Settled;
-                        n.emitted_tier3_this_wave = true;
+                        let mut n = self.graph.borrow_mut();
+                        let (inner, e) = n.get_node_and_edges_mut(self.id);
+                        inner.cache = Some(v.clone());
+                        inner.has_data = true;
+                        inner.status = Status::Settled;
+                        e.wave.emitted_tier3_this_wave = true;
                     }
                     self.emit_to_subs(&Message::Data(v));
                 }
@@ -1660,13 +1913,14 @@ impl Core {
                     // that must honor pause/batch timing also route through here, so keep
                     // the no-cache case at SENTINEL while still emitting RESOLVED.
                     {
-                        let mut n = self.0.borrow_mut();
-                        n.status = if n.has_data {
+                        let mut n = self.graph.borrow_mut();
+                        let (inner, e) = n.get_node_and_edges_mut(self.id);
+                        inner.status = if inner.has_data {
                             Status::Resolved
                         } else {
                             Status::Sentinel
                         };
-                        n.emitted_tier3_this_wave = true;
+                        e.wave.emitted_tier3_this_wave = true;
                     }
                     self.emit_to_subs(&Message::Resolved);
                 }
@@ -1677,7 +1931,7 @@ impl Core {
                 }
                 Message::Complete => {
                     let go = {
-                        let mut n = self.0.borrow_mut();
+                        let mut n = self.borrow_mut();
                         if n.terminal {
                             false
                         } else {
@@ -1695,7 +1949,7 @@ impl Core {
                 }
                 Message::Error(e) => {
                     let go = {
-                        let mut n = self.0.borrow_mut();
+                        let mut n = self.borrow_mut();
                         if n.terminal {
                             false
                         } else {
@@ -1720,9 +1974,10 @@ impl Core {
         }
 
         if !inside {
-            let mut n = self.0.borrow_mut();
-            n.emitted_dirty_this_wave = false;
-            n.emitted_tier3_this_wave = false;
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.emitted_dirty_this_wave = false;
+                e.wave.emitted_tier3_this_wave = false;
+            });
         }
     }
 
@@ -1743,36 +1998,36 @@ impl Core {
     }
 
     pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
-        self.0.borrow_mut().batch_dirty_owed = false;
+        self.with_inner_edges_mut(|_, e| {
+            e.wave.batch_dirty_owed = false;
+        });
         self.owned_down(wave);
     }
 
     pub(crate) fn rollback_batched(&self) {
-        let should_balance = {
-            let mut n = self.0.borrow_mut();
-            if n.batch_dirty_owed {
-                n.batch_dirty_owed = false;
+        let should_balance = self.with_inner_edges_mut(|_, e| {
+            if e.wave.batch_dirty_owed {
+                e.wave.batch_dirty_owed = false;
                 true
             } else {
                 false
             }
-        };
+        });
         if should_balance {
             self.owned_down(vec![Message::Resolved]);
         }
     }
 
     fn emit_dirty_once(&self) {
-        let emit = {
-            let mut n = self.0.borrow_mut();
-            if !n.emitted_dirty_this_wave {
-                n.emitted_dirty_this_wave = true;
+        let emit = self.with_inner_edges_mut(|n, e| {
+            if !e.wave.emitted_dirty_this_wave {
+                e.wave.emitted_dirty_this_wave = true;
                 n.status = Status::Dirty;
                 true
             } else {
                 false
             }
-        };
+        });
         if emit {
             self.emit_to_subs(&Message::Dirty);
         }
@@ -1782,7 +2037,6 @@ impl Core {
         // Clone the sink handles out, drop the borrow, then deliver — guards against
         // subscribe/unsubscribe (and any re-entry) during iteration.
         let subs: Vec<Sink> = self
-            .0
             .borrow()
             .subscribers
             .iter()
@@ -1817,17 +2071,17 @@ impl Core {
                 "ctx.up: {m:?} is down-only; up carries control tiers only (R-ctx-up)"
             );
         }
-        let is_depless = self.0.borrow().deps.is_empty();
+        let is_depless = self.borrow().deps.is_empty();
         for m in msgs {
             match m {
                 Message::Pause(lock) => self.pause_acquire(lock),
                 Message::Resume(lock) => {
-                    let is_pull_demand = self.0.borrow().pull_id.as_ref() == Some(&lock);
+                    let is_pull_demand = self.borrow().pull_id.as_ref() == Some(&lock);
                     if is_pull_demand {
                         if !route.mark_demand(&lock, self) {
                             self.on_demand();
                         }
-                    } else if self.0.borrow().pause_lockset.contains(&lock) {
+                    } else if self.borrow().pause_lockset.contains(&lock) {
                         self.pause_release(lock);
                     } else {
                         self.forward_up(Message::Resume(lock), toward_dep, route);
@@ -1851,7 +2105,7 @@ impl Core {
     }
 
     fn forward_up(&self, m: Msg, toward_dep: Option<usize>, route: &mut UpRouteState) {
-        let deps = self.0.borrow().deps.clone();
+        let deps = self.borrow().deps.clone();
         if let Some(i) = toward_dep {
             if let Some(dep) = deps.get(i) {
                 dep.up_route(vec![m], None, route);
@@ -1866,11 +2120,11 @@ impl Core {
     // ── PAUSE/RESUME lockset (R-pause-lockset) + default mode (R-pause-modes) ──
 
     fn is_paused(&self) -> bool {
-        !self.0.borrow().pause_lockset.is_empty()
+        !self.borrow().pause_lockset.is_empty()
     }
 
     fn is_pull_quiet(&self) -> bool {
-        let n = self.0.borrow();
+        let n = self.borrow();
         n.pull_id
             .as_ref()
             .is_some_and(|id| n.pause_lockset.contains(id))
@@ -1878,12 +2132,12 @@ impl Core {
 
     fn pause_acquire(&self, lock: LockId) {
         // Set ⇒ a same-id repeat PAUSE is idempotent.
-        self.0.borrow_mut().pause_lockset.insert(lock);
+        self.borrow_mut().pause_lockset.insert(lock);
     }
 
     fn pause_release(&self, lock: LockId) {
         let resumed = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             if !n.pause_lockset.remove(&lock) {
                 return; // unknown id ⇒ no-op
             }
@@ -1897,7 +2151,7 @@ impl Core {
 
     fn on_demand(&self) {
         {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             if n.pull_id.is_none() {
                 return;
             }
@@ -1907,22 +2161,27 @@ impl Core {
     }
 
     fn fire_owed_demand_if_ready(&self) {
-        let (pull_id, should_mark_dirty) = {
-            let n = self.0.borrow();
-            let Some(id) = n.pull_id.clone() else { return };
-            if n.terminal || !n.pull_demand_owed || n.pending != 0 {
-                return;
+        let Some((pull_id, should_mark_dirty)) = self.with_inner_edges(|n, e| {
+            let id = n.pull_id.clone()?;
+            if n.terminal || !n.pull_demand_owed || e.state.pending != 0 {
+                return None;
             }
             if n.pause_lockset.iter().any(|held| held != &id) {
-                return;
+                return None;
             }
-            if n.handle.is_some() && !n.has_called_fn_once && !n.partial && !n.all_deps_settled() {
-                return;
+            if n.handle.is_some()
+                && !n.has_called_fn_once
+                && !n.partial
+                && !n.all_deps_settled(&e.state)
+            {
+                return None;
             }
-            (id, n.paused_dep_wave_occurred)
+            Some((id, n.paused_dep_wave_occurred))
+        }) else {
+            return;
         };
         {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             n.pull_demand_owed = false;
             n.pause_lockset.remove(&pull_id);
         }
@@ -1933,7 +2192,7 @@ impl Core {
         impl Drop for Requiet<'_> {
             fn drop(&mut self) {
                 let Some(id) = self.id.take() else { return };
-                if let Ok(mut n) = self.core.0.try_borrow_mut() {
+                if let Ok(mut n) = self.core.try_borrow_mut() {
                     if !n.terminal && n.pull_id.as_ref() == Some(&id) {
                         n.pause_lockset.insert(id);
                     }
@@ -1953,8 +2212,8 @@ impl Core {
     fn on_resume(&self) {
         // terminal-is-forever: a node that terminated while paused discards its buffer
         // and never replays/recomputes (BH3).
-        if self.0.borrow().terminal {
-            let mut n = self.0.borrow_mut();
+        if self.borrow().terminal {
+            let mut n = self.borrow_mut();
             n.paused_dep_wave_occurred = false;
             n.pause_buffer.clear();
             return;
@@ -1964,7 +2223,7 @@ impl Core {
         // us), so each replayed wave emits normally — DIRTY synth + DATA, no longer
         // buffered. Drain BEFORE the default-mode recompute (matches the TS arm order).
         let buf = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             std::mem::take(&mut n.pause_buffer)
         };
         for wave in buf {
@@ -1973,7 +2232,7 @@ impl Core {
         // Default ("true") mode: a dep wave skipped while paused fires the fn once now,
         // with the latest dep values.
         let fire = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             std::mem::take(&mut n.paused_dep_wave_occurred)
         };
         if fire {
@@ -1993,8 +2252,7 @@ impl Core {
     /// Should an outgoing settle slice be deferred into the pause buffer? `pausable` mode
     /// is the OUTER gate over R-async-paused buffering (D44).
     fn should_buffer_on_pause(&self) -> bool {
-        let n = self.0.borrow();
-        match n.pausable {
+        self.with_inner_edges(|n, e| match n.pausable {
             // false: ignore PAUSE/RESUME ENTIRELY — never buffer, keep producing (B20).
             Pausable::False => false,
             _ if n.pause_lockset.is_empty() => false,
@@ -2004,8 +2262,10 @@ impl Core {
             // own production. An async COMPUTE node's (deps>0) in-flight result buffers
             // (C-2); a depless async leaf source delivers immediately (C-10). The
             // leaf-vs-compute discriminator is deps.is_empty().
-            Pausable::True => !n.inside_run_wave && Self::inner_is_async(&n) && !n.deps.is_empty(),
-        }
+            Pausable::True => {
+                !e.wave.inside_run_wave && Self::inner_is_async(n) && !n.deps.is_empty()
+            }
+        })
     }
 
     /// R-invalidate-idempotent: clear cache → SENTINEL, flush onInvalidate, broadcast
@@ -2013,7 +2273,7 @@ impl Core {
     /// already-reset are observationally equivalent — prevents double-cleanup).
     fn invalidate(&self) {
         let hooks = {
-            let mut n = self.0.borrow_mut();
+            let mut n = self.borrow_mut();
             if !n.has_data {
                 return; // idempotent no-op
             }
@@ -2033,37 +2293,38 @@ impl Core {
     /// PERSISTED state (cache / dep_prev / dep_has_data / status / ctx.state) intact —
     /// only the wave-local bookkeeping a clean wave would have rolled forward itself.
     fn reset_wave_flags(&self) {
-        let mut n = self.0.borrow_mut();
-        n.inside_run_wave = false;
-        n.emitted_dirty_this_wave = false;
-        n.emitted_tier3_this_wave = false;
-        n.pending = 0;
-        for i in 0..n.deps.len() {
-            n.dep_batch[i] = None;
-            n.dep_dirty[i] = false;
+        self.with_inner_edges_mut(|n, e| {
+            e.wave.inside_run_wave = false;
+            e.wave.emitted_dirty_this_wave = false;
+            e.wave.emitted_tier3_this_wave = false;
+            e.state.pending = 0;
+            for i in 0..n.deps.len() {
+                e.state.batch[i] = None;
+                e.state.dirty[i] = false;
+            }
             // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
             // (the dep really did COMPLETE/ERROR — terminal-is-forever, D17), not a wave-transient
             // like `dep_dirty`/`dep_batch`. `deactivate`/`rewire_apply` refresh it on a fresh
             // lifecycle; a panic-aborted wave must leave a terminated dep marked terminal.
-        }
+        });
     }
 
     // ── ctx.state + hooks (called from Ctx) ──
 
     pub(crate) fn get_state(&self) -> Option<AnyValue> {
-        self.0.borrow().state.clone()
+        self.borrow().state.clone()
     }
     pub(crate) fn set_state(&self, v: AnyValue) {
-        self.0.borrow_mut().state = Some(v);
+        self.borrow_mut().state = Some(v);
     }
     pub(crate) fn set_state_persist(&self, on: bool) {
-        self.0.borrow_mut().state_persist = on;
+        self.borrow_mut().state_persist = on;
     }
     pub(crate) fn register_on_deactivation(&self, f: Box<dyn FnOnce()>) {
-        self.0.borrow_mut().on_deactivation.push(f);
+        self.borrow_mut().on_deactivation.push(f);
     }
     pub(crate) fn register_on_invalidate(&self, f: Rc<dyn Fn()>) {
-        self.0.borrow_mut().on_invalidate.push(f);
+        self.borrow_mut().on_invalidate.push(f);
     }
 }
 
@@ -2084,31 +2345,31 @@ fn dup_control(m: &Msg) -> Msg {
 }
 
 /// Is `target` reachable upstream from `from` (following deps)? The rewire cycle-
-/// prevention DFS (R-rewire / D42). Node identity = `Rc::ptr_eq` on the inner.
+/// prevention DFS (R-rewire / D42). Node identity = (graph arena, node id).
 fn reachable_upstream(from: &Core, target: &Core) -> bool {
     let mut seen: Vec<Core> = Vec::new();
     let mut stack: Vec<Core> = vec![from.clone()];
     while let Some(n) = stack.pop() {
-        if Rc::ptr_eq(&n.0, &target.0) {
+        if n.ptr_eq(target) {
             return true;
         }
-        if seen.iter().any(|s| Rc::ptr_eq(&s.0, &n.0)) {
+        if seen.iter().any(|s| s.ptr_eq(&n)) {
             continue;
         }
         seen.push(n.clone());
-        for d in n.0.borrow().deps.iter() {
+        for d in n.borrow().deps.iter() {
             stack.push(d.clone());
         }
     }
     false
 }
 
-/// Dedup a dep list by node identity (`Rc::ptr_eq`), preserving first-seen order — a dep
+/// Dedup a dep list by node identity, preserving first-seen order — a dep
 /// appearing twice in a rewire collapses to one (Option-C; matches the TS `_dedupDeps`).
 fn dedup_cores(deps: Vec<Core>) -> Vec<Core> {
     let mut out: Vec<Core> = Vec::with_capacity(deps.len());
     for d in deps {
-        if !out.iter().any(|o| Rc::ptr_eq(&o.0, &d.0)) {
+        if !out.iter().any(|o| o.ptr_eq(&d)) {
             out.push(d);
         }
     }
@@ -2239,7 +2500,7 @@ impl<T: 'static> Node<T> {
         {
             // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
-            let mut n = node.core.0.borrow_mut();
+            let mut n = node.core.borrow_mut();
             n.partial = opts.partial;
             n.complete_when_deps_complete = opts.complete_when_deps_complete;
             n.error_when_deps_error = opts.error_when_deps_error;
@@ -2281,7 +2542,6 @@ impl<T: 'static> Node<T> {
         T: Clone,
     {
         self.core
-            .0
             .borrow()
             .cache
             .as_ref()
@@ -2290,11 +2550,11 @@ impl<T: 'static> Node<T> {
 
     /// The node's lifecycle status (R-status-enum).
     pub fn status(&self) -> Status {
-        self.core.0.borrow().status
+        self.core.borrow().status
     }
 
     pub fn pull_id(&self) -> Option<LockId> {
-        self.core.0.borrow().pull_id.clone()
+        self.core.borrow().pull_id.clone()
     }
 
     /// Subscribe a sink; returns an unsubscribe handle (call it to detach; the node
@@ -2311,7 +2571,7 @@ impl<T: 'static> Node<T> {
     /// later slice.)
     pub fn subscribe(&self, sink: impl Fn(&Msg) + 'static) -> Unsub {
         assert!(
-            !self.core.0.borrow().terminal,
+            !self.core.borrow().terminal,
             "subscribe: node is terminal and non-resubscribable — the stream is permanently over (R-terminal / D17)"
         );
         let body_core = self.core.clone();
@@ -2347,17 +2607,16 @@ impl<T: 'static> Node<T> {
 
     /// Add one dep (special case of [`Node::set_deps`]); returns its index. fn required (SD-1).
     pub fn add_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
-        let mut next = self.core.0.borrow().deps.clone();
-        if !next.iter().any(|d| Rc::ptr_eq(&d.0, &dep.0)) {
+        let mut next = self.core.borrow().deps.clone();
+        if !next.iter().any(|d| d.ptr_eq(&dep)) {
             next.push(dep.clone());
         }
         self.core.rewire(next, Rc::new(f));
         self.core
-            .0
             .borrow()
             .deps
             .iter()
-            .position(|d| Rc::ptr_eq(&d.0, &dep.0))
+            .position(|d| d.ptr_eq(&dep))
             .expect("added dep present after rewire")
     }
 
@@ -2366,11 +2625,10 @@ impl<T: 'static> Node<T> {
     pub fn remove_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
         let next: Vec<Core> = self
             .core
-            .0
             .borrow()
             .deps
             .iter()
-            .filter(|d| !Rc::ptr_eq(&d.0, &dep.0))
+            .filter(|d| !d.ptr_eq(&dep))
             .cloned()
             .collect();
         self.core.rewire(next, Rc::new(f));
@@ -2722,6 +2980,46 @@ mod tests {
     }
 
     #[test]
+    fn run_wave_hook_clear_drops_captured_core_borrow_free() {
+        // B49/D71 regression: clearing per-run hooks must drop the old user closures
+        // AFTER releasing the GraphCore borrow. A hook may capture the last handle to
+        // another node; dropping that handle re-enters Core::drop on the same arena.
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            let held = Node::<i32>::state(99);
+            ctx.on_invalidate(move || {
+                let _ = held.status();
+            });
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        });
+        let _u = d.subscribe(|_| {});
+
+        a.set(2);
+        assert_eq!(d.cache(), Some(2));
+    }
+
+    #[test]
+    fn drop_returns_arena_slot_when_cleanup_hook_panics() {
+        // B49/D71 regression: Core::drop removes the NodeInner from the arena before
+        // running cleanup. Even if a user cleanup hook panics, the slot id must be
+        // returned to the free list.
+        let free_before = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let p = Node::<i32>::producer(|ctx| {
+                ctx.on_deactivation(|| panic!("cleanup boom"));
+                ctx.emit(1i32);
+            });
+            let _u = p.subscribe(|_| {});
+        }));
+        assert!(result.is_err());
+        let free_after = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
+        assert!(
+            free_after > free_before,
+            "panicking cleanup still returns the arena slot to the free list"
+        );
+    }
+
+    #[test]
     fn resumeall_buffers_each_recompute_and_replays_all_on_resume() {
         // R-pause-modes resumeAll (D44): unlike `true` (coalesce → fire ONCE on resume),
         // resumeAll RUNS the fn on each dep wave while paused and BUFFERS the output,
@@ -3046,10 +3344,11 @@ mod tests {
     #[test]
     fn rewire_panic_in_added_dep_activation_does_not_wedge_node() {
         // QA-F1 regression: adding a dep whose ACTIVATION fn panics. The wave-owner catch
-        // blames the added producer (its fn ran) → ERROR lands on IT. Without the
-        // DepMutationGuard, `d` would be left in_dep_mutation=true forever → every future
-        // maybe_run defers (never recomputes) + every future rewire is rejected as reentrant.
-        // With the guard `d` recovers cleanly.
+        // blames the added producer (its fn ran) → ERROR lands on IT. The partially
+        // registered edge is rolled back so `boom` does not retain an orphaned subscriber.
+        // Without the DepMutationGuard, `d` would be left in_dep_mutation=true forever
+        // → every future maybe_run defers (never recomputes) + every future rewire is
+        // rejected as reentrant. With the guard `d` recovers cleanly.
         //
         // `d` ABSORBS a dep error (errorWhenDepsError:false) so this test isolates the QA-F1
         // GUARD concern (in_dep_mutation cleared on the unwind, observed via the recompute
@@ -3074,8 +3373,14 @@ mod tests {
         let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
         d.add_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
 
-        // d ABSORBED boom's error → d is NOT terminal; the QA-F1 guard cleared
-        // in_dep_mutation on the unwind so d is not wedged.
+        assert_eq!(
+            boom.core.borrow().subscribers.len(),
+            0,
+            "failed added-dep activation rolls back the partially registered subscriber"
+        );
+
+        // d is NOT terminal; the QA-F1 guard cleared in_dep_mutation on the unwind so
+        // d is not wedged.
         assert_ne!(
             d.status(),
             Status::Errored,
