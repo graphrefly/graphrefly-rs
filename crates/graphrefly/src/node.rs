@@ -2460,13 +2460,11 @@ impl Core {
     /// leading DIRTY is synthesized (`inside_run_wave` is false here). Nested under a live
     /// wave-owner (e.g. a deferred emit fired during a RESUME cascade) it just runs.
     pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
-        let core = self.clone();
-        with_wave_owner(self, move || core.down(msgs), || {});
+        with_wave_owner(self, || self.down(msgs), || {});
     }
 
     pub(crate) fn owned_up(&self, msgs: Wave<AnyValue>, toward_dep: Option<usize>) {
-        let core = self.clone();
-        with_wave_owner(self, move || core.up(msgs, toward_dep), || {});
+        with_wave_owner(self, || self.up(msgs, toward_dep), || {});
     }
 
     pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
@@ -3064,21 +3062,18 @@ impl<T: 'static> Node<T> {
     /// Emit a raw wave downstream (R-node-iface). The wave-owner boundary for the D30
     /// catch (a panicking fn the cascade triggers becomes `[[ERROR,e]]`, not an escape).
     pub fn down(&self, msgs: Wave<AnyValue>) {
-        let core = self.core.clone();
-        with_wave_owner(&self.core, move || core.down(msgs), || {});
+        with_wave_owner(&self.core, || self.core.down(msgs), || {});
     }
 
     /// Emit a raw control wave upstream — control tiers only (R-ctx-up / R-node-iface).
     /// PAUSE/RESUME act on this node's lockset (R-pause-lockset).
     pub fn up(&self, msgs: Wave<AnyValue>) {
-        let core = self.core.clone();
-        with_wave_owner(&self.core, move || core.up(msgs, None), || {});
+        with_wave_owner(&self.core, || self.core.up(msgs, None), || {});
     }
 
     /// Directed upstream control along one declared dep edge (R-up-routing).
     pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
-        let core = self.core.clone();
-        with_wave_owner(&self.core, move || core.up(msgs, Some(toward_dep)), || {});
+        with_wave_owner(&self.core, || self.core.up(msgs, Some(toward_dep)), || {});
     }
 
     /// The current cached value (downcast), or `None` for SENTINEL.
@@ -3550,6 +3545,28 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_callback_drops_handle_borrow_free() {
+        // DR-8/B54 owner-execution invariant: callbacks run only after the owner arena
+        // mutation borrow has been released. A subscriber may drop the last handle to
+        // another same-arena node, which re-enters Core::drop; holding the owner borrow
+        // across the callback would panic.
+        let held: Rc<RefCell<Option<Node<i32>>>> =
+            Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
+        let source = Node::<i32>::state_empty();
+        let h = held.clone();
+        let _u = source.subscribe(move |m| {
+            if matches!(m, Message::Data(_)) {
+                let _ = h.borrow_mut().take();
+            }
+        });
+
+        source.set(1);
+
+        assert!(held.borrow().is_none());
+        assert_eq!(source.cache(), Some(1));
+    }
+
+    #[test]
     fn drop_returns_arena_slot_when_cleanup_hook_panics() {
         // B49/D71 regression: Core::drop removes the NodeInner from the arena before
         // running cleanup. Even if a user cleanup hook panics, the slot id must be
@@ -3685,6 +3702,30 @@ mod tests {
         );
         drop(counted);
         assert_eq!(derived.core.refs.get(), refs_before);
+    }
+
+    #[test]
+    fn public_wave_owner_entry_does_not_preclone_core() {
+        // DR-8/B54 owner-execution prep: public down/up entry should enter the
+        // wave-owner boundary with the existing owner handle instead of creating an
+        // extra counted Core clone before the hot wave path runs.
+        let source = Node::<i32>::state_empty();
+        let refs = source.core.refs.clone();
+        let seen_refs = Rc::new(Cell::new(0usize));
+        let seen = seen_refs.clone();
+        let _u = source.subscribe(move |m| {
+            if matches!(m, Message::Data(_)) {
+                seen.set(refs.get());
+            }
+        });
+
+        source.set(1);
+
+        assert_eq!(
+            seen_refs.get(),
+            4,
+            "expected source handle + unsubscribe handle + wave owner + touched-set clone, with no extra public-entry Core clone"
+        );
     }
 
     #[test]
