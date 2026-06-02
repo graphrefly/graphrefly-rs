@@ -37,18 +37,19 @@
 //! - **D8** — the fn boundary is `ctx.up(msgs)` / `ctx.down(msgs)`; one `msgs`
 //!   array = one wave. `ctx.up` is control-tier only (R-ctx-up).
 //!
-//! ## CSP-5 scope (what this crate builds)
+//! ## Clean-slate scope (what this crate builds)
 //!
-//! The **substrate only**: protocol + node + dispatcher (LocalSync + LocalAsync
-//! pools) + ctx + batch + rewire. The graph layer / 8-verb sugar / operators /
-//! inspection are later per-language phases (CSP-2-rs equivalents) and are NOT in
-//! this skeleton. See `CLEAN-SLATE.md` for the conformance target map.
+//! A self-contained Rust package (D32): protocol + node + dispatcher (LocalSync +
+//! LocalAsync pools) + ctx + batch + rewire, plus the B53 graph-layer MVP
+//! (Graph/graph, graph-owned 8-verb sugar, find/describe/observe first cut).
+//! Operators remain per-language graph-layer sugar (D6/D24) and are re-derived
+//! after this MVP rather than shimmed from the retired port model.
 //!
 //! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
 //! > (kernel + control/terminal + async + rewire + dep-terminal + `ctx.rewire_next`
-//! > slices, plus pull/routed-up, terminal/later-async catch-up, and batch). The Rust
-//! > conformance arm is green for **C-2..C-22 except C-1**; **C-1** remains
-//! > wire-bridge-blocked. See
+//! > slices, plus pull/routed-up, terminal/later-async catch-up, and batch). [`graph`]
+//! > adds the first product-completeness layer (B53). The Rust conformance arm is green
+//! > for **C-2..C-22 except C-1**; **C-1** remains wire-bridge-blocked. See
 //! > `CLEAN-SLATE.md` for the per-module status + conformance target map.
 
 #![forbid(unsafe_code)]
@@ -56,11 +57,17 @@
 pub mod batch;
 pub mod ctx;
 pub mod dispatcher;
+pub mod graph;
 pub mod node;
 pub mod protocol;
 
 pub use batch::{batch, BatchCtx};
 pub use ctx::{Ctx, DeferredCtx, DepRecord, DepTerminal};
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
+pub use graph::{
+    graph, graph_opts, DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, Graph,
+    GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, ObserveEvent, ObserveMessage,
+    ObserveStream, Values,
+};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};

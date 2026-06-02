@@ -38,8 +38,11 @@ pub enum DepTerminal {
 pub struct DepRecord {
     /// DATA values this dep delivered in the current wave; `None` = not involved.
     pub batch: Option<Vec<AnyValue>>,
-    /// Last DATA from any wave; `None` = SENTINEL (never emitted DATA) — the
-    /// canonical never-emitted detector (R-sentinel).
+    /// DATA values grouped by each upstream `down(msgs)` wave accumulated before
+    /// this node's dirty contribution cleared.
+    pub batches: Vec<Vec<AnyValue>>,
+    /// Last committed DATA before the current batch; `None` = SENTINEL (never emitted DATA) —
+    /// the canonical never-emitted detector (R-sentinel).
     pub prev_data: Option<AnyValue>,
     /// Latest DATA = last of `batch` if present, else `prev_data`.
     pub latest: Option<AnyValue>,
@@ -77,13 +80,30 @@ impl Ctx {
             .and_then(|a| a.downcast::<U>().ok())
     }
 
-    /// Typed read of dep `i`'s prior-wave DATA (the SENTINEL-aware never-emitted
-    /// detector reads `prev_data.is_none()`).
+    /// Typed read of dep `i`'s last committed DATA before the current batch (the
+    /// SENTINEL-aware never-emitted detector reads `prev_data.is_none()`).
     pub fn prev<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
         self.dep_records
             .get(i)
             .and_then(|r| r.prev_data.clone())
             .and_then(|a| a.downcast::<U>().ok())
+    }
+
+    /// Typed read of dep `i`'s accumulated DATA grouped by upstream wave.
+    pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
+        self.dep_records
+            .get(i)
+            .map(|r| {
+                r.batches
+                    .iter()
+                    .map(|wave| {
+                        wave.iter()
+                            .filter_map(|a| a.clone().downcast::<U>().ok())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean):
@@ -212,12 +232,29 @@ impl DeferredCtx {
             .and_then(|a| a.downcast::<U>().ok())
     }
 
-    /// Typed read of dep `i`'s prior-wave DATA at defer time.
+    /// Typed read of dep `i`'s last committed DATA before the captured batch.
     pub fn prev<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
         self.dep_records
             .get(i)
             .and_then(|r| r.prev_data.clone())
             .and_then(|a| a.downcast::<U>().ok())
+    }
+
+    /// Typed read of dep `i`'s captured DATA grouped by upstream wave.
+    pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
+        self.dep_records
+            .get(i)
+            .map(|r| {
+                r.batches
+                    .iter()
+                    .map(|wave| {
+                        wave.iter()
+                            .filter_map(|a| a.clone().downcast::<U>().ok())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Emit one typed DATA downstream as the deferred async result.

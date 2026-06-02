@@ -172,6 +172,18 @@ struct NodeId(usize);
 /// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
 /// `Rc<RefCell<NodeInner>>`. This keeps the public API stable while moving ownership
 /// toward a GraphCore/PropagationEngine shape.
+pub(crate) struct GraphArena(Rc<RefCell<GraphCore>>);
+
+impl GraphArena {
+    pub(crate) fn new() -> Self {
+        Self(Rc::new(RefCell::new(GraphCore::new())))
+    }
+
+    fn default() -> Self {
+        DEFAULT_GRAPH_CORE.with(|graph| Self(graph.clone()))
+    }
+}
+
 struct GraphCore {
     slots: Vec<Option<NodeInner>>,
     edge_slots: Vec<Option<DepEdges>>,
@@ -291,6 +303,8 @@ thread_local! {
 /// Per-dependency wave bookkeeping for one node slot.
 struct DepState {
     batch: Vec<Option<Vec<AnyValue>>>,
+    batch_waves: Vec<Vec<Vec<AnyValue>>>,
+    batch_wave_id: Vec<Option<u64>>,
     prev: Vec<Option<AnyValue>>,
     has_data: Vec<bool>,
     dirty: Vec<bool>,
@@ -303,6 +317,8 @@ impl DepState {
     fn new(dep_count: usize) -> Self {
         Self {
             batch: vec![None; dep_count],
+            batch_waves: vec![Vec::new(); dep_count],
+            batch_wave_id: vec![None; dep_count],
             prev: vec![None; dep_count],
             has_data: vec![false; dep_count],
             dirty: vec![false; dep_count],
@@ -716,6 +732,14 @@ thread_local! {
     /// The current wave's scope, if a wave is in flight (single-thread, D22 ⇒
     /// thread-local, like the default dispatcher D26). `Some` ⇔ inside a wave.
     static WAVE: RefCell<Option<WaveScope>> = const { RefCell::new(None) };
+    /// Downstream delivery depth for one `down(msgs)` wave. A dep may receive
+    /// multiple DATA messages before its dirty contribution is cleared; the fn
+    /// must see the full batch once, not run once per DATA occurrence.
+    static DELIVERY_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static NEXT_DELIVERY_ID: Cell<u64> = const { Cell::new(1) };
+    static CURRENT_DELIVERY_ID: Cell<u64> = const { Cell::new(0) };
+    static DEFERRED_RUNS: RefCell<Vec<Core>> = const { RefCell::new(Vec::new()) };
+    static DEFERRED_ABSORBED_SETTLES: RefCell<Vec<Core>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `true` while a wave is in flight on this thread (a scope is installed).
@@ -731,6 +755,111 @@ fn wave_register(core: &Core) {
             scope.touched.push(core.clone());
         }
     });
+}
+
+fn delivery_in_flight() -> bool {
+    DELIVERY_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn current_delivery_id() -> u64 {
+    CURRENT_DELIVERY_ID.with(Cell::get)
+}
+
+fn defer_run_until_delivery_boundary(core: &Core) {
+    DEFERRED_RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        if !runs.iter().any(|n| n.ptr_eq(core)) {
+            runs.push(core.clone());
+        }
+    });
+}
+
+fn defer_absorbed_settle_until_delivery_boundary(core: &Core) {
+    DEFERRED_ABSORBED_SETTLES.with(|settles| {
+        let mut settles = settles.borrow_mut();
+        if !settles.iter().any(|n| n.ptr_eq(core)) {
+            settles.push(core.clone());
+        }
+    });
+}
+
+struct DeliveryGuard {
+    active: bool,
+    prev_id: u64,
+}
+
+impl DeliveryGuard {
+    fn enter() -> Self {
+        let prev_id = CURRENT_DELIVERY_ID.with(Cell::get);
+        let id = NEXT_DELIVERY_ID.with(|next| {
+            let id = next.get();
+            next.set(id.wrapping_add(1).max(1));
+            id
+        });
+        CURRENT_DELIVERY_ID.with(|current| current.set(id));
+        DELIVERY_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self {
+            active: true,
+            prev_id,
+        }
+    }
+
+    fn finish(mut self) {
+        self.active = false;
+        CURRENT_DELIVERY_ID.with(|current| current.set(self.prev_id));
+        let outer = DELIVERY_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0);
+            depth.set(current - 1);
+            current == 1
+        });
+        if outer {
+            drain_deferred_runs();
+        }
+    }
+}
+
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        if self.active {
+            CURRENT_DELIVERY_ID.with(|current| current.set(self.prev_id));
+            DELIVERY_DEPTH.with(|depth| {
+                let current = depth.get();
+                if current > 0 {
+                    depth.set(current - 1);
+                }
+            });
+            if !std::thread::panicking() && !delivery_in_flight() {
+                drain_deferred_runs();
+            }
+        }
+    }
+}
+
+fn with_delivery_scope(body: impl FnOnce()) {
+    let guard = DeliveryGuard::enter();
+    body();
+    guard.finish();
+}
+
+fn drain_deferred_runs() {
+    loop {
+        let runs = DEFERRED_RUNS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        let settles = DEFERRED_ABSORBED_SETTLES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        if runs.is_empty() && settles.is_empty() {
+            break;
+        }
+        for node in runs {
+            if node.is_live() {
+                node.maybe_run();
+            }
+        }
+        for node in settles {
+            if node.is_live() {
+                node.settle_after_absorbed_terminal();
+            }
+        }
+    }
 }
 
 /// Record the node whose fn is about to run — the ERROR-bearing node on a panic.
@@ -892,17 +1021,44 @@ impl Core {
         Rc::ptr_eq(&self.graph, &other.graph) && self.id == other.id
     }
 
+    fn is_live(&self) -> bool {
+        self.graph.borrow().is_live(self.id)
+    }
+
     pub(crate) fn same_graph(&self, other: &Core) -> bool {
         Rc::ptr_eq(&self.graph, &other.graph)
     }
 
-    fn new(
+    pub(crate) fn same_graph_arena(&self, arena: &GraphArena) -> bool {
+        Rc::ptr_eq(&self.graph, &arena.0)
+    }
+
+    pub(crate) fn deps(&self) -> Vec<Core> {
+        self.borrow().deps.clone()
+    }
+
+    pub(crate) fn cache_any(&self) -> Option<AnyValue> {
+        self.with_inner_edges(|_n, e| e.value.cache.clone())
+    }
+
+    pub(crate) fn status(&self) -> Status {
+        self.with_inner_edges(|_n, e| e.value.status)
+    }
+
+    fn new_in_arena(
+        arena: &GraphArena,
         deps: Vec<Core>,
         handle: Option<Handle>,
         dispatcher: Dispatcher,
         initial: Option<AnyValue>,
         pausable: Pausable,
     ) -> Core {
+        for dep in &deps {
+            assert!(
+                dep.same_graph_arena(arena),
+                "node construction: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
+            );
+        }
         let inner = NodeInner {
             deps,
             handle,
@@ -917,8 +1073,8 @@ impl Core {
             error_when_deps_error: true,
             terminal_as_real_input: false,
         };
-        DEFAULT_GRAPH_CORE.with(|graph| {
-            let mut g = graph.borrow_mut();
+        {
+            let mut g = arena.0.borrow_mut();
             let id = g.alloc(inner);
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
@@ -928,11 +1084,11 @@ impl Core {
                 e.value.status = Status::Settled;
             }
             Core {
-                graph: graph.clone(),
+                graph: arena.0.clone(),
                 id,
                 refs: Rc::new(Cell::new(1)),
             }
-        })
+        }
     }
 
     fn configure_pull(&self, pull_id: Option<LockId>) {
@@ -1079,6 +1235,8 @@ impl Core {
             }
             for i in 0..n.deps.len() {
                 e.state.batch[i] = None;
+                e.state.batch_waves[i].clear();
+                e.state.batch_wave_id[i] = None;
                 e.state.prev[i] = None;
                 e.state.has_data[i] = false;
                 e.state.dirty[i] = false;
@@ -1129,6 +1287,8 @@ impl Core {
                     e.state.prev[idx] = None;
                     e.state.has_data[idx] = false;
                     e.state.batch[idx] = None;
+                    e.state.batch_waves[idx].clear();
+                    e.state.batch_wave_id[idx] = None;
                     // Un-wedge the dirty bookkeeping if this dep had gone DIRTY first, so an
                     // INVALIDATE-before-DATA doesn't strand `pending` / downstream forever
                     // (R-invalidate-idempotent — the wedged-DIRTY deadlock guard).
@@ -1186,7 +1346,14 @@ impl Core {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
                     }
-                    e.state.prev[idx] = Some(v.clone());
+                    let delivery_id = current_delivery_id();
+                    if e.state.batch_wave_id[idx] != Some(delivery_id) {
+                        e.state.batch_waves[idx].push(Vec::new());
+                        e.state.batch_wave_id[idx] = Some(delivery_id);
+                    }
+                    if let Some(wave) = e.state.batch_waves[idx].last_mut() {
+                        wave.push(v.clone());
+                    }
                     e.state.has_data[idx] = true;
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
@@ -1302,6 +1469,10 @@ impl Core {
     ///   - else no value materialised (or the recompute is gated) → one undirty RESOLVED
     ///     (R-resolved-undirty), keeping the cache (a terminal, unlike INVALIDATE, leaves it).
     fn settle_after_absorbed_terminal(&self) {
+        if delivery_in_flight() {
+            defer_absorbed_settle_until_delivery_boundary(self);
+            return;
+        }
         if !self.with_inner_edges(|_, e| e.state.pending == 0 && e.wave.emitted_dirty_this_wave) {
             return;
         }
@@ -1346,6 +1517,10 @@ impl Core {
     }
 
     fn maybe_run(&self) {
+        if delivery_in_flight() {
+            defer_run_until_delivery_boundary(self);
+            return;
+        }
         // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
         // Defer the fn-run to ONE atomic settle after every added dep is wired (P2 — the
         // fn never fires on a partially-populated added-dep view).
@@ -1399,7 +1574,12 @@ impl Core {
         // Single-dep wire (deps, no fn): relay dep 0's latest DATA downstream.
         let v = self.with_inner_edges_mut(|_n, e| {
             let v = e.state.batch[0].as_ref().and_then(|b| b.last().cloned());
+            if let Some(v) = &v {
+                e.state.prev[0] = Some(v.clone());
+            }
             e.state.batch[0] = None;
+            e.state.batch_waves[0].clear();
+            e.state.batch_wave_id[0] = None;
             v
         });
         if let Some(v) = v {
@@ -1423,6 +1603,12 @@ impl Core {
 
     fn rewire_inner(&self, new_deps: Vec<Core>, fn_: NodeFn, allow_terminal_owner: bool) {
         let new_deps = dedup_cores(new_deps);
+        for dep in &new_deps {
+            assert!(
+                dep.same_graph(self),
+                "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
+            );
+        }
         if !allow_terminal_owner {
             let core = self.clone();
             let deps = new_deps.clone();
@@ -1618,6 +1804,8 @@ impl Core {
             let mut graph = self.graph.borrow_mut();
             let (nn, edges) = graph.get_node_and_edges_mut(self.id);
             let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
+            let mut new_batch_waves: Vec<Vec<Vec<AnyValue>>> = vec![Vec::new(); n];
+            let mut new_batch_wave_id: Vec<Option<u64>> = vec![None; n];
             let mut new_prev: Vec<Option<AnyValue>> = vec![None; n];
             let mut new_has = vec![false; n];
             let mut new_dirty = vec![false; n];
@@ -1629,6 +1817,8 @@ impl Core {
             for (j, dep) in new_deps.iter().enumerate() {
                 if let Some(old_idx) = old_deps.iter().position(|o| o.ptr_eq(dep)) {
                     new_batch[j] = edges.state.batch[old_idx].take();
+                    new_batch_waves[j] = std::mem::take(&mut edges.state.batch_waves[old_idx]);
+                    new_batch_wave_id[j] = edges.state.batch_wave_id[old_idx].take();
                     new_prev[j] = edges.state.prev[old_idx].clone();
                     new_has[j] = edges.state.has_data[old_idx];
                     new_dirty[j] = edges.state.dirty[old_idx];
@@ -1645,6 +1835,8 @@ impl Core {
             }
             nn.deps = new_deps.clone();
             edges.state.batch = new_batch;
+            edges.state.batch_waves = new_batch_waves;
+            edges.state.batch_wave_id = new_batch_wave_id;
             edges.state.prev = new_prev;
             edges.state.has_data = new_has;
             edges.state.dirty = new_dirty;
@@ -1768,6 +1960,7 @@ impl Core {
                         .or_else(|| e.state.prev[i].clone());
                     DepRecord {
                         batch: e.state.batch[i].clone(),
+                        batches: e.state.batch_waves[i].clone(),
                         prev_data: e.state.prev[i].clone(),
                         latest,
                         tier: e.state.tier[i],
@@ -1843,8 +2036,13 @@ impl Core {
         }
         // roll wave-local state forward.
         self.with_inner_edges_mut(|_n, e| {
-            for b in e.state.batch.iter_mut() {
+            for (i, b) in e.state.batch.iter_mut().enumerate() {
+                if let Some(last) = b.as_ref().and_then(|batch| batch.last()).cloned() {
+                    e.state.prev[i] = Some(last);
+                }
                 *b = None;
+                e.state.batch_waves[i].clear();
+                e.state.batch_wave_id[i] = None;
             }
             e.wave.emitted_dirty_this_wave = false;
             e.wave.emitted_tier3_this_wave = false;
@@ -1970,86 +2168,88 @@ impl Core {
             self.emit_dirty_once();
         }
 
-        for m in sorted {
-            match m {
-                Message::Dirty => self.emit_dirty_once(),
-                Message::Data(v) => {
-                    // D49: every occurrence is DATA — no equals-substitution.
-                    {
-                        let mut n = self.graph.borrow_mut();
-                        let (_inner, e) = n.get_node_and_edges_mut(self.id);
-                        e.value.cache = Some(v.clone());
-                        e.value.has_data = true;
-                        e.value.status = Status::Settled;
-                        e.wave.emitted_tier3_this_wave = true;
+        with_delivery_scope(|| {
+            for m in sorted {
+                match m {
+                    Message::Dirty => self.emit_dirty_once(),
+                    Message::Data(v) => {
+                        // D49: every occurrence is DATA — no equals-substitution.
+                        {
+                            let mut n = self.graph.borrow_mut();
+                            let (_inner, e) = n.get_node_and_edges_mut(self.id);
+                            e.value.cache = Some(v.clone());
+                            e.value.has_data = true;
+                            e.value.status = Status::Settled;
+                            e.wave.emitted_tier3_this_wave = true;
+                        }
+                        self.emit_to_subs(&Message::Data(v));
                     }
-                    self.emit_to_subs(&Message::Data(v));
-                }
-                Message::Resolved => {
-                    // Explicit operator escape hatch (D49); the substrate-synthesized
-                    // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
-                    // that must honor pause/batch timing also route through here, so keep
-                    // the no-cache case at SENTINEL while still emitting RESOLVED.
-                    {
-                        let mut n = self.graph.borrow_mut();
-                        let (_inner, e) = n.get_node_and_edges_mut(self.id);
-                        e.value.status = if e.value.has_data {
-                            Status::Resolved
-                        } else {
-                            Status::Sentinel
+                    Message::Resolved => {
+                        // Explicit operator escape hatch (D49); the substrate-synthesized
+                        // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
+                        // that must honor pause/batch timing also route through here, so keep
+                        // the no-cache case at SENTINEL while still emitting RESOLVED.
+                        {
+                            let mut n = self.graph.borrow_mut();
+                            let (_inner, e) = n.get_node_and_edges_mut(self.id);
+                            e.value.status = if e.value.has_data {
+                                Status::Resolved
+                            } else {
+                                Status::Sentinel
+                            };
+                            e.wave.emitted_tier3_this_wave = true;
+                        }
+                        self.emit_to_subs(&Message::Resolved);
+                    }
+                    Message::Invalidate => {
+                        // Honor the invalidate-request: clear cache → SENTINEL, fire
+                        // onInvalidate, broadcast downstream (idempotent, no-op if unpopulated).
+                        self.invalidate();
+                    }
+                    Message::Complete => {
+                        let go = {
+                            self.with_inner_edges_aux_mut(|_n, e, a| {
+                                if e.value.terminal {
+                                    return false;
+                                }
+                                e.value.terminal = true;
+                                e.value.status = Status::Completed;
+                                a.pull_demand_owed = false;
+                                a.paused_dep_wave_occurred = false;
+                                a.pause_buffer.clear();
+                                true
+                            })
                         };
-                        e.wave.emitted_tier3_this_wave = true;
+                        if go {
+                            self.emit_to_subs(&Message::Complete);
+                        }
                     }
-                    self.emit_to_subs(&Message::Resolved);
-                }
-                Message::Invalidate => {
-                    // Honor the invalidate-request: clear cache → SENTINEL, fire
-                    // onInvalidate, broadcast downstream (idempotent, no-op if unpopulated).
-                    self.invalidate();
-                }
-                Message::Complete => {
-                    let go = {
-                        self.with_inner_edges_aux_mut(|_n, e, a| {
-                            if e.value.terminal {
-                                return false;
-                            }
-                            e.value.terminal = true;
-                            e.value.status = Status::Completed;
-                            a.pull_demand_owed = false;
-                            a.paused_dep_wave_occurred = false;
-                            a.pause_buffer.clear();
-                            true
-                        })
-                    };
-                    if go {
-                        self.emit_to_subs(&Message::Complete);
+                    Message::Error(e) => {
+                        let go = {
+                            self.with_inner_edges_aux_mut(|_n, edges, a| {
+                                if edges.value.terminal {
+                                    return false;
+                                }
+                                edges.value.terminal = true;
+                                edges.value.status = Status::Errored;
+                                a.pull_demand_owed = false;
+                                a.paused_dep_wave_occurred = false;
+                                a.pause_buffer.clear();
+                                true
+                            })
+                        };
+                        if go {
+                            self.emit_to_subs(&Message::Error(e));
+                        }
                     }
-                }
-                Message::Error(e) => {
-                    let go = {
-                        self.with_inner_edges_aux_mut(|_n, edges, a| {
-                            if edges.value.terminal {
-                                return false;
-                            }
-                            edges.value.terminal = true;
-                            edges.value.status = Status::Errored;
-                            a.pull_demand_owed = false;
-                            a.paused_dep_wave_occurred = false;
-                            a.pause_buffer.clear();
-                            true
-                        })
-                    };
-                    if go {
-                        self.emit_to_subs(&Message::Error(e));
+                    Message::Teardown => {
+                        self.emit_to_subs(&Message::Teardown);
                     }
+                    // PAUSE / RESUME are control-only and are delivered via up().
+                    _ => {}
                 }
-                Message::Teardown => {
-                    self.emit_to_subs(&Message::Teardown);
-                }
-                // PAUSE / RESUME are control-only and are delivered via up().
-                _ => {}
             }
-        }
+        });
 
         if !inside {
             self.with_inner_edges_mut(|_, e| {
@@ -2379,6 +2579,8 @@ impl Core {
             e.state.pending = 0;
             for i in 0..n.deps.len() {
                 e.state.batch[i] = None;
+                e.state.batch_waves[i].clear();
+                e.state.batch_wave_id[i] = None;
                 e.state.dirty[i] = false;
             }
             // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
@@ -2484,8 +2686,13 @@ impl<T: 'static> Node<T> {
     /// A state node pre-populated with `initial`; a new subscriber gets `[DATA]`
     /// (R-initial). Manual source — push new values with [`Node::set`].
     pub fn state(initial: T) -> Node<T> {
+        Self::state_in_arena(&GraphArena::default(), initial)
+    }
+
+    pub(crate) fn state_in_arena(arena: &GraphArena, initial: T) -> Node<T> {
         Node {
-            core: Core::new(
+            core: Core::new_in_arena(
+                arena,
                 vec![],
                 None,
                 default_dispatcher(),
@@ -2498,8 +2705,19 @@ impl<T: 'static> Node<T> {
 
     /// A SENTINEL state node — no value until the first [`Node::set`].
     pub fn state_empty() -> Node<T> {
+        Self::state_empty_in_arena(&GraphArena::default())
+    }
+
+    pub(crate) fn state_empty_in_arena(arena: &GraphArena) -> Node<T> {
         Node {
-            core: Core::new(vec![], None, default_dispatcher(), None, Pausable::True),
+            core: Core::new_in_arena(
+                arena,
+                vec![],
+                None,
+                default_dispatcher(),
+                None,
+                Pausable::True,
+            ),
             _t: PhantomData,
         }
     }
@@ -2529,6 +2747,14 @@ impl<T: 'static> Node<T> {
 
     /// A producer with explicit [`NodeOpts`] (pool + pause mode).
     pub fn producer_opts<F: Fn(&Ctx) + 'static>(opts: NodeOpts, f: F) -> Node<T> {
+        Self::producer_opts_in_arena(&GraphArena::default(), opts, f)
+    }
+
+    pub(crate) fn producer_opts_in_arena<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
         assert!(
             !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
@@ -2536,7 +2762,7 @@ impl<T: 'static> Node<T> {
         let disp = default_dispatcher();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
         let node = Node {
-            core: Core::new(vec![], Some(handle), disp, None, opts.pausable),
+            core: Core::new_in_arena(arena, vec![], Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
         };
         node.core.configure_pull(opts.pull_id);
@@ -2571,6 +2797,15 @@ impl<T: 'static> Node<T> {
 
     /// A derived node with explicit [`NodeOpts`] (pool + pause mode + dep-terminal policy).
     pub fn derived_opts<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, opts: NodeOpts, f: F) -> Node<T> {
+        Self::derived_opts_in_arena(&GraphArena::default(), deps, opts, f)
+    }
+
+    pub(crate) fn derived_opts_in_arena<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        deps: Vec<Core>,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
         assert!(
             !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
@@ -2578,7 +2813,7 @@ impl<T: 'static> Node<T> {
         let disp = default_dispatcher();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
         let node = Node {
-            core: Core::new(deps, Some(handle), disp, None, opts.pausable),
+            core: Core::new_in_arena(arena, deps, Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
         };
         {
@@ -2720,6 +2955,13 @@ impl<T: 'static> Node<T> {
     /// The erased core, for wiring this node as a dep of a `derived` node.
     pub fn erased(&self) -> Core {
         self.core.clone()
+    }
+
+    pub(crate) fn from_core(core: Core) -> Node<T> {
+        Node {
+            core,
+            _t: PhantomData,
+        }
     }
 }
 
