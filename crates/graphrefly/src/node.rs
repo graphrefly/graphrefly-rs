@@ -172,6 +172,12 @@ pub(crate) enum RewireRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NodeId(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NodeKey {
+    id: NodeId,
+    generation: u64,
+}
+
 /// B49 / D71 first migration slice: graph-local arena for node bookkeeping. The
 /// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
 /// `Rc<RefCell<NodeInner>>`. This keeps the public API stable while moving ownership
@@ -214,11 +220,15 @@ impl GraphCore {
     fn alloc(&mut self, inner: NodeInner) -> NodeId {
         let edges = DepEdges::new(inner.deps.len());
         let aux = NodeAux::new();
-        if let Some(id) = self.free.pop() {
+        if let Some(id) = self.free.last().copied() {
+            let next_generation = self.generations[id]
+                .checked_add(1)
+                .expect("GraphCore generation overflow on slot reuse");
+            self.free.pop();
             self.slots[id] = Some(inner);
             self.edge_slots[id] = Some(edges);
             self.aux_slots[id] = Some(aux);
-            self.generations[id] = self.generations[id].wrapping_add(1);
+            self.generations[id] = next_generation;
             NodeId(id)
         } else {
             let id = self.slots.len();
@@ -230,29 +240,48 @@ impl GraphCore {
         }
     }
 
-    fn get(&self, id: NodeId) -> &NodeInner {
+    fn key_for(&self, id: NodeId) -> NodeKey {
+        NodeKey {
+            id,
+            generation: self.generations[id.0],
+        }
+    }
+
+    fn get(&self, key: NodeKey) -> &NodeInner {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
         self.slots
-            .get(id.0)
+            .get(key.id.0)
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore slot")
     }
 
-    fn get_mut(&mut self, id: NodeId) -> &mut NodeInner {
+    fn get_mut(&mut self, key: NodeKey) -> &mut NodeInner {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
         self.slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore slot")
     }
 
-    fn get_node_and_edges_mut(&mut self, id: NodeId) -> (&mut NodeInner, &mut DepEdges) {
+    fn get_node_and_edges_mut(&mut self, key: NodeKey) -> (&mut NodeInner, &mut DepEdges) {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
         let n = self
             .slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore slot");
         let e = self
             .edge_slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore edge slot");
         (n, e)
@@ -260,29 +289,37 @@ impl GraphCore {
 
     fn get_node_edges_aux_mut(
         &mut self,
-        id: NodeId,
+        key: NodeKey,
     ) -> (&mut NodeInner, &mut DepEdges, &mut NodeAux) {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
         let slots = &mut self.slots;
         let edge_slots = &mut self.edge_slots;
         let aux_slots = &mut self.aux_slots;
         let n = slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore slot");
         let e = edge_slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore edge slot");
         let a = aux_slots
-            .get_mut(id.0)
+            .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore aux slot");
         (n, e, a)
     }
 
-    fn get_aux(&self, id: NodeId) -> &NodeAux {
+    fn get_aux(&self, key: NodeKey) -> &NodeAux {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
         self.aux_slots
-            .get(id.0)
+            .get(key.id.0)
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore aux slot")
     }
@@ -293,10 +330,17 @@ impl GraphCore {
             && self.aux_slots.get(id.0).is_some_and(Option::is_some)
     }
 
-    fn take_live(&mut self, id: NodeId) -> Option<(NodeInner, DepEdges, NodeAux)> {
-        let inner = self.slots.get_mut(id.0)?.take()?;
-        let edges = self.edge_slots.get_mut(id.0)?.take()?;
-        let aux = self.aux_slots.get_mut(id.0)?.take()?;
+    fn is_live_key(&self, key: NodeKey) -> bool {
+        self.generations.get(key.id.0) == Some(&key.generation) && self.is_live(key.id)
+    }
+
+    fn take_live(&mut self, key: NodeKey) -> Option<(NodeInner, DepEdges, NodeAux)> {
+        if !self.is_live_key(key) {
+            return None;
+        }
+        let inner = self.slots.get_mut(key.id.0)?.take()?;
+        let edges = self.edge_slots.get_mut(key.id.0)?.take()?;
+        let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
         Some((inner, edges, aux))
     }
 }
@@ -572,27 +616,64 @@ impl NodeInner {
 pub struct Core {
     graph: Rc<RefCell<GraphCore>>,
     id: NodeId,
+    generation: u64,
     /// Kept outside the arena so `Core::clone` can run while `GraphCore` is borrowed.
     refs: Rc<Cell<usize>>,
+    /// Public/user handles are counted. Internal arena callbacks may construct an
+    /// uncounted view for one synchronous dispatch to avoid refcount churn.
+    counted: bool,
 }
 
 impl Core {
-    fn from_parts(graph: Rc<RefCell<GraphCore>>, id: NodeId, refs: Rc<Cell<usize>>) -> Self {
+    fn from_parts(
+        graph: Rc<RefCell<GraphCore>>,
+        id: NodeId,
+        generation: u64,
+        refs: Rc<Cell<usize>>,
+    ) -> Self {
         refs.set(refs.get().checked_add(1).expect("Core refcount overflow"));
-        Self { graph, id, refs }
+        Self {
+            graph,
+            id,
+            generation,
+            refs,
+            counted: true,
+        }
+    }
+
+    fn from_borrowed_parts(
+        graph: Rc<RefCell<GraphCore>>,
+        id: NodeId,
+        generation: u64,
+        refs: Rc<Cell<usize>>,
+    ) -> Self {
+        Self {
+            graph,
+            id,
+            generation,
+            refs,
+            counted: false,
+        }
+    }
+
+    fn key(&self) -> NodeKey {
+        NodeKey {
+            id: self.id,
+            generation: self.generation,
+        }
     }
 
     fn borrow(&self) -> Ref<'_, NodeInner> {
-        Ref::map(self.graph.borrow(), |g| g.get(self.id))
+        Ref::map(self.graph.borrow(), |g| g.get(self.key()))
     }
 
     fn borrow_mut(&self) -> RefMut<'_, NodeInner> {
-        RefMut::map(self.graph.borrow_mut(), |g| g.get_mut(self.id))
+        RefMut::map(self.graph.borrow_mut(), |g| g.get_mut(self.key()))
     }
 
     fn with_inner_edges_mut<R>(&self, f: impl FnOnce(&mut NodeInner, &mut DepEdges) -> R) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, e) = g.get_node_and_edges_mut(self.id);
+        let (n, e) = g.get_node_and_edges_mut(self.key());
         f(n, e)
     }
 
@@ -601,13 +682,13 @@ impl Core {
         f: impl FnOnce(&mut NodeInner, &mut DepEdges, &mut NodeAux) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, e, a) = g.get_node_edges_aux_mut(self.id);
+        let (n, e, a) = g.get_node_edges_aux_mut(self.key());
         f(n, e, a)
     }
 
     fn with_inner_edges<R>(&self, f: impl FnOnce(&NodeInner, &DepEdges) -> R) -> R {
         let g = self.graph.borrow();
-        let n = g.get(self.id);
+        let n = g.get(self.key());
         let e = g
             .edge_slots
             .get(self.id.0)
@@ -618,11 +699,15 @@ impl Core {
 
     fn with_aux<R>(&self, f: impl FnOnce(&NodeAux) -> R) -> R {
         let g = self.graph.borrow();
-        f(g.get_aux(self.id))
+        f(g.get_aux(self.key()))
     }
 
     fn with_aux_mut<R>(&self, f: impl FnOnce(&mut NodeAux) -> R) -> R {
         let mut g = self.graph.borrow_mut();
+        assert!(
+            g.is_live_key(self.key()),
+            "Core points at a stale or freed GraphCore slot"
+        );
         let a = g
             .aux_slots
             .get_mut(self.id.0)
@@ -636,14 +721,14 @@ impl Core {
         f: impl FnOnce(&mut NodeInner, &mut DepEdges, &mut NodeAux) -> R,
     ) -> Option<R> {
         let mut g = self.graph.try_borrow_mut().ok()?;
-        let (n, e, a) = g.get_node_edges_aux_mut(self.id);
+        let (n, e, a) = g.get_node_edges_aux_mut(self.key());
         Some(f(n, e, a))
     }
 
     fn downgrade(&self) -> CoreWeak {
         CoreWeak {
             graph: Rc::downgrade(&self.graph),
-            id: self.id,
+            key: self.key(),
             refs: Rc::downgrade(&self.refs),
         }
     }
@@ -651,12 +736,20 @@ impl Core {
 
 impl Clone for Core {
     fn clone(&self) -> Self {
-        Self::from_parts(self.graph.clone(), self.id, self.refs.clone())
+        Self::from_parts(
+            self.graph.clone(),
+            self.id,
+            self.generation,
+            self.refs.clone(),
+        )
     }
 }
 
 impl Drop for Core {
     fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
         let refs = self.refs.get();
         if refs > 1 {
             self.refs.set(refs - 1);
@@ -669,7 +762,7 @@ impl Drop for Core {
         let graph_ref = self.graph.clone();
         let (mut inner, mut edges, mut aux) = {
             let mut graph = graph_ref.borrow_mut();
-            let Some(pair) = graph.take_live(self.id) else {
+            let Some(pair) = graph.take_live(self.key()) else {
                 return;
             };
             pair
@@ -699,21 +792,54 @@ impl Drop for Core {
 
 struct CoreWeak {
     graph: Weak<RefCell<GraphCore>>,
-    id: NodeId,
+    key: NodeKey,
     refs: Weak<Cell<usize>>,
 }
 
 impl CoreWeak {
-    fn upgrade(&self) -> Option<Core> {
+    fn counted_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
         if refs.get() == 0 {
             return None;
         }
-        if !graph.borrow().is_live(self.id) {
+        if !graph.borrow().is_live_key(self.key) {
             return None;
         }
-        Some(Core::from_parts(graph, self.id, refs))
+        Some(Core::from_parts(
+            graph,
+            self.key.id,
+            self.key.generation,
+            refs,
+        ))
+    }
+
+    fn borrowed_core(&self) -> Option<Core> {
+        let graph = self.graph.upgrade()?;
+        let refs = self.refs.upgrade()?;
+        if refs.get() == 0 {
+            return None;
+        }
+        if !graph.borrow().is_live_key(self.key) {
+            return None;
+        }
+        Some(Core::from_borrowed_parts(
+            graph,
+            self.key.id,
+            self.key.generation,
+            refs,
+        ))
+    }
+
+    fn receive_from_dep(&self, idx: usize, msg: &Msg) {
+        let core = if wave_in_flight() {
+            self.borrowed_core()
+        } else {
+            self.counted_core()
+        };
+        if let Some(core) = core {
+            core.receive_from_dep(idx, msg);
+        }
     }
 }
 
@@ -1067,11 +1193,13 @@ fn drain_deferred_rewires(owner: &Core) {
 
 impl Core {
     pub(crate) fn ptr_eq(&self, other: &Core) -> bool {
-        Rc::ptr_eq(&self.graph, &other.graph) && self.id == other.id
+        Rc::ptr_eq(&self.graph, &other.graph)
+            && self.id == other.id
+            && self.generation == other.generation
     }
 
     fn is_live(&self) -> bool {
-        self.graph.borrow().is_live(self.id)
+        self.graph.borrow().is_live_key(self.key())
     }
 
     pub(crate) fn same_graph(&self, other: &Core) -> bool {
@@ -1103,11 +1231,7 @@ impl Core {
     }
 
     pub(crate) fn identity_key(&self) -> (usize, usize, u64) {
-        (
-            Rc::as_ptr(&self.graph) as usize,
-            self.id.0,
-            self.graph.borrow().generations[self.id.0],
-        )
+        (Rc::as_ptr(&self.graph) as usize, self.id.0, self.generation)
     }
 
     fn new_in_arena(
@@ -1142,9 +1266,10 @@ impl Core {
         {
             let mut g = arena.0.borrow_mut();
             let id = g.alloc(inner);
+            let generation = g.key_for(id).generation;
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
-                let (_n, e) = g.get_node_and_edges_mut(id);
+                let (_n, e) = g.get_node_and_edges_mut(NodeKey { id, generation });
                 e.value.cache = Some(v);
                 e.value.has_data = true;
                 e.value.status = Status::Settled;
@@ -1152,7 +1277,9 @@ impl Core {
             Core {
                 graph: arena.0.clone(),
                 id,
+                generation,
                 refs: Rc::new(Cell::new(1)),
+                counted: true,
             }
         }
     }
@@ -1257,9 +1384,7 @@ impl Core {
             if i < 0 {
                 return; // dep removed — stale in-flight callback drops (drain)
             }
-            if let Some(core) = weak.upgrade() {
-                core.receive_from_dep(i as usize, msg);
-            }
+            weak.receive_from_dep(i as usize, msg);
         });
         // dep.subscribe synchronously pushes START (+ cached DATA) into the sink,
         // re-entering receive_from_dep — done before we re-borrow self below.
@@ -1336,6 +1461,11 @@ impl Core {
     // ── upstream wave receive (two-phase + diamond) ──
 
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
+        // B25: enroll in the wave touched-set so a panic-abort can reset our flags.
+        // DR-8/B54: the internal dep-callback entry may be an uncounted arena view;
+        // under a real wave this counted touched-set clone also pins the node while
+        // borrow-free subscriber callbacks run.
+        wave_register(self);
         // Terminal-is-forever (D17): a terminated node ignores further upstream messages.
         if self.with_inner_edges(|_n, e| e.value.terminal) {
             if matches!(msg, Message::Teardown) {
@@ -1343,8 +1473,6 @@ impl Core {
             }
             return;
         }
-        // B25: enroll in the wave touched-set so a panic-abort can reset our flags.
-        wave_register(self);
         match msg {
             Message::Start => {}
             Message::Invalidate => {
@@ -1847,7 +1975,7 @@ impl Core {
                 .expect("removed dep was in old_deps");
             let unsub = {
                 let mut graph = self.graph.borrow_mut();
-                let (_nn, edges) = graph.get_node_and_edges_mut(self.id);
+                let (_nn, edges) = graph.get_node_and_edges_mut(self.key());
                 if edges.state.dirty[old_idx] {
                     removed_dirty_contributor = true;
                     edges.state.pending -= 1;
@@ -1866,7 +1994,7 @@ impl Core {
         // subscription + idx-box (rerouted to the new index), added deps start fresh.
         {
             let mut graph = self.graph.borrow_mut();
-            let (nn, edges) = graph.get_node_and_edges_mut(self.id);
+            let (nn, edges) = graph.get_node_and_edges_mut(self.key());
             let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
             let mut new_batch_waves: Vec<Vec<Vec<WaveData>>> = vec![Vec::new(); n];
             let mut new_batch_wave_id: Vec<Option<u64>> = vec![None; n];
@@ -2242,7 +2370,7 @@ impl Core {
                         // D49: every occurrence is DATA — no equals-substitution.
                         {
                             let mut n = self.graph.borrow_mut();
-                            let (_inner, e) = n.get_node_and_edges_mut(self.id);
+                            let (_inner, e) = n.get_node_and_edges_mut(self.key());
                             e.value.cache = Some(v.clone());
                             e.value.has_data = true;
                             e.value.status = Status::Settled;
@@ -2257,7 +2385,7 @@ impl Core {
                         // the no-cache case at SENTINEL while still emitting RESOLVED.
                         {
                             let mut n = self.graph.borrow_mut();
-                            let (_inner, e) = n.get_node_and_edges_mut(self.id);
+                            let (_inner, e) = n.get_node_and_edges_mut(self.key());
                             e.value.status = if e.value.has_data {
                                 Status::Resolved
                             } else {
@@ -3467,6 +3595,109 @@ mod tests {
             first_key, second_key,
             "D51 synthetic describe ids must not inherit across reused arena slots"
         );
+    }
+
+    #[test]
+    fn arena_generation_key_rejects_reused_slot() {
+        // DR-8/B54 owner-execution prep: arena entries are addressed by slot +
+        // generation, so a stale key cannot hit a later node that reused the slot.
+        let arena = GraphArena::new();
+        let first = Node::<i32>::state_in_arena(&arena, 1);
+        let old_key = first.core.key();
+        let old_weak = first.core.downgrade();
+        assert!(old_weak.borrowed_core().is_some());
+        drop(first);
+
+        let second = Node::<i32>::state_in_arena(&arena, 2);
+        let new_key = second.core.key();
+        assert_eq!(
+            old_key.id, new_key.id,
+            "isolated arena should reuse the just-freed slot"
+        );
+        assert_ne!(old_key.generation, new_key.generation);
+        assert!(
+            !arena.0.borrow().is_live_key(old_key),
+            "the old generation key is stale after slot reuse"
+        );
+
+        // A stale weak dep-callback entry is a no-op and must not disturb the new node.
+        old_weak.receive_from_dep(0, &Message::Start);
+        assert_eq!(second.cache(), Some(2));
+        assert_eq!(second.status(), Status::Settled);
+    }
+
+    #[test]
+    fn internal_dep_callback_entry_does_not_increment_core_refcount() {
+        // The B54 first slice keeps closure transport but avoids constructing a counted
+        // Core for every internal dep message. START is enough to exercise the entry
+        // without mutating dep-slot arrays. This path is only uncounted while a real
+        // wave owner is active; outside a wave, the callback entry must pin the slot.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        );
+        let weak = derived.core.downgrade();
+        let refs_before = derived.core.refs.get();
+
+        let borrowed = with_wave_owner(&source.core, || weak.borrowed_core(), || None)
+            .expect("borrowed core should exist while the node is live");
+        assert_eq!(
+            derived.core.refs.get(),
+            refs_before,
+            "borrowed weak dep entry should not increment Core refs while held"
+        );
+        drop(borrowed);
+
+        assert_eq!(
+            derived.core.refs.get(),
+            refs_before,
+            "internal weak dep entry should borrow by arena key, not create a counted Core"
+        );
+    }
+
+    #[test]
+    fn internal_dep_callback_entry_pins_core_outside_wave() {
+        // Recovery ERROR delivery runs outside the original wave scope. In that path a
+        // weak dep callback must hold a counted Core so subscriber callbacks cannot drop
+        // the final public handle and free the slot mid-delivery.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        );
+        let weak = derived.core.downgrade();
+        let refs_before = derived.core.refs.get();
+
+        let counted = weak
+            .counted_core()
+            .expect("counted core should exist while the node is live");
+        assert_eq!(
+            derived.core.refs.get(),
+            refs_before + 1,
+            "outside a wave, weak dep entry pins the node with a counted Core"
+        );
+        drop(counted);
+        assert_eq!(derived.core.refs.get(), refs_before);
+    }
+
+    #[test]
+    #[should_panic(expected = "GraphCore generation overflow")]
+    fn arena_generation_overflow_fails_closed() {
+        // A stale NodeKey must never become live again via generation wraparound.
+        let arena = GraphArena::new();
+        let first = Node::<i32>::state_in_arena(&arena, 1);
+        let slot = first.core.id.0;
+        drop(first);
+        arena.0.borrow_mut().generations[slot] = u64::MAX;
+
+        let _second = Node::<i32>::state_in_arena(&arena, 2);
     }
 
     #[test]
