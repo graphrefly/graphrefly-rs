@@ -62,7 +62,7 @@ pub mod node;
 pub mod protocol;
 
 pub use batch::{batch, BatchCtx};
-pub use ctx::{Ctx, DeferredCtx, DepRecord, DepTerminal};
+pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, Graph,

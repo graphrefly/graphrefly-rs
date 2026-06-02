@@ -47,7 +47,7 @@ use std::rc::{Rc, Weak};
 use crate::batch::{
     boundary_drains_blocked, collecting_batch, defer_after_batch_for_target, defer_to_batch,
 };
-use crate::ctx::{Ctx, DepRecord, DepTerminal};
+use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 
@@ -303,7 +303,7 @@ thread_local! {
 /// Per-dependency wave bookkeeping for one node slot.
 struct DepState {
     batch: Vec<Option<Vec<AnyValue>>>,
-    batch_waves: Vec<Vec<Vec<AnyValue>>>,
+    batch_waves: Vec<Vec<Vec<WaveData>>>,
     batch_wave_id: Vec<Option<u64>>,
     prev: Vec<Option<AnyValue>>,
     has_data: Vec<bool>,
@@ -311,6 +311,7 @@ struct DepState {
     tier: Vec<u8>,
     pending: i32,
     terminal: Vec<Option<DepTerminal>>,
+    terminal_wave: Vec<Option<DepTerminal>>,
 }
 
 impl DepState {
@@ -325,6 +326,7 @@ impl DepState {
             tier: vec![0; dep_count],
             pending: 0,
             terminal: vec![None; dep_count],
+            terminal_wave: vec![None; dep_count],
         }
     }
 
@@ -339,6 +341,44 @@ impl DepState {
             return false;
         }
         true
+    }
+
+    fn current_wave_mut(&mut self, idx: usize) -> &mut Vec<WaveData> {
+        let delivery_id = current_delivery_id();
+        if self.batch_wave_id[idx] != Some(delivery_id) {
+            self.batch_waves[idx].push(Vec::new());
+            self.batch_wave_id[idx] = Some(delivery_id);
+        }
+        self.batch_waves[idx]
+            .last_mut()
+            .expect("current_wave_mut just pushed an entry")
+    }
+
+    fn record_wave_data(&mut self, idx: usize, value: AnyValue) {
+        self.current_wave_mut(idx).push(WaveData::Data(value));
+    }
+
+    fn record_wave_sentinel(&mut self, idx: usize) -> bool {
+        let had_current_projection = self.batch_wave_id[idx] == Some(current_delivery_id());
+        self.current_wave_mut(idx).push(WaveData::Sentinel);
+        had_current_projection
+    }
+
+    fn has_run_triggering_projection(&self) -> bool {
+        self.batch_waves.iter().any(|dep_waves| {
+            dep_waves.iter().any(|wave| {
+                wave.is_empty() || wave.iter().any(|item| matches!(item, WaveData::Data(_)))
+            })
+        })
+    }
+
+    fn clear_wave_projection(&mut self, idx: usize) {
+        self.batch_waves[idx].clear();
+        self.batch_wave_id[idx] = None;
+    }
+
+    fn record_resolved_wave(&mut self, idx: usize) {
+        let _ = self.current_wave_mut(idx);
     }
 }
 
@@ -1242,6 +1282,7 @@ impl Core {
                 e.state.dirty[i] = false;
                 e.state.tier[i] = 0;
                 e.state.terminal[i] = None;
+                e.state.terminal_wave[i] = None;
             }
             e.state.pending = 0;
             e.wave.emitted_dirty_this_wave = false;
@@ -1287,8 +1328,10 @@ impl Core {
                     e.state.prev[idx] = None;
                     e.state.has_data[idx] = false;
                     e.state.batch[idx] = None;
-                    e.state.batch_waves[idx].clear();
-                    e.state.batch_wave_id[idx] = None;
+                    let had_current_projection = e.state.record_wave_sentinel(idx);
+                    if !had_current_projection && !e.state.has_run_triggering_projection() {
+                        e.state.clear_wave_projection(idx);
+                    }
                     // Un-wedge the dirty bookkeeping if this dep had gone DIRTY first, so an
                     // INVALIDATE-before-DATA doesn't strand `pending` / downstream forever
                     // (R-invalidate-idempotent — the wedged-DIRTY deadlock guard).
@@ -1346,14 +1389,7 @@ impl Core {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
                     }
-                    let delivery_id = current_delivery_id();
-                    if e.state.batch_wave_id[idx] != Some(delivery_id) {
-                        e.state.batch_waves[idx].push(Vec::new());
-                        e.state.batch_wave_id[idx] = Some(delivery_id);
-                    }
-                    if let Some(wave) = e.state.batch_waves[idx].last_mut() {
-                        wave.push(v.clone());
-                    }
+                    e.state.record_wave_data(idx, v.clone());
                     e.state.has_data[idx] = true;
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
@@ -1366,6 +1402,7 @@ impl Core {
             }
             Message::Resolved => {
                 self.with_inner_edges_mut(|_n, e| {
+                    e.state.record_resolved_wave(idx);
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
                         e.state.dirty[idx] = false;
@@ -1389,6 +1426,7 @@ impl Core {
                 let is_error = matches!(dep_term, DepTerminal::Error(_));
                 self.with_inner_edges_mut(|_n, e| {
                     e.state.terminal[idx] = Some(dep_term.clone());
+                    e.state.terminal_wave[idx] = Some(dep_term.clone());
                 });
                 // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding in-wave
                 // DIRTY contribution (the exactly-one-settle invariant) — exactly as DATA/RESOLVED/
@@ -1409,7 +1447,7 @@ impl Core {
                         self.down(vec![Message::Error(s.to_string().into())]);
                     }
                 } else if tari {
-                    // rescue/reduce/catch/*Map: the fn reads ctx.dep_records()[idx].terminal.
+                    // rescue/reduce/catch/*Map: the fn reads ctx.terminal(idx).
                     self.maybe_run();
                 } else if auto_complete && self.all_deps_terminal() {
                     // R-deps-terminal auto-COMPLETE + B42: COMPLETE once ALL deps are TERMINAL (each
@@ -1804,13 +1842,14 @@ impl Core {
             let mut graph = self.graph.borrow_mut();
             let (nn, edges) = graph.get_node_and_edges_mut(self.id);
             let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
-            let mut new_batch_waves: Vec<Vec<Vec<AnyValue>>> = vec![Vec::new(); n];
+            let mut new_batch_waves: Vec<Vec<Vec<WaveData>>> = vec![Vec::new(); n];
             let mut new_batch_wave_id: Vec<Option<u64>> = vec![None; n];
             let mut new_prev: Vec<Option<AnyValue>> = vec![None; n];
             let mut new_has = vec![false; n];
             let mut new_dirty = vec![false; n];
             let mut new_tier = vec![0u8; n];
             let mut new_terminal: Vec<Option<DepTerminal>> = vec![None; n];
+            let mut new_terminal_wave: Vec<Option<DepTerminal>> = vec![None; n];
             let mut new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
             let mut new_boxes: Vec<Rc<Cell<i64>>> =
                 (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
@@ -1824,6 +1863,7 @@ impl Core {
                     new_dirty[j] = edges.state.dirty[old_idx];
                     new_tier[j] = edges.state.tier[old_idx];
                     new_terminal[j] = edges.state.terminal[old_idx].clone();
+                    new_terminal_wave[j] = edges.state.terminal_wave[old_idx].clone();
                     if let Some(slot) = edges.unsubs.get_mut(old_idx) {
                         new_unsubs[j] = slot.take();
                     }
@@ -1842,6 +1882,7 @@ impl Core {
             edges.state.dirty = new_dirty;
             edges.state.tier = new_tier;
             edges.state.terminal = new_terminal;
+            edges.state.terminal_wave = new_terminal_wave;
             edges.unsubs = new_unsubs;
             edges.idx_boxes = new_boxes;
         }
@@ -1959,12 +2000,10 @@ impl Core {
                         .and_then(|b| b.last().cloned())
                         .or_else(|| e.state.prev[i].clone());
                     DepRecord {
-                        batch: e.state.batch[i].clone(),
-                        batches: e.state.batch_waves[i].clone(),
+                        wave_data: e.state.batch_waves[i].clone(),
                         prev_data: e.state.prev[i].clone(),
                         latest,
-                        tier: e.state.tier[i],
-                        terminal: e.state.terminal[i].clone(),
+                        terminal: e.state.terminal_wave[i].clone(),
                     }
                 })
                 .collect();
@@ -2043,6 +2082,7 @@ impl Core {
                 *b = None;
                 e.state.batch_waves[i].clear();
                 e.state.batch_wave_id[i] = None;
+                e.state.terminal_wave[i] = None;
             }
             e.wave.emitted_dirty_this_wave = false;
             e.wave.emitted_tier3_this_wave = false;
@@ -2581,6 +2621,7 @@ impl Core {
                 e.state.batch[i] = None;
                 e.state.batch_waves[i].clear();
                 e.state.batch_wave_id[i] = None;
+                e.state.terminal_wave[i] = None;
                 e.state.dirty[i] = false;
             }
             // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact

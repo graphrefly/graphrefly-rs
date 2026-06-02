@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::batch::{batch as run_batch, BatchCtx};
-use crate::ctx::{Ctx, DepRecord, DepTerminal};
+use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::protocol::{AnyValue, LockId, Message, Tier};
 
@@ -446,8 +446,8 @@ impl<'a> Values<'a> {
         self.records.is_empty()
     }
 
-    /// Last committed DATA before dep `i`'s current batch; `None` is the
-    /// SENTINEL/never-emitted state.
+    /// Value-level derived helper: last committed DATA before dep `i`'s current batch.
+    /// This is graph sugar, not part of the raw `Ctx` dep-value surface (D77).
     pub fn prev<T: 'static>(&self, i: usize) -> Option<Rc<T>> {
         self.records
             .get(i)
@@ -460,13 +460,9 @@ impl<'a> Values<'a> {
         self.records
             .get(i)
             .map(|r| {
-                r.batches
+                r.wave_data
                     .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|a| a.clone().downcast::<T>().ok())
-                            .collect()
-                    })
+                    .map(|wave| wave.iter().filter_map(WaveData::data::<T>).collect())
                     .collect()
             })
             .unwrap_or_default()

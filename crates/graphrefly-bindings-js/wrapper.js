@@ -108,6 +108,15 @@ function symbolToCode(sym) {
   throw new Error(`[graphrefly/native] unknown tier symbol: ${String(sym)}`);
 }
 
+function assertValidErrorPayload(payload, where) {
+  if (payload === undefined) {
+    throw new Error(`${where}: ERROR requires a non-SENTINEL payload (R-data-payload / D78)`);
+  }
+  if (typeof payload === 'boolean') {
+    throw new Error(`${where}: ERROR payload must be non-boolean (R-data-payload / D78)`);
+  }
+}
+
 /**
  * Decode a flat `[code, payload, ...]` array into `[tier, value?]`
  * tuples, resolving handle payloads via the JS-side registry. Skips
@@ -268,6 +277,7 @@ class NativeNode {
       } else if (tier === COMPLETE) {
         encoded.push(MSG_CODE_COMPLETE, 0);
       } else if (tier === ERROR) {
+        assertValidErrorPayload(msg[1], 'NativeNode.down');
         const h = this.core.allocExternalHandle();
         this.registry.set(h, msg[1]);
         encoded.push(MSG_CODE_ERROR, h);
@@ -292,6 +302,7 @@ class NativeNode {
   }
 
   async error(value) {
+    assertValidErrorPayload(value, 'NativeNode.error');
     const h = this.core.allocExternalHandle();
     this.registry.set(h, value);
     await this.core.batchEmitHandleMessages(this.nodeId, [MSG_CODE_ERROR, h]);
@@ -1140,6 +1151,7 @@ function createNativeImpl(opts) {
             benchCtx.downComplete(nodeId);
           } else if (tier === ERROR) {
             const payload = msg[1];
+            assertValidErrorPayload(payload, 'BatchCtx.down');
             if (typeof payload === 'number' && Number.isInteger(payload)) {
               benchCtx.downErrorInt(nodeId, payload);
             } else if (typeof payload === 'string') {
@@ -1449,6 +1461,7 @@ function createNativeImpl(opts) {
       return wrapNode(await state.operators.registerEmpty());
     },
     async throwError(error) {
+      assertValidErrorPayload(error, 'sources.throwError');
       const h = state.core.allocExternalHandle();
       state.registry.set(h, error);
       return wrapNode(await state.operators.registerThrowError(h));

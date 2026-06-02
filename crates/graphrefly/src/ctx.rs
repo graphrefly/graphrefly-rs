@@ -14,7 +14,7 @@ use std::rc::Rc;
 use crate::node::{Core, RewireRequest};
 use crate::protocol::{AnyValue, Message, Wave};
 
-/// A dep's terminal state, visible to the fn via [`DepRecord::terminal`]
+/// A dep's terminal state, visible to the fn via [`Ctx::terminal`]
 /// (R-deps-terminal / C-15). `None` ⇔ the dep is live; `Some(..)` ⇔ it COMPLETEd
 /// or ERRORed. Read by `terminalAsRealInput` operators (rescue/reduce/*Map) that
 /// treat an inner terminal as a real input rather than an absorbed settle.
@@ -32,25 +32,45 @@ pub enum DepTerminal {
     Error(Rc<str>),
 }
 
-/// Per-dependency record visible to a node fn (R-fn-contract). One per declared
-/// dep, a snapshot of this wave's view (values erased — downcast via [`Ctx::data`]).
+/// One raw ctx wave-data projection item (R-ctx-wave-data / D77).
 #[derive(Clone)]
-pub struct DepRecord {
-    /// DATA values this dep delivered in the current wave; `None` = not involved.
-    pub batch: Option<Vec<AnyValue>>,
-    /// DATA values grouped by each upstream `down(msgs)` wave accumulated before
-    /// this node's dirty contribution cleared.
-    pub batches: Vec<Vec<AnyValue>>,
+pub enum WaveData {
+    /// A legal DATA payload.
+    Data(AnyValue),
+    /// The protocol SENTINEL marker used for INVALIDATE inside `ctx.wave_data`.
+    Sentinel,
+}
+
+impl WaveData {
+    /// Typed read of a DATA payload; returns `None` for SENTINEL or type mismatch.
+    pub fn data<U: 'static>(&self) -> Option<Rc<U>> {
+        match self {
+            Self::Data(v) => v.clone().downcast::<U>().ok(),
+            Self::Sentinel => None,
+        }
+    }
+
+    /// True iff this item is the protocol SENTINEL marker.
+    pub fn is_sentinel(&self) -> bool {
+        matches!(self, Self::Sentinel)
+    }
+}
+
+/// Internal per-dependency snapshot backing Ctx helpers. Raw ctx exposes only
+/// `wave_data` + `terminal` as public dep-input surfaces (R-fn-contract / D77);
+/// latest/prev helpers are derived reads over this snapshot and node-owned cache.
+#[derive(Clone)]
+pub(crate) struct DepRecord {
+    /// Per-upstream-wave projections delivered to this fn invocation.
+    pub(crate) wave_data: Vec<Vec<WaveData>>,
     /// Last committed DATA before the current batch; `None` = SENTINEL (never emitted DATA) —
     /// the canonical never-emitted detector (R-sentinel).
-    pub prev_data: Option<AnyValue>,
+    pub(crate) prev_data: Option<AnyValue>,
     /// Latest DATA = last of `batch` if present, else `prev_data`.
-    pub latest: Option<AnyValue>,
-    /// Tier of this dep's most recent message in the current wave (0 if none).
-    pub tier: u8,
+    pub(crate) latest: Option<AnyValue>,
     /// The dep's terminal state (R-deps-terminal). `None` ⇔ live. A
     /// `terminalAsRealInput` fn reads this to react to an inner COMPLETE/ERROR.
-    pub terminal: Option<DepTerminal>,
+    pub(crate) terminal: Option<DepTerminal>,
 }
 
 /// The single argument to a node fn. All emission is explicit via [`Ctx::down`] /
@@ -65,9 +85,31 @@ impl Ctx {
         Self { node, dep_records }
     }
 
-    /// The per-dep wave snapshot (R-fn-contract). Read erased values positionally.
-    pub fn dep_records(&self) -> &[DepRecord] {
+    pub(crate) fn dep_records(&self) -> &[DepRecord] {
         &self.dep_records
+    }
+
+    /// Raw dep-value input surface (R-ctx-wave-data / D77): dep -> waves -> values/SENTINEL.
+    pub fn wave_data(&self) -> Vec<&[Vec<WaveData>]> {
+        self.dep_records
+            .iter()
+            .map(|record| record.wave_data.as_slice())
+            .collect()
+    }
+
+    /// Terminal metadata for dep `i`, separate from `wave_data` (R-fn-contract / D77).
+    pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
+        self.dep_records.get(i).and_then(|r| r.terminal.as_ref())
+    }
+
+    /// Number of declared deps in this fn invocation.
+    pub fn dep_len(&self) -> usize {
+        self.dep_records.len()
+    }
+
+    /// True iff no deps are declared.
+    pub fn deps_empty(&self) -> bool {
+        self.dep_records.is_empty()
     }
 
     /// Typed read of dep `i`'s latest DATA, downcast to `U` (SENTINEL → `None`).
@@ -80,30 +122,23 @@ impl Ctx {
             .and_then(|a| a.downcast::<U>().ok())
     }
 
-    /// Typed read of dep `i`'s last committed DATA before the current batch (the
-    /// SENTINEL-aware never-emitted detector reads `prev_data.is_none()`).
-    pub fn prev<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
-        self.dep_records
-            .get(i)
-            .and_then(|r| r.prev_data.clone())
-            .and_then(|a| a.downcast::<U>().ok())
-    }
-
     /// Typed read of dep `i`'s accumulated DATA grouped by upstream wave.
     pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
         self.dep_records
             .get(i)
             .map(|r| {
-                r.batches
+                r.wave_data
                     .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|a| a.clone().downcast::<U>().ok())
-                            .collect()
-                    })
+                    .map(|wave| wave.iter().filter_map(WaveData::data::<U>).collect())
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Typed DATA payloads dep `i` delivered in this invocation, flattened across
+    /// upstream waves. This is a derived helper; raw occurrence shape lives in `wave_data`.
+    pub fn batch<U: 'static>(&self, i: usize) -> Vec<Rc<U>> {
+        self.batches(i).into_iter().flatten().collect()
     }
 
     /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean):
@@ -219,9 +254,17 @@ pub struct DeferredCtx {
 }
 
 impl DeferredCtx {
-    /// The per-dep wave snapshot captured at defer time (R-fn-contract).
-    pub fn dep_records(&self) -> &[DepRecord] {
-        &self.dep_records
+    /// Raw dep-value input surface captured at defer time (R-ctx-wave-data / D77).
+    pub fn wave_data(&self) -> Vec<&[Vec<WaveData>]> {
+        self.dep_records
+            .iter()
+            .map(|record| record.wave_data.as_slice())
+            .collect()
+    }
+
+    /// Terminal metadata for dep `i`, separate from captured `wave_data`.
+    pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
+        self.dep_records.get(i).and_then(|r| r.terminal.as_ref())
     }
 
     /// Typed read of dep `i`'s latest DATA at defer time (SENTINEL → `None`).
@@ -232,29 +275,23 @@ impl DeferredCtx {
             .and_then(|a| a.downcast::<U>().ok())
     }
 
-    /// Typed read of dep `i`'s last committed DATA before the captured batch.
-    pub fn prev<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
-        self.dep_records
-            .get(i)
-            .and_then(|r| r.prev_data.clone())
-            .and_then(|a| a.downcast::<U>().ok())
-    }
-
     /// Typed read of dep `i`'s captured DATA grouped by upstream wave.
     pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
         self.dep_records
             .get(i)
             .map(|r| {
-                r.batches
+                r.wave_data
                     .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|a| a.clone().downcast::<U>().ok())
-                            .collect()
-                    })
+                    .map(|wave| wave.iter().filter_map(WaveData::data::<U>).collect())
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Typed DATA payloads dep `i` delivered in the captured invocation, flattened
+    /// across upstream waves.
+    pub fn batch<U: 'static>(&self, i: usize) -> Vec<Rc<U>> {
+        self.batches(i).into_iter().flatten().collect()
     }
 
     /// Emit one typed DATA downstream as the deferred async result.

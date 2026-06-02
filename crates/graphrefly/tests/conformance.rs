@@ -34,10 +34,13 @@ use std::rc::Rc;
 
 use graphrefly::{
     batch, AnyValue, Core, Ctx, DeferredCtx, DepTerminal, LockId, Message, Node, NodeOpts,
-    Pausable, PoolKind, Status,
+    Pausable, PoolKind, Status, WaveData,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
+type WaveShape = Vec<Vec<String>>;
+type SeenWavePairs = Rc<RefCell<Vec<(WaveShape, WaveShape)>>>;
+type SeenTerminal = Rc<RefCell<Vec<(WaveShape, String)>>>;
 /// An unsubscribe handle (kept alive to hold a node active).
 type Unsub = Box<dyn FnOnce()>;
 
@@ -72,6 +75,42 @@ fn record_data_i32(node: &Node<i32>) -> (Rc<RefCell<Vec<i32>>>, Unsub) {
 /// Count occurrences of a message kind in a recorded log.
 fn count_kind(log: &Log, kind: &str) -> usize {
     log.borrow().iter().filter(|k| *k == kind).count()
+}
+
+fn dep_wave_data(ctx: &Ctx, dep: usize) -> &[Vec<WaveData>] {
+    ctx.wave_data().get(dep).copied().unwrap_or(&[])
+}
+
+fn wave_shape(ctx: &Ctx, dep: usize) -> WaveShape {
+    dep_wave_data(ctx, dep)
+        .iter()
+        .map(|wave| {
+            wave.iter()
+                .map(|item| match item {
+                    WaveData::Sentinel => "SENTINEL".to_string(),
+                    WaveData::Data(v) => {
+                        if let Ok(n) = v.clone().downcast::<i32>() {
+                            format!("i32:{n}")
+                        } else if let Ok(n) = v.clone().downcast::<Option<i32>>() {
+                            format!("option:{n:?}")
+                        } else if let Ok(xs) = v.clone().downcast::<Vec<i32>>() {
+                            format!("vec:{xs:?}")
+                        } else {
+                            "data".to_string()
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn terminal_shape(ctx: &Ctx, dep: usize) -> String {
+    match ctx.terminal(dep) {
+        None => "none".to_string(),
+        Some(DepTerminal::Complete) => "complete".to_string(),
+        Some(DepTerminal::Error(e)) => format!("error:{e}"),
+    }
 }
 
 /// The shared self-fn type for a self-referential operator (the rewire fn re-pairs the deps,
@@ -154,28 +193,23 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                 op_runs.set(op_runs.get() + 1);
                 let self_fn = cell.borrow().clone().expect("op fn installed");
                 // forward any inner DATA (dep i >= 1).
-                for i in 1..ctx.dep_records().len() {
-                    if let Some(b) = &ctx.dep_records()[i].batch {
-                        for v in b {
-                            if let Ok(rc) = v.clone().downcast::<i32>() {
-                                ctx.emit(*rc);
-                            }
-                        }
+                for i in 1..ctx.dep_len() {
+                    for v in ctx.batch::<i32>(i) {
+                        ctx.emit(*v);
                     }
                 }
                 // on S DATA (dep 0): spawn + REQUEST add an inner (seed = S * 10).
-                if let Some(b) = &ctx.dep_records()[0].batch {
-                    if let Some(last) = b.last() {
-                        let sv = *last.clone().downcast::<i32>().unwrap();
-                        let inner = make_inner(Some(sv * 10));
-                        let core = inner.core();
-                        let act = inner.activated.clone();
-                        inners.borrow_mut().push(inner);
-                        let sf = self_fn.clone();
-                        ctx.rewire_next_add(core, move |c| sf(c));
-                        // mid-run: the add is DEFERRED — the inner is NOT wired/activated yet.
-                        deferred_ok.set(!act.get());
-                    }
+                let source_batch = ctx.batch::<i32>(0);
+                if let Some(last) = source_batch.last() {
+                    let sv = **last;
+                    let inner = make_inner(Some(sv * 10));
+                    let core = inner.core();
+                    let act = inner.activated.clone();
+                    inners.borrow_mut().push(inner);
+                    let sf = self_fn.clone();
+                    ctx.rewire_next_add(core, move |c| sf(c));
+                    // mid-run: the add is DEFERRED — the inner is NOT wired/activated yet.
+                    deferred_ok.set(!act.get());
                 }
             })
         };
@@ -226,27 +260,22 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                 // Collect completed inners as (tracking-index, core) — do NOT mutate `inners`
                 // mid-loop (a splice would shift later indices and desync the read for ≥2 inners).
                 let mut removals: Vec<(usize, Core)> = Vec::new();
-                for i in 1..ctx.dep_records().len() {
-                    if let Some(b) = &ctx.dep_records()[i].batch {
-                        for v in b {
-                            if let Ok(rc) = v.clone().downcast::<i32>() {
-                                ctx.emit(*rc);
-                            }
-                        }
+                for i in 1..ctx.dep_len() {
+                    for v in ctx.batch::<i32>(i) {
+                        ctx.emit(*v);
                     }
-                    if matches!(ctx.dep_records()[i].terminal, Some(DepTerminal::Complete)) {
+                    if matches!(ctx.terminal(i), Some(DepTerminal::Complete)) {
                         removals.push((i - 1, inners.borrow()[i - 1].core()));
                     }
                 }
-                if let Some(b) = &ctx.dep_records()[0].batch {
-                    if let Some(last) = b.last() {
-                        let sv = *last.clone().downcast::<i32>().unwrap();
-                        let inner = make_inner(Some(sv * 10));
-                        let core = inner.core();
-                        inners.borrow_mut().push(inner); // appends at the end → earlier indices stay valid
-                        let sf = self_fn.clone();
-                        ctx.rewire_next_add(core, move |c| sf(c));
-                    }
+                let source_batch = ctx.batch::<i32>(0);
+                if let Some(last) = source_batch.last() {
+                    let sv = **last;
+                    let inner = make_inner(Some(sv * 10));
+                    let core = inner.core();
+                    inners.borrow_mut().push(inner); // appends at the end → earlier indices stay valid
+                    let sf = self_fn.clone();
+                    ctx.rewire_next_add(core, move |c| sf(c));
                 }
                 // Splice the completed inners out of the tracking list in DESCENDING index order
                 // (so each removal keeps the not-yet-removed lower indices valid) + request removeDep,
@@ -301,26 +330,21 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                 (s.erased(), a_core.clone(), b_core.clone(), cell.clone());
             Rc::new(move |ctx: &Ctx| {
                 let self_fn = cell.borrow().clone().expect("op fn installed");
-                for i in 1..ctx.dep_records().len() {
-                    if let Some(b) = &ctx.dep_records()[i].batch {
-                        for v in b {
-                            if let Ok(rc) = v.clone().downcast::<i32>() {
-                                ctx.emit(*rc);
-                            }
-                        }
+                for i in 1..ctx.dep_len() {
+                    for v in ctx.batch::<i32>(i) {
+                        ctx.emit(*v);
                     }
                 }
-                if let Some(b) = &ctx.dep_records()[0].batch {
-                    if let Some(last) = b.last() {
-                        let sv = *last.clone().downcast::<i32>().unwrap();
-                        let current = if sv == 1 {
-                            a_core.clone()
-                        } else {
-                            b_core.clone()
-                        };
-                        let sf = self_fn.clone();
-                        ctx.rewire_next_set(vec![s2.clone(), current], move |c| sf(c));
-                    }
+                let source_batch = ctx.batch::<i32>(0);
+                if let Some(last) = source_batch.last() {
+                    let sv = **last;
+                    let current = if sv == 1 {
+                        a_core.clone()
+                    } else {
+                        b_core.clone()
+                    };
+                    let sf = self_fn.clone();
+                    ctx.rewire_next_set(vec![s2.clone(), current], move |c| sf(c));
                 }
             })
         };
@@ -395,7 +419,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let body: OpFn = {
             let (inner_core, cell) = (inner_core.clone(), cell.clone());
             Rc::new(move |ctx: &Ctx| {
-                if ctx.dep_records()[0].batch.is_some() {
+                if !ctx.batch::<i32>(0).is_empty() {
                     let sf = cell.borrow().clone().expect("op fn");
                     ctx.rewire_next_add(inner_core.clone(), move |c| sf(c)); // queued…
                     ctx.down(vec![Message::Complete]); // …then OP goes terminal THIS wave
@@ -1067,7 +1091,7 @@ fn c15_dep_terminal_settles_dirty() {
             },
             |ctx| {
                 // rescue B's value to 0 when it errored; else read its latest (R-deps-terminal).
-                let bv = if matches!(ctx.dep_records()[0].terminal, Some(DepTerminal::Error(_))) {
+                let bv = if matches!(ctx.terminal(0), Some(DepTerminal::Error(_))) {
                     0
                 } else {
                     ctx.data::<i32>(0).map(|r| *r).unwrap_or(0)
@@ -1311,14 +1335,10 @@ fn c16_pull_mode_routed_demand() {
                 ..NodeOpts::default()
             },
             move |ctx| {
-                if let Some(b) = &ctx.dep_records()[1].batch {
-                    for v in b {
-                        if let Ok(rc) = v.clone().downcast::<i32>() {
-                            rec.borrow_mut().push(*rc);
-                        }
-                    }
+                for v in ctx.batch::<i32>(1) {
+                    rec.borrow_mut().push(*v);
                 }
-                if ctx.dep_records()[0].batch.is_some() {
+                if !ctx.batch::<i32>(0).is_empty() {
                     ctx.up_next(vec![Message::Resume(pid.clone())]);
                 }
             },
@@ -1352,13 +1372,9 @@ fn c16_pull_mode_routed_demand() {
             snap_fn,
         );
         let fwd = |ctx: &Ctx| {
-            for r in ctx.dep_records() {
-                if let Some(b) = &r.batch {
-                    for v in b {
-                        if let Ok(rc) = v.clone().downcast::<i32>() {
-                            ctx.emit(*rc);
-                        }
-                    }
+            for i in 0..ctx.dep_len() {
+                for v in ctx.batch::<i32>(i) {
+                    ctx.emit(*v);
                 }
             }
         };
@@ -1406,7 +1422,7 @@ fn c16_pull_mode_routed_demand() {
                 ..NodeOpts::default()
             },
             move |ctx| {
-                if ctx.dep_records()[0].batch.is_some() {
+                if !ctx.batch::<i32>(0).is_empty() {
                     ctx.up(vec![Message::Resume(pid.clone())]);
                 }
             },
@@ -1440,13 +1456,9 @@ fn c18_routed_pull_demand_over_diamond_fires_once() {
         },
     );
     let fwd = |ctx: &Ctx| {
-        for r in ctx.dep_records() {
-            if let Some(b) = &r.batch {
-                for v in b {
-                    if let Ok(rc) = v.clone().downcast::<i32>() {
-                        ctx.emit(*rc);
-                    }
-                }
+        for i in 0..ctx.dep_len() {
+            for v in ctx.batch::<i32>(i) {
+                ctx.emit(*v);
             }
         }
     };
@@ -1893,5 +1905,265 @@ fn c12_occurrences_stay_data_resolved_is_undirty_only() {
             "the deduped repeat is an undirty RESOLVED"
         );
         assert_eq!(count_kind(&log, "DATA"), 2);
+    }
+}
+
+/// C-23 — D77 raw ctx contract: `wave_data` is the only raw dep-value input
+/// surface, preserves per-upstream-wave distinctions, and terminal metadata stays
+/// separate (R-fn-contract / R-ctx-wave-data / R-dynamic-node).
+#[test]
+fn c23_raw_ctx_wave_data_preserves_per_wave_distinctions() {
+    // (a) no-wave for A while B changes.
+    {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(10);
+        let seen: SeenWavePairs = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![a.erased(), b.erased()],
+                NodeOpts {
+                    partial: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    seen.borrow_mut()
+                        .push((wave_shape(ctx, 0), wave_shape(ctx, 1)));
+                },
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        b.set(11);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some((vec![], vec![vec!["i32:11".to_string()]]))
+        );
+    }
+
+    // (b) RESOLVED-only is one delivered wave with an empty inner projection.
+    {
+        let s = Node::<i32>::state(1);
+        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![s.erased()],
+                NodeOpts {
+                    partial: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        s.down(vec![Message::Resolved]);
+        assert_eq!(seen.borrow().last().cloned(), Some(vec![vec![]]));
+    }
+
+    // (c) DATA + INVALIDATE in the same upstream wave preserves DATA occurrences
+    // and appends the Rust SENTINEL marker.
+    {
+        let s = Node::<i32>::state(0);
+        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![s.erased()],
+                NodeOpts {
+                    partial: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        s.down(vec![
+            Message::Data(Rc::new(1i32)),
+            Message::Data(Rc::new(2i32)),
+            Message::Invalidate,
+        ]);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some(vec![vec![
+                "i32:1".to_string(),
+                "i32:2".to_string(),
+                "SENTINEL".to_string()
+            ]])
+        );
+    }
+
+    // (c2) INVALIDATE-only does not leave a stale sentinel for the next invocation.
+    {
+        let s = Node::<i32>::state(1);
+        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![s.erased()],
+                NodeOpts {
+                    partial: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        s.down(vec![Message::Invalidate]);
+        s.set(3);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some(vec![vec!["i32:3".to_string()]])
+        );
+    }
+
+    // (d/e) DATA payloads that are Rust "null-like" or empty containers remain
+    // legal DATA, not SENTINEL/no-wave.
+    {
+        let opt = Node::<Option<i32>>::state_empty();
+        let empty = Node::<Vec<i32>>::state_empty();
+        let seen: SeenWavePairs = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![opt.erased(), empty.erased()],
+                NodeOpts {
+                    partial: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    seen.borrow_mut()
+                        .push((wave_shape(ctx, 0), wave_shape(ctx, 1)));
+                },
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        opt.down(vec![Message::Data(Rc::new(None::<i32>))]);
+        assert_eq!(
+            seen.borrow().last().cloned().map(|pair| pair.0),
+            Some(vec![vec!["option:None".to_string()]])
+        );
+        empty.down(vec![Message::Data(Rc::new(Vec::<i32>::new()))]);
+        assert_eq!(
+            seen.borrow().last().cloned().map(|pair| pair.1),
+            Some(vec![vec!["vec:[]".to_string()]])
+        );
+    }
+
+    // (f) COMPLETE/ERROR do not enter wave_data; terminal metadata is separate.
+    {
+        let complete = Node::<i32>::state(1);
+        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![complete.erased()],
+                NodeOpts {
+                    error_when_deps_error: false,
+                    terminal_as_real_input: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    seen.borrow_mut()
+                        .push((wave_shape(ctx, 0), terminal_shape(ctx, 0)));
+                },
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        complete.down(vec![Message::Complete]);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some((vec![], "complete".to_string()))
+        );
+
+        let live = Node::<i32>::state(10);
+        let complete = Node::<i32>::state(1);
+        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![complete.erased(), live.erased()],
+                NodeOpts {
+                    complete_when_deps_complete: false,
+                    terminal_as_real_input: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    seen.borrow_mut()
+                        .push((wave_shape(ctx, 1), terminal_shape(ctx, 0)));
+                },
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        complete.down(vec![Message::Complete]);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some((vec![], "complete".to_string()))
+        );
+        seen.borrow_mut().clear();
+        live.set(11);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some((vec![vec!["i32:11".to_string()]], "none".to_string()))
+        );
+
+        let error = Node::<i32>::state(1);
+        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
+        let out = {
+            let seen = seen.clone();
+            Node::<()>::derived_opts(
+                vec![error.erased()],
+                NodeOpts {
+                    error_when_deps_error: false,
+                    terminal_as_real_input: true,
+                    ..NodeOpts::default()
+                },
+                move |ctx| {
+                    seen.borrow_mut()
+                        .push((wave_shape(ctx, 0), terminal_shape(ctx, 0)));
+                },
+            )
+        };
+        let (_log, _u) = record(&out);
+        seen.borrow_mut().clear();
+        error.down(vec![Message::Error("boom".into())]);
+        assert_eq!(
+            seen.borrow().last().cloned(),
+            Some((vec![], "error:boom".to_string()))
+        );
+    }
+
+    // (g) dynamic-node-style unread dep: the fn can inspect wave_data and stay
+    // quiet on a B-only wave, producing only the substrate undirty settle.
+    {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(10);
+        let out = Node::<i32>::derived_opts(
+            vec![a.erased(), b.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                if dep_wave_data(ctx, 0).is_empty() {
+                    return;
+                }
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.emit(*v);
+                }
+            },
+        );
+        let (vals, _u) = record_data_i32(&out);
+        vals.borrow_mut().clear();
+        b.set(11);
+        assert_eq!(*vals.borrow(), Vec::<i32>::new());
+        a.set(2);
+        assert_eq!(*vals.borrow(), vec![2]);
     }
 }

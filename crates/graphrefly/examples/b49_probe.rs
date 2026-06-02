@@ -177,7 +177,7 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
     let join = Node::<f64>::derived(deps, move |ctx: &Ctx| {
         jr.set(jr.get() + 1);
         let mut acc = 0.0;
-        for i in 0..ctx.dep_records().len() {
+        for i in 0..ctx.dep_len() {
             acc += *ctx.data::<f64>(i).unwrap();
         }
         ctx.emit(acc);

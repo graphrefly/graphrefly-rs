@@ -61,17 +61,18 @@ silent no-op, never a recycled-slot misfire. Rust-only; B15 is the TS sibling
 | `protocol` | **concrete** — `Tier` (D34), `Message`/`Wave` (D8/D9, kind-only `Debug`), `Handle` (D7), `LockId` (D10), `GraphError` (D31), `AnyValue`. |
 | `node` | **kernel + control/terminal impl** — `Core` (erased wave engine) + typed `Node<T>` (state/state_empty/producer/derived; `up`/`down` public per R-node-iface; `Clone` handle). Two-phase DIRTY→DATA, diamond pending-join (R-diamond/R-two-phase), first-run gate (R-first-run-gate), **every occurrence is DATA + substrate-synthesized undirty RESOLVED (R-resolved-undirty / D49)**, push-on-subscribe (R-push-subscribe), lazy activation, ROM/RAM (R-rom-ram), `Drop` cleanup (D1). **+INVALIDATE (idempotent `!has_data`, `dep_prev`→SENTINEL, dirty un-wedge, same-wave merge — C-3)**, **+PAUSE/RESUME lockset + default-mode coalesce (C-5)**, **+COMPLETE/ERROR terminal (terminal-is-forever, D17)**, **+the D30 catch boundary** = `catch_unwind` at the wave-owner converting a panic (Rust throw analogue) → `[[ERROR,e]]` on the blamed cycle node (C-6), with the **`WaveScope` touched-set** whole-cascade wave-flag recovery (**B25 closed**). **+Slice A (async):** `producer_async`/`derived_async`/`*_opts` constructors + `Pausable {True\|ResumeAll\|False}` + `pause_buffer` + `should_buffer_on_pause` (async COMPUTE buffers in `true`, leaf source immediate, `resumeAll` buffers own production) + `on_resume` drain/replay + `owned_down` (the DeferredCtx late-emit boundary) + the async-pool undirty-RESOLVED exemption (C-2/C-4/C-9/C-10). |
 | `dispatcher` | **impl** — `Dispatcher` + LocalSync **and LocalAsync slotmap pools** (`pools: Vec<Pool>` by `pool_id`; `register`/`register_async`/`unregister`/`invoke`/`pool_kind`, clone-out-before-invoke, generation-checked); the async `invoke` is still **sync void** (R-sync-core) — async is a node-kind label. `Handle` widened with a local `generation` (B32, per-language); thread-local default (D26). |
-| `ctx` | **impl** — `Ctx` (`down`/`emit`/typed `data`/`prev`/`state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
+| `ctx` | **impl** — `Ctx` (`down`/`emit`/**`wave_data`** + `terminal` raw dep input, typed `data`/`batch` derived helpers, `state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
 | `batch` | **impl** — `batch(fn)` + `BatchCtx::rollback()` (D12); tier≥3 settle slices defer to commit with last-value coalescing; rollback balances the immediate DIRTY with RESOLVED; boundary drains are held until after commit; immediate rewire on a node with an uncommitted batch slice defers per D67. |
 
-**29 unit + 22 conformance tests green** (clippy `-D warnings` clean, fmt clean,
+**32 unit + 23 conformance + 13 graph-layer tests green** (clippy `-D warnings` clean, fmt clean,
 `#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
 PAUSE lockset multi-source, **C-6** sync feedback cycle→ERROR (+B25 recovery), **C-13**
 INVALIDATE×PAUSE precedence, **C-14** per-run cleanup hooks (control/terminal slice),
 **C-2 / C-4 / C-9 / C-10** (Slice A async), **C-7** up-at-source, **C-8** intra-graph
 rewire, **C-11** higher-order inner rewire at the wave boundary (`ctx.rewire_next`),
 **C-12** occurrences-stay-DATA (D49), **C-15** dep-terminal-settles-dirty (B35),
-**C-19** undirty timing under resumeAll/batch, and **C-22** batch-before-rewire.
+**C-19** undirty timing under resumeAll/batch, **C-22** batch-before-rewire, and
+**C-23** raw ctx `wave_data` shape (D77).
 Unit tests add the Slice A `resumeAll` buffer+replay case + 12 rewire cases.
 Teeth-verified: Slice A (async-compute buffer / async undirty exemption), C-7 (terminus
 INVALIDATE), C-8 (idx-box reroute / atomic multi-add defer), QA-F1 (DepMutationGuard),
@@ -191,15 +192,16 @@ SUGAR (a future Rust graph layer, CSP-2-rs).
 | 11 | **C-21** | late async ctx emission uses live deps after rewire | ✅ **GREEN** 2026-05-31 |
 | 12 | **C-19** | undirty RESOLVED timing respects resumeAll and batch | ✅ **GREEN** 2026-06-01 (D64 delivery path: balancing RESOLVED routes through `down`, so resumeAll buffers and batch commits before visibility) |
 | 13 | **C-22** | batch commit precedes rewire requested during open batch | ✅ **GREEN** 2026-06-01 (D67: open-batch immediate rewire queues until after the old-shape commit, then drains as a fresh boundary wave) |
+| 14 | **C-23** | raw ctx waveData is the only dep-value input and preserves per-wave distinctions | ✅ **GREEN** 2026-06-02 (D77: Rust `WaveData::{Data,Sentinel}`, terminal metadata separate; no public raw `DepRecord`) |
 | last | **C-1** | cross-graph diamond coalesce | needs wire bridge (B2, post-1.0); in-process core only for now |
 
-**Arm status:** C-2..C-22 except C-1 are `rust:pass`. Remaining Rust conformance
+**Arm status:** C-2..C-23 except C-1 are `rust:pass`. Remaining Rust conformance
 todo: C-1 (wire bridge, B2/post-1.0).
 
 ## Cross-track sequencing
 
 - **Python (CSP-7) deferred** until this Rust arm drives the non-wire substrate scenarios green
-  (now C-2..C-22 except C-1) — Rust's
+  (now C-2..C-23 except C-1) — Rust's
   ownership/no-GC model is the high-signal second implementation that stress-tests
   the spec's language-neutrality; Py is GC + semantically close to TS, so opening
   it now adds low marginal hardening signal and triples redo risk against the still-
