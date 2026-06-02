@@ -1,5 +1,5 @@
 [package]
-name        = "graphrefly"
+name        = "graphrefly-rs"
 version     = "0.0.0"          # fresh clean-slate; port-model history is on `main`
 description  = "GraphReFly — reactive universal reduction layer (Rust clean-slate substrate)"
 edition      = { workspace = true }
@@ -8,6 +8,9 @@ license      = { workspace = true }
 repository   = { workspace = true }
 homepage     = { workspace = true }
 authors      = { workspace = true }
+
+[lib]
+name = "graphrefly"
 
 [dependencies]
 # Substrate is sync-core (F-SYNC-CORE) + single-thread (D22): deliberately

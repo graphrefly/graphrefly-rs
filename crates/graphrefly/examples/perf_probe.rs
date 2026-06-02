@@ -44,7 +44,9 @@ fn time_ms(runs: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     println!("== DR-7 Rust perf probe ==  cores(available_parallelism)={cores}\n");
 
     // ===== Probe A: typed vs erased value representation =====
@@ -82,8 +84,14 @@ fn main() {
         }
         black_box(x);
     });
-    println!("typed       : {typed:8.1} ms   ({:.2} ns/op)", typed * 1e6 / ops as f64);
-    println!("erased      : {erased:8.1} ms   ({:.2} ns/op)", erased * 1e6 / ops as f64);
+    println!(
+        "typed       : {typed:8.1} ms   ({:.2} ns/op)",
+        typed * 1e6 / ops as f64
+    );
+    println!(
+        "erased      : {erased:8.1} ms   ({:.2} ns/op)",
+        erased * 1e6 / ops as f64
+    );
     println!(
         "ERASURE TAX : {:.2}x   (+{:.0}% over typed) <- de-gates DR-7 GO\n",
         erased / typed,
