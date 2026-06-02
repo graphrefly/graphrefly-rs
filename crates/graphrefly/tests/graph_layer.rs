@@ -3,8 +3,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
-    graph, graph_opts, DescribeEdge, DescribeValue, GraphNodeOpts, GraphOptions, LockId, Message,
-    Status, Tier, Values,
+    describe_to_ascii, describe_to_d2, describe_to_json, describe_to_mermaid,
+    describe_to_mermaid_url, describe_to_pretty, distinct_until_changed, filter, from_iter, graph,
+    graph_opts, map, merge, scan, take, DescribeEdge, DescribeOpts, DescribeValue, Explain,
+    GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status, Tier, Values,
 };
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
@@ -317,4 +319,251 @@ fn state_empty_describe_omits_sentinel_value() {
     let snap = g.describe();
     let empty = snap.nodes.iter().find(|n| n.id == "empty").unwrap();
     assert_eq!(empty.value, Some(DescribeValue::I64(3)));
+}
+
+#[test]
+fn describe_explain_and_renderers_are_pure_snapshot_functions() {
+    let g = graph_opts(GraphOptions::named("render-demo"));
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let mapped = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("mapped"),
+    );
+    let sink = g.derived_opts(
+        vec![mapped.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 10),
+        GraphNodeOpts::named("sink"),
+    );
+    g.state_opts(99i32, GraphNodeOpts::named("unrelated"));
+    let _keep_alive = sink.subscribe(|_| {});
+
+    let explain = g.describe_opts(DescribeOpts {
+        explain: Some(Explain {
+            from: "source".to_owned(),
+            to: "sink".to_owned(),
+        }),
+    });
+    assert!(explain.nodes.iter().any(|n| n.id == "source"));
+    assert!(explain.nodes.iter().any(|n| n.id == "mapped"));
+    assert!(explain.nodes.iter().any(|n| n.id == "sink"));
+    assert!(!explain.nodes.iter().any(|n| n.id == "unrelated"));
+
+    let snap = g.describe();
+    assert!(describe_to_mermaid(&snap).contains("flowchart LR"));
+    assert!(describe_to_d2(&snap).contains("direction: right"));
+    assert!(describe_to_pretty(&snap).contains("source (state/Settled): 1"));
+    assert!(describe_to_ascii(&snap, true).contains("source [state/Settled 1] -> mapped"));
+    assert!(describe_to_json(&snap).contains("\"id\":\"source\""));
+    assert!(describe_to_mermaid_url(&snap).starts_with("https://mermaid.live/edit#base64:"));
+}
+
+#[test]
+fn explain_filters_mounted_subgraphs_without_leaking_unrelated_nodes() {
+    let parent = graph_opts(GraphOptions::named("parent"));
+    parent.state_opts(99i32, GraphNodeOpts::named("root_unrelated"));
+    let child = graph_opts(GraphOptions::named("child"));
+    let source = child.state_opts(1i32, GraphNodeOpts::named("source"));
+    let sink = child.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("sink"),
+    );
+    child.state_opts(5i32, GraphNodeOpts::named("child_unrelated"));
+    let _keep_alive = sink.subscribe(|_| {});
+    parent.mount(child, "sub");
+
+    let explain = parent.describe_opts(DescribeOpts {
+        explain: Some(Explain {
+            from: "sub::source".to_owned(),
+            to: "sub::sink".to_owned(),
+        }),
+    });
+
+    assert_eq!(explain.subgraphs, None);
+    let ids = explain
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["sub::source", "sub::sink"]);
+    assert_eq!(
+        explain.edges,
+        vec![DescribeEdge {
+            from: "sub::source".to_owned(),
+            to: "sub::sink".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn profile_counts_graph_registered_invokes_when_enabled() {
+    let g = graph_opts(GraphOptions {
+        name: Some("profile-demo".to_owned()),
+        profile: true,
+    });
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let doubled = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_alive = doubled.subscribe(|_| {});
+    source.set(2);
+
+    let profile = g.profile();
+    assert!(profile.total_invokes >= 2);
+    assert_eq!(profile.nodes["source"].invokes, 0);
+    assert!(profile.nodes["doubled"].invokes >= 2);
+    assert_eq!(profile.nodes["doubled"].status, Status::Settled);
+}
+
+#[test]
+fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
+    let parent = graph_opts(GraphOptions {
+        name: Some("profile-parent".to_owned()),
+        profile: true,
+    });
+    let child = graph();
+    let leaf = child.state_opts(1i32, GraphNodeOpts::named("leaf"));
+    let doubled = child.derived_opts(
+        vec![leaf.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_doubled = doubled.subscribe(|_| {});
+    parent.mount(child, "sub");
+
+    let profile = parent.profile();
+    assert!(profile.nodes.contains_key("sub::leaf"));
+    assert!(profile.nodes["sub::doubled"].invokes >= 1);
+
+    let panics = graph_opts(GraphOptions {
+        name: Some("panic-profile".to_owned()),
+        profile: true,
+    });
+    let bad = panics.producer_opts::<i32, _>(|_| panic!("boom"), GraphNodeOpts::named("bad"));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _keep_bad = bad.subscribe(|_| {});
+    }));
+    assert!(
+        result.is_ok(),
+        "D30 catch boundary converts the user panic to ERROR"
+    );
+    let profile = panics.profile();
+    assert_eq!(profile.nodes["bad"].invokes, 1);
+    assert_eq!(profile.nodes["bad"].status, Status::Errored);
+}
+
+#[test]
+fn first_operator_and_source_slice_is_graph_visible() {
+    let g = graph();
+    let source = g.init_node(
+        from_iter(vec![1i32, 2, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("source"),
+    );
+    let mapped = g.init_node(
+        map::<i32, i32>(|v| v * 2),
+        vec![source.erased()],
+        GraphNodeOpts::named("mapped"),
+    );
+    let filtered = g.init_node(
+        filter::<i32>(|v| *v == 4),
+        vec![mapped.erased()],
+        GraphNodeOpts::named("filtered"),
+    );
+    let distinct = g.init_node(
+        distinct_until_changed::<i32>(|a, b| a == b),
+        vec![filtered.erased()],
+        GraphNodeOpts::named("distinct"),
+    );
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let event_sink = events.clone();
+    let _keep_alive = distinct.subscribe(move |msg| match msg {
+        Message::Data(value) => {
+            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                event_sink.borrow_mut().push(format!("DATA:{v}"));
+            }
+        }
+        other => event_sink.borrow_mut().push(format!("{other:?}")),
+    });
+
+    assert_eq!(distinct.cache(), Some(4));
+    assert!(events.borrow().contains(&"DATA:4".to_owned()));
+    assert!(events.borrow().contains(&"COMPLETE".to_owned()));
+
+    let snap = g.describe();
+    let factory = |id: &str| {
+        snap.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.factory.as_str())
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(factory("source"), "fromIter");
+    assert_eq!(factory("mapped"), "map");
+    assert_eq!(factory("filtered"), "filter");
+    assert_eq!(factory("distinct"), "distinctUntilChanged");
+}
+
+#[test]
+fn scan_and_take_preserve_occurrence_semantics() {
+    let g = graph();
+    let source = g.init_node(
+        from_iter(vec![1i32, 1, 1, 2]),
+        vec![],
+        GraphNodeOpts::named("source"),
+    );
+    let scanned = g.init_node(
+        scan::<i32, i32>(|acc, v| acc + *v, 0),
+        vec![source.erased()],
+        GraphNodeOpts::named("scanned"),
+    );
+    let first_three = g.init_node(
+        take::<i32>(3),
+        vec![scanned.erased()],
+        GraphNodeOpts::named("first_three"),
+    );
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_sink = seen.clone();
+    let _keep_alive = first_three.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                seen_sink.borrow_mut().push(*v);
+            }
+        }
+    });
+
+    assert_eq!(*seen.borrow(), vec![1, 2, 3]);
+    assert_eq!(first_three.status(), Status::Completed);
+}
+
+#[test]
+fn operator_caller_opts_do_not_drop_intrinsic_partial_flag() {
+    let g = graph();
+    let left = g.state_empty_opts::<i32>(GraphNodeOpts::named("left"));
+    let right = g.state_empty_opts::<i32>(GraphNodeOpts::named("right"));
+    let mut opts = GraphNodeOpts::named("merged");
+    opts.node = NodeOpts {
+        pausable: Pausable::False,
+        ..NodeOpts::default()
+    };
+    let merged = g.init_node(merge::<i32>(), vec![left.erased(), right.erased()], opts);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_sink = seen.clone();
+    let _keep_alive = merged.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                seen_sink.borrow_mut().push(*v);
+            }
+        }
+    });
+
+    left.set(7);
+
+    assert_eq!(*seen.borrow(), vec![7]);
+    assert_eq!(merged.cache(), Some(7));
 }

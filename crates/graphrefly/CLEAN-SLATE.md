@@ -64,7 +64,7 @@ silent no-op, never a recycled-slot misfire. Rust-only; B15 is the TS sibling
 | `ctx` | **impl** — `Ctx` (`down`/`emit`/**`wave_data`** + `terminal` raw dep input, typed `data`/`batch` derived helpers, `state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
 | `batch` | **impl** — `batch(fn)` + `BatchCtx::rollback()` (D12); tier≥3 settle slices defer to commit with last-value coalescing; rollback balances the immediate DIRTY with RESOLVED; boundary drains are held until after commit; immediate rewire on a node with an uncommitted batch slice defers per D67. |
 
-**32 unit + 23 conformance + 13 graph-layer tests green** (clippy `-D warnings` clean, fmt clean,
+**33 unit + 23 conformance + 20 graph-layer tests green** (clippy `-D warnings` clean, fmt clean,
 `#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
 PAUSE lockset multi-source, **C-6** sync feedback cycle→ERROR (+B25 recovery), **C-13**
 INVALIDATE×PAUSE precedence, **C-14** per-run cleanup hooks (control/terminal slice),
@@ -197,6 +197,28 @@ SUGAR (a future Rust graph layer, CSP-2-rs).
 
 **Arm status:** C-2..C-23 except C-1 are `rust:pass`. Remaining Rust conformance
 todo: C-1 (wire bridge, B2/post-1.0).
+
+## B53 product surface catch-up (Rust, started 2026-06-02)
+
+The Rust product-completeness path has moved beyond substrate conformance. First
+B53 graph/product slices now include:
+
+- D39 inspection completion first cut: graph `profile()` backed by the dispatcher
+  invoke recorder (default off), `describe_opts({ explain })`, live-deps
+  auto-discovery support for unregistered same-graph deps, and pure renderers
+  `describe_to_mermaid` / `describe_to_d2` / `describe_to_pretty` /
+  `describe_to_ascii` / `describe_to_json` / Mermaid Live URL helpers.
+- D40 catalog base first cut: graph-bound `Graph::init_node`, free-standing
+  `Operator<T>` definitions, sync sources `of` / `from_iter`, and core operators
+  `map` / `filter` / `scan` / `take` / `distinct_until_changed` / `merge`.
+- QA fixes: operator caller opts layer over intrinsic factory flags (so `merge`
+  keeps `partial:true`), synthetic describe ids include the arena-slot
+  generation, profile snapshots include mounted `::` paths and count panicking
+  invokes, and explain filtering flattens mounted snapshots before taking the
+  causal-chain subset.
+
+This is product surface work (D6/D24), not conformance parity. It does not change
+wave protocol behavior.
 
 ## Cross-track sequencing
 

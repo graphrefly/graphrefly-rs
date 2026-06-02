@@ -59,15 +59,25 @@ pub mod ctx;
 pub mod dispatcher;
 pub mod graph;
 pub mod node;
+pub mod operators;
 pub mod protocol;
+pub mod render;
+pub mod sources;
 
 pub use batch::{batch, BatchCtx};
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use graph::{
-    graph, graph_opts, DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, Graph,
-    GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, ObserveEvent, ObserveMessage,
-    ObserveStream, Values,
+    graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
+    Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, NodeProfile,
+    ObserveEvent, ObserveMessage, ObserveStream, Profile, Values,
 };
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
+pub use operators::{distinct_until_changed, filter, init_node, map, merge, scan, take, Operator};
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
+pub use render::{
+    describe_to_ascii, describe_to_d2, describe_to_d2_with_direction, describe_to_json,
+    describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
+    describe_to_pretty, mermaid_live_url, DiagramDirection,
+};
+pub use sources::{from_iter, of};

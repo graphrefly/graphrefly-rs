@@ -109,6 +109,9 @@ pub enum Pausable {
 /// pause mode (R-pause-modes), and the dep-terminal propagation policy (R-deps-terminal).
 #[derive(Debug, Clone)]
 pub struct NodeOpts {
+    /// Real factory name for graph-less nodes that `describe` auto-discovers (D43/D51).
+    /// Registered graph entries still carry their own graph-layer factory string.
+    pub factory: Option<String>,
     /// The dispatch pool (default LocalSync, R-sync-core).
     pub pool: PoolKind,
     /// The pause mode (default `true`, R-pause-modes).
@@ -137,6 +140,7 @@ pub struct NodeOpts {
 impl Default for NodeOpts {
     fn default() -> Self {
         Self {
+            factory: None,
             pool: PoolKind::default(),
             pausable: Pausable::default(),
             partial: false,
@@ -179,7 +183,7 @@ impl GraphArena {
         Self(Rc::new(RefCell::new(GraphCore::new())))
     }
 
-    fn default() -> Self {
+    pub(crate) fn default() -> Self {
         DEFAULT_GRAPH_CORE.with(|graph| Self(graph.clone()))
     }
 }
@@ -188,6 +192,7 @@ struct GraphCore {
     slots: Vec<Option<NodeInner>>,
     edge_slots: Vec<Option<DepEdges>>,
     aux_slots: Vec<Option<NodeAux>>,
+    generations: Vec<u64>,
     free: Vec<usize>,
     deferred_boundary: VecDeque<Box<dyn FnOnce()>>,
     draining_boundary: bool,
@@ -199,6 +204,7 @@ impl GraphCore {
             slots: Vec::new(),
             edge_slots: Vec::new(),
             aux_slots: Vec::new(),
+            generations: Vec::new(),
             free: Vec::new(),
             deferred_boundary: VecDeque::new(),
             draining_boundary: false,
@@ -212,12 +218,14 @@ impl GraphCore {
             self.slots[id] = Some(inner);
             self.edge_slots[id] = Some(edges);
             self.aux_slots[id] = Some(aux);
+            self.generations[id] = self.generations[id].wrapping_add(1);
             NodeId(id)
         } else {
             let id = self.slots.len();
             self.slots.push(Some(inner));
             self.edge_slots.push(Some(edges));
             self.aux_slots.push(Some(aux));
+            self.generations.push(0);
             NodeId(id)
         }
     }
@@ -488,6 +496,7 @@ impl NodeAux {
 /// reentrant engine lives on [`Core`].
 struct NodeInner {
     deps: Vec<Core>,
+    factory: Option<String>,
     handle: Option<Handle>,
     dispatcher: Dispatcher,
     /// First-run gate off (fn fires as soon as dirty-count hits 0; fn body guards
@@ -1085,6 +1094,22 @@ impl Core {
         self.with_inner_edges(|_n, e| e.value.status)
     }
 
+    pub(crate) fn handle(&self) -> Option<Handle> {
+        self.borrow().handle
+    }
+
+    pub(crate) fn factory(&self) -> Option<String> {
+        self.borrow().factory.clone()
+    }
+
+    pub(crate) fn identity_key(&self) -> (usize, usize, u64) {
+        (
+            Rc::as_ptr(&self.graph) as usize,
+            self.id.0,
+            self.graph.borrow().generations[self.id.0],
+        )
+    }
+
     fn new_in_arena(
         arena: &GraphArena,
         deps: Vec<Core>,
@@ -1101,6 +1126,7 @@ impl Core {
         }
         let inner = NodeInner {
             deps,
+            factory: None,
             handle,
             dispatcher,
             partial: false,
@@ -2778,6 +2804,7 @@ impl<T: 'static> Node<T> {
     pub fn producer_async<F: Fn(&Ctx) + 'static>(f: F) -> Node<T> {
         Self::producer_opts(
             NodeOpts {
+                factory: None,
                 pool: PoolKind::Async,
                 pausable: Pausable::True,
                 ..NodeOpts::default()
@@ -2801,11 +2828,13 @@ impl<T: 'static> Node<T> {
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
         );
         let disp = default_dispatcher();
+        let factory = opts.factory.clone();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
         let node = Node {
             core: Core::new_in_arena(arena, vec![], Some(handle), disp, None, opts.pausable),
             _t: PhantomData,
         };
+        node.core.borrow_mut().factory = factory;
         node.core.configure_pull(opts.pull_id);
         node
     }
@@ -2828,6 +2857,7 @@ impl<T: 'static> Node<T> {
         Self::derived_opts(
             deps,
             NodeOpts {
+                factory: None,
                 pool: PoolKind::Async,
                 pausable: Pausable::True,
                 ..NodeOpts::default()
@@ -2852,6 +2882,7 @@ impl<T: 'static> Node<T> {
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
         );
         let disp = default_dispatcher();
+        let factory = opts.factory.clone();
         let handle = register_with(&disp, opts.pool, Rc::new(f));
         let node = Node {
             core: Core::new_in_arena(arena, deps, Some(handle), disp, None, opts.pausable),
@@ -2865,6 +2896,7 @@ impl<T: 'static> Node<T> {
             n.complete_when_deps_complete = opts.complete_when_deps_complete;
             n.error_when_deps_error = opts.error_when_deps_error;
             n.terminal_as_real_input = opts.terminal_as_real_input;
+            n.factory = factory;
         }
         node.core.configure_pull(opts.pull_id);
         node
@@ -3382,6 +3414,33 @@ mod tests {
         assert!(
             free_after > free_before,
             "panicking cleanup still returns the arena slot to the free list"
+        );
+    }
+
+    #[test]
+    fn identity_key_changes_when_arena_slot_is_reused() {
+        let first = Node::<i32>::producer_opts(
+            NodeOpts {
+                factory: Some("first".to_owned()),
+                ..NodeOpts::default()
+            },
+            |_| {},
+        );
+        let first_key = first.erased().identity_key();
+        drop(first);
+
+        let second = Node::<i32>::producer_opts(
+            NodeOpts {
+                factory: Some("second".to_owned()),
+                ..NodeOpts::default()
+            },
+            |_| {},
+        );
+        let second_key = second.erased().identity_key();
+
+        assert_ne!(
+            first_key, second_key,
+            "D51 synthetic describe ids must not inherit across reused arena slots"
         );
     }
 

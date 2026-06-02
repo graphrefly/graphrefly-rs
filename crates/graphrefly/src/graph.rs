@@ -5,24 +5,28 @@
 //! (R-node-thin / D39) while substrate nodes remain arena-slot handles.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::batch::{batch as run_batch, BatchCtx};
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
+use crate::dispatcher::{default_dispatcher, Dispatcher};
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
+use crate::operators::{init_node_in_arena, Operator};
 use crate::protocol::{AnyValue, LockId, Message, Tier};
 
 /// Graph construction options.
 #[derive(Debug, Clone, Default)]
 pub struct GraphOptions {
     pub name: Option<String>,
+    pub profile: bool,
 }
 
 impl GraphOptions {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
+            profile: false,
         }
     }
 }
@@ -66,6 +70,8 @@ struct GraphInner {
     by_id: RefCell<HashMap<String, Core>>,
     mounts: RefCell<Vec<Mount>>,
     seq: Cell<usize>,
+    synth_seq: Cell<usize>,
+    synth_ids: RefCell<HashMap<(usize, usize, u64), String>>,
     clock: Rc<Cell<u64>>,
 }
 
@@ -77,6 +83,9 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(opts: GraphOptions) -> Self {
+        if opts.profile {
+            default_dispatcher().set_recording(true);
+        }
         Self {
             inner: Rc::new(GraphInner {
                 name: opts.name,
@@ -85,6 +94,8 @@ impl Graph {
                 by_id: RefCell::new(HashMap::new()),
                 mounts: RefCell::new(Vec::new()),
                 seq: Cell::new(0),
+                synth_seq: Cell::new(0),
+                synth_ids: RefCell::new(HashMap::new()),
                 clock: Rc::new(Cell::new(0)),
             }),
         }
@@ -212,6 +223,18 @@ impl Graph {
         run_batch(f)
     }
 
+    /// Instantiate a free-standing operator/source as a registered graph node (D43/D40).
+    pub fn init_node<T: 'static>(
+        &self,
+        op: Operator<T>,
+        deps: Vec<Core>,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
+        self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or(op.factory));
+        let node = init_node_in_arena(op.clone(), &self.inner.arena, deps, opts.node.clone());
+        self.add(node, op.factory, opts)
+    }
+
     /// Mount a child graph under a stable `::` path prefix.
     pub fn mount(&self, child: Graph, at: impl Into<String>) {
         let at = at.into();
@@ -232,7 +255,16 @@ impl Graph {
 
     /// Static point-in-time inspection snapshot (D39 first cut).
     pub fn describe(&self) -> DescribeSnapshot {
-        self.describe_with_prefix("")
+        self.describe_opts(DescribeOpts::default())
+    }
+
+    pub fn describe_opts(&self, opts: DescribeOpts) -> DescribeSnapshot {
+        let snap = self.describe_with_prefix("");
+        if let Some(explain) = opts.explain {
+            explain_subset(snap, &explain)
+        } else {
+            snap
+        }
     }
 
     /// Read-only observation egress for every currently registered node in this graph.
@@ -248,6 +280,52 @@ impl Graph {
         ObserveStream {
             graph: self.clone(),
             path: Some(path.to_owned()),
+        }
+    }
+
+    /// Opt-in accumulated-counter snapshot (D39/R-profile).
+    pub fn profile(&self) -> Profile {
+        let dispatcher = default_dispatcher();
+        let mut total_invokes = 0;
+        let mut nodes = BTreeMap::new();
+        self.collect_profile("", &dispatcher, &mut nodes, &mut total_invokes);
+        Profile {
+            total_invokes,
+            nodes,
+        }
+    }
+
+    fn collect_profile(
+        &self,
+        prefix: &str,
+        dispatcher: &Dispatcher,
+        nodes: &mut BTreeMap<String, NodeProfile>,
+        total_invokes: &mut u64,
+    ) {
+        for entry in self.inner.entries.borrow().iter() {
+            let stat = entry
+                .core
+                .handle()
+                .and_then(|handle| dispatcher.stat_for(handle));
+            let invokes = stat.map_or(0, |s| s.invokes);
+            *total_invokes += invokes;
+            nodes.insert(
+                format!("{prefix}{}", entry.id),
+                NodeProfile {
+                    invokes,
+                    total_duration_ns: stat.map_or(0, |s| s.total_duration_ns),
+                    last_duration_ns: stat.map_or(0, |s| s.last_duration_ns),
+                    status: entry.core.status(),
+                },
+            );
+        }
+        for mount in self.inner.mounts.borrow().iter() {
+            mount.graph.collect_profile(
+                &format!("{prefix}{}::", mount.at),
+                dispatcher,
+                nodes,
+                total_invokes,
+            );
         }
     }
 
@@ -286,7 +364,7 @@ impl Graph {
         }
     }
 
-    fn id_for_core(&self, core: &Core, prefix: &str) -> Option<String> {
+    fn registered_id_for_core(&self, core: &Core, prefix: &str) -> Option<String> {
         self.inner
             .entries
             .borrow()
@@ -295,17 +373,50 @@ impl Graph {
             .map(|entry| format!("{prefix}{}", entry.id))
     }
 
+    fn synthetic_id_for_core(&self, core: &Core, prefix: &str) -> String {
+        let key = core.identity_key();
+        let id = {
+            let mut synth = self.inner.synth_ids.borrow_mut();
+            if let Some(id) = synth.get(&key) {
+                id.clone()
+            } else {
+                let next = self.inner.synth_seq.get();
+                self.inner.synth_seq.set(next + 1);
+                let id = format!(
+                    "~{}#{next}",
+                    core.factory().unwrap_or_else(|| "?".to_owned())
+                );
+                synth.insert(key, id.clone());
+                id
+            }
+        };
+        format!("{prefix}{id}")
+    }
+
+    fn id_for_core(&self, core: &Core, prefix: &str) -> String {
+        self.registered_id_for_core(core, prefix)
+            .unwrap_or_else(|| self.synthetic_id_for_core(core, prefix))
+    }
+
     fn describe_with_prefix(&self, prefix: &str) -> DescribeSnapshot {
         let entries = self.inner.entries.borrow().clone();
         let mut nodes = Vec::with_capacity(entries.len());
         let mut edges = Vec::new();
+        let mut discovered: Vec<Core> = Vec::new();
         for entry in &entries {
             let id = format!("{prefix}{}", entry.id);
             let deps: Vec<String> = entry
                 .core
                 .deps()
                 .iter()
-                .filter_map(|dep| self.id_for_core(dep, prefix))
+                .map(|dep| {
+                    if self.registered_id_for_core(dep, prefix).is_none()
+                        && !discovered.iter().any(|d| d.ptr_eq(dep))
+                    {
+                        discovered.push(dep.clone());
+                    }
+                    self.id_for_core(dep, prefix)
+                })
                 .collect();
             for dep_id in &deps {
                 edges.push(DescribeEdge {
@@ -325,6 +436,44 @@ impl Graph {
                 } else {
                     Some(entry.meta.clone())
                 },
+            });
+        }
+        let mut seen = HashSet::new();
+        let mut i = 0;
+        while i < discovered.len() {
+            let core = discovered[i].clone();
+            i += 1;
+            let key = core.identity_key();
+            if !seen.insert(key) {
+                continue;
+            }
+            let id = self.synthetic_id_for_core(&core, prefix);
+            let deps: Vec<String> = core
+                .deps()
+                .iter()
+                .map(|dep| {
+                    if self.registered_id_for_core(dep, prefix).is_none()
+                        && !discovered.iter().any(|d| d.ptr_eq(dep))
+                    {
+                        discovered.push(dep.clone());
+                    }
+                    self.id_for_core(dep, prefix)
+                })
+                .collect();
+            for dep_id in &deps {
+                edges.push(DescribeEdge {
+                    from: dep_id.clone(),
+                    to: id.clone(),
+                });
+            }
+            nodes.push(DescribeNode {
+                id,
+                name: None,
+                factory: core.factory().unwrap_or_else(|| "?".to_owned()),
+                status: core.status(),
+                value: core.cache_any().as_ref().map(describe_value),
+                deps,
+                meta: None,
             });
         }
         let subgraphs = self
@@ -421,6 +570,17 @@ pub fn graph() -> Graph {
 
 pub fn graph_opts(opts: GraphOptions) -> Graph {
     Graph::new(opts)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescribeOpts {
+    pub explain: Option<Explain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explain {
+    pub from: String,
+    pub to: String,
 }
 
 /// Read-only value-level view over a node fn's dependency snapshot (D27/R-primary-api-clean).
@@ -633,6 +793,75 @@ impl Drop for GraphObserver {
     fn drop(&mut self) {
         self.unsubscribe_all();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeProfile {
+    pub invokes: u64,
+    pub total_duration_ns: u128,
+    pub last_duration_ns: u128,
+    pub status: Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub total_invokes: u64,
+    pub nodes: BTreeMap<String, NodeProfile>,
+}
+
+fn explain_subset(snapshot: DescribeSnapshot, explain: &Explain) -> DescribeSnapshot {
+    let snapshot = flatten_describe_snapshot(snapshot);
+    let mut fwd: HashMap<String, Vec<String>> = HashMap::new();
+    let mut rev: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in &snapshot.edges {
+        fwd.entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+        rev.entry(edge.to.clone())
+            .or_default()
+            .push(edge.from.clone());
+    }
+    let from_reach = reachable(&explain.from, &fwd);
+    let to_reach = reachable(&explain.to, &rev);
+    let on_path: HashSet<String> = from_reach.intersection(&to_reach).cloned().collect();
+    DescribeSnapshot {
+        name: snapshot.name,
+        nodes: snapshot
+            .nodes
+            .into_iter()
+            .filter(|node| on_path.contains(&node.id))
+            .collect(),
+        edges: snapshot
+            .edges
+            .into_iter()
+            .filter(|edge| on_path.contains(&edge.from) && on_path.contains(&edge.to))
+            .collect(),
+        subgraphs: None,
+    }
+}
+
+fn flatten_describe_snapshot(mut snapshot: DescribeSnapshot) -> DescribeSnapshot {
+    if let Some(subgraphs) = snapshot.subgraphs.take() {
+        for child in subgraphs {
+            let mut child = flatten_describe_snapshot(child);
+            snapshot.nodes.append(&mut child.nodes);
+            snapshot.edges.append(&mut child.edges);
+        }
+    }
+    snapshot
+}
+
+fn reachable(start: &str, adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    let mut seen = HashSet::from([start.to_owned()]);
+    let mut stack = vec![start.to_owned()];
+    while let Some(current) = stack.pop() {
+        for next in adj.get(&current).into_iter().flatten() {
+            if seen.insert(next.clone()) {
+                stack.push(next.clone());
+            }
+        }
+    }
+    seen
 }
 
 fn describe_value(value: &AnyValue) -> DescribeValue {

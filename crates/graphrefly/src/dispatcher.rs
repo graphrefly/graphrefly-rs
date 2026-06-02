@@ -16,7 +16,9 @@
 //! later slices.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::ctx::Ctx;
 pub use crate::protocol::Handle;
@@ -114,12 +116,24 @@ struct DispatcherInner {
     /// `pools[SYNC_POOL_ID]` = sync, `pools[ASYNC_POOL_ID]` = async. The trait stays
     /// pluggable for WorkerPool/RemotePool (D20) — a `Vec` so a new pool just appends.
     pools: Vec<Pool>,
+    /// Opt-in profile recorder (D39 / R-profile). Default off = one boolean branch
+    /// per invoke; counters live on the dispatcher, not on the thin node.
+    recording: bool,
+    stats: HashMap<Handle, ProfileStat>,
 }
 
 /// First-class dispatcher (D21), cloneable handle over shared inner state. A graph
 /// binds one; the default is the process(thread)-global singleton (D26).
 #[derive(Clone)]
 pub struct Dispatcher(Rc<RefCell<DispatcherInner>>);
+
+/// Per-handle accumulated profile counters (D39).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileStat {
+    pub invokes: u64,
+    pub total_duration_ns: u128,
+    pub last_duration_ns: u128,
+}
 
 /// The LocalSync pool id (D20).
 pub const SYNC_POOL_ID: u32 = 0;
@@ -131,7 +145,19 @@ impl Dispatcher {
         Dispatcher(Rc::new(RefCell::new(DispatcherInner {
             // index order MUST match SYNC_POOL_ID / ASYNC_POOL_ID.
             pools: vec![Pool::new(PoolKind::Sync), Pool::new(PoolKind::Async)],
+            recording: false,
+            stats: HashMap::new(),
         })))
+    }
+
+    /// Turn the profile recorder on/off (D39). Off = near-zero invoke overhead.
+    pub fn set_recording(&self, on: bool) {
+        self.0.borrow_mut().recording = on;
+    }
+
+    /// Read one handle's accumulated counters.
+    pub fn stat_for(&self, handle: Handle) -> Option<ProfileStat> {
+        self.0.borrow().stats.get(&handle).copied()
     }
 
     /// Register a fn in the sync pool, returning its [`Handle`] (R-dispatch-all).
@@ -165,23 +191,55 @@ impl Dispatcher {
     /// holding a dropped node's fn (and thus its captured upstream `Core`s) alive for
     /// the whole process. Idempotent / generation-checked: a stale unregister is a no-op.
     pub fn unregister(&self, handle: Handle) {
-        self.0.borrow_mut().pools[handle.pool_id as usize]
-            .unregister(handle.handle_id, handle.generation);
+        let mut inner = self.0.borrow_mut();
+        inner.pools[handle.pool_id as usize].unregister(handle.handle_id, handle.generation);
+        inner.stats.remove(&handle);
     }
 
     /// Uniform sync-void invoke (R-sync-core / R-dispatch-all). Clones the fn out
     /// and drops the pool borrow before calling, so a nested downstream invoke
     /// triggered from inside the fn does not double-borrow the pool.
     pub fn invoke(&self, handle: Handle, ctx: &Ctx) {
-        let f =
-            self.0.borrow().pools[handle.pool_id as usize].get(handle.handle_id, handle.generation);
+        let (f, recording) = {
+            let inner = self.0.borrow();
+            (
+                inner.pools[handle.pool_id as usize].get(handle.handle_id, handle.generation),
+                inner.recording,
+            )
+        };
         // A live node is the SOLE invoker of its own handle, so the slot is present on
         // the live path. A generation mismatch (a stale handle — e.g. a future
         // async-pool deferred callback firing after the node dropped + the slot was
         // recycled) yields None → a silent no-op, never a recycled-slot misfire.
         if let Some(f) = f {
-            f(ctx);
+            if recording {
+                let _profile = InvokeProfileGuard {
+                    dispatcher: self.clone(),
+                    handle,
+                    start: Instant::now(),
+                };
+                f(ctx);
+            } else {
+                f(ctx);
+            }
         }
+    }
+}
+
+struct InvokeProfileGuard {
+    dispatcher: Dispatcher,
+    handle: Handle,
+    start: Instant,
+}
+
+impl Drop for InvokeProfileGuard {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed().as_nanos();
+        let mut inner = self.dispatcher.0.borrow_mut();
+        let stat = inner.stats.entry(self.handle).or_default();
+        stat.invokes += 1;
+        stat.total_duration_ns += elapsed;
+        stat.last_duration_ns = elapsed;
     }
 }
 
