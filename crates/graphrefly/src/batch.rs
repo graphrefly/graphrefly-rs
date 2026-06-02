@@ -21,7 +21,8 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::node::{
-    clear_deferred_boundary_tasks, defer_boundary_task, drain_committed_boundary, Core,
+    boundary_root_for, clear_deferred_boundary_root, clear_deferred_boundary_tasks,
+    drain_committed_boundaries, BoundaryRoot, Core,
 };
 use crate::protocol::{AnyValue, Wave};
 
@@ -42,6 +43,7 @@ impl BatchCtx {
 struct ActiveBatch {
     order: Vec<Core>,
     deferred: Vec<DeferredEntry>,
+    boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     rolled_back: Rc<Cell<bool>>,
     collecting: bool,
@@ -52,6 +54,7 @@ impl ActiveBatch {
         Self {
             order: Vec::new(),
             deferred: Vec::new(),
+            boundary_roots: Vec::new(),
             committed,
             rolled_back,
             collecting: true,
@@ -71,6 +74,22 @@ pub(crate) fn boundary_drains_blocked() -> bool {
 
 pub(crate) fn collecting_batch() -> bool {
     ACTIVE_BATCH.with(|b| b.borrow().as_ref().is_some_and(|batch| batch.collecting))
+}
+
+/// Remember that a graph-local committed-boundary task was queued during this batch.
+/// Some tasks do not also create a tier>=3 batched wave, so they need their graph root
+/// included in the post-commit drain/rollback cleanup set (R-rewire-batch-boundary).
+pub(crate) fn register_boundary_root(target: &Core) {
+    ACTIVE_BATCH.with(|b| {
+        let mut active = b.borrow_mut();
+        let Some(batch) = active.as_mut() else {
+            return;
+        };
+        if batch.boundary_roots.iter().any(|r| r.same_graph(target)) {
+            return;
+        }
+        batch.boundary_roots.push(boundary_root_for(target));
+    });
 }
 
 /// Capture a tier>=3 settle slice into the current collecting batch. Returns false when
@@ -98,38 +117,28 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
     })
 }
 
-/// Queue a topology mutation until after the active batch commits, but only when this
-/// target has an uncommitted settle slice in that batch (R-rewire-batch-boundary / D67).
-pub(crate) fn defer_after_batch_for_target(target: &Core, f: Box<dyn FnOnce()>) -> bool {
+/// Return the active batch's commit token, but only when this target has an
+/// uncommitted settle slice in that batch (R-rewire-batch-boundary / D67).
+pub(crate) fn committed_after_batch_for_target(target: &Core) -> Option<Rc<Cell<bool>>> {
     ACTIVE_BATCH.with(|b| {
         let active = b.borrow();
-        let Some(batch) = active.as_ref() else {
-            return false;
-        };
+        let batch = active.as_ref()?;
         if !batch.collecting
             || !batch
                 .deferred
                 .iter()
                 .any(|(existing, _)| existing.ptr_eq(target))
         {
-            return false;
+            return None;
         }
-        let committed = batch.committed.clone();
-        defer_boundary_task(
-            target,
-            Box::new(move || {
-                if committed.get() {
-                    f();
-                }
-            }),
-        );
-        true
+        Some(batch.committed.clone())
     })
 }
 
 struct BatchFinish {
     order: Vec<Core>,
     deferred: Vec<DeferredEntry>,
+    boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     explicit_rollback: bool,
 }
@@ -142,6 +151,7 @@ fn take_for_finish() -> BatchFinish {
         BatchFinish {
             order: std::mem::take(&mut batch.order),
             deferred: std::mem::take(&mut batch.deferred),
+            boundary_roots: std::mem::take(&mut batch.boundary_roots),
             committed: batch.committed.clone(),
             explicit_rollback: batch.rolled_back.get(),
         }
@@ -183,23 +193,54 @@ fn boundary_graph_roots(order: &[Core], deferred: &[DeferredEntry]) -> Vec<Core>
     roots
 }
 
-fn clear_boundary_for_roots(roots: &[Core]) {
-    for root in roots {
+fn take_late_boundary_roots() -> Vec<BoundaryRoot> {
+    ACTIVE_BATCH.with(|b| {
+        let mut active = b.borrow_mut();
+        active
+            .as_mut()
+            .map(|batch| std::mem::take(&mut batch.boundary_roots))
+            .unwrap_or_default()
+    })
+}
+
+fn append_boundary_roots(
+    task_roots: &mut Vec<BoundaryRoot>,
+    core_roots: &[Core],
+    boundary_roots: Vec<BoundaryRoot>,
+) {
+    for root in boundary_roots {
+        if core_roots.iter().any(|r| root.same_graph(r))
+            || task_roots.iter().any(|r| r.same_root(&root))
+        {
+            continue;
+        }
+        task_roots.push(root);
+    }
+}
+
+fn clear_boundary_for_roots(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
+    for root in core_roots {
         clear_deferred_boundary_tasks(root);
     }
-}
-
-fn drain_boundary_for_roots(roots: &[Core]) {
-    for root in roots {
-        drain_committed_boundary(root);
+    for root in task_roots {
+        clear_deferred_boundary_root(root);
     }
 }
 
-fn rollback_and_cleanup(order: Vec<Core>) -> std::thread::Result<()> {
-    let roots = boundary_graph_roots(&order, &[]);
+fn drain_boundary_for_roots(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
+    drain_committed_boundaries(core_roots, task_roots);
+}
+
+fn rollback_and_cleanup(
+    order: Vec<Core>,
+    mut task_roots: Vec<BoundaryRoot>,
+) -> std::thread::Result<()> {
+    let core_roots = boundary_graph_roots(&order, &[]);
     let result = catch_unwind(AssertUnwindSafe(|| rollback(order)));
+    let late_roots = take_late_boundary_roots();
+    append_boundary_roots(&mut task_roots, &core_roots, late_roots);
     clear_active();
-    clear_boundary_for_roots(&roots);
+    clear_boundary_for_roots(&core_roots, &task_roots);
     result
 }
 
@@ -224,29 +265,37 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     };
     let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
     let finish = take_for_finish();
-    let boundary_roots = boundary_graph_roots(&finish.order, &finish.deferred);
+    let boundary_core_roots = boundary_graph_roots(&finish.order, &finish.deferred);
+    let mut boundary_task_roots = Vec::new();
+    append_boundary_roots(
+        &mut boundary_task_roots,
+        &boundary_core_roots,
+        finish.boundary_roots,
+    );
 
     match result {
         Ok(value) => {
             if finish.explicit_rollback {
-                if let Err(payload) = rollback_and_cleanup(finish.order) {
+                if let Err(payload) = rollback_and_cleanup(finish.order, boundary_task_roots) {
                     resume_unwind(payload);
                 }
             } else {
                 let commit_result = catch_unwind(AssertUnwindSafe(|| commit(finish.deferred)));
+                let late_roots = take_late_boundary_roots();
+                append_boundary_roots(&mut boundary_task_roots, &boundary_core_roots, late_roots);
                 if let Err(payload) = commit_result {
                     clear_active();
-                    clear_boundary_for_roots(&boundary_roots);
+                    clear_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
                     resume_unwind(payload);
                 }
                 finish.committed.set(true);
                 clear_active();
-                drain_boundary_for_roots(&boundary_roots);
+                drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
             }
             value
         }
         Err(payload) => {
-            if let Err(rollback_payload) = rollback_and_cleanup(finish.order) {
+            if let Err(rollback_payload) = rollback_and_cleanup(finish.order, boundary_task_roots) {
                 resume_unwind(rollback_payload);
             }
             resume_unwind(payload);
