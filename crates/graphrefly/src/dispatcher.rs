@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -126,6 +127,12 @@ struct DispatcherInner {
 /// binds one; the default is the process(thread)-global singleton (D26).
 #[derive(Clone)]
 pub struct Dispatcher(Rc<RefCell<DispatcherInner>>);
+
+impl fmt::Debug for Dispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Dispatcher").finish_non_exhaustive()
+    }
+}
 
 /// Per-handle accumulated profile counters (D39).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

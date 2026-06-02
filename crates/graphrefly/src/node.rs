@@ -2757,12 +2757,20 @@ impl<T: 'static> Node<T> {
     }
 
     pub(crate) fn state_in_arena(arena: &GraphArena, initial: T) -> Node<T> {
+        Self::state_in_arena_with_dispatcher(arena, default_dispatcher(), initial)
+    }
+
+    pub(crate) fn state_in_arena_with_dispatcher(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+        initial: T,
+    ) -> Node<T> {
         Node {
             core: Core::new_in_arena(
                 arena,
                 vec![],
                 None,
-                default_dispatcher(),
+                dispatcher,
                 Some(Rc::new(initial)),
                 Pausable::True,
             ),
@@ -2776,15 +2784,15 @@ impl<T: 'static> Node<T> {
     }
 
     pub(crate) fn state_empty_in_arena(arena: &GraphArena) -> Node<T> {
+        Self::state_empty_in_arena_with_dispatcher(arena, default_dispatcher())
+    }
+
+    pub(crate) fn state_empty_in_arena_with_dispatcher(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+    ) -> Node<T> {
         Node {
-            core: Core::new_in_arena(
-                arena,
-                vec![],
-                None,
-                default_dispatcher(),
-                None,
-                Pausable::True,
-            ),
+            core: Core::new_in_arena(arena, vec![], None, dispatcher, None, Pausable::True),
             _t: PhantomData,
         }
     }
@@ -2823,15 +2831,23 @@ impl<T: 'static> Node<T> {
         opts: NodeOpts,
         f: F,
     ) -> Node<T> {
+        Self::producer_opts_in_arena_with_dispatcher(arena, default_dispatcher(), opts, f)
+    }
+
+    pub(crate) fn producer_opts_in_arena_with_dispatcher<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
         assert!(
             !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
         );
-        let disp = default_dispatcher();
         let factory = opts.factory.clone();
-        let handle = register_with(&disp, opts.pool, Rc::new(f));
+        let handle = register_with(&dispatcher, opts.pool, Rc::new(f));
         let node = Node {
-            core: Core::new_in_arena(arena, vec![], Some(handle), disp, None, opts.pausable),
+            core: Core::new_in_arena(arena, vec![], Some(handle), dispatcher, None, opts.pausable),
             _t: PhantomData,
         };
         node.core.borrow_mut().factory = factory;
@@ -2877,15 +2893,24 @@ impl<T: 'static> Node<T> {
         opts: NodeOpts,
         f: F,
     ) -> Node<T> {
+        Self::derived_opts_in_arena_with_dispatcher(arena, default_dispatcher(), deps, opts, f)
+    }
+
+    pub(crate) fn derived_opts_in_arena_with_dispatcher<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+        deps: Vec<Core>,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
         assert!(
             !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
         );
-        let disp = default_dispatcher();
         let factory = opts.factory.clone();
-        let handle = register_with(&disp, opts.pool, Rc::new(f));
+        let handle = register_with(&dispatcher, opts.pool, Rc::new(f));
         let node = Node {
-            core: Core::new_in_arena(arena, deps, Some(handle), disp, None, opts.pausable),
+            core: Core::new_in_arena(arena, deps, Some(handle), dispatcher, None, opts.pausable),
             _t: PhantomData,
         };
         {

@@ -12,7 +12,7 @@ use crate::batch::{batch as run_batch, BatchCtx};
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher};
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
-use crate::operators::{init_node_in_arena, Operator};
+use crate::operators::Operator;
 use crate::protocol::{AnyValue, LockId, Message, Tier};
 
 /// Graph construction options.
@@ -20,6 +20,7 @@ use crate::protocol::{AnyValue, LockId, Message, Tier};
 pub struct GraphOptions {
     pub name: Option<String>,
     pub profile: bool,
+    pub dispatcher: Option<Dispatcher>,
 }
 
 impl GraphOptions {
@@ -27,6 +28,7 @@ impl GraphOptions {
         Self {
             name: Some(name.into()),
             profile: false,
+            dispatcher: None,
         }
     }
 }
@@ -66,6 +68,8 @@ struct Mount {
 struct GraphInner {
     name: Option<String>,
     arena: GraphArena,
+    dispatcher: Dispatcher,
+    profile_enabled: Cell<bool>,
     entries: RefCell<Vec<Entry>>,
     by_id: RefCell<HashMap<String, Core>>,
     mounts: RefCell<Vec<Mount>>,
@@ -83,13 +87,16 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(opts: GraphOptions) -> Self {
+        let dispatcher = opts.dispatcher.unwrap_or_else(default_dispatcher);
         if opts.profile {
-            default_dispatcher().set_recording(true);
+            dispatcher.set_recording(true);
         }
         Self {
             inner: Rc::new(GraphInner {
                 name: opts.name,
                 arena: GraphArena::new(),
+                dispatcher,
+                profile_enabled: Cell::new(opts.profile),
                 entries: RefCell::new(Vec::new()),
                 by_id: RefCell::new(HashMap::new()),
                 mounts: RefCell::new(Vec::new()),
@@ -127,7 +134,13 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<T> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("node"));
-        let node = Node::derived_opts_in_arena(&self.inner.arena, deps, opts.node.clone(), f);
+        let node = Node::derived_opts_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            deps,
+            opts.node.clone(),
+            f,
+        );
         self.add(node, "node", opts)
     }
 
@@ -137,7 +150,11 @@ impl Graph {
     }
 
     pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
-        let node = Node::state_in_arena(&self.inner.arena, initial);
+        let node = Node::state_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            initial,
+        );
         self.add(node, "state", opts)
     }
 
@@ -147,7 +164,10 @@ impl Graph {
     }
 
     pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
-        let node = Node::state_empty_in_arena(&self.inner.arena);
+        let node = Node::state_empty_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+        );
         self.add(node, "state", opts)
     }
 
@@ -161,7 +181,12 @@ impl Graph {
         f: F,
         opts: GraphNodeOpts,
     ) -> Node<T> {
-        let node = Node::producer_opts_in_arena(&self.inner.arena, opts.node.clone(), f);
+        let node = Node::producer_opts_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            opts.node.clone(),
+            f,
+        );
         self.add(node, "producer", opts)
     }
 
@@ -182,13 +207,18 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<T> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("derived"));
-        let node =
-            Node::derived_opts_in_arena(&self.inner.arena, deps, opts.node.clone(), move |ctx| {
+        let node = Node::derived_opts_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            deps,
+            opts.node.clone(),
+            move |ctx| {
                 let values = Values::new(ctx.dep_records());
                 if let Some(value) = f(&values) {
                     ctx.emit(value);
                 }
-            });
+            },
+        );
         self.add(node, "derived", opts)
     }
 
@@ -208,13 +238,18 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<()> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("effect"));
-        let node =
-            Node::derived_opts_in_arena(&self.inner.arena, deps, opts.node.clone(), move |ctx| {
+        let node = Node::derived_opts_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            deps,
+            opts.node.clone(),
+            move |ctx| {
                 let values = Values::new(ctx.dep_records());
                 if let Some(cleanup) = f(&values) {
                     ctx.on_deactivation(cleanup);
                 }
-            });
+            },
+        );
         self.add(node, "effect", opts)
     }
 
@@ -231,7 +266,13 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<T> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or(op.factory));
-        let node = init_node_in_arena(op.clone(), &self.inner.arena, deps, opts.node.clone());
+        let node = crate::operators::init_node_in_arena_with_dispatcher(
+            op.clone(),
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            deps,
+            opts.node.clone(),
+        );
         self.add(node, op.factory, opts)
     }
 
@@ -247,6 +288,9 @@ impl Graph {
             !self.inner.mounts.borrow().iter().any(|m| m.at == at),
             "duplicate mount path '{at}'"
         );
+        if self.inner.profile_enabled.get() {
+            child.enable_profile_recorder_recursive();
+        }
         self.inner
             .mounts
             .borrow_mut()
@@ -285,10 +329,9 @@ impl Graph {
 
     /// Opt-in accumulated-counter snapshot (D39/R-profile).
     pub fn profile(&self) -> Profile {
-        let dispatcher = default_dispatcher();
         let mut total_invokes = 0;
         let mut nodes = BTreeMap::new();
-        self.collect_profile("", &dispatcher, &mut nodes, &mut total_invokes);
+        self.collect_profile("", &mut nodes, &mut total_invokes);
         Profile {
             total_invokes,
             nodes,
@@ -298,7 +341,6 @@ impl Graph {
     fn collect_profile(
         &self,
         prefix: &str,
-        dispatcher: &Dispatcher,
         nodes: &mut BTreeMap<String, NodeProfile>,
         total_invokes: &mut u64,
     ) {
@@ -306,7 +348,7 @@ impl Graph {
             let stat = entry
                 .core
                 .handle()
-                .and_then(|handle| dispatcher.stat_for(handle));
+                .and_then(|handle| self.inner.dispatcher.stat_for(handle));
             let invokes = stat.map_or(0, |s| s.invokes);
             *total_invokes += invokes;
             nodes.insert(
@@ -320,12 +362,17 @@ impl Graph {
             );
         }
         for mount in self.inner.mounts.borrow().iter() {
-            mount.graph.collect_profile(
-                &format!("{prefix}{}::", mount.at),
-                dispatcher,
-                nodes,
-                total_invokes,
-            );
+            mount
+                .graph
+                .collect_profile(&format!("{prefix}{}::", mount.at), nodes, total_invokes);
+        }
+    }
+
+    fn enable_profile_recorder_recursive(&self) {
+        self.inner.dispatcher.set_recording(true);
+        self.inner.profile_enabled.set(true);
+        for mount in self.inner.mounts.borrow().iter() {
+            mount.graph.enable_profile_recorder_recursive();
         }
     }
 

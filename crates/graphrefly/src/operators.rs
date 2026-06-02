@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::ctx::Ctx;
+use crate::dispatcher::Dispatcher;
 use crate::node::{Core, GraphArena, Node, NodeOpts, Pausable};
 use crate::protocol::{AnyValue, Message};
 
@@ -64,11 +65,29 @@ pub(crate) fn init_node_in_arena<T: 'static>(
     deps: Vec<Core>,
     caller_opts: NodeOpts,
 ) -> Node<T> {
+    init_node_in_arena_with_dispatcher(
+        op,
+        arena,
+        crate::dispatcher::default_dispatcher(),
+        deps,
+        caller_opts,
+    )
+}
+
+pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
+    op: Operator<T>,
+    arena: &GraphArena,
+    dispatcher: Dispatcher,
+    deps: Vec<Core>,
+    caller_opts: NodeOpts,
+) -> Node<T> {
     let mut opts = merge_node_opts(&op.opts, caller_opts);
     if opts.factory.is_none() {
         opts.factory = Some(op.factory.to_owned());
     }
-    Node::derived_opts_in_arena(arena, deps, opts, move |ctx| (op.body)(ctx))
+    Node::derived_opts_in_arena_with_dispatcher(arena, dispatcher, deps, opts, move |ctx| {
+        (op.body)(ctx)
+    })
 }
 
 /// map: emit `fn(value)` for every upstream DATA occurrence.

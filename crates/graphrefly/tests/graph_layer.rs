@@ -3,10 +3,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
-    describe_to_ascii, describe_to_d2, describe_to_json, describe_to_mermaid,
+    default_dispatcher, describe_to_ascii, describe_to_d2, describe_to_json, describe_to_mermaid,
     describe_to_mermaid_url, describe_to_pretty, distinct_until_changed, filter, from_iter, graph,
-    graph_opts, map, merge, scan, take, DescribeEdge, DescribeOpts, DescribeValue, Explain,
-    GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status, Tier, Values,
+    graph_opts, map, merge, scan, take, DescribeEdge, DescribeOpts, DescribeValue, Dispatcher,
+    Explain, GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status, Tier,
+    Values,
 };
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
@@ -397,10 +398,71 @@ fn explain_filters_mounted_subgraphs_without_leaking_unrelated_nodes() {
 }
 
 #[test]
+fn profile_enabled_graph_defaults_to_default_dispatcher_and_injection_isolates() {
+    let default = default_dispatcher();
+    default.set_recording(false);
+
+    let g = graph_opts(GraphOptions {
+        name: Some("default-profile".to_owned()),
+        profile: true,
+        ..GraphOptions::default()
+    });
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let doubled = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_alive = doubled.subscribe(|_| {});
+    source.set(2);
+    assert!(
+        g.profile().nodes["doubled"].invokes >= 2,
+        "profile:true records through the default dispatcher when no dispatcher is injected"
+    );
+
+    default.set_recording(false);
+
+    let injected = Dispatcher::new();
+    let g = graph_opts(GraphOptions {
+        name: Some("injected-profile".to_owned()),
+        profile: true,
+        dispatcher: Some(injected.clone()),
+    });
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let doubled = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_alive = doubled.subscribe(|_| {});
+    source.set(2);
+
+    let profile = g.profile();
+    assert_eq!(profile.nodes["source"].invokes, 0);
+    assert!(profile.nodes["doubled"].invokes >= 2);
+
+    let unprofiled_default = graph_opts(GraphOptions::named("unprofiled-default"));
+    let source = unprofiled_default.state_opts(1i32, GraphNodeOpts::named("source"));
+    let doubled = unprofiled_default.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_alive = doubled.subscribe(|_| {});
+    source.set(2);
+    assert_eq!(
+        unprofiled_default.profile().nodes["doubled"].invokes,
+        0,
+        "explicit injection records on the injected dispatcher, not the default"
+    );
+}
+
+#[test]
 fn profile_counts_graph_registered_invokes_when_enabled() {
     let g = graph_opts(GraphOptions {
         name: Some("profile-demo".to_owned()),
         profile: true,
+        ..GraphOptions::default()
     });
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
     let doubled = g.derived_opts(
@@ -423,6 +485,7 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
     let parent = graph_opts(GraphOptions {
         name: Some("profile-parent".to_owned()),
         profile: true,
+        ..GraphOptions::default()
     });
     let child = graph();
     let leaf = child.state_opts(1i32, GraphNodeOpts::named("leaf"));
@@ -431,8 +494,8 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
         |values| Some(*last_or_prev(values, 0).unwrap() * 2),
         GraphNodeOpts::named("doubled"),
     );
-    let _keep_doubled = doubled.subscribe(|_| {});
     parent.mount(child, "sub");
+    let _keep_doubled = doubled.subscribe(|_| {});
 
     let profile = parent.profile();
     assert!(profile.nodes.contains_key("sub::leaf"));
@@ -441,6 +504,7 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
     let panics = graph_opts(GraphOptions {
         name: Some("panic-profile".to_owned()),
         profile: true,
+        ..GraphOptions::default()
     });
     let bad = panics.producer_opts::<i32, _>(|_| panic!("boom"), GraphNodeOpts::named("bad"));
     let result = catch_unwind(AssertUnwindSafe(|| {
