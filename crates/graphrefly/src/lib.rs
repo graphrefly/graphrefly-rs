@@ -55,6 +55,7 @@
 #![forbid(unsafe_code)]
 
 pub mod batch;
+pub mod combinators;
 pub mod ctx;
 pub mod dispatcher;
 pub mod graph;
@@ -65,6 +66,10 @@ pub mod render;
 pub mod sources;
 
 pub use batch::{batch, BatchCtx};
+pub use combinators::{
+    buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,
+    with_latest_from, zip,
+};
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use graph::{
@@ -73,7 +78,11 @@ pub use graph::{
     ObserveEvent, ObserveMessage, ObserveStream, Profile, Values,
 };
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
-pub use operators::{distinct_until_changed, filter, init_node, map, merge, scan, take, Operator};
+pub use operators::{
+    catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
+    last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
+    settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
+};
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 pub use render::{
     describe_to_ascii, describe_to_d2, describe_to_d2_with_direction, describe_to_json,

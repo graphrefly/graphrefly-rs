@@ -64,8 +64,8 @@ silent no-op, never a recycled-slot misfire. Rust-only; B15 is the TS sibling
 | `ctx` | **impl** — `Ctx` (`down`/`emit`/**`wave_data`** + `terminal` raw dep input, typed `data`/`batch` derived helpers, `state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
 | `batch` | **impl** — `batch(fn)` + `BatchCtx::rollback()` (D12); tier≥3 settle slices defer to commit with last-value coalescing; rollback balances the immediate DIRTY with RESOLVED; boundary drains are held until after commit; immediate rewire on a node with an uncommitted batch slice defers per D67. |
 
-**33 unit + 23 conformance + 20 graph-layer tests green** (clippy `-D warnings` clean, fmt clean,
-`#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
+**33 unit + 23 conformance + 21 graph-layer + 5 catalog tests green** (clippy `-D warnings` clean,
+fmt clean, `#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
 PAUSE lockset multi-source, **C-6** sync feedback cycle→ERROR (+B25 recovery), **C-13**
 INVALIDATE×PAUSE precedence, **C-14** per-run cleanup hooks (control/terminal slice),
 **C-2 / C-4 / C-9 / C-10** (Slice A async), **C-7** up-at-source, **C-8** intra-graph
@@ -211,6 +211,14 @@ B53 graph/product slices now include:
 - D40 catalog base first cut: graph-bound `Graph::init_node`, free-standing
   `Operator<T>` definitions, sync sources `of` / `from_iter`, and core operators
   `map` / `filter` / `scan` / `take` / `distinct_until_changed` / `merge`.
+- B53 catalog catch-up slice 2A: static graph-visible operators `reduce` / `pairwise` /
+  `skip` / `take_while` / `first(_any)` / `last(_any)` / `find` / `element_at` /
+  `tap` / `on_first_data` / `tap_first` / `settle(_by)` / `rescue` / `catch_error` /
+  `valve`, plus homogeneous/static-dep combinators `combine` / `combine_latest` /
+  `with_latest_from` / `zip` / `concat` / `race` / `buffer` / `buffer_count` /
+  `sample` / `take_until`. Heterogeneous TS tuple helpers, TS-only abort control,
+  async/timer sources, time operators, higher-order operators, and reactive structures
+  remain deferred product slices.
 - QA fixes: operator caller opts layer over intrinsic factory flags (so `merge`
   keeps `partial:true`), synthetic describe ids include the arena-slot
   generation, profile snapshots include mounted `::` paths and count panicking
