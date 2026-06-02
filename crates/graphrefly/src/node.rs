@@ -178,6 +178,12 @@ struct NodeKey {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ArenaNodeKey {
+    graph: usize,
+    node: NodeKey,
+}
+
 /// B49 / D71 first migration slice: graph-local arena for node bookkeeping. The
 /// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
 /// `Rc<RefCell<NodeInner>>`. This keeps the public API stable while moving ownership
@@ -663,6 +669,13 @@ impl Core {
         }
     }
 
+    fn arena_node_key(&self) -> ArenaNodeKey {
+        ArenaNodeKey {
+            graph: Rc::as_ptr(&self.graph) as usize,
+            node: self.key(),
+        }
+    }
+
     fn borrow(&self) -> Ref<'_, NodeInner> {
         Ref::map(self.graph.borrow(), |g| g.get(self.key()))
     }
@@ -900,7 +913,12 @@ struct WaveScope {
     /// [`Core::reset_wave_flags`] is idempotent; the set lives for one wave only).
     touched: Vec<Core>,
     /// Innermost node whose fn ran before the panic (the ERROR-bearing node).
-    blamed: Option<Core>,
+    ///
+    /// DR-8/B54: blame is a generation-keyed arena reference on the hot path. The
+    /// node is already pinned by `touched` because `run_wave` registers before
+    /// invoking the fn; the cold panic path reconstructs the counted handle from
+    /// that pin when it needs to emit ERROR.
+    blamed: Option<ArenaNodeKey>,
 }
 
 thread_local! {
@@ -1041,7 +1059,7 @@ fn drain_deferred_runs() {
 fn wave_set_blamed(core: &Core) {
     WAVE.with(|w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
-            scope.blamed = Some(core.clone());
+            scope.blamed = Some(core.arena_node_key());
         }
     });
 }
@@ -1085,7 +1103,16 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             for n in &scope.touched {
                 n.reset_wave_flags();
             }
-            let blamed = scope.blamed.unwrap_or(scope.owner);
+            let blamed = scope
+                .blamed
+                .and_then(|key| {
+                    scope
+                        .touched
+                        .iter()
+                        .find(|n| n.arena_node_key() == key)
+                        .cloned()
+                })
+                .unwrap_or(scope.owner);
             let err = panic_to_error(payload);
             // The recovery ERROR emit runs OUTSIDE any catch (the scope is taken). A
             // user subscriber sink that itself panics while handling this ERROR must not
@@ -3725,6 +3752,149 @@ mod tests {
             seen_refs.get(),
             4,
             "expected source handle + unsubscribe handle + wave owner + touched-set clone, with no extra public-entry Core clone"
+        );
+    }
+
+    #[test]
+    fn wave_scope_blamed_does_not_add_ref_pin() {
+        // DR-8/B54 next slice: `blamed` is a generation-keyed arena reference rather
+        // than another counted Core clone. The touched-set still pins live nodes for
+        // drop/unwind safety; blame should not add another refcount bump on top of it.
+        let source = Node::<i32>::state(1);
+        let refs = source.core.refs.clone();
+
+        with_wave_owner(
+            &source.core,
+            || {
+                let owner_pinned = refs.get();
+                wave_register(&source.core);
+                let touched_pinned = refs.get();
+                assert_eq!(touched_pinned, owner_pinned + 1);
+
+                wave_set_blamed(&source.core);
+                assert_eq!(
+                    refs.get(),
+                    touched_pinned,
+                    "blame records a generation key, not a counted Core clone"
+                );
+            },
+            || {},
+        );
+
+        assert_eq!(
+            refs.get(),
+            1,
+            "all wave-owner/touched pins are released after the wave"
+        );
+    }
+
+    #[test]
+    fn generation_keyed_blame_recovers_after_callback_drop_and_fn_panic() {
+        // DR-8/B54: the fn-running node is pinned by the touched set, while `blamed`
+        // itself is only a generation key. If a subscriber callback drops another
+        // same-arena node and the fn then panics, recovery still emits ERROR on the
+        // blamed node without holding a GraphCore borrow across the callback.
+        let held: Rc<RefCell<Option<Node<i32>>>> =
+            Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
+        let source = Node::<i32>::state_empty();
+        let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+            panic!("panic after subscriber callback");
+        });
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let h = held.clone();
+        let l = log.clone();
+        let _u = derived.subscribe(move |m| {
+            l.borrow_mut().push(format!("{m:?}"));
+            if matches!(m, Message::Data(_)) {
+                let _ = h.borrow_mut().take();
+            }
+        });
+
+        source.set(1);
+
+        assert!(held.borrow().is_none());
+        assert_eq!(derived.status(), Status::Errored);
+        assert!(
+            log.borrow().iter().any(|k| k == "ERROR"),
+            "panic recovery should emit ERROR on the generation-keyed blamed node"
+        );
+    }
+
+    #[test]
+    fn stale_blamed_generation_does_not_target_reused_slot() {
+        // A stale blamed key must not match a later node that reused the same arena slot.
+        // This is an artificial cold-path probe for the panic recovery lookup: generation
+        // is part of the key, so the old slot id cannot reset or ERROR the new occupant.
+        let arena = GraphArena::new();
+        let old = Node::<i32>::state_in_arena(&arena, 1);
+        let old_key = old.core.key();
+        let old_arena_key = old.core.arena_node_key();
+        drop(old);
+
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(old_key.id, reused.core.key().id);
+        assert_ne!(old_key.generation, reused.core.key().generation);
+
+        let owner = Node::<i32>::state_in_arena(&arena, 3);
+        with_wave_owner(
+            &owner.core,
+            || {
+                wave_register(&reused.core);
+                WAVE.with(|w| {
+                    w.borrow_mut().as_mut().expect("wave installed").blamed = Some(old_arena_key);
+                });
+                panic!("stale blame");
+            },
+            || {},
+        );
+
+        assert_eq!(
+            reused.status(),
+            Status::Settled,
+            "stale generation key must not ERROR/reset the reused slot occupant"
+        );
+        assert_eq!(
+            owner.status(),
+            Status::Errored,
+            "stale blame falls back to the live wave owner"
+        );
+    }
+
+    #[test]
+    fn blame_key_is_arena_qualified_for_nested_cross_arena_panic() {
+        // DR-8/B54: WAVE is thread-local, so a nested public call into another
+        // GraphArena shares the outer wave-owner scope. Two independent arenas can
+        // both have slot 0/generation 0; blame lookup must include arena identity or
+        // the recovery ERROR can land on the wrong same-key node.
+        let arena_a = GraphArena::new();
+        let arena_b = GraphArena::new();
+        let outer = Node::<i32>::state_empty_in_arena(&arena_a);
+        let panicker = Node::<i32>::producer_opts_in_arena(&arena_b, NodeOpts::default(), |_| {
+            panic!("nested cross-arena panic");
+        });
+
+        assert_eq!(outer.core.key(), panicker.core.key());
+        assert_ne!(outer.core.arena_node_key(), panicker.core.arena_node_key());
+
+        let p = panicker.clone();
+        let _u = outer.subscribe(move |m| {
+            if matches!(m, Message::Data(_)) {
+                let _ = p.subscribe(|_| {});
+            }
+        });
+
+        outer.set(1);
+
+        assert_eq!(
+            outer.status(),
+            Status::Settled,
+            "outer same-slot node must not receive the nested arena's recovery ERROR"
+        );
+        assert_eq!(
+            panicker.status(),
+            Status::Errored,
+            "panic recovery should blame the nested arena node that ran the fn"
         );
     }
 
