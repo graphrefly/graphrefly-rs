@@ -2186,7 +2186,7 @@ impl Core {
         if self.should_buffer_on_pause() {
             let (buffered, rest): (Vec<Msg>, Vec<Msg>) = sorted
                 .into_iter()
-                .partition(|m| matches!(m.tier().as_u8(), 3 | 4));
+                .partition(|m| m.tier().is_pause_buffered());
             if !buffered.is_empty() {
                 self.with_inner_edges_aux_mut(|_n, e, a| {
                     // A buffered tier-3 IS a produced settle — mark emitted_tier3 so run_wave

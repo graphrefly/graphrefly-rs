@@ -5,6 +5,8 @@
 //! tuple helpers are represented here as homogeneous `Vec<T>` or fixed tuple
 //! helpers where Rust can type them cleanly.
 
+use std::collections::VecDeque;
+
 use crate::ctx::{Ctx, DepTerminal, WaveData};
 use crate::node::NodeOpts;
 use crate::operators::Operator;
@@ -62,7 +64,7 @@ pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A
 
 #[derive(Clone)]
 struct ZipState<T> {
-    queues: Vec<Vec<T>>,
+    queues: Vec<VecDeque<T>>,
     complete: Vec<bool>,
 }
 
@@ -86,17 +88,17 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
                 .state_get::<ZipState<T>>()
                 .map(|v| (*v).clone())
                 .unwrap_or_else(|| ZipState {
-                    queues: vec![Vec::new(); n],
+                    queues: vec![VecDeque::new(); n],
                     complete: vec![false; n],
                 });
             if st.queues.len() != n {
-                st.queues.resize_with(n, Vec::new);
+                st.queues.resize_with(n, VecDeque::new);
                 st.complete.resize(n, false);
             }
 
             for i in 0..n {
                 for value in ctx.batch::<T>(i) {
-                    st.queues[i].push((*value).clone());
+                    st.queues[i].push_back((*value).clone());
                 }
                 if is_complete(ctx.terminal(i)) {
                     st.complete[i] = true;
@@ -107,7 +109,7 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
                 let tuple = st
                     .queues
                     .iter_mut()
-                    .map(|q| q.remove(0))
+                    .map(|q| q.pop_front().expect("zip queue is non-empty"))
                     .collect::<Vec<_>>();
                 ctx.emit(tuple);
             }

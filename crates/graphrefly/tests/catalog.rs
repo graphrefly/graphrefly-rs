@@ -2,10 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use graphrefly::{
-    batch, buffer, buffer_count, combine, concat, distinct_until_changed, element_at, filter, find,
-    first_any, from_iter, graph, last_any, map, on_first_data, pairwise, race, reduce, rescue,
-    sample, settle, skip, take, take_until, take_while, tap, valve, with_latest_from, zip,
-    GraphNodeOpts, Message,
+    batch, buffer, buffer_count, catch_error, combine, combine_latest, concat,
+    distinct_until_changed, element_at, filter, find, first, first_any, from_iter, graph, last,
+    last_any, map, on_first_data, on_first_data_where, pairwise, race, reduce, rescue, sample,
+    settle, settle_by, skip, take, take_until, take_while, tap, tap_first, valve, with_latest_from,
+    zip, GraphNodeOpts, Message,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -137,6 +138,133 @@ fn single_dep_catalog_preserves_occurrences_and_terminal_inputs() {
 }
 
 #[test]
+fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
+    let g = graph();
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("first_predicate_src"),
+    );
+    let first_even = g.init_node(
+        first::<i32>(|v| *v % 2 == 0),
+        vec![src.erased()],
+        GraphNodeOpts::named("first_predicate"),
+    );
+    assert_eq!(*collect_data(&first_even).borrow(), vec![2]);
+    assert_eq!(first_even.status(), graphrefly::Status::Completed);
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("last_predicate_src"),
+    );
+    let last_even = g.init_node(
+        last::<i32>(|v| *v % 2 == 0),
+        vec![src.erased()],
+        GraphNodeOpts::named("last_predicate"),
+    );
+    assert_eq!(*collect_data(&last_even).borrow(), vec![2]);
+    assert_eq!(last_even.status(), graphrefly::Status::Completed);
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("find_empty_src"),
+    );
+    let not_found = g.init_node(
+        find::<i32>(|v| *v > 9),
+        vec![src.erased()],
+        GraphNodeOpts::named("find_empty"),
+    );
+    assert_eq!(
+        *collect_shapes::<i32>(&not_found).borrow(),
+        vec!["COMPLETE"]
+    );
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("last_empty_src"),
+    );
+    let no_last = g.init_node(
+        last::<i32>(|v| *v > 9),
+        vec![src.erased()],
+        GraphNodeOpts::named("last_empty"),
+    );
+    assert_eq!(*collect_shapes::<i32>(&no_last).borrow(), vec!["COMPLETE"]);
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("element_empty_src"),
+    );
+    let out_of_range = g.init_node(
+        element_at::<i32>(5),
+        vec![src.erased()],
+        GraphNodeOpts::named("element_empty"),
+    );
+    assert_eq!(
+        *collect_shapes::<i32>(&out_of_range).borrow(),
+        vec!["COMPLETE"]
+    );
+
+    let empty = g.init_node(
+        from_iter(Vec::<i32>::new()),
+        vec![],
+        GraphNodeOpts::named("reduce_empty_src"),
+    );
+    let reduced = g.init_node(
+        reduce::<i32, i32>(|acc, v| acc + *v, 10),
+        vec![empty.erased()],
+        GraphNodeOpts::named("reduce_empty"),
+    );
+    assert_eq!(*collect_data(&reduced).borrow(), vec![10]);
+
+    let source = g.state(1i32);
+    let recovered = g.init_node(
+        catch_error::<i32>(|_| 42),
+        vec![source.erased()],
+        GraphNodeOpts::named("catch_error"),
+    );
+    let recovered_seen = collect_data(&recovered);
+    source.down(vec![Message::Error("boom".into())]);
+    assert_eq!(*recovered_seen.borrow(), vec![1, 42]);
+    assert_ne!(recovered.status(), graphrefly::Status::Completed);
+    assert_ne!(recovered.status(), graphrefly::Status::Errored);
+
+    let first_seen = Rc::new(Cell::new(0));
+    let first_seen_sink = first_seen.clone();
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("on_first_where_src"),
+    );
+    let first_where = g.init_node(
+        on_first_data_where::<i32>(move |v| first_seen_sink.set(*v), |v| *v > 1),
+        vec![src.erased()],
+        GraphNodeOpts::named("on_first_where"),
+    );
+    assert_eq!(*collect_data(&first_where).borrow(), vec![1, 2, 3]);
+    assert_eq!(first_seen.get(), 2);
+
+    let tapped_values = Rc::new(RefCell::new(Vec::new()));
+    let tapped_sink = tapped_values.clone();
+    let src = g.init_node(
+        from_iter(vec![8i32, 9]),
+        vec![],
+        GraphNodeOpts::named("tap_first_src"),
+    );
+    let tapped = g.init_node(
+        tap_first::<i32>(move |v| tapped_sink.borrow_mut().push(*v)),
+        vec![src.erased()],
+        GraphNodeOpts::named("tap_first"),
+    );
+    assert_eq!(*collect_data(&tapped).borrow(), vec![8, 9]);
+    assert_eq!(*tapped_values.borrow(), vec![8]);
+}
+
+#[test]
 fn side_effect_error_and_gate_operators_are_graph_visible() {
     let g = graph();
 
@@ -226,6 +354,18 @@ fn static_combinators_use_declared_deps_and_state() {
     right.set(2);
     left.set(3);
     assert_eq!(*combined_seen.borrow(), vec![vec![1, 2], vec![3, 2]]);
+
+    let left = g.state_empty::<i32>();
+    let right = g.state_empty::<i32>();
+    let combined_latest = g.init_node(
+        combine_latest::<i32>(),
+        vec![left.erased(), right.erased()],
+        GraphNodeOpts::named("combine_latest"),
+    );
+    let combined_latest_seen = collect_data(&combined_latest);
+    left.set(4);
+    right.set(5);
+    assert_eq!(*combined_latest_seen.borrow(), vec![vec![4, 5]]);
 
     let primary = g.state(1i32);
     let secondary = g.state(10i32);
@@ -368,6 +508,85 @@ fn notifier_combinators_and_race_follow_static_edges() {
 }
 
 #[test]
+fn batched_notifier_and_control_ordering_is_pinned() {
+    let g = graph();
+
+    let source = g.state(1i32);
+    let notifier = g.state_empty::<()>();
+    let buffered = g.init_node(
+        buffer::<i32>(),
+        vec![source.erased(), notifier.erased()],
+        GraphNodeOpts::named("buffer_same_wave"),
+    );
+    let buffer_seen = collect_data(&buffered);
+    batch(|_| {
+        source.set(2);
+        notifier.set(());
+    });
+    assert_eq!(*buffer_seen.borrow(), vec![vec![1, 2]]);
+
+    let source = g.state(5i32);
+    let notifier = g.state_empty::<()>();
+    let sampled = g.init_node(
+        sample::<i32>(),
+        vec![source.erased(), notifier.erased()],
+        GraphNodeOpts::named("sample_same_wave"),
+    );
+    let sample_seen = collect_data(&sampled);
+    batch(|_| {
+        source.set(6);
+        notifier.set(());
+    });
+    assert_eq!(*sample_seen.borrow(), vec![6]);
+
+    let source = g.state_empty::<i32>();
+    let notifier = g.state_empty::<()>();
+    let until = g.init_node(
+        take_until::<i32>(),
+        vec![source.erased(), notifier.erased()],
+        GraphNodeOpts::named("take_until_same_wave"),
+    );
+    let until_seen = collect_shapes::<i32>(&until);
+    batch(|_| {
+        source.set(8);
+        notifier.set(());
+    });
+    assert_eq!(*until_seen.borrow(), vec!["COMPLETE"]);
+
+    let source = g.state_empty::<i32>();
+    let notifier = g.state_empty::<()>();
+    let until = g.init_node(
+        take_until::<i32>(),
+        vec![source.erased(), notifier.erased()],
+        GraphNodeOpts::named("take_until_notifier_first"),
+    );
+    let until_seen = collect_shapes::<i32>(&until);
+    batch(|_| {
+        notifier.set(());
+        source.set(21);
+    });
+    assert_eq!(*until_seen.borrow(), vec!["COMPLETE"]);
+
+    let source = g.state(10i32);
+    let control = g.state_empty::<bool>();
+    let gated = g.init_node(
+        valve::<i32>(),
+        vec![source.erased(), control.erased()],
+        GraphNodeOpts::named("valve_same_wave"),
+    );
+    let gated_seen = collect_data(&gated);
+    batch(|_| {
+        control.set(true);
+        source.set(11);
+    });
+    batch(|_| {
+        control.set(false);
+        source.set(12);
+    });
+    assert_eq!(*gated_seen.borrow(), vec![11]);
+}
+
+#[test]
 fn existing_core_catalog_still_composes_after_widening() {
     let g = graph();
     let source = g.init_node(
@@ -411,5 +630,20 @@ fn existing_core_catalog_still_composes_after_widening() {
     assert_eq!(
         *collect_shapes::<i32>(&settled).borrow(),
         vec!["DATA", "DATA", "COMPLETE"]
+    );
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 2]),
+        vec![],
+        GraphNodeOpts::named("settle_by_src"),
+    );
+    let settled = g.init_node(
+        settle_by::<i32>(1, Some(3), |a, b| a == b),
+        vec![src.erased()],
+        GraphNodeOpts::named("settle_by"),
+    );
+    assert_eq!(
+        *collect_shapes::<i32>(&settled).borrow(),
+        vec!["DATA", "DATA", "DATA", "COMPLETE"]
     );
 }

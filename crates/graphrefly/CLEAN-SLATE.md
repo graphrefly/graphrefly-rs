@@ -64,7 +64,7 @@ silent no-op, never a recycled-slot misfire. Rust-only; B15 is the TS sibling
 | `ctx` | **impl** — `Ctx` (`down`/`emit`/**`wave_data`** + `terminal` raw dep input, typed `data`/`batch` derived helpers, `state`/`on_deactivation`/**`on_invalidate`**/**`defer`**); cleanup hooks are **per-run** (cleared each fn invoke + re-registered, R-cleanup-hooks / C-14); `up` validates R-ctx-up + self-handles PAUSE/RESUME. **`defer()` → `DeferredCtx`** is the owned `'static` async late-emit handle (Slice A). |
 | `batch` | **impl** — `batch(fn)` + `BatchCtx::rollback()` (D12); tier≥3 settle slices defer to commit with last-value coalescing; rollback balances the immediate DIRTY with RESOLVED; boundary drains are held until after commit; immediate rewire on a node with an uncommitted batch slice defers per D67. |
 
-**33 unit + 23 conformance + 21 graph-layer + 5 catalog tests green** (clippy `-D warnings` clean,
+**33 unit + 23 conformance + 21 graph-layer + 7 catalog tests green** (clippy `-D warnings` clean,
 fmt clean, `#![forbid(unsafe_code)]`). Conformance: **C-3** INVALIDATE×state×onInvalidate, **C-5**
 PAUSE lockset multi-source, **C-6** sync feedback cycle→ERROR (+B25 recovery), **C-13**
 INVALIDATE×PAUSE precedence, **C-14** per-run cleanup hooks (control/terminal slice),

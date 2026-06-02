@@ -111,6 +111,12 @@ impl Tier {
     pub fn is_batch_deferred(self) -> bool {
         !self.is_immediate()
     }
+
+    /// Pause buffering holds the settle slice: value-tier DATA/RESOLVED plus INVALIDATE.
+    #[inline]
+    pub fn is_pause_buffered(self) -> bool {
+        matches!(self, Tier::Value | Tier::Settle)
+    }
 }
 
 /// One protocol message. A `Vec<Message<T>>` ([`Wave`]) is one wave (D8) and may

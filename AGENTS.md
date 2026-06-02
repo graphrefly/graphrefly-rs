@@ -116,15 +116,15 @@ crates/graphrefly-{core,graph,operators,storage,structures,bindings-*}/
 ```bash
 # Toolchain is managed via `mise`; do NOT assume `cargo`/`rustc` is on PATH in agent shells.
 # Preferred:
-mise exec -- cargo test  -p graphrefly        # the clean-slate crate (the only workspace member)
-mise exec -- cargo build -p graphrefly
-mise exec -- cargo clippy -p graphrefly --all-targets
+mise exec -- cargo test  -p graphrefly-rs     # the clean-slate package; lib crate name is `graphrefly`
+mise exec -- cargo build -p graphrefly-rs
+mise exec -- cargo clippy -p graphrefly-rs --all-targets
 mise exec -- cargo fmt --all
 
 # Fallback when `mise` is unavailable in a constrained shell:
-~/.cargo/bin/cargo test  -p graphrefly
-~/.cargo/bin/cargo build -p graphrefly
-~/.cargo/bin/cargo clippy -p graphrefly --all-targets
+~/.cargo/bin/cargo test  -p graphrefly-rs
+~/.cargo/bin/cargo build -p graphrefly-rs
+~/.cargo/bin/cargo clippy -p graphrefly-rs --all-targets
 ~/.cargo/bin/cargo fmt --all
 
 # Long gates: as the crate grows, run via the sanctioned runner — NEVER `;`-chain
