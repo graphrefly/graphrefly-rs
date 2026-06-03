@@ -1491,8 +1491,8 @@ impl DeferredDeliveryAction {
         self.target.counted_core()
     }
 
-    fn apply(self) {
-        let Some(node) = self.core_for_drain().filter(Core::is_live) else {
+    fn apply(&self) {
+        let Some(node) = self.core_for_drain() else {
             return;
         };
         if node.with_inner_edges(|_, e| e.value.terminal) {
@@ -1830,14 +1830,15 @@ fn drain_deferred_runs() {
         if actions.is_empty() {
             break;
         }
-        let (runs, settles): (Vec<_>, Vec<_>) = actions
-            .into_iter()
-            .partition(|action| action.kind == DeferredDeliveryKind::Run);
-        for action in runs {
-            action.apply();
-        }
-        for action in settles {
-            action.apply();
+        for kind in [
+            DeferredDeliveryKind::Run,
+            DeferredDeliveryKind::AbsorbedSettle,
+        ] {
+            for action in &actions {
+                if action.kind == kind {
+                    action.apply();
+                }
+            }
         }
     }
 }
@@ -2101,10 +2102,6 @@ impl Core {
         Rc::ptr_eq(&self.graph, &other.graph)
             && self.id == other.id
             && self.generation == other.generation
-    }
-
-    fn is_live(&self) -> bool {
-        self.graph.borrow().is_live_key(self.key())
     }
 
     pub(crate) fn same_graph(&self, other: &Core) -> bool {
@@ -2985,17 +2982,29 @@ impl Core {
         let n = new_deps.len();
         let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
         let mut new_to_old: Vec<Option<usize>> = vec![None; n];
-        let mut first_old_by_key: HashMap<ArenaNodeKey, usize> =
-            HashMap::with_capacity(old_deps.len());
-        for (old_idx, old_dep) in old_deps.iter().enumerate() {
-            first_old_by_key
-                .entry(old_dep.arena_node_key())
-                .or_insert(old_idx);
-        }
-        for (new_idx, new_dep) in new_deps.iter().enumerate() {
-            if let Some(old_idx) = first_old_by_key.remove(&new_dep.arena_node_key()) {
-                old_to_new[old_idx] = Some(new_idx);
-                new_to_old[new_idx] = Some(old_idx);
+        if old_deps.len().saturating_mul(n) <= 64 {
+            for (old_idx, old_dep) in old_deps.iter().enumerate() {
+                for (new_idx, new_dep) in new_deps.iter().enumerate() {
+                    if old_dep.ptr_eq(new_dep) && new_to_old[new_idx].is_none() {
+                        old_to_new[old_idx] = Some(new_idx);
+                        new_to_old[new_idx] = Some(old_idx);
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut first_old_by_key: HashMap<ArenaNodeKey, usize> =
+                HashMap::with_capacity(old_deps.len());
+            for (old_idx, old_dep) in old_deps.iter().enumerate() {
+                first_old_by_key
+                    .entry(old_dep.arena_node_key())
+                    .or_insert(old_idx);
+            }
+            for (new_idx, new_dep) in new_deps.iter().enumerate() {
+                if let Some(old_idx) = first_old_by_key.remove(&new_dep.arena_node_key()) {
+                    old_to_new[old_idx] = Some(new_idx);
+                    new_to_old[new_idx] = Some(old_idx);
+                }
             }
         }
         let added: Vec<(usize, Core)> = new_deps
