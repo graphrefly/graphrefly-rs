@@ -164,10 +164,18 @@ type Unsub = Box<dyn FnOnce()>;
 pub(crate) enum RewireRequest {
     /// Add a dep (idempotent if already present) + swap the fn.
     Add(Core, NodeFn),
-    /// Remove a dep (idempotent if absent) + swap the fn.
-    Remove(Core, NodeFn),
+    /// Remove a live dep identity + swap the fn. If that identity is already absent
+    /// at boundary-apply time, the request is a full no-op, including no fn swap, so
+    /// stale duplicate removes cannot desync the live dep/fn pairing.
+    Remove(CoreIdentity, NodeFn),
     /// Replace the whole dep set + swap the fn.
     Set(Vec<Core>, NodeFn),
+}
+
+impl RewireRequest {
+    pub(crate) fn remove(dep: &Core, f: NodeFn) -> Self {
+        Self::Remove(CoreIdentity::from_core(dep), f)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -183,6 +191,22 @@ struct NodeKey {
 struct ArenaNodeKey {
     graph: usize,
     node: NodeKey,
+}
+
+pub(crate) struct CoreIdentity {
+    arena_key: ArenaNodeKey,
+}
+
+impl CoreIdentity {
+    fn from_core(core: &Core) -> Self {
+        Self {
+            arena_key: core.arena_node_key(),
+        }
+    }
+
+    fn matches(&self, core: &Core) -> bool {
+        self.arena_key == core.arena_node_key()
+    }
 }
 
 /// B49 / D71 first migration slice: graph-local arena for node bookkeeping. The
@@ -663,6 +687,15 @@ impl Core {
         }
     }
 
+    fn borrowed_view(&self) -> Self {
+        Self::from_borrowed_parts(
+            self.graph.clone(),
+            self.id,
+            self.generation,
+            self.refs.clone(),
+        )
+    }
+
     fn key(&self) -> NodeKey {
         NodeKey {
             id: self.id,
@@ -878,6 +911,20 @@ impl DeferredNodeAction {
     fn counted_core(&self) -> Option<Core> {
         self.weak.counted_core()
     }
+
+    fn with_live_edges_mut<R>(&self, f: impl FnOnce(&mut DepEdges) -> R) -> Option<R> {
+        let graph = self.weak.graph.upgrade()?;
+        let refs = self.weak.refs.upgrade()?;
+        if refs.get() == 0 {
+            return None;
+        }
+        let mut g = graph.borrow_mut();
+        if !g.is_live_key(self.weak.key) {
+            return None;
+        }
+        let (_n, e) = g.get_node_and_edges_mut(self.weak.key);
+        Some(f(e))
+    }
 }
 
 #[derive(Clone)]
@@ -969,11 +1016,9 @@ pub(crate) fn boundary_root_for(target: &Core) -> BoundaryRoot {
 struct WaveGuard(DeferredNodeAction);
 impl Drop for WaveGuard {
     fn drop(&mut self) {
-        if let Some(core) = self.0.counted_core() {
-            core.with_inner_edges_mut(|_, e| {
-                e.wave.inside_run_wave = false;
-            });
-        }
+        let _ = self.0.with_live_edges_mut(|e| {
+            e.wave.inside_run_wave = false;
+        });
     }
 }
 
@@ -988,11 +1033,9 @@ impl Drop for WaveGuard {
 struct DepMutationGuard(DeferredNodeAction);
 impl Drop for DepMutationGuard {
     fn drop(&mut self) {
-        if let Some(core) = self.0.counted_core() {
-            core.with_inner_edges_mut(|_, e| {
-                e.wave.in_dep_mutation = false;
-            });
-        }
+        let _ = self.0.with_live_edges_mut(|e| {
+            e.wave.in_dep_mutation = false;
+        });
     }
 }
 
@@ -1016,7 +1059,7 @@ impl Drop for DepMutationGuard {
 /// Forward-looking: this wave-owner boundary is the same "committed wave boundary"
 /// that batch (D12) and the `ctx.rewire_next` deferred drain (D47) will reuse.
 struct WaveScope {
-    owner: Core,
+    owner_graph_id: usize,
     /// Graph roots that received committed-boundary tasks during this wave but are not
     /// necessarily the wave owner's graph (nested cross-arena public calls share WAVE).
     boundary_roots: Vec<BoundaryRoot>,
@@ -1064,7 +1107,7 @@ fn wave_register(core: &Core) {
 fn wave_register_boundary_root(core: &Core) {
     WAVE.with(|w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
-            if scope.owner.same_graph(core)
+            if scope.owner_graph_id == Rc::as_ptr(&core.graph) as usize
                 || scope.boundary_roots.iter().any(|r| r.same_graph(core))
             {
                 return;
@@ -1179,6 +1222,11 @@ fn drain_deferred_runs() {
     }
 }
 
+fn clear_deferred_delivery_actions() {
+    DEFERRED_RUNS.with(|runs| runs.borrow_mut().clear());
+    DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().clear());
+}
+
 /// Record the node whose fn is about to run — the ERROR-bearing node on a panic.
 fn wave_set_blamed(core: &Core) {
     WAVE.with(|w| {
@@ -1210,7 +1258,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
     }
     WAVE.with(|w| {
         *w.borrow_mut() = Some(WaveScope {
-            owner: owner.clone(),
+            owner_graph_id: Rc::as_ptr(&owner.graph) as usize,
             boundary_roots: Vec::new(),
             touched: Vec::new(),
             blamed: None,
@@ -1230,6 +1278,11 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             for n in &scope.touched {
                 n.reset_wave_flags();
             }
+            // Delivery-boundary run/settle queues are wave-local. If the delivery
+            // aborted before its guard could drain them, carrying those actions into a
+            // later unrelated wave would resurrect stale dep projections after B25 has
+            // already reset the touched nodes.
+            clear_deferred_delivery_actions();
             let blamed = scope
                 .blamed
                 .and_then(|key| {
@@ -1239,7 +1292,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
                         .find(|n| n.arena_node_key() == key)
                         .cloned()
                 })
-                .unwrap_or_else(|| scope.owner.clone());
+                .unwrap_or_else(|| owner.clone());
             let err = panic_to_error(payload);
             // The recovery ERROR emit runs OUTSIDE any catch (the scope is taken). A
             // user subscriber sink that itself panics while handling this ERROR must not
@@ -1249,6 +1302,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             let _ = catch_unwind(AssertUnwindSafe(move || {
                 blamed.down(vec![Message::Error(err)]);
             }));
+            clear_deferred_delivery_actions();
             on_error()
         }
     };
@@ -2133,11 +2187,13 @@ impl Core {
                 (next, f)
             }
             RewireRequest::Remove(dep, f) => {
-                let next: Vec<Core> = self
-                    .borrow()
-                    .deps
+                let current = self.borrow().deps.clone();
+                if !current.iter().any(|d| dep.matches(d)) {
+                    return;
+                }
+                let next: Vec<Core> = current
                     .iter()
-                    .filter(|d| !d.ptr_eq(&dep))
+                    .filter(|d| !dep.matches(d))
                     .cloned()
                     .collect();
                 (next, f)
@@ -2416,7 +2472,7 @@ impl Core {
             (
                 n.handle.expect("run_wave ⇒ handle present"),
                 n.dispatcher.clone(),
-                Ctx::new(self.clone(), dep_records),
+                Ctx::new(self.borrowed_view(), dep_records),
             )
         });
         let (old_on_invalidate, old_on_deactivation) = self.with_inner_edges_aux_mut(|n, e, a| {
@@ -3969,6 +4025,56 @@ mod tests {
     }
 
     #[test]
+    fn panic_aborted_delivery_clears_deferred_delivery_actions() {
+        // B25/DR-8: delivery-boundary run/settle queues are wave-local. If a subscriber
+        // panics after a dep callback queued a run, the wave-owner catch resets touched
+        // flags AND must discard those queued actions. A later unrelated delivery must
+        // not run stale work against reset dep projections.
+        DEFERRED_RUNS.with(|runs| runs.borrow_mut().clear());
+        DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().clear());
+
+        let source = Node::<i32>::state_empty();
+        let runs = Rc::new(Cell::new(0usize));
+        let d: Node<i32> = Node::derived(vec![source.erased()], {
+            let runs = runs.clone();
+            move |_ctx| {
+                runs.set(runs.get() + 1);
+            }
+        });
+        let _d_sub = d.subscribe(|_| {});
+        let _panic_sub = source.subscribe(|m| {
+            if matches!(m, Message::Data(_)) {
+                panic!("subscriber aborts delivery after dep callback queued run");
+            }
+        });
+
+        source.set(1);
+
+        assert_eq!(runs.get(), 0, "aborted delivery must not run the queued fn");
+        DEFERRED_RUNS.with(|queued| {
+            assert!(
+                queued.borrow().is_empty(),
+                "aborted wave must clear queued deferred runs"
+            );
+        });
+        DEFERRED_ABSORBED_SETTLES.with(|queued| {
+            assert!(
+                queued.borrow().is_empty(),
+                "aborted wave must clear queued absorbed-terminal settles"
+            );
+        });
+
+        let unrelated = Node::<i32>::state_empty();
+        let _u = unrelated.subscribe(|_| {});
+        unrelated.set(1);
+        assert_eq!(
+            runs.get(),
+            0,
+            "later unrelated delivery must not drain stale work from the aborted wave"
+        );
+    }
+
+    #[test]
     fn internal_dep_callback_entry_does_not_increment_core_refcount() {
         // The B54 first slice keeps closure transport but avoids constructing a counted
         // Core for every internal dep message. START is enough to exercise the entry
@@ -4033,7 +4139,9 @@ mod tests {
     fn public_wave_owner_entry_does_not_preclone_core() {
         // DR-8/B54 owner-execution prep: public down/up entry should enter the
         // wave-owner boundary with the existing owner handle instead of creating an
-        // extra counted Core clone before the hot wave path runs.
+        // extra counted Core clone before the hot wave path runs. The scope itself
+        // also stores only the owner's graph id; the touched-set remains the only
+        // in-wave counted safety pin.
         let source = Node::<i32>::state_empty();
         let refs = source.core.refs.clone();
         let seen_refs = Rc::new(Cell::new(0usize));
@@ -4048,8 +4156,64 @@ mod tests {
 
         assert_eq!(
             seen_refs.get(),
+            3,
+            "expected source handle + unsubscribe handle + touched-set clone, with no wave-owner Core clone"
+        );
+    }
+
+    #[test]
+    fn run_wave_ctx_borrows_core_until_defer_promotes() {
+        // DR-8/B54 delivery-waist follow-up: a synchronous fn-body Ctx is used only
+        // while the wave touched-set already pins the owner, so it can be an uncounted
+        // arena view. The async escape hatch ctx.defer() must promote to a counted Core
+        // because DeferredCtx can outlive the wave.
+        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
+        let sync_refs = Rc::new(Cell::new(0usize));
+        let deferred_refs = Rc::new(Cell::new(0usize));
+        let deferred_ctx: Rc<RefCell<Option<crate::ctx::DeferredCtx>>> =
+            Rc::new(RefCell::new(None));
+
+        let p = Node::<i32>::producer({
+            let refs_slot = refs_slot.clone();
+            let sync_refs = sync_refs.clone();
+            let deferred_refs = deferred_refs.clone();
+            let deferred_ctx = deferred_ctx.clone();
+            move |ctx| {
+                let refs = refs_slot
+                    .borrow()
+                    .as_ref()
+                    .expect("test installed ref counter before activation")
+                    .clone();
+                sync_refs.set(refs.get());
+                *deferred_ctx.borrow_mut() = Some(ctx.defer());
+                deferred_refs.set(refs.get());
+                ctx.emit(1i32);
+            }
+        });
+        *refs_slot.borrow_mut() = Some(p.core.refs.clone());
+
+        let _u = p.subscribe(|_| {});
+
+        assert_eq!(
+            sync_refs.get(),
             4,
-            "expected source handle + unsubscribe handle + wave owner + touched-set clone, with no extra public-entry Core clone"
+            "expected public handle + subscribe body/error handles + touched-set pin; Ctx itself must not count"
+        );
+        assert_eq!(
+            deferred_refs.get(),
+            5,
+            "ctx.defer() promotes the borrowed fn-body Ctx to a counted async handle"
+        );
+        assert_eq!(
+            p.core.refs.get(),
+            3,
+            "after activation, only public handle + unsubscribe handle + stashed DeferredCtx remain"
+        );
+        drop(deferred_ctx.borrow_mut().take());
+        assert_eq!(
+            p.core.refs.get(),
+            2,
+            "dropping the deferred async handle releases its counted Core pin"
         );
     }
 
@@ -4089,6 +4253,112 @@ mod tests {
             refs.get(),
             1,
             "boundary execution releases its temporary counted handle"
+        );
+    }
+
+    #[test]
+    fn deferred_rewire_remove_does_not_pin_removed_dep_while_queued() {
+        // DR-8/B54: a queued remove only needs dep identity. Add/Set must retain
+        // runtime-created deps until the boundary, but Remove should not add another
+        // counted dep pin while waiting to apply.
+        let dep = Node::<i32>::state(1);
+        let derived: Node<i32> = Node::derived(vec![dep.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = derived.subscribe(|_| {});
+        let refs = dep.core.refs.clone();
+
+        with_wave_owner(
+            &derived.core,
+            || {
+                let before = refs.get();
+                derived
+                    .core
+                    .request_rewire_next(RewireRequest::remove(&dep.core, Rc::new(|_| {})));
+                assert_eq!(
+                    refs.get(),
+                    before,
+                    "queued remove stores dep identity, not a counted dep Core"
+                );
+            },
+            || {},
+        );
+
+        assert!(
+            derived.core.deps().is_empty(),
+            "queued remove still applies at the committed boundary"
+        );
+    }
+
+    #[test]
+    fn core_identity_does_not_match_reused_slot_generation() {
+        // CoreIdentity is used by queued remove requests: it must be graph+generation
+        // identity, not just a slot id, or a stale remove could target a later occupant.
+        let arena = GraphArena::new();
+        let old = Node::<i32>::state_in_arena(&arena, 1);
+        let old_identity = CoreIdentity::from_core(&old.core);
+        let old_key = old.core.key();
+        drop(old);
+
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(old_key.id, reused.core.key().id);
+        assert_ne!(old_key.generation, reused.core.key().generation);
+        assert!(
+            !old_identity.matches(&reused.core),
+            "stale identity must not match a reused arena slot"
+        );
+    }
+
+    #[test]
+    fn queued_remove_identity_noops_after_prior_remove_and_preserves_later_add() {
+        // Multiple ctx.rewire_next requests compose at apply time. A later remove of
+        // an already-removed dep must be a no-op and must not remove a replacement dep
+        // that was added in between.
+        let old = Node::<i32>::state(1);
+        let replacement = Node::<i32>::state(2);
+        let derived: Node<i32> = Node::derived(vec![old.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = derived.subscribe(|_| {});
+
+        with_wave_owner(
+            &derived.core,
+            || {
+                derived
+                    .core
+                    .request_rewire_next(RewireRequest::remove(&old.core, Rc::new(|_| {})));
+                derived.core.request_rewire_next(RewireRequest::Add(
+                    replacement.erased(),
+                    Rc::new(|ctx| {
+                        if let Some(v) = ctx.data::<i32>(0) {
+                            ctx.emit(*v);
+                        }
+                    }),
+                ));
+                derived
+                    .core
+                    .request_rewire_next(RewireRequest::remove(&old.core, Rc::new(|_| {})));
+            },
+            || {},
+        );
+
+        let deps = derived.core.deps();
+        assert_eq!(deps.len(), 1);
+        assert!(
+            deps[0].ptr_eq(&replacement.core),
+            "second stale remove must not disturb the replacement dep"
+        );
+        assert_eq!(
+            derived.cache(),
+            Some(2),
+            "replacement add should install the replacement fn"
+        );
+
+        replacement.set(3);
+        assert_eq!(
+            derived.cache(),
+            Some(3),
+            "stale remove must not swap in its stale fn after the replacement add"
         );
     }
 
@@ -4384,6 +4654,10 @@ mod tests {
         assert!(
             d.core.borrow().deps.is_empty(),
             "queued topology still drains on the terminal owner"
+        );
+        assert!(
+            !d.core.with_inner_edges(|_, e| e.wave.in_dep_mutation),
+            "terminal-owner early return must still clear the dep-mutation guard"
         );
     }
 

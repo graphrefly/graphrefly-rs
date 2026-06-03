@@ -211,12 +211,15 @@ impl Ctx {
             .request_rewire_next(RewireRequest::Add(dep, Rc::new(f)));
     }
 
-    /// Request a deferred self-rewire REMOVE (R-rewire-deferred): remove `dep` + swap the fn at
-    /// the boundary. removeDep DRAINS the dep's edge + tears down its source on last-subscriber
-    /// (onDeactivation) = the switchMap/abortInFlight cancellation + memory bounding (D47 beta).
+    /// Request a deferred self-rewire REMOVE (R-rewire-deferred): if `dep` is still live at the
+    /// boundary, remove it + swap the fn. If the identity is already absent at apply time, the
+    /// request is a full no-op, including no fn swap, so stale duplicate removes cannot desync
+    /// the live dep/fn pairing. A successful remove DRAINS the dep's edge + tears down its source
+    /// on last-subscriber (onDeactivation) = the switchMap/abortInFlight cancellation + memory
+    /// bounding (D47 beta).
     pub fn rewire_next_remove<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
         self.node
-            .request_rewire_next(RewireRequest::Remove(dep, Rc::new(f)));
+            .request_rewire_next(RewireRequest::remove(&dep, Rc::new(f)));
     }
 
     /// Request a deferred self-rewire SET (R-rewire-deferred): replace the whole dep set + swap
