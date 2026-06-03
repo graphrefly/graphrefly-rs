@@ -1841,7 +1841,7 @@ impl Core {
                 }
             }
             Message::Data(v) => {
-                self.with_inner_edges_mut(|_n, e| {
+                let pending_drained = self.with_inner_edges_aux_mut(|n, e, a| {
                     match &mut e.state.batch[idx] {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
@@ -1853,21 +1853,43 @@ impl Core {
                         e.state.dirty[idx] = false;
                         e.state.pending -= 1;
                     }
+                    let pending_drained = e.state.pending == 0;
+                    if !pending_drained
+                        && matches!(n.pausable, Pausable::True)
+                        && !e.wave.in_dep_mutation
+                        && !a.pause_lockset.is_empty()
+                    {
+                        a.paused_dep_wave_occurred = true;
+                    }
+                    pending_drained
                 });
-                self.maybe_run();
-                self.fire_owed_demand_if_ready();
+                if pending_drained {
+                    self.maybe_run();
+                    self.fire_owed_demand_if_ready();
+                }
             }
             Message::Resolved => {
-                self.with_inner_edges_mut(|_n, e| {
+                let pending_drained = self.with_inner_edges_aux_mut(|n, e, a| {
                     e.state.record_resolved_wave(idx);
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
                         e.state.dirty[idx] = false;
                         e.state.pending -= 1;
                     }
+                    let pending_drained = e.state.pending == 0;
+                    if !pending_drained
+                        && matches!(n.pausable, Pausable::True)
+                        && !e.wave.in_dep_mutation
+                        && !a.pause_lockset.is_empty()
+                    {
+                        a.paused_dep_wave_occurred = true;
+                    }
+                    pending_drained
                 });
-                self.maybe_run();
-                self.fire_owed_demand_if_ready();
+                if pending_drained {
+                    self.maybe_run();
+                    self.fire_owed_demand_if_ready();
+                }
             }
             // Tier 5 (D34): COMPLETE | ERROR — ONE arm routed by the CENTRAL tier
             // (`Message::tier() == Tier::Terminal`), not per-variant. The shared terminal
@@ -3741,6 +3763,114 @@ mod tests {
         a.set(10); // recompute (gate already passed), sum = 14
         assert_eq!(runs.get(), 2);
         assert_eq!(sum.cache(), Some(14));
+    }
+
+    #[test]
+    fn data_waits_while_another_dep_is_pending() {
+        let a = Node::<i32>::state_empty();
+        let b = Node::<i32>::state_empty();
+        let runs = Rc::new(Cell::new(0usize));
+        let r2 = runs.clone();
+        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
+            r2.set(r2.get() + 1);
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+        });
+        let (log, sink) = recorder();
+        let _u = sum.subscribe(sink);
+        assert_eq!(*log.borrow(), vec!["START"]);
+
+        with_wave_owner(
+            &a.core,
+            || sum.core.receive_from_dep(0, &Message::Dirty),
+            || {},
+        );
+        with_wave_owner(
+            &b.core,
+            || sum.core.receive_from_dep(1, &Message::Dirty),
+            || {},
+        );
+        assert_eq!(*log.borrow(), vec!["START", "DIRTY"]);
+
+        with_wave_owner(
+            &a.core,
+            || sum.core.receive_from_dep(0, &Message::Data(Rc::new(3i32))),
+            || {},
+        );
+        assert_eq!(runs.get(), 0, "dep 1 is still pending");
+
+        with_wave_owner(
+            &b.core,
+            || sum.core.receive_from_dep(1, &Message::Data(Rc::new(4i32))),
+            || {},
+        );
+        assert_eq!(runs.get(), 1);
+        assert_eq!(sum.cache(), Some(7));
+        assert_eq!(*log.borrow(), vec!["START", "DIRTY", "DATA"]);
+    }
+
+    #[test]
+    fn data_without_prior_dirty_still_satisfies_first_run_gate() {
+        let a = Node::<i32>::state_empty();
+        let b = Node::<i32>::state_empty();
+        let runs = Rc::new(Cell::new(0usize));
+        let r2 = runs.clone();
+        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
+            r2.set(r2.get() + 1);
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+        });
+        let (log, sink) = recorder();
+        let _u = sum.subscribe(sink);
+        assert_eq!(*log.borrow(), vec!["START"]);
+
+        with_wave_owner(
+            &a.core,
+            || sum.core.receive_from_dep(0, &Message::Data(Rc::new(3i32))),
+            || {},
+        );
+        assert_eq!(runs.get(), 0, "first-run gate still waits for dep 1");
+
+        with_wave_owner(
+            &b.core,
+            || sum.core.receive_from_dep(1, &Message::Data(Rc::new(4i32))),
+            || {},
+        );
+        assert_eq!(runs.get(), 1);
+        assert_eq!(sum.cache(), Some(7));
+        assert_eq!(*log.borrow(), vec!["START", "DATA"]);
+    }
+
+    #[test]
+    fn paused_data_survives_until_later_invalidate_drains_pending() {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(10);
+        let runs = Rc::new(Cell::new(0usize));
+        let r2 = runs.clone();
+        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
+            r2.set(r2.get() + 1);
+            let x = ctx.data::<i32>(0).map(|v| *v).unwrap_or(0);
+            let y = ctx.data::<i32>(1).map(|v| *v).unwrap_or(0);
+            ctx.emit(x + y);
+        });
+        let (log, sink) = recorder();
+        let _u = sum.subscribe(sink);
+        assert_eq!(runs.get(), 1);
+        assert_eq!(sum.cache(), Some(11));
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("coalesce");
+        sum.up(vec![Message::Pause(pause.clone())]);
+        a.down(vec![Message::Dirty]);
+        b.down(vec![Message::Dirty]);
+        a.down(vec![Message::Data(Rc::new(2i32))]);
+        assert_eq!(runs.get(), 1, "dep 1 is still pending while paused");
+
+        b.down(vec![Message::Invalidate]);
+        assert_eq!(runs.get(), 1, "still paused after pending drains");
+        sum.up(vec![Message::Resume(pause)]);
+
+        assert_eq!(runs.get(), 2);
+        assert_eq!(sum.cache(), Some(2));
+        assert_eq!(*log.borrow(), vec!["DIRTY", "INVALIDATE", "DATA"]);
     }
 
     #[test]
