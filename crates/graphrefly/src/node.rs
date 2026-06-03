@@ -266,6 +266,7 @@ struct GraphCore {
     edge_slots: Vec<Option<DepEdges>>,
     aux_slots: Vec<Option<NodeAux>>,
     generations: Vec<u64>,
+    touched_waves: Vec<u64>,
     pins: Vec<usize>,
     free: Vec<usize>,
     deferred_boundary: VecDeque<BoundaryTask>,
@@ -283,6 +284,7 @@ impl GraphCore {
             edge_slots: Vec::new(),
             aux_slots: Vec::new(),
             generations: Vec::new(),
+            touched_waves: Vec::new(),
             pins: Vec::new(),
             free: Vec::new(),
             deferred_boundary: VecDeque::new(),
@@ -313,6 +315,7 @@ impl GraphCore {
             self.edge_slots[id] = Some(edges);
             self.aux_slots[id] = Some(aux);
             self.generations[id] = next_generation;
+            self.touched_waves[id] = 0;
             self.pins[id] = 0;
             NodeId(id)
         } else {
@@ -325,6 +328,7 @@ impl GraphCore {
             self.edge_slots.push(Some(edges));
             self.aux_slots.push(Some(aux));
             self.generations.push(0);
+            self.touched_waves.push(0);
             self.pins.push(0);
             NodeId(id)
         }
@@ -574,6 +578,7 @@ impl GraphCore {
         self.generations.get(key.id.0) == Some(&key.generation) && self.is_live(key.id)
     }
 
+    #[cfg(test)]
     fn pin_live_key(&mut self, key: NodeKey) -> bool {
         if !self.is_live_key(key) {
             return false;
@@ -1193,6 +1198,7 @@ struct ArenaNodePin {
 }
 
 impl ArenaNodePin {
+    #[cfg(test)]
     fn from_core(core: &Core) -> Option<Self> {
         {
             let mut graph = core.graph.borrow_mut();
@@ -1294,18 +1300,7 @@ impl CoreWeak {
             let Some(scope) = wave.as_mut() else {
                 return false;
             };
-            {
-                let mut g = graph.borrow_mut();
-                if !g.pin_live_key(self.key) {
-                    return false;
-                }
-            }
-            scope.touched.push(ArenaNodePin {
-                arena_key,
-                graph: graph.clone(),
-                refs: refs.clone(),
-            });
-            true
+            scope.pin_once(arena_key, &graph, &refs)
         });
         if !registered {
             return None;
@@ -1504,6 +1499,9 @@ impl Drop for DepMutationGuard {
 /// that batch (D12) and the `ctx.rewire_next` deferred drain (D47) will reuse.
 struct WaveScope {
     owner_graph_id: usize,
+    /// Process-local wave id used to mark arena nodes once per wave without a
+    /// per-touch hash lookup (DR-8/B54 owner-execution hot path).
+    wave_id: u64,
     /// Graph roots that received committed-boundary tasks during this wave but are not
     /// necessarily the wave owner's graph (nested cross-arena public calls share WAVE).
     boundary_roots: Vec<BoundaryRoot>,
@@ -1519,10 +1517,45 @@ struct WaveScope {
     blamed: Option<ArenaNodeKey>,
 }
 
+impl WaveScope {
+    fn pin_once(
+        &mut self,
+        arena_key: ArenaNodeKey,
+        graph: &Rc<RefCell<GraphCore>>,
+        refs: &Rc<Cell<usize>>,
+    ) -> bool {
+        {
+            let mut g = graph.borrow_mut();
+            if !g.is_live_key(arena_key.node) {
+                return false;
+            }
+            let id = arena_key.node.id.0;
+            if g.touched_waves.get(id) == Some(&self.wave_id) {
+                return true;
+            }
+            g.pins[id] = g.pins[id]
+                .checked_add(1)
+                .expect("GraphCore pin count overflow");
+            let touched = g
+                .touched_waves
+                .get_mut(id)
+                .expect("Core points at a live GraphCore touch slot");
+            *touched = self.wave_id;
+        }
+        self.touched.push(ArenaNodePin {
+            arena_key,
+            graph: graph.clone(),
+            refs: refs.clone(),
+        });
+        true
+    }
+}
+
 thread_local! {
     /// The current wave's scope, if a wave is in flight (single-thread, D22 ⇒
     /// thread-local, like the default dispatcher D26). `Some` ⇔ inside a wave.
     static WAVE: RefCell<Option<WaveScope>> = const { RefCell::new(None) };
+    static NEXT_WAVE_SCOPE_ID: Cell<u64> = const { Cell::new(1) };
     /// Downstream delivery depth for one `down(msgs)` wave. A dep may receive
     /// multiple DATA messages before its dirty contribution is cleared; the fn
     /// must see the full batch once, not run once per DATA occurrence.
@@ -1538,14 +1571,20 @@ fn wave_in_flight() -> bool {
     WAVE.with(|w| w.borrow().is_some())
 }
 
+fn next_wave_scope_id() -> u64 {
+    NEXT_WAVE_SCOPE_ID.with(|next| {
+        let id = next.get();
+        next.set(id.checked_add(1).expect("wave scope id overflow"));
+        id
+    })
+}
+
 /// Register a node as a wave participant (for the B25 touched-set reset). No-op if
 /// no wave is in flight (e.g. a `cache` read outside any wave).
 fn wave_register(core: &Core) {
     WAVE.with(|w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
-            if let Some(pin) = ArenaNodePin::from_core(core) {
-                scope.touched.push(pin);
-            }
+            let _ = scope.pin_once(core.arena_node_key(), &core.graph, &core.refs);
         }
     });
 }
@@ -1705,6 +1744,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
     WAVE.with(|w| {
         *w.borrow_mut() = Some(WaveScope {
             owner_graph_id: Rc::as_ptr(&owner.graph) as usize,
+            wave_id: next_wave_scope_id(),
             boundary_roots: Vec::new(),
             touched: Vec::new(),
             blamed: None,
@@ -2957,11 +2997,13 @@ impl Core {
                             .as_ref()
                             .and_then(|b| b.last().cloned())
                             .or_else(|| e.state.prev[i].clone());
+                        let wave_data = std::mem::take(&mut e.state.batch_waves[i]);
+                        e.state.batch_wave_id[i] = None;
                         DepRecord {
-                            wave_data: e.state.batch_waves[i].clone(),
+                            wave_data,
                             prev_data: e.state.prev[i].clone(),
                             latest,
-                            terminal: e.state.terminal_wave[i].clone(),
+                            terminal: e.state.terminal_wave[i].take(),
                         }
                     })
                     .collect();
@@ -3032,9 +3074,6 @@ impl Core {
                     e.state.prev[i] = Some(last);
                 }
                 *b = None;
-                e.state.batch_waves[i].clear();
-                e.state.batch_wave_id[i] = None;
-                e.state.terminal_wave[i] = None;
             }
             e.wave.emitted_dirty_this_wave = false;
             e.wave.emitted_tier3_this_wave = false;
@@ -4874,6 +4913,55 @@ mod tests {
         let reused = Node::<i32>::state_in_arena(&arena, 2);
         assert_eq!(victim_key.id, reused.core.key().id);
         assert_ne!(victim_key.generation, reused.core.key().generation);
+    }
+
+    #[test]
+    fn touched_arena_pin_dedupes_same_node_within_wave() {
+        // DR-8/B54 owner-execution: repeated callbacks to one node in a single wave
+        // need one arena lifetime pin + one unwind-reset entry. DIRTY, DATA, and
+        // run_wave may all touch the same node; duplicate pins only add hot-path tax.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let owner = Node::<i32>::state_in_arena(&arena, 0);
+        let victim = Node::<i32>::state_in_arena(&arena, 1);
+        let victim_key = victim.core.key();
+        let victim_refs = victim.core.refs.clone();
+        let graph_in_wave = graph.clone();
+
+        with_wave_owner(
+            &owner.core,
+            move || {
+                wave_register(&victim.core);
+                wave_register(&victim.core);
+                wave_register(&victim.core);
+                WAVE.with(|w| {
+                    let wave = w.borrow();
+                    let scope = wave.as_ref().expect("wave installed");
+                    assert_eq!(scope.touched.len(), 1);
+                });
+                assert_eq!(
+                    graph_in_wave.borrow().pin_count(victim_key),
+                    1,
+                    "duplicate touches should share one arena pin"
+                );
+                drop(victim);
+                assert_eq!(
+                    victim_refs.get(),
+                    0,
+                    "the deduped arena pin still allows external refs to reach zero"
+                );
+                assert!(
+                    graph_in_wave.borrow().is_live_key(victim_key),
+                    "one deduped pin must still keep the slot live through wave exit"
+                );
+            },
+            || {},
+        );
+
+        assert!(
+            !graph.borrow().is_live_key(victim_key),
+            "deduped pin releases at wave exit and frees externally-dead slot"
+        );
     }
 
     #[test]
