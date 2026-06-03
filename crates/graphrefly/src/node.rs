@@ -39,7 +39,7 @@
 //! (C-2/C-9/C-10), up-at-source INVALIDATE terminus (C-7).
 
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
@@ -1273,6 +1273,48 @@ impl InWaveDepReceiveAction {
             || self.fire_demand
             || self.down_msgs.as_ref().is_some_and(|msgs| !msgs.is_empty())
     }
+
+    fn apply(self, core: &Core) {
+        if self.emit_teardown_subscribers {
+            core.emit_to_subs(&Message::Teardown);
+        }
+        if self.emit_dirty {
+            core.emit_to_subs(&Message::Dirty);
+        }
+        if self.do_invalidate {
+            if self.invalidate_as_invalidate_msg && self.had_node_data_before_invalidate {
+                core.down(vec![Message::Invalidate]);
+            } else {
+                core.invalidate();
+            }
+        }
+        if self.clear_undirty_after_invalidate {
+            if self.had_node_data_before_invalidate {
+                core.with_inner_edges_mut(|_n, e| {
+                    e.wave.emitted_dirty_this_wave = false;
+                });
+            } else {
+                core.down(vec![Message::Resolved]);
+            }
+        }
+        if self.do_maybe_run {
+            core.maybe_run();
+        }
+        if let Some(msgs) = self.down_msgs {
+            core.down(msgs);
+        }
+        if self.do_settle_after_absorbed_terminal {
+            core.settle_after_absorbed_terminal();
+        }
+        if self.fire_demand {
+            core.fire_owed_demand_if_ready();
+        }
+    }
+}
+
+enum DownAction {
+    Emit { msg: Msg, subs: SubscriberSnapshot },
+    Invalidate { hooks: Vec<Rc<dyn Fn()>> },
 }
 
 impl CoreWeak {
@@ -2299,40 +2341,7 @@ impl Core {
     }
 
     fn apply_receive_from_dep_action(&self, action: InWaveDepReceiveAction) {
-        if action.emit_teardown_subscribers {
-            self.emit_to_subs(&Message::Teardown);
-        }
-        if action.emit_dirty {
-            self.emit_to_subs(&Message::Dirty);
-        }
-        if action.do_invalidate {
-            if action.invalidate_as_invalidate_msg && action.had_node_data_before_invalidate {
-                self.down(vec![Message::Invalidate]);
-            } else {
-                self.invalidate();
-            }
-        }
-        if action.clear_undirty_after_invalidate {
-            if action.had_node_data_before_invalidate {
-                self.with_inner_edges_mut(|_n, e| {
-                    e.wave.emitted_dirty_this_wave = false;
-                });
-            } else {
-                self.down(vec![Message::Resolved]);
-            }
-        }
-        if action.do_maybe_run {
-            self.maybe_run();
-        }
-        if let Some(msgs) = action.down_msgs {
-            self.down(msgs);
-        }
-        if action.do_settle_after_absorbed_terminal {
-            self.settle_after_absorbed_terminal();
-        }
-        if action.fire_demand {
-            self.fire_owed_demand_if_ready();
-        }
+        action.apply(self);
     }
 
     fn collect_receive_from_dep_action_from_graph(
@@ -2931,13 +2940,17 @@ impl Core {
         let n = new_deps.len();
         let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
         let mut new_to_old: Vec<Option<usize>> = vec![None; n];
+        let mut first_old_by_key: HashMap<ArenaNodeKey, usize> =
+            HashMap::with_capacity(old_deps.len());
         for (old_idx, old_dep) in old_deps.iter().enumerate() {
-            for (new_idx, new_dep) in new_deps.iter().enumerate() {
-                if old_dep.ptr_eq(new_dep) && new_to_old[new_idx].is_none() {
-                    old_to_new[old_idx] = Some(new_idx);
-                    new_to_old[new_idx] = Some(old_idx);
-                    break;
-                }
+            first_old_by_key
+                .entry(old_dep.arena_node_key())
+                .or_insert(old_idx);
+        }
+        for (new_idx, new_dep) in new_deps.iter().enumerate() {
+            if let Some(old_idx) = first_old_by_key.remove(&new_dep.arena_node_key()) {
+                old_to_new[old_idx] = Some(new_idx);
+                new_to_old[new_idx] = Some(old_idx);
             }
         }
         let added: Vec<(usize, Core)> = new_deps
@@ -3393,85 +3406,8 @@ impl Core {
 
         with_delivery_scope(|| {
             for m in sorted {
-                match m {
-                    Message::Dirty => self.emit_dirty_once(),
-                    Message::Data(v) => {
-                        // D49: every occurrence is DATA — no equals-substitution.
-                        let subs = {
-                            let mut n = self.graph.borrow_mut();
-                            let (_inner, e, a) = n.get_node_edges_aux_mut(self.key());
-                            e.value.cache = Some(v.clone());
-                            e.value.has_data = true;
-                            e.value.status = Status::Settled;
-                            e.wave.emitted_tier3_this_wave = true;
-                            snapshot_subscribers(a)
-                        };
-                        deliver_subscriber_snapshot(subs, &Message::Data(v));
-                    }
-                    Message::Resolved => {
-                        // Explicit operator escape hatch (D49); the substrate-synthesized
-                        // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
-                        // that must honor pause/batch timing also route through here, so keep
-                        // the no-cache case at SENTINEL while still emitting RESOLVED.
-                        let subs = {
-                            let mut n = self.graph.borrow_mut();
-                            let (_inner, e, a) = n.get_node_edges_aux_mut(self.key());
-                            e.value.status = if e.value.has_data {
-                                Status::Resolved
-                            } else {
-                                Status::Sentinel
-                            };
-                            e.wave.emitted_tier3_this_wave = true;
-                            snapshot_subscribers(a)
-                        };
-                        deliver_subscriber_snapshot(subs, &Message::Resolved);
-                    }
-                    Message::Invalidate => {
-                        // Honor the invalidate-request: clear cache → SENTINEL, fire
-                        // onInvalidate, broadcast downstream (idempotent, no-op if unpopulated).
-                        self.invalidate();
-                    }
-                    Message::Complete => {
-                        let go = {
-                            self.with_inner_edges_aux_mut(|_n, e, a| {
-                                if e.value.terminal {
-                                    return false;
-                                }
-                                e.value.terminal = true;
-                                e.value.status = Status::Completed;
-                                a.pull_demand_owed = false;
-                                a.paused_dep_wave_occurred = false;
-                                a.pause_buffer.clear();
-                                true
-                            })
-                        };
-                        if go {
-                            self.emit_to_subs(&Message::Complete);
-                        }
-                    }
-                    Message::Error(e) => {
-                        let go = {
-                            self.with_inner_edges_aux_mut(|_n, edges, a| {
-                                if edges.value.terminal {
-                                    return false;
-                                }
-                                edges.value.terminal = true;
-                                edges.value.status = Status::Errored;
-                                a.pull_demand_owed = false;
-                                a.paused_dep_wave_occurred = false;
-                                a.pause_buffer.clear();
-                                true
-                            })
-                        };
-                        if go {
-                            self.emit_to_subs(&Message::Error(e));
-                        }
-                    }
-                    Message::Teardown => {
-                        self.emit_to_subs(&Message::Teardown);
-                    }
-                    // PAUSE / RESUME are control-only and are delivered via up().
-                    _ => {}
+                if let Some(action) = self.collect_down_action(m) {
+                    self.apply_down_action(action);
                 }
             }
         });
@@ -3481,6 +3417,125 @@ impl Core {
                 e.wave.emitted_dirty_this_wave = false;
                 e.wave.emitted_tier3_this_wave = false;
             });
+        }
+    }
+
+    fn collect_down_action(&self, msg: Msg) -> Option<DownAction> {
+        let mut g = self.graph.borrow_mut();
+        Self::collect_down_action_from_graph(&mut g, self.key(), msg)
+    }
+
+    fn apply_down_action(&self, action: DownAction) {
+        match action {
+            DownAction::Emit { msg, subs } => deliver_subscriber_snapshot(subs, &msg),
+            DownAction::Invalidate { hooks } => {
+                // Invalidate hooks may unsubscribe current observers. Preserve the
+                // existing hook-before-subscriber-snapshot order (R-cleanup-hooks).
+                for f in hooks {
+                    f();
+                }
+                self.emit_to_subs(&Message::Invalidate);
+            }
+        }
+    }
+
+    fn collect_down_action_from_graph(
+        g: &mut GraphCore,
+        key: NodeKey,
+        msg: Msg,
+    ) -> Option<DownAction> {
+        match msg {
+            Message::Dirty => {
+                let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                if e.wave.emitted_dirty_this_wave {
+                    return None;
+                }
+                e.wave.emitted_dirty_this_wave = true;
+                e.value.status = Status::Dirty;
+                Some(DownAction::Emit {
+                    msg: Message::Dirty,
+                    subs: snapshot_subscribers(a),
+                })
+            }
+            Message::Data(v) => {
+                // D49: every occurrence is DATA — no equals-substitution.
+                let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                e.value.cache = Some(v.clone());
+                e.value.has_data = true;
+                e.value.status = Status::Settled;
+                e.wave.emitted_tier3_this_wave = true;
+                Some(DownAction::Emit {
+                    msg: Message::Data(v),
+                    subs: snapshot_subscribers(a),
+                })
+            }
+            Message::Resolved => {
+                // Explicit operator escape hatch (D49); the substrate-synthesized
+                // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
+                // that must honor pause/batch timing also route through here, so keep
+                // the no-cache case at SENTINEL while still emitting RESOLVED.
+                let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                e.value.status = if e.value.has_data {
+                    Status::Resolved
+                } else {
+                    Status::Sentinel
+                };
+                e.wave.emitted_tier3_this_wave = true;
+                Some(DownAction::Emit {
+                    msg: Message::Resolved,
+                    subs: snapshot_subscribers(a),
+                })
+            }
+            Message::Invalidate => {
+                // Honor the invalidate-request: clear cache → SENTINEL, fire
+                // onInvalidate, broadcast downstream (idempotent, no-op if unpopulated).
+                let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                if !e.value.has_data {
+                    return None;
+                }
+                e.value.cache = None;
+                e.value.has_data = false;
+                e.value.status = Status::Sentinel;
+                Some(DownAction::Invalidate {
+                    hooks: a.on_invalidate.clone(),
+                })
+            }
+            Message::Complete => {
+                let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                if e.value.terminal {
+                    return None;
+                }
+                e.value.terminal = true;
+                e.value.status = Status::Completed;
+                a.pull_demand_owed = false;
+                a.paused_dep_wave_occurred = false;
+                a.pause_buffer.clear();
+                Some(DownAction::Emit {
+                    msg: Message::Complete,
+                    subs: snapshot_subscribers(a),
+                })
+            }
+            Message::Error(e) => {
+                let (_n, edges, a) = g.get_node_edges_aux_mut(key);
+                if edges.value.terminal {
+                    return None;
+                }
+                edges.value.terminal = true;
+                edges.value.status = Status::Errored;
+                a.pull_demand_owed = false;
+                a.paused_dep_wave_occurred = false;
+                a.pause_buffer.clear();
+                Some(DownAction::Emit {
+                    msg: Message::Error(e),
+                    subs: snapshot_subscribers(a),
+                })
+            }
+            Message::Teardown => Some(DownAction::Emit {
+                msg: Message::Teardown,
+                subs: snapshot_subscribers(g.get_aux(key)),
+            }),
+            // PAUSE / RESUME are control-only and are delivered via up().
+            _ => None,
         }
     }
 
