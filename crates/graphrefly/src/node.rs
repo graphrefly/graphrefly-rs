@@ -38,7 +38,7 @@
 //! replay-buffer, the resumeAll/false pause modes + async-paused buffering
 //! (C-2/C-9/C-10), up-at-source INVALIDATE terminus (C-7).
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -233,6 +233,9 @@ impl GraphArena {
 
 struct GraphCore {
     slots: Vec<Option<NodeInner>>,
+    call_slots: Vec<Option<NodeCallSlot>>,
+    config_slots: Vec<Option<NodeConfigSlot>>,
+    run_slots: Vec<Option<NodeRunState>>,
     edge_slots: Vec<Option<DepEdges>>,
     aux_slots: Vec<Option<NodeAux>>,
     generations: Vec<u64>,
@@ -246,6 +249,9 @@ impl GraphCore {
     fn new() -> Self {
         Self {
             slots: Vec::new(),
+            call_slots: Vec::new(),
+            config_slots: Vec::new(),
+            run_slots: Vec::new(),
             edge_slots: Vec::new(),
             aux_slots: Vec::new(),
             generations: Vec::new(),
@@ -256,15 +262,19 @@ impl GraphCore {
         }
     }
 
-    fn alloc(&mut self, inner: NodeInner) -> NodeId {
+    fn alloc(&mut self, inner: NodeInner, call: NodeCallSlot, config: NodeConfigSlot) -> NodeId {
         let edges = DepEdges::new(inner.deps.len());
         let aux = NodeAux::new();
+        let run = NodeRunState::new();
         if let Some(id) = self.free.last().copied() {
             let next_generation = self.generations[id]
                 .checked_add(1)
                 .expect("GraphCore generation overflow on slot reuse");
             self.free.pop();
             self.slots[id] = Some(inner);
+            self.call_slots[id] = Some(call);
+            self.config_slots[id] = Some(config);
+            self.run_slots[id] = Some(run);
             self.edge_slots[id] = Some(edges);
             self.aux_slots[id] = Some(aux);
             self.generations[id] = next_generation;
@@ -273,6 +283,9 @@ impl GraphCore {
         } else {
             let id = self.slots.len();
             self.slots.push(Some(inner));
+            self.call_slots.push(Some(call));
+            self.config_slots.push(Some(config));
+            self.run_slots.push(Some(run));
             self.edge_slots.push(Some(edges));
             self.aux_slots.push(Some(aux));
             self.generations.push(0);
@@ -299,17 +312,6 @@ impl GraphCore {
             .expect("Core points at a live GraphCore slot")
     }
 
-    fn get_mut(&mut self, key: NodeKey) -> &mut NodeInner {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore slot")
-    }
-
     fn get_node_and_edges_mut(&mut self, key: NodeKey) -> (&mut NodeInner, &mut DepEdges) {
         assert!(
             self.is_live_key(key),
@@ -326,6 +328,70 @@ impl GraphCore {
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore edge slot");
         (n, e)
+    }
+
+    fn get_node_call_config_run_edges(
+        &self,
+        key: NodeKey,
+    ) -> (
+        &NodeInner,
+        &NodeCallSlot,
+        &NodeConfigSlot,
+        &NodeRunState,
+        &DepEdges,
+    ) {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        let n = self
+            .slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore slot");
+        let c = self
+            .call_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore call slot");
+        let cfg = self
+            .config_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore config slot");
+        let r = self
+            .run_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore run slot");
+        let e = self
+            .edge_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore edge slot");
+        (n, c, cfg, r, e)
+    }
+
+    fn get_call(&self, key: NodeKey) -> &NodeCallSlot {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        self.call_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore call slot")
+    }
+
+    fn get_config(&self, key: NodeKey) -> &NodeConfigSlot {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        self.config_slots
+            .get(key.id.0)
+            .and_then(Option::as_ref)
+            .expect("Core points at a live GraphCore config slot")
     }
 
     fn get_node_edges_aux_mut(
@@ -354,6 +420,96 @@ impl GraphCore {
         (n, e, a)
     }
 
+    fn get_node_call_config_run_edges_mut(
+        &mut self,
+        key: NodeKey,
+    ) -> (
+        &mut NodeInner,
+        &mut NodeCallSlot,
+        &mut NodeConfigSlot,
+        &mut NodeRunState,
+        &mut DepEdges,
+    ) {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        let slots = &mut self.slots;
+        let call_slots = &mut self.call_slots;
+        let config_slots = &mut self.config_slots;
+        let run_slots = &mut self.run_slots;
+        let edge_slots = &mut self.edge_slots;
+        let n = slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot");
+        let c = call_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore call slot");
+        let cfg = config_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore config slot");
+        let r = run_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore run slot");
+        let e = edge_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore edge slot");
+        (n, c, cfg, r, e)
+    }
+
+    fn get_node_call_config_run_edges_aux_mut(
+        &mut self,
+        key: NodeKey,
+    ) -> (
+        &mut NodeInner,
+        &mut NodeCallSlot,
+        &mut NodeConfigSlot,
+        &mut NodeRunState,
+        &mut DepEdges,
+        &mut NodeAux,
+    ) {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        let slots = &mut self.slots;
+        let call_slots = &mut self.call_slots;
+        let config_slots = &mut self.config_slots;
+        let run_slots = &mut self.run_slots;
+        let edge_slots = &mut self.edge_slots;
+        let aux_slots = &mut self.aux_slots;
+        let n = slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore slot");
+        let c = call_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore call slot");
+        let cfg = config_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore config slot");
+        let r = run_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore run slot");
+        let e = edge_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore edge slot");
+        let a = aux_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore aux slot");
+        (n, c, cfg, r, e, a)
+    }
+
     fn get_aux(&self, key: NodeKey) -> &NodeAux {
         assert!(
             self.is_live_key(key),
@@ -366,9 +522,15 @@ impl GraphCore {
     }
 
     fn is_live(&self, id: NodeId) -> bool {
-        self.slots.get(id.0).is_some_and(Option::is_some)
-            && self.edge_slots.get(id.0).is_some_and(Option::is_some)
-            && self.aux_slots.get(id.0).is_some_and(Option::is_some)
+        let live = self.slots.get(id.0).is_some_and(Option::is_some);
+        if live {
+            debug_assert!(self.call_slots.get(id.0).is_some_and(Option::is_some));
+            debug_assert!(self.config_slots.get(id.0).is_some_and(Option::is_some));
+            debug_assert!(self.run_slots.get(id.0).is_some_and(Option::is_some));
+            debug_assert!(self.edge_slots.get(id.0).is_some_and(Option::is_some));
+            debug_assert!(self.aux_slots.get(id.0).is_some_and(Option::is_some));
+        }
+        live
     }
 
     fn is_live_key(&self, key: NodeKey) -> bool {
@@ -404,14 +566,27 @@ impl GraphCore {
         self.pins.get(key.id.0).copied().unwrap_or(0)
     }
 
-    fn take_live(&mut self, key: NodeKey) -> Option<(NodeInner, DepEdges, NodeAux)> {
+    fn take_live(
+        &mut self,
+        key: NodeKey,
+    ) -> Option<(
+        NodeInner,
+        NodeCallSlot,
+        NodeConfigSlot,
+        NodeRunState,
+        DepEdges,
+        NodeAux,
+    )> {
         if !self.is_live_key(key) {
             return None;
         }
         let inner = self.slots.get_mut(key.id.0)?.take()?;
+        let call = self.call_slots.get_mut(key.id.0)?.take()?;
+        let config = self.config_slots.get_mut(key.id.0)?.take()?;
+        let run = self.run_slots.get_mut(key.id.0)?.take()?;
         let edges = self.edge_slots.get_mut(key.id.0)?.take()?;
         let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
-        Some((inner, edges, aux))
+        Some((inner, call, config, run, edges, aux))
     }
 }
 
@@ -567,6 +742,58 @@ impl DepEdges {
     }
 }
 
+/// Dispatcher-owned callable metadata for one node. Keeping this in GraphCore
+/// lets the hot wave path snapshot the call target by arena index, then invoke
+/// borrow-free through the dispatcher (R-dispatch-all).
+struct NodeCallSlot {
+    factory: Option<String>,
+    handle: Option<Handle>,
+    dispatcher: Dispatcher,
+}
+
+/// Construction/configuration state for one node. This is side-table owned so the
+/// public `Core` handle can keep thinning toward a graph/id/generation token.
+struct NodeConfigSlot {
+    partial: bool,
+    pausable: Pausable,
+    pull_id: Option<LockId>,
+    complete_when_deps_complete: bool,
+    error_when_deps_error: bool,
+    terminal_as_real_input: bool,
+}
+
+impl NodeConfigSlot {
+    fn new(pausable: Pausable) -> Self {
+        Self {
+            partial: false,
+            pausable,
+            pull_id: None,
+            complete_when_deps_complete: true,
+            error_when_deps_error: true,
+            terminal_as_real_input: false,
+        }
+    }
+
+    fn all_deps_settled(&self, dep: &DepState) -> bool {
+        dep.all_settled(self.terminal_as_real_input)
+    }
+}
+
+/// Lifecycle/run mutable state. Transient wave flags stay in [`NodeWaveState`];
+/// this side table holds state that persists across waves but resets on lifecycle
+/// teardown.
+struct NodeRunState {
+    has_called_fn_once: bool,
+}
+
+impl NodeRunState {
+    fn new() -> Self {
+        Self {
+            has_called_fn_once: false,
+        }
+    }
+}
+
 /// Node-local sidecars that are NOT part of dep-slot wave bookkeeping. Keeping these
 /// in a side-table continues the B49 thinning path without changing observable behavior.
 struct NodeAux {
@@ -610,40 +837,6 @@ impl NodeAux {
 /// reentrant engine lives on [`Core`].
 struct NodeInner {
     deps: Vec<Core>,
-    factory: Option<String>,
-    handle: Option<Handle>,
-    dispatcher: Dispatcher,
-    /// First-run gate off (fn fires as soon as dirty-count hits 0; fn body guards
-    /// SENTINEL per dep). Default false (R-first-run-gate).
-    partial: bool,
-    has_called_fn_once: bool,
-
-    // control + terminal
-    /// Pause mode (R-pause-modes / D44). `true` coalesces dep-driven recompute; `false`
-    /// ignores PAUSE entirely; `resumeAll` buffers+replays the own settle slice.
-    pausable: Pausable,
-    /// Pull-mode id (R-pull / D59). `Some(id)` means quiet-by-default; demand is a
-    /// cone-routed RESUME(id), matched by id equality in Rust's per-language representation.
-    pull_id: Option<LockId>,
-
-    /// Auto-emit COMPLETE when ALL deps complete (default true). last/reduce/*Map set
-    /// false to ABSORB inner terminals (R-deps-terminal).
-    complete_when_deps_complete: bool,
-    /// Auto-emit ERROR when ANY dep errors (default true). rescue/catch set false.
-    error_when_deps_error: bool,
-    /// A dep's terminal is a real input the fn reads (rescue/reduce/*Map), not an
-    /// absorbed settle (R-deps-terminal).
-    terminal_as_real_input: bool,
-}
-
-impl NodeInner {
-    /// First-run gate predicate: every declared dep has delivered ≥1 DATA. A
-    /// `terminal_as_real_input` node (rescue/reduce/*Map) also treats a TERMINATED dep
-    /// as settled, so the fn may run when an inner terminates without ever delivering
-    /// DATA (R-deps-terminal / R-first-run-gate).
-    fn all_deps_settled(&self, dep: &DepState) -> bool {
-        dep.all_settled(self.terminal_as_real_input)
-    }
 }
 
 /// Release a node's upstream subscriptions + external resources when its inner is
@@ -659,13 +852,12 @@ impl NodeInner {
 /// recursively deactivating up the DAG (terminates); idempotent with `deactivate`
 /// (which already drained both vecs, so this is then a no-op).
 impl NodeInner {
-    fn cleanup_before_free(&mut self, edges: &mut DepEdges, aux: &mut NodeAux) {
-        for u in edges.unsubs.drain(..).flatten() {
-            u();
-        }
-        for h in std::mem::take(&mut aux.on_deactivation) {
-            h();
-        }
+    fn cleanup_before_free(
+        &mut self,
+        call: &mut NodeCallSlot,
+        edges: &mut DepEdges,
+        aux: &mut NodeAux,
+    ) {
         // B32: free this node's fn slot so the dispatcher pool no longer holds the fn —
         // and thus the upstream `Core`s the fn captured (e.g. a `Node: Clone` handle, the
         // idiomatic feedback pattern) — alive for the whole process. Safe: invoke clones
@@ -673,8 +865,16 @@ impl NodeInner {
         // dropped from inside a fn can re-borrow the pool here. A fn that captures its OWN
         // node is a genuine Rc cycle this cannot break (the pool keeps that node alive →
         // Drop never runs) — that is a user-level self-cycle (use a Weak self-handle).
-        if let Some(handle) = self.handle {
-            self.dispatcher.unregister(handle);
+        // Run this before user cleanup callbacks so a panicking cleanup cannot strand the
+        // dispatcher slot and its captures.
+        if let Some(handle) = call.handle {
+            call.dispatcher.unregister(handle);
+        }
+        for u in edges.unsubs.drain(..).flatten() {
+            u();
+        }
+        for h in std::mem::take(&mut aux.on_deactivation) {
+            h();
         }
     }
 }
@@ -757,10 +957,6 @@ impl Core {
         Ref::map(self.graph.borrow(), |g| g.get(self.key()))
     }
 
-    fn borrow_mut(&self) -> RefMut<'_, NodeInner> {
-        RefMut::map(self.graph.borrow_mut(), |g| g.get_mut(self.key()))
-    }
-
     fn with_inner_edges_mut<R>(&self, f: impl FnOnce(&mut NodeInner, &mut DepEdges) -> R) -> R {
         let mut g = self.graph.borrow_mut();
         let (n, e) = g.get_node_and_edges_mut(self.key());
@@ -787,6 +983,56 @@ impl Core {
         f(n, e)
     }
 
+    fn with_node_state<R>(
+        &self,
+        f: impl FnOnce(&NodeInner, &NodeCallSlot, &NodeConfigSlot, &NodeRunState, &DepEdges) -> R,
+    ) -> R {
+        let g = self.graph.borrow();
+        let (n, c, cfg, r, e) = g.get_node_call_config_run_edges(self.key());
+        f(n, c, cfg, r, e)
+    }
+
+    fn with_node_state_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut NodeInner,
+            &mut NodeCallSlot,
+            &mut NodeConfigSlot,
+            &mut NodeRunState,
+            &mut DepEdges,
+        ) -> R,
+    ) -> R {
+        let mut g = self.graph.borrow_mut();
+        let (n, c, cfg, r, e) = g.get_node_call_config_run_edges_mut(self.key());
+        f(n, c, cfg, r, e)
+    }
+
+    fn with_node_state_aux_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut NodeInner,
+            &mut NodeCallSlot,
+            &mut NodeConfigSlot,
+            &mut NodeRunState,
+            &mut DepEdges,
+            &mut NodeAux,
+        ) -> R,
+    ) -> R {
+        let mut g = self.graph.borrow_mut();
+        let (n, c, cfg, r, e, a) = g.get_node_call_config_run_edges_aux_mut(self.key());
+        f(n, c, cfg, r, e, a)
+    }
+
+    fn with_call<R>(&self, f: impl FnOnce(&NodeCallSlot) -> R) -> R {
+        let g = self.graph.borrow();
+        f(g.get_call(self.key()))
+    }
+
+    fn with_config<R>(&self, f: impl FnOnce(&NodeConfigSlot) -> R) -> R {
+        let g = self.graph.borrow();
+        f(g.get_config(self.key()))
+    }
+
     fn with_aux<R>(&self, f: impl FnOnce(&NodeAux) -> R) -> R {
         let g = self.graph.borrow();
         f(g.get_aux(self.key()))
@@ -806,13 +1052,20 @@ impl Core {
         f(a)
     }
 
-    fn try_with_inner_aux_mut<R>(
+    fn try_with_node_state_aux_mut<R>(
         &self,
-        f: impl FnOnce(&mut NodeInner, &mut DepEdges, &mut NodeAux) -> R,
+        f: impl FnOnce(
+            &mut NodeInner,
+            &mut NodeCallSlot,
+            &mut NodeConfigSlot,
+            &mut NodeRunState,
+            &mut DepEdges,
+            &mut NodeAux,
+        ) -> R,
     ) -> Option<R> {
         let mut g = self.graph.try_borrow_mut().ok()?;
-        let (n, e, a) = g.get_node_edges_aux_mut(self.key());
-        Some(f(n, e, a))
+        let (n, c, cfg, r, e, a) = g.get_node_call_config_run_edges_aux_mut(self.key());
+        Some(f(n, c, cfg, r, e, a))
     }
 
     fn downgrade(&self) -> CoreWeak {
@@ -857,7 +1110,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     if refs.get() != 0 {
         return;
     }
-    let (mut inner, mut edges, mut aux) = {
+    let (mut inner, mut call, _config, _run, mut edges, mut aux) = {
         let mut graph = graph_ref.borrow_mut();
         if graph.pin_count(key) != 0 {
             return;
@@ -884,7 +1137,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
         id: key.id.0,
         armed: true,
     };
-    inner.cleanup_before_free(&mut edges, &mut aux);
+    inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
     free_slot.armed = false;
     graph_ref.borrow_mut().free.push(key.id.0);
 }
@@ -1617,11 +1870,11 @@ impl Core {
     }
 
     pub(crate) fn handle(&self) -> Option<Handle> {
-        self.borrow().handle
+        self.with_call(|c| c.handle)
     }
 
     pub(crate) fn factory(&self) -> Option<String> {
-        self.borrow().factory.clone()
+        self.with_call(|c| c.factory.clone())
     }
 
     pub(crate) fn identity_key(&self) -> (usize, usize, u64) {
@@ -1642,24 +1895,16 @@ impl Core {
                 "node construction: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
             );
         }
-        let inner = NodeInner {
-            deps,
+        let inner = NodeInner { deps };
+        let call = NodeCallSlot {
             factory: None,
             handle,
             dispatcher,
-            partial: false,
-            has_called_fn_once: false,
-            pausable,
-            pull_id: None,
-            // Defaults: plain derived/effect — auto-cascade COMPLETE/ERROR, terminal not
-            // an input. derived_opts overrides from NodeOpts for last/reduce/rescue/*Map.
-            complete_when_deps_complete: true,
-            error_when_deps_error: true,
-            terminal_as_real_input: false,
         };
+        let config = NodeConfigSlot::new(pausable);
         {
             let mut g = arena.0.borrow_mut();
-            let id = g.alloc(inner);
+            let id = g.alloc(inner, call, config);
             let generation = g.key_for(id).generation;
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
@@ -1680,9 +1925,9 @@ impl Core {
 
     fn configure_pull(&self, pull_id: Option<LockId>) {
         if let Some(id) = pull_id {
-            self.with_inner_edges_aux_mut(|n, _e, a| {
+            self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
                 a.pause_lockset.insert(id.clone());
-                n.pull_id = Some(id);
+                cfg.pull_id = Some(id);
             });
         }
     }
@@ -1697,11 +1942,11 @@ impl Core {
     /// reconstructs the real unsub from `id_out`) — no orphaned subscriber.
     fn subscribe_recording_id(&self, sink: Sink, id_out: &Cell<Option<u64>>) -> Unsub {
         let (id, push) = {
-            self.with_inner_edges_aux_mut(|n, e, a| {
+            self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
                 let id = a.next_sub_id;
                 a.next_sub_id += 1;
                 a.subscribers.push((id, sink.clone()));
-                let push = if n.pull_id.is_some() {
+                let push = if cfg.pull_id.is_some() {
                     None
                 } else if e.value.has_data {
                     Some(Message::Data(
@@ -1741,9 +1986,9 @@ impl Core {
     // ── activation / deactivation (lazy; R-rom-ram) ──
 
     fn activate(&self) {
-        let deps = self.with_inner_edges_aux_mut(|n, e, a| {
+        let deps = self.with_node_state_aux_mut(|n, _c, cfg, _r, e, a| {
             a.activated = true;
-            if let Some(id) = n.pull_id.clone() {
+            if let Some(id) = cfg.pull_id.clone() {
                 a.pause_lockset.insert(id);
             }
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
@@ -1758,10 +2003,9 @@ impl Core {
             self.subscribe_dep(i, dep);
         }
         // Depless producer (fn, no deps): run once on activation.
-        let run = {
-            let n = self.borrow();
-            n.deps.is_empty() && n.handle.is_some() && !n.has_called_fn_once
-        };
+        let run = self.with_node_state(|n, c, _cfg, r, _e| {
+            n.deps.is_empty() && c.handle.is_some() && !r.has_called_fn_once
+        });
         if run {
             self.run_wave();
         }
@@ -1805,14 +2049,14 @@ impl Core {
     }
 
     fn deactivate(&self) {
-        let (unsubs, hooks) = self.with_inner_edges_aux_mut(|n, e, a| {
+        let (unsubs, hooks) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
             a.activated = false;
             let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
             e.idx_boxes.clear();
             let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut a.on_deactivation);
             // RAM: a compute node (fn and/or deps) clears its cache on deactivation;
             // a depless state node retains it (ROM).
-            let is_compute = n.handle.is_some() || !n.deps.is_empty();
+            let is_compute = c.handle.is_some() || !n.deps.is_empty();
             if is_compute {
                 e.value.cache = None;
                 e.value.has_data = false;
@@ -1831,7 +2075,7 @@ impl Core {
             }
             e.state.pending = 0;
             e.wave.emitted_dirty_this_wave = false;
-            n.has_called_fn_once = false;
+            r.has_called_fn_once = false;
             // Control + INVALIDATE hooks are fresh-lifecycle (R-cleanup-hooks / D28):
             // the next activation re-registers them from the fn body.
             a.on_invalidate.clear();
@@ -1917,14 +2161,14 @@ impl Core {
                 self.fire_owed_demand_if_ready();
             }
             Message::Dirty => {
-                let emit_dirty = self.with_inner_edges_aux_mut(|n, e, a| {
+                let emit_dirty = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
                     if e.state.dirty[idx] {
                         return false;
                     }
                     e.state.dirty[idx] = true;
                     e.state.pending += 1;
                     e.state.tier[idx] = 2;
-                    let pull_quiet = n
+                    let pull_quiet = cfg
                         .pull_id
                         .as_ref()
                         .is_some_and(|id| a.pause_lockset.contains(id));
@@ -1940,7 +2184,7 @@ impl Core {
                 }
             }
             Message::Data(v) => {
-                let pending_drained = self.with_inner_edges_aux_mut(|n, e, a| {
+                let pending_drained = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
                     match &mut e.state.batch[idx] {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
@@ -1954,7 +2198,7 @@ impl Core {
                     }
                     let pending_drained = e.state.pending == 0;
                     if !pending_drained
-                        && matches!(n.pausable, Pausable::True)
+                        && matches!(cfg.pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
                         && !a.pause_lockset.is_empty()
                     {
@@ -1968,7 +2212,7 @@ impl Core {
                 }
             }
             Message::Resolved => {
-                let pending_drained = self.with_inner_edges_aux_mut(|n, e, a| {
+                let pending_drained = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
                     e.state.record_resolved_wave(idx);
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
@@ -1977,7 +2221,7 @@ impl Core {
                     }
                     let pending_drained = e.state.pending == 0;
                     if !pending_drained
-                        && matches!(n.pausable, Pausable::True)
+                        && matches!(cfg.pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
                         && !a.pause_lockset.is_empty()
                     {
@@ -2011,14 +2255,13 @@ impl Core {
                 // INVALIDATE do; a dirty-then-terminal-without-DATA dep would otherwise strand
                 // `pending` and wedge the node (the INVALIDATE arm's guard, generalized to terminals).
                 self.release_dep_dirty(idx);
-                let (auto_error, auto_complete, tari) = {
-                    let n = self.borrow();
+                let (auto_error, auto_complete, tari) = self.with_config(|cfg| {
                     (
-                        n.error_when_deps_error,
-                        n.complete_when_deps_complete,
-                        n.terminal_as_real_input,
+                        cfg.error_when_deps_error,
+                        cfg.complete_when_deps_complete,
+                        cfg.terminal_as_real_input,
                     )
-                };
+                });
                 if is_error && auto_error {
                     // Auto-cascade ERROR (R-deps-terminal): forward the error's message. Node terminal.
                     if let DepTerminal::Error(s) = &dep_term {
@@ -2151,7 +2394,7 @@ impl Core {
         // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers its output
         // (down → should_buffer_on_pause); `false` runs + emits immediately (ignores
         // PAUSE). D44: pause mode is the outer gate.
-        if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
+        if self.with_config(|cfg| matches!(cfg.pausable, Pausable::True)) && self.is_paused() {
             self.with_aux_mut(|a| a.paused_dep_wave_occurred = true);
             return;
         }
@@ -2160,13 +2403,13 @@ impl Core {
 
     fn try_run(&self) {
         let (pending, has_handle, has_called, partial, all_settled) =
-            self.with_inner_edges(|n, e| {
+            self.with_node_state(|_n, c, cfg, r, e| {
                 (
                     e.state.pending,
-                    n.handle.is_some(),
-                    n.has_called_fn_once,
-                    n.partial,
-                    n.all_deps_settled(&e.state),
+                    c.handle.is_some(),
+                    r.has_called_fn_once,
+                    cfg.partial,
+                    cfg.all_deps_settled(&e.state),
                 )
             });
         if pending > 0 {
@@ -2405,15 +2648,15 @@ impl Core {
         // old handle so the rewired-away closure (and its captures) is freed and its slot
         // reused. Register-first keeps `handle` never pointing at a freed slot.
         {
-            let (old_handle, disp) = {
-                let nn = self.borrow();
-                (nn.handle, nn.dispatcher.clone())
-            };
+            let (old_handle, disp) =
+                { self.with_call(|call| (call.handle, call.dispatcher.clone())) };
             let kind = old_handle
                 .map(|h| disp.pool_kind(h.pool_id))
                 .unwrap_or(PoolKind::Sync);
             let new_handle = register_with(&disp, kind, fn_);
-            self.borrow_mut().handle = Some(new_handle);
+            self.with_node_state_mut(|_n, call, _cfg, _r, _e| {
+                call.handle = Some(new_handle);
+            });
             if let Some(oh) = old_handle {
                 disp.unregister(oh);
             }
@@ -2557,18 +2800,18 @@ impl Core {
     /// pause + gate + pending guards, then injects the phase-1 DIRTY the added dep's
     /// [START,DATA] handshake did not carry (R-dirty-before-data).
     fn settle_rewire(&self) {
-        if matches!(self.borrow().pausable, Pausable::True) && self.is_paused() {
+        if self.with_config(|cfg| matches!(cfg.pausable, Pausable::True)) && self.is_paused() {
             self.with_aux_mut(|a| a.paused_dep_wave_occurred = true);
             return;
         }
         let (pending, has_handle, has_called, partial, all_settled) =
-            self.with_inner_edges(|n, e| {
+            self.with_node_state(|_n, c, cfg, r, e| {
                 (
                     e.state.pending,
-                    n.handle.is_some(),
-                    n.has_called_fn_once,
-                    n.partial,
-                    n.all_deps_settled(&e.state),
+                    c.handle.is_some(),
+                    r.has_called_fn_once,
+                    cfg.partial,
+                    cfg.all_deps_settled(&e.state),
                 )
             });
         if pending > 0 {
@@ -2599,42 +2842,38 @@ impl Core {
                 "synchronous feedback cycle: node fn re-entered its own wave (R-reentrancy / D37)"
             );
         }
-        // build ctx (snapshot the per-dep wave view), reading under a short borrow.
-        let (handle, dispatcher, ctx) = self.with_inner_edges(|n, e| {
-            let dep_records: Vec<DepRecord> = (0..n.deps.len())
-                .map(|i| {
-                    let latest = e.state.batch[i]
-                        .as_ref()
-                        .and_then(|b| b.last().cloned())
-                        .or_else(|| e.state.prev[i].clone());
-                    DepRecord {
-                        wave_data: e.state.batch_waves[i].clone(),
-                        prev_data: e.state.prev[i].clone(),
-                        latest,
-                        terminal: e.state.terminal_wave[i].clone(),
-                    }
-                })
-                .collect();
-            (
-                n.handle.expect("run_wave ⇒ handle present"),
-                n.dispatcher.clone(),
-                Ctx::new(self.borrowed_view(), dep_records),
-            )
-        });
-        let (old_on_invalidate, old_on_deactivation) = self.with_inner_edges_aux_mut(|n, e, a| {
-            n.has_called_fn_once = true;
-            e.wave.inside_run_wave = true;
-            e.wave.emitted_tier3_this_wave = false;
-            // R-cleanup-hooks per-run lifecycle (D28 clarification / C-14): clear BOTH
-            // hook lists before the fn runs; the fn body re-registers the current run's
-            // hooks. Only the latest run's registrations are live — a re-run supersedes the
-            // prior run's, discarded WITHOUT firing (no fire-on-rerun; onRerun stays cut).
-            // Fixes the push-only accumulation (K stale hooks fired after K runs).
-            (
-                std::mem::take(&mut a.on_invalidate),
-                std::mem::take(&mut a.on_deactivation),
-            )
-        });
+        // Build ctx + call snapshot under one short arena borrow, then invoke
+        // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
+        let (handle, dispatcher, is_async, ctx, old_on_invalidate, old_on_deactivation) = self
+            .with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
+                let dep_records: Vec<DepRecord> = (0..n.deps.len())
+                    .map(|i| {
+                        let latest = e.state.batch[i]
+                            .as_ref()
+                            .and_then(|b| b.last().cloned())
+                            .or_else(|| e.state.prev[i].clone());
+                        DepRecord {
+                            wave_data: e.state.batch_waves[i].clone(),
+                            prev_data: e.state.prev[i].clone(),
+                            latest,
+                            terminal: e.state.terminal_wave[i].clone(),
+                        }
+                    })
+                    .collect();
+                r.has_called_fn_once = true;
+                e.wave.inside_run_wave = true;
+                e.wave.emitted_tier3_this_wave = false;
+                (
+                    c.handle.expect("run_wave ⇒ handle present"),
+                    c.dispatcher.clone(),
+                    c.handle
+                        .map(|h| c.dispatcher.pool_kind(h.pool_id) == PoolKind::Async)
+                        .unwrap_or(false),
+                    Ctx::new(self.borrowed_view(), dep_records),
+                    std::mem::take(&mut a.on_invalidate),
+                    std::mem::take(&mut a.on_deactivation),
+                )
+            });
         // Dropping user hooks may drop captured `Core`s. Do that after releasing the
         // graph-arena borrow, or the captured handle's `Drop` can re-enter `GraphCore`.
         drop(old_on_invalidate);
@@ -2655,7 +2894,7 @@ impl Core {
                       // its result (it emits later via a stashed DeferredCtx), NOT rejected — synthesizing
                       // an undirty RESOLVED here would prematurely settle a still-pending diamond leg
                       // (R-async-paused / C-4). The eventual deferred emit carries its own DIRTY balance.
-        let undirty = self.with_inner_edges(|n, e| {
+        let undirty = self.with_inner_edges(|_n, e| {
             // EXEMPT a TERMINAL wave (the fn emitted COMPLETE/ERROR): the terminal IS the settle,
             // and R-terminal-settles-dirty releases the downstream dirty — synthesizing an undirty
             // RESOLVED here would overwrite the terminal status + emit a spurious post-terminal
@@ -2664,7 +2903,7 @@ impl Core {
             e.wave.emitted_dirty_this_wave
                 && !e.wave.emitted_tier3_this_wave
                 && !e.value.terminal
-                && !Self::inner_is_async(n)
+                && !is_async
         });
         if undirty {
             {
@@ -3007,7 +3246,8 @@ impl Core {
             match m {
                 Message::Pause(lock) => self.pause_acquire(lock),
                 Message::Resume(lock) => {
-                    let is_pull_demand = self.borrow().pull_id.as_ref() == Some(&lock);
+                    let is_pull_demand =
+                        self.with_config(|cfg| cfg.pull_id.as_ref() == Some(&lock));
                     if is_pull_demand {
                         if !route.mark_demand(&lock, self) {
                             self.on_demand();
@@ -3077,8 +3317,8 @@ impl Core {
     }
 
     fn on_demand(&self) {
-        let has_pull = self.with_inner_edges_aux_mut(|n, _e, a| {
-            if n.pull_id.is_none() {
+        let has_pull = self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
+            if cfg.pull_id.is_none() {
                 return false;
             }
             a.pull_demand_owed = true;
@@ -3091,23 +3331,25 @@ impl Core {
     }
 
     fn fire_owed_demand_if_ready(&self) {
-        let Some((pull_id, should_mark_dirty)) = self.with_inner_edges_aux_mut(|n, e, a| {
-            let id = n.pull_id.clone()?;
-            if e.value.terminal || !a.pull_demand_owed || e.state.pending != 0 {
-                return None;
-            }
-            if a.pause_lockset.iter().any(|held| held != &id) {
-                return None;
-            }
-            if n.handle.is_some()
-                && !n.has_called_fn_once
-                && !n.partial
-                && !n.all_deps_settled(&e.state)
-            {
-                return None;
-            }
-            Some((id, a.paused_dep_wave_occurred))
-        }) else {
+        let Some((pull_id, should_mark_dirty)) =
+            self.with_node_state_aux_mut(|_n, c, cfg, r, e, a| {
+                let id = cfg.pull_id.clone()?;
+                if e.value.terminal || !a.pull_demand_owed || e.state.pending != 0 {
+                    return None;
+                }
+                if a.pause_lockset.iter().any(|held| held != &id) {
+                    return None;
+                }
+                if c.handle.is_some()
+                    && !r.has_called_fn_once
+                    && !cfg.partial
+                    && !cfg.all_deps_settled(&e.state)
+                {
+                    return None;
+                }
+                Some((id, a.paused_dep_wave_occurred))
+            })
+        else {
             return;
         };
         self.with_aux_mut(|a| {
@@ -3121,11 +3363,13 @@ impl Core {
         impl Drop for Requiet<'_> {
             fn drop(&mut self) {
                 let Some(id) = self.id.take() else { return };
-                let _ = self.core.try_with_inner_aux_mut(|n, e, a| {
-                    if !e.value.terminal && n.pull_id.as_ref() == Some(&id) {
-                        a.pause_lockset.insert(id);
-                    }
-                });
+                let _ = self
+                    .core
+                    .try_with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
+                        if !e.value.terminal && cfg.pull_id.as_ref() == Some(&id) {
+                            a.pause_lockset.insert(id);
+                        }
+                    });
             }
         }
         let _requiet = Requiet {
@@ -3164,19 +3408,18 @@ impl Core {
         }
     }
 
-    /// Async-pool check that takes an existing borrow (avoids a re-borrow when the caller
-    /// already holds `NodeInner`). The pool kind is a dispatcher property of the handle.
-    fn inner_is_async(n: &NodeInner) -> bool {
-        match n.handle {
-            Some(h) => n.dispatcher.pool_kind(h.pool_id) == PoolKind::Async,
-            None => false,
-        }
+    /// Async-pool check that takes an existing borrow. The pool kind is a dispatcher
+    /// property of the handle.
+    fn call_is_async(c: &NodeCallSlot) -> bool {
+        c.handle
+            .map(|h| c.dispatcher.pool_kind(h.pool_id) == PoolKind::Async)
+            .unwrap_or(false)
     }
 
     /// Should an outgoing settle slice be deferred into the pause buffer? `pausable` mode
     /// is the OUTER gate over R-async-paused buffering (D44).
     fn should_buffer_on_pause(&self) -> bool {
-        self.with_inner_edges(|n, e| match n.pausable {
+        self.with_node_state(|n, c, cfg, _r, e| match cfg.pausable {
             // false: ignore PAUSE/RESUME ENTIRELY — never buffer, keep producing (B20).
             Pausable::False => false,
             _ if self.with_aux(|a| a.pause_lockset.is_empty()) => false,
@@ -3187,7 +3430,7 @@ impl Core {
             // (C-2); a depless async leaf source delivers immediately (C-10). The
             // leaf-vs-compute discriminator is deps.is_empty().
             Pausable::True => {
-                !e.wave.inside_run_wave && Self::inner_is_async(n) && !n.deps.is_empty()
+                !e.wave.inside_run_wave && Self::call_is_async(c) && !n.deps.is_empty()
             }
         })
     }
@@ -3277,18 +3520,35 @@ fn dup_control(m: &Msg) -> Msg {
 /// Is `target` reachable upstream from `from` (following deps)? The rewire cycle-
 /// prevention DFS (R-rewire / D42). Node identity = (graph arena, node id).
 fn reachable_upstream(from: &Core, target: &Core) -> bool {
-    let mut seen: Vec<Core> = Vec::new();
-    let mut stack: Vec<Core> = vec![from.clone()];
-    while let Some(n) = stack.pop() {
-        if n.ptr_eq(target) {
+    if !from.same_graph(target) {
+        return false;
+    }
+    let target_key = target.key();
+    let mut seen: HashSet<NodeKey> = HashSet::new();
+    let mut stack: Vec<NodeKey> = vec![from.key()];
+    while let Some(key) = stack.pop() {
+        if key == target_key {
             return true;
         }
-        if seen.iter().any(|s| s.ptr_eq(&n)) {
+        if !seen.insert(key) {
             continue;
         }
-        seen.push(n.clone());
-        for d in n.borrow().deps.iter() {
-            stack.push(d.clone());
+        let deps: Vec<NodeKey> = {
+            let graph = from.graph.borrow();
+            if !graph.is_live_key(key) {
+                Vec::new()
+            } else {
+                graph
+                    .get(key)
+                    .deps
+                    .iter()
+                    .filter(|dep| dep.same_graph(from))
+                    .map(Core::key)
+                    .collect()
+            }
+        };
+        for dep_key in deps {
+            stack.push(dep_key);
         }
     }
     false
@@ -3298,8 +3558,9 @@ fn reachable_upstream(from: &Core, target: &Core) -> bool {
 /// appearing twice in a rewire collapses to one (Option-C; matches the TS `_dedupDeps`).
 fn dedup_cores(deps: Vec<Core>) -> Vec<Core> {
     let mut out: Vec<Core> = Vec::with_capacity(deps.len());
+    let mut seen: HashSet<ArenaNodeKey> = HashSet::with_capacity(deps.len());
     for d in deps {
-        if !out.iter().any(|o| o.ptr_eq(&d)) {
+        if seen.insert(d.arena_node_key()) {
             out.push(d);
         }
     }
@@ -3427,7 +3688,9 @@ impl<T: 'static> Node<T> {
             core: Core::new_in_arena(arena, vec![], Some(handle), dispatcher, None, opts.pausable),
             _t: PhantomData,
         };
-        node.core.borrow_mut().factory = factory;
+        node.core.with_node_state_mut(|_n, call, _cfg, _r, _e| {
+            call.factory = factory;
+        });
         node.core.configure_pull(opts.pull_id);
         node
     }
@@ -3493,12 +3756,13 @@ impl<T: 'static> Node<T> {
         {
             // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
-            let mut n = node.core.borrow_mut();
-            n.partial = opts.partial;
-            n.complete_when_deps_complete = opts.complete_when_deps_complete;
-            n.error_when_deps_error = opts.error_when_deps_error;
-            n.terminal_as_real_input = opts.terminal_as_real_input;
-            n.factory = factory;
+            node.core.with_node_state_mut(|_n, call, cfg, _r, _e| {
+                cfg.partial = opts.partial;
+                cfg.complete_when_deps_complete = opts.complete_when_deps_complete;
+                cfg.error_when_deps_error = opts.error_when_deps_error;
+                cfg.terminal_as_real_input = opts.terminal_as_real_input;
+                call.factory = factory;
+            });
         }
         node.core.configure_pull(opts.pull_id);
         node
@@ -3544,7 +3808,7 @@ impl<T: 'static> Node<T> {
     }
 
     pub fn pull_id(&self) -> Option<LockId> {
-        self.core.borrow().pull_id.clone()
+        self.core.with_config(|cfg| cfg.pull_id.clone())
     }
 
     /// Subscribe a sink; returns an unsubscribe handle (call it to detach; the node
@@ -4147,6 +4411,39 @@ mod tests {
     }
 
     #[test]
+    fn drop_unregisters_fn_even_when_cleanup_hook_panics() {
+        // DR-8/B54 side-table cleanup regression: the call slot must unregister before
+        // user cleanup hooks run, or a panicking onDeactivation strands the dispatcher
+        // fn slot and every Core/resource captured by the fn.
+        struct DropFlag(Rc<Cell<bool>>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let fn_dropped = Rc::new(Cell::new(false));
+        let result = catch_unwind(AssertUnwindSafe({
+            let fn_dropped = fn_dropped.clone();
+            move || {
+                let guard = DropFlag(fn_dropped);
+                let p = Node::<i32>::producer(move |ctx| {
+                    let _keep = &guard;
+                    ctx.on_deactivation(|| panic!("cleanup boom"));
+                    ctx.emit(1i32);
+                });
+                let _u = p.subscribe(|_| {});
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            fn_dropped.get(),
+            "dispatcher unregister must drop fn captures even if user cleanup panics"
+        );
+    }
+
+    #[test]
     fn identity_key_changes_when_arena_slot_is_reused() {
         let first = Node::<i32>::producer_opts(
             NodeOpts {
@@ -4555,6 +4852,103 @@ mod tests {
     }
 
     #[test]
+    fn run_state_slot_resets_on_deactivation_while_call_slot_persists() {
+        // DR-8/B54 next slice: first-run lifecycle state lives in GraphCore run_slots,
+        // while the dispatcher handle lives in call_slots. Deactivation must re-arm the
+        // producer without unregistering/re-registering its callable.
+        let runs = Rc::new(Cell::new(0usize));
+        let p = Node::<i32>::producer({
+            let runs = runs.clone();
+            move |ctx| {
+                runs.set(runs.get() + 1);
+                ctx.emit(runs.get() as i32);
+            }
+        });
+        let handle_before = p.core.handle().expect("producer registered a call slot");
+
+        let u = {
+            let u = p.subscribe(|_| {});
+            assert_eq!(runs.get(), 1);
+            assert!(p
+                .core
+                .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once));
+            u
+        };
+        u();
+
+        assert!(
+            !p.core
+                .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once),
+            "deactivation resets run_slots.has_called_fn_once"
+        );
+        assert_eq!(
+            p.core.handle(),
+            Some(handle_before),
+            "deactivation keeps the call slot registered for the next lifecycle"
+        );
+
+        let _u2 = p.subscribe(|_| {});
+        assert_eq!(
+            runs.get(),
+            2,
+            "run state reset re-arms the depless producer on the next activation"
+        );
+        assert_eq!(p.cache(), Some(2));
+    }
+
+    #[test]
+    fn config_slot_partial_gate_runs_with_sentinel_dep() {
+        // DR-8/B54 next slice: first-run config moved out of NodeInner. The partial
+        // flag still opens the gate for a SENTINEL dep once the node is asked to run;
+        // without config-slot wiring this derived node would wait for source DATA.
+        let source = Node::<i32>::state_empty();
+        let d: Node<i32> = Node::derived_opts(
+            vec![source.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            |ctx| {
+                assert!(ctx.data::<i32>(0).is_none());
+                ctx.emit(7i32);
+            },
+        );
+        assert!(d.core.with_config(|cfg| cfg.partial));
+
+        let _u = d.subscribe(|_| {});
+        d.core.try_run();
+
+        assert_eq!(d.cache(), Some(7));
+        assert!(d
+            .core
+            .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once));
+    }
+
+    #[test]
+    fn reachable_upstream_uses_arena_keys_without_refcount_churn() {
+        // DR-8/B54 topology-token safe subset: the cycle-prevention DFS should walk
+        // graph-owned generation keys, not counted Core clones, so validation doesn't
+        // perturb public/refcount lifetime.
+        let a = Node::<i32>::state(1);
+        let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let c: Node<i32> = Node::derived(vec![b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let before = (a.core.refs.get(), b.core.refs.get(), c.core.refs.get());
+
+        assert!(reachable_upstream(&c.core, &a.core));
+        assert!(!reachable_upstream(&a.core, &c.core));
+
+        assert_eq!(
+            (a.core.refs.get(), b.core.refs.get(), c.core.refs.get()),
+            before,
+            "reachable_upstream must not allocate counted Core clones for stack/seen traversal"
+        );
+    }
+
+    #[test]
     fn borrowed_core_cannot_promote_after_external_death() {
         // DR-8/B54 fail-closed lifetime rule: an arena pin may keep a slot live for
         // the current synchronous wave after the last public handle drops, but a
@@ -4849,6 +5243,44 @@ mod tests {
             d.cache(),
             Some(20),
             "batch-deferred external rewire still drains at the committed boundary"
+        );
+    }
+
+    #[test]
+    fn stale_external_rewire_token_does_not_target_reused_slot() {
+        // DR-8/B54 boundary freshness: ExternalRewire queues carry a weak generation
+        // token for the owner. A stale queued owner must no-op after slot reuse, never
+        // apply a topology/fn swap to the new occupant.
+        let arena = GraphArena::new();
+        let old = Node::<i32>::state_in_arena(&arena, 1);
+        let old_key = old.core.key();
+        let committed = Rc::new(Cell::new(true));
+        defer_boundary(
+            &old.core,
+            BoundaryTask::ExternalRewire {
+                target: CoreToken::from_core(&old.core),
+                new_deps: vec![],
+                fn_: Rc::new(|ctx| ctx.emit(999i32)),
+                committed,
+            },
+        );
+        drop(old);
+
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(old_key.id, reused.core.key().id);
+        assert_ne!(old_key.generation, reused.core.key().generation);
+
+        drain_committed_boundary(&reused.core);
+
+        assert_eq!(reused.cache(), Some(2));
+        assert_eq!(
+            reused.status(),
+            Status::Settled,
+            "stale ExternalRewire token must not disturb the reused slot occupant"
+        );
+        assert!(
+            reused.core.deps().is_empty(),
+            "state node topology remains unchanged after stale external rewire drains"
         );
     }
 
