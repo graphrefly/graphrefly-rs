@@ -1377,6 +1377,7 @@ impl CoreWeak {
         ))
     }
 
+    #[cfg(test)]
     fn borrowed_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
@@ -1506,12 +1507,8 @@ impl DeferredNodeAction {
         self.arena_key == core.arena_node_key()
     }
 
-    fn counted_core(&self) -> Option<Core> {
-        self.weak.counted_core()
-    }
-
-    fn borrowed_core(&self) -> Option<Core> {
-        self.weak.borrowed_core()
+    fn pinned_borrowed_core(&self) -> Option<(ArenaNodePin, Core)> {
+        self.weak.pinned_borrowed_core()
     }
 
     fn with_live_edges_mut<R>(&self, f: impl FnOnce(&mut DepEdges) -> R) -> Option<R> {
@@ -1549,17 +1546,12 @@ impl DeferredDeliveryAction {
         self.kind == kind && self.target.matches(core)
     }
 
-    fn core_for_drain(&self) -> Option<Core> {
-        if wave_in_flight() {
-            if let Some(core) = self.target.borrowed_core() {
-                return Some(core);
-            }
-        }
-        self.target.counted_core()
+    fn core_for_drain(&self) -> Option<(ArenaNodePin, Core)> {
+        self.target.pinned_borrowed_core()
     }
 
     fn apply(&self) {
-        let Some(node) = self.core_for_drain() else {
+        let Some((_pin, node)) = self.core_for_drain() else {
             return;
         };
         if node.with_inner_edges(|_, e| e.value.terminal) {
@@ -5167,7 +5159,7 @@ mod tests {
         assert_eq!(
             derived.core.refs.get(),
             refs_before,
-            "draining releases any transient counted Core reconstructed at the boundary"
+            "delivery-boundary drain does not retain queued counted Core refs"
         );
     }
 
@@ -5238,6 +5230,88 @@ mod tests {
             &*events.borrow(),
             &["run", "resolved"],
             "deferred Run must drain before AbsorbedSettle"
+        );
+    }
+
+    #[test]
+    fn deferred_delivery_outside_wave_run_does_not_increment_refs() {
+        // DR-8/B54: when a queued delivery-boundary run drains outside a wave, the
+        // borrowed pin is used for execution, so no temporary counted ref is added.
+        let source = Node::<i32>::state(1);
+        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
+        let observed_refs = Rc::new(Cell::new(usize::MAX));
+        let run_count = Rc::new(Cell::new(0usize));
+
+        let derived: Node<i32> = Node::derived_opts(
+            vec![source.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            {
+                let refs_slot = refs_slot.clone();
+                let observed_refs = observed_refs.clone();
+                let run_count = run_count.clone();
+                move |_ctx| {
+                    if let Some(refs) = refs_slot.borrow().as_ref() {
+                        observed_refs.set(refs.get());
+                    }
+                    run_count.set(run_count.get() + 1);
+                }
+            },
+        );
+
+        *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
+        let before = derived.core.refs.get();
+
+        with_delivery_scope(|| {
+            defer_run_until_delivery_boundary(&derived.core);
+        });
+
+        assert_eq!(
+            run_count.get(),
+            1,
+            "queued delivery-boundary run must execute"
+        );
+        assert_eq!(
+            observed_refs.get(),
+            before,
+            "outside-wave delivery-boundary run must execute from a borrowed pin"
+        );
+    }
+
+    #[test]
+    fn stale_deferred_delivery_action_does_not_run_after_slot_free() {
+        // DR-8/B54: once a node's slot is released, queued deferred actions must be
+        // generation-checked and become inert, even before the slot is reused.
+        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
+
+        let arena = GraphArena::new();
+        let old = Node::<i32>::state_in_arena(&arena, 1);
+        let old_key = old.core.key();
+        let weak = old.core.downgrade();
+        let stale_run = DeferredDeliveryAction::from_core(DeferredDeliveryKind::Run, &old.core);
+        let stale_settle =
+            DeferredDeliveryAction::from_core(DeferredDeliveryKind::AbsorbedSettle, &old.core);
+
+        drop(old);
+
+        assert!(
+            weak.borrowed_core().is_none(),
+            "old slot is not live after drop"
+        );
+        assert_eq!(weak.key.generation, old_key.generation);
+
+        DEFERRED_DELIVERY_ACTIONS.with(|actions| {
+            let mut actions = actions.borrow_mut();
+            actions.push(stale_run);
+            actions.push(stale_settle);
+        });
+        drain_deferred_runs();
+
+        assert!(
+            weak.borrowed_core().is_none(),
+            "freed slot remains out-of-scope for stale deferred work"
         );
     }
 
