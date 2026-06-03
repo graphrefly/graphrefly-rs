@@ -3754,41 +3754,70 @@ impl Core {
                 "ctx.up: {m:?} is down-only; up carries control tiers only (R-ctx-up)"
             );
         }
-        let is_depless = self.borrow().deps.is_empty();
         for m in msgs {
-            match m {
-                Message::Pause(lock) => self.pause_acquire(lock),
-                Message::Resume(lock) => {
-                    let is_pull_demand =
-                        self.with_config(|cfg| cfg.pull_id.as_ref() == Some(&lock));
-                    if is_pull_demand {
-                        if !route.mark_demand(&lock, self) {
-                            self.on_demand();
-                        }
-                    } else if self.with_aux(|a| a.pause_lockset.contains(&lock)) {
-                        self.pause_release(lock);
-                    } else {
-                        self.forward_up(Message::Resume(lock), toward_dep, route);
+            self.up_msg(m, toward_dep, route);
+        }
+    }
+
+    fn up_msg(&self, m: Msg, toward_dep: Option<usize>, route: &mut UpRouteState) {
+        let is_depless = self.borrow().deps.is_empty();
+        match m {
+            Message::Pause(lock) => self.pause_acquire(lock),
+            Message::Resume(lock) => {
+                let is_pull_demand = self.with_config(|cfg| cfg.pull_id.as_ref() == Some(&lock));
+                if is_pull_demand {
+                    if !route.mark_demand(&lock, self) {
+                        self.on_demand();
                     }
+                } else if self.with_aux(|a| a.pause_lockset.contains(&lock)) {
+                    self.pause_release(lock);
+                } else {
+                    self.forward_up(Message::Resume(lock), toward_dep, route);
                 }
-                // R-up-at-source (D38): INVALIDATE/DIRTY/TEARDOWN.
-                other if is_depless => {
-                    // terminus: honor INVALIDATE, drop DIRTY/TEARDOWN.
-                    if matches!(other, Message::Invalidate) {
-                        self.down(vec![Message::Invalidate]);
-                    }
+            }
+            // R-up-at-source (D38): INVALIDATE/DIRTY/TEARDOWN.
+            other if is_depless => {
+                // terminus: honor INVALIDATE, drop DIRTY/TEARDOWN.
+                if matches!(other, Message::Invalidate) {
+                    self.down(vec![Message::Invalidate]);
                 }
-                other => {
-                    // dep-bearing intermediate: forward toward deps (reconstruct the
-                    // payload-free control kind — Msg is not Clone, but only the unit
-                    // control kinds reach here per is_up_allowed minus PAUSE/RESUME).
-                    self.forward_up(other, toward_dep, route);
-                }
+            }
+            other => {
+                // dep-bearing intermediate: forward toward deps (reconstruct the
+                // payload-free control kind — Msg is not Clone, but only the unit
+                // control kinds reach here per is_up_allowed minus PAUSE/RESUME).
+                self.forward_up(other, toward_dep, route);
             }
         }
     }
 
     fn forward_up(&self, m: Msg, toward_dep: Option<usize>, route: &mut UpRouteState) {
+        // DR-8/B54: route control fanout over borrowed dep keys under wave safety.
+        // In-wave, the path stays on borrowed arena views (no counted Core clones
+        // in the hot control fanout). Outside a wave, preserve prior semantics.
+        if wave_in_flight() {
+            let deps = self.with_inner_edges(|n, _e| {
+                n.deps
+                    .iter()
+                    .map(|dep| (dep.id, dep.generation, dep.refs.clone()))
+                    .collect::<Vec<_>>()
+            });
+            if let Some(i) = toward_dep {
+                if let Some(dep) = deps.get(i) {
+                    let dep_core =
+                        Core::from_borrowed_parts(self.graph.clone(), dep.0, dep.1, dep.2.clone());
+                    dep_core.up_msg(m, None, route);
+                }
+                return;
+            }
+            for dep in deps {
+                let dep_core =
+                    Core::from_borrowed_parts(self.graph.clone(), dep.0, dep.1, dep.2.clone());
+                dep_core.up_msg(dup_control(&m), None, route);
+            }
+            return;
+        }
+
         let deps = self.borrow().deps.clone();
         if let Some(i) = toward_dep {
             if let Some(dep) = deps.get(i) {
@@ -5364,6 +5393,61 @@ mod tests {
         );
         drop(counted);
         assert_eq!(derived.core.refs.get(), refs_before);
+    }
+
+    #[test]
+    fn internal_up_route_broadcast_uses_borrowed_deps() {
+        // DR-8/B54: control fanout from an in-wave `up` path should traverse the
+        // hot deps as borrowed arena views, so callback-visible refcounts must not
+        // bump by one per forwarded target.
+        let arena = GraphArena::new();
+        let a = Node::<i32>::state_in_arena(&arena, 1);
+        let b = Node::<i32>::state_in_arena(&arena, 2);
+        let a_refs = a.core.refs.clone();
+        let b_refs = b.core.refs.clone();
+        let observed: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let _ua = a.subscribe({
+            let observed = observed.clone();
+            let a_refs = a_refs.clone();
+            move |msg| {
+                if matches!(msg, Message::Invalidate) {
+                    observed.borrow_mut().push(a_refs.get());
+                }
+            }
+        });
+        let _ub = b.subscribe({
+            let observed = observed.clone();
+            let b_refs = b_refs.clone();
+            move |msg| {
+                if matches!(msg, Message::Invalidate) {
+                    observed.borrow_mut().push(b_refs.get());
+                }
+            }
+        });
+
+        let parent = Node::<i32>::derived_opts_in_arena(
+            &arena,
+            vec![a.erased(), b.erased()],
+            NodeOpts::default(),
+            |_| {},
+        );
+        let baseline = (a_refs.get(), b_refs.get());
+        parent.up(vec![Message::Invalidate]);
+
+        let observed = observed.borrow();
+        assert_eq!(
+            observed.len(),
+            2,
+            "both deps should receive one in-wave INVALIDATE control wave"
+        );
+        assert_eq!(
+            observed[0], baseline.0,
+            "dep a must not pick up a temporary counted up-route ref bump"
+        );
+        assert_eq!(
+            observed[1], baseline.1,
+            "dep b must not pick up a temporary counted up-route ref bump"
+        );
     }
 
     #[test]
