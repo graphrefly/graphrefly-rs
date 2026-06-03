@@ -578,7 +578,6 @@ impl GraphCore {
         self.generations.get(key.id.0) == Some(&key.generation) && self.is_live(key.id)
     }
 
-    #[cfg(test)]
     fn pin_live_key(&mut self, key: NodeKey) -> bool {
         if !self.is_live_key(key) {
             return false;
@@ -1507,6 +1506,7 @@ impl DeferredDeliveryAction {
 
 #[derive(Clone)]
 struct CoreToken {
+    graph_id: usize,
     key: NodeKey,
     refs: Weak<Cell<usize>>,
 }
@@ -1514,26 +1514,72 @@ struct CoreToken {
 impl CoreToken {
     fn from_core(core: &Core) -> Self {
         Self {
+            graph_id: Rc::as_ptr(&core.graph) as usize,
             key: core.key(),
             refs: Rc::downgrade(&core.refs),
         }
     }
 
-    fn counted_core(&self, graph: &Rc<RefCell<GraphCore>>) -> Option<Core> {
+    fn pinned_borrowed_core(&self, graph: &Rc<RefCell<GraphCore>>) -> Option<PinnedBorrowedCore> {
+        if Rc::as_ptr(graph) as usize != self.graph_id {
+            return None;
+        }
         let refs = self.refs.upgrade()?;
         if refs.get() == 0 {
             return None;
         }
-        if !graph.borrow().is_live_key(self.key) {
-            return None;
+        {
+            let mut g = graph.borrow_mut();
+            if !g.pin_live_key(self.key) {
+                return None;
+            }
         }
-        Some(Core::from_parts(
-            graph.clone(),
-            self.key.id,
-            self.key.generation,
-            refs,
-        ))
+        let arena_key = ArenaNodeKey {
+            graph: Rc::as_ptr(graph) as usize,
+            node: self.key,
+        };
+        Some(PinnedBorrowedCore {
+            _pin: ArenaNodePin {
+                arena_key,
+                graph: graph.clone(),
+                refs: refs.clone(),
+            },
+            core: Core::from_borrowed_parts(graph.clone(), self.key.id, self.key.generation, refs),
+        })
     }
+}
+
+struct BoundaryDrainGuard {
+    graph: Rc<RefCell<GraphCore>>,
+    active: bool,
+}
+
+impl BoundaryDrainGuard {
+    fn enter(graph: &Rc<RefCell<GraphCore>>) -> Self {
+        graph.borrow_mut().draining_boundary = true;
+        Self {
+            graph: graph.clone(),
+            active: true,
+        }
+    }
+
+    fn finish(mut self) {
+        self.active = false;
+        self.graph.borrow_mut().draining_boundary = false;
+    }
+}
+
+impl Drop for BoundaryDrainGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.graph.borrow_mut().draining_boundary = false;
+        }
+    }
+}
+
+struct PinnedBorrowedCore {
+    _pin: ArenaNodePin,
+    core: Core,
 }
 
 enum BoundaryTask {
@@ -2042,7 +2088,7 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
     if graph.borrow().deferred_boundary.is_empty() {
         return; // F-PERF: one empty-queue check per outermost wave when unused (behavior-neutral)
     }
-    graph.borrow_mut().draining_boundary = true;
+    let drain_guard = BoundaryDrainGuard::enter(graph);
     let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
     loop {
         let task = {
@@ -2060,7 +2106,7 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
             }
         }
     }
-    graph.borrow_mut().draining_boundary = false;
+    drain_guard.finish();
     if let Some(e) = escaped {
         std::panic::resume_unwind(e);
     }
@@ -2069,8 +2115,8 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
 fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) {
     match task {
         BoundaryTask::Rewire { target, req } => {
-            if let Some(node) = target.counted_core(graph) {
-                node.apply_rewire_next(req);
+            if let Some(node) = target.pinned_borrowed_core(graph) {
+                node.core.apply_rewire_next(req);
             }
         }
         BoundaryTask::ExternalRewire {
@@ -2080,8 +2126,8 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) {
             committed,
         } => {
             if committed.get() {
-                if let Some(node) = target.counted_core(graph) {
-                    node.rewire_inner(new_deps, fn_, false);
+                if let Some(node) = target.pinned_borrowed_core(graph) {
+                    node.core.rewire_inner(new_deps, fn_, false);
                 }
             }
         }
@@ -2090,8 +2136,8 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) {
             msgs,
             toward_dep,
         } => {
-            if let Some(node) = target.counted_core(graph) {
-                node.owned_up(msgs, toward_dep);
+            if let Some(node) = target.pinned_borrowed_core(graph) {
+                node.core.owned_up(msgs, toward_dep);
             }
         }
     }
@@ -2784,8 +2830,7 @@ impl Core {
                 "rewire: cannot add a non-resubscribable terminal dep — would wedge (R-rewire / D42)"
             );
         }
-        let core = self.clone();
-        with_wave_owner(self, move || core.rewire_apply(new_deps, fn_), || {});
+        with_wave_owner(self, || self.rewire_apply(new_deps, fn_), || {});
     }
 
     // ── deferred self-rewire (R-rewire-deferred / D47): ctx.rewire_next ──
@@ -2843,10 +2888,7 @@ impl Core {
         // apply becomes ERROR on the blamed node there). Only the PRE-apply validation rejects
         // panic OUT of rewire() — caught here → ERROR on this node, via owned_down (a fresh
         // wave-owner; the drain runs outside any live wave).
-        let core = self.clone();
-        let outcome = catch_unwind(AssertUnwindSafe(move || {
-            core.rewire_inner(new_deps, fn_, true)
-        }));
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.rewire_inner(new_deps, fn_, true)));
         if let Err(payload) = outcome {
             let err = panic_to_error(payload);
             self.owned_down(vec![Message::Error(err)]);
@@ -4262,8 +4304,6 @@ impl<T: 'static> Node<T> {
             !self.core.with_inner_edges(|_n, e| e.value.terminal),
             "subscribe: node is terminal and non-resubscribable — the stream is permanently over (R-terminal / D17)"
         );
-        let body_core = self.core.clone();
-        let err_core = self.core.clone();
         let sink = Rc::new(sink);
         // Record the subscriber id before activation so the error path hands back a real
         // unsubscribe instead of leaking the just-registered sink (no orphaned sink).
@@ -4271,9 +4311,12 @@ impl<T: 'static> Node<T> {
         let body_cell = id_cell.clone();
         with_wave_owner(
             &self.core,
-            move || body_core.subscribe_recording_id(sink, &body_cell),
+            || self.core.subscribe_recording_id(sink, &body_cell),
             move || match id_cell.get() {
-                Some(id) => Box::new(move || err_core.unsubscribe(id)) as Unsub,
+                Some(id) => {
+                    let err_core = self.core.clone();
+                    Box::new(move || err_core.unsubscribe(id)) as Unsub
+                }
                 None => Box::new(|| {}) as Unsub,
             },
         )
@@ -5056,6 +5099,44 @@ mod tests {
     }
 
     #[test]
+    fn deferred_delivery_drains_run_before_absorbed_settle() {
+        // DR-8/B54: delivery boundary actions must process Run before AbsorbedSettle
+        // so a deferred recompute is not starved behind its follow-up settle.
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let derived: Node<i32> = Node::derived(vec![], {
+            let events = events.clone();
+            move |_ctx| {
+                events.borrow_mut().push("run");
+            }
+        });
+        let _u = derived.subscribe({
+            let events = events.clone();
+            move |msg| {
+                if let Message::Resolved = msg {
+                    events.borrow_mut().push("resolved");
+                }
+            }
+        });
+        events.borrow_mut().clear();
+
+        // Seed settle eligibility for the same wave as an absorbed terminal path would do.
+        derived
+            .core
+            .with_inner_edges_mut(|_n, e| e.wave.emitted_dirty_this_wave = true);
+
+        with_delivery_scope(|| {
+            defer_run_until_delivery_boundary(&derived.core);
+            defer_absorbed_settle_until_delivery_boundary(&derived.core);
+        });
+
+        assert_eq!(
+            &*events.borrow(),
+            &["run", "resolved"],
+            "deferred Run must drain before AbsorbedSettle"
+        );
+    }
+
+    #[test]
     fn weak_borrowed_core_uses_arena_pin_after_external_death() {
         // DR-8/B54: a wave pin, not the counted Core refcount, owns liveness for
         // in-wave borrowed execution. This must fail closed once the pin releases.
@@ -5442,18 +5523,18 @@ mod tests {
 
         assert_eq!(
             sync_refs.get(),
-            3,
-            "expected public handle + subscribe body/error handles; touched arena pin and Ctx itself must not count"
+            1,
+            "expected only the public handle; subscribe owner execution, touched arena pin, and Ctx itself must not count"
         );
         assert_eq!(
             deferred_refs.get(),
-            4,
+            2,
             "ctx.defer() promotes the borrowed fn-body Ctx to a counted async handle"
         );
         assert_eq!(
             p.core.refs.get(),
             3,
-            "after activation, only public handle + unsubscribe handle + stashed DeferredCtx remain"
+            "after activation, public handle + unsubscribe handle + stashed DeferredCtx remain"
         );
         drop(deferred_ctx.borrow_mut().take());
         assert_eq!(
@@ -5707,6 +5788,77 @@ mod tests {
             1,
             "boundary execution releases its temporary counted handle"
         );
+    }
+
+    #[test]
+    fn boundary_up_task_executes_with_borrowed_pinned_owner() {
+        // DR-8/B54: committed-boundary owner actions execute via an arena pin +
+        // borrowed Core view. The queue still does not retain the owner, but the drain
+        // also avoids a temporary counted promotion while running the task.
+        let source = Node::<i32>::state(1);
+        let refs = source.core.refs.clone();
+        let seen_refs = Rc::new(Cell::new(usize::MAX));
+        let seen = seen_refs.clone();
+        let refs_for_sink = refs.clone();
+        let _u = source.subscribe(move |m| {
+            if matches!(m, Message::Invalidate) {
+                seen.set(refs_for_sink.get());
+            }
+        });
+        let refs_before = refs.get();
+
+        with_wave_owner(
+            &source.core,
+            || source.core.request_up_next(vec![Message::Invalidate], None),
+            || {},
+        );
+
+        assert_eq!(
+            seen_refs.get(),
+            refs_before,
+            "boundary up task should not add a counted owner Core while executing"
+        );
+        assert_eq!(refs.get(), refs_before);
+    }
+
+    #[test]
+    fn boundary_rewire_task_executes_with_borrowed_pinned_owner() {
+        // Same owner-execution invariant for the rewire boundary task. The added cached
+        // dep drives the queued fn during boundary drain, where old code had both a
+        // task-level counted promotion and a rewire_inner pre-clone.
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(10);
+        let observed_refs = Rc::new(Cell::new(usize::MAX));
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+        let refs = d.core.refs.clone();
+        let refs_before = refs.get();
+
+        with_wave_owner(
+            &d.core,
+            || {
+                let observed_refs = observed_refs.clone();
+                let refs = refs.clone();
+                d.core.request_rewire_next(RewireRequest::Set(
+                    vec![b.erased()],
+                    Rc::new(move |ctx| {
+                        observed_refs.set(refs.get());
+                        ctx.emit(*ctx.data::<i32>(0).unwrap());
+                    }),
+                ));
+            },
+            || {},
+        );
+
+        assert_eq!(
+            observed_refs.get(),
+            refs_before,
+            "boundary rewire task should run without counted owner promotions"
+        );
+        assert_eq!(refs.get(), refs_before);
+        assert_eq!(d.cache(), Some(10));
     }
 
     #[test]
