@@ -2262,15 +2262,28 @@ impl Core {
     fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
         let old_deps: Vec<Core> = self.borrow().deps.clone();
         let n = new_deps.len();
-        let added: Vec<Core> = new_deps
+        let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
+        let mut new_to_old: Vec<Option<usize>> = vec![None; n];
+        for (old_idx, old_dep) in old_deps.iter().enumerate() {
+            for (new_idx, new_dep) in new_deps.iter().enumerate() {
+                if old_dep.ptr_eq(new_dep) && new_to_old[new_idx].is_none() {
+                    old_to_new[old_idx] = Some(new_idx);
+                    new_to_old[new_idx] = Some(old_idx);
+                    break;
+                }
+            }
+        }
+        let added: Vec<(usize, Core)> = new_deps
             .iter()
-            .filter(|d| !old_deps.iter().any(|o| o.ptr_eq(d)))
-            .cloned()
+            .enumerate()
+            .filter(|(idx, _)| new_to_old[*idx].is_none())
+            .map(|(idx, dep)| (idx, dep.clone()))
             .collect();
-        let removed: Vec<Core> = old_deps
+        let removed: Vec<usize> = old_deps
             .iter()
-            .filter(|d| !new_deps.iter().any(|nd| nd.ptr_eq(d)))
-            .cloned()
+            .enumerate()
+            .filter(|(idx, _)| old_to_new[*idx].is_none())
+            .map(|(idx, _)| idx)
             .collect();
 
         self.with_inner_edges_mut(|_, e| {
@@ -2309,11 +2322,8 @@ impl Core {
 
         // removed deps: clear dirty contribution + drain (box→-1, unsubscribe the edge).
         let mut removed_dirty_contributor = false;
-        for d in &removed {
-            let old_idx = old_deps
-                .iter()
-                .position(|o| o.ptr_eq(d))
-                .expect("removed dep was in old_deps");
+        for old_idx in &removed {
+            let old_idx = *old_idx;
             let unsub = {
                 let mut graph = self.graph.borrow_mut();
                 let (_nn, edges) = graph.get_node_and_edges_mut(self.key());
@@ -2348,8 +2358,8 @@ impl Core {
             let mut new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
             let mut new_boxes: Vec<Rc<Cell<i64>>> =
                 (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
-            for (j, dep) in new_deps.iter().enumerate() {
-                if let Some(old_idx) = old_deps.iter().position(|o| o.ptr_eq(dep)) {
+            for (j, old_idx) in new_to_old.iter().enumerate() {
+                if let Some(old_idx) = *old_idx {
                     new_batch[j] = edges.state.batch[old_idx].take();
                     new_batch_waves[j] = std::mem::take(&mut edges.state.batch_waves[old_idx]);
                     new_batch_wave_id[j] = edges.state.batch_wave_id[old_idx].take();
@@ -2386,12 +2396,8 @@ impl Core {
         // maybe_run, which DEFERS to the atomic settle via in_dep_mutation); a SENTINEL dep
         // delivers START only. Only when activated (else activation will subscribe later).
         if activated {
-            for d in &added {
-                let idx = new_deps
-                    .iter()
-                    .position(|nd| nd.ptr_eq(d))
-                    .expect("added dep present in new_deps");
-                self.subscribe_dep(idx, d);
+            for (idx, d) in &added {
+                self.subscribe_dep(*idx, d);
             }
         }
 
@@ -5134,6 +5140,58 @@ mod tests {
         d.set_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
         a.set(11); // a is now dep1; reroutes correctly
         assert_eq!(d.cache(), Some(2011)); // dep0=b=20, dep1=a=11 → 20*100+11
+    }
+
+    #[test]
+    fn rewire_precompute_keeps_first_duplicate_old_dep_slot() {
+        // Public construction may still contain duplicate old deps while rewire
+        // dedups the new dep list. The precomputed index map must preserve the
+        // old `.position()` behavior: keep the first old slot's DepRecord/idx-box,
+        // and drain the duplicate old edge.
+        let a = Node::<i32>::state(1);
+        let d: Node<i32> = Node::derived(vec![a.erased(), a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+        assert_eq!(
+            a.core.subscriber_count(),
+            2,
+            "duplicate old deps install two internal edges before rewire"
+        );
+
+        d.core.with_inner_edges_mut(|_, e| {
+            e.state.prev[0] = Some(Rc::new(11i32));
+            e.state.prev[1] = Some(Rc::new(22i32));
+            e.state.has_data[0] = true;
+            e.state.has_data[1] = true;
+        });
+
+        d.set_deps(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+
+        d.core.with_inner_edges(|n, e| {
+            assert_eq!(n.deps.len(), 1);
+            assert_eq!(e.state.prev.len(), 1);
+            assert_eq!(
+                e.state.prev[0]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>())
+                    .copied(),
+                Some(11),
+                "rewire should keep the first old duplicate dep slot"
+            );
+            assert_eq!(
+                e.idx_boxes[0].get(),
+                0,
+                "kept first duplicate edge should reroute to new index 0"
+            );
+        });
+        assert_eq!(
+            a.core.subscriber_count(),
+            1,
+            "the duplicate old edge is drained during rewire"
+        );
     }
 
     #[test]

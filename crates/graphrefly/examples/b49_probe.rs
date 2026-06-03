@@ -36,6 +36,109 @@ fn ns_per_op(ms: f64, ops: usize) -> f64 {
     (ms * 1_000_000.0) / (ops.max(1) as f64)
 }
 
+fn typed_vs_erased_probe(hops: usize, waves: usize, protocol_waves: usize, runs: usize) {
+    println!(
+        "--- Probe E: typed vs erased value path ({hops} hops x {waves} waves; protocol {protocol_waves} waves) ---"
+    );
+    let typed_values: Vec<Rc<f64>> = (0..hops).map(|i| Rc::new(i as f64 + 1.0)).collect();
+    let erased_values: Vec<AnyValue> = typed_values
+        .iter()
+        .map(|v| Rc::new(**v) as AnyValue)
+        .collect();
+
+    let typed_read_ms = time_ms(runs, || {
+        let mut acc = 0.0;
+        for _ in 0..waves {
+            for v in &typed_values {
+                let cloned = black_box(v.clone());
+                acc += *cloned;
+            }
+        }
+        black_box(acc);
+    });
+
+    let erased_read_ms = time_ms(runs, || {
+        let mut acc = 0.0;
+        for _ in 0..waves {
+            for v in &erased_values {
+                let cloned = black_box(v.clone());
+                acc += *cloned
+                    .downcast::<f64>()
+                    .expect("probe stores only f64 payloads");
+            }
+        }
+        black_box(acc);
+    });
+
+    let typed_emit_ms = time_ms(runs, || {
+        let mut acc = 0.0;
+        for i in 0..(waves * hops) {
+            let produced: Rc<f64> = black_box(Rc::new(i as f64));
+            acc += *produced;
+        }
+        black_box(acc);
+    });
+
+    let erased_emit_ms = time_ms(runs, || {
+        let mut acc = 0.0;
+        for i in 0..(waves * hops) {
+            let produced: AnyValue = black_box(Rc::new(i as f64));
+            acc += *produced
+                .downcast::<f64>()
+                .expect("probe stores only f64 payloads");
+        }
+        black_box(acc);
+    });
+
+    let source = Node::<f64>::state(0.0);
+    let derived = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
+        ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+    });
+    let sink_count = Rc::new(Cell::new(0u64));
+    let sc = sink_count.clone();
+    let _u = derived.subscribe(move |m| {
+        if matches!(m, Message::Data(_)) {
+            sc.set(sc.get().wrapping_add(1));
+        }
+    });
+    let graph_ms = time_ms(runs, || {
+        for i in 0..protocol_waves {
+            source.set(i as f64);
+        }
+        black_box(sink_count.get());
+        black_box(derived.cache());
+    });
+
+    let value_ops = waves * hops;
+    println!(
+        "typed read Rc<T>    : {:8.3} ms ({:8.2} ns/op)",
+        typed_read_ms,
+        ns_per_op(typed_read_ms, value_ops)
+    );
+    println!(
+        "erased read+cast    : {:8.3} ms ({:8.2} ns/op, {:5.2}x typed)",
+        erased_read_ms,
+        ns_per_op(erased_read_ms, value_ops),
+        erased_read_ms / typed_read_ms
+    );
+    println!(
+        "typed emit alloc    : {:8.3} ms ({:8.2} ns/op)",
+        typed_emit_ms,
+        ns_per_op(typed_emit_ms, value_ops)
+    );
+    println!(
+        "erased emit+cast    : {:8.3} ms ({:8.2} ns/op, {:5.2}x typed)",
+        erased_emit_ms,
+        ns_per_op(erased_emit_ms, value_ops),
+        erased_emit_ms / typed_emit_ms
+    );
+    println!(
+        "graph ctx data+emit : {:8.3} ms ({:8.2} ns/source.set)\n",
+        graph_ms,
+        ns_per_op(graph_ms, protocol_waves)
+    );
+}
+
 fn queue_probe(queue_n: usize, runs: usize) {
     println!("--- Probe Q: boundary FIFO queue ({queue_n} tasks) ---");
 
@@ -364,11 +467,15 @@ fn main() {
     let frontier_sources = 256;
     let waves = 2_000;
     let rewires = 10_000;
+    let value_hops = 8;
+    let value_waves = 1_000_000;
+    let protocol_value_waves = 50_000;
     let heap_rounds = 6;
     let heap_nodes_per_round = 2_500;
     let heap_payload_bytes = 4 * 1024;
 
     println!("== B49 probe (Rust) ==");
+    typed_vs_erased_probe(value_hops, value_waves, protocol_value_waves, runs);
     queue_probe(queue_n, runs);
     fanout_probe(fanout, waves, runs);
     invalidate_probe(inv_fanout, waves, runs);
