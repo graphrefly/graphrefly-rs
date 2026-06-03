@@ -2748,6 +2748,18 @@ impl Core {
     /// settle if any added dep delivered data or the sole dirty contributor was removed.
     fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
         let old_deps = self.borrow().deps.clone();
+        if same_ordered_deps(&old_deps, &new_deps) {
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.in_dep_mutation = true;
+                e.wave.rewire_run_pending = false;
+            });
+            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
+            self.swap_fn_preserving_pool(fn_);
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.in_dep_mutation = false;
+            });
+            return;
+        }
         let n = new_deps.len();
         let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
         let mut new_to_old: Vec<Option<usize>> = vec![None; n];
@@ -2792,20 +2804,7 @@ impl Core {
         // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister the
         // old handle so the rewired-away closure (and its captures) is freed and its slot
         // reused. Register-first keeps `handle` never pointing at a freed slot.
-        {
-            let (old_handle, disp) =
-                { self.with_call(|call| (call.handle, call.dispatcher.clone())) };
-            let kind = old_handle
-                .map(|h| disp.pool_kind(h.pool_id))
-                .unwrap_or(PoolKind::Sync);
-            let new_handle = register_with(&disp, kind, fn_);
-            self.with_node_state_mut(|_n, call, _cfg, _r, _e| {
-                call.handle = Some(new_handle);
-            });
-            if let Some(oh) = old_handle {
-                disp.unregister(oh);
-            }
-        }
+        self.swap_fn_preserving_pool(fn_);
 
         // removed deps: clear dirty contribution + drain (box→-1, unsubscribe the edge).
         let mut removed_dirty_contributor = false;
@@ -2971,6 +2970,20 @@ impl Core {
         }
         self.mark_dirty(); // phase 1 (no-op if already dirty, e.g. removeDep auto-settle)
         self.run_wave(); // phase 2: fn → DATA / undirty RESOLVED
+    }
+
+    fn swap_fn_preserving_pool(&self, fn_: NodeFn) {
+        let (old_handle, disp) = { self.with_call(|call| (call.handle, call.dispatcher.clone())) };
+        let kind = old_handle
+            .map(|h| disp.pool_kind(h.pool_id))
+            .unwrap_or(PoolKind::Sync);
+        let new_handle = register_with(&disp, kind, fn_);
+        self.with_node_state_mut(|_n, call, _cfg, _r, _e| {
+            call.handle = Some(new_handle);
+        });
+        if let Some(oh) = old_handle {
+            disp.unregister(oh);
+        }
     }
 
     fn run_wave(&self) {
@@ -3691,6 +3704,14 @@ fn dedup_cores(deps: Vec<Core>) -> Vec<Core> {
         }
     }
     out
+}
+
+fn same_ordered_deps(old_deps: &[Core], new_deps: &[Core]) -> bool {
+    old_deps.len() == new_deps.len()
+        && old_deps
+            .iter()
+            .zip(new_deps)
+            .all(|(old_dep, new_dep)| old_dep.ptr_eq(new_dep))
 }
 
 /// Register a fn into the pool selected by `pool` (R-dispatch-all). The async pool's
@@ -6123,6 +6144,100 @@ mod tests {
         d.set_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
         a.set(11); // a is now dep1; reroutes correctly
         assert_eq!(d.cache(), Some(2011)); // dep0=b=20, dep1=a=11 → 20*100+11
+    }
+
+    #[test]
+    fn rewire_same_order_deps_swaps_fn_without_rebuilding_dep_state() {
+        // DR-8/B54: same-ordered deps are a fn swap only. Option-C state and
+        // subscriber transport stay untouched; the next dep wave uses the new fn.
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+        assert_eq!(d.cache(), Some(3));
+        assert_eq!(a.core.subscriber_count(), 1);
+        assert_eq!(b.core.subscriber_count(), 1);
+
+        d.core.with_inner_edges_mut(|_, e| {
+            e.state.prev[0] = Some(Rc::new(11i32));
+            e.state.prev[1] = Some(Rc::new(22i32));
+        });
+
+        d.set_deps(vec![a.erased(), b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * *ctx.data::<i32>(1).unwrap())
+        });
+
+        assert_eq!(a.core.subscriber_count(), 1);
+        assert_eq!(b.core.subscriber_count(), 1);
+        d.core.with_inner_edges(|_, e| {
+            assert_eq!(
+                e.state.prev[0]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>())
+                    .copied(),
+                Some(11),
+            );
+            assert_eq!(
+                e.state.prev[1]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>())
+                    .copied(),
+                Some(22),
+            );
+        });
+
+        a.set(3);
+        assert_eq!(d.cache(), Some(66)); // new fn: dep0=3, dep1=22
+    }
+
+    #[test]
+    fn rewire_same_order_fn_swap_rejects_reentrant_rewire_from_old_fn_drop() {
+        struct ReenterOnDrop {
+            target: Rc<RefCell<Option<Node<i32>>>>,
+            dep: Core,
+            saw_guard: Rc<Cell<bool>>,
+        }
+
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                let Some(target) = self.target.borrow().as_ref().cloned() else {
+                    return;
+                };
+                self.saw_guard
+                    .set(target.core.with_inner_edges(|_, e| e.wave.in_dep_mutation));
+                target.set_deps(vec![self.dep.clone()], |_| {});
+            }
+        }
+
+        let a = Node::<i32>::state(1);
+        let holder: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
+        let saw_guard = Rc::new(Cell::new(false));
+        let drop_probe = ReenterOnDrop {
+            target: holder.clone(),
+            dep: a.erased(),
+            saw_guard: saw_guard.clone(),
+        };
+        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
+            let _keep = &drop_probe;
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        });
+        *holder.borrow_mut() = Some(d.clone());
+        let _u = d.subscribe(|_| {});
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            d.set_deps(vec![a.erased()], |ctx| {
+                ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
+            });
+        }));
+
+        assert!(saw_guard.get(), "old fn Drop should see the rewire guard");
+        assert!(
+            !d.core.with_inner_edges(|_, e| e.wave.in_dep_mutation),
+            "DepMutationGuard must clear the fast-path mutation guard after panic"
+        );
+        *holder.borrow_mut() = None;
     }
 
     #[test]
