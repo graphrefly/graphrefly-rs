@@ -1335,14 +1335,14 @@ impl CoreWeak {
         ))
     }
 
-    #[cfg(test)]
     fn borrowed_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
-        if refs.get() == 0 {
-            return None;
-        }
-        if !graph.borrow().is_live_key(self.key) {
+        let can_borrow = {
+            let g = graph.borrow();
+            g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)
+        };
+        if !can_borrow {
             return None;
         }
         Some(Core::from_borrowed_parts(
@@ -1440,6 +1440,10 @@ impl DeferredNodeAction {
         self.weak.counted_core()
     }
 
+    fn borrowed_core(&self) -> Option<Core> {
+        self.weak.borrowed_core()
+    }
+
     fn with_live_edges_mut<R>(&self, f: impl FnOnce(&mut DepEdges) -> R) -> Option<R> {
         let graph = self.weak.graph.upgrade()?;
         let refs = self.weak.refs.upgrade()?;
@@ -1452,6 +1456,52 @@ impl DeferredNodeAction {
         }
         let (_n, e) = g.get_node_and_edges_mut(self.weak.key);
         Some(f(e))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferredDeliveryKind {
+    Run,
+    AbsorbedSettle,
+}
+
+struct DeferredDeliveryAction {
+    kind: DeferredDeliveryKind,
+    target: DeferredNodeAction,
+}
+
+impl DeferredDeliveryAction {
+    fn from_core(kind: DeferredDeliveryKind, core: &Core) -> Self {
+        Self {
+            kind,
+            target: DeferredNodeAction::from_core(core),
+        }
+    }
+
+    fn matches(&self, kind: DeferredDeliveryKind, core: &Core) -> bool {
+        self.kind == kind && self.target.matches(core)
+    }
+
+    fn core_for_drain(&self) -> Option<Core> {
+        if wave_in_flight() {
+            if let Some(core) = self.target.borrowed_core() {
+                return Some(core);
+            }
+        }
+        self.target.counted_core()
+    }
+
+    fn apply(self) {
+        let Some(node) = self.core_for_drain().filter(Core::is_live) else {
+            return;
+        };
+        if node.with_inner_edges(|_, e| e.value.terminal) {
+            return;
+        }
+        match self.kind {
+            DeferredDeliveryKind::Run => node.maybe_run(),
+            DeferredDeliveryKind::AbsorbedSettle => node.settle_after_absorbed_terminal(),
+        }
     }
 }
 
@@ -1651,8 +1701,7 @@ thread_local! {
     static DELIVERY_DEPTH: Cell<usize> = const { Cell::new(0) };
     static NEXT_DELIVERY_ID: Cell<u64> = const { Cell::new(1) };
     static CURRENT_DELIVERY_ID: Cell<u64> = const { Cell::new(0) };
-    static DEFERRED_RUNS: RefCell<Vec<DeferredNodeAction>> = const { RefCell::new(Vec::new()) };
-    static DEFERRED_ABSORBED_SETTLES: RefCell<Vec<DeferredNodeAction>> = const { RefCell::new(Vec::new()) };
+    static DEFERRED_DELIVERY_ACTIONS: RefCell<Vec<DeferredDeliveryAction>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `true` while a wave is in flight on this thread (a scope is installed).
@@ -1700,19 +1749,18 @@ fn current_delivery_id() -> u64 {
 }
 
 fn defer_run_until_delivery_boundary(core: &Core) {
-    DEFERRED_RUNS.with(|runs| {
-        let mut runs = runs.borrow_mut();
-        if !runs.iter().any(|n| n.matches(core)) {
-            runs.push(DeferredNodeAction::from_core(core));
-        }
-    });
+    defer_delivery_action_until_boundary(core, DeferredDeliveryKind::Run);
 }
 
 fn defer_absorbed_settle_until_delivery_boundary(core: &Core) {
-    DEFERRED_ABSORBED_SETTLES.with(|settles| {
-        let mut settles = settles.borrow_mut();
-        if !settles.iter().any(|n| n.matches(core)) {
-            settles.push(DeferredNodeAction::from_core(core));
+    defer_delivery_action_until_boundary(core, DeferredDeliveryKind::AbsorbedSettle);
+}
+
+fn defer_delivery_action_until_boundary(core: &Core, kind: DeferredDeliveryKind) {
+    DEFERRED_DELIVERY_ACTIONS.with(|actions| {
+        let mut actions = actions.borrow_mut();
+        if !actions.iter().any(|action| action.matches(kind, core)) {
+            actions.push(DeferredDeliveryAction::from_core(kind, core));
         }
     });
 }
@@ -1778,27 +1826,24 @@ fn with_delivery_scope(body: impl FnOnce()) {
 
 fn drain_deferred_runs() {
     loop {
-        let runs = DEFERRED_RUNS.with(|r| std::mem::take(&mut *r.borrow_mut()));
-        let settles = DEFERRED_ABSORBED_SETTLES.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        if runs.is_empty() && settles.is_empty() {
+        let actions = DEFERRED_DELIVERY_ACTIONS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        if actions.is_empty() {
             break;
         }
+        let (runs, settles): (Vec<_>, Vec<_>) = actions
+            .into_iter()
+            .partition(|action| action.kind == DeferredDeliveryKind::Run);
         for action in runs {
-            if let Some(node) = action.counted_core().filter(Core::is_live) {
-                node.maybe_run();
-            }
+            action.apply();
         }
         for action in settles {
-            if let Some(node) = action.counted_core().filter(Core::is_live) {
-                node.settle_after_absorbed_terminal();
-            }
+            action.apply();
         }
     }
 }
 
 fn clear_deferred_delivery_actions() {
-    DEFERRED_RUNS.with(|runs| runs.borrow_mut().clear());
-    DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().clear());
+    DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
 }
 
 /// Record the node whose fn is about to run — the ERROR-bearing node on a panic.
@@ -4936,12 +4981,26 @@ mod tests {
                 refs_before,
                 "queued delivery-boundary actions must not hold counted Core refs"
             );
-            DEFERRED_RUNS.with(|runs| {
-                assert_eq!(runs.borrow().len(), 1, "run actions dedupe by arena key");
-            });
-            DEFERRED_ABSORBED_SETTLES.with(|settles| {
+            DEFERRED_DELIVERY_ACTIONS.with(|actions| {
+                let actions = actions.borrow();
                 assert_eq!(
-                    settles.borrow().len(),
+                    actions.len(),
+                    2,
+                    "delivery-boundary actions dedupe by arena key and action kind"
+                );
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| action.kind == DeferredDeliveryKind::Run)
+                        .count(),
+                    1,
+                    "run actions dedupe by arena key"
+                );
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| action.kind == DeferredDeliveryKind::AbsorbedSettle)
+                        .count(),
                     1,
                     "absorbed-settle actions dedupe by arena key"
                 );
@@ -4951,8 +5010,93 @@ mod tests {
         assert_eq!(
             derived.core.refs.get(),
             refs_before,
-            "draining releases the transient counted Core reconstructed at the boundary"
+            "draining releases any transient counted Core reconstructed at the boundary"
         );
+    }
+
+    #[test]
+    fn active_wave_deferred_delivery_drain_uses_borrowed_core() {
+        // DR-8/B54: when a DATA delivery queues a fn run until the delivery boundary,
+        // the owner wave's arena pin is still live while the drain executes. Rehydrate
+        // that target as a borrowed Core, not a transient counted Core.
+        let source = Node::<i32>::state_empty();
+        let observed_refs = Rc::new(Cell::new(usize::MAX));
+        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
+        let derived: Node<i32> = Node::derived(vec![source.erased()], {
+            let observed_refs = observed_refs.clone();
+            let refs_slot = refs_slot.clone();
+            move |ctx| {
+                if let Some(refs) = refs_slot.borrow().as_ref() {
+                    observed_refs.set(refs.get());
+                }
+                ctx.emit(*ctx.data::<i32>(0).unwrap());
+            }
+        });
+        *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
+        let _u = derived.subscribe(|_| {});
+        let refs_before = derived.core.refs.get();
+
+        source.set(1);
+
+        assert_eq!(
+            observed_refs.get(),
+            refs_before,
+            "active-wave delivery-boundary drain should run through a borrowed arena view"
+        );
+        assert_eq!(derived.core.refs.get(), refs_before);
+    }
+
+    #[test]
+    fn weak_borrowed_core_uses_arena_pin_after_external_death() {
+        // DR-8/B54: a wave pin, not the counted Core refcount, owns liveness for
+        // in-wave borrowed execution. This must fail closed once the pin releases.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let victim = Node::<i32>::state_in_arena(&arena, 1);
+        let key = victim.core.key();
+        let weak = victim.core.downgrade();
+        let refs = victim.core.refs.clone();
+        let pin = ArenaNodePin::from_core(&victim.core).expect("live slot pins");
+        drop(victim);
+
+        assert_eq!(refs.get(), 0);
+        assert!(graph.borrow().is_live_key(key));
+        assert!(
+            weak.borrowed_core().is_some(),
+            "active arena pin should allow borrowed weak rehydration without reviving refs"
+        );
+        drop(pin);
+        assert!(!graph.borrow().is_live_key(key));
+        assert!(
+            weak.borrowed_core().is_none(),
+            "borrowed weak rehydration must fail once the pin releases"
+        );
+    }
+
+    #[test]
+    fn deferred_delivery_run_skips_same_wave_terminalized_target() {
+        // R-terminal: a DATA may queue a delivery-boundary run, then a later terminal in
+        // the same upstream wave can complete the target before that boundary drains.
+        // The stale run must not invoke user code after terminal-is-forever seals output.
+        let source = Node::<i32>::state_empty();
+        let runs = Rc::new(Cell::new(0usize));
+        let derived: Node<i32> = Node::derived(vec![source.erased()], {
+            let runs = runs.clone();
+            move |ctx| {
+                runs.set(runs.get() + 1);
+                ctx.emit(*ctx.data::<i32>(0).unwrap());
+            }
+        });
+        let _u = derived.subscribe(|_| {});
+
+        source.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
+
+        assert_eq!(
+            runs.get(),
+            0,
+            "queued delivery-boundary run must not execute after same-wave terminal"
+        );
+        assert_eq!(derived.status(), Status::Completed);
     }
 
     #[test]
@@ -4960,13 +5104,13 @@ mod tests {
         // A queued weak arena action may outlive the original slot after an unwind/drop.
         // Rehydration must check the generation and old ref token, so a later occupant of
         // the same slot is a no-op target, not a run/settle target.
-        DEFERRED_RUNS.with(|runs| runs.borrow_mut().clear());
-        DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().clear());
+        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
 
         let arena = GraphArena::new();
         let old = Node::<i32>::state_in_arena(&arena, 1);
-        let stale_run = DeferredNodeAction::from_core(&old.core);
-        let stale_settle = DeferredNodeAction::from_core(&old.core);
+        let stale_run = DeferredDeliveryAction::from_core(DeferredDeliveryKind::Run, &old.core);
+        let stale_settle =
+            DeferredDeliveryAction::from_core(DeferredDeliveryKind::AbsorbedSettle, &old.core);
         let old_key = old.core.key();
         drop(old);
 
@@ -4974,8 +5118,11 @@ mod tests {
         assert_eq!(old_key.id, reused.core.key().id);
         assert_ne!(old_key.generation, reused.core.key().generation);
 
-        DEFERRED_RUNS.with(|runs| runs.borrow_mut().push(stale_run));
-        DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().push(stale_settle));
+        DEFERRED_DELIVERY_ACTIONS.with(|actions| {
+            let mut actions = actions.borrow_mut();
+            actions.push(stale_run);
+            actions.push(stale_settle);
+        });
         drain_deferred_runs();
 
         assert_eq!(reused.cache(), Some(2));
@@ -4992,8 +5139,7 @@ mod tests {
         // panics after a dep callback queued a run, the wave-owner catch resets touched
         // flags AND must discard those queued actions. A later unrelated delivery must
         // not run stale work against reset dep projections.
-        DEFERRED_RUNS.with(|runs| runs.borrow_mut().clear());
-        DEFERRED_ABSORBED_SETTLES.with(|settles| settles.borrow_mut().clear());
+        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
 
         let source = Node::<i32>::state_empty();
         let runs = Rc::new(Cell::new(0usize));
@@ -5013,16 +5159,10 @@ mod tests {
         source.set(1);
 
         assert_eq!(runs.get(), 0, "aborted delivery must not run the queued fn");
-        DEFERRED_RUNS.with(|queued| {
+        DEFERRED_DELIVERY_ACTIONS.with(|queued| {
             assert!(
                 queued.borrow().is_empty(),
-                "aborted wave must clear queued deferred runs"
-            );
-        });
-        DEFERRED_ABSORBED_SETTLES.with(|queued| {
-            assert!(
-                queued.borrow().is_empty(),
-                "aborted wave must clear queued absorbed-terminal settles"
+                "aborted wave must clear queued deferred delivery actions"
             );
         });
 
