@@ -236,6 +236,7 @@ struct GraphCore {
     edge_slots: Vec<Option<DepEdges>>,
     aux_slots: Vec<Option<NodeAux>>,
     generations: Vec<u64>,
+    pins: Vec<usize>,
     free: Vec<usize>,
     deferred_boundary: VecDeque<BoundaryTask>,
     draining_boundary: bool,
@@ -248,6 +249,7 @@ impl GraphCore {
             edge_slots: Vec::new(),
             aux_slots: Vec::new(),
             generations: Vec::new(),
+            pins: Vec::new(),
             free: Vec::new(),
             deferred_boundary: VecDeque::new(),
             draining_boundary: false,
@@ -266,6 +268,7 @@ impl GraphCore {
             self.edge_slots[id] = Some(edges);
             self.aux_slots[id] = Some(aux);
             self.generations[id] = next_generation;
+            self.pins[id] = 0;
             NodeId(id)
         } else {
             let id = self.slots.len();
@@ -273,6 +276,7 @@ impl GraphCore {
             self.edge_slots.push(Some(edges));
             self.aux_slots.push(Some(aux));
             self.generations.push(0);
+            self.pins.push(0);
             NodeId(id)
         }
     }
@@ -369,6 +373,35 @@ impl GraphCore {
 
     fn is_live_key(&self, key: NodeKey) -> bool {
         self.generations.get(key.id.0) == Some(&key.generation) && self.is_live(key.id)
+    }
+
+    fn pin_live_key(&mut self, key: NodeKey) -> bool {
+        if !self.is_live_key(key) {
+            return false;
+        }
+        self.pins[key.id.0] = self.pins[key.id.0]
+            .checked_add(1)
+            .expect("GraphCore pin count overflow");
+        true
+    }
+
+    fn release_pin(&mut self, key: NodeKey) {
+        if self.generations.get(key.id.0) != Some(&key.generation) {
+            return;
+        }
+        let Some(pin) = self.pins.get_mut(key.id.0) else {
+            return;
+        };
+        if *pin > 0 {
+            *pin -= 1;
+        }
+    }
+
+    fn pin_count(&self, key: NodeKey) -> usize {
+        if self.generations.get(key.id.0) != Some(&key.generation) {
+            return 0;
+        }
+        self.pins.get(key.id.0).copied().unwrap_or(0)
     }
 
     fn take_live(&mut self, key: NodeKey) -> Option<(NodeInner, DepEdges, NodeAux)> {
@@ -668,6 +701,10 @@ impl Core {
         generation: u64,
         refs: Rc<Cell<usize>>,
     ) -> Self {
+        assert!(
+            refs.get() != 0,
+            "Core counted promotion rejected: node is externally dead"
+        );
         refs.set(refs.get().checked_add(1).expect("Core refcount overflow"));
         Self {
             graph,
@@ -812,34 +849,93 @@ impl Drop for Core {
             return;
         }
         self.refs.set(0);
-        let graph_ref = self.graph.clone();
-        let (mut inner, mut edges, mut aux) = {
-            let mut graph = graph_ref.borrow_mut();
-            let Some(pair) = graph.take_live(self.key()) else {
-                return;
-            };
-            pair
-        };
-        struct FreeSlotOnDrop {
-            graph: Rc<RefCell<GraphCore>>,
-            id: usize,
-            armed: bool,
+        free_slot_if_unreferenced(&self.graph, self.key(), &self.refs);
+    }
+}
+
+fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, refs: &Cell<usize>) {
+    if refs.get() != 0 {
+        return;
+    }
+    let (mut inner, mut edges, mut aux) = {
+        let mut graph = graph_ref.borrow_mut();
+        if graph.pin_count(key) != 0 {
+            return;
         }
-        impl Drop for FreeSlotOnDrop {
-            fn drop(&mut self) {
-                if self.armed {
-                    self.graph.borrow_mut().free.push(self.id);
-                }
+        let Some(pair) = graph.take_live(key) else {
+            return;
+        };
+        pair
+    };
+    struct FreeSlotOnDrop {
+        graph: Rc<RefCell<GraphCore>>,
+        id: usize,
+        armed: bool,
+    }
+    impl Drop for FreeSlotOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                self.graph.borrow_mut().free.push(self.id);
             }
         }
-        let mut free_slot = FreeSlotOnDrop {
-            graph: graph_ref.clone(),
-            id: self.id.0,
-            armed: true,
-        };
-        inner.cleanup_before_free(&mut edges, &mut aux);
-        free_slot.armed = false;
-        graph_ref.borrow_mut().free.push(self.id.0);
+    }
+    let mut free_slot = FreeSlotOnDrop {
+        graph: graph_ref.clone(),
+        id: key.id.0,
+        armed: true,
+    };
+    inner.cleanup_before_free(&mut edges, &mut aux);
+    free_slot.armed = false;
+    graph_ref.borrow_mut().free.push(key.id.0);
+}
+
+struct ArenaNodePin {
+    arena_key: ArenaNodeKey,
+    graph: Rc<RefCell<GraphCore>>,
+    refs: Rc<Cell<usize>>,
+}
+
+impl ArenaNodePin {
+    fn from_core(core: &Core) -> Option<Self> {
+        {
+            let mut graph = core.graph.borrow_mut();
+            if !graph.pin_live_key(core.key()) {
+                return None;
+            }
+        }
+        Some(Self {
+            arena_key: core.arena_node_key(),
+            graph: core.graph.clone(),
+            refs: core.refs.clone(),
+        })
+    }
+
+    fn borrowed_core(&self) -> Option<Core> {
+        if !self.graph.borrow().is_live_key(self.arena_key.node) {
+            return None;
+        }
+        Some(Core::from_borrowed_parts(
+            self.graph.clone(),
+            self.arena_key.node.id,
+            self.arena_key.node.generation,
+            self.refs.clone(),
+        ))
+    }
+
+    fn reset_wave_flags(&self) {
+        let mut g = self.graph.borrow_mut();
+        if !g.is_live_key(self.arena_key.node) {
+            return;
+        }
+        let (n, e) = g.get_node_and_edges_mut(self.arena_key.node);
+        reset_wave_flags_inner(n, e);
+    }
+}
+
+impl Drop for ArenaNodePin {
+    fn drop(&mut self) {
+        self.graph.borrow_mut().release_pin(self.arena_key.node);
+        free_slot_if_unreferenced(&self.graph, self.arena_key.node, &self.refs);
     }
 }
 
@@ -888,7 +984,7 @@ impl CoreWeak {
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
         // DR-8/B54 receive policy:
         // - active wave: use a borrowed arena view; `Core::receive_from_dep` immediately
-        //   enrolls in the counted touched-set before any callback-capable work;
+        //   enrolls in the arena-pinned touched set before any callback-capable work;
         // - no active wave: promote to a counted Core so recovery/error-side delivery
         //   cannot free the target while it is receiving.
         let core = if wave_in_flight() {
@@ -1035,7 +1131,7 @@ impl Drop for WaveGuard {
 
 /// Clear `in_dep_mutation` on scope exit — including a panic unwind during a rewire
 /// (QA-F1). A user fn can panic mid-rewire (an added dep's activation fn, or a removed
-/// dep's onDeactivation hook); the wave-owner catch's [`Core::reset_wave_flags`] does NOT
+/// dep's onDeactivation hook); the wave-owner catch's wave-flag reset does NOT
 /// cover `in_dep_mutation` (and may not include the rewiring node in its touched-set), so
 /// without this RAII a caught rewire panic would wedge the node forever (every future
 /// recompute deferred + every future rewire rejected as reentrant). Mirrors the TS arm's
@@ -1059,7 +1155,7 @@ impl Drop for DepMutationGuard {
 /// graceful return). The **outermost** public mutating entry (`subscribe` / `down` /
 /// `up` / `set`) becomes the wave OWNER: it installs a scope, runs the cascade under
 /// `catch_unwind`, and on a caught panic resets every participating node's transient
-/// wave-flags ([`Core::reset_wave_flags`]) before emitting `[[ERROR,e]]` from the
+/// wave-flags before emitting `[[ERROR,e]]` from the
 /// `blamed` node. Nested re-entrant calls see the active scope and just run.
 ///
 /// `blamed` is the innermost node whose fn actually ran ([`Core::run_wave`] records
@@ -1074,9 +1170,9 @@ struct WaveScope {
     /// Graph roots that received committed-boundary tasks during this wave but are not
     /// necessarily the wave owner's graph (nested cross-arena public calls share WAVE).
     boundary_roots: Vec<BoundaryRoot>,
-    /// Every node that mutated a transient wave-flag this wave (may contain dups —
-    /// [`Core::reset_wave_flags`] is idempotent; the set lives for one wave only).
-    touched: Vec<Core>,
+    /// Every node that mutated a transient wave-flag this wave. DR-8/B54: these are
+    /// arena pins keyed by (graph, node id, generation), not counted Core clones.
+    touched: Vec<ArenaNodePin>,
     /// Innermost node whose fn ran before the panic (the ERROR-bearing node).
     ///
     /// DR-8/B54: blame is a generation-keyed arena reference on the hot path. The
@@ -1110,7 +1206,9 @@ fn wave_in_flight() -> bool {
 fn wave_register(core: &Core) {
     WAVE.with(|w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
-            scope.touched.push(core.clone());
+            if let Some(pin) = ArenaNodePin::from_core(core) {
+                scope.touched.push(pin);
+            }
         }
     });
 }
@@ -1300,10 +1398,10 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
                     scope
                         .touched
                         .iter()
-                        .find(|n| n.arena_node_key() == key)
-                        .cloned()
+                        .find(|n| n.arena_key == key)
+                        .and_then(ArenaNodePin::borrowed_core)
                 })
-                .unwrap_or_else(|| owner.clone());
+                .unwrap_or_else(|| owner.borrowed_view());
             let err = panic_to_error(payload);
             // The recovery ERROR emit runs OUTSIDE any catch (the scope is taken). A
             // user subscriber sink that itself panics while handling this ERROR must not
@@ -1317,6 +1415,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             on_error()
         }
     };
+    drop(std::mem::take(&mut scope.touched));
     // Committed wave boundary (R-rewire-deferred / D47): drain any `ctx.rewire_next` queued
     // during this wave, each applied as a FRESH wave. Batch holds this drain until AFTER
     // the outermost commit/rollback, so topology never mutates on an uncommitted view
@@ -1758,8 +1857,8 @@ impl Core {
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
         // B25: enroll in the wave touched-set so a panic-abort can reset our flags.
         // DR-8/B54: the internal dep-callback entry may be an uncounted arena view;
-        // under a real wave this counted touched-set clone also pins the node while
-        // borrow-free subscriber callbacks run.
+        // under a real wave this generation-keyed touched action pins the node in the
+        // owner arena while borrow-free subscriber callbacks run.
         wave_register(self);
         // Terminal-is-forever (D17): a terminated node ignores further upstream messages.
         if self.with_inner_edges(|_n, e| e.value.terminal) {
@@ -3117,30 +3216,6 @@ impl Core {
         self.emit_to_subs(&Message::Invalidate);
     }
 
-    /// B25: reset transient wave-flags to their between-wave baseline after a
-    /// panic-aborted wave (called from `with_wave_owner` on the touched-set). Leaves
-    /// PERSISTED state (cache / dep_prev / dep_has_data / status / ctx.state) intact —
-    /// only the wave-local bookkeeping a clean wave would have rolled forward itself.
-    fn reset_wave_flags(&self) {
-        self.with_inner_edges_mut(|n, e| {
-            e.wave.inside_run_wave = false;
-            e.wave.emitted_dirty_this_wave = false;
-            e.wave.emitted_tier3_this_wave = false;
-            e.state.pending = 0;
-            for i in 0..n.deps.len() {
-                e.state.batch[i] = None;
-                e.state.batch_waves[i].clear();
-                e.state.batch_wave_id[i] = None;
-                e.state.terminal_wave[i] = None;
-                e.state.dirty[i] = false;
-            }
-            // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
-            // (the dep really did COMPLETE/ERROR — terminal-is-forever, D17), not a wave-transient
-            // like `dep_dirty`/`dep_batch`. `deactivate`/`rewire_apply` refresh it on a fresh
-            // lifecycle; a panic-aborted wave must leave a terminated dep marked terminal.
-        });
-    }
-
     // ── ctx.state + hooks (called from Ctx) ──
 
     pub(crate) fn get_state(&self) -> Option<AnyValue> {
@@ -3163,6 +3238,24 @@ impl Core {
     fn subscriber_count(&self) -> usize {
         self.with_aux(|a| a.subscribers.len())
     }
+}
+
+fn reset_wave_flags_inner(n: &mut NodeInner, e: &mut DepEdges) {
+    e.wave.inside_run_wave = false;
+    e.wave.emitted_dirty_this_wave = false;
+    e.wave.emitted_tier3_this_wave = false;
+    e.state.pending = 0;
+    for i in 0..n.deps.len() {
+        e.state.batch[i] = None;
+        e.state.batch_waves[i].clear();
+        e.state.batch_wave_id[i] = None;
+        e.state.terminal_wave[i] = None;
+        e.state.dirty[i] = false;
+    }
+    // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
+    // (the dep really did COMPLETE/ERROR — terminal-is-forever, D17), not a wave-transient
+    // like `dep_dirty`/`dep_batch`. `deactivate`/`rewire_apply` refresh it on a fresh
+    // lifecycle; a panic-aborted wave must leave a terminated dep marked terminal.
 }
 
 /// Reconstruct a payload-free upstream control message for forwarding toward deps
@@ -4299,7 +4392,7 @@ mod tests {
         // wave-owner boundary with the existing owner handle instead of creating an
         // extra counted Core clone before the hot wave path runs. The scope itself
         // also stores only the owner's graph id; the touched-set remains the only
-        // in-wave counted safety pin.
+        // in-wave arena safety pin.
         let source = Node::<i32>::state_empty();
         let refs = source.core.refs.clone();
         let seen_refs = Rc::new(Cell::new(0usize));
@@ -4314,17 +4407,103 @@ mod tests {
 
         assert_eq!(
             seen_refs.get(),
-            3,
-            "expected source handle + unsubscribe handle + touched-set clone, with no wave-owner Core clone"
+            2,
+            "expected source handle + unsubscribe handle; wave-owner/touched arena pins must not increment Core refs"
         );
+    }
+
+    #[test]
+    fn touched_arena_pin_defers_slot_free_without_core_refcount_pin() {
+        // DR-8/B54 owner-execution: a touched node is pinned by graph arena slot,
+        // not by a counted Core clone. If the last public handle drops mid-wave,
+        // cleanup/free waits until the arena pin releases at the wave boundary.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let owner = Node::<i32>::state_in_arena(&arena, 0);
+        let victim = Node::<i32>::state_in_arena(&arena, 1);
+        let victim_key = victim.core.key();
+        let victim_refs = victim.core.refs.clone();
+        let graph_in_wave = graph.clone();
+
+        with_wave_owner(
+            &owner.core,
+            move || {
+                assert_eq!(victim_refs.get(), 1);
+                wave_register(&victim.core);
+                assert_eq!(
+                    victim_refs.get(),
+                    1,
+                    "arena touched pin must not increment counted Core refs"
+                );
+                drop(victim);
+                assert_eq!(
+                    victim_refs.get(),
+                    0,
+                    "dropping the final public handle marks the slot externally dead"
+                );
+                assert!(
+                    graph_in_wave.borrow().is_live_key(victim_key),
+                    "arena pin keeps the touched slot live until wave exit"
+                );
+            },
+            || {},
+        );
+
+        assert!(
+            !graph.borrow().is_live_key(victim_key),
+            "wave exit releases the arena pin and frees the externally-dead slot"
+        );
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(victim_key.id, reused.core.key().id);
+        assert_ne!(victim_key.generation, reused.core.key().generation);
+    }
+
+    #[test]
+    fn touched_arena_pins_release_before_committed_boundary_drain() {
+        // R-rewire-deferred/D47 boundary tasks are fresh waves. A touched node whose
+        // final public handle dropped during the prior wave must be cleaned up before
+        // queued boundary tasks run, not kept alive until after the drain.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let owner = Node::<i32>::state_in_arena(&arena, 1);
+        let victim = Node::<i32>::state_in_arena(&arena, 2);
+        let victim_key = victim.core.key();
+        let saw_boundary = Rc::new(Cell::new(false));
+        let saw = saw_boundary.clone();
+        let graph_for_sink = graph.clone();
+        let _u = owner.subscribe(move |m| {
+            if matches!(m, Message::Invalidate) {
+                saw.set(true);
+                assert!(
+                    !graph_for_sink.borrow().is_live_key(victim_key),
+                    "touched pins must release before committed-boundary tasks run"
+                );
+            }
+        });
+        let owner_core = owner.core.clone();
+
+        with_wave_owner(
+            &owner.core,
+            move || {
+                wave_register(&victim.core);
+                drop(victim);
+                owner_core.request_up_next(vec![Message::Invalidate], None);
+            },
+            || {},
+        );
+
+        assert!(saw_boundary.get(), "queued boundary INVALIDATE should run");
+        let reused = Node::<i32>::state_in_arena(&arena, 3);
+        assert_eq!(victim_key.id, reused.core.key().id);
+        assert_ne!(victim_key.generation, reused.core.key().generation);
     }
 
     #[test]
     fn run_wave_ctx_borrows_core_until_defer_promotes() {
         // DR-8/B54 delivery-waist follow-up: a synchronous fn-body Ctx is used only
-        // while the wave touched-set already pins the owner, so it can be an uncounted
-        // arena view. The async escape hatch ctx.defer() must promote to a counted Core
-        // because DeferredCtx can outlive the wave.
+        // while the wave touched-set already pins the owner in the arena, so it can be
+        // an uncounted arena view. The async escape hatch ctx.defer() must promote to a
+        // counted Core because DeferredCtx can outlive the wave.
         let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
         let sync_refs = Rc::new(Cell::new(0usize));
         let deferred_refs = Rc::new(Cell::new(0usize));
@@ -4354,12 +4533,12 @@ mod tests {
 
         assert_eq!(
             sync_refs.get(),
-            4,
-            "expected public handle + subscribe body/error handles + touched-set pin; Ctx itself must not count"
+            3,
+            "expected public handle + subscribe body/error handles; touched arena pin and Ctx itself must not count"
         );
         assert_eq!(
             deferred_refs.get(),
-            5,
+            4,
             "ctx.defer() promotes the borrowed fn-body Ctx to a counted async handle"
         );
         assert_eq!(
@@ -4373,6 +4552,41 @@ mod tests {
             2,
             "dropping the deferred async handle releases its counted Core pin"
         );
+    }
+
+    #[test]
+    fn borrowed_core_cannot_promote_after_external_death() {
+        // DR-8/B54 fail-closed lifetime rule: an arena pin may keep a slot live for
+        // the current synchronous wave after the last public handle drops, but a
+        // borrowed Core must not promote that externally-dead slot into a new counted
+        // handle.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let victim = Node::<i32>::state_in_arena(&arena, 1);
+        let victim_key = victim.core.key();
+        let victim_refs = victim.core.refs.clone();
+        let pin = ArenaNodePin::from_core(&victim.core).expect("live slot pins");
+        let borrowed = pin.borrowed_core().expect("pin can create borrowed view");
+        drop(victim);
+
+        assert_eq!(victim_refs.get(), 0);
+        assert!(
+            graph.borrow().is_live_key(victim_key),
+            "arena pin keeps the externally-dead slot live only for the current wave"
+        );
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _revived = borrowed.clone();
+        }));
+        assert!(
+            result.is_err(),
+            "borrowed Core clone must fail closed instead of reviving refs from zero"
+        );
+        drop(borrowed);
+        drop(pin);
+        assert!(!graph.borrow().is_live_key(victim_key));
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(victim_key.id, reused.core.key().id);
+        assert_ne!(victim_key.generation, reused.core.key().generation);
     }
 
     #[test]
@@ -4822,8 +5036,8 @@ mod tests {
     #[test]
     fn wave_scope_blamed_does_not_add_ref_pin() {
         // DR-8/B54 next slice: `blamed` is a generation-keyed arena reference rather
-        // than another counted Core clone. The touched-set still pins live nodes for
-        // drop/unwind safety; blame should not add another refcount bump on top of it.
+        // than another counted Core clone. The touched-set now pins live nodes in the
+        // owner arena for drop/unwind safety; neither touch nor blame increments Core refs.
         let source = Node::<i32>::state(1);
         let refs = source.core.refs.clone();
 
@@ -4833,7 +5047,7 @@ mod tests {
                 let owner_pinned = refs.get();
                 wave_register(&source.core);
                 let touched_pinned = refs.get();
-                assert_eq!(touched_pinned, owner_pinned + 1);
+                assert_eq!(touched_pinned, owner_pinned);
 
                 wave_set_blamed(&source.core);
                 assert_eq!(
@@ -4848,7 +5062,7 @@ mod tests {
         assert_eq!(
             refs.get(),
             1,
-            "all wave-owner/touched pins are released after the wave"
+            "all wave-owner/touched arena pins are released after the wave"
         );
     }
 
