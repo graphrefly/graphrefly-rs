@@ -2760,6 +2760,113 @@ impl Core {
             });
             return;
         }
+        if old_deps.len() == new_deps.len() && Self::same_graph_no_overlap(&old_deps, &new_deps) {
+            // DR-8/B54 no-kept fast path: full dep replacement (same arity, no shared
+            // identity) keeps this in the same O(n) class as the old keep-path, but bypasses
+            // full O(n²) matching when no dep survives.
+            let n = new_deps.len();
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.in_dep_mutation = true;
+                e.wave.rewire_run_pending = false;
+            });
+            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
+            let activated = self.with_aux(|a| a.activated);
+            let mut removed_dirty_contributor = false;
+
+            self.swap_fn_preserving_pool(fn_);
+
+            for old_idx in 0..old_deps.len() {
+                let unsub = {
+                    let mut graph = self.graph.borrow_mut();
+                    let (_nn, edges) = graph.get_node_and_edges_mut(self.key());
+                    if edges.state.dirty[old_idx] {
+                        removed_dirty_contributor = true;
+                        edges.state.pending -= 1;
+                    }
+                    if let Some(box_ref) = edges.idx_boxes.get(old_idx) {
+                        box_ref.set(-1);
+                    }
+                    edges.unsubs.get_mut(old_idx).and_then(|u| u.take())
+                };
+                if let Some(unsub) = unsub {
+                    unsub();
+                }
+            }
+
+            let new_batch: Vec<Option<Vec<AnyValue>>> = (0..n).map(|_| None).collect();
+            let new_batch_waves: Vec<Vec<Vec<WaveData>>> = (0..n).map(|_| Vec::new()).collect();
+            let new_batch_wave_id: Vec<Option<u64>> = (0..n).map(|_| None).collect();
+            let new_prev: Vec<Option<AnyValue>> = (0..n).map(|_| None).collect();
+            let new_tier: Vec<u8> = (0..n).map(|_| 0).collect();
+            let new_terminal: Vec<Option<DepTerminal>> = (0..n).map(|_| None).collect();
+            let new_terminal_wave: Vec<Option<DepTerminal>> = (0..n).map(|_| None).collect();
+            let new_has: Vec<bool> = (0..n).map(|_| false).collect();
+            let new_dirty: Vec<bool> = (0..n).map(|_| false).collect();
+            let new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
+            let new_boxes: Vec<Rc<Cell<i64>>> = (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
+            self.with_inner_edges_mut(|nn, e| {
+                nn.deps = new_deps.clone();
+                e.state.batch = new_batch;
+                e.state.batch_waves = new_batch_waves;
+                e.state.batch_wave_id = new_batch_wave_id;
+                e.state.prev = new_prev;
+                e.state.has_data = new_has;
+                e.state.dirty = new_dirty;
+                e.state.tier = new_tier;
+                e.state.terminal = new_terminal;
+                e.state.terminal_wave = new_terminal_wave;
+                e.unsubs = new_unsubs;
+                e.idx_boxes = new_boxes;
+            });
+
+            if activated {
+                for (idx, dep) in new_deps.iter().enumerate() {
+                    self.subscribe_dep(idx, dep);
+                }
+            }
+
+            if self.with_inner_edges(|_, e| e.value.terminal) {
+                return;
+            }
+
+            let should_rewire_settle = self.with_inner_edges(|_, e| {
+                removed_dirty_contributor && e.state.pending == 0 && e.value.status == Status::Dirty
+            });
+            let mut zero_dep_undirty = false;
+            if should_rewire_settle {
+                if n == 0 {
+                    zero_dep_undirty = true;
+                } else {
+                    self.with_inner_edges_mut(|_, e| {
+                        e.wave.rewire_run_pending = true;
+                    });
+                }
+            }
+
+            self.with_inner_edges_mut(|_, e| {
+                e.wave.in_dep_mutation = false;
+            });
+
+            let run_pending =
+                self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.rewire_run_pending));
+            if run_pending {
+                self.settle_rewire();
+            } else if zero_dep_undirty {
+                let emitted = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
+                if emitted {
+                    self.down(vec![Message::Resolved]);
+                } else {
+                    self.with_inner_edges_mut(|_n, e| {
+                        e.value.status = if e.value.has_data {
+                            Status::Settled
+                        } else {
+                            Status::Sentinel
+                        };
+                    });
+                }
+            }
+            return;
+        }
         let n = new_deps.len();
         let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
         let mut new_to_old: Vec<Option<usize>> = vec![None; n];
@@ -2937,6 +3044,16 @@ impl Core {
                 });
             }
         }
+    }
+
+    fn same_graph_no_overlap(old_deps: &[Core], new_deps: &[Core]) -> bool {
+        let mut old_ids = HashSet::with_capacity(old_deps.len());
+        for dep in old_deps {
+            old_ids.insert(dep.arena_node_key());
+        }
+        !new_deps
+            .iter()
+            .any(|dep| old_ids.contains(&dep.arena_node_key()))
     }
 
     /// R-rewire atomic settle (D42 + the D1 /qa fix): emit ONE proper two-phase
@@ -6289,6 +6406,115 @@ mod tests {
             a.core.subscriber_count(),
             1,
             "the duplicate old edge is drained during rewire"
+        );
+    }
+
+    #[test]
+    fn rewire_setdeps_all_replaced_fast_path() {
+        // DR-8/B54 no-kept fast path: same-length rewire where every old dep is dropped
+        // and replaced by new deps should re-subscribe to the fresh edge set, drop the old
+        // callback transport, and run once on the fresh push-on-subscribe wave.
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let c = Node::<i32>::state(10);
+        let e = Node::<i32>::state(20);
+        let runs = Rc::new(Cell::new(0usize));
+        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], {
+            let runs = runs.clone();
+            move |ctx| {
+                runs.set(runs.get() + 1);
+                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+            }
+        });
+        let _u = d.subscribe(|_| {});
+        assert_eq!(d.cache(), Some(3));
+        runs.set(0);
+
+        let runs2 = runs.clone();
+        d.set_deps(vec![c.erased(), e.erased()], move |ctx| {
+            runs2.set(runs2.get() + 1);
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap() + 100);
+        });
+        assert_eq!(
+            runs.get(),
+            1,
+            "one recompute after full no-kept replacement"
+        );
+        assert_eq!(d.cache(), Some(130));
+
+        assert_eq!(
+            a.core.subscriber_count(),
+            0,
+            "old dep A edge is fully drained"
+        );
+        assert_eq!(
+            b.core.subscriber_count(),
+            0,
+            "old dep B edge is fully drained"
+        );
+        assert_eq!(c.core.subscriber_count(), 1, "new dep C edge is active");
+        assert_eq!(e.core.subscriber_count(), 1, "new dep E edge is active");
+
+        // Old deps no longer drive cache.
+        a.set(99);
+        b.set(99);
+        assert_eq!(runs.get(), 1);
+        assert_eq!(d.cache(), Some(130));
+
+        // New deps continue to drive and preserve atomic settle.
+        c.set(11);
+        assert_eq!(runs.get(), 2);
+        assert_eq!(d.cache(), Some(131));
+    }
+
+    #[test]
+    fn rewire_no_kept_fast_path_preserves_remaining_unsubs_on_removed_cleanup_panic() {
+        // QA regression for the DR-8/B54 no-kept fast path: a panicking removed-dep
+        // deactivation hook must not drop later old-edge Unsub handles without running
+        // them. The broader half-applied-rewire panic class is tracked by B16; this
+        // test pins the new fast path to the slow path's cleanup ownership behavior.
+        let b_deactivated = Rc::new(Cell::new(false));
+        let a = Node::<i32>::producer(|ctx| {
+            ctx.on_deactivation(|| panic!("removed cleanup boom"));
+            ctx.emit(1i32);
+        });
+        let b = {
+            let b_deactivated = b_deactivated.clone();
+            Node::<i32>::producer(move |ctx| {
+                let flag = b_deactivated.clone();
+                ctx.on_deactivation(move || flag.set(true));
+                ctx.emit(2i32);
+            })
+        };
+        let c = Node::<i32>::state(10);
+        let e = Node::<i32>::state(20);
+
+        {
+            let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
+                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+            });
+            let _u = d.subscribe(|_| {});
+            assert_eq!(d.cache(), Some(3));
+            assert_eq!(b.core.subscriber_count(), 1);
+
+            d.set_deps(vec![c.erased(), e.erased()], |ctx| {
+                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+            });
+            assert_eq!(
+                b.core.subscriber_count(),
+                1,
+                "later old edge remains owned by the rewiring node after the first cleanup panic"
+            );
+        }
+
+        assert!(
+            b_deactivated.get(),
+            "dropping the rewiring node must still run the remaining old-edge unsubscribe"
+        );
+        assert_eq!(
+            b.core.subscriber_count(),
+            0,
+            "remaining old edge is not leaked after owner drop"
         );
     }
 
