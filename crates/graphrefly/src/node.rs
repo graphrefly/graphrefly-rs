@@ -1197,8 +1197,7 @@ struct ArenaNodePin {
 }
 
 impl ArenaNodePin {
-    #[cfg(test)]
-    fn from_core(core: &Core) -> Option<Self> {
+    pub(crate) fn from_core(core: &Core) -> Option<Self> {
         {
             let mut graph = core.graph.borrow_mut();
             if !graph.pin_live_key(core.key()) {
@@ -1232,12 +1231,56 @@ impl ArenaNodePin {
         let (n, e) = g.get_node_and_edges_mut(self.arena_key.node);
         reset_wave_flags_inner(n, e);
     }
+
+    fn boundary_root(&self) -> BoundaryRoot {
+        BoundaryRoot {
+            graph_id: self.arena_key.graph,
+            graph: Rc::downgrade(&self.graph),
+        }
+    }
 }
 
 impl Drop for ArenaNodePin {
     fn drop(&mut self) {
         self.graph.borrow_mut().release_pin(self.arena_key.node);
         free_slot_if_unreferenced(&self.graph, self.arena_key.node, &self.refs);
+    }
+}
+
+pub(crate) struct BatchTarget {
+    pin: ArenaNodePin,
+}
+
+impl BatchTarget {
+    pub(crate) fn from_core(core: &Core) -> Option<Self> {
+        Some(Self {
+            pin: ArenaNodePin::from_core(core)?,
+        })
+    }
+
+    pub(crate) fn matches(&self, core: &Core) -> bool {
+        self.pin.arena_key == core.arena_node_key()
+    }
+
+    pub(crate) fn boundary_root(&self) -> BoundaryRoot {
+        self.pin.boundary_root()
+    }
+
+    pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
+        if let Some(core) = self.pin.borrowed_core() {
+            core.commit_batched_wave(wave);
+        }
+    }
+
+    pub(crate) fn rollback_batched(&self) {
+        if let Some(core) = self.pin.borrowed_core() {
+            core.rollback_batched();
+        }
+    }
+
+    #[cfg(test)]
+    fn borrowed_core(&self) -> Option<Core> {
+        self.pin.borrowed_core()
     }
 }
 
@@ -2055,10 +2098,6 @@ fn remember_first_boundary_panic(
             *escaped = Some(e);
         }
     }
-}
-
-pub(crate) fn clear_deferred_boundary_tasks(target: &Core) {
-    target.graph.borrow_mut().deferred_boundary.clear();
 }
 
 pub(crate) fn clear_deferred_boundary_root(root: &BoundaryRoot) {
@@ -6082,6 +6121,140 @@ mod tests {
             d.cache(),
             Some(20),
             "batch-deferred external rewire still drains at the committed boundary"
+        );
+    }
+
+    #[test]
+    fn defer_to_batch_does_not_increment_refs() {
+        let source = Node::<i32>::state(1);
+        let refs = source.core.refs.clone();
+        let before = refs.get();
+
+        crate::batch::batch(|_| {
+            source.set(2);
+            source.set(3);
+            source.set(4);
+            assert_eq!(
+                refs.get(),
+                before,
+                "defer_to_batch should use generation-checked batch pins, not counted Core handles"
+            );
+        });
+
+        assert_eq!(
+            refs.get(),
+            before,
+            "collecting batch should not permanently retain extra refs"
+        );
+        assert_eq!(source.cache(), Some(4));
+    }
+
+    #[test]
+    fn dropping_last_public_handle_inside_batch_keeps_slot_live_for_commit_and_rollback() {
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+
+        {
+            let source = Node::<i32>::state_in_arena(&arena, 0);
+            let refs = source.core.refs.clone();
+            let key = source.core.key();
+            let initial_refs = refs.get();
+            assert_eq!(initial_refs, 1);
+
+            crate::batch::batch({
+                let graph = graph.clone();
+                let refs = refs.clone();
+                move |_| {
+                    let owned = source;
+                    owned.set(1);
+                    drop(owned);
+
+                    assert_eq!(
+                        refs.get(),
+                        0,
+                        "explicitly dropping the public handle should leave no counted owners"
+                    );
+                    assert!(
+                        graph.borrow().is_live_key(key),
+                        "arena pin keeps the node slot live for open batch finish"
+                    );
+                }
+            });
+
+            assert_eq!(refs.get(), 0);
+            assert!(
+                !graph.borrow().is_live_key(key),
+                "batch pin should release when commit finishes"
+            );
+        };
+
+        let source = Node::<i32>::state_in_arena(&arena, 0);
+        let refs = source.core.refs.clone();
+        let key = source.core.key();
+        crate::batch::batch({
+            let graph = graph.clone();
+            let refs = refs.clone();
+            move |bctx| {
+                let owned = source;
+                owned.set(2);
+                drop(owned);
+
+                assert_eq!(
+                    refs.get(),
+                    0,
+                    "explicit rollback should not restore a counted batch owner reference"
+                );
+                assert!(
+                    graph.borrow().is_live_key(key),
+                    "rollback also runs with a pinned slot while the batch remains open"
+                );
+                bctx.rollback();
+            }
+        });
+
+        assert_eq!(refs.get(), 0);
+        assert!(
+            !graph.borrow().is_live_key(key),
+            "batch pin should release after rollback too"
+        );
+    }
+
+    #[test]
+    fn batch_target_stale_generation_does_not_borrow_reused_slot() {
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let stale_target: BatchTarget;
+        let old_key;
+        {
+            let node = Node::<i32>::state_in_arena(&arena, 1);
+            old_key = node.core.key();
+            stale_target =
+                BatchTarget::from_core(&node.core).expect("pin tracks live batch target");
+            let borrowed = stale_target
+                .borrowed_core()
+                .expect("pin may borrow while owner is alive");
+            assert_eq!(
+                borrowed
+                    .cache_any()
+                    .and_then(|value| value.downcast_ref::<i32>().copied()),
+                Some(1)
+            );
+            drop(node);
+            assert!(
+                graph.borrow().is_live_key(old_key),
+                "pin keeps dead owner slot alive while batch-target lives"
+            );
+        }
+
+        drop(stale_target);
+        assert!(!graph.borrow().is_live_key(old_key));
+
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(old_key.id, reused.core.key().id);
+        assert_ne!(old_key.generation, reused.core.key().generation);
+        assert!(
+            graph.borrow().is_live_key(reused.core.key()),
+            "reused slot is live with the new generation"
         );
     }
 

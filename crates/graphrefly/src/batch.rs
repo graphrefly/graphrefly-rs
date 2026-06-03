@@ -21,12 +21,10 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::node::{
-    boundary_root_for, clear_deferred_boundary_root, clear_deferred_boundary_tasks,
-    drain_committed_boundaries, BoundaryRoot, Core,
+    boundary_root_for, clear_deferred_boundary_root, drain_committed_boundary_root, BatchTarget,
+    BoundaryRoot, Core,
 };
 use crate::protocol::{AnyValue, Wave};
-
-type DeferredEntry = (Core, Wave<AnyValue>);
 
 /// Explicit rollback escape hatch for [`batch`] (D12).
 pub struct BatchCtx {
@@ -41,8 +39,9 @@ impl BatchCtx {
 }
 
 struct ActiveBatch {
-    order: Vec<Core>,
-    deferred: Vec<DeferredEntry>,
+    targets: Vec<BatchTarget>,
+    order: Vec<usize>,
+    deferred: Vec<Option<Wave<AnyValue>>>,
     boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     rolled_back: Rc<Cell<bool>>,
@@ -52,6 +51,7 @@ struct ActiveBatch {
 impl ActiveBatch {
     fn new(committed: Rc<Cell<bool>>, rolled_back: Rc<Cell<bool>>) -> Self {
         Self {
+            targets: Vec::new(),
             order: Vec::new(),
             deferred: Vec::new(),
             boundary_roots: Vec::new(),
@@ -103,16 +103,20 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
         if !batch.collecting {
             return false;
         }
-        if let Some((_, slot)) = batch
-            .deferred
-            .iter_mut()
-            .find(|(existing, _)| existing.ptr_eq(target))
-        {
-            *slot = wave;
-        } else {
-            batch.order.push(target.clone());
-            batch.deferred.push((target.clone(), wave));
-        }
+        let index = match batch.targets.iter().position(|entry| entry.matches(target)) {
+            Some(index) => index,
+            None => {
+                let Some(target) = BatchTarget::from_core(target) else {
+                    return false;
+                };
+                let index = batch.targets.len();
+                batch.targets.push(target);
+                batch.deferred.push(None);
+                batch.order.push(index);
+                index
+            }
+        };
+        batch.deferred[index] = Some(wave);
         true
     })
 }
@@ -124,10 +128,9 @@ pub(crate) fn committed_after_batch_for_target(target: &Core) -> Option<Rc<Cell<
         let active = b.borrow();
         let batch = active.as_ref()?;
         if !batch.collecting
-            || !batch
-                .deferred
-                .iter()
-                .any(|(existing, _)| existing.ptr_eq(target))
+            || !batch.targets.iter().enumerate().any(|(index, existing)| {
+                existing.matches(target) && batch.deferred.get(index).is_some_and(Option::is_some)
+            })
         {
             return None;
         }
@@ -136,8 +139,9 @@ pub(crate) fn committed_after_batch_for_target(target: &Core) -> Option<Rc<Cell<
 }
 
 struct BatchFinish {
-    order: Vec<Core>,
-    deferred: Vec<DeferredEntry>,
+    targets: Vec<BatchTarget>,
+    order: Vec<usize>,
+    deferred: Vec<Option<Wave<AnyValue>>>,
     boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     explicit_rollback: bool,
@@ -149,6 +153,7 @@ fn take_for_finish() -> BatchFinish {
         let batch = active.as_mut().expect("batch frame installed");
         batch.collecting = false;
         BatchFinish {
+            targets: std::mem::take(&mut batch.targets),
             order: std::mem::take(&mut batch.order),
             deferred: std::mem::take(&mut batch.deferred),
             boundary_roots: std::mem::take(&mut batch.boundary_roots),
@@ -164,31 +169,45 @@ fn clear_active() {
     });
 }
 
-fn commit(deferred: Vec<DeferredEntry>) {
-    for (target, wave) in deferred {
-        target.commit_batched_wave(wave);
+fn commit(targets: &[BatchTarget], deferred: Vec<Option<Wave<AnyValue>>>) {
+    for (target_index, wave) in deferred.into_iter().enumerate() {
+        if let Some(wave) = wave {
+            targets[target_index].commit_batched_wave(wave);
+        }
     }
 }
 
-fn rollback(order: Vec<Core>) {
-    for target in order {
-        target.rollback_batched();
+fn rollback(targets: &[BatchTarget], order: Vec<usize>) {
+    for target_index in order {
+        targets[target_index].rollback_batched();
     }
 }
 
-fn boundary_graph_roots(order: &[Core], deferred: &[DeferredEntry]) -> Vec<Core> {
-    let mut roots: Vec<Core> = Vec::new();
-    let mut push_unique = |node: &Core| {
-        if roots.iter().any(|r| r.same_graph(node)) {
+fn boundary_graph_roots(
+    targets: &[BatchTarget],
+    order: &[usize],
+    deferred: &[Option<Wave<AnyValue>>],
+) -> Vec<BoundaryRoot> {
+    let mut roots: Vec<BoundaryRoot> = Vec::new();
+    let mut push_unique = |target: &BatchTarget| {
+        let root = target.boundary_root();
+        if roots.iter().any(|r| r.same_root(&root)) {
             return;
         }
-        roots.push(node.clone());
+        roots.push(root);
     };
-    for node in order {
-        push_unique(node);
+    for target_index in order {
+        if let Some(target) = targets.get(*target_index) {
+            push_unique(target);
+        }
     }
-    for (node, _) in deferred {
-        push_unique(node);
+    for (target_index, wave) in deferred.iter().enumerate() {
+        if wave.is_some() {
+            let Some(target) = targets.get(target_index) else {
+                continue;
+            };
+            push_unique(target);
+        }
     }
     roots
 }
@@ -205,11 +224,11 @@ fn take_late_boundary_roots() -> Vec<BoundaryRoot> {
 
 fn append_boundary_roots(
     task_roots: &mut Vec<BoundaryRoot>,
-    core_roots: &[Core],
+    core_roots: &[BoundaryRoot],
     boundary_roots: Vec<BoundaryRoot>,
 ) {
     for root in boundary_roots {
-        if core_roots.iter().any(|r| root.same_graph(r))
+        if core_roots.iter().any(|r| r.same_root(&root))
             || task_roots.iter().any(|r| r.same_root(&root))
         {
             continue;
@@ -218,25 +237,52 @@ fn append_boundary_roots(
     }
 }
 
-fn clear_boundary_for_roots(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
+fn clear_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryRoot]) {
     for root in core_roots {
-        clear_deferred_boundary_tasks(root);
+        clear_deferred_boundary_root(root);
     }
     for root in task_roots {
         clear_deferred_boundary_root(root);
     }
 }
 
-fn drain_boundary_for_roots(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
-    drain_committed_boundaries(core_roots, task_roots);
+fn drain_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryRoot]) {
+    let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
+    for root in core_roots {
+        remember_first_boundary_panic(
+            &mut escaped,
+            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root))),
+        );
+    }
+    for root in task_roots {
+        remember_first_boundary_panic(
+            &mut escaped,
+            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root))),
+        );
+    }
+    if let Some(e) = escaped {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn remember_first_boundary_panic(
+    escaped: &mut Option<Box<dyn std::any::Any + Send>>,
+    result: std::thread::Result<()>,
+) {
+    if let Err(e) = result {
+        if escaped.is_none() {
+            *escaped = Some(e);
+        }
+    }
 }
 
 fn rollback_and_cleanup(
-    order: Vec<Core>,
+    targets: Vec<BatchTarget>,
+    order: Vec<usize>,
     mut task_roots: Vec<BoundaryRoot>,
 ) -> std::thread::Result<()> {
-    let core_roots = boundary_graph_roots(&order, &[]);
-    let result = catch_unwind(AssertUnwindSafe(|| rollback(order)));
+    let core_roots = boundary_graph_roots(&targets, &order, &[]);
+    let result = catch_unwind(AssertUnwindSafe(|| rollback(&targets, order)));
     let late_roots = take_late_boundary_roots();
     append_boundary_roots(&mut task_roots, &core_roots, late_roots);
     clear_active();
@@ -265,7 +311,8 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     };
     let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
     let finish = take_for_finish();
-    let boundary_core_roots = boundary_graph_roots(&finish.order, &finish.deferred);
+    let boundary_core_roots =
+        boundary_graph_roots(&finish.targets, &finish.order, &finish.deferred);
     let mut boundary_task_roots = Vec::new();
     append_boundary_roots(
         &mut boundary_task_roots,
@@ -276,11 +323,15 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     match result {
         Ok(value) => {
             if finish.explicit_rollback {
-                if let Err(payload) = rollback_and_cleanup(finish.order, boundary_task_roots) {
+                if let Err(payload) =
+                    rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
+                {
                     resume_unwind(payload);
                 }
             } else {
-                let commit_result = catch_unwind(AssertUnwindSafe(|| commit(finish.deferred)));
+                let commit_result = catch_unwind(AssertUnwindSafe(|| {
+                    commit(&finish.targets, finish.deferred)
+                }));
                 let late_roots = take_late_boundary_roots();
                 append_boundary_roots(&mut boundary_task_roots, &boundary_core_roots, late_roots);
                 if let Err(payload) = commit_result {
@@ -295,7 +346,9 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
             value
         }
         Err(payload) => {
-            if let Err(rollback_payload) = rollback_and_cleanup(finish.order, boundary_task_roots) {
+            if let Err(rollback_payload) =
+                rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
+            {
                 resume_unwind(rollback_payload);
             }
             resume_unwind(payload);
