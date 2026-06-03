@@ -1395,6 +1395,28 @@ impl CoreWeak {
         ))
     }
 
+    fn pinned_borrowed_core(&self) -> Option<(ArenaNodePin, Core)> {
+        let graph = self.graph.upgrade()?;
+        let refs = self.refs.upgrade()?;
+        let arena_key = ArenaNodeKey {
+            graph: Rc::as_ptr(&graph) as usize,
+            node: self.key,
+        };
+        {
+            let mut g = graph.borrow_mut();
+            if !g.pin_live_key(self.key) {
+                return None;
+            }
+        }
+        let pin = ArenaNodePin {
+            arena_key,
+            graph,
+            refs,
+        };
+        let core = pin.borrowed_core()?;
+        Some((pin, core))
+    }
+
     fn collect_in_wave_receive_from_dep_action(
         &self,
         idx: usize,
@@ -1402,9 +1424,6 @@ impl CoreWeak {
     ) -> Option<InWaveDepReceiveAction> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
-        if refs.get() == 0 {
-            return None;
-        }
         let arena_key = ArenaNodeKey {
             graph: Rc::as_ptr(&graph) as usize,
             node: self.key,
@@ -1432,7 +1451,11 @@ impl CoreWeak {
             Some(refs) => refs,
             None => return,
         };
-        if refs.get() == 0 || !graph.borrow().is_live_key(self.key) {
+        let can_apply = {
+            let g = graph.borrow();
+            g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)
+        };
+        if !can_apply {
             return;
         }
         let core = Core::from_borrowed_parts(graph, self.key.id, self.key.generation, refs);
@@ -1443,8 +1466,9 @@ impl CoreWeak {
         // DR-8/B54 receive policy:
         // - active wave: use a borrowed arena view; `Core::receive_from_dep` immediately
         //   enrolls in the arena-pinned touched set before any callback-capable work;
-        // - no active wave: promote to a counted Core so recovery/error-side delivery
-        //   cannot free the target while it is receiving.
+        // - no active wave: promote to a counted Core when available; if the slot is
+        //   already arena-pinned, a borrowed view is still safe and avoids counted churn
+        //   during late cleanup/release windows.
         if wave_in_flight() {
             let Some(action) = self.collect_in_wave_receive_from_dep_action(idx, msg) else {
                 return;
@@ -1454,7 +1478,11 @@ impl CoreWeak {
             }
             return;
         }
-        let Some(core) = self.counted_core() else {
+        if let Some(core) = self.counted_core() {
+            core.receive_from_dep_registered(idx, msg);
+            return;
+        }
+        let Some((_pin, core)) = self.pinned_borrowed_core() else {
             return;
         };
         core.receive_from_dep_registered(idx, msg);
@@ -1489,11 +1517,8 @@ impl DeferredNodeAction {
     fn with_live_edges_mut<R>(&self, f: impl FnOnce(&mut DepEdges) -> R) -> Option<R> {
         let graph = self.weak.graph.upgrade()?;
         let refs = self.weak.refs.upgrade()?;
-        if refs.get() == 0 {
-            return None;
-        }
         let mut g = graph.borrow_mut();
-        if !g.is_live_key(self.weak.key) {
+        if !g.is_live_key(self.weak.key) || (refs.get() == 0 && g.pin_count(self.weak.key) == 0) {
             return None;
         }
         let (_n, e) = g.get_node_and_edges_mut(self.weak.key);
@@ -3793,40 +3818,52 @@ impl Core {
 
     fn forward_up(&self, m: Msg, toward_dep: Option<usize>, route: &mut UpRouteState) {
         // DR-8/B54: route control fanout over borrowed dep keys under wave safety.
-        // In-wave, the path stays on borrowed arena views (no counted Core clones
-        // in the hot control fanout). Outside a wave, preserve prior semantics.
-        if wave_in_flight() {
-            let deps = self.with_inner_edges(|n, _e| {
-                n.deps
-                    .iter()
-                    .map(|dep| (dep.id, dep.generation, dep.refs.clone()))
-                    .collect::<Vec<_>>()
-            });
-            if let Some(i) = toward_dep {
-                if let Some(dep) = deps.get(i) {
-                    let dep_core =
-                        Core::from_borrowed_parts(self.graph.clone(), dep.0, dep.1, dep.2.clone());
-                    dep_core.up_msg(m, None, route);
+        // In-wave and out-of-wave share the same path: resolve dep projections as
+        // arena keys and only materialize a borrowed Core when the target is live and
+        // can be re-entered this slice (counted or pinned).
+        let deps = self.with_inner_edges(|n, _| {
+            n.deps
+                .iter()
+                .map(|dep| (dep.id, dep.generation, dep.refs.clone()))
+                .collect::<Vec<_>>()
+        });
+        let mut to_target = |target: &(NodeId, u64, Rc<Cell<usize>>), msg: Msg| {
+            let (id, generation, refs) = target;
+            let key = NodeKey {
+                id: *id,
+                generation: *generation,
+            };
+            let arena_key = ArenaNodeKey {
+                graph: Rc::as_ptr(&self.graph) as usize,
+                node: key,
+            };
+            {
+                let mut graph = self.graph.borrow_mut();
+                if !graph.is_live_key(key) || (refs.get() == 0 && graph.pin_count(key) == 0) {
+                    return;
                 }
+                if !graph.pin_live_key(key) {
+                    return;
+                }
+            }
+            let pin = ArenaNodePin {
+                arena_key,
+                graph: self.graph.clone(),
+                refs: refs.clone(),
+            };
+            let Some(dep_core) = pin.borrowed_core() else {
                 return;
-            }
-            for dep in deps {
-                let dep_core =
-                    Core::from_borrowed_parts(self.graph.clone(), dep.0, dep.1, dep.2.clone());
-                dep_core.up_msg(dup_control(&m), None, route);
-            }
-            return;
-        }
-
-        let deps = self.borrow().deps.clone();
+            };
+            dep_core.up_msg(msg, None, route);
+        };
         if let Some(i) = toward_dep {
             if let Some(dep) = deps.get(i) {
-                dep.up_route(vec![m], None, route);
+                to_target(dep, m);
             }
             return;
         }
-        for dep in &deps {
-            dep.up_route(vec![dup_control(&m)], None, route);
+        for dep in deps {
+            to_target(&dep, dup_control(&m));
         }
     }
 
@@ -5396,6 +5433,65 @@ mod tests {
     }
 
     #[test]
+    fn internal_dep_callback_entry_outside_wave_uses_pinned_borrow_when_refcount_dead() {
+        // DR-8/B54: when a node is already arena-pinned (eg. by a temporary
+        // batch/closure token) and `refs == 0`, we can process an off-wave dep callback
+        // without creating a temporary counted Core clone.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        );
+        let weak = derived.core.downgrade();
+        let borrowed = derived.core.borrowed_view();
+        let pin = ArenaNodePin::from_core(&derived.core).expect("node must be pinnable while live");
+        let refs = derived.core.refs.clone();
+
+        drop(derived);
+        assert_eq!(
+            refs.get(),
+            0,
+            "setup drops the final public node handle so receive path is stress-tested with no counted refs"
+        );
+
+        weak.receive_from_dep(0, &Message::Data(Rc::new(4i32)));
+        assert_eq!(
+            refs.get(),
+            0,
+            "pinned receive should not promote a counted Core when the slot is already externally dead"
+        );
+        assert_eq!(
+            borrowed
+                .cache_any()
+                .and_then(|v| v.downcast_ref::<i32>().copied()),
+            Some(4),
+            "borrowed owner execution should still run the dep callback while pinned"
+        );
+
+        with_wave_owner(
+            &source.core,
+            || weak.receive_from_dep(0, &Message::Data(Rc::new(5i32))),
+            || {},
+        );
+        assert_eq!(
+            refs.get(),
+            0,
+            "in-wave pinned receive should also avoid counted Core promotion"
+        );
+        assert_eq!(
+            borrowed
+                .cache_any()
+                .and_then(|v| v.downcast_ref::<i32>().copied()),
+            Some(5),
+            "in-wave collect/apply must not half-apply dep bookkeeping then skip the action"
+        );
+        drop(pin);
+    }
+
+    #[test]
     fn internal_up_route_broadcast_uses_borrowed_deps() {
         // DR-8/B54: control fanout from an in-wave `up` path should traverse the
         // hot deps as borrowed arena views, so callback-visible refcounts must not
@@ -5405,22 +5501,36 @@ mod tests {
         let b = Node::<i32>::state_in_arena(&arena, 2);
         let a_refs = a.core.refs.clone();
         let b_refs = b.core.refs.clone();
+        let graph = arena.0.clone();
+        let a_key = a.core.key();
+        let b_key = b.core.key();
         let observed: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed_pins: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
         let _ua = a.subscribe({
             let observed = observed.clone();
+            let observed_pins = observed_pins.clone();
             let a_refs = a_refs.clone();
+            let graph = graph.clone();
             move |msg| {
                 if matches!(msg, Message::Invalidate) {
                     observed.borrow_mut().push(a_refs.get());
+                    observed_pins
+                        .borrow_mut()
+                        .push(graph.borrow().pin_count(a_key));
                 }
             }
         });
         let _ub = b.subscribe({
             let observed = observed.clone();
+            let observed_pins = observed_pins.clone();
             let b_refs = b_refs.clone();
+            let graph = graph.clone();
             move |msg| {
                 if matches!(msg, Message::Invalidate) {
                     observed.borrow_mut().push(b_refs.get());
+                    observed_pins
+                        .borrow_mut()
+                        .push(graph.borrow().pin_count(b_key));
                 }
             }
         });
@@ -5447,6 +5557,84 @@ mod tests {
         assert_eq!(
             observed[1], baseline.1,
             "dep b must not pick up a temporary counted up-route ref bump"
+        );
+        assert_eq!(
+            *observed_pins.borrow(),
+            vec![2, 2],
+            "in-wave borrowed up-route should keep the wave pin and add a scoped route pin around each dep callback"
+        );
+    }
+
+    #[test]
+    fn out_of_wave_up_route_broadcast_uses_borrowed_deps() {
+        // DR-8/B54: direct `Core::up` control routing (no owning wave) should use
+        // borrowed dep views rather than counted clones when forwarding out-of-wave.
+        let arena = GraphArena::new();
+        let a = Node::<i32>::state_in_arena(&arena, 1);
+        let b = Node::<i32>::state_in_arena(&arena, 2);
+        let a_refs = a.core.refs.clone();
+        let b_refs = b.core.refs.clone();
+        let graph = arena.0.clone();
+        let a_key = a.core.key();
+        let b_key = b.core.key();
+        let observed: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed_pins: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let _ua = a.subscribe({
+            let observed = observed.clone();
+            let observed_pins = observed_pins.clone();
+            let a_refs = a_refs.clone();
+            let graph = graph.clone();
+            move |msg| {
+                if matches!(msg, Message::Invalidate) {
+                    observed.borrow_mut().push(a_refs.get());
+                    observed_pins
+                        .borrow_mut()
+                        .push(graph.borrow().pin_count(a_key));
+                }
+            }
+        });
+        let _ub = b.subscribe({
+            let observed = observed.clone();
+            let observed_pins = observed_pins.clone();
+            let b_refs = b_refs.clone();
+            let graph = graph.clone();
+            move |msg| {
+                if matches!(msg, Message::Invalidate) {
+                    observed.borrow_mut().push(b_refs.get());
+                    observed_pins
+                        .borrow_mut()
+                        .push(graph.borrow().pin_count(b_key));
+                }
+            }
+        });
+
+        let parent = Node::<i32>::derived_opts_in_arena(
+            &arena,
+            vec![a.erased(), b.erased()],
+            NodeOpts::default(),
+            |_| {},
+        );
+        let baseline = (a_refs.get(), b_refs.get());
+        parent.core.up(vec![Message::Invalidate], None);
+
+        let observed = observed.borrow();
+        assert_eq!(
+            observed.len(),
+            2,
+            "both deps should receive one out-of-wave INVALIDATE control wave"
+        );
+        assert_eq!(
+            observed[0], baseline.0,
+            "dep a must not pick up a temporary counted up-route ref bump"
+        );
+        assert_eq!(
+            observed[1], baseline.1,
+            "dep b must not pick up a temporary counted up-route ref bump"
+        );
+        assert_eq!(
+            *observed_pins.borrow(),
+            vec![1, 1],
+            "out-of-wave borrowed up-route should hold an arena pin around each dep callback"
         );
     }
 
