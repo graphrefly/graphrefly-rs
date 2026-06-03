@@ -1249,6 +1249,32 @@ struct CoreWeak {
     refs: Weak<Cell<usize>>,
 }
 
+#[derive(Default)]
+struct InWaveDepReceiveAction {
+    emit_teardown_subscribers: bool,
+    emit_dirty: bool,
+    do_invalidate: bool,
+    invalidate_as_invalidate_msg: bool,
+    had_node_data_before_invalidate: bool,
+    clear_undirty_after_invalidate: bool,
+    do_maybe_run: bool,
+    down_msgs: Option<Vec<Msg>>,
+    do_settle_after_absorbed_terminal: bool,
+    fire_demand: bool,
+}
+
+impl InWaveDepReceiveAction {
+    fn has_work(&self) -> bool {
+        self.emit_teardown_subscribers
+            || self.emit_dirty
+            || self.do_invalidate
+            || self.do_maybe_run
+            || self.do_settle_after_absorbed_terminal
+            || self.fire_demand
+            || self.down_msgs.as_ref().is_some_and(|msgs| !msgs.is_empty())
+    }
+}
+
 impl CoreWeak {
     fn counted_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
@@ -1285,7 +1311,11 @@ impl CoreWeak {
         ))
     }
 
-    fn borrowed_core_registered_for_wave(&self) -> Option<Core> {
+    fn collect_in_wave_receive_from_dep_action(
+        &self,
+        idx: usize,
+        msg: &Msg,
+    ) -> Option<InWaveDepReceiveAction> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
         if refs.get() == 0 {
@@ -1305,12 +1335,258 @@ impl CoreWeak {
         if !registered {
             return None;
         }
-        Some(Core::from_borrowed_parts(
-            graph,
-            self.key.id,
-            self.key.generation,
-            refs,
-        ))
+
+        let mut action = InWaveDepReceiveAction::default();
+        let mut g = graph.borrow_mut();
+        if !g.is_live_key(self.key) {
+            return None;
+        }
+
+        if g.get_node_call_config_run_edges(self.key).4.value.terminal {
+            if matches!(msg, Message::Teardown) {
+                action.emit_teardown_subscribers = true;
+            }
+            return Some(action);
+        }
+
+        match msg {
+            Message::Start => {}
+            Message::Invalidate => {
+                let (had_node_data, undirty_no_settle, buffer_own_invalidate) = {
+                    let (_n, _c, cfg, _r, e, a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    let had_node_data = e.value.has_data;
+                    e.state.prev[idx] = None;
+                    e.state.has_data[idx] = false;
+                    e.state.batch[idx] = None;
+                    let had_current_projection = e.state.record_wave_sentinel(idx);
+                    if !had_current_projection && !e.state.has_run_triggering_projection() {
+                        e.state.clear_wave_projection(idx);
+                    }
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    let undirty_no_settle = e.state.pending == 0 && e.wave.emitted_dirty_this_wave;
+                    if a.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
+                        a.paused_dep_wave_occurred = false;
+                    }
+                    let buffer_own_invalidate =
+                        !a.pause_lockset.is_empty() && matches!(cfg.pausable, Pausable::ResumeAll);
+                    (had_node_data, undirty_no_settle, buffer_own_invalidate)
+                };
+                action.do_invalidate = true;
+                action.invalidate_as_invalidate_msg = buffer_own_invalidate && had_node_data;
+                action.had_node_data_before_invalidate = had_node_data;
+                action.clear_undirty_after_invalidate = undirty_no_settle;
+                action.fire_demand = true;
+            }
+            Message::Dirty => {
+                let emit_dirty = {
+                    let (_n, _c, cfg, _r, e, a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    if e.state.dirty[idx] {
+                        false
+                    } else {
+                        e.state.dirty[idx] = true;
+                        e.state.pending += 1;
+                        e.state.tier[idx] = 2;
+                        let pull_quiet = cfg
+                            .pull_id
+                            .as_ref()
+                            .is_some_and(|id| a.pause_lockset.contains(id));
+                        if pull_quiet || e.wave.emitted_dirty_this_wave {
+                            false
+                        } else {
+                            e.wave.emitted_dirty_this_wave = true;
+                            e.value.status = Status::Dirty;
+                            true
+                        }
+                    }
+                };
+                if emit_dirty {
+                    action.emit_dirty = true;
+                }
+            }
+            Message::Data(v) => {
+                let pending_drained = {
+                    let (_n, _c, cfg, _r, e, a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    match &mut e.state.batch[idx] {
+                        Some(b) => b.push(v.clone()),
+                        none => *none = Some(vec![v.clone()]),
+                    }
+                    e.state.record_wave_data(idx, v.clone());
+                    e.state.has_data[idx] = true;
+                    e.state.tier[idx] = 3;
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    let pending_drained = e.state.pending == 0;
+                    if !pending_drained
+                        && matches!(cfg.pausable, Pausable::True)
+                        && !e.wave.in_dep_mutation
+                        && !a.pause_lockset.is_empty()
+                    {
+                        a.paused_dep_wave_occurred = true;
+                    }
+                    pending_drained
+                };
+                if pending_drained {
+                    action.do_maybe_run = true;
+                    action.fire_demand = true;
+                }
+            }
+            Message::Resolved => {
+                let pending_drained = {
+                    let (_n, _c, cfg, _r, e, a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    e.state.record_resolved_wave(idx);
+                    e.state.tier[idx] = 3;
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    let pending_drained = e.state.pending == 0;
+                    if !pending_drained
+                        && matches!(cfg.pausable, Pausable::True)
+                        && !e.wave.in_dep_mutation
+                        && !a.pause_lockset.is_empty()
+                    {
+                        a.paused_dep_wave_occurred = true;
+                    }
+                    pending_drained
+                };
+                if pending_drained {
+                    action.do_maybe_run = true;
+                    action.fire_demand = true;
+                }
+            }
+            Message::Complete => {
+                let (_auto_error, auto_complete, tari, all_deps_terminal) = {
+                    let (n, _c, cfg, _r, e, _a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    e.state.terminal[idx] = Some(DepTerminal::Complete);
+                    e.state.terminal_wave[idx] = Some(DepTerminal::Complete);
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    let all_deps_terminal = if n.deps.is_empty() {
+                        false
+                    } else {
+                        e.state.terminal.iter().all(|t| t.is_some())
+                    };
+                    (
+                        cfg.error_when_deps_error,
+                        cfg.complete_when_deps_complete,
+                        cfg.terminal_as_real_input,
+                        all_deps_terminal,
+                    )
+                };
+                if tari {
+                    action.do_maybe_run = true;
+                } else if auto_complete && all_deps_terminal {
+                    action.down_msgs = Some(vec![Message::Complete]);
+                } else {
+                    action.do_settle_after_absorbed_terminal = true;
+                }
+                action.fire_demand = true;
+            }
+            Message::Error(err) => {
+                let (auto_error, auto_complete, tari, all_deps_terminal) = {
+                    let (n, _c, cfg, _r, e, _a) =
+                        g.get_node_call_config_run_edges_aux_mut(self.key);
+                    let term = DepTerminal::Error(format!("{err}").into());
+                    e.state.terminal[idx] = Some(term.clone());
+                    e.state.terminal_wave[idx] = Some(term);
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    let all_deps_terminal = if n.deps.is_empty() {
+                        false
+                    } else {
+                        e.state.terminal.iter().all(|t| t.is_some())
+                    };
+                    (
+                        cfg.error_when_deps_error,
+                        cfg.complete_when_deps_complete,
+                        cfg.terminal_as_real_input,
+                        all_deps_terminal,
+                    )
+                };
+                if auto_error {
+                    action.down_msgs = Some(vec![Message::Error(err.to_string().into())]);
+                } else if tari {
+                    action.do_maybe_run = true;
+                } else if auto_complete && all_deps_terminal {
+                    action.down_msgs = Some(vec![Message::Complete]);
+                } else {
+                    action.do_settle_after_absorbed_terminal = true;
+                }
+                action.fire_demand = true;
+            }
+            Message::Teardown => {
+                action.down_msgs = Some(vec![Message::Complete, Message::Teardown]);
+            }
+            _ => {}
+        }
+        Some(action)
+    }
+
+    fn apply_in_wave_receive_action(&self, action: InWaveDepReceiveAction) {
+        let graph = match self.graph.upgrade() {
+            Some(graph) => graph,
+            None => return,
+        };
+        let refs = match self.refs.upgrade() {
+            Some(refs) => refs,
+            None => return,
+        };
+        if refs.get() == 0 {
+            return;
+        }
+        if !graph.borrow().is_live_key(self.key) {
+            return;
+        }
+        let core = Core::from_borrowed_parts(graph, self.key.id, self.key.generation, refs);
+
+        if action.emit_teardown_subscribers {
+            core.emit_to_subs(&Message::Teardown);
+        }
+        if action.emit_dirty {
+            core.emit_to_subs(&Message::Dirty);
+        }
+        if action.do_invalidate {
+            if action.invalidate_as_invalidate_msg && action.had_node_data_before_invalidate {
+                core.down(vec![Message::Invalidate]);
+            } else {
+                core.invalidate();
+            }
+        }
+        if action.clear_undirty_after_invalidate {
+            if action.had_node_data_before_invalidate {
+                core.with_inner_edges_mut(|_n, e| {
+                    e.wave.emitted_dirty_this_wave = false;
+                });
+            } else {
+                core.down(vec![Message::Resolved]);
+            }
+        }
+        if action.do_maybe_run {
+            core.maybe_run();
+        }
+        if let Some(msgs) = action.down_msgs {
+            core.down(msgs);
+        }
+        if action.do_settle_after_absorbed_terminal {
+            core.settle_after_absorbed_terminal();
+        }
+        if action.fire_demand {
+            core.fire_owed_demand_if_ready();
+        }
     }
 
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
@@ -1319,14 +1595,19 @@ impl CoreWeak {
         //   enrolls in the arena-pinned touched set before any callback-capable work;
         // - no active wave: promote to a counted Core so recovery/error-side delivery
         //   cannot free the target while it is receiving.
-        let core = if wave_in_flight() {
-            self.borrowed_core_registered_for_wave()
-        } else {
-            self.counted_core()
-        };
-        if let Some(core) = core {
-            core.receive_from_dep_registered(idx, msg);
+        if wave_in_flight() {
+            let Some(action) = self.collect_in_wave_receive_from_dep_action(idx, msg) else {
+                return;
+            };
+            if action.has_work() {
+                self.apply_in_wave_receive_action(action);
+            }
+            return;
         }
+        let Some(core) = self.counted_core() else {
+            return;
+        };
+        core.receive_from_dep_registered(idx, msg);
     }
 }
 
