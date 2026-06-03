@@ -1335,205 +1335,8 @@ impl CoreWeak {
         if !registered {
             return None;
         }
-
-        let mut action = InWaveDepReceiveAction::default();
         let mut g = graph.borrow_mut();
-        if !g.is_live_key(self.key) {
-            return None;
-        }
-
-        if g.get_node_call_config_run_edges(self.key).4.value.terminal {
-            if matches!(msg, Message::Teardown) {
-                action.emit_teardown_subscribers = true;
-            }
-            return Some(action);
-        }
-
-        match msg {
-            Message::Start => {}
-            Message::Invalidate => {
-                let (had_node_data, undirty_no_settle, buffer_own_invalidate) = {
-                    let (_n, _c, cfg, _r, e, a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    let had_node_data = e.value.has_data;
-                    e.state.prev[idx] = None;
-                    e.state.has_data[idx] = false;
-                    e.state.batch[idx] = None;
-                    let had_current_projection = e.state.record_wave_sentinel(idx);
-                    if !had_current_projection && !e.state.has_run_triggering_projection() {
-                        e.state.clear_wave_projection(idx);
-                    }
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    let undirty_no_settle = e.state.pending == 0 && e.wave.emitted_dirty_this_wave;
-                    if a.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
-                        a.paused_dep_wave_occurred = false;
-                    }
-                    let buffer_own_invalidate =
-                        !a.pause_lockset.is_empty() && matches!(cfg.pausable, Pausable::ResumeAll);
-                    (had_node_data, undirty_no_settle, buffer_own_invalidate)
-                };
-                action.do_invalidate = true;
-                action.invalidate_as_invalidate_msg = buffer_own_invalidate && had_node_data;
-                action.had_node_data_before_invalidate = had_node_data;
-                action.clear_undirty_after_invalidate = undirty_no_settle;
-                action.fire_demand = true;
-            }
-            Message::Dirty => {
-                let emit_dirty = {
-                    let (_n, _c, cfg, _r, e, a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    if e.state.dirty[idx] {
-                        false
-                    } else {
-                        e.state.dirty[idx] = true;
-                        e.state.pending += 1;
-                        e.state.tier[idx] = 2;
-                        let pull_quiet = cfg
-                            .pull_id
-                            .as_ref()
-                            .is_some_and(|id| a.pause_lockset.contains(id));
-                        if pull_quiet || e.wave.emitted_dirty_this_wave {
-                            false
-                        } else {
-                            e.wave.emitted_dirty_this_wave = true;
-                            e.value.status = Status::Dirty;
-                            true
-                        }
-                    }
-                };
-                if emit_dirty {
-                    action.emit_dirty = true;
-                }
-            }
-            Message::Data(v) => {
-                let pending_drained = {
-                    let (_n, _c, cfg, _r, e, a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    match &mut e.state.batch[idx] {
-                        Some(b) => b.push(v.clone()),
-                        none => *none = Some(vec![v.clone()]),
-                    }
-                    e.state.record_wave_data(idx, v.clone());
-                    e.state.has_data[idx] = true;
-                    e.state.tier[idx] = 3;
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    let pending_drained = e.state.pending == 0;
-                    if !pending_drained
-                        && matches!(cfg.pausable, Pausable::True)
-                        && !e.wave.in_dep_mutation
-                        && !a.pause_lockset.is_empty()
-                    {
-                        a.paused_dep_wave_occurred = true;
-                    }
-                    pending_drained
-                };
-                if pending_drained {
-                    action.do_maybe_run = true;
-                    action.fire_demand = true;
-                }
-            }
-            Message::Resolved => {
-                let pending_drained = {
-                    let (_n, _c, cfg, _r, e, a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    e.state.record_resolved_wave(idx);
-                    e.state.tier[idx] = 3;
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    let pending_drained = e.state.pending == 0;
-                    if !pending_drained
-                        && matches!(cfg.pausable, Pausable::True)
-                        && !e.wave.in_dep_mutation
-                        && !a.pause_lockset.is_empty()
-                    {
-                        a.paused_dep_wave_occurred = true;
-                    }
-                    pending_drained
-                };
-                if pending_drained {
-                    action.do_maybe_run = true;
-                    action.fire_demand = true;
-                }
-            }
-            Message::Complete => {
-                let (_auto_error, auto_complete, tari, all_deps_terminal) = {
-                    let (n, _c, cfg, _r, e, _a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    e.state.terminal[idx] = Some(DepTerminal::Complete);
-                    e.state.terminal_wave[idx] = Some(DepTerminal::Complete);
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    let all_deps_terminal = if n.deps.is_empty() {
-                        false
-                    } else {
-                        e.state.terminal.iter().all(|t| t.is_some())
-                    };
-                    (
-                        cfg.error_when_deps_error,
-                        cfg.complete_when_deps_complete,
-                        cfg.terminal_as_real_input,
-                        all_deps_terminal,
-                    )
-                };
-                if tari {
-                    action.do_maybe_run = true;
-                } else if auto_complete && all_deps_terminal {
-                    action.down_msgs = Some(vec![Message::Complete]);
-                } else {
-                    action.do_settle_after_absorbed_terminal = true;
-                }
-                action.fire_demand = true;
-            }
-            Message::Error(err) => {
-                let (auto_error, auto_complete, tari, all_deps_terminal) = {
-                    let (n, _c, cfg, _r, e, _a) =
-                        g.get_node_call_config_run_edges_aux_mut(self.key);
-                    let term = DepTerminal::Error(format!("{err}").into());
-                    e.state.terminal[idx] = Some(term.clone());
-                    e.state.terminal_wave[idx] = Some(term);
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    let all_deps_terminal = if n.deps.is_empty() {
-                        false
-                    } else {
-                        e.state.terminal.iter().all(|t| t.is_some())
-                    };
-                    (
-                        cfg.error_when_deps_error,
-                        cfg.complete_when_deps_complete,
-                        cfg.terminal_as_real_input,
-                        all_deps_terminal,
-                    )
-                };
-                if auto_error {
-                    action.down_msgs = Some(vec![Message::Error(err.to_string().into())]);
-                } else if tari {
-                    action.do_maybe_run = true;
-                } else if auto_complete && all_deps_terminal {
-                    action.down_msgs = Some(vec![Message::Complete]);
-                } else {
-                    action.do_settle_after_absorbed_terminal = true;
-                }
-                action.fire_demand = true;
-            }
-            Message::Teardown => {
-                action.down_msgs = Some(vec![Message::Complete, Message::Teardown]);
-            }
-            _ => {}
-        }
-        Some(action)
+        Core::collect_receive_from_dep_action_from_graph(&mut g, self.key, idx, msg)
     }
 
     fn apply_in_wave_receive_action(&self, action: InWaveDepReceiveAction) {
@@ -1545,48 +1348,11 @@ impl CoreWeak {
             Some(refs) => refs,
             None => return,
         };
-        if refs.get() == 0 {
-            return;
-        }
-        if !graph.borrow().is_live_key(self.key) {
+        if refs.get() == 0 || !graph.borrow().is_live_key(self.key) {
             return;
         }
         let core = Core::from_borrowed_parts(graph, self.key.id, self.key.generation, refs);
-
-        if action.emit_teardown_subscribers {
-            core.emit_to_subs(&Message::Teardown);
-        }
-        if action.emit_dirty {
-            core.emit_to_subs(&Message::Dirty);
-        }
-        if action.do_invalidate {
-            if action.invalidate_as_invalidate_msg && action.had_node_data_before_invalidate {
-                core.down(vec![Message::Invalidate]);
-            } else {
-                core.invalidate();
-            }
-        }
-        if action.clear_undirty_after_invalidate {
-            if action.had_node_data_before_invalidate {
-                core.with_inner_edges_mut(|_n, e| {
-                    e.wave.emitted_dirty_this_wave = false;
-                });
-            } else {
-                core.down(vec![Message::Resolved]);
-            }
-        }
-        if action.do_maybe_run {
-            core.maybe_run();
-        }
-        if let Some(msgs) = action.down_msgs {
-            core.down(msgs);
-        }
-        if action.do_settle_after_absorbed_terminal {
-            core.settle_after_absorbed_terminal();
-        }
-        if action.fire_demand {
-            core.fire_owed_demand_if_ready();
-        }
+        core.apply_receive_from_dep_action(action);
     }
 
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
@@ -2515,95 +2281,149 @@ impl Core {
     }
 
     fn receive_from_dep_registered(&self, idx: usize, msg: &Msg) {
-        // Terminal-is-forever (D17): a terminated node ignores further upstream messages.
-        if self.with_inner_edges(|_n, e| e.value.terminal) {
-            if matches!(msg, Message::Teardown) {
-                self.emit_to_subs(&Message::Teardown);
-            }
+        let Some(action) = self.collect_receive_from_dep_action(idx, msg) else {
             return;
+        };
+        if action.has_work() {
+            self.apply_receive_from_dep_action(action);
         }
+    }
+
+    fn collect_receive_from_dep_action(
+        &self,
+        idx: usize,
+        msg: &Msg,
+    ) -> Option<InWaveDepReceiveAction> {
+        let mut g = self.graph.borrow_mut();
+        Self::collect_receive_from_dep_action_from_graph(&mut g, self.key(), idx, msg)
+    }
+
+    fn apply_receive_from_dep_action(&self, action: InWaveDepReceiveAction) {
+        if action.emit_teardown_subscribers {
+            self.emit_to_subs(&Message::Teardown);
+        }
+        if action.emit_dirty {
+            self.emit_to_subs(&Message::Dirty);
+        }
+        if action.do_invalidate {
+            if action.invalidate_as_invalidate_msg && action.had_node_data_before_invalidate {
+                self.down(vec![Message::Invalidate]);
+            } else {
+                self.invalidate();
+            }
+        }
+        if action.clear_undirty_after_invalidate {
+            if action.had_node_data_before_invalidate {
+                self.with_inner_edges_mut(|_n, e| {
+                    e.wave.emitted_dirty_this_wave = false;
+                });
+            } else {
+                self.down(vec![Message::Resolved]);
+            }
+        }
+        if action.do_maybe_run {
+            self.maybe_run();
+        }
+        if let Some(msgs) = action.down_msgs {
+            self.down(msgs);
+        }
+        if action.do_settle_after_absorbed_terminal {
+            self.settle_after_absorbed_terminal();
+        }
+        if action.fire_demand {
+            self.fire_owed_demand_if_ready();
+        }
+    }
+
+    fn collect_receive_from_dep_action_from_graph(
+        g: &mut GraphCore,
+        key: NodeKey,
+        idx: usize,
+        msg: &Msg,
+    ) -> Option<InWaveDepReceiveAction> {
+        let (pausable, pull_id, auto_error, auto_complete, terminal_as_real_input) = {
+            let cfg = g.get_config(key);
+            (
+                cfg.pausable,
+                cfg.pull_id.clone(),
+                cfg.error_when_deps_error,
+                cfg.complete_when_deps_complete,
+                cfg.terminal_as_real_input,
+            )
+        };
+        if g.get_node_and_edges_mut(key).1.value.terminal {
+            if matches!(msg, Message::Teardown) {
+                return Some(InWaveDepReceiveAction {
+                    emit_teardown_subscribers: true,
+                    ..Default::default()
+                });
+            }
+            return None;
+        }
+
+        let mut action = InWaveDepReceiveAction::default();
         match msg {
             Message::Start => {}
             Message::Invalidate => {
-                // The dep's value is gone — drop our view of it (prev_data → SENTINEL so
-                // the never-emitted detector reads correctly, C-3) and cascade idempotently.
-                let (had_data, undirty_no_settle, paused) =
-                    self.with_inner_edges_aux_mut(|_n, e, a| {
-                        e.state.prev[idx] = None;
-                        e.state.has_data[idx] = false;
-                        e.state.batch[idx] = None;
-                        let had_current_projection = e.state.record_wave_sentinel(idx);
-                        if !had_current_projection && !e.state.has_run_triggering_projection() {
-                            e.state.clear_wave_projection(idx);
-                        }
-                        // Un-wedge the dirty bookkeeping if this dep had gone DIRTY first, so an
-                        // INVALIDATE-before-DATA doesn't strand `pending` / downstream forever
-                        // (R-invalidate-idempotent — the wedged-DIRTY deadlock guard).
-                        if e.state.dirty[idx] {
-                            e.state.dirty[idx] = false;
-                            e.state.pending -= 1;
-                        }
-                        // D50 / R-paused-invalidate: this INVALIDATE SUPERSEDES the dep's
-                        // buffered paused dep-wave (dep_batch[idx] just cleared). Re-derive the
-                        // paused-recompute flag — if no dep still carries a buffered DATA, CANCEL
-                        // the paused recompute (the node has settled to SENTINEL via its own
-                        // INVALIDATE; a RESUME must not recompute against a now-SENTINEL dep —
-                        // attributed cancellation). A surviving dep keeps it set; a later DATA
-                        // re-arms it ([DATA, INVALIDATE, DATA2] → recompute with DATA2).
-                        if a.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
-                            a.paused_dep_wave_occurred = false;
-                        }
-                        (
-                            e.value.has_data,
-                            e.state.pending == 0 && e.wave.emitted_dirty_this_wave,
-                            !a.pause_lockset.is_empty(),
-                        )
-                    });
-                let buffer_own_invalidate =
-                    paused && self.with_config(|cfg| matches!(cfg.pausable, Pausable::ResumeAll));
-                if buffer_own_invalidate && had_data {
-                    self.down(vec![Message::Invalidate]);
-                } else {
-                    self.invalidate(); // cascades INVALIDATE iff populated; no-op otherwise
-                }
-                // If we broadcast DIRTY this wave but produced no settle (never populated, so
-                // the cascade was suppressed), un-dirty downstream with one RESOLVED.
+                let (had_data, undirty_no_settle, paused) = {
+                    let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                    e.state.prev[idx] = None;
+                    e.state.has_data[idx] = false;
+                    e.state.batch[idx] = None;
+                    let had_current_projection = e.state.record_wave_sentinel(idx);
+                    if !had_current_projection && !e.state.has_run_triggering_projection() {
+                        e.state.clear_wave_projection(idx);
+                    }
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
+                    }
+                    if a.paused_dep_wave_occurred && e.state.batch.iter().all(|b| b.is_none()) {
+                        a.paused_dep_wave_occurred = false;
+                    }
+                    (
+                        e.value.has_data,
+                        e.state.pending == 0 && e.wave.emitted_dirty_this_wave,
+                        !a.pause_lockset.is_empty(),
+                    )
+                };
+                let buffer_own_invalidate = paused && matches!(pausable, Pausable::ResumeAll);
+                action.had_node_data_before_invalidate = had_data;
+                action.do_invalidate = true;
+                action.invalidate_as_invalidate_msg = buffer_own_invalidate && had_data;
                 if undirty_no_settle {
                     if !had_data {
-                        self.down(vec![Message::Resolved]);
+                        action.down_msgs = Some(vec![Message::Resolved]);
                     } else {
-                        self.with_inner_edges_mut(|_, e| {
-                            e.wave.emitted_dirty_this_wave = false;
-                        });
+                        action.clear_undirty_after_invalidate = true;
                     }
                 }
-                self.fire_owed_demand_if_ready();
+                action.fire_demand = true;
             }
             Message::Dirty => {
-                let emit_dirty = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
+                action.emit_dirty = {
+                    let pull_id = pull_id.clone();
+                    let (_n, e, a) = g.get_node_edges_aux_mut(key);
                     if e.state.dirty[idx] {
-                        return false;
+                        false
+                    } else {
+                        e.state.dirty[idx] = true;
+                        e.state.pending += 1;
+                        e.state.tier[idx] = 2;
+                        let pull_quiet = pull_id.is_some_and(|id| a.pause_lockset.contains(&id));
+                        if pull_quiet || e.wave.emitted_dirty_this_wave {
+                            false
+                        } else {
+                            e.wave.emitted_dirty_this_wave = true;
+                            e.value.status = Status::Dirty;
+                            true
+                        }
                     }
-                    e.state.dirty[idx] = true;
-                    e.state.pending += 1;
-                    e.state.tier[idx] = 2;
-                    let pull_quiet = cfg
-                        .pull_id
-                        .as_ref()
-                        .is_some_and(|id| a.pause_lockset.contains(id));
-                    if pull_quiet || e.wave.emitted_dirty_this_wave {
-                        return false;
-                    }
-                    e.wave.emitted_dirty_this_wave = true;
-                    e.value.status = Status::Dirty;
-                    true
-                });
-                if emit_dirty {
-                    self.emit_to_subs(&Message::Dirty);
-                }
+                };
             }
             Message::Data(v) => {
-                let pending_drained = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
+                let pending_drained = {
+                    let (_n, e, a) = g.get_node_edges_aux_mut(key);
                     match &mut e.state.batch[idx] {
                         Some(b) => b.push(v.clone()),
                         none => *none = Some(vec![v.clone()]),
@@ -2617,21 +2437,22 @@ impl Core {
                     }
                     let pending_drained = e.state.pending == 0;
                     if !pending_drained
-                        && matches!(cfg.pausable, Pausable::True)
+                        && matches!(pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
                         && !a.pause_lockset.is_empty()
                     {
                         a.paused_dep_wave_occurred = true;
                     }
                     pending_drained
-                });
+                };
                 if pending_drained {
-                    self.maybe_run();
-                    self.fire_owed_demand_if_ready();
+                    action.do_maybe_run = true;
+                    action.fire_demand = true;
                 }
             }
             Message::Resolved => {
-                let pending_drained = self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
+                let pending_drained = {
+                    let (_n, e, a) = g.get_node_edges_aux_mut(key);
                     e.state.record_resolved_wave(idx);
                     e.state.tier[idx] = 3;
                     if e.state.dirty[idx] {
@@ -2640,23 +2461,19 @@ impl Core {
                     }
                     let pending_drained = e.state.pending == 0;
                     if !pending_drained
-                        && matches!(cfg.pausable, Pausable::True)
+                        && matches!(pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
                         && !a.pause_lockset.is_empty()
                     {
                         a.paused_dep_wave_occurred = true;
                     }
                     pending_drained
-                });
+                };
                 if pending_drained {
-                    self.maybe_run();
-                    self.fire_owed_demand_if_ready();
+                    action.do_maybe_run = true;
+                    action.fire_demand = true;
                 }
             }
-            // Tier 5 (D34): COMPLETE | ERROR — ONE arm routed by the CENTRAL tier
-            // (`Message::tier() == Tier::Terminal`), not per-variant. The shared terminal
-            // bookkeeping (record the terminal + release the in-wave DIRTY) runs for ANY tier-5;
-            // only the COMPLETE-vs-ERROR cascade differs, discriminated by the type within.
             m if m.tier() == Tier::Terminal => {
                 // Box<dyn Error> is not Clone and `m` is a borrow (D31): keep the error as its
                 // Display message in the DepTerminal record (Rc<str>, which IS Clone).
@@ -2665,78 +2482,41 @@ impl Core {
                     _ => DepTerminal::Complete,
                 };
                 let is_error = matches!(dep_term, DepTerminal::Error(_));
-                self.with_inner_edges_mut(|_n, e| {
+                let all_deps_terminal = {
+                    let (n, e) = g.get_node_and_edges_mut(key);
                     e.state.terminal[idx] = Some(dep_term.clone());
                     e.state.terminal_wave[idx] = Some(dep_term.clone());
-                });
-                // R-terminal-settles-dirty (B35): a terminal RELEASES this dep's outstanding in-wave
-                // DIRTY contribution (the exactly-one-settle invariant) — exactly as DATA/RESOLVED/
-                // INVALIDATE do; a dirty-then-terminal-without-DATA dep would otherwise strand
-                // `pending` and wedge the node (the INVALIDATE arm's guard, generalized to terminals).
-                self.release_dep_dirty(idx);
-                let (auto_error, auto_complete, tari) = self.with_config(|cfg| {
-                    (
-                        cfg.error_when_deps_error,
-                        cfg.complete_when_deps_complete,
-                        cfg.terminal_as_real_input,
-                    )
-                });
-                if is_error && auto_error {
-                    // Auto-cascade ERROR (R-deps-terminal): forward the error's message. Node terminal.
-                    if let DepTerminal::Error(s) = &dep_term {
-                        self.down(vec![Message::Error(s.to_string().into())]);
+                    if e.state.dirty[idx] {
+                        e.state.dirty[idx] = false;
+                        e.state.pending -= 1;
                     }
-                } else if tari {
-                    // rescue/reduce/catch/*Map: the fn reads ctx.terminal(idx).
-                    self.maybe_run();
-                } else if auto_complete && self.all_deps_terminal() {
-                    // R-deps-terminal auto-COMPLETE + B42: COMPLETE once ALL deps are TERMINAL (each
-                    // COMPLETE or an absorbed ERROR) — so an absorbed-error dep terminating LAST still
-                    // fires the cascade. `tari` is checked FIRST so a rescue recovers via maybe_run
-                    // rather than being preempted (no node sets both complete_when_deps_complete + tari).
-                    self.down(vec![Message::Complete]);
+                    !n.deps.is_empty() && e.state.terminal.iter().all(|t| t.is_some())
+                };
+                if is_error && auto_error {
+                    if let DepTerminal::Error(s) = &dep_term {
+                        action.down_msgs = Some(vec![Message::Error(s.to_string().into())]);
+                    }
+                } else if terminal_as_real_input {
+                    action.do_maybe_run = true;
+                } else if auto_complete && all_deps_terminal {
+                    action.down_msgs = Some(vec![Message::Complete]);
                 } else {
-                    // absorbed terminal, NOT an input: the dep's signalled change did not materialise
-                    // (no DATA) → un-dirty downstream, keep cache.
-                    self.settle_after_absorbed_terminal();
+                    action.do_settle_after_absorbed_terminal = true;
                 }
-                self.fire_owed_demand_if_ready();
+                action.fire_demand = true;
             }
             Message::Teardown => {
-                self.down(vec![Message::Complete, Message::Teardown]);
+                action.down_msgs = Some(vec![Message::Complete, Message::Teardown]);
             }
             // PAUSE/RESUME are never delivered to a dep-subscriber (a node is paused via its
             // own up(), not by an upstream dep).
             _ => {}
         }
-    }
-
-    /// R-terminal-settles-dirty (B35): release a dep's outstanding in-wave DIRTY
-    /// contribution. A settle-class event for that dep (DATA/RESOLVED inline above,
-    /// INVALIDATE, and now COMPLETE/ERROR) clears its dirty flag + decrements `pending`.
-    /// No-op if the dep already settled this wave — so the normal DATA-then-COMPLETE flow
-    /// is unaffected. Makes the exactly-one-settle invariant a single shared step.
-    fn release_dep_dirty(&self, idx: usize) {
-        self.with_inner_edges_mut(|_n, e| {
-            if e.state.dirty[idx] {
-                e.state.dirty[idx] = false;
-                e.state.pending -= 1;
-            }
-        });
-    }
-
-    /// B42 (R-deps-terminal): true iff EVERY dep is TERMINAL — COMPLETE *or* an absorbed ERROR
-    /// (errorWhenDepsError:false). Block only on a LIVE dep (`dep_terminal[i]` is None); an errored
-    /// dep COUNTS as terminal-done (was `matches!(.., Complete)`, which wedged a node whose
-    /// errorWhenDepsError:false dep ERRORed — it never auto-completed even after every other dep
-    /// completed). A node with no deps never auto-completes. combineLatest semantics (all, not any).
-    fn all_deps_terminal(&self) -> bool {
-        self.with_inner_edges(|n, e| {
-            if n.deps.is_empty() {
-                return false;
-            }
-            e.state.terminal.iter().all(|t| t.is_some())
-        })
+        if action.has_work() {
+            Some(action)
+        } else {
+            None
+        }
     }
 
     /// R-terminal-settles-dirty (B35): settle a node whose dirtied dep was released by an
