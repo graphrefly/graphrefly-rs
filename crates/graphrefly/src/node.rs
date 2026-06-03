@@ -157,6 +157,12 @@ type Msg = Message<AnyValue>;
 type Sink = Rc<dyn Fn(&Msg)>;
 type Unsub = Box<dyn FnOnce()>;
 
+enum SubscriberSnapshot {
+    Empty,
+    One(Sink),
+    Many(Vec<Sink>),
+}
+
 /// A deferred self-rewire request (R-rewire-deferred / D47), issued via `ctx.rewire_next`
 /// and applied at the committed wave boundary. The new dep set is computed at APPLY time (so
 /// multiple requests in one wave compose against the live deps), then the surgical R-rewire
@@ -880,6 +886,11 @@ impl CoreWeak {
     }
 
     fn receive_from_dep(&self, idx: usize, msg: &Msg) {
+        // DR-8/B54 receive policy:
+        // - active wave: use a borrowed arena view; `Core::receive_from_dep` immediately
+        //   enrolls in the counted touched-set before any callback-capable work;
+        // - no active wave: promote to a counted Core so recovery/error-side delivery
+        //   cannot free the target while it is receiving.
         let core = if wave_in_flight() {
             self.borrowed_core()
         } else {
@@ -1807,18 +1818,26 @@ impl Core {
                 self.fire_owed_demand_if_ready();
             }
             Message::Dirty => {
-                let mark = self.with_inner_edges_mut(|_n, e| {
-                    if !e.state.dirty[idx] {
-                        e.state.dirty[idx] = true;
-                        e.state.pending += 1;
-                        e.state.tier[idx] = 2;
-                        true
-                    } else {
-                        false
+                let emit_dirty = self.with_inner_edges_aux_mut(|n, e, a| {
+                    if e.state.dirty[idx] {
+                        return false;
                     }
+                    e.state.dirty[idx] = true;
+                    e.state.pending += 1;
+                    e.state.tier[idx] = 2;
+                    let pull_quiet = n
+                        .pull_id
+                        .as_ref()
+                        .is_some_and(|id| a.pause_lockset.contains(id));
+                    if pull_quiet || e.wave.emitted_dirty_this_wave {
+                        return false;
+                    }
+                    e.wave.emitted_dirty_this_wave = true;
+                    e.value.status = Status::Dirty;
+                    true
                 });
-                if mark && !self.is_pull_quiet() {
-                    self.mark_dirty();
+                if emit_dirty {
+                    self.emit_to_subs(&Message::Dirty);
                 }
             }
             Message::Data(v) => {
@@ -2565,14 +2584,15 @@ impl Core {
         // Terminal-is-forever (D17 / R-terminal): a terminated node emits nothing
         // further — including a self-emit DATA via `set()` / `ctx.down`. (The
         // COMPLETE/ERROR arms below also self-guard against a double terminal.)
-        if self.with_inner_edges(|_n, e| e.value.terminal) {
+        let (terminal, inside) =
+            self.with_inner_edges(|_n, e| (e.value.terminal, e.wave.inside_run_wave));
+        if terminal {
             return;
         }
         // B25: enroll in the wave touched-set before any mutation.
         wave_register(self);
         let mut sorted = msgs;
         sorted.sort_by_key(|m| m.tier().as_u8()); // stable: preserves intra-tier order
-        let inside = self.with_inner_edges(|_, e| e.wave.inside_run_wave);
 
         // R-invalidate-idempotent: collapse repeated INVALIDATE in one wave so the
         // cleanup hook + downstream broadcast fire at most once.
@@ -2813,11 +2833,21 @@ impl Core {
 
     fn emit_to_subs(&self, msg: &Msg) {
         // Clone the sink handles out, drop the borrow, then deliver — guards against
-        // subscribe/unsubscribe (and any re-entry) during iteration.
-        let subs: Vec<Sink> =
-            self.with_aux(|a| a.subscribers.iter().map(|(_, s)| s.clone()).collect());
-        for s in subs {
-            s(msg);
+        // subscribe/unsubscribe (and any re-entry) during iteration. The 0/1-sink
+        // cases avoid allocating a Vec while preserving the same snapshot boundary.
+        let subs = self.with_aux(|a| match a.subscribers.as_slice() {
+            [] => SubscriberSnapshot::Empty,
+            [(_, sink)] => SubscriberSnapshot::One(sink.clone()),
+            many => SubscriberSnapshot::Many(many.iter().map(|(_, s)| s.clone()).collect()),
+        });
+        match subs {
+            SubscriberSnapshot::Empty => {}
+            SubscriberSnapshot::One(s) => s(msg),
+            SubscriberSnapshot::Many(subs) => {
+                for s in subs {
+                    s(msg);
+                }
+            }
         }
     }
 
@@ -2895,14 +2925,6 @@ impl Core {
 
     fn is_paused(&self) -> bool {
         !self.with_aux(|a| a.pause_lockset.is_empty())
-    }
-
-    fn is_pull_quiet(&self) -> bool {
-        self.with_inner_edges_aux_mut(|n, _e, a| {
-            n.pull_id
-                .as_ref()
-                .is_some_and(|id| a.pause_lockset.contains(id))
-        })
     }
 
     fn pause_acquire(&self, lock: LockId) {
