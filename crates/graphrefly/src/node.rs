@@ -163,7 +163,9 @@ enum SubscriberSnapshot {
     Many(Vec<Sink>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum MaybeRunDecision {
+    #[default]
     Skip,
     Passthrough,
     Run,
@@ -1299,7 +1301,8 @@ struct InWaveDepReceiveAction {
     invalidate_as_invalidate_msg: bool,
     had_node_data_before_invalidate: bool,
     clear_undirty_after_invalidate: bool,
-    do_maybe_run: bool,
+    defer_maybe_run: bool,
+    maybe_run_decision: MaybeRunDecision,
     down_msgs: Option<Vec<Msg>>,
     do_settle_after_absorbed_terminal: bool,
     fire_demand: bool,
@@ -1310,7 +1313,8 @@ impl InWaveDepReceiveAction {
         self.emit_teardown_subscribers
             || self.emit_dirty
             || self.do_invalidate
-            || self.do_maybe_run
+            || self.defer_maybe_run
+            || !matches!(self.maybe_run_decision, MaybeRunDecision::Skip)
             || self.do_settle_after_absorbed_terminal
             || self.fire_demand
             || self.down_msgs.as_ref().is_some_and(|msgs| !msgs.is_empty())
@@ -1339,8 +1343,15 @@ impl InWaveDepReceiveAction {
                 core.down(vec![Message::Resolved]);
             }
         }
-        if self.do_maybe_run {
-            core.maybe_run();
+        if self.defer_maybe_run {
+            defer_run_until_delivery_boundary(core);
+        }
+        match self.maybe_run_decision {
+            MaybeRunDecision::Skip => {}
+            MaybeRunDecision::Passthrough => core.passthrough_emit(),
+            MaybeRunDecision::Run => {
+                core.run_wave();
+            }
         }
         if let Some(msgs) = self.down_msgs {
             core.down(msgs);
@@ -2483,6 +2494,45 @@ impl Core {
         Self::collect_receive_from_dep_action_from_graph(&mut g, self.key(), idx, msg)
     }
 
+    fn decide_maybe_run_from_graph(g: &mut GraphCore, key: NodeKey) -> MaybeRunDecision {
+        let (_n, c, cfg, r, e, a) = g.get_node_call_config_run_edges_aux_mut(key);
+
+        // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
+        // Defer fn-run to ONE atomic settle after every added dep is wired.
+        if e.wave.in_dep_mutation {
+            e.wave.rewire_run_pending = true;
+            return MaybeRunDecision::Skip;
+        }
+
+        // R-pause-modes: only the default "true" mode coalesces dep-driven recompute
+        // (skip the fn while any lock is held → fire once with latest dep values on
+        // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers output
+        // (`down` → `pause_buffer`). `false` runs + emits immediately.
+        if matches!(cfg.pausable, Pausable::True) && !a.pause_lockset.is_empty() {
+            a.paused_dep_wave_occurred = true;
+            return MaybeRunDecision::Skip;
+        }
+        if e.state.pending > 0 {
+            return MaybeRunDecision::Skip;
+        }
+        if c.handle.is_none() {
+            return MaybeRunDecision::Passthrough;
+        }
+        if !(r.has_called_fn_once || cfg.partial || cfg.all_deps_settled(&e.state)) {
+            return MaybeRunDecision::Skip;
+        }
+
+        MaybeRunDecision::Run
+    }
+
+    fn set_maybe_run_action(g: &mut GraphCore, key: NodeKey, action: &mut InWaveDepReceiveAction) {
+        if delivery_in_flight() {
+            action.defer_maybe_run = true;
+        } else {
+            action.maybe_run_decision = Self::decide_maybe_run_from_graph(g, key);
+        }
+    }
+
     fn apply_receive_from_dep_action(&self, action: InWaveDepReceiveAction) {
         action.apply(self);
     }
@@ -2598,7 +2648,7 @@ impl Core {
                     pending_drained
                 };
                 if pending_drained {
-                    action.do_maybe_run = true;
+                    Self::set_maybe_run_action(g, key, &mut action);
                     action.fire_demand = true;
                 }
             }
@@ -2622,7 +2672,7 @@ impl Core {
                     pending_drained
                 };
                 if pending_drained {
-                    action.do_maybe_run = true;
+                    Self::set_maybe_run_action(g, key, &mut action);
                     action.fire_demand = true;
                 }
             }
@@ -2649,7 +2699,7 @@ impl Core {
                         action.down_msgs = Some(vec![Message::Error(s.to_string().into())]);
                     }
                 } else if terminal_as_real_input {
-                    action.do_maybe_run = true;
+                    Self::set_maybe_run_action(g, key, &mut action);
                 } else if auto_complete && all_deps_terminal {
                     action.down_msgs = Some(vec![Message::Complete]);
                 } else {
@@ -2729,33 +2779,10 @@ impl Core {
             defer_run_until_delivery_boundary(self);
             return;
         }
-        // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
-        // Defer the fn-run to ONE atomic settle after every added dep is wired (P2 — the
-        // fn never fires on a partially-populated added-dep view).
-        let decision = self.with_node_state_aux_mut(|_n, c, cfg, r, e, a| {
-            if e.wave.in_dep_mutation {
-                e.wave.rewire_run_pending = true;
-                return MaybeRunDecision::Skip;
-            }
-            // R-pause-modes: only the default "true" mode coalesces dep-driven recompute
-            // (skip the fn while any lock is held → fire once with the latest dep values on
-            // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers its output
-            // (down → should_buffer_on_pause); `false` runs + emits immediately.
-            if matches!(cfg.pausable, Pausable::True) && !a.pause_lockset.is_empty() {
-                a.paused_dep_wave_occurred = true;
-                return MaybeRunDecision::Skip;
-            }
-            if e.state.pending > 0 {
-                return MaybeRunDecision::Skip;
-            }
-            if c.handle.is_none() {
-                return MaybeRunDecision::Passthrough;
-            }
-            if !(r.has_called_fn_once || cfg.partial || cfg.all_deps_settled(&e.state)) {
-                return MaybeRunDecision::Skip;
-            }
-            MaybeRunDecision::Run
-        });
+        let decision = {
+            let mut g = self.graph.borrow_mut();
+            Self::decide_maybe_run_from_graph(&mut g, self.key())
+        };
         match decision {
             MaybeRunDecision::Skip => {}
             MaybeRunDecision::Passthrough => self.passthrough_emit(),
@@ -5736,6 +5763,214 @@ mod tests {
             "in-wave collect/apply must not half-apply dep bookkeeping then skip the action"
         );
         drop(pin);
+    }
+
+    #[test]
+    fn internal_dep_callback_entry_run_decision_executes_from_borrowed_action() {
+        // A precomputed in-wave Run decision must execute from the borrowed action
+        // path and avoid perturbing the owner Core refcount during fn execution.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_empty_in_arena(&arena);
+        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
+        let observed_refs_in_fn = Rc::new(Cell::new(usize::MAX));
+        let run_count = Rc::new(Cell::new(0usize));
+
+        let derived = Node::<i32>::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            {
+                let refs_slot = refs_slot.clone();
+                let observed_refs_in_fn = observed_refs_in_fn.clone();
+                let run_count = run_count.clone();
+                move |ctx| {
+                    run_count.set(run_count.get() + 1);
+                    let refs = refs_slot
+                        .borrow()
+                        .as_ref()
+                        .expect("test installed ref counter before run")
+                        .clone();
+                    observed_refs_in_fn.set(refs.get());
+                    ctx.emit(*ctx.data::<i32>(0).unwrap());
+                }
+            },
+        );
+        *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
+        let _u = derived.subscribe(|_| {});
+        let baseline_refs = derived.core.refs.get();
+        assert_eq!(
+            run_count.get(),
+            0,
+            "first-run gate should hold before source DATA"
+        );
+
+        let weak = derived.core.downgrade();
+        let action = with_wave_owner(
+            &source.core,
+            || {
+                weak.collect_in_wave_receive_from_dep_action(0, &Message::Data(Rc::new(4i32)))
+                    .expect("in-wave receive should collect a runnable action")
+            },
+            InWaveDepReceiveAction::default,
+        );
+
+        assert!(
+            matches!(action.maybe_run_decision, MaybeRunDecision::Run),
+            "first in-wave settle for a ready dep should materialize as Run"
+        );
+
+        weak.apply_in_wave_receive_action(action);
+
+        assert_eq!(
+            run_count.get(),
+            1,
+            "borrowed in-wave action must still execute one fn run"
+        );
+        assert_eq!(
+            observed_refs_in_fn.get(),
+            baseline_refs,
+            "fn execution from borrowed action must not re-count owner refs"
+        );
+        assert_eq!(derived.cache(), Some(4));
+    }
+
+    #[test]
+    fn stale_in_wave_receive_action_is_generation_checked() {
+        // A collected in-wave action is still keyed by the generation-scoped weak token.
+        // Once the slot is reused, rehydrating the stale action must be a no-op.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        let run_count = Rc::new(Cell::new(0usize));
+
+        let (weak, old_key, action) = {
+            let derived = Node::<i32>::derived_opts_in_arena(
+                &arena,
+                vec![source.erased()],
+                NodeOpts::default(),
+                {
+                    let run_count = run_count.clone();
+                    move |ctx| {
+                        run_count.set(run_count.get() + 1);
+                        ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
+                    }
+                },
+            );
+            let old_key = derived.core.key();
+            let weak = derived.core.downgrade();
+            let action = with_wave_owner(
+                &source.core,
+                || {
+                    weak.collect_in_wave_receive_from_dep_action(0, &Message::Data(Rc::new(9i32)))
+                        .expect("in-wave receive should collect a runnable action")
+                },
+                InWaveDepReceiveAction::default,
+            );
+            (weak, old_key, action)
+        };
+
+        let replacement = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(old_key.id, replacement.core.key().id);
+        assert_ne!(old_key.generation, replacement.core.key().generation);
+
+        weak.apply_in_wave_receive_action(action);
+
+        assert_eq!(
+            run_count.get(),
+            0,
+            "stale in-wave action must not execute after generation drift"
+        );
+        assert_eq!(
+            replacement.cache(),
+            Some(2),
+            "reused slot should keep its own initial cache when action is stale"
+        );
+    }
+
+    #[test]
+    fn in_flight_passthrough_decision_waits_for_delivery_boundary() {
+        // R-diamond/D77: a single upstream msgs array may carry multiple DATA
+        // occurrences. A no-fn passthrough must wait until the delivery boundary so
+        // it relays the wave's latest DATA once instead of clearing its dep batch on
+        // the first occurrence.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_empty_in_arena(&arena);
+        let wire = Node::<i32>::from_core(Core::new_in_arena(
+            &arena,
+            vec![source.erased()],
+            None,
+            default_dispatcher(),
+            None,
+            Pausable::True,
+        ));
+        let seen = Rc::new(RefCell::new(Vec::<i32>::new()));
+        let seen_sink = seen.clone();
+        let _u = wire.subscribe(move |msg| {
+            if let Message::Data(v) = msg {
+                seen_sink
+                    .borrow_mut()
+                    .push(*v.downcast_ref::<i32>().expect("wire emits i32"));
+            }
+        });
+
+        source.down(vec![
+            Message::Data(Rc::new(1i32)),
+            Message::Data(Rc::new(2i32)),
+        ]);
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[2],
+            "passthrough must coalesce one upstream wave to its latest DATA"
+        );
+        assert_eq!(wire.cache(), Some(2));
+    }
+
+    #[test]
+    fn in_flight_pause_resume_preserves_single_wave_projection() {
+        // C-23/D77: deciding a paused skip during receive collection used to split
+        // a multi-DATA upstream wave if another subscriber RESUMEd the node before
+        // the delivery finished. The in-flight path must defer the whole maybe-run
+        // decision until the delivery boundary so ctx.wave_data keeps [1, 2] in one
+        // projection and the fn runs once.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_empty_in_arena(&arena);
+        let lock = LockId::from("qa-in-flight-resume");
+        let batches_seen = Rc::new(RefCell::new(Vec::<Vec<i32>>::new()));
+        let runs = Rc::new(Cell::new(0usize));
+        let derived: Node<i32> =
+            Node::derived_opts_in_arena(&arena, vec![source.erased()], NodeOpts::default(), {
+                let batches_seen = batches_seen.clone();
+                let runs = runs.clone();
+                move |ctx| {
+                    runs.set(runs.get() + 1);
+                    batches_seen
+                        .borrow_mut()
+                        .push(ctx.batch::<i32>(0).into_iter().map(|v| *v).collect());
+                    ctx.emit(*ctx.data::<i32>(0).expect("latest source DATA"));
+                }
+            });
+        let _derived_sub = derived.subscribe(|_| {});
+        derived.up(vec![Message::Pause(lock.clone())]);
+        let derived_for_resume = derived.clone();
+        let lock_for_resume = lock.clone();
+        let _controller = source.subscribe(move |msg| {
+            if matches!(msg, Message::Data(_)) {
+                derived_for_resume.up(vec![Message::Resume(lock_for_resume.clone())]);
+            }
+        });
+
+        source.down(vec![
+            Message::Data(Rc::new(1i32)),
+            Message::Data(Rc::new(2i32)),
+        ]);
+
+        assert_eq!(runs.get(), 1, "receiver fn should run once at boundary");
+        assert_eq!(
+            batches_seen.borrow().as_slice(),
+            &[vec![1, 2]],
+            "receiver must see one upstream wave projection, not two split runs"
+        );
+        assert_eq!(derived.cache(), Some(2));
     }
 
     #[test]
