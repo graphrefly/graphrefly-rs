@@ -1673,7 +1673,65 @@ fn c19_undirty_resolved_timing_respects_resumeall_and_batch() {
         assert_eq!(d.status(), Status::Sentinel);
     }
 
-    // (e) default true mode remains immediate, matching D50's default INVALIDATE
+    // (e) resumeAll + fn no-emit: the substrate-synthesized undirty RESOLVED takes the
+    // same delivery waist as terminal/INVALIDATE dirty-balance, so it buffers while paused.
+    {
+        let src = Node::<i32>::state_empty();
+        let filtered = Node::<i32>::derived_opts(
+            vec![src.erased()],
+            NodeOpts {
+                pausable: Pausable::ResumeAll,
+                ..NodeOpts::default()
+            },
+            |ctx| {
+                let v = *ctx.data::<i32>(0).unwrap();
+                if v % 2 == 0 {
+                    ctx.emit(v);
+                }
+            },
+        );
+        let (log, _u) = record(&filtered);
+        src.set(2);
+        assert_eq!(filtered.cache(), Some(2));
+        log.borrow_mut().clear();
+
+        let pause = LockId::new("resumeall-filter");
+        filtered.up(vec![Message::Pause(pause.clone())]);
+        src.set(3);
+        assert_eq!(
+            kinds(&log),
+            vec!["DIRTY"],
+            "resumeAll buffers a no-emit undirty RESOLVED while paused"
+        );
+        filtered.up(vec![Message::Resume(pause)]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+    }
+
+    // (f) batch + fn no-emit: a no-emit undirty RESOLVED is not visible inside the
+    // uncommitted batch body; it appears only after the batch commits.
+    {
+        let src = Node::<i32>::state_empty();
+        let filtered = Node::<i32>::derived(vec![src.erased()], |ctx| {
+            let v = *ctx.data::<i32>(0).unwrap();
+            if v % 2 == 0 {
+                ctx.emit(v);
+            }
+        });
+        let (log, _u) = record(&filtered);
+        log.borrow_mut().clear();
+
+        batch(|_| {
+            src.set(3);
+            assert_eq!(
+                kinds(&log),
+                vec!["DIRTY"],
+                "batch defers a no-emit undirty RESOLVED until commit"
+            );
+        });
+        assert_eq!(kinds(&log), vec!["DIRTY", "RESOLVED"]);
+    }
+
+    // (g) default true mode remains immediate, matching D50's default INVALIDATE
     // precedence and the non-paused C-15 behavior.
     {
         let b = Node::<i32>::state(1);

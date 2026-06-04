@@ -3408,21 +3408,17 @@ impl Core {
                 && !is_async
         });
         if undirty {
-            {
-                // status reflects cache freshness: a carried-over value → Resolved
-                // (fresh, no new occurrence); never-valued → Sentinel. The RESOLVED
-                // message clears the downstream dirty either way.
-                self.with_inner_edges_mut(|_n, e| {
-                    e.value.status = if e.value.has_data {
-                        Status::Resolved
-                    } else {
-                        Status::Sentinel
-                    };
-                });
-            }
-            self.emit_to_subs(&Message::Resolved);
+            // Route the balancing RESOLVED through the normal delivery waist so
+            // resumeAll and batch timing obey R-undirty-settle-timing.
+            self.down(vec![Message::Resolved]);
         }
-        // roll wave-local state forward.
+        let keep_dirty_for_deferred_undirty = undirty
+            && self.with_inner_edges(|_n, e| {
+                e.wave.batch_dirty_owed || e.wave.emitted_tier3_this_wave
+            });
+
+        // Roll wave-local state forward after the settle path sees this wave's
+        // dirty/tier flags. Subscriber callbacks above run borrow-free.
         self.with_inner_edges_mut(|_n, e| {
             for (i, b) in e.state.batch.iter_mut().enumerate() {
                 if let Some(last) = b.as_ref().and_then(|batch| batch.last()).cloned() {
@@ -3430,8 +3426,10 @@ impl Core {
                 }
                 *b = None;
             }
-            e.wave.emitted_dirty_this_wave = false;
-            e.wave.emitted_tier3_this_wave = false;
+            if !keep_dirty_for_deferred_undirty {
+                e.wave.emitted_dirty_this_wave = false;
+                e.wave.emitted_tier3_this_wave = false;
+            }
         });
     }
 
@@ -4607,13 +4605,38 @@ mod tests {
             } // odd → emit nothing (filter-reject)
         });
         let (log, sink) = recorder();
-        let _u = evens.subscribe(sink);
+        let seen_refs = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let evens_refs = evens.core.refs.clone();
+        let seen_ref_count = seen_refs.clone();
+        let _u = evens.subscribe({
+            move |m| {
+                if matches!(m, Message::Resolved) {
+                    seen_ref_count.borrow_mut().push(evens_refs.get());
+                }
+                sink(m)
+            }
+        });
+        let base_refs = evens.core.refs.get();
         assert_eq!(*log.borrow(), vec!["START"]); // first-run gate holds (a SENTINEL)
 
         a.set(3); // odd → fn runs, no emit → substrate undirties with one RESOLVED
         assert_eq!(*log.borrow(), vec!["START", "DIRTY", "RESOLVED"]);
         assert_eq!(evens.cache(), None); // filtered → never valued
         assert_eq!(evens.status(), Status::Sentinel);
+        assert!(
+            seen_refs.borrow().iter().all(|count| *count == base_refs),
+            "post-run RESOLVED must not promote a counted owner Core"
+        );
+        let (prev, batch) = evens.core.with_inner_edges(|_n, e| {
+            (
+                e.state.prev[0]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>().copied()),
+                e.state.batch[0].is_none(),
+            )
+        });
+        assert_eq!(prev, Some(3));
+        assert!(batch);
 
         a.set(4); // even → real DATA (downstream was NOT wedged by the prior RESOLVED)
         assert_eq!(
@@ -4622,6 +4645,12 @@ mod tests {
         );
         assert_eq!(evens.cache(), Some(4));
         assert_eq!(evens.status(), Status::Settled);
+        let prev = evens.core.with_inner_edges(|_n, e| {
+            e.state.prev[0]
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<i32>().copied())
+        });
+        assert_eq!(prev, Some(4));
 
         a.set(5); // odd → filter; node KEEPS its value 4, status → Resolved (no new occurrence)
         assert_eq!(
@@ -4630,6 +4659,151 @@ mod tests {
         );
         assert_eq!(evens.cache(), Some(4));
         assert_eq!(evens.status(), Status::Resolved);
+        let (seen_refs, prev_batch) = evens.core.with_inner_edges(|_n, e| {
+            (
+                seen_refs.borrow().clone(),
+                e.state.prev[0]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>().copied()),
+            )
+        });
+        assert_eq!(
+            seen_refs,
+            vec![base_refs, base_refs],
+            "RESOLVED callbacks should not increment counted Core refs"
+        );
+        assert_eq!(prev_batch, Some(5));
+    }
+
+    #[test]
+    fn run_wave_post_dispatch_resolved_is_borrow_free_and_rolls_dep_state() {
+        // DR-8/B54 owner-execution: post-dispatch run_wave cleanup should route the
+        // synthesized undirty RESOLVED through the delivery waist, deliver callbacks
+        // borrow-free, and then roll dep state without counted owner promotion.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_in_arena(&arena, 2);
+        type SeenRuns = Rc<RefCell<Vec<(Option<i32>, Vec<i32>)>>>;
+        let seen: SeenRuns = Rc::new(RefCell::new(Vec::new()));
+        let evens: Node<i32> =
+            Node::derived_opts_in_arena(&arena, vec![source.erased()], NodeOpts::default(), {
+                let seen = seen.clone();
+                move |ctx| {
+                    let prev = ctx.dep_records()[0]
+                        .prev_data
+                        .as_ref()
+                        .and_then(|v| v.downcast_ref::<i32>().copied());
+                    let batch = ctx
+                        .batch::<i32>(0)
+                        .into_iter()
+                        .map(|v| *v)
+                        .collect::<Vec<_>>();
+                    seen.borrow_mut().push((prev, batch));
+                    let v = *ctx.data::<i32>(0).unwrap();
+                    if v % 2 == 0 {
+                        ctx.emit(v);
+                    }
+                }
+            });
+        let held: Rc<RefCell<Option<Node<i32>>>> =
+            Rc::new(RefCell::new(Some(Node::<i32>::state_in_arena(&arena, 99))));
+        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
+        let resolved_refs = Rc::new(Cell::new(usize::MAX));
+        let _u = evens.subscribe({
+            let held = held.clone();
+            let refs_slot = refs_slot.clone();
+            let resolved_refs = resolved_refs.clone();
+            move |msg| {
+                if matches!(msg, Message::Resolved) {
+                    if let Some(refs) = refs_slot.borrow().as_ref() {
+                        resolved_refs.set(refs.get());
+                    }
+                    let _ = held.borrow_mut().take();
+                }
+            }
+        });
+        *refs_slot.borrow_mut() = Some(evens.core.refs.clone());
+        let refs_before = evens.core.refs.get();
+
+        assert_eq!(
+            &*seen.borrow(),
+            &[(None, vec![2])],
+            "activation run sees the cached source wave once"
+        );
+        source.set(3);
+
+        assert!(held.borrow().is_none(), "RESOLVED callback ran borrow-free");
+        assert_eq!(
+            resolved_refs.get(),
+            refs_before,
+            "post-run RESOLVED delivery must not temporarily promote the owner Core"
+        );
+        assert_eq!(evens.cache(), Some(2));
+        assert_eq!(evens.status(), Status::Resolved);
+
+        source.set(4);
+        assert_eq!(
+            &*seen.borrow(),
+            &[(None, vec![2]), (Some(2), vec![3]), (Some(3), vec![4])],
+            "the rejected odd wave must still roll dep prev_data before the next run"
+        );
+        assert_eq!(evens.cache(), Some(4));
+        let (res_refs, rolled_prev) = evens.core.with_inner_edges(|_n, e| {
+            (
+                resolved_refs.get(),
+                e.state.prev[0]
+                    .as_ref()
+                    .and_then(|v| v.downcast_ref::<i32>().copied()),
+            )
+        });
+        assert_eq!(
+            rolled_prev,
+            Some(4),
+            "run_wave should carry latest settled data forward in prev"
+        );
+        assert!(
+            evens
+                .core
+                .with_inner_edges(|_n, e| e.state.batch[0].is_none()),
+            "post-wave state must clear batch"
+        );
+        assert_eq!(
+            res_refs, refs_before,
+            "post-run RESOLVED delivery should remain borrow-free and ref-neutral"
+        );
+    }
+
+    #[test]
+    fn run_wave_post_dispatch_panic_keeps_wave_guard() {
+        // DR-8/B54: if a synthesized RESOLVED callback panics, WaveGuard must
+        // clear `inside_run_wave` on unwind so D30 recovery can proceed.
+        let source = Node::<i32>::state_empty();
+        let resolved = Rc::new(Cell::new(false));
+        let resolved_flag = resolved.clone();
+        let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
+            let _ = ctx.data::<i32>(0).unwrap();
+        });
+        let _u = derived.subscribe(move |msg| {
+            if matches!(msg, Message::Resolved) {
+                resolved_flag.set(true);
+                panic!("resolved callback panic");
+            }
+        });
+
+        source.set(1);
+
+        assert!(
+            resolved.get(),
+            "post-run RESOLVED should still be delivered before callback-panic recovery"
+        );
+        assert_eq!(
+            derived.status(),
+            Status::Errored,
+            "panic during callback should land ERROR"
+        );
+        assert!(
+            !derived.core.with_inner_edges(|_, e| e.wave.inside_run_wave),
+            "WaveGuard must clear inside_run_wave during unwind"
+        );
     }
 
     #[test]
