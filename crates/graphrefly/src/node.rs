@@ -4121,23 +4121,23 @@ fn reachable_upstream(from: &Core, target: &Core) -> bool {
     let target_key = target.key();
     let mut seen: HashSet<NodeKey> = HashSet::new();
     let mut stack: Vec<NodeKey> = vec![from.key()];
+    let graph = from.graph.borrow();
+    if !graph.is_live_key(target_key) {
+        return false;
+    }
     while let Some(key) = stack.pop() {
-        if key == target_key {
-            return true;
-        }
         if !seen.insert(key) {
             continue;
         }
-        let deps: Vec<NodeKey> = {
-            let graph = from.graph.borrow();
-            if !graph.is_live_key(key) {
-                Vec::new()
-            } else {
-                graph.get(key).deps.iter().map(Core::key).collect()
-            }
-        };
-        for dep_key in deps {
-            stack.push(dep_key);
+        if !graph.is_live_key(key) {
+            continue;
+        }
+        if key == target_key {
+            return true;
+        }
+        let topology = graph.get(key);
+        for dep in &topology.deps {
+            stack.push(dep.key());
         }
     }
     false
@@ -6537,6 +6537,53 @@ mod tests {
             (a.core.refs.get(), b.core.refs.get(), c.core.refs.get()),
             before,
             "reachable_upstream must not allocate extra counted Core clones for traversal"
+        );
+    }
+
+    #[test]
+    fn reachable_upstream_stale_key_fails_closed() {
+        // DR-8/B54 fail-closed safety: stale/liveness-checked keys in cycle-prevention DFS
+        // should be inert and never follow dead arena slots.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+
+        let victim = Node::<i32>::state_in_arena(&arena, 1);
+        let victim_key = victim.core.key();
+        drop(victim);
+
+        let reused = Node::<i32>::state_in_arena(&arena, 2);
+        assert_eq!(
+            victim_key.id,
+            reused.core.key().id,
+            "slot should be reused so stale generation is visible"
+        );
+        assert_ne!(
+            victim_key.generation,
+            reused.core.key().generation,
+            "reused slot must advance generation"
+        );
+        assert!(
+            !graph.borrow().is_live_key(victim_key),
+            "old generation key is dead after slot reuse"
+        );
+
+        let stale_source = Core::from_borrowed_parts(
+            graph.clone(),
+            victim_key.id,
+            victim_key.generation,
+            Rc::new(Cell::new(0)),
+        );
+        assert!(
+            !reachable_upstream(&stale_source, &reused.core),
+            "stale source key should never reach a live target"
+        );
+        assert!(
+            !reachable_upstream(&reused.core, &stale_source),
+            "stale target key should never be considered reachable"
+        );
+        assert!(
+            !reachable_upstream(&stale_source, &stale_source),
+            "stale source and target keys should still fail closed"
         );
     }
 
