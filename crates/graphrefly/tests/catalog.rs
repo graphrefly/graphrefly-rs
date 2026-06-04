@@ -14,8 +14,8 @@ use graphrefly::{
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
     element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
     future_local, graph, interval, last, last_any, map, merge_map, never, on_first_data,
-    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, settle, settle_by, skip,
-    stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
+    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan, settle, settle_by,
+    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
     throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
     GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
 };
@@ -1036,6 +1036,108 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
     );
     assert_eq!(*collect_data(&tapped).borrow(), vec![8, 9]);
     assert_eq!(*tapped_values.borrow(), vec![8]);
+}
+
+#[test]
+fn scan_and_merge_catalog_symbols_are_directly_pinned() {
+    let g = graph();
+
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("scan_src"),
+    );
+    let scanned = g.init_node(
+        scan::<i32, i32>(|acc, v| acc + *v, 0),
+        vec![src.erased()],
+        GraphNodeOpts::named("scan"),
+    );
+    let scan_data = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let scan_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let scan_data_sink = scan_data.clone();
+    let scan_shapes_sink = scan_shapes.clone();
+    let _scan_keep = scanned.subscribe(move |msg| match msg {
+        Message::Data(value) => {
+            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                scan_data_sink.borrow_mut().push(*v);
+                scan_shapes_sink.borrow_mut().push("DATA".to_owned());
+            }
+        }
+        Message::Complete => scan_shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => scan_shapes_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(*scan_data.borrow(), vec![1, 3, 6]);
+    assert_eq!(
+        *scan_shapes.borrow(),
+        vec!["DATA", "DATA", "DATA", "COMPLETE"]
+    );
+    assert_eq!(scanned.status(), graphrefly::Status::Completed);
+
+    let left = g.state_empty::<i32>();
+    let right = g.state_empty::<i32>();
+    let merged = g.init_node(
+        graphrefly::merge::<i32>(),
+        vec![left.erased(), right.erased()],
+        GraphNodeOpts::named("merge"),
+    );
+    let merged_seen = collect_data(&merged);
+    batch(|_| {
+        left.set(1);
+        right.set(10);
+    });
+    right.set(11);
+    assert_eq!(*merged_seen.borrow(), vec![1, 10, 11]);
+
+    let factories = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| n.factory)
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&"scan".to_owned()));
+    assert!(factories.contains(&"merge".to_owned()));
+}
+
+#[test]
+fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
+    let g = graph();
+
+    let source = g.state_empty::<i32>();
+    let recovered = g.init_node(
+        rescue::<i32>(|err| {
+            assert_eq!(err, "boom");
+            42
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("rescue_same_wave_error"),
+    );
+    let recovered_seen = collect_data(&recovered);
+    let recovered_shapes = collect_shapes::<i32>(&recovered);
+
+    source.down(vec![
+        Message::Data(Rc::new(7i32)),
+        Message::Error("boom".into()),
+    ]);
+
+    assert_eq!(*recovered_seen.borrow(), vec![7, 42]);
+    assert_eq!(*recovered_shapes.borrow(), vec!["DATA", "DATA"]);
+    assert_ne!(recovered.status(), graphrefly::Status::Completed);
+    assert_ne!(recovered.status(), graphrefly::Status::Errored);
+
+    let source = g.state_empty::<i32>();
+    let recovered = g.init_node(
+        catch_error::<i32>(|_| panic!("recover callback boom")),
+        vec![source.erased()],
+        GraphNodeOpts::named("catch_error_recover_panic"),
+    );
+    let shapes = collect_shapes::<i32>(&recovered);
+
+    source.down(vec![Message::Error("boom".into())]);
+
+    assert_eq!(*shapes.borrow(), vec!["ERROR"]);
+    assert_eq!(recovered.status(), graphrefly::Status::Errored);
 }
 
 #[test]
