@@ -59,6 +59,7 @@ pub mod combinators;
 pub mod ctx;
 pub mod dispatcher;
 pub mod graph;
+pub mod higher_order;
 pub mod node;
 pub mod operators;
 pub mod protocol;
@@ -77,6 +78,7 @@ pub use graph::{
     Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, NodeProfile,
     ObserveEvent, ObserveMessage, ObserveStream, Profile, Values,
 };
+pub use higher_order::{concat_map, exhaust_map, flat_map, merge_map, switch_map};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,

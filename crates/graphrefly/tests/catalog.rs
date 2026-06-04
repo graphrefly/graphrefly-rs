@@ -2,11 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use graphrefly::{
-    batch, buffer, buffer_count, catch_error, combine, combine_latest, concat,
-    distinct_until_changed, element_at, filter, find, first, first_any, from_iter, graph, last,
-    last_any, map, on_first_data, on_first_data_where, pairwise, race, reduce, rescue, sample,
-    settle, settle_by, skip, take, take_until, take_while, tap, tap_first, valve, with_latest_from,
-    zip, GraphNodeOpts, Message,
+    batch, buffer, buffer_count, catch_error, combine, combine_latest, concat, concat_map,
+    distinct_until_changed, element_at, exhaust_map, filter, find, first, first_any, flat_map,
+    from_iter, graph, last, last_any, map, merge_map, on_first_data, on_first_data_where, pairwise,
+    race, reduce, rescue, sample, settle, settle_by, skip, switch_map, take, take_until,
+    take_while, tap, tap_first, valve, with_latest_from, zip, GraphNodeOpts, Message, Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -645,5 +645,277 @@ fn existing_core_catalog_still_composes_after_widening() {
     assert_eq!(
         *collect_shapes::<i32>(&settled).borrow(),
         vec!["DATA", "DATA", "DATA", "COMPLETE"]
+    );
+}
+
+#[test]
+fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
+    let g = graph();
+
+    let source = g.state(1i32);
+    let switch_cleanups = Rc::new(Cell::new(0usize));
+    let switched = g.init_node(
+        switch_map::<i32, i32>({
+            let g = g.clone();
+            let switch_cleanups = switch_cleanups.clone();
+            move |v| {
+                let value = *v * 10;
+                let switch_cleanups = switch_cleanups.clone();
+                g.producer(move |ctx| {
+                    ctx.on_deactivation({
+                        let switch_cleanups = switch_cleanups.clone();
+                        move || switch_cleanups.set(switch_cleanups.get() + 1)
+                    });
+                    ctx.emit(value);
+                })
+            }
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("switch_map"),
+    );
+    let switch_seen = collect_data(&switched);
+    assert_eq!(*switch_seen.borrow(), vec![10]);
+    source.set(2);
+    assert_eq!(*switch_seen.borrow(), vec![10, 20]);
+    assert_eq!(
+        switch_cleanups.get(),
+        1,
+        "switch_map should remove/deactivate the superseded inner"
+    );
+
+    let exhaust_source = g.state(1i32);
+    let exhaust_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let exhausted = g.init_node(
+        exhaust_map::<i32, i32>({
+            let g = g.clone();
+            let exhaust_inners = exhaust_inners.clone();
+            move |v| {
+                let inner = g.state(*v * 10);
+                exhaust_inners.borrow_mut().push(inner.clone());
+                inner
+            }
+        }),
+        vec![exhaust_source.erased()],
+        GraphNodeOpts::named("exhaust_map"),
+    );
+    let exhaust_seen = collect_data(&exhausted);
+    assert_eq!(*exhaust_seen.borrow(), vec![10]);
+    exhaust_source.set(2);
+    assert_eq!(
+        exhaust_inners.borrow().len(),
+        1,
+        "exhaust_map ignores source DATA while an inner is live"
+    );
+    assert_eq!(*exhaust_seen.borrow(), vec![10]);
+    exhaust_inners.borrow()[0].down(vec![Message::Complete]);
+    exhaust_source.set(3);
+    assert_eq!(*exhaust_seen.borrow(), vec![10, 30]);
+
+    let snap = g.describe();
+    let factories = snap
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.factory.as_str()))
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&("switch_map", "switchMap")));
+    assert!(factories.contains(&("exhaust_map", "exhaustMap")));
+}
+
+#[test]
+fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
+    let g = graph();
+
+    let merge_source = g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("merge_outer"),
+    );
+    let merge_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let merged = g.init_node(
+        merge_map::<i32, i32>({
+            let g = g.clone();
+            let merge_inners = merge_inners.clone();
+            move |v| {
+                let inner = g.state(*v * 10);
+                merge_inners.borrow_mut().push(inner.clone());
+                inner
+            }
+        }),
+        vec![merge_source.erased()],
+        GraphNodeOpts::named("merge_map"),
+    );
+    let merge_seen = collect_data(&merged);
+    assert_eq!(*merge_seen.borrow(), vec![10, 20]);
+    let merge_inner_0 = merge_inners.borrow()[0].clone();
+    let merge_inner_1 = merge_inners.borrow()[1].clone();
+    merge_inner_0.set(11);
+    merge_inner_1.set(22);
+    assert_eq!(*merge_seen.borrow(), vec![10, 20, 11, 22]);
+
+    let concat_source = g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("concat_outer"),
+    );
+    let concat_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let concatted = g.init_node(
+        concat_map::<i32, i32>({
+            let g = g.clone();
+            let concat_inners = concat_inners.clone();
+            move |v| {
+                let inner = g.state(*v * 10);
+                concat_inners.borrow_mut().push(inner.clone());
+                inner
+            }
+        }),
+        vec![concat_source.erased()],
+        GraphNodeOpts::named("concat_map"),
+    );
+    let concat_shapes = collect_shapes::<i32>(&concatted);
+    assert_eq!(*concat_shapes.borrow(), vec!["DATA"]);
+    assert_eq!(
+        concat_inners.borrow().len(),
+        1,
+        "concat_map projects the next queued inner only after the live one completes"
+    );
+    let concat_inner_0 = concat_inners.borrow()[0].clone();
+    concat_inner_0.down(vec![Message::Complete]);
+    assert_eq!(*concat_shapes.borrow(), vec!["DATA", "DATA"]);
+    let concat_inner_1 = concat_inners.borrow()[1].clone();
+    concat_inner_1.down(vec![Message::Complete]);
+    assert_eq!(*concat_shapes.borrow(), vec!["DATA", "DATA", "COMPLETE"]);
+
+    let flat_source = g.init_node(
+        from_iter(vec![3i32]),
+        vec![],
+        GraphNodeOpts::named("flat_outer"),
+    );
+    let flattened = g.init_node(
+        flat_map::<i32, i32>({
+            let g = g.clone();
+            move |v| g.state(*v * 10)
+        }),
+        vec![flat_source.erased()],
+        GraphNodeOpts::named("flat_map"),
+    );
+    assert_eq!(*collect_data(&flattened).borrow(), vec![30]);
+
+    let snap = g.describe();
+    let factories = snap
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.factory.as_str()))
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&("merge_map", "mergeMap")));
+    assert!(factories.contains(&("concat_map", "concatMap")));
+    assert!(factories.contains(&("flat_map", "flatMap")));
+}
+
+#[test]
+fn higher_order_error_paths_detach_live_inners_and_seal_output() {
+    let g = graph();
+
+    let source = g.state_empty::<i32>();
+    let cleanup_a = Rc::new(Cell::new(0usize));
+    let cleanup_b = Rc::new(Cell::new(0usize));
+    let inner_a = g.producer({
+        let cleanup_a = cleanup_a.clone();
+        move |ctx| {
+            ctx.on_deactivation({
+                let cleanup_a = cleanup_a.clone();
+                move || cleanup_a.set(cleanup_a.get() + 1)
+            });
+        }
+    });
+    let inner_b = g.producer({
+        let cleanup_b = cleanup_b.clone();
+        move |ctx| {
+            ctx.on_deactivation({
+                let cleanup_b = cleanup_b.clone();
+                move || cleanup_b.set(cleanup_b.get() + 1)
+            });
+        }
+    });
+    let merged = g.init_node(
+        merge_map::<i32, i32>({
+            let inner_a = inner_a.clone();
+            let inner_b = inner_b.clone();
+            move |v| {
+                if *v == 1 {
+                    inner_a.clone()
+                } else {
+                    inner_b.clone()
+                }
+            }
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("merge_error"),
+    );
+    let shapes = collect_shapes::<i32>(&merged);
+
+    source.down(vec![Message::Data(Rc::new(1i32))]);
+    source.down(vec![Message::Data(Rc::new(2i32))]);
+    inner_a.down(vec![Message::Data(Rc::new(10i32))]);
+    source.down(vec![Message::Error("source boom".into())]);
+
+    assert_eq!(merged.status(), graphrefly::Status::Errored);
+    assert_eq!(cleanup_a.get(), 1, "source ERROR should detach inner A");
+    assert_eq!(cleanup_b.get(), 1, "source ERROR should detach inner B");
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+
+    let after_error = shapes.borrow().len();
+    inner_a.down(vec![Message::Data(Rc::new(11i32))]);
+    inner_b.down(vec![Message::Data(Rc::new(20i32))]);
+    source.down(vec![Message::Data(Rc::new(3i32))]);
+    assert_eq!(
+        shapes.borrow().len(),
+        after_error,
+        "terminal higher-order output should be sealed after ERROR"
+    );
+}
+
+#[test]
+fn higher_order_projector_panic_cleans_live_inners() {
+    let g = graph();
+
+    let source = g.state_empty::<i32>();
+    let cleanup = Rc::new(Cell::new(0usize));
+    let inner = g.producer({
+        let cleanup = cleanup.clone();
+        move |ctx| {
+            ctx.on_deactivation({
+                let cleanup = cleanup.clone();
+                move || cleanup.set(cleanup.get() + 1)
+            });
+        }
+    });
+    let merged = g.init_node(
+        merge_map::<i32, i32>({
+            let inner = inner.clone();
+            move |v| {
+                assert!(*v != 2, "projector boom");
+                inner.clone()
+            }
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("merge_panic"),
+    );
+    let shapes = collect_shapes::<i32>(&merged);
+
+    source.down(vec![Message::Data(Rc::new(1i32))]);
+    inner.down(vec![Message::Data(Rc::new(10i32))]);
+    source.down(vec![Message::Data(Rc::new(2i32))]);
+
+    assert_eq!(merged.status(), graphrefly::Status::Errored);
+    assert_eq!(cleanup.get(), 1, "projector panic should detach live inner");
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+
+    let after_error = shapes.borrow().len();
+    inner.down(vec![Message::Data(Rc::new(11i32))]);
+    source.down(vec![Message::Data(Rc::new(3i32))]);
+    assert_eq!(
+        shapes.borrow().len(),
+        after_error,
+        "terminal higher-order output should be sealed after projector panic"
     );
 }
