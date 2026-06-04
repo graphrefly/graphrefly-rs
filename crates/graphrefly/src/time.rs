@@ -10,10 +10,10 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal, WaveData};
 use crate::higher_order::{merge_map_with_ctx, switch_map_with_ctx};
-use crate::node::{Core, Node};
+use crate::node::{Core, Node, NodeOpts};
 use crate::operators::Operator;
 use crate::protocol::Message;
-use crate::sources::timer;
+use crate::sources::{interval, timer};
 
 type Body = Rc<dyn Fn(&Ctx)>;
 type BodyCell = Rc<RefCell<Option<Body>>>;
@@ -82,6 +82,18 @@ struct AuditState<S> {
     window_open: bool,
     latest: Option<S>,
     notifier: Option<Core>,
+    suppress_next_notifier: bool,
+}
+
+#[derive(Clone)]
+struct TimeoutState {
+    timer: Option<Core>,
+}
+
+#[derive(Clone)]
+struct BufferTimeState<S> {
+    buffer: Vec<S>,
+    interval: Option<Core>,
 }
 
 #[derive(Clone)]
@@ -204,13 +216,16 @@ fn run_audit_body<S: Clone + 'static>(
             window_open: false,
             latest: None,
             notifier: None,
+            suppress_next_notifier: false,
         });
 
-    for value in ctx.batch::<S>(0) {
-        st.latest = Some((*value).clone());
+    let source_batch = ctx.batch::<S>(0);
+    let notifier_signaled = dep_has_data(ctx, 1) || is_complete(ctx.terminal(1));
+    let notifier_fired = st.window_open && notifier_signaled && !st.suppress_next_notifier;
+    let fired_notifier = notifier_fired.then(|| st.notifier.clone()).flatten();
+    if st.window_open && notifier_signaled && st.suppress_next_notifier {
+        st.suppress_next_notifier = false;
     }
-
-    let notifier_fired = st.window_open && (dep_has_data(ctx, 1) || is_complete(ctx.terminal(1)));
     if notifier_fired {
         if let Some(value) = st.latest.clone() {
             ctx.down(vec![Message::Data(Rc::new(value))]);
@@ -218,6 +233,7 @@ fn run_audit_body<S: Clone + 'static>(
         let old = st.notifier.take();
         st.window_open = false;
         st.latest = None;
+        st.suppress_next_notifier = false;
         if let Some(old) = old {
             ctx.rewire_next_remove(old, rewire_body(body_cell));
         }
@@ -231,16 +247,19 @@ fn run_audit_body<S: Clone + 'static>(
             window_open: false,
             latest: None,
             notifier: None,
+            suppress_next_notifier: false,
         });
         ctx.down(vec![Message::Error(error.into())]);
         return;
     }
 
+    for value in &source_batch {
+        st.latest = Some((**value).clone());
+    }
+
     if is_complete(ctx.terminal(0)) {
-        if st.window_open {
-            if let Some(value) = st.latest.clone() {
-                ctx.down(vec![Message::Data(Rc::new(value))]);
-            }
+        if let Some(value) = st.latest.clone() {
+            ctx.down(vec![Message::Data(Rc::new(value))]);
         }
         if let Some(old) = st.notifier.take() {
             ctx.rewire_next_remove(old, rewire_body(body_cell));
@@ -249,16 +268,20 @@ fn run_audit_body<S: Clone + 'static>(
             window_open: false,
             latest: None,
             notifier: None,
+            suppress_next_notifier: false,
         });
         ctx.down(vec![Message::Complete]);
         return;
     }
 
-    if !st.window_open && !ctx.batch::<S>(0).is_empty() {
+    if !st.window_open && !source_batch.is_empty() {
         if let Some(value) = st.latest.as_ref() {
             match catch_unwind(AssertUnwindSafe(|| duration_selector(ctx, value))) {
                 Ok(notifier) => {
                     st.window_open = true;
+                    st.suppress_next_notifier = fired_notifier
+                        .as_ref()
+                        .is_some_and(|old| old.ptr_eq(&notifier));
                     st.notifier = Some(notifier.clone());
                     ctx.rewire_next_add(notifier, rewire_body(body_cell));
                 }
@@ -267,6 +290,7 @@ fn run_audit_body<S: Clone + 'static>(
                         window_open: false,
                         latest: None,
                         notifier: None,
+                        suppress_next_notifier: false,
                     });
                     ctx.down(vec![Message::Error(panic_payload(payload).into())]);
                     return;
@@ -276,6 +300,225 @@ fn run_audit_body<S: Clone + 'static>(
     }
 
     ctx.state_set(st);
+}
+
+/// timeout: subscribe-armed idle watchdog. The helper is a free node constructor,
+/// not an operator factory or graph method (D114).
+pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
+    let source_core = source.erased();
+    let initial_timer = scoped_timer(&source_core, ms).erased();
+    let body_cell: BodyCell = Rc::new(RefCell::new(None));
+    let body_cell_for_body = body_cell.clone();
+    let initial_for_body = initial_timer.clone();
+    let source_for_body = source_core.clone();
+    let body: Body = Rc::new(move |ctx| {
+        run_timeout_body::<S>(
+            ctx,
+            ms,
+            &initial_for_body,
+            &source_for_body,
+            &body_cell_for_body,
+        );
+    });
+    *body_cell.borrow_mut() = Some(body.clone());
+
+    let node = crate::operators::init_node_in_arena_with_dispatcher(
+        Operator::with_opts("timeout", time_helper_opts(), move |ctx| {
+            body(ctx);
+        }),
+        &source_core.arena(),
+        source_core.dispatcher(),
+        vec![initial_timer, source_core.clone()],
+        NodeOpts::default(),
+    );
+    node.erased()
+        .set_local_async_driver(source_core.local_async_driver());
+    node
+}
+
+fn run_timeout_body<S: Clone + 'static>(
+    ctx: &Ctx,
+    ms: u64,
+    initial_timer: &Core,
+    source: &Core,
+    body_cell: &BodyCell,
+) {
+    let mut st = ctx
+        .state_get::<TimeoutState>()
+        .map(|v| (*v).clone())
+        .unwrap_or_else(|| TimeoutState {
+            timer: Some(initial_timer.clone()),
+        });
+
+    let source_batch = ctx.batch::<S>(1);
+    for value in &source_batch {
+        ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
+    }
+
+    if is_complete(ctx.terminal(1)) {
+        if let Some(timer) = st.timer.take() {
+            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+        }
+        ctx.state_set(TimeoutState { timer: None });
+        ctx.down(vec![Message::Complete]);
+        return;
+    }
+
+    if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
+        if let Some(timer) = st.timer.take() {
+            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+        }
+        ctx.state_set(TimeoutState { timer: None });
+        ctx.down(vec![Message::Error(error.to_string().into())]);
+        return;
+    }
+
+    if !source_batch.is_empty() {
+        let old = st.timer.take();
+        let next = ctx.init_node_in_scope(timer(ms), vec![]).erased();
+        st.timer = Some(next.clone());
+        ctx.state_set(st);
+        if old.is_some() {
+            ctx.rewire_next_set(vec![next, source.clone()], rewire_body(body_cell));
+        } else {
+            ctx.rewire_next_add(next, rewire_body(body_cell));
+        }
+        return;
+    }
+
+    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+        ctx.state_set(TimeoutState { timer: None });
+        ctx.down(vec![Message::Error(error.to_string().into())]);
+        return;
+    }
+
+    if dep_has_data(ctx, 0) || is_complete(ctx.terminal(0)) {
+        ctx.state_set(TimeoutState { timer: None });
+        ctx.down(vec![Message::Error(
+            format!("timeout: no value within {ms}ms").into(),
+        )]);
+        return;
+    }
+
+    ctx.state_set(st);
+}
+
+/// buffer_time: subscribe-armed interval buffer helper (D114).
+pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>> {
+    let source_core = source.erased();
+    let interval_node = scoped_interval(&source_core, ms).erased();
+    let body_cell: BodyCell = Rc::new(RefCell::new(None));
+    let body_cell_for_body = body_cell.clone();
+    let interval_for_body = interval_node.clone();
+    let body: Body = Rc::new(move |ctx| {
+        run_buffer_time_body::<S>(ctx, &interval_for_body, &body_cell_for_body);
+    });
+    *body_cell.borrow_mut() = Some(body.clone());
+
+    let node = crate::operators::init_node_in_arena_with_dispatcher(
+        Operator::with_opts("bufferTime", time_helper_opts(), move |ctx| {
+            body(ctx);
+        }),
+        &source_core.arena(),
+        source_core.dispatcher(),
+        vec![interval_node, source_core.clone()],
+        NodeOpts::default(),
+    );
+    node.erased()
+        .set_local_async_driver(source_core.local_async_driver());
+    node
+}
+
+fn run_buffer_time_body<S: Clone + 'static>(
+    ctx: &Ctx,
+    initial_interval: &Core,
+    body_cell: &BodyCell,
+) {
+    let mut st = ctx
+        .state_get::<BufferTimeState<S>>()
+        .map(|v| (*v).clone())
+        .unwrap_or_else(|| BufferTimeState {
+            buffer: Vec::new(),
+            interval: Some(initial_interval.clone()),
+        });
+
+    for value in ctx.batch::<S>(1) {
+        st.buffer.push((*value).clone());
+    }
+
+    if is_complete(ctx.terminal(1)) {
+        if !st.buffer.is_empty() {
+            ctx.down(vec![Message::Data(Rc::new(st.buffer.clone()))]);
+        }
+        if let Some(interval) = st.interval.take() {
+            ctx.rewire_next_remove(interval, rewire_body(body_cell));
+        }
+        ctx.state_set(BufferTimeState::<S> {
+            buffer: Vec::new(),
+            interval: None,
+        });
+        ctx.down(vec![Message::Complete]);
+        return;
+    }
+
+    if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
+        if let Some(interval) = st.interval.take() {
+            ctx.rewire_next_remove(interval, rewire_body(body_cell));
+        }
+        ctx.state_set(BufferTimeState::<S> {
+            buffer: Vec::new(),
+            interval: None,
+        });
+        ctx.down(vec![Message::Error(error.to_string().into())]);
+        return;
+    }
+
+    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+        ctx.state_set(BufferTimeState::<S> {
+            buffer: Vec::new(),
+            interval: None,
+        });
+        ctx.down(vec![Message::Error(error.to_string().into())]);
+        return;
+    }
+
+    if dep_has_data(ctx, 0) {
+        ctx.down(vec![Message::Data(Rc::new(st.buffer.clone()))]);
+        st.buffer.clear();
+    }
+
+    ctx.state_set(st);
+}
+
+fn scoped_timer(anchor: &Core, ms: u64) -> Node<u64> {
+    scoped_time_source(anchor, timer(ms))
+}
+
+fn scoped_interval(anchor: &Core, ms: u64) -> Node<u64> {
+    scoped_time_source(anchor, interval(ms))
+}
+
+fn scoped_time_source(anchor: &Core, op: Operator<u64>) -> Node<u64> {
+    let node = crate::operators::init_node_in_arena_with_dispatcher(
+        op,
+        &anchor.arena(),
+        anchor.dispatcher(),
+        vec![],
+        NodeOpts::default(),
+    );
+    node.erased()
+        .set_local_async_driver(anchor.local_async_driver());
+    node
+}
+
+fn time_helper_opts() -> NodeOpts {
+    NodeOpts {
+        partial: true,
+        complete_when_deps_complete: false,
+        error_when_deps_error: false,
+        terminal_as_real_input: true,
+        ..NodeOpts::default()
+    }
 }
 
 fn rewire_body(body_cell: &BodyCell) -> impl Fn(&Ctx) + 'static {

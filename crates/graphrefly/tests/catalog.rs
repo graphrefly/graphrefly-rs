@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use graphrefly::{
-    audit, audit_time, batch, buffer, buffer_count, catch_error, combine, combine_latest, concat,
-    concat_map, debounce, debounce_time, delay, distinct_until_changed, element_at, empty,
-    exhaust_map, filter, find, first, first_any, flat_map, from_iter, future_local, graph,
-    interval, last, last_any, map, merge_map, never, on_first_data, on_first_data_where, pairwise,
-    race, reduce, rescue, sample, settle, settle_by, skip, stream_local, switch_map, take,
-    take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error, timer, valve,
-    with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message,
-    Node,
+    audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
+    combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
+    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
+    future_local, graph, interval, last, last_any, map, merge_map, never, on_first_data,
+    on_first_data_where, pairwise, race, reduce, rescue, sample, settle, settle_by, skip,
+    stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
+    throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
+    GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -532,6 +532,260 @@ fn audit_time_flushes_pending_value_on_source_complete() {
 }
 
 #[test]
+fn audit_flushes_same_wave_source_data_before_complete() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let audited = g.init_node(
+        audit_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_same_wave_complete"),
+    );
+    let seen = collect_shapes::<i32>(&audited);
+    let data = collect_data(&audited);
+
+    src.down(vec![Message::Data(Rc::new(9i32)), Message::Complete]);
+
+    assert_eq!(*data.borrow(), vec![9]);
+    assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
+}
+
+#[test]
+fn audit_same_wave_notifier_close_uses_pre_wave_latest() {
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let notifier = g.state_empty::<()>();
+    let audited = g.init_node(
+        audit::<i32, ()>({
+            let notifier = notifier.clone();
+            move |_| notifier.clone()
+        }),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_same_wave_close"),
+    );
+    let data = collect_data(&audited);
+
+    src.set(1);
+    batch(|_| {
+        notifier.set(());
+        src.set(2);
+    });
+    assert_eq!(
+        *data.borrow(),
+        vec![1],
+        "a notifier close should flush the old window before same-wave source DATA opens a new one"
+    );
+
+    notifier.set(());
+    assert_eq!(*data.borrow(), vec![1, 2]);
+}
+
+#[test]
+fn audit_same_wave_reopen_only_suppresses_the_closed_notifier() {
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let old_notifier = g.state_empty::<()>();
+    let ready_notifier = g.state(());
+    let audited = g.init_node(
+        audit::<i32, ()>({
+            let old_notifier = old_notifier.clone();
+            let ready_notifier = ready_notifier.clone();
+            move |v| {
+                if *v == 1 {
+                    old_notifier.clone()
+                } else {
+                    ready_notifier.clone()
+                }
+            }
+        }),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_reopen_ready_notifier"),
+    );
+    let data = collect_data(&audited);
+
+    src.set(1);
+    batch(|_| {
+        old_notifier.set(());
+        src.set(2);
+    });
+
+    assert_eq!(
+        *data.borrow(),
+        vec![1, 2],
+        "only the old notifier's cached close is suppressed; a different ready notifier closes immediately"
+    );
+}
+
+#[test]
+fn timeout_arms_on_subscribe_resets_and_cleans_up() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let timed = timeout(&src, 10);
+    let seen = collect_shapes::<i32>(&timed);
+    let data = collect_data(&timed);
+
+    assert_eq!(driver.sleepers.borrow().len(), 1);
+    src.set(1);
+    src.set(2);
+    assert_eq!(*data.borrow(), vec![1, 2]);
+    assert_eq!(
+        driver
+            .sleepers
+            .borrow()
+            .iter()
+            .filter(|s| s.active.get())
+            .count(),
+        1,
+        "each source value should cancel and replace the idle timer"
+    );
+
+    driver.fire_sleepers();
+    assert_eq!(*seen.borrow(), vec!["DATA", "DATA", "ERROR"]);
+
+    let src = g.state_empty::<i32>();
+    let completing = timeout(&src, 10);
+    let completing_seen = collect_shapes::<i32>(&completing);
+    src.down(vec![Message::Data(Rc::new(3i32)), Message::Complete]);
+    assert_eq!(*completing_seen.borrow(), vec!["DATA", "COMPLETE"]);
+    driver.fire_sleepers();
+    assert_eq!(
+        *completing_seen.borrow(),
+        vec!["DATA", "COMPLETE"],
+        "source COMPLETE should remove the live idle timer"
+    );
+}
+
+#[test]
+fn timeout_propagates_source_error_and_missing_driver_error() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let timed = timeout(&src, 10);
+    let seen = collect_shapes::<i32>(&timed);
+
+    src.down(vec![Message::Error("source failed".into())]);
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+    driver.fire_sleepers();
+    assert_eq!(
+        *seen.borrow(),
+        vec!["ERROR"],
+        "source ERROR should cancel the helper timer"
+    );
+
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let missing = timeout(&src, 10);
+    assert_eq!(*collect_shapes::<i32>(&missing).borrow(), vec!["ERROR"]);
+
+    let cached_src = g.state(5i32);
+    let missing = timeout(&cached_src, 10);
+    assert_eq!(
+        *collect_shapes::<i32>(&missing).borrow(),
+        vec!["ERROR"],
+        "D114 subscribe-armed timeout must activate the clock before cached source DATA"
+    );
+}
+
+#[test]
+fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let buffered = buffer_time(&src, 10);
+    let data = collect_data(&buffered);
+    let seen = collect_shapes::<Vec<i32>>(&buffered);
+
+    assert_eq!(driver.intervals.borrow().len(), 1);
+    driver.tick_intervals();
+    assert_eq!(*data.borrow(), vec![Vec::<i32>::new()]);
+
+    src.set(1);
+    src.set(2);
+    driver.tick_intervals();
+    assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2]]);
+
+    src.down(vec![Message::Data(Rc::new(3i32)), Message::Complete]);
+    assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2], vec![3]]);
+    assert_eq!(*seen.borrow(), vec!["DATA", "DATA", "DATA", "COMPLETE"]);
+    driver.tick_intervals();
+    assert_eq!(
+        *seen.borrow(),
+        vec!["DATA", "DATA", "DATA", "COMPLETE"],
+        "source COMPLETE should remove the helper interval"
+    );
+}
+
+#[test]
+fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let buffered = buffer_time(&src, 10);
+    let seen = collect_shapes::<Vec<i32>>(&buffered);
+
+    src.down(vec![Message::Error("source failed".into())]);
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+    driver.tick_intervals();
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+
+    let src = g.state_empty::<i32>();
+    let timed = timeout(&src, 10);
+    let buffered = buffer_time(&src, 10);
+    let _timed_sink = g.init_node(
+        map::<i32, i32>(|v| *v),
+        vec![timed.erased()],
+        GraphNodeOpts::named("timeout_sink"),
+    );
+    let _buffered_sink = g.init_node(
+        map::<Vec<i32>, Vec<i32>>(|v| v.clone()),
+        vec![buffered.erased()],
+        GraphNodeOpts::named("buffer_time_sink"),
+    );
+    let factories = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| n.factory)
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&"timeout".to_owned()));
+    assert!(factories.contains(&"bufferTime".to_owned()));
+    assert!(factories.contains(&"timer".to_owned()));
+    assert!(factories.contains(&"interval".to_owned()));
+
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let missing = buffer_time(&src, 10);
+    assert_eq!(
+        *collect_shapes::<Vec<i32>>(&missing).borrow(),
+        vec!["ERROR"]
+    );
+
+    let cached_src = g.state(5i32);
+    let missing = buffer_time(&cached_src, 10);
+    assert_eq!(
+        *collect_shapes::<Vec<i32>>(&missing).borrow(),
+        vec!["ERROR"],
+        "D114 subscribe-armed buffer_time must activate the interval before cached source DATA"
+    );
+}
+
+#[test]
 fn time_operator_missing_driver_routes_timer_error() {
     let g = graph();
     let src = g.state_empty::<i32>();
@@ -546,6 +800,17 @@ fn time_operator_missing_driver_routes_timer_error() {
 
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
     assert_eq!(delayed.status(), graphrefly::Status::Errored);
+
+    let src = g.state_empty::<i32>();
+    let audited = g.init_node(
+        audit_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_time_missing_driver"),
+    );
+    let seen = collect_shapes::<i32>(&audited);
+    src.set(1);
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+    assert_eq!(audited.status(), graphrefly::Status::Errored);
 }
 
 #[test]
