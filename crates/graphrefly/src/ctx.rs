@@ -11,7 +11,8 @@
 
 use std::rc::Rc;
 
-use crate::node::{Core, RewireRequest};
+use crate::node::{Core, Node, NodeOpts, RewireRequest};
+use crate::operators::Operator;
 use crate::protocol::{AnyValue, Message, Wave};
 
 /// A dep's terminal state, visible to the fn via [`Ctx::terminal`]
@@ -207,6 +208,23 @@ impl Ctx {
         &self,
     ) -> Option<Rc<dyn crate::async_driver::LocalAsyncDriver>> {
         self.node.local_async_driver()
+    }
+
+    pub(crate) fn init_node_in_scope<T: 'static>(
+        &self,
+        op: Operator<T>,
+        deps: Vec<Core>,
+    ) -> Node<T> {
+        let node = crate::operators::init_node_in_arena_with_dispatcher(
+            op,
+            &self.node.arena(),
+            self.node.dispatcher(),
+            deps,
+            NodeOpts::default(),
+        );
+        node.erased()
+            .set_local_async_driver(self.node.local_async_driver());
+        node
     }
 
     /// Request a deferred self-rewire ADD at the committed wave boundary (R-rewire-deferred /

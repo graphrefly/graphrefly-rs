@@ -2239,6 +2239,14 @@ impl Core {
         Rc::ptr_eq(&self.graph, &arena.0)
     }
 
+    pub(crate) fn arena(&self) -> GraphArena {
+        GraphArena(self.graph.clone())
+    }
+
+    pub(crate) fn dispatcher(&self) -> Dispatcher {
+        self.with_call(|c| c.dispatcher.clone())
+    }
+
     pub(crate) fn deps(&self) -> Vec<Core> {
         self.borrow().deps.clone()
     }

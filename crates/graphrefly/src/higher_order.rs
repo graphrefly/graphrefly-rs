@@ -16,7 +16,7 @@ use crate::protocol::Message;
 
 type Body = Rc<dyn Fn(&Ctx)>;
 type BodyCell = Rc<RefCell<Option<Body>>>;
-type Project<TIn, TOut> = Rc<dyn Fn(&TIn) -> Node<TOut>>;
+type Project<TIn, TOut> = Rc<dyn Fn(&Ctx, &TIn) -> Node<TOut>>;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -37,40 +37,58 @@ struct MapState<TIn> {
 pub fn switch_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("switchMap", project, Mode::Switch)
+    map_operator("switchMap", move |_ctx, value| project(value), Mode::Switch)
 }
 
 /// merge_map: project every source DATA to an inner node and merge all live inners.
 pub fn merge_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("mergeMap", project, Mode::Merge)
+    map_operator("mergeMap", move |_ctx, value| project(value), Mode::Merge)
 }
 
 /// flat_map: alias-shaped Rust helper for [`merge_map`].
 pub fn flat_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("flatMap", project, Mode::Merge)
+    map_operator("flatMap", move |_ctx, value| project(value), Mode::Merge)
 }
 
 /// concat_map: queue source values and run one projected inner at a time.
 pub fn concat_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("concatMap", project, Mode::Concat)
+    map_operator("concatMap", move |_ctx, value| project(value), Mode::Concat)
 }
 
 /// exhaust_map: project the first source DATA while no inner is live; ignore source DATA while busy.
 pub fn exhaust_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("exhaustMap", project, Mode::Exhaust)
+    map_operator(
+        "exhaustMap",
+        move |_ctx, value| project(value),
+        Mode::Exhaust,
+    )
+}
+
+pub(crate) fn switch_map_with_ctx<TIn: Clone + 'static, TOut: 'static>(
+    factory: &'static str,
+    project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
+) -> Operator<TOut> {
+    map_operator(factory, project, Mode::Switch)
+}
+
+pub(crate) fn merge_map_with_ctx<TIn: Clone + 'static, TOut: 'static>(
+    factory: &'static str,
+    project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
+) -> Operator<TOut> {
+    map_operator(factory, project, Mode::Merge)
 }
 
 fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     factory: &'static str,
-    project: impl Fn(&TIn) -> Node<TOut> + 'static,
+    project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
     mode: Mode,
 ) -> Operator<TOut> {
     let project: Project<TIn, TOut> = Rc::new(project);
@@ -223,7 +241,7 @@ fn project_inner<TIn: Clone + 'static, TOut: 'static>(
     st: &mut MapState<TIn>,
     body_cell: &BodyCell,
 ) -> Option<Core> {
-    match catch_unwind(AssertUnwindSafe(|| project(value).erased())) {
+    match catch_unwind(AssertUnwindSafe(|| project(ctx, value).erased())) {
         Ok(core) => Some(core),
         Err(payload) => {
             cleanup_all_inners(ctx, st, body_cell);

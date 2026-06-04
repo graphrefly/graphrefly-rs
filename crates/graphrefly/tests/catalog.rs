@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use graphrefly::{
-    batch, buffer, buffer_count, catch_error, combine, combine_latest, concat, concat_map,
-    distinct_until_changed, element_at, empty, exhaust_map, filter, find, first, first_any,
-    flat_map, from_iter, future_local, graph, interval, last, last_any, map, merge_map, never,
-    on_first_data, on_first_data_where, pairwise, race, reduce, rescue, sample, settle, settle_by,
-    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throw_error,
-    timer, valve, with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
-    Message, Node,
+    audit, audit_time, batch, buffer, buffer_count, catch_error, combine, combine_latest, concat,
+    concat_map, debounce, debounce_time, delay, distinct_until_changed, element_at, empty,
+    exhaust_map, filter, find, first, first_any, flat_map, from_iter, future_local, graph,
+    interval, last, last_any, map, merge_map, never, on_first_data, on_first_data_where, pairwise,
+    race, reduce, rescue, sample, settle, settle_by, skip, stream_local, switch_map, take,
+    take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error, timer, valve,
+    with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message,
+    Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -379,6 +380,172 @@ fn local_future_and_stream_sources_route_errors_into_protocol() {
     assert_eq!(*stream_shapes.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(*stream_data.borrow(), vec![1]);
     assert_eq!(stream.status(), graphrefly::Status::Errored);
+}
+
+#[test]
+fn time_operators_compose_over_graph_scoped_timer_helpers() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let delayed_src = g.state_empty::<i32>();
+    let delayed = g.init_node(
+        delay::<i32>(10),
+        vec![delayed_src.erased()],
+        GraphNodeOpts::named("delay"),
+    );
+    let delayed_seen = collect_data(&delayed);
+    let delayed_shapes = collect_shapes::<i32>(&delayed);
+    delayed_src.set(1);
+    delayed_src.set(2);
+    assert!(delayed_seen.borrow().is_empty());
+    assert_eq!(driver.sleepers.borrow().len(), 2);
+    assert!(
+        g.describe().nodes.iter().any(|n| n.factory == "timer"),
+        "time operators should expose pending helper timer nodes through describe discovery"
+    );
+    driver.fire_sleepers();
+    assert_eq!(
+        *delayed_shapes.borrow(),
+        vec!["DATA", "DATA"],
+        "delay helper timers should settle through DATA, not ERROR or silent COMPLETE"
+    );
+    assert_eq!(*delayed_seen.borrow(), vec![1, 2]);
+
+    let debounced_src = g.state_empty::<i32>();
+    let debounced = g.init_node(
+        debounce_time::<i32>(10),
+        vec![debounced_src.erased()],
+        GraphNodeOpts::named("debounce_time"),
+    );
+    let debounced_seen = collect_data(&debounced);
+    debounced_src.set(1);
+    debounced_src.set(2);
+    driver.fire_sleepers();
+    assert_eq!(
+        *debounced_seen.borrow(),
+        vec![2],
+        "debounce_time should cancel the superseded timer via removeDep"
+    );
+
+    let throttled_src = g.state_empty::<i32>();
+    let throttled = g.init_node(
+        throttle_time::<i32>(10),
+        vec![throttled_src.erased()],
+        GraphNodeOpts::named("throttle_time"),
+    );
+    let throttled_seen = collect_data(&throttled);
+    throttled_src.set(1);
+    throttled_src.set(2);
+    assert_eq!(
+        *throttled_seen.borrow(),
+        vec![1],
+        "throttle_time is leading-edge and ignores values while the timer window is live"
+    );
+    driver.fire_sleepers();
+    throttled_src.set(3);
+    assert_eq!(*throttled_seen.borrow(), vec![1, 3]);
+
+    let audited_src = g.state_empty::<i32>();
+    let audited = g.init_node(
+        audit_time::<i32>(10),
+        vec![audited_src.erased()],
+        GraphNodeOpts::named("audit_time"),
+    );
+    let audited_seen = collect_data(&audited);
+    audited_src.set(1);
+    audited_src.set(2);
+    assert!(audited_seen.borrow().is_empty());
+    driver.fire_sleepers();
+    assert_eq!(
+        *audited_seen.borrow(),
+        vec![2],
+        "audit_time should emit the latest value when the visible timer dep closes"
+    );
+
+    let factories = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| n.factory)
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&"delay".to_owned()));
+    assert!(factories.contains(&"debounceTime".to_owned()));
+    assert!(factories.contains(&"throttleTime".to_owned()));
+    assert!(factories.contains(&"auditTime".to_owned()));
+
+    let alias_src = g.state_empty::<i32>();
+    let _debounce = g.init_node(
+        debounce::<i32>(10),
+        vec![alias_src.erased()],
+        GraphNodeOpts::named("debounce"),
+    );
+    let _throttle = g.init_node(
+        throttle::<i32>(10),
+        vec![alias_src.erased()],
+        GraphNodeOpts::named("throttle"),
+    );
+    let notifier = g.state_empty::<()>();
+    let _audit = g.init_node(
+        audit::<i32, ()>({
+            let notifier = notifier.clone();
+            move |_| notifier.clone()
+        }),
+        vec![alias_src.erased()],
+        GraphNodeOpts::named("audit"),
+    );
+    let alias_factories = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| n.factory)
+        .collect::<Vec<_>>();
+    assert!(alias_factories.contains(&"debounce".to_owned()));
+    assert!(alias_factories.contains(&"throttle".to_owned()));
+    assert!(alias_factories.contains(&"audit".to_owned()));
+}
+
+#[test]
+fn audit_time_flushes_pending_value_on_source_complete() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let audited = g.init_node(
+        audit_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_time_complete"),
+    );
+    let seen = collect_shapes::<i32>(&audited);
+    let data = collect_data(&audited);
+
+    src.set(7);
+    src.down(vec![Message::Complete]);
+
+    assert_eq!(*data.borrow(), vec![7]);
+    assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(audited.status(), graphrefly::Status::Completed);
+}
+
+#[test]
+fn time_operator_missing_driver_routes_timer_error() {
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let delayed = g.init_node(
+        delay::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("delay_missing_driver"),
+    );
+    let seen = collect_shapes::<i32>(&delayed);
+
+    src.set(1);
+
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+    assert_eq!(delayed.status(), graphrefly::Status::Errored);
 }
 
 #[test]
