@@ -6,8 +6,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
+use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{batch as run_batch, BatchCtx};
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher};
@@ -16,11 +18,26 @@ use crate::operators::Operator;
 use crate::protocol::{AnyValue, LockId, Message, Tier};
 
 /// Graph construction options.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct GraphOptions {
     pub name: Option<String>,
     pub profile: bool,
     pub dispatcher: Option<Dispatcher>,
+    pub local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+}
+
+impl fmt::Debug for GraphOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GraphOptions")
+            .field("name", &self.name)
+            .field("profile", &self.profile)
+            .field("dispatcher", &self.dispatcher)
+            .field(
+                "local_async_driver",
+                &self.local_async_driver.as_ref().map(|_| "<installed>"),
+            )
+            .finish()
+    }
 }
 
 impl GraphOptions {
@@ -29,6 +46,7 @@ impl GraphOptions {
             name: Some(name.into()),
             profile: false,
             dispatcher: None,
+            local_async_driver: None,
         }
     }
 }
@@ -69,6 +87,7 @@ struct GraphInner {
     name: Option<String>,
     arena: GraphArena,
     dispatcher: Dispatcher,
+    local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
     profile_enabled: Cell<bool>,
     entries: RefCell<Vec<Entry>>,
     by_id: RefCell<HashMap<String, Core>>,
@@ -87,7 +106,22 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(opts: GraphOptions) -> Self {
-        let dispatcher = opts.dispatcher.unwrap_or_else(default_dispatcher);
+        let (dispatcher, local_async_driver) = match (opts.dispatcher, opts.local_async_driver) {
+            (Some(dispatcher), Some(driver)) => (dispatcher, Some(driver)),
+            (Some(dispatcher), None) => {
+                let driver = dispatcher.local_async_driver();
+                (dispatcher, driver)
+            }
+            (None, Some(driver)) => {
+                let dispatcher = Dispatcher::new();
+                (dispatcher, Some(driver))
+            }
+            (None, None) => {
+                let dispatcher = default_dispatcher();
+                let driver = dispatcher.local_async_driver();
+                (dispatcher, driver)
+            }
+        };
         if opts.profile {
             dispatcher.set_recording(true);
         }
@@ -96,6 +130,7 @@ impl Graph {
                 name: opts.name,
                 arena: GraphArena::new(),
                 dispatcher,
+                local_async_driver,
                 profile_enabled: Cell::new(opts.profile),
                 entries: RefCell::new(Vec::new()),
                 by_id: RefCell::new(HashMap::new()),
@@ -381,6 +416,8 @@ impl Graph {
             node.erased().same_graph_arena(&self.inner.arena),
             "graph node belongs to a different graph arena"
         );
+        let core = node.erased();
+        core.set_local_async_driver(self.inner.local_async_driver.clone());
         let id = opts.name.clone().unwrap_or_else(|| {
             let next = self.inner.seq.get();
             self.inner.seq.set(next + 1);
@@ -391,13 +428,13 @@ impl Graph {
             "duplicate graph node id '{id}'"
         );
         let entry = Entry {
-            core: node.erased(),
+            core: core.clone(),
             id: id.clone(),
             name: opts.name,
             factory: factory.to_owned(),
             meta: opts.meta,
         };
-        self.inner.by_id.borrow_mut().insert(id, node.erased());
+        self.inner.by_id.borrow_mut().insert(id, core);
         self.inner.entries.borrow_mut().push(entry);
         node
     }

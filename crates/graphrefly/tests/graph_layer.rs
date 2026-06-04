@@ -427,6 +427,7 @@ fn profile_enabled_graph_defaults_to_default_dispatcher_and_injection_isolates()
         name: Some("injected-profile".to_owned()),
         profile: true,
         dispatcher: Some(injected.clone()),
+        ..GraphOptions::default()
     });
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
     let doubled = g.derived_opts(

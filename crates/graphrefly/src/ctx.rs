@@ -202,6 +202,13 @@ impl Ctx {
         self.node.register_on_invalidate(Rc::new(f));
     }
 
+    /// Graph-local async/time driver for source bodies (D111).
+    pub(crate) fn local_async_driver(
+        &self,
+    ) -> Option<Rc<dyn crate::async_driver::LocalAsyncDriver>> {
+        self.node.local_async_driver()
+    }
+
     /// Request a deferred self-rewire ADD at the committed wave boundary (R-rewire-deferred /
     /// D47): add `dep` (and swap the fn) AFTER the current wave settles — never in place, so
     /// this is NOT the D37 mid-fn reject. Higher-order operators (*Map) use this to wire

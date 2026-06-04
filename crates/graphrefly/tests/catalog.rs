@@ -1,12 +1,22 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
+use futures_core::Stream;
 use graphrefly::{
     batch, buffer, buffer_count, catch_error, combine, combine_latest, concat, concat_map,
-    distinct_until_changed, element_at, exhaust_map, filter, find, first, first_any, flat_map,
-    from_iter, graph, last, last_any, map, merge_map, on_first_data, on_first_data_where, pairwise,
-    race, reduce, rescue, sample, settle, settle_by, skip, switch_map, take, take_until,
-    take_while, tap, tap_first, valve, with_latest_from, zip, GraphNodeOpts, Message, Node,
+    distinct_until_changed, element_at, empty, exhaust_map, filter, find, first, first_any,
+    flat_map, from_iter, future_local, graph, interval, last, last_any, map, merge_map, never,
+    on_first_data, on_first_data_where, pairwise, race, reduce, rescue, sample, settle, settle_by,
+    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throw_error,
+    timer, valve, with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
+    Message, Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -37,6 +47,338 @@ fn collect_shapes<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<
         Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
     });
     seen
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+struct Sleeper {
+    active: Rc<Cell<bool>>,
+    callback: Option<Box<dyn FnOnce()>>,
+}
+
+struct IntervalTick {
+    active: Rc<Cell<bool>>,
+    callback: Rc<dyn Fn()>,
+}
+
+type PendingFuture = (Rc<Cell<bool>>, Pin<Box<dyn Future<Output = ()>>>);
+
+#[derive(Default)]
+struct ManualDriver {
+    sleepers: RefCell<Vec<Sleeper>>,
+    intervals: RefCell<Vec<IntervalTick>>,
+    futures: RefCell<Vec<PendingFuture>>,
+}
+
+impl ManualDriver {
+    fn fire_sleepers(&self) {
+        let sleepers = std::mem::take(&mut *self.sleepers.borrow_mut());
+        for mut sleeper in sleepers {
+            if sleeper.active.get() {
+                if let Some(callback) = sleeper.callback.take() {
+                    callback();
+                }
+            }
+        }
+    }
+
+    fn tick_intervals(&self) {
+        for tick in self.intervals.borrow().iter() {
+            if tick.active.get() {
+                (tick.callback)();
+            }
+        }
+    }
+
+    fn poll_futures(&self) {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut remaining = Vec::new();
+        for (active, mut fut) in std::mem::take(&mut *self.futures.borrow_mut()) {
+            if !active.get() {
+                continue;
+            }
+            if fut.as_mut().poll(&mut cx).is_pending() {
+                remaining.push((active, fut));
+            }
+        }
+        *self.futures.borrow_mut() = remaining;
+    }
+}
+
+impl LocalAsyncDriver for ManualDriver {
+    fn sleep(&self, _duration: Duration, callback: Box<dyn FnOnce()>) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.sleepers.borrow_mut().push(Sleeper {
+            active: active.clone(),
+            callback: Some(callback),
+        });
+        Box::new(move || active.set(false))
+    }
+
+    fn interval(&self, _period: Duration, callback: Rc<dyn Fn()>) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.intervals.borrow_mut().push(IntervalTick {
+            active: active.clone(),
+            callback,
+        });
+        Box::new(move || active.set(false))
+    }
+
+    fn spawn_local(
+        &self,
+        fut: Pin<Box<dyn Future<Output = ()> + 'static>>,
+    ) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.futures.borrow_mut().push((active.clone(), fut));
+        Box::new(move || active.set(false))
+    }
+}
+
+struct VecStream<T> {
+    values: VecDeque<T>,
+}
+
+impl<T> VecStream<T> {
+    fn new(values: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+}
+
+impl<T: Unpin> Stream for VecStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().values.pop_front())
+    }
+}
+
+#[test]
+fn source_primitives_cover_empty_never_and_throw_error() {
+    let g = graph();
+
+    let done = g.init_node(empty::<i32>(), vec![], GraphNodeOpts::named("empty"));
+    assert_eq!(*collect_shapes::<i32>(&done).borrow(), vec!["COMPLETE"]);
+    assert_eq!(done.status(), graphrefly::Status::Completed);
+
+    let silent = g.init_node(never::<i32>(), vec![], GraphNodeOpts::named("never"));
+    assert!(collect_shapes::<i32>(&silent).borrow().is_empty());
+    assert_eq!(silent.status(), graphrefly::Status::Sentinel);
+
+    let failed = g.init_node(
+        throw_error::<i32>("boom"),
+        vec![],
+        GraphNodeOpts::named("throw"),
+    );
+    assert_eq!(*collect_shapes::<i32>(&failed).borrow(), vec!["ERROR"]);
+    assert_eq!(failed.status(), graphrefly::Status::Errored);
+}
+
+#[test]
+fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let once = g.init_node(timer(10), vec![], GraphNodeOpts::named("timer"));
+    let once_seen = collect_shapes::<u64>(&once);
+    assert!(once_seen.borrow().is_empty());
+    driver.fire_sleepers();
+    assert_eq!(*once_seen.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(once.cache(), Some(0));
+
+    let ticks = g.init_node(interval(10), vec![], GraphNodeOpts::named("interval"));
+    let tick_seen = Rc::new(RefCell::new(Vec::new()));
+    let tick_sink = tick_seen.clone();
+    let unsubscribe = ticks.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(v) = value.as_ref().downcast_ref::<u64>() {
+                tick_sink.borrow_mut().push(*v);
+            }
+        }
+    });
+    driver.tick_intervals();
+    driver.tick_intervals();
+    assert_eq!(*tick_seen.borrow(), vec![0, 1]);
+    unsubscribe();
+    driver.tick_intervals();
+    assert_eq!(
+        *tick_seen.borrow(),
+        vec![0, 1],
+        "interval cancel should stop future driver ticks after deactivation"
+    );
+}
+
+#[test]
+fn missing_driver_reports_source_activation_error() {
+    let g = graph();
+    let timed = g.init_node(timer(1), vec![], GraphNodeOpts::named("timer_missing"));
+    assert_eq!(*collect_shapes::<u64>(&timed).borrow(), vec!["ERROR"]);
+    assert_eq!(timed.status(), graphrefly::Status::Errored);
+
+    let future = g.init_node(
+        future_local(|| async { Ok::<_, io::Error>(7i32) }),
+        vec![],
+        GraphNodeOpts::named("future_missing"),
+    );
+    assert_eq!(*collect_shapes::<i32>(&future).borrow(), vec!["ERROR"]);
+
+    let interval_node = g.init_node(
+        interval(1),
+        vec![],
+        GraphNodeOpts::named("interval_missing"),
+    );
+    assert_eq!(
+        *collect_shapes::<u64>(&interval_node).borrow(),
+        vec!["ERROR"]
+    );
+
+    let stream = g.init_node(
+        stream_local(|| VecStream::new([Ok::<_, io::Error>(1i32)])),
+        vec![],
+        GraphNodeOpts::named("stream_missing"),
+    );
+    assert_eq!(*collect_shapes::<i32>(&stream).borrow(), vec!["ERROR"]);
+}
+
+#[test]
+fn graph_with_explicit_dispatcher_uses_preinstalled_driver() {
+    let driver = Rc::new(ManualDriver::default());
+    let dispatcher = Dispatcher::new();
+    dispatcher.set_local_async_driver(Some(driver.clone()));
+    let g = graphrefly::graph_opts(GraphOptions {
+        dispatcher: Some(dispatcher),
+        ..GraphOptions::default()
+    });
+
+    let once = g.init_node(
+        timer(5),
+        vec![],
+        GraphNodeOpts::named("explicit_dispatcher_timer"),
+    );
+    let seen = collect_data(&once);
+    driver.fire_sleepers();
+    assert_eq!(*seen.borrow(), vec![0]);
+}
+
+#[test]
+fn graph_local_driver_does_not_mutate_shared_dispatcher_scope() {
+    let dispatcher = Dispatcher::new();
+    let first_driver = Rc::new(ManualDriver::default());
+    let second_driver = Rc::new(ManualDriver::default());
+
+    let first = graphrefly::graph_opts(GraphOptions {
+        dispatcher: Some(dispatcher.clone()),
+        local_async_driver: Some(first_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let second = graphrefly::graph_opts(GraphOptions {
+        dispatcher: Some(dispatcher.clone()),
+        local_async_driver: Some(second_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let no_driver = graphrefly::graph_opts(GraphOptions {
+        dispatcher: Some(dispatcher),
+        ..GraphOptions::default()
+    });
+
+    let first_timer = first.init_node(timer(1), vec![], GraphNodeOpts::named("first_timer"));
+    let second_timer = second.init_node(timer(1), vec![], GraphNodeOpts::named("second_timer"));
+    let missing_timer =
+        no_driver.init_node(timer(1), vec![], GraphNodeOpts::named("missing_timer"));
+
+    let first_seen = collect_shapes::<u64>(&first_timer);
+    let second_seen = collect_shapes::<u64>(&second_timer);
+    let missing_seen = collect_shapes::<u64>(&missing_timer);
+
+    second_driver.fire_sleepers();
+    assert_eq!(*first_seen.borrow(), Vec::<String>::new());
+    assert_eq!(*second_seen.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(*missing_seen.borrow(), vec!["ERROR"]);
+
+    first_driver.fire_sleepers();
+    assert_eq!(*first_seen.borrow(), vec!["DATA", "COMPLETE"]);
+}
+
+#[test]
+fn local_future_and_stream_sources_emit_via_driver_boundary() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let future = g.init_node(
+        future_local(|| async { Ok::<_, io::Error>(42i32) }),
+        vec![],
+        GraphNodeOpts::named("future"),
+    );
+    let future_seen = collect_shapes::<i32>(&future);
+    assert!(future_seen.borrow().is_empty());
+    driver.poll_futures();
+    assert_eq!(*future_seen.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(future.cache(), Some(42));
+
+    let stream = g.init_node(
+        stream_local(|| {
+            VecStream::new([
+                Ok::<_, io::Error>(1i32),
+                Ok::<_, io::Error>(2),
+                Ok::<_, io::Error>(3),
+            ])
+        }),
+        vec![],
+        GraphNodeOpts::named("stream"),
+    );
+    let stream_seen = collect_data(&stream);
+    driver.poll_futures();
+    assert_eq!(*stream_seen.borrow(), vec![1, 2, 3]);
+    assert_eq!(stream.status(), graphrefly::Status::Completed);
+}
+
+#[test]
+fn local_future_and_stream_sources_route_errors_into_protocol() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let future = g.init_node(
+        future_local(|| async { Err::<i32, _>(io::Error::other("future failed")) }),
+        vec![],
+        GraphNodeOpts::named("future_error"),
+    );
+    let future_seen = collect_shapes::<i32>(&future);
+    driver.poll_futures();
+    assert_eq!(*future_seen.borrow(), vec!["ERROR"]);
+    assert_eq!(future.status(), graphrefly::Status::Errored);
+
+    let stream = g.init_node(
+        stream_local(|| {
+            VecStream::new([
+                Ok::<_, io::Error>(1i32),
+                Err(io::Error::other("stream failed")),
+                Ok::<_, io::Error>(2),
+            ])
+        }),
+        vec![],
+        GraphNodeOpts::named("stream_error"),
+    );
+    let stream_shapes = collect_shapes::<i32>(&stream);
+    let stream_data = collect_data(&stream);
+    driver.poll_futures();
+    assert_eq!(*stream_shapes.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(*stream_data.borrow(), vec![1]);
+    assert_eq!(stream.status(), graphrefly::Status::Errored);
 }
 
 #[test]

@@ -54,6 +54,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod async_driver;
 pub mod batch;
 pub mod combinators;
 pub mod ctx;
@@ -66,6 +67,9 @@ pub mod protocol;
 pub mod render;
 pub mod sources;
 
+#[cfg(feature = "tokio")]
+pub use async_driver::TokioLocalDriver;
+pub use async_driver::{DriverCancel, LocalAsyncDriver};
 pub use batch::{batch, BatchCtx};
 pub use combinators::{
     buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,
@@ -91,4 +95,6 @@ pub use render::{
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
-pub use sources::{from_iter, of};
+pub use sources::{
+    empty, from_iter, future_local, interval, never, of, stream_local, throw_error, timer,
+};

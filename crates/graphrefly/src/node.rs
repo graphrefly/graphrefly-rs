@@ -44,6 +44,7 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
+use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{
     boundary_drains_blocked, collecting_batch, committed_after_batch_for_target, defer_to_batch,
     register_boundary_root,
@@ -425,6 +426,17 @@ impl GraphCore {
             .expect("Core points at a live GraphCore call slot")
     }
 
+    fn get_call_mut(&mut self, key: NodeKey) -> &mut NodeCallSlot {
+        assert!(
+            self.is_live_key(key),
+            "Core points at a stale or freed GraphCore slot"
+        );
+        self.call_slots
+            .get_mut(key.id.0)
+            .and_then(Option::as_mut)
+            .expect("Core points at a live GraphCore call slot")
+    }
+
     fn get_config(&self, key: NodeKey) -> &NodeConfigSlot {
         assert!(
             self.is_live_key(key),
@@ -794,6 +806,7 @@ struct NodeCallSlot {
     factory: Option<String>,
     handle: Option<Handle>,
     dispatcher: Dispatcher,
+    local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
 }
 
 /// Construction/configuration state for one node. This is side-table owned so the
@@ -1076,6 +1089,11 @@ impl Core {
     fn with_call<R>(&self, f: impl FnOnce(&NodeCallSlot) -> R) -> R {
         let g = self.graph.borrow();
         f(g.get_call(self.key()))
+    }
+
+    fn with_call_mut<R>(&self, f: impl FnOnce(&mut NodeCallSlot) -> R) -> R {
+        let mut g = self.graph.borrow_mut();
+        f(g.get_call_mut(self.key()))
     }
 
     fn with_config<R>(&self, f: impl FnOnce(&NodeConfigSlot) -> R) -> R {
@@ -2237,6 +2255,21 @@ impl Core {
         self.with_call(|c| c.handle)
     }
 
+    pub(crate) fn local_async_driver(
+        &self,
+    ) -> Option<Rc<dyn crate::async_driver::LocalAsyncDriver>> {
+        self.with_call(|c| c.local_async_driver.clone())
+    }
+
+    pub(crate) fn set_local_async_driver(
+        &self,
+        driver: Option<Rc<dyn crate::async_driver::LocalAsyncDriver>>,
+    ) {
+        self.with_call_mut(|c| {
+            c.local_async_driver = driver;
+        });
+    }
+
     pub(crate) fn factory(&self) -> Option<String> {
         self.with_call(|c| c.factory.clone())
     }
@@ -2261,10 +2294,12 @@ impl Core {
         }
         let topology = NodeTopologySlot { deps };
         let inner = NodeInner;
+        let local_async_driver = dispatcher.local_async_driver();
         let call = NodeCallSlot {
             factory: None,
             handle,
             dispatcher,
+            local_async_driver,
         };
         let config = NodeConfigSlot::new(pausable);
         {

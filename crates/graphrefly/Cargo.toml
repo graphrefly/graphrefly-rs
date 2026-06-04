@@ -12,7 +12,14 @@ authors      = { workspace = true }
 [lib]
 name = "graphrefly"
 
+[features]
+default = []
+tokio   = ["dep:tokio"]
+
 [dependencies]
+futures-core = { version = "0.3", default-features = false }
+tokio        = { workspace = true, optional = true, features = ["rt", "time"] }
+
 # Substrate is sync-core (F-SYNC-CORE) + single-thread (D22): deliberately
 # dependency-light. Uncomment per-module as CSP-5 fills the skeleton.
 # thiserror.workspace         = true

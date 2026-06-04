@@ -21,6 +21,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::Instant;
 
+use crate::async_driver::LocalAsyncDriver;
 use crate::ctx::Ctx;
 pub use crate::protocol::Handle;
 
@@ -121,6 +122,7 @@ struct DispatcherInner {
     /// per invoke; counters live on the dispatcher, not on the thin node.
     recording: bool,
     stats: HashMap<Handle, ProfileStat>,
+    local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
 }
 
 /// First-class dispatcher (D21), cloneable handle over shared inner state. A graph
@@ -154,6 +156,7 @@ impl Dispatcher {
             pools: vec![Pool::new(PoolKind::Sync), Pool::new(PoolKind::Async)],
             recording: false,
             stats: HashMap::new(),
+            local_async_driver: None,
         })))
     }
 
@@ -165,6 +168,16 @@ impl Dispatcher {
     /// Read one handle's accumulated counters.
     pub fn stat_for(&self, handle: Handle) -> Option<ProfileStat> {
         self.0.borrow().stats.get(&handle).copied()
+    }
+
+    /// Install or clear the graph-local async/time source driver (D111).
+    pub fn set_local_async_driver(&self, driver: Option<Rc<dyn LocalAsyncDriver>>) {
+        self.0.borrow_mut().local_async_driver = driver;
+    }
+
+    /// Read the installed local async/time source driver, if any.
+    pub fn local_async_driver(&self) -> Option<Rc<dyn LocalAsyncDriver>> {
+        self.0.borrow().local_async_driver.clone()
     }
 
     /// Register a fn in the sync pool, returning its [`Handle`] (R-dispatch-all).
