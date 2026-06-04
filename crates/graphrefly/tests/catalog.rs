@@ -14,7 +14,7 @@ use graphrefly::{
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
     element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
     future_local, graph, interval, last, last_any, map, merge_map, never, on_first_data,
-    on_first_data_where, pairwise, race, reduce, rescue, sample, settle, settle_by, skip,
+    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, settle, settle_by, skip,
     stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
     throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
     GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
@@ -1214,6 +1214,21 @@ fn notifier_combinators_and_race_follow_static_edges() {
     right.set(10);
     assert_eq!(*race_seen.borrow(), vec![9, 10]);
 
+    let empty_source = g.state_empty::<i32>();
+    let empty_notifier = g.state_empty::<()>();
+    let empty_buffered = g.init_node(
+        buffer::<i32>(),
+        vec![empty_source.erased(), empty_notifier.erased()],
+        GraphNodeOpts::named("buffer_empty_flush"),
+    );
+    let empty_buffer_seen = collect_data(&empty_buffered);
+    empty_notifier.set(());
+    assert_eq!(
+        *empty_buffer_seen.borrow(),
+        vec![Vec::<i32>::new()],
+        "buffer should flush an empty Vec on notifier DATA, like the TS catalog"
+    );
+
     let source = g.state(1i32);
     let notifier = g.state_empty::<()>();
     let buffered = g.init_node(
@@ -1420,6 +1435,199 @@ fn existing_core_catalog_still_composes_after_widening() {
         *collect_shapes::<i32>(&settled).borrow(),
         vec!["DATA", "DATA", "DATA", "COMPLETE"]
     );
+}
+
+#[test]
+fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
+    let g = graph();
+    let round = Rc::new(Cell::new(0i32));
+    let repeated = g.init_node(
+        repeat::<i32>(
+            {
+                let g = g.clone();
+                let round = round.clone();
+                move || {
+                    let next = round.get() + 1;
+                    round.set(next);
+                    g.init_node(
+                        from_iter(vec![next * 10, next * 10 + 1]),
+                        vec![],
+                        GraphNodeOpts::named(format!("repeat_inner_{next}")),
+                    )
+                }
+            },
+            3,
+        ),
+        vec![],
+        GraphNodeOpts::named("repeat"),
+    );
+    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let data = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let seen_sink = seen.clone();
+    let data_sink = data.clone();
+    let _keep = repeated.subscribe(move |msg| match msg {
+        Message::Data(value) => {
+            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                data_sink.borrow_mut().push(*v);
+                seen_sink.borrow_mut().push("DATA".to_owned());
+            }
+        }
+        Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    assert_eq!(*data.borrow(), vec![10, 11, 20, 21, 30, 31]);
+    assert_eq!(
+        *seen.borrow(),
+        vec!["DATA", "DATA", "DATA", "DATA", "DATA", "DATA", "COMPLETE"],
+        "same-wave inner DATA must forward before the final repeat COMPLETE"
+    );
+    assert_eq!(
+        round.get(),
+        3,
+        "repeat must call the factory once per round"
+    );
+    assert_eq!(repeated.status(), graphrefly::Status::Completed);
+
+    let factories = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| n.factory)
+        .collect::<Vec<_>>();
+    assert!(factories.contains(&"repeat".to_owned()));
+}
+
+#[test]
+#[should_panic(expected = "repeat: count must be positive")]
+fn higher_order_repeat_rejects_zero_count() {
+    let _ = repeat::<i32>(|| Node::producer(|_| {}), 0);
+}
+
+#[test]
+fn higher_order_repeat_inner_error_detaches_and_seals_output() {
+    let g = graph();
+    let cleanup = Rc::new(Cell::new(0usize));
+    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let repeated = g.init_node(
+        repeat::<i32>(
+            {
+                let g = g.clone();
+                let cleanup = cleanup.clone();
+                let inners = inners.clone();
+                move || {
+                    let cleanup = cleanup.clone();
+                    let inner = g.producer(move |ctx| {
+                        ctx.on_deactivation({
+                            let cleanup = cleanup.clone();
+                            move || cleanup.set(cleanup.get() + 1)
+                        });
+                    });
+                    inners.borrow_mut().push(inner.clone());
+                    inner
+                }
+            },
+            2,
+        ),
+        vec![],
+        GraphNodeOpts::named("repeat_error"),
+    );
+    let shapes = collect_shapes::<i32>(&repeated);
+
+    assert_eq!(inners.borrow().len(), 1);
+    inners.borrow()[0].down(vec![Message::Data(Rc::new(1i32))]);
+    inners.borrow()[0].down(vec![Message::Error("inner boom".into())]);
+
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(cleanup.get(), 1, "inner ERROR should detach the live round");
+    assert_eq!(repeated.status(), graphrefly::Status::Errored);
+
+    let after_error = shapes.borrow().len();
+    inners.borrow()[0].down(vec![Message::Data(Rc::new(2i32))]);
+    assert_eq!(
+        shapes.borrow().len(),
+        after_error,
+        "repeat output should be sealed after inner ERROR"
+    );
+}
+
+#[test]
+fn higher_order_repeat_factory_panic_errors_after_cleaning_completed_round() {
+    let g = graph();
+    let calls = Rc::new(Cell::new(0usize));
+    let repeated = g.init_node(
+        repeat::<i32>(
+            {
+                let g = g.clone();
+                let calls = calls.clone();
+                move || {
+                    let next = calls.get() + 1;
+                    calls.set(next);
+                    assert!(next != 2, "repeat factory boom");
+                    g.init_node(
+                        from_iter(vec![7i32]),
+                        vec![],
+                        GraphNodeOpts::named(format!("repeat_panic_inner_{next}")),
+                    )
+                }
+            },
+            2,
+        ),
+        vec![],
+        GraphNodeOpts::named("repeat_panic"),
+    );
+    let shapes = collect_shapes::<i32>(&repeated);
+
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(calls.get(), 2);
+    assert_eq!(repeated.status(), graphrefly::Status::Errored);
+}
+
+#[test]
+fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
+    let g = graph();
+    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let repeated = g.init_node(
+        repeat::<i32>(
+            {
+                let g = g.clone();
+                let inners = inners.clone();
+                move || {
+                    let next = inners.borrow().len() + 1;
+                    let inner = g
+                        .producer_opts(|_| {}, GraphNodeOpts::named(format!("repeat_live_{next}")));
+                    inners.borrow_mut().push(inner.clone());
+                    inner
+                }
+            },
+            2,
+        ),
+        vec![],
+        GraphNodeOpts::named("repeat_live"),
+    );
+    let _seen = collect_shapes::<i32>(&repeated);
+
+    let snap = g.describe();
+    assert!(snap.nodes.iter().any(|n| n.id == "repeat_live_1"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|e| e.from == "repeat_live_1" && e.to == "repeat_live"));
+
+    let first_inner = inners.borrow()[0].clone();
+    first_inner.down(vec![Message::Complete]);
+    let snap = g.describe();
+    assert!(snap.nodes.iter().any(|n| n.id == "repeat_live_2"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|e| e.from == "repeat_live_2" && e.to == "repeat_live"));
+    assert!(!snap
+        .edges
+        .iter()
+        .any(|e| e.from == "repeat_live_1" && e.to == "repeat_live"));
 }
 
 #[test]

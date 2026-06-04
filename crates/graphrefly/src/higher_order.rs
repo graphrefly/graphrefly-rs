@@ -86,6 +86,41 @@ pub(crate) fn merge_map_with_ctx<TIn: Clone + 'static, TOut: 'static>(
     map_operator(factory, project, Mode::Merge)
 }
 
+#[derive(Clone)]
+struct RepeatState {
+    started: bool,
+    round: usize,
+    inner: Option<Core>,
+}
+
+/// repeat: run a fresh source from `factory` `count` times in sequence.
+///
+/// The factory must return a fresh node for each round. Reusing the same node is
+/// not a repeat in the clean-slate substrate: same-node remove+add is a no-op
+/// under D47, and terminal nodes cannot be force-resubscribed.
+pub fn repeat<T: 'static>(factory: impl Fn() -> Node<T> + 'static, count: usize) -> Operator<T> {
+    assert!(count > 0, "repeat: count must be positive");
+
+    let factory: Rc<dyn Fn() -> Node<T>> = Rc::new(factory);
+    let body_cell: BodyCell = Rc::new(RefCell::new(None));
+    let body_cell_for_body = body_cell.clone();
+    let body: Body = Rc::new(move |ctx| {
+        run_repeat_body(ctx, &factory, count, &body_cell_for_body);
+    });
+    *body_cell.borrow_mut() = Some(body.clone());
+
+    Operator::with_opts(
+        "repeat",
+        NodeOpts {
+            error_when_deps_error: false,
+            complete_when_deps_complete: false,
+            terminal_as_real_input: true,
+            ..NodeOpts::default()
+        },
+        move |ctx| body(ctx),
+    )
+}
+
 fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     factory: &'static str,
     project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
@@ -231,6 +266,81 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
 
     if st.source_done && st.inners.is_empty() && st.queue.is_empty() {
         ctx.down(vec![Message::Complete]);
+    }
+}
+
+fn run_repeat_body<T: 'static>(
+    ctx: &Ctx,
+    factory: &Rc<dyn Fn() -> Node<T>>,
+    count: usize,
+    body_cell: &BodyCell,
+) {
+    let mut st = ctx
+        .state_get::<RepeatState>()
+        .map(|v| (*v).clone())
+        .unwrap_or(RepeatState {
+            started: false,
+            round: 0,
+            inner: None,
+        });
+
+    forward_data(ctx, 0);
+
+    if let Some(error) = first_error_terminal(ctx) {
+        if let Some(inner) = st.inner.take() {
+            ctx.rewire_next_remove(inner, rewire_body(body_cell));
+        }
+        ctx.state_set(st);
+        ctx.down(vec![Message::Error(error.into())]);
+        return;
+    }
+
+    if !st.started {
+        let Some(inner) = make_repeat_inner(ctx, factory) else {
+            return;
+        };
+        st.started = true;
+        st.round = 0;
+        st.inner = Some(inner.clone());
+        ctx.state_set(st);
+        ctx.rewire_next_add(inner, rewire_body(body_cell));
+        return;
+    }
+
+    if st.inner.is_some() && is_complete(ctx.terminal(0)) {
+        let old = st.inner.take().expect("repeat inner was checked as Some");
+        ctx.rewire_next_remove(old, rewire_body(body_cell));
+        if st.round + 1 < count {
+            st.round += 1;
+            let Some(next) = make_repeat_inner(ctx, factory) else {
+                ctx.state_set(RepeatState {
+                    started: true,
+                    round: st.round,
+                    inner: None,
+                });
+                return;
+            };
+            st.inner = Some(next.clone());
+            ctx.state_set(st);
+            ctx.rewire_next_add(next, rewire_body(body_cell));
+        } else {
+            ctx.state_set(RepeatState {
+                started: true,
+                round: st.round,
+                inner: None,
+            });
+            ctx.down(vec![Message::Complete]);
+        }
+    }
+}
+
+fn make_repeat_inner<T: 'static>(ctx: &Ctx, factory: &Rc<dyn Fn() -> Node<T>>) -> Option<Core> {
+    match catch_unwind(AssertUnwindSafe(|| factory().erased())) {
+        Ok(core) => Some(core),
+        Err(payload) => {
+            ctx.down(vec![Message::Error(panic_payload(payload).into())]);
+            None
+        }
     }
 }
 

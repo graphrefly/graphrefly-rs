@@ -287,7 +287,7 @@ pub fn buffer<T: Clone + 'static>() -> Operator<Vec<T>> {
                 return;
             }
             if dep_has_data(ctx, 1) {
-                ctx.emit(buf.clone());
+                ctx.emit(std::mem::take(&mut buf));
                 ctx.state_set(Vec::<T>::new());
             } else {
                 ctx.state_set(buf);
