@@ -1371,6 +1371,7 @@ enum DownAction {
 }
 
 impl CoreWeak {
+    #[cfg(test)]
     fn counted_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
@@ -1480,7 +1481,7 @@ impl CoreWeak {
         //   enrolls in the arena-pinned touched set before any callback-capable work;
         // - no active wave: pin first and run through a borrowed owner view, avoiding
         //   counted churn for ordinary callback delivery and for late cleanup/release
-        //   windows. The counted path remains only as a defensive fallback.
+        //   windows.
         if wave_in_flight() {
             let Some(action) = self.collect_in_wave_receive_from_dep_action(idx, msg) else {
                 return;
@@ -1491,10 +1492,6 @@ impl CoreWeak {
             return;
         }
         if let Some((_pin, core)) = self.pinned_borrowed_core() {
-            core.receive_from_dep_registered(idx, msg);
-            return;
-        }
-        if let Some(core) = self.counted_core() {
             core.receive_from_dep_registered(idx, msg);
         }
     }
@@ -5679,10 +5676,9 @@ mod tests {
     }
 
     #[test]
-    fn internal_dep_callback_entry_pins_core_outside_wave() {
-        // The counted fallback remains available for non-wave weak recovery paths that
-        // cannot use an arena pin. The main receive_from_dep path now prefers a borrowed
-        // pinned owner, but counted_core itself must still pin while held.
+    fn internal_dep_callback_entry_uses_borrowed_pin_outside_wave() {
+        // DR-8/B54: the off-wave weak dep callback path should also use a temporary
+        // arena pin + borrowed Core, not a counted Core promotion.
         let arena = GraphArena::new();
         let source = Node::<i32>::state_in_arena(&arena, 1);
         let derived: Node<i32> = Node::derived_opts_in_arena(
@@ -5694,16 +5690,12 @@ mod tests {
         let weak = derived.core.downgrade();
         let refs_before = derived.core.refs.get();
 
-        let counted = weak
-            .counted_core()
-            .expect("counted core should exist while the node is live");
+        weak.receive_from_dep(0, &Message::Start);
         assert_eq!(
             derived.core.refs.get(),
-            refs_before + 1,
-            "outside a wave, weak dep entry pins the node with a counted Core"
+            refs_before,
+            "outside a wave, weak dep entry must not promote a counted Core"
         );
-        drop(counted);
-        assert_eq!(derived.core.refs.get(), refs_before);
     }
 
     #[test]
