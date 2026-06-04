@@ -1467,9 +1467,9 @@ impl CoreWeak {
         // DR-8/B54 receive policy:
         // - active wave: use a borrowed arena view; `Core::receive_from_dep` immediately
         //   enrolls in the arena-pinned touched set before any callback-capable work;
-        // - no active wave: promote to a counted Core when available; if the slot is
-        //   already arena-pinned, a borrowed view is still safe and avoids counted churn
-        //   during late cleanup/release windows.
+        // - no active wave: pin first and run through a borrowed owner view, avoiding
+        //   counted churn for ordinary callback delivery and for late cleanup/release
+        //   windows. The counted path remains only as a defensive fallback.
         if wave_in_flight() {
             let Some(action) = self.collect_in_wave_receive_from_dep_action(idx, msg) else {
                 return;
@@ -1479,14 +1479,13 @@ impl CoreWeak {
             }
             return;
         }
-        if let Some(core) = self.counted_core() {
+        if let Some((_pin, core)) = self.pinned_borrowed_core() {
             core.receive_from_dep_registered(idx, msg);
             return;
         }
-        let Some((_pin, core)) = self.pinned_borrowed_core() else {
-            return;
-        };
-        core.receive_from_dep_registered(idx, msg);
+        if let Some(core) = self.counted_core() {
+            core.receive_from_dep_registered(idx, msg);
+        }
     }
 }
 
@@ -5480,9 +5479,9 @@ mod tests {
 
     #[test]
     fn internal_dep_callback_entry_pins_core_outside_wave() {
-        // Recovery ERROR delivery runs outside the original wave scope. In that path a
-        // weak dep callback must hold a counted Core so subscriber callbacks cannot drop
-        // the final public handle and free the slot mid-delivery.
+        // The counted fallback remains available for non-wave weak recovery paths that
+        // cannot use an arena pin. The main receive_from_dep path now prefers a borrowed
+        // pinned owner, but counted_core itself must still pin while held.
         let arena = GraphArena::new();
         let source = Node::<i32>::state_in_arena(&arena, 1);
         let derived: Node<i32> = Node::derived_opts_in_arena(
@@ -5563,6 +5562,112 @@ mod tests {
             "in-wave collect/apply must not half-apply dep bookkeeping then skip the action"
         );
         drop(pin);
+    }
+
+    #[test]
+    fn internal_dep_callback_entry_out_of_wave_does_not_inflate_live_refcount() {
+        // When the target is still publicly owned, a borrowed owner execution should be used
+        // without increasing the temporary Core refcount visible to user callbacks.
+        let arena = GraphArena::new();
+        let source = Node::<i32>::state_empty_in_arena(&arena);
+        let observed_refs = Rc::new(Cell::new(0usize));
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| {
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.emit(*v);
+                }
+            },
+        );
+        let weak = derived.core.downgrade();
+
+        let _sub = derived.subscribe({
+            let observed_refs = observed_refs.clone();
+            let live_refs = derived.core.refs.clone();
+            move |msg| {
+                if matches!(msg, Message::Data(_)) {
+                    observed_refs.set(live_refs.get());
+                }
+            }
+        });
+        let live_refs = derived.core.refs.clone();
+        let baseline = live_refs.get();
+
+        weak.receive_from_dep(0, &Message::Data(Rc::new(7i32)));
+
+        assert_eq!(
+            observed_refs.get(),
+            baseline,
+            "out-of-wave receive should not promote/ref-bump while still borrowed by arena pin"
+        );
+        assert_eq!(derived.cache(), Some(7));
+        assert_eq!(
+            derived.core.refs.get(),
+            baseline,
+            "out-of-wave borrowed execution should preserve live counted handle count"
+        );
+    }
+
+    #[test]
+    fn internal_dep_callback_entry_out_of_wave_refcount_dead_pin_stays_fail_closed() {
+        // DR-8/B54 pin-first execution should work with refcount-dead live pins,
+        // then fail closed once that temporary pin is released.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        );
+        let weak = derived.core.downgrade();
+        let key = derived.core.key();
+        let refs = derived.core.refs.clone();
+        let borrowed = derived.core.borrowed_view();
+        let pin = ArenaNodePin::from_core(&derived.core).expect("node must be pinnable while live");
+
+        drop(derived);
+
+        assert_eq!(
+            refs.get(),
+            0,
+            "setup leaves no counted owner so this only exercises fail-closed pin behavior"
+        );
+        weak.receive_from_dep(0, &Message::Data(Rc::new(4i32)));
+        assert_eq!(
+            borrowed
+                .cache_any()
+                .and_then(|v| v.downcast_ref::<i32>().copied()),
+            Some(4),
+            "pinned borrowed receive should still execute while the slot is temporarily alive"
+        );
+
+        drop(pin);
+        assert!(
+            !graph.borrow().is_live_key(key),
+            "pin release should allow slot cleanup"
+        );
+        assert!(
+            weak.counted_core().is_none(),
+            "fail-closed should not revive a dead counted handle after pin release"
+        );
+        assert!(
+            weak.borrowed_core().is_none(),
+            "fail-closed should not rehydrate from dead refs with no pin"
+        );
+        assert!(
+            weak.pinned_borrowed_core().is_none(),
+            "fail-closed should not construct a borrowed pin path after release"
+        );
+        weak.receive_from_dep(0, &Message::Data(Rc::new(5i32)));
+        assert_eq!(
+            refs.get(),
+            0,
+            "receive from a dead slot must not resurrect refs"
+        );
     }
 
     #[test]
