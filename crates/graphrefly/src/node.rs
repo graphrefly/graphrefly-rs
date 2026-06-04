@@ -1585,11 +1585,11 @@ impl CoreToken {
             return None;
         }
         let refs = self.refs.upgrade()?;
-        if refs.get() == 0 {
-            return None;
-        }
         {
             let mut g = graph.borrow_mut();
+            if !(g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)) {
+                return None;
+            }
             if !g.pin_live_key(self.key) {
                 return None;
             }
@@ -6467,6 +6467,63 @@ mod tests {
             d.cache(),
             Some(20),
             "batch-deferred external rewire still drains at the committed boundary"
+        );
+    }
+
+    #[test]
+    fn batch_boundary_task_executes_after_last_public_owner_drops() {
+        // DR-8/B54: a queued boundary task can run while the public handle is gone,
+        // as long as the batch target pin keeps the arena slot live during commit.
+        let arena = GraphArena::new();
+        let graph = arena.0.clone();
+        let dep = Node::<i32>::state_in_arena(&arena, 10);
+        let source = Node::<i32>::state_in_arena(&arena, 1);
+        source.core.activate();
+        let key = source.core.key();
+        let refs = source.core.refs.clone();
+        let seen_refs = Rc::new(Cell::new(usize::MAX));
+
+        crate::batch::batch({
+            let dep = dep.erased();
+            let graph = graph.clone();
+            let refs = refs.clone();
+            let seen_refs = seen_refs.clone();
+            move |_| {
+                let owned = source;
+                owned.set(2);
+                owned.set_deps(vec![dep], {
+                    let refs = refs.clone();
+                    let seen_refs = seen_refs.clone();
+                    move |ctx| {
+                        seen_refs.set(refs.get());
+                        ctx.emit(*ctx.data::<i32>(0).expect("cached added dep data"));
+                    }
+                });
+                drop(owned);
+                assert_eq!(
+                    refs.get(),
+                    0,
+                    "batch-deferred external rewire owner can drop to zero while queued"
+                );
+                assert!(
+                    graph.borrow().pin_count(key) >= 1,
+                    "batch target pin keeps the arena slot live during commit"
+                );
+                assert!(
+                    graph.borrow().is_live_key(key),
+                    "batch target pin keeps slot live during committed-boundary drain"
+                );
+            }
+        });
+
+        assert_eq!(
+            seen_refs.get(),
+            0,
+            "batch-deferred external rewire executes from borrowed pin when refs reach zero"
+        );
+        assert!(
+            !graph.borrow().is_live_key(key),
+            "batch pin should release when commit finishes"
         );
     }
 
