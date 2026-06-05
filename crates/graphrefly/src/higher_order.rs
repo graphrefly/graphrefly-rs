@@ -33,32 +33,79 @@ struct MapState<TIn> {
     source_done: bool,
 }
 
+/// Options for [`merge_map_with_options`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MergeMapOptions {
+    /// Maximum number of live inner deps at once. `None` keeps the default unbounded merge_map.
+    pub concurrent: Option<usize>,
+}
+
 /// switch_map: project each source DATA to an inner node, cancelling the prior live inner.
 pub fn switch_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("switchMap", move |_ctx, value| project(value), Mode::Switch)
+    map_operator(
+        "switchMap",
+        move |_ctx, value| project(value),
+        Mode::Switch,
+        None,
+    )
 }
 
 /// merge_map: project every source DATA to an inner node and merge all live inners.
 pub fn merge_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("mergeMap", move |_ctx, value| project(value), Mode::Merge)
+    map_operator(
+        "mergeMap",
+        move |_ctx, value| project(value),
+        Mode::Merge,
+        None,
+    )
+}
+
+/// merge_map_with_options: merge_map plus optional in-flight inner limiting.
+///
+/// `concurrent = Some(n)` means at most `n` live inner deps are subscribed at once; excess
+/// outer DATA values are queued and projected lazily when an inner COMPLETE frees a slot.
+#[must_use]
+pub fn merge_map_with_options<TIn: Clone + 'static, TOut: 'static>(
+    project: impl Fn(&TIn) -> Node<TOut> + 'static,
+    opts: MergeMapOptions,
+) -> Operator<TOut> {
+    if let Some(0) = opts.concurrent {
+        panic!("merge_map_with_options: concurrent must be positive");
+    }
+    map_operator(
+        "mergeMap",
+        move |_ctx, value| project(value),
+        Mode::Merge,
+        opts.concurrent,
+    )
 }
 
 /// flat_map: alias-shaped Rust helper for [`merge_map`].
 pub fn flat_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("flatMap", move |_ctx, value| project(value), Mode::Merge)
+    map_operator(
+        "flatMap",
+        move |_ctx, value| project(value),
+        Mode::Merge,
+        None,
+    )
 }
 
 /// concat_map: queue source values and run one projected inner at a time.
 pub fn concat_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator("concatMap", move |_ctx, value| project(value), Mode::Concat)
+    map_operator(
+        "concatMap",
+        move |_ctx, value| project(value),
+        Mode::Concat,
+        None,
+    )
 }
 
 /// exhaust_map: project the first source DATA while no inner is live; ignore source DATA while busy.
@@ -69,6 +116,7 @@ pub fn exhaust_map<TIn: Clone + 'static, TOut: 'static>(
         "exhaustMap",
         move |_ctx, value| project(value),
         Mode::Exhaust,
+        None,
     )
 }
 
@@ -76,14 +124,14 @@ pub(crate) fn switch_map_with_ctx<TIn: Clone + 'static, TOut: 'static>(
     factory: &'static str,
     project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator(factory, project, Mode::Switch)
+    map_operator(factory, project, Mode::Switch, None)
 }
 
 pub(crate) fn merge_map_with_ctx<TIn: Clone + 'static, TOut: 'static>(
     factory: &'static str,
     project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
 ) -> Operator<TOut> {
-    map_operator(factory, project, Mode::Merge)
+    map_operator(factory, project, Mode::Merge, None)
 }
 
 #[derive(Clone)]
@@ -127,12 +175,13 @@ fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     factory: &'static str,
     project: impl Fn(&Ctx, &TIn) -> Node<TOut> + 'static,
     mode: Mode,
+    concurrent: Option<usize>,
 ) -> Operator<TOut> {
     let project: Project<TIn, TOut> = Rc::new(project);
     let body_cell: BodyCell = Rc::new(RefCell::new(None));
     let body_cell_for_body = body_cell.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_map_body(ctx, &project, mode, &body_cell_for_body);
+        run_map_body(ctx, &project, mode, concurrent, &body_cell_for_body);
     });
     *body_cell.borrow_mut() = Some(body.clone());
     Operator::with_opts(
@@ -152,6 +201,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     ctx: &Ctx,
     project: &Project<TIn, TOut>,
     mode: Mode,
+    concurrent: Option<usize>,
     body_cell: &BodyCell,
 ) {
     let mut st = ctx
@@ -207,21 +257,32 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
                         push_unique(&mut to_remove, live.clone());
                     }
                 }
-                if !contains_core(&st.inners, &inner) {
-                    to_add.push(inner.clone());
+                if contains_core(&to_remove, &inner) {
+                    st.inners.clear();
+                } else {
+                    if !contains_core(&st.inners, &inner) {
+                        to_add.push(inner.clone());
+                    }
+                    st.inners = vec![inner];
                 }
-                st.inners = vec![inner];
             }
             Mode::Merge => {
-                for value in source_batch {
-                    let Some(inner) =
-                        project_inner(ctx, project, value.as_ref(), &mut st, body_cell)
-                    else {
-                        return;
-                    };
-                    if !contains_core(&st.inners, &inner) {
-                        st.inners.push(inner.clone());
-                        to_add.push(inner);
+                if concurrent.is_some() {
+                    for value in source_batch {
+                        st.queue.push_back(value.as_ref().clone());
+                    }
+                } else {
+                    for value in source_batch {
+                        let Some(inner) =
+                            project_inner(ctx, project, value.as_ref(), &mut st, body_cell)
+                        else {
+                            return;
+                        };
+                        if !contains_core(&st.inners, &inner) && !contains_core(&to_remove, &inner)
+                        {
+                            st.inners.push(inner.clone());
+                            to_add.push(inner);
+                        }
                     }
                 }
             }
@@ -241,9 +302,24 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
                     else {
                         return;
                     };
-                    st.inners.push(inner.clone());
-                    to_add.push(inner);
+                    if !contains_core(&to_remove, &inner) {
+                        st.inners.push(inner.clone());
+                        to_add.push(inner);
+                    }
                 }
+            }
+        }
+    }
+
+    if matches!(mode, Mode::Merge) {
+        while !st.queue.is_empty() && concurrent.is_none_or(|max| st.inners.len() < max) {
+            let value = st.queue.pop_front().expect("queue checked as non-empty");
+            let Some(inner) = project_inner(ctx, project, &value, &mut st, body_cell) else {
+                return;
+            };
+            if !contains_core(&st.inners, &inner) && !contains_core(&to_remove, &inner) {
+                st.inners.push(inner.clone());
+                to_add.push(inner);
             }
         }
     }
@@ -253,8 +329,10 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
             let Some(inner) = project_inner(ctx, project, &value, &mut st, body_cell) else {
                 return;
             };
-            st.inners.push(inner.clone());
-            to_add.push(inner);
+            if !contains_core(&to_remove, &inner) {
+                st.inners.push(inner.clone());
+                to_add.push(inner);
+            }
         }
     }
 

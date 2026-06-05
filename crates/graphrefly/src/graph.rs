@@ -11,8 +11,9 @@ use std::rc::Rc;
 
 use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{batch as run_batch, BatchCtx};
+use crate::checkpoint::GraphCheckpointJson;
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
-use crate::dispatcher::{default_dispatcher, Dispatcher};
+use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, LockId, Message, Tier};
@@ -58,6 +59,7 @@ pub struct GraphNodeOpts {
     pub name: Option<String>,
     pub meta: BTreeMap<String, String>,
     pub node: NodeOpts,
+    pub restore: Option<RestoreFactoryMeta>,
 }
 
 impl GraphNodeOpts {
@@ -69,6 +71,33 @@ impl GraphNodeOpts {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreFactoryMeta {
+    pub ref_: String,
+    pub config: Option<GraphCheckpointJson>,
+    pub config_version: Option<GraphCheckpointJson>,
+}
+
+impl RestoreFactoryMeta {
+    pub fn registry_ref(ref_: impl Into<String>) -> Self {
+        Self {
+            ref_: ref_.into(),
+            config: None,
+            config_version: None,
+        }
+    }
+
+    pub fn with_config(mut self, config: GraphCheckpointJson) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn with_config_version(mut self, config_version: GraphCheckpointJson) -> Self {
+        self.config_version = Some(config_version);
+        self
+    }
+}
+
 #[derive(Clone)]
 struct Entry {
     core: Core,
@@ -76,6 +105,7 @@ struct Entry {
     name: Option<String>,
     factory: String,
     meta: BTreeMap<String, String>,
+    restore: Option<RestoreFactoryMeta>,
 }
 
 struct Mount {
@@ -411,18 +441,93 @@ impl Graph {
         }
     }
 
+    pub(crate) fn checkpoint_entries(&self) -> Vec<crate::checkpoint::CheckpointEntry> {
+        self.inner
+            .entries
+            .borrow()
+            .iter()
+            .map(|entry| crate::checkpoint::CheckpointEntry {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                factory: entry.factory.clone(),
+                meta: entry.meta.clone(),
+                restore: entry.restore.clone(),
+                core: entry.core.clone(),
+                unregistered: false,
+            })
+            .collect()
+    }
+
+    pub(crate) fn checkpoint_mounts(&self) -> Vec<(String, Graph)> {
+        self.inner
+            .mounts
+            .borrow()
+            .iter()
+            .map(|mount| (mount.at.clone(), mount.graph.clone()))
+            .collect()
+    }
+
+    pub(crate) fn checkpoint_synthetic_id_for_core(&self, core: &Core) -> String {
+        self.synthetic_id_for_core(core, "")
+    }
+
+    pub(crate) fn restore_state_json_with_id(
+        &self,
+        id: String,
+        opts: GraphNodeOpts,
+    ) -> Node<GraphCheckpointJson> {
+        let node = Node::state_empty_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+        );
+        self.add_with_id(node, "state", id, opts)
+    }
+
+    pub(crate) fn restore_node_with_id(
+        &self,
+        id: String,
+        factory: &'static str,
+        deps: Vec<Core>,
+        f: NodeFn,
+        opts: GraphNodeOpts,
+    ) -> Node<GraphCheckpointJson> {
+        self.assert_graph_local_deps(&deps, &id);
+        let node = Node::derived_opts_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+            deps,
+            opts.node.clone(),
+            move |ctx| f(ctx),
+        );
+        self.add_with_id(node, factory, id, opts)
+    }
+
+    pub(crate) fn mount_restored(&self, child: Graph, at: String) {
+        self.mount(child, at);
+    }
+
     fn add<T: 'static>(&self, node: Node<T>, factory: &str, opts: GraphNodeOpts) -> Node<T> {
+        let id = opts.name.clone().unwrap_or_else(|| {
+            let next = self.inner.seq.get();
+            self.inner.seq.set(next + 1);
+            format!("{factory}#{next}")
+        });
+        self.add_with_id(node, factory, id, opts)
+    }
+
+    fn add_with_id<T: 'static>(
+        &self,
+        node: Node<T>,
+        factory: &str,
+        id: String,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
         assert!(
             node.erased().same_graph_arena(&self.inner.arena),
             "graph node belongs to a different graph arena"
         );
         let core = node.erased();
         core.set_local_async_driver(self.inner.local_async_driver.clone());
-        let id = opts.name.clone().unwrap_or_else(|| {
-            let next = self.inner.seq.get();
-            self.inner.seq.set(next + 1);
-            format!("{factory}#{next}")
-        });
         assert!(
             !self.inner.by_id.borrow().contains_key(&id),
             "duplicate graph node id '{id}'"
@@ -433,9 +538,16 @@ impl Graph {
             name: opts.name,
             factory: factory.to_owned(),
             meta: opts.meta,
+            restore: opts.restore,
         };
-        self.inner.by_id.borrow_mut().insert(id, core);
+        self.inner.by_id.borrow_mut().insert(id.clone(), core);
         self.inner.entries.borrow_mut().push(entry);
+        if let Some(n) = id
+            .rsplit_once('#')
+            .and_then(|(_, n)| n.parse::<usize>().ok())
+        {
+            self.inner.seq.set(self.inner.seq.get().max(n + 1));
+        }
         node
     }
 

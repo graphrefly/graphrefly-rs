@@ -13,11 +13,12 @@ use graphrefly::{
     audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
     element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
-    from_timer, future_local, graph, interval, last, last_any, map, merge_map, never, of,
-    on_first_data, on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan,
-    settle, settle_by, skip, stream_local, switch_map, take, take_until, take_while, tap,
-    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
-    Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
+    from_timer, future_local, graph, interval, last, last_any, map, merge_map,
+    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, race, reduce,
+    repeat, rescue, sample, scan, settle, settle_by, skip, stream_local, switch_map, take,
+    take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error, timeout, timer,
+    valve, with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
+    MergeMapOptions, Message, Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -2553,6 +2554,96 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
     assert!(factories.contains(&("merge_map", "mergeMap")));
     assert!(factories.contains(&("concat_map", "concatMap")));
     assert!(factories.contains(&("flat_map", "flatMap")));
+}
+
+#[test]
+fn higher_order_merge_map_with_options_limits_live_inners() {
+    let g = graph();
+    let source = g.state_empty::<i32>();
+    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let merged = g.init_node(
+        merge_map_with_options::<i32, i32>(
+            {
+                let g = g.clone();
+                let inners = inners.clone();
+                move |_v| {
+                    let inner = g.state_empty::<i32>();
+                    inners.borrow_mut().push(inner.clone());
+                    inner
+                }
+            },
+            MergeMapOptions {
+                concurrent: Some(2),
+            },
+        ),
+        vec![source.erased()],
+        GraphNodeOpts::named("merge_map_bounded"),
+    );
+    let seen = collect_data(&merged);
+
+    source.down(vec![
+        Message::Data(Rc::new(1i32)),
+        Message::Data(Rc::new(2i32)),
+        Message::Data(Rc::new(3i32)),
+        Message::Complete,
+    ]);
+    assert_eq!(
+        inners.borrow().len(),
+        2,
+        "bounded merge_map should not project queued work until an inner completes"
+    );
+    let inner_0 = inners.borrow()[0].clone();
+    let inner_1 = inners.borrow()[1].clone();
+    inner_0.set(10);
+    inner_1.set(20);
+    assert_eq!(*seen.borrow(), vec![10, 20]);
+    assert_ne!(merged.status(), graphrefly::Status::Completed);
+
+    inner_0.down(vec![Message::Complete]);
+    assert_eq!(
+        inners.borrow().len(),
+        3,
+        "one completed inner frees exactly one bounded merge_map slot"
+    );
+    let inner_2 = inners.borrow()[2].clone();
+    inner_2.set(30);
+    assert_eq!(*seen.borrow(), vec![10, 20, 30]);
+    inner_1.down(vec![Message::Complete]);
+    inner_2.down(vec![Message::Complete]);
+    assert_eq!(merged.status(), graphrefly::Status::Completed);
+}
+
+#[test]
+fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
+    let g = graph();
+    let source = g.state_empty::<i32>();
+    let inner = g.state_empty::<i32>();
+    let merged = g.init_node(
+        merge_map_with_options::<i32, i32>(
+            {
+                let inner = inner.clone();
+                move |_v| inner.clone()
+            },
+            MergeMapOptions {
+                concurrent: Some(1),
+            },
+        ),
+        vec![source.erased()],
+        GraphNodeOpts::named("merge_map_bounded_reused_inner"),
+    );
+    let seen = collect_data(&merged);
+
+    source.down(vec![
+        Message::Data(Rc::new(1i32)),
+        Message::Data(Rc::new(2i32)),
+        Message::Complete,
+    ]);
+    inner.set(10);
+    assert_eq!(*seen.borrow(), vec![10]);
+    assert_ne!(merged.status(), graphrefly::Status::Completed);
+
+    inner.down(vec![Message::Complete]);
+    assert_eq!(merged.status(), graphrefly::Status::Completed);
 }
 
 #[test]

@@ -3,13 +3,17 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
-    default_dispatcher, describe_to_ascii, describe_to_d2, describe_to_d2_with_direction,
-    describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
+    default_dispatcher, default_restore_registry, describe_to_ascii, describe_to_d2,
+    describe_to_d2_with_direction, describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
     describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, filter,
-    from_iter, graph, graph_opts, map, merge, scan, take, timeout, DescribeEdge, DescribeOpts,
-    DescribeValue, DiagramDirection, Dispatcher, Explain, GraphNodeOpts, GraphOptions, LockId,
-    Message, NodeOpts, Pausable, Status, Tier, Values,
+    from_iter, graph, graph_opts, map, merge, restore_graph, restore_registry, scan, take, timeout,
+    DescribeEdge, DescribeOpts, DescribeValue, DiagramDirection, Dispatcher, Explain,
+    GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue,
+    GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry, LockId, Message,
+    NodeOpts, Pausable, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, Values,
+    GRAPH_CHECKPOINT_VERSION,
 };
+use serde_json::json;
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
     values
@@ -17,6 +21,15 @@ fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
         .last()
         .and_then(|wave| wave.last().cloned())
         .or_else(|| values.prev::<i32>(i))
+}
+
+fn json_cache(node: graphrefly::GraphNode) -> GraphCheckpointJson {
+    node.cache_any()
+        .expect("node has cached DATA")
+        .downcast::<GraphCheckpointJson>()
+        .expect("restored DATA is JSON")
+        .as_ref()
+        .clone()
 }
 
 #[test]
@@ -109,6 +122,176 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
         to: "raw".to_owned(),
     }));
     observer.unsubscribe();
+}
+
+#[test]
+fn checkpoint_uses_neutral_schema_and_restores_fresh_json_state() {
+    let g = graph_opts(GraphOptions::named("restore-demo"));
+    let count = g.state_opts(2i32, GraphNodeOpts::named("count"));
+    let _keep_active = count.subscribe(|_| {});
+
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    assert_eq!(checkpoint.version, GRAPH_CHECKPOINT_VERSION);
+    assert_eq!(checkpoint.name.as_deref(), Some("restore-demo"));
+    let count_checkpoint = checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "count")
+        .expect("count checkpoint exists");
+    assert_eq!(
+        count_checkpoint.value,
+        GraphCheckpointValue::Data { data: json!(2) }
+    );
+    serde_json::to_string(&checkpoint).expect("checkpoint is JSON serializable");
+
+    let restored = restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(default_restore_registry()),
+    )
+    .expect("fresh restore succeeds");
+    let restored_count = restored.find("count").expect("restored node is registered");
+    assert_eq!(restored_count.status(), Status::Settled);
+    assert_eq!(json_cache(restored_count.clone()), json!(2));
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_sink = seen.clone();
+    let _unsub = restored_count.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            seen_sink.borrow_mut().push(
+                value
+                    .as_ref()
+                    .downcast_ref::<GraphCheckpointJson>()
+                    .cloned(),
+            );
+        }
+    });
+    assert_eq!(*seen.borrow(), vec![Some(json!(2))]);
+}
+
+#[test]
+fn restore_registry_definitions_rebuild_declared_json_map_nodes() {
+    let g = graph();
+    let source = g.state_opts(json!(3), GraphNodeOpts::named("source"));
+    let mut opts = GraphNodeOpts::named("double");
+    opts.restore =
+        Some(RestoreFactoryMeta::registry_ref("map").with_config(json!({ "fn": "double-json" })));
+    let doubled = g.node_opts::<GraphCheckpointJson, _>(
+        vec![source.erased()],
+        |ctx| {
+            for value in ctx.batch::<GraphCheckpointJson>(0) {
+                ctx.emit(json!(value.as_i64().expect("number input") * 2));
+            }
+        },
+        opts,
+    );
+    let _keep_active = doubled.subscribe(|_| {});
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+
+    let registry = restore_registry([
+        GraphRestoreEntry::descriptor(graphrefly::StateRestoreDescriptor),
+        GraphRestoreEntry::descriptor(graphrefly::MapJsonRestoreDescriptor),
+        GraphRestoreEntry::definition(GraphRestoreDefinition::json("double-json", |value| {
+            Ok(json!(value.as_i64().expect("number input") * 2))
+        })),
+    ]);
+    let restored = restore_graph(checkpoint, RestoreGraphOptions::new(registry))
+        .expect("fresh restore succeeds");
+
+    assert_eq!(
+        json_cache(restored.find("source").expect("source restored")),
+        json!(3)
+    );
+    assert_eq!(
+        json_cache(restored.find("double").expect("double restored")),
+        json!(6)
+    );
+    let snap = restored.describe();
+    assert!(snap.edges.contains(&DescribeEdge {
+        from: "source".to_owned(),
+        to: "double".to_owned(),
+    }));
+}
+
+#[test]
+fn checkpoint_auto_discovers_unregistered_live_deps_as_local_only() {
+    let g = graph_opts(GraphOptions::named("synthetic-checkpoint"));
+    let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
+    let timed = timeout(&source, 10);
+    g.init_node(
+        map::<i32, i32>(|v| *v),
+        vec![timed.erased()],
+        GraphNodeOpts::named("sink"),
+    );
+
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    let timeout_node = checkpoint
+        .nodes
+        .iter()
+        .find(|node| {
+            node.factory
+                == (GraphCheckpointFactory::LocalOnly {
+                    name: "timeout".to_owned(),
+                    reason: "node is an unregistered live dependency auto-discovered from topology"
+                        .to_owned(),
+                })
+        })
+        .expect("timeout helper is checkpointed as local-only");
+    let timer_node = checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id.starts_with("~timer#"))
+        .expect("transitive timer helper is checkpointed");
+
+    assert!(timeout_node.id.starts_with("~timeout#"));
+    assert!(timeout_node.deps.contains(&"source".to_owned()));
+    assert!(timeout_node.deps.contains(&timer_node.id));
+    assert!(checkpoint.edges.contains(&GraphCheckpointEdge {
+        from: timeout_node.id.clone(),
+        to: "sink".to_owned(),
+    }));
+    assert!(checkpoint.edges.contains(&GraphCheckpointEdge {
+        from: timer_node.id.clone(),
+        to: timeout_node.id.clone(),
+    }));
+}
+
+#[test]
+fn restored_explicit_hash_ids_advance_unnamed_node_sequence() {
+    let g = graph();
+    let source = g.state_opts(json!(1), GraphNodeOpts::default());
+    let _keep_active = source.subscribe(|_| {});
+
+    let restored = restore_graph(
+        g.checkpoint().expect("checkpoint succeeds"),
+        RestoreGraphOptions::new(default_restore_registry()),
+    )
+    .expect("restore succeeds");
+    restored.state_opts(json!(2), GraphNodeOpts::default());
+
+    assert!(restored.find("state#0").is_some());
+    assert!(restored.find("state#1").is_some());
+}
+
+#[test]
+fn restore_rejects_local_only_factories_honestly() {
+    let g = graph();
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let derived = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("local"),
+    );
+    let _keep_active = derived.subscribe(|_| {});
+
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    let err = match restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(default_restore_registry()),
+    ) {
+        Ok(_) => panic!("local-only derived restore must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("local-only"));
 }
 
 #[test]

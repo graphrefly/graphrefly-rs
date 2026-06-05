@@ -891,6 +891,27 @@ impl NodeAux {
     }
 }
 
+pub(crate) struct NodeCheckpointRuntime {
+    pub cache: Option<AnyValue>,
+    pub has_data: bool,
+    pub status: Status,
+    pub terminal: bool,
+    pub activated: bool,
+    pub has_called_fn_once: bool,
+    pub ctx_state: Option<AnyValue>,
+    pub ctx_state_persist: bool,
+}
+
+pub(crate) struct NodeRestoreRuntime {
+    pub cache: Option<AnyValue>,
+    pub has_data: bool,
+    pub status: Status,
+    pub terminal: bool,
+    pub has_called_fn_once: bool,
+    pub ctx_state: Option<AnyValue>,
+    pub ctx_state_persist: bool,
+}
+
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
 /// reentrant engine lives on [`Core`].
 struct NodeTopologySlot {
@@ -2321,6 +2342,43 @@ impl Core {
 
     pub(crate) fn handle(&self) -> Option<Handle> {
         self.with_call(|c| c.handle)
+    }
+
+    pub(crate) fn checkpoint_runtime(&self) -> NodeCheckpointRuntime {
+        self.with_node_state_aux_mut(|_n, _c, _cfg, r, e, a| NodeCheckpointRuntime {
+            cache: e.value.cache.clone(),
+            has_data: e.value.has_data,
+            status: e.value.status,
+            terminal: e.value.terminal,
+            activated: a.activated,
+            has_called_fn_once: r.has_called_fn_once,
+            ctx_state: a.state.clone(),
+            ctx_state_persist: a.state_persist,
+        })
+    }
+
+    pub(crate) fn restore_runtime(&self, state: NodeRestoreRuntime) {
+        self.with_node_state_aux_mut(|_n, _c, cfg, r, e, a| {
+            e.value.cache = state.cache;
+            e.value.has_data = state.has_data;
+            e.value.status = state.status;
+            e.value.terminal = state.terminal;
+            e.wave = NodeWaveState::new();
+            e.state = DepState::new(e.unsubs.len());
+            r.has_called_fn_once = state.has_called_fn_once;
+            a.activated = false;
+            a.state = state.ctx_state;
+            a.state_persist = state.ctx_state_persist;
+            a.on_deactivation.clear();
+            a.on_invalidate.clear();
+            a.pull_demand_owed = false;
+            a.pause_lockset.clear();
+            if let Some(lock) = cfg.pull_id.clone() {
+                a.pause_lockset.insert(lock);
+            }
+            a.paused_dep_wave_occurred = false;
+            a.pause_buffer.clear();
+        });
     }
 
     pub(crate) fn local_async_driver(

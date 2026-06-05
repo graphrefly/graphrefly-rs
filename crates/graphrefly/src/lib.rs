@@ -56,6 +56,7 @@
 
 pub mod async_driver;
 pub mod batch;
+pub mod checkpoint;
 pub mod combinators;
 pub mod ctx;
 pub mod dispatcher;
@@ -72,6 +73,14 @@ pub mod time;
 pub use async_driver::TokioLocalDriver;
 pub use async_driver::{DriverCancel, LocalAsyncDriver};
 pub use batch::{batch, BatchCtx};
+pub use checkpoint::{
+    default_restore_registry, restore_graph, restore_registry, GraphCheckpoint,
+    GraphCheckpointCtxState, GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson,
+    GraphCheckpointLifecycle, GraphCheckpointMount, GraphCheckpointNode, GraphCheckpointTerminal,
+    GraphCheckpointValue, GraphRestoreDefinition, GraphRestoreEntry, GraphRestoreError,
+    GraphRestoreRegistry, GraphRestoreResult, MapJsonRestoreDescriptor, RestoreGraphOptions,
+    RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, GRAPH_CHECKPOINT_VERSION,
+};
 pub use combinators::{
     buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,
     with_latest_from, zip,
@@ -81,9 +90,12 @@ pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
     Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, NodeProfile,
-    ObserveEvent, ObserveMessage, ObserveStream, Profile, Values,
+    ObserveEvent, ObserveMessage, ObserveStream, Profile, RestoreFactoryMeta, Values,
 };
-pub use higher_order::{concat_map, exhaust_map, flat_map, merge_map, repeat, switch_map};
+pub use higher_order::{
+    concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,
+    MergeMapOptions,
+};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,

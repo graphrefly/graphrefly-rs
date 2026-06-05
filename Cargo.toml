@@ -49,6 +49,8 @@ authors      = ["David Chen<clfhhc@gmail.com>"]
 # Errors / logging
 thiserror   = { version = "1" }
 tracing     = { version = "0.1" }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1" }
 
 # Small-collection primitives
 smallvec    = { version = "1.13", features = ["union", "const_new"] }
