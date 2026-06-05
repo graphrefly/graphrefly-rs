@@ -663,6 +663,41 @@ fn timeout_arms_on_subscribe_resets_and_cleans_up() {
 }
 
 #[test]
+fn timeout_cached_source_forwards_cached_value_then_times_out_after_deadline() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state(5i32);
+    let timed = timeout(&src, 10);
+    let seen = collect_shapes::<i32>(&timed);
+    let data = collect_data(&timed);
+
+    assert_eq!(*data.borrow(), vec![5]);
+    assert_eq!(*seen.borrow(), vec!["DATA"]);
+    assert_eq!(
+        driver
+            .sleepers
+            .borrow()
+            .iter()
+            .filter(|s| s.active.get())
+            .count(),
+        1,
+        "cached source activation should replace the initial idle timer with exactly one live timer"
+    );
+
+    driver.fire_sleepers();
+
+    assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(
+        timed.status(),
+        graphrefly::Status::Errored,
+        "cached source DATA should not satisfy future idle deadlines forever"
+    );
+}
+
+#[test]
 fn timeout_propagates_source_error_and_missing_driver_error() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
@@ -729,6 +764,39 @@ fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
 }
 
 #[test]
+fn buffer_time_cached_source_buffers_initial_value_and_flushes_on_first_tick() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state(5i32);
+    let buffered = buffer_time(&src, 10);
+    let data = collect_data(&buffered);
+
+    assert!(data.borrow().is_empty());
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        1,
+        "cached source activation should keep one live flushing interval"
+    );
+
+    driver.tick_intervals();
+    assert_eq!(*data.borrow(), vec![vec![5]]);
+    driver.tick_intervals();
+    assert_eq!(
+        *data.borrow(),
+        vec![vec![5], Vec::<i32>::new()],
+        "cached source DATA should not be replayed into later windows"
+    );
+}
+
+#[test]
 fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
@@ -782,6 +850,62 @@ fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
         *collect_shapes::<Vec<i32>>(&missing).borrow(),
         vec!["ERROR"],
         "D114 subscribe-armed buffer_time must activate the interval before cached source DATA"
+    );
+}
+
+#[test]
+fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let delayed = g.init_node(
+        delay::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("delay_same_wave_terminal"),
+    );
+    let delayed_seen = collect_shapes::<i32>(&delayed);
+    let delayed_data = collect_data(&delayed);
+
+    src.down(vec![Message::Data(Rc::new(7i32)), Message::Complete]);
+    assert!(delayed_seen.borrow().is_empty());
+    driver.fire_sleepers();
+    assert_eq!(*delayed_data.borrow(), vec![7]);
+    assert_eq!(*delayed_seen.borrow(), vec!["DATA", "COMPLETE"]);
+
+    let src = g.state_empty::<i32>();
+    let buffered = buffer_time(&src, 10);
+    let buffered_seen = collect_shapes::<Vec<i32>>(&buffered);
+    let buffered_data = collect_data(&buffered);
+
+    src.down(vec![
+        Message::Data(Rc::new(9i32)),
+        Message::Error("source failed".into()),
+    ]);
+
+    assert_eq!(
+        *buffered_data.borrow(),
+        Vec::<Vec<i32>>::new(),
+        "same-wave DATA+ERROR should drop the partial buffer instead of flushing it"
+    );
+    assert_eq!(*buffered_seen.borrow(), vec!["ERROR"]);
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        0,
+        "source ERROR should deactivate the helper interval, not just seal the output"
+    );
+    driver.tick_intervals();
+    assert_eq!(
+        *buffered_seen.borrow(),
+        vec!["ERROR"],
+        "source ERROR should remove the interval helper before future ticks"
     );
 }
 
@@ -1896,6 +2020,38 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
 }
 
 #[test]
+fn higher_order_merge_map_dedupes_reused_live_inner() {
+    let g = graph();
+    let source = g.state_empty::<i32>();
+    let shared = g.state_empty::<i32>();
+    let merged = g.init_node(
+        merge_map::<i32, i32>({
+            let shared = shared.clone();
+            move |_| shared.clone()
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("merge_reused_inner"),
+    );
+    let shapes = collect_shapes::<i32>(&merged);
+    let data = collect_data(&merged);
+
+    source.down(vec![
+        Message::Data(Rc::new(1i32)),
+        Message::Data(Rc::new(2i32)),
+        Message::Complete,
+    ]);
+    shared.set(10);
+    shared.down(vec![Message::Complete]);
+
+    assert_eq!(*data.borrow(), vec![10]);
+    assert_eq!(
+        *shapes.borrow(),
+        vec!["DATA", "COMPLETE"],
+        "a projector returning an already-live inner should not leave a duplicate tracked inner"
+    );
+}
+
+#[test]
 fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     let g = graph();
 
@@ -2001,5 +2157,55 @@ fn higher_order_projector_panic_cleans_live_inners() {
         shapes.borrow().len(),
         after_error,
         "terminal higher-order output should be sealed after projector panic"
+    );
+}
+
+#[test]
+fn higher_order_switch_projector_panic_detaches_previous_inner() {
+    let g = graph();
+
+    let source = g.state_empty::<i32>();
+    let cleanup = Rc::new(Cell::new(0usize));
+    let inner = g.producer({
+        let cleanup = cleanup.clone();
+        move |ctx| {
+            ctx.on_deactivation({
+                let cleanup = cleanup.clone();
+                move || cleanup.set(cleanup.get() + 1)
+            });
+        }
+    });
+    let switched = g.init_node(
+        switch_map::<i32, i32>({
+            let inner = inner.clone();
+            move |v| {
+                assert!(*v != 2, "switch projector boom");
+                inner.clone()
+            }
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("switch_panic"),
+    );
+    let shapes = collect_shapes::<i32>(&switched);
+
+    source.down(vec![Message::Data(Rc::new(1i32))]);
+    inner.down(vec![Message::Data(Rc::new(10i32))]);
+    source.down(vec![Message::Data(Rc::new(2i32))]);
+
+    assert_eq!(switched.status(), graphrefly::Status::Errored);
+    assert_eq!(
+        cleanup.get(),
+        1,
+        "switch projector panic should detach the previous live inner"
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+
+    let after_error = shapes.borrow().len();
+    inner.down(vec![Message::Data(Rc::new(11i32))]);
+    source.down(vec![Message::Data(Rc::new(3i32))]);
+    assert_eq!(
+        shapes.borrow().len(),
+        after_error,
+        "terminal switch_map output should be sealed after projector panic"
     );
 }

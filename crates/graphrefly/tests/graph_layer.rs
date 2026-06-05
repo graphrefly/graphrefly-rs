@@ -5,9 +5,9 @@ use std::rc::Rc;
 use graphrefly::{
     default_dispatcher, describe_to_ascii, describe_to_d2, describe_to_json, describe_to_mermaid,
     describe_to_mermaid_url, describe_to_pretty, distinct_until_changed, filter, from_iter, graph,
-    graph_opts, map, merge, scan, take, DescribeEdge, DescribeOpts, DescribeValue, Dispatcher,
-    Explain, GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status, Tier,
-    Values,
+    graph_opts, map, merge, scan, take, timeout, DescribeEdge, DescribeOpts, DescribeValue,
+    Dispatcher, Explain, GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status,
+    Tier, Values,
 };
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
@@ -357,6 +357,68 @@ fn describe_explain_and_renderers_are_pure_snapshot_functions() {
     assert!(describe_to_ascii(&snap, true).contains("source [state/Settled 1] -> mapped"));
     assert!(describe_to_json(&snap).contains("\"id\":\"source\""));
     assert!(describe_to_mermaid_url(&snap).starts_with("https://mermaid.live/edit#base64:"));
+}
+
+#[test]
+fn describe_includes_discovered_same_graph_deps_with_synthetic_ids() {
+    let g = graph_opts(GraphOptions::named("synthetic-demo"));
+    let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
+    let timed = timeout(&source, 10);
+    let sink = g.init_node(
+        map::<i32, i32>(|v| *v),
+        vec![timed.erased()],
+        GraphNodeOpts::named("sink"),
+    );
+    let _keep_alive = sink.subscribe(|_| {});
+
+    let snap = g.describe();
+    let timeout_nodes = snap
+        .nodes
+        .iter()
+        .filter(|node| node.factory == "timeout" && node.id.starts_with("~timeout#"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timeout_nodes.len(),
+        1,
+        "unregistered same-graph helper deps should be discovered exactly once"
+    );
+    let timeout_id = timeout_nodes[0].id.clone();
+    let timer_nodes = snap
+        .nodes
+        .iter()
+        .filter(|node| node.factory == "timer" && node.id.starts_with("~timer#"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timer_nodes.len(),
+        1,
+        "transitive helper deps should be discovered exactly once"
+    );
+    let timer_id = timer_nodes[0].id.clone();
+    assert!(timeout_nodes[0].deps.contains(&"source".to_owned()));
+    assert!(timeout_nodes[0].deps.contains(&timer_id));
+    assert!(snap.edges.contains(&DescribeEdge {
+        from: "source".to_owned(),
+        to: timeout_id.clone(),
+    }));
+    assert!(snap.edges.contains(&DescribeEdge {
+        from: timer_id,
+        to: timeout_id.clone(),
+    }));
+    assert!(snap.edges.contains(&DescribeEdge {
+        from: timeout_id.clone(),
+        to: "sink".to_owned(),
+    }));
+
+    let mermaid = describe_to_mermaid(&snap);
+    let ascii = describe_to_ascii(&snap, false);
+    assert!(mermaid.contains("\"source\""));
+    assert!(mermaid.contains("\"sink\""));
+    assert!(ascii.contains("source [state/"));
+    assert!(ascii.contains("sink [map/"));
+    assert!(
+        ascii.contains("~timeout#"),
+        "renderers should include the same visible synthetic helper path set"
+    );
 }
 
 #[test]
