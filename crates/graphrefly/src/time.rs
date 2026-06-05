@@ -99,6 +99,7 @@ struct BufferTimeState<S> {
 #[derive(Clone)]
 struct ThrottleState {
     timer: Option<Core>,
+    source_done: bool,
 }
 
 fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> Operator<S> {
@@ -123,46 +124,83 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
 }
 
 fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCell) {
+    ctx.state_persist(true);
     let mut st = ctx
         .state_get::<ThrottleState>()
         .map(|v| (*v).clone())
-        .unwrap_or(ThrottleState { timer: None });
+        .unwrap_or(ThrottleState {
+            timer: None,
+            source_done: false,
+        });
 
-    if st.timer.is_some() && (dep_has_data(ctx, 1) || is_complete(ctx.terminal(1))) {
+    let timer_dep = if st.source_done { 0 } else { 1 };
+    let mut to_remove = Vec::new();
+    let mut to_add = None;
+    let mut set_to_timer_only = false;
+    let mut complete = false;
+
+    if st.timer.is_some() && (dep_has_data(ctx, timer_dep) || is_complete(ctx.terminal(timer_dep)))
+    {
         if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+            to_remove.push(timer);
+        }
+        if st.source_done {
+            complete = true;
         }
     }
 
     if let Some(error) = first_error(ctx) {
         if let Some(timer) = st.timer.take() {
+            to_remove.push(timer);
+        }
+        ctx.state_set(ThrottleState {
+            timer: None,
+            source_done: true,
+        });
+        for timer in to_remove {
             ctx.rewire_next_remove(timer, rewire_body(body_cell));
         }
-        ctx.state_set(ThrottleState { timer: None });
         ctx.down(vec![Message::Error(error.into())]);
         return;
     }
 
-    let source_batch = ctx.batch::<S>(0);
-    if st.timer.is_none() {
-        if let Some(value) = source_batch.first() {
-            ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
-            let timer = ctx.init_node_in_scope(timer(ms), vec![]).erased();
-            st.timer = Some(timer.clone());
-            ctx.rewire_next_add(timer, rewire_body(body_cell));
+    if !st.source_done {
+        let source_batch = ctx.batch::<S>(0);
+        if st.timer.is_none() {
+            if let Some(value) = source_batch.first() {
+                ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
+                let timer = ctx.init_node_in_scope(timer(ms), vec![]).erased();
+                st.timer = Some(timer.clone());
+                to_add = Some(timer);
+            }
+        }
+
+        if is_complete(ctx.terminal(0)) {
+            st.source_done = true;
+            if st.timer.is_some() {
+                set_to_timer_only = true;
+            } else {
+                complete = true;
+            }
         }
     }
 
-    if is_complete(ctx.terminal(0)) {
-        if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_remove(timer, rewire_body(body_cell));
-        }
-        ctx.state_set(ThrottleState { timer: None });
+    ctx.state_set(st.clone());
+    for timer in to_remove {
+        ctx.rewire_next_remove(timer, rewire_body(body_cell));
+    }
+    if set_to_timer_only {
+        let timer = st
+            .timer
+            .clone()
+            .expect("source_done with live throttle timer");
+        ctx.rewire_next_set(vec![timer], rewire_body(body_cell));
+    } else if let Some(timer) = to_add {
+        ctx.rewire_next_add(timer, rewire_body(body_cell));
+    }
+    if complete {
         ctx.down(vec![Message::Complete]);
-        return;
     }
-
-    ctx.state_set(st);
 }
 
 /// audit: value-triggered trailing throttle. The selector returns the duration notifier node.

@@ -545,6 +545,89 @@ fn local_future_and_stream_sources_emit_via_driver_boundary() {
 }
 
 #[test]
+fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let future = g.init_node(
+        future_local(|| async { Ok::<_, io::Error>(42i32) }),
+        vec![],
+        GraphNodeOpts::named("future_cancel"),
+    );
+    let future_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let future_sink = future_shapes.clone();
+    let unsubscribe = future.subscribe(move |msg| match msg {
+        Message::Data(_) => future_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => future_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => future_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(
+        driver
+            .futures
+            .borrow()
+            .iter()
+            .filter(|(active, _)| active.get())
+            .count(),
+        1
+    );
+    unsubscribe();
+    assert_eq!(
+        driver
+            .futures
+            .borrow()
+            .iter()
+            .filter(|(active, _)| active.get())
+            .count(),
+        0,
+        "future_local deactivation should cancel spawned source work"
+    );
+    driver.poll_futures();
+    assert!(future_shapes.borrow().is_empty());
+
+    let stream = g.init_node(
+        stream_local(|| VecStream::new([Ok::<_, io::Error>(1i32), Ok::<_, io::Error>(2)])),
+        vec![],
+        GraphNodeOpts::named("stream_cancel"),
+    );
+    let stream_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let stream_sink = stream_shapes.clone();
+    let unsubscribe = stream.subscribe(move |msg| match msg {
+        Message::Data(_) => stream_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => stream_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => stream_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(
+        driver
+            .futures
+            .borrow()
+            .iter()
+            .filter(|(active, _)| active.get())
+            .count(),
+        1
+    );
+    unsubscribe();
+    assert_eq!(
+        driver
+            .futures
+            .borrow()
+            .iter()
+            .filter(|(active, _)| active.get())
+            .count(),
+        0,
+        "stream_local deactivation should cancel spawned source work"
+    );
+    driver.poll_futures();
+    assert!(stream_shapes.borrow().is_empty());
+}
+
+#[test]
 fn local_future_and_stream_sources_route_errors_into_protocol() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
@@ -707,6 +790,108 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
 }
 
 #[test]
+fn throttle_waits_for_open_window_before_source_complete() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let throttled = g.init_node(
+        throttle_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("throttle_complete_window"),
+    );
+    let seen = collect_shapes::<i32>(&throttled);
+    let data = collect_data(&throttled);
+
+    src.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
+
+    assert_eq!(*data.borrow(), vec![1]);
+    assert_eq!(
+        *seen.borrow(),
+        vec!["DATA"],
+        "throttle is exhaustMap-shaped: source COMPLETE waits for the live window dep"
+    );
+    assert_eq!(throttled.status(), graphrefly::Status::Settled);
+
+    driver.fire_sleepers();
+
+    assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(throttled.status(), graphrefly::Status::Completed);
+}
+
+#[test]
+fn throttle_completion_window_survives_deactivation_without_resubscribing_source() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let throttled = g.init_node(
+        throttle_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("throttle_deactivate_window"),
+    );
+
+    let first_events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let first_sink = first_events.clone();
+    let unsubscribe = throttled.subscribe(move |msg| match msg {
+        Message::Data(value) => first_sink.borrow_mut().push(format!(
+            "DATA:{}",
+            value
+                .as_ref()
+                .downcast_ref::<i32>()
+                .expect("throttle emits i32")
+        )),
+        Message::Complete => first_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(error) => first_sink.borrow_mut().push(format!("ERROR:{error}")),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    src.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
+    assert_eq!(*first_events.borrow(), vec!["DATA:1"]);
+    unsubscribe();
+
+    driver.fire_sleepers();
+    assert_eq!(
+        *first_events.borrow(),
+        vec!["DATA:1"],
+        "deactivation should cancel the in-flight helper timer while no subscriber is present"
+    );
+
+    let second_events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let second_sink = second_events.clone();
+    let _second = throttled.subscribe(move |msg| match msg {
+        Message::Data(value) => second_sink.borrow_mut().push(format!(
+            "DATA:{}",
+            value
+                .as_ref()
+                .downcast_ref::<i32>()
+                .expect("throttle emits i32")
+        )),
+        Message::Complete => second_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(error) => second_sink.borrow_mut().push(format!("ERROR:{error}")),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    assert!(
+        second_events.borrow().is_empty(),
+        "reactivation should not duplicate the leading DATA from the completed source"
+    );
+    driver.fire_sleepers();
+    assert_eq!(
+        *second_events.borrow(),
+        vec!["COMPLETE"],
+        "the retained helper timer should close the pending completion window"
+    );
+    assert_eq!(throttled.status(), graphrefly::Status::Completed);
+}
+
+#[test]
 fn audit_time_flushes_pending_value_on_source_complete() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
@@ -815,6 +1000,43 @@ fn audit_same_wave_reopen_only_suppresses_the_closed_notifier() {
         *data.borrow(),
         vec![1, 2],
         "only the old notifier's cached close is suppressed; a different ready notifier closes immediately"
+    );
+}
+
+#[test]
+fn audit_selector_panic_errors_and_seals_output() {
+    let g = graph();
+    let src = g.state_empty::<i32>();
+    let notifier = g.state_empty::<()>();
+    let audited = g.init_node(
+        audit::<i32, ()>({
+            let notifier = notifier.clone();
+            move |v| {
+                assert!(*v != 2, "audit selector boom");
+                notifier.clone()
+            }
+        }),
+        vec![src.erased()],
+        GraphNodeOpts::named("audit_selector_panic"),
+    );
+    let shapes = collect_shapes::<i32>(&audited);
+    let data = collect_data(&audited);
+
+    src.set(1);
+    notifier.set(());
+    src.set(2);
+
+    assert_eq!(audited.status(), graphrefly::Status::Errored);
+    assert_eq!(*data.borrow(), vec![1]);
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+
+    let after_error = shapes.borrow().len();
+    src.set(3);
+    notifier.set(());
+    assert_eq!(
+        shapes.borrow().len(),
+        after_error,
+        "terminal audit output should be sealed after selector panic"
     );
 }
 
@@ -928,6 +1150,39 @@ fn timeout_propagates_source_error_and_missing_driver_error() {
         vec!["ERROR"],
         "D114 subscribe-armed timeout must activate the clock before cached source DATA"
     );
+}
+
+#[test]
+fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let src = g.state_empty::<i32>();
+    let timed = timeout(&src, 10);
+    let seen = collect_shapes::<i32>(&timed);
+    let data = collect_data(&timed);
+
+    src.down(vec![
+        Message::Data(Rc::new(7i32)),
+        Message::Error("source failed".into()),
+    ]);
+
+    assert_eq!(*data.borrow(), vec![7]);
+    assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(
+        driver
+            .sleepers
+            .borrow()
+            .iter()
+            .filter(|s| s.active.get())
+            .count(),
+        0,
+        "source ERROR should clear the helper timer after same-wave DATA is forwarded"
+    );
+    driver.fire_sleepers();
+    assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
 }
 
 #[test]
@@ -1125,6 +1380,32 @@ fn time_operator_missing_driver_routes_timer_error() {
     assert_eq!(delayed.status(), graphrefly::Status::Errored);
 
     let src = g.state_empty::<i32>();
+    let debounced = g.init_node(
+        debounce_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("debounce_time_missing_driver"),
+    );
+    let seen = collect_shapes::<i32>(&debounced);
+    src.set(1);
+    assert_eq!(*seen.borrow(), vec!["ERROR"]);
+    assert_eq!(debounced.status(), graphrefly::Status::Errored);
+
+    let src = g.state_empty::<i32>();
+    let throttled = g.init_node(
+        throttle_time::<i32>(10),
+        vec![src.erased()],
+        GraphNodeOpts::named("throttle_time_missing_driver"),
+    );
+    let seen = collect_shapes::<i32>(&throttled);
+    src.set(1);
+    assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(
+        throttled.status(),
+        graphrefly::Status::Errored,
+        "throttle emits the leading value, then the helper timer reports the missing driver"
+    );
+
+    let src = g.state_empty::<i32>();
     let audited = g.init_node(
         audit_time::<i32>(10),
         vec![src.erased()],
@@ -1134,6 +1415,44 @@ fn time_operator_missing_driver_routes_timer_error() {
     src.set(1);
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
     assert_eq!(audited.status(), graphrefly::Status::Errored);
+}
+
+#[test]
+fn tap_callback_panic_becomes_error_and_seals_output() {
+    let g = graph();
+    let src = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("tap_panic_src"),
+    );
+    let tapped = g.init_node(
+        tap::<i32>(|v| assert!(*v != 2, "tap callback boom")),
+        vec![src.erased()],
+        GraphNodeOpts::named("tap_panic"),
+    );
+    let events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let sink = events.clone();
+    let _sub = tapped.subscribe(move |msg| match msg {
+        Message::Data(value) => sink.borrow_mut().push(format!(
+            "DATA:{}",
+            value.as_ref().downcast_ref::<i32>().expect("tap emits i32")
+        )),
+        Message::Error(error) => sink.borrow_mut().push(format!("ERROR:{error}")),
+        Message::Complete => sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    assert_eq!(
+        events
+            .borrow()
+            .iter()
+            .map(|event| event.split(':').next().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["DATA", "ERROR"],
+        "D30 graph-layer catch should convert tap callback panic into terminal ERROR"
+    );
+    assert_eq!(tapped.status(), graphrefly::Status::Errored);
 }
 
 #[test]
