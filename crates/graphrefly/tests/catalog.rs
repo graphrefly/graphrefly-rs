@@ -175,6 +175,46 @@ impl<T: Unpin> Stream for VecStream<T> {
 fn source_primitives_cover_empty_never_and_throw_error() {
     let g = graph();
 
+    let single = g.init_node(of(7i32), vec![], GraphNodeOpts::named("of"));
+    let single_events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let single_sink = single_events.clone();
+    let _single_sub = single.subscribe(move |msg| match msg {
+        Message::Data(value) => single_sink.borrow_mut().push(format!(
+            "DATA:{}",
+            value.as_ref().downcast_ref::<i32>().expect("of emits i32")
+        )),
+        Message::Complete => single_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Error(_) | Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(*single_events.borrow(), vec!["DATA:7", "COMPLETE"]);
+    assert_eq!(single.status(), graphrefly::Status::Completed);
+
+    let iter = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("from_iter"),
+    );
+    let iter_events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let iter_sink = iter_events.clone();
+    let _iter_sub = iter.subscribe(move |msg| match msg {
+        Message::Data(value) => iter_sink.borrow_mut().push(format!(
+            "DATA:{}",
+            value
+                .as_ref()
+                .downcast_ref::<i32>()
+                .expect("from_iter emits i32")
+        )),
+        Message::Complete => iter_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Error(_) | Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(
+        *iter_events.borrow(),
+        vec!["DATA:1", "DATA:2", "DATA:3", "COMPLETE"]
+    );
+    assert_eq!(iter.status(), graphrefly::Status::Completed);
+
     let done = g.init_node(empty::<i32>(), vec![], GraphNodeOpts::named("empty"));
     assert_eq!(*collect_shapes::<i32>(&done).borrow(), vec!["COMPLETE"]);
     assert_eq!(done.status(), graphrefly::Status::Completed);
@@ -188,7 +228,14 @@ fn source_primitives_cover_empty_never_and_throw_error() {
         vec![],
         GraphNodeOpts::named("throw"),
     );
-    assert_eq!(*collect_shapes::<i32>(&failed).borrow(), vec!["ERROR"]);
+    let failed_events = Rc::new(RefCell::new(Vec::<String>::new()));
+    let failed_sink = failed_events.clone();
+    let _failed_sub = failed.subscribe(move |msg| {
+        if let Message::Error(error) = msg {
+            failed_sink.borrow_mut().push(format!("ERROR:{error}"));
+        }
+    });
+    assert_eq!(*failed_events.borrow(), vec!["ERROR:boom"]);
     assert_eq!(failed.status(), graphrefly::Status::Errored);
 }
 
@@ -206,6 +253,16 @@ fn source_factory_names_are_stable_in_describe() {
         vec![],
         GraphNodeOpts::named("throw_error"),
     );
+    g.init_node(
+        future_local(|| async { Ok::<_, io::Error>(1i32) }),
+        vec![],
+        GraphNodeOpts::named("future_local"),
+    );
+    g.init_node(
+        stream_local(|| VecStream::new([Ok::<_, io::Error>(1i32)])),
+        vec![],
+        GraphNodeOpts::named("stream_local"),
+    );
     g.init_node(from_timer(10), vec![], GraphNodeOpts::named("from_timer"));
 
     let snap = g.describe();
@@ -220,6 +277,8 @@ fn source_factory_names_are_stable_in_describe() {
     assert_eq!(factory("of"), "of");
     assert_eq!(factory("from_iter"), "fromIter");
     assert_eq!(factory("throw_error"), "throwError");
+    assert_eq!(factory("future_local"), "futureLocal");
+    assert_eq!(factory("stream_local"), "streamLocal");
     assert_eq!(
         factory("from_timer"),
         "fromTimer",
@@ -353,7 +412,10 @@ fn missing_driver_reports_source_activation_error() {
         vec![],
         GraphNodeOpts::named("future_missing"),
     );
-    assert_eq!(*collect_shapes::<i32>(&future).borrow(), vec!["ERROR"]);
+    assert_eq!(
+        *collect_errors::<i32>(&future).borrow(),
+        vec!["futureLocal: missing local async driver"]
+    );
 
     let interval_node = g.init_node(
         interval(1),
@@ -370,7 +432,10 @@ fn missing_driver_reports_source_activation_error() {
         vec![],
         GraphNodeOpts::named("stream_missing"),
     );
-    assert_eq!(*collect_shapes::<i32>(&stream).borrow(), vec!["ERROR"]);
+    assert_eq!(
+        *collect_errors::<i32>(&stream).borrow(),
+        vec!["streamLocal: missing local async driver"]
+    );
 
     let from_timer_node = g.init_node(
         from_timer(1),
@@ -1673,6 +1738,24 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         notifier.set(());
     });
     assert_eq!(*buffer_seen.borrow(), vec![vec![1, 2]]);
+
+    let source = g.state(3i32);
+    let notifier = g.state_empty::<()>();
+    let buffered = g.init_node(
+        buffer::<i32>(),
+        vec![source.erased(), notifier.erased()],
+        GraphNodeOpts::named("buffer_multi_notifier_wave"),
+    );
+    let buffer_seen = collect_data(&buffered);
+    batch(|_| {
+        source.set(4);
+        notifier.down(vec![Message::Data(Rc::new(())), Message::Data(Rc::new(()))]);
+    });
+    assert_eq!(
+        *buffer_seen.borrow(),
+        vec![vec![3, 4]],
+        "a notifier wave with one or more DATA occurrences flushes the current window once"
+    );
 
     let source = g.state(5i32);
     let notifier = g.state_empty::<()>();
