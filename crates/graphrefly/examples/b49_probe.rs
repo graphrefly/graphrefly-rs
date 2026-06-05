@@ -426,7 +426,7 @@ fn retained_heap_probe(rounds: usize, nodes_per_round: usize, payload_bytes: usi
 }
 
 fn rewire_probe(iterations: usize, runs: usize) {
-    println!("--- Probe R: rewire churn ({iterations} alternating set_deps) ---");
+    println!("--- Probe R: rewire churn ({iterations} alternating replace_deps) ---");
     let a = Node::<f64>::state(1.0);
     let b = Node::<f64>::state(2.0);
     let out = Node::<f64>::derived(vec![a.erased()], |ctx: &Ctx| {
@@ -439,12 +439,12 @@ fn rewire_probe(iterations: usize, runs: usize) {
     let ms = time_ms(runs, || {
         for i in 0..iterations {
             if (i & 1) == 0 {
-                out.set_deps(vec![a.erased()], |ctx: &Ctx| {
+                out.replace_deps(vec![a.erased()], |ctx: &Ctx| {
                     ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
                 });
                 a.set(i as f64);
             } else {
-                out.set_deps(vec![b.erased()], |ctx: &Ctx| {
+                out.replace_deps(vec![b.erased()], |ctx: &Ctx| {
                     ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
                 });
                 b.set(i as f64);

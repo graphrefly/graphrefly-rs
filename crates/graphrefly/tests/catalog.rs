@@ -709,7 +709,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     assert_eq!(
         *debounced_seen.borrow(),
         vec![2],
-        "debounce_time should cancel the superseded timer via removeDep"
+        "debounce_time should cancel the superseded timer via unsubscribe_dep"
     );
 
     let throttled_src = g.state_empty::<i32>();

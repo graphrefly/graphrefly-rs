@@ -96,8 +96,10 @@ struct RepeatState {
 /// repeat: run a fresh source from `factory` `count` times in sequence.
 ///
 /// The factory must return a fresh node for each round. Reusing the same node is
-/// not a repeat in the clean-slate substrate: same-node remove+add is a no-op
-/// under D47, and terminal nodes cannot be force-resubscribed.
+/// not a repeat in the clean-slate substrate: same-boundary
+/// unsubscribe_dep+subscribe_dep is a no-op under D47. D115 keeps the model to
+/// ordinary unsubscribe plus a later subscribe, so same-node repeat needs a
+/// separate future design.
 pub fn repeat<T: 'static>(factory: impl Fn() -> Node<T> + 'static, count: usize) -> Operator<T> {
     assert!(count > 0, "repeat: count must be positive");
 
@@ -258,10 +260,10 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
 
     ctx.state_set(st.clone());
     for dep in to_remove {
-        ctx.rewire_next_remove(dep, rewire_body(body_cell));
+        ctx.rewire_next_unsubscribe_dep(dep, rewire_body(body_cell));
     }
     for dep in to_add {
-        ctx.rewire_next_add(dep, rewire_body(body_cell));
+        ctx.rewire_next_subscribe_dep(dep, rewire_body(body_cell));
     }
 
     if st.source_done && st.inners.is_empty() && st.queue.is_empty() {
@@ -288,7 +290,7 @@ fn run_repeat_body<T: 'static>(
 
     if let Some(error) = first_error_terminal(ctx) {
         if let Some(inner) = st.inner.take() {
-            ctx.rewire_next_remove(inner, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(inner, rewire_body(body_cell));
         }
         ctx.state_set(st);
         ctx.down(vec![Message::Error(error.into())]);
@@ -303,13 +305,13 @@ fn run_repeat_body<T: 'static>(
         st.round = 0;
         st.inner = Some(inner.clone());
         ctx.state_set(st);
-        ctx.rewire_next_add(inner, rewire_body(body_cell));
+        ctx.rewire_next_subscribe_dep(inner, rewire_body(body_cell));
         return;
     }
 
     if st.inner.is_some() && is_complete(ctx.terminal(0)) {
         let old = st.inner.take().expect("repeat inner was checked as Some");
-        ctx.rewire_next_remove(old, rewire_body(body_cell));
+        ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
         if st.round + 1 < count {
             st.round += 1;
             let Some(next) = make_repeat_inner(ctx, factory) else {
@@ -322,7 +324,7 @@ fn run_repeat_body<T: 'static>(
             };
             st.inner = Some(next.clone());
             ctx.state_set(st);
-            ctx.rewire_next_add(next, rewire_body(body_cell));
+            ctx.rewire_next_subscribe_dep(next, rewire_body(body_cell));
         } else {
             ctx.state_set(RepeatState {
                 started: true,
@@ -376,7 +378,7 @@ fn cleanup_all_inners<TIn: Clone + 'static>(
     st.queue.clear();
     st.source_done = true;
     for inner in seen {
-        ctx.rewire_next_remove(inner, rewire_body(body_cell));
+        ctx.rewire_next_unsubscribe_dep(inner, rewire_body(body_cell));
     }
 }
 

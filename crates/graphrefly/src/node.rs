@@ -2877,8 +2877,8 @@ impl Core {
 
     // ── runtime topology rewire (R-rewire / D42, C-8) ──
 
-    /// Runtime topology rewire — the public substrate entry (called by `Node::set_deps`/
-    /// `add_dep`/`remove_dep`). The validation REJECTS run first and panic: called
+    /// Runtime topology rewire — the public substrate entry (called by `Node::replace_deps`/
+    /// `subscribe_dep`/`unsubscribe_dep`). The validation REJECTS run first and panic: called
     /// EXTERNALLY (no wave in flight) the panic propagates to the caller (idiomatic
     /// error); called MID-FN (inside a wave) the panic is caught by the running wave-owner
     /// → `[[ERROR,e]]` (R-reentrancy/D37 — a fn mutating its own topology mid-wave is the
@@ -2929,7 +2929,7 @@ impl Core {
             );
             assert!(
                 !in_dep_mutation,
-                "rewire: reentrant dep mutation — another setDeps/addDep/removeDep is in flight (R-rewire)"
+                "rewire: reentrant dep mutation — another replace_deps/subscribe_dep/unsubscribe_dep is in flight (R-rewire)"
             );
         }
         assert!(
@@ -2958,8 +2958,8 @@ impl Core {
     // ── deferred self-rewire (R-rewire-deferred / D47): ctx.rewire_next ──
 
     /// Enqueue a deferred self-rewire (`ctx.rewire_next`). Applied at the committed wave
-    /// boundary by the wave-owner drain, NEVER in place — the immediate `set_deps`/`add_dep`/
-    /// `remove_dep` still panics mid-fn (D37/R-reentrancy). The drain runs each as a fresh
+    /// boundary by the wave-owner drain, NEVER in place — the immediate `replace_deps`/`subscribe_dep`/
+    /// `unsubscribe_dep` still panics mid-fn (D37/R-reentrancy). The drain runs each as a fresh
     /// wave; this is the substrate affordance the higher-order *Map operators wire inners with.
     pub(crate) fn request_rewire_next(&self, req: RewireRequest) {
         defer_boundary(
@@ -3377,7 +3377,7 @@ impl Core {
         if !(has_called || partial || all_settled) {
             return; // first-run gate still holds
         }
-        self.mark_dirty(); // phase 1 (no-op if already dirty, e.g. removeDep auto-settle)
+        self.mark_dirty(); // phase 1 (no-op if already dirty, e.g. unsubscribe_dep auto-settle)
         self.run_wave(); // phase 2: fn → DATA / undirty RESOLVED
     }
 
@@ -4493,12 +4493,12 @@ impl<T: 'static> Node<T> {
     /// terminal added dep, a reentrant rewire — these panic (propagate to the caller). A
     /// mid-fn rewire (during this node's own fn run) is the D37 feedback cycle → caught by
     /// the running wave-owner as `[[ERROR,e]]`, not a propagated panic.
-    pub fn set_deps<F: Fn(&Ctx) + 'static>(&self, new_deps: Vec<Core>, f: F) {
+    pub fn replace_deps<F: Fn(&Ctx) + 'static>(&self, new_deps: Vec<Core>, f: F) {
         self.core.rewire(new_deps, Rc::new(f));
     }
 
-    /// Add one dep (special case of [`Node::set_deps`]); returns its index. fn required (SD-1).
-    pub fn add_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
+    /// Subscribe to one dep (special case of [`Node::replace_deps`]); returns its index. fn required (SD-1).
+    pub fn subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
         let mut next = self.core.deps();
         if !next.iter().any(|d| d.ptr_eq(&dep)) {
             next.push(dep.clone());
@@ -4512,9 +4512,9 @@ impl<T: 'static> Node<T> {
             .expect("added dep present after rewire")
     }
 
-    /// Remove one dep (special case of [`Node::set_deps`]); idempotent if absent (the fn
+    /// Unsubscribe from one dep (special case of [`Node::replace_deps`]); idempotent if absent (the fn
     /// swap still applies). fn required (SD-1).
-    pub fn remove_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+    pub fn unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
         let next: Vec<Core> = self
             .core
             .deps()
@@ -6988,7 +6988,7 @@ mod tests {
             Node::derived_opts_in_arena(&arena_b, vec![inner_dep.clone()], NodeOpts::default(), {
                 let replacement_dep = replacement_dep.clone();
                 move |ctx| {
-                    ctx.rewire_next_set(vec![replacement_dep.clone()], |next| {
+                    ctx.rewire_next_replace_deps(vec![replacement_dep.clone()], |next| {
                         next.emit(*next.data::<i32>(0).unwrap() * 10)
                     });
                     ctx.emit(*ctx.data::<i32>(0).unwrap());
@@ -7049,7 +7049,7 @@ mod tests {
         crate::batch::batch(|_| {
             a.set(3);
             let refs_after_batched_settle = d.core.refs.get();
-            d.set_deps(vec![b.erased()], |ctx| {
+            d.replace_deps(vec![b.erased()], |ctx| {
                 ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
             });
             assert_eq!(
@@ -7087,7 +7087,7 @@ mod tests {
             move |_| {
                 let owned = source;
                 owned.set(2);
-                owned.set_deps(vec![dep], {
+                owned.replace_deps(vec![dep], {
                     let refs = refs.clone();
                     let seen_refs = seen_refs.clone();
                     move |ctx| {
@@ -7310,7 +7310,7 @@ mod tests {
             Node::derived_opts_in_arena(&arena_b, vec![inner_dep.clone()], NodeOpts::default(), {
                 let replacement_dep = replacement_dep.clone();
                 move |ctx| {
-                    ctx.rewire_next_set(vec![replacement_dep.clone()], |next| {
+                    ctx.rewire_next_replace_deps(vec![replacement_dep.clone()], |next| {
                         next.emit(*next.data::<i32>(0).unwrap() * 10)
                     });
                     ctx.emit(*ctx.data::<i32>(0).unwrap());
@@ -7745,7 +7745,7 @@ mod tests {
     // ── rewire (R-rewire / D42, C-8) ──
 
     #[test]
-    fn rewire_adddep_sentinel_dep_does_not_rearm_gate() {
+    fn rewire_subscribe_dep_sentinel_dep_does_not_rearm_gate() {
         // Q2: adding a never-emitted (SENTINEL) dep delivers START only — no recompute — and
         // does NOT re-arm the first-run gate (a alone re-drives d, not waiting for b).
         let a = Node::<i32>::state(1);
@@ -7764,7 +7764,7 @@ mod tests {
         runs.set(0);
 
         let r2 = runs.clone();
-        d.add_dep(b.erased(), move |ctx| {
+        d.subscribe_dep(b.erased(), move |ctx| {
             r2.set(r2.get() + 1);
             let bv = ctx.data::<i32>(1).map(|v| *v).unwrap_or(0); // SENTINEL guard
             ctx.emit(*ctx.data::<i32>(0).unwrap() * 10 + bv);
@@ -7781,8 +7781,8 @@ mod tests {
     }
 
     #[test]
-    fn rewire_removedep_drains_and_preserves_cache() {
-        // Q3/Q7: removeDep of a non-dirty dep preserves cache (no recompute) + drains the
+    fn rewire_unsubscribe_dep_drains_and_preserves_cache() {
+        // Q3/Q7: unsubscribe_dep of a non-dirty dep preserves cache (no recompute) + drains the
         // removed edge (it no longer drives the node); the swapped fn runs on the next wave.
         let a = Node::<i32>::state(1);
         let b = Node::<i32>::state(2);
@@ -7793,8 +7793,8 @@ mod tests {
         let _u = d.subscribe(sink);
         assert_eq!(d.cache(), Some(3));
 
-        d.remove_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-        assert_eq!(d.cache(), Some(3)); // preserved (removeDep of a non-dirty dep: no recompute)
+        d.unsubscribe_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+        assert_eq!(d.cache(), Some(3)); // preserved (unsubscribe_dep of a non-dirty dep: no recompute)
 
         b.set(99); // drained — must NOT drive d
         assert_eq!(d.cache(), Some(3));
@@ -7804,8 +7804,8 @@ mod tests {
     }
 
     #[test]
-    fn rewire_removedep_to_zero_deps_is_inert() {
-        // SD-3: removeDep to zero deps → degenerate fn-no-deps, cache preserved, no auto-fire.
+    fn rewire_unsubscribe_dep_to_zero_deps_is_inert() {
+        // SD-3: unsubscribe_dep to zero deps → degenerate fn-no-deps, cache preserved, no auto-fire.
         let a = Node::<i32>::state(7);
         let runs = Rc::new(Cell::new(0usize));
         let d = {
@@ -7821,7 +7821,7 @@ mod tests {
         runs.set(0);
 
         let r2 = runs.clone();
-        d.remove_dep(a.erased(), move |ctx| {
+        d.unsubscribe_dep(a.erased(), move |ctx| {
             r2.set(r2.get() + 1);
             ctx.emit(-1i32);
         });
@@ -7834,7 +7834,7 @@ mod tests {
     }
 
     #[test]
-    fn rewire_setdeps_reorders_kept_deps() {
+    fn rewire_replace_deps_reorders_kept_deps() {
         // Option-C / DepRecord-ref dispatch: reorder kept deps without losing state; a kept
         // dep's callback reroutes to its new index via the shared idx-box (O(1)).
         fn combine(ctx: &Ctx) {
@@ -7847,7 +7847,7 @@ mod tests {
         let _u = d.subscribe(sink);
         assert_eq!(d.cache(), Some(1020)); // dep0=a=10, dep1=b=20
 
-        d.set_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
+        d.replace_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
         a.set(11); // a is now dep1; reroutes correctly
         assert_eq!(d.cache(), Some(2011)); // dep0=b=20, dep1=a=11 → 20*100+11
     }
@@ -7871,7 +7871,7 @@ mod tests {
             e.state.prev[1] = Some(Rc::new(22i32));
         });
 
-        d.set_deps(vec![a.erased(), b.erased()], |ctx| {
+        d.replace_deps(vec![a.erased(), b.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap() * *ctx.data::<i32>(1).unwrap())
         });
 
@@ -7913,7 +7913,7 @@ mod tests {
                 };
                 self.saw_guard
                     .set(target.core.with_inner_edges(|_, e| e.wave.in_dep_mutation));
-                target.set_deps(vec![self.dep.clone()], |_| {});
+                target.replace_deps(vec![self.dep.clone()], |_| {});
             }
         }
 
@@ -7933,7 +7933,7 @@ mod tests {
         let _u = d.subscribe(|_| {});
 
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            d.set_deps(vec![a.erased()], |ctx| {
+            d.replace_deps(vec![a.erased()], |ctx| {
                 ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
             });
         }));
@@ -7970,7 +7970,7 @@ mod tests {
             e.state.has_data[1] = true;
         });
 
-        d.set_deps(vec![a.erased()], |ctx| {
+        d.replace_deps(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
         });
 
@@ -7999,7 +7999,7 @@ mod tests {
     }
 
     #[test]
-    fn rewire_setdeps_all_replaced_fast_path() {
+    fn rewire_replace_deps_all_replaced_fast_path() {
         // DR-8/B54 no-kept fast path: same-length rewire where every old dep is dropped
         // and replaced by new deps should re-subscribe to the fresh edge set, drop the old
         // callback transport, and run once on the fresh push-on-subscribe wave.
@@ -8020,7 +8020,7 @@ mod tests {
         runs.set(0);
 
         let runs2 = runs.clone();
-        d.set_deps(vec![c.erased(), e.erased()], move |ctx| {
+        d.replace_deps(vec![c.erased(), e.erased()], move |ctx| {
             runs2.set(runs2.get() + 1);
             ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap() + 100);
         });
@@ -8086,7 +8086,7 @@ mod tests {
             assert_eq!(d.cache(), Some(3));
             assert_eq!(b.core.subscriber_count(), 1);
 
-            d.set_deps(vec![c.erased(), e.erased()], |ctx| {
+            d.replace_deps(vec![c.erased(), e.erased()], |ctx| {
                 ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
             });
             assert_eq!(
@@ -8109,7 +8109,7 @@ mod tests {
 
     #[test]
     fn rewire_atomic_multi_add_settles_once() {
-        // P2: adding ≥2 cached deps in ONE setDeps settles ATOMICALLY — the fn fires once,
+        // P2: adding ≥2 cached deps in ONE replace_deps settles ATOMICALLY — the fn fires once,
         // never on a partial view (an added dep still SENTINEL at invocation = the bug).
         let a = Node::<i32>::state(1);
         let b = Node::<i32>::state(10);
@@ -8125,7 +8125,7 @@ mod tests {
 
         let r = runs.clone();
         let sp = saw_partial.clone();
-        d.set_deps(vec![a.erased(), b.erased(), c.erased()], move |ctx| {
+        d.replace_deps(vec![a.erased(), b.erased(), c.erased()], move |ctx| {
             r.set(r.get() + 1);
             if ctx.data::<i32>(1).is_none() || ctx.data::<i32>(2).is_none() {
                 sp.set(true);
@@ -8160,7 +8160,7 @@ mod tests {
         let _u = d.subscribe(sink);
         log.borrow_mut().clear(); // isolate the rewire wave
 
-        d.add_dep(b.erased(), |ctx| {
+        d.subscribe_dep(b.erased(), |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
         });
         assert_eq!(*log.borrow(), vec!["DIRTY", "DATA"]); // glitch-free two-phase
@@ -8175,7 +8175,7 @@ mod tests {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
         });
         let _u = d.subscribe(|_| {});
-        d.set_deps(vec![d.erased()], |_| {}); // self-dep → panic
+        d.replace_deps(vec![d.erased()], |_| {}); // self-dep → panic
     }
 
     #[test]
@@ -8189,7 +8189,8 @@ mod tests {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
         });
         let _u = e.subscribe(|_| {}); // e depends on d (→ a)
-        d.add_dep(e.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap())); // would close d→e→d
+        d.subscribe_dep(e.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+        // would close d→e→d
     }
 
     #[test]
@@ -8203,7 +8204,8 @@ mod tests {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
         });
         let _u = d.subscribe(|_| {});
-        d.add_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap())); // terminal dep → panic
+        d.subscribe_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+        // terminal dep → panic
     }
 
     #[test]
@@ -8218,13 +8220,13 @@ mod tests {
         let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
             if let Some(dh) = slot2.borrow().as_ref() {
                 // mid-fn self-rewire — illegal (R-rewire / D37)
-                dh.add_dep(x.erased(), |c| c.emit(*c.data::<i32>(0).unwrap()));
+                dh.subscribe_dep(x.erased(), |c| c.emit(*c.data::<i32>(0).unwrap()));
             }
             ctx.emit(*ctx.data::<i32>(0).unwrap());
         });
         *slot.borrow_mut() = Some(d.clone());
         let (log, sink) = recorder();
-        let _u = d.subscribe(sink); // activate → fn → mid-fn add_dep → reject → wave-owner → ERROR
+        let _u = d.subscribe(sink); // activate → fn → mid-fn subscribe_dep → reject → wave-owner → ERROR
         assert_eq!(d.status(), Status::Errored);
         assert!(
             log.borrow().iter().any(|k| k == "ERROR"),
@@ -8253,7 +8255,7 @@ mod tests {
         let _u = d.subscribe(|_| {});
         assert!(!old_fn_dropped.get(), "old fn is live before the swap");
 
-        d.set_deps(vec![a.erased()], |ctx| {
+        d.replace_deps(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
         }); // fn swap
         assert!(
@@ -8292,7 +8294,7 @@ mod tests {
 
         // boom: a producer whose activation fn panics — added as a dep of d.
         let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
-        d.add_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+        d.subscribe_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
 
         assert_eq!(
             boom.core.subscriber_count(),
@@ -8318,7 +8320,7 @@ mod tests {
         );
 
         // And a follow-up rewire is NOT rejected as reentrant (the flag is clear).
-        d.set_deps(vec![a.erased()], |ctx| {
+        d.replace_deps(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap() * 2)
         });
         a.set(3);

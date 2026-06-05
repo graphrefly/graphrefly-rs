@@ -301,7 +301,7 @@ fn substrate_rewire_rejects_cross_arena_deps() {
     let source = g1.state(1i32);
     let target = g2.derived::<i32, _>(vec![], |_| Some(0));
 
-    target.set_deps(vec![source.erased()], |ctx| {
+    target.replace_deps(vec![source.erased()], |ctx| {
         ctx.emit(*ctx.data::<i32>(0).unwrap())
     });
 }

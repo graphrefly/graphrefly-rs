@@ -158,7 +158,7 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCel
             source_done: true,
         });
         for timer in to_remove {
-            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
         }
         ctx.down(vec![Message::Error(error.into())]);
         return;
@@ -187,16 +187,16 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCel
 
     ctx.state_set(st.clone());
     for timer in to_remove {
-        ctx.rewire_next_remove(timer, rewire_body(body_cell));
+        ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
     }
     if set_to_timer_only {
         let timer = st
             .timer
             .clone()
             .expect("source_done with live throttle timer");
-        ctx.rewire_next_set(vec![timer], rewire_body(body_cell));
+        ctx.rewire_next_replace_deps(vec![timer], rewire_body(body_cell));
     } else if let Some(timer) = to_add {
-        ctx.rewire_next_add(timer, rewire_body(body_cell));
+        ctx.rewire_next_subscribe_dep(timer, rewire_body(body_cell));
     }
     if complete {
         ctx.down(vec![Message::Complete]);
@@ -273,13 +273,13 @@ fn run_audit_body<S: Clone + 'static>(
         st.latest = None;
         st.suppress_next_notifier = false;
         if let Some(old) = old {
-            ctx.rewire_next_remove(old, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
         }
     }
 
     if let Some(error) = first_error(ctx) {
         if let Some(old) = st.notifier.take() {
-            ctx.rewire_next_remove(old, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
         }
         ctx.state_set(AuditState::<S> {
             window_open: false,
@@ -300,7 +300,7 @@ fn run_audit_body<S: Clone + 'static>(
             ctx.down(vec![Message::Data(Rc::new(value))]);
         }
         if let Some(old) = st.notifier.take() {
-            ctx.rewire_next_remove(old, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
         }
         ctx.state_set(AuditState::<S> {
             window_open: false,
@@ -321,7 +321,7 @@ fn run_audit_body<S: Clone + 'static>(
                         .as_ref()
                         .is_some_and(|old| old.ptr_eq(&notifier));
                     st.notifier = Some(notifier.clone());
-                    ctx.rewire_next_add(notifier, rewire_body(body_cell));
+                    ctx.rewire_next_subscribe_dep(notifier, rewire_body(body_cell));
                 }
                 Err(payload) => {
                     ctx.state_set(AuditState::<S> {
@@ -395,7 +395,7 @@ fn run_timeout_body<S: Clone + 'static>(
 
     if is_complete(ctx.terminal(1)) {
         if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
         }
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Complete]);
@@ -404,7 +404,7 @@ fn run_timeout_body<S: Clone + 'static>(
 
     if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
         if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_remove(timer, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
         }
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Error(error.to_string().into())]);
@@ -417,9 +417,9 @@ fn run_timeout_body<S: Clone + 'static>(
         st.timer = Some(next.clone());
         ctx.state_set(st);
         if old.is_some() {
-            ctx.rewire_next_set(vec![next, source.clone()], rewire_body(body_cell));
+            ctx.rewire_next_replace_deps(vec![next, source.clone()], rewire_body(body_cell));
         } else {
-            ctx.rewire_next_add(next, rewire_body(body_cell));
+            ctx.rewire_next_subscribe_dep(next, rewire_body(body_cell));
         }
         return;
     }
@@ -489,7 +489,7 @@ fn run_buffer_time_body<S: Clone + 'static>(
             ctx.down(vec![Message::Data(Rc::new(st.buffer.clone()))]);
         }
         if let Some(interval) = st.interval.take() {
-            ctx.rewire_next_remove(interval, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(interval, rewire_body(body_cell));
         }
         ctx.state_set(BufferTimeState::<S> {
             buffer: Vec::new(),
@@ -501,7 +501,7 @@ fn run_buffer_time_body<S: Clone + 'static>(
 
     if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
         if let Some(interval) = st.interval.take() {
-            ctx.rewire_next_remove(interval, rewire_body(body_cell));
+            ctx.rewire_next_unsubscribe_dep(interval, rewire_body(body_cell));
         }
         ctx.state_set(BufferTimeState::<S> {
             buffer: Vec::new(),

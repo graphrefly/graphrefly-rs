@@ -227,30 +227,30 @@ impl Ctx {
         node
     }
 
-    /// Request a deferred self-rewire ADD at the committed wave boundary (R-rewire-deferred /
-    /// D47): add `dep` (and swap the fn) AFTER the current wave settles — never in place, so
+    /// Request a deferred self-rewire subscribe at the committed wave boundary (R-rewire-deferred /
+    /// D47): subscribe to `dep` (and swap the fn) AFTER the current wave settles — never in place, so
     /// this is NOT the D37 mid-fn reject. Higher-order operators (*Map) use this to wire
     /// runtime-created inner nodes as VISIBLE self-deps. `f` re-pairs the deps (SD-1 pairing).
-    pub fn rewire_next_add<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+    pub fn rewire_next_subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
         self.node
             .request_rewire_next(RewireRequest::Add(dep, Rc::new(f)));
     }
 
-    /// Request a deferred self-rewire REMOVE (R-rewire-deferred): if `dep` is still live at the
-    /// boundary, remove it + swap the fn. If the identity is already absent at apply time, the
-    /// request is a full no-op, including no fn swap, so stale duplicate removes cannot desync
-    /// the live dep/fn pairing. A successful remove DRAINS the dep's edge + tears down its source
+    /// Request a deferred self-rewire unsubscribe (R-rewire-deferred): if `dep` is still live at the
+    /// boundary, unsubscribe from it + swap the fn. If the identity is already absent at apply time, the
+    /// request is a full no-op, including no fn swap, so stale duplicate unsubscribes cannot desync
+    /// the live dep/fn pairing. A successful unsubscribe DRAINS the dep's edge + tears down its source
     /// on last-subscriber (onDeactivation) = the switchMap/abortInFlight cancellation + memory
     /// bounding (D47 beta).
-    pub fn rewire_next_remove<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+    pub fn rewire_next_unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
         self.node
             .request_rewire_next(RewireRequest::remove(&dep, Rc::new(f)));
     }
 
-    /// Request a deferred self-rewire SET (R-rewire-deferred): replace the whole dep set + swap
+    /// Request a deferred self-rewire replace (R-rewire-deferred): replace the whole dep set + swap
     /// the fn at the boundary (the switch-variant — removes-before-adds keeps the tracked inner
     /// list aligned across boundary waves).
-    pub fn rewire_next_set<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) {
+    pub fn rewire_next_replace_deps<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) {
         self.node
             .request_rewire_next(RewireRequest::Set(deps, Rc::new(f)));
     }

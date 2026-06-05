@@ -174,7 +174,7 @@ fn make_inner(seed: Option<i32>) -> Inner {
 /// The Rust arm has no *Map sugar yet, so the operators are substrate-expressed (self-ref fns).
 #[test]
 fn c11_higher_order_inner_rewire_at_wave_boundary() {
-    // ── (steps 1-3) addDep deferred to the boundary; the added cached inner pushes
+    // ── (steps 1-3) subscribe_dep deferred to the boundary; the added cached inner pushes
     //    [DIRTY,DATA]; the first-run gate is NOT re-armed (S alone re-drives the fn). ──
     {
         let s = Node::<i32>::state_empty();
@@ -207,7 +207,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                     let act = inner.activated.clone();
                     inners.borrow_mut().push(inner);
                     let sf = self_fn.clone();
-                    ctx.rewire_next_add(core, move |c| sf(c));
+                    ctx.rewire_next_subscribe_dep(core, move |c| sf(c));
                     // mid-run: the add is DEFERRED — the inner is NOT wired/activated yet.
                     deferred_ok.set(!act.get());
                 }
@@ -227,10 +227,10 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let (log, _u) = record(&op);
         let (vals, _u2) = record_data_i32(&op);
 
-        s.set(1); // request addDep(innerA) → boundary drain wires it → innerA's seed forwarded
+        s.set(1); // request subscribe_dep(innerA) → boundary drain wires it → innerA's seed forwarded
         assert!(
             deferred_ok.get(),
-            "addDep was deferred (inner not activated mid-run)"
+            "subscribe_dep was deferred (inner not activated mid-run)"
         );
         assert!(
             inners.borrow()[0].is_activated(),
@@ -239,7 +239,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         assert!(kinds(&log).contains(&"DIRTY".to_string())); // the boundary wave is two-phase
         assert_eq!(*vals.borrow(), vec![10]); // innerA's seed (1*10) forwarded as DATA
 
-        // S alone re-drives the op fn after the rewire AND adds innerB — i.e. addDep did NOT re-arm
+        // S alone re-drives the op fn after the rewire AND adds innerB — i.e. subscribe_dep did NOT re-arm
         // the gate to re-wait for all deps. (That gate property is the shared R-rewire path covered by
         // C-8; here we observe the operator stays live + re-drivable post-rewire.)
         op_runs.set(0);
@@ -275,15 +275,15 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                     let core = inner.core();
                     inners.borrow_mut().push(inner); // appends at the end → earlier indices stay valid
                     let sf = self_fn.clone();
-                    ctx.rewire_next_add(core, move |c| sf(c));
+                    ctx.rewire_next_subscribe_dep(core, move |c| sf(c));
                 }
                 // Splice the completed inners out of the tracking list in DESCENDING index order
-                // (so each removal keeps the not-yet-removed lower indices valid) + request removeDep,
+                // (so each removal keeps the not-yet-removed lower indices valid) + request unsubscribe_dep,
                 // keeping `inners` aligned with the op's deps[1..].
                 for (idx, core) in removals.into_iter().rev() {
                     inners.borrow_mut().remove(idx);
                     let sf = self_fn.clone();
-                    ctx.rewire_next_remove(core, move |c| sf(c));
+                    ctx.rewire_next_unsubscribe_dep(core, move |c| sf(c));
                 }
             })
         };
@@ -316,7 +316,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         assert!(!kinds(&log).contains(&"COMPLETE".to_string()));
     }
 
-    // ── (steps 4-6, switch) setDeps tears down the SUPERSEDED inner's source + forwards only
+    // ── (steps 4-6, switch) replace_deps tears down the SUPERSEDED inner's source + forwards only
     //    the new one; the superseded inner is DRAINED (a stale emit does not survive). ──
     {
         let s = Node::<i32>::state_empty();
@@ -344,7 +344,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                         b_core.clone()
                     };
                     let sf = self_fn.clone();
-                    ctx.rewire_next_set(vec![s2.clone(), current], move |c| sf(c));
+                    ctx.rewire_next_replace_deps(vec![s2.clone(), current], move |c| sf(c));
                 }
             })
         };
@@ -381,7 +381,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
     }
 
     // ── (variant) an IMMEDIATE in-fn self-rewire is the D37 feedback cycle → ERROR (NOT
-    //    ctx.rewire_next). The immediate add_dep mid-run panics → wave-owner catch → ERROR. ──
+    //    ctx.rewire_next). The immediate subscribe_dep mid-run panics → wave-owner catch → ERROR. ──
     {
         let a = Node::<i32>::state(1);
         let x = Node::<i32>::state(9);
@@ -391,7 +391,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let op = Node::<i32>::derived(vec![a.erased()], move |ctx| {
             let op = cf.borrow().clone().expect("op installed");
             // IMMEDIATE self-rewire mid-run (not ctx.rewire_next) → D37 reject panics.
-            op.add_dep(xc.clone(), |c| {
+            op.subscribe_dep(xc.clone(), |c| {
                 c.emit(c.data::<i32>(0).map(|r| *r).unwrap_or(0))
             });
             ctx.emit(*ctx.data::<i32>(0).unwrap());
@@ -421,7 +421,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
             Rc::new(move |ctx: &Ctx| {
                 if !ctx.batch::<i32>(0).is_empty() {
                     let sf = cell.borrow().clone().expect("op fn");
-                    ctx.rewire_next_add(inner_core.clone(), move |c| sf(c)); // queued…
+                    ctx.rewire_next_subscribe_dep(inner_core.clone(), move |c| sf(c)); // queued…
                     ctx.down(vec![Message::Complete]); // …then OP goes terminal THIS wave
                 }
             })
@@ -443,7 +443,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         assert_eq!(op.status(), Status::Completed);
         assert!(
             inner_act.get(),
-            "the queued addDep drained even though OP became terminal"
+            "the queued subscribe_dep drained even though OP became terminal"
         );
         assert_eq!(kinds(&log), vec!["DIRTY", "COMPLETE"]);
     }
@@ -460,7 +460,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
                 if runs.get() < 5 {
                     let sf = cell.borrow().clone().expect("op fn");
                     // identical dep set every run → no net change → no fresh wave → no loop.
-                    ctx.rewire_next_set(vec![a2.clone()], move |c| sf(c));
+                    ctx.rewire_next_replace_deps(vec![a2.clone()], move |c| sf(c));
                 }
                 ctx.emit(*ctx.data::<i32>(0).unwrap());
             })
@@ -474,7 +474,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         assert_eq!(
             runs.get(),
             1,
-            "the idempotent setDeps changes nothing → no loop"
+            "the idempotent replace_deps changes nothing → no loop"
         );
         assert_eq!(op.cache(), Some(1));
     }
@@ -948,8 +948,8 @@ fn c7_upstream_control_at_depless_source() {
     }
 }
 
-/// C-8 — intra-graph runtime rewire (R-rewire / D42). Surgical Option-C: addDep
-/// (push-on-subscribe for a cached dep) → removeDep (drain) → idempotent setDeps. The
+/// C-8 — intra-graph runtime rewire (R-rewire / D42). Surgical Option-C: subscribe_dep
+/// (push-on-subscribe for a cached dep) → unsubscribe_dep (drain) → idempotent replace_deps. The
 /// cache is PRESERVED across every rewire, the first-run gate is never re-armed, and a
 /// removed dep's edge is drained so it no longer drives the node.
 #[test]
@@ -962,9 +962,9 @@ fn c8_intra_graph_runtime_rewire() {
     let (_log, _u) = record(&d);
     assert_eq!(d.cache(), Some(1)); // (1) A settled → D ran (a-only)
 
-    // (2) addDep(B): B cached → push-on-subscribe → D recomputes (sum). The first-run gate
+    // (2) subscribe_dep(B): B cached → push-on-subscribe → D recomputes (sum). The first-run gate
     //     is NOT re-armed (D already passed it).
-    d.add_dep(b.erased(), |ctx| {
+    d.subscribe_dep(b.erased(), |ctx| {
         ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
     });
     assert_eq!(d.cache(), Some(101)); // 1 + 100
@@ -972,8 +972,8 @@ fn c8_intra_graph_runtime_rewire() {
     b.set(50); // (3) B drives D
     assert_eq!(d.cache(), Some(51)); // 1 + 50
 
-    // (4) removeDep(A) → deps = [B]; cache PRESERVED (A was not dirty → no recompute).
-    d.remove_dep(a.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+    // (4) unsubscribe_dep(A) → deps = [B]; cache PRESERVED (A was not dirty → no recompute).
+    d.unsubscribe_dep(a.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
     assert_eq!(d.cache(), Some(51));
 
     a.set(9); // (5) A no longer drives D — its edge is drained
@@ -982,10 +982,10 @@ fn c8_intra_graph_runtime_rewire() {
     b.set(7); // B is dep0 now (reroute) → drives D with the a-only fn
     assert_eq!(d.cache(), Some(7));
 
-    // (6) setDeps to the current set → idempotent (no spurious recompute, no churn).
+    // (6) replace_deps to the current set → idempotent (no spurious recompute, no churn).
     let runs = Rc::new(Cell::new(0usize));
     let r = runs.clone();
-    d.set_deps(vec![b.erased()], move |ctx| {
+    d.replace_deps(vec![b.erased()], move |ctx| {
         r.set(r.get() + 1);
         ctx.emit(*ctx.data::<i32>(0).unwrap());
     });
@@ -1007,7 +1007,7 @@ fn c8_rewire_on_terminal_node_rejected() {
     let _u = d.subscribe(|_| {});
     d.down(vec![Message::Complete]); // D terminal
     assert_eq!(d.status(), Status::Completed);
-    d.set_deps(vec![a.erased()], |ctx| {
+    d.replace_deps(vec![a.erased()], |ctx| {
         ctx.emit(*ctx.data::<i32>(0).unwrap())
     }); // → panic
 }
@@ -1534,7 +1534,7 @@ fn c21_late_async_ctx_uses_live_deps_after_rewire() {
     );
     let (_log, _u) = record(&d);
 
-    d.set_deps(vec![b.erased()], |_| {});
+    d.replace_deps(vec![b.erased()], |_| {});
     captured
         .borrow()
         .as_ref()
@@ -1774,7 +1774,7 @@ fn c22_batch_commit_precedes_rewire_requested_during_open_batch() {
 
     batch(|_| {
         n.down(vec![Message::Data(Rc::new(2i32))]); // N has an uncommitted old-shape DATA(2)
-        n.set_deps(vec![b.erased()], |ctx| {
+        n.replace_deps(vec![b.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap() * 10);
         });
 

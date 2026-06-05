@@ -119,7 +119,8 @@ Drives **C-2 / C-4 / C-9 / C-10** green. `resumeAll` is at the TS partial (B9) l
 test, no conformance scenario). Both new mechanisms teeth-verified.
 
 **Up-at-source + rewire slices (LANDED 2026-05-30 — /dev-dispatch):** C-7 (D38 —
-`Core::up` terminus/forward) and C-8 (D42 — `setDeps`/`addDep`/`removeDep` + `Core::rewire`,
+`Core::up` terminus/forward) and C-8 (D42 — originally `set_deps`/`add_dep`/`remove_dep`,
+renamed by D115 to `replace_deps`/`subscribe_dep`/`unsubscribe_dep` + `Core::rewire`,
 the per-dep dispatch refactored to a shared `Rc<Cell<i64>>` CURRENT-index box for the
 surgical Option-C reroute/drain, fn-swap GC, atomic multi-add settle, Q6 auto-settle).
 
@@ -136,9 +137,9 @@ D49 — already in the substrate from CSP-5; take/distinctUntilChanged expressed
 `ctx.state` derived nodes, no operator library). **C-11** (`ctx.rewire_next` — a `DEFERRED_REWIRE`
 thread-local FIFO + `DRAINING` re-entrancy guard, drained at the `with_wave_owner` committed
 boundary, **reusing the B25 `WaveScope`** = the Rust analogue of the TS `boundary.ts`;
-`request`/`apply_rewire_next` add/remove/set reuse the R-rewire surgical path (C-8),
+`request`/`apply_rewire_next` subscribe/unsubscribe/replace reuse the R-rewire surgical path (C-8),
 D62 terminal-drains-queued-topology, a per-apply reject→ERROR via `owned_down`;
-`Ctx::rewire_next_add/remove/set`).
+`Ctx::rewire_next_subscribe_dep`/`rewire_next_unsubscribe_dep`/`rewire_next_replace_deps`, renamed by D115).
 **Parity fix (Rust-only, pre-existing):** the `run_wave` undirty-RESOLVED synthesis now exempts a
 TERMINAL wave (`+ !n.terminal`, mirroring the TS `_terminal === undefined` guard) — surfaced by
 C-11 facet 5 (a fn emitting a bare COMPLETE). The B16 QA-F1 rewire-panic unit test was adapted
@@ -182,7 +183,7 @@ SUGAR (a future Rust graph layer, CSP-2-rs).
 | 2 | **C-9** | `pausable:false` async source ignores PAUSE | ✅ **GREEN** 2026-05-30 (Slice A — D44 outer gate) |
 | 2 | **C-10** | `true`-mode async leaf source delivers own production | ✅ **GREEN** 2026-05-30 (Slice A — D44 leaf carve-out) |
 | 3 | **C-7** | upstream control at a depless source | ✅ **GREEN** 2026-05-30 (D38 — depless terminus honors INVALIDATE, drops DIRTY/TEARDOWN; intermediate forwards) |
-| 4 | **C-8** | intra-graph runtime rewire | ✅ **GREEN** 2026-05-30 (D42 — setDeps/addDep/removeDep; Rc<Cell<i64>> idx-box reroute/drain; atomic multi-add settle) |
+| 4 | **C-8** | intra-graph runtime rewire | ✅ **GREEN** 2026-05-30 (D42; public names renamed by D115 to replace_deps/subscribe_dep/unsubscribe_dep; Rc<Cell<i64>> idx-box reroute/drain; atomic multi-add settle) |
 | 5 | **C-15** | a dep's terminal releases its in-wave DIRTY (no wedge) | ✅ **GREEN** 2026-05-30 (B35/R-deps-terminal — release + absorbed-terminal settle + terminal_as_real_input + auto-cascade; teeth-verified) |
 | 6 | **C-12** | occurrences stay DATA; RESOLVED undirty-only | ✅ **GREEN** 2026-05-30 (D49 already in substrate; take/distinctUntilChanged as inline ctx.state derived nodes) |
 | 7 | **C-11** | higher-order inner rewire at the wave boundary | ✅ **GREEN** 2026-05-31 (D47/D62 `ctx.rewire_next` — DEFERRED_REWIRE FIFO drained at the WaveScope boundary; terminal drains queued topology while sealing output) |
