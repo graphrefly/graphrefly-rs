@@ -76,6 +76,13 @@ pub(crate) fn collecting_batch() -> bool {
     ACTIVE_BATCH.with(|b| b.borrow().as_ref().is_some_and(|batch| batch.collecting))
 }
 
+/// Return the active batch's commit token for boundary tasks caused while the
+/// batch frame is open. The token flips only after commit succeeds; rollback or
+/// commit failure leaves it false so cleanup can drop only uncommitted tasks.
+pub(crate) fn active_batch_committed_token() -> Option<Rc<Cell<bool>>> {
+    ACTIVE_BATCH.with(|b| b.borrow().as_ref().map(|batch| batch.committed.clone()))
+}
+
 /// Remember that a graph-local committed-boundary task was queued during this batch.
 /// Some tasks do not also create a tier>=3 batched wave, so they need their graph root
 /// included in the post-commit drain/rollback cleanup set (R-rewire-batch-boundary).

@@ -25,7 +25,8 @@
 //!
 //! Later substrate slices in this same file cover up-at-source (C-7), rewire (C-8),
 //! rewire-deferred (C-11), pull/routed up (C-16/C-18), terminal/late-async edges
-//! (C-20/C-21), and batch boundaries (C-19/C-22). C-1 remains wire-bridge-blocked.
+//! (C-20/C-21), batch boundaries (C-19/C-22), and committed-boundary self tasks
+//! (C-25). C-1 remains wire-bridge-blocked.
 //!
 //! Authority: `~/src/graphrefly/spec/conformance.jsonl` + `decisions/decisions.jsonl`.
 
@@ -1431,6 +1432,404 @@ fn c16_pull_mode_routed_demand() {
         acc.set(7);
         stream.set(1);
         assert_eq!(c.status(), Status::Errored);
+    }
+}
+
+/// C-25 — queued self-triggered boundary tasks apply only once the owner is at a
+/// committed, unpaused boundary view (R-rewire-deferred-committed-boundary / D110).
+#[test]
+fn c25_deferred_self_boundary_tasks_require_committed_unpaused_boundary() {
+    // ── batch commit: old-shape output commits before subscribe_dep drains. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let helper = make_inner(Some(42));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let activated = helper.activated.clone();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                for v in ctx.batch::<i32>(1) {
+                    ctx.emit(*v);
+                }
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                    ctx.emit(1i32);
+                    assert!(
+                        !activated.get(),
+                        "subscribe_dep must not activate the helper inside the fn/batch"
+                    );
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let (vals, _u) = record_data_i32(&op);
+        vals.borrow_mut().clear();
+
+        batch(|_| {
+            s.set(1);
+            assert!(!helper.is_activated());
+            assert_eq!(*vals.borrow(), Vec::<i32>::new());
+        });
+
+        assert!(helper.is_activated());
+        assert_eq!(*vals.borrow(), vec![1, 42]);
+    }
+
+    // ── rollback drops subscribe_dep: no topology mutation or helper activation survives. ──
+    {
+        let s = Node::<i32>::state(1);
+        let helper = make_inner(Some(10));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+
+        batch(|bctx| {
+            let (_log, _u) = record(&op);
+            assert!(!helper.is_activated());
+            bctx.rollback();
+        });
+
+        assert!(!helper.is_activated());
+    }
+
+    // ── rollback drops unsubscribe_dep cleanup: helper remains live and still drives OP. ──
+    {
+        let s = Node::<i32>::state(1);
+        let helper = make_inner(Some(20));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_unsubscribe_dep(helper_core.clone(), move |c| sf(c));
+                }
+                for v in ctx.batch::<i32>(1) {
+                    ctx.emit(*v);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased(), helper.core()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let vals = Rc::new(RefCell::new(Vec::<i32>::new()));
+
+        batch(|bctx| {
+            let seen = vals.clone();
+            let _u = op.subscribe(move |msg| {
+                if let Message::Data(value) = msg {
+                    if let Ok(v) = value.clone().downcast::<i32>() {
+                        seen.borrow_mut().push(*v);
+                    }
+                }
+            });
+            assert!(helper.is_activated());
+            bctx.rollback();
+        });
+
+        assert!(!helper.is_deactivated());
+        vals.borrow_mut().clear();
+        helper.emit(21);
+        assert_eq!(*vals.borrow(), vec![21]);
+    }
+
+    // ── rollback drops replace_deps: replacement helper never activates. ──
+    {
+        let s = Node::<i32>::state(1);
+        let old_helper = make_inner(Some(30));
+        let new_helper = make_inner(Some(31));
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let s_core = s.erased();
+            let new_core = new_helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_replace_deps(
+                        vec![s_core.clone(), new_core.clone()],
+                        move |c| sf(c),
+                    );
+                }
+                for v in ctx.batch::<i32>(1) {
+                    ctx.emit(*v);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased(), old_helper.core()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                terminal_as_real_input: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+
+        batch(|bctx| {
+            let (_log, _u) = record(&op);
+            assert!(old_helper.is_activated());
+            bctx.rollback();
+        });
+
+        assert!(!old_helper.is_deactivated());
+        assert!(!new_helper.is_activated());
+    }
+
+    // ── rollback drops ctx.up_next self-demand: no pull delivery survives rollback. ──
+    {
+        let pull_id = LockId::new("c25-pull");
+        let acc = Node::<i32>::state(7);
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(pull_id.clone()),
+                ..NodeOpts::default()
+            },
+            |ctx| {
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.emit(*v);
+                }
+            },
+        );
+        let stream = Node::<i32>::state(1);
+        let received = Rc::new(RefCell::new(Vec::<i32>::new()));
+        let rec = received.clone();
+        let pid = pull_id.clone();
+        let consumer = Node::<i32>::derived_opts(
+            vec![stream.erased(), snap.erased()],
+            NodeOpts {
+                partial: true,
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                for v in ctx.batch::<i32>(1) {
+                    rec.borrow_mut().push(*v);
+                }
+                if !ctx.batch::<i32>(0).is_empty() {
+                    ctx.up_next(vec![Message::Resume(pid.clone())]);
+                }
+            },
+        );
+
+        batch(|bctx| {
+            let (_log, _u) = record(&consumer);
+            bctx.rollback();
+        });
+
+        assert_eq!(*received.borrow(), Vec::<i32>::new());
+    }
+
+    // ── pause gating: queued subscribe_dep waits for the final-lock RESUME. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let helper = make_inner(Some(50));
+        let l1 = LockId::new("c25-pause-1");
+        let l2 = LockId::new("c25-pause-2");
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                    ctx.emit(1i32);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let op_for_pause = op.clone();
+        let p1 = l1.clone();
+        let p2 = l2.clone();
+        let _u = op.subscribe(move |msg| {
+            if matches!(msg, Message::Data(_)) {
+                op_for_pause.up(vec![Message::Pause(p1.clone()), Message::Pause(p2.clone())]);
+            }
+        });
+
+        s.set(1);
+        assert!(!helper.is_activated());
+        op.up(vec![Message::Resume(l1)]);
+        assert!(!helper.is_activated());
+        op.up(vec![Message::Resume(l2)]);
+        assert!(helper.is_activated());
+    }
+
+    // ── unrelated rollback must not wipe an older committed task waiting on pause. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let helper = make_inner(Some(55));
+        let lock = LockId::new("c25-preexisting-paused-task");
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                    ctx.emit(1i32);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let op_for_pause = op.clone();
+        let pause = lock.clone();
+        let _u = op.subscribe(move |msg| {
+            if matches!(msg, Message::Data(_)) {
+                op_for_pause.up(vec![Message::Pause(pause.clone())]);
+            }
+        });
+
+        s.set(1);
+        assert!(!helper.is_activated());
+
+        let unrelated = Node::<i32>::state(0);
+        let (_log, _keep_unrelated) = record(&unrelated);
+        batch(|bctx| {
+            unrelated.set(1);
+            bctx.rollback();
+        });
+
+        assert!(!helper.is_activated());
+        op.up(vec![Message::Resume(lock)]);
+        assert!(helper.is_activated());
+    }
+
+    // ── combined batch+pause: commit before resume still waits for RESUME. ──
+    {
+        let s = Node::<i32>::state_empty();
+        let helper = make_inner(Some(60));
+        let lock = LockId::new("c25-combined-commit-first");
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                    ctx.emit(1i32);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let op_for_pause = op.clone();
+        let pause = lock.clone();
+        let _u = op.subscribe(move |msg| {
+            if matches!(msg, Message::Data(_)) {
+                op_for_pause.up(vec![Message::Pause(pause.clone())]);
+            }
+        });
+
+        batch(|_| s.set(1));
+        assert!(!helper.is_activated());
+        op.up(vec![Message::Resume(lock)]);
+        assert!(helper.is_activated());
+    }
+
+    // ── combined batch+pause: resume before commit still waits for batch commit. ──
+    {
+        let s = Node::<i32>::state(1);
+        let helper = make_inner(Some(70));
+        let lock = LockId::new("c25-combined-resume-first");
+        let cell: Rc<RefCell<Option<OpFn>>> = Rc::new(RefCell::new(None));
+        let body: OpFn = {
+            let helper_core = helper.core();
+            let cell = cell.clone();
+            Rc::new(move |ctx: &Ctx| {
+                if !ctx.batch::<i32>(0).is_empty() {
+                    let sf = cell.borrow().clone().expect("op fn installed");
+                    ctx.rewire_next_subscribe_dep(helper_core.clone(), move |c| sf(c));
+                    ctx.emit(1i32);
+                }
+            })
+        };
+        *cell.borrow_mut() = Some(body.clone());
+        let op = Node::<i32>::derived_opts(
+            vec![s.erased()],
+            NodeOpts {
+                complete_when_deps_complete: false,
+                ..NodeOpts::default()
+            },
+            move |ctx| body(ctx),
+        );
+        let op_for_pause = op.clone();
+        let pause = lock.clone();
+        let _u = op.subscribe(move |msg| {
+            if matches!(msg, Message::Data(_)) {
+                op_for_pause.up(vec![Message::Pause(pause.clone())]);
+            }
+        });
+
+        batch(|_| {
+            assert!(!helper.is_activated());
+            op.up(vec![Message::Resume(lock.clone())]);
+            assert!(!helper.is_activated());
+        });
+        assert!(helper.is_activated());
     }
 }
 

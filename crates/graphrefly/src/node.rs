@@ -46,8 +46,8 @@ use std::rc::{Rc, Weak};
 
 use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{
-    boundary_drains_blocked, collecting_batch, committed_after_batch_for_target, defer_to_batch,
-    register_boundary_root,
+    active_batch_committed_token, boundary_drains_blocked, collecting_batch,
+    committed_after_batch_for_target, defer_to_batch, register_boundary_root,
 };
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
@@ -1671,6 +1671,7 @@ enum BoundaryTask {
     Rewire {
         target: CoreToken,
         req: RewireRequest,
+        committed: Rc<Cell<bool>>,
     },
     ExternalRewire {
         target: CoreToken,
@@ -1682,7 +1683,18 @@ enum BoundaryTask {
         target: CoreToken,
         msgs: Wave<AnyValue>,
         toward_dep: Option<usize>,
+        committed: Rc<Cell<bool>>,
     },
+}
+
+impl BoundaryTask {
+    fn committed(&self) -> bool {
+        match self {
+            BoundaryTask::Rewire { committed, .. }
+            | BoundaryTask::ExternalRewire { committed, .. }
+            | BoundaryTask::Up { committed, .. } => committed.get(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2144,7 +2156,10 @@ fn remember_first_boundary_panic(
 
 pub(crate) fn clear_deferred_boundary_root(root: &BoundaryRoot) {
     if let Some(graph) = root.upgrade() {
-        graph.borrow_mut().deferred_boundary.clear();
+        graph
+            .borrow_mut()
+            .deferred_boundary
+            .retain(BoundaryTask::committed);
     }
 }
 
@@ -2171,6 +2186,7 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
     }
     let drain_guard = BoundaryDrainGuard::enter(graph);
     let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
+    let mut blocked = 0usize;
     loop {
         let task = {
             let mut g = graph.borrow_mut();
@@ -2181,9 +2197,26 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
             }
         };
         let Some(task) = task else { break };
-        if let Err(e) = catch_unwind(AssertUnwindSafe(|| run_boundary_task(graph, task))) {
-            if escaped.is_none() {
-                escaped = Some(e);
+        match catch_unwind(AssertUnwindSafe(|| run_boundary_task(graph, task))) {
+            Ok(Some(task)) => {
+                let queued = {
+                    let mut g = graph.borrow_mut();
+                    g.deferred_boundary.push_back(task);
+                    g.deferred_boundary.len()
+                };
+                blocked += 1;
+                if blocked >= queued {
+                    break;
+                }
+            }
+            Ok(None) => {
+                blocked = 0;
+            }
+            Err(e) => {
+                blocked = 0;
+                if escaped.is_none() {
+                    escaped = Some(e);
+                }
             }
         }
     }
@@ -2193,10 +2226,24 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
     }
 }
 
-fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) {
+fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Option<BoundaryTask> {
     match task {
-        BoundaryTask::Rewire { target, req } => {
+        BoundaryTask::Rewire {
+            target,
+            req,
+            committed,
+        } => {
+            if !committed.get() {
+                return None;
+            }
             if let Some(node) = target.pinned_borrowed_core(graph) {
+                if node.core.is_paused() {
+                    return Some(BoundaryTask::Rewire {
+                        target,
+                        req,
+                        committed,
+                    });
+                }
                 node.core.apply_rewire_next(req);
             }
         }
@@ -2216,12 +2263,25 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) {
             target,
             msgs,
             toward_dep,
+            committed,
         } => {
+            if !committed.get() {
+                return None;
+            }
             if let Some(node) = target.pinned_borrowed_core(graph) {
+                if node.core.is_paused() {
+                    return Some(BoundaryTask::Up {
+                        target,
+                        msgs,
+                        toward_dep,
+                        committed,
+                    });
+                }
                 node.core.owned_up(msgs, toward_dep);
             }
         }
     }
+    None
 }
 
 impl Core {
@@ -2967,6 +3027,8 @@ impl Core {
             BoundaryTask::Rewire {
                 target: CoreToken::from_core(self),
                 req,
+                committed: active_batch_committed_token()
+                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
         );
     }
@@ -2978,6 +3040,8 @@ impl Core {
                 target: CoreToken::from_core(self),
                 msgs,
                 toward_dep,
+                committed: active_batch_committed_token()
+                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
         );
     }
@@ -3947,6 +4011,9 @@ impl Core {
         };
         if resumed {
             self.on_resume();
+            if boundary_drains_blocked() {
+                register_boundary_root(self);
+            }
         }
         self.fire_owed_demand_if_ready();
     }
