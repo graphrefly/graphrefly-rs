@@ -3,11 +3,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
-    default_dispatcher, describe_to_ascii, describe_to_d2, describe_to_json, describe_to_mermaid,
-    describe_to_mermaid_url, describe_to_pretty, distinct_until_changed, filter, from_iter, graph,
-    graph_opts, map, merge, scan, take, timeout, DescribeEdge, DescribeOpts, DescribeValue,
-    Dispatcher, Explain, GraphNodeOpts, GraphOptions, LockId, Message, NodeOpts, Pausable, Status,
-    Tier, Values,
+    default_dispatcher, describe_to_ascii, describe_to_d2, describe_to_d2_with_direction,
+    describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
+    describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, filter,
+    from_iter, graph, graph_opts, map, merge, scan, take, timeout, DescribeEdge, DescribeOpts,
+    DescribeValue, DiagramDirection, Dispatcher, Explain, GraphNodeOpts, GraphOptions, LockId,
+    Message, NodeOpts, Pausable, Status, Tier, Values,
 };
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
@@ -357,6 +358,43 @@ fn describe_explain_and_renderers_are_pure_snapshot_functions() {
     assert!(describe_to_ascii(&snap, true).contains("source [state/Settled 1] -> mapped"));
     assert!(describe_to_json(&snap).contains("\"id\":\"source\""));
     assert!(describe_to_mermaid_url(&snap).starts_with("https://mermaid.live/edit#base64:"));
+}
+
+#[test]
+fn renderers_respect_direction_and_ascii_value_toggle() {
+    let g = graph_opts(GraphOptions::named("render-options"));
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let sink = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("sink"),
+    );
+    let _keep_alive = sink.subscribe(|_| {});
+    let snap = g.describe();
+
+    assert!(
+        describe_to_mermaid_with_direction(&snap, DiagramDirection::Td).starts_with("flowchart TD")
+    );
+    assert!(
+        describe_to_mermaid_with_direction(&snap, DiagramDirection::Bt).starts_with("flowchart BT")
+    );
+    assert!(
+        describe_to_mermaid_with_direction(&snap, DiagramDirection::Rl).starts_with("flowchart RL")
+    );
+
+    assert!(
+        describe_to_d2_with_direction(&snap, DiagramDirection::Td).starts_with("direction: down")
+    );
+    assert!(describe_to_d2_with_direction(&snap, DiagramDirection::Bt).starts_with("direction: up"));
+    assert!(
+        describe_to_d2_with_direction(&snap, DiagramDirection::Rl).starts_with("direction: left")
+    );
+
+    let without_values = describe_to_ascii(&snap, false);
+    let with_values = describe_to_ascii(&snap, true);
+    assert!(without_values.contains("source [state/Settled] -> sink"));
+    assert!(!without_values.contains("source [state/Settled 1] -> sink"));
+    assert!(with_values.contains("source [state/Settled 1] -> sink"));
 }
 
 #[test]

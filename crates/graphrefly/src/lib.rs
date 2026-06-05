@@ -97,7 +97,8 @@ pub use render::{
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
 pub use sources::{
-    empty, from_iter, future_local, interval, never, of, stream_local, throw_error, timer,
+    empty, from_iter, from_timer, future_local, interval, never, of, stream_local, throw_error,
+    timer,
 };
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,

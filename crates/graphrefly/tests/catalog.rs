@@ -13,11 +13,11 @@ use graphrefly::{
     audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
     element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
-    future_local, graph, interval, last, last_any, map, merge_map, never, on_first_data,
-    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan, settle, settle_by,
-    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
-    throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
-    GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
+    from_timer, future_local, graph, interval, last, last_any, map, merge_map, never, of,
+    on_first_data, on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan,
+    settle, settle_by, skip, stream_local, switch_map, take, take_until, take_while, tap,
+    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
+    Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver, Message, Node,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -46,6 +46,17 @@ fn collect_shapes<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<
         Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
         Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
         Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    seen
+}
+
+fn collect_errors<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<String>>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_sink = seen.clone();
+    let _keep = node.subscribe(move |msg| {
+        if let Message::Error(error) = msg {
+            seen_sink.borrow_mut().push(error.to_string());
+        }
     });
     seen
 }
@@ -182,6 +193,41 @@ fn source_primitives_cover_empty_never_and_throw_error() {
 }
 
 #[test]
+fn source_factory_names_are_stable_in_describe() {
+    let g = graph();
+    g.init_node(of(1i32), vec![], GraphNodeOpts::named("of"));
+    g.init_node(
+        from_iter(vec![1i32, 2]),
+        vec![],
+        GraphNodeOpts::named("from_iter"),
+    );
+    g.init_node(
+        throw_error::<i32>("boom"),
+        vec![],
+        GraphNodeOpts::named("throw_error"),
+    );
+    g.init_node(from_timer(10), vec![], GraphNodeOpts::named("from_timer"));
+
+    let snap = g.describe();
+    let factory = |id: &str| {
+        snap.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.factory.as_str())
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(factory("of"), "of");
+    assert_eq!(factory("from_iter"), "fromIter");
+    assert_eq!(factory("throw_error"), "throwError");
+    assert_eq!(
+        factory("from_timer"),
+        "fromTimer",
+        "the Rust alias should preserve TS's frozen source factory name in describe"
+    );
+}
+
+#[test]
 fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
@@ -219,6 +265,83 @@ fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
 }
 
 #[test]
+fn time_helpers_cancel_armed_clock_on_unsubscribe() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let src = g.state_empty::<i32>();
+    let timed = timeout(&src, 10);
+    let timeout_seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let timeout_sink = timeout_seen.clone();
+    let unsubscribe = timed.subscribe(move |msg| match msg {
+        Message::Data(_) => timeout_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => timeout_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => timeout_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(
+        driver
+            .sleepers
+            .borrow()
+            .iter()
+            .filter(|s| s.active.get())
+            .count(),
+        1
+    );
+    unsubscribe();
+    assert_eq!(
+        driver
+            .sleepers
+            .borrow()
+            .iter()
+            .filter(|s| s.active.get())
+            .count(),
+        0,
+        "timeout unsubscribe should deactivate the armed helper timer"
+    );
+    driver.fire_sleepers();
+    assert!(timeout_seen.borrow().is_empty());
+
+    let src = g.state_empty::<i32>();
+    let buffered = buffer_time(&src, 10);
+    let buffer_seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let buffer_sink = buffer_seen.clone();
+    let unsubscribe = buffered.subscribe(move |msg| match msg {
+        Message::Data(_) => buffer_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => buffer_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => buffer_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        1
+    );
+    unsubscribe();
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        0,
+        "buffer_time unsubscribe should deactivate the armed helper interval"
+    );
+    driver.tick_intervals();
+    assert!(buffer_seen.borrow().is_empty());
+}
+
+#[test]
 fn missing_driver_reports_source_activation_error() {
     let g = graph();
     let timed = g.init_node(timer(1), vec![], GraphNodeOpts::named("timer_missing"));
@@ -248,6 +371,17 @@ fn missing_driver_reports_source_activation_error() {
         GraphNodeOpts::named("stream_missing"),
     );
     assert_eq!(*collect_shapes::<i32>(&stream).borrow(), vec!["ERROR"]);
+
+    let from_timer_node = g.init_node(
+        from_timer(1),
+        vec![],
+        GraphNodeOpts::named("from_timer_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<u64>(&from_timer_node).borrow(),
+        vec!["fromTimer: missing local async driver".to_owned()],
+        "alias diagnostics should match the visible source factory name"
+    );
 }
 
 #[test]
@@ -2048,6 +2182,49 @@ fn higher_order_merge_map_dedupes_reused_live_inner() {
         *shapes.borrow(),
         vec!["DATA", "COMPLETE"],
         "a projector returning an already-live inner should not leave a duplicate tracked inner"
+    );
+}
+
+#[test]
+fn higher_order_switch_map_dedupes_reused_live_inner() {
+    let g = graph();
+    let source = g.state_empty::<i32>();
+    let cleanup = Rc::new(Cell::new(0usize));
+    let shared = g.producer({
+        let cleanup = cleanup.clone();
+        move |ctx| {
+            ctx.on_deactivation({
+                let cleanup = cleanup.clone();
+                move || cleanup.set(cleanup.get() + 1)
+            });
+        }
+    });
+    let switched = g.init_node(
+        switch_map::<i32, i32>({
+            let shared = shared.clone();
+            move |_| shared.clone()
+        }),
+        vec![source.erased()],
+        GraphNodeOpts::named("switch_reused_inner"),
+    );
+    let shapes = collect_shapes::<i32>(&switched);
+    let data = collect_data(&switched);
+
+    source.down(vec![Message::Data(Rc::new(1i32))]);
+    source.down(vec![Message::Data(Rc::new(2i32)), Message::Complete]);
+    shared.set(10);
+    shared.down(vec![Message::Complete]);
+
+    assert_eq!(*data.borrow(), vec![10]);
+    assert_eq!(
+        cleanup.get(),
+        1,
+        "the shared inner should deactivate only when it completes, not on the second source wave"
+    );
+    assert_eq!(
+        *shapes.borrow(),
+        vec!["DATA", "COMPLETE"],
+        "switch_map should not remove and re-add the same already-live projected inner"
     );
 }
 

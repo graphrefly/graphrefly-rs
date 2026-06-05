@@ -57,13 +57,10 @@ pub fn throw_error<T: 'static>(err: impl Into<String>) -> Operator<T> {
     })
 }
 
-/// timer: one tick (`0`) after `ms`, then COMPLETE.
-///
-/// Requires a graph-local driver (D111); missing driver reports ERROR on activation.
-pub fn timer(ms: u64) -> Operator<u64> {
+fn timer_source(factory: &'static str, ms: u64) -> Operator<u64> {
     let duration = Duration::from_millis(ms);
     Operator::with_opts(
-        "timer",
+        factory,
         NodeOpts {
             pausable: Pausable::False,
             ..NodeOpts::default()
@@ -71,7 +68,7 @@ pub fn timer(ms: u64) -> Operator<u64> {
         move |ctx| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
-                    "timer: missing local async driver".into(),
+                    format!("{factory}: missing local async driver").into(),
                 )]);
                 return;
             };
@@ -85,6 +82,20 @@ pub fn timer(ms: u64) -> Operator<u64> {
             ctx.on_deactivation(cancel);
         },
     )
+}
+
+/// timer: one tick (`0`) after `ms`, then COMPLETE.
+///
+/// Requires a graph-local driver (D111); missing driver reports ERROR on activation.
+pub fn timer(ms: u64) -> Operator<u64> {
+    timer_source("timer", ms)
+}
+
+/// from_timer: frozen source-name alias for [`timer`].
+///
+/// Preserves the real factory name (`fromTimer`) in describe/render output.
+pub fn from_timer(ms: u64) -> Operator<u64> {
+    timer_source("fromTimer", ms)
 }
 
 /// interval: ticks `0, 1, 2, ...` every `ms` until deactivation.
