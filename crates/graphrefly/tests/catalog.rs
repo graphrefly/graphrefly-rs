@@ -1,23 +1,26 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::fs;
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
 use graphrefly::{
     audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
-    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_iter,
-    from_timer, future_local, graph, interval, last, last_any, map, merge_map,
-    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, race, reduce,
-    repeat, rescue, sample, scan, settle, settle_by, skip, stream_local, switch_map, take,
-    take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error, timeout, timer,
-    valve, with_latest_from, zip, Dispatcher, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
+    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_fs_watch,
+    from_fs_watch_with_options, from_iter, from_timer, future_local, graph, interval, last,
+    last_any, map, merge_map, merge_map_with_options, never, of, on_first_data,
+    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan, settle, settle_by,
+    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
+    throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
+    FromFsWatchOptions, FsEvent, FsEventKind, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
     MergeMapOptions, Message, Node,
 };
 
@@ -60,6 +63,19 @@ fn collect_errors<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<
         }
     });
     seen
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "graphrefly-rs-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("temp dir can be created");
+    dir
 }
 
 struct NoopWake;
@@ -243,6 +259,7 @@ fn source_primitives_cover_empty_never_and_throw_error() {
 #[test]
 fn source_factory_names_are_stable_in_describe() {
     let g = graph();
+    let dir = temp_dir("factory");
     g.init_node(of(1i32), vec![], GraphNodeOpts::named("of"));
     g.init_node(
         from_iter(vec![1i32, 2]),
@@ -265,6 +282,11 @@ fn source_factory_names_are_stable_in_describe() {
         GraphNodeOpts::named("stream_local"),
     );
     g.init_node(from_timer(10), vec![], GraphNodeOpts::named("from_timer"));
+    g.init_node(
+        from_fs_watch([dir.clone()]),
+        vec![],
+        GraphNodeOpts::named("from_fs_watch"),
+    );
 
     let snap = g.describe();
     let factory = |id: &str| {
@@ -285,6 +307,106 @@ fn source_factory_names_are_stable_in_describe() {
         "fromTimer",
         "the Rust alias should preserve TS's frozen source factory name in describe"
     );
+    assert_eq!(factory("from_fs_watch"), "fromFSWatch");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn fs_watch_source_initial_scan_is_inspectable_and_filtered() {
+    let dir = temp_dir("fs-initial");
+    fs::write(dir.join("a.txt"), "a").expect("write txt file");
+    fs::write(dir.join("skip.log"), "skip").expect("write log file");
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver),
+        ..GraphOptions::default()
+    });
+
+    let watched = g.init_node(
+        from_fs_watch_with_options(
+            [dir.clone()],
+            FromFsWatchOptions {
+                debounce_ms: 1,
+                initial_scan: true,
+                include: vec!["*.txt".to_owned()],
+                ..FromFsWatchOptions::default()
+            },
+        ),
+        vec![],
+        GraphNodeOpts::named("fs"),
+    );
+    let seen = collect_data(&watched);
+
+    assert_eq!(seen.borrow().len(), 1);
+    let event = seen.borrow()[0].clone();
+    assert_eq!(event.kind, FsEventKind::Create);
+    assert_eq!(event.relative_path, PathBuf::from("a.txt"));
+    assert!(event.path.ends_with("a.txt"));
+    assert_eq!(
+        g.describe()
+            .nodes
+            .iter()
+            .find(|node| node.id == "fs")
+            .map(|node| node.factory.as_str()),
+        Some("fromFSWatch")
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn fs_watch_source_rejects_empty_paths_and_reports_missing_driver() {
+    let empty = std::panic::catch_unwind(|| from_fs_watch(Vec::<PathBuf>::new()));
+    assert!(empty.is_err());
+
+    let dir = temp_dir("fs-missing-driver");
+    let g = graph();
+    let watched = g.init_node(
+        from_fs_watch([dir.clone()]),
+        vec![],
+        GraphNodeOpts::named("fs_missing_driver"),
+    );
+    assert_eq!(
+        *collect_errors::<FsEvent>(&watched).borrow(),
+        vec!["fromFSWatch: missing local async driver".to_owned()]
+    );
+    assert_eq!(watched.status(), graphrefly::Status::Errored);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn fs_watch_source_deactivation_cancels_poll_driver() {
+    let dir = temp_dir("fs-cleanup");
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        local_async_driver: Some(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let watched = g.init_node(
+        from_fs_watch([dir.clone()]),
+        vec![],
+        GraphNodeOpts::named("fs_cleanup"),
+    );
+    let unsubscribe = watched.subscribe(|_| {});
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        1
+    );
+    unsubscribe();
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        0
+    );
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]

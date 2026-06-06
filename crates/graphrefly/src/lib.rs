@@ -109,8 +109,9 @@ pub use render::{
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
 pub use sources::{
-    empty, from_iter, from_timer, future_local, interval, never, of, stream_local, throw_error,
-    timer,
+    empty, from_fs_watch, from_fs_watch_with_options, from_iter, from_timer, future_local,
+    interval, never, of, stream_local, throw_error, timer, FromFsWatchOptions, FsEvent,
+    FsEventKind,
 };
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,
