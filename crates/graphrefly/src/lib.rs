@@ -59,6 +59,7 @@ pub mod batch;
 pub mod checkpoint;
 pub mod combinators;
 pub mod ctx;
+pub mod data_structures;
 pub mod diagnostics;
 pub mod dispatcher;
 pub mod graph;
@@ -87,6 +88,7 @@ pub use combinators::{
     with_latest_from, zip,
 };
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
+pub use data_structures::{reactive_list, ListChange, ReactiveList, ReactiveListOptions};
 pub use diagnostics::{
     explain_path, reachable, validate_no_islands, CausalChain, CausalStep, ExplainPathOptions,
     ExplainPathReason, IslandReport, ReachableDirection, ReachableOptions, ReachableResult,

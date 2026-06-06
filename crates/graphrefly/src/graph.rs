@@ -515,6 +515,14 @@ impl Graph {
         self.add_with_id(node, factory, id, opts)
     }
 
+    pub(crate) fn empty_source<T: 'static>(&self, factory: &str, opts: GraphNodeOpts) -> Node<T> {
+        let node = Node::state_empty_in_arena_with_dispatcher(
+            &self.inner.arena,
+            self.inner.dispatcher.clone(),
+        );
+        self.add(node, factory, opts)
+    }
+
     fn add_with_id<T: 'static>(
         &self,
         node: Node<T>,
