@@ -785,6 +785,7 @@ struct DepEdges {
     state: DepState,
     unsubs: Vec<Option<Unsub>>,
     idx_boxes: Vec<Rc<Cell<i64>>>,
+    restored_activation_handshake: Vec<bool>,
 }
 
 impl DepEdges {
@@ -795,6 +796,7 @@ impl DepEdges {
             state: DepState::new(dep_count),
             unsubs: (0..dep_count).map(|_| None).collect(),
             idx_boxes: (0..dep_count).map(|_| Rc::new(Cell::new(-1i64))).collect(),
+            restored_activation_handshake: vec![false; dep_count],
         }
     }
 }
@@ -2365,6 +2367,8 @@ impl Core {
             e.value.terminal = state.terminal;
             e.wave = NodeWaveState::new();
             e.state = DepState::new(e.unsubs.len());
+            e.restored_activation_handshake =
+                vec![state.has_data || state.has_called_fn_once; e.unsubs.len()];
             r.has_called_fn_once = state.has_called_fn_once;
             a.activated = false;
             a.state = state.ctx_state;
@@ -2571,6 +2575,7 @@ impl Core {
         self.with_inner_edges_mut(|_, e| {
             e.unsubs[idx] = Some(unsub);
             e.idx_boxes[idx] = idx_box;
+            e.restored_activation_handshake[idx] = false;
         });
     }
 
@@ -2599,6 +2604,7 @@ impl Core {
                 e.state.terminal[i] = None;
                 e.state.terminal_wave[i] = None;
             }
+            e.restored_activation_handshake.fill(false);
             e.state.pending = 0;
             e.wave.emitted_dirty_this_wave = false;
             r.has_called_fn_once = false;
@@ -2782,6 +2788,17 @@ impl Core {
                 };
             }
             Message::Data(v) => {
+                if g.get_node_and_edges_mut(key)
+                    .1
+                    .restored_activation_handshake[idx]
+                {
+                    let (_n, e) = g.get_node_and_edges_mut(key);
+                    e.state.prev[idx] = Some(v.clone());
+                    e.state.has_data[idx] = true;
+                    e.state.tier[idx] = 3;
+                    e.state.batch[idx] = None;
+                    return None;
+                }
                 let pending_drained = {
                     let (_n, e, a) = g.get_node_edges_aux_mut(key);
                     match &mut e.state.batch[idx] {
@@ -3202,6 +3219,7 @@ impl Core {
             let new_dirty: Vec<bool> = (0..n).map(|_| false).collect();
             let new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
             let new_boxes: Vec<Rc<Cell<i64>>> = (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
+            let new_restored_handshake: Vec<bool> = vec![false; n];
             self.with_inner_edges_mut(|nn, e| {
                 nn.deps = new_deps.clone();
                 e.state.batch = new_batch;
@@ -3215,6 +3233,7 @@ impl Core {
                 e.state.terminal_wave = new_terminal_wave;
                 e.unsubs = new_unsubs;
                 e.idx_boxes = new_boxes;
+                e.restored_activation_handshake = new_restored_handshake;
             });
 
             if activated {
@@ -3397,6 +3416,7 @@ impl Core {
             edges.state.terminal_wave = new_terminal_wave;
             edges.unsubs = new_unsubs;
             edges.idx_boxes = new_boxes;
+            edges.restored_activation_handshake = vec![false; n];
         }
 
         // subscribe added deps — push-on-subscribe delivers a cached dep's DATA (driving

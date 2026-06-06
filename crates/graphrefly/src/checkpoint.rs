@@ -534,6 +534,7 @@ fn checkpoint_value(
 
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
     if let Some(v) = value.downcast_ref::<GraphCheckpointJson>() {
+        validate_checkpoint_json(v, path, 0)?;
         return Ok(v.clone());
     }
     if let Some(v) = value.downcast_ref::<String>() {
@@ -559,12 +560,56 @@ fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJso
     }
     if let Some(v) = value.downcast_ref::<f64>() {
         if let Some(n) = Number::from_f64(*v) {
-            return Ok(Value::Number(n));
+            let out = Value::Number(n);
+            validate_checkpoint_json(&out, path, 0)?;
+            return Ok(out);
         }
     }
     Err(GraphRestoreError::new(format!(
         "checkpoint: value at {path} is not strict JSON compatible"
     )))
+}
+
+fn validate_checkpoint_json(
+    value: &GraphCheckpointJson,
+    path: &str,
+    depth: u32,
+) -> RestoreResult<()> {
+    if depth > 128 {
+        return Err(GraphRestoreError::new(format!(
+            "checkpoint: JSON value at {path} exceeds maximum depth 128"
+        )));
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                validate_checkpoint_json(value, &format!("{path}.{key}"), depth + 1)?;
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_checkpoint_json(value, &format!("{path}[{index}]"), depth + 1)?;
+            }
+        }
+        Value::Number(number) => {
+            let text = number.to_string();
+            if text == "-0.0" || text == "-0" {
+                return Err(GraphRestoreError::new(format!(
+                    "checkpoint: JSON number at {path} is not strict canonical JSON compatible"
+                )));
+            }
+            if let Some(float) = number.as_f64() {
+                let abs = float.abs();
+                if abs > 0.0 && abs < f64::MIN_POSITIVE {
+                    return Err(GraphRestoreError::new(format!(
+                        "checkpoint: JSON number at {path} is subnormal and not strict canonical JSON compatible"
+                    )));
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
+    }
+    Ok(())
 }
 
 fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts> {
@@ -662,6 +707,7 @@ fn prepare_checkpoint(
         };
         let status = status_from_str(&node.status, &node.id)?;
         ensure_quiescent_status(status, &node.id, "restore_graph")?;
+        validate_checkpoint_node_json(node)?;
         if node.version.is_some() {
             return Err(GraphRestoreError::new(format!(
                 "restore_graph: node '{}' carries runtime version metadata, which Rust restore does not support yet",
@@ -747,6 +793,41 @@ fn prepare_checkpoint(
         nodes,
         mounts,
     })
+}
+
+fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()> {
+    if let GraphCheckpointFactory::RegistryRef {
+        config,
+        config_version,
+        ..
+    } = &node.factory
+    {
+        if let Some(config) = config {
+            validate_checkpoint_json(config, &format!("{}.factory.config", node.id), 0)?;
+        }
+        if let Some(config_version) = config_version {
+            validate_checkpoint_json(
+                config_version,
+                &format!("{}.factory.configVersion", node.id),
+                0,
+            )?;
+        }
+    }
+    if let GraphCheckpointValue::Data { data } = &node.value {
+        validate_checkpoint_json(data, &format!("{}.value", node.id), 0)?;
+    }
+    if let GraphCheckpointValue::Data { data } = &node.ctx_state.value {
+        validate_checkpoint_json(data, &format!("{}.ctxState", node.id), 0)?;
+    }
+    if let GraphCheckpointTerminal::Error { error } = &node.terminal {
+        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id), 0)?;
+    }
+    if let Some(meta) = &node.meta {
+        for (key, value) in meta {
+            validate_checkpoint_json(value, &format!("{}.meta.{key}", node.id), 0)?;
+        }
+    }
+    Ok(())
 }
 
 fn construct_prepared(
@@ -898,15 +979,10 @@ fn restore_terminal(node: &GraphCheckpointNode) -> RestoreResult<(bool, Status)>
             }
             Ok((true, status))
         }
-        GraphCheckpointTerminal::Error { .. } => {
-            if status != Status::Errored {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' ERROR terminal requires errored status",
-                    node.id
-                )));
-            }
-            Ok((true, status))
-        }
+        GraphCheckpointTerminal::Error { .. } => Err(GraphRestoreError::new(format!(
+            "restore_graph: node '{}' carries ERROR terminal payload, which Rust restore cannot preserve yet",
+            node.id
+        ))),
     }
 }
 
@@ -1043,6 +1119,52 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("runtime version metadata"));
+    }
+
+    #[test]
+    fn checkpoint_and_restore_reject_noncanonical_json_numbers() {
+        let g = crate::graph::graph();
+        let source = g.state_opts(-0.0_f64, GraphNodeOpts::named("source"));
+        let _keep_active = source.subscribe(|_| {});
+        let err = g
+            .checkpoint()
+            .expect_err("negative zero is not strict canonical JSON");
+        assert!(err.to_string().contains("strict canonical JSON"));
+
+        let g = crate::graph::graph();
+        g.state_opts(json!(1), GraphNodeOpts::named("source"));
+        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
+        checkpoint.nodes[0].value = GraphCheckpointValue::Data {
+            data: Value::Number(Number::from_f64(f64::MIN_POSITIVE / 2.0).unwrap()),
+        };
+        let err = match restore_graph(
+            checkpoint,
+            RestoreGraphOptions::new(default_restore_registry()),
+        ) {
+            Ok(_) => panic!("subnormal checkpoint number must fail restore validation"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("subnormal"));
+    }
+
+    #[test]
+    fn restore_rejects_error_terminal_payload_until_preservation_lands() {
+        let g = crate::graph::graph();
+        g.state_opts(json!(1), GraphNodeOpts::named("source"));
+        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
+        checkpoint.nodes[0].status = "errored".to_owned();
+        checkpoint.nodes[0].terminal = GraphCheckpointTerminal::Error {
+            error: json!("boom"),
+        };
+
+        let err = match restore_graph(
+            checkpoint,
+            RestoreGraphOptions::new(default_restore_registry()),
+        ) {
+            Ok(_) => panic!("ERROR terminal payload restore must fail honestly"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cannot preserve yet"));
     }
 
     #[test]

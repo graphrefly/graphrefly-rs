@@ -863,6 +863,13 @@ impl GraphNode {
     pub fn subscribe(&self, sink: impl Fn(&Message<AnyValue>) + 'static) -> Box<dyn FnOnce()> {
         Node::<AnyValue>::from_core(self.core.clone()).subscribe(sink)
     }
+
+    /// Emit a raw erased wave at this graph-registered node boundary.
+    ///
+    /// This mirrors [`Node::down`] for nodes recovered through [`Graph::find`].
+    pub fn down(&self, msgs: Vec<Message<AnyValue>>) {
+        Node::<AnyValue>::from_core(self.core.clone()).down(msgs)
+    }
 }
 
 /// D39 describe snapshot: flat nodes/edges plus mounted subgraphs.

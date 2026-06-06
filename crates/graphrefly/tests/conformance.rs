@@ -33,10 +33,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
 use graphrefly::{
-    batch, AnyValue, Core, Ctx, DeferredCtx, DepTerminal, LockId, Message, Node, NodeOpts,
-    Pausable, PoolKind, Status, WaveData,
+    batch, graph, restore_graph, restore_registry, AnyValue, Core, Ctx, DeferredCtx, DepTerminal,
+    GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreEntry, LockId, Message, Node,
+    NodeOpts, Pausable, PoolKind, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
+    RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
 };
+use serde_json::json;
 
 type Log = Rc<RefCell<Vec<String>>>;
 type WaveShape = Vec<Vec<String>>;
@@ -71,6 +75,25 @@ fn record_data_i32(node: &Node<i32>) -> (Rc<RefCell<Vec<i32>>>, Unsub) {
         }
     });
     (vals, unsub)
+}
+
+fn record_graph_node_data_json(node: &GraphNode) -> (Rc<RefCell<Vec<GraphCheckpointJson>>>, Unsub) {
+    let vals: Rc<RefCell<Vec<GraphCheckpointJson>>> = Rc::new(RefCell::new(Vec::new()));
+    let v = vals.clone();
+    let unsub = node.subscribe(move |m: &Message<AnyValue>| {
+        if let Message::Data(a) = m {
+            if let Ok(rc) = a.clone().downcast::<GraphCheckpointJson>() {
+                v.borrow_mut().push(rc.as_ref().clone());
+            }
+        }
+    });
+    (vals, unsub)
+}
+
+fn graph_node_json_cache(node: &GraphNode) -> Option<GraphCheckpointJson> {
+    node.cache_any()
+        .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
+        .map(|v| v.as_ref().clone())
 }
 
 /// Count occurrences of a message kind in a recorded log.
@@ -2623,4 +2646,205 @@ fn c23_raw_ctx_wave_data_preserves_per_wave_distinctions() {
         a.set(2);
         assert_eq!(*vals.borrow(), vec![2]);
     }
+}
+
+struct C24StatefulMapDescriptor {
+    runs: Rc<Cell<usize>>,
+}
+
+impl GraphRestoreDescriptor for C24StatefulMapDescriptor {
+    fn ref_(&self) -> &'static str {
+        "c24-stateful-map"
+    }
+
+    fn define(
+        &self,
+        ctx: RestoreDefineCtx<'_>,
+    ) -> graphrefly::GraphRestoreResult<RestoreNodeDefinition> {
+        assert_eq!(ctx.deps.len(), 1);
+        let runs = self.runs.clone();
+        Ok(RestoreNodeDefinition {
+            factory: "c24-stateful-map",
+            kind: RestoreNodeKind::NodeJson(Rc::new(move |ctx: &Ctx| {
+                runs.set(runs.get() + 1);
+                let prev = ctx
+                    .state_get::<GraphCheckpointJson>()
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let next = prev + 1;
+                for value in ctx.batch::<GraphCheckpointJson>(0) {
+                    let input = value.as_i64().expect("C-24 JSON input is a number");
+                    ctx.emit(json!(input * 10 + next));
+                }
+                ctx.state_set(json!(next));
+            })),
+            opts: GraphNodeOpts {
+                name: ctx.checkpoint.name.clone(),
+                restore: Some(RestoreFactoryMeta::registry_ref("c24-stateful-map")),
+                ..GraphNodeOpts::default()
+            },
+        })
+    }
+}
+
+/// C-24 — snapshot/restore is state-preserving, not a fresh lifecycle. A restored
+/// dep-bearing node's checkpointed cache is load-bearing for late subscribers; restored
+/// dependency activation/push-on-subscribe must not recompute or overwrite it (D117).
+/// Local-only and missing factories fail honestly (R-snapshot/R-restore).
+#[test]
+fn c24_snapshot_restore_preserves_state_and_rejects_local_only_factories() {
+    let original_runs = Rc::new(Cell::new(0usize));
+    let g = graph();
+    let source = g.state_opts(json!(3), GraphNodeOpts::named("source"));
+    let mut opts = GraphNodeOpts::named("memo");
+    opts.restore = Some(RestoreFactoryMeta::registry_ref("c24-stateful-map"));
+    let memo = {
+        let runs = original_runs.clone();
+        g.node_opts::<GraphCheckpointJson, _>(
+            vec![source.erased()],
+            move |ctx| {
+                runs.set(runs.get() + 1);
+                let prev = ctx
+                    .state_get::<GraphCheckpointJson>()
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let next = prev + 1;
+                for value in ctx.batch::<GraphCheckpointJson>(0) {
+                    let input = value.as_i64().expect("C-24 JSON input is a number");
+                    ctx.emit(json!(input * 10 + next));
+                }
+                ctx.state_set(json!(next));
+            },
+            opts,
+        )
+    };
+    let _keep_active = memo.subscribe(|_| {});
+    assert_eq!(memo.cache(), Some(json!(31)));
+    assert_eq!(original_runs.get(), 1);
+
+    let checkpoint = g.checkpoint().expect("C-24 checkpoint succeeds");
+    let restored_runs = Rc::new(Cell::new(0usize));
+    let restored = restore_graph(
+        checkpoint.clone(),
+        RestoreGraphOptions::new(restore_registry([
+            GraphRestoreEntry::descriptor(StateRestoreDescriptor),
+            GraphRestoreEntry::descriptor(C24StatefulMapDescriptor {
+                runs: restored_runs.clone(),
+            }),
+        ])),
+    )
+    .expect("C-24 restore succeeds");
+
+    let restored_memo = restored.find("memo").expect("memo restored");
+    assert_eq!(
+        graph_node_json_cache(&restored_memo),
+        Some(json!(31)),
+        "restore keeps checkpointed cache"
+    );
+    assert_eq!(
+        restored_runs.get(),
+        0,
+        "fresh restore commit must not run user fn"
+    );
+
+    let (seen, _late_sub) = record_graph_node_data_json(&restored_memo);
+    assert_eq!(
+        *seen.borrow(),
+        vec![json!(31)],
+        "late subscribe receives restored cache directly"
+    );
+    assert_eq!(
+        restored_runs.get(),
+        0,
+        "restored dep activation/push-on-subscribe must not recompute"
+    );
+
+    let snap = restored.describe();
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "source" && edge.to == "memo"));
+
+    let restored_checkpoint = restored
+        .checkpoint()
+        .expect("restored graph can checkpoint again");
+    let memo_checkpoint = restored_checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "memo")
+        .expect("memo checkpoint exists");
+    assert_eq!(
+        memo_checkpoint.ctx_state.value,
+        graphrefly::GraphCheckpointValue::Data { data: json!(1) }
+    );
+
+    let restored_source = restored.find("source").expect("source restored");
+    restored_source.down(vec![Message::Data(Rc::new(json!(4)) as AnyValue)]);
+    assert_eq!(
+        restored_runs.get(),
+        1,
+        "post-commit DATA is an ordinary wave"
+    );
+    assert_eq!(
+        graph_node_json_cache(&restored_memo),
+        Some(json!(42)),
+        "post-commit wave updates from restored ctx.state"
+    );
+
+    let missing_err = match restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(restore_registry([GraphRestoreEntry::descriptor(
+            StateRestoreDescriptor,
+        )])),
+    ) {
+        Ok(_) => panic!("missing factory descriptor fails honestly"),
+        Err(err) => err,
+    };
+    assert!(missing_err
+        .to_string()
+        .contains("missing registry descriptor"));
+
+    let mut versioned_checkpoint = restored_checkpoint.clone();
+    versioned_checkpoint
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "memo")
+        .expect("memo checkpoint exists")
+        .version = Some(json!({ "level": 0, "counter": 1 }));
+    let version_err = match restore_graph(
+        versioned_checkpoint,
+        RestoreGraphOptions::new(restore_registry([
+            GraphRestoreEntry::descriptor(StateRestoreDescriptor),
+            GraphRestoreEntry::descriptor(C24StatefulMapDescriptor {
+                runs: Rc::new(Cell::new(0)),
+            }),
+        ])),
+    ) {
+        Ok(_) => panic!("unsupported runtime version metadata fails honestly"),
+        Err(err) => err,
+    };
+    assert!(version_err.to_string().contains("runtime version metadata"));
+
+    let local_graph = graph();
+    let local_source = local_graph.state_opts(json!(1), GraphNodeOpts::named("source"));
+    let local = local_graph.node_opts::<GraphCheckpointJson, _>(
+        vec![local_source.erased()],
+        |ctx| {
+            for value in ctx.batch::<GraphCheckpointJson>(0) {
+                ctx.emit(json!(value.as_i64().unwrap() + 1));
+            }
+        },
+        GraphNodeOpts::named("local"),
+    );
+    let _keep_local_active = local.subscribe(|_| {});
+    let local_err = match restore_graph(
+        local_graph.checkpoint().expect("local checkpoint succeeds"),
+        RestoreGraphOptions::new(restore_registry([GraphRestoreEntry::descriptor(
+            StateRestoreDescriptor,
+        )])),
+    ) {
+        Ok(_) => panic!("local-only factory restore fails honestly"),
+        Err(err) => err,
+    };
+    assert!(local_err.to_string().contains("local-only"));
 }
