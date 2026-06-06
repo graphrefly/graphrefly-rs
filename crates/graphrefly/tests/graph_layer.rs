@@ -5,13 +5,14 @@ use std::rc::Rc;
 use graphrefly::{
     default_dispatcher, default_restore_registry, describe_to_ascii, describe_to_d2,
     describe_to_d2_with_direction, describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
-    describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, filter,
-    from_iter, graph, graph_opts, map, merge, restore_graph, restore_registry, scan, take, timeout,
-    DescribeEdge, DescribeOpts, DescribeValue, DiagramDirection, Dispatcher, Explain,
-    GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue,
-    GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry, LockId, Message,
-    NodeOpts, Pausable, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, Values,
-    GRAPH_CHECKPOINT_VERSION,
+    describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, explain_path,
+    filter, from_iter, graph, graph_opts, map, merge, reachable, restore_graph, restore_registry,
+    scan, take, timeout, validate_no_islands, DescribeEdge, DescribeNode, DescribeOpts,
+    DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher, Explain, ExplainPathOptions,
+    ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson,
+    GraphCheckpointValue, GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry,
+    IslandReport, LockId, Message, NodeOpts, Pausable, ReachableDirection, ReachableOptions,
+    RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -122,6 +123,337 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
         to: "raw".to_owned(),
     }));
     observer.unsubscribe();
+}
+
+#[test]
+fn graph_diagnostics_reachable_walks_deterministically() {
+    let g = graph();
+    let a = g.state_opts(1i32, GraphNodeOpts::named("a"));
+    let b = g.derived_opts(
+        vec![a.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("b"),
+    );
+    let _c = g.derived_opts(
+        vec![b.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("c"),
+    );
+    let sink = g.effect_opts(vec![a.erased()], |_| None, GraphNodeOpts::named("sink"));
+    let _keep_active = sink.subscribe(|_| {});
+
+    let snap = g.describe();
+    assert_eq!(
+        reachable(
+            &snap,
+            "c",
+            ReachableDirection::Upstream,
+            ReachableOptions::default()
+        )
+        .paths,
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+    assert_eq!(
+        reachable(
+            &snap,
+            "a",
+            ReachableDirection::Downstream,
+            ReachableOptions::default()
+        )
+        .paths,
+        vec!["b".to_owned(), "c".to_owned(), "sink".to_owned()]
+    );
+    assert_eq!(
+        reachable(
+            &snap,
+            "b",
+            ReachableDirection::Upstream,
+            ReachableOptions {
+                both: true,
+                ..ReachableOptions::default()
+            },
+        )
+        .paths,
+        vec!["a".to_owned(), "c".to_owned(), "sink".to_owned()]
+    );
+
+    let detailed = reachable(
+        &snap,
+        "a",
+        ReachableDirection::Downstream,
+        ReachableOptions {
+            max_depth: Some(1),
+            both: false,
+        },
+    );
+    assert_eq!(detailed.paths, vec!["b".to_owned(), "sink".to_owned()]);
+    assert_eq!(detailed.depths.get("b"), Some(&1));
+    assert_eq!(detailed.depths.get("sink"), Some(&1));
+    assert!(detailed.truncated);
+
+    let zero = reachable(
+        &snap,
+        "a",
+        ReachableDirection::Downstream,
+        ReachableOptions {
+            max_depth: Some(0),
+            both: false,
+        },
+    );
+    assert!(zero.paths.is_empty());
+    assert!(zero.truncated);
+}
+
+#[test]
+fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
+    let g = graph();
+    let a = g.state_opts(1i32, GraphNodeOpts::named("a"));
+    let b = g.derived_opts(
+        vec![a.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("b"),
+    );
+    let _c = g.derived_opts(
+        vec![b.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("c"),
+    );
+
+    let snap = g.describe();
+    let chain = explain_path(&snap, "a", "c", ExplainPathOptions::default());
+    assert!(chain.found);
+    assert_eq!(chain.reason, ExplainPathReason::Ok);
+    assert_eq!(
+        chain
+            .steps
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"]
+    );
+    assert_eq!(
+        chain.steps.iter().map(|s| s.hop).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(chain.steps[0].factory, "state");
+    assert_eq!(chain.steps[0].dep_index, Some(0));
+    assert_eq!(chain.steps[1].factory, "derived");
+    assert_eq!(chain.steps[1].dep_index, Some(0));
+    assert_eq!(chain.text, "a -> b -> c");
+    assert_eq!(
+        explain_path(&snap, "missing", "c", ExplainPathOptions::default()).reason,
+        ExplainPathReason::NoSuchFrom
+    );
+    assert_eq!(
+        explain_path(&snap, "a", "missing", ExplainPathOptions::default()).reason,
+        ExplainPathReason::NoSuchTo
+    );
+    assert_eq!(
+        explain_path(
+            &snap,
+            "c",
+            "a",
+            ExplainPathOptions {
+                max_depth: Some(1),
+                find_cycle: false,
+            },
+        )
+        .reason,
+        ExplainPathReason::NoPath
+    );
+
+    let parent = graph();
+    let root = parent.state_opts(0i32, GraphNodeOpts::named("root"));
+    parent.derived_opts(
+        vec![root.erased()],
+        |values| last_or_prev(values, 0).map(|v| *v),
+        GraphNodeOpts::named("rootD"),
+    );
+    let child = graph();
+    let leaf = child.state_opts(1i32, GraphNodeOpts::named("leaf"));
+    child.derived_opts(
+        vec![leaf.erased()],
+        |values| last_or_prev(values, 0).map(|v| *v),
+        GraphNodeOpts::named("leafD"),
+    );
+    child.state_opts(9i32, GraphNodeOpts::named("orphan"));
+    parent.mount(child, "child");
+
+    let islands = validate_no_islands(&parent.describe());
+    assert!(!islands.ok);
+    assert_eq!(
+        islands.orphans,
+        vec![IslandReport {
+            id: "child::orphan".to_owned(),
+            factory: "state".to_owned()
+        }]
+    );
+    assert_eq!(
+        islands.summary(),
+        "validate_no_islands: 1 island node(s) - child::orphan (state)"
+    );
+}
+
+#[test]
+fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
+    let snap = DescribeSnapshot {
+        name: None,
+        nodes: vec![
+            DescribeNode {
+                id: "x".to_owned(),
+                name: None,
+                factory: "state".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec![],
+                meta: None,
+            },
+            DescribeNode {
+                id: "y".to_owned(),
+                name: None,
+                factory: "derived".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec![],
+                meta: None,
+            },
+        ],
+        edges: vec![DescribeEdge {
+            from: "x".to_owned(),
+            to: "y".to_owned(),
+        }],
+        subgraphs: None,
+    };
+    assert_eq!(
+        reachable(
+            &snap,
+            "x",
+            ReachableDirection::Downstream,
+            ReachableOptions::default()
+        )
+        .paths,
+        vec!["y".to_owned()]
+    );
+    assert_eq!(
+        explain_path(&snap, "x", "y", ExplainPathOptions::default())
+            .steps
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["x", "y"]
+    );
+    assert!(validate_no_islands(&snap).ok);
+
+    let dangling = DescribeSnapshot {
+        name: None,
+        nodes: vec![
+            DescribeNode {
+                id: "x".to_owned(),
+                name: None,
+                factory: "state".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec!["missing".to_owned()],
+                meta: None,
+            },
+            DescribeNode {
+                id: "y".to_owned(),
+                name: None,
+                factory: "derived".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec![],
+                meta: None,
+            },
+        ],
+        edges: vec![
+            DescribeEdge {
+                from: "x".to_owned(),
+                to: "missing".to_owned(),
+            },
+            DescribeEdge {
+                from: "missing".to_owned(),
+                to: "y".to_owned(),
+            },
+        ],
+        subgraphs: None,
+    };
+    assert!(reachable(
+        &dangling,
+        "x",
+        ReachableDirection::Downstream,
+        ReachableOptions::default()
+    )
+    .paths
+    .is_empty());
+    assert_eq!(
+        explain_path(&dangling, "x", "y", ExplainPathOptions::default()).reason,
+        ExplainPathReason::NoPath
+    );
+
+    let cycle = DescribeSnapshot {
+        name: None,
+        nodes: vec![
+            DescribeNode {
+                id: "a".to_owned(),
+                name: None,
+                factory: "node".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec!["b".to_owned()],
+                meta: None,
+            },
+            DescribeNode {
+                id: "b".to_owned(),
+                name: None,
+                factory: "node".to_owned(),
+                status: Status::Sentinel,
+                value: None,
+                deps: vec!["a".to_owned()],
+                meta: None,
+            },
+        ],
+        edges: vec![
+            DescribeEdge {
+                from: "b".to_owned(),
+                to: "a".to_owned(),
+            },
+            DescribeEdge {
+                from: "a".to_owned(),
+                to: "b".to_owned(),
+            },
+        ],
+        subgraphs: None,
+    };
+    assert_eq!(
+        explain_path(
+            &cycle,
+            "a",
+            "a",
+            ExplainPathOptions {
+                max_depth: None,
+                find_cycle: true,
+            },
+        )
+        .steps
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect::<Vec<_>>(),
+        vec!["a", "b", "a"]
+    );
+    assert_eq!(
+        explain_path(
+            &cycle,
+            "a",
+            "a",
+            ExplainPathOptions {
+                max_depth: Some(1),
+                find_cycle: true,
+            },
+        )
+        .reason,
+        ExplainPathReason::MaxDepthExceeded
+    );
 }
 
 #[test]
