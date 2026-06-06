@@ -1,7 +1,8 @@
 //! Fresh graph checkpoint/restore (R-snapshot/R-restore, D83/D94/D116).
 //!
-//! Storage is deliberately absent here: callers load/decode checkpoint JSON outside
-//! the sync core, then pass the already-loaded value to [`restore_graph`].
+//! Checkpoint-owned storage integration is deliberately absent here: callers
+//! load/decode checkpoint JSON outside the sync core, then pass the already-loaded
+//! value to [`restore_graph`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
