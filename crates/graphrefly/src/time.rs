@@ -369,8 +369,7 @@ pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
         vec![initial_timer, source_core.clone()],
         NodeOpts::default(),
     );
-    node.erased()
-        .set_local_async_driver(source_core.local_async_driver());
+    node.erased().set_environment(source_core.environment());
     node
 }
 
@@ -462,8 +461,7 @@ pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>
         vec![interval_node, source_core.clone()],
         NodeOpts::default(),
     );
-    node.erased()
-        .set_local_async_driver(source_core.local_async_driver());
+    node.erased().set_environment(source_core.environment());
     node
 }
 
@@ -544,8 +542,7 @@ fn scoped_time_source(anchor: &Core, op: Operator<u64>) -> Node<u64> {
         vec![],
         NodeOpts::default(),
     );
-    node.erased()
-        .set_local_async_driver(anchor.local_async_driver());
+    node.erased().set_environment(anchor.environment());
     node
 }
 

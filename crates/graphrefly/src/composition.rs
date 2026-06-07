@@ -191,23 +191,12 @@ where
             ..NodeOpts::default()
         },
         move |ctx: &Ctx| {
-            let initialized = ctx.state_get::<bool>().map(|value| *value).unwrap_or(false);
             if let Some(rules) = ctx.data::<R>(rules_index) {
-                let mut values = ctx.batch::<T>(source_index);
-                let rules_changed = !ctx.batch::<R>(rules_index).is_empty();
-                if values.is_empty() && (!initialized || rules_changed) {
-                    if let Some(value) = ctx.data::<T>(source_index) {
-                        values.push(value);
-                    }
-                }
-                for value in values {
+                for value in ctx.batch::<T>(source_index) {
                     if classifier(rules.as_ref(), value.as_ref()) {
                         ctx.emit((*value).clone());
                     }
                 }
-            }
-            if !initialized {
-                ctx.state_set(true);
             }
 
             match ctx.terminal(source_index) {

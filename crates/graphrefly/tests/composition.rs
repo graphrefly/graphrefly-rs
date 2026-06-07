@@ -99,7 +99,7 @@ fn stratify_branch_routes_source_values_through_declared_deps() {
     rules.set(ModRule { modulo: 1 });
     source.set(3);
 
-    assert_eq!(*seen.borrow(), vec![0, 2, 3]);
+    assert_eq!(*seen.borrow(), vec![2, 3]);
     let snap = g.describe();
     assert!(snap.edges.contains(&DescribeEdge {
         from: "source".to_owned(),
@@ -121,7 +121,7 @@ fn stratify_branch_routes_source_values_through_declared_deps() {
 }
 
 #[test]
-fn stratify_branch_drops_source_values_while_rules_are_sentinel_then_rechecks_latest() {
+fn stratify_branch_drops_source_values_while_rules_are_sentinel_until_future_source_data() {
     let g = graph();
     let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
     let rules = g.state_empty_opts::<bool>(GraphNodeOpts::named("rules"));
@@ -141,7 +141,7 @@ fn stratify_branch_drops_source_values_while_rules_are_sentinel_then_rechecks_la
     rules.set(true);
     source.set(3);
 
-    assert_eq!(*seen.borrow(), vec![2, 3]);
+    assert_eq!(*seen.borrow(), vec![3]);
 }
 
 #[test]
@@ -180,8 +180,8 @@ fn stratify_builds_static_named_branches_with_metadata() {
     source.set(3);
     source.set(4);
 
-    assert_eq!(*even_seen.borrow(), vec![0, 2, 3]);
-    assert_eq!(*odd_seen.borrow(), vec![1, 2, 4]);
+    assert_eq!(*even_seen.borrow(), vec![2, 3]);
+    assert_eq!(*odd_seen.borrow(), vec![1, 4]);
     let snap = g.describe();
     let even_node = snap
         .nodes
@@ -214,6 +214,98 @@ fn stratify_builds_static_named_branches_with_metadata() {
         odd_node.deps,
         vec!["source".to_owned(), "topic/rules".to_owned()]
     );
+}
+
+#[test]
+fn stratify_rules_only_update_does_not_reemit_latest_source_value() {
+    let g = graph();
+    let source = g.state_opts(0i32, GraphNodeOpts::named("source"));
+    let stratified = stratify(
+        &g,
+        &source,
+        vec![StratifyRule::new("even", ModRule { modulo: 0 })],
+        |rule: &ModRule, value: &i32| value % 2 == rule.modulo,
+        StratifyOptions {
+            prefix: "topic".to_owned(),
+            ..StratifyOptions::default()
+        },
+    );
+    let even_seen = collect_data(stratified.branches.get("even").unwrap());
+
+    source.set(2);
+    stratified
+        .rules
+        .set(vec![StratifyRule::new("even", ModRule { modulo: 1 })]);
+    stratified
+        .rules
+        .set(vec![StratifyRule::new("even", ModRule { modulo: 0 })]);
+    source.set(4);
+
+    assert_eq!(*even_seen.borrow(), vec![2, 4]);
+}
+
+#[test]
+fn stratify_omitted_declared_branch_drops_until_rule_is_reintroduced() {
+    let g = graph();
+    let source = g.state_opts(0i32, GraphNodeOpts::named("source"));
+    let stratified = stratify(
+        &g,
+        &source,
+        vec![
+            StratifyRule::new("even", ModRule { modulo: 0 }),
+            StratifyRule::new("odd", ModRule { modulo: 1 }),
+        ],
+        |rule: &ModRule, value: &i32| value % 2 == rule.modulo,
+        StratifyOptions {
+            prefix: "topic".to_owned(),
+            ..StratifyOptions::default()
+        },
+    );
+    let odd_seen = collect_data(stratified.branches.get("odd").unwrap());
+
+    source.set(1);
+    stratified
+        .rules
+        .set(vec![StratifyRule::new("even", ModRule { modulo: 0 })]);
+    source.set(3);
+    stratified.rules.set(vec![
+        StratifyRule::new("even", ModRule { modulo: 0 }),
+        StratifyRule::new("odd", ModRule { modulo: 1 }),
+    ]);
+    source.set(5);
+
+    assert_eq!(*odd_seen.borrow(), vec![1, 5]);
+}
+
+#[test]
+fn stratify_unknown_later_rule_does_not_create_a_branch_or_mutate_topology() {
+    let g = graph();
+    let source = g.state_opts(0i32, GraphNodeOpts::named("source"));
+    let stratified = stratify(
+        &g,
+        &source,
+        vec![StratifyRule::new("even", ModRule { modulo: 0 })],
+        |rule: &ModRule, value: &i32| value % 2 == rule.modulo,
+        StratifyOptions {
+            prefix: "topic".to_owned(),
+            ..StratifyOptions::default()
+        },
+    );
+    let before = g.describe();
+    let before_node_ids: Vec<_> = before.nodes.iter().map(|node| node.id.clone()).collect();
+
+    stratified.rules.set(vec![
+        StratifyRule::new("even", ModRule { modulo: 0 }),
+        StratifyRule::new("odd", ModRule { modulo: 1 }),
+    ]);
+    source.set(1);
+
+    let after = g.describe();
+    let after_node_ids: Vec<_> = after.nodes.iter().map(|node| node.id.clone()).collect();
+    assert!(stratified.branches.contains_key("even"));
+    assert!(!stratified.branches.contains_key("odd"));
+    assert_eq!(before_node_ids, after_node_ids);
+    assert_eq!(before.edges, after.edges);
 }
 
 #[test]

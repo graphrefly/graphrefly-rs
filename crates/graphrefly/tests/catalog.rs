@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -14,14 +15,19 @@ use futures_core::Stream;
 use graphrefly::{
     audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
-    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_fs_watch,
-    from_fs_watch_with_options, from_iter, from_timer, future_local, graph, interval, last,
-    last_any, map, merge_map, merge_map_with_options, never, of, on_first_data,
-    on_first_data_where, pairwise, race, reduce, repeat, rescue, sample, scan, settle, settle_by,
-    skip, stream_local, switch_map, take, take_until, take_while, tap, tap_first, throttle,
-    throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip, Dispatcher,
-    FromFsWatchOptions, FsEvent, FsEventKind, GraphNodeOpts, GraphOptions, LocalAsyncDriver,
-    MergeMapOptions, Message, Node,
+    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_cron,
+    from_cron_with_options, from_fs_watch, from_fs_watch_with_options, from_git_hook,
+    from_git_hook_with_options, from_http, from_iter, from_process, from_sse, from_timer,
+    from_websocket, future_local, graph, interval, last, last_any, map, matches_cron, merge_map,
+    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, parse_cron,
+    race, reduce, repeat, rescue, run_process, sample, scan, settle, settle_by, skip, stream_local,
+    switch_map, take, take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error,
+    timeout, timer, valve, with_latest_from, zip, CronInstant, CronTick, Dispatcher,
+    EnvironmentDrivers, FromCronOptions, FromFsWatchOptions, FromGitHookOptions, FsEvent,
+    FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
+    LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver, LocalWebSocketDriver,
+    MergeMapOptions, Message, Node, ProcessCommand, ProcessResult, SseDriverEvent, SseEvent,
+    WebSocketDriverEvent, WebSocketEvent,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -78,6 +84,21 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+fn git(dir: &PathBuf, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git command can run");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct NoopWake;
 
 impl Wake for NoopWake {
@@ -95,6 +116,14 @@ struct IntervalTick {
 }
 
 type PendingFuture = (Rc<Cell<bool>>, Pin<Box<dyn Future<Output = ()>>>);
+type ProcessCallback = Box<dyn FnOnce(Result<ProcessResult, graphrefly::GraphError>)>;
+type PendingProcess = (ProcessCommand, Rc<Cell<bool>>, Option<ProcessCallback>);
+type HttpCallback = Box<dyn FnOnce(Result<HttpResponse, graphrefly::GraphError>)>;
+type PendingHttp = (HttpRequest, Rc<Cell<bool>>, Option<HttpCallback>);
+type SseCallback = Rc<dyn Fn(SseDriverEvent)>;
+type PendingSse = (String, Rc<Cell<bool>>, SseCallback);
+type WebSocketCallback = Rc<dyn Fn(WebSocketDriverEvent)>;
+type PendingWebSocket = (String, Rc<Cell<bool>>, WebSocketCallback);
 
 #[derive(Default)]
 struct ManualDriver {
@@ -164,6 +193,186 @@ impl LocalAsyncDriver for ManualDriver {
     ) -> graphrefly::DriverCancel {
         let active = Rc::new(Cell::new(true));
         self.futures.borrow_mut().push((active.clone(), fut));
+        Box::new(move || active.set(false))
+    }
+}
+
+#[derive(Default)]
+struct ManualProcessDriver {
+    processes: RefCell<Vec<PendingProcess>>,
+}
+
+impl ManualProcessDriver {
+    fn commands(&self) -> Vec<ProcessCommand> {
+        self.processes
+            .borrow()
+            .iter()
+            .map(|(command, _, _)| command.clone())
+            .collect()
+    }
+
+    fn finish_next(&self, result: Result<ProcessResult, graphrefly::GraphError>) {
+        let (_, active, callback) = self.processes.borrow_mut().remove(0);
+        if active.get() {
+            callback.expect("process callback is live")(result);
+        }
+    }
+
+    fn finish_next_ignoring_cancel(&self, result: Result<ProcessResult, graphrefly::GraphError>) {
+        let (_, _, callback) = self.processes.borrow_mut().remove(0);
+        callback.expect("process callback is live")(result);
+    }
+
+    fn active_count(&self) -> usize {
+        self.processes
+            .borrow()
+            .iter()
+            .filter(|(_, active, _)| active.get())
+            .count()
+    }
+}
+
+impl LocalProcessDriver for ManualProcessDriver {
+    fn run(&self, command: ProcessCommand, callback: ProcessCallback) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.processes
+            .borrow_mut()
+            .push((command, active.clone(), Some(callback)));
+        Box::new(move || active.set(false))
+    }
+}
+
+#[derive(Default)]
+struct ManualHttpDriver {
+    requests: RefCell<Vec<PendingHttp>>,
+}
+
+impl ManualHttpDriver {
+    fn requests(&self) -> Vec<HttpRequest> {
+        self.requests
+            .borrow()
+            .iter()
+            .map(|(request, _, _)| request.clone())
+            .collect()
+    }
+
+    fn finish_next(&self, result: Result<HttpResponse, graphrefly::GraphError>) {
+        let (_, active, callback) = self.requests.borrow_mut().remove(0);
+        if active.get() {
+            callback.expect("http callback is live")(result);
+        }
+    }
+
+    fn finish_next_ignoring_cancel(&self, result: Result<HttpResponse, graphrefly::GraphError>) {
+        let (_, _, callback) = self.requests.borrow_mut().remove(0);
+        callback.expect("http callback is live")(result);
+    }
+}
+
+impl LocalHttpDriver for ManualHttpDriver {
+    fn request(&self, request: HttpRequest, callback: HttpCallback) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.requests
+            .borrow_mut()
+            .push((request, active.clone(), Some(callback)));
+        Box::new(move || active.set(false))
+    }
+}
+
+struct EagerHttpDriver {
+    canceled: Rc<Cell<usize>>,
+}
+
+impl LocalHttpDriver for EagerHttpDriver {
+    fn request(&self, request: HttpRequest, callback: HttpCallback) -> graphrefly::DriverCancel {
+        callback(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: request.url.into_bytes(),
+        }));
+        let canceled = self.canceled.clone();
+        Box::new(move || canceled.set(canceled.get() + 1))
+    }
+}
+
+#[derive(Default)]
+struct ManualSseDriver {
+    connections: RefCell<Vec<PendingSse>>,
+}
+
+impl ManualSseDriver {
+    fn emit(&self, event: SseDriverEvent) {
+        let (_, active, callback) = &self.connections.borrow()[0];
+        if active.get() {
+            callback(event);
+        }
+    }
+
+    fn emit_ignoring_cancel(&self, event: SseDriverEvent) {
+        let (_, _, callback) = &self.connections.borrow()[0];
+        callback(event);
+    }
+
+    fn active_count(&self) -> usize {
+        self.connections
+            .borrow()
+            .iter()
+            .filter(|(_, active, _)| active.get())
+            .count()
+    }
+}
+
+impl LocalSseDriver for ManualSseDriver {
+    fn connect(
+        &self,
+        request: graphrefly::SseRequest,
+        callback: Rc<dyn Fn(SseDriverEvent)>,
+    ) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.connections
+            .borrow_mut()
+            .push((request.url, active.clone(), callback));
+        Box::new(move || active.set(false))
+    }
+}
+
+#[derive(Default)]
+struct ManualWebSocketDriver {
+    connections: RefCell<Vec<PendingWebSocket>>,
+}
+
+impl ManualWebSocketDriver {
+    fn emit(&self, event: WebSocketDriverEvent) {
+        let (_, active, callback) = &self.connections.borrow()[0];
+        if active.get() {
+            callback(event);
+        }
+    }
+
+    fn emit_ignoring_cancel(&self, event: WebSocketDriverEvent) {
+        let (_, _, callback) = &self.connections.borrow()[0];
+        callback(event);
+    }
+
+    fn active_count(&self) -> usize {
+        self.connections
+            .borrow()
+            .iter()
+            .filter(|(_, active, _)| active.get())
+            .count()
+    }
+}
+
+impl LocalWebSocketDriver for ManualWebSocketDriver {
+    fn connect(
+        &self,
+        request: graphrefly::WebSocketRequest,
+        callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+    ) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.connections
+            .borrow_mut()
+            .push((request.url, active.clone(), callback));
         Box::new(move || active.set(false))
     }
 }
@@ -283,9 +492,44 @@ fn source_factory_names_are_stable_in_describe() {
     );
     g.init_node(from_timer(10), vec![], GraphNodeOpts::named("from_timer"));
     g.init_node(
+        from_cron("* * * * *"),
+        vec![],
+        GraphNodeOpts::named("from_cron"),
+    );
+    g.init_node(
         from_fs_watch([dir.clone()]),
         vec![],
         GraphNodeOpts::named("from_fs_watch"),
+    );
+    g.init_node(
+        from_git_hook(dir.clone()),
+        vec![],
+        GraphNodeOpts::named("from_git_hook"),
+    );
+    g.init_node(
+        run_process("echo", ["ok"]),
+        vec![],
+        GraphNodeOpts::named("run_process"),
+    );
+    g.init_node(
+        from_process("echo", ["ok"]),
+        vec![],
+        GraphNodeOpts::named("from_process"),
+    );
+    g.init_node(
+        from_http("https://example.invalid"),
+        vec![],
+        GraphNodeOpts::named("from_http"),
+    );
+    g.init_node(
+        from_sse("https://example.invalid/events"),
+        vec![],
+        GraphNodeOpts::named("from_sse"),
+    );
+    g.init_node(
+        from_websocket("wss://example.invalid/socket"),
+        vec![],
+        GraphNodeOpts::named("from_websocket"),
     );
 
     let snap = g.describe();
@@ -307,7 +551,266 @@ fn source_factory_names_are_stable_in_describe() {
         "fromTimer",
         "the Rust alias should preserve TS's frozen source factory name in describe"
     );
+    assert_eq!(factory("from_cron"), "fromCron");
     assert_eq!(factory("from_fs_watch"), "fromFSWatch");
+    assert_eq!(factory("from_git_hook"), "fromGitHook");
+    assert_eq!(factory("run_process"), "runProcess");
+    assert_eq!(factory("from_process"), "fromProcess");
+    assert_eq!(factory("from_http"), "fromHttp");
+    assert_eq!(factory("from_sse"), "fromSSE");
+    assert_eq!(factory("from_websocket"), "fromWebSocket");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cron_parser_supports_lists_ranges_steps_and_matching() {
+    let schedule = parse_cron("0,30 9-17/2 * 1-3 1-5").expect("cron parses");
+
+    assert_eq!(
+        schedule.minutes.into_iter().collect::<Vec<_>>(),
+        vec![0, 30]
+    );
+    assert_eq!(
+        schedule.hours.into_iter().collect::<Vec<_>>(),
+        vec![9, 11, 13, 15, 17]
+    );
+    assert!(parse_cron("60 * * * *").is_err());
+    assert!(parse_cron("* * * *").is_err());
+    assert!(parse_cron("*/5foo * * * *").is_err());
+    assert!(parse_cron("1/2/3 * * * *").is_err());
+    assert!(parse_cron("8-12bar * * * *").is_err());
+
+    let schedule = parse_cron("30 8 * * 1").expect("cron parses");
+    assert!(matches_cron(
+        &schedule,
+        CronInstant::new(2026, 3, 30, 8, 30, 1)
+    ));
+    assert!(!matches_cron(
+        &schedule,
+        CronInstant::new(2026, 3, 30, 8, 31, 1)
+    ));
+
+    let schedule = parse_cron("0 9 1 * 1").expect("cron parses");
+    assert!(
+        matches_cron(&schedule, CronInstant::new(2026, 7, 1, 9, 0, 3)),
+        "standard cron matches when day-of-month matches"
+    );
+    assert!(
+        matches_cron(&schedule, CronInstant::new(2026, 6, 8, 9, 0, 1)),
+        "standard cron matches when day-of-week matches"
+    );
+    assert!(!matches_cron(
+        &schedule,
+        CronInstant::new(2026, 6, 2, 9, 0, 2)
+    ));
+
+    let schedule = parse_cron("0 9 * * 1").expect("cron parses");
+    assert!(matches_cron(
+        &schedule,
+        CronInstant::new(2026, 6, 8, 9, 0, 1)
+    ));
+    assert!(!matches_cron(
+        &schedule,
+        CronInstant::new(2026, 6, 9, 9, 0, 2)
+    ));
+
+    let schedule = parse_cron("0 9 1 * *").expect("cron parses");
+    assert!(matches_cron(
+        &schedule,
+        CronInstant::new(2026, 7, 1, 9, 0, 3)
+    ));
+    assert!(!matches_cron(
+        &schedule,
+        CronInstant::new(2026, 7, 2, 9, 0, 4)
+    ));
+}
+
+#[test]
+fn from_cron_emits_once_per_matching_minute_and_cleans_up_driver_interval() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let ticks = Rc::new(RefCell::new(VecDeque::from([
+        CronTick::new(CronInstant::new(2026, 3, 30, 8, 30, 1), "100"),
+        CronTick::new(CronInstant::new(2026, 3, 30, 8, 30, 1), "101"),
+        CronTick::new(CronInstant::new(2026, 3, 30, 8, 31, 1), "102"),
+        CronTick::new(CronInstant::new(2026, 4, 6, 8, 30, 1), "103"),
+        CronTick::new(CronInstant::new(2026, 4, 13, 8, 30, 1), "104"),
+    ])));
+    let now_ticks = ticks.clone();
+    let cron = g.init_node(
+        from_cron_with_options(
+            "30 8 * * 1",
+            FromCronOptions {
+                tick_ms: 1_000,
+                now: Some(Rc::new(move || {
+                    now_ticks.borrow_mut().pop_front().expect("test cron tick")
+                })),
+            },
+        ),
+        vec![],
+        GraphNodeOpts::named("cron"),
+    );
+    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let seen_sink = seen.clone();
+    let unsubscribe = cron.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(tick) = value.as_ref().downcast_ref::<CronTick>() {
+                seen_sink.borrow_mut().push(tick.timestamp_ns.clone());
+            }
+        }
+    });
+
+    assert_eq!(*seen.borrow(), vec!["100".to_owned()]);
+    driver.tick_intervals();
+    driver.tick_intervals();
+    driver.tick_intervals();
+    assert_eq!(*seen.borrow(), vec!["100".to_owned(), "103".to_owned()]);
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        1
+    );
+    assert_eq!(
+        g.describe()
+            .nodes
+            .iter()
+            .find(|node| node.id == "cron")
+            .map(|node| node.factory.as_str()),
+        Some("fromCron")
+    );
+
+    unsubscribe();
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        0
+    );
+    driver.tick_intervals();
+    assert_eq!(*seen.borrow(), vec!["100".to_owned(), "103".to_owned()]);
+}
+
+#[test]
+fn from_git_hook_records_baseline_then_emits_filtered_commit_events() {
+    let dir = temp_dir("git-hook");
+    git(&dir, &["init"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
+    git(&dir, &["config", "user.name", "GraphReFly Test"]);
+    fs::write(dir.join("a.txt"), "a").expect("write initial file");
+    git(&dir, &["add", "a.txt"]);
+    git(&dir, &["commit", "-m", "initial"]);
+
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let hook = g.init_node(
+        from_git_hook_with_options(
+            dir.clone(),
+            FromGitHookOptions {
+                poll_ms: 1,
+                include: vec!["*.txt".to_owned()],
+                exclude: vec!["skip*".to_owned()],
+                ..FromGitHookOptions::default()
+            },
+        ),
+        vec![],
+        GraphNodeOpts::named("git_hook"),
+    );
+    let seen = collect_data::<GitEvent>(&hook);
+    assert!(seen.borrow().is_empty(), "first poll establishes baseline");
+
+    fs::write(dir.join(" spaced .txt"), "kept").expect("write kept file");
+    fs::write(dir.join("skip.log"), "ignored").expect("write skipped file");
+    git(&dir, &["add", "--", " spaced .txt", "skip.log"]);
+    git(&dir, &["commit", "-m", "second"]);
+    driver.tick_intervals();
+
+    let events = seen.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].hook, graphrefly::GitHookType::PostCommit);
+    assert_eq!(events[0].message, "second");
+    assert_eq!(events[0].author, "GraphReFly Test");
+    assert_eq!(events[0].files, vec![" spaced .txt".to_owned()]);
+    assert!(!events[0].commit.is_empty());
+    assert!(!events[0].timestamp_ns.is_empty());
+    assert_eq!(
+        g.describe()
+            .nodes
+            .iter()
+            .find(|node| node.id == "git_hook")
+            .map(|node| node.factory.as_str()),
+        Some("fromGitHook")
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn from_git_hook_initial_errors_respect_threshold_and_cancel_interval() {
+    let dir = temp_dir("git-hook-errors");
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let hook = g.init_node(
+        from_git_hook_with_options(
+            dir.clone(),
+            FromGitHookOptions {
+                poll_ms: 1,
+                max_consecutive_errors: 2,
+                ..FromGitHookOptions::default()
+            },
+        ),
+        vec![],
+        GraphNodeOpts::named("git_hook_errors"),
+    );
+    let errors = collect_errors::<GitEvent>(&hook);
+
+    assert!(
+        errors.borrow().is_empty(),
+        "first activation error is below the configured threshold"
+    );
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        1
+    );
+
+    driver.tick_intervals();
+    assert_eq!(errors.borrow().len(), 1);
+    assert!(
+        errors.borrow()[0].contains("rev-parse"),
+        "git diagnostic should preserve the failing command"
+    );
+    assert_eq!(
+        driver
+            .intervals
+            .borrow()
+            .iter()
+            .filter(|tick| tick.active.get())
+            .count(),
+        0,
+        "terminal source error should clean up the driver interval"
+    );
+
+    driver.tick_intervals();
+    assert_eq!(errors.borrow().len(), 1);
     fs::remove_dir_all(dir).ok();
 }
 
@@ -318,7 +821,7 @@ fn fs_watch_source_initial_scan_is_inspectable_and_filtered() {
     fs::write(dir.join("skip.log"), "skip").expect("write log file");
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver),
+        environment: EnvironmentDrivers::new().with_local_async(driver),
         ..GraphOptions::default()
     });
 
@@ -378,7 +881,7 @@ fn fs_watch_source_deactivation_cancels_poll_driver() {
     let dir = temp_dir("fs-cleanup");
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let watched = g.init_node(
@@ -413,7 +916,7 @@ fn fs_watch_source_deactivation_cancels_poll_driver() {
 fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -450,7 +953,7 @@ fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
 fn time_helpers_cancel_armed_clock_on_unsubscribe() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -570,6 +1073,305 @@ fn missing_driver_reports_source_activation_error() {
         vec!["fromTimer: missing local async driver".to_owned()],
         "alias diagnostics should match the visible source factory name"
     );
+
+    let cron_node = g.init_node(
+        from_cron("* * * * *"),
+        vec![],
+        GraphNodeOpts::named("cron_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<CronTick>(&cron_node).borrow(),
+        vec!["fromCron: missing local async driver".to_owned()]
+    );
+
+    let git_node = g.init_node(
+        from_git_hook("."),
+        vec![],
+        GraphNodeOpts::named("git_hook_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<GitEvent>(&git_node).borrow(),
+        vec!["fromGitHook: missing local async driver".to_owned()]
+    );
+
+    let process = g.init_node(
+        run_process("cargo", ["--version"]),
+        vec![],
+        GraphNodeOpts::named("process_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<ProcessResult>(&process).borrow(),
+        vec!["runProcess: missing process driver".to_owned()]
+    );
+
+    let http = g.init_node(
+        from_http("https://example.invalid"),
+        vec![],
+        GraphNodeOpts::named("http_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<HttpResponse>(&http).borrow(),
+        vec!["fromHttp: missing http driver".to_owned()]
+    );
+
+    let sse = g.init_node(
+        from_sse("https://example.invalid/events"),
+        vec![],
+        GraphNodeOpts::named("sse_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<SseEvent>(&sse).borrow(),
+        vec!["fromSSE: missing sse driver".to_owned()]
+    );
+
+    let websocket = g.init_node(
+        from_websocket("wss://example.invalid/socket"),
+        vec![],
+        GraphNodeOpts::named("websocket_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<WebSocketEvent>(&websocket).borrow(),
+        vec!["fromWebSocket: missing websocket driver".to_owned()]
+    );
+}
+
+#[test]
+fn run_process_uses_graph_environment_process_driver() {
+    let driver = Rc::new(ManualProcessDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_process(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let process = g.init_node(
+        run_process("cargo", ["--version"]),
+        vec![],
+        GraphNodeOpts::named("process"),
+    );
+    let seen = collect_data::<ProcessResult>(&process);
+    let shapes = collect_shapes::<ProcessResult>(&process);
+
+    assert_eq!(
+        driver.commands(),
+        vec![ProcessCommand::new("cargo").args(["--version"])]
+    );
+    driver.finish_next(Ok(ProcessResult {
+        stdout: "cargo 1.0\n".to_owned(),
+        stderr: "warning\n".to_owned(),
+        exit_code: Some(7),
+        signal: None,
+    }));
+
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(
+        *seen.borrow(),
+        vec![ProcessResult {
+            stdout: "cargo 1.0\n".to_owned(),
+            stderr: "warning\n".to_owned(),
+            exit_code: Some(7),
+            signal: None,
+        }]
+    );
+}
+
+#[test]
+fn process_driver_cancel_suppresses_late_completion() {
+    let driver = Rc::new(ManualProcessDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_process(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let process = g.init_node(
+        from_process("cargo", ["--version"]),
+        vec![],
+        GraphNodeOpts::named("cancel_process"),
+    );
+    let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let shapes_sink = shapes.clone();
+    let unsubscribe = process.subscribe(move |msg| match msg {
+        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    unsubscribe();
+    assert_eq!(driver.active_count(), 0);
+    driver.finish_next_ignoring_cancel(Ok(ProcessResult {
+        stdout: "late\n".to_owned(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        signal: None,
+    }));
+
+    assert!(shapes.borrow().is_empty());
+}
+
+#[test]
+fn from_http_uses_graph_environment_http_driver() {
+    let driver = Rc::new(ManualHttpDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let http = g.init_node(
+        from_http("https://example.test/resource"),
+        vec![],
+        GraphNodeOpts::named("http"),
+    );
+    let seen = collect_data::<HttpResponse>(&http);
+    let shapes = collect_shapes::<HttpResponse>(&http);
+
+    assert_eq!(
+        driver.requests(),
+        vec![HttpRequest::get("https://example.test/resource")]
+    );
+    driver.finish_next(Ok(HttpResponse {
+        status: 503,
+        headers: vec![("retry-after".to_owned(), "1".to_owned())],
+        body: b"busy".to_vec(),
+    }));
+
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(
+        *seen.borrow(),
+        vec![HttpResponse {
+            status: 503,
+            headers: vec![("retry-after".to_owned(), "1".to_owned())],
+            body: b"busy".to_vec(),
+        }]
+    );
+}
+
+#[test]
+fn http_driver_cancel_suppresses_late_completion() {
+    let driver = Rc::new(ManualHttpDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let http = g.init_node(
+        from_http("https://example.test/slow"),
+        vec![],
+        GraphNodeOpts::named("cancel_http"),
+    );
+    let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let shapes_sink = shapes.clone();
+    let unsubscribe = http.subscribe(move |msg| match msg {
+        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    unsubscribe();
+    driver.finish_next_ignoring_cancel(Ok(HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: b"late".to_vec(),
+    }));
+
+    assert!(shapes.borrow().is_empty());
+}
+
+#[test]
+fn eager_http_driver_cleanup_installs_returned_cancel_after_sync_completion() {
+    let canceled = Rc::new(Cell::new(0usize));
+    let driver = Rc::new(EagerHttpDriver {
+        canceled: canceled.clone(),
+    });
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http(driver),
+        ..GraphOptions::default()
+    });
+    let http = g.init_node(
+        from_http("https://example.test/eager"),
+        vec![],
+        GraphNodeOpts::named("eager_http"),
+    );
+    let _subscription = http.subscribe(|_| {});
+
+    assert_eq!(
+        canceled.get(),
+        1,
+        "sync driver completion must still release the returned cancel handle"
+    );
+    assert_eq!(http.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        http.cache().expect("http response is cached").body,
+        b"https://example.test/eager".to_vec()
+    );
+}
+
+#[test]
+fn from_sse_and_websocket_emit_driver_events() {
+    let sse_driver = Rc::new(ManualSseDriver::default());
+    let websocket_driver = Rc::new(ManualWebSocketDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new()
+            .with_sse(sse_driver.clone())
+            .with_websocket(websocket_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/events"),
+        vec![],
+        GraphNodeOpts::named("sse"),
+    );
+    let websocket = g.init_node(
+        from_websocket("wss://example.test/socket"),
+        vec![],
+        GraphNodeOpts::named("websocket"),
+    );
+    let sse_seen = collect_data::<SseEvent>(&sse);
+    let sse_shapes = collect_shapes::<SseEvent>(&sse);
+    let websocket_seen = collect_data::<WebSocketEvent>(&websocket);
+    let websocket_shapes = collect_shapes::<WebSocketEvent>(&websocket);
+
+    sse_driver.emit(SseDriverEvent::Event(SseEvent {
+        event: Some("message".to_owned()),
+        data: "hello".to_owned(),
+        id: Some("42".to_owned()),
+        retry_ms: Some(500),
+    }));
+    sse_driver.emit(SseDriverEvent::Complete);
+    assert_eq!(sse_driver.active_count(), 0);
+    sse_driver.emit_ignoring_cancel(SseDriverEvent::Event(SseEvent {
+        event: Some("message".to_owned()),
+        data: "late".to_owned(),
+        id: None,
+        retry_ms: None,
+    }));
+
+    websocket_driver.emit(WebSocketDriverEvent::Event(WebSocketEvent::Open));
+    websocket_driver.emit(WebSocketDriverEvent::Event(WebSocketEvent::Text(
+        "hello".to_owned(),
+    )));
+    websocket_driver.emit(WebSocketDriverEvent::Complete);
+    assert_eq!(websocket_driver.active_count(), 0);
+    websocket_driver.emit_ignoring_cancel(WebSocketDriverEvent::Event(WebSocketEvent::Text(
+        "late".to_owned(),
+    )));
+
+    assert_eq!(
+        *sse_seen.borrow(),
+        vec![SseEvent {
+            event: Some("message".to_owned()),
+            data: "hello".to_owned(),
+            id: Some("42".to_owned()),
+            retry_ms: Some(500),
+        }]
+    );
+    assert_eq!(*sse_shapes.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(
+        *websocket_seen.borrow(),
+        vec![
+            WebSocketEvent::Open,
+            WebSocketEvent::Text("hello".to_owned())
+        ]
+    );
+    assert_eq!(*websocket_shapes.borrow(), vec!["DATA", "DATA", "COMPLETE"]);
 }
 
 #[test]
@@ -600,12 +1402,12 @@ fn graph_local_driver_does_not_mutate_shared_dispatcher_scope() {
 
     let first = graphrefly::graph_opts(GraphOptions {
         dispatcher: Some(dispatcher.clone()),
-        local_async_driver: Some(first_driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(first_driver.clone()),
         ..GraphOptions::default()
     });
     let second = graphrefly::graph_opts(GraphOptions {
         dispatcher: Some(dispatcher.clone()),
-        local_async_driver: Some(second_driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(second_driver.clone()),
         ..GraphOptions::default()
     });
     let no_driver = graphrefly::graph_opts(GraphOptions {
@@ -635,7 +1437,7 @@ fn graph_local_driver_does_not_mutate_shared_dispatcher_scope() {
 fn local_future_and_stream_sources_emit_via_driver_boundary() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -671,7 +1473,7 @@ fn local_future_and_stream_sources_emit_via_driver_boundary() {
 fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -754,7 +1556,7 @@ fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
 fn local_future_and_stream_sources_route_errors_into_protocol() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -791,7 +1593,7 @@ fn local_future_and_stream_sources_route_errors_into_protocol() {
 fn time_operators_compose_over_graph_scoped_timer_helpers() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
 
@@ -916,7 +1718,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
 fn throttle_waits_for_open_window_before_source_complete() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -948,7 +1750,7 @@ fn throttle_waits_for_open_window_before_source_complete() {
 fn throttle_completion_window_survives_deactivation_without_resubscribing_source() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1018,7 +1820,7 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
 fn audit_time_flushes_pending_value_on_source_complete() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver),
+        environment: EnvironmentDrivers::new().with_local_async(driver),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1042,7 +1844,7 @@ fn audit_time_flushes_pending_value_on_source_complete() {
 fn audit_flushes_same_wave_source_data_before_complete() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver),
+        environment: EnvironmentDrivers::new().with_local_async(driver),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1167,7 +1969,7 @@ fn audit_selector_panic_errors_and_seals_output() {
 fn timeout_arms_on_subscribe_resets_and_cleans_up() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1210,7 +2012,7 @@ fn timeout_arms_on_subscribe_resets_and_cleans_up() {
 fn timeout_cached_source_forwards_cached_value_then_times_out_after_deadline() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state(5i32);
@@ -1245,7 +2047,7 @@ fn timeout_cached_source_forwards_cached_value_then_times_out_after_deadline() {
 fn timeout_propagates_source_error_and_missing_driver_error() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1279,7 +2081,7 @@ fn timeout_propagates_source_error_and_missing_driver_error() {
 fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1312,7 +2114,7 @@ fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer()
 fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1344,7 +2146,7 @@ fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
 fn buffer_time_cached_source_buffers_initial_value_and_flushes_on_first_tick() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state(5i32);
@@ -1377,7 +2179,7 @@ fn buffer_time_cached_source_buffers_initial_value_and_flushes_on_first_tick() {
 fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();
@@ -1434,7 +2236,7 @@ fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
 fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
-        local_async_driver: Some(driver.clone()),
+        environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
         ..GraphOptions::default()
     });
     let src = g.state_empty::<i32>();

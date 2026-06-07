@@ -22,7 +22,7 @@ notify       = { version = "8.2" }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 sha2         = { workspace = true }
-tokio        = { workspace = true, optional = true, features = ["rt", "time"] }
+tokio        = { workspace = true, optional = true, features = ["process", "rt", "time"] }
 
 # Substrate is sync-core (F-SYNC-CORE) + single-thread (D22): deliberately
 # dependency-light. Uncomment per-module as CSP-5 fills the skeleton.

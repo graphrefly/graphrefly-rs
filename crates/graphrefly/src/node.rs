@@ -44,13 +44,13 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
-use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{
     active_batch_committed_token, boundary_drains_blocked, collecting_batch,
     committed_after_batch_for_target, defer_to_batch, register_boundary_root,
 };
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
+use crate::environment::EnvironmentDrivers;
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 use crate::versioning::{
     advance_node_version, assert_node_version_data_compatible, create_node_version,
@@ -846,7 +846,7 @@ struct NodeCallSlot {
     factory: Option<String>,
     handle: Option<Handle>,
     dispatcher: Dispatcher,
-    local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    environment: EnvironmentDrivers,
 }
 
 /// Construction/configuration state for one node. This is side-table owned so the
@@ -2546,15 +2546,16 @@ impl Core {
     pub(crate) fn local_async_driver(
         &self,
     ) -> Option<Rc<dyn crate::async_driver::LocalAsyncDriver>> {
-        self.with_call(|c| c.local_async_driver.clone())
+        self.with_call(|c| c.environment.local_async_driver())
     }
 
-    pub(crate) fn set_local_async_driver(
-        &self,
-        driver: Option<Rc<dyn crate::async_driver::LocalAsyncDriver>>,
-    ) {
+    pub(crate) fn environment(&self) -> EnvironmentDrivers {
+        self.with_call(|c| c.environment.clone())
+    }
+
+    pub(crate) fn set_environment(&self, environment: EnvironmentDrivers) {
         self.with_call_mut(|c| {
-            c.local_async_driver = driver;
+            c.environment = environment;
         });
     }
 
@@ -2582,12 +2583,13 @@ impl Core {
         }
         let topology = NodeTopologySlot { deps };
         let inner = NodeInner;
-        let local_async_driver = dispatcher.local_async_driver();
+        let mut environment = EnvironmentDrivers::default();
+        environment.set_local_async_driver(dispatcher.local_async_driver());
         let call = NodeCallSlot {
             factory: None,
             handle,
             dispatcher,
-            local_async_driver,
+            environment,
         };
         let config = NodeConfigSlot::from_opts(&opts);
         let version = NodeVersionState::new(config.versioning.clone(), initial.as_ref());

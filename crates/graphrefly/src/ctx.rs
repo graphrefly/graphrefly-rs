@@ -210,6 +210,10 @@ impl Ctx {
         self.node.local_async_driver()
     }
 
+    pub(crate) fn environment(&self) -> crate::environment::EnvironmentDrivers {
+        self.node.environment()
+    }
+
     pub(crate) fn init_node_in_scope<T: 'static>(
         &self,
         op: Operator<T>,
@@ -222,8 +226,7 @@ impl Ctx {
             deps,
             NodeOpts::default(),
         );
-        node.erased()
-            .set_local_async_driver(self.node.local_async_driver());
+        node.erased().set_environment(self.node.environment());
         node
     }
 

@@ -10,11 +10,11 @@ use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::async_driver::LocalAsyncDriver;
 use crate::batch::{batch as run_batch, BatchCtx};
 use crate::checkpoint::GraphCheckpointJson;
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
+use crate::environment::EnvironmentDrivers;
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, LockId, Message, Tier};
@@ -26,7 +26,7 @@ pub struct GraphOptions {
     pub name: Option<String>,
     pub profile: bool,
     pub dispatcher: Option<Dispatcher>,
-    pub local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    pub environment: EnvironmentDrivers,
     pub versioning: Option<NodeVersioningPolicy>,
 }
 
@@ -36,10 +36,7 @@ impl fmt::Debug for GraphOptions {
             .field("name", &self.name)
             .field("profile", &self.profile)
             .field("dispatcher", &self.dispatcher)
-            .field(
-                "local_async_driver",
-                &self.local_async_driver.as_ref().map(|_| "<installed>"),
-            )
+            .field("environment", &self.environment)
             .field("versioning", &self.versioning)
             .finish()
     }
@@ -51,7 +48,7 @@ impl GraphOptions {
             name: Some(name.into()),
             profile: false,
             dispatcher: None,
-            local_async_driver: None,
+            environment: EnvironmentDrivers::default(),
             versioning: None,
         }
     }
@@ -122,7 +119,7 @@ struct GraphInner {
     name: Option<String>,
     arena: GraphArena,
     dispatcher: Dispatcher,
-    local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    environment: EnvironmentDrivers,
     versioning: Option<NodeVersioningPolicy>,
     profile_enabled: Cell<bool>,
     entries: RefCell<Vec<Entry>>,
@@ -143,22 +140,11 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(opts: GraphOptions) -> Self {
-        let (dispatcher, local_async_driver) = match (opts.dispatcher, opts.local_async_driver) {
-            (Some(dispatcher), Some(driver)) => (dispatcher, Some(driver)),
-            (Some(dispatcher), None) => {
-                let driver = dispatcher.local_async_driver();
-                (dispatcher, driver)
-            }
-            (None, Some(driver)) => {
-                let dispatcher = Dispatcher::new();
-                (dispatcher, Some(driver))
-            }
-            (None, None) => {
-                let dispatcher = default_dispatcher();
-                let driver = dispatcher.local_async_driver();
-                (dispatcher, driver)
-            }
-        };
+        let dispatcher = opts.dispatcher.unwrap_or_else(default_dispatcher);
+        let mut environment = opts.environment;
+        if environment.local_async_driver().is_none() {
+            environment.set_local_async_driver(dispatcher.local_async_driver());
+        }
         if opts.profile {
             dispatcher.set_recording(true);
         }
@@ -167,7 +153,7 @@ impl Graph {
                 name: opts.name,
                 arena: GraphArena::new(),
                 dispatcher,
-                local_async_driver,
+                environment,
                 versioning: opts.versioning,
                 profile_enabled: Cell::new(opts.profile),
                 entries: RefCell::new(Vec::new()),
@@ -566,7 +552,7 @@ impl Graph {
             "graph node belongs to a different graph arena"
         );
         let core = node.erased();
-        core.set_local_async_driver(self.inner.local_async_driver.clone());
+        core.set_environment(self.inner.environment.clone());
         assert!(
             !self.inner.by_id.borrow().contains_key(&id),
             "duplicate graph node id '{id}'"
