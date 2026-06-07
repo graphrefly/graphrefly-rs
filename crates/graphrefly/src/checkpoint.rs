@@ -15,6 +15,7 @@ use serde_json::{Number, Value};
 use crate::ctx::Ctx;
 use crate::dispatcher::NodeFn;
 use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
+use crate::json::validate_strict_json_value;
 use crate::node::{Core, NodeRestoreRuntime, Status};
 use crate::protocol::AnyValue;
 
@@ -535,7 +536,7 @@ fn checkpoint_value(
 
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
     if let Some(v) = value.downcast_ref::<GraphCheckpointJson>() {
-        validate_checkpoint_json(v, path, 0)?;
+        validate_checkpoint_json(v, path)?;
         return Ok(v.clone());
     }
     if let Some(v) = value.downcast_ref::<String>() {
@@ -562,7 +563,7 @@ fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJso
     if let Some(v) = value.downcast_ref::<f64>() {
         if let Some(n) = Number::from_f64(*v) {
             let out = Value::Number(n);
-            validate_checkpoint_json(&out, path, 0)?;
+            validate_checkpoint_json(&out, path)?;
             return Ok(out);
         }
     }
@@ -571,46 +572,9 @@ fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJso
     )))
 }
 
-fn validate_checkpoint_json(
-    value: &GraphCheckpointJson,
-    path: &str,
-    depth: u32,
-) -> RestoreResult<()> {
-    if depth > 128 {
-        return Err(GraphRestoreError::new(format!(
-            "checkpoint: JSON value at {path} exceeds maximum depth 128"
-        )));
-    }
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                validate_checkpoint_json(value, &format!("{path}.{key}"), depth + 1)?;
-            }
-        }
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                validate_checkpoint_json(value, &format!("{path}[{index}]"), depth + 1)?;
-            }
-        }
-        Value::Number(number) => {
-            let text = number.to_string();
-            if text == "-0.0" || text == "-0" {
-                return Err(GraphRestoreError::new(format!(
-                    "checkpoint: JSON number at {path} is not strict canonical JSON compatible"
-                )));
-            }
-            if let Some(float) = number.as_f64() {
-                let abs = float.abs();
-                if abs > 0.0 && abs < f64::MIN_POSITIVE {
-                    return Err(GraphRestoreError::new(format!(
-                        "checkpoint: JSON number at {path} is subnormal and not strict canonical JSON compatible"
-                    )));
-                }
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::String(_) => {}
-    }
-    Ok(())
+fn validate_checkpoint_json(value: &GraphCheckpointJson, path: &str) -> RestoreResult<()> {
+    validate_strict_json_value(value, path)
+        .map_err(|err| GraphRestoreError::new(format!("checkpoint: {err}")))
 }
 
 fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts> {
@@ -804,28 +768,27 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
     } = &node.factory
     {
         if let Some(config) = config {
-            validate_checkpoint_json(config, &format!("{}.factory.config", node.id), 0)?;
+            validate_checkpoint_json(config, &format!("{}.factory.config", node.id))?;
         }
         if let Some(config_version) = config_version {
             validate_checkpoint_json(
                 config_version,
                 &format!("{}.factory.configVersion", node.id),
-                0,
             )?;
         }
     }
     if let GraphCheckpointValue::Data { data } = &node.value {
-        validate_checkpoint_json(data, &format!("{}.value", node.id), 0)?;
+        validate_checkpoint_json(data, &format!("{}.value", node.id))?;
     }
     if let GraphCheckpointValue::Data { data } = &node.ctx_state.value {
-        validate_checkpoint_json(data, &format!("{}.ctxState", node.id), 0)?;
+        validate_checkpoint_json(data, &format!("{}.ctxState", node.id))?;
     }
     if let GraphCheckpointTerminal::Error { error } = &node.terminal {
-        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id), 0)?;
+        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))?;
     }
     if let Some(meta) = &node.meta {
         for (key, value) in meta {
-            validate_checkpoint_json(value, &format!("{}.meta.{key}", node.id), 0)?;
+            validate_checkpoint_json(value, &format!("{}.meta.{key}", node.id))?;
         }
     }
     Ok(())

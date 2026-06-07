@@ -2,14 +2,21 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
-    append_log_key, append_log_storage, dict_kv, graph, memory_append_log, memory_kv,
-    memory_multi_writer_append_log, multi_writer_append_log_storage, reactive_cascading_cache,
-    read_append_log_page, tiered_read_through, AppendLogReadOptions, AppendLogStorageTier,
-    CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus, KvStorageTier,
-    KvVersionedRead, Message, Node, PromotionPolicy, ReactiveCascadingCacheOptions,
-    ReadThroughErrorStage, ReadThroughOutcome, StorageError, StorageResult,
-    TieredReadThroughOptions, TieredReadThroughStatus,
+    append_log_key, append_log_storage, assert_decimal_integer_string,
+    assert_non_negative_decimal_integer_string, content_addressed_kv, content_addressed_storage,
+    decimal_string_to_i128, dict_kv, graph, i128_to_decimal_string, is_decimal_integer_string,
+    is_non_negative_decimal_integer_string, json_codec_for, memory_append_log, memory_kv,
+    memory_multi_writer_append_log, multi_writer_append_log_storage,
+    non_negative_decimal_string_to_u128, reactive_cascading_cache, read_append_log_page,
+    stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
+    tiered_read_through, u128_to_non_negative_decimal_string, AppendLogReadOptions,
+    AppendLogStorageTier, CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus, Codec,
+    ContentAddressedKvOptions, ContentAddressedMode, JsonCodec, KvStorageTier, KvVersionedRead,
+    Message, Node, PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage,
+    ReadThroughOutcome, StorageError, StorageResult, TieredReadThroughOptions,
+    TieredReadThroughStatus,
 };
+use serde_json::json;
 
 #[derive(Clone)]
 struct PlainTier {
@@ -101,6 +108,193 @@ fn event_kind<V>(event: &CascadingCacheEvent<V>) -> &'static str {
         CascadingCacheEvent::Fill { .. } => "fill",
         CascadingCacheEvent::Error { .. } => "error",
     }
+}
+
+#[test]
+fn stable_and_strict_json_helpers_use_canonical_bytes() {
+    let value = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
+
+    assert_eq!(
+        stable_json_string(&value).unwrap(),
+        r#"{"a":{"c":3,"d":4},"b":2}"#
+    );
+    assert_eq!(
+        String::from_utf8(strict_canonical_json_bytes(&value).unwrap()).unwrap(),
+        r#"{"a":{"c":3,"d":4},"b":2}"#
+    );
+    assert_eq!(
+        strict_json_decode(br#"{"a":{"c":3,"d":4},"b":2}"#).unwrap(),
+        json!({ "a": { "c": 3, "d": 4 }, "b": 2 })
+    );
+
+    assert!(strict_json_decode(br#"{"b":2,"a":1}"#)
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+    assert!(strict_json_decode(br#"{ "a": 1 }"#)
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+}
+
+#[test]
+fn strict_json_decode_rejects_duplicate_keys_and_malformed_utf8() {
+    for raw in [
+        br#"{"a":1,"a":2}"#.as_slice(),
+        br#"{"a":1,"\u0061":2}"#,
+        br#"{"a":{"b":1,"b":2}}"#,
+        br#"{"a":[{"b":1,"b":2}]}"#,
+    ] {
+        assert!(strict_json_decode(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate object key"));
+    }
+
+    assert!(strict_json_decode(&[0xff]).is_err());
+    assert!(strict_json_decode(br#""\ud800""#).is_err());
+}
+
+#[test]
+fn json_codecs_round_trip_and_strict_decode_rejects_noncanonical_bytes() {
+    let json_codec = json_codec_for::<serde_json::Value>();
+    let strict_codec = strict_json_codec_for::<serde_json::Value>();
+    let value = json!({ "z": 1, "a": [true, null] });
+
+    assert_eq!(
+        String::from_utf8(
+            <JsonCodec as Codec<serde_json::Value>>::encode(&json_codec, &value).unwrap()
+        )
+        .unwrap(),
+        r#"{"a":[true,null],"z":1}"#
+    );
+    assert_eq!(
+        <JsonCodec as Codec<serde_json::Value>>::decode(
+            &json_codec,
+            br#"{ "z": 1, "a": [true, null] }"#
+        )
+        .unwrap(),
+        value
+    );
+    assert_eq!(
+        <graphrefly::StrictJsonCodec as Codec<serde_json::Value>>::decode(
+            &strict_codec,
+            br#"{"a":[true,null],"z":1}"#
+        )
+        .unwrap(),
+        value
+    );
+    assert!(
+        <graphrefly::StrictJsonCodec as Codec<serde_json::Value>>::decode(
+            &strict_codec,
+            br#"{ "a": [true, null], "z": 1 }"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("canonical")
+    );
+}
+
+#[test]
+fn decimal_scalar_helpers_keep_host_conversion_explicit() {
+    assert_eq!(i128_to_decimal_string(-12), "-12");
+    assert_eq!(i128_to_decimal_string(0), "0");
+    assert_eq!(u128_to_non_negative_decimal_string(12), "12");
+    assert_eq!(decimal_string_to_i128("-12").unwrap(), -12);
+    assert_eq!(decimal_string_to_i128("0").unwrap(), 0);
+    assert_eq!(non_negative_decimal_string_to_u128("12").unwrap(), 12);
+    assert_eq!(assert_decimal_integer_string("-12", "t_ns").unwrap(), "-12");
+    assert_eq!(
+        assert_non_negative_decimal_integer_string("12", "t_ns").unwrap(),
+        "12"
+    );
+
+    assert!(is_decimal_integer_string("-12"));
+    assert!(!is_decimal_integer_string("-0"));
+    assert!(!is_decimal_integer_string("01"));
+    assert!(is_non_negative_decimal_integer_string("12"));
+    assert!(!is_non_negative_decimal_integer_string("-12"));
+    assert!(assert_decimal_integer_string("01", "t_ns").is_err());
+    assert!(assert_non_negative_decimal_integer_string("-12", "t_ns").is_err());
+}
+
+#[test]
+fn content_addressed_kv_keys_are_deterministic_across_object_key_order() {
+    let kv = Rc::new(memory_kv::<String>());
+    let cache = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv)
+            .with_key_prefix("calc")
+            .with_key_context(|ctx: &serde_json::Value| Ok(ctx["request"].clone())),
+    );
+
+    let a = cache
+        .key_for(&json!({ "request": { "b": 2, "a": { "d": 4, "c": 3 } } }))
+        .unwrap();
+    let b = cache
+        .key_for(&json!({ "request": { "a": { "c": 3, "d": 4 }, "b": 2 } }))
+        .unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        a,
+        "calc:c461c47a913352f1a21e3f2ea49e1fd34754c0dc12cb7366e4636d5e186c6c6e"
+    );
+}
+
+#[test]
+fn content_addressed_kv_honors_modes_and_strict_misses() {
+    let kv = Rc::new(memory_kv::<String>());
+    let ctx = json!({ "prompt": "hello", "opts": { "temp": 0 } });
+
+    let write_only = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv.clone()).with_mode(ContentAddressedMode::Write),
+    );
+    write_only.store(&ctx, "hi".to_owned()).unwrap();
+    assert_eq!(write_only.lookup(&ctx).unwrap(), None);
+
+    let read_only = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv.clone()).with_mode(ContentAddressedMode::Read),
+    );
+    assert_eq!(read_only.lookup(&ctx).unwrap(), Some("hi".to_owned()));
+    read_only.store(&ctx, "ignored".to_owned()).unwrap();
+    assert_eq!(read_only.lookup(&ctx).unwrap(), Some("hi".to_owned()));
+
+    let read_write = content_addressed_storage(ContentAddressedKvOptions::new(kv.clone()));
+    let bye = json!({ "prompt": "bye" });
+    read_write.store(&bye, "goodbye".to_owned()).unwrap();
+    assert_eq!(read_write.lookup(&bye).unwrap(), Some("goodbye".to_owned()));
+
+    let strict = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv).with_mode(ContentAddressedMode::ReadStrict),
+    );
+    assert!(matches!(
+        strict.lookup(&json!({ "prompt": "missing" })).unwrap_err(),
+        StorageError::ContentAddressedMiss { .. }
+    ));
+}
+
+#[test]
+fn content_addressed_disallowed_modes_skip_bad_key_contexts() {
+    let kv = Rc::new(memory_kv::<String>());
+    let bad_ctx = json!({ "value": 1 });
+
+    let write_only = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv.clone())
+            .with_mode(ContentAddressedMode::Write)
+            .with_key_context(|_| Err(graphrefly::JsonCodecError::validation("bad context"))),
+    );
+    assert_eq!(write_only.lookup(&bad_ctx).unwrap(), None);
+    assert!(write_only.store(&bad_ctx, "value".to_owned()).is_err());
+    assert!(write_only.forget(&bad_ctx).is_ok());
+
+    let read_only = content_addressed_kv(
+        ContentAddressedKvOptions::new(kv)
+            .with_mode(ContentAddressedMode::Read)
+            .with_key_context(|_| Err(graphrefly::JsonCodecError::validation("bad context"))),
+    );
+    assert!(read_only.store(&bad_ctx, "ignored".to_owned()).is_ok());
+    assert!(read_only.forget(&bad_ctx).is_ok());
+    assert!(read_only.lookup(&bad_ctx).is_err());
 }
 
 #[test]

@@ -51,6 +51,7 @@ thiserror   = { version = "1" }
 tracing     = { version = "0.1" }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
+sha2        = { version = "0.10" }
 
 # Small-collection primitives
 smallvec    = { version = "1.13", features = ["union", "const_new"] }

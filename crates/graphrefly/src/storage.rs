@@ -12,6 +12,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::json::{strict_canonical_json_bytes, JsonCodecError};
+
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -19,6 +24,7 @@ pub type StorageResult<T> = Result<T, StorageError>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageError {
     Unsupported { label: String, capability: String },
+    ContentAddressedMiss { key: String },
     Backend(String),
 }
 
@@ -40,6 +46,12 @@ impl fmt::Display for StorageError {
         match self {
             Self::Unsupported { label, capability } => {
                 write!(f, "{label}: KV tier does not support {capability}")
+            }
+            Self::ContentAddressedMiss { key } => {
+                write!(
+                    f,
+                    "content-addressed lookup miss in read-strict mode: {key}"
+                )
             }
             Self::Backend(message) => f.write_str(message),
         }
@@ -285,6 +297,162 @@ impl<T: Clone> KvStorageTier<T> for MemoryKv<T> {
         self.set(key, value)?;
         Ok(true)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContentAddressedMode {
+    Read,
+    Write,
+    #[default]
+    ReadWrite,
+    ReadStrict,
+}
+
+pub type ContentAddressedKeyContext<Ctx> = dyn Fn(&Ctx) -> Result<Value, JsonCodecError>;
+
+pub struct ContentAddressedKvOptions<Ctx, V: Clone> {
+    pub kv: Rc<dyn KvStorageTier<V>>,
+    pub key_context: Rc<ContentAddressedKeyContext<Ctx>>,
+    pub key_prefix: Option<String>,
+    pub mode: ContentAddressedMode,
+}
+
+impl<V: Clone> ContentAddressedKvOptions<Value, V> {
+    pub fn new(kv: Rc<dyn KvStorageTier<V>>) -> Self {
+        Self {
+            kv,
+            key_context: Rc::new(|ctx| Ok(ctx.clone())),
+            key_prefix: None,
+            mode: ContentAddressedMode::ReadWrite,
+        }
+    }
+}
+
+impl<Ctx, V: Clone> ContentAddressedKvOptions<Ctx, V> {
+    pub fn from_key_context(
+        kv: Rc<dyn KvStorageTier<V>>,
+        f: impl Fn(&Ctx) -> Result<Value, JsonCodecError> + 'static,
+    ) -> Self {
+        Self {
+            kv,
+            key_context: Rc::new(f),
+            key_prefix: None,
+            mode: ContentAddressedMode::ReadWrite,
+        }
+    }
+
+    pub fn with_key_context(
+        mut self,
+        f: impl Fn(&Ctx) -> Result<Value, JsonCodecError> + 'static,
+    ) -> Self {
+        self.key_context = Rc::new(f);
+        self
+    }
+
+    pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.key_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn with_mode(mut self, mode: ContentAddressedMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct ContentAddressedKv<Ctx, V: Clone> {
+    kv: Rc<dyn KvStorageTier<V>>,
+    key_context: Rc<ContentAddressedKeyContext<Ctx>>,
+    key_prefix: Option<String>,
+    mode: ContentAddressedMode,
+}
+
+impl<Ctx, V: Clone> fmt::Debug for ContentAddressedKv<Ctx, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContentAddressedKv")
+            .field("key_prefix", &self.key_prefix)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+pub type ContentAddressedStorage<Ctx, V> = ContentAddressedKv<Ctx, V>;
+pub type ContentAddressedStorageOptions<Ctx, V> = ContentAddressedKvOptions<Ctx, V>;
+
+pub fn content_addressed_kv<Ctx, V: Clone>(
+    opts: ContentAddressedKvOptions<Ctx, V>,
+) -> ContentAddressedKv<Ctx, V> {
+    ContentAddressedKv {
+        kv: opts.kv,
+        key_context: opts.key_context,
+        key_prefix: opts.key_prefix,
+        mode: opts.mode,
+    }
+}
+
+pub fn content_addressed_storage<Ctx, V: Clone>(
+    opts: ContentAddressedStorageOptions<Ctx, V>,
+) -> ContentAddressedStorage<Ctx, V> {
+    content_addressed_kv(opts)
+}
+
+impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
+    pub fn key_for(&self, ctx: &Ctx) -> StorageResult<String> {
+        let context = (self.key_context)(ctx).map_err(storage_json_error)?;
+        let bytes = strict_canonical_json_bytes(&context).map_err(storage_json_error)?;
+        let hex = sha256_hex(&bytes);
+        Ok(match &self.key_prefix {
+            Some(prefix) => format!("{prefix}:{hex}"),
+            None => hex,
+        })
+    }
+
+    pub fn lookup(&self, ctx: &Ctx) -> StorageResult<Option<V>> {
+        if self.mode == ContentAddressedMode::Write {
+            return Ok(None);
+        }
+        let key = self.key_for(ctx)?;
+        let value = self.kv.get(&key)?;
+        if value.is_none() && self.mode == ContentAddressedMode::ReadStrict {
+            return Err(StorageError::ContentAddressedMiss { key });
+        }
+        Ok(value)
+    }
+
+    pub fn store(&self, ctx: &Ctx, value: V) -> StorageResult<()> {
+        if self.mode == ContentAddressedMode::Read {
+            return Ok(());
+        }
+        let key = self.key_for(ctx)?;
+        self.kv.set(&key, value)
+    }
+
+    pub fn forget(&self, ctx: &Ctx) -> StorageResult<()> {
+        if matches!(
+            self.mode,
+            ContentAddressedMode::Read | ContentAddressedMode::Write
+        ) {
+            return Ok(());
+        }
+        let key = self.key_for(ctx)?;
+        self.kv.delete(&key)
+    }
+}
+
+fn storage_json_error(error: JsonCodecError) -> StorageError {
+    StorageError::backend(error.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub const APPEND_LOG_SEQ_PAD: usize = 20;

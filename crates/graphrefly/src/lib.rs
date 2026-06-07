@@ -65,6 +65,7 @@ pub mod diagnostics;
 pub mod dispatcher;
 pub mod graph;
 pub mod higher_order;
+pub mod json;
 pub mod node;
 pub mod operators;
 pub mod protocol;
@@ -110,6 +111,14 @@ pub use higher_order::{
     concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,
     MergeMapOptions,
 };
+pub use json::{
+    assert_decimal_integer_string, assert_non_negative_decimal_integer_string,
+    decimal_string_to_i128, i128_to_decimal_string, is_decimal_integer_string,
+    is_non_negative_decimal_integer_string, json_codec_for, non_negative_decimal_string_to_u128,
+    stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
+    u128_to_non_negative_decimal_string, Codec, DecimalIntegerString, JsonCodec, JsonCodecError,
+    JsonCodecResult, JsonValue, NonNegativeDecimalIntegerString, StrictJsonCodec,
+};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
@@ -128,10 +137,12 @@ pub use sources::{
     FsEventKind,
 };
 pub use storage::{
-    append_log_key, append_log_storage, dict_kv, memory_append_log, memory_kv,
-    memory_multi_writer_append_log, multi_writer_append_log_storage, read_append_log_page,
-    read_through_kv, tiered_read_through, AppendLogEntry, AppendLogPage, AppendLogReadOptions,
-    AppendLogStorage, AppendLogStorageTier, KvGeneration, KvStorageTier, KvVersionedRead, MemoryKv,
+    append_log_key, append_log_storage, content_addressed_kv, content_addressed_storage, dict_kv,
+    memory_append_log, memory_kv, memory_multi_writer_append_log, multi_writer_append_log_storage,
+    read_append_log_page, read_through_kv, tiered_read_through, AppendLogEntry, AppendLogPage,
+    AppendLogReadOptions, AppendLogStorage, AppendLogStorageTier, ContentAddressedKeyContext,
+    ContentAddressedKv, ContentAddressedKvOptions, ContentAddressedMode, ContentAddressedStorage,
+    ContentAddressedStorageOptions, KvGeneration, KvStorageTier, KvVersionedRead, MemoryKv,
     MultiWriterAppendLogStorage, PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn,
     ReadThroughErrorStage, ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier,
     ReadThroughMissContext, ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact,
