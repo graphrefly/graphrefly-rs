@@ -161,6 +161,43 @@ pub enum WebSocketEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookRegistration {
+    pub id: String,
+    pub method: Option<String>,
+    pub path: Option<String>,
+}
+
+impl WebhookRegistration {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            method: None,
+            path: None,
+        }
+    }
+
+    pub fn method(mut self, method: impl Into<String>) -> Self {
+        self.method = Some(method.into());
+        self
+    }
+
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookEvent {
+    pub registration_id: String,
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub query: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// Graph-local process driver. Implementations own process/runtime details.
 pub trait LocalProcessDriver {
     fn run(
@@ -199,6 +236,20 @@ pub trait LocalWebSocketDriver {
         &self,
         request: WebSocketRequest,
         callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+    ) -> DriverCancel;
+}
+
+pub enum WebhookDriverEvent {
+    Event(WebhookEvent),
+    Error(GraphError),
+    Complete,
+}
+
+pub trait LocalWebhookDriver {
+    fn register(
+        &self,
+        registration: WebhookRegistration,
+        callback: Rc<dyn Fn(WebhookDriverEvent)>,
     ) -> DriverCancel;
 }
 
@@ -273,6 +324,7 @@ pub struct EnvironmentDrivers {
     http: Option<Rc<dyn LocalHttpDriver>>,
     sse: Option<Rc<dyn LocalSseDriver>>,
     websocket: Option<Rc<dyn LocalWebSocketDriver>>,
+    webhook: Option<Rc<dyn LocalWebhookDriver>>,
 }
 
 impl EnvironmentDrivers {
@@ -305,6 +357,11 @@ impl EnvironmentDrivers {
         self
     }
 
+    pub fn with_webhook(mut self, driver: Rc<dyn LocalWebhookDriver>) -> Self {
+        self.webhook = Some(driver);
+        self
+    }
+
     pub fn local_async_driver(&self) -> Option<Rc<dyn LocalAsyncDriver>> {
         self.local_async.clone()
     }
@@ -325,6 +382,10 @@ impl EnvironmentDrivers {
         self.websocket.clone()
     }
 
+    pub fn webhook_driver(&self) -> Option<Rc<dyn LocalWebhookDriver>> {
+        self.webhook.clone()
+    }
+
     pub(crate) fn set_local_async_driver(&mut self, driver: Option<Rc<dyn LocalAsyncDriver>>) {
         self.local_async = driver;
     }
@@ -341,6 +402,7 @@ impl fmt::Debug for EnvironmentDrivers {
             .field("http", &self.http.as_ref().map(|_| "<installed>"))
             .field("sse", &self.sse.as_ref().map(|_| "<installed>"))
             .field("websocket", &self.websocket.as_ref().map(|_| "<installed>"))
+            .field("webhook", &self.webhook.as_ref().map(|_| "<installed>"))
             .finish()
     }
 }

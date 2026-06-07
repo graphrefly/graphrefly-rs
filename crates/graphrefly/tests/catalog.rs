@@ -18,16 +18,17 @@ use graphrefly::{
     element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_cron,
     from_cron_with_options, from_fs_watch, from_fs_watch_with_options, from_git_hook,
     from_git_hook_with_options, from_http, from_iter, from_process, from_sse, from_timer,
-    from_websocket, future_local, graph, interval, last, last_any, map, matches_cron, merge_map,
-    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, parse_cron,
-    race, reduce, repeat, rescue, run_process, sample, scan, settle, settle_by, skip, stream_local,
-    switch_map, take, take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error,
-    timeout, timer, valve, with_latest_from, zip, CronInstant, CronTick, Dispatcher,
-    EnvironmentDrivers, FromCronOptions, FromFsWatchOptions, FromGitHookOptions, FsEvent,
-    FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
-    LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver, LocalWebSocketDriver,
-    MergeMapOptions, Message, Node, ProcessCommand, ProcessResult, SseDriverEvent, SseEvent,
-    WebSocketDriverEvent, WebSocketEvent,
+    from_webhook, from_webhook_with_options, from_websocket, future_local, graph, interval, last,
+    last_any, map, matches_cron, merge_map, merge_map_with_options, never, of, on_first_data,
+    on_first_data_where, pairwise, parse_cron, race, reduce, repeat, rescue, run_process, sample,
+    scan, settle, settle_by, skip, stream_local, switch_map, take, take_until, take_while, tap,
+    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
+    CronInstant, CronTick, Dispatcher, EnvironmentDrivers, FromCronOptions, FromFsWatchOptions,
+    FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest,
+    HttpResponse, LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver,
+    LocalWebSocketDriver, LocalWebhookDriver, MergeMapOptions, Message, Node, ProcessCommand,
+    ProcessResult, SseDriverEvent, SseEvent, WebSocketDriverEvent, WebSocketEvent,
+    WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -124,6 +125,8 @@ type SseCallback = Rc<dyn Fn(SseDriverEvent)>;
 type PendingSse = (String, Rc<Cell<bool>>, SseCallback);
 type WebSocketCallback = Rc<dyn Fn(WebSocketDriverEvent)>;
 type PendingWebSocket = (String, Rc<Cell<bool>>, WebSocketCallback);
+type WebhookCallback = Rc<dyn Fn(WebhookDriverEvent)>;
+type PendingWebhook = (WebhookRegistration, Rc<Cell<bool>>, WebhookCallback);
 
 #[derive(Default)]
 struct ManualDriver {
@@ -377,6 +380,55 @@ impl LocalWebSocketDriver for ManualWebSocketDriver {
     }
 }
 
+#[derive(Default)]
+struct ManualWebhookDriver {
+    registrations: RefCell<Vec<PendingWebhook>>,
+}
+
+impl ManualWebhookDriver {
+    fn registrations(&self) -> Vec<WebhookRegistration> {
+        self.registrations
+            .borrow()
+            .iter()
+            .map(|(registration, _, _)| registration.clone())
+            .collect()
+    }
+
+    fn emit(&self, event: WebhookDriverEvent) {
+        let (_, active, callback) = &self.registrations.borrow()[0];
+        if active.get() {
+            callback(event);
+        }
+    }
+
+    fn emit_ignoring_cancel(&self, event: WebhookDriverEvent) {
+        let (_, _, callback) = &self.registrations.borrow()[0];
+        callback(event);
+    }
+
+    fn active_count(&self) -> usize {
+        self.registrations
+            .borrow()
+            .iter()
+            .filter(|(_, active, _)| active.get())
+            .count()
+    }
+}
+
+impl LocalWebhookDriver for ManualWebhookDriver {
+    fn register(
+        &self,
+        registration: WebhookRegistration,
+        callback: Rc<dyn Fn(WebhookDriverEvent)>,
+    ) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.registrations
+            .borrow_mut()
+            .push((registration, active.clone(), callback));
+        Box::new(move || active.set(false))
+    }
+}
+
 struct VecStream<T> {
     values: VecDeque<T>,
 }
@@ -531,6 +583,11 @@ fn source_factory_names_are_stable_in_describe() {
         vec![],
         GraphNodeOpts::named("from_websocket"),
     );
+    g.init_node(
+        from_webhook("stripe"),
+        vec![],
+        GraphNodeOpts::named("from_webhook"),
+    );
 
     let snap = g.describe();
     let factory = |id: &str| {
@@ -559,6 +616,7 @@ fn source_factory_names_are_stable_in_describe() {
     assert_eq!(factory("from_http"), "fromHttp");
     assert_eq!(factory("from_sse"), "fromSSE");
     assert_eq!(factory("from_websocket"), "fromWebSocket");
+    assert_eq!(factory("from_webhook"), "fromWebhook");
     fs::remove_dir_all(dir).ok();
 }
 
@@ -1133,6 +1191,16 @@ fn missing_driver_reports_source_activation_error() {
         *collect_errors::<WebSocketEvent>(&websocket).borrow(),
         vec!["fromWebSocket: missing websocket driver".to_owned()]
     );
+
+    let webhook = g.init_node(
+        from_webhook("stripe"),
+        vec![],
+        GraphNodeOpts::named("webhook_missing"),
+    );
+    assert_eq!(
+        *collect_errors::<WebhookEvent>(&webhook).borrow(),
+        vec!["fromWebhook: missing webhook driver".to_owned()]
+    );
 }
 
 #[test]
@@ -1372,6 +1440,122 @@ fn from_sse_and_websocket_emit_driver_events() {
         ]
     );
     assert_eq!(*websocket_shapes.borrow(), vec!["DATA", "DATA", "COMPLETE"]);
+}
+
+#[test]
+fn from_webhook_registers_environment_bridge_and_emits_events() {
+    let driver = Rc::new(ManualWebhookDriver::default());
+    let registration = WebhookRegistration::new("stripe")
+        .method("POST")
+        .path("/hooks/stripe");
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_webhook(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let webhook = g.init_node(
+        from_webhook_with_options(registration.clone()),
+        vec![],
+        GraphNodeOpts::named("webhook"),
+    );
+    let seen = collect_data::<WebhookEvent>(&webhook);
+    let shapes = collect_shapes::<WebhookEvent>(&webhook);
+
+    assert_eq!(driver.registrations(), vec![registration]);
+    driver.emit(WebhookDriverEvent::Event(WebhookEvent {
+        registration_id: "stripe".to_owned(),
+        method: "POST".to_owned(),
+        path: "/hooks/stripe".to_owned(),
+        headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        query: vec![("source".to_owned(), "test".to_owned())],
+        body: br#"{"ok":true}"#.to_vec(),
+    }));
+    driver.emit(WebhookDriverEvent::Complete);
+    assert_eq!(driver.active_count(), 0);
+    driver.emit_ignoring_cancel(WebhookDriverEvent::Event(WebhookEvent {
+        registration_id: "stripe".to_owned(),
+        method: "POST".to_owned(),
+        path: "/hooks/stripe".to_owned(),
+        headers: Vec::new(),
+        query: Vec::new(),
+        body: b"late".to_vec(),
+    }));
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![WebhookEvent {
+            registration_id: "stripe".to_owned(),
+            method: "POST".to_owned(),
+            path: "/hooks/stripe".to_owned(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            query: vec![("source".to_owned(), "test".to_owned())],
+            body: br#"{"ok":true}"#.to_vec(),
+        }]
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
+}
+
+#[test]
+fn from_webhook_error_releases_driver_and_suppresses_late_events() {
+    let driver = Rc::new(ManualWebhookDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_webhook(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let webhook = g.init_node(
+        from_webhook("github"),
+        vec![],
+        GraphNodeOpts::named("webhook_error"),
+    );
+    let shapes = collect_shapes::<WebhookEvent>(&webhook);
+
+    driver.emit(WebhookDriverEvent::Error("webhook failed".into()));
+    assert_eq!(driver.active_count(), 0);
+    driver.emit_ignoring_cancel(WebhookDriverEvent::Event(WebhookEvent {
+        registration_id: "github".to_owned(),
+        method: "POST".to_owned(),
+        path: "/hooks/github".to_owned(),
+        headers: Vec::new(),
+        query: Vec::new(),
+        body: b"late".to_vec(),
+    }));
+
+    assert_eq!(*shapes.borrow(), vec!["ERROR"]);
+}
+
+#[test]
+fn from_webhook_unsubscribe_cancels_registration_and_suppresses_late_events() {
+    let driver = Rc::new(ManualWebhookDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_webhook(driver.clone()),
+        ..GraphOptions::default()
+    });
+    let webhook = g.init_node(
+        from_webhook("github"),
+        vec![],
+        GraphNodeOpts::named("webhook_cancel"),
+    );
+    let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let shapes_sink = shapes.clone();
+    let unsubscribe = webhook.subscribe(move |msg| match msg {
+        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Teardown => {}
+    });
+
+    unsubscribe();
+    assert_eq!(driver.active_count(), 0);
+    driver.emit_ignoring_cancel(WebhookDriverEvent::Event(WebhookEvent {
+        registration_id: "github".to_owned(),
+        method: "POST".to_owned(),
+        path: "/hooks/github".to_owned(),
+        headers: Vec::new(),
+        query: Vec::new(),
+        body: b"late".to_vec(),
+    }));
+
+    assert!(shapes.borrow().is_empty());
 }
 
 #[test]

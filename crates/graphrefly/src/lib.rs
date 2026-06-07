@@ -119,8 +119,9 @@ pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use environment::TokioProcessDriver;
 pub use environment::{
     EnvironmentDrivers, HttpRequest, HttpResponse, LocalHttpDriver, LocalProcessDriver,
-    LocalSseDriver, LocalWebSocketDriver, ProcessCommand, ProcessResult, SseDriverEvent, SseEvent,
-    SseRequest, WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
+    LocalSseDriver, LocalWebSocketDriver, LocalWebhookDriver, ProcessCommand, ProcessResult,
+    SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
+    WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
@@ -155,11 +156,11 @@ pub use resilience::{BackoffPolicy, RetryPolicy, RetryState, RetryStatus};
 pub use sources::{
     empty, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
     from_git_hook, from_git_hook_with_options, from_http, from_http_with_options, from_iter,
-    from_process, from_sse, from_sse_with_options, from_timer, from_websocket,
-    from_websocket_with_options, future_local, interval, matches_cron, never, of, parse_cron,
-    run_process, run_process_with_options, stream_local, throw_error, timer, CronInstant,
-    CronParseError, CronSchedule, CronTick, FromCronOptions, FromFsWatchOptions,
-    FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GitHookType,
+    from_process, from_sse, from_sse_with_options, from_timer, from_webhook,
+    from_webhook_with_options, from_websocket, from_websocket_with_options, future_local, interval,
+    matches_cron, never, of, parse_cron, run_process, run_process_with_options, stream_local,
+    throw_error, timer, CronInstant, CronParseError, CronSchedule, CronTick, FromCronOptions,
+    FromFsWatchOptions, FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GitHookType,
 };
 pub use storage::{
     append_log_key, append_log_storage, assert_wal_frame, change_envelope_codec, codec_kv_storage,

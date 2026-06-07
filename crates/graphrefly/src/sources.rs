@@ -23,7 +23,8 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::async_driver::DriverCancel;
 use crate::environment::{
     HttpRequest, HttpResponse, ProcessCommand, ProcessResult, SseDriverEvent, SseEvent, SseRequest,
-    WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
+    WebSocketDriverEvent, WebSocketEvent, WebSocketRequest, WebhookDriverEvent, WebhookEvent,
+    WebhookRegistration,
 };
 use crate::node::{NodeOpts, Pausable};
 use crate::operators::Operator;
@@ -305,6 +306,70 @@ pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSoc
                 }
             });
             let cancel = driver.connect(request.clone(), callback);
+            install_driver_cancel(&active, &cancel_slot, cancel);
+        },
+    )
+}
+
+/// from_webhook: register an inbound webhook bridge through the graph environment.
+///
+/// The host HTTP framework/server owns routing and calls the installed driver.
+/// GraphReFly exposes the inbound payload as DATA while keeping async work at
+/// the environment boundary (D130/D131).
+pub fn from_webhook(id: impl Into<String>) -> Operator<WebhookEvent> {
+    from_webhook_with_options(WebhookRegistration::new(id))
+}
+
+/// Configurable form of [`from_webhook`].
+pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<WebhookEvent> {
+    assert!(
+        !registration.id.is_empty(),
+        "fromWebhook: id must be non-empty"
+    );
+    Operator::with_opts(
+        "fromWebhook",
+        NodeOpts {
+            pool: crate::dispatcher::PoolKind::Async,
+            pausable: Pausable::False,
+            ..NodeOpts::default()
+        },
+        move |ctx| {
+            let Some(driver) = ctx.environment().webhook_driver() else {
+                ctx.down(vec![Message::Error(
+                    "fromWebhook: missing webhook driver".into(),
+                )]);
+                return;
+            };
+            let active = Rc::new(Cell::new(true));
+            let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
+            let cleanup_active = active.clone();
+            let cleanup_cancel = cancel_slot.clone();
+            ctx.on_deactivation(move || {
+                cleanup_driver_work(&cleanup_active, &cleanup_cancel);
+            });
+            let out = ctx.defer();
+            let callback_active = active.clone();
+            let callback_cancel = cancel_slot.clone();
+            let callback = Rc::new(move |event| match event {
+                WebhookDriverEvent::Event(event) => {
+                    if callback_active.get() {
+                        out.down(vec![Message::Data(Rc::new(event))]);
+                    }
+                }
+                WebhookDriverEvent::Error(error) => {
+                    if callback_active.get() {
+                        cleanup_driver_work(&callback_active, &callback_cancel);
+                        out.down(vec![Message::Error(error)]);
+                    }
+                }
+                WebhookDriverEvent::Complete => {
+                    if callback_active.get() {
+                        cleanup_driver_work(&callback_active, &callback_cancel);
+                        out.down(vec![Message::Complete]);
+                    }
+                }
+            });
+            let cancel = driver.register(registration.clone(), callback);
             install_driver_cancel(&active, &cancel_slot, cancel);
         },
     )
