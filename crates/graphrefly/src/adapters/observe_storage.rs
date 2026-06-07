@@ -149,7 +149,7 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
         Rc::new(move || {
             let mut first_error = None;
             loop {
-                let Some((event, frame)) = pending.borrow_mut().pop_front() else {
+                let Some((event, frame)) = pending.borrow().front().cloned() else {
                     break;
                 };
                 if let Err(error) = log.append(frame.clone()) {
@@ -165,7 +165,9 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
+                    break;
                 }
+                pending.borrow_mut().pop_front();
             }
             match first_error {
                 Some(error) => Err(error),

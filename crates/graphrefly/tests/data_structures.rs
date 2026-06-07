@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
@@ -6,17 +7,23 @@ use graphrefly::{
     LogChange, Message, Node, ReactiveListOptions, ReactiveLogOptions,
 };
 
+type DataCollector<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
+
 fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
+    collect_data_with_unsub(node).0
+}
+
+fn collect_data_with_unsub<T: Clone + 'static>(node: &Node<T>) -> DataCollector<T> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
+    let keep = node.subscribe(move |msg| {
         if let Message::Data(value) = msg {
             if let Some(v) = value.as_ref().downcast_ref::<T>() {
                 seen_sink.borrow_mut().push(v.clone());
             }
         }
     });
-    seen
+    (seen, keep)
 }
 
 fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static str>>> {
@@ -207,14 +214,45 @@ fn reactive_log_incremental_views_follow_delta_backbone() {
 }
 
 #[test]
+fn reactive_log_scan_recomputes_after_max_size_trimmed_append() {
+    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default().max_size(3));
+    let sum = log.scan(0i32, |acc, value| acc + *value);
+    let sum_seen = collect_data(&sum);
+
+    log.append_many(vec![1, 2, 3]);
+    log.append(4);
+
+    assert_eq!(
+        *sum_seen.borrow(),
+        vec![6, 9],
+        "scan must include the appended tail value after a ring-buffer head trim"
+    );
+}
+
+#[test]
+fn reactive_log_scan_recomputes_after_oversized_append_many_trim() {
+    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default().max_size(3));
+    let sum = log.scan(0i32, |acc, value| acc + *value);
+    let sum_seen = collect_data(&sum);
+
+    log.append_many(vec![1, 2, 3, 4, 5]);
+
+    assert_eq!(
+        sum_seen.borrow().last().copied(),
+        Some(12),
+        "scan must converge on the retained tail after an append_many overflow trim"
+    );
+}
+
+#[test]
 fn reactive_log_page_is_light_view_and_lazy_pull() {
     let g = graph();
     let log = reactive_log::<i32>(vec![1, 2, 3, 4], ReactiveLogOptions::named("log").graph(g));
     let page = log.page(1, 2);
     let same = log.page(1, 2);
     assert_eq!(page.pull_id, same.pull_id);
-    let page_deltas = collect_data(&page.delta);
-    let pages = collect_data(&page.snapshot);
+    let (page_deltas, unsub_page_deltas) = collect_data_with_unsub(&page.delta);
+    let (pages, unsub_pages) = collect_data_with_unsub(&page.snapshot);
 
     log.append(5);
     assert_eq!(
@@ -227,6 +265,8 @@ fn reactive_log_page_is_light_view_and_lazy_pull() {
     demand_view_snapshot(&page);
     assert_eq!(*pages.borrow(), vec![vec![2, 3]]);
 
+    unsub_pages();
+    unsub_page_deltas();
     page.dispose();
     let rebuilt = log.page(1, 2);
     assert!(
@@ -296,6 +336,28 @@ fn reactive_log_page_dispose_rejects_external_registered_dependents() {
     );
 
     page.dispose();
+}
+
+#[test]
+fn reactive_log_page_dispose_rejects_live_external_subscribers_and_can_retry() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3, 4],
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let page = log.page(1, 2);
+    let unsub = page.snapshot.subscribe(|_| {});
+
+    let result = catch_unwind(AssertUnwindSafe(|| page.dispose()));
+
+    assert!(result.is_err());
+    assert!(
+        g.find("log.page#0.snapshot").is_some(),
+        "failed D124 release keeps the view nodes visible for retry"
+    );
+    unsub();
+    page.dispose();
+    assert!(g.find("log.page#0.snapshot").is_none());
 }
 
 #[test]

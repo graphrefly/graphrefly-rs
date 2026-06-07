@@ -270,14 +270,24 @@ pub(crate) fn verify_restored_node_version(
         };
     };
     let version = validate_node_version_json(restored, path)?;
-    match &version {
-        NodeVersion::V0 { .. } => Ok(RestoredNodeVersion::Version(version)),
-        NodeVersion::V1 { counter, cid, .. } => {
-            let ResolvedNodeVersioningPolicy::Level1 { hash } = policy else {
-                return Err(NodeVersioningError::new(
-                    "restore_graph: checkpoint node version level 1 requires matching node versioning policy",
-                ));
-            };
+    match (policy, &version) {
+        (ResolvedNodeVersioningPolicy::Disabled, _) => Err(NodeVersioningError::new(
+            "restore_graph: checkpoint node version metadata is present but node versioning is disabled",
+        )),
+        (ResolvedNodeVersioningPolicy::Level0, NodeVersion::V0 { .. }) => {
+            Ok(RestoredNodeVersion::Version(version))
+        }
+        (ResolvedNodeVersioningPolicy::Level0, NodeVersion::V1 { .. }) => Err(
+            NodeVersioningError::new(
+                "restore_graph: checkpoint node version level 1 requires matching node versioning policy",
+            ),
+        ),
+        (ResolvedNodeVersioningPolicy::Level1 { .. }, NodeVersion::V0 { .. }) => Err(
+            NodeVersioningError::new(
+                "restore_graph: checkpoint node version level 0 requires matching node versioning policy",
+            ),
+        ),
+        (ResolvedNodeVersioningPolicy::Level1 { hash }, NodeVersion::V1 { counter, cid, .. }) => {
             if !has_data && *counter > 0 {
                 return Err(NodeVersioningError::new(
                     "restore_graph: checkpoint node version cid cannot be verified without current DATA under V1 versioning (D109)",

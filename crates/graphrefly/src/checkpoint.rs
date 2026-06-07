@@ -1109,6 +1109,53 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_v0_metadata_when_selected_policy_is_not_v0() {
+        let g = crate::graph::graph();
+        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
+        source.set(json!(2));
+        let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+
+        let disabled_err = match restore_graph(
+            checkpoint.clone(),
+            RestoreGraphOptions {
+                registry: default_restore_registry(),
+                graph: GraphOptions {
+                    versioning: Some(NodeVersioningPolicy::Disabled),
+                    ..GraphOptions::default()
+                },
+            },
+        ) {
+            Ok(_) => panic!("V0 metadata must not restore into disabled versioning"),
+            Err(err) => err,
+        };
+        assert!(disabled_err.to_string().contains("versioning is disabled"));
+
+        let level1_err = match restore_graph(
+            checkpoint,
+            RestoreGraphOptions {
+                registry: default_restore_registry(),
+                graph: GraphOptions {
+                    versioning: Some(NodeVersioningPolicy::Level1 {
+                        hash: Some(Rc::new(|bytes: &[u8]| {
+                            format!(
+                                "h:{}",
+                                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
+                            )
+                        })),
+                    }),
+                    ..GraphOptions::default()
+                },
+            },
+        ) {
+            Ok(_) => panic!("V0 metadata must not restore into a V1 lane"),
+            Err(err) => err,
+        };
+        assert!(level1_err
+            .to_string()
+            .contains("level 0 requires matching node versioning policy"));
+    }
+
+    #[test]
     fn restores_v1_only_with_matching_hash_lane() {
         let hash = Rc::new(|bytes: &[u8]| {
             format!(

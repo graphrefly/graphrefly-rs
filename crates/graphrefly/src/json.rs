@@ -13,6 +13,10 @@ use serde_json::Value;
 pub type JsonValue = Value;
 pub type JsonCodecResult<T> = Result<T, JsonCodecError>;
 
+const JS_MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
+const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
+const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JsonCodecError {
     Encode(String),
@@ -148,11 +152,29 @@ fn validate_strict_json_value_inner(
                     "strictJsonCodec: JSON number at {path} is not strict canonical JSON compatible"
                 )));
             }
+            if let Some(value) = number.as_i64() {
+                if !(-JS_MAX_SAFE_INTEGER_I64..=JS_MAX_SAFE_INTEGER_I64).contains(&value) {
+                    return Err(JsonCodecError::validation(format!(
+                        "strictJsonCodec: JSON integer at {path} is outside the safe integer range"
+                    )));
+                }
+            } else if let Some(value) = number.as_u64() {
+                if value > JS_MAX_SAFE_INTEGER_U64 {
+                    return Err(JsonCodecError::validation(format!(
+                        "strictJsonCodec: JSON integer at {path} is outside the safe integer range"
+                    )));
+                }
+            }
             if let Some(float) = number.as_f64() {
                 let abs = float.abs();
                 if abs > 0.0 && abs < f64::MIN_POSITIVE {
                     return Err(JsonCodecError::validation(format!(
                         "strictJsonCodec: JSON number at {path} is subnormal and not strict canonical JSON compatible"
+                    )));
+                }
+                if float.fract() == 0.0 && abs > JS_MAX_SAFE_INTEGER_F64 {
+                    return Err(JsonCodecError::validation(format!(
+                        "strictJsonCodec: JSON integer at {path} is outside the safe integer range"
                     )));
                 }
             }
@@ -167,7 +189,7 @@ fn canonical_json_string(value: &JsonValue) -> JsonCodecResult<String> {
         Value::Null => Ok("null".to_owned()),
         Value::Bool(true) => Ok("true".to_owned()),
         Value::Bool(false) => Ok("false".to_owned()),
-        Value::Number(number) => Ok(number.to_string()),
+        Value::Number(number) => Ok(canonical_number_string(number)),
         Value::String(value) => {
             serde_json::to_string(value).map_err(|err| JsonCodecError::encode(err.to_string()))
         }
@@ -203,6 +225,24 @@ fn canonical_json_string(value: &JsonValue) -> JsonCodecResult<String> {
             Ok(out)
         }
     }
+}
+
+fn canonical_number_string(number: &serde_json::Number) -> String {
+    if let Some(value) = number.as_i64() {
+        return value.to_string();
+    }
+    if let Some(value) = number.as_u64() {
+        return value.to_string();
+    }
+    if let Some(value) = number.as_f64() {
+        if value == 0.0 {
+            return "0".to_owned();
+        }
+        if value.is_finite() && value.fract() == 0.0 && value.abs() <= JS_MAX_SAFE_INTEGER_F64 {
+            return format!("{value:.0}");
+        }
+    }
+    number.to_string()
 }
 
 fn cmp_js_utf16(a: &str, b: &str) -> Ordering {

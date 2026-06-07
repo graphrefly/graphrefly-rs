@@ -2410,7 +2410,7 @@ impl Core {
         self.with_call(|c| c.handle)
     }
 
-    pub(crate) fn is_quiescent_for_release(&self) -> bool {
+    pub(crate) fn runtime_is_quiescent_for_release(&self) -> bool {
         if wave_in_flight() || delivery_in_flight() {
             return false;
         }
@@ -2443,12 +2443,16 @@ impl Core {
             && (a.pause_lockset.is_empty() || allowed_pause_lock)
     }
 
+    pub(crate) fn is_quiescent_for_release(&self) -> bool {
+        self.runtime_is_quiescent_for_release() && self.subscriber_count() == 0
+    }
+
     pub(crate) fn release_runtime_for_graph(&self) -> bool {
         if !self.is_quiescent_for_release() {
             return false;
         }
         let key = self.key();
-        let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = {
+        let slot = {
             let mut graph = self.graph.borrow_mut();
             if graph.pin_count(key) != 0 {
                 return false;
@@ -2477,6 +2481,7 @@ impl Core {
             id: key.id.0,
             armed: true,
         };
+        let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = slot;
         inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
         free_slot.armed = false;
         self.graph.borrow_mut().free.push(key.id.0);
@@ -4438,9 +4443,12 @@ impl Core {
         self.with_aux_mut(|a| a.on_invalidate.push(f));
     }
 
-    #[cfg(test)]
-    fn subscriber_count(&self) -> usize {
+    pub(crate) fn subscriber_count(&self) -> usize {
         self.with_aux(|a| a.subscribers.len())
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.with_aux(|a| a.activated)
     }
 }
 

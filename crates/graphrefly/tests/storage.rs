@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -19,14 +19,15 @@ use graphrefly::{
     reactive_cascading_cache, read_append_log_page, read_observe_event_log_page,
     stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
     tiered_read_through, u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame,
-    wal_frame_checksum, wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogReadOptions,
-    AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
-    CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
-    ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, JsonCodec, KvStorageTier,
-    KvVersionedRead, Message, Node, ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
-    PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage, ReadThroughOutcome,
-    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughStatus, WalFrame,
-    WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
+    wal_frame_checksum, wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogEntry,
+    AppendLogReadOptions, AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent,
+    CascadingCachePolicy, CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec,
+    ContentAddressedKvOptions, ContentAddressedMode, FileAppendLogOptions, FileBackendOptions,
+    JsonCodec, KvStorageTier, KvVersionedRead, Message, Node, ObserveEventFrame,
+    ObserveEventFrameOptions, ObserveMessage, PromotionPolicy, ReactiveCascadingCacheOptions,
+    ReadThroughErrorStage, ReadThroughOutcome, StorageError, StorageResult,
+    TieredReadThroughOptions, TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions,
+    WAL_FORMAT_VERSION,
 };
 use serde_json::json;
 
@@ -151,9 +152,42 @@ fn stable_and_strict_json_helpers_use_canonical_bytes() {
         r#"{"a":{"c":3,"d":4},"b":2}"#
     );
     assert_eq!(
+        String::from_utf8(strict_canonical_json_bytes(&json!(1.0)).unwrap()).unwrap(),
+        "1",
+        "D112: integral floats use the same canonical number bytes as TS/Py JSON"
+    );
+    assert_eq!(
         strict_json_decode(br#"{"a":{"c":3,"d":4},"b":2}"#).unwrap(),
         json!({ "a": { "c": 3, "d": 4 }, "b": 2 })
     );
+    assert!(strict_json_decode(b"1.0")
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+    assert!(strict_json_decode(b"-0")
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+    assert!(
+        strict_canonical_json_bytes(&json!(9_007_199_254_740_992_u64))
+            .unwrap_err()
+            .to_string()
+            .contains("safe integer")
+    );
+    assert!(
+        strict_canonical_json_bytes(&json!(-9_007_199_254_740_992_i64))
+            .unwrap_err()
+            .to_string()
+            .contains("safe integer")
+    );
+    assert!(strict_json_decode(b"9007199254740992")
+        .unwrap_err()
+        .to_string()
+        .contains("safe integer"));
+    assert!(strict_json_decode(b"1e20")
+        .unwrap_err()
+        .to_string()
+        .contains("safe integer"));
 
     assert!(strict_json_decode(br#"{"b":2,"a":1}"#)
         .unwrap_err()
@@ -734,6 +768,88 @@ fn attach_observe_event_log_persists_mapped_data_frames_in_observe_order() {
             .map(|entry| entry.value.change)
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
+    );
+}
+
+#[derive(Clone)]
+struct FailAfterSuccessfulAppendsLog<T: Clone> {
+    inner: graphrefly::AppendLogStorage<T>,
+    remaining_successes_before_failure: Rc<Cell<usize>>,
+    failed: Rc<Cell<bool>>,
+}
+
+impl<T: Clone> AppendLogStorageTier<T> for FailAfterSuccessfulAppendsLog<T> {
+    fn append(&self, value: T) -> StorageResult<AppendLogEntry<T>> {
+        let remaining = self.remaining_successes_before_failure.get();
+        if remaining == 0 && !self.failed.get() {
+            self.failed.set(true);
+            return Err(StorageError::backend("append failed once"));
+        }
+        if remaining > 0 {
+            self.remaining_successes_before_failure.set(remaining - 1);
+        }
+        self.inner.append(value)
+    }
+
+    fn read(&self, opts: AppendLogReadOptions) -> StorageResult<Vec<AppendLogEntry<T>>> {
+        self.inner.read(opts)
+    }
+
+    fn truncate_after(&self, seq: u64) -> StorageResult<()> {
+        self.inner.truncate_after(seq)
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        self.inner.size()
+    }
+}
+
+#[test]
+fn observe_event_log_flush_keeps_failed_frame_for_retry() {
+    let g = graph();
+    let count = g.state_opts(0, graphrefly::GraphNodeOpts::named("count"));
+    let inner = memory_append_log::<ObserveEventFrame<i32>>("observe-retry");
+    let log = FailAfterSuccessfulAppendsLog {
+        inner: inner.clone(),
+        remaining_successes_before_failure: Rc::new(Cell::new(1)),
+        failed: Rc::new(Cell::new(false)),
+    };
+    let handle = attach_observe_event_log(
+        &g,
+        Rc::new(log),
+        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
+            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+            _ => None,
+        })
+        .with_path("count"),
+    );
+
+    count.set(1);
+
+    assert!(handle
+        .flush()
+        .unwrap_err()
+        .to_string()
+        .contains("append failed once"));
+    assert_eq!(
+        inner
+            .read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.value.change)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "a successful frame before the failed append is committed exactly once"
+    );
+    handle.flush().unwrap();
+    assert_eq!(
+        inner
+            .read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.value.change)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
     );
 }
 

@@ -705,6 +705,21 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ..NodeOpts::default()
             },
             move |ctx| {
+                let changes = ctx.batch::<LogChange<T>>(0);
+                let appended = changes
+                    .iter()
+                    .map(|change| match change.as_ref() {
+                        LogChange::Append { .. } => 1,
+                        LogChange::AppendMany { values } => values.len(),
+                        LogChange::TrimHead { .. } | LogChange::Clear { .. } => 0,
+                    })
+                    .sum::<usize>();
+                let reset_change = changes.iter().any(|change| {
+                    matches!(
+                        change.as_ref(),
+                        LogChange::TrimHead { .. } | LogChange::Clear { .. }
+                    )
+                });
                 let previous = ctx.state_get::<LogScanState<A>>();
                 let mut state = previous
                     .as_ref()
@@ -717,9 +732,13 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                         processed: 0,
                     });
                 let all = backend.snapshot();
-                if all.len() < state.processed {
+                if reset_change || all.len() < state.processed {
                     state.acc = initial.clone();
                     state.processed = 0;
+                }
+                if appended > 0 && all.len() < state.processed.saturating_add(appended) {
+                    ctx.state_set(state);
+                    return;
                 }
                 for value in all.iter().skip(state.processed) {
                     state.acc = step(state.acc, value);

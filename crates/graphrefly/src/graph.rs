@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::async_driver::LocalAsyncDriver;
@@ -639,8 +640,18 @@ impl Graph {
         }
         for (id, core) in &release_entries {
             assert!(
-                core.is_quiescent_for_release(),
-                "graph: cannot release node group for {reason}; '{id}' is not quiescent (D124)"
+                core.runtime_is_quiescent_for_release(),
+                "graph: cannot release node group for {reason}; '{id}' is not runtime-quiescent (D124)"
+            );
+            let internal_subscribers = release_cores
+                .iter()
+                .filter(|dependent| dependent.is_active())
+                .flat_map(|dependent| dependent.deps())
+                .filter(|dep| dep.ptr_eq(core))
+                .count();
+            assert!(
+                core.subscriber_count() <= internal_subscribers,
+                "graph: cannot release node group for {reason}; '{id}' still has live subscribers (D124)"
             );
         }
         {
@@ -655,12 +666,40 @@ impl Graph {
                 retired.insert(id.clone());
             }
         }
-        for core in release_cores.into_iter().rev() {
-            assert!(
-                core.release_runtime_for_graph(),
-                "graph: cannot release node group for {reason}; runtime became non-quiescent (D124)"
-            );
+        let mut pending = release_cores.iter().rev().cloned().collect::<Vec<_>>();
+        let mut first_panic = None;
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut index = 0;
+            while index < pending.len() {
+                if pending[index].subscriber_count() != 0 {
+                    index += 1;
+                    continue;
+                }
+                let core = pending.remove(index);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    assert!(
+                        core.release_runtime_for_graph(),
+                        "graph: cannot release node group for {reason}; runtime became non-quiescent (D124)"
+                    );
+                }));
+                if let Err(panic) = result {
+                    if first_panic.is_none() {
+                        first_panic = Some(panic);
+                    }
+                }
+            }
+            if pending.len() == before {
+                break;
+            }
         }
+        if let Some(panic) = first_panic {
+            resume_unwind(panic);
+        }
+        assert!(
+            pending.is_empty(),
+            "graph: cannot release node group for {reason}; internal release order did not quiesce (D124)"
+        );
     }
 
     fn assert_graph_local_deps(&self, deps: &[Core], label: &str) {
@@ -1220,5 +1259,43 @@ fn describe_value(value: &AnyValue) -> DescribeValue {
         DescribeValue::String((*v).to_owned())
     } else {
         DescribeValue::Opaque
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[test]
+    fn release_nodes_hides_registry_and_releases_remaining_after_cleanup_panic() {
+        let g = graph();
+        let panic_node = g.state_opts(1, GraphNodeOpts::named("panic"));
+        let later_node = g.state_opts(2, GraphNodeOpts::named("later"));
+        let later_released = Rc::new(Cell::new(false));
+        let flag = later_released.clone();
+        panic_node
+            .erased()
+            .register_on_deactivation(Box::new(|| panic!("cleanup boom")));
+        later_node
+            .erased()
+            .register_on_deactivation(Box::new(move || flag.set(true)));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            g.release_nodes(&[later_node.erased(), panic_node.erased()], "test");
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            g.find("panic").is_none() && g.find("later").is_none(),
+            "D122: cleanup panic must not leave graph registry pointing at released slots"
+        );
+        assert!(
+            later_released.get(),
+            "a cleanup panic in one released node must not skip later nodes in the group"
+        );
     }
 }
