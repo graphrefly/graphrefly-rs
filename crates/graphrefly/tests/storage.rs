@@ -5,26 +5,28 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use graphrefly::adapters::observe_storage::{
+    attach_observe_event_log, AttachObserveEventLogOptions,
+};
 use graphrefly::{
     append_log_key, append_log_storage, assert_decimal_integer_string,
-    assert_non_negative_decimal_integer_string, assert_wal_frame, attach_observe_event_log,
-    change_envelope_codec, content_addressed_kv, content_addressed_storage, decimal_string_to_i128,
-    dict_kv, envelope_change, file_append_log, file_backend, file_kv, graph,
-    i128_to_decimal_string, is_decimal_integer_string, is_non_negative_decimal_integer_string,
-    json_codec_for, memory_append_log, memory_kv, memory_multi_writer_append_log,
-    multi_writer_append_log_storage, non_negative_decimal_string_to_u128, observe_event_frame,
-    observe_event_frame_codec, reactive_cascading_cache, read_append_log_page,
-    read_observe_event_log_page, stable_json_string, strict_canonical_json_bytes,
-    strict_json_codec_for, strict_json_decode, tiered_read_through,
-    u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame, wal_frame_checksum,
-    wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogReadOptions, AppendLogStorageTier,
-    AttachObserveEventLogOptions, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
+    assert_non_negative_decimal_integer_string, assert_wal_frame, change_envelope_codec,
+    content_addressed_kv, content_addressed_storage, decimal_string_to_i128, dict_kv,
+    envelope_change, file_append_log, file_backend, file_kv, graph, i128_to_decimal_string,
+    is_decimal_integer_string, is_non_negative_decimal_integer_string, json_codec_for,
+    memory_append_log, memory_kv, memory_multi_writer_append_log, multi_writer_append_log_storage,
+    non_negative_decimal_string_to_u128, observe_event_frame, observe_event_frame_codec,
+    reactive_cascading_cache, read_append_log_page, read_observe_event_log_page,
+    stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
+    tiered_read_through, u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame,
+    wal_frame_checksum, wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogReadOptions,
+    AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
     CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
     ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, JsonCodec, KvStorageTier,
-    KvVersionedRead, Message, Node, ObserveEvent, ObserveEventFrame, ObserveEventFrameOptions,
-    ObserveMessage, PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage,
-    ReadThroughOutcome, StorageError, StorageResult, Tier, TieredReadThroughOptions,
-    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
+    KvVersionedRead, Message, Node, ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
+    PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage, ReadThroughOutcome,
+    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughStatus, WalFrame,
+    WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
 };
 use serde_json::json;
 
@@ -760,40 +762,22 @@ fn observe_event_log_rollback_drops_queued_frames_before_flush() {
 #[test]
 fn observe_event_log_page_orders_by_append_sequence_not_graph_projection() {
     let entries = memory_kv::<ObserveEventFrame<i32>>();
-    let event_a = ObserveEvent {
-        path: "count".to_owned(),
-        msg: ObserveMessage::Dirty,
-        tier: Tier::Control,
-        seq: 10,
-    };
-    let event_b = ObserveEvent {
-        path: "count".to_owned(),
-        msg: ObserveMessage::Dirty,
-        tier: Tier::Control,
-        seq: 5,
-    };
-    let event_c = ObserveEvent {
-        path: "count".to_owned(),
-        msg: ObserveMessage::Dirty,
-        tier: Tier::Control,
-        seq: 7,
-    };
     entries
         .set(
             &append_log_key("observe-unordered", 0),
-            observe_event_frame(&event_a, 1, ObserveEventFrameOptions::default()).unwrap(),
+            observe_event_frame(10, "count", 1, ObserveEventFrameOptions::default()).unwrap(),
         )
         .unwrap();
     entries
         .set(
             &append_log_key("observe-unordered", 2),
-            observe_event_frame(&event_b, 2, ObserveEventFrameOptions::default()).unwrap(),
+            observe_event_frame(5, "count", 2, ObserveEventFrameOptions::default()).unwrap(),
         )
         .unwrap();
     entries
         .set(
             &append_log_key("observe-unordered", 10),
-            observe_event_frame(&event_c, 3, ObserveEventFrameOptions::default()).unwrap(),
+            observe_event_frame(7, "count", 3, ObserveEventFrameOptions::default()).unwrap(),
         )
         .unwrap();
     let log = append_log_storage(Rc::new(entries), "observe-unordered");
@@ -862,14 +846,9 @@ fn change_and_observe_event_codecs_validate_storage_frames_only() {
     .to_string()
     .contains("version"));
 
-    let event = ObserveEvent {
-        path: "count".to_owned(),
-        msg: ObserveMessage::Dirty,
-        tier: Tier::Control,
-        seq: 7,
-    };
     let frame = observe_event_frame(
-        &event,
+        7,
+        "count",
         json!({ "value": 1 }),
         ObserveEventFrameOptions::default().with_stream("audit"),
     )

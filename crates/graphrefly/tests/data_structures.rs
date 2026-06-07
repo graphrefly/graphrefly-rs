@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
-    graph, reactive_list, GraphNodeOpts, ListChange, Message, Node, ReactiveListOptions,
+    graph, merge_reactive_logs, reactive_list, reactive_log, scan_log, GraphNodeOpts, ListChange,
+    LogChange, Message, Node, ReactiveListOptions, ReactiveLogOptions,
 };
 
 fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -41,6 +42,17 @@ fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static 
 fn demand_snapshot<T: Clone + 'static>(list: &graphrefly::ReactiveList<T>) {
     list.snapshot
         .up(vec![Message::Resume(list.pull_id.clone())]);
+}
+
+fn demand_log_snapshot<T: Clone + 'static>(log: &graphrefly::ReactiveLog<T>) {
+    log.snapshot.up(vec![Message::Resume(log.pull_id.clone())]);
+}
+
+fn demand_view_snapshot<C: Clone + 'static, S: Clone + 'static>(
+    view: &graphrefly::ReactiveView<C, S>,
+) {
+    view.snapshot
+        .up(vec![Message::Resume(view.pull_id.clone())]);
 }
 
 #[test]
@@ -122,6 +134,249 @@ fn reactive_list_capacity_trims_head_and_emits_delta() {
             ListChange::TrimHead { n: 1 },
         ]
     );
+}
+
+#[test]
+fn reactive_log_delta_quick_reads_and_pull_snapshot() {
+    let log = reactive_log::<i32>(vec![1], ReactiveLogOptions::default().max_size(3));
+    let deltas = collect_data(&log.delta);
+    let snapshots = collect_data(&log.snapshot);
+
+    log.append(2);
+    log.append_many(vec![3, 4]);
+    assert_eq!(log.to_vec(), vec![2, 3, 4]);
+    assert_eq!(log.len(), 3);
+    assert_eq!(log.at(-1), Some(4));
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            LogChange::Append { value: 2 },
+            LogChange::AppendMany { values: vec![3, 4] },
+            LogChange::TrimHead { n: 1 },
+        ]
+    );
+    assert!(snapshots.borrow().is_empty());
+
+    demand_log_snapshot(&log);
+    assert_eq!(*snapshots.borrow(), vec![vec![2, 3, 4]]);
+    demand_log_snapshot(&log);
+    assert_eq!(
+        *snapshots.borrow(),
+        vec![vec![2, 3, 4]],
+        "D60/R-pull: demand with no intervening delta coalesces"
+    );
+
+    log.trim_head(2);
+    log.clear();
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            LogChange::Append { value: 2 },
+            LogChange::AppendMany { values: vec![3, 4] },
+            LogChange::TrimHead { n: 1 },
+            LogChange::TrimHead { n: 2 },
+            LogChange::Clear { count: 1 },
+        ]
+    );
+}
+
+#[test]
+fn reactive_log_incremental_views_follow_delta_backbone() {
+    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let tail = log.tail(2);
+    let slice = log.slice(1, Some(3));
+    let sum = log.scan(0i32, |acc, value| acc + *value);
+    let tail_seen = collect_data(&tail);
+    let slice_seen = collect_data(&slice);
+    let sum_seen = collect_data(&sum);
+
+    log.append(1);
+    log.append(2);
+    log.append(3);
+
+    assert_eq!(*tail_seen.borrow(), vec![vec![1], vec![1, 2], vec![2, 3]]);
+    assert_eq!(*slice_seen.borrow(), vec![vec![], vec![2], vec![2, 3]]);
+    assert_eq!(*sum_seen.borrow(), vec![1, 3, 6]);
+
+    log.trim_head(2);
+    assert_eq!(
+        *tail_seen.borrow(),
+        vec![vec![1], vec![1, 2], vec![2, 3], vec![3]]
+    );
+    assert_eq!(*sum_seen.borrow(), vec![1, 3, 6, 3]);
+}
+
+#[test]
+fn reactive_log_page_is_light_view_and_lazy_pull() {
+    let g = graph();
+    let log = reactive_log::<i32>(vec![1, 2, 3, 4], ReactiveLogOptions::named("log").graph(g));
+    let page = log.page(1, 2);
+    let same = log.page(1, 2);
+    assert_eq!(page.pull_id, same.pull_id);
+    let page_deltas = collect_data(&page.delta);
+    let pages = collect_data(&page.snapshot);
+
+    log.append(5);
+    assert_eq!(
+        *page_deltas.borrow(),
+        vec![LogChange::Append { value: 5 }],
+        "D121: light view delta forwards parent mutations"
+    );
+    assert!(pages.borrow().is_empty());
+
+    demand_view_snapshot(&page);
+    assert_eq!(*pages.borrow(), vec![vec![2, 3]]);
+
+    page.dispose();
+    let rebuilt = log.page(1, 2);
+    assert!(
+        rebuilt.pull_id != page.pull_id,
+        "disposing a memoized page removes it from the memo table"
+    );
+    rebuilt.dispose();
+}
+
+#[test]
+fn reactive_log_page_dispose_releases_graph_registered_nodes() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3, 4],
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let page = log.page(1, 2);
+
+    let snap = g.describe();
+    assert!(snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "log.page#0.delta" && node.factory == "reactiveLog.page.delta"));
+    assert!(snap.nodes.iter().any(
+        |node| node.id == "log.page#0.snapshot" && node.factory == "reactiveLog.page.snapshot"
+    ));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "log.delta".to_owned(),
+        to: "log.page#0.delta".to_owned(),
+    }));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "log.page#0.delta".to_owned(),
+        to: "log.page#0.snapshot".to_owned(),
+    }));
+
+    page.dispose();
+
+    let after = g.describe();
+    assert!(!after.nodes.iter().any(|node| node.id == "log.page#0.delta"));
+    assert!(!after
+        .nodes
+        .iter()
+        .any(|node| node.id == "log.page#0.snapshot"));
+    assert!(g.find("log.page#0.delta").is_none());
+    let rebuilt = log.page(1, 2);
+    let rebuilt_snap = g.describe();
+    assert!(rebuilt_snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "log.page#1.delta"));
+    rebuilt.dispose();
+}
+
+#[test]
+#[should_panic(expected = "still depends")]
+fn reactive_log_page_dispose_rejects_external_registered_dependents() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3, 4],
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let page = log.page(1, 2);
+    let _consumer = g.derived_opts(
+        vec![page.snapshot.erased()],
+        |_| Some(0i32),
+        GraphNodeOpts::named("consumer"),
+    );
+
+    page.dispose();
+}
+
+#[test]
+fn reactive_log_attach_is_graph_visible_declared_dep() {
+    let g = graph();
+    let src = g.state_opts(0i32, GraphNodeOpts::named("src"));
+    let log = reactive_log::<i32>(
+        Vec::new(),
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let deltas = collect_data(&log.delta);
+
+    let dispose = log.attach(&src);
+    src.set(1);
+    src.set(2);
+
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            LogChange::Append { value: 0 },
+            LogChange::Append { value: 1 },
+            LogChange::Append { value: 2 },
+        ]
+    );
+    assert_eq!(log.to_vec(), vec![0, 1, 2]);
+    let snap = g.describe();
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "src".to_owned(),
+        to: "log.bind#0".to_owned(),
+    }));
+    assert_eq!(
+        snap.nodes
+            .iter()
+            .find(|node| node.id == "log.bind#0")
+            .map(|node| node.factory.as_str()),
+        Some("reactiveLog.bindSource")
+    );
+
+    dispose();
+    let snap_after_dispose = g.describe();
+    assert!(!snap_after_dispose
+        .edges
+        .contains(&graphrefly::DescribeEdge {
+            from: "src".to_owned(),
+            to: "log.bind#0".to_owned(),
+        }));
+    src.set(3);
+    assert_eq!(log.to_vec(), vec![0, 1, 2]);
+}
+
+#[test]
+fn merge_reactive_logs_is_declared_dep_fan_in() {
+    let a = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let b = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let merged = merge_reactive_logs(vec![a.clone(), b.clone()]);
+    let seen = collect_data(&merged);
+
+    a.append(1);
+    b.append(2);
+    a.append_many(vec![3, 4]);
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            LogChange::Append { value: 1 },
+            LogChange::Append { value: 2 },
+            LogChange::AppendMany { values: vec![3, 4] },
+        ]
+    );
+}
+
+#[test]
+fn scan_log_helper_delegates_to_reactive_log_scan() {
+    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let scanned = scan_log(&log, 1i32, |acc, value| acc * *value);
+    let seen = collect_data(&scanned);
+
+    log.append(2);
+    log.append(3);
+
+    assert_eq!(*seen.borrow(), vec![2, 6]);
 }
 
 #[test]

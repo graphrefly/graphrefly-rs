@@ -37,8 +37,8 @@ use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
 use graphrefly::{
     batch, graph, restore_graph, restore_registry, AnyValue, Core, Ctx, DeferredCtx, DepTerminal,
     GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreEntry, LockId, Message, Node,
-    NodeOpts, Pausable, PoolKind, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
-    RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
+    NodeOpts, NodeVersion, Pausable, PoolKind, RestoreFactoryMeta, RestoreGraphOptions,
+    RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
 };
 use serde_json::json;
 
@@ -2811,7 +2811,7 @@ fn c24_snapshot_restore_preserves_state_and_rejects_local_only_factories() {
         .find(|node| node.id == "memo")
         .expect("memo checkpoint exists")
         .version = Some(json!({ "level": 0, "counter": 1 }));
-    let version_err = match restore_graph(
+    let versioned_restored = restore_graph(
         versioned_checkpoint,
         RestoreGraphOptions::new(restore_registry([
             GraphRestoreEntry::descriptor(StateRestoreDescriptor),
@@ -2819,11 +2819,14 @@ fn c24_snapshot_restore_preserves_state_and_rejects_local_only_factories() {
                 runs: Rc::new(Cell::new(0)),
             }),
         ])),
-    ) {
-        Ok(_) => panic!("unsupported runtime version metadata fails honestly"),
-        Err(err) => err,
-    };
-    assert!(version_err.to_string().contains("runtime version metadata"));
+    )
+    .expect("V0 runtime version metadata restores after B68");
+    assert_eq!(
+        versioned_restored
+            .find("memo")
+            .and_then(|node| node.version()),
+        Some(NodeVersion::V0 { counter: 1 })
+    );
 
     let local_graph = graph();
     let local_source = local_graph.state_opts(json!(1), GraphNodeOpts::named("source"));

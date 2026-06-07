@@ -54,6 +54,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapters;
 pub mod async_driver;
 pub mod batch;
 pub mod cascading_cache;
@@ -73,6 +74,7 @@ pub mod render;
 pub mod sources;
 pub mod storage;
 pub mod time;
+mod versioning;
 
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;
@@ -95,7 +97,10 @@ pub use combinators::{
     with_latest_from, zip,
 };
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
-pub use data_structures::{reactive_list, ListChange, ReactiveList, ReactiveListOptions};
+pub use data_structures::{
+    merge_reactive_logs, reactive_list, reactive_log, scan_log, ListChange, LogChange,
+    ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveView,
+};
 pub use diagnostics::{
     explain_path, reachable, validate_no_islands, CausalChain, CausalStep, ExplainPathOptions,
     ExplainPathReason, IslandReport, ReachableDirection, ReachableOptions, ReachableResult,
@@ -137,30 +142,31 @@ pub use sources::{
     FsEventKind,
 };
 pub use storage::{
-    append_log_key, append_log_storage, assert_wal_frame, attach_observe_event_log,
-    change_envelope_codec, codec_kv_storage, content_addressed_kv, content_addressed_storage,
-    dict_kv, envelope_change, file_append_log, file_backend, file_kv, memory_append_log, memory_kv,
-    memory_multi_writer_append_log, multi_writer_append_log_storage, now_ns, observe_event_frame,
-    observe_event_frame_codec, read_append_log_page, read_observe_event_log_page, read_through_kv,
-    tiered_read_through, verify_wal_frame_checksum, wal_frame, wal_frame_checksum, wal_frame_codec,
-    wal_frame_key, wal_frame_prefix, AppendLogEntry, AppendLogPage, AppendLogReadOptions,
-    AppendLogStorage, AppendLogStorageTier, AttachObserveEventLogOptions, ByteStorageBackend,
-    ChangeEnvelope, ChangeEnvelopeCodec, ChangeEnvelopeOptions, ChangeLifecycle, CodecKvStorage,
-    ContentAddressedKeyContext, ContentAddressedKv, ContentAddressedKvOptions,
-    ContentAddressedMode, ContentAddressedStorage, ContentAddressedStorageOptions,
-    FileAppendLogOptions, FileBackend, FileBackendOptions, FileKv, KvGeneration, KvStorageTier,
-    KvVersionedRead, MemoryKv, MultiWriterAppendLogStorage, ObserveEventFrame,
-    ObserveEventFrameCodec, ObserveEventFrameOptions, ObserveEventLogErrorContext,
-    ObserveEventLogErrorFn, ObserveEventLogErrorPhase, ObserveEventLogHandle, ObserveEventLogMap,
-    ObserveEventLogPage, PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn,
-    ReadThroughErrorStage, ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier,
-    ReadThroughMissContext, ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact,
-    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughResult,
-    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameCodec, WalFrameOptions,
-    WalFrameTimestampNs, APPEND_LOG_SEQ_PAD, WAL_FORMAT_VERSION, WAL_FRAME_SEQ_PAD,
-    WAL_KEY_SEGMENT,
+    append_log_key, append_log_storage, assert_wal_frame, change_envelope_codec, codec_kv_storage,
+    content_addressed_kv, content_addressed_storage, dict_kv, envelope_change, file_append_log,
+    file_backend, file_kv, memory_append_log, memory_kv, memory_multi_writer_append_log,
+    multi_writer_append_log_storage, now_ns, observe_event_frame, observe_event_frame_codec,
+    read_append_log_page, read_observe_event_log_page, read_through_kv, tiered_read_through,
+    verify_wal_frame_checksum, wal_frame, wal_frame_checksum, wal_frame_codec, wal_frame_key,
+    wal_frame_prefix, AppendLogEntry, AppendLogPage, AppendLogReadOptions, AppendLogStorage,
+    AppendLogStorageTier, ByteStorageBackend, ChangeEnvelope, ChangeEnvelopeCodec,
+    ChangeEnvelopeOptions, ChangeLifecycle, CodecKvStorage, ContentAddressedKeyContext,
+    ContentAddressedKv, ContentAddressedKvOptions, ContentAddressedMode, ContentAddressedStorage,
+    ContentAddressedStorageOptions, FileAppendLogOptions, FileBackend, FileBackendOptions, FileKv,
+    KvGeneration, KvStorageTier, KvVersionedRead, MemoryKv, MultiWriterAppendLogStorage,
+    ObserveEventFrame, ObserveEventFrameCodec, ObserveEventFrameOptions, ObserveEventLogPage,
+    PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn, ReadThroughErrorStage,
+    ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier, ReadThroughMissContext,
+    ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact, StorageError, StorageResult,
+    TieredReadThroughOptions, TieredReadThroughResult, TieredReadThroughStatus, WalFrame,
+    WalFrameBody, WalFrameCodec, WalFrameOptions, WalFrameTimestampNs, APPEND_LOG_SEQ_PAD,
+    WAL_FORMAT_VERSION, WAL_FRAME_SEQ_PAD, WAL_KEY_SEGMENT,
 };
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,
     timeout,
+};
+pub use versioning::{
+    default_node_version_hash, NodeVersion, NodeVersionHashFn, NodeVersioningPolicy,
+    ResolvedNodeVersioningPolicy,
 };

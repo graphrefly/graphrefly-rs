@@ -18,6 +18,9 @@ use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
 use crate::json::validate_strict_json_value;
 use crate::node::{Core, NodeRestoreRuntime, Status};
 use crate::protocol::AnyValue;
+use crate::versioning::{
+    node_version_to_json, validate_node_version_json, verify_restored_node_version,
+};
 
 pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly.checkpoint.v1";
 
@@ -425,7 +428,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             status: status_to_str(runtime.status).to_owned(),
             deps: dep_ids,
             value: checkpoint_value(runtime.cache.as_ref(), runtime.has_data, &entry.id)?,
-            version: None,
+            version: runtime.version.as_ref().map(node_version_to_json),
             terminal: if runtime.terminal {
                 match runtime.status {
                     Status::Completed => GraphCheckpointTerminal::Complete,
@@ -673,11 +676,9 @@ fn prepare_checkpoint(
         let status = status_from_str(&node.status, &node.id)?;
         ensure_quiescent_status(status, &node.id, "restore_graph")?;
         validate_checkpoint_node_json(node)?;
-        if node.version.is_some() {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: node '{}' carries runtime version metadata, which Rust restore does not support yet",
-                node.id
-            )));
+        if let Some(version) = &node.version {
+            validate_node_version_json(version, &format!("{}.version", node.id))
+                .map_err(|err| GraphRestoreError::new(err.to_string()))?;
         }
         nodes.insert(
             node.id.clone(),
@@ -825,9 +826,18 @@ fn construct_prepared(
         let (cache, has_data) = restore_value(&node.value);
         let (terminal, status) = restore_terminal(node)?;
         let (ctx_state, ctx_state_persist) = restore_ctx_state(&node.ctx_state);
+        let restored_version = verify_restored_node_version(
+            &core.versioning_policy(),
+            node.version.as_ref(),
+            has_data,
+            cache.as_ref(),
+            &format!("{}.version", node.id),
+        )
+        .map_err(|err| GraphRestoreError::new(err.to_string()))?;
         core.restore_runtime(NodeRestoreRuntime {
             cache,
             has_data,
+            version: restored_version,
             status,
             terminal,
             has_called_fn_once: node.lifecycle.has_called_fn_once,
@@ -993,6 +1003,7 @@ mod tests {
     use crate::graph::RestoreFactoryMeta;
     use crate::node::Node;
     use crate::protocol::Message;
+    use crate::versioning::{NodeVersion, NodeVersioningPolicy};
     use serde_json::json;
 
     struct StatefulJsonDescriptor;
@@ -1069,20 +1080,160 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_unsupported_runtime_version_metadata() {
+    fn checkpoints_and_restores_node_runtime_versions() {
         let g = crate::graph::graph();
-        g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].version = Some(json!({ "level": 0, "counter": 1 }));
+        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
+        source.set(json!(2));
+        let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+        assert_eq!(
+            checkpoint.nodes[0].version,
+            Some(json!({ "level": 0, "counter": 1 }))
+        );
+
+        let restored = restore_graph(
+            checkpoint,
+            RestoreGraphOptions::new(default_restore_registry()),
+        )
+        .expect("V0 restore succeeds");
+        let restored_source = restored.find("source").expect("source restored");
+        assert_eq!(
+            restored_source.version(),
+            Some(NodeVersion::V0 { counter: 1 })
+        );
+
+        restored_source.down(vec![Message::Data(Rc::new(json!(3)))]);
+        assert_eq!(
+            restored_source.version(),
+            Some(NodeVersion::V0 { counter: 2 })
+        );
+    }
+
+    #[test]
+    fn restores_v1_only_with_matching_hash_lane() {
+        let hash = Rc::new(|bytes: &[u8]| {
+            format!(
+                "h:{}",
+                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
+            )
+        });
+        let graph = crate::graph::graph_opts(GraphOptions {
+            versioning: Some(NodeVersioningPolicy::Level1 {
+                hash: Some(hash.clone()),
+            }),
+            ..GraphOptions::default()
+        });
+        let source = graph.state_opts(json!(1), GraphNodeOpts::named("source"));
+        source.set(json!(2));
+        let checkpoint = graph.checkpoint().expect("checkpoint succeeds");
+        assert_eq!(
+            checkpoint.nodes[0].version,
+            Some(json!({ "level": 1, "counter": 1, "cid": "h:2", "prev": "h:1" }))
+        );
+
+        let err = match restore_graph(
+            checkpoint.clone(),
+            RestoreGraphOptions::new(default_restore_registry()),
+        ) {
+            Ok(_) => panic!("V1 restore without a matching lane must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("matching node versioning policy"));
+
+        let err = match restore_graph(
+            checkpoint.clone(),
+            RestoreGraphOptions {
+                registry: default_restore_registry(),
+                graph: GraphOptions {
+                    versioning: Some(NodeVersioningPolicy::Level1 {
+                        hash: Some(Rc::new(|bytes: &[u8]| {
+                            format!(
+                                "other:{}",
+                                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
+                            )
+                        })),
+                    }),
+                    ..GraphOptions::default()
+                },
+            },
+        ) {
+            Ok(_) => panic!("wrong hash lane must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("hash policy"));
+
+        let restored = restore_graph(
+            checkpoint,
+            RestoreGraphOptions {
+                registry: default_restore_registry(),
+                graph: GraphOptions {
+                    versioning: Some(NodeVersioningPolicy::Level1 { hash: Some(hash) }),
+                    ..GraphOptions::default()
+                },
+            },
+        )
+        .expect("matching V1 lane restores");
+        let restored_source = restored.find("source").expect("source restored");
+        assert_eq!(
+            restored_source.version(),
+            Some(NodeVersion::V1 {
+                counter: 1,
+                cid: "h:2".to_owned(),
+                prev: Some("h:1".to_owned()),
+            })
+        );
+        restored_source.down(vec![Message::Data(Rc::new(json!(3)))]);
+        assert_eq!(
+            restored_source.version(),
+            Some(NodeVersion::V1 {
+                counter: 2,
+                cid: "h:3".to_owned(),
+                prev: Some("h:2".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn restore_requires_version_metadata_when_versioning_is_enabled() {
+        let graph = crate::graph::graph();
+        graph.state_opts(json!(1), GraphNodeOpts::named("source"));
+        let mut checkpoint = graph.checkpoint().expect("checkpoint succeeds");
+        checkpoint.nodes[0].version = None;
 
         let err = match restore_graph(
             checkpoint,
             RestoreGraphOptions::new(default_restore_registry()),
         ) {
-            Ok(_) => panic!("Rust does not silently drop version metadata"),
+            Ok(_) => panic!("missing version metadata must fail under default V0 versioning"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("runtime version metadata"));
+        assert!(err.to_string().contains("version metadata is required"));
+    }
+
+    #[test]
+    fn restore_rejects_invalid_node_version_metadata_shape() {
+        let graph = crate::graph::graph();
+        graph.state_opts(json!(1), GraphNodeOpts::named("source"));
+        let checkpoint = graph.checkpoint().expect("checkpoint succeeds");
+
+        let mut extra = checkpoint.clone();
+        extra.nodes[0].version = Some(json!({ "level": 0, "counter": 1, "extra": true }));
+        let err = match restore_graph(extra, RestoreGraphOptions::new(default_restore_registry())) {
+            Ok(_) => panic!("extra node version fields must fail honestly"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unexpected node version fields"));
+
+        let mut unsafe_counter = checkpoint;
+        unsafe_counter.nodes[0].version =
+            Some(json!({ "level": 0, "counter": 9_007_199_254_740_992u64 }));
+        let err = match restore_graph(
+            unsafe_counter,
+            RestoreGraphOptions::new(default_restore_registry()),
+        ) {
+            Ok(_) => panic!("unsafe node version counters must fail honestly"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("safe integer"));
     }
 
     #[test]

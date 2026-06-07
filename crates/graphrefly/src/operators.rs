@@ -560,6 +560,7 @@ fn is_default_node_opts(opts: &NodeOpts) -> bool {
         && opts.complete_when_deps_complete
         && opts.error_when_deps_error
         && !opts.terminal_as_real_input
+        && opts.versioning.is_none()
 }
 
 fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
@@ -591,6 +592,9 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     }
     if caller.terminal_as_real_input {
         opts.terminal_as_real_input = true;
+    }
+    if caller.versioning.is_some() {
+        opts.versioning = caller.versioning;
     }
     opts
 }

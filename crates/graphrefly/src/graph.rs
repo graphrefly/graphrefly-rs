@@ -17,6 +17,7 @@ use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, LockId, Message, Tier};
+use crate::versioning::{NodeVersion, NodeVersioningPolicy};
 
 /// Graph construction options.
 #[derive(Clone, Default)]
@@ -25,6 +26,7 @@ pub struct GraphOptions {
     pub profile: bool,
     pub dispatcher: Option<Dispatcher>,
     pub local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    pub versioning: Option<NodeVersioningPolicy>,
 }
 
 impl fmt::Debug for GraphOptions {
@@ -37,6 +39,7 @@ impl fmt::Debug for GraphOptions {
                 "local_async_driver",
                 &self.local_async_driver.as_ref().map(|_| "<installed>"),
             )
+            .field("versioning", &self.versioning)
             .finish()
     }
 }
@@ -48,6 +51,7 @@ impl GraphOptions {
             profile: false,
             dispatcher: None,
             local_async_driver: None,
+            versioning: None,
         }
     }
 }
@@ -118,9 +122,11 @@ struct GraphInner {
     arena: GraphArena,
     dispatcher: Dispatcher,
     local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    versioning: Option<NodeVersioningPolicy>,
     profile_enabled: Cell<bool>,
     entries: RefCell<Vec<Entry>>,
     by_id: RefCell<HashMap<String, Core>>,
+    retired_ids: RefCell<HashSet<String>>,
     mounts: RefCell<Vec<Mount>>,
     seq: Cell<usize>,
     synth_seq: Cell<usize>,
@@ -161,9 +167,11 @@ impl Graph {
                 arena: GraphArena::new(),
                 dispatcher,
                 local_async_driver,
+                versioning: opts.versioning,
                 profile_enabled: Cell::new(opts.profile),
                 entries: RefCell::new(Vec::new()),
                 by_id: RefCell::new(HashMap::new()),
+                retired_ids: RefCell::new(HashSet::new()),
                 mounts: RefCell::new(Vec::new()),
                 seq: Cell::new(0),
                 synth_seq: Cell::new(0),
@@ -213,7 +221,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
             initial,
             f,
         );
@@ -226,10 +234,11 @@ impl Graph {
     }
 
     pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
-        let node = Node::state_in_arena_with_dispatcher(
+        let node = Node::state_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             initial,
+            self.apply_default_node_opts(opts.node.clone()),
         );
         self.add(node, "state", opts)
     }
@@ -240,9 +249,10 @@ impl Graph {
     }
 
     pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
-        let node = Node::state_empty_in_arena_with_dispatcher(
+        let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
         );
         self.add(node, "state", opts)
     }
@@ -260,7 +270,7 @@ impl Graph {
         let node = Node::producer_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
             f,
         );
         self.add(node, "producer", opts)
@@ -287,7 +297,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
             move |ctx| {
                 let values = Values::new(ctx.dep_records());
                 if let Some(value) = f(&values) {
@@ -318,7 +328,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
             move |ctx| {
                 let values = Values::new(ctx.dep_records());
                 if let Some(cleanup) = f(&values) {
@@ -347,7 +357,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
         );
         self.add(node, op.factory, opts)
     }
@@ -487,9 +497,10 @@ impl Graph {
         id: String,
         opts: GraphNodeOpts,
     ) -> Node<GraphCheckpointJson> {
-        let node = Node::state_empty_in_arena_with_dispatcher(
+        let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
         );
         self.add_with_id(node, "state", id, opts)
     }
@@ -507,7 +518,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            opts.node.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
             move |ctx| f(ctx),
         );
         self.add_with_id(node, factory, id, opts)
@@ -526,10 +537,18 @@ impl Graph {
         self.add_with_id(node, factory, id, opts)
     }
 
+    fn apply_default_node_opts(&self, mut opts: NodeOpts) -> NodeOpts {
+        if opts.versioning.is_none() {
+            opts.versioning = self.inner.versioning.clone();
+        }
+        opts
+    }
+
     pub(crate) fn empty_source<T: 'static>(&self, factory: &str, opts: GraphNodeOpts) -> Node<T> {
-        let node = Node::state_empty_in_arena_with_dispatcher(
+        let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
+            self.apply_default_node_opts(opts.node.clone()),
         );
         self.add(node, factory, opts)
     }
@@ -551,6 +570,10 @@ impl Graph {
             !self.inner.by_id.borrow().contains_key(&id),
             "duplicate graph node id '{id}'"
         );
+        assert!(
+            !self.inner.retired_ids.borrow().contains(&id),
+            "graph node id '{id}' has been released from this graph lifecycle (D122)"
+        );
         let entry = Entry {
             core: core.clone(),
             id: id.clone(),
@@ -568,6 +591,76 @@ impl Graph {
             self.inner.seq.set(self.inner.seq.get().max(n + 1));
         }
         node
+    }
+
+    pub(crate) fn release_nodes(&self, nodes: &[Core], reason: &str) {
+        let mut release_entries: Vec<(String, Core)> = Vec::new();
+        for node in nodes {
+            if release_entries.iter().any(|(_, core)| core.ptr_eq(node)) {
+                continue;
+            }
+            let found = self
+                .inner
+                .entries
+                .borrow()
+                .iter()
+                .find(|entry| entry.core.ptr_eq(node))
+                .map(|entry| (entry.id.clone(), entry.core.clone()));
+            if let Some(entry) = found {
+                release_entries.push(entry);
+            }
+        }
+        if release_entries.is_empty() {
+            return;
+        }
+        let release_ids = release_entries
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let release_cores = release_entries
+            .iter()
+            .map(|(_, core)| core.clone())
+            .collect::<Vec<_>>();
+        for entry in self.inner.entries.borrow().iter() {
+            if release_ids.contains(&entry.id) {
+                continue;
+            }
+            for dep in entry.core.deps() {
+                if let Some((dep_id, _)) = release_entries
+                    .iter()
+                    .find(|(_, released)| released.ptr_eq(&dep))
+                {
+                    panic!(
+                        "graph: cannot release node group for {reason}; '{}' still depends on '{}' (D122)",
+                        entry.id, dep_id
+                    );
+                }
+            }
+        }
+        for (id, core) in &release_entries {
+            assert!(
+                core.is_quiescent_for_release(),
+                "graph: cannot release node group for {reason}; '{id}' is not quiescent (D124)"
+            );
+        }
+        {
+            let mut entries = self.inner.entries.borrow_mut();
+            entries.retain(|entry| !release_ids.contains(&entry.id));
+        }
+        {
+            let mut by_id = self.inner.by_id.borrow_mut();
+            let mut retired = self.inner.retired_ids.borrow_mut();
+            for id in &release_ids {
+                by_id.remove(id);
+                retired.insert(id.clone());
+            }
+        }
+        for core in release_cores.into_iter().rev() {
+            assert!(
+                core.release_runtime_for_graph(),
+                "graph: cannot release node group for {reason}; runtime became non-quiescent (D124)"
+            );
+        }
     }
 
     fn assert_graph_local_deps(&self, deps: &[Core], label: &str) {
@@ -645,6 +738,7 @@ impl Graph {
                 factory: entry.factory.clone(),
                 status: entry.core.status(),
                 value: entry.core.cache_any().as_ref().map(describe_value),
+                version: entry.core.version(),
                 deps,
                 meta: if entry.meta.is_empty() {
                     None
@@ -687,6 +781,7 @@ impl Graph {
                 factory: core.factory().unwrap_or_else(|| "?".to_owned()),
                 status: core.status(),
                 value: core.cache_any().as_ref().map(describe_value),
+                version: core.version(),
                 deps,
                 meta: None,
             });
@@ -871,6 +966,10 @@ impl GraphNode {
         self.core.status()
     }
 
+    pub fn version(&self) -> Option<NodeVersion> {
+        self.core.version()
+    }
+
     pub fn cache_any(&self) -> Option<AnyValue> {
         self.core.cache_any()
     }
@@ -907,6 +1006,7 @@ pub struct DescribeNode {
     pub factory: String,
     pub status: Status,
     pub value: Option<DescribeValue>,
+    pub version: Option<NodeVersion>,
     pub deps: Vec<String>,
     pub meta: Option<BTreeMap<String, String>>,
 }
