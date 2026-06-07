@@ -60,6 +60,7 @@ pub mod batch;
 pub mod cascading_cache;
 pub mod checkpoint;
 pub mod combinators;
+pub mod composition;
 pub mod ctx;
 pub mod data_structures;
 pub mod diagnostics;
@@ -96,15 +97,20 @@ pub use combinators::{
     buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,
     with_latest_from, zip,
 };
+pub use composition::{
+    pipe, stratify, stratify_branch, Pipe, Stratified, StratifyOptions, StratifyRule,
+};
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use data_structures::{
-    merge_reactive_logs, reactive_list, reactive_log, scan_log, ListChange, LogChange,
-    ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveView,
+    merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map, scan_log,
+    IndexChange, IndexRow, ListChange, LogChange, MapChange, ReactiveIndex, ReactiveIndexOptions,
+    ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap,
+    ReactiveMapOptions, ReactiveView,
 };
 pub use diagnostics::{
-    explain_path, reachable, validate_no_islands, CausalChain, CausalStep, ExplainPathOptions,
-    ExplainPathReason, IslandReport, ReachableDirection, ReachableOptions, ReachableResult,
-    ValidateNoIslandsResult,
+    explain_path, reachable, topology_diff, validate_no_islands, CausalChain, CausalStep,
+    DescribeChangeset, DescribeEvent, ExplainPathOptions, ExplainPathReason, IslandReport,
+    ReachableDirection, ReachableOptions, ReachableResult, ValidateNoIslandsResult,
 };
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 pub use graph::{

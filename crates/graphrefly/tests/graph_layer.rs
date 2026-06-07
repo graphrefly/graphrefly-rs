@@ -7,13 +7,14 @@ use graphrefly::{
     describe_to_d2_with_direction, describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
     describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, explain_path,
     filter, from_iter, graph, graph_opts, map, merge, of, reachable, reactive_list, restore_graph,
-    restore_registry, scan, take, timeout, validate_no_islands, DescribeEdge, DescribeNode,
-    DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher, Explain,
-    ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
-    GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions, GraphRestoreDefinition,
-    GraphRestoreEntry, IslandReport, LockId, Message, NodeOpts, NodeVersion, NodeVersioningPolicy,
-    Pausable, ReachableDirection, ReachableOptions, ReactiveListOptions, RestoreFactoryMeta,
-    RestoreGraphOptions, Status, Tier, Values, GRAPH_CHECKPOINT_VERSION,
+    restore_registry, scan, take, timeout, topology_diff, validate_no_islands, DescribeEdge,
+    DescribeEvent, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection,
+    Dispatcher, Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge,
+    GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions,
+    GraphRestoreDefinition, GraphRestoreEntry, IslandReport, LockId, Message, NodeOpts,
+    NodeVersion, NodeVersioningPolicy, Pausable, ReachableDirection, ReachableOptions,
+    ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, Values,
+    GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -334,6 +335,103 @@ fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
         islands.summary(),
         "validate_no_islands: 1 island node(s) - child::orphan (state)"
     );
+}
+
+#[test]
+fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
+    let g = graph();
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let prev = g.describe();
+
+    let mut opts = GraphNodeOpts::named("mapped");
+    opts.meta.insert("role".to_owned(), "projection".to_owned());
+    let mapped = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        opts,
+    );
+    let next = g.describe();
+    let diff = topology_diff(&prev, &next);
+
+    assert!(diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeAdded { id, node }
+            if id == "mapped" && node.factory == "derived"
+    )));
+    assert!(diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::EdgeAdded { from, to } if from == "source" && to == "mapped"
+    )));
+
+    source.set(2);
+    assert!(
+        topology_diff(&next, &g.describe()).events.is_empty(),
+        "value/status changes are observe/profile data, not topology"
+    );
+
+    let mut meta_prev = next.clone();
+    let mut meta_next = next.clone();
+    meta_prev
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "mapped")
+        .unwrap()
+        .meta = None;
+    meta_next
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "mapped")
+        .unwrap()
+        .meta
+        .as_mut()
+        .unwrap()
+        .insert("role".to_owned(), "view".to_owned());
+    assert!(topology_diff(&meta_prev, &meta_next)
+        .events
+        .iter()
+        .any(|event| matches!(
+            event,
+            DescribeEvent::NodeMetaChanged { id, next_meta, .. }
+                if id == "mapped" && next_meta.get("role") == Some(&"view".to_owned())
+        )));
+
+    let child = graph_opts(GraphOptions::named("child"));
+    child.state_opts(1i32, GraphNodeOpts::named("leaf"));
+    let before_mount = g.describe();
+    g.mount(child, "child");
+    let mounted = topology_diff(&before_mount, &g.describe());
+    assert!(mounted.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::SubgraphMounted { path } if path == "child"
+    )));
+    assert!(mounted.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeAdded { id, .. } if id == "child::leaf"
+    )));
+
+    let empty_child = graph_opts(GraphOptions::named("ignored-child-name"));
+    let before_empty_mount = g.describe();
+    g.mount(empty_child, "empty");
+    let empty_mounted = topology_diff(&before_empty_mount, &g.describe());
+    assert!(empty_mounted.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::SubgraphMounted { path } if path == "empty"
+    )));
+
+    let mut removed = next.clone();
+    removed.nodes.retain(|node| node.id != "mapped");
+    removed.edges.clear();
+    let removed_diff = topology_diff(&next, &removed);
+    assert!(removed_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::EdgeRemoved { from, to } if from == "source" && to == "mapped"
+    )));
+    assert!(removed_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeRemoved { id } if id == "mapped"
+    )));
+
+    drop(mapped);
 }
 
 #[test]

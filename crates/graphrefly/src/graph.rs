@@ -830,7 +830,12 @@ impl Graph {
             .mounts
             .borrow()
             .iter()
-            .map(|m| m.graph.describe_with_prefix(&format!("{prefix}{}::", m.at)))
+            .map(|m| {
+                let mount_path = format!("{prefix}{}", m.at);
+                let mut child = m.graph.describe_with_prefix(&format!("{mount_path}::"));
+                child.name = Some(mount_path);
+                child
+            })
             .collect::<Vec<_>>();
         DescribeSnapshot {
             name: self.inner.name.clone(),

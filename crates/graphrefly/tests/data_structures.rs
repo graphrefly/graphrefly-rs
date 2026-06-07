@@ -1,13 +1,18 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use graphrefly::{
-    graph, merge_reactive_logs, reactive_list, reactive_log, scan_log, GraphNodeOpts, ListChange,
-    LogChange, Message, Node, ReactiveListOptions, ReactiveLogOptions,
+    graph, merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
+    scan_log, GraphNodeOpts, IndexChange, IndexRow, ListChange, LogChange, MapChange, Message,
+    Node, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions,
 };
 
 type DataCollector<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
+type StringNumberPredicate = Rc<dyn Fn(&i32, &String) -> bool>;
 
 fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
     collect_data_with_unsub(node).0
@@ -60,6 +65,50 @@ fn demand_view_snapshot<C: Clone + 'static, S: Clone + 'static>(
 ) {
     view.snapshot
         .up(vec![Message::Resume(view.pull_id.clone())]);
+}
+
+fn demand_index_snapshot<K, S, V>(index: &graphrefly::ReactiveIndex<K, S, V>)
+where
+    K: Clone + Ord + std::fmt::Debug + 'static,
+    S: Clone + Ord + 'static,
+    V: Clone + 'static,
+{
+    index
+        .snapshot
+        .up(vec![Message::Resume(index.pull_id.clone())]);
+}
+
+fn demand_map_snapshot<K, V>(map: &graphrefly::ReactiveMap<K, V>)
+where
+    K: Clone + Ord + std::fmt::Debug + 'static,
+    V: Clone + 'static,
+{
+    map.snapshot.up(vec![Message::Resume(map.pull_id.clone())]);
+}
+
+fn btree<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> BTreeMap<K, V> {
+    entries.into_iter().collect()
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DebugCollisionKey(i32);
+
+impl Ord for DebugCollisionKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for DebugCollisionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for DebugCollisionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("same-debug")
+    }
 }
 
 #[test]
@@ -277,6 +326,200 @@ fn reactive_log_page_is_light_view_and_lazy_pull() {
 }
 
 #[test]
+fn reactive_index_range_is_light_view_and_lazy_pull() {
+    let g = graph();
+    let index = reactive_index::<i32, String, i32>(
+        Vec::new(),
+        ReactiveIndexOptions::named("idx").graph(g.clone()),
+    );
+    let deltas = collect_data(&index.delta);
+    let snapshots = collect_data(&index.snapshot);
+
+    index.upsert(30, "z".to_owned(), 300);
+    index.upsert(10, "a".to_owned(), 100);
+    index.upsert(20, "m".to_owned(), 200);
+
+    assert_eq!(index.range_by_primary(&10, &30), vec![100, 200]);
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            IndexChange::Upsert {
+                primary: 30,
+                secondary: "z".to_owned(),
+                value: 300,
+            },
+            IndexChange::Upsert {
+                primary: 10,
+                secondary: "a".to_owned(),
+                value: 100,
+            },
+            IndexChange::Upsert {
+                primary: 20,
+                secondary: "m".to_owned(),
+                value: 200,
+            },
+        ]
+    );
+    assert!(snapshots.borrow().is_empty());
+
+    demand_index_snapshot(&index);
+    assert_eq!(
+        *snapshots.borrow(),
+        vec![vec![
+            IndexRow {
+                primary: 10,
+                secondary: "a".to_owned(),
+                value: 100,
+            },
+            IndexRow {
+                primary: 20,
+                secondary: "m".to_owned(),
+                value: 200,
+            },
+            IndexRow {
+                primary: 30,
+                secondary: "z".to_owned(),
+                value: 300,
+            },
+        ]]
+    );
+
+    let range = index.range(10, 30);
+    let (range_deltas, unsub_range_deltas) = collect_data_with_unsub(&range.delta);
+    let (ranges, unsub_ranges) = collect_data_with_unsub(&range.snapshot);
+    index.upsert(25, "b".to_owned(), 250);
+    assert_eq!(
+        *range_deltas.borrow(),
+        vec![
+            IndexChange::Upsert {
+                primary: 20,
+                secondary: "m".to_owned(),
+                value: 200,
+            },
+            IndexChange::Upsert {
+                primary: 25,
+                secondary: "b".to_owned(),
+                value: 250,
+            },
+        ]
+    );
+    demand_view_snapshot(&range);
+    assert_eq!(*ranges.borrow(), vec![vec![100, 200, 250]]);
+
+    unsub_ranges();
+    unsub_range_deltas();
+    range.dispose();
+}
+
+#[test]
+fn reactive_index_range_memo_uses_structural_keys_not_debug_text() {
+    let index = reactive_index::<DebugCollisionKey, i32, i32>(
+        vec![
+            IndexRow {
+                primary: DebugCollisionKey(1),
+                secondary: 1,
+                value: 10,
+            },
+            IndexRow {
+                primary: DebugCollisionKey(2),
+                secondary: 2,
+                value: 20,
+            },
+            IndexRow {
+                primary: DebugCollisionKey(3),
+                secondary: 3,
+                value: 30,
+            },
+        ],
+        ReactiveIndexOptions::default(),
+    );
+
+    let first = index.range(DebugCollisionKey(1), DebugCollisionKey(3));
+    let second = index.range(DebugCollisionKey(2), DebugCollisionKey(4));
+    let (first_seen, unsub_first) = collect_data_with_unsub(&first.snapshot);
+    let (second_seen, unsub_second) = collect_data_with_unsub(&second.snapshot);
+
+    assert_ne!(first.pull_id, second.pull_id);
+    index.upsert(DebugCollisionKey(4), 4, 40);
+    demand_view_snapshot(&first);
+    demand_view_snapshot(&second);
+    assert_eq!(*first_seen.borrow(), vec![vec![10, 20]]);
+    assert_eq!(*second_seen.borrow(), vec![vec![20, 30]]);
+
+    unsub_first();
+    unsub_second();
+    first.dispose();
+    second.dispose();
+}
+
+#[test]
+fn reactive_index_range_dispose_releases_graph_registered_nodes() {
+    let g = graph();
+    let index = reactive_index::<i32, String, i32>(
+        vec![
+            IndexRow {
+                primary: 1,
+                secondary: "a".to_owned(),
+                value: 10,
+            },
+            IndexRow {
+                primary: 2,
+                secondary: "b".to_owned(),
+                value: 20,
+            },
+        ],
+        ReactiveIndexOptions::named("idx").graph(g.clone()),
+    );
+    let range = index.range(1, 3);
+
+    let snap = g.describe();
+    assert!(snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "idx.range#0.delta" && node.factory == "reactiveIndex.range.delta"));
+    assert!(snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "idx.range#0.snapshot"
+            && node.factory == "reactiveIndex.range.snapshot"));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "idx.delta".to_owned(),
+        to: "idx.range#0.delta".to_owned(),
+    }));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "idx.range#0.delta".to_owned(),
+        to: "idx.range#0.snapshot".to_owned(),
+    }));
+
+    range.dispose();
+
+    assert!(g.find("idx.range#0.delta").is_none());
+    assert!(g.find("idx.range#0.snapshot").is_none());
+    let rebuilt = index.range(1, 3);
+    assert!(g.find("idx.range#1.delta").is_some());
+    rebuilt.dispose();
+}
+
+#[test]
+fn reactive_index_dispose_releases_memoized_range_views() {
+    let g = graph();
+    let index = reactive_index::<i32, String, i32>(
+        vec![IndexRow {
+            primary: 1,
+            secondary: "a".to_owned(),
+            value: 10,
+        }],
+        ReactiveIndexOptions::named("idx").graph(g.clone()),
+    );
+    let _range = index.range(1, 2);
+
+    index.dispose();
+
+    assert!(g.find("idx.range#0.delta").is_none());
+    assert!(g.find("idx.range#0.snapshot").is_none());
+}
+
+#[test]
 fn reactive_log_page_dispose_releases_graph_registered_nodes() {
     let g = graph();
     let log = reactive_log::<i32>(
@@ -317,6 +560,185 @@ fn reactive_log_page_dispose_releases_graph_registered_nodes() {
         .nodes
         .iter()
         .any(|node| node.id == "log.page#1.delta"));
+    rebuilt.dispose();
+}
+
+#[test]
+fn reactive_log_dispose_releases_memoized_page_views() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3],
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let _page = log.page(0, 2);
+
+    log.dispose();
+
+    assert!(g.find("log.page#0.delta").is_none());
+    assert!(g.find("log.page#0.snapshot").is_none());
+}
+
+#[test]
+fn graphless_light_views_mint_distinct_pull_ids() {
+    let log = reactive_log::<i32>(vec![1, 2, 3], ReactiveLogOptions::default());
+    let first = log.page(0, 1);
+    let second = log.page(1, 1);
+
+    assert_ne!(first.pull_id, second.pull_id);
+
+    first.dispose();
+    second.dispose();
+}
+
+#[test]
+fn reactive_map_delta_quick_reads_and_pull_snapshot() {
+    let map = reactive_map::<String, i32>(vec![("a".to_owned(), 1)], ReactiveMapOptions::default());
+    let deltas = collect_data(&map.delta);
+    let snapshots = collect_data(&map.snapshot);
+
+    map.set("b".to_owned(), 2);
+    map.set_many(vec![("c".to_owned(), 3), ("d".to_owned(), 4)]);
+    map.delete(&"a".to_owned());
+    map.delete_many(vec!["missing".to_owned(), "c".to_owned()]);
+    assert_eq!(map.get(&"b".to_owned()), Some(2));
+    assert!(map.has(&"d".to_owned()));
+    assert_eq!(map.len(), 2);
+    assert_eq!(
+        map.to_map(),
+        btree([("b".to_owned(), 2), ("d".to_owned(), 4)])
+    );
+
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            MapChange::Set {
+                key: "b".to_owned(),
+                value: 2,
+            },
+            MapChange::Set {
+                key: "c".to_owned(),
+                value: 3,
+            },
+            MapChange::Set {
+                key: "d".to_owned(),
+                value: 4,
+            },
+            MapChange::Delete {
+                key: "a".to_owned(),
+                previous: 1,
+            },
+            MapChange::Delete {
+                key: "c".to_owned(),
+                previous: 3,
+            },
+        ]
+    );
+    assert!(snapshots.borrow().is_empty());
+
+    demand_map_snapshot(&map);
+    assert_eq!(
+        *snapshots.borrow(),
+        vec![btree([("b".to_owned(), 2), ("d".to_owned(), 4)])]
+    );
+    demand_map_snapshot(&map);
+    assert_eq!(
+        snapshots.borrow().len(),
+        1,
+        "D60/R-pull: demand with no intervening delta coalesces"
+    );
+
+    map.clear();
+    assert!(map.is_empty());
+    assert_eq!(deltas.borrow().last(), Some(&MapChange::Clear { count: 2 }));
+}
+
+#[test]
+fn reactive_map_select_is_light_view_and_lazy_pull() {
+    let g = graph();
+    let map = reactive_map::<String, i32>(
+        vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
+        ReactiveMapOptions::named("map").graph(g),
+    );
+    let is_even: StringNumberPredicate = Rc::new(|value, _| *value % 2 == 0);
+    let view = map.select_by(is_even.clone());
+    let same = map.select_by(is_even);
+    assert_eq!(same.pull_id, view.pull_id);
+    let (view_deltas, unsub_view_deltas) = collect_data_with_unsub(&view.delta);
+    let (selected, unsub_selected) = collect_data_with_unsub(&view.snapshot);
+
+    map.set("c".to_owned(), 4);
+
+    assert_eq!(
+        *view_deltas.borrow(),
+        vec![MapChange::Set {
+            key: "c".to_owned(),
+            value: 4,
+        }],
+        "D121: light view delta forwards parent mutations"
+    );
+    assert!(selected.borrow().is_empty());
+
+    demand_view_snapshot(&view);
+    assert_eq!(
+        *selected.borrow(),
+        vec![btree([("b".to_owned(), 2), ("c".to_owned(), 4)])]
+    );
+
+    unsub_selected();
+    unsub_view_deltas();
+    view.dispose();
+
+    let fresh = map.select(|value, _| *value > 0);
+    assert_ne!(fresh.pull_id, view.pull_id);
+    fresh.dispose();
+}
+
+#[test]
+fn reactive_map_select_dispose_releases_graph_registered_nodes() {
+    let g = graph();
+    let map = reactive_map::<String, i32>(
+        vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
+        ReactiveMapOptions::named("map").graph(g.clone()),
+    );
+    let select = map.select(|value, _| *value > 1);
+
+    let snap = g.describe();
+    assert!(snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.delta" && node.factory == "reactiveMap.select.delta"));
+    assert!(snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.snapshot"
+            && node.factory == "reactiveMap.select.snapshot"));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "map.delta".to_owned(),
+        to: "map.select#0.delta".to_owned(),
+    }));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "map.select#0.delta".to_owned(),
+        to: "map.select#0.snapshot".to_owned(),
+    }));
+
+    select.dispose();
+
+    let after = g.describe();
+    assert!(!after
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.delta"));
+    assert!(!after
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.snapshot"));
+    assert!(g.find("map.select#0.delta").is_none());
+    let rebuilt = map.select(|value, _| *value > 1);
+    let rebuilt_snap = g.describe();
+    assert!(rebuilt_snap
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#1.delta"));
     rebuilt.dispose();
 }
 
