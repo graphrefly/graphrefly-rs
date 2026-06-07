@@ -2,10 +2,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
-    dict_kv, graph, memory_kv, reactive_cascading_cache, tiered_read_through, CascadingCacheEvent,
-    CascadingCachePolicy, CascadingCacheStatus, KvStorageTier, KvVersionedRead, Message, Node,
-    PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage, ReadThroughOutcome,
-    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughStatus,
+    append_log_key, append_log_storage, dict_kv, graph, memory_append_log, memory_kv,
+    memory_multi_writer_append_log, multi_writer_append_log_storage, reactive_cascading_cache,
+    read_append_log_page, tiered_read_through, AppendLogReadOptions, AppendLogStorageTier,
+    CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus, KvStorageTier,
+    KvVersionedRead, Message, Node, PromotionPolicy, ReactiveCascadingCacheOptions,
+    ReadThroughErrorStage, ReadThroughOutcome, StorageError, StorageResult,
+    TieredReadThroughOptions, TieredReadThroughStatus,
 };
 
 #[derive(Clone)]
@@ -98,6 +101,392 @@ fn event_kind<V>(event: &CascadingCacheEvent<V>) -> &'static str {
         CascadingCacheEvent::Fill { .. } => "fill",
         CascadingCacheEvent::Error { .. } => "error",
     }
+}
+
+#[test]
+fn append_log_key_uses_canonical_padded_sequence_keys() {
+    assert_eq!(append_log_key("events", 7), "events/00000000000000000007");
+    assert_eq!(
+        append_log_key("events", u64::MAX),
+        "events/18446744073709551615"
+    );
+}
+
+#[test]
+fn memory_append_log_appends_reads_sizes_and_truncates_in_order() {
+    let log = memory_append_log::<String>("changes");
+    assert_eq!(log.append("a".to_owned()).unwrap().seq, 0);
+    assert_eq!(log.append("b".to_owned()).unwrap().seq, 1);
+    assert_eq!(log.append("c".to_owned()).unwrap().seq, 2);
+
+    assert_eq!(log.size().unwrap(), 3);
+    assert_eq!(
+        log.read(AppendLogReadOptions {
+            after: Some(0),
+            limit: None
+        })
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.seq, entry.value))
+        .collect::<Vec<_>>(),
+        vec![(1, "b".to_owned()), (2, "c".to_owned())]
+    );
+
+    log.truncate_after(0).unwrap();
+    assert_eq!(
+        log.read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.seq, entry.value))
+            .collect::<Vec<_>>(),
+        vec![(0, "a".to_owned())]
+    );
+    assert_eq!(log.append("d".to_owned()).unwrap().seq, 1);
+}
+
+#[test]
+fn read_append_log_page_returns_ordered_pages_and_next_cursor() {
+    let log = memory_append_log::<String>("page");
+    for value in ["a", "b", "c"] {
+        log.append(value.to_owned()).unwrap();
+    }
+
+    let first = read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: None,
+            limit: Some(2),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| (entry.seq, entry.value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "a"), (1, "b")]
+    );
+    assert_eq!(first.next_after, Some(1));
+    assert!(!first.done);
+
+    let second = read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: first.next_after,
+            limit: Some(2),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| (entry.seq, entry.value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(2, "c")]
+    );
+    assert_eq!(second.next_after, Some(2));
+    assert!(second.done);
+
+    let empty = read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: Some(100),
+            limit: Some(2),
+        },
+    )
+    .unwrap();
+    assert!(empty.entries.is_empty());
+    assert_eq!(empty.next_after, Some(100));
+    assert!(empty.done);
+    assert!(read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: None,
+            limit: Some(0)
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("positive"));
+    assert!(read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: None,
+            limit: Some(usize::MAX)
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("lookahead"));
+}
+
+#[test]
+fn append_log_storage_sorts_unordered_listings_and_rejects_malformed_keys() {
+    let kv = memory_kv::<String>();
+    kv.set(&append_log_key("unordered", 10), "c".to_owned())
+        .unwrap();
+    kv.set(&append_log_key("unordered", 0), "a".to_owned())
+        .unwrap();
+    kv.set(&append_log_key("unordered", 2), "b".to_owned())
+        .unwrap();
+    let log = append_log_storage(Rc::new(kv.clone()), "unordered");
+
+    assert_eq!(
+        log.read(AppendLogReadOptions {
+            after: None,
+            limit: Some(2)
+        })
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.seq, entry.value))
+        .collect::<Vec<_>>(),
+        vec![(0, "a".to_owned()), (2, "b".to_owned())]
+    );
+
+    let malformed = memory_kv::<String>();
+    malformed
+        .set("bad/not-a-sequence", "oops".to_owned())
+        .unwrap();
+    assert!(append_log_storage(Rc::new(malformed), "bad")
+        .read(AppendLogReadOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("non-numeric"));
+
+    let torn = TornAppendKv;
+    assert!(append_log_storage(Rc::new(torn), "torn")
+        .read(AppendLogReadOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("listed key is missing"));
+}
+
+#[test]
+fn append_log_truncate_validates_all_keys_before_deleting() {
+    struct OrderedMalformedKv {
+        inner: graphrefly::MemoryKv<String>,
+    }
+
+    impl KvStorageTier<String> for OrderedMalformedKv {
+        fn get(&self, key: &str) -> StorageResult<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, value: String) -> StorageResult<()> {
+            self.inner.set(key, value)
+        }
+
+        fn delete(&self, key: &str) -> StorageResult<()> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, _prefix: &str) -> StorageResult<Vec<String>> {
+            Ok(vec![append_log_key("partial", 1), "partial/bad".to_owned()])
+        }
+    }
+
+    let inner = memory_kv::<String>();
+    inner
+        .set(&append_log_key("partial", 1), "keep".to_owned())
+        .unwrap();
+    inner.set("partial/bad", "bad".to_owned()).unwrap();
+    let log = append_log_storage(
+        Rc::new(OrderedMalformedKv {
+            inner: inner.clone(),
+        }),
+        "partial",
+    );
+
+    assert!(log
+        .truncate_after(0)
+        .unwrap_err()
+        .to_string()
+        .contains("non-numeric"));
+    assert_eq!(
+        inner.get(&append_log_key("partial", 1)).unwrap(),
+        Some("keep".to_owned())
+    );
+}
+
+struct TornAppendKv;
+
+impl KvStorageTier<String> for TornAppendKv {
+    fn get(&self, _key: &str) -> StorageResult<Option<String>> {
+        Ok(None)
+    }
+
+    fn set(&self, _key: &str, _value: String) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn delete(&self, _key: &str) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn list(&self, _prefix: &str) -> StorageResult<Vec<String>> {
+        Ok(vec![append_log_key("torn", 0)])
+    }
+}
+
+#[test]
+fn memory_kv_put_if_absent_preserves_existing_values() {
+    let kv = memory_kv::<i32>();
+    assert!(kv.put_if_absent("k", 1).unwrap());
+    assert!(!kv.put_if_absent("k", 2).unwrap());
+    assert_eq!(kv.get("k").unwrap(), Some(1));
+}
+
+#[test]
+fn multi_writer_append_log_uses_put_if_absent_and_rejects_unsupported_truncate() {
+    let log = memory_multi_writer_append_log::<String>("mw");
+    assert_eq!(log.append("a".to_owned()).unwrap().seq, 0);
+    assert_eq!(log.append("b".to_owned()).unwrap().seq, 1);
+    assert_eq!(
+        log.read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.seq, entry.value))
+            .collect::<Vec<_>>(),
+        vec![(0, "a".to_owned()), (1, "b".to_owned())]
+    );
+    assert!(log
+        .truncate_after(0)
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported"));
+
+    let plain = Rc::new(PlainTier::new(
+        "plain",
+        Ok(None),
+        Rc::new(RefCell::new(Vec::new())),
+    ));
+    let unsupported = multi_writer_append_log_storage(plain, "plain", 3).unwrap();
+    assert!(unsupported
+        .append(1)
+        .unwrap_err()
+        .to_string()
+        .contains("put-if-absent"));
+    assert!(
+        multi_writer_append_log_storage(Rc::new(memory_kv::<i32>()), "bad", 0)
+            .unwrap_err()
+            .to_string()
+            .contains("positive")
+    );
+}
+
+#[test]
+fn multi_writer_append_log_refreshes_tail_after_retry_window() {
+    struct StaleListKv {
+        inner: graphrefly::MemoryKv<String>,
+        stale_once: RefCell<bool>,
+    }
+
+    impl KvStorageTier<String> for StaleListKv {
+        fn get(&self, key: &str) -> StorageResult<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, value: String) -> StorageResult<()> {
+            self.inner.set(key, value)
+        }
+
+        fn put_if_absent(&self, key: &str, value: String) -> StorageResult<bool> {
+            self.inner.put_if_absent(key, value)
+        }
+
+        fn delete(&self, key: &str) -> StorageResult<()> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+            if self.stale_once.replace(false) {
+                Ok(Vec::new())
+            } else {
+                self.inner.list(prefix)
+            }
+        }
+    }
+
+    let inner = memory_kv::<String>();
+    inner
+        .set(&append_log_key("refresh", 0), "existing-0".to_owned())
+        .unwrap();
+    inner
+        .set(&append_log_key("refresh", 1), "existing-1".to_owned())
+        .unwrap();
+    let kv = Rc::new(StaleListKv {
+        inner,
+        stale_once: RefCell::new(true),
+    });
+    let log = multi_writer_append_log_storage(kv, "refresh", 2).unwrap();
+
+    let entry = log.append("new".to_owned()).unwrap();
+
+    assert_eq!(entry.seq, 2);
+    assert_eq!(entry.key, append_log_key("refresh", 2));
+}
+
+#[test]
+fn multi_writer_append_log_drops_lower_slot_when_fresher_tail_appears() {
+    struct StaleHigherTailKv {
+        inner: graphrefly::MemoryKv<String>,
+        stale_once: RefCell<bool>,
+    }
+
+    impl KvStorageTier<String> for StaleHigherTailKv {
+        fn get(&self, key: &str) -> StorageResult<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, value: String) -> StorageResult<()> {
+            self.inner.set(key, value)
+        }
+
+        fn put_if_absent(&self, key: &str, value: String) -> StorageResult<bool> {
+            self.inner.put_if_absent(key, value)
+        }
+
+        fn delete(&self, key: &str) -> StorageResult<()> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+            if self.stale_once.replace(false) {
+                Ok(Vec::new())
+            } else {
+                self.inner.list(prefix)
+            }
+        }
+    }
+
+    let inner = memory_kv::<String>();
+    inner
+        .set(&append_log_key("stale-higher", 10), "existing".to_owned())
+        .unwrap();
+    let log = multi_writer_append_log_storage(
+        Rc::new(StaleHigherTailKv {
+            inner: inner.clone(),
+            stale_once: RefCell::new(true),
+        }),
+        "stale-higher",
+        2,
+    )
+    .unwrap();
+
+    let entry = log.append("new".to_owned()).unwrap();
+
+    assert_eq!(entry.seq, 11);
+    assert_eq!(inner.get(&append_log_key("stale-higher", 0)).unwrap(), None);
+    assert_eq!(
+        log.read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
+        vec![10, 11]
+    );
 }
 
 #[test]

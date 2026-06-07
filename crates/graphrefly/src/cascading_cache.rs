@@ -409,6 +409,7 @@ fn start_lookup<V: Clone + 'static>(
     st.seq += 1;
     let request_seq = st.seq;
     st.latest_key = Some(key.clone());
+    ctx.state_set(st.clone());
     let start_event: CascadingCacheEvent<V> = match cause {
         LookupCause::Request => CascadingCacheEvent::Request {
             key: key.clone(),
@@ -441,8 +442,19 @@ fn start_lookup<V: Clone + 'static>(
             StorageError::backend(panic_payload(payload)),
         ),
     };
+    let current = ctx
+        .state_get::<DriverState>()
+        .map(|state| (*state).clone())
+        .unwrap_or_else(|| st.clone());
+    if current.seq != request_seq {
+        *st = current;
+        return;
+    }
     if !messages.is_empty() {
         ctx.down(messages);
+    }
+    if let Some(current) = ctx.state_get::<DriverState>().map(|state| (*state).clone()) {
+        *st = current;
     }
 }
 

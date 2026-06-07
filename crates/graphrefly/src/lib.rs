@@ -128,12 +128,15 @@ pub use sources::{
     FsEventKind,
 };
 pub use storage::{
-    dict_kv, memory_kv, read_through_kv, tiered_read_through, KvGeneration, KvStorageTier,
-    KvVersionedRead, MemoryKv, PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn,
+    append_log_key, append_log_storage, dict_kv, memory_append_log, memory_kv,
+    memory_multi_writer_append_log, multi_writer_append_log_storage, read_append_log_page,
+    read_through_kv, tiered_read_through, AppendLogEntry, AppendLogPage, AppendLogReadOptions,
+    AppendLogStorage, AppendLogStorageTier, KvGeneration, KvStorageTier, KvVersionedRead, MemoryKv,
+    MultiWriterAppendLogStorage, PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn,
     ReadThroughErrorStage, ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier,
     ReadThroughMissContext, ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact,
     StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughResult,
-    TieredReadThroughStatus,
+    TieredReadThroughStatus, APPEND_LOG_SEQ_PAD,
 };
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,

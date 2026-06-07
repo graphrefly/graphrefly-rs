@@ -92,6 +92,9 @@ impl<T> KvVersionedRead<T> {
 pub trait KvStorageTier<T: Clone> {
     fn get(&self, key: &str) -> StorageResult<Option<T>>;
     fn set(&self, key: &str, value: T) -> StorageResult<()>;
+    fn put_if_absent(&self, _key: &str, _value: T) -> StorageResult<bool> {
+        Err(StorageError::unsupported("kvStorage", "put-if-absent"))
+    }
     fn delete(&self, key: &str) -> StorageResult<()>;
     fn list(&self, prefix: &str) -> StorageResult<Vec<String>>;
 
@@ -218,6 +221,14 @@ impl<T: Clone> KvStorageTier<T> for MemoryKv<T> {
         Ok(())
     }
 
+    fn put_if_absent(&self, key: &str, value: T) -> StorageResult<bool> {
+        if self.inner.entries.borrow().contains_key(key) {
+            return Ok(false);
+        }
+        self.set(key, value)?;
+        Ok(true)
+    }
+
     fn delete(&self, key: &str) -> StorageResult<()> {
         if self.inner.entries.borrow_mut().remove(key).is_some() {
             let version = self.bump_version();
@@ -274,6 +285,302 @@ impl<T: Clone> KvStorageTier<T> for MemoryKv<T> {
         self.set(key, value)?;
         Ok(true)
     }
+}
+
+pub const APPEND_LOG_SEQ_PAD: usize = 20;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppendLogEntry<T> {
+    pub key: String,
+    pub seq: u64,
+    pub value: T,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AppendLogReadOptions {
+    pub after: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppendLogPage<T> {
+    pub entries: Vec<AppendLogEntry<T>>,
+    pub next_after: Option<u64>,
+    pub done: bool,
+}
+
+pub trait AppendLogStorageTier<T: Clone> {
+    fn append(&self, value: T) -> StorageResult<AppendLogEntry<T>>;
+    fn read(&self, opts: AppendLogReadOptions) -> StorageResult<Vec<AppendLogEntry<T>>>;
+    fn truncate_after(&self, seq: u64) -> StorageResult<()>;
+    fn size(&self) -> StorageResult<usize>;
+}
+
+#[derive(Clone)]
+pub struct AppendLogStorage<T: Clone> {
+    kv: Rc<dyn KvStorageTier<T>>,
+    prefix: String,
+}
+
+impl<T: Clone> fmt::Debug for AppendLogStorage<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppendLogStorage")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct MultiWriterAppendLogStorage<T: Clone> {
+    kv: Rc<dyn KvStorageTier<T>>,
+    prefix: String,
+    max_attempts: usize,
+}
+
+impl<T: Clone> fmt::Debug for MultiWriterAppendLogStorage<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MultiWriterAppendLogStorage")
+            .field("prefix", &self.prefix)
+            .field("max_attempts", &self.max_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn append_log_key(prefix: &str, seq: u64) -> String {
+    format!("{prefix}/{seq:0APPEND_LOG_SEQ_PAD$}")
+}
+
+pub fn append_log_storage<T: Clone>(
+    kv: Rc<dyn KvStorageTier<T>>,
+    prefix: impl Into<String>,
+) -> AppendLogStorage<T> {
+    AppendLogStorage {
+        kv,
+        prefix: prefix.into(),
+    }
+}
+
+pub fn memory_append_log<T: Clone + 'static>(prefix: impl Into<String>) -> AppendLogStorage<T> {
+    append_log_storage(Rc::new(memory_kv()), prefix)
+}
+
+pub fn multi_writer_append_log_storage<T: Clone>(
+    kv: Rc<dyn KvStorageTier<T>>,
+    prefix: impl Into<String>,
+    max_attempts: usize,
+) -> StorageResult<MultiWriterAppendLogStorage<T>> {
+    if max_attempts == 0 {
+        return Err(StorageError::backend(
+            "multi_writer_append_log_storage: max_attempts must be positive",
+        ));
+    }
+    Ok(MultiWriterAppendLogStorage {
+        kv,
+        prefix: prefix.into(),
+        max_attempts,
+    })
+}
+
+pub fn memory_multi_writer_append_log<T: Clone + 'static>(
+    prefix: impl Into<String>,
+) -> MultiWriterAppendLogStorage<T> {
+    multi_writer_append_log_storage(Rc::new(memory_kv()), prefix, 1024)
+        .expect("memory_kv supports put-if-absent")
+}
+
+pub fn read_append_log_page<T: Clone>(
+    log: &dyn AppendLogStorageTier<T>,
+    opts: AppendLogReadOptions,
+) -> StorageResult<AppendLogPage<T>> {
+    let limit = opts.limit.unwrap_or(100);
+    if limit == 0 {
+        return Err(StorageError::backend(
+            "read_append_log_page: limit must be positive",
+        ));
+    }
+    if limit == usize::MAX {
+        return Err(StorageError::backend(
+            "read_append_log_page: limit must leave room for one lookahead entry",
+        ));
+    }
+    let mut lookahead_opts = opts.clone();
+    lookahead_opts.limit = Some(limit + 1);
+    let mut entries = log.read(lookahead_opts)?;
+    let done = entries.len() <= limit;
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+    let next_after = entries.last().map(|entry| entry.seq).or(opts.after);
+    Ok(AppendLogPage {
+        entries,
+        next_after,
+        done,
+    })
+}
+
+impl<T: Clone> AppendLogStorage<T> {
+    fn next_seq(&self) -> StorageResult<u64> {
+        next_seq_from_keys(&self.prefix, self.kv.list(&format!("{}/", self.prefix))?)
+    }
+}
+
+impl<T: Clone> AppendLogStorageTier<T> for AppendLogStorage<T> {
+    fn append(&self, value: T) -> StorageResult<AppendLogEntry<T>> {
+        let seq = self.next_seq()?;
+        let key = append_log_key(&self.prefix, seq);
+        self.kv.set(&key, value.clone())?;
+        Ok(AppendLogEntry { key, seq, value })
+    }
+
+    fn read(&self, opts: AppendLogReadOptions) -> StorageResult<Vec<AppendLogEntry<T>>> {
+        read_append_log_entries(self.kv.as_ref(), &self.prefix, opts)
+    }
+
+    fn truncate_after(&self, seq: u64) -> StorageResult<()> {
+        delete_append_log_entries_after(self.kv.as_ref(), &self.prefix, seq)
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        size_from_keys(&self.prefix, &self.kv.list(&format!("{}/", self.prefix))?)
+    }
+}
+
+impl<T: Clone> AppendLogStorageTier<T> for MultiWriterAppendLogStorage<T> {
+    fn append(&self, value: T) -> StorageResult<AppendLogEntry<T>> {
+        let mut seq =
+            next_seq_from_keys(&self.prefix, self.kv.list(&format!("{}/", self.prefix))?)?;
+        let mut attempts = 0;
+        loop {
+            if attempts >= self.max_attempts {
+                let refreshed =
+                    next_seq_from_keys(&self.prefix, self.kv.list(&format!("{}/", self.prefix))?)?;
+                seq = seq.max(refreshed);
+                attempts = 0;
+            }
+            attempts += 1;
+            let key = append_log_key(&self.prefix, seq);
+            if self.kv.put_if_absent(&key, value.clone())? {
+                let refreshed =
+                    next_seq_from_keys(&self.prefix, self.kv.list(&format!("{}/", self.prefix))?)?;
+                if refreshed > seq.saturating_add(1) {
+                    self.kv.delete(&key)?;
+                    seq = refreshed;
+                    attempts = 0;
+                    continue;
+                }
+                return Ok(AppendLogEntry { key, seq, value });
+            }
+            seq = seq.checked_add(1).ok_or_else(|| {
+                StorageError::backend(format!(
+                    "append log next sequence is outside the u64 range: {}",
+                    self.prefix
+                ))
+            })?;
+        }
+    }
+
+    fn read(&self, opts: AppendLogReadOptions) -> StorageResult<Vec<AppendLogEntry<T>>> {
+        read_append_log_entries(self.kv.as_ref(), &self.prefix, opts)
+    }
+
+    fn truncate_after(&self, _seq: u64) -> StorageResult<()> {
+        Err(StorageError::backend(
+            "multi_writer_append_log_storage.truncate_after: unsupported without a stronger compaction capability",
+        ))
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        size_from_keys(&self.prefix, &self.kv.list(&format!("{}/", self.prefix))?)
+    }
+}
+
+fn read_append_log_entries<T: Clone>(
+    kv: &dyn KvStorageTier<T>,
+    prefix: &str,
+    opts: AppendLogReadOptions,
+) -> StorageResult<Vec<AppendLogEntry<T>>> {
+    let mut keys = kv
+        .list(&format!("{prefix}/"))?
+        .into_iter()
+        .map(|key| seq_from_key(prefix, &key).map(|seq| (key, seq)))
+        .collect::<StorageResult<Vec<_>>>()?;
+    keys.retain(|(_, seq)| opts.after.is_none_or(|after| *seq > after));
+    keys.sort_by_key(|(_, seq)| *seq);
+    if let Some(limit) = opts.limit {
+        keys.truncate(limit);
+    }
+    let mut entries = Vec::with_capacity(keys.len());
+    for (key, seq) in keys {
+        let value = kv.get(&key)?.ok_or_else(|| {
+            StorageError::backend(format!("append log listed key is missing: {key}"))
+        })?;
+        entries.push(AppendLogEntry { key, seq, value });
+    }
+    Ok(entries)
+}
+
+fn delete_append_log_entries_after<T: Clone>(
+    kv: &dyn KvStorageTier<T>,
+    prefix: &str,
+    seq: u64,
+) -> StorageResult<()> {
+    let keys = kv
+        .list(&format!("{prefix}/"))?
+        .into_iter()
+        .map(|key| seq_from_key(prefix, &key).map(|parsed| (key, parsed)))
+        .collect::<StorageResult<Vec<_>>>()?;
+    for (key, parsed) in keys {
+        if parsed > seq {
+            kv.delete(&key)?;
+        }
+    }
+    Ok(())
+}
+
+fn next_seq_from_keys(prefix: &str, keys: Vec<String>) -> StorageResult<u64> {
+    let Some(max_seq) = keys
+        .iter()
+        .map(|key| seq_from_key(prefix, key))
+        .collect::<StorageResult<Vec<_>>>()?
+        .into_iter()
+        .max()
+    else {
+        return Ok(0);
+    };
+    max_seq.checked_add(1).ok_or_else(|| {
+        StorageError::backend(format!(
+            "append log next sequence is outside the u64 range: {prefix}"
+        ))
+    })
+}
+
+fn size_from_keys(prefix: &str, keys: &[String]) -> StorageResult<usize> {
+    for key in keys {
+        seq_from_key(prefix, key)?;
+    }
+    Ok(keys.len())
+}
+
+fn seq_from_key(prefix: &str, key: &str) -> StorageResult<u64> {
+    let head = format!("{prefix}/");
+    let raw = key
+        .strip_prefix(&head)
+        .ok_or_else(|| StorageError::backend(format!("append log key outside prefix: {key}")))?;
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(StorageError::backend(format!(
+            "append log key has a non-numeric sequence: {key}"
+        )));
+    }
+    if raw.len() != APPEND_LOG_SEQ_PAD {
+        return Err(StorageError::backend(format!(
+            "append log key sequence must be {APPEND_LOG_SEQ_PAD} padded digits: {key}"
+        )));
+    }
+    raw.parse::<u64>().map_err(|_| {
+        StorageError::backend(format!(
+            "append log key sequence is outside the u64 range: {key}"
+        ))
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
