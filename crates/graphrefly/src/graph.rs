@@ -198,12 +198,23 @@ impl Graph {
         f: F,
         opts: GraphNodeOpts,
     ) -> Node<T> {
+        self.node_opts_initial(deps, f, opts, None)
+    }
+
+    pub(crate) fn node_opts_initial<T: 'static, F: Fn(&Ctx) + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+        opts: GraphNodeOpts,
+        initial: Option<T>,
+    ) -> Node<T> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("node"));
-        let node = Node::derived_opts_in_arena_with_dispatcher(
+        let node = Node::derived_opts_initial_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
             opts.node.clone(),
+            initial,
             f,
         );
         self.add(node, "node", opts)

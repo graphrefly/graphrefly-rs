@@ -56,6 +56,7 @@
 
 pub mod async_driver;
 pub mod batch;
+pub mod cascading_cache;
 pub mod checkpoint;
 pub mod combinators;
 pub mod ctx;
@@ -76,6 +77,10 @@ pub mod time;
 pub use async_driver::TokioLocalDriver;
 pub use async_driver::{DriverCancel, LocalAsyncDriver};
 pub use batch::{batch, BatchCtx};
+pub use cascading_cache::{
+    reactive_cascading_cache, CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus,
+    ReactiveCascadingCache, ReactiveCascadingCacheLoadFn, ReactiveCascadingCacheOptions,
+};
 pub use checkpoint::{
     default_restore_registry, restore_graph, restore_registry, GraphCheckpoint,
     GraphCheckpointCtxState, GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson,

@@ -2,9 +2,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
-    dict_kv, memory_kv, tiered_read_through, KvStorageTier, KvVersionedRead, PromotionPolicy,
-    ReadThroughErrorStage, ReadThroughOutcome, StorageError, StorageResult,
-    TieredReadThroughOptions, TieredReadThroughStatus,
+    dict_kv, graph, memory_kv, reactive_cascading_cache, tiered_read_through, CascadingCacheEvent,
+    CascadingCachePolicy, CascadingCacheStatus, KvStorageTier, KvVersionedRead, Message, Node,
+    PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage, ReadThroughOutcome,
+    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughStatus,
 };
 
 #[derive(Clone)]
@@ -48,6 +49,54 @@ impl KvStorageTier<i32> for PlainTier {
 
     fn list(&self, _prefix: &str) -> StorageResult<Vec<String>> {
         Ok(Vec::new())
+    }
+}
+
+type Collected<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
+type KindLog = (Rc<RefCell<Vec<&'static str>>>, Box<dyn FnOnce()>);
+
+fn data_of<T: Clone + 'static>(node: &Node<T>) -> Collected<T> {
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let sink = out.clone();
+    let unsub = node.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                sink.borrow_mut().push(value.clone());
+            }
+        }
+    });
+    (out, unsub)
+}
+
+fn message_kinds<T: 'static>(node: &Node<T>) -> KindLog {
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let sink = out.clone();
+    let unsub = node.subscribe(move |msg| {
+        let kind = match msg {
+            Message::Start => "START",
+            Message::Pause(_) => "PAUSE",
+            Message::Resume(_) => "RESUME",
+            Message::Dirty => "DIRTY",
+            Message::Data(_) => "DATA",
+            Message::Resolved => "RESOLVED",
+            Message::Invalidate => "INVALIDATE",
+            Message::Complete => "COMPLETE",
+            Message::Error(_) => "ERROR",
+            Message::Teardown => "TEARDOWN",
+        };
+        sink.borrow_mut().push(kind);
+    });
+    (out, unsub)
+}
+
+fn event_kind<V>(event: &CascadingCacheEvent<V>) -> &'static str {
+    match event {
+        CascadingCacheEvent::Request { .. } => "request",
+        CascadingCacheEvent::Invalidate { .. } => "invalidate",
+        CascadingCacheEvent::Lookup { .. } => "lookup",
+        CascadingCacheEvent::Promotion { .. } => "promotion",
+        CascadingCacheEvent::Fill { .. } => "fill",
+        CascadingCacheEvent::Error { .. } => "error",
     }
 }
 
@@ -142,6 +191,29 @@ fn tiered_read_through_orders_tiers_and_promotes_first_hit() {
     assert_eq!(result.promotions[0].tier.index, 0);
     assert!(result.promotions[0].ok);
     assert_eq!(*calls.borrow(), vec!["hot:k", "warm:k", "hot:set:k:2"]);
+}
+
+#[test]
+fn tiered_read_through_can_disable_promotion_for_graph_layer_default() {
+    let hot = memory_kv::<i32>();
+    let cold = memory_kv::<i32>();
+    cold.set("k", 42).unwrap();
+    let mut opts = TieredReadThroughOptions::new("k", vec![&hot, &cold]);
+    opts.promote_to = PromotionPolicy::Disabled;
+
+    let result = tiered_read_through(opts);
+
+    assert_eq!(result.status, TieredReadThroughStatus::Hit);
+    assert_eq!(
+        result
+            .facts
+            .iter()
+            .map(|fact| (fact.outcome.clone(), fact.tier.index))
+            .collect::<Vec<_>>(),
+        vec![(ReadThroughOutcome::Miss, 0), (ReadThroughOutcome::Hit, 1)]
+    );
+    assert!(result.promotions.is_empty());
+    assert_eq!(hot.get("k").unwrap(), None);
 }
 
 #[test]
@@ -380,5 +452,225 @@ fn tiered_read_through_versioned_promotion_requires_generation() {
                     .to_owned()
             )
         ]
+    );
+}
+
+#[test]
+fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() {
+    let g = graph();
+    let request = g.state_empty_opts::<String>(graphrefly::GraphNodeOpts::named("request"));
+    let hot = memory_kv::<i32>();
+    let cold = memory_kv::<i32>();
+    cold.set("user:1", 7).unwrap();
+    let cache = reactive_cascading_cache(
+        &g,
+        ReactiveCascadingCacheOptions {
+            request: request.clone(),
+            tiers: vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
+            tier_names: vec!["hot".to_owned(), "cold".to_owned()],
+            name: Some("cache".to_owned()),
+            ..ReactiveCascadingCacheOptions::new(request.clone(), Vec::new())
+        },
+    );
+    let (statuses, _status_unsub) = data_of(&cache.status);
+    let (values, _value_unsub) = data_of(&cache.value);
+    let (events, _events_unsub) = data_of(&cache.events);
+
+    assert_eq!(*statuses.borrow(), vec![CascadingCacheStatus::Idle]);
+    request.down(vec![Message::Data(Rc::new("user:1".to_owned()))]);
+
+    let snap = g.describe();
+    let mut ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["cache.events", "cache.status", "cache.value", "request"]
+    );
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "request".to_owned(),
+        to: "cache.events".to_owned(),
+    }));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "cache.events".to_owned(),
+        to: "cache.status".to_owned(),
+    }));
+    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+        from: "cache.events".to_owned(),
+        to: "cache.value".to_owned(),
+    }));
+
+    assert_eq!(*values.borrow(), vec![7]);
+    assert_eq!(cache.value.cache(), Some(7));
+    assert_eq!(hot.get("user:1").unwrap(), None);
+    assert_eq!(
+        statuses.borrow().last(),
+        Some(&CascadingCacheStatus::Hit {
+            key: "user:1".to_owned(),
+            request_seq: 1,
+            tier: Some(graphrefly::ReadThroughLookupTier {
+                index: 1,
+                name: Some("cold".to_owned()),
+            }),
+        })
+    );
+    assert_eq!(
+        events.borrow().iter().map(event_kind).collect::<Vec<_>>(),
+        vec!["request", "lookup", "lookup", "fill"]
+    );
+}
+
+#[test]
+fn reactive_cascading_cache_promotes_only_when_explicitly_enabled() {
+    let g = graph();
+    let request = g.state_empty::<String>();
+    let hot = memory_kv::<i32>();
+    let cold = memory_kv::<i32>();
+    cold.set("k", 42).unwrap();
+    let mut opts = ReactiveCascadingCacheOptions::new(
+        request.clone(),
+        vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
+    );
+    opts.tier_names = vec!["hot".to_owned(), "cold".to_owned()];
+    opts.promote_to = PromotionPolicy::Indices(vec![0]);
+    opts.name = Some("cache".to_owned());
+    let cache = reactive_cascading_cache(&g, opts);
+    let (_statuses, _status_unsub) = data_of(&cache.status);
+    let (_values, _value_unsub) = data_of(&cache.value);
+    let (events, _events_unsub) = data_of(&cache.events);
+
+    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+
+    assert_eq!(cache.value.cache(), Some(42));
+    assert_eq!(hot.get("k").unwrap(), Some(42));
+    assert_eq!(
+        events.borrow().iter().map(event_kind).collect::<Vec<_>>(),
+        vec!["request", "lookup", "lookup", "promotion", "fill"]
+    );
+}
+
+#[test]
+fn reactive_cascading_cache_uses_versioned_promotion_without_overwriting_stale_tier() {
+    let g = graph();
+    let request = g.state_empty::<String>();
+    let hot_inner = memory_kv::<i32>();
+    let hot = StaleVersionedTier {
+        inner: hot_inner.clone(),
+    };
+    let cold = memory_kv::<i32>();
+    cold.set("k", 7).unwrap();
+    let mut opts = ReactiveCascadingCacheOptions::new(
+        request.clone(),
+        vec![Rc::new(hot), Rc::new(cold.clone())],
+    );
+    opts.promote_to = PromotionPolicy::Indices(vec![0]);
+    opts.name = Some("cache".to_owned());
+    let cache = reactive_cascading_cache(&g, opts);
+    let (_statuses, _status_unsub) = data_of(&cache.status);
+    let (_values, _value_unsub) = data_of(&cache.value);
+    let (events, _events_unsub) = data_of(&cache.events);
+
+    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+
+    assert_eq!(cache.value.cache(), Some(7));
+    assert_eq!(hot_inner.get("k").unwrap(), Some(1));
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        CascadingCacheEvent::Promotion {
+            tier,
+            ok: false,
+            ..
+        } if tier.index == 0
+    )));
+}
+
+#[test]
+fn reactive_cascading_cache_loader_fallback_policy_and_invalidation_are_graph_events() {
+    let g = graph();
+    let request = g.state_empty::<String>();
+    let policy = g.state_empty::<CascadingCachePolicy>();
+    let invalidate = g.state_empty::<String>();
+    let hot = memory_kv::<i32>();
+    let cold = memory_kv::<i32>();
+    let load_calls = Rc::new(RefCell::new(Vec::new()));
+    let calls = load_calls.clone();
+    let mut opts = ReactiveCascadingCacheOptions::new(
+        request.clone(),
+        vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
+    );
+    opts.policy = Some(policy.clone());
+    opts.invalidate = Some(invalidate.clone());
+    opts.load = Some(Rc::new(move |key| {
+        calls.borrow_mut().push(key.to_owned());
+        Ok(if key == "remote" { Some(9) } else { None })
+    }));
+    opts.name = Some("cache".to_owned());
+    let cache = reactive_cascading_cache(&g, opts);
+    let (statuses, _status_unsub) = data_of(&cache.status);
+    let (value_kinds, _value_kind_unsub) = message_kinds(&cache.value);
+    let (events, _events_unsub) = data_of(&cache.events);
+
+    request.down(vec![Message::Data(Rc::new("remote".to_owned()))]);
+
+    assert_eq!(cache.value.cache(), Some(9));
+    assert_eq!(hot.get("remote").unwrap(), None);
+    assert_eq!(
+        statuses.borrow().last(),
+        Some(&CascadingCacheStatus::Hit {
+            key: "remote".to_owned(),
+            request_seq: 1,
+            tier: Some(graphrefly::ReadThroughLookupTier {
+                index: -1,
+                name: Some("load".to_owned()),
+            }),
+        })
+    );
+
+    cold.set("remote", 3).unwrap();
+    policy.down(vec![Message::Data(Rc::new(CascadingCachePolicy {
+        promote_to: Some(PromotionPolicy::Indices(vec![0])),
+    }))]);
+    assert_eq!(hot.get("remote").unwrap(), Some(3));
+
+    invalidate.down(vec![Message::Data(Rc::new("remote".to_owned()))]);
+
+    assert_eq!(
+        events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, CascadingCacheEvent::Invalidate { .. }))
+            .count(),
+        1
+    );
+    assert!(value_kinds.borrow().contains(&"INVALIDATE"));
+    assert_eq!(*load_calls.borrow(), vec!["remote".to_owned()]);
+}
+
+#[test]
+fn reactive_cascading_cache_load_panic_becomes_error_events_not_terminal_error() {
+    let g = graph();
+    let request = g.state_empty::<String>();
+    let mut opts = ReactiveCascadingCacheOptions::new(request.clone(), Vec::new());
+    opts.load = Some(Rc::new(|_| -> StorageResult<Option<i32>> {
+        panic!("loader exploded")
+    }));
+    opts.name = Some("cache".to_owned());
+    let cache = reactive_cascading_cache(&g, opts);
+    let (statuses, _status_unsub) = data_of(&cache.status);
+    let (events, _events_unsub) = data_of(&cache.events);
+
+    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+
+    assert_eq!(cache.events.status(), graphrefly::Status::Settled);
+    assert_eq!(
+        statuses.borrow().last(),
+        Some(&CascadingCacheStatus::Error {
+            key: "k".to_owned(),
+            request_seq: 1,
+            error: StorageError::backend("loader exploded"),
+        })
+    );
+    assert_eq!(
+        events.borrow().iter().map(event_kind).collect::<Vec<_>>(),
+        vec!["request", "error", "fill"]
     );
 }

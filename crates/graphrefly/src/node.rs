@@ -4525,6 +4525,17 @@ impl<T: 'static> Node<T> {
         opts: NodeOpts,
         f: F,
     ) -> Node<T> {
+        Self::derived_opts_initial_in_arena_with_dispatcher(arena, dispatcher, deps, opts, None, f)
+    }
+
+    pub(crate) fn derived_opts_initial_in_arena_with_dispatcher<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+        deps: Vec<Core>,
+        opts: NodeOpts,
+        initial: Option<T>,
+        f: F,
+    ) -> Node<T> {
         assert!(
             !(opts.pull_id.is_some() && matches!(opts.pausable, Pausable::False)),
             "pullId + pausable:false is invalid (R-pull / R-pause-modes)"
@@ -4535,6 +4546,13 @@ impl<T: 'static> Node<T> {
             core: Core::new_in_arena(arena, deps, Some(handle), dispatcher, None, opts.pausable),
             _t: PhantomData,
         };
+        if let Some(initial) = initial {
+            node.core.with_node_state_mut(|_n, _call, _cfg, _r, e| {
+                e.value.has_data = true;
+                e.value.cache = Some(Rc::new(initial));
+                e.value.status = Status::Settled;
+            });
+        }
         {
             // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
