@@ -1,20 +1,30 @@
 use std::cell::RefCell;
+use std::fs;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use graphrefly::{
     append_log_key, append_log_storage, assert_decimal_integer_string,
-    assert_non_negative_decimal_integer_string, content_addressed_kv, content_addressed_storage,
-    decimal_string_to_i128, dict_kv, graph, i128_to_decimal_string, is_decimal_integer_string,
-    is_non_negative_decimal_integer_string, json_codec_for, memory_append_log, memory_kv,
-    memory_multi_writer_append_log, multi_writer_append_log_storage,
-    non_negative_decimal_string_to_u128, reactive_cascading_cache, read_append_log_page,
-    stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
-    tiered_read_through, u128_to_non_negative_decimal_string, AppendLogReadOptions,
-    AppendLogStorageTier, CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus, Codec,
-    ContentAddressedKvOptions, ContentAddressedMode, JsonCodec, KvStorageTier, KvVersionedRead,
-    Message, Node, PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage,
-    ReadThroughOutcome, StorageError, StorageResult, TieredReadThroughOptions,
-    TieredReadThroughStatus,
+    assert_non_negative_decimal_integer_string, assert_wal_frame, attach_observe_event_log,
+    change_envelope_codec, content_addressed_kv, content_addressed_storage, decimal_string_to_i128,
+    dict_kv, envelope_change, file_append_log, file_backend, file_kv, graph,
+    i128_to_decimal_string, is_decimal_integer_string, is_non_negative_decimal_integer_string,
+    json_codec_for, memory_append_log, memory_kv, memory_multi_writer_append_log,
+    multi_writer_append_log_storage, non_negative_decimal_string_to_u128, observe_event_frame,
+    observe_event_frame_codec, reactive_cascading_cache, read_append_log_page,
+    read_observe_event_log_page, stable_json_string, strict_canonical_json_bytes,
+    strict_json_codec_for, strict_json_decode, tiered_read_through,
+    u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame, wal_frame_checksum,
+    wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogReadOptions, AppendLogStorageTier,
+    AttachObserveEventLogOptions, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
+    CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
+    ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, JsonCodec, KvStorageTier,
+    KvVersionedRead, Message, Node, ObserveEvent, ObserveEventFrame, ObserveEventFrameOptions,
+    ObserveMessage, PromotionPolicy, ReactiveCascadingCacheOptions, ReadThroughErrorStage,
+    ReadThroughOutcome, StorageError, StorageResult, Tier, TieredReadThroughOptions,
+    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
 };
 use serde_json::json;
 
@@ -108,6 +118,22 @@ fn event_kind<V>(event: &CascadingCacheEvent<V>) -> &'static str {
         CascadingCacheEvent::Fill { .. } => "fill",
         CascadingCacheEvent::Error { .. } => "error",
     }
+}
+
+static NEXT_TMP_DIR: AtomicU64 = AtomicU64::new(1);
+
+fn temp_storage_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "graphrefly-rs-{label}-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&path);
+    path
 }
 
 #[test]
@@ -295,6 +321,582 @@ fn content_addressed_disallowed_modes_skip_bad_key_contexts() {
     assert!(read_only.store(&bad_ctx, "ignored".to_owned()).is_ok());
     assert!(read_only.forget(&bad_ctx).is_ok());
     assert!(read_only.lookup(&bad_ctx).is_err());
+}
+
+#[test]
+fn file_backend_persists_bytes_lists_logical_keys_and_supports_put_if_absent() {
+    let dir = temp_storage_dir("file-backend");
+    let backend =
+        file_backend(dir.clone(), FileBackendOptions::new().with_namespace("ns")).unwrap();
+    let default_namespace = file_backend(dir.clone(), FileBackendOptions::new()).unwrap();
+
+    default_namespace.put("root", &[5]).unwrap();
+    backend.put("", &[0]).unwrap();
+    backend.put("a", &[1, 2, 3]).unwrap();
+    backend.put("ab", &[9, 8, 7]).unwrap();
+    assert!(!backend.put_if_absent("a", &[4]).unwrap());
+    assert!(backend.put_if_absent("c", &[3]).unwrap());
+
+    let mut first = backend.get("a").unwrap().unwrap();
+    first[0] = 99;
+    assert_eq!(backend.get("a").unwrap(), Some(vec![1, 2, 3]));
+    assert_eq!(backend.get("ab").unwrap(), Some(vec![9, 8, 7]));
+    assert_eq!(backend.list("").unwrap(), vec!["", "a", "ab", "c"]);
+    assert_eq!(backend.list("a").unwrap(), vec!["a", "ab"]);
+
+    backend.delete("ab").unwrap();
+    assert_eq!(backend.get("ab").unwrap(), None);
+    assert_eq!(backend.list("").unwrap(), vec!["", "a", "c"]);
+
+    let other_namespace = file_backend(
+        dir.clone(),
+        FileBackendOptions::new().with_namespace("other"),
+    )
+    .unwrap();
+    assert_eq!(other_namespace.list("").unwrap(), Vec::<String>::new());
+    assert_eq!(default_namespace.list("").unwrap(), vec!["root"]);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn file_backend_rejects_ambiguous_keys_and_bad_extensions() {
+    let dir = temp_storage_dir("file-backend-invalid");
+
+    assert!(
+        file_backend(dir.clone(), FileBackendOptions::new().with_extension("bin"))
+            .unwrap_err()
+            .to_string()
+            .contains("extension")
+    );
+    assert!(file_backend(
+        dir.clone(),
+        FileBackendOptions::new().with_extension("../bad")
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("extension"));
+    assert!(file_backend(
+        dir.clone(),
+        FileBackendOptions::new().with_namespace("bad\0namespace")
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("namespace"));
+
+    let backend = file_backend(dir.clone(), FileBackendOptions::new()).unwrap();
+    backend.put("%", &[7]).unwrap();
+    fs::write(dir.join("k-%.bin"), [9]).unwrap();
+    fs::write(dir.join("k-%2F.bin"), [9]).unwrap();
+    assert_eq!(backend.list("").unwrap(), vec!["%"]);
+
+    assert!(backend
+        .put("bad\0key", &[1])
+        .unwrap_err()
+        .to_string()
+        .contains("U+0000"));
+    assert!(backend
+        .list("bad\0prefix")
+        .unwrap_err()
+        .to_string()
+        .contains("U+0000"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn file_kv_and_append_log_lift_codec_storage_without_restore_semantics() {
+    let dir = temp_storage_dir("file-kv");
+    let kv = file_kv::<serde_json::Value, _>(
+        dir.clone(),
+        FileBackendOptions::new().with_namespace("json"),
+        strict_json_codec_for::<serde_json::Value>(),
+    )
+    .unwrap();
+    kv.set("item", json!({ "b": 2, "a": 1 })).unwrap();
+    assert_eq!(kv.get("item").unwrap(), Some(json!({ "a": 1, "b": 2 })));
+    assert!(!kv
+        .put_if_absent("item", json!({ "ignored": true }))
+        .unwrap());
+    assert!(kv.put_if_absent("other", json!({ "ok": true })).unwrap());
+    assert_eq!(kv.list("").unwrap(), vec!["item", "other"]);
+
+    let log = file_append_log::<serde_json::Value, _>(
+        dir.clone(),
+        FileAppendLogOptions::new()
+            .with_backend(FileBackendOptions::new().with_namespace("log"))
+            .with_prefix("events"),
+        strict_json_codec_for::<serde_json::Value>(),
+    )
+    .unwrap();
+    log.append(json!({ "value": "a" })).unwrap();
+    log.append(json!({ "value": "b" })).unwrap();
+    assert_eq!(
+        read_append_log_page(
+            &log,
+            AppendLogReadOptions {
+                after: None,
+                limit: Some(1)
+            }
+        )
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>(),
+        vec![json!({ "value": "a" })]
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn wal_frame_key_builds_padded_passive_storage_keys() {
+    let prefix = wal_frame_prefix("graph/main");
+    assert_eq!(prefix, "graph/main/wal");
+    assert_eq!(wal_frame_prefix(""), "wal");
+    assert_eq!(
+        wal_frame_key(&prefix, 7),
+        "graph/main/wal/00000000000000000007"
+    );
+    assert_eq!(
+        wal_frame_key(&prefix, u64::MAX),
+        "graph/main/wal/18446744073709551615"
+    );
+}
+
+#[test]
+fn wal_frame_produces_stable_checksums_and_detects_tampering() {
+    let body = WalFrameBody {
+        t: "c".to_owned(),
+        lifecycle: ChangeLifecycle::Data,
+        path: "count".to_owned(),
+        change: json!({ "op": "set", "value": 1 }),
+        frame_seq: 2,
+        frame_t_ns: "123".to_owned(),
+        format_version: WAL_FORMAT_VERSION,
+    };
+
+    let checksum = wal_frame_checksum(&body).unwrap();
+    assert_eq!(checksum.len(), 64);
+    assert!(checksum
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+    assert_eq!(wal_frame_checksum(&body).unwrap(), checksum);
+    assert_eq!(
+        wal_frame_checksum(&WalFrameBody {
+            change: json!({ "value": 1, "op": "set" }),
+            ..body.clone()
+        })
+        .unwrap(),
+        checksum
+    );
+
+    let frame =
+        wal_frame(WalFrameOptions::new("count", body.change.clone(), 2).with_frame_t_ns("123"))
+            .unwrap();
+    assert_eq!(frame.t, "c");
+    assert_eq!(frame.lifecycle, ChangeLifecycle::Data);
+    assert_eq!(frame.path, "count");
+    assert_eq!(frame.change, json!({ "op": "set", "value": 1 }));
+    assert_eq!(frame.frame_seq, 2);
+    assert_eq!(frame.frame_t_ns, "123");
+    assert_eq!(frame.format_version, WAL_FORMAT_VERSION);
+    assert!(verify_wal_frame_checksum(&frame).unwrap());
+    assert!(!verify_wal_frame_checksum(&WalFrame {
+        path: "other".to_owned(),
+        ..frame.clone()
+    })
+    .unwrap());
+
+    let frame_value = serde_json::to_value(&frame).unwrap();
+    for forbidden in ["snapshot", "restore", "checkpoint", "factory"] {
+        assert!(frame_value.get(forbidden).is_none());
+    }
+}
+
+#[test]
+fn wal_frame_codec_validates_passive_shape_without_restore_semantics() {
+    let frame = wal_frame(WalFrameOptions::new("node", json!({ "event": "DATA" }), 0)).unwrap();
+    let codec = wal_frame_codec::<serde_json::Value>();
+    let decoded = <graphrefly::WalFrameCodec<serde_json::Value> as Codec<
+        WalFrame<serde_json::Value>,
+    >>::decode(&codec, &codec.encode(&frame).unwrap())
+    .unwrap();
+    assert_eq!(decoded, frame);
+    assert_wal_frame(&frame).unwrap();
+    assert!(assert_wal_frame(&WalFrame {
+        checksum: "BAD".to_owned(),
+        ..frame.clone()
+    })
+    .unwrap_err()
+    .to_string()
+    .contains("checksum"));
+
+    let strict = strict_json_codec_for::<serde_json::Value>();
+    let mut bad_t = serde_json::to_value(&frame).unwrap();
+    bad_t["t"] = json!("r");
+    assert!(codec
+        .decode(&strict.encode(&bad_t).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("t must be c"));
+
+    let mut bad_lifecycle = serde_json::to_value(&frame).unwrap();
+    bad_lifecycle["lifecycle"] = json!("restore");
+    assert!(codec
+        .decode(&strict.encode(&bad_lifecycle).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("lifecycle"));
+
+    assert!(codec
+        .decode(br#"{"checksum":"bad","checksum":"also-bad"}"#)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate object key"));
+    assert!(codec
+        .decode(format!(r#"{{"path":"node","checksum":"{}"}}"#, frame.checksum).as_bytes())
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+}
+
+#[test]
+fn wal_frame_shape_checks_reject_malformed_passive_frames() {
+    let frame = wal_frame(WalFrameOptions::new("node", json!({ "event": "DATA" }), 0)).unwrap();
+    let codec = wal_frame_codec::<serde_json::Value>();
+    let strict = strict_json_codec_for::<serde_json::Value>();
+
+    let mut missing_change = serde_json::to_value(&frame).unwrap();
+    missing_change.as_object_mut().unwrap().remove("change");
+    assert!(codec
+        .decode(&strict.encode(&missing_change).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("change payload"));
+
+    for (field, expected) in [
+        ("restore", "unknown field restore"),
+        ("checkpoint", "unknown field checkpoint"),
+    ] {
+        let mut value = serde_json::to_value(&frame).unwrap();
+        value[field] = json!(true);
+        assert!(codec
+            .decode(&strict.encode(&value).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+    }
+
+    let mut empty_path = serde_json::to_value(&frame).unwrap();
+    empty_path["path"] = json!("");
+    assert!(codec
+        .decode(&strict.encode(&empty_path).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("path"));
+
+    let mut bad_seq = serde_json::to_value(&frame).unwrap();
+    bad_seq["frame_seq"] = json!(-1);
+    assert!(codec
+        .decode(&strict.encode(&bad_seq).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("frame_seq"));
+
+    let mut bad_timestamp = serde_json::to_value(&frame).unwrap();
+    bad_timestamp["frame_t_ns"] = json!("01");
+    assert!(codec
+        .decode(&strict.encode(&bad_timestamp).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("frame_t_ns"));
+
+    let mut bad_version = serde_json::to_value(&frame).unwrap();
+    bad_version["format_version"] = json!(WAL_FORMAT_VERSION + 1);
+    assert!(codec
+        .decode(&strict.encode(&bad_version).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("format_version"));
+
+    let mut extra = serde_json::to_value(&frame).unwrap();
+    extra["checkpoint"] = json!({ "nodes": [] });
+    assert!(codec
+        .decode(&strict.encode(&extra).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field checkpoint"));
+}
+
+#[test]
+fn wal_frames_store_and_page_as_ordinary_append_log_facts() {
+    let log = memory_append_log::<WalFrame<serde_json::Value>>("wal-store");
+    log.append(wal_frame(WalFrameOptions::new("a", json!({ "value": "a" }), 0)).unwrap())
+        .unwrap();
+    log.append(wal_frame(WalFrameOptions::new("b", json!({ "value": "b" }), 1)).unwrap())
+        .unwrap();
+    log.append(wal_frame(WalFrameOptions::new("c", json!({ "value": "c" }), 2)).unwrap())
+        .unwrap();
+
+    let page = read_append_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: None,
+            limit: Some(2),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| (entry.seq, entry.value.frame_seq, entry.value.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, 0, "a"), (1, 1, "b")]
+    );
+    assert!(!page.done);
+    assert_eq!(
+        read_append_log_page(
+            &log,
+            AppendLogReadOptions {
+                after: page.next_after,
+                limit: None,
+            },
+        )
+        .unwrap()
+        .entries[0]
+            .value
+            .path,
+        "c"
+    );
+}
+
+#[test]
+fn attach_observe_event_log_persists_mapped_data_frames_in_observe_order() {
+    let g = graph();
+    let count = g.state_opts(0, graphrefly::GraphNodeOpts::named("count"));
+    let log = memory_append_log::<ObserveEventFrame<i32>>("observe");
+    let mut handle = attach_observe_event_log(
+        &g,
+        Rc::new(log.clone()),
+        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
+            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+            _ => None,
+        })
+        .with_path("count")
+        .with_stream("audit"),
+    );
+
+    assert_eq!(log.read(AppendLogReadOptions::default()).unwrap().len(), 0);
+    count.set(1);
+    count.set(2);
+    assert_eq!(log.read(AppendLogReadOptions::default()).unwrap().len(), 0);
+    handle.flush().unwrap();
+
+    let frames = log
+        .read(AppendLogReadOptions::default())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        frames.iter().map(|frame| frame.change).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["count", "count", "count"]
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.stream.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("audit"), Some("audit"), Some("audit")]
+    );
+    assert!(frames
+        .windows(2)
+        .all(|pair| pair[0].observe_seq < pair[1].observe_seq));
+
+    handle.dispose().unwrap();
+    count.set(3);
+    handle.flush().unwrap();
+    assert_eq!(
+        log.read(AppendLogReadOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.value.change)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+}
+
+#[test]
+fn observe_event_log_rollback_drops_queued_frames_before_flush() {
+    let g = graph();
+    let count = g.state_opts(0, graphrefly::GraphNodeOpts::named("count"));
+    let log = memory_append_log::<ObserveEventFrame<i32>>("observe-rollback");
+    let handle = attach_observe_event_log(
+        &g,
+        Rc::new(log.clone()),
+        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
+            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+            _ => None,
+        })
+        .with_path("count"),
+    );
+
+    count.set(1);
+    handle.rollback().unwrap();
+    handle.flush().unwrap();
+
+    assert_eq!(log.read(AppendLogReadOptions::default()).unwrap().len(), 0);
+}
+
+#[test]
+fn observe_event_log_page_orders_by_append_sequence_not_graph_projection() {
+    let entries = memory_kv::<ObserveEventFrame<i32>>();
+    let event_a = ObserveEvent {
+        path: "count".to_owned(),
+        msg: ObserveMessage::Dirty,
+        tier: Tier::Control,
+        seq: 10,
+    };
+    let event_b = ObserveEvent {
+        path: "count".to_owned(),
+        msg: ObserveMessage::Dirty,
+        tier: Tier::Control,
+        seq: 5,
+    };
+    let event_c = ObserveEvent {
+        path: "count".to_owned(),
+        msg: ObserveMessage::Dirty,
+        tier: Tier::Control,
+        seq: 7,
+    };
+    entries
+        .set(
+            &append_log_key("observe-unordered", 0),
+            observe_event_frame(&event_a, 1, ObserveEventFrameOptions::default()).unwrap(),
+        )
+        .unwrap();
+    entries
+        .set(
+            &append_log_key("observe-unordered", 2),
+            observe_event_frame(&event_b, 2, ObserveEventFrameOptions::default()).unwrap(),
+        )
+        .unwrap();
+    entries
+        .set(
+            &append_log_key("observe-unordered", 10),
+            observe_event_frame(&event_c, 3, ObserveEventFrameOptions::default()).unwrap(),
+        )
+        .unwrap();
+    let log = append_log_storage(Rc::new(entries), "observe-unordered");
+
+    let page = read_observe_event_log_page(
+        &log,
+        AppendLogReadOptions {
+            after: None,
+            limit: Some(3),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| (entry.seq, entry.value.change))
+            .collect::<Vec<_>>(),
+        vec![(0, 1), (2, 2), (10, 3)]
+    );
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.value.observe_seq)
+            .collect::<Vec<_>>(),
+        vec![10, 5, 7]
+    );
+    assert!(page.done);
+}
+
+#[test]
+fn change_and_observe_event_codecs_validate_storage_frames_only() {
+    let change_codec = change_envelope_codec::<serde_json::Value>();
+    let change = envelope_change(
+        json!({ "op": "set" }),
+        ChangeEnvelopeOptions::new("kv-change")
+            .with_t_ns("123")
+            .with_seq(0),
+    )
+    .unwrap();
+    assert_eq!(
+        <graphrefly::ChangeEnvelopeCodec<serde_json::Value> as Codec<
+            graphrefly::ChangeEnvelope<serde_json::Value>,
+        >>::decode(&change_codec, &change_codec.encode(&change).unwrap())
+        .unwrap()
+        .change,
+        json!({ "op": "set" })
+    );
+    assert!(change_codec
+        .decode(br#"{"change":{},"change":{"op":"set"}}"#)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate object key"));
+    assert!(change_codec
+        .decode(
+            br#"{"lifecycle":"data","structure":"kv-change","version":1,"t_ns":"123","change":{}}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
+    assert!(envelope_change(
+        json!({}),
+        ChangeEnvelopeOptions::new("kv-change").with_version(json!({ "restore": true }))
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("version"));
+
+    let event = ObserveEvent {
+        path: "count".to_owned(),
+        msg: ObserveMessage::Dirty,
+        tier: Tier::Control,
+        seq: 7,
+    };
+    let frame = observe_event_frame(
+        &event,
+        json!({ "value": 1 }),
+        ObserveEventFrameOptions::default().with_stream("audit"),
+    )
+    .unwrap();
+    let frame_codec = observe_event_frame_codec::<serde_json::Value>();
+    let decoded = <graphrefly::ObserveEventFrameCodec<serde_json::Value> as Codec<
+        ObserveEventFrame<serde_json::Value>,
+    >>::decode(&frame_codec, &frame_codec.encode(&frame).unwrap())
+    .unwrap();
+
+    assert_eq!(decoded.structure, "observe-event");
+    assert_eq!(decoded.observe_seq, 7);
+    assert_eq!(decoded.path, "count");
+    assert_eq!(decoded.stream.as_deref(), Some("audit"));
+    assert_eq!(decoded.change, json!({ "value": 1 }));
+    assert!(frame_codec
+        .decode(br#"{"change":{},"change":{"value":1}}"#)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate object key"));
+    assert!(frame_codec
+        .decode(
+            br#"{"lifecycle":"data","structure":"observe-event","version":1,"t_ns":"123","change":{},"observeSeq":1,"path":"count"}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("canonical"));
 }
 
 #[test]
@@ -623,7 +1225,7 @@ fn multi_writer_append_log_refreshes_tail_after_retry_window() {
 }
 
 #[test]
-fn multi_writer_append_log_drops_lower_slot_when_fresher_tail_appears() {
+fn multi_writer_append_log_keeps_committed_lower_slot_when_fresher_tail_appears() {
     struct StaleHigherTailKv {
         inner: graphrefly::MemoryKv<String>,
         stale_once: RefCell<bool>,
@@ -671,15 +1273,18 @@ fn multi_writer_append_log_drops_lower_slot_when_fresher_tail_appears() {
 
     let entry = log.append("new".to_owned()).unwrap();
 
-    assert_eq!(entry.seq, 11);
-    assert_eq!(inner.get(&append_log_key("stale-higher", 0)).unwrap(), None);
+    assert_eq!(entry.seq, 0);
+    assert_eq!(
+        inner.get(&append_log_key("stale-higher", 0)).unwrap(),
+        Some("new".to_owned())
+    );
     assert_eq!(
         log.read(AppendLogReadOptions::default())
             .unwrap()
             .into_iter()
             .map(|entry| entry.seq)
             .collect::<Vec<_>>(),
-        vec![10, 11]
+        vec![0, 10]
     );
 }
 

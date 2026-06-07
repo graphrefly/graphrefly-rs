@@ -5,17 +5,24 @@
 //! protocol semantics.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::json::{strict_canonical_json_bytes, JsonCodecError};
+use crate::graph::{Graph, GraphObserver, ObserveEvent};
+use crate::json::{strict_canonical_json_bytes, strict_json_decode, Codec, JsonCodecError};
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -59,6 +66,339 @@ impl fmt::Display for StorageError {
 }
 
 impl Error for StorageError {}
+
+pub trait ByteStorageBackend {
+    fn get(&self, key: &str) -> StorageResult<Option<Vec<u8>>>;
+    fn put(&self, key: &str, value: &[u8]) -> StorageResult<()>;
+    fn put_if_absent(&self, _key: &str, _value: &[u8]) -> StorageResult<bool> {
+        Err(StorageError::unsupported("byteStorage", "put-if-absent"))
+    }
+    fn delete(&self, key: &str) -> StorageResult<()>;
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>>;
+}
+
+const FILE_STEM_PREFIX: &str = "k-";
+const DEFAULT_FILE_EXTENSION: &str = ".bin";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileBackendOptions {
+    pub namespace: String,
+    pub extension: String,
+}
+
+impl Default for FileBackendOptions {
+    fn default() -> Self {
+        Self {
+            namespace: String::new(),
+            extension: DEFAULT_FILE_EXTENSION.to_owned(),
+        }
+    }
+}
+
+impl FileBackendOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    pub fn with_extension(mut self, extension: impl Into<String>) -> Self {
+        self.extension = extension.into();
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileBackend {
+    dir: PathBuf,
+    namespace: String,
+    extension: String,
+}
+
+pub fn file_backend(
+    dir: impl Into<PathBuf>,
+    opts: FileBackendOptions,
+) -> StorageResult<FileBackend> {
+    validate_namespace("fileBackend", &opts.namespace)?;
+    validate_extension(&opts.extension)?;
+    Ok(FileBackend {
+        dir: dir.into(),
+        namespace: opts.namespace,
+        extension: opts.extension,
+    })
+}
+
+impl FileBackend {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn namespace_prefix(&self) -> String {
+        if self.namespace.is_empty() {
+            String::new()
+        } else {
+            format!("{}\0", self.namespace)
+        }
+    }
+
+    fn storage_key(&self, key: &str) -> StorageResult<String> {
+        validate_logical_key("fileBackend", key)?;
+        Ok(format!("{}{}", self.namespace_prefix(), key))
+    }
+
+    fn path_for(&self, key: &str) -> StorageResult<PathBuf> {
+        let stem = key_to_file_stem(&self.storage_key(key)?);
+        Ok(self
+            .dir
+            .join(format!("{FILE_STEM_PREFIX}{stem}{}", self.extension)))
+    }
+
+    fn key_from_filename(&self, filename: &str) -> StorageResult<Option<String>> {
+        if filename.starts_with('.') || !filename.ends_with(&self.extension) {
+            return Ok(None);
+        }
+        let stem = &filename[..filename.len() - self.extension.len()];
+        let Some(raw_stem) = stem.strip_prefix(FILE_STEM_PREFIX) else {
+            return Ok(None);
+        };
+        let Some(key) = file_stem_to_key(raw_stem) else {
+            return Ok(None);
+        };
+        let namespace_prefix = self.namespace_prefix();
+        if !key.starts_with(&namespace_prefix) {
+            return Ok(None);
+        }
+        let logical = key[namespace_prefix.len()..].to_owned();
+        if namespace_prefix.is_empty() && logical.contains('\0') {
+            return Ok(None);
+        }
+        if logical.contains('\0') {
+            return Err(StorageError::backend(
+                "fileBackend: malformed stored key contains U+0000",
+            ));
+        }
+        Ok(Some(logical))
+    }
+}
+
+impl ByteStorageBackend for FileBackend {
+    fn get(&self, key: &str) -> StorageResult<Option<Vec<u8>>> {
+        match fs::read(self.path_for(key)?) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StorageError::backend(format!("fileBackend.get: {error}"))),
+        }
+    }
+
+    fn put(&self, key: &str, value: &[u8]) -> StorageResult<()> {
+        fs::create_dir_all(&self.dir)
+            .map_err(|err| StorageError::backend(format!("fileBackend.put: {err}")))?;
+        let file_path = self.path_for(key)?;
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| StorageError::backend("fileBackend.put: invalid file name"))?;
+        let tmp = write_temp_file(&self.dir, file_name, value, "fileBackend.put")?;
+        if let Err(error) = fs::rename(&tmp, &file_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(StorageError::backend(format!("fileBackend.put: {error}")));
+        }
+        Ok(())
+    }
+
+    fn put_if_absent(&self, key: &str, value: &[u8]) -> StorageResult<bool> {
+        fs::create_dir_all(&self.dir)
+            .map_err(|err| StorageError::backend(format!("fileBackend.put_if_absent: {err}")))?;
+        let file_path = self.path_for(key)?;
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| StorageError::backend("fileBackend.put_if_absent: invalid file name"))?;
+        let tmp = write_temp_file(&self.dir, file_name, value, "fileBackend.put_if_absent")?;
+        match fs::hard_link(&tmp, &file_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp);
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp);
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                Err(StorageError::backend(format!(
+                    "fileBackend.put_if_absent: {error}"
+                )))
+            }
+        }
+    }
+
+    fn delete(&self, key: &str) -> StorageResult<()> {
+        match fs::remove_file(self.path_for(key)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StorageError::backend(format!(
+                "fileBackend.delete: {error}"
+            ))),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        validate_list_prefix("fileBackend", prefix)?;
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StorageError::backend(format!("fileBackend.list: {error}"))),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|err| StorageError::backend(format!("fileBackend.list: {err}")))?;
+            let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(key) = self.key_from_filename(&filename)? {
+                if key.starts_with(prefix) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+fn validate_namespace(label: &str, value: &str) -> StorageResult<()> {
+    if value.contains('\0') {
+        return Err(StorageError::backend(format!(
+            "{label}: namespace must not contain U+0000"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_logical_key(label: &str, value: &str) -> StorageResult<()> {
+    if value.contains('\0') {
+        return Err(StorageError::backend(format!(
+            "{label}: key must not contain U+0000"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_list_prefix(label: &str, value: &str) -> StorageResult<()> {
+    if value.contains('\0') {
+        return Err(StorageError::backend(format!(
+            "{label}: list prefix must not contain U+0000"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_extension(extension: &str) -> StorageResult<()> {
+    let valid = extension.len() >= 2
+        && extension.starts_with('.')
+        && !extension.contains("..")
+        && !extension.contains('/')
+        && !extension.contains('\\')
+        && !extension.contains('\0')
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::backend(
+            "fileBackend: extension must be a simple suffix such as .bin",
+        ))
+    }
+}
+
+fn temp_file_path(dir: &Path, file_name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        nanos,
+        NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn write_temp_file(
+    dir: &Path,
+    file_name: &str,
+    value: &[u8],
+    label: &str,
+) -> StorageResult<PathBuf> {
+    for _ in 0..16 {
+        let tmp = temp_file_path(dir, file_name);
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(StorageError::backend(format!("{label}: {error}"))),
+        };
+        if let Err(error) = file.write_all(value).and_then(|_| file.sync_all()) {
+            let _ = fs::remove_file(&tmp);
+            return Err(StorageError::backend(format!("{label}: {error}")));
+        }
+        return Ok(tmp);
+    }
+    Err(StorageError::backend(format!(
+        "{label}: could not allocate a unique temporary file"
+    )))
+}
+
+fn key_to_file_stem(key: &str) -> String {
+    let mut out = String::new();
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(hex_nibble(byte >> 4));
+            out.push(hex_nibble(byte & 0x0f));
+        }
+    }
+    out
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + (value - 10)) as char,
+    }
+}
+
+fn file_stem_to_key(stem: &str) -> Option<String> {
+    let bytes = stem.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hi = (bytes[index + 1] as char).to_digit(16)?;
+            let lo = (bytes[index + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            index += 3;
+        } else if bytes[index].is_ascii() {
+            out.push(bytes[index]);
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    let key = String::from_utf8(out).ok()?;
+    if key_to_file_stem(&key) == stem {
+        Some(key)
+    } else {
+        None
+    }
+}
 
 /// Opaque D108 per-key generation token for typed KV versioned reads.
 #[derive(Clone)]
@@ -299,6 +639,116 @@ impl<T: Clone> KvStorageTier<T> for MemoryKv<T> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CodecKvStorage<B, C, T> {
+    backend: B,
+    codec: C,
+    marker: std::marker::PhantomData<T>,
+}
+
+pub fn codec_kv_storage<B, C, T>(backend: B, codec: C) -> CodecKvStorage<B, C, T>
+where
+    B: ByteStorageBackend + Clone,
+    C: Codec<T> + Clone,
+    T: Clone,
+{
+    CodecKvStorage {
+        backend,
+        codec,
+        marker: std::marker::PhantomData,
+    }
+}
+
+impl<B, C, T> KvStorageTier<T> for CodecKvStorage<B, C, T>
+where
+    B: ByteStorageBackend + Clone,
+    C: Codec<T> + Clone,
+    T: Clone,
+{
+    fn get(&self, key: &str) -> StorageResult<Option<T>> {
+        self.backend
+            .get(key)?
+            .map(|bytes| self.codec.decode(&bytes).map_err(storage_json_error))
+            .transpose()
+    }
+
+    fn set(&self, key: &str, value: T) -> StorageResult<()> {
+        let bytes = self.codec.encode(&value).map_err(storage_json_error)?;
+        self.backend.put(key, &bytes)
+    }
+
+    fn put_if_absent(&self, key: &str, value: T) -> StorageResult<bool> {
+        let bytes = self.codec.encode(&value).map_err(storage_json_error)?;
+        self.backend.put_if_absent(key, &bytes)
+    }
+
+    fn delete(&self, key: &str) -> StorageResult<()> {
+        self.backend.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        self.backend.list(prefix)
+    }
+}
+
+pub type FileKv<T, C> = CodecKvStorage<FileBackend, C, T>;
+
+pub fn file_kv<T, C>(
+    dir: impl Into<PathBuf>,
+    opts: FileBackendOptions,
+    codec: C,
+) -> StorageResult<FileKv<T, C>>
+where
+    C: Codec<T> + Clone,
+    T: Clone,
+{
+    Ok(codec_kv_storage(file_backend(dir, opts)?, codec))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAppendLogOptions {
+    pub backend: FileBackendOptions,
+    pub prefix: String,
+}
+
+impl Default for FileAppendLogOptions {
+    fn default() -> Self {
+        Self {
+            backend: FileBackendOptions::default(),
+            prefix: "event-log".to_owned(),
+        }
+    }
+}
+
+impl FileAppendLogOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_backend(mut self, backend: FileBackendOptions) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+}
+
+pub fn file_append_log<T, C>(
+    dir: impl Into<PathBuf>,
+    opts: FileAppendLogOptions,
+    codec: C,
+) -> StorageResult<AppendLogStorage<T>>
+where
+    C: Codec<T> + Clone + 'static,
+    T: Clone + 'static,
+{
+    let kv = file_kv(dir, opts.backend, codec)?;
+    Ok(append_log_storage(Rc::new(kv), opts.prefix))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContentAddressedMode {
     Read,
@@ -453,6 +903,848 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeLifecycle {
+    Spec,
+    Data,
+    Ownership,
+}
+
+pub const WAL_KEY_SEGMENT: &str = "wal";
+pub const WAL_FRAME_SEQ_PAD: usize = 20;
+pub const WAL_FORMAT_VERSION: u64 = 1;
+
+pub type WalFrameTimestampNs = String;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WalFrameBody<T> {
+    pub t: String,
+    pub lifecycle: ChangeLifecycle,
+    pub path: String,
+    pub change: T,
+    pub frame_seq: u64,
+    pub frame_t_ns: WalFrameTimestampNs,
+    pub format_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WalFrame<T> {
+    pub t: String,
+    pub lifecycle: ChangeLifecycle,
+    pub path: String,
+    pub change: T,
+    pub frame_seq: u64,
+    pub frame_t_ns: WalFrameTimestampNs,
+    pub format_version: u64,
+    pub checksum: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalFrameOptions<T> {
+    pub path: String,
+    pub change: T,
+    pub frame_seq: u64,
+    pub lifecycle: ChangeLifecycle,
+    pub frame_t_ns: Option<String>,
+}
+
+impl<T> WalFrameOptions<T> {
+    pub fn new(path: impl Into<String>, change: T, frame_seq: u64) -> Self {
+        Self {
+            path: path.into(),
+            change,
+            frame_seq,
+            lifecycle: ChangeLifecycle::Data,
+            frame_t_ns: None,
+        }
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: ChangeLifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub fn with_frame_t_ns(mut self, frame_t_ns: impl Into<String>) -> Self {
+        self.frame_t_ns = Some(frame_t_ns.into());
+        self
+    }
+}
+
+pub fn wal_frame_prefix(namespace: &str) -> String {
+    if namespace.is_empty() {
+        WAL_KEY_SEGMENT.to_owned()
+    } else {
+        format!("{namespace}/{WAL_KEY_SEGMENT}")
+    }
+}
+
+pub fn wal_frame_key(prefix: &str, frame_seq: u64) -> String {
+    format!("{prefix}/{frame_seq:0>width$}", width = WAL_FRAME_SEQ_PAD)
+}
+
+pub fn wal_frame_checksum<T: Serialize>(body: &WalFrameBody<T>) -> StorageResult<String> {
+    assert_wal_frame_body(body).map_err(storage_json_error)?;
+    let value = serde_json::to_value(body).map_err(|err| StorageError::backend(err.to_string()))?;
+    assert_wal_frame_body_value(&value, "walFrameCodec").map_err(storage_json_error)?;
+    let bytes = strict_canonical_json_bytes(&value).map_err(storage_json_error)?;
+    Ok(sha256_hex(&bytes))
+}
+
+pub fn wal_frame<T: Serialize>(opts: WalFrameOptions<T>) -> StorageResult<WalFrame<T>> {
+    let body = WalFrameBody {
+        t: "c".to_owned(),
+        lifecycle: opts.lifecycle,
+        path: opts.path,
+        change: opts.change,
+        frame_seq: opts.frame_seq,
+        frame_t_ns: match opts.frame_t_ns {
+            Some(value) => crate::json::assert_non_negative_decimal_integer_string(
+                value,
+                "walFrameCodec: frame_t_ns",
+            )
+            .map_err(storage_json_error)?,
+            None => now_ns(),
+        },
+        format_version: WAL_FORMAT_VERSION,
+    };
+    let checksum = wal_frame_checksum(&body)?;
+    Ok(WalFrame {
+        t: body.t,
+        lifecycle: body.lifecycle,
+        path: body.path,
+        change: body.change,
+        frame_seq: body.frame_seq,
+        frame_t_ns: body.frame_t_ns,
+        format_version: body.format_version,
+        checksum,
+    })
+}
+
+pub fn assert_wal_frame<T: Serialize>(frame: &WalFrame<T>) -> crate::json::JsonCodecResult<()> {
+    assert_wal_frame_body(&WalFrameBody {
+        t: frame.t.clone(),
+        lifecycle: frame.lifecycle.clone(),
+        path: frame.path.clone(),
+        change: &frame.change,
+        frame_seq: frame.frame_seq,
+        frame_t_ns: frame.frame_t_ns.clone(),
+        format_version: frame.format_version,
+    })?;
+    if !is_sha256_hex(&frame.checksum) {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: checksum must be a lowercase sha256 hex string",
+        ));
+    }
+    Ok(())
+}
+
+pub fn verify_wal_frame_checksum<T: Serialize>(frame: &WalFrame<T>) -> StorageResult<bool> {
+    assert_wal_frame(frame).map_err(storage_json_error)?;
+    let body = WalFrameBody {
+        t: frame.t.clone(),
+        lifecycle: frame.lifecycle.clone(),
+        path: frame.path.clone(),
+        change: &frame.change,
+        frame_seq: frame.frame_seq,
+        frame_t_ns: frame.frame_t_ns.clone(),
+        format_version: frame.format_version,
+    };
+    Ok(wal_frame_checksum(&body)? == frame.checksum)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WalFrameCodec<T> {
+    marker: std::marker::PhantomData<T>,
+}
+
+pub fn wal_frame_codec<T>() -> WalFrameCodec<T> {
+    WalFrameCodec {
+        marker: std::marker::PhantomData,
+    }
+}
+
+impl<T> Codec<WalFrame<T>> for WalFrameCodec<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    fn encode(&self, value: &WalFrame<T>) -> crate::json::JsonCodecResult<Vec<u8>> {
+        assert_wal_frame(value)?;
+        let value =
+            serde_json::to_value(value).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+        assert_wal_frame_value(&value)?;
+        strict_canonical_json_bytes(&value)
+    }
+
+    fn decode(&self, bytes: &[u8]) -> crate::json::JsonCodecResult<WalFrame<T>> {
+        let value = strict_json_decode(bytes)?;
+        assert_wal_frame_value(&value)?;
+        serde_json::from_value(value).map_err(|err| JsonCodecError::decode(err.to_string()))
+    }
+}
+
+fn assert_wal_frame_body<T: Serialize>(body: &WalFrameBody<T>) -> crate::json::JsonCodecResult<()> {
+    if body.t != "c" {
+        return Err(JsonCodecError::validation("walFrameCodec: t must be c"));
+    }
+    if body.path.is_empty() {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: path must be a non-empty string",
+        ));
+    }
+    crate::json::assert_non_negative_decimal_integer_string(
+        body.frame_t_ns.clone(),
+        "walFrameCodec: frame_t_ns",
+    )?;
+    if body.format_version != WAL_FORMAT_VERSION {
+        return Err(JsonCodecError::validation(format!(
+            "walFrameCodec: format_version must be {WAL_FORMAT_VERSION}"
+        )));
+    }
+    let value =
+        serde_json::to_value(body).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+    assert_wal_frame_body_value(&value, "walFrameCodec")
+}
+
+fn assert_wal_frame_value(value: &Value) -> crate::json::JsonCodecResult<()> {
+    assert_wal_frame_body_value(value, "walFrameCodec")?;
+    let Some(record) = value.as_object() else {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: frame must be an object",
+        ));
+    };
+    if !record.contains_key("checksum") {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: checksum is required",
+        ));
+    }
+    let Some(checksum) = record.get("checksum").and_then(Value::as_str) else {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: checksum must be a lowercase sha256 hex string",
+        ));
+    };
+    if !is_sha256_hex(checksum) {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: checksum must be a lowercase sha256 hex string",
+        ));
+    }
+    Ok(())
+}
+
+fn assert_wal_frame_body_value(value: &Value, label: &str) -> crate::json::JsonCodecResult<()> {
+    let Some(record) = value.as_object() else {
+        return Err(JsonCodecError::validation(format!(
+            "{label}: frame must be an object"
+        )));
+    };
+    for key in record.keys() {
+        match key.as_str() {
+            "t" | "lifecycle" | "path" | "change" | "frame_seq" | "frame_t_ns"
+            | "format_version" | "checksum" => {}
+            _ => {
+                return Err(JsonCodecError::validation(format!(
+                    "walFrameCodec: unknown field {key}"
+                )))
+            }
+        }
+    }
+    match record.get("t").and_then(Value::as_str) {
+        Some("c") => {}
+        _ => return Err(JsonCodecError::validation("walFrameCodec: t must be c")),
+    }
+    match record.get("lifecycle").and_then(Value::as_str) {
+        Some("spec" | "data" | "ownership") => {}
+        _ => {
+            return Err(JsonCodecError::validation(
+                "walFrameCodec: lifecycle must be spec, data, or ownership",
+            ))
+        }
+    }
+    match record.get("path").and_then(Value::as_str) {
+        Some(path) if !path.is_empty() => {}
+        _ => {
+            return Err(JsonCodecError::validation(
+                "walFrameCodec: path must be a non-empty string",
+            ))
+        }
+    }
+    if !record.contains_key("change") {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: change payload is required",
+        ));
+    }
+    if record.get("frame_seq").and_then(Value::as_u64).is_none() {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: frame_seq must be a non-negative integer",
+        ));
+    }
+    let Some(frame_t_ns) = record.get("frame_t_ns").and_then(Value::as_str) else {
+        return Err(JsonCodecError::validation(
+            "walFrameCodec: frame_t_ns must be a canonical non-negative decimal integer string",
+        ));
+    };
+    crate::json::assert_non_negative_decimal_integer_string(
+        frame_t_ns,
+        "walFrameCodec: frame_t_ns",
+    )?;
+    if record.get("format_version").and_then(Value::as_u64) != Some(WAL_FORMAT_VERSION) {
+        return Err(JsonCodecError::validation(format!(
+            "walFrameCodec: format_version must be {WAL_FORMAT_VERSION}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEnvelope<T> {
+    pub lifecycle: ChangeLifecycle,
+    pub structure: String,
+    pub version: Value,
+    pub t_ns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    pub change: T,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChangeEnvelopeOptions {
+    pub lifecycle: ChangeLifecycle,
+    pub structure: String,
+    pub version: Value,
+    pub t_ns: Option<String>,
+    pub seq: Option<u64>,
+}
+
+impl ChangeEnvelopeOptions {
+    pub fn new(structure: impl Into<String>) -> Self {
+        Self {
+            lifecycle: ChangeLifecycle::Data,
+            structure: structure.into(),
+            version: Value::from(1),
+            t_ns: None,
+            seq: None,
+        }
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: ChangeLifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub fn with_version(mut self, version: impl Into<Value>) -> Self {
+        self.version = version.into();
+        self
+    }
+
+    pub fn with_t_ns(mut self, t_ns: impl Into<String>) -> Self {
+        self.t_ns = Some(t_ns.into());
+        self
+    }
+
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = Some(seq);
+        self
+    }
+}
+
+pub fn now_ns() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
+pub fn envelope_change<T>(
+    change: T,
+    opts: ChangeEnvelopeOptions,
+) -> StorageResult<ChangeEnvelope<T>> {
+    if opts.structure.is_empty() {
+        return Err(StorageError::backend(
+            "changeEnvelopeCodec: structure must be a non-empty string",
+        ));
+    }
+    let t_ns = match opts.t_ns {
+        Some(value) => crate::json::assert_non_negative_decimal_integer_string(
+            value,
+            "changeEnvelopeCodec: t_ns",
+        )
+        .map_err(storage_json_error)?,
+        None => now_ns(),
+    };
+    let envelope = ChangeEnvelope {
+        lifecycle: opts.lifecycle,
+        structure: opts.structure,
+        version: opts.version,
+        t_ns,
+        seq: opts.seq,
+        change,
+    };
+    assert_change_envelope(&envelope).map_err(storage_json_error)?;
+    Ok(envelope)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChangeEnvelopeCodec<T> {
+    marker: std::marker::PhantomData<T>,
+}
+
+pub fn change_envelope_codec<T>() -> ChangeEnvelopeCodec<T> {
+    ChangeEnvelopeCodec {
+        marker: std::marker::PhantomData,
+    }
+}
+
+impl<T> Codec<ChangeEnvelope<T>> for ChangeEnvelopeCodec<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    fn encode(&self, value: &ChangeEnvelope<T>) -> crate::json::JsonCodecResult<Vec<u8>> {
+        assert_change_envelope(value)?;
+        let value =
+            serde_json::to_value(value).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+        strict_canonical_json_bytes(&value)
+    }
+
+    fn decode(&self, bytes: &[u8]) -> crate::json::JsonCodecResult<ChangeEnvelope<T>> {
+        let value = strict_json_decode(bytes)?;
+        assert_change_envelope_value(&value, "changeEnvelopeCodec")?;
+        serde_json::from_value(value).map_err(|err| JsonCodecError::decode(err.to_string()))
+    }
+}
+
+pub fn assert_change_envelope<T>(value: &ChangeEnvelope<T>) -> crate::json::JsonCodecResult<()> {
+    if value.structure.is_empty() {
+        return Err(JsonCodecError::validation(
+            "changeEnvelopeCodec: structure must be a non-empty string",
+        ));
+    }
+    crate::json::assert_non_negative_decimal_integer_string(
+        value.t_ns.clone(),
+        "changeEnvelopeCodec: t_ns",
+    )?;
+    match &value.version {
+        Value::Number(_) | Value::String(_) => Ok(()),
+        _ => Err(JsonCodecError::validation(
+            "changeEnvelopeCodec: version must be a finite number or string",
+        )),
+    }
+}
+
+fn assert_change_envelope_value(value: &Value, label: &str) -> crate::json::JsonCodecResult<()> {
+    let Some(record) = value.as_object() else {
+        return Err(JsonCodecError::validation(format!(
+            "{label}: frame must be an object"
+        )));
+    };
+    match record.get("lifecycle").and_then(Value::as_str) {
+        Some("spec" | "data" | "ownership") => {}
+        _ => {
+            return Err(JsonCodecError::validation(
+                "changeEnvelopeCodec: lifecycle must be spec, data, or ownership",
+            ))
+        }
+    }
+    match record.get("structure").and_then(Value::as_str) {
+        Some(structure) if !structure.is_empty() => {}
+        _ => {
+            return Err(JsonCodecError::validation(
+                "changeEnvelopeCodec: structure must be a non-empty string",
+            ))
+        }
+    }
+    match record.get("version") {
+        Some(Value::Number(_) | Value::String(_)) => {}
+        _ => {
+            return Err(JsonCodecError::validation(
+                "changeEnvelopeCodec: version must be a finite number or string",
+            ))
+        }
+    }
+    let Some(t_ns) = record.get("t_ns").and_then(Value::as_str) else {
+        return Err(JsonCodecError::validation(
+            "changeEnvelopeCodec: t_ns must be a canonical non-negative decimal integer string",
+        ));
+    };
+    crate::json::assert_non_negative_decimal_integer_string(t_ns, "changeEnvelopeCodec: t_ns")?;
+    if record.get("seq").is_some_and(|seq| seq.as_u64().is_none()) {
+        return Err(JsonCodecError::validation(
+            "changeEnvelopeCodec: seq must be a non-negative integer when present",
+        ));
+    }
+    if !record.contains_key("change") {
+        return Err(JsonCodecError::validation(
+            "changeEnvelopeCodec: change payload is required",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObserveEventFrame<T> {
+    pub lifecycle: ChangeLifecycle,
+    pub structure: String,
+    pub version: Value,
+    pub t_ns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    pub change: T,
+    #[serde(rename = "observeSeq")]
+    pub observe_seq: u64,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ObserveEventFrameOptions {
+    pub stream: Option<String>,
+}
+
+impl ObserveEventFrameOptions {
+    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
+        self.stream = Some(stream.into());
+        self
+    }
+}
+
+pub fn observe_event_frame<T>(
+    event: &ObserveEvent,
+    change: T,
+    opts: ObserveEventFrameOptions,
+) -> StorageResult<ObserveEventFrame<T>> {
+    let envelope = envelope_change(
+        change,
+        ChangeEnvelopeOptions::new("observe-event").with_seq(event.seq),
+    )?;
+    Ok(ObserveEventFrame {
+        lifecycle: envelope.lifecycle,
+        structure: envelope.structure,
+        version: envelope.version,
+        t_ns: envelope.t_ns,
+        seq: envelope.seq,
+        change: envelope.change,
+        observe_seq: event.seq,
+        path: event.path.clone(),
+        stream: opts.stream,
+    })
+}
+
+pub fn assert_observe_event_frame<T>(
+    value: &ObserveEventFrame<T>,
+) -> crate::json::JsonCodecResult<()> {
+    assert_change_envelope(&ChangeEnvelope {
+        lifecycle: value.lifecycle.clone(),
+        structure: value.structure.clone(),
+        version: value.version.clone(),
+        t_ns: value.t_ns.clone(),
+        seq: value.seq,
+        change: (),
+    })?;
+    if value.structure != "observe-event" {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: structure must be observe-event",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ObserveEventFrameCodec<T> {
+    marker: std::marker::PhantomData<T>,
+}
+
+pub fn observe_event_frame_codec<T>() -> ObserveEventFrameCodec<T> {
+    ObserveEventFrameCodec {
+        marker: std::marker::PhantomData,
+    }
+}
+
+impl<T> Codec<ObserveEventFrame<T>> for ObserveEventFrameCodec<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    fn encode(&self, value: &ObserveEventFrame<T>) -> crate::json::JsonCodecResult<Vec<u8>> {
+        assert_observe_event_frame(value)?;
+        let value =
+            serde_json::to_value(value).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+        strict_canonical_json_bytes(&value)
+    }
+
+    fn decode(&self, bytes: &[u8]) -> crate::json::JsonCodecResult<ObserveEventFrame<T>> {
+        let value = strict_json_decode(bytes)?;
+        assert_observe_event_frame_value(&value)?;
+        serde_json::from_value(value).map_err(|err| JsonCodecError::decode(err.to_string()))
+    }
+}
+
+fn assert_observe_event_frame_value(value: &Value) -> crate::json::JsonCodecResult<()> {
+    assert_change_envelope_value(value, "observeEventFrameCodec")?;
+    let Some(record) = value.as_object() else {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: frame must be an object",
+        ));
+    };
+    if record.get("structure").and_then(Value::as_str) != Some("observe-event") {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: structure must be observe-event",
+        ));
+    }
+    if record.get("observeSeq").and_then(Value::as_u64).is_none() {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: observeSeq must be a non-negative integer",
+        ));
+    }
+    if record.get("path").and_then(Value::as_str).is_none() {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: path must be a string",
+        ));
+    }
+    if record
+        .get("stream")
+        .is_some_and(|stream| !stream.is_string())
+    {
+        return Err(JsonCodecError::validation(
+            "observeEventFrameCodec: stream must be a string when present",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserveEventLogErrorPhase {
+    Map,
+    Write,
+    Flush,
+    Rollback,
+    Dispose,
+}
+
+#[derive(Clone)]
+pub struct ObserveEventLogErrorContext<T> {
+    pub phase: ObserveEventLogErrorPhase,
+    pub event: Option<ObserveEvent>,
+    pub value: Option<ObserveEventFrame<T>>,
+}
+
+pub type ObserveEventLogMap<T> = dyn Fn(&ObserveEvent) -> Option<T>;
+pub type ObserveEventLogErrorFn<T> = dyn Fn(StorageError, ObserveEventLogErrorContext<T>);
+
+#[derive(Clone)]
+pub struct AttachObserveEventLogOptions<T: Clone> {
+    pub path: Option<String>,
+    pub stream: Option<String>,
+    pub map: Rc<ObserveEventLogMap<T>>,
+    pub on_error: Option<Rc<ObserveEventLogErrorFn<T>>>,
+}
+
+impl<T> AttachObserveEventLogOptions<T>
+where
+    T: Clone + From<ObserveEvent> + 'static,
+{
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            stream: None,
+            map: Rc::new(|event| Some(event.clone().into())),
+            on_error: None,
+        }
+    }
+}
+
+impl<T> Default for AttachObserveEventLogOptions<T>
+where
+    T: Clone + From<ObserveEvent> + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone> AttachObserveEventLogOptions<T> {
+    pub fn from_map(map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
+        Self {
+            path: None,
+            stream: None,
+            map: Rc::new(map),
+            on_error: None,
+        }
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
+        self.stream = Some(stream.into());
+        self
+    }
+
+    pub fn with_map(mut self, map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
+        self.map = Rc::new(map);
+        self
+    }
+
+    pub fn with_on_error(
+        mut self,
+        on_error: impl Fn(StorageError, ObserveEventLogErrorContext<T>) + 'static,
+    ) -> Self {
+        self.on_error = Some(Rc::new(on_error));
+        self
+    }
+}
+
+pub struct ObserveEventLogHandle {
+    observer: Option<GraphObserver>,
+    flush: Rc<dyn Fn() -> StorageResult<()>>,
+    rollback: Rc<dyn Fn() -> StorageResult<()>>,
+}
+
+impl ObserveEventLogHandle {
+    pub fn flush(&self) -> StorageResult<()> {
+        (self.flush)()
+    }
+
+    pub fn rollback(&self) -> StorageResult<()> {
+        (self.rollback)()
+    }
+
+    pub fn dispose(&mut self) -> StorageResult<()> {
+        self.observer.take();
+        (self.flush)()
+    }
+}
+
+impl Drop for ObserveEventLogHandle {
+    fn drop(&mut self) {
+        let _ = self.dispose();
+    }
+}
+
+pub type ObserveEventLogPage<T> = AppendLogPage<ObserveEventFrame<T>>;
+
+pub fn attach_observe_event_log<T: Clone + 'static>(
+    graph: &Graph,
+    log: Rc<dyn AppendLogStorageTier<ObserveEventFrame<T>>>,
+    opts: AttachObserveEventLogOptions<T>,
+) -> ObserveEventLogHandle {
+    let stream = match &opts.path {
+        Some(path) => graph.observe_path(path),
+        None => graph.observe(),
+    };
+    let map = opts.map.clone();
+    let on_error = opts.on_error.clone();
+    let frame_opts = ObserveEventFrameOptions {
+        stream: opts.stream.clone(),
+    };
+    let pending = Rc::new(RefCell::new(
+        VecDeque::<(ObserveEvent, ObserveEventFrame<T>)>::new(),
+    ));
+    let flush_pending = {
+        let pending = pending.clone();
+        let log = log.clone();
+        let on_error = on_error.clone();
+        Rc::new(move || {
+            let mut first_error = None;
+            loop {
+                let Some((event, frame)) = pending.borrow_mut().pop_front() else {
+                    break;
+                };
+                if let Err(error) = log.append(frame.clone()) {
+                    report_observe_event_log_error(
+                        &on_error,
+                        error.clone(),
+                        ObserveEventLogErrorContext {
+                            phase: ObserveEventLogErrorPhase::Write,
+                            event: Some(event),
+                            value: Some(frame),
+                        },
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }) as Rc<dyn Fn() -> StorageResult<()>>
+    };
+    let rollback_pending = {
+        let pending = pending.clone();
+        Rc::new(move || {
+            pending.borrow_mut().clear();
+            Ok(())
+        }) as Rc<dyn Fn() -> StorageResult<()>>
+    };
+    let observer = stream.subscribe(move |event| {
+        let mapped = match catch_unwind(AssertUnwindSafe(|| (map)(&event))) {
+            Ok(mapped) => mapped,
+            Err(_) => {
+                report_observe_event_log_error(
+                    &on_error,
+                    StorageError::backend("attach_observe_event_log: map panicked"),
+                    ObserveEventLogErrorContext {
+                        phase: ObserveEventLogErrorPhase::Map,
+                        event: Some(event),
+                        value: None,
+                    },
+                );
+                return;
+            }
+        };
+        let Some(value) = mapped else {
+            return;
+        };
+        let frame = match observe_event_frame(&event, value, frame_opts.clone()) {
+            Ok(frame) => frame,
+            Err(error) => {
+                report_observe_event_log_error(
+                    &on_error,
+                    error,
+                    ObserveEventLogErrorContext {
+                        phase: ObserveEventLogErrorPhase::Map,
+                        event: Some(event),
+                        value: None,
+                    },
+                );
+                return;
+            }
+        };
+        pending.borrow_mut().push_back((event, frame));
+    });
+    ObserveEventLogHandle {
+        observer: Some(observer),
+        flush: flush_pending,
+        rollback: rollback_pending,
+    }
+}
+
+fn report_observe_event_log_error<T: Clone>(
+    on_error: &Option<Rc<ObserveEventLogErrorFn<T>>>,
+    error: StorageError,
+    ctx: ObserveEventLogErrorContext<T>,
+) {
+    if let Some(on_error) = on_error {
+        let _ = catch_unwind(AssertUnwindSafe(|| on_error(error, ctx)));
+    }
+}
+
+pub fn read_observe_event_log_page<T: Clone>(
+    log: &dyn AppendLogStorageTier<ObserveEventFrame<T>>,
+    opts: AppendLogReadOptions,
+) -> StorageResult<ObserveEventLogPage<T>> {
+    read_append_log_page(log, opts)
 }
 
 pub const APPEND_LOG_SEQ_PAD: usize = 20;
@@ -628,14 +1920,6 @@ impl<T: Clone> AppendLogStorageTier<T> for MultiWriterAppendLogStorage<T> {
             attempts += 1;
             let key = append_log_key(&self.prefix, seq);
             if self.kv.put_if_absent(&key, value.clone())? {
-                let refreshed =
-                    next_seq_from_keys(&self.prefix, self.kv.list(&format!("{}/", self.prefix))?)?;
-                if refreshed > seq.saturating_add(1) {
-                    self.kv.delete(&key)?;
-                    seq = refreshed;
-                    attempts = 0;
-                    continue;
-                }
                 return Ok(AppendLogEntry { key, seq, value });
             }
             seq = seq.checked_add(1).ok_or_else(|| {
