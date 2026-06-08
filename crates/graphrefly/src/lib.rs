@@ -61,6 +61,7 @@ pub mod cascading_cache;
 pub mod checkpoint;
 pub mod combinators;
 pub mod composition;
+pub mod cqrs;
 pub mod ctx;
 pub mod data_structures;
 pub mod diagnostics;
@@ -117,6 +118,14 @@ pub use combinators::{
 pub use composition::{
     pipe, stratify, stratify_branch, Pipe, Stratified, StratifyOptions, StratifyRule,
 };
+pub use cqrs::{
+    cqrs, cqrs_command_handler, cqrs_projection, cqrs_with_options, CqrsAuditOutcome,
+    CqrsAuditRecord, CqrsBundle, CqrsCommand, CqrsCommandHandlerDefinition, CqrsCursor,
+    CqrsDedupePolicy, CqrsDedupeSnapshot, CqrsDedupeWindow, CqrsError, CqrsErrorCode, CqrsEvent,
+    CqrsEventDraft, CqrsOptions, CqrsProjection, CqrsProjectionError, CqrsProjectionErrorCode,
+    CqrsProjectionFrame, CqrsProjectionOptions, CqrsProjectionReducer, CqrsProjectionStatus,
+    CqrsProjectionStatusState, CqrsRuntimeFact, CqrsStatus, CqrsStatusState,
+};
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use data_structures::{
     merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map, scan_log,
@@ -160,7 +169,11 @@ pub use json::{
     JsonCodecResult, JsonValue, NonNegativeDecimalIntegerString, StrictJsonCodec,
 };
 pub use messaging::{
-    from_topic, message_bus, to_topic, topic_core, MessageBus, MessageBusEvent, MessageEnvelope,
+    dynamic_hub, dynamic_hub_with_options, from_hub_topic, from_hub_topic_with_name, from_topic,
+    message_bus, to_hub_topic, to_topic, topic_core, DynamicHub, DynamicHubCommand,
+    DynamicHubDeadLetter, DynamicHubError, DynamicHubEvent, DynamicHubEventKind,
+    DynamicHubMetadata, DynamicHubOptions, DynamicHubStatus, DynamicHubUnknownTopicPolicy,
+    MessageBus, MessageBusEvent, MessageEnvelope, ToHubTopicBundle,
 };
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{

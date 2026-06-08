@@ -688,6 +688,14 @@ impl Graph {
         );
     }
 
+    pub(crate) fn retain<T: 'static>(&self, node: &Node<T>, reason: &str) -> Box<dyn FnOnce()> {
+        assert!(
+            node.erased().same_graph_arena(&self.inner.arena),
+            "graph: cannot retain node for {reason}; node belongs to a different graph"
+        );
+        node.subscribe(|_| {})
+    }
+
     fn assert_graph_local_deps(&self, deps: &[Core], label: &str) {
         for dep in deps {
             assert!(
