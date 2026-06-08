@@ -82,6 +82,13 @@ mod versioning;
 #[cfg(feature = "tokio-worker")]
 pub mod worker;
 
+pub use adapters::bridge::{
+    wire_bridge, wire_bridge_envelope, wire_bridge_idempotency_key, WireBridgeAck,
+    WireBridgeAttempt, WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope,
+    WireBridgeEnvelopeError, WireBridgeEnvelopeInput, WireBridgeEnvelopeType, WireBridgeEvent,
+    WireBridgeInbound, WireBridgeIngress, WireBridgeMetadata, WireBridgeNack, WireBridgeOptions,
+    WireBridgePayload, WireBridgeReceipt, WireBridgeStatus, WireBridgeStatusState,
+};
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
     to_websocket_with_options, OutboundAdapterOptions, OutboundBundle, OutboundEvent,
