@@ -79,6 +79,8 @@ pub mod sources;
 pub mod storage;
 pub mod time;
 mod versioning;
+#[cfg(feature = "tokio-worker")]
+pub mod worker;
 
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
@@ -208,3 +210,5 @@ pub use versioning::{
     default_node_version_hash, NodeVersion, NodeVersionHashFn, NodeVersioningPolicy,
     ResolvedNodeVersioningPolicy,
 };
+#[cfg(feature = "tokio-worker")]
+pub use worker::worker_derived;

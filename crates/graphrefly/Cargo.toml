@@ -17,6 +17,7 @@ default          = []
 tokio            = ["dep:tokio"]
 tokio-http       = ["tokio", "dep:reqwest"]
 tokio-websocket  = ["tokio", "dep:futures-util", "dep:tokio-tungstenite"]
+tokio-worker     = ["tokio"]
 
 [dependencies]
 futures-core = { version = "0.3", default-features = false }
