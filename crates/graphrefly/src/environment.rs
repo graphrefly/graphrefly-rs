@@ -162,6 +162,28 @@ pub enum WebSocketEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSend {
+    pub data: Vec<u8>,
+}
+
+impl WebSocketSend {
+    pub fn text(data: impl Into<String>) -> Self {
+        Self {
+            data: data.into().into_bytes(),
+        }
+    }
+
+    pub fn binary(data: impl Into<Vec<u8>>) -> Self {
+        Self { data: data.into() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebSocketSendResult {
+    pub sent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookRegistration {
     pub id: String,
     pub method: Option<String>,
@@ -237,6 +259,15 @@ pub trait LocalWebSocketDriver {
         request: WebSocketRequest,
         callback: Rc<dyn Fn(WebSocketDriverEvent)>,
     ) -> DriverCancel;
+
+    fn send(
+        &self,
+        _request: WebSocketRequest,
+        _message: WebSocketSend,
+        _callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
+    ) -> Option<DriverCancel> {
+        None
+    }
 }
 
 pub enum WebhookDriverEvent {

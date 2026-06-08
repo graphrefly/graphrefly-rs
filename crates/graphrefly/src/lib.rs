@@ -69,6 +69,7 @@ pub mod environment;
 pub mod graph;
 pub mod higher_order;
 pub mod json;
+pub mod messaging;
 pub mod node;
 pub mod operators;
 pub mod protocol;
@@ -79,6 +80,11 @@ pub mod storage;
 pub mod time;
 mod versioning;
 
+pub use adapters::environment::{
+    to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
+    to_websocket_with_options, OutboundAdapterOptions, OutboundBundle, OutboundEvent,
+    OutboundState, OutboundStatus,
+};
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;
 pub use async_driver::{DriverCancel, LocalAsyncDriver};
@@ -121,7 +127,7 @@ pub use environment::{
     EnvironmentDrivers, HttpRequest, HttpResponse, LocalHttpDriver, LocalProcessDriver,
     LocalSseDriver, LocalWebSocketDriver, LocalWebhookDriver, ProcessCommand, ProcessResult,
     SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
-    WebhookDriverEvent, WebhookEvent, WebhookRegistration,
+    WebSocketSend, WebSocketSendResult, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
@@ -140,6 +146,9 @@ pub use json::{
     u128_to_non_negative_decimal_string, Codec, DecimalIntegerString, JsonCodec, JsonCodecError,
     JsonCodecResult, JsonValue, NonNegativeDecimalIntegerString, StrictJsonCodec,
 };
+pub use messaging::{
+    from_topic, message_bus, to_topic, topic_core, MessageBus, MessageBusEvent, MessageEnvelope,
+};
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
@@ -152,7 +161,11 @@ pub use render::{
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
-pub use resilience::{BackoffPolicy, RetryPolicy, RetryState, RetryStatus};
+pub use resilience::{
+    breaker_status_node, rate_limit_bundle, retry_status_node, timeout_bundle, BackoffPolicy,
+    BreakerState, BreakerStatus, RateLimitBundle, RateLimitStatus, RetryEvent, RetryPolicy,
+    RetryState, RetryStatus, TimeoutBundle, TimeoutStatus,
+};
 pub use sources::{
     empty, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
     from_git_hook, from_git_hook_with_options, from_http, from_http_with_options, from_iter,
