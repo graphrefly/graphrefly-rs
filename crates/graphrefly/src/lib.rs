@@ -121,8 +121,12 @@ pub use diagnostics::{
     ReachableDirection, ReachableOptions, ReachableResult, ValidateNoIslandsResult,
 };
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
+#[cfg(feature = "tokio-http")]
+pub use environment::TokioHttpDriver;
 #[cfg(feature = "tokio")]
 pub use environment::TokioProcessDriver;
+#[cfg(feature = "tokio-websocket")]
+pub use environment::TokioWebSocketDriver;
 pub use environment::{
     EnvironmentDrivers, HttpRequest, HttpResponse, LocalHttpDriver, LocalProcessDriver,
     LocalSseDriver, LocalWebSocketDriver, LocalWebhookDriver, ProcessCommand, ProcessResult,
