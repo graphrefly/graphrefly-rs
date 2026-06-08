@@ -2,9 +2,9 @@
 //!
 //! Worker work never receives `Ctx`, `Node`, `Rc<RefCell<...>>`, live topology,
 //! or erased graph values. The graph-thread kickoff prepares one owned `Send`
-//! input from normal ctx dep reads, then a Tokio blocking worker computes over
-//! that input. Completion is awaited on the graph-local async driver and emitted
-//! through `DeferredCtx` as a fresh later wave.
+//! input from normal ctx dep reads, then submits the owned compute to the
+//! dispatcher-owned worker backend. Completion is awaited on the graph-local
+//! async driver and emitted through `DeferredCtx` as a fresh later wave.
 
 use std::cell::Cell;
 use std::fmt;
@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ctx::Ctx;
-use crate::dispatcher::PoolKind;
+use crate::dispatcher::{PoolKind, WorkerSubmitError};
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::node::{Core, Node, NodeOpts};
 use crate::operators::Operator;
@@ -52,6 +52,12 @@ where
             ..NodeOpts::default()
         },
         move |ctx| {
+            let latest_invocation = latest_invocation.clone();
+            let invocation = latest_invocation
+                .get()
+                .checked_add(1)
+                .expect("worker_derived invocation generation overflow");
+            latest_invocation.set(invocation);
             let Some(input) = prepare(ctx) else {
                 ctx.down(vec![Message::Resolved]);
                 return;
@@ -62,25 +68,25 @@ where
                 )]);
                 return;
             };
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                ctx.down(vec![Message::Error(
-                    "worker_derived: missing Tokio runtime".into(),
-                )]);
-                return;
-            };
-
             let out = ctx.defer();
             let compute = compute.clone();
-            let latest_invocation = latest_invocation.clone();
-            let invocation = latest_invocation
-                .get()
-                .checked_add(1)
-                .expect("worker_derived invocation generation overflow");
-            latest_invocation.set(invocation);
+            let job = match ctx.dispatcher().submit_worker(input, compute) {
+                Ok(job) => job,
+                Err(WorkerSubmitError::MissingBackend) => {
+                    ctx.down(vec![Message::Error(
+                        "worker_derived: missing worker backend".into(),
+                    )]);
+                    return;
+                }
+                Err(WorkerSubmitError::MissingRuntime) => {
+                    ctx.down(vec![Message::Error(
+                        "worker_derived: missing Tokio runtime".into(),
+                    )]);
+                    return;
+                }
+            };
             let cancel = driver.spawn_local(Box::pin(async move {
-                let joined = handle
-                    .spawn_blocking(move || compute(input).map_err(|e| e.to_string()))
-                    .await;
+                let joined = job.spawn().await;
                 if latest_invocation.get() != invocation {
                     return;
                 }
@@ -105,11 +111,13 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;
     use std::time::Duration;
 
     use crate::async_driver::{DriverCancel, LocalAsyncDriver, TokioLocalDriver};
+    use crate::dispatcher::Dispatcher;
     use crate::environment::EnvironmentDrivers;
     use crate::graph::{graph_opts, GraphOptions};
     use crate::node::Status;
@@ -197,6 +205,22 @@ mod tests {
 
         fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
             panic!("NeverDriver.spawn_local should not be called")
+        }
+    }
+
+    struct PanickingSpawnDriver;
+
+    impl LocalAsyncDriver for PanickingSpawnDriver {
+        fn sleep(&self, _duration: Duration, _callback: Box<dyn FnOnce()>) -> DriverCancel {
+            panic!("PanickingSpawnDriver.sleep should not be called")
+        }
+
+        fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
+            panic!("PanickingSpawnDriver.interval should not be called")
+        }
+
+        fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
+            panic!("local waiter unavailable")
         }
     }
 
@@ -293,6 +317,38 @@ mod tests {
     }
 
     #[test]
+    fn worker_derived_no_submit_invocation_fences_prior_worker_result() {
+        run_tokio_local(async {
+            let g = graph_opts(GraphOptions {
+                environment: EnvironmentDrivers::new().with_local_async(Rc::new(TokioLocalDriver)),
+                ..GraphOptions::default()
+            });
+            let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
+            let worker = worker_derived(
+                &g,
+                vec![source.erased()],
+                |ctx| {
+                    let value = *ctx.data::<i32>(0)?;
+                    (value != 0).then_some(value)
+                },
+                |value| {
+                    std::thread::sleep(Duration::from_millis(75));
+                    Ok::<_, String>(value)
+                },
+                GraphNodeOpts::named("worker"),
+            );
+            let _sub = worker.subscribe(|_| {});
+
+            source.set(1);
+            source.set(0);
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(worker.cache(), None);
+            assert_eq!(worker.status(), Status::Sentinel);
+        });
+    }
+
+    #[test]
     fn worker_derived_dep_complete_does_not_seal_pending_worker_result() {
         run_tokio_local(async {
             let g = graph_opts(GraphOptions {
@@ -346,6 +402,69 @@ mod tests {
             &*errors.borrow(),
             &["worker_derived: missing local async driver".to_owned()]
         );
+    }
+
+    #[test]
+    fn worker_derived_missing_worker_backend_errors_before_spawning_local_task() {
+        let dispatcher = Dispatcher::new();
+        dispatcher.set_worker_backend_for_test(false);
+        let g = graph_opts(GraphOptions {
+            dispatcher: Some(dispatcher),
+            environment: EnvironmentDrivers::new().with_local_async(Rc::new(NeverDriver)),
+            ..GraphOptions::default()
+        });
+        let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
+        let worker = worker_derived(
+            &g,
+            vec![source.erased()],
+            |ctx| ctx.data::<i32>(0).map(|v| *v),
+            Ok::<_, String>,
+            GraphNodeOpts::named("worker"),
+        );
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let errors_sink = errors.clone();
+        let _sub = worker.subscribe(move |msg| {
+            if let Message::Error(error) = msg {
+                errors_sink.borrow_mut().push(error.to_string());
+            }
+        });
+
+        source.set(1);
+
+        assert_eq!(
+            &*errors.borrow(),
+            &["worker_derived: missing worker backend".to_owned()]
+        );
+    }
+
+    #[test]
+    fn worker_derived_does_not_start_worker_before_local_waiter_is_scheduled() {
+        run_tokio_local(async {
+            let compute_runs = Arc::new(AtomicUsize::new(0));
+            let compute_runs_for_worker = compute_runs.clone();
+            let g = graph_opts(GraphOptions {
+                environment: EnvironmentDrivers::new()
+                    .with_local_async(Rc::new(PanickingSpawnDriver)),
+                ..GraphOptions::default()
+            });
+            let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
+            let worker = worker_derived(
+                &g,
+                vec![source.erased()],
+                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                move |value| {
+                    compute_runs_for_worker.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(value)
+                },
+                GraphNodeOpts::named("worker"),
+            );
+            let _sub = worker.subscribe(|_| {});
+
+            source.set(1);
+            tokio::task::yield_now().await;
+
+            assert_eq!(compute_runs.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]

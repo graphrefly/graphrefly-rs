@@ -210,6 +210,11 @@ impl Ctx {
         self.node.local_async_driver()
     }
 
+    #[cfg(feature = "tokio-worker")]
+    pub(crate) fn dispatcher(&self) -> crate::dispatcher::Dispatcher {
+        self.node.dispatcher()
+    }
+
     pub(crate) fn environment(&self) -> crate::environment::EnvironmentDrivers {
         self.node.environment()
     }

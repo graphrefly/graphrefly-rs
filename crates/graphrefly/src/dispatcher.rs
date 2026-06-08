@@ -19,6 +19,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+#[cfg(feature = "tokio-worker")]
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::async_driver::LocalAsyncDriver;
@@ -123,6 +125,8 @@ struct DispatcherInner {
     recording: bool,
     stats: HashMap<Handle, ProfileStat>,
     local_async_driver: Option<Rc<dyn LocalAsyncDriver>>,
+    #[cfg(feature = "tokio-worker")]
+    worker_backend: Option<WorkerBackend>,
 }
 
 /// First-class dispatcher (D21), cloneable handle over shared inner state. A graph
@@ -144,6 +148,56 @@ pub struct ProfileStat {
     pub last_duration_ns: u128,
 }
 
+#[cfg(feature = "tokio-worker")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerSubmitError {
+    MissingBackend,
+    MissingRuntime,
+}
+
+#[cfg(feature = "tokio-worker")]
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerBackend;
+
+#[cfg(feature = "tokio-worker")]
+type WorkerTask<R> = Box<dyn FnOnce() -> Result<R, String> + Send + 'static>;
+
+#[cfg(feature = "tokio-worker")]
+pub(crate) struct WorkerJob<R> {
+    handle: tokio::runtime::Handle,
+    task: WorkerTask<R>,
+}
+
+#[cfg(feature = "tokio-worker")]
+impl<R: Send + 'static> WorkerJob<R> {
+    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<Result<R, String>> {
+        let task = self.task;
+        self.handle.spawn_blocking(task)
+    }
+}
+
+#[cfg(feature = "tokio-worker")]
+impl WorkerBackend {
+    fn submit<I, R, E, C>(
+        self,
+        input: I,
+        compute: Arc<C>,
+    ) -> Result<WorkerJob<R>, WorkerSubmitError>
+    where
+        I: Send + 'static,
+        R: Send + 'static,
+        E: fmt::Display + Send + 'static,
+        C: Fn(I) -> Result<R, E> + Send + Sync + 'static,
+    {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| WorkerSubmitError::MissingRuntime)?;
+        Ok(WorkerJob {
+            handle,
+            task: Box::new(move || compute(input).map_err(|error| error.to_string())),
+        })
+    }
+}
+
 /// The LocalSync pool id (D20).
 pub const SYNC_POOL_ID: u32 = 0;
 /// The LocalAsync pool id (D20).
@@ -157,6 +211,8 @@ impl Dispatcher {
             recording: false,
             stats: HashMap::new(),
             local_async_driver: None,
+            #[cfg(feature = "tokio-worker")]
+            worker_backend: Some(WorkerBackend),
         })))
     }
 
@@ -178,6 +234,31 @@ impl Dispatcher {
     /// Read the installed local async/time source driver, if any.
     pub fn local_async_driver(&self) -> Option<Rc<dyn LocalAsyncDriver>> {
         self.0.borrow().local_async_driver.clone()
+    }
+
+    #[cfg(feature = "tokio-worker")]
+    pub(crate) fn submit_worker<I, R, E, C>(
+        &self,
+        input: I,
+        compute: Arc<C>,
+    ) -> Result<WorkerJob<R>, WorkerSubmitError>
+    where
+        I: Send + 'static,
+        R: Send + 'static,
+        E: fmt::Display + Send + 'static,
+        C: Fn(I) -> Result<R, E> + Send + Sync + 'static,
+    {
+        let backend = self
+            .0
+            .borrow()
+            .worker_backend
+            .ok_or(WorkerSubmitError::MissingBackend)?;
+        backend.submit(input, compute)
+    }
+
+    #[cfg(all(test, feature = "tokio-worker"))]
+    pub(crate) fn set_worker_backend_for_test(&self, installed: bool) {
+        self.0.borrow_mut().worker_backend = installed.then_some(WorkerBackend);
     }
 
     /// Register a fn in the sync pool, returning its [`Handle`] (R-dispatch-all).
