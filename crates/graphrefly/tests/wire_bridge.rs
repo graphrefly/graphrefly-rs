@@ -786,3 +786,96 @@ fn remote_responder_handler_error_is_local_error_fact_and_remote_error_response(
         _ => panic!("handler Err must stay a bridge DATA error response"),
     };
 }
+
+#[test]
+fn remote_responder_release_detaches_response_commands_from_long_lived_bridge() {
+    let g = graph();
+    let bridge = wire_bridge::<RemoteCallResponse<String>, RemoteCallRequest<String>>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let responder = remote_responder(
+        &g,
+        &bridge,
+        RemoteResponderOptions::named("responder").with_handlers(vec![remote_responder_handler(
+            "uppercase",
+            |request: &RemoteCallRequest<String>| Ok(request.payload.to_uppercase()),
+        )]),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    assert!(g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| { edge.from == "responder/responseCommands" && edge.to == "bridge/command" }));
+
+    responder.release();
+    responder.release();
+
+    assert!(g.find("responder/responseCommands").is_none());
+    assert!(!g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| { edge.from == "responder/responseCommands" && edge.to == "bridge/command" }));
+    bridge.inbound.set(envelope_with_request(
+        "session-a",
+        WireBridgeEnvelopeType::Data,
+        1,
+        Some(WireBridgePayload::Data(RemoteCallRequest::new(
+            "uppercase",
+            "req-1",
+            "hello".to_owned(),
+        ))),
+        Some("req-1"),
+    ));
+    assert!(
+        outbound.borrow().is_empty(),
+        "released responder must not publish response command facts"
+    );
+}
+
+#[test]
+fn remote_responder_release_is_retryable_when_external_subscriber_blocks_release() {
+    let g = graph();
+    let bridge = wire_bridge::<RemoteCallResponse<String>, RemoteCallRequest<String>>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let responder = remote_responder(
+        &g,
+        &bridge,
+        RemoteResponderOptions::named("responder").with_handlers(vec![remote_responder_handler(
+            "uppercase",
+            |request: &RemoteCallRequest<String>| Ok(request.payload.to_uppercase()),
+        )]),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    let unsub = responder.status.subscribe(|_| {});
+
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| responder.release())).is_err()
+    );
+    assert!(g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| { edge.from == "responder/responseCommands" && edge.to == "bridge/command" }));
+
+    bridge.inbound.set(envelope_with_request(
+        "session-a",
+        WireBridgeEnvelopeType::Data,
+        1,
+        Some(WireBridgePayload::Data(RemoteCallRequest::new(
+            "uppercase",
+            "req-1",
+            "hello".to_owned(),
+        ))),
+        Some("req-1"),
+    ));
+    assert_eq!(outbound.borrow().len(), 1);
+
+    unsub();
+    responder.release();
+    assert!(g.find("responder/status").is_none());
+}

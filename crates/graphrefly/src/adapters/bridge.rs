@@ -4,7 +4,7 @@
 //! envelope facts; remote receipts enter as later inbound DATA envelope facts.
 //! Remote ERROR/COMPLETE are bridge facts, never local protocol terminals.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -673,6 +673,47 @@ pub struct RemoteResponderBundle<TRequest: Clone + 'static, TResponse: Clone + '
     pub requests: Node<RemoteCallRequest<TRequest>>,
     pub status: Node<RemoteResponderStatus>,
     pub errors: Node<RemoteCallError>,
+    graph: Graph,
+    bridge_command: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
+    command_sources: Rc<RefCell<Vec<Core>>>,
+    released: Cell<bool>,
+}
+
+impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
+    RemoteResponderBundle<TRequest, TResponse>
+{
+    /// D157 graph-owned responder release: detach responseCommands before releasing nodes.
+    pub fn release(&self) {
+        if self.released.get() {
+            return;
+        }
+        detach_wire_bridge_command_source(
+            &self.bridge_command,
+            &self.command_sources,
+            self.response_commands.erased(),
+        );
+        let release = catch_unwind(AssertUnwindSafe(|| {
+            self.graph.release_nodes(
+                &[
+                    self.events.erased(),
+                    self.response_commands.erased(),
+                    self.requests.erased(),
+                    self.status.erased(),
+                    self.errors.erased(),
+                ],
+                "remote_responder release",
+            );
+        }));
+        if let Err(panic) = release {
+            attach_wire_bridge_command_source_parts(
+                &self.bridge_command,
+                &self.command_sources,
+                self.response_commands.erased(),
+            );
+            resume_unwind(panic);
+        }
+        self.released.set(true);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,6 +928,10 @@ where
         requests,
         status,
         errors,
+        graph: graph.clone(),
+        bridge_command: bridge.command.clone(),
+        command_sources: bridge.command_sources.clone(),
+        released: Cell::new(false),
     }
 }
 
@@ -1828,20 +1873,70 @@ fn attach_wire_bridge_command_source<TOutbound, TInbound>(
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    bridge.command_sources.borrow_mut().push(source.clone());
-    let command_sources = bridge.command_sources.borrow().clone();
+    attach_wire_bridge_command_source_parts(&bridge.command, &bridge.command_sources, source);
+}
+
+fn attach_wire_bridge_command_source_parts<TOutbound>(
+    command: &Node<WireBridgeCommand<TOutbound>>,
+    sources: &Rc<RefCell<Vec<Core>>>,
+    source: Core,
+) where
+    TOutbound: Clone + 'static,
+{
+    let previous = sources.borrow().clone();
+    {
+        let mut current = sources.borrow_mut();
+        if !current.iter().any(|candidate| candidate.ptr_eq(&source)) {
+            current.push(source.clone());
+        }
+    }
+    let command_sources = sources.borrow().clone();
     let source_count = command_sources.len();
     let rewire = catch_unwind(AssertUnwindSafe(|| {
-        bridge.command.replace_deps(
+        command.replace_deps(
             command_sources,
             wire_bridge_command_body::<TOutbound>(source_count),
         );
     }));
     if let Err(panic) = rewire {
-        bridge
-            .command_sources
-            .borrow_mut()
-            .retain(|candidate| !candidate.ptr_eq(&source));
+        *sources.borrow_mut() = previous.clone();
+        command.replace_deps(
+            previous,
+            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
+        );
+        resume_unwind(panic);
+    }
+}
+
+fn detach_wire_bridge_command_source<TOutbound>(
+    command: &Node<WireBridgeCommand<TOutbound>>,
+    sources: &Rc<RefCell<Vec<Core>>>,
+    source: Core,
+) where
+    TOutbound: Clone + 'static,
+{
+    let previous = sources.borrow().clone();
+    if !previous.iter().any(|candidate| candidate.ptr_eq(&source)) {
+        return;
+    }
+    let next = previous
+        .iter()
+        .filter(|candidate| !candidate.ptr_eq(&source))
+        .cloned()
+        .collect::<Vec<_>>();
+    *sources.borrow_mut() = next.clone();
+    let rewire = catch_unwind(AssertUnwindSafe(|| {
+        command.replace_deps(
+            next,
+            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
+        );
+    }));
+    if let Err(panic) = rewire {
+        *sources.borrow_mut() = previous.clone();
+        command.replace_deps(
+            previous,
+            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
+        );
         resume_unwind(panic);
     }
 }
