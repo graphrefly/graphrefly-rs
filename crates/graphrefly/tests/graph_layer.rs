@@ -11,10 +11,10 @@ use graphrefly::{
     DescribeEvent, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection,
     Dispatcher, Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge,
     GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions,
-    GraphRestoreDefinition, GraphRestoreEntry, IslandReport, LockId, Message, NodeOpts,
+    GraphRestoreDefinition, GraphRestoreEntry, IslandReport, LockId, Message, Node, NodeOpts,
     NodeVersion, NodeVersioningPolicy, Pausable, ReachableDirection, ReachableOptions,
     ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, TopologyEvent,
-    TopologyEventKind, Values, GRAPH_CHECKPOINT_VERSION,
+    TopologyEventKind, TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -239,6 +239,164 @@ fn observe_topology_deps_changed_matches_describe_edges() {
         from: "a".to_owned(),
         to: "d".to_owned(),
     }));
+}
+
+#[test]
+fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
+    let g = graph_opts(GraphOptions {
+        profile: true,
+        ..GraphOptions::default()
+    });
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology()
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+    let group = g.topology_group_opts(TopologyGroupOptions::named("view"));
+
+    let delta = group.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("view.delta"),
+    );
+    let _snapshot = group.derived_opts(
+        vec![delta.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("view.snapshot"),
+    );
+
+    assert!(g.find("view.delta").is_some());
+    assert!(g.find("view.snapshot").is_some());
+    let describe_ids = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    assert!(describe_ids.contains(&"source".to_owned()));
+    assert!(describe_ids.contains(&"view.delta".to_owned()));
+    assert!(describe_ids.contains(&"view.snapshot".to_owned()));
+    assert!(g.profile().nodes.contains_key("view.delta"));
+    assert!(g
+        .checkpoint()
+        .unwrap()
+        .nodes
+        .iter()
+        .any(|node| node.id == "view.delta"));
+
+    group.release();
+    group.release();
+    observer.unsubscribe();
+
+    assert!(group.is_released());
+    let events = events.borrow();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[0].path, "view.delta");
+    assert_eq!(events[0].deps, vec!["source".to_owned()]);
+    assert_eq!(events[0].factory.as_deref(), Some("derived"));
+    assert_eq!(events[0].seq, 0);
+    assert_eq!(events[1].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[1].path, "view.snapshot");
+    assert_eq!(events[1].deps, vec!["view.delta".to_owned()]);
+    assert_eq!(events[1].factory.as_deref(), Some("derived"));
+    assert_eq!(events[1].seq, 1);
+    assert_eq!(events[2].kind, TopologyEventKind::NodeReleased);
+    assert_eq!(events[2].path, "view.delta");
+    assert_eq!(events[2].deps, vec!["source".to_owned()]);
+    assert_eq!(events[2].factory.as_deref(), Some("derived"));
+    assert_eq!(events[2].seq, 2);
+    assert_eq!(events[3].kind, TopologyEventKind::NodeReleased);
+    assert_eq!(events[3].path, "view.snapshot");
+    assert_eq!(events[3].deps, vec!["view.delta".to_owned()]);
+    assert_eq!(events[3].factory.as_deref(), Some("derived"));
+    assert_eq!(events[3].seq, 3);
+
+    assert!(g.find("view.delta").is_none());
+    assert!(!g
+        .describe()
+        .nodes
+        .iter()
+        .any(|node| node.id == "view.delta"));
+    assert!(!g.profile().nodes.contains_key("view.delta"));
+    assert!(!g
+        .checkpoint()
+        .unwrap()
+        .nodes
+        .iter()
+        .any(|node| node.id == "view.delta"));
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        g.state_opts(0i32, GraphNodeOpts::named("view.delta"));
+    }))
+    .is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        group.state_opts(0i32, GraphNodeOpts::named("late"));
+    }))
+    .is_err());
+}
+
+#[test]
+fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
+    let g = graph();
+    let group = g.topology_group_opts(TopologyGroupOptions::named("view"));
+    let registered = g.state_opts(1i32, GraphNodeOpts::named("registered"));
+    let added = group.add(&registered);
+    assert_eq!(added.cache(), Some(1));
+    let duplicate = group.add(&registered);
+    assert_eq!(duplicate.cache(), Some(1));
+
+    let other = graph().state_opts(1i32, GraphNodeOpts::named("other"));
+    assert!(catch_unwind(AssertUnwindSafe(|| group.add(&other))).is_err());
+
+    let released_group = g.topology_group();
+    let temp = released_group.state_opts(1i32, GraphNodeOpts::named("temp"));
+    released_group.release();
+    let fresh_group = g.topology_group();
+    assert!(catch_unwind(AssertUnwindSafe(|| fresh_group.add(&temp))).is_err());
+
+    let bare = Node::state(1i32);
+    assert!(catch_unwind(AssertUnwindSafe(|| group.add(&bare))).is_err());
+}
+
+#[test]
+fn topology_group_release_rejects_external_deps_subscribers_and_dirty_nodes() {
+    let g = graph();
+
+    let dep_group = g.topology_group_opts(TopologyGroupOptions::named("dep"));
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let child = dep_group.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("dep.child"),
+    );
+    let _consumer = g.derived_opts(
+        vec![child.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("consumer"),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| dep_group.release())).is_err());
+    assert!(!dep_group.is_released());
+    assert!(g.find("dep.child").is_some());
+
+    let sub_group = g.topology_group_opts(TopologyGroupOptions::named("sub"));
+    let subscribed = sub_group.state_opts(1i32, GraphNodeOpts::named("sub.child"));
+    let unsub = subscribed.subscribe(|_| {});
+    assert!(catch_unwind(AssertUnwindSafe(|| sub_group.release())).is_err());
+    assert!(!sub_group.is_released());
+    unsub();
+    sub_group.release();
+    assert!(sub_group.is_released());
+    assert!(g.find("sub.child").is_none());
+
+    let dirty_group = g.topology_group_opts(TopologyGroupOptions::named("dirty"));
+    let dirty =
+        dirty_group.node_opts::<i32, _>(vec![], |_| {}, GraphNodeOpts::named("dirty.child"));
+    dirty.down(vec![Message::Dirty]);
+    assert_eq!(dirty.status(), Status::Dirty);
+    assert!(catch_unwind(AssertUnwindSafe(|| dirty_group.release())).is_err());
+    assert!(!dirty_group.is_released());
+    assert!(g.find("dirty.child").is_some());
 }
 
 #[test]

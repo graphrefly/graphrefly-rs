@@ -73,6 +73,20 @@ impl GraphNodeOpts {
     }
 }
 
+/// Graph-owned topology/release group options (D152).
+#[derive(Debug, Clone, Default)]
+pub struct TopologyGroupOptions {
+    pub name: Option<String>,
+}
+
+impl TopologyGroupOptions {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoreFactoryMeta {
     pub ref_: String,
@@ -149,6 +163,184 @@ pub struct Graph {
     inner: Rc<GraphInner>,
 }
 
+struct TopologyGroupInner {
+    graph: Graph,
+    name: Option<String>,
+    members: RefCell<Vec<Core>>,
+    released: Cell<bool>,
+}
+
+/// D152 graph-owned release group over ordinary graph-registered nodes.
+///
+/// The group is a label/release handle, not a registry: the graph registry remains
+/// the source of truth for describe/find/profile/checkpoint and id retirement.
+#[derive(Clone)]
+pub struct TopologyGroup {
+    inner: Rc<TopologyGroupInner>,
+}
+
+impl TopologyGroup {
+    fn new(graph: Graph, opts: TopologyGroupOptions) -> Self {
+        Self {
+            inner: Rc::new(TopologyGroupInner {
+                graph,
+                name: opts.name,
+                members: RefCell::new(Vec::new()),
+                released: Cell::new(false),
+            }),
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.inner.released.get()
+    }
+
+    pub fn add<T: 'static>(&self, node: &Node<T>) -> Node<T> {
+        self.assert_live();
+        self.inner.graph.assert_registered_core(
+            &node.erased(),
+            &format!("topology group '{}' member", self.name().unwrap_or("group")),
+        );
+        self.track(node.erased());
+        node.clone()
+    }
+
+    pub fn node<T: 'static, F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) -> Node<T> {
+        self.node_opts(deps, f, GraphNodeOpts::default())
+    }
+
+    pub fn node_opts<T: 'static, F: Fn(&Ctx) + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.node_opts(deps, f, opts))
+    }
+
+    pub fn state<T: 'static>(&self, initial: T) -> Node<T> {
+        self.state_opts(initial, GraphNodeOpts::default())
+    }
+
+    pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.state_opts(initial, opts))
+    }
+
+    pub fn state_empty<T: 'static>(&self) -> Node<T> {
+        self.state_empty_opts(GraphNodeOpts::default())
+    }
+
+    pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.state_empty_opts(opts))
+    }
+
+    pub fn producer<T: 'static, F: Fn(&Ctx) + 'static>(&self, f: F) -> Node<T> {
+        self.producer_opts(f, GraphNodeOpts::default())
+    }
+
+    pub fn producer_opts<T: 'static, F: Fn(&Ctx) + 'static>(
+        &self,
+        f: F,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.producer_opts(f, opts))
+    }
+
+    pub fn derived<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+    ) -> Node<T> {
+        self.derived_opts(deps, f, GraphNodeOpts::default())
+    }
+
+    pub fn derived_opts<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.derived_opts(deps, f, opts))
+    }
+
+    pub fn effect<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+    ) -> Node<()> {
+        self.effect_opts(deps, f, GraphNodeOpts::default())
+    }
+
+    pub fn effect_opts<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
+        &self,
+        deps: Vec<Core>,
+        f: F,
+        opts: GraphNodeOpts,
+    ) -> Node<()> {
+        self.assert_live();
+        self.track_node(self.inner.graph.effect_opts(deps, f, opts))
+    }
+
+    pub fn init_node<T: 'static>(
+        &self,
+        op: Operator<T>,
+        deps: Vec<Core>,
+        opts: GraphNodeOpts,
+    ) -> Node<T> {
+        self.assert_live();
+        self.track_node(self.inner.graph.init_node(op, deps, opts))
+    }
+
+    pub fn release(&self) {
+        let reason = self
+            .inner
+            .name
+            .clone()
+            .unwrap_or_else(|| "topology group".to_owned());
+        self.release_with_reason(&reason);
+    }
+
+    pub fn release_with_reason(&self, reason: &str) {
+        if self.inner.released.get() {
+            return;
+        }
+        let members = self.inner.members.borrow().clone();
+        self.inner.graph.release_nodes(&members, reason);
+        self.inner.members.borrow_mut().clear();
+        self.inner.released.set(true);
+    }
+
+    fn track_node<T: 'static>(&self, node: Node<T>) -> Node<T> {
+        self.assert_live();
+        self.track(node.erased());
+        node
+    }
+
+    fn track(&self, core: Core) {
+        let mut members = self.inner.members.borrow_mut();
+        if !members.iter().any(|member| member.ptr_eq(&core)) {
+            members.push(core);
+        }
+    }
+
+    fn assert_live(&self) {
+        assert!(
+            !self.inner.released.get(),
+            "topology group '{}' has been released (D152)",
+            self.name().unwrap_or("group")
+        );
+    }
+}
+
 impl Graph {
     pub fn new(opts: GraphOptions) -> Self {
         let dispatcher = opts.dispatcher.unwrap_or_else(default_dispatcher);
@@ -186,6 +378,16 @@ impl Graph {
 
     pub fn name(&self) -> Option<&str> {
         self.inner.name.as_deref()
+    }
+
+    /// D152 graph-owned topology/release group. Members are ordinary registered
+    /// graph nodes and release is quiescent-only; no protocol messages are synthesized.
+    pub fn topology_group(&self) -> TopologyGroup {
+        self.topology_group_opts(TopologyGroupOptions::default())
+    }
+
+    pub fn topology_group_opts(&self, opts: TopologyGroupOptions) -> TopologyGroup {
+        TopologyGroup::new(self.clone(), opts)
     }
 
     /// Look up a registered graph node by stable id.
@@ -682,6 +884,27 @@ impl Graph {
                 "graph: cannot release node group for {reason}; '{id}' still has live subscribers (D124)"
             );
         }
+        let release_events = if self.has_topology_observers() {
+            release_entries
+                .iter()
+                .filter_map(|(id, core)| {
+                    self.inner
+                        .entries
+                        .borrow()
+                        .iter()
+                        .find(|entry| entry.id == *id && entry.core.ptr_eq(core))
+                        .map(|entry| {
+                            (
+                                entry.id.clone(),
+                                entry.factory.clone(),
+                                self.topology_deps(&entry.core.deps()),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         {
             let mut entries = self.inner.entries.borrow_mut();
             entries.retain(|entry| !release_ids.contains(&entry.id));
@@ -721,6 +944,11 @@ impl Graph {
                 break;
             }
         }
+        if pending.is_empty() {
+            for (id, factory, deps) in release_events {
+                self.emit_topology_node_released(id, factory, deps);
+            }
+        }
         if let Some(panic) = first_panic {
             resume_unwind(panic);
         }
@@ -745,6 +973,21 @@ impl Graph {
                 "{label} dep belongs to a different graph; cross-graph deps require a wire bridge"
             );
         }
+    }
+
+    fn assert_registered_core(&self, core: &Core, label: &str) {
+        assert!(
+            core.same_graph_arena(&self.inner.arena),
+            "{label} belongs to a different graph; cross-graph deps require a wire bridge"
+        );
+        assert!(
+            self.inner
+                .entries
+                .borrow()
+                .iter()
+                .any(|entry| entry.core.ptr_eq(core)),
+            "{label} is not a registered graph node (D152)"
+        );
     }
 
     fn registered_id_for_core(&self, core: &Core, prefix: &str) -> Option<String> {
@@ -830,6 +1073,22 @@ impl Graph {
             deps: self.topology_deps(new_deps),
             prev_deps: Some(self.topology_deps(old_deps)),
             factory: None,
+            seq,
+        });
+    }
+
+    fn emit_topology_node_released(&self, path: String, factory: String, deps: Vec<String>) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        let seq = self.inner.clock.get();
+        self.inner.clock.set(seq + 1);
+        self.emit_topology_event(TopologyEvent {
+            kind: TopologyEventKind::NodeReleased,
+            path,
+            deps,
+            prev_deps: None,
+            factory: Some(factory),
             seq,
         });
     }
@@ -1259,6 +1518,7 @@ impl ObserveMessage {
 pub enum TopologyEventKind {
     NodeRegistered,
     DepsChanged,
+    NodeReleased,
 }
 
 #[derive(Clone)]
@@ -1503,7 +1763,7 @@ fn describe_value(value: &AnyValue) -> DescribeValue {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
 
@@ -1536,5 +1796,34 @@ mod tests {
             later_released.get(),
             "a cleanup panic in one released node must not skip later nodes in the group"
         );
+    }
+
+    #[test]
+    fn release_nodes_emits_node_released_even_when_cleanup_panics_after_commit() {
+        let g = graph();
+        let panic_node = g.state_opts(1, GraphNodeOpts::named("panic"));
+        panic_node
+            .erased()
+            .register_on_deactivation(Box::new(|| panic!("cleanup boom")));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let event_sink = events.clone();
+        let observer = g
+            .observe_topology()
+            .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            g.release_nodes(&[panic_node.erased()], "test");
+        }));
+
+        observer.unsubscribe();
+        assert!(result.is_err());
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TopologyEventKind::NodeReleased);
+        assert_eq!(events[0].path, "panic");
+        assert_eq!(events[0].factory.as_deref(), Some("state"));
+        assert_eq!(events[0].deps, Vec::<String>::new());
+        assert_eq!(events[0].seq, 0);
+        assert!(g.find("panic").is_none());
     }
 }

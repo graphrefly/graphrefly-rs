@@ -10,7 +10,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::graph::{Graph, GraphNodeOpts};
+use crate::graph::{Graph, GraphNodeOpts, TopologyGroupOptions};
 use crate::node::{Node, NodeOpts};
 use crate::operators::{init_node, Operator};
 use crate::protocol::{LockId, Message};
@@ -1703,6 +1703,11 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     materialize_snapshot: F,
     on_dispose: Option<ViewDisposeHook>,
 ) -> ReactiveView<C, S> {
+    let group = graph.map(|graph| {
+        graph.topology_group_opts(TopologyGroupOptions::named(
+            name.clone().unwrap_or_else(|| factories.group.to_owned()),
+        ))
+    });
     let delta_op = Operator::with_opts(
         factories.delta,
         NodeOpts {
@@ -1715,15 +1720,15 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             }
         },
     );
-    let delta = match graph {
-        Some(graph) => {
+    let delta = match group.as_ref() {
+        Some(group) => {
             let mut opts =
                 graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}.delta")));
             opts.meta
                 .insert("kind".to_owned(), "collection_view_delta".to_owned());
             opts.meta
                 .insert("factory".to_owned(), factories.group.to_owned());
-            graph.init_node(delta_op, vec![parent_delta.erased()], opts)
+            group.init_node(delta_op, vec![parent_delta.erased()], opts)
         }
         None => init_node(delta_op, vec![parent_delta.erased()], NodeOpts::default()),
     };
@@ -1746,28 +1751,25 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             ctx.emit(materialize_snapshot());
         },
     );
-    let snapshot = match graph {
-        Some(graph) => {
+    let snapshot = match group.as_ref() {
+        Some(group) => {
             let mut opts =
                 graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}.snapshot")));
             opts.meta
                 .insert("kind".to_owned(), "collection_view_snapshot".to_owned());
             opts.meta
                 .insert("factory".to_owned(), factories.group.to_owned());
-            graph.init_node(snapshot_op, vec![delta.erased()], opts)
+            group.init_node(snapshot_op, vec![delta.erased()], opts)
         }
         None => init_node(snapshot_op, vec![delta.erased()], NodeOpts::default()),
     };
     let delta_core = delta.erased();
     let snapshot_core = snapshot.erased();
-    let graph_for_dispose = graph.cloned();
+    let group_for_dispose = group.clone();
     let on_dispose = Rc::new(RefCell::new(on_dispose));
     let dispose_action = Rc::new(move || {
-        if let Some(graph) = graph_for_dispose.as_ref() {
-            graph.release_nodes(
-                &[delta_core.clone(), snapshot_core.clone()],
-                factories.group,
-            );
+        if let Some(group) = group_for_dispose.as_ref() {
+            group.release_with_reason(factories.group);
         } else {
             assert!(
                 snapshot_core.release_runtime_for_graph() && delta_core.release_runtime_for_graph(),

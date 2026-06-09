@@ -9,6 +9,7 @@ use graphrefly::{
     graph, merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
     scan_log, GraphNodeOpts, IndexChange, IndexRow, ListChange, LogChange, MapChange, Message,
     Node, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions,
+    TopologyEvent, TopologyEventKind,
 };
 
 type DataCollector<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
@@ -743,6 +744,62 @@ fn reactive_map_select_dispose_releases_graph_registered_nodes() {
 }
 
 #[test]
+fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
+    let g = graph();
+    let map = reactive_map::<String, i32>(
+        vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
+        ReactiveMapOptions::named("map").graph(g.clone()),
+    );
+    let select = map.select(|value, _| *value > 1);
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology()
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    select.dispose();
+    observer.unsubscribe();
+
+    let events = events.borrow();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].kind, TopologyEventKind::NodeReleased);
+    assert_eq!(events[0].path, "map.select#0.delta");
+    assert_eq!(
+        events[0].factory.as_deref(),
+        Some("reactiveMap.select.delta")
+    );
+    assert_eq!(events[0].deps, vec!["map.delta".to_owned()]);
+    assert_eq!(events[0].seq, 0);
+    assert_eq!(events[1].kind, TopologyEventKind::NodeReleased);
+    assert_eq!(events[1].path, "map.select#0.snapshot");
+    assert_eq!(
+        events[1].factory.as_deref(),
+        Some("reactiveMap.select.snapshot")
+    );
+    assert_eq!(events[1].deps, vec!["map.select#0.delta".to_owned()]);
+    assert_eq!(events[1].seq, 1);
+    assert!(g.find("map.select#0.delta").is_none());
+    assert!(g.find("map.select#0.snapshot").is_none());
+    let describe = g.describe();
+    let describe_ids = describe
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(!describe_ids.contains(&"map.select#0.delta"));
+    assert!(!describe_ids.contains(&"map.select#0.snapshot"));
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    assert!(!checkpoint
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.delta"));
+    assert!(!checkpoint
+        .nodes
+        .iter()
+        .any(|node| node.id == "map.select#0.snapshot"));
+}
+
+#[test]
 #[should_panic(expected = "still depends")]
 fn reactive_log_page_dispose_rejects_external_registered_dependents() {
     let g = graph();
@@ -780,6 +837,51 @@ fn reactive_log_page_dispose_rejects_live_external_subscribers_and_can_retry() {
     unsub();
     page.dispose();
     assert!(g.find("log.page#0.snapshot").is_none());
+}
+
+#[test]
+fn failed_reactive_log_page_dispose_emits_no_node_released_and_keeps_topology() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3, 4],
+        ReactiveLogOptions::named("log").graph(g.clone()),
+    );
+    let page = log.page(1, 2);
+    let _consumer = g.derived_opts(
+        vec![page.snapshot.erased()],
+        |_| Some(0i32),
+        GraphNodeOpts::named("consumer"),
+    );
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology_path("log.page#0")
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    let result = catch_unwind(AssertUnwindSafe(|| page.dispose()));
+
+    observer.unsubscribe();
+    assert!(result.is_err());
+    assert!(events.borrow().is_empty());
+    assert!(g.find("log.page#0.delta").is_some());
+    assert!(g.find("log.page#0.snapshot").is_some());
+    let describe = g.describe();
+    let describe_ids = describe
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(describe_ids.contains(&"log.page#0.delta"));
+    assert!(describe_ids.contains(&"log.page#0.snapshot"));
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    assert!(checkpoint
+        .nodes
+        .iter()
+        .any(|node| node.id == "log.page#0.delta"));
+    assert!(checkpoint
+        .nodes
+        .iter()
+        .any(|node| node.id == "log.page#0.snapshot"));
 }
 
 #[test]

@@ -2449,7 +2449,9 @@ impl Core {
             .pull_id
             .as_ref()
             .is_some_and(|id| a.pause_lockset.len() == 1 && a.pause_lockset.contains(id));
-        e.state.pending == 0
+        e.value.status != Status::Dirty
+            && e.value.status != Status::Pending
+            && e.state.pending == 0
             && !e.wave.inside_run_wave
             && !e.wave.in_dep_mutation
             && !e.wave.rewire_run_pending
