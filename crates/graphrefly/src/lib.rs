@@ -73,6 +73,7 @@ pub mod json;
 pub mod messaging;
 pub mod node;
 pub mod operators;
+pub mod process;
 pub mod protocol;
 pub mod render;
 pub mod resilience;
@@ -186,6 +187,12 @@ pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
     settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
+};
+pub use process::{
+    process_bundle, ProcessAuditOutcome, ProcessAuditRecord, ProcessBundle, ProcessBundleOptions,
+    ProcessCursor, ProcessEffectRequest, ProcessEffectRequestDraft, ProcessError, ProcessErrorCode,
+    ProcessEvent, ProcessEventDraft, ProcessReducer, ProcessReducerFn, ProcessReduction,
+    ProcessRuntimeFact, ProcessStatus, ProcessStatusState,
 };
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 pub use render::{
