@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -29,12 +30,16 @@ pub enum WireBridgeEnvelopeType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBridgeMetadata {
+    /// Monotonic envelope sequence within the bridge session.
     pub seq: u64,
+    /// Monotonic accepted inbound cursor observed by the sending side.
     pub cursor: u64,
+    /// D151: correlation/idempotency metadata, not an authoritative duplicate lookup key.
     pub idempotency_key: String,
     pub attempt: u32,
     pub max_attempts: u32,
     pub timestamp_ms: Option<u64>,
+    /// D151 ack/nack correlation target; receipt duplicate recognition still uses seq/cursor.
     pub ack_for_seq: Option<u64>,
     pub request_id: Option<String>,
 }
@@ -170,12 +175,12 @@ pub enum WireBridgeCommand<T> {
         request_id: Option<String>,
     },
     Ack {
-        seq: u64,
+        ack_for_seq: u64,
         idempotency_key: Option<String>,
         request_id: Option<String>,
     },
     Nack {
-        seq: u64,
+        ack_for_seq: u64,
         error: String,
         idempotency_key: Option<String>,
         request_id: Option<String>,
@@ -201,12 +206,12 @@ pub enum WireBridgeEvent<TOutbound, TInbound> {
         envelope: WireBridgeEnvelope<TInbound>,
     },
     Ack {
-        seq: u64,
+        ack_for_seq: u64,
         envelope: WireBridgeEnvelope<TInbound>,
         outbound: WireBridgeEnvelope<TOutbound>,
     },
     Nack {
-        seq: u64,
+        ack_for_seq: u64,
         envelope: WireBridgeEnvelope<TInbound>,
         outbound: WireBridgeEnvelope<TOutbound>,
         error: String,
@@ -243,7 +248,7 @@ pub enum WireBridgeEvent<TOutbound, TInbound> {
     },
     LateReceipt {
         receipt: WireBridgeReceipt,
-        seq: u64,
+        ack_for_seq: u64,
     },
     Invalid {
         error: String,
@@ -252,13 +257,13 @@ pub enum WireBridgeEvent<TOutbound, TInbound> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBridgeAck<TInbound> {
-    pub seq: u64,
+    pub ack_for_seq: u64,
     pub envelope: WireBridgeEnvelope<TInbound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBridgeNack<TInbound> {
-    pub seq: u64,
+    pub ack_for_seq: u64,
     pub envelope: WireBridgeEnvelope<TInbound>,
     pub error: String,
 }
@@ -358,9 +363,14 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
         });
     }
 
-    pub fn ack(&self, seq: u64, idempotency_key: Option<String>, request_id: Option<String>) {
+    pub fn ack(
+        &self,
+        ack_for_seq: u64,
+        idempotency_key: Option<String>,
+        request_id: Option<String>,
+    ) {
         self.command.set(WireBridgeCommand::Ack {
-            seq,
+            ack_for_seq,
             idempotency_key,
             request_id,
         });
@@ -368,13 +378,13 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
 
     pub fn nack(
         &self,
-        seq: u64,
+        ack_for_seq: u64,
         error: impl Into<String>,
         idempotency_key: Option<String>,
         request_id: Option<String>,
     ) {
         self.command.set(WireBridgeCommand::Nack {
-            seq,
+            ack_for_seq,
             error: error.into(),
             idempotency_key,
             request_id,
@@ -620,15 +630,15 @@ fn install_cleanup<T: Clone + 'static>(ctx: &Ctx, state: Rc<RefCell<BridgeState<
     }
     state.borrow_mut().cleanup_installed = true;
     ctx.on_deactivation(move || {
-        let mut state = state.borrow_mut();
-        state.active = false;
-        state.cleanup_installed = false;
-        for pending in state.pending.values_mut() {
-            if let Some(cancel) = pending.cancel.take() {
-                cancel();
-            }
+        let cancels = {
+            let mut state = state.borrow_mut();
+            state.active = false;
+            state.cleanup_installed = false;
+            take_pending_cancels(&mut state)
+        };
+        for cancel in cancels {
+            run_driver_cancel(cancel);
         }
-        state.pending.clear();
     });
 }
 
@@ -701,13 +711,13 @@ fn process_command<TOutbound, TInbound>(
             now,
         ),
         WireBridgeCommand::Ack {
-            seq,
+            ack_for_seq,
             idempotency_key,
             request_id,
         } => {
-            if seq == 0 {
+            if ack_for_seq == 0 {
                 ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-                    error: "wireBridge: ack command seq must be positive".to_owned(),
+                    error: "wireBridge: ack command ack_for_seq must be positive".to_owned(),
                 });
                 return;
             }
@@ -719,7 +729,7 @@ fn process_command<TOutbound, TInbound>(
                     payload: None,
                     idempotency_key,
                     request_id,
-                    ack_for_seq: Some(seq),
+                    ack_for_seq: Some(ack_for_seq),
                     track_ack: false,
                     clear_pending_first: false,
                 },
@@ -729,14 +739,14 @@ fn process_command<TOutbound, TInbound>(
             );
         }
         WireBridgeCommand::Nack {
-            seq,
+            ack_for_seq,
             error,
             idempotency_key,
             request_id,
         } => {
-            if seq == 0 {
+            if ack_for_seq == 0 {
                 ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-                    error: "wireBridge: nack command seq must be positive".to_owned(),
+                    error: "wireBridge: nack command ack_for_seq must be positive".to_owned(),
                 });
                 return;
             }
@@ -748,7 +758,7 @@ fn process_command<TOutbound, TInbound>(
                     payload: Some(WireBridgePayload::Error(error)),
                     idempotency_key,
                     request_id,
-                    ack_for_seq: Some(seq),
+                    ack_for_seq: Some(ack_for_seq),
                     track_ack: false,
                     clear_pending_first: false,
                 },
@@ -849,13 +859,28 @@ fn emit_outbound<TOutbound, TInbound>(
 }
 
 fn clear_pending<T>(state: &Rc<RefCell<BridgeState<T>>>) {
-    let mut state = state.borrow_mut();
+    let cancels = {
+        let mut state = state.borrow_mut();
+        take_pending_cancels(&mut state)
+    };
+    for cancel in cancels {
+        run_driver_cancel(cancel);
+    }
+}
+
+fn take_pending_cancels<T>(state: &mut BridgeState<T>) -> Vec<DriverCancel> {
+    let mut cancels = Vec::new();
     for pending in state.pending.values_mut() {
         if let Some(cancel) = pending.cancel.take() {
-            cancel();
+            cancels.push(cancel);
         }
     }
     state.pending.clear();
+    cancels
+}
+
+fn run_driver_cancel(cancel: DriverCancel) {
+    let _ = catch_unwind(AssertUnwindSafe(cancel));
 }
 
 fn arm_ack_timeout<TOutbound, TInbound>(
@@ -1202,25 +1227,25 @@ fn process_ack<TOutbound, TInbound>(
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    let seq = envelope
+    let ack_for_seq = envelope
         .metadata
         .ack_for_seq
         .expect("validated ack has ack_for_seq");
-    let pending = state.borrow_mut().pending.remove(&seq);
+    let pending = state.borrow_mut().pending.remove(&ack_for_seq);
     match pending {
         Some(mut pending) => {
             if let Some(cancel) = pending.cancel.take() {
-                cancel();
+                run_driver_cancel(cancel);
             }
             ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Ack {
-                seq,
+                ack_for_seq,
                 envelope,
                 outbound: pending.envelope,
             });
         }
         None => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
             receipt: WireBridgeReceipt::Ack,
-            seq,
+            ack_for_seq,
         }),
     }
 }
@@ -1233,19 +1258,19 @@ fn process_nack<TOutbound, TInbound>(
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    let seq = envelope
+    let ack_for_seq = envelope
         .metadata
         .ack_for_seq
         .expect("validated nack has ack_for_seq");
-    let pending = state.borrow_mut().pending.remove(&seq);
+    let pending = state.borrow_mut().pending.remove(&ack_for_seq);
     let error = payload_error_string(&envelope.payload, "remote nack");
     match pending {
         Some(mut pending) => {
             if let Some(cancel) = pending.cancel.take() {
-                cancel();
+                run_driver_cancel(cancel);
             }
             ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Nack {
-                seq,
+                ack_for_seq,
                 envelope,
                 outbound: pending.envelope,
                 error,
@@ -1253,7 +1278,7 @@ fn process_nack<TOutbound, TInbound>(
         }
         None => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
             receipt: WireBridgeReceipt::Nack,
-            seq,
+            ack_for_seq,
         }),
     }
 }
@@ -1293,9 +1318,14 @@ where
         vec![events.erased()],
         |ctx| {
             for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
-                if let WireBridgeEvent::Ack { seq, envelope, .. } = event.as_ref() {
+                if let WireBridgeEvent::Ack {
+                    ack_for_seq,
+                    envelope,
+                    ..
+                } = event.as_ref()
+                {
                     ctx.emit(WireBridgeAck {
-                        seq: *seq,
+                        ack_for_seq: *ack_for_seq,
                         envelope: envelope.clone(),
                     });
                 }
@@ -1319,14 +1349,14 @@ where
         |ctx| {
             for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
                 if let WireBridgeEvent::Nack {
-                    seq,
+                    ack_for_seq,
                     envelope,
                     error,
                     ..
                 } = event.as_ref()
                 {
                     ctx.emit(WireBridgeNack {
-                        seq: *seq,
+                        ack_for_seq: *ack_for_seq,
                         envelope: envelope.clone(),
                         error: error.clone(),
                     });
@@ -1407,7 +1437,9 @@ fn reduce_status<TOutbound, TInbound>(
             }
             current.last_seq = Some(envelope.metadata.seq);
         }
-        WireBridgeEvent::Ack { seq, outbound, .. } => {
+        WireBridgeEvent::Ack {
+            envelope, outbound, ..
+        } => {
             current.state = if outbound.envelope_type == WireBridgeEnvelopeType::Close {
                 WireBridgeStatusState::Closed
             } else {
@@ -1415,14 +1447,14 @@ fn reduce_status<TOutbound, TInbound>(
             };
             current.pending = current.pending.saturating_sub(1);
             current.acked = current.acked.saturating_add(1);
-            current.last_seq = Some(*seq);
+            current.last_seq = Some(envelope.metadata.seq);
         }
-        WireBridgeEvent::Nack { seq, .. } => {
+        WireBridgeEvent::Nack { envelope, .. } => {
             current.state = WireBridgeStatusState::Errored;
             current.pending = current.pending.saturating_sub(1);
             current.nacked = current.nacked.saturating_add(1);
             current.errors = current.errors.saturating_add(1);
-            current.last_seq = Some(*seq);
+            current.last_seq = Some(envelope.metadata.seq);
         }
         WireBridgeEvent::Retry { seq, delay_ms, .. } => {
             current.state = WireBridgeStatusState::Waiting;
@@ -1493,8 +1525,11 @@ where
                     WireBridgeEvent::SessionMismatch { expected, actual } => ctx.emit(format!(
                         "{name}: inbound session {actual} did not match expected {expected}"
                     )),
-                    WireBridgeEvent::LateReceipt { receipt, seq } => ctx.emit(format!(
-                        "{name}: late {receipt:?} for unknown or completed seq {seq}"
+                    WireBridgeEvent::LateReceipt {
+                        receipt,
+                        ack_for_seq,
+                    } => ctx.emit(format!(
+                        "{name}: late {receipt:?} for unknown or completed ack_for_seq {ack_for_seq}"
                     )),
                     WireBridgeEvent::Inbound { envelope }
                         if envelope.envelope_type == WireBridgeEnvelopeType::Error =>
@@ -1603,6 +1638,8 @@ mod tests {
         sleeps: SleepQueue,
     }
 
+    struct PanickingCancelDriver;
+
     impl ManualAsyncDriver {
         fn new() -> (Rc<Self>, SleepQueue) {
             let sleeps = Rc::new(RefCell::new(Vec::new()));
@@ -1619,6 +1656,20 @@ mod tests {
         fn sleep(&self, _duration: Duration, callback: Box<dyn FnOnce()>) -> DriverCancel {
             self.sleeps.borrow_mut().push(callback);
             Box::new(|| {})
+        }
+
+        fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
+            Box::new(|| {})
+        }
+
+        fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
+            Box::new(|| {})
+        }
+    }
+
+    impl LocalAsyncDriver for PanickingCancelDriver {
+        fn sleep(&self, _duration: Duration, _callback: Box<dyn FnOnce()>) -> DriverCancel {
+            Box::new(|| panic!("cancel failed"))
         }
 
         fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
@@ -1846,7 +1897,7 @@ mod tests {
         ));
 
         assert_eq!(bridge.cursor.cache(), Some(1));
-        assert_eq!(bridge.acks.cache().unwrap().seq, 1);
+        assert_eq!(bridge.acks.cache().unwrap().ack_for_seq, 1);
         let status = bridge.status.cache().unwrap();
         assert_eq!(status.pending, 0);
         assert_eq!(status.acked, 1);
@@ -1871,7 +1922,7 @@ mod tests {
             Some(1),
         ));
 
-        assert_eq!(bridge.nacks.cache().unwrap().seq, 1);
+        assert_eq!(bridge.nacks.cache().unwrap().ack_for_seq, 1);
         assert_eq!(bridge.errors.cache(), Some("remote failed".to_owned()));
         let status = bridge.status.cache().unwrap();
         assert_eq!(status.state, WireBridgeStatusState::Errored);
@@ -1954,7 +2005,7 @@ mod tests {
             event,
             WireBridgeEvent::LateReceipt {
                 receipt: WireBridgeReceipt::Ack,
-                seq: 99
+                ack_for_seq: 99
             }
         )));
     }
@@ -2048,7 +2099,7 @@ mod tests {
             Some(1),
         ));
 
-        assert_eq!(bridge.acks.cache().unwrap().seq, 1);
+        assert_eq!(bridge.acks.cache().unwrap().ack_for_seq, 1);
         let status = bridge.status.cache().unwrap();
         assert_eq!(status.pending, 0);
         assert_eq!(status.acked, 1);
@@ -2169,6 +2220,42 @@ mod tests {
             bridge.errors.cache(),
             Some("session-a: ack timeout for seq 1".to_owned())
         );
+    }
+
+    #[test]
+    fn ack_cancel_panic_does_not_suppress_receipt_facts() {
+        let g = graph_opts(GraphOptions {
+            environment: EnvironmentDrivers::new()
+                .with_local_async(Rc::new(PanickingCancelDriver) as Rc<dyn LocalAsyncDriver>),
+            ..GraphOptions::default()
+        });
+        let bridge = wire_bridge::<String, String>(
+            &g,
+            WireBridgeOptions {
+                name: Some("bridge".to_owned()),
+                session_id: "session-a".to_owned(),
+                ack_timeout: Some(Duration::from_millis(5)),
+                ..WireBridgeOptions::new("session-a")
+            },
+        );
+        let _acks = bridge.acks.subscribe(|_| {});
+        let _status = bridge.status.subscribe(|_| {});
+
+        bridge.send("work".to_owned(), None, None);
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Ack,
+            1,
+            1,
+            None,
+            Some(1),
+        ));
+
+        assert_eq!(bridge.acks.cache().unwrap().ack_for_seq, 1);
+        let status = bridge.status.cache().unwrap();
+        assert_eq!(status.pending, 0);
+        assert_eq!(status.acked, 1);
+        assert_eq!(status.last_seq, Some(1));
     }
 
     #[test]

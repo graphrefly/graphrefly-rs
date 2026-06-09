@@ -159,6 +159,10 @@ pub enum CqrsRuntimeFact<TCommand = crate::protocol::AnyValue, TEvent = crate::p
     Cursor(CqrsCursor),
 }
 
+/// D151 membership-based duplicate-recognition window for CQRS ids.
+///
+/// This is passive CQRS vocabulary, not a shared idempotency reducer engine:
+/// commands and events each own their own id membership window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CqrsDedupeWindow {
     Unbounded,

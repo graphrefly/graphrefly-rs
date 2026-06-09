@@ -13,8 +13,8 @@ use graphrefly::{
     GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions,
     GraphRestoreDefinition, GraphRestoreEntry, IslandReport, LockId, Message, NodeOpts,
     NodeVersion, NodeVersioningPolicy, Pausable, ReachableDirection, ReachableOptions,
-    ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, Values,
-    GRAPH_CHECKPOINT_VERSION,
+    ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, TopologyEvent,
+    TopologyEventKind, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -166,6 +166,207 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
         to: "raw".to_owned(),
     }));
     observer.unsubscribe();
+}
+
+#[test]
+fn observe_topology_emits_registered_nodes_from_existing_registry() {
+    let g = graph();
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology()
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
+    let _derived = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        GraphNodeOpts::named("derived"),
+    );
+
+    observer.unsubscribe();
+    let events = events.borrow();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[0].path, "source");
+    assert_eq!(events[0].deps, Vec::<String>::new());
+    assert_eq!(events[0].factory.as_deref(), Some("state"));
+    assert_eq!(events[0].seq, 0);
+    assert_eq!(events[1].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[1].path, "derived");
+    assert_eq!(events[1].deps, vec!["source".to_owned()]);
+    assert_eq!(events[1].factory.as_deref(), Some("derived"));
+    assert_eq!(events[1].seq, 1);
+}
+
+#[test]
+fn observe_topology_deps_changed_matches_describe_edges() {
+    let g = graph();
+    let a = g.state_opts(1i32, GraphNodeOpts::named("a"));
+    let b = g.state_opts(2i32, GraphNodeOpts::named("b"));
+    let d = g.node_opts::<i32, _>(
+        vec![a.erased()],
+        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        GraphNodeOpts::named("d"),
+    );
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology_path("d")
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    d.replace_deps(vec![b.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap());
+    });
+
+    observer.unsubscribe();
+    let events = events.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, TopologyEventKind::DepsChanged);
+    assert_eq!(events[0].path, "d");
+    assert_eq!(events[0].prev_deps, Some(vec!["a".to_owned()]));
+    assert_eq!(events[0].deps, vec!["b".to_owned()]);
+    assert_eq!(events[0].seq, 0);
+
+    let snap = g.describe();
+    let d_node = snap.nodes.iter().find(|node| node.id == "d").unwrap();
+    assert_eq!(d_node.deps, vec!["b".to_owned()]);
+    assert!(snap.edges.contains(&DescribeEdge {
+        from: "b".to_owned(),
+        to: "d".to_owned(),
+    }));
+    assert!(!snap.edges.contains(&DescribeEdge {
+        from: "a".to_owned(),
+        to: "d".to_owned(),
+    }));
+}
+
+#[test]
+fn observe_topology_is_read_only_and_separate_from_protocol_observe() {
+    let g = graph();
+    let runs = Rc::new(Cell::new(0usize));
+    let runs_for_fn = runs.clone();
+    let cold = g.producer_opts::<i32, _>(
+        move |ctx| {
+            runs_for_fn.set(runs_for_fn.get() + 1);
+            ctx.emit(7i32);
+        },
+        GraphNodeOpts::named("cold"),
+    );
+    let topology_events = Rc::new(RefCell::new(Vec::new()));
+    let topology_sink = topology_events.clone();
+    let topology_observer = g
+        .observe_topology()
+        .subscribe(move |event| topology_sink.borrow_mut().push(event.kind));
+
+    topology_observer.unsubscribe();
+    assert_eq!(runs.get(), 0);
+    assert_eq!(cold.cache(), None);
+    assert!(topology_events.borrow().is_empty());
+
+    let protocol_events = Rc::new(RefCell::new(Vec::new()));
+    let protocol_sink = protocol_events.clone();
+    let protocol_observer = g
+        .observe_path("cold")
+        .subscribe(move |event| protocol_sink.borrow_mut().push(event.msg.kind()));
+    protocol_observer.unsubscribe();
+    assert_eq!(runs.get(), 1);
+    assert!(protocol_events.borrow().contains(&"DATA"));
+    assert!(topology_events.borrow().is_empty());
+}
+
+#[test]
+fn observe_topology_stops_after_unsubscribe() {
+    let g = graph();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let event_sink = events.clone();
+    let observer = g
+        .observe_topology()
+        .subscribe(move |event| event_sink.borrow_mut().push(event.path));
+    observer.unsubscribe();
+
+    let _later = g.state_opts(1i32, GraphNodeOpts::named("later"));
+
+    assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn observe_topology_delivers_nested_events_fifo_and_isolates_panics() {
+    let g = graph();
+    let first = Rc::new(RefCell::new(Vec::new()));
+    let second = Rc::new(RefCell::new(Vec::new()));
+    let late = Rc::new(RefCell::new(Vec::new()));
+    let late_observers = Rc::new(RefCell::new(Vec::new()));
+    let added = Rc::new(Cell::new(false));
+    let first_sink = first.clone();
+    let late_sink = late.clone();
+    let late_handles = late_observers.clone();
+    let added_flag = added.clone();
+    let graph_for_nested = g.clone();
+    let _first_observer = g.observe_topology().subscribe(move |event| {
+        first_sink
+            .borrow_mut()
+            .push(format!("{}:{}", event.path, event.seq));
+        if !added_flag.get() {
+            added_flag.set(true);
+            let late_events = late_sink.clone();
+            let late_observer = graph_for_nested
+                .observe_topology()
+                .subscribe(move |late_event| {
+                    late_events
+                        .borrow_mut()
+                        .push(format!("{}:{}", late_event.path, late_event.seq));
+                });
+            late_handles.borrow_mut().push(late_observer);
+            let _nested = graph_for_nested.state_opts(2i32, GraphNodeOpts::named("nested"));
+        }
+    });
+    let second_sink = second.clone();
+    let _second_observer = g.observe_topology().subscribe(move |event| {
+        second_sink
+            .borrow_mut()
+            .push(format!("{}:{}", event.path, event.seq));
+        panic!("observer failure must not veto topology mutation");
+    });
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _root = g.state_opts(1i32, GraphNodeOpts::named("root"));
+    }));
+
+    assert!(result.is_ok());
+    assert!(g.find("root").is_some());
+    assert!(g.find("nested").is_some());
+    assert_eq!(
+        *first.borrow(),
+        vec!["root:0".to_owned(), "nested:1".to_owned()]
+    );
+    assert_eq!(
+        *second.borrow(),
+        vec!["root:0".to_owned(), "nested:1".to_owned()]
+    );
+    assert_eq!(*late.borrow(), vec!["nested:1".to_owned()]);
+}
+
+#[test]
+fn observe_topology_skips_observer_unsubscribed_before_its_turn() {
+    let g = graph();
+    let second = Rc::new(RefCell::new(Vec::new()));
+    let second_observer = Rc::new(RefCell::new(None::<graphrefly::GraphTopologyObserver>));
+    let second_handle = second_observer.clone();
+    let _first = g.observe_topology().subscribe(move |_| {
+        if let Some(observer) = second_handle.borrow_mut().take() {
+            observer.unsubscribe();
+        }
+    });
+    let second_sink = second.clone();
+    *second_observer.borrow_mut() = Some(
+        g.observe_topology()
+            .subscribe(move |event| second_sink.borrow_mut().push(event.path)),
+    );
+
+    let _root = g.state_opts(1i32, GraphNodeOpts::named("root"));
+
+    assert!(second.borrow().is_empty());
 }
 
 #[test]

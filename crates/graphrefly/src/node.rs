@@ -972,8 +972,11 @@ pub(crate) struct NodeRestoreRuntime {
 
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
 /// reentrant engine lives on [`Core`].
+type TopologyDepsChangedObserver = Rc<dyn Fn(&[Core], &[Core])>;
+
 struct NodeTopologySlot {
     deps: Vec<Core>,
+    topology_deps_changed: Option<TopologyDepsChangedObserver>,
 }
 
 struct NodeInner;
@@ -2390,6 +2393,19 @@ impl Core {
         self.borrow().deps.clone()
     }
 
+    pub(crate) fn set_topology_deps_changed_observer(&self, observer: TopologyDepsChangedObserver) {
+        self.with_node_state_mut(|n, _c, _cfg, _r, _e| {
+            n.topology_deps_changed = Some(observer);
+        });
+    }
+
+    fn notify_topology_deps_changed(&self, old_deps: &[Core], new_deps: &[Core]) {
+        let observer = self.with_inner_edges(|n, _e| n.topology_deps_changed.clone());
+        if let Some(observer) = observer {
+            observer(old_deps, new_deps);
+        }
+    }
+
     pub(crate) fn cache_any(&self) -> Option<AnyValue> {
         self.with_inner_edges(|_n, e| e.value.cache.clone())
     }
@@ -2581,7 +2597,10 @@ impl Core {
                 "node construction: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
             );
         }
-        let topology = NodeTopologySlot { deps };
+        let topology = NodeTopologySlot {
+            deps,
+            topology_deps_changed: None,
+        };
         let inner = NodeInner;
         let mut environment = EnvironmentDrivers::default();
         environment.set_local_async_driver(dispatcher.local_async_driver());
@@ -3402,6 +3421,7 @@ impl Core {
                     self.subscribe_dep(idx, dep);
                 }
             }
+            self.notify_topology_deps_changed(&old_deps, &new_deps);
 
             if self.with_inner_edges(|_, e| e.value.terminal) {
                 return;
@@ -3588,6 +3608,7 @@ impl Core {
                 self.subscribe_dep(*idx, d);
             }
         }
+        self.notify_topology_deps_changed(&old_deps, &new_deps);
 
         // D62 / R-rewire-deferred: a terminal owner still drains queued topology intent,
         // but terminal-is-forever remains an output guard. Apply the dep-set/fn cleanup

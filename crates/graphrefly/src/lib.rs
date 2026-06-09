@@ -153,8 +153,9 @@ pub use environment::{
 };
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
-    Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, NodeProfile,
-    ObserveEvent, ObserveMessage, ObserveStream, Profile, RestoreFactoryMeta, Values,
+    Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, GraphTopologyObserver,
+    NodeProfile, ObserveEvent, ObserveMessage, ObserveStream, Profile, RestoreFactoryMeta,
+    TopologyEvent, TopologyEventKind, TopologyStream, Values,
 };
 pub use higher_order::{
     concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,

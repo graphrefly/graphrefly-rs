@@ -127,6 +127,59 @@ fn cqrs_bounded_dedupe_window_is_explicit() {
 }
 
 #[test]
+fn cqrs_default_dedupe_is_unbounded_id_membership() {
+    let g = graph();
+    let app = cqrs_with_options::<String, String>(
+        &g,
+        CqrsOptions::named("orders")
+            .with_events(["OrderPlaced"])
+            .with_handlers(vec![cqrs_command_handler(
+                "PlaceOrder",
+                |command: &CqrsCommand<String>| {
+                    let mut event = CqrsEventDraft::new("OrderPlaced", command.payload.clone());
+                    event.id = Some(command.payload.clone());
+                    vec![event]
+                },
+            )]),
+    );
+    let events = collect_data(&app.events);
+    let errors = collect_data(&app.errors);
+    let cursor = collect_data(&app.cursor);
+
+    app.dispatch(CqrsCommand::new(
+        "cmd-1",
+        "PlaceOrder",
+        "event-1".to_owned(),
+    ));
+    app.dispatch(CqrsCommand::new(
+        "cmd-2",
+        "PlaceOrder",
+        "event-2".to_owned(),
+    ));
+    app.dispatch(CqrsCommand::new(
+        "cmd-3",
+        "PlaceOrder",
+        "event-3".to_owned(),
+    ));
+    app.dispatch(CqrsCommand::new(
+        "cmd-1",
+        "PlaceOrder",
+        "event-4".to_owned(),
+    ));
+
+    assert_eq!(events.borrow().len(), 3);
+    assert_eq!(
+        errors.borrow().last().unwrap().code,
+        CqrsErrorCode::DuplicateCommand
+    );
+    let cursor = cursor.borrow().last().unwrap().clone();
+    assert_eq!(cursor.event_seq, 3);
+    assert_eq!(cursor.command_count, 4);
+    assert_eq!(cursor.error_count, 1);
+    assert!(cursor.dedupe.is_none());
+}
+
+#[test]
 fn cqrs_rejects_empty_command_ids_as_graph_visible_errors() {
     let g = graph();
     let app = cqrs_with_options::<String, String>(

@@ -5,7 +5,7 @@
 //! (R-node-thin / D39) while substrate nodes remain arena-slot handles.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -115,6 +115,12 @@ struct Mount {
     graph: Graph,
 }
 
+#[derive(Clone)]
+struct TopologyObserverEntry {
+    path: Option<String>,
+    sink: Rc<dyn Fn(TopologyEvent)>,
+}
+
 struct GraphInner {
     name: Option<String>,
     arena: GraphArena,
@@ -130,6 +136,11 @@ struct GraphInner {
     synth_seq: Cell<usize>,
     synth_ids: RefCell<HashMap<(usize, usize, u64), String>>,
     clock: Rc<Cell<u64>>,
+    topology_observers: RefCell<Vec<Option<TopologyObserverEntry>>>,
+    topology_observer_active: Cell<usize>,
+    topology_observer_free: RefCell<Vec<usize>>,
+    topology_delivering: Cell<bool>,
+    topology_queue: RefCell<VecDeque<TopologyEvent>>,
 }
 
 /// A single-thread graph/concurrency-domain product surface (D22/B53).
@@ -164,6 +175,11 @@ impl Graph {
                 synth_seq: Cell::new(0),
                 synth_ids: RefCell::new(HashMap::new()),
                 clock: Rc::new(Cell::new(0)),
+                topology_observers: RefCell::new(Vec::new()),
+                topology_observer_active: Cell::new(0),
+                topology_observer_free: RefCell::new(Vec::new()),
+                topology_delivering: Cell::new(false),
+                topology_queue: RefCell::new(VecDeque::new()),
             }),
         }
     }
@@ -400,6 +416,24 @@ impl Graph {
         }
     }
 
+    /// D145 read-only topology lifecycle egress over the existing graph registry.
+    ///
+    /// This is not a graph node, does not subscribe to nodes, and does not publish DATA.
+    pub fn observe_topology(&self) -> TopologyStream {
+        TopologyStream {
+            graph: self.clone(),
+            path: None,
+        }
+    }
+
+    /// Read-only topology lifecycle egress for one registered id or `::` subtree prefix.
+    pub fn observe_topology_path(&self, path: &str) -> TopologyStream {
+        TopologyStream {
+            graph: self.clone(),
+            path: Some(path.to_owned()),
+        }
+    }
+
     /// Opt-in accumulated-counter snapshot (D39/R-profile).
     pub fn profile(&self) -> Profile {
         let mut total_invokes = 0;
@@ -569,6 +603,13 @@ impl Graph {
             meta: opts.meta,
             restore: opts.restore,
         };
+        let weak_inner = Rc::downgrade(&self.inner);
+        let topology_id = id.clone();
+        core.set_topology_deps_changed_observer(Rc::new(move |old_deps, new_deps| {
+            if let Some(inner) = weak_inner.upgrade() {
+                Graph { inner }.emit_topology_deps_changed(&topology_id, old_deps, new_deps);
+            }
+        }));
         self.inner.by_id.borrow_mut().insert(id.clone(), core);
         self.inner.entries.borrow_mut().push(entry);
         if let Some(n) = id
@@ -577,6 +618,7 @@ impl Graph {
         {
             self.inner.seq.set(self.inner.seq.get().max(n + 1));
         }
+        self.emit_topology_node_registered(&id);
         node
     }
 
@@ -737,6 +779,100 @@ impl Graph {
     fn id_for_core(&self, core: &Core, prefix: &str) -> String {
         self.registered_id_for_core(core, prefix)
             .unwrap_or_else(|| self.synthetic_id_for_core(core, prefix))
+    }
+
+    fn topology_deps(&self, deps: &[Core]) -> Vec<String> {
+        deps.iter().map(|dep| self.id_for_core(dep, "")).collect()
+    }
+
+    fn has_topology_observers(&self) -> bool {
+        self.inner.topology_observer_active.get() > 0
+    }
+
+    fn emit_topology_node_registered(&self, id: &str) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        let Some(entry) = self
+            .inner
+            .entries
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        let seq = self.inner.clock.get();
+        self.inner.clock.set(seq + 1);
+        self.emit_topology_event(TopologyEvent {
+            kind: TopologyEventKind::NodeRegistered,
+            path: entry.id,
+            deps: self.topology_deps(&entry.core.deps()),
+            prev_deps: None,
+            factory: Some(entry.factory),
+            seq,
+        });
+    }
+
+    fn emit_topology_deps_changed(&self, id: &str, old_deps: &[Core], new_deps: &[Core]) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        if self.find(id).is_none() {
+            return;
+        }
+        let seq = self.inner.clock.get();
+        self.inner.clock.set(seq + 1);
+        self.emit_topology_event(TopologyEvent {
+            kind: TopologyEventKind::DepsChanged,
+            path: id.to_owned(),
+            deps: self.topology_deps(new_deps),
+            prev_deps: Some(self.topology_deps(old_deps)),
+            factory: None,
+            seq,
+        });
+    }
+
+    fn emit_topology_event(&self, event: TopologyEvent) {
+        if self.inner.topology_delivering.get() {
+            self.inner.topology_queue.borrow_mut().push_back(event);
+            return;
+        }
+        self.inner.topology_delivering.set(true);
+        let mut current = Some(event);
+        while let Some(event) = current {
+            let observers = self
+                .inner
+                .topology_observers
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter_map(|(id, entry)| entry.clone().map(|entry| (id, entry)))
+                .collect::<Vec<_>>();
+            for (id, observer) in observers {
+                let still_active = self
+                    .inner
+                    .topology_observers
+                    .borrow()
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| Rc::ptr_eq(&current.sink, &observer.sink));
+                if !still_active {
+                    continue;
+                }
+                if observer
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| !topology_path_matches(&event.path, path))
+                {
+                    continue;
+                }
+                let _ = catch_unwind(AssertUnwindSafe(|| (observer.sink)(event.clone())));
+            }
+            current = self.inner.topology_queue.borrow_mut().pop_front();
+        }
+        self.inner.topology_delivering.set(false);
     }
 
     fn describe_with_prefix(&self, prefix: &str) -> DescribeSnapshot {
@@ -1119,8 +1255,30 @@ impl ObserveMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyEventKind {
+    NodeRegistered,
+    DepsChanged,
+}
+
+#[derive(Clone)]
+pub struct TopologyEvent {
+    pub kind: TopologyEventKind,
+    pub path: String,
+    pub deps: Vec<String>,
+    pub prev_deps: Option<Vec<String>>,
+    pub factory: Option<String>,
+    pub seq: u64,
+}
+
 pub struct GraphObserver {
     unsubs: Vec<Option<Box<dyn FnOnce()>>>,
+}
+
+pub struct GraphTopologyObserver {
+    graph: Graph,
+    id: usize,
+    active: bool,
 }
 
 #[derive(Clone)]
@@ -1129,9 +1287,46 @@ pub struct ObserveStream {
     path: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct TopologyStream {
+    graph: Graph,
+    path: Option<String>,
+}
+
 impl ObserveStream {
     pub fn subscribe(&self, sink: impl Fn(ObserveEvent) + 'static) -> GraphObserver {
         self.graph.observe_targets(self.path.as_deref(), sink)
+    }
+}
+
+impl TopologyStream {
+    pub fn subscribe(&self, sink: impl Fn(TopologyEvent) + 'static) -> GraphTopologyObserver {
+        let id = self
+            .graph
+            .inner
+            .topology_observer_free
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| {
+                let mut observers = self.graph.inner.topology_observers.borrow_mut();
+                let id = observers.len();
+                observers.push(None);
+                id
+            });
+        let mut observers = self.graph.inner.topology_observers.borrow_mut();
+        observers[id] = Some(TopologyObserverEntry {
+            path: self.path.clone(),
+            sink: Rc::new(sink),
+        });
+        self.graph
+            .inner
+            .topology_observer_active
+            .set(self.graph.inner.topology_observer_active.get() + 1);
+        GraphTopologyObserver {
+            graph: self.graph.clone(),
+            id,
+            active: true,
+        }
     }
 }
 
@@ -1146,6 +1341,47 @@ impl GraphObserver {
                 unsub();
             }
         }
+    }
+}
+
+impl GraphTopologyObserver {
+    pub fn unsubscribe(mut self) {
+        self.unsubscribe_inner();
+    }
+
+    fn unsubscribe_inner(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Some(slot) = self
+            .graph
+            .inner
+            .topology_observers
+            .borrow_mut()
+            .get_mut(self.id)
+        {
+            if slot.take().is_some() {
+                self.graph.inner.topology_observer_active.set(
+                    self.graph
+                        .inner
+                        .topology_observer_active
+                        .get()
+                        .saturating_sub(1),
+                );
+                self.graph
+                    .inner
+                    .topology_observer_free
+                    .borrow_mut()
+                    .push(self.id);
+            }
+        }
+    }
+}
+
+impl Drop for GraphTopologyObserver {
+    fn drop(&mut self) {
+        self.unsubscribe_inner();
     }
 }
 
@@ -1222,6 +1458,10 @@ fn reachable(start: &str, adj: &HashMap<String, Vec<String>>) -> HashSet<String>
         }
     }
     seen
+}
+
+fn topology_path_matches(event_path: &str, path: &str) -> bool {
+    event_path == path || event_path.starts_with(&format!("{path}::"))
 }
 
 fn describe_value(value: &AnyValue) -> DescribeValue {
