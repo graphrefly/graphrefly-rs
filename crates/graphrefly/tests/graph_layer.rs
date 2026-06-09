@@ -242,6 +242,102 @@ fn observe_topology_deps_changed_matches_describe_edges() {
 }
 
 #[test]
+fn observe_topology_emits_mount_changed_from_parent_graph() {
+    let parent = graph();
+    let child = graph();
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = parent
+        .observe_topology_path("sub")
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    parent.mount(child, "sub");
+
+    observer.unsubscribe();
+    let events = events.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, TopologyEventKind::MountChanged);
+    assert_eq!(events[0].path, "sub");
+    assert_eq!(events[0].deps, Vec::<String>::new());
+    assert_eq!(events[0].factory.as_deref(), Some("mount"));
+    assert_eq!(events[0].seq, 0);
+    assert!(parent.describe().subgraphs.unwrap()[0].nodes.is_empty());
+}
+
+#[test]
+fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
+    let parent = graph();
+    let child = graph();
+    parent.mount(child.clone(), "sub");
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = parent
+        .observe_topology_path("sub")
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+    let a = child.state_opts(1i32, GraphNodeOpts::named("a"));
+    let b = child.state_opts(2i32, GraphNodeOpts::named("b"));
+    let d = child.node_opts::<i32, _>(
+        vec![a.erased()],
+        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        GraphNodeOpts::named("d"),
+    );
+    d.replace_deps(vec![b.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap());
+    });
+
+    observer.unsubscribe();
+    let events = events.borrow();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[0].path, "sub::a");
+    assert_eq!(events[0].deps, Vec::<String>::new());
+    assert_eq!(events[0].factory.as_deref(), Some("state"));
+    assert_eq!(events[0].seq, 0);
+    assert_eq!(events[1].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[1].path, "sub::b");
+    assert_eq!(events[1].deps, Vec::<String>::new());
+    assert_eq!(events[1].factory.as_deref(), Some("state"));
+    assert_eq!(events[1].seq, 1);
+    assert_eq!(events[2].kind, TopologyEventKind::NodeRegistered);
+    assert_eq!(events[2].path, "sub::d");
+    assert_eq!(events[2].deps, vec!["sub::a".to_owned()]);
+    assert_eq!(events[2].factory.as_deref(), Some("node"));
+    assert_eq!(events[2].seq, 2);
+    assert_eq!(events[3].kind, TopologyEventKind::DepsChanged);
+    assert_eq!(events[3].path, "sub::d");
+    assert_eq!(events[3].prev_deps, Some(vec!["sub::a".to_owned()]));
+    assert_eq!(events[3].deps, vec!["sub::b".to_owned()]);
+    assert_eq!(events[3].seq, 3);
+
+    let snap = parent.describe();
+    let subgraph = snap.subgraphs.unwrap().remove(0);
+    let d_node = subgraph
+        .nodes
+        .iter()
+        .find(|node| node.id == "sub::d")
+        .unwrap();
+    assert_eq!(d_node.deps, vec!["sub::b".to_owned()]);
+}
+
+#[test]
+fn observe_topology_stops_forwarding_mounted_child_events_after_unsubscribe() {
+    let parent = graph();
+    let child = graph();
+    parent.mount(child.clone(), "sub");
+    let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let event_sink = events.clone();
+    let observer = parent
+        .observe_topology()
+        .subscribe(move |event| event_sink.borrow_mut().push(event));
+    observer.unsubscribe();
+
+    let _leaf = child.state_opts(1i32, GraphNodeOpts::named("leaf"));
+
+    assert!(events.borrow().is_empty());
+}
+
+#[test]
 fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
     let g = graph_opts(GraphOptions {
         profile: true,

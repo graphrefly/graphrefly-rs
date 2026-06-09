@@ -84,11 +84,16 @@ mod versioning;
 pub mod worker;
 
 pub use adapters::bridge::{
-    wire_bridge, wire_bridge_envelope, wire_bridge_idempotency_key, WireBridgeAck,
-    WireBridgeAttempt, WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope,
-    WireBridgeEnvelopeError, WireBridgeEnvelopeInput, WireBridgeEnvelopeType, WireBridgeEvent,
-    WireBridgeInbound, WireBridgeIngress, WireBridgeMetadata, WireBridgeNack, WireBridgeOptions,
-    WireBridgePayload, WireBridgeReceipt, WireBridgeStatus, WireBridgeStatusState,
+    remote_call, remote_call_with_options, remote_responder, remote_responder_handler, wire_bridge,
+    wire_bridge_envelope, wire_bridge_idempotency_key, RemoteCallBundle, RemoteCallError,
+    RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatus,
+    RemoteCallStatusState, RemoteCallTimeout, RemoteResponderBundle, RemoteResponderEvent,
+    RemoteResponderHandlerDefinition, RemoteResponderOptions, RemoteResponderStatus,
+    RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt, WireBridgeBundle,
+    WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError, WireBridgeEnvelopeInput,
+    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound, WireBridgeIngress,
+    WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeReceipt,
+    WireBridgeStatus, WireBridgeStatusState,
 };
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,

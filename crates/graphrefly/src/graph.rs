@@ -127,6 +127,7 @@ struct Entry {
 struct Mount {
     at: String,
     graph: Graph,
+    topology_observer: RefCell<Option<GraphTopologyObserver>>,
 }
 
 #[derive(Clone)]
@@ -582,10 +583,15 @@ impl Graph {
         if self.inner.profile_enabled.get() {
             child.enable_profile_recorder_recursive();
         }
-        self.inner
-            .mounts
-            .borrow_mut()
-            .push(Mount { at, graph: child });
+        self.inner.mounts.borrow_mut().push(Mount {
+            at: at.clone(),
+            graph: child,
+            topology_observer: RefCell::new(None),
+        });
+        if self.has_topology_observers() {
+            self.ensure_mounted_topology_forwarders();
+        }
+        self.emit_topology_mount_changed(at);
     }
 
     /// Static point-in-time inspection snapshot (D39 first cut).
@@ -1093,6 +1099,72 @@ impl Graph {
         });
     }
 
+    fn emit_topology_mount_changed(&self, path: String) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        let seq = self.inner.clock.get();
+        self.inner.clock.set(seq + 1);
+        self.emit_topology_event(TopologyEvent {
+            kind: TopologyEventKind::MountChanged,
+            path,
+            deps: Vec::new(),
+            prev_deps: None,
+            factory: Some("mount".to_owned()),
+            seq,
+        });
+    }
+
+    fn ensure_mounted_topology_forwarders(&self) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        let parent = Rc::downgrade(&self.inner);
+        for mount in self.inner.mounts.borrow().iter() {
+            if mount.topology_observer.borrow().is_some() {
+                continue;
+            }
+            let parent = parent.clone();
+            let mount_path = mount.at.clone();
+            let observer = mount.graph.observe_topology().subscribe(move |event| {
+                if let Some(inner) = parent.upgrade() {
+                    Graph { inner }.emit_mounted_topology_event(&mount_path, event);
+                }
+            });
+            *mount.topology_observer.borrow_mut() = Some(observer);
+        }
+    }
+
+    fn release_mounted_topology_forwarders(&self) {
+        for mount in self.inner.mounts.borrow().iter() {
+            mount.topology_observer.borrow_mut().take();
+        }
+    }
+
+    fn emit_mounted_topology_event(&self, mount_path: &str, event: TopologyEvent) {
+        if !self.has_topology_observers() {
+            return;
+        }
+        let seq = self.inner.clock.get();
+        self.inner.clock.set(seq + 1);
+        self.emit_topology_event(TopologyEvent {
+            kind: event.kind,
+            path: prefix_topology_path(mount_path, &event.path),
+            deps: event
+                .deps
+                .iter()
+                .map(|dep| prefix_topology_path(mount_path, dep))
+                .collect(),
+            prev_deps: event.prev_deps.map(|deps| {
+                deps.iter()
+                    .map(|dep| prefix_topology_path(mount_path, dep))
+                    .collect()
+            }),
+            factory: event.factory,
+            seq,
+        });
+    }
+
     fn emit_topology_event(&self, event: TopologyEvent) {
         if self.inner.topology_delivering.get() {
             self.inner.topology_queue.borrow_mut().push_back(event);
@@ -1519,6 +1591,7 @@ pub enum TopologyEventKind {
     NodeRegistered,
     DepsChanged,
     NodeReleased,
+    MountChanged,
 }
 
 #[derive(Clone)]
@@ -1582,6 +1655,7 @@ impl TopologyStream {
             .inner
             .topology_observer_active
             .set(self.graph.inner.topology_observer_active.get() + 1);
+        self.graph.ensure_mounted_topology_forwarders();
         GraphTopologyObserver {
             graph: self.graph.clone(),
             id,
@@ -1614,6 +1688,7 @@ impl GraphTopologyObserver {
             return;
         }
         self.active = false;
+        let mut release_forwarders = false;
         if let Some(slot) = self
             .graph
             .inner
@@ -1622,19 +1697,23 @@ impl GraphTopologyObserver {
             .get_mut(self.id)
         {
             if slot.take().is_some() {
-                self.graph.inner.topology_observer_active.set(
-                    self.graph
-                        .inner
-                        .topology_observer_active
-                        .get()
-                        .saturating_sub(1),
-                );
+                let active = self
+                    .graph
+                    .inner
+                    .topology_observer_active
+                    .get()
+                    .saturating_sub(1);
+                self.graph.inner.topology_observer_active.set(active);
+                release_forwarders = active == 0;
                 self.graph
                     .inner
                     .topology_observer_free
                     .borrow_mut()
                     .push(self.id);
             }
+        }
+        if release_forwarders {
+            self.graph.release_mounted_topology_forwarders();
         }
     }
 }
@@ -1722,6 +1801,10 @@ fn reachable(start: &str, adj: &HashMap<String, Vec<String>>) -> HashSet<String>
 
 fn topology_path_matches(event_path: &str, path: &str) -> bool {
     event_path == path || event_path.starts_with(&format!("{path}::"))
+}
+
+fn prefix_topology_path(prefix: &str, path: &str) -> String {
+    format!("{prefix}::{path}")
 }
 
 fn describe_value(value: &AnyValue) -> DescribeValue {
