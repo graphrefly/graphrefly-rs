@@ -189,10 +189,14 @@ pub use operators::{
     settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
 };
 pub use process::{
-    process_bundle, ProcessAuditOutcome, ProcessAuditRecord, ProcessBundle, ProcessBundleOptions,
-    ProcessCursor, ProcessEffectRequest, ProcessEffectRequestDraft, ProcessError, ProcessErrorCode,
-    ProcessEvent, ProcessEventDraft, ProcessReducer, ProcessReducerFn, ProcessReduction,
-    ProcessRuntimeFact, ProcessStatus, ProcessStatusState,
+    process_bundle, process_effect_runner, ProcessAuditOutcome, ProcessAuditRecord, ProcessBundle,
+    ProcessBundleOptions, ProcessCursor, ProcessEffectCommandPayload, ProcessEffectCommandType,
+    ProcessEffectOutcome, ProcessEffectOutcomeKind, ProcessEffectRequest,
+    ProcessEffectRequestDraft, ProcessEffectRunnerBundle, ProcessEffectRunnerError,
+    ProcessEffectRunnerErrorCode, ProcessEffectRunnerOptions, ProcessEffectRunnerStatus,
+    ProcessEffectRunnerStatusState, ProcessError, ProcessErrorCode, ProcessEvent,
+    ProcessEventDraft, ProcessReducer, ProcessReducerFn, ProcessReduction, ProcessRuntimeFact,
+    ProcessStatus, ProcessStatusState,
 };
 pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
 pub use render::{

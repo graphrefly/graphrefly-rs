@@ -3,9 +3,11 @@ use std::rc::Rc;
 
 use graphrefly::process::ProcessCommand;
 use graphrefly::{
-    graph, GraphCheckpointValue, Message, ProcessAuditOutcome, ProcessBundleOptions,
-    ProcessEffectRequestDraft, ProcessErrorCode, ProcessEventDraft, ProcessReduction,
-    ProcessStatusState, Values,
+    graph, GraphCheckpointValue, GraphNodeOpts, Message, ProcessAuditOutcome, ProcessBundleOptions,
+    ProcessEffectCommandPayload, ProcessEffectCommandType, ProcessEffectOutcome,
+    ProcessEffectOutcomeKind, ProcessEffectRequestDraft, ProcessEffectRunnerErrorCode,
+    ProcessEffectRunnerOptions, ProcessEffectRunnerStatusState, ProcessErrorCode,
+    ProcessEventDraft, ProcessReduction, ProcessStatusState, Values,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,29 @@ struct EventPayload {
 #[derive(Debug, Clone, PartialEq)]
 struct EffectPayload {
     url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EffectResult {
+    delivered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RunnerCommandPayload {
+    Start { order_id: String },
+    Effect(ProcessEffectCommandPayload<EffectResult>),
+}
+
+impl From<ProcessEffectCommandPayload<EffectResult>> for RunnerCommandPayload {
+    fn from(payload: ProcessEffectCommandPayload<EffectResult>) -> Self {
+        Self::Effect(payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RunnerState {
+    notified: bool,
+    effects_seen: u64,
 }
 
 #[test]
@@ -355,4 +380,381 @@ fn process_bundle_state_can_feed_regular_graph_reductions() {
 
     assert_eq!(doubled_values.borrow().last().cloned(), Some(8));
     assert_eq!(doubled.cache(), Some(8));
+}
+
+#[test]
+fn process_effect_runner_projects_result_commands_through_declared_process_edge() {
+    let g = graph();
+    let process = graphrefly::process_bundle::<
+        RunnerCommandPayload,
+        RunnerState,
+        &'static str,
+        EffectPayload,
+    >(
+        &g,
+        ProcessBundleOptions::new(
+            RunnerState {
+                notified: false,
+                effects_seen: 0,
+            },
+            |command, state| match &command.payload {
+                RunnerCommandPayload::Start { order_id } => ProcessReduction::new(state)
+                    .with_effects(vec![ProcessEffectRequestDraft {
+                        id: None,
+                        effect_type: "notify".to_owned(),
+                        payload: EffectPayload {
+                            url: format!("/orders/{order_id}"),
+                        },
+                        process_id: command.process_id.clone(),
+                        correlation_id: command.correlation_id.clone(),
+                        causation_id: Some(command.id.clone()),
+                    }]),
+                RunnerCommandPayload::Effect(payload)
+                    if payload.kind == ProcessEffectOutcomeKind::Result =>
+                {
+                    ProcessReduction::new(RunnerState {
+                        notified: payload
+                            .value
+                            .as_ref()
+                            .is_some_and(|result| result.delivered),
+                        effects_seen: state.effects_seen + 1,
+                    })
+                    .with_events(vec![ProcessEventDraft::new("notified", "event")])
+                }
+                RunnerCommandPayload::Effect(_) => ProcessReduction::new(RunnerState {
+                    effects_seen: state.effects_seen + 1,
+                    ..state
+                }),
+            },
+        )
+        .named("order"),
+    );
+    let outcomes = g.state_empty_opts::<ProcessEffectOutcome<EffectResult>>(GraphNodeOpts::named(
+        "notify/outcomeFacts",
+    ));
+    let runner = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![outcomes.clone()])
+            .named("notify")
+            .map_command_payload(RunnerCommandPayload::from),
+    );
+    let commands = collect_data(&runner.commands);
+
+    process.dispatch(ProcessCommand {
+        id: "cmd-1".to_owned(),
+        command_type: "start".to_owned(),
+        payload: RunnerCommandPayload::Start {
+            order_id: "o-1".to_owned(),
+        },
+        process_id: Some("p-1".to_owned()),
+        correlation_id: Some("corr-1".to_owned()),
+        causation_id: None,
+    });
+    assert_eq!(
+        runner.requests.cache().unwrap().id,
+        "cmd-1:effect:1".to_owned()
+    );
+
+    outcomes.down(vec![Message::Data(Rc::new(
+        ProcessEffectOutcome::result("cmd-1:effect:1", "notify", EffectResult { delivered: true })
+            .with_process_id("p-1")
+            .with_correlation_id("corr-1"),
+    ))]);
+
+    let command = commands.borrow().last().unwrap().clone();
+    assert_eq!(command.id, "cmd-1:effect:1:effect.result");
+    assert_eq!(command.command_type, "effect.result");
+    assert_eq!(command.process_id.as_deref(), Some("p-1"));
+    match command.payload {
+        RunnerCommandPayload::Effect(payload) => {
+            assert_eq!(payload.kind, ProcessEffectOutcomeKind::Result);
+            assert_eq!(payload.effect_id, "cmd-1:effect:1");
+            assert_eq!(payload.effect_type, "notify");
+            assert!(payload.value.unwrap().delivered);
+        }
+        RunnerCommandPayload::Start { .. } => panic!("runner must publish effect command payloads"),
+    }
+    assert_eq!(
+        process.state.cache(),
+        Some(RunnerState {
+            notified: true,
+            effects_seen: 1
+        })
+    );
+
+    let snap = g.describe();
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "order/effect_request" && edge.to == "notify/requests"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "notify/outcomeFacts" && edge.to == "notify/runtime"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "notify/commands" && edge.to == "order/command"));
+}
+
+#[test]
+fn process_effect_runner_surfaces_malformed_outcomes_as_data_facts() {
+    let g = graph();
+    let process =
+        graphrefly::process_bundle::<ProcessEffectCommandPayload<String>, u64, String, String>(
+            &g,
+            ProcessBundleOptions::new(0, |_command, state| ProcessReduction::new(state + 1)),
+        );
+    let outcomes = g.state_empty_opts::<ProcessEffectOutcome<String>>(GraphNodeOpts::named(
+        "effect/outcomeFacts",
+    ));
+    let runner = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![outcomes.clone()]).named("effect"),
+    );
+    let errors = collect_data(&runner.errors);
+    let status = collect_data(&runner.status);
+
+    outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome {
+        kind: ProcessEffectOutcomeKind::Result,
+        effect_id: String::new(),
+        effect_type: "call".to_owned(),
+        value: Some("ok".to_owned()),
+        error: None,
+        reason: None,
+        command_id: None,
+        process_id: None,
+        correlation_id: None,
+        causation_id: None,
+    }))]);
+
+    assert_eq!(
+        errors.borrow().last().unwrap().code,
+        ProcessEffectRunnerErrorCode::MalformedOutcome
+    );
+    assert!(errors
+        .borrow()
+        .last()
+        .unwrap()
+        .message
+        .contains("effect_id"));
+    let rejected = status.borrow().last().unwrap().clone();
+    assert_eq!(rejected.state, ProcessEffectRunnerStatusState::Rejected);
+    assert_eq!(rejected.rejected, 1);
+    assert_eq!(runner.commands.cache(), None);
+    assert_eq!(process.state.cache(), None);
+
+    outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome {
+        kind: ProcessEffectOutcomeKind::Result,
+        effect_id: "effect-1".to_owned(),
+        effect_type: "call".to_owned(),
+        value: Some("ok".to_owned()),
+        error: Some("contradiction".to_owned()),
+        reason: None,
+        command_id: None,
+        process_id: None,
+        correlation_id: None,
+        causation_id: None,
+    }))]);
+    assert!(errors
+        .borrow()
+        .last()
+        .unwrap()
+        .message
+        .contains("must not carry error"));
+    assert_eq!(status.borrow().last().unwrap().rejected, 2);
+}
+
+#[test]
+fn process_effect_runner_maps_failure_cancel_and_timeout_payloads() {
+    let g = graph();
+    let process = graphrefly::process_bundle::<
+        ProcessEffectCommandPayload<String>,
+        Vec<String>,
+        String,
+        String,
+    >(
+        &g,
+        ProcessBundleOptions::new(Vec::<String>::new(), |command, mut state| {
+            state.push(command.command_type.clone());
+            ProcessReduction::new(state)
+        }),
+    );
+    let outcomes = g.state_empty_opts::<ProcessEffectOutcome<String>>(GraphNodeOpts::named(
+        "effect/outcomeFacts",
+    ));
+    let runner = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![outcomes.clone()]).named("effect"),
+    );
+    let commands = collect_data(&runner.commands);
+    let status = collect_data(&runner.status);
+
+    outcomes.down(vec![Message::Data(Rc::new(
+        ProcessEffectOutcome::<String>::failure("effect-1", "http", "boom"),
+    ))]);
+    outcomes.down(vec![Message::Data(Rc::new(
+        ProcessEffectOutcome::<String>::cancel("effect-2", "http").with_reason("not needed"),
+    ))]);
+    outcomes.down(vec![Message::Data(Rc::new(
+        ProcessEffectOutcome::<String>::timeout("effect-3", "http", "deadline"),
+    ))]);
+
+    let commands = commands.borrow();
+    assert_eq!(commands[0].command_type, "effect.failure");
+    assert_eq!(commands[0].payload.error.as_deref(), Some("boom"));
+    assert_eq!(commands[1].command_type, "effect.cancel");
+    assert_eq!(commands[1].payload.reason.as_deref(), Some("not needed"));
+    assert_eq!(commands[2].command_type, "effect.timeout");
+    assert_eq!(commands[2].payload.error.as_deref(), Some("deadline"));
+    assert_eq!(
+        process.state.cache(),
+        Some(vec![
+            "effect.failure".to_owned(),
+            "effect.cancel".to_owned(),
+            "effect.timeout".to_owned()
+        ])
+    );
+    let commanded = status.borrow().last().unwrap().clone();
+    assert_eq!(commanded.state, ProcessEffectRunnerStatusState::Commanded);
+    assert_eq!(commanded.commanded, 3);
+    assert_eq!(
+        commanded.command_type,
+        Some(ProcessEffectCommandType::Timeout)
+    );
+}
+
+#[test]
+fn process_effect_runner_command_source_fan_in_accepts_multiple_runners() {
+    let g = graph();
+    let process = graphrefly::process_bundle::<
+        ProcessEffectCommandPayload<String>,
+        Vec<String>,
+        String,
+        String,
+    >(
+        &g,
+        ProcessBundleOptions::new(
+            Vec::<String>::new(),
+            |command: &ProcessCommand<ProcessEffectCommandPayload<String>>, mut state| {
+                state.push(command.payload.effect_id.clone());
+                ProcessReduction::new(state)
+            },
+        )
+        .named("process"),
+    );
+    let left_outcomes = g.state_empty_opts::<ProcessEffectOutcome<String>>(GraphNodeOpts::named(
+        "left/outcomeFacts",
+    ));
+    let right_outcomes = g.state_empty_opts::<ProcessEffectOutcome<String>>(GraphNodeOpts::named(
+        "right/outcomeFacts",
+    ));
+    let _left = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![left_outcomes.clone()]).named("left"),
+    );
+    let _right = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![right_outcomes.clone()]).named("right"),
+    );
+
+    left_outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome::result(
+        "left-effect",
+        "left",
+        "ok".to_owned(),
+    )))]);
+    right_outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome::result(
+        "right-effect",
+        "right",
+        "ok".to_owned(),
+    )))]);
+
+    assert_eq!(
+        process.state.cache(),
+        Some(vec!["left-effect".to_owned(), "right-effect".to_owned()])
+    );
+    let snap = g.describe();
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "left/commands" && edge.to == "process/command"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "right/commands" && edge.to == "process/command"));
+}
+
+#[test]
+fn process_effect_runner_release_is_idempotent_and_retryable_after_release_failure() {
+    let g = graph();
+    let process =
+        graphrefly::process_bundle::<ProcessEffectCommandPayload<String>, u64, String, String>(
+            &g,
+            ProcessBundleOptions::new(0, |command, state| {
+                if command.command_type == "effect.result" {
+                    ProcessReduction::new(state + 1)
+                } else {
+                    ProcessReduction::new(state)
+                }
+            })
+            .named("process"),
+        );
+    let outcomes = g.state_empty_opts::<ProcessEffectOutcome<String>>(GraphNodeOpts::named(
+        "work/outcomeFacts",
+    ));
+    let runner = graphrefly::process_effect_runner(
+        &g,
+        &process,
+        ProcessEffectRunnerOptions::new(vec![outcomes.clone()]).named("work"),
+    );
+    outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome::result(
+        "effect-1",
+        "work",
+        "ok".to_owned(),
+    )))]);
+    assert_eq!(process.state.cache(), Some(1));
+
+    let unsub = runner.status.subscribe(|_| {});
+
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.release())).is_err());
+    assert_eq!(
+        process.state.cache(),
+        Some(1),
+        "release rollback must not replay cached runner.commands"
+    );
+    assert!(g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));
+
+    outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome::result(
+        "effect-2",
+        "work",
+        "next".to_owned(),
+    )))]);
+    assert_eq!(process.state.cache(), Some(2));
+
+    unsub();
+    runner.release();
+    runner.release();
+    assert!(g.find("work/runtime").is_none());
+    assert!(g.find("work/commands").is_none());
+    assert!(!g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));
+
+    outcomes.down(vec![Message::Data(Rc::new(ProcessEffectOutcome::result(
+        "effect-3",
+        "work",
+        "late".to_owned(),
+    )))]);
+    assert_eq!(process.state.cache(), Some(2));
 }
