@@ -10,14 +10,407 @@
 //! create or delete graph nodes.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::json::JsonValue;
 use crate::node::{Core, Node};
 use crate::protocol::AnyValue;
+
+pub const PROMPTS_TOPIC: &str = "prompts";
+pub const RESPONSES_TOPIC: &str = "responses";
+pub const INJECTIONS_TOPIC: &str = "injections";
+pub const DEFERRED_TOPIC: &str = "deferred";
+pub const SPAWNS_TOPIC: &str = "spawns";
+pub const CONTEXT_TOPIC: &str = "context";
+pub const TODOS_TOPIC: &str = "todos";
+
+pub const STANDARD_TOPICS: [&str; 7] = [
+    PROMPTS_TOPIC,
+    RESPONSES_TOPIC,
+    INJECTIONS_TOPIC,
+    DEFERRED_TOPIC,
+    SPAWNS_TOPIC,
+    CONTEXT_TOPIC,
+    TODOS_TOPIC,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JsonSchemaType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Object,
+    Array,
+    Null,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonSchemaTypeSpec {
+    Single(JsonSchemaType),
+    AnyOf(Vec<JsonSchemaType>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonSchemaAdditionalProperties {
+    Bool(bool),
+    Schema(Box<JsonSchema>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonSchemaItems {
+    Schema(Box<JsonSchema>),
+    Tuple(Vec<JsonSchema>),
+}
+
+/// Minimal passive JSON Schema vocabulary for D159 messaging payload facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct JsonSchema {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub schema_type: Option<JsonSchemaTypeSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, JsonSchema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+    #[serde(
+        rename = "additionalProperties",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_properties: Option<JsonSchemaAdditionalProperties>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<JsonSchemaItems>,
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<JsonValue>>,
+    #[serde(rename = "const", skip_serializing_if = "Option::is_none")]
+    pub const_value: Option<JsonValue>,
+    #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
+    pub ref_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definitions: Option<BTreeMap<String, JsonSchema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Passive D159 envelope for payloads that cross topic, agent, or graph boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicMessage<T> {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<JsonSchema>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(rename = "correlationId", skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonSchemaValidationError {
+    pub path: String,
+    pub message: String,
+}
+
+impl JsonSchemaValidationError {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for JsonSchemaValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path, self.message)
+    }
+}
+
+impl Error for JsonSchemaValidationError {}
+
+pub type JsonSchemaValidationResult<T> = Result<T, JsonSchemaValidationError>;
+
+/// Caller-invoked, side-effect-free validation for JSON-like payload values (D159).
+pub fn validate_json_schema(
+    schema: &JsonSchema,
+    value: &JsonValue,
+) -> JsonSchemaValidationResult<()> {
+    validate_json_schema_inner(schema, schema, value, "$", &mut Vec::new())
+}
+
+pub fn is_json_schema_valid(schema: &JsonSchema, value: &JsonValue) -> bool {
+    validate_json_schema(schema, value).is_ok()
+}
+
+/// Validate a passive topic message payload only when the caller explicitly asks.
+pub fn validate_topic_message_payload(
+    message: &TopicMessage<JsonValue>,
+) -> JsonSchemaValidationResult<()> {
+    if let Some(schema) = &message.schema {
+        validate_json_schema(schema, &message.payload)?;
+    }
+    Ok(())
+}
+
+fn validate_json_schema_inner(
+    schema: &JsonSchema,
+    root: &JsonSchema,
+    value: &JsonValue,
+    path: &str,
+    refs_seen: &mut Vec<(String, String)>,
+) -> JsonSchemaValidationResult<()> {
+    if let Some(ref_path) = &schema.ref_path {
+        validate_json_schema_ref(root, ref_path, value, path, refs_seen)?;
+    }
+    if let Some(const_value) = &schema.const_value {
+        if value != const_value {
+            return Err(JsonSchemaValidationError::new(
+                path,
+                "value does not match const",
+            ));
+        }
+    }
+    if let Some(enum_values) = &schema.enum_values {
+        if !enum_values.iter().any(|candidate| candidate == value) {
+            return Err(JsonSchemaValidationError::new(
+                path,
+                "value is not one of the allowed enum values",
+            ));
+        }
+    }
+    if let Some(schema_type) = &schema.schema_type {
+        validate_json_schema_type(schema_type, value, path)?;
+    }
+    if let Value::Object(object) = value {
+        validate_json_schema_object(schema, root, object, path, refs_seen)?;
+    }
+    if let Value::Array(items) = value {
+        validate_json_schema_array(schema, root, items, path, refs_seen)?;
+    }
+    Ok(())
+}
+
+fn validate_json_schema_ref(
+    root: &JsonSchema,
+    ref_path: &str,
+    value: &JsonValue,
+    path: &str,
+    refs_seen: &mut Vec<(String, String)>,
+) -> JsonSchemaValidationResult<()> {
+    let name = ref_path.strip_prefix("#/definitions/").ok_or_else(|| {
+        JsonSchemaValidationError::new(path, "only local #/definitions refs are supported")
+    })?;
+    if refs_seen
+        .iter()
+        .any(|(seen_ref, seen_path)| seen_ref == ref_path && seen_path == path)
+    {
+        return Err(JsonSchemaValidationError::new(
+            path,
+            format!("cyclic JSON schema ref '{ref_path}'"),
+        ));
+    }
+    let definitions = root.definitions.as_ref().ok_or_else(|| {
+        JsonSchemaValidationError::new(path, format!("unknown JSON schema ref '{ref_path}'"))
+    })?;
+    let referenced = definitions.get(name).ok_or_else(|| {
+        JsonSchemaValidationError::new(path, format!("unknown JSON schema ref '{ref_path}'"))
+    })?;
+    refs_seen.push((ref_path.to_owned(), path.to_owned()));
+    let result = validate_json_schema_inner(referenced, root, value, path, refs_seen);
+    refs_seen.pop();
+    result
+}
+
+fn validate_json_schema_type(
+    schema_type: &JsonSchemaTypeSpec,
+    value: &JsonValue,
+    path: &str,
+) -> JsonSchemaValidationResult<()> {
+    let ok = match schema_type {
+        JsonSchemaTypeSpec::Single(expected) => json_value_matches_type(value, *expected),
+        JsonSchemaTypeSpec::AnyOf(expected) => expected
+            .iter()
+            .any(|expected| json_value_matches_type(value, *expected)),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(JsonSchemaValidationError::new(
+            path,
+            format!(
+                "expected {}, got {}",
+                json_schema_type_label(schema_type),
+                json_value_type_label(value)
+            ),
+        ))
+    }
+}
+
+fn json_value_matches_type(value: &JsonValue, expected: JsonSchemaType) -> bool {
+    match expected {
+        JsonSchemaType::String => value.is_string(),
+        JsonSchemaType::Number => value.is_number(),
+        JsonSchemaType::Integer => {
+            value.as_i64().is_some()
+                || value.as_u64().is_some()
+                || value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+        }
+        JsonSchemaType::Boolean => value.is_boolean(),
+        JsonSchemaType::Object => value.is_object(),
+        JsonSchemaType::Array => value.is_array(),
+        JsonSchemaType::Null => value.is_null(),
+    }
+}
+
+fn json_schema_type_label(schema_type: &JsonSchemaTypeSpec) -> String {
+    match schema_type {
+        JsonSchemaTypeSpec::Single(expected) => format!("{expected:?}").to_lowercase(),
+        JsonSchemaTypeSpec::AnyOf(expected) => expected
+            .iter()
+            .map(|expected| format!("{expected:?}").to_lowercase())
+            .collect::<Vec<_>>()
+            .join("|"),
+    }
+}
+
+fn json_value_type_label(value: &JsonValue) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn validate_json_schema_object(
+    schema: &JsonSchema,
+    root: &JsonSchema,
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    refs_seen: &mut Vec<(String, String)>,
+) -> JsonSchemaValidationResult<()> {
+    if let Some(required) = &schema.required {
+        for key in required {
+            if !object.contains_key(key) {
+                return Err(JsonSchemaValidationError::new(
+                    path,
+                    format!("missing required property '{key}'"),
+                ));
+            }
+        }
+    }
+    let empty_properties = BTreeMap::new();
+    let properties = schema.properties.as_ref().unwrap_or(&empty_properties);
+    for (key, property_schema) in properties {
+        if let Some(property_value) = object.get(key) {
+            validate_json_schema_inner(
+                property_schema,
+                root,
+                property_value,
+                &format!("{path}.{key}"),
+                refs_seen,
+            )?;
+        }
+    }
+    validate_additional_properties(schema, root, object, properties, path, refs_seen)?;
+    Ok(())
+}
+
+fn validate_additional_properties(
+    schema: &JsonSchema,
+    root: &JsonSchema,
+    object: &serde_json::Map<String, Value>,
+    properties: &BTreeMap<String, JsonSchema>,
+    path: &str,
+    refs_seen: &mut Vec<(String, String)>,
+) -> JsonSchemaValidationResult<()> {
+    let Some(additional_properties) = &schema.additional_properties else {
+        return Ok(());
+    };
+    for (key, value) in object {
+        if properties.contains_key(key) {
+            continue;
+        }
+        match additional_properties {
+            JsonSchemaAdditionalProperties::Bool(true) => {}
+            JsonSchemaAdditionalProperties::Bool(false) => {
+                return Err(JsonSchemaValidationError::new(
+                    path,
+                    format!("unexpected additional property '{key}'"),
+                ));
+            }
+            JsonSchemaAdditionalProperties::Schema(additional_schema) => {
+                validate_json_schema_inner(
+                    additional_schema,
+                    root,
+                    value,
+                    &format!("{path}.{key}"),
+                    refs_seen,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_schema_array(
+    schema: &JsonSchema,
+    root: &JsonSchema,
+    values: &[Value],
+    path: &str,
+    refs_seen: &mut Vec<(String, String)>,
+) -> JsonSchemaValidationResult<()> {
+    let Some(items) = &schema.items else {
+        return Ok(());
+    };
+    match items {
+        JsonSchemaItems::Schema(item_schema) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_json_schema_inner(
+                    item_schema,
+                    root,
+                    value,
+                    &format!("{path}[{index}]"),
+                    refs_seen,
+                )?;
+            }
+        }
+        JsonSchemaItems::Tuple(item_schemas) => {
+            for (index, item_schema) in item_schemas.iter().enumerate() {
+                if let Some(value) = values.get(index) {
+                    validate_json_schema_inner(
+                        item_schema,
+                        root,
+                        value,
+                        &format!("{path}[{index}]"),
+                        refs_seen,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct MessageEnvelope {
@@ -1300,6 +1693,251 @@ fn is_reachable_upstream(from: &Core, target: &Core) -> bool {
 mod tests {
     use super::*;
     use crate::graph::{graph, GraphNodeOpts};
+    use serde_json::json;
+
+    #[test]
+    fn standard_topic_constants_are_stable_d159_vocabulary() {
+        assert_eq!(PROMPTS_TOPIC, "prompts");
+        assert_eq!(RESPONSES_TOPIC, "responses");
+        assert_eq!(INJECTIONS_TOPIC, "injections");
+        assert_eq!(DEFERRED_TOPIC, "deferred");
+        assert_eq!(SPAWNS_TOPIC, "spawns");
+        assert_eq!(CONTEXT_TOPIC, "context");
+        assert_eq!(TODOS_TOPIC, "todos");
+        assert_eq!(
+            STANDARD_TOPICS,
+            [
+                "prompts",
+                "responses",
+                "injections",
+                "deferred",
+                "spawns",
+                "context",
+                "todos"
+            ]
+        );
+    }
+
+    #[test]
+    fn topic_message_is_passive_metadata_plus_payload() {
+        let message = TopicMessage {
+            id: "msg-1".to_owned(),
+            schema: Some(JsonSchema {
+                schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+                title: Some("Prompt".to_owned()),
+                ..JsonSchema::default()
+            }),
+            expires_at: Some("2026-06-09T00:00:00Z".to_owned()),
+            correlation_id: Some("corr-1".to_owned()),
+            payload: json!({ "prompt": "hello" }),
+        };
+
+        assert_eq!(message.id, "msg-1");
+        assert_eq!(message.expires_at.as_deref(), Some("2026-06-09T00:00:00Z"));
+        assert_eq!(message.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(message.payload["prompt"], "hello");
+
+        let encoded = serde_json::to_value(&message).expect("topic message encodes");
+        assert_eq!(encoded["expiresAt"], "2026-06-09T00:00:00Z");
+        assert_eq!(encoded["correlationId"], "corr-1");
+        assert_eq!(encoded["schema"]["type"], "object");
+    }
+
+    #[test]
+    fn json_schema_representation_round_trips_camel_case_fields() {
+        let schema = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+            properties: Some(BTreeMap::from([(
+                "id".to_owned(),
+                JsonSchema {
+                    schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                    ..JsonSchema::default()
+                },
+            )])),
+            required: Some(vec!["id".to_owned()]),
+            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+            description: Some("payload shape".to_owned()),
+            ..JsonSchema::default()
+        };
+
+        let encoded = serde_json::to_value(&schema).expect("schema encodes");
+        assert_eq!(encoded["type"], "object");
+        assert_eq!(encoded["properties"]["id"]["type"], "string");
+        assert_eq!(encoded["required"], json!(["id"]));
+        assert_eq!(encoded["additionalProperties"], false);
+        assert_eq!(encoded["description"], "payload shape");
+    }
+
+    #[test]
+    fn json_schema_deserialization_rejects_unsupported_keywords() {
+        let error = serde_json::from_value::<JsonSchema>(json!({
+            "type": "string",
+            "minLength": 2
+        }))
+        .expect_err("unsupported schema keywords fail closed");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn explicit_json_schema_validation_accepts_matching_payloads() {
+        let schema = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+            properties: Some(BTreeMap::from([
+                (
+                    "id".to_owned(),
+                    JsonSchema {
+                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                        ..JsonSchema::default()
+                    },
+                ),
+                (
+                    "attempts".to_owned(),
+                    JsonSchema {
+                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Integer)),
+                        ..JsonSchema::default()
+                    },
+                ),
+                (
+                    "tags".to_owned(),
+                    JsonSchema {
+                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Array)),
+                        items: Some(JsonSchemaItems::Schema(Box::new(JsonSchema {
+                            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                            ..JsonSchema::default()
+                        }))),
+                        ..JsonSchema::default()
+                    },
+                ),
+            ])),
+            required: Some(vec!["id".to_owned(), "attempts".to_owned()]),
+            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+            ..JsonSchema::default()
+        };
+
+        let payload = json!({ "id": "job-1", "attempts": 2, "tags": ["fast", "safe"] });
+
+        validate_json_schema(&schema, &payload).expect("payload matches schema");
+        assert!(is_json_schema_valid(&schema, &payload));
+
+        let integer_schema = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Integer)),
+            ..JsonSchema::default()
+        };
+        validate_json_schema(&integer_schema, &json!(1.0)).expect("1.0 is an integer JSON number");
+    }
+
+    #[test]
+    fn explicit_json_schema_validation_accepts_finite_recursive_refs() {
+        let node_schema = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+            properties: Some(BTreeMap::from([
+                (
+                    "value".to_owned(),
+                    JsonSchema {
+                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                        ..JsonSchema::default()
+                    },
+                ),
+                (
+                    "child".to_owned(),
+                    JsonSchema {
+                        ref_path: Some("#/definitions/Node".to_owned()),
+                        ..JsonSchema::default()
+                    },
+                ),
+            ])),
+            required: Some(vec!["value".to_owned()]),
+            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+            ..JsonSchema::default()
+        };
+        let schema = JsonSchema {
+            ref_path: Some("#/definitions/Node".to_owned()),
+            definitions: Some(BTreeMap::from([("Node".to_owned(), node_schema)])),
+            ..JsonSchema::default()
+        };
+
+        validate_json_schema(
+            &schema,
+            &json!({
+                "value": "root",
+                "child": { "value": "leaf" }
+            }),
+        )
+        .expect("finite recursive payload validates");
+    }
+
+    #[test]
+    fn explicit_json_schema_validation_reports_failures_without_side_effects() {
+        let schema = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+            properties: Some(BTreeMap::from([(
+                "id".to_owned(),
+                JsonSchema {
+                    schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                    ..JsonSchema::default()
+                },
+            )])),
+            required: Some(vec!["id".to_owned()]),
+            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+            ..JsonSchema::default()
+        };
+
+        let missing = validate_json_schema(&schema, &json!({})).expect_err("missing id fails");
+        assert_eq!(missing.path, "$");
+        assert_eq!(missing.message, "missing required property 'id'");
+
+        let wrong_type =
+            validate_json_schema(&schema, &json!({ "id": 42 })).expect_err("wrong type fails");
+        assert_eq!(wrong_type.path, "$.id");
+        assert_eq!(wrong_type.message, "expected string, got number");
+
+        let extra = validate_json_schema(&schema, &json!({ "id": "a", "extra": true }))
+            .expect_err("extra property fails");
+        assert_eq!(extra.path, "$");
+        assert_eq!(extra.message, "unexpected additional property 'extra'");
+
+        let no_declared_properties = JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+            ..JsonSchema::default()
+        };
+        let extra_without_properties =
+            validate_json_schema(&no_declared_properties, &json!({ "extra": true }))
+                .expect_err("additionalProperties applies without properties");
+        assert_eq!(extra_without_properties.path, "$");
+        assert_eq!(
+            extra_without_properties.message,
+            "unexpected additional property 'extra'"
+        );
+    }
+
+    #[test]
+    fn topic_message_payload_validation_is_explicit_and_schema_optional() {
+        let unchecked = TopicMessage {
+            id: "msg-1".to_owned(),
+            schema: None,
+            expires_at: None,
+            correlation_id: None,
+            payload: json!({ "anything": true }),
+        };
+        validate_topic_message_payload(&unchecked).expect("no schema means no validation");
+
+        let checked = TopicMessage {
+            id: "msg-2".to_owned(),
+            schema: Some(JsonSchema {
+                schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+                ..JsonSchema::default()
+            }),
+            expires_at: None,
+            correlation_id: None,
+            payload: json!(10),
+        };
+
+        let error = validate_topic_message_payload(&checked).expect_err("schema is explicit");
+        assert_eq!(error.path, "$");
+        assert_eq!(error.message, "expected string, got number");
+    }
 
     #[test]
     fn message_bus_topic_starts_sentinel_then_publishes_envelope() {

@@ -177,10 +177,14 @@ pub use json::{
 };
 pub use messaging::{
     dynamic_hub, dynamic_hub_with_options, from_hub_topic, from_hub_topic_with_name, from_topic,
-    message_bus, to_hub_topic, to_topic, topic_core, DynamicHub, DynamicHubCommand,
-    DynamicHubDeadLetter, DynamicHubError, DynamicHubEvent, DynamicHubEventKind,
-    DynamicHubMetadata, DynamicHubOptions, DynamicHubStatus, DynamicHubUnknownTopicPolicy,
-    MessageBus, MessageBusEvent, MessageEnvelope, ToHubTopicBundle,
+    is_json_schema_valid, message_bus, to_hub_topic, to_topic, topic_core, validate_json_schema,
+    validate_topic_message_payload, DynamicHub, DynamicHubCommand, DynamicHubDeadLetter,
+    DynamicHubError, DynamicHubEvent, DynamicHubEventKind, DynamicHubMetadata, DynamicHubOptions,
+    DynamicHubStatus, DynamicHubUnknownTopicPolicy, JsonSchema, JsonSchemaAdditionalProperties,
+    JsonSchemaItems, JsonSchemaType, JsonSchemaTypeSpec, JsonSchemaValidationError,
+    JsonSchemaValidationResult, MessageBus, MessageBusEvent, MessageEnvelope, ToHubTopicBundle,
+    TopicMessage, CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC,
+    SPAWNS_TOPIC, STANDARD_TOPICS, TODOS_TOPIC,
 };
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
