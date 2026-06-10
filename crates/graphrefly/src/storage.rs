@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::data_structures::{IndexChange, IndexRow, ListChange, LogChange, MapChange};
 use crate::json::{strict_canonical_json_bytes, strict_json_decode, Codec, JsonCodecError};
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1657,6 +1658,817 @@ pub fn read_append_log_page<T: Clone>(
         next_after,
         done,
     })
+}
+
+pub const REACTIVE_COLLECTION_SNAPSHOT_FORMAT: &str = "graphrefly.reactive-collection.snapshot.v1";
+pub const REACTIVE_COLLECTION_CHANGE_FORMAT: &str = "graphrefly.reactive-collection.change.v1";
+pub const REACTIVE_COLLECTION_FRAME_VERSION: u8 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReactiveCollectionKind {
+    #[serde(rename = "reactiveList")]
+    ReactiveList,
+    #[serde(rename = "reactiveLog")]
+    ReactiveLog,
+    #[serde(rename = "reactiveMap")]
+    ReactiveMap,
+    #[serde(rename = "reactiveIndex")]
+    ReactiveIndex,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveCollectionSnapshotFrame {
+    pub format: String,
+    pub version: u8,
+    pub kind: ReactiveCollectionKind,
+    #[serde(rename = "changeCursor")]
+    pub change_cursor: i64,
+    pub snapshot: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveCollectionChangeFrame {
+    pub format: String,
+    pub version: u8,
+    pub kind: ReactiveCollectionKind,
+    pub change: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReactiveCollectionRestoreState<T> {
+    pub kind: ReactiveCollectionKind,
+    pub state: T,
+    pub source: ReactiveCollectionRestoreSource,
+    pub snapshot: ReactiveCollectionSnapshotRestoreMeta,
+    pub changes: ReactiveCollectionChangesRestoreMeta,
+    pub cursor: Option<u64>,
+    pub snapshot_found: bool,
+    pub changes_applied: usize,
+}
+
+pub type ReactiveListRestoreState<T> = ReactiveCollectionRestoreState<Vec<T>>;
+pub type ReactiveLogRestoreState<T> = ReactiveCollectionRestoreState<Vec<T>>;
+pub type ReactiveMapRestoreState<K, V> = ReactiveCollectionRestoreState<Vec<(K, V)>>;
+pub type ReactiveIndexRestoreState<K, S, V> =
+    ReactiveCollectionRestoreState<Vec<IndexRow<K, S, V>>>;
+
+struct FoldedCollectionState<T> {
+    state: T,
+    cursor: Option<u64>,
+    snapshot_cursor: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactiveCollectionRestoreSource {
+    Empty,
+    Changes,
+    Snapshot,
+    SnapshotAndChanges,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactiveCollectionSnapshotRestoreMeta {
+    pub found: bool,
+    pub change_cursor: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactiveCollectionChangesRestoreMeta {
+    pub applied: usize,
+    pub cursor: i64,
+}
+
+#[derive(Clone, Default)]
+pub struct LoadReactiveCollectionStateOptions<'a> {
+    pub storage_prefix: Option<&'a str>,
+    pub snapshot_key: Option<&'a str>,
+    pub change_log: Option<&'a dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReactiveCollectionSnapshotFrameCodec;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReactiveCollectionChangeFrameCodec;
+
+pub fn reactive_collection_snapshot_key(prefix: &str) -> StorageResult<String> {
+    if prefix.is_empty() {
+        return Err(StorageError::backend(
+            "reactive_collection_snapshot_key: storage_prefix must be non-empty",
+        ));
+    }
+    Ok(format!("{prefix}/snapshot"))
+}
+
+pub fn reactive_collection_snapshot_frame(
+    kind: ReactiveCollectionKind,
+    change_cursor: i64,
+    snapshot: Value,
+) -> StorageResult<ReactiveCollectionSnapshotFrame> {
+    let frame = ReactiveCollectionSnapshotFrame {
+        format: REACTIVE_COLLECTION_SNAPSHOT_FORMAT.to_owned(),
+        version: REACTIVE_COLLECTION_FRAME_VERSION,
+        kind,
+        change_cursor,
+        snapshot,
+    };
+    assert_reactive_collection_snapshot_frame(&frame)?;
+    Ok(frame)
+}
+
+pub fn reactive_collection_change_frame(
+    kind: ReactiveCollectionKind,
+    change: Value,
+) -> StorageResult<ReactiveCollectionChangeFrame> {
+    let frame = ReactiveCollectionChangeFrame {
+        format: REACTIVE_COLLECTION_CHANGE_FORMAT.to_owned(),
+        version: REACTIVE_COLLECTION_FRAME_VERSION,
+        kind,
+        change,
+    };
+    assert_reactive_collection_change_frame(&frame)?;
+    Ok(frame)
+}
+
+pub fn reactive_collection_snapshot_frame_codec() -> ReactiveCollectionSnapshotFrameCodec {
+    ReactiveCollectionSnapshotFrameCodec
+}
+
+pub fn reactive_collection_change_frame_codec() -> ReactiveCollectionChangeFrameCodec {
+    ReactiveCollectionChangeFrameCodec
+}
+
+pub fn assert_reactive_collection_snapshot_frame(
+    frame: &ReactiveCollectionSnapshotFrame,
+) -> StorageResult<()> {
+    if frame.format != REACTIVE_COLLECTION_SNAPSHOT_FORMAT {
+        return Err(StorageError::backend(format!(
+            "reactiveCollection snapshot frame: unsupported format {}",
+            frame.format
+        )));
+    }
+    if frame.version != REACTIVE_COLLECTION_FRAME_VERSION {
+        return Err(StorageError::backend(format!(
+            "reactiveCollection snapshot frame: unsupported version {}",
+            frame.version
+        )));
+    }
+    if frame.change_cursor < -1 {
+        return Err(StorageError::backend(
+            "reactiveCollection snapshot frame: changeCursor must be -1 or a non-negative integer",
+        ));
+    }
+    let value = serde_json::to_value(frame).map_err(storage_serde_json_error)?;
+    strict_canonical_json_bytes(&value).map_err(storage_json_error)?;
+    Ok(())
+}
+
+pub fn assert_reactive_collection_change_frame(
+    frame: &ReactiveCollectionChangeFrame,
+) -> StorageResult<()> {
+    if frame.format != REACTIVE_COLLECTION_CHANGE_FORMAT {
+        return Err(StorageError::backend(format!(
+            "reactiveCollection change frame: unsupported format {}",
+            frame.format
+        )));
+    }
+    if frame.version != REACTIVE_COLLECTION_FRAME_VERSION {
+        return Err(StorageError::backend(format!(
+            "reactiveCollection change frame: unsupported version {}",
+            frame.version
+        )));
+    }
+    let value = serde_json::to_value(frame).map_err(storage_serde_json_error)?;
+    strict_canonical_json_bytes(&value).map_err(storage_json_error)?;
+    Ok(())
+}
+
+impl Codec<ReactiveCollectionSnapshotFrame> for ReactiveCollectionSnapshotFrameCodec {
+    fn encode(
+        &self,
+        value: &ReactiveCollectionSnapshotFrame,
+    ) -> crate::json::JsonCodecResult<Vec<u8>> {
+        assert_reactive_collection_snapshot_frame(value).map_err(storage_error_to_json)?;
+        let json =
+            serde_json::to_value(value).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+        strict_canonical_json_bytes(&json)
+    }
+
+    fn decode(
+        &self,
+        bytes: &[u8],
+    ) -> crate::json::JsonCodecResult<ReactiveCollectionSnapshotFrame> {
+        let json = strict_json_decode(bytes)?;
+        let frame =
+            serde_json::from_value(json).map_err(|err| JsonCodecError::decode(err.to_string()))?;
+        assert_reactive_collection_snapshot_frame(&frame).map_err(storage_error_to_json)?;
+        Ok(frame)
+    }
+}
+
+impl Codec<ReactiveCollectionChangeFrame> for ReactiveCollectionChangeFrameCodec {
+    fn encode(
+        &self,
+        value: &ReactiveCollectionChangeFrame,
+    ) -> crate::json::JsonCodecResult<Vec<u8>> {
+        assert_reactive_collection_change_frame(value).map_err(storage_error_to_json)?;
+        let json =
+            serde_json::to_value(value).map_err(|err| JsonCodecError::encode(err.to_string()))?;
+        strict_canonical_json_bytes(&json)
+    }
+
+    fn decode(&self, bytes: &[u8]) -> crate::json::JsonCodecResult<ReactiveCollectionChangeFrame> {
+        let json = strict_json_decode(bytes)?;
+        let frame =
+            serde_json::from_value(json).map_err(|err| JsonCodecError::decode(err.to_string()))?;
+        assert_reactive_collection_change_frame(&frame).map_err(storage_error_to_json)?;
+        Ok(frame)
+    }
+}
+
+pub fn load_reactive_list_state<T>(
+    snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
+    options: LoadReactiveCollectionStateOptions<'_>,
+) -> StorageResult<ReactiveListRestoreState<T>>
+where
+    T: Clone + Serialize + DeserializeOwned,
+{
+    let (snapshot, cursor, snapshot_found) = load_collection_snapshot::<Vec<T>>(
+        snapshot_store,
+        &options,
+        ReactiveCollectionKind::ReactiveList,
+    )?;
+    let mut state = snapshot.unwrap_or_default();
+    let (cursor, changes_applied) = fold_collection_changes(
+        state,
+        cursor,
+        options.change_log,
+        ReactiveCollectionKind::ReactiveList,
+        fold_list_change::<T>,
+    )?;
+    state = cursor.state;
+    restore_state(
+        ReactiveCollectionKind::ReactiveList,
+        state,
+        snapshot_found,
+        cursor.snapshot_cursor,
+        changes_applied,
+        cursor.cursor,
+    )
+}
+
+pub fn load_reactive_log_state<T>(
+    snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
+    options: LoadReactiveCollectionStateOptions<'_>,
+) -> StorageResult<ReactiveLogRestoreState<T>>
+where
+    T: Clone + Serialize + DeserializeOwned,
+{
+    let (snapshot, cursor, snapshot_found) = load_collection_snapshot::<Vec<T>>(
+        snapshot_store,
+        &options,
+        ReactiveCollectionKind::ReactiveLog,
+    )?;
+    let mut state = snapshot.unwrap_or_default();
+    let (cursor, changes_applied) = fold_collection_changes(
+        state,
+        cursor,
+        options.change_log,
+        ReactiveCollectionKind::ReactiveLog,
+        fold_log_change::<T>,
+    )?;
+    state = cursor.state;
+    restore_state(
+        ReactiveCollectionKind::ReactiveLog,
+        state,
+        snapshot_found,
+        cursor.snapshot_cursor,
+        changes_applied,
+        cursor.cursor,
+    )
+}
+
+pub fn load_reactive_map_state<K, V>(
+    snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
+    options: LoadReactiveCollectionStateOptions<'_>,
+) -> StorageResult<ReactiveMapRestoreState<K, V>>
+where
+    K: Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
+{
+    let (snapshot, cursor, snapshot_found) = load_collection_snapshot::<Vec<(K, V)>>(
+        snapshot_store,
+        &options,
+        ReactiveCollectionKind::ReactiveMap,
+    )?;
+    let mut state = snapshot.unwrap_or_default();
+    assert_unique_map_keys(&state, "reactiveMap snapshot")?;
+    let (cursor, changes_applied) = fold_collection_changes(
+        state,
+        cursor,
+        options.change_log,
+        ReactiveCollectionKind::ReactiveMap,
+        fold_map_change::<K, V>,
+    )?;
+    state = cursor.state;
+    assert_unique_map_keys(&state, "reactiveMap restore")?;
+    restore_state(
+        ReactiveCollectionKind::ReactiveMap,
+        state,
+        snapshot_found,
+        cursor.snapshot_cursor,
+        changes_applied,
+        cursor.cursor,
+    )
+}
+
+pub fn load_reactive_index_state<K, S, V>(
+    snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
+    options: LoadReactiveCollectionStateOptions<'_>,
+) -> StorageResult<ReactiveIndexRestoreState<K, S, V>>
+where
+    K: Clone + Serialize + DeserializeOwned,
+    S: Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
+{
+    let (snapshot, cursor, snapshot_found) = load_collection_snapshot::<Vec<IndexRow<K, S, V>>>(
+        snapshot_store,
+        &options,
+        ReactiveCollectionKind::ReactiveIndex,
+    )?;
+    let mut state = snapshot.unwrap_or_default();
+    assert_unique_index_primaries(&state, "reactiveIndex snapshot")?;
+    let (cursor, changes_applied) = fold_collection_changes(
+        state,
+        cursor,
+        options.change_log,
+        ReactiveCollectionKind::ReactiveIndex,
+        fold_index_change::<K, S, V>,
+    )?;
+    state = cursor.state;
+    assert_unique_index_primaries(&state, "reactiveIndex restore")?;
+    restore_state(
+        ReactiveCollectionKind::ReactiveIndex,
+        state,
+        snapshot_found,
+        cursor.snapshot_cursor,
+        changes_applied,
+        cursor.cursor,
+    )
+}
+
+fn load_collection_snapshot<T>(
+    snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
+    options: &LoadReactiveCollectionStateOptions<'_>,
+    kind: ReactiveCollectionKind,
+) -> StorageResult<(Option<T>, Option<u64>, bool)>
+where
+    T: DeserializeOwned,
+{
+    let key = resolve_collection_snapshot_key(options)?;
+    let Some(frame) = snapshot_store.get(&key)? else {
+        return Ok((None, None, false));
+    };
+    assert_reactive_collection_snapshot_frame(&frame)?;
+    if frame.kind != kind {
+        return Err(StorageError::backend(format!(
+            "reactiveCollection snapshot frame: expected {:?}, got {:?}",
+            kind, frame.kind
+        )));
+    }
+    let state = serde_json::from_value(frame.snapshot.clone()).map_err(storage_serde_json_error)?;
+    let cursor = if frame.change_cursor < 0 {
+        None
+    } else {
+        Some(frame.change_cursor as u64)
+    };
+    Ok((Some(state), cursor, true))
+}
+
+fn fold_collection_changes<T, F>(
+    mut state: T,
+    mut cursor: Option<u64>,
+    change_log: Option<&dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>>,
+    kind: ReactiveCollectionKind,
+    mut fold: F,
+) -> StorageResult<(FoldedCollectionState<T>, usize)>
+where
+    F: FnMut(&mut T, ReactiveCollectionChangeFrame) -> StorageResult<()>,
+{
+    let snapshot_cursor = cursor
+        .map(seq_to_snapshot_cursor)
+        .transpose()?
+        .unwrap_or(-1);
+    let Some(log) = change_log else {
+        return Ok((
+            FoldedCollectionState {
+                state,
+                cursor,
+                snapshot_cursor,
+            },
+            0,
+        ));
+    };
+    let entries = log.read(AppendLogReadOptions {
+        after: cursor,
+        limit: None,
+    })?;
+    let mut expected = cursor.map_or(0, |seq| seq.saturating_add(1));
+    for entry in entries.iter() {
+        if entry.seq != expected {
+            return Err(StorageError::backend(format!(
+                "reactiveCollection load: non-contiguous change log sequence, expected {expected}, got {}",
+                entry.seq
+            )));
+        }
+        assert_reactive_collection_change_frame(&entry.value)?;
+        if entry.value.kind != kind {
+            return Err(StorageError::backend(format!(
+                "reactiveCollection change frame: expected {:?}, got {:?}",
+                kind, entry.value.kind
+            )));
+        }
+        fold(&mut state, entry.value.clone())?;
+        cursor = Some(entry.seq);
+        expected = expected.checked_add(1).ok_or_else(|| {
+            StorageError::backend("reactiveCollection load: change log sequence overflow")
+        })?;
+    }
+    Ok((
+        FoldedCollectionState {
+            state,
+            cursor,
+            snapshot_cursor,
+        },
+        entries.len(),
+    ))
+}
+
+fn restore_state<T>(
+    kind: ReactiveCollectionKind,
+    state: T,
+    snapshot_found: bool,
+    snapshot_cursor: i64,
+    changes_applied: usize,
+    cursor: Option<u64>,
+) -> StorageResult<ReactiveCollectionRestoreState<T>> {
+    let change_cursor = cursor
+        .map(seq_to_snapshot_cursor)
+        .transpose()?
+        .unwrap_or(-1);
+    let source = match (snapshot_found, changes_applied > 0) {
+        (false, false) => ReactiveCollectionRestoreSource::Empty,
+        (false, true) => ReactiveCollectionRestoreSource::Changes,
+        (true, false) => ReactiveCollectionRestoreSource::Snapshot,
+        (true, true) => ReactiveCollectionRestoreSource::SnapshotAndChanges,
+    };
+    Ok(ReactiveCollectionRestoreState {
+        kind,
+        state,
+        source,
+        snapshot: ReactiveCollectionSnapshotRestoreMeta {
+            found: snapshot_found,
+            change_cursor: snapshot_cursor,
+        },
+        changes: ReactiveCollectionChangesRestoreMeta {
+            applied: changes_applied,
+            cursor: change_cursor,
+        },
+        cursor,
+        snapshot_found,
+        changes_applied,
+    })
+}
+
+fn fold_list_change<T>(
+    state: &mut Vec<T>,
+    frame: ReactiveCollectionChangeFrame,
+) -> StorageResult<()>
+where
+    T: Clone + Serialize + DeserializeOwned,
+{
+    let change: ListChange<T> =
+        serde_json::from_value(frame.change).map_err(storage_serde_json_error)?;
+    match change {
+        ListChange::Append { value } => state.push(value),
+        ListChange::AppendMany { values } => state.extend(values),
+        ListChange::Insert { index, value } => {
+            if index > state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveList fold: insert index {index} is out of bounds for len {}",
+                    state.len()
+                )));
+            }
+            state.insert(index, value);
+        }
+        ListChange::InsertMany { index, values } => {
+            if index > state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveList fold: insertMany index {index} is out of bounds for len {}",
+                    state.len()
+                )));
+            }
+            state.splice(index..index, values);
+        }
+        ListChange::Pop { index, value } => {
+            if index >= state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveList fold: pop index {index} is out of bounds for len {}",
+                    state.len()
+                )));
+            }
+            let actual = state.remove(index);
+            if !strict_json_equal(&actual, &value)? {
+                return Err(StorageError::backend(
+                    "reactiveList fold: pop value does not match stored state",
+                ));
+            }
+        }
+        ListChange::TrimHead { n } => {
+            if n > state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveList fold: trimHead {n} exceeds len {}",
+                    state.len()
+                )));
+            }
+            state.drain(0..n);
+        }
+        ListChange::Clear { count } => {
+            if count != state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveList fold: clear count {count} does not match len {}",
+                    state.len()
+                )));
+            }
+            state.clear();
+        }
+    }
+    Ok(())
+}
+
+fn fold_log_change<T>(state: &mut Vec<T>, frame: ReactiveCollectionChangeFrame) -> StorageResult<()>
+where
+    T: Clone + Serialize + DeserializeOwned,
+{
+    let change: LogChange<T> =
+        serde_json::from_value(frame.change).map_err(storage_serde_json_error)?;
+    match change {
+        LogChange::Append { value } => state.push(value),
+        LogChange::AppendMany { values } => state.extend(values),
+        LogChange::TrimHead { n } => {
+            if n > state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveLog fold: trimHead {n} exceeds len {}",
+                    state.len()
+                )));
+            }
+            state.drain(0..n);
+        }
+        LogChange::Clear { count } => {
+            if count != state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveLog fold: clear count {count} does not match len {}",
+                    state.len()
+                )));
+            }
+            state.clear();
+        }
+    }
+    Ok(())
+}
+
+fn fold_map_change<K, V>(
+    state: &mut Vec<(K, V)>,
+    frame: ReactiveCollectionChangeFrame,
+) -> StorageResult<()>
+where
+    K: Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
+{
+    let change: MapChange<K, V> =
+        serde_json::from_value(frame.change).map_err(storage_serde_json_error)?;
+    match change {
+        MapChange::Set { key, value } => match find_map_key(state, &key)? {
+            Some(index) => state[index] = (key, value),
+            None => state.push((key, value)),
+        },
+        MapChange::Delete { key, previous } => {
+            let Some(index) = find_map_key(state, &key)? else {
+                return Err(StorageError::backend(
+                    "reactiveMap fold: delete key is missing",
+                ));
+            };
+            let (_, actual) = state.remove(index);
+            if !strict_json_equal(&actual, &previous)? {
+                return Err(StorageError::backend(
+                    "reactiveMap fold: delete previous value does not match stored state",
+                ));
+            }
+        }
+        MapChange::Clear { count } => {
+            if count != state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveMap fold: clear count {count} does not match len {}",
+                    state.len()
+                )));
+            }
+            state.clear();
+        }
+    }
+    Ok(())
+}
+
+fn fold_index_change<K, S, V>(
+    state: &mut Vec<IndexRow<K, S, V>>,
+    frame: ReactiveCollectionChangeFrame,
+) -> StorageResult<()>
+where
+    K: Clone + Serialize + DeserializeOwned,
+    S: Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
+{
+    let change: IndexChange<K, S, V> =
+        serde_json::from_value(frame.change).map_err(storage_serde_json_error)?;
+    match change {
+        IndexChange::Upsert {
+            primary,
+            secondary,
+            value,
+        } => {
+            let row = IndexRow {
+                primary,
+                secondary,
+                value,
+            };
+            match find_index_primary(state, &row.primary)? {
+                Some(index) => state[index] = row,
+                None => state.push(row),
+            }
+        }
+        IndexChange::Delete { primary } => {
+            let Some(index) = find_index_primary(state, &primary)? else {
+                return Err(StorageError::backend(
+                    "reactiveIndex fold: delete primary is missing",
+                ));
+            };
+            state.remove(index);
+        }
+        IndexChange::DeleteMany { primaries } => {
+            remove_index_primaries(state, &primaries, "reactiveIndex fold: deleteMany primary")?;
+        }
+        IndexChange::Clear { count } => {
+            if count != state.len() {
+                return Err(StorageError::backend(format!(
+                    "reactiveIndex fold: clear count {count} does not match len {}",
+                    state.len()
+                )));
+            }
+            state.clear();
+        }
+    }
+    Ok(())
+}
+
+fn assert_unique_map_keys<K, V>(entries: &[(K, V)], label: &str) -> StorageResult<()>
+where
+    K: Serialize,
+{
+    let mut seen = Vec::<Vec<u8>>::new();
+    for (index, (key, _)) in entries.iter().enumerate() {
+        let id = strict_json_identity(key)?;
+        if seen.iter().any(|existing| existing == &id) {
+            return Err(StorageError::backend(format!(
+                "{label}: entry {index} duplicates an earlier key"
+            )));
+        }
+        seen.push(id);
+    }
+    Ok(())
+}
+
+fn assert_unique_index_primaries<K, S, V>(
+    rows: &[IndexRow<K, S, V>],
+    label: &str,
+) -> StorageResult<()>
+where
+    K: Serialize,
+{
+    let mut seen = Vec::<Vec<u8>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        let id = strict_json_identity(&row.primary)?;
+        if seen.iter().any(|existing| existing == &id) {
+            return Err(StorageError::backend(format!(
+                "{label}: row {index} duplicates an earlier primary"
+            )));
+        }
+        seen.push(id);
+    }
+    Ok(())
+}
+
+fn find_map_key<K, V>(entries: &[(K, V)], key: &K) -> StorageResult<Option<usize>>
+where
+    K: Serialize,
+{
+    let target = strict_json_identity(key)?;
+    for (index, (candidate, _)) in entries.iter().enumerate() {
+        if strict_json_identity(candidate)? == target {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn find_index_primary<K, S, V>(
+    rows: &[IndexRow<K, S, V>],
+    primary: &K,
+) -> StorageResult<Option<usize>>
+where
+    K: Serialize,
+{
+    let target = strict_json_identity(primary)?;
+    for (index, row) in rows.iter().enumerate() {
+        if strict_json_identity(&row.primary)? == target {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn remove_index_primaries<K, S, V>(
+    rows: &mut Vec<IndexRow<K, S, V>>,
+    primaries: &[K],
+    label: &str,
+) -> StorageResult<()>
+where
+    K: Serialize,
+{
+    let mut seen = Vec::<Vec<u8>>::new();
+    let mut indexes = Vec::<usize>::new();
+    for (index, primary) in primaries.iter().enumerate() {
+        let id = strict_json_identity(primary)?;
+        if seen.iter().any(|existing| existing == &id) {
+            return Err(StorageError::backend(format!(
+                "{label} {index} duplicates an earlier primary"
+            )));
+        }
+        seen.push(id);
+        let Some(row_index) = find_index_primary(rows, primary)? else {
+            return Err(StorageError::backend(format!("{label} {index} is missing")));
+        };
+        indexes.push(row_index);
+    }
+    indexes.sort_unstable_by(|a, b| b.cmp(a));
+    for index in indexes {
+        rows.remove(index);
+    }
+    Ok(())
+}
+
+fn resolve_collection_snapshot_key(
+    options: &LoadReactiveCollectionStateOptions<'_>,
+) -> StorageResult<String> {
+    if let Some(key) = options.snapshot_key {
+        if key.is_empty() {
+            return Err(StorageError::backend(
+                "reactiveCollection load: snapshot_key must be non-empty",
+            ));
+        }
+        return Ok(key.to_owned());
+    }
+    let prefix = options.storage_prefix.ok_or_else(|| {
+        StorageError::backend("reactiveCollection load: storage_prefix or snapshot_key is required")
+    })?;
+    reactive_collection_snapshot_key(prefix)
+}
+
+fn strict_json_equal<T: Serialize>(left: &T, right: &T) -> StorageResult<bool> {
+    let left = serde_json::to_value(left).map_err(storage_serde_json_error)?;
+    let right = serde_json::to_value(right).map_err(storage_serde_json_error)?;
+    Ok(
+        strict_canonical_json_bytes(&left).map_err(storage_json_error)?
+            == strict_canonical_json_bytes(&right).map_err(storage_json_error)?,
+    )
+}
+
+fn strict_json_identity<T: Serialize>(value: &T) -> StorageResult<Vec<u8>> {
+    let value = serde_json::to_value(value).map_err(storage_serde_json_error)?;
+    strict_canonical_json_bytes(&value).map_err(storage_json_error)
+}
+
+fn seq_to_snapshot_cursor(seq: u64) -> StorageResult<i64> {
+    i64::try_from(seq)
+        .map_err(|_| StorageError::backend("reactiveCollection cursor exceeds i64 range"))
+}
+
+fn storage_error_to_json(error: StorageError) -> JsonCodecError {
+    JsonCodecError::validation(error.to_string())
+}
+
+fn storage_serde_json_error(error: serde_json::Error) -> StorageError {
+    StorageError::backend(format!("reactiveCollection JSON error: {error}"))
 }
 
 impl<T: Clone> AppendLogStorage<T> {

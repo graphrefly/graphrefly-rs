@@ -4,7 +4,9 @@
 //! load/decode checkpoint JSON outside the sync core, then pass the already-loaded
 //! value to [`restore_graph`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
@@ -71,6 +73,8 @@ pub struct GraphCheckpointNode {
     pub status: String,
     pub deps: Vec<String>,
     pub value: GraphCheckpointValue,
+    #[serde(rename = "backendState", skip_serializing_if = "Option::is_none")]
+    pub backend_state: Option<GraphCheckpointJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<GraphCheckpointJson>,
     pub terminal: GraphCheckpointTerminal,
@@ -148,6 +152,49 @@ impl Error for GraphRestoreError {}
 pub type GraphRestoreResult<T> = Result<T, GraphRestoreError>;
 type RestoreResult<T> = GraphRestoreResult<T>;
 type JsonDefinitionFn = dyn Fn(&GraphCheckpointJson) -> RestoreResult<GraphCheckpointJson>;
+type BackendStateContributor = dyn Fn(&str) -> Result<GraphCheckpointJson, String>;
+type CustomRestoreFn = dyn Fn(&Graph) -> RestoreResult<Core>;
+
+thread_local! {
+    static BACKEND_STATE_CONTRIBUTORS: RefCell<HashMap<(usize, usize, u64), Rc<BackendStateContributor>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// D160 collection-owned backend checkpoint contributor for graph checkpoint.
+pub(crate) fn register_backend_state_contributor(
+    core: &Core,
+    contributor: Rc<BackendStateContributor>,
+) {
+    BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
+        contributors
+            .borrow_mut()
+            .insert(core.identity_key(), contributor);
+    });
+}
+
+pub(crate) fn unregister_backend_state_contributor(core: &Core) {
+    unregister_backend_state_contributor_key(core.identity_key());
+}
+
+pub(crate) fn unregister_backend_state_contributor_key(key: (usize, usize, u64)) {
+    BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
+        contributors.borrow_mut().remove(&key);
+    });
+}
+
+fn checkpoint_backend_state(core: &Core, path: &str) -> RestoreResult<Option<GraphCheckpointJson>> {
+    let contributor = BACKEND_STATE_CONTRIBUTORS
+        .with(|contributors| contributors.borrow().get(&core.identity_key()).cloned());
+    contributor
+        .map(|contributor| {
+            let value = contributor(path).map_err(|err| {
+                GraphRestoreError::new(format!("checkpoint: backendState at {path}: {err}"))
+            })?;
+            validate_checkpoint_json(&value, path)?;
+            Ok(value)
+        })
+        .transpose()
+}
 
 #[derive(Clone)]
 pub struct GraphRestoreDefinition {
@@ -238,6 +285,14 @@ pub fn default_restore_registry() -> GraphRestoreRegistry {
     GraphRestoreRegistry::new([
         GraphRestoreEntry::descriptor(StateRestoreDescriptor),
         GraphRestoreEntry::descriptor(MapJsonRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveListDeltaRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveListSnapshotRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveLogDeltaRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveLogSnapshotRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveMapDeltaRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveMapSnapshotRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveIndexDeltaRestoreDescriptor),
+        GraphRestoreEntry::descriptor(ReactiveIndexSnapshotRestoreDescriptor),
     ])
 }
 
@@ -264,6 +319,7 @@ impl RestoreDefineCtx<'_> {
 pub enum RestoreNodeKind {
     StateJson,
     NodeJson(NodeFn),
+    Custom(Rc<CustomRestoreFn>),
 }
 
 pub struct RestoreNodeDefinition {
@@ -346,6 +402,394 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct CheckpointJsonOrd(GraphCheckpointJson);
+
+impl Ord for CheckpointJsonOrd {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        let left = strict_canonical_json_bytes_for_ord(&self.0);
+        let right = strict_canonical_json_bytes_for_ord(&other.0);
+        left.cmp(&right)
+    }
+}
+
+impl PartialOrd for CheckpointJsonOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn strict_canonical_json_bytes_for_ord(value: &GraphCheckpointJson) -> Vec<u8> {
+    crate::json::strict_canonical_json_bytes(value)
+        .expect("CheckpointJsonOrd is constructed only after strict JSON validation")
+}
+
+fn collection_base_id(id: &str, suffix: &str, ref_: &str) -> RestoreResult<String> {
+    let Some(base) = id.strip_suffix(suffix) else {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' node '{id}' must end with '{suffix}'"
+        )));
+    };
+    if base.is_empty() {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' node '{id}' has no collection name"
+        )));
+    }
+    Ok(base.to_owned())
+}
+
+fn reject_collection_config(
+    config: Option<&GraphCheckpointJson>,
+    config_version: Option<&GraphCheckpointJson>,
+    ref_: &str,
+) -> RestoreResult<()> {
+    if config.is_some() || config_version.is_some() {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' descriptor does not accept config"
+        )));
+    }
+    Ok(())
+}
+
+fn collection_log_max_size_config(
+    config: Option<&GraphCheckpointJson>,
+    config_version: Option<&GraphCheckpointJson>,
+    ref_: &str,
+) -> RestoreResult<Option<usize>> {
+    if config_version.is_some() {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' descriptor does not accept configVersion"
+        )));
+    }
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let GraphCheckpointJson::Object(config) = config else {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' descriptor requires object config"
+        )));
+    };
+    if config.is_empty() {
+        return Ok(None);
+    }
+    if config.len() != 1 || !config.contains_key("maxSize") {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' config only accepts maxSize"
+        )));
+    }
+    let max_size = config
+        .get("maxSize")
+        .expect("checked")
+        .as_u64()
+        .ok_or_else(|| {
+            GraphRestoreError::new(format!(
+                "restore_graph: '{ref_}' config.maxSize must be a positive integer"
+            ))
+        })?;
+    if max_size == 0 {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' config.maxSize must be a positive integer"
+        )));
+    }
+    usize::try_from(max_size).map(Some).map_err(|_| {
+        GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' config.maxSize exceeds usize"
+        ))
+    })
+}
+
+fn backend_array(
+    node: &GraphCheckpointNode,
+    ref_: &str,
+) -> RestoreResult<Vec<GraphCheckpointJson>> {
+    let Some(GraphCheckpointJson::Array(items)) = &node.backend_state else {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' node '{}' requires array backendState",
+            node.id
+        )));
+    };
+    Ok(items.clone())
+}
+
+fn map_entries(
+    node: &GraphCheckpointNode,
+    ref_: &str,
+) -> RestoreResult<Vec<(CheckpointJsonOrd, GraphCheckpointJson)>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (i, entry) in backend_array(node, ref_)?.into_iter().enumerate() {
+        let GraphCheckpointJson::Array(pair) = entry else {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}] must be a [key,value] map entry",
+                node.id
+            )));
+        };
+        if pair.len() != 2 {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}] must be a [key,value] map entry",
+                node.id
+            )));
+        }
+        let key = CheckpointJsonOrd(pair[0].clone());
+        if !seen.insert(key.clone()) {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}][0] duplicates an earlier map key",
+                node.id
+            )));
+        }
+        out.push((key, pair[1].clone()));
+    }
+    Ok(out)
+}
+
+fn index_rows(
+    node: &GraphCheckpointNode,
+    ref_: &str,
+) -> RestoreResult<
+    Vec<
+        crate::data_structures::IndexRow<CheckpointJsonOrd, CheckpointJsonOrd, GraphCheckpointJson>,
+    >,
+> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (i, row) in backend_array(node, ref_)?.into_iter().enumerate() {
+        let GraphCheckpointJson::Object(obj) = row else {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}] must be an index row object",
+                node.id
+            )));
+        };
+        if obj.len() != 3
+            || !obj.contains_key("primary")
+            || !obj.contains_key("secondary")
+            || !obj.contains_key("value")
+        {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}] must contain primary, secondary, and value",
+                node.id
+            )));
+        }
+        let primary = CheckpointJsonOrd(obj.get("primary").expect("checked").clone());
+        if !seen.insert(primary.clone()) {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: {}.backendState[{i}].primary duplicates an earlier index row",
+                node.id
+            )));
+        }
+        out.push(crate::data_structures::IndexRow {
+            primary,
+            secondary: CheckpointJsonOrd(obj.get("secondary").expect("checked").clone()),
+            value: obj.get("value").expect("checked").clone(),
+        });
+    }
+    Ok(out)
+}
+
+pub struct ReactiveListDeltaRestoreDescriptor;
+pub struct ReactiveListSnapshotRestoreDescriptor;
+pub struct ReactiveLogDeltaRestoreDescriptor;
+pub struct ReactiveLogSnapshotRestoreDescriptor;
+pub struct ReactiveMapDeltaRestoreDescriptor;
+pub struct ReactiveMapSnapshotRestoreDescriptor;
+pub struct ReactiveIndexDeltaRestoreDescriptor;
+pub struct ReactiveIndexSnapshotRestoreDescriptor;
+
+impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveList.delta"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_delta_definition(
+            ctx,
+            "reactiveList.delta",
+            ".delta",
+            false,
+            |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+                let collection = crate::data_structures::reactive_list::<GraphCheckpointJson>(
+                    backend_array(node, "reactiveList.delta")?,
+                    crate::data_structures::ReactiveListOptions::named(base).graph(graph.clone()),
+                );
+                Ok(collection.delta.erased())
+            },
+        )
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveListSnapshotRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveList.snapshot"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_existing_definition(ctx, "reactiveList.snapshot", ".snapshot")
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveLog.delta"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        let max_size = collection_log_max_size_config(ctx.config, ctx.config_version, self.ref_())?;
+        collection_delta_definition(
+            ctx,
+            "reactiveLog.delta",
+            ".delta",
+            true,
+            move |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+                let state = backend_array(node, "reactiveLog.delta")?;
+                if let Some(max_size) = max_size {
+                    if state.len() > max_size {
+                        return Err(GraphRestoreError::new(format!(
+                        "restore_graph: 'reactiveLog.delta' node '{}' backendState exceeds config.maxSize",
+                        node.id
+                    )));
+                    }
+                }
+                let mut options =
+                    crate::data_structures::ReactiveLogOptions::named(base).graph(graph.clone());
+                if let Some(max_size) = max_size {
+                    options = options.max_size(max_size);
+                }
+                let collection =
+                    crate::data_structures::reactive_log::<GraphCheckpointJson>(state, options);
+                Ok(collection.delta.erased())
+            },
+        )
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveLogSnapshotRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveLog.snapshot"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_existing_definition(ctx, "reactiveLog.snapshot", ".snapshot")
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveMapDeltaRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveMap.delta"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_delta_definition(
+            ctx,
+            "reactiveMap.delta",
+            ".delta",
+            false,
+            |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+                let collection =
+                    crate::data_structures::reactive_map::<CheckpointJsonOrd, GraphCheckpointJson>(
+                        map_entries(node, "reactiveMap.delta")?,
+                        crate::data_structures::ReactiveMapOptions::named(base)
+                            .graph(graph.clone()),
+                    );
+                Ok(collection.delta.erased())
+            },
+        )
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveMapSnapshotRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveMap.snapshot"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_existing_definition(ctx, "reactiveMap.snapshot", ".snapshot")
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveIndexDeltaRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveIndex.delta"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_delta_definition(
+            ctx,
+            "reactiveIndex.delta",
+            ".delta",
+            false,
+            |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+                let collection = crate::data_structures::reactive_index::<
+                    CheckpointJsonOrd,
+                    CheckpointJsonOrd,
+                    GraphCheckpointJson,
+                >(
+                    index_rows(node, "reactiveIndex.delta")?,
+                    crate::data_structures::ReactiveIndexOptions::named(base).graph(graph.clone()),
+                );
+                Ok(collection.delta.erased())
+            },
+        )
+    }
+}
+
+impl GraphRestoreDescriptor for ReactiveIndexSnapshotRestoreDescriptor {
+    fn ref_(&self) -> &'static str {
+        "reactiveIndex.snapshot"
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_existing_definition(ctx, "reactiveIndex.snapshot", ".snapshot")
+    }
+}
+
+fn collection_delta_definition(
+    ctx: RestoreDefineCtx<'_>,
+    ref_: &'static str,
+    suffix: &str,
+    allow_config: bool,
+    restore: impl Fn(&Graph, String, &GraphCheckpointNode) -> RestoreResult<Core> + 'static,
+) -> RestoreResult<RestoreNodeDefinition> {
+    if !ctx.deps.is_empty() {
+        return Err(GraphRestoreError::new(format!(
+            "restore_graph: '{ref_}' node '{}' cannot restore deps",
+            ctx.id
+        )));
+    }
+    if !allow_config {
+        reject_collection_config(ctx.config, ctx.config_version, ref_)?;
+    }
+    let base = collection_base_id(ctx.id, suffix, ref_)?;
+    let checkpoint = ctx.checkpoint.clone();
+    Ok(RestoreNodeDefinition {
+        factory: ref_,
+        kind: RestoreNodeKind::Custom(Rc::new(move |graph| {
+            restore(graph, base.clone(), &checkpoint)
+        })),
+        opts: restored_opts(ctx.checkpoint)?,
+    })
+}
+
+fn collection_existing_definition(
+    ctx: RestoreDefineCtx<'_>,
+    ref_: &'static str,
+    suffix: &str,
+) -> RestoreResult<RestoreNodeDefinition> {
+    reject_collection_config(ctx.config, ctx.config_version, ref_)?;
+    let id = ctx.id.to_owned();
+    let _base = collection_base_id(ctx.id, suffix, ref_)?;
+    Ok(RestoreNodeDefinition {
+        factory: ref_,
+        kind: RestoreNodeKind::Custom(Rc::new(move |graph| {
+            graph.find(&id).map(|node| node.core()).ok_or_else(|| {
+                GraphRestoreError::new(format!(
+                    "restore_graph: '{ref_}' node '{id}' was not restored with its collection"
+                ))
+            })
+        })),
+        opts: restored_opts(ctx.checkpoint)?,
+    })
+}
+
 #[derive(Clone)]
 pub struct RestoreGraphOptions {
     pub registry: GraphRestoreRegistry,
@@ -421,13 +865,22 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             from: dep.clone(),
             to: entry.id.clone(),
         }));
+        let backend_state =
+            checkpoint_backend_state(&entry.core, &format!("{}.backendState", entry.id))?;
+        let non_authoritative_collection_helper =
+            is_non_authoritative_collection_helper(entry.meta.get("kind").map(String::as_str));
         nodes.push(GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
             factory: checkpoint_factory(entry),
             status: status_to_str(runtime.status).to_owned(),
             deps: dep_ids,
-            value: checkpoint_value(runtime.cache.as_ref(), runtime.has_data, &entry.id)?,
+            value: if non_authoritative_collection_helper {
+                GraphCheckpointValue::Sentinel
+            } else {
+                checkpoint_value(runtime.cache.as_ref(), runtime.has_data, &entry.id)?
+            },
+            backend_state,
             version: runtime.version.as_ref().map(node_version_to_json),
             terminal: if runtime.terminal {
                 match runtime.status {
@@ -449,11 +902,15 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             },
             ctx_state: GraphCheckpointCtxState {
                 persist: runtime.ctx_state_persist,
-                value: checkpoint_value(
-                    runtime.ctx_state.as_ref(),
-                    runtime.ctx_state.is_some(),
-                    &format!("{}.ctxState", entry.id),
-                )?,
+                value: if non_authoritative_collection_helper {
+                    GraphCheckpointValue::Sentinel
+                } else {
+                    checkpoint_value(
+                        runtime.ctx_state.as_ref(),
+                        runtime.ctx_state.is_some(),
+                        &format!("{}.ctxState", entry.id),
+                    )?
+                },
             },
             meta: if entry.meta.is_empty() {
                 None
@@ -489,6 +946,18 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             Some(mounts)
         },
     })
+}
+
+fn is_non_authoritative_collection_helper(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some(
+            "collection_delta"
+                | "collection_snapshot"
+                | "collection_view_delta"
+                | "collection_view_snapshot"
+        )
+    )
 }
 
 fn checkpoint_factory(entry: &CheckpointEntry) -> GraphCheckpointFactory {
@@ -784,6 +1253,9 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
     if let GraphCheckpointValue::Data { data } = &node.ctx_state.value {
         validate_checkpoint_json(data, &format!("{}.ctxState", node.id))?;
     }
+    if let Some(backend_state) = &node.backend_state {
+        validate_checkpoint_json(backend_state, &format!("{}.backendState", node.id))?;
+    }
     if let GraphCheckpointTerminal::Error { error } = &node.terminal {
         validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))?;
     }
@@ -901,6 +1373,7 @@ fn build_node(
                 definition.opts,
             )
             .erased(),
+        RestoreNodeKind::Custom(restore) => restore(graph)?,
     };
     let restored_deps = core.deps();
     if restored_deps.len() != deps.len()

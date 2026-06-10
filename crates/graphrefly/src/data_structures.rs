@@ -4,13 +4,18 @@
 //! The substrate pull behavior is reused through `NodeOpts::pull_id`; no protocol
 //! tier/message semantics live here.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::graph::{Graph, GraphNodeOpts, TopologyGroupOptions};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Number, Value};
+
+use crate::checkpoint::register_backend_state_contributor;
+use crate::graph::{Graph, GraphNodeOpts, RestoreFactoryMeta, TopologyGroupOptions};
 use crate::node::{Node, NodeOpts};
 use crate::operators::{init_node, Operator};
 use crate::protocol::{LockId, Message};
@@ -36,40 +41,63 @@ struct ViewFactories {
     snapshot: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum ListChange<T> {
+    #[serde(rename = "append")]
     Append { value: T },
+    #[serde(rename = "appendMany")]
     AppendMany { values: Vec<T> },
+    #[serde(rename = "insert")]
     Insert { index: usize, value: T },
+    #[serde(rename = "insertMany")]
     InsertMany { index: usize, values: Vec<T> },
+    #[serde(rename = "pop")]
     Pop { index: usize, value: T },
+    #[serde(rename = "trimHead")]
     TrimHead { n: usize },
+    #[serde(rename = "clear")]
     Clear { count: usize },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum LogChange<T> {
+    #[serde(rename = "append")]
     Append { value: T },
+    #[serde(rename = "appendMany")]
     AppendMany { values: Vec<T> },
+    #[serde(rename = "trimHead")]
     TrimHead { n: usize },
+    #[serde(rename = "clear")]
     Clear { count: usize },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum IndexChange<K, S, V> {
+    #[serde(rename = "upsert")]
     Upsert { primary: K, secondary: S, value: V },
+    #[serde(rename = "delete")]
     Delete { primary: K },
+    #[serde(rename = "deleteMany")]
+    DeleteMany { primaries: Vec<K> },
+    #[serde(rename = "clear")]
     Clear { count: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum MapChange<K, V> {
+    #[serde(rename = "set")]
     Set { key: K, value: V },
+    #[serde(rename = "delete")]
     Delete { key: K, previous: V },
+    #[serde(rename = "clear")]
     Clear { count: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRow<K, S, V> {
     pub primary: K,
     pub secondary: S,
@@ -419,6 +447,21 @@ impl<K: Clone + Ord, S: Clone + Ord, V: Clone> IndexBackend<K, S, V> {
         removed
     }
 
+    fn delete_many(&self, primaries: &[K]) -> Vec<K> {
+        let mut rows = self.rows.borrow_mut();
+        let mut removed = Vec::new();
+        for primary in primaries {
+            if rows.remove(primary).is_some() {
+                removed.push(primary.clone());
+            }
+        }
+        if !removed.is_empty() {
+            drop(rows);
+            self.bump();
+        }
+        removed
+    }
+
     fn clear(&self) -> usize {
         let mut rows = self.rows.borrow_mut();
         let count = rows.len();
@@ -465,6 +508,14 @@ impl<K: Clone + Ord, V: Clone> MapBackend<K, V> {
 
     fn snapshot(&self) -> BTreeMap<K, V> {
         self.rows.borrow().clone()
+    }
+
+    fn entries_snapshot(&self) -> Vec<(K, V)> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     fn selected_snapshot(&self, predicate: &MapSelectPredicate<K, V>) -> BTreeMap<K, V> {
@@ -616,13 +667,22 @@ impl<T: Clone + 'static> ReactiveList<T> {
             "{id_prefix}.snapshot@{:x}",
             backend.instance_token()
         ));
-        let delta = make_delta_node::<T>(options.graph.as_ref(), &id_prefix);
+        let restorable =
+            options.graph.is_some() && options.name.is_some() && options.max_size.is_none();
+        let delta = make_delta_node::<T>(options.graph.as_ref(), &id_prefix, restorable);
+        if restorable {
+            let backend_for_checkpoint = backend.clone();
+            register_backend_state_json(&delta, move || {
+                vec_to_checkpoint_json(backend_for_checkpoint.snapshot())
+            });
+        }
         let snapshot = make_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
             pull_id.clone(),
+            restorable,
         );
         Self {
             delta,
@@ -827,13 +887,22 @@ where
             "{id_prefix}.snapshot@{:x}",
             backend.instance_token()
         ));
-        let delta = make_index_delta_node::<K, S, V>(options.graph.as_ref(), &id_prefix);
+        let restorable = options.graph.is_some() && options.name.is_some();
+        let delta =
+            make_index_delta_node::<K, S, V>(options.graph.as_ref(), &id_prefix, restorable);
+        if restorable {
+            let backend_for_checkpoint = backend.clone();
+            register_backend_state_json(&delta, move || {
+                index_rows_to_checkpoint_json(backend_for_checkpoint.snapshot())
+            });
+        }
         let snapshot = make_index_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
             pull_id.clone(),
+            restorable,
         );
         Self {
             delta,
@@ -889,6 +958,16 @@ where
                     primary: primary.clone(),
                 }
                     as IndexChange<K, S, V>))]);
+        }
+    }
+
+    pub fn delete_many(&self, primaries: Vec<K>) {
+        let removed = self.backend.delete_many(&primaries);
+        if !removed.is_empty() {
+            self.delta
+                .down(vec![Message::Data(Rc::new(
+                    IndexChange::DeleteMany { primaries: removed } as IndexChange<K, S, V>,
+                ))]);
         }
     }
 
@@ -969,13 +1048,21 @@ where
             "{id_prefix}.snapshot@{:x}",
             backend.instance_token()
         ));
-        let delta = make_map_delta_node::<K, V>(options.graph.as_ref(), &id_prefix);
+        let restorable = options.graph.is_some() && options.name.is_some();
+        let delta = make_map_delta_node::<K, V>(options.graph.as_ref(), &id_prefix, restorable);
+        if restorable {
+            let backend_for_checkpoint = backend.clone();
+            register_backend_state_json(&delta, move || {
+                map_entries_to_checkpoint_json(backend_for_checkpoint.entries_snapshot())
+            });
+        }
         let snapshot = make_map_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
             pull_id.clone(),
+            restorable,
         );
         Self {
             delta,
@@ -1149,13 +1236,26 @@ impl<T: Clone + 'static> ReactiveLog<T> {
             "{id_prefix}.snapshot@{:x}",
             backend.instance_token()
         ));
-        let delta = make_log_delta_node::<T>(options.graph.as_ref(), &id_prefix);
+        let restorable = options.graph.is_some() && options.name.is_some();
+        let delta = make_log_delta_node::<T>(
+            options.graph.as_ref(),
+            &id_prefix,
+            restorable,
+            options.max_size,
+        );
+        if restorable {
+            let backend_for_checkpoint = backend.clone();
+            register_backend_state_json(&delta, move || {
+                vec_to_checkpoint_json(backend_for_checkpoint.snapshot())
+            });
+        }
         let snapshot = make_log_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
             pull_id.clone(),
+            restorable,
         );
         Self {
             delta,
@@ -1445,6 +1545,65 @@ pub fn reactive_log<T: Clone + 'static>(
     ReactiveLog::new(initial, options)
 }
 
+pub fn restore_reactive_list<T: Clone + 'static>(
+    state: crate::storage::ReactiveListRestoreState<T>,
+    options: ReactiveListOptions,
+) -> crate::storage::StorageResult<ReactiveList<T>> {
+    if state.kind != crate::storage::ReactiveCollectionKind::ReactiveList {
+        return Err(crate::storage::StorageError::backend(
+            "restore_reactive_list: restore state kind must be reactiveList",
+        ));
+    }
+    Ok(ReactiveList::new(state.state, options))
+}
+
+pub fn restore_reactive_log<T: Clone + 'static>(
+    state: crate::storage::ReactiveLogRestoreState<T>,
+    options: ReactiveLogOptions,
+) -> crate::storage::StorageResult<ReactiveLog<T>> {
+    if state.kind != crate::storage::ReactiveCollectionKind::ReactiveLog {
+        return Err(crate::storage::StorageError::backend(
+            "restore_reactive_log: restore state kind must be reactiveLog",
+        ));
+    }
+    Ok(ReactiveLog::new(state.state, options))
+}
+
+pub fn restore_reactive_map<K, V>(
+    state: crate::storage::ReactiveMapRestoreState<K, V>,
+    options: ReactiveMapOptions,
+) -> crate::storage::StorageResult<ReactiveMap<K, V>>
+where
+    K: Clone + Ord + fmt::Debug + 'static,
+    V: Clone + 'static,
+{
+    if state.kind != crate::storage::ReactiveCollectionKind::ReactiveMap {
+        return Err(crate::storage::StorageError::backend(
+            "restore_reactive_map: restore state kind must be reactiveMap",
+        ));
+    }
+    assert_unique_restore_map_keys(&state.state)?;
+    Ok(ReactiveMap::new(state.state, options))
+}
+
+pub fn restore_reactive_index<K, S, V>(
+    state: crate::storage::ReactiveIndexRestoreState<K, S, V>,
+    options: ReactiveIndexOptions,
+) -> crate::storage::StorageResult<ReactiveIndex<K, S, V>>
+where
+    K: Clone + Ord + fmt::Debug + 'static,
+    S: Clone + Ord + 'static,
+    V: Clone + 'static,
+{
+    if state.kind != crate::storage::ReactiveCollectionKind::ReactiveIndex {
+        return Err(crate::storage::StorageError::backend(
+            "restore_reactive_index: restore state kind must be reactiveIndex",
+        ));
+    }
+    assert_unique_restore_index_primaries(&state.state)?;
+    Ok(ReactiveIndex::new(state.state, options))
+}
+
 pub fn reactive_index<K, S, V>(
     initial: Vec<IndexRow<K, S, V>>,
     options: ReactiveIndexOptions,
@@ -1498,11 +1657,18 @@ pub fn scan_log<T: Clone + 'static, A: Clone + 'static, F: Fn(A, &T) -> A + 'sta
 fn make_delta_node<T: Clone + 'static>(
     graph: Option<&Graph>,
     id_prefix: &str,
+    restorable: bool,
 ) -> Node<ListChange<T>> {
     match graph {
         Some(graph) => graph.empty_source(
             "reactiveList.delta",
-            GraphNodeOpts::named(node_name(id_prefix, "delta")),
+            collection_node_opts(
+                id_prefix,
+                "delta",
+                "collection_delta",
+                "reactiveList.delta",
+                restorable,
+            ),
         ),
         None => Node::state_empty(),
     }
@@ -1511,11 +1677,20 @@ fn make_delta_node<T: Clone + 'static>(
 fn make_log_delta_node<T: Clone + 'static>(
     graph: Option<&Graph>,
     id_prefix: &str,
+    restorable: bool,
+    max_size: Option<usize>,
 ) -> Node<LogChange<T>> {
     match graph {
         Some(graph) => graph.empty_source(
             "reactiveLog.delta",
-            GraphNodeOpts::named(node_name(id_prefix, "delta")),
+            collection_node_opts_with_restore_config(
+                id_prefix,
+                "delta",
+                "collection_delta",
+                "reactiveLog.delta",
+                restorable,
+                max_size.map(|max_size| json!({ "maxSize": max_size })),
+            ),
         ),
         None => Node::state_empty(),
     }
@@ -1524,11 +1699,18 @@ fn make_log_delta_node<T: Clone + 'static>(
 fn make_index_delta_node<K: Clone + Ord + 'static, S: Clone + Ord + 'static, V: Clone + 'static>(
     graph: Option<&Graph>,
     id_prefix: &str,
+    restorable: bool,
 ) -> Node<IndexChange<K, S, V>> {
     match graph {
         Some(graph) => graph.empty_source(
             "reactiveIndex.delta",
-            GraphNodeOpts::named(node_name(id_prefix, "delta")),
+            collection_node_opts(
+                id_prefix,
+                "delta",
+                "collection_delta",
+                "reactiveIndex.delta",
+                restorable,
+            ),
         ),
         None => Node::state_empty(),
     }
@@ -1537,11 +1719,18 @@ fn make_index_delta_node<K: Clone + Ord + 'static, S: Clone + Ord + 'static, V: 
 fn make_map_delta_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     graph: Option<&Graph>,
     id_prefix: &str,
+    restorable: bool,
 ) -> Node<MapChange<K, V>> {
     match graph {
         Some(graph) => graph.empty_source(
             "reactiveMap.delta",
-            GraphNodeOpts::named(node_name(id_prefix, "delta")),
+            collection_node_opts(
+                id_prefix,
+                "delta",
+                "collection_delta",
+                "reactiveMap.delta",
+                restorable,
+            ),
         ),
         None => Node::state_empty(),
     }
@@ -1553,6 +1742,7 @@ fn make_snapshot_node<T: Clone + 'static>(
     delta: &Node<ListChange<T>>,
     backend: &ListBackend<T>,
     pull_id: LockId,
+    restorable: bool,
 ) -> Node<Vec<T>> {
     let backend = backend.clone();
     let op = Operator::with_opts(
@@ -1576,7 +1766,13 @@ fn make_snapshot_node<T: Clone + 'static>(
         Some(graph) => graph.init_node(
             op,
             vec![delta.erased()],
-            GraphNodeOpts::named(node_name(id_prefix, "snapshot")),
+            collection_node_opts(
+                id_prefix,
+                "snapshot",
+                "collection_snapshot",
+                "reactiveList.snapshot",
+                restorable,
+            ),
         ),
         None => init_node(op, vec![delta.erased()], NodeOpts::default()),
     }
@@ -1588,6 +1784,7 @@ fn make_log_snapshot_node<T: Clone + 'static>(
     delta: &Node<LogChange<T>>,
     backend: &LogBackend<T>,
     pull_id: LockId,
+    restorable: bool,
 ) -> Node<Vec<T>> {
     let backend = backend.clone();
     let op = Operator::with_opts(
@@ -1611,7 +1808,13 @@ fn make_log_snapshot_node<T: Clone + 'static>(
         Some(graph) => graph.init_node(
             op,
             vec![delta.erased()],
-            GraphNodeOpts::named(node_name(id_prefix, "snapshot")),
+            collection_node_opts(
+                id_prefix,
+                "snapshot",
+                "collection_snapshot",
+                "reactiveLog.snapshot",
+                restorable,
+            ),
         ),
         None => init_node(op, vec![delta.erased()], NodeOpts::default()),
     }
@@ -1627,6 +1830,7 @@ fn make_index_snapshot_node<
     delta: &Node<IndexChange<K, S, V>>,
     backend: &IndexBackend<K, S, V>,
     pull_id: LockId,
+    restorable: bool,
 ) -> Node<Vec<IndexRow<K, S, V>>> {
     let backend = backend.clone();
     let op = Operator::with_opts(
@@ -1650,7 +1854,13 @@ fn make_index_snapshot_node<
         Some(graph) => graph.init_node(
             op,
             vec![delta.erased()],
-            GraphNodeOpts::named(node_name(id_prefix, "snapshot")),
+            collection_node_opts(
+                id_prefix,
+                "snapshot",
+                "collection_snapshot",
+                "reactiveIndex.snapshot",
+                restorable,
+            ),
         ),
         None => init_node(op, vec![delta.erased()], NodeOpts::default()),
     }
@@ -1662,6 +1872,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     delta: &Node<MapChange<K, V>>,
     backend: &MapBackend<K, V>,
     pull_id: LockId,
+    restorable: bool,
 ) -> Node<BTreeMap<K, V>> {
     let backend = backend.clone();
     let op = Operator::with_opts(
@@ -1685,7 +1896,13 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
         Some(graph) => graph.init_node(
             op,
             vec![delta.erased()],
-            GraphNodeOpts::named(node_name(id_prefix, "snapshot")),
+            collection_node_opts(
+                id_prefix,
+                "snapshot",
+                "collection_snapshot",
+                "reactiveMap.snapshot",
+                restorable,
+            ),
         ),
         None => init_node(op, vec![delta.erased()], NodeOpts::default()),
     }
@@ -1693,6 +1910,160 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
 
 fn node_name(prefix: &str, suffix: &str) -> String {
     format!("{prefix}.{suffix}")
+}
+
+fn collection_node_opts(
+    id_prefix: &str,
+    suffix: &str,
+    kind: &str,
+    restore_ref: &str,
+    restorable: bool,
+) -> GraphNodeOpts {
+    collection_node_opts_with_restore_config(id_prefix, suffix, kind, restore_ref, restorable, None)
+}
+
+fn collection_node_opts_with_restore_config(
+    id_prefix: &str,
+    suffix: &str,
+    kind: &str,
+    restore_ref: &str,
+    restorable: bool,
+    config: Option<Value>,
+) -> GraphNodeOpts {
+    let mut opts = GraphNodeOpts::named(node_name(id_prefix, suffix));
+    opts.meta.insert("kind".to_owned(), kind.to_owned());
+    if restorable {
+        let restore = RestoreFactoryMeta::registry_ref(restore_ref);
+        opts.restore = Some(match config {
+            Some(config) => restore.with_config(config),
+            None => restore,
+        });
+    }
+    opts
+}
+
+fn register_backend_state_json<T, F>(node: &Node<T>, snapshot: F)
+where
+    T: 'static,
+    F: Fn() -> Result<Value, String> + 'static,
+{
+    register_backend_state_contributor(&node.erased(), Rc::new(move |_path| snapshot()));
+}
+
+fn vec_to_checkpoint_json<T: Clone + 'static>(values: Vec<T>) -> Result<Value, String> {
+    values
+        .iter()
+        .map(any_to_checkpoint_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn map_entries_to_checkpoint_json<K: Clone + 'static, V: Clone + 'static>(
+    entries: Vec<(K, V)>,
+) -> Result<Value, String> {
+    entries
+        .iter()
+        .map(|(key, value)| {
+            Ok(Value::Array(vec![
+                any_to_checkpoint_json(key)?,
+                any_to_checkpoint_json(value)?,
+            ]))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn index_rows_to_checkpoint_json<K: Clone + 'static, S: Clone + 'static, V: Clone + 'static>(
+    rows: Vec<IndexRow<K, S, V>>,
+) -> Result<Value, String> {
+    rows.iter()
+        .map(|row| {
+            let mut out = serde_json::Map::new();
+            out.insert("primary".to_owned(), any_to_checkpoint_json(&row.primary)?);
+            out.insert(
+                "secondary".to_owned(),
+                any_to_checkpoint_json(&row.secondary)?,
+            );
+            out.insert("value".to_owned(), any_to_checkpoint_json(&row.value)?);
+            Ok(Value::Object(out))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn any_to_checkpoint_json<T: 'static>(value: &T) -> Result<Value, String> {
+    let any = value as &dyn Any;
+    if let Some(v) = any.downcast_ref::<Value>() {
+        return Ok(v.clone());
+    }
+    if let Some(v) = any.downcast_ref::<String>() {
+        return Ok(Value::String(v.clone()));
+    }
+    if let Some(v) = any.downcast_ref::<&'static str>() {
+        return Ok(Value::String((*v).to_owned()));
+    }
+    if let Some(v) = any.downcast_ref::<bool>() {
+        return Ok(Value::Bool(*v));
+    }
+    if let Some(v) = any.downcast_ref::<i32>() {
+        return Ok(Value::Number(Number::from(*v)));
+    }
+    if let Some(v) = any.downcast_ref::<i64>() {
+        return Ok(Value::Number(Number::from(*v)));
+    }
+    if let Some(v) = any.downcast_ref::<u32>() {
+        return Ok(Value::Number(Number::from(*v)));
+    }
+    if let Some(v) = any.downcast_ref::<u64>() {
+        return Ok(Value::Number(Number::from(*v)));
+    }
+    if let Some(v) = any.downcast_ref::<usize>() {
+        return Ok(Value::Number(Number::from(*v as u64)));
+    }
+    if let Some(v) = any.downcast_ref::<f64>() {
+        if let Some(n) = Number::from_f64(*v) {
+            return Ok(Value::Number(n));
+        }
+    }
+    Err("collection backend value is not strict JSON compatible (D160)".to_owned())
+}
+
+fn assert_unique_restore_map_keys<K: 'static, V>(
+    entries: &[(K, V)],
+) -> crate::storage::StorageResult<()> {
+    let mut seen = Vec::<Vec<u8>>::new();
+    for (index, (key, _)) in entries.iter().enumerate() {
+        let id = restore_json_identity(key)?;
+        if seen.iter().any(|existing| existing == &id) {
+            return Err(crate::storage::StorageError::backend(format!(
+                "restore_reactive_map: entry {index} duplicates an earlier strict-JSON key"
+            )));
+        }
+        seen.push(id);
+    }
+    Ok(())
+}
+
+fn assert_unique_restore_index_primaries<K: 'static, S, V>(
+    rows: &[IndexRow<K, S, V>],
+) -> crate::storage::StorageResult<()> {
+    let mut seen = Vec::<Vec<u8>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        let id = restore_json_identity(&row.primary)?;
+        if seen.iter().any(|existing| existing == &id) {
+            return Err(crate::storage::StorageError::backend(format!(
+                "restore_reactive_index: row {index} duplicates an earlier strict-JSON primary"
+            )));
+        }
+        seen.push(id);
+    }
+    Ok(())
+}
+
+fn restore_json_identity<T: 'static>(value: &T) -> crate::storage::StorageResult<Vec<u8>> {
+    let json = any_to_checkpoint_json(value).map_err(crate::storage::StorageError::backend)?;
+    crate::json::strict_canonical_json_bytes(&json)
+        .map_err(|err| crate::storage::StorageError::backend(format!("restore_reactive_*: {err}")))
 }
 
 fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 'static>(

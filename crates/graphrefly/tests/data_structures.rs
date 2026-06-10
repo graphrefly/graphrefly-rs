@@ -413,6 +413,49 @@ fn reactive_index_range_is_light_view_and_lazy_pull() {
 }
 
 #[test]
+fn reactive_index_delete_many_emits_one_delta_for_removed_primaries() {
+    let index = reactive_index::<i32, String, i32>(Vec::new(), ReactiveIndexOptions::default());
+    let deltas = collect_data(&index.delta);
+
+    index.upsert(1, "a".to_owned(), 10);
+    index.upsert(2, "b".to_owned(), 20);
+    index.upsert(3, "c".to_owned(), 30);
+    index.delete_many(vec![2, 4, 1]);
+
+    assert_eq!(
+        *deltas.borrow(),
+        vec![
+            IndexChange::Upsert {
+                primary: 1,
+                secondary: "a".to_owned(),
+                value: 10,
+            },
+            IndexChange::Upsert {
+                primary: 2,
+                secondary: "b".to_owned(),
+                value: 20,
+            },
+            IndexChange::Upsert {
+                primary: 3,
+                secondary: "c".to_owned(),
+                value: 30,
+            },
+            IndexChange::DeleteMany {
+                primaries: vec![2, 1],
+            },
+        ]
+    );
+    assert_eq!(
+        index.to_vec(),
+        vec![IndexRow {
+            primary: 3,
+            secondary: "c".to_owned(),
+            value: 30,
+        }]
+    );
+}
+
+#[test]
 fn reactive_index_range_memo_uses_structural_keys_not_debug_text() {
     let index = reactive_index::<DebugCollisionKey, i32, i32>(
         vec![

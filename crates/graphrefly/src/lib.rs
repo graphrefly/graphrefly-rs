@@ -73,6 +73,7 @@ pub mod json;
 pub mod messaging;
 pub mod node;
 pub mod operators;
+pub mod patterns;
 pub mod process;
 pub mod protocol;
 pub mod render;
@@ -100,6 +101,17 @@ pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
     to_websocket_with_options, OutboundAdapterOptions, OutboundBundle, OutboundEvent,
     OutboundState, OutboundStatus,
+};
+pub use adapters::reactive_collection_storage::{
+    open_persistent_reactive_index, open_persistent_reactive_list, open_persistent_reactive_log,
+    open_persistent_reactive_map, persist_reactive_index, persist_reactive_list,
+    persist_reactive_log, persist_reactive_map, OpenPersistentReactiveIndex,
+    OpenPersistentReactiveIndexOptions, OpenPersistentReactiveList,
+    OpenPersistentReactiveListOptions, OpenPersistentReactiveLog, OpenPersistentReactiveLogOptions,
+    OpenPersistentReactiveMap, OpenPersistentReactiveMapOptions, PersistReactiveCollectionOptions,
+    ReactiveCollectionPersistence, ReactiveCollectionPersistenceCursor,
+    ReactiveCollectionPersistenceErrorFact, ReactiveCollectionPersistenceStatus,
+    ReactiveCollectionPersistenceStatusFact,
 };
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;
@@ -134,10 +146,11 @@ pub use cqrs::{
 };
 pub use ctx::{Ctx, DeferredCtx, DepTerminal, WaveData};
 pub use data_structures::{
-    merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map, scan_log,
-    IndexChange, IndexRow, ListChange, LogChange, MapChange, ReactiveIndex, ReactiveIndexOptions,
-    ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions, ReactiveMap,
-    ReactiveMapOptions, ReactiveView,
+    merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
+    restore_reactive_index, restore_reactive_list, restore_reactive_log, restore_reactive_map,
+    scan_log, IndexChange, IndexRow, ListChange, LogChange, MapChange, ReactiveIndex,
+    ReactiveIndexOptions, ReactiveList, ReactiveListOptions, ReactiveLog, ReactiveLogOptions,
+    ReactiveMap, ReactiveMapOptions, ReactiveView,
 };
 pub use diagnostics::{
     explain_path, reachable, topology_diff, validate_no_islands, CausalChain, CausalStep,
@@ -192,6 +205,12 @@ pub use operators::{
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
     settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
 };
+pub use patterns::{
+    memory_retrieval_bundle, FactId, MemoryAnswer, MemoryFragment, MemoryRetrievalBundle,
+    MemoryRetrievalBundleOptions, MemoryRetrievalCursor, MemoryRetrievalError,
+    MemoryRetrievalErrorCode, MemoryRetrievalFact, MemoryRetrievalIndex, MemoryRetrievalQuery,
+    MemoryRetrievalSnapshot, MemoryRetrievalStatus, MemoryRetrievalStatusState,
+};
 pub use process::{
     process_bundle, process_effect_runner, ProcessAuditOutcome, ProcessAuditRecord, ProcessBundle,
     ProcessBundleOptions, ProcessCursor, ProcessEffectCommandPayload, ProcessEffectCommandType,
@@ -225,8 +244,12 @@ pub use sources::{
 pub use storage::{
     append_log_key, append_log_storage, assert_wal_frame, change_envelope_codec, codec_kv_storage,
     content_addressed_kv, content_addressed_storage, dict_kv, envelope_change, file_append_log,
-    file_backend, file_kv, memory_append_log, memory_kv, memory_multi_writer_append_log,
-    multi_writer_append_log_storage, now_ns, observe_event_frame, observe_event_frame_codec,
+    file_backend, file_kv, load_reactive_index_state, load_reactive_list_state,
+    load_reactive_log_state, load_reactive_map_state, memory_append_log, memory_kv,
+    memory_multi_writer_append_log, multi_writer_append_log_storage, now_ns, observe_event_frame,
+    observe_event_frame_codec, reactive_collection_change_frame,
+    reactive_collection_change_frame_codec, reactive_collection_snapshot_frame,
+    reactive_collection_snapshot_frame_codec, reactive_collection_snapshot_key,
     read_append_log_page, read_observe_event_log_page, read_through_kv, tiered_read_through,
     verify_wal_frame_checksum, wal_frame, wal_frame_checksum, wal_frame_codec, wal_frame_key,
     wal_frame_prefix, AppendLogEntry, AppendLogPage, AppendLogReadOptions, AppendLogStorage,
@@ -234,14 +257,21 @@ pub use storage::{
     ChangeEnvelopeOptions, ChangeLifecycle, CodecKvStorage, ContentAddressedKeyContext,
     ContentAddressedKv, ContentAddressedKvOptions, ContentAddressedMode, ContentAddressedStorage,
     ContentAddressedStorageOptions, FileAppendLogOptions, FileBackend, FileBackendOptions, FileKv,
-    KvGeneration, KvStorageTier, KvVersionedRead, MemoryKv, MultiWriterAppendLogStorage,
-    ObserveEventFrame, ObserveEventFrameCodec, ObserveEventFrameOptions, ObserveEventLogPage,
-    PromotionPolicy, ReadThroughErrorContext, ReadThroughErrorFn, ReadThroughErrorStage,
-    ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier, ReadThroughMissContext,
-    ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact, StorageError, StorageResult,
-    TieredReadThroughOptions, TieredReadThroughResult, TieredReadThroughStatus, WalFrame,
-    WalFrameBody, WalFrameCodec, WalFrameOptions, WalFrameTimestampNs, APPEND_LOG_SEQ_PAD,
-    WAL_FORMAT_VERSION, WAL_FRAME_SEQ_PAD, WAL_KEY_SEGMENT,
+    KvGeneration, KvStorageTier, KvVersionedRead, LoadReactiveCollectionStateOptions, MemoryKv,
+    MultiWriterAppendLogStorage, ObserveEventFrame, ObserveEventFrameCodec,
+    ObserveEventFrameOptions, ObserveEventLogPage, PromotionPolicy, ReactiveCollectionChangeFrame,
+    ReactiveCollectionChangeFrameCodec, ReactiveCollectionChangesRestoreMeta,
+    ReactiveCollectionKind, ReactiveCollectionRestoreSource, ReactiveCollectionRestoreState,
+    ReactiveCollectionSnapshotFrame, ReactiveCollectionSnapshotFrameCodec,
+    ReactiveCollectionSnapshotRestoreMeta, ReactiveIndexRestoreState, ReactiveListRestoreState,
+    ReactiveLogRestoreState, ReactiveMapRestoreState, ReadThroughErrorContext, ReadThroughErrorFn,
+    ReadThroughErrorStage, ReadThroughLoadFn, ReadThroughLookupFact, ReadThroughLookupTier,
+    ReadThroughMissContext, ReadThroughMissFn, ReadThroughOutcome, ReadThroughPromotionFact,
+    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughResult,
+    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameCodec, WalFrameOptions,
+    WalFrameTimestampNs, APPEND_LOG_SEQ_PAD, REACTIVE_COLLECTION_CHANGE_FORMAT,
+    REACTIVE_COLLECTION_FRAME_VERSION, REACTIVE_COLLECTION_SNAPSHOT_FORMAT, WAL_FORMAT_VERSION,
+    WAL_FRAME_SEQ_PAD, WAL_KEY_SEGMENT,
 };
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,

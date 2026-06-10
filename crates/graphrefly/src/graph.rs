@@ -721,6 +721,16 @@ impl Graph {
         self.synthetic_id_for_core(core, "")
     }
 
+    pub(crate) fn contains_core(&self, core: &Core) -> bool {
+        core.same_graph_arena(&self.inner.arena)
+            && self
+                .inner
+                .entries
+                .borrow()
+                .iter()
+                .any(|entry| entry.core.ptr_eq(core))
+    }
+
     pub(crate) fn restore_state_json_with_id(
         &self,
         id: String,

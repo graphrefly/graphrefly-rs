@@ -11,23 +11,35 @@ use graphrefly::adapters::observe_storage::{
 use graphrefly::{
     append_log_key, append_log_storage, assert_decimal_integer_string,
     assert_non_negative_decimal_integer_string, assert_wal_frame, change_envelope_codec,
-    content_addressed_kv, content_addressed_storage, decimal_string_to_i128, dict_kv,
-    envelope_change, file_append_log, file_backend, file_kv, graph, i128_to_decimal_string,
-    is_decimal_integer_string, is_non_negative_decimal_integer_string, json_codec_for,
-    memory_append_log, memory_kv, memory_multi_writer_append_log, multi_writer_append_log_storage,
+    content_addressed_kv, content_addressed_storage, decimal_string_to_i128,
+    default_restore_registry, dict_kv, envelope_change, file_append_log, file_backend, file_kv,
+    graph, i128_to_decimal_string, is_decimal_integer_string,
+    is_non_negative_decimal_integer_string, json_codec_for, load_reactive_index_state,
+    load_reactive_list_state, load_reactive_log_state, load_reactive_map_state, memory_append_log,
+    memory_kv, memory_multi_writer_append_log, multi_writer_append_log_storage,
     non_negative_decimal_string_to_u128, observe_event_frame, observe_event_frame_codec,
-    reactive_cascading_cache, read_append_log_page, read_observe_event_log_page,
-    stable_json_string, strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode,
-    tiered_read_through, u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame,
-    wal_frame_checksum, wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogEntry,
-    AppendLogReadOptions, AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent,
-    CascadingCachePolicy, CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec,
-    ContentAddressedKvOptions, ContentAddressedMode, FileAppendLogOptions, FileBackendOptions,
-    JsonCodec, KvStorageTier, KvVersionedRead, Message, Node, ObserveEventFrame,
-    ObserveEventFrameOptions, ObserveMessage, PromotionPolicy, ReactiveCascadingCacheOptions,
-    ReadThroughErrorStage, ReadThroughOutcome, StorageError, StorageResult,
-    TieredReadThroughOptions, TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions,
-    WAL_FORMAT_VERSION,
+    open_persistent_reactive_index, open_persistent_reactive_list, open_persistent_reactive_log,
+    open_persistent_reactive_map, persist_reactive_list, reactive_cascading_cache,
+    reactive_collection_change_frame, reactive_collection_snapshot_frame,
+    reactive_collection_snapshot_key, reactive_list, reactive_log, reactive_map,
+    read_append_log_page, read_observe_event_log_page, restore_graph, restore_reactive_index,
+    restore_reactive_list, restore_reactive_log, restore_reactive_map, stable_json_string,
+    strict_canonical_json_bytes, strict_json_codec_for, strict_json_decode, tiered_read_through,
+    u128_to_non_negative_decimal_string, verify_wal_frame_checksum, wal_frame, wal_frame_checksum,
+    wal_frame_codec, wal_frame_key, wal_frame_prefix, AppendLogEntry, AppendLogReadOptions,
+    AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
+    CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
+    ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, GraphCheckpointFactory,
+    GraphCheckpointValue, JsonCodec, KvStorageTier, KvVersionedRead, Message, Node,
+    ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
+    OpenPersistentReactiveIndexOptions, OpenPersistentReactiveListOptions,
+    OpenPersistentReactiveLogOptions, OpenPersistentReactiveMapOptions,
+    PersistReactiveCollectionOptions, PromotionPolicy, ReactiveCascadingCacheOptions,
+    ReactiveCollectionChangeFrame, ReactiveCollectionKind, ReactiveCollectionPersistenceStatus,
+    ReactiveCollectionRestoreSource, ReactiveCollectionSnapshotFrame, ReactiveIndexOptions,
+    ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions, ReadThroughErrorStage,
+    ReadThroughOutcome, RestoreGraphOptions, StorageError, StorageResult, TieredReadThroughOptions,
+    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
 };
 use serde_json::json;
 
@@ -215,6 +227,1275 @@ fn strict_json_decode_rejects_duplicate_keys_and_malformed_utf8() {
 
     assert!(strict_json_decode(&[0xff]).is_err());
     assert!(strict_json_decode(br#""\ud800""#).is_err());
+}
+
+#[test]
+fn reactive_collection_load_folds_list_snapshot_and_changes() {
+    let snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    let changes = memory_append_log::<ReactiveCollectionChangeFrame>("reactive-list/changes");
+    let snapshot_key = reactive_collection_snapshot_key("reactive-list").unwrap();
+    snapshots
+        .set(
+            &snapshot_key,
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveList,
+                -1,
+                json!([1, 2]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveList,
+                json!({ "kind": "append", "value": 3 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveList,
+                json!({ "kind": "pop", "index": 1, "value": 2 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let restored = load_reactive_list_state::<i32>(
+        &snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("reactive-list"),
+            snapshot_key: None,
+            change_log: Some(&changes),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(restored.state, vec![1, 3]);
+    assert_eq!(restored.cursor, Some(1));
+    assert!(restored.snapshot_found);
+    assert_eq!(restored.changes_applied, 2);
+}
+
+#[test]
+fn reactive_collection_load_accepts_empty_and_changes_only_from_seq_zero() {
+    let snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    let empty = load_reactive_list_state::<i32>(
+        &snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("empty-list"),
+            snapshot_key: None,
+            change_log: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(empty.source, ReactiveCollectionRestoreSource::Empty);
+    assert_eq!(empty.state, Vec::<i32>::new());
+
+    let empty_changes = memory_append_log::<ReactiveCollectionChangeFrame>("empty-list/changes");
+    let empty_with_log = load_reactive_list_state::<i32>(
+        &snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("empty-list"),
+            snapshot_key: None,
+            change_log: Some(&empty_changes),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        empty_with_log.source,
+        ReactiveCollectionRestoreSource::Empty
+    );
+    assert_eq!(empty_with_log.state, Vec::<i32>::new());
+
+    let changes = memory_append_log::<ReactiveCollectionChangeFrame>("orphan-list/changes");
+    changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveList,
+                json!({ "kind": "append", "value": 1 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let restored = load_reactive_list_state::<i32>(
+        &snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("orphan-list"),
+            snapshot_key: None,
+            change_log: Some(&changes),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(restored.source, ReactiveCollectionRestoreSource::Changes);
+    assert_eq!(restored.state, vec![1]);
+    assert_eq!(restored.cursor, Some(0));
+}
+
+#[derive(Clone)]
+struct GapChangeLog {
+    entries: Vec<AppendLogEntry<ReactiveCollectionChangeFrame>>,
+}
+
+impl AppendLogStorageTier<ReactiveCollectionChangeFrame> for GapChangeLog {
+    fn append(
+        &self,
+        _value: ReactiveCollectionChangeFrame,
+    ) -> StorageResult<AppendLogEntry<ReactiveCollectionChangeFrame>> {
+        Err(StorageError::backend("gap log is read-only"))
+    }
+
+    fn read(
+        &self,
+        _opts: AppendLogReadOptions,
+    ) -> StorageResult<Vec<AppendLogEntry<ReactiveCollectionChangeFrame>>> {
+        Ok(self.entries.clone())
+    }
+
+    fn truncate_after(&self, _seq: u64) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        Ok(self.entries.len())
+    }
+}
+
+#[derive(Clone)]
+struct FailOnceChangeLog {
+    inner: graphrefly::AppendLogStorage<ReactiveCollectionChangeFrame>,
+    fail_next: Rc<Cell<bool>>,
+}
+
+impl FailOnceChangeLog {
+    fn new(prefix: &str) -> Self {
+        Self {
+            inner: memory_append_log(prefix),
+            fail_next: Rc::new(Cell::new(true)),
+        }
+    }
+}
+
+impl AppendLogStorageTier<ReactiveCollectionChangeFrame> for FailOnceChangeLog {
+    fn append(
+        &self,
+        value: ReactiveCollectionChangeFrame,
+    ) -> StorageResult<AppendLogEntry<ReactiveCollectionChangeFrame>> {
+        if self.fail_next.replace(false) {
+            return Err(StorageError::backend("injected append failure"));
+        }
+        self.inner.append(value)
+    }
+
+    fn read(
+        &self,
+        opts: AppendLogReadOptions,
+    ) -> StorageResult<Vec<AppendLogEntry<ReactiveCollectionChangeFrame>>> {
+        self.inner.read(opts)
+    }
+
+    fn truncate_after(&self, seq: u64) -> StorageResult<()> {
+        self.inner.truncate_after(seq)
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        self.inner.size()
+    }
+}
+
+#[derive(Clone)]
+struct FailOnceSnapshotStore {
+    entries: Rc<RefCell<std::collections::BTreeMap<String, ReactiveCollectionSnapshotFrame>>>,
+    fail_next: Rc<Cell<bool>>,
+}
+
+impl FailOnceSnapshotStore {
+    fn new() -> Self {
+        Self {
+            entries: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+            fail_next: Rc::new(Cell::new(true)),
+        }
+    }
+}
+
+impl KvStorageTier<ReactiveCollectionSnapshotFrame> for FailOnceSnapshotStore {
+    fn get(&self, key: &str) -> StorageResult<Option<ReactiveCollectionSnapshotFrame>> {
+        Ok(self.entries.borrow().get(key).cloned())
+    }
+
+    fn set(&self, key: &str, value: ReactiveCollectionSnapshotFrame) -> StorageResult<()> {
+        if self.fail_next.replace(false) {
+            return Err(StorageError::backend("injected snapshot failure"));
+        }
+        self.entries.borrow_mut().insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> StorageResult<()> {
+        self.entries.borrow_mut().remove(key);
+        Ok(())
+    }
+
+    fn list(&self, prefix: &str) -> StorageResult<Vec<String>> {
+        Ok(self
+            .entries
+            .borrow()
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+}
+
+#[test]
+fn reactive_collection_load_rejects_seq_holes_and_duplicate_keys() {
+    let snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    let gap = GapChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "gap/0000000000000001".to_owned(),
+            seq: 1,
+            value: reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveList,
+                json!({ "kind": "append", "value": 1 }),
+            )
+            .unwrap(),
+        }],
+    };
+
+    let err = load_reactive_list_state::<i32>(
+        &snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("gap-list"),
+            snapshot_key: None,
+            change_log: Some(&gap),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("non-contiguous"));
+
+    let map_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    map_snapshots
+        .set(
+            "map/snapshot",
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveMap,
+                -1,
+                json!([["a", 1], ["a", 2]]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_map_state::<String, i32>(
+        &map_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("map/snapshot"),
+            change_log: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("duplicates"));
+
+    let index_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    index_snapshots
+        .set(
+            "index/snapshot",
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveIndex,
+                -1,
+                json!([
+                    { "primary": "p", "secondary": 1, "value": 10 },
+                    { "primary": "p", "secondary": 2, "value": 20 }
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_index_state::<String, i32, i32>(
+        &index_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("index/snapshot"),
+            change_log: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("duplicates"));
+}
+
+#[test]
+fn reactive_collection_load_rejects_corrupt_frames_and_impossible_folds() {
+    let wrong_kind_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    wrong_kind_snapshots
+        .set(
+            "wrong/snapshot",
+            reactive_collection_snapshot_frame(ReactiveCollectionKind::ReactiveLog, -1, json!([]))
+                .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_list_state::<i32>(
+        &wrong_kind_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("wrong/snapshot"),
+            change_log: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("expected ReactiveList"));
+
+    let bad_version = GapChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "bad-version/0000000000000000".to_owned(),
+            seq: 0,
+            value: ReactiveCollectionChangeFrame {
+                format: graphrefly::REACTIVE_COLLECTION_CHANGE_FORMAT.to_owned(),
+                version: 2,
+                kind: ReactiveCollectionKind::ReactiveList,
+                change: json!({ "kind": "append", "value": 1 }),
+            },
+        }],
+    };
+    let err = load_reactive_list_state::<i32>(
+        &memory_kv::<ReactiveCollectionSnapshotFrame>(),
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("bad-version"),
+            snapshot_key: None,
+            change_log: Some(&bad_version),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unsupported version"));
+
+    let bad_shape = GapChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "bad-shape/0000000000000000".to_owned(),
+            seq: 0,
+            value: ReactiveCollectionChangeFrame {
+                format: graphrefly::REACTIVE_COLLECTION_CHANGE_FORMAT.to_owned(),
+                version: 1,
+                kind: ReactiveCollectionKind::ReactiveList,
+                change: json!({ "value": 1 }),
+            },
+        }],
+    };
+    let err = load_reactive_list_state::<i32>(
+        &memory_kv::<ReactiveCollectionSnapshotFrame>(),
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("bad-shape"),
+            snapshot_key: None,
+            change_log: Some(&bad_shape),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("missing field"));
+
+    let list_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    list_snapshots
+        .set(
+            "list/impossible",
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveList,
+                -1,
+                json!([1, 2]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let list_changes = memory_append_log::<ReactiveCollectionChangeFrame>("list/impossible/log");
+    list_changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveList,
+                json!({ "kind": "pop", "index": 1, "value": 99 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_list_state::<i32>(
+        &list_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("list/impossible"),
+            change_log: Some(&list_changes),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("pop value"));
+
+    let map_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    map_snapshots
+        .set(
+            "map/impossible",
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveMap,
+                -1,
+                json!([["a", 1]]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let map_changes = memory_append_log::<ReactiveCollectionChangeFrame>("map/impossible/log");
+    map_changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveMap,
+                json!({ "kind": "delete", "key": "a", "previous": 2 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_map_state::<String, i32>(
+        &map_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("map/impossible"),
+            change_log: Some(&map_changes),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("previous value"));
+
+    let index_changes = memory_append_log::<ReactiveCollectionChangeFrame>("index/impossible/log");
+    index_changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveIndex,
+                json!({ "kind": "delete", "primary": "missing" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_index_state::<String, i32, i32>(
+        &memory_kv::<ReactiveCollectionSnapshotFrame>(),
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: Some("index/impossible"),
+            snapshot_key: None,
+            change_log: Some(&index_changes),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("delete primary"));
+
+    let index_many_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    index_many_snapshots
+        .set(
+            "index/delete-many",
+            reactive_collection_snapshot_frame(
+                ReactiveCollectionKind::ReactiveIndex,
+                -1,
+                json!([
+                    { "primary": "a", "secondary": 1, "value": 10 },
+                    { "primary": "b", "secondary": 2, "value": 20 }
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let index_many_changes =
+        memory_append_log::<ReactiveCollectionChangeFrame>("index/delete-many/log");
+    index_many_changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveIndex,
+                json!({ "kind": "deleteMany", "primaries": ["a", "a"] }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_index_state::<String, i32, i32>(
+        &index_many_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("index/delete-many"),
+            change_log: Some(&index_many_changes),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("duplicates"));
+
+    let log_snapshots = memory_kv::<ReactiveCollectionSnapshotFrame>();
+    log_snapshots
+        .set(
+            "log/impossible",
+            reactive_collection_snapshot_frame(ReactiveCollectionKind::ReactiveLog, -1, json!([1]))
+                .unwrap(),
+        )
+        .unwrap();
+    let log_changes = memory_append_log::<ReactiveCollectionChangeFrame>("log/impossible/log");
+    log_changes
+        .append(
+            reactive_collection_change_frame(
+                ReactiveCollectionKind::ReactiveLog,
+                json!({ "kind": "clear", "count": 2 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let err = load_reactive_log_state::<i32>(
+        &log_snapshots,
+        graphrefly::LoadReactiveCollectionStateOptions {
+            storage_prefix: None,
+            snapshot_key: Some("log/impossible"),
+            change_log: Some(&log_changes),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("clear count"));
+}
+
+#[test]
+fn restore_reactive_helpers_seed_backends_without_storage_reads() {
+    let list_state = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveList,
+        state: vec![1, 2],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let list = restore_reactive_list(list_state, ReactiveListOptions::default()).unwrap();
+    assert_eq!(list.to_vec(), vec![1, 2]);
+
+    let log_state = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveLog,
+        state: vec!["a".to_owned(), "b".to_owned()],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let log = restore_reactive_log(log_state, ReactiveLogOptions::default()).unwrap();
+    assert_eq!(log.to_vec(), vec!["a".to_owned(), "b".to_owned()]);
+
+    let map_state = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveMap,
+        state: vec![("k".to_owned(), 7)],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let map = restore_reactive_map(map_state, ReactiveMapOptions::default()).unwrap();
+    assert_eq!(map.get(&"k".to_owned()), Some(7));
+    let duplicate_map = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveMap,
+        state: vec![("dup".to_owned(), 1), ("dup".to_owned(), 2)],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let err = match restore_reactive_map(duplicate_map, ReactiveMapOptions::default()) {
+        Ok(_) => panic!("duplicate map keys must fail restore"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("duplicates"));
+
+    let index_state = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveIndex,
+        state: vec![graphrefly::IndexRow {
+            primary: "p".to_owned(),
+            secondary: 1,
+            value: 9,
+        }],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let index = restore_reactive_index(index_state, ReactiveIndexOptions::default()).unwrap();
+    assert_eq!(index.get(&"p".to_owned()), Some(9));
+    let duplicate_index = graphrefly::ReactiveCollectionRestoreState {
+        kind: ReactiveCollectionKind::ReactiveIndex,
+        state: vec![
+            graphrefly::IndexRow {
+                primary: "p".to_owned(),
+                secondary: 1,
+                value: 9,
+            },
+            graphrefly::IndexRow {
+                primary: "p".to_owned(),
+                secondary: 2,
+                value: 10,
+            },
+        ],
+        source: ReactiveCollectionRestoreSource::Snapshot,
+        snapshot: graphrefly::ReactiveCollectionSnapshotRestoreMeta {
+            found: true,
+            change_cursor: -1,
+        },
+        changes: graphrefly::ReactiveCollectionChangesRestoreMeta {
+            applied: 0,
+            cursor: -1,
+        },
+        cursor: None,
+        snapshot_found: true,
+        changes_applied: 0,
+    };
+    let err = match restore_reactive_index(duplicate_index, ReactiveIndexOptions::default()) {
+        Ok(_) => panic!("duplicate index primaries must fail restore"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("duplicates"));
+}
+
+#[test]
+fn open_persistent_reactive_list_composes_load_restore_and_persist() {
+    let snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("persistent-list/changes"),
+    );
+
+    let opened_graph = graph();
+    let opened = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
+        initial: vec![10],
+        collection: ReactiveListOptions::default().graph(opened_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(opened_graph),
+            name: None,
+            storage_prefix: Some("persistent-list".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: Some(changes.clone()),
+            snapshot_on_attach: true,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+
+    assert_eq!(opened.collection.to_vec(), vec![10]);
+    opened.collection.append(11);
+    assert_eq!(
+        changes.size().unwrap(),
+        0,
+        "D161: sidecar queues storage writes until flush"
+    );
+    assert_eq!(opened.persistence.ready.cache(), Some(false));
+    opened.persistence.flush().unwrap();
+    assert_eq!(changes.size().unwrap(), 1);
+    let cursor = opened.persistence.cursor_fact().unwrap();
+    assert_eq!(cursor.change_seq, Some(0));
+    assert_eq!(cursor.snapshot_writes, 1);
+    assert_eq!(cursor.change_writes, 1);
+    assert_eq!(opened.persistence.ready.cache(), Some(true));
+
+    let reopened_graph = graph();
+    let reopened = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
+        initial: vec![99],
+        collection: ReactiveListOptions::default().graph(reopened_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(reopened_graph),
+            name: None,
+            storage_prefix: Some("persistent-list".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: Some(changes.clone()),
+            snapshot_on_attach: true,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+
+    assert_eq!(
+        reopened.collection.to_vec(),
+        vec![10, 11],
+        "D161: missing durable state uses initial, but existing snapshot+log wins"
+    );
+    let reopened_cursor = reopened.persistence.cursor_fact().unwrap();
+    assert_eq!(reopened_cursor.change_seq, Some(0));
+    assert_eq!(reopened_cursor.snapshot_writes, 1);
+    assert_eq!(reopened_cursor.change_writes, 0);
+
+    let reopened_again_graph = graph();
+    let reopened_again = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
+        initial: vec![99],
+        collection: ReactiveListOptions::default().graph(reopened_again_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(reopened_again_graph),
+            name: None,
+            storage_prefix: Some("persistent-list".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots,
+            change_log: Some(changes),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+
+    assert_eq!(
+        reopened_again.collection.to_vec(),
+        vec![10, 11],
+        "restored cursor must prevent double replay after snapshot_on_attach"
+    );
+}
+
+#[test]
+fn open_persistent_reactive_log_composes_load_restore_and_persist() {
+    let snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("persistent-log/changes"),
+    );
+
+    let opened_graph = graph();
+    let opened = open_persistent_reactive_log(OpenPersistentReactiveLogOptions {
+        initial: vec!["a".to_owned()],
+        collection: ReactiveLogOptions::default().graph(opened_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(opened_graph),
+            name: None,
+            storage_prefix: Some("persistent-log".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: Some(changes.clone()),
+            snapshot_on_attach: true,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    opened.collection.append("b".to_owned());
+    opened.persistence.flush().unwrap();
+
+    let reopened_graph = graph();
+    let reopened = open_persistent_reactive_log(OpenPersistentReactiveLogOptions {
+        initial: vec!["ignored".to_owned()],
+        collection: ReactiveLogOptions::default().graph(reopened_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(reopened_graph),
+            name: None,
+            storage_prefix: Some("persistent-log".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots,
+            change_log: Some(changes),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        reopened.collection.to_vec(),
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+}
+
+#[test]
+fn open_persistent_map_and_index_compose_load_restore_and_persist() {
+    let map_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let map_changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("persistent-map/changes"),
+    );
+    let opened_map_graph = graph();
+    let opened_map = open_persistent_reactive_map(OpenPersistentReactiveMapOptions {
+        initial: vec![("a".to_owned(), 1)],
+        collection: ReactiveMapOptions::default().graph(opened_map_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(opened_map_graph),
+            name: None,
+            storage_prefix: Some("persistent-map".to_owned()),
+            snapshot_key: None,
+            snapshot_store: map_snapshots.clone(),
+            change_log: Some(map_changes.clone()),
+            snapshot_on_attach: true,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    opened_map.collection.set("b".to_owned(), 2);
+    opened_map.persistence.flush().unwrap();
+
+    let reopened_map_graph = graph();
+    let reopened_map = open_persistent_reactive_map(OpenPersistentReactiveMapOptions {
+        initial: vec![("ignored".to_owned(), 9)],
+        collection: ReactiveMapOptions::default().graph(reopened_map_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(reopened_map_graph),
+            name: None,
+            storage_prefix: Some("persistent-map".to_owned()),
+            snapshot_key: None,
+            snapshot_store: map_snapshots,
+            change_log: Some(map_changes),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    assert_eq!(reopened_map.collection.get(&"a".to_owned()), Some(1));
+    assert_eq!(reopened_map.collection.get(&"b".to_owned()), Some(2));
+
+    let index_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let index_changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("persistent-index/changes"),
+    );
+    let opened_index_graph = graph();
+    let opened_index = open_persistent_reactive_index(OpenPersistentReactiveIndexOptions {
+        initial: vec![graphrefly::IndexRow {
+            primary: "p1".to_owned(),
+            secondary: 2,
+            value: 20,
+        }],
+        collection: ReactiveIndexOptions::default().graph(opened_index_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(opened_index_graph),
+            name: None,
+            storage_prefix: Some("persistent-index".to_owned()),
+            snapshot_key: None,
+            snapshot_store: index_snapshots.clone(),
+            change_log: Some(index_changes.clone()),
+            snapshot_on_attach: true,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    opened_index.collection.upsert("p2".to_owned(), 1, 10);
+    opened_index.collection.upsert("p3".to_owned(), 3, 30);
+    opened_index.collection.delete_many(vec![
+        "p1".to_owned(),
+        "missing".to_owned(),
+        "p3".to_owned(),
+    ]);
+    opened_index.persistence.flush().unwrap();
+
+    let reopened_index_graph = graph();
+    let reopened_index = open_persistent_reactive_index(OpenPersistentReactiveIndexOptions {
+        initial: Vec::<graphrefly::IndexRow<String, i32, i32>>::new(),
+        collection: ReactiveIndexOptions::default().graph(reopened_index_graph.clone()),
+        persistence: PersistReactiveCollectionOptions {
+            graph: Some(reopened_index_graph),
+            name: None,
+            storage_prefix: Some("persistent-index".to_owned()),
+            snapshot_key: None,
+            snapshot_store: index_snapshots,
+            change_log: Some(index_changes),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    })
+    .unwrap();
+    assert_eq!(reopened_index.collection.get(&"p1".to_owned()), None);
+    assert_eq!(reopened_index.collection.get(&"p2".to_owned()), Some(10));
+    assert_eq!(reopened_index.collection.get(&"p3".to_owned()), None);
+}
+
+#[test]
+fn persistence_sidecar_snapshot_cadence_and_cross_graph_preflight() {
+    let snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("cadence/changes"),
+    );
+    let g = graph();
+    let list = reactive_list::<i32>(
+        vec![0],
+        ReactiveListOptions::named("cadence").graph(g.clone()),
+    );
+    let persistence = persist_reactive_list(
+        &list,
+        PersistReactiveCollectionOptions {
+            graph: Some(g.clone()),
+            name: None,
+            storage_prefix: Some("cadence".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: Some(changes.clone()),
+            snapshot_on_attach: false,
+            snapshot_every_changes: Some(2),
+        },
+    )
+    .unwrap();
+
+    list.append(1);
+    assert!(snapshots
+        .get(&reactive_collection_snapshot_key("cadence").unwrap())
+        .unwrap()
+        .is_none());
+    list.append(2);
+    assert_eq!(
+        changes.size().unwrap(),
+        0,
+        "snapshotEveryChanges queues sidecar writes until flush"
+    );
+    assert!(snapshots
+        .get(&reactive_collection_snapshot_key("cadence").unwrap())
+        .unwrap()
+        .is_none());
+    persistence.flush().unwrap();
+    assert_eq!(
+        changes.size().unwrap(),
+        2,
+        "flush drains queued change writes before the cadence snapshot"
+    );
+    let snapshot = snapshots
+        .get(&reactive_collection_snapshot_key("cadence").unwrap())
+        .unwrap()
+        .expect("snapshotEveryChanges writes a snapshot");
+    assert_eq!(snapshot.change_cursor, 1);
+    assert_eq!(snapshot.snapshot, json!([0, 1, 2]));
+    let cursor = persistence.cursor_fact().unwrap();
+    assert_eq!(cursor.change_seq, Some(1));
+    assert_eq!(cursor.change_writes, 2);
+    assert_eq!(cursor.snapshot_writes, 1);
+    let status = persistence.status_fact().unwrap();
+    assert_eq!(status.state, ReactiveCollectionPersistenceStatus::Ready);
+    assert_eq!(status.writes, 3);
+
+    let graphless = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
+    let graphless_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let graphless_err = match persist_reactive_list(
+        &graphless,
+        PersistReactiveCollectionOptions {
+            graph: None,
+            name: Some("graphless/persistence".to_owned()),
+            storage_prefix: Some("graphless".to_owned()),
+            snapshot_key: Some("graphless/snapshot".to_owned()),
+            snapshot_store: graphless_snapshots.clone(),
+            change_log: None,
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    ) {
+        Ok(_) => panic!("graphless persistence must fail before creating facts"),
+        Err(err) => err,
+    };
+    assert!(graphless_err.to_string().contains("graph is required"));
+    assert!(graphless_snapshots
+        .get("graphless/snapshot")
+        .unwrap()
+        .is_none());
+
+    let owner = graph();
+    let other = graph();
+    let owned = reactive_list::<i32>(
+        Vec::new(),
+        ReactiveListOptions::named("owned").graph(owner.clone()),
+    );
+    let cross_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let cross_changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
+        memory_append_log::<ReactiveCollectionChangeFrame>("bad/changes"),
+    );
+    let err = match persist_reactive_list(
+        &owned,
+        PersistReactiveCollectionOptions {
+            graph: Some(other.clone()),
+            name: Some("bad/persistence".to_owned()),
+            storage_prefix: Some("bad".to_owned()),
+            snapshot_key: Some("bad/snapshot".to_owned()),
+            snapshot_store: cross_snapshots.clone(),
+            change_log: Some(cross_changes.clone()),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    ) {
+        Ok(_) => panic!("cross-graph persistence must fail before creating facts"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("different graph"));
+    assert!(
+        other.find("bad/persistence.ready").is_none(),
+        "cross-graph preflight must not create graph-visible sidecar facts"
+    );
+    assert!(
+        owner.find("bad/persistence.ready").is_none(),
+        "cross-graph preflight must not create facts on the collection owner graph either"
+    );
+    assert!(cross_snapshots.get("bad/snapshot").unwrap().is_none());
+    assert_eq!(cross_changes.size().unwrap(), 0);
+}
+
+#[test]
+fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_append_retries() {
+    let snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let snapshot_only_graph = graph();
+    let list = reactive_list::<i32>(
+        vec![1],
+        ReactiveListOptions::default().graph(snapshot_only_graph.clone()),
+    );
+    let persistence = persist_reactive_list(
+        &list,
+        PersistReactiveCollectionOptions {
+            graph: Some(snapshot_only_graph),
+            name: None,
+            storage_prefix: Some("snapshot-only".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: None,
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    )
+    .unwrap();
+    list.append(2);
+    persistence.flush().unwrap();
+    let snapshot = snapshots
+        .get(&reactive_collection_snapshot_key("snapshot-only").unwrap())
+        .unwrap()
+        .expect("flush writes snapshot when no change log exists");
+    assert_eq!(snapshot.snapshot, json!([1, 2]));
+
+    let failing_snapshots = Rc::new(FailOnceSnapshotStore::new());
+    let failing_snapshot_graph = graph();
+    let failing_snapshot_list = reactive_list::<i32>(
+        vec![1],
+        ReactiveListOptions::default().graph(failing_snapshot_graph.clone()),
+    );
+    let failing_snapshot = persist_reactive_list(
+        &failing_snapshot_list,
+        PersistReactiveCollectionOptions {
+            graph: Some(failing_snapshot_graph),
+            name: None,
+            storage_prefix: Some("snapshot-failure".to_owned()),
+            snapshot_key: None,
+            snapshot_store: failing_snapshots,
+            change_log: None,
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    )
+    .unwrap();
+    failing_snapshot_list.append(2);
+    assert!(failing_snapshot
+        .flush()
+        .unwrap_err()
+        .to_string()
+        .contains("injected snapshot failure"));
+    let error = failing_snapshot
+        .error_fact()
+        .unwrap()
+        .expect("snapshot error fact is set");
+    assert_eq!(error.phase, "snapshot");
+    assert!(error.message.contains("injected snapshot failure"));
+
+    let retry_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
+    let failing_log = Rc::new(FailOnceChangeLog::new("retry/changes"));
+    let retry_graph = graph();
+    let retry_list = reactive_list::<i32>(
+        vec![0],
+        ReactiveListOptions::default().graph(retry_graph.clone()),
+    );
+    let retry = persist_reactive_list(
+        &retry_list,
+        PersistReactiveCollectionOptions {
+            graph: Some(retry_graph),
+            name: None,
+            storage_prefix: Some("retry".to_owned()),
+            snapshot_key: None,
+            snapshot_store: retry_snapshots,
+            change_log: Some(failing_log.clone()),
+            snapshot_on_attach: false,
+            snapshot_every_changes: None,
+        },
+    )
+    .unwrap();
+    retry_list.append(1);
+    assert!(retry
+        .flush()
+        .unwrap_err()
+        .to_string()
+        .contains("injected append failure"));
+    let status = retry.status_fact().unwrap();
+    assert_eq!(status.state, ReactiveCollectionPersistenceStatus::Errored);
+    assert_eq!(status.errors, 1);
+    let error = retry.error_fact().unwrap().expect("error fact is set");
+    assert_eq!(error.phase, "change");
+    assert!(error.message.contains("injected append failure"));
+
+    // The failed frame remains queued; `snapshot()` drains it before writing the baseline.
+    retry.snapshot().unwrap();
+    // The public handle stays errored, but the underlying log proves the queued frame was not lost.
+    assert_eq!(failing_log.size().unwrap(), 1);
+}
+
+#[test]
+fn graph_checkpoint_uses_collection_backend_state_as_authority() {
+    let g = graph();
+    let list = reactive_list::<i32>(vec![1], ReactiveListOptions::named("list").graph(g.clone()));
+    list.append(2);
+    let _activate_snapshot = list.snapshot.subscribe(|_| {});
+
+    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+    let by_id = checkpoint
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(by_id["list.delta"].backend_state, Some(json!([1, 2])));
+    assert_eq!(by_id["list.snapshot"].value, GraphCheckpointValue::Sentinel);
+    assert_eq!(
+        by_id["list.snapshot"].ctx_state.value,
+        GraphCheckpointValue::Sentinel,
+        "R-snapshot/D160: collection helper ctxState is a non-authoritative derived cache"
+    );
+
+    let mut stale = checkpoint.clone();
+    stale
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "list.snapshot")
+        .expect("snapshot node exists")
+        .value = GraphCheckpointValue::Data {
+        data: json!(["stale"]),
+    };
+    let restored = restore_graph(stale, RestoreGraphOptions::new(default_restore_registry()))
+        .expect("collection backendState restores");
+    let restored_checkpoint = restored.checkpoint().expect("re-checkpoint succeeds");
+    let restored_delta = restored_checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "list.delta")
+        .expect("restored delta exists");
+    assert_eq!(restored_delta.backend_state, Some(json!([1, 2])));
+
+    let view_graph = graph();
+    let map = reactive_map::<String, i32>(
+        vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
+        ReactiveMapOptions::named("map").graph(view_graph.clone()),
+    );
+    let view = map.select(|value, _key| *value > 1);
+    view.snapshot
+        .up(vec![Message::Resume(view.pull_id.clone())]);
+    let view_checkpoint = view_graph.checkpoint().expect("view checkpoint succeeds");
+    let view_by_id = view_checkpoint
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        view_by_id["map.select#0.delta"].value,
+        GraphCheckpointValue::Sentinel
+    );
+    assert_eq!(
+        view_by_id["map.select#0.snapshot"].value,
+        GraphCheckpointValue::Sentinel
+    );
+    assert_eq!(
+        view_by_id["map.select#0.snapshot"].ctx_state.value,
+        GraphCheckpointValue::Sentinel,
+        "collection light-view helper caches are also non-authoritative"
+    );
+}
+
+#[test]
+fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state() {
+    let unsupported = graph();
+    reactive_list::<i16>(
+        vec![1],
+        ReactiveListOptions::named("unsupported").graph(unsupported.clone()),
+    );
+    let err = unsupported.checkpoint().unwrap_err();
+    assert!(
+        err.to_string().contains("not strict JSON compatible"),
+        "unsupported host-ish backend values fail rather than widening D160 implicitly"
+    );
+
+    let local_only = graph();
+    reactive_list::<i32>(
+        vec![1, 2, 3],
+        ReactiveListOptions::named("capped")
+            .graph(local_only.clone())
+            .max_size(2),
+    );
+    let checkpoint = local_only.checkpoint().unwrap();
+    let capped = checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "capped.delta")
+        .expect("capped list delta exists");
+    assert!(matches!(
+        capped.factory,
+        GraphCheckpointFactory::LocalOnly { .. }
+    ));
+    assert_eq!(capped.backend_state, None);
+}
+
+#[test]
+fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
+    let g = graph();
+    let log = reactive_log::<i32>(
+        vec![1, 2, 3],
+        ReactiveLogOptions::named("log")
+            .graph(g.clone())
+            .max_size(2),
+    );
+    log.append(4);
+
+    let checkpoint = g.checkpoint().unwrap();
+    let by_id = checkpoint
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(by_id["log.delta"].backend_state, Some(json!([3, 4])));
+    assert!(matches!(
+        &by_id["log.delta"].factory,
+        GraphCheckpointFactory::RegistryRef { config, .. }
+            if config.as_ref().is_some_and(|value| value == &json!({ "maxSize": 2 }))
+    ));
+
+    let restored = restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(default_restore_registry()),
+    )
+    .expect("capped log restores through config");
+    let restored_checkpoint = restored.checkpoint().unwrap();
+    let restored_log = restored_checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "log.delta")
+        .expect("restored log delta exists");
+    assert_eq!(restored_log.backend_state, Some(json!([3, 4])));
 }
 
 #[test]

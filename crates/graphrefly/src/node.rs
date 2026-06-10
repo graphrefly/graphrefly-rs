@@ -48,6 +48,9 @@ use crate::batch::{
     active_batch_committed_token, boundary_drains_blocked, collecting_batch,
     committed_after_batch_for_target, defer_to_batch, register_boundary_root,
 };
+use crate::checkpoint::{
+    unregister_backend_state_contributor, unregister_backend_state_contributor_key,
+};
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
@@ -1287,6 +1290,11 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
         id: key.id.0,
         armed: true,
     };
+    unregister_backend_state_contributor_key((
+        Rc::as_ptr(graph_ref) as usize,
+        key.id.0,
+        key.generation,
+    ));
     inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
     free_slot.armed = false;
     graph_ref.borrow_mut().free.push(key.id.0);
@@ -2499,6 +2507,7 @@ impl Core {
             id: key.id.0,
             armed: true,
         };
+        unregister_backend_state_contributor(self);
         let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = slot;
         inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
         free_slot.armed = false;
