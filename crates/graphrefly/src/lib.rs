@@ -115,8 +115,8 @@ pub use adapters::environment::{
     to_websocket_with_options, websocket_session, websocket_session_with_options,
     OutboundAdapterOptions, OutboundBundle, OutboundEvent, OutboundState, OutboundStatus,
     WebSocketSessionBundle, WebSocketSessionCommand, WebSocketSessionInbound,
-    WebSocketSessionLifecycle, WebSocketSessionOptions, WebSocketSessionStateKind,
-    WebSocketSessionStatus,
+    WebSocketSessionLifecycle, WebSocketSessionOptions, WebSocketSessionOutbound,
+    WebSocketSessionSendPolicy, WebSocketSessionStateKind, WebSocketSessionStatus,
 };
 pub use adapters::reactive_collection_storage::{
     open_persistent_reactive_index, open_persistent_reactive_list, open_persistent_reactive_log,

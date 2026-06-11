@@ -169,10 +169,37 @@ pub struct WebSocketSessionStatus {
     pub last_delay_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketSessionOutbound {
+    Queued {
+        seq: u64,
+        message: WebSocketSend,
+    },
+    Sending {
+        seq: u64,
+        message: WebSocketSend,
+    },
+    Sent {
+        seq: u64,
+        message: WebSocketSend,
+    },
+    Rejected {
+        seq: u64,
+        message: WebSocketSend,
+        error: String,
+    },
+    Canceled {
+        seq: u64,
+        message: WebSocketSend,
+        reason: String,
+    },
+}
+
 pub struct WebSocketSessionBundle {
     pub command: Node<WebSocketSessionCommand>,
     pub inbound: Node<WebSocketSessionInbound>,
     pub lifecycle: Node<WebSocketSessionLifecycle>,
+    pub outbound: Node<WebSocketSessionOutbound>,
     pub status: Node<WebSocketSessionStatus>,
     pub errors: Node<String>,
     pub attempts: Node<u32>,
@@ -201,10 +228,20 @@ impl WebSocketSessionBundle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WebSocketSessionSendPolicy {
+    #[default]
+    Reject,
+    Buffer {
+        max_pending: usize,
+    },
+}
+
 #[derive(Clone, Default)]
 pub struct WebSocketSessionOptions {
     pub name: Option<String>,
     pub retry: RetryPolicy,
+    pub send_policy: WebSocketSessionSendPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +271,7 @@ enum WebSocketSessionEvent {
         delay_ms: u64,
         error: String,
     },
+    Outbound(WebSocketSessionOutbound),
     Error {
         attempt: Option<u32>,
         error: String,
@@ -254,6 +292,9 @@ struct WebSocketSessionState {
     current_attempt: u32,
     current_session: Option<Rc<dyn LocalWebSocketSession>>,
     next_send_id: u64,
+    next_outbound_seq: u64,
+    pending_outbound: Vec<PendingWebSocketOutbound>,
+    live_outbound: Vec<LiveWebSocketOutbound>,
     send_cancels: Vec<WebSocketSendCancel>,
     retry_cancels: Vec<CancelSlot>,
 }
@@ -262,6 +303,18 @@ struct WebSocketSessionState {
 struct WebSocketSendCancel {
     id: u64,
     slot: CancelSlot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWebSocketOutbound {
+    seq: u64,
+    message: WebSocketSend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveWebSocketOutbound {
+    id: u64,
+    item: PendingWebSocketOutbound,
 }
 
 pub fn websocket_session(graph: &Graph, request: WebSocketRequest) -> WebSocketSessionBundle {
@@ -281,12 +334,28 @@ pub fn websocket_session_with_options(
         .name
         .clone()
         .unwrap_or_else(|| "websocketSession".to_owned());
+    validate_websocket_session_send_policy(&opts.send_policy);
     let command = graph.state_empty_opts::<WebSocketSessionCommand>(GraphNodeOpts::named(format!(
         "{name}/command"
     )));
-    let events =
-        websocket_session_events(graph, &command, request, name.clone(), opts.retry.clone());
+    let events = websocket_session_events(
+        graph,
+        &command,
+        request,
+        name.clone(),
+        opts.retry.clone(),
+        opts.send_policy.clone(),
+    );
     websocket_session_nodes(graph, command, events, name, opts.retry)
+}
+
+fn validate_websocket_session_send_policy(policy: &WebSocketSessionSendPolicy) {
+    if let WebSocketSessionSendPolicy::Buffer { max_pending } = policy {
+        assert!(
+            *max_pending > 0,
+            "websocket_session: buffer send_policy requires finite max_pending >= 1"
+        );
+    }
 }
 
 fn websocket_session_events(
@@ -295,6 +364,7 @@ fn websocket_session_events(
     request: WebSocketRequest,
     name: String,
     policy: RetryPolicy,
+    send_policy: WebSocketSessionSendPolicy,
 ) -> Node<WebSocketSessionEvent> {
     let events_name = name.clone();
     graph.node_opts::<WebSocketSessionEvent, _>(
@@ -319,7 +389,13 @@ fn websocket_session_events(
                         });
                     }
                     WebSocketSessionCommand::Send(message) => {
-                        send_websocket_session_message(&state, &out, &name, message.clone());
+                        send_websocket_session_message(
+                            &state,
+                            &out,
+                            &name,
+                            message.clone(),
+                            &send_policy,
+                        );
                     }
                     WebSocketSessionCommand::Close { code, reason } => {
                         cancel_websocket_retry_timers(&state);
@@ -327,10 +403,17 @@ fn websocket_session_events(
                             code: *code,
                             reason: reason.clone(),
                         });
-                        if let Some(session) = state.0.borrow().current_session.clone() {
+                        let cleanup = close_websocket_session_connection(&state, false);
+                        emit_outbound_canceled(
+                            &out,
+                            cleanup.canceled,
+                            format!("{name}: session closed"),
+                        );
+                        let pending = drain_pending_websocket_outbound(&state);
+                        emit_outbound_canceled(&out, pending, format!("{name}: session closed"));
+                        if let Some(session) = cleanup.session {
                             session.close(*code, reason.clone());
                         }
-                        close_websocket_session_connection(&state, false);
                         out.emit(WebSocketSessionEvent::Closed {
                             code: *code,
                             reason: reason.clone(),
@@ -398,6 +481,11 @@ fn start_websocket_session_attempt(args: WebSocketSessionStart) {
                     out_for_callback.emit(WebSocketSessionEvent::Open {
                         attempt: args.attempt,
                     });
+                    flush_pending_websocket_outbound(
+                        &state_for_callback,
+                        &out_for_callback,
+                        &name_for_callback,
+                    );
                 }
                 WebSocketDriverEvent::Event(WebSocketEvent::Text(text)) => {
                     out_for_callback.emit(WebSocketSessionEvent::Message(
@@ -411,8 +499,21 @@ fn start_websocket_session_attempt(args: WebSocketSessionStart) {
                 }
                 WebSocketDriverEvent::Event(WebSocketEvent::Close { code, reason }) => {
                     let normal_close = code == Some(1000);
-                    close_websocket_session_connection(&state_for_callback, false);
+                    let cleanup = close_websocket_session_connection(&state_for_callback, false);
+                    emit_outbound_canceled(
+                        &out_for_callback,
+                        cleanup.canceled,
+                        format!("{name_for_callback}: session closed"),
+                    );
                     out_for_callback.emit(WebSocketSessionEvent::Closed { code, reason });
+                    if normal_close {
+                        let pending = drain_pending_websocket_outbound(&state_for_callback);
+                        emit_outbound_canceled(
+                            &out_for_callback,
+                            pending,
+                            format!("{name_for_callback}: session closed"),
+                        );
+                    }
                     if !normal_close {
                         retry_or_exhaust_websocket_session(WebSocketSessionRetry {
                             state: state_for_callback.clone(),
@@ -488,8 +589,15 @@ struct WebSocketSessionRetry {
 }
 
 fn retry_or_exhaust_websocket_session(args: WebSocketSessionRetry) {
-    close_websocket_session_connection(&args.state, true);
+    let cleanup = close_websocket_session_connection(&args.state, true);
+    emit_outbound_canceled(
+        &args.out,
+        cleanup.canceled,
+        format!("{}: connection cleanup", args.name),
+    );
     if !args.policy.should_retry(args.attempt) {
+        let pending = drain_pending_websocket_outbound(&args.state);
+        emit_outbound_rejected(&args.out, pending, args.error.clone());
         exhaust_websocket_session(&args.state, &args.out, args.attempt, args.error);
         return;
     }
@@ -554,10 +662,73 @@ fn send_websocket_session_message(
     out: &Rc<DeferredCtx>,
     name: &str,
     message: WebSocketSend,
+    send_policy: &WebSocketSessionSendPolicy,
+) {
+    let item = next_websocket_outbound_item(state, message);
+    if !state.0.borrow().connected {
+        match send_policy {
+            WebSocketSessionSendPolicy::Reject => {
+                let error = format!("{name}: session is not open");
+                out.emit(WebSocketSessionEvent::Outbound(
+                    WebSocketSessionOutbound::Rejected {
+                        seq: item.seq,
+                        message: item.message,
+                        error: error.clone(),
+                    },
+                ));
+                out.emit(WebSocketSessionEvent::Error {
+                    attempt: (state.0.borrow().current_attempt > 0)
+                        .then_some(state.0.borrow().current_attempt),
+                    error,
+                });
+            }
+            WebSocketSessionSendPolicy::Buffer { max_pending } => {
+                if state.0.borrow().pending_outbound.len() >= *max_pending {
+                    let error = format!("{name}: outbound buffer full");
+                    out.emit(WebSocketSessionEvent::Outbound(
+                        WebSocketSessionOutbound::Rejected {
+                            seq: item.seq,
+                            message: item.message,
+                            error: error.clone(),
+                        },
+                    ));
+                    out.emit(WebSocketSessionEvent::Error {
+                        attempt: (state.0.borrow().current_attempt > 0)
+                            .then_some(state.0.borrow().current_attempt),
+                        error,
+                    });
+                    return;
+                }
+                out.emit(WebSocketSessionEvent::Outbound(
+                    WebSocketSessionOutbound::Queued {
+                        seq: item.seq,
+                        message: item.message.clone(),
+                    },
+                ));
+                state.0.borrow_mut().pending_outbound.push(item);
+            }
+        }
+        return;
+    }
+    send_websocket_session_item(state, out, name, item);
+}
+
+fn send_websocket_session_item(
+    state: &WebSocketSessionStateCell,
+    out: &Rc<DeferredCtx>,
+    name: &str,
+    item: PendingWebSocketOutbound,
 ) {
     let session = {
         let state_ref = state.0.borrow();
         if !state_ref.connected {
+            out.emit(WebSocketSessionEvent::Outbound(
+                WebSocketSessionOutbound::Rejected {
+                    seq: item.seq,
+                    message: item.message,
+                    error: format!("{name}: session is not open"),
+                },
+            ));
             out.emit(WebSocketSessionEvent::Error {
                 attempt: (state_ref.current_attempt > 0).then_some(state_ref.current_attempt),
                 error: format!("{name}: session is not open"),
@@ -567,6 +738,13 @@ fn send_websocket_session_message(
         state_ref.current_session.clone()
     };
     let Some(session) = session else {
+        out.emit(WebSocketSessionEvent::Outbound(
+            WebSocketSessionOutbound::Rejected {
+                seq: item.seq,
+                message: item.message,
+                error: format!("{name}: missing WebSocket session capability"),
+            },
+        ));
         out.emit(WebSocketSessionEvent::Error {
             attempt: None,
             error: format!("{name}: missing WebSocket session capability"),
@@ -575,32 +753,63 @@ fn send_websocket_session_message(
     };
     let state_for_callback = state.clone();
     let out_for_callback = out.clone();
-    let message_for_callback = message.clone();
     let send_id = {
         let mut state_ref = state.0.borrow_mut();
         let send_id = state_ref.next_send_id;
         state_ref.next_send_id = state_ref.next_send_id.saturating_add(1);
+        state_ref.live_outbound.push(LiveWebSocketOutbound {
+            id: send_id,
+            item: item.clone(),
+        });
         send_id
     };
+    out.emit(WebSocketSessionEvent::Outbound(
+        WebSocketSessionOutbound::Sending {
+            seq: item.seq,
+            message: item.message.clone(),
+        },
+    ));
     let send_active = Rc::new(Cell::new(true));
     let send_active_for_callback = send_active.clone();
     let cancel = session.send(
-        message,
+        item.message,
         Box::new(move |result| {
             if !send_active_for_callback.get() || !state_for_callback.0.borrow().node_active {
                 return;
             }
             send_active_for_callback.set(false);
             remove_websocket_send_cancel(&state_for_callback, send_id);
+            let Some(live_item) = remove_websocket_live_outbound(&state_for_callback, send_id)
+            else {
+                return;
+            };
             match result {
-                Ok(_) => out_for_callback.emit(WebSocketSessionEvent::Sent {
-                    message: message_for_callback,
-                }),
-                Err(error) => out_for_callback.emit(WebSocketSessionEvent::Error {
-                    attempt: (state_for_callback.0.borrow().current_attempt > 0)
-                        .then_some(state_for_callback.0.borrow().current_attempt),
-                    error: error.to_string(),
-                }),
+                Ok(_) => {
+                    out_for_callback.emit(WebSocketSessionEvent::Outbound(
+                        WebSocketSessionOutbound::Sent {
+                            seq: live_item.seq,
+                            message: live_item.message.clone(),
+                        },
+                    ));
+                    out_for_callback.emit(WebSocketSessionEvent::Sent {
+                        message: live_item.message,
+                    });
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    out_for_callback.emit(WebSocketSessionEvent::Outbound(
+                        WebSocketSessionOutbound::Rejected {
+                            seq: live_item.seq,
+                            message: live_item.message,
+                            error: error.clone(),
+                        },
+                    ));
+                    out_for_callback.emit(WebSocketSessionEvent::Error {
+                        attempt: (state_for_callback.0.borrow().current_attempt > 0)
+                            .then_some(state_for_callback.0.borrow().current_attempt),
+                        error,
+                    });
+                }
             }
         }),
     );
@@ -615,6 +824,8 @@ fn send_websocket_session_message(
             .borrow_mut()
             .send_cancels
             .push(WebSocketSendCancel { id: send_id, slot });
+    } else {
+        let _ = remove_websocket_live_outbound(state, send_id);
     }
 }
 
@@ -686,10 +897,22 @@ fn websocket_session_nodes(
                         });
                     }
                     WebSocketSessionEvent::Message(_) | WebSocketSessionEvent::Error { .. } => {}
+                    WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
         },
         GraphNodeOpts::named(format!("{name}/lifecycle")),
+    );
+    let outbound = graph.node_opts::<WebSocketSessionOutbound, _>(
+        vec![events.erased()],
+        move |ctx| {
+            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+                if let WebSocketSessionEvent::Outbound(fact) = event.as_ref() {
+                    ctx.emit(fact.clone());
+                }
+            }
+        },
+        GraphNodeOpts::named(format!("{name}/outbound")),
     );
     let status = graph.node_opts::<WebSocketSessionStatus, _>(
         vec![events.erased()],
@@ -727,7 +950,8 @@ fn websocket_session_nodes(
                     | WebSocketSessionEvent::Message(_)
                     | WebSocketSessionEvent::Sent { .. }
                     | WebSocketSessionEvent::Closing { .. }
-                    | WebSocketSessionEvent::Closed { .. } => {}
+                    | WebSocketSessionEvent::Closed { .. }
+                    | WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
         },
@@ -748,6 +972,7 @@ fn websocket_session_nodes(
         command,
         inbound,
         lifecycle,
+        outbound,
         status,
         errors,
         attempts,
@@ -812,6 +1037,7 @@ fn reduce_websocket_session_status(
             errors: current.errors.saturating_add(1),
             ..current.clone()
         },
+        WebSocketSessionEvent::Outbound(_) => current.clone(),
     }
 }
 
@@ -828,6 +1054,9 @@ fn init_websocket_session_state(ctx: &Ctx) -> WebSocketSessionStateCell {
         current_attempt: 0,
         current_session: None,
         next_send_id: 0,
+        next_outbound_seq: 0,
+        pending_outbound: Vec::new(),
+        live_outbound: Vec::new(),
         send_cancels: Vec::new(),
         retry_cancels: Vec::new(),
     })));
@@ -844,32 +1073,124 @@ fn is_current_websocket_attempt(state: &WebSocketSessionStateCell, attempt: u32)
     state.node_active && state.current_attempt == attempt
 }
 
+fn next_websocket_outbound_item(
+    state: &WebSocketSessionStateCell,
+    message: WebSocketSend,
+) -> PendingWebSocketOutbound {
+    let mut state_ref = state.0.borrow_mut();
+    let seq = state_ref.next_outbound_seq;
+    state_ref.next_outbound_seq = state_ref.next_outbound_seq.saturating_add(1);
+    PendingWebSocketOutbound { seq, message }
+}
+
+fn flush_pending_websocket_outbound(
+    state: &WebSocketSessionStateCell,
+    out: &Rc<DeferredCtx>,
+    name: &str,
+) {
+    let mut pending = drain_pending_websocket_outbound(state);
+    while !pending.is_empty() {
+        if !state.0.borrow().connected || state.0.borrow().current_session.is_none() {
+            emit_outbound_canceled(out, pending, format!("{name}: session closed"));
+            return;
+        }
+        let item = pending.remove(0);
+        send_websocket_session_item(state, out, name, item);
+    }
+}
+
+fn drain_pending_websocket_outbound(
+    state: &WebSocketSessionStateCell,
+) -> Vec<PendingWebSocketOutbound> {
+    state.0.borrow_mut().pending_outbound.drain(..).collect()
+}
+
+fn remove_websocket_live_outbound(
+    state: &WebSocketSessionStateCell,
+    send_id: u64,
+) -> Option<PendingWebSocketOutbound> {
+    let mut state_ref = state.0.borrow_mut();
+    let index = state_ref
+        .live_outbound
+        .iter()
+        .position(|send| send.id == send_id)?;
+    Some(state_ref.live_outbound.remove(index).item)
+}
+
+fn emit_outbound_canceled(out: &DeferredCtx, items: Vec<PendingWebSocketOutbound>, reason: String) {
+    for item in items {
+        out.emit(WebSocketSessionEvent::Outbound(
+            WebSocketSessionOutbound::Canceled {
+                seq: item.seq,
+                message: item.message,
+                reason: reason.clone(),
+            },
+        ));
+    }
+}
+
+fn emit_outbound_rejected(out: &DeferredCtx, items: Vec<PendingWebSocketOutbound>, error: String) {
+    for item in items {
+        out.emit(WebSocketSessionEvent::Outbound(
+            WebSocketSessionOutbound::Rejected {
+                seq: item.seq,
+                message: item.message,
+                error: error.clone(),
+            },
+        ));
+    }
+}
+
 fn exhaust_websocket_session(
     state: &WebSocketSessionStateCell,
     out: &DeferredCtx,
     attempt: u32,
     error: String,
 ) {
-    close_websocket_session_connection(state, true);
+    let cleanup = close_websocket_session_connection(state, true);
+    emit_outbound_canceled(
+        out,
+        cleanup.canceled,
+        "websocketSession: connection cleanup".to_owned(),
+    );
+    let pending = drain_pending_websocket_outbound(state);
+    emit_outbound_rejected(out, pending, error.clone());
     out.emit(WebSocketSessionEvent::Exhausted { attempt, error });
 }
 
-fn close_websocket_session_connection(state: &WebSocketSessionStateCell, cancel_session: bool) {
-    let mut state = state.0.borrow_mut();
-    state.connected = false;
-    state.current_attempt = 0;
-    if cancel_session {
-        if let Some(session) = state.current_session.take() {
-            session.cancel();
-        }
-    } else {
-        state.current_session = None;
-    }
-    for send in state.send_cancels.drain(..) {
+struct WebSocketConnectionCleanup {
+    canceled: Vec<PendingWebSocketOutbound>,
+    session: Option<Rc<dyn LocalWebSocketSession>>,
+}
+
+fn close_websocket_session_connection(
+    state: &WebSocketSessionStateCell,
+    cancel_session: bool,
+) -> WebSocketConnectionCleanup {
+    let (session, send_cancels, canceled) = {
+        let mut state = state.0.borrow_mut();
+        state.connected = false;
+        state.current_attempt = 0;
+        let session = state.current_session.take();
+        let send_cancels = state.send_cancels.drain(..).collect::<Vec<_>>();
+        let canceled = state
+            .live_outbound
+            .drain(..)
+            .map(|send| send.item)
+            .collect();
+        (session, send_cancels, canceled)
+    };
+    for send in send_cancels {
         if let Some(cancel) = send.slot.borrow_mut().take() {
             cancel();
         }
     }
+    if cancel_session {
+        if let Some(session) = &session {
+            session.cancel();
+        }
+    }
+    WebSocketConnectionCleanup { canceled, session }
 }
 
 fn remove_websocket_send_cancel(state: &WebSocketSessionStateCell, send_id: u64) {
@@ -900,7 +1221,7 @@ fn deactivate_websocket_session_state(state: &WebSocketSessionStateCell) {
         state_ref.node_active = false;
     }
     cancel_websocket_retry_timers(state);
-    close_websocket_session_connection(state, true);
+    let _cleanup = close_websocket_session_connection(state, true);
 }
 
 pub fn to_http<T, F>(
@@ -1433,6 +1754,87 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PendingSendWebSocketDriver {
+        sessions: RefCell<Vec<Rc<PendingSendWebSocketSession>>>,
+    }
+
+    impl PendingSendWebSocketDriver {
+        fn session(&self, index: usize) -> Rc<PendingSendWebSocketSession> {
+            self.sessions.borrow()[index].clone()
+        }
+    }
+
+    impl LocalWebSocketDriver for PendingSendWebSocketDriver {
+        fn connect(
+            &self,
+            _request: WebSocketRequest,
+            _callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+        ) -> DriverCancel {
+            Box::new(|| {})
+        }
+
+        fn connect_session(
+            &self,
+            request: WebSocketRequest,
+            callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+        ) -> Option<Rc<dyn LocalWebSocketSession>> {
+            let session = Rc::new(PendingSendWebSocketSession {
+                url: request.url,
+                callback,
+                sent: RefCell::new(Vec::new()),
+                send_callbacks: RefCell::new(Vec::new()),
+                closes: RefCell::new(Vec::new()),
+                canceled_sends: Rc::new(Cell::new(0)),
+            });
+            self.sessions.borrow_mut().push(session.clone());
+            Some(session)
+        }
+    }
+
+    type PendingSendCallback = Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>;
+
+    struct PendingSendWebSocketSession {
+        url: String,
+        callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+        sent: RefCell<Vec<WebSocketSend>>,
+        send_callbacks: RefCell<Vec<PendingSendCallback>>,
+        closes: RefCell<Vec<(Option<u16>, Option<String>)>>,
+        canceled_sends: Rc<Cell<u32>>,
+    }
+
+    impl PendingSendWebSocketSession {
+        fn emit(&self, event: WebSocketDriverEvent) {
+            (self.callback)(event);
+        }
+
+        fn complete_next_send(&self, result: Result<WebSocketSendResult, GraphError>) {
+            let callback = self.send_callbacks.borrow_mut().remove(0);
+            callback(result);
+        }
+    }
+
+    impl LocalWebSocketSession for PendingSendWebSocketSession {
+        fn send(
+            &self,
+            message: WebSocketSend,
+            callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
+        ) -> DriverCancel {
+            self.sent.borrow_mut().push(message);
+            self.send_callbacks.borrow_mut().push(callback);
+            let canceled = self.canceled_sends.clone();
+            Box::new(move || {
+                canceled.set(canceled.get().saturating_add(1));
+            })
+        }
+
+        fn close(&self, code: Option<u16>, reason: Option<String>) {
+            self.closes.borrow_mut().push((code, reason));
+        }
+
+        fn cancel(&self) {}
+    }
+
     impl LocalWebSocketSession for ManualWebSocketSession {
         fn send(
             &self,
@@ -1693,6 +2095,185 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn websocket_session_default_send_before_open_rejects_outbound() {
+        let driver = Rc::new(ManualSessionWebSocketDriver::default());
+        let g = graph_opts(GraphOptions {
+            environment: EnvironmentDrivers::new().with_websocket(driver),
+            ..GraphOptions::default()
+        });
+        let bundle = websocket_session_with_options(
+            &g,
+            WebSocketRequest::new("wss://example.test/session"),
+            WebSocketSessionOptions {
+                name: Some("ws".to_owned()),
+                ..WebSocketSessionOptions::default()
+            },
+        );
+        let outbound = collect_node_data(&bundle.outbound);
+        let errors = collect_node_data(&bundle.errors);
+        let _status = bundle.status.subscribe(|_| {});
+
+        bundle.send_text("early");
+
+        assert_eq!(
+            *outbound.borrow(),
+            vec![WebSocketSessionOutbound::Rejected {
+                seq: 0,
+                message: WebSocketSend::text("early"),
+                error: "ws: session is not open".to_owned(),
+            }]
+        );
+        assert_eq!(*errors.borrow(), vec!["ws: session is not open".to_owned()]);
+        assert_eq!(
+            bundle.status.cache(),
+            Some(WebSocketSessionStatus {
+                state: WebSocketSessionStateKind::Errored,
+                attempt: 0,
+                max_attempts: 1,
+                sent: 0,
+                received: 0,
+                errors: 1,
+                last_delay_ms: None,
+            })
+        );
+    }
+
+    #[test]
+    fn websocket_session_buffer_policy_is_bounded_and_flushes_fifo_on_open() {
+        let driver = Rc::new(ManualSessionWebSocketDriver::default());
+        let g = graph_opts(GraphOptions {
+            environment: EnvironmentDrivers::new().with_websocket(driver.clone()),
+            ..GraphOptions::default()
+        });
+        let bundle = websocket_session_with_options(
+            &g,
+            WebSocketRequest::new("wss://example.test/session"),
+            WebSocketSessionOptions {
+                name: Some("ws".to_owned()),
+                send_policy: WebSocketSessionSendPolicy::Buffer { max_pending: 2 },
+                ..WebSocketSessionOptions::default()
+            },
+        );
+        let outbound = collect_node_data(&bundle.outbound);
+
+        bundle.send_text("a");
+        bundle.send_text("b");
+        bundle.send_text("c");
+        bundle.start();
+        let session = driver.session(0);
+
+        assert_eq!(
+            *outbound.borrow(),
+            vec![
+                WebSocketSessionOutbound::Queued {
+                    seq: 0,
+                    message: WebSocketSend::text("a"),
+                },
+                WebSocketSessionOutbound::Queued {
+                    seq: 1,
+                    message: WebSocketSend::text("b"),
+                },
+                WebSocketSessionOutbound::Rejected {
+                    seq: 2,
+                    message: WebSocketSend::text("c"),
+                    error: "ws: outbound buffer full".to_owned(),
+                },
+            ]
+        );
+        assert!(session.sent.borrow().is_empty());
+
+        session.emit(WebSocketDriverEvent::Event(WebSocketEvent::Open));
+
+        assert_eq!(
+            session.sent.borrow().as_slice(),
+            &[WebSocketSend::text("a"), WebSocketSend::text("b")]
+        );
+        assert_eq!(
+            *outbound.borrow(),
+            vec![
+                WebSocketSessionOutbound::Queued {
+                    seq: 0,
+                    message: WebSocketSend::text("a"),
+                },
+                WebSocketSessionOutbound::Queued {
+                    seq: 1,
+                    message: WebSocketSend::text("b"),
+                },
+                WebSocketSessionOutbound::Rejected {
+                    seq: 2,
+                    message: WebSocketSend::text("c"),
+                    error: "ws: outbound buffer full".to_owned(),
+                },
+                WebSocketSessionOutbound::Sending {
+                    seq: 0,
+                    message: WebSocketSend::text("a"),
+                },
+                WebSocketSessionOutbound::Sent {
+                    seq: 0,
+                    message: WebSocketSend::text("a"),
+                },
+                WebSocketSessionOutbound::Sending {
+                    seq: 1,
+                    message: WebSocketSend::text("b"),
+                },
+                WebSocketSessionOutbound::Sent {
+                    seq: 1,
+                    message: WebSocketSend::text("b"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn websocket_session_close_cancels_pending_and_fences_late_send_callback() {
+        let driver = Rc::new(PendingSendWebSocketDriver::default());
+        let g = graph_opts(GraphOptions {
+            environment: EnvironmentDrivers::new().with_websocket(driver.clone()),
+            ..GraphOptions::default()
+        });
+        let bundle = websocket_session_with_options(
+            &g,
+            WebSocketRequest::new("wss://example.test/session"),
+            WebSocketSessionOptions {
+                name: Some("ws".to_owned()),
+                send_policy: WebSocketSessionSendPolicy::Buffer { max_pending: 1 },
+                ..WebSocketSessionOptions::default()
+            },
+        );
+        let outbound = collect_node_data(&bundle.outbound);
+        let lifecycle = collect_node_data(&bundle.lifecycle);
+
+        bundle.send_text("queued");
+        bundle.start();
+        let session = driver.session(0);
+        assert_eq!(session.url, "wss://example.test/session");
+        session.emit(WebSocketDriverEvent::Event(WebSocketEvent::Open));
+        bundle.send_text("live");
+        bundle.close(Some(1000), Some("done".to_owned()));
+        session.complete_next_send(Ok(WebSocketSendResult { sent: true }));
+
+        assert_eq!(session.canceled_sends.get(), 2);
+        assert!(outbound
+            .borrow()
+            .contains(&WebSocketSessionOutbound::Canceled {
+                seq: 1,
+                message: WebSocketSend::text("live"),
+                reason: "ws: session closed".to_owned(),
+            }));
+        assert!(
+            !outbound.borrow().contains(&WebSocketSessionOutbound::Sent {
+                seq: 1,
+                message: WebSocketSend::text("live"),
+            })
+        );
+        assert!(!lifecycle
+            .borrow()
+            .contains(&WebSocketSessionLifecycle::Sent {
+                message: WebSocketSend::text("live"),
+            }));
     }
 
     #[test]
