@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::json::JsonValue;
 use crate::node::{Node, NodeOpts};
 use crate::operators::Operator;
 
@@ -48,6 +49,29 @@ impl<T> MemoryFragment<T> {
             provenance: None,
         }
     }
+}
+
+/// Passive lower-layer KG assertion object vocabulary.
+///
+/// D165 keeps KG assertions independent from the agentic-memory record
+/// envelope. Agentic solution bundles may project to this shape, but lower KG
+/// reducers do not need `AgenticMemoryRecord`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KnowledgeAssertionObject {
+    Entity { entity_id: FactId },
+    Literal { value: JsonValue },
+}
+
+/// Passive KG assertion fact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnowledgeAssertion {
+    pub id: FactId,
+    pub subject_id: FactId,
+    pub predicate: String,
+    pub object: KnowledgeAssertionObject,
+    pub sources: Vec<FactId>,
+    pub confidence: f64,
+    pub t_ns: u128,
 }
 
 pub type ShardKey = String;

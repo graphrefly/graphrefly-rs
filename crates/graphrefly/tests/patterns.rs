@@ -1,14 +1,22 @@
 use graphrefly::{
-    admission_filter_3d, admission_scored, agentic_memory_bundle, cosine_similarity,
-    filter_memory_fragments, graph, memory_fragment_matches_query, memory_fragment_valid_at,
-    memory_retrieval_bundle, shard_by_tenant, validate_agentic_memory_record,
-    validate_agentic_memory_scope, validate_memory_fragment, AdmissionScore3DOptions,
-    AdmissionScoredOptions, AdmissionScores, AgenticMemoryArtifactKind, AgenticMemoryBundleOptions,
-    AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryRecord, AgenticMemoryScope,
-    AgenticMemoryStatusState, FactStore, GraphNodeOpts, MemoryFragment, MemoryQuery,
-    MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode, MemoryRetrievalQuery,
-    MemoryRetrievalStatusState, ShardByTenantOptions,
+    admission_filter_3d, admission_scored, agentic_memory_bundle,
+    agentic_memory_context_packing_bundle, agentic_memory_kg_projection_bundle,
+    agentic_memory_record_frame, agentic_memory_record_frame_codec,
+    agentic_memory_retention_bundle, cosine_similarity, filter_memory_fragments, graph,
+    memory_fragment_matches_query, memory_fragment_valid_at, memory_retrieval_bundle,
+    shard_by_tenant, validate_agentic_memory_record, validate_agentic_memory_scope,
+    validate_memory_fragment, AdmissionScore3DOptions, AdmissionScoredOptions, AdmissionScores,
+    AgenticMemoryArtifactKind, AgenticMemoryBundleOptions,
+    AgenticMemoryContextPackingBundleOptions, AgenticMemoryContextPackingPolicy,
+    AgenticMemoryErrorCode, AgenticMemoryKgAssertionDraft, AgenticMemoryKgProjectionBundleOptions,
+    AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryRecord,
+    AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
+    AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
+    AgenticMemoryTextProjection, Codec, FactStore, GraphNodeOpts, KnowledgeAssertionObject,
+    MemoryFragment, MemoryQuery, MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode,
+    MemoryRetrievalQuery, MemoryRetrievalStatusState, ShardByTenantOptions,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -30,6 +38,7 @@ fn fragment(id: &str, payload: &str) -> MemoryFragment<String> {
 
 fn record(id: &str, payload: &str) -> AgenticMemoryRecord<String> {
     AgenticMemoryRecord {
+        id: format!("record-{id}"),
         fragment: fragment(id, payload),
         kind: AgenticMemoryKind::Episodic,
         persistence_level: AgenticMemoryPersistenceLevel::Session,
@@ -660,11 +669,17 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
     let _status = bundle.status.subscribe(|_| {});
 
     let errors = bundle.errors.cache().unwrap();
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].index, Some(2));
+    assert_eq!(
+        errors.iter().map(|error| error.code).collect::<Vec<_>>(),
+        vec![
+            AgenticMemoryErrorCode::DuplicateRecordId,
+            AgenticMemoryErrorCode::InvalidRecord,
+        ]
+    );
+    assert_eq!(errors[1].index, Some(2));
     let projection_error_evaluation = errors[0].cursor.evaluation;
     assert_eq!(
-        errors[0].validation_errors,
+        errors[1].validation_errors,
         vec![
             "fragment.id must be a non-empty string",
             "fragment.confidence must be finite in [0, 1]",
@@ -678,7 +693,7 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
             .iter()
             .map(|error| error.code)
             .collect::<Vec<_>>(),
-        vec![MemoryRetrievalErrorCode::DuplicateFragmentId]
+        Vec::<MemoryRetrievalErrorCode>::new()
     );
     assert_eq!(
         bundle.context.cache().unwrap().state,
@@ -707,10 +722,7 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
             .iter()
             .map(|error| error.code)
             .collect::<Vec<_>>(),
-        vec![
-            MemoryRetrievalErrorCode::InvalidQueryVector,
-            MemoryRetrievalErrorCode::DuplicateFragmentId,
-        ]
+        vec![MemoryRetrievalErrorCode::InvalidQueryVector,]
     );
     assert!(bundle.context.cache().unwrap().entries.is_empty());
 
@@ -724,4 +736,516 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
         "a batch with only invalid solution records is an agentic-memory error, not partial context"
     );
     assert!(!bundle.context.cache().unwrap().context_ready);
+}
+
+#[test]
+fn agentic_memory_bundle_rejects_duplicate_projected_fragment_ownership() {
+    let g = graph();
+    let mut a = record("a", "first");
+    a.fragment.id = "same-fragment".to_owned();
+    let mut b = record("b", "second");
+    b.fragment.id = "same-fragment".to_owned();
+    let records = g.state_opts(vec![a, b], GraphNodeOpts::named("records"));
+    let query = g.state_opts(
+        MemoryRetrievalQuery::default(),
+        GraphNodeOpts::named("query"),
+    );
+    let bundle = agentic_memory_bundle(
+        &g,
+        AgenticMemoryBundleOptions::new(records, query).named("memory"),
+    );
+    let _errors = bundle.errors.subscribe(|_| {});
+    let _fragments = bundle.fragments.subscribe(|_| {});
+    let _indexed = bundle.indexed.subscribe(|_| {});
+    let _context = bundle.context.subscribe(|_| {});
+
+    let errors = bundle.errors.cache().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, AgenticMemoryErrorCode::DuplicateFragmentId);
+    assert_eq!(errors[0].record_id.as_deref(), Some("record-b"));
+    assert_eq!(errors[0].fragment_id.as_deref(), Some("same-fragment"));
+    assert_eq!(
+        bundle
+            .fragments
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|fragment| (fragment.id.as_str(), fragment.payload.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("same-fragment", "first")]
+    );
+    assert_eq!(
+        bundle.indexed.cache().unwrap().ids,
+        vec!["same-fragment".to_owned()]
+    );
+    assert_eq!(bundle.context.cache().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn agentic_memory_kg_projection_validates_drafts_and_exposes_topology() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("fact", "payload"), record("other", "other")],
+        GraphNodeOpts::named("records"),
+    );
+    let drafts = g.state_opts(
+        vec![
+            AgenticMemoryKgAssertionDraft {
+                id: "assertion-1".to_owned(),
+                record_id: Some("record-fact".to_owned()),
+                fragment_id: Some("fact".to_owned()),
+                subject_id: "entity:user".to_owned(),
+                predicate: "prefers".to_owned(),
+                object: KnowledgeAssertionObject::Literal {
+                    value: json!("quiet tools"),
+                },
+                confidence: 0.9,
+                t_ns: 42,
+            },
+            AgenticMemoryKgAssertionDraft {
+                id: "assertion-1".to_owned(),
+                record_id: Some("missing".to_owned()),
+                fragment_id: None,
+                subject_id: String::new(),
+                predicate: String::new(),
+                object: KnowledgeAssertionObject::Entity {
+                    entity_id: String::new(),
+                },
+                confidence: f64::NAN,
+                t_ns: 43,
+            },
+            AgenticMemoryKgAssertionDraft {
+                id: "assertion-2".to_owned(),
+                record_id: Some("record-fact".to_owned()),
+                fragment_id: Some("other".to_owned()),
+                subject_id: "entity:user".to_owned(),
+                predicate: "mentions".to_owned(),
+                object: KnowledgeAssertionObject::Entity {
+                    entity_id: "entity:other".to_owned(),
+                },
+                confidence: 0.8,
+                t_ns: 44,
+            },
+        ],
+        GraphNodeOpts::named("drafts"),
+    );
+    let bundle = agentic_memory_kg_projection_bundle(
+        &g,
+        AgenticMemoryKgProjectionBundleOptions::new(records, drafts).named("kg"),
+    );
+    let described = g.describe();
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "records" && edge.to == "kg/snapshot"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "drafts" && edge.to == "kg/snapshot"));
+    assert!(described
+        .nodes
+        .iter()
+        .any(|node| node.id == "kg/assertions" && node.factory == "agenticMemoryKgAssertions"));
+
+    let _assertions = bundle.assertions.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+    assert_eq!(bundle.assertions.cache().unwrap().len(), 1);
+    assert_eq!(bundle.assertions.cache().unwrap()[0].id, "assertion-1");
+    assert_eq!(
+        bundle
+            .errors
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        vec![
+            AgenticMemoryErrorCode::DuplicateAssertionId,
+            AgenticMemoryErrorCode::InvalidKgDraft,
+        ]
+    );
+    assert_eq!(
+        bundle.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
+}
+
+#[test]
+fn agentic_memory_kg_projection_invalid_draft_does_not_poison_later_valid_id() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("fact", "payload")],
+        GraphNodeOpts::named("records"),
+    );
+    let drafts = g.state_opts(
+        vec![
+            AgenticMemoryKgAssertionDraft {
+                id: "assertion-reused".to_owned(),
+                record_id: Some("missing".to_owned()),
+                fragment_id: None,
+                subject_id: String::new(),
+                predicate: "bad".to_owned(),
+                object: KnowledgeAssertionObject::Entity {
+                    entity_id: "entity:ok".to_owned(),
+                },
+                confidence: 0.9,
+                t_ns: 1,
+            },
+            AgenticMemoryKgAssertionDraft {
+                id: "assertion-reused".to_owned(),
+                record_id: Some("record-fact".to_owned()),
+                fragment_id: Some("fact".to_owned()),
+                subject_id: "entity:user".to_owned(),
+                predicate: "prefers".to_owned(),
+                object: KnowledgeAssertionObject::Literal {
+                    value: json!("quiet tools"),
+                },
+                confidence: 0.9,
+                t_ns: 2,
+            },
+        ],
+        GraphNodeOpts::named("drafts"),
+    );
+    let bundle = agentic_memory_kg_projection_bundle(
+        &g,
+        AgenticMemoryKgProjectionBundleOptions::new(records, drafts).named("kg"),
+    );
+    let _assertions = bundle.assertions.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+
+    assert_eq!(bundle.assertions.cache().unwrap().len(), 1);
+    assert_eq!(bundle.assertions.cache().unwrap()[0].id, "assertion-reused");
+    assert_eq!(
+        bundle.errors.cache().unwrap()[0].code,
+        AgenticMemoryErrorCode::InvalidKgDraft
+    );
+}
+
+#[test]
+fn agentic_memory_record_frame_codec_roundtrips_and_rejects_corruption() {
+    let mut fragment = MemoryFragment::new("fact-json", json!({"text": "payload"}), 12);
+    fragment.valid_from = Some(10);
+    fragment.valid_to = Some(20);
+    fragment.sources = vec!["source".to_owned()];
+    let record = AgenticMemoryRecord {
+        id: "record-json".to_owned(),
+        fragment,
+        kind: AgenticMemoryKind::Semantic,
+        persistence_level: AgenticMemoryPersistenceLevel::Project,
+        artifact_kind: AgenticMemoryArtifactKind::Insight,
+        scope: Some(AgenticMemoryScope {
+            session_id: Some("session".to_owned()),
+            project_id: Some("project".to_owned()),
+            user_id: None,
+            tenant_id: None,
+        }),
+    };
+    let frame = agentic_memory_record_frame(record);
+    let codec = agentic_memory_record_frame_codec();
+    let encoded = codec.encode(&frame).unwrap();
+    let encoded_text = std::str::from_utf8(&encoded).unwrap();
+    assert!(encoded_text.contains("\"tNs\":\"12\""));
+    assert!(encoded_text.contains("\"validFrom\":\"10\""));
+    assert_eq!(codec.decode(&encoded).unwrap(), frame);
+
+    let mut corrupt = serde_json::to_value(json!({
+        "format": "graphrefly.agentic-memory.record",
+        "version": 1,
+        "record": {
+            "id": "record-json",
+            "kind": "cold",
+            "persistenceLevel": "project",
+            "artifactKind": "insight",
+            "fragment": {
+                "id": "fact-json",
+                "payload": {},
+                "tNs": "01",
+                "confidence": 1.0,
+                "tags": [],
+                "sources": []
+            },
+            "unknown": true
+        }
+    }))
+    .unwrap();
+    let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
+    assert!(codec.decode(&corrupt_bytes).is_err());
+    corrupt["record"]["kind"] = json!("semantic");
+    corrupt["record"].as_object_mut().unwrap().remove("unknown");
+    let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
+    assert!(codec.decode(&corrupt_bytes).is_err());
+}
+
+#[test]
+fn agentic_memory_retention_commands_project_archive_and_consolidation_requests() {
+    let g = graph();
+    let mut archived_metadata_only = record("meta-archived", "meta-archived");
+    archived_metadata_only.persistence_level = AgenticMemoryPersistenceLevel::Archived;
+    let records = g.state_opts(
+        vec![
+            record("active", "active"),
+            archived_metadata_only,
+            record("archive", "archive"),
+        ],
+        GraphNodeOpts::named("records"),
+    );
+    let commands = g.state_opts(
+        vec![
+            AgenticMemoryRetentionCommand {
+                id: "archive-cmd".to_owned(),
+                record_id: "record-archive".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Archive,
+                reason: Some("done".to_owned()),
+            },
+            AgenticMemoryRetentionCommand {
+                id: "consolidate-cmd".to_owned(),
+                record_id: "record-active".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::RequestConsolidation,
+                reason: Some("merge".to_owned()),
+            },
+            AgenticMemoryRetentionCommand {
+                id: "bad-cmd".to_owned(),
+                record_id: "missing".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Archive,
+                reason: None,
+            },
+        ],
+        GraphNodeOpts::named("commands"),
+    );
+    let bundle = agentic_memory_retention_bundle(
+        &g,
+        AgenticMemoryRetentionBundleOptions::new(records, commands).named("retention"),
+    );
+    let _active = bundle.active_records.subscribe(|_| {});
+    let _archived = bundle.archived_records.subscribe(|_| {});
+    let _requests = bundle.consolidation_requests.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+
+    assert_eq!(
+        bundle
+            .active_records
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["record-active", "record-meta-archived"]
+    );
+    assert_eq!(
+        bundle
+            .archived_records
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["record-archive"]
+    );
+    assert_eq!(bundle.consolidation_requests.cache().unwrap().len(), 1);
+    assert_eq!(
+        bundle.consolidation_requests.cache().unwrap()[0].fragment_id,
+        "active"
+    );
+    assert_eq!(
+        bundle.errors.cache().unwrap()[0].code,
+        AgenticMemoryErrorCode::InvalidRetentionCommand
+    );
+    assert_eq!(
+        bundle.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
+}
+
+#[test]
+fn agentic_memory_retention_invalid_command_does_not_poison_later_valid_id() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("active", "active")],
+        GraphNodeOpts::named("records"),
+    );
+    let commands = g.state_opts(
+        vec![
+            AgenticMemoryRetentionCommand {
+                id: "reused-command".to_owned(),
+                record_id: "missing".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Archive,
+                reason: None,
+            },
+            AgenticMemoryRetentionCommand {
+                id: "reused-command".to_owned(),
+                record_id: "record-active".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Archive,
+                reason: None,
+            },
+        ],
+        GraphNodeOpts::named("commands"),
+    );
+    let bundle = agentic_memory_retention_bundle(
+        &g,
+        AgenticMemoryRetentionBundleOptions::new(records, commands).named("retention"),
+    );
+    let _active = bundle.active_records.subscribe(|_| {});
+    let _archived = bundle.archived_records.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+
+    assert!(bundle.active_records.cache().unwrap().is_empty());
+    assert_eq!(
+        bundle.archived_records.cache().unwrap()[0].id,
+        "record-active"
+    );
+    assert_eq!(
+        bundle.errors.cache().unwrap()[0].code,
+        AgenticMemoryErrorCode::InvalidRetentionCommand
+    );
+}
+
+#[test]
+fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("near", "payload-near"), record("far", "payload-far")],
+        GraphNodeOpts::named("records"),
+    );
+    let query = g.state_opts(
+        MemoryRetrievalQuery {
+            limit: Some(2),
+            ..MemoryRetrievalQuery::default()
+        },
+        GraphNodeOpts::named("query"),
+    );
+    let memory = agentic_memory_bundle(
+        &g,
+        AgenticMemoryBundleOptions::new(records, query).named("memory"),
+    );
+    let texts = g.state_opts(
+        vec![
+            AgenticMemoryTextProjection {
+                fragment_id: "near".to_owned(),
+                text: "near text".to_owned(),
+            },
+            AgenticMemoryTextProjection {
+                fragment_id: "far".to_owned(),
+                text: "far text".to_owned(),
+            },
+        ],
+        GraphNodeOpts::named("texts"),
+    );
+    let policy = g.state_opts(
+        AgenticMemoryContextPackingPolicy {
+            max_chars: Some(24),
+            separator: " | ".to_owned(),
+            include_fragment_ids: true,
+        },
+        GraphNodeOpts::named("policy"),
+    );
+    let packing = agentic_memory_context_packing_bundle(
+        &g,
+        AgenticMemoryContextPackingBundleOptions::new(memory.context.clone(), texts, policy)
+            .named("packing"),
+    );
+    let described = g.describe();
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "memory/context" && edge.to == "packing/snapshot"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "texts" && edge.to == "packing/snapshot"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "policy" && edge.to == "packing/snapshot"));
+
+    let _packed = packing.packed_context.subscribe(|_| {});
+    let _status = packing.status.subscribe(|_| {});
+    let packed = packing.packed_context.cache().unwrap();
+    assert_eq!(packed.fragment_ids, vec!["near".to_owned()]);
+    assert_eq!(packed.text, "[near] near text");
+    assert!(packed.truncated);
+    assert_eq!(
+        packing.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
+
+    packing.policy_input.set(AgenticMemoryContextPackingPolicy {
+        max_chars: Some(5),
+        separator: " | ".to_owned(),
+        include_fragment_ids: true,
+    });
+    let packed = packing.packed_context.cache().unwrap();
+    assert!(packed.fragment_ids.is_empty());
+    assert!(packed.text.is_empty());
+    assert!(packed.truncated);
+    assert_eq!(
+        packing.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
+}
+
+#[test]
+fn agentic_memory_context_packing_validates_text_projection_facts() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("near", "payload-near")],
+        GraphNodeOpts::named("records"),
+    );
+    let query = g.state_opts(
+        MemoryRetrievalQuery::default(),
+        GraphNodeOpts::named("query"),
+    );
+    let memory = agentic_memory_bundle(
+        &g,
+        AgenticMemoryBundleOptions::new(records, query).named("memory"),
+    );
+    let texts = g.state_opts(
+        vec![
+            AgenticMemoryTextProjection {
+                fragment_id: "near".to_owned(),
+                text: "near text".to_owned(),
+            },
+            AgenticMemoryTextProjection {
+                fragment_id: "near".to_owned(),
+                text: "conflicting text".to_owned(),
+            },
+            AgenticMemoryTextProjection {
+                fragment_id: String::new(),
+                text: String::new(),
+            },
+        ],
+        GraphNodeOpts::named("texts"),
+    );
+    let policy = g.state_opts(
+        AgenticMemoryContextPackingPolicy::default(),
+        GraphNodeOpts::named("policy"),
+    );
+    let packing = agentic_memory_context_packing_bundle(
+        &g,
+        AgenticMemoryContextPackingBundleOptions::new(memory.context.clone(), texts, policy)
+            .named("packing"),
+    );
+    let _packed = packing.packed_context.subscribe(|_| {});
+    let _errors = packing.errors.subscribe(|_| {});
+    let _status = packing.status.subscribe(|_| {});
+
+    assert_eq!(packing.packed_context.cache().unwrap().text, "near text");
+    assert_eq!(
+        packing
+            .errors
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        vec![
+            AgenticMemoryErrorCode::DuplicateTextProjection,
+            AgenticMemoryErrorCode::InvalidTextProjection,
+        ]
+    );
+    assert_eq!(
+        packing.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
 }
