@@ -1,8 +1,11 @@
 use graphrefly::{
-    admission_filter_3d, admission_scored, cosine_similarity, filter_memory_fragments, graph,
-    memory_fragment_matches_query, memory_fragment_valid_at, memory_retrieval_bundle,
-    shard_by_tenant, validate_memory_fragment, AdmissionScore3DOptions, AdmissionScoredOptions,
-    AdmissionScores, FactStore, GraphNodeOpts, MemoryFragment, MemoryQuery,
+    admission_filter_3d, admission_scored, agentic_memory_bundle, cosine_similarity,
+    filter_memory_fragments, graph, memory_fragment_matches_query, memory_fragment_valid_at,
+    memory_retrieval_bundle, shard_by_tenant, validate_agentic_memory_record,
+    validate_agentic_memory_scope, validate_memory_fragment, AdmissionScore3DOptions,
+    AdmissionScoredOptions, AdmissionScores, AgenticMemoryArtifactKind, AgenticMemoryBundleOptions,
+    AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryRecord, AgenticMemoryScope,
+    AgenticMemoryStatusState, FactStore, GraphNodeOpts, MemoryFragment, MemoryQuery,
     MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode, MemoryRetrievalQuery,
     MemoryRetrievalStatusState, ShardByTenantOptions,
 };
@@ -22,6 +25,21 @@ fn fragment(id: &str, payload: &str) -> MemoryFragment<String> {
         embedding: None,
         parent_fragment_id: None,
         provenance: None,
+    }
+}
+
+fn record(id: &str, payload: &str) -> AgenticMemoryRecord<String> {
+    AgenticMemoryRecord {
+        fragment: fragment(id, payload),
+        kind: AgenticMemoryKind::Episodic,
+        persistence_level: AgenticMemoryPersistenceLevel::Session,
+        artifact_kind: AgenticMemoryArtifactKind::Raw,
+        scope: Some(AgenticMemoryScope {
+            session_id: Some("session-1".to_owned()),
+            project_id: Some("project-1".to_owned()),
+            user_id: Some("user-1".to_owned()),
+            tenant_id: Some("tenant-1".to_owned()),
+        }),
     }
 }
 
@@ -490,4 +508,220 @@ fn memory_retrieval_bundle_keeps_storage_controls_out_of_surface() {
     assert!(g.find("memory/snapshot").is_some());
     assert!(g.find("memory/ranked").is_some());
     assert_eq!(bundle.snapshot.cache(), None);
+}
+
+#[test]
+fn agentic_memory_record_validation_keeps_axes_and_scope_explicit() {
+    let ok = record("ok", "payload");
+    assert!(validate_agentic_memory_record(&ok).ok);
+    assert!(validate_agentic_memory_scope(ok.scope.as_ref().unwrap()).ok);
+
+    let mut invalid = record("", "bad");
+    invalid.fragment.confidence = f64::NAN;
+    invalid.scope = Some(AgenticMemoryScope {
+        session_id: Some(String::new()),
+        project_id: Some("project".to_owned()),
+        user_id: None,
+        tenant_id: Some(String::new()),
+    });
+    let validation = validate_agentic_memory_record(&invalid);
+    assert!(!validation.ok);
+    assert_eq!(
+        validation.errors,
+        vec![
+            "fragment.id must be a non-empty string",
+            "fragment.confidence must be finite in [0, 1]",
+            "scope.session_id must be a non-empty string when present",
+            "scope.tenant_id must be a non-empty string when present",
+        ]
+    );
+}
+
+#[test]
+fn agentic_memory_bundle_projects_records_to_retrieval_and_context_metadata() {
+    let g = graph();
+    let mut near = record("near", "close");
+    near.kind = AgenticMemoryKind::Semantic;
+    near.persistence_level = AgenticMemoryPersistenceLevel::LongTerm;
+    near.artifact_kind = AgenticMemoryArtifactKind::Insight;
+    near.fragment.confidence = 0.6;
+    near.fragment.embedding = Some(vec![1.0, 0.0]);
+    near.fragment.sources = vec!["seed".to_owned(), "note".to_owned()];
+    near.fragment.parent_fragment_id = Some("seed".to_owned());
+    let mut far = record("far", "distant");
+    far.fragment.confidence = 0.95;
+    far.fragment.embedding = Some(vec![0.0, 1.0]);
+    far.fragment.provenance = Some("fixture".to_owned());
+    let records = g.state_opts(vec![far, near], GraphNodeOpts::named("records"));
+    let query = g.state_opts(
+        MemoryRetrievalQuery {
+            tags: vec!["policy".to_owned()],
+            vector: Some(vec![1.0, 0.0]),
+            limit: Some(2),
+            ..MemoryRetrievalQuery::default()
+        },
+        GraphNodeOpts::named("query"),
+    );
+
+    let bundle = agentic_memory_bundle(
+        &g,
+        AgenticMemoryBundleOptions::new(records.clone(), query.clone()).named("memory"),
+    );
+
+    let described = g.describe();
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "records" && edge.to == "memory/projection"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "memory/projection" && edge.to == "memory/fragments"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "memory/fragments" && edge.to == "memory/retrieval/snapshot"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "memory/retrieval/snapshot" && edge.to == "memory/context"));
+    assert!(described
+        .nodes
+        .iter()
+        .any(|node| node.id == "memory/projection" && node.factory == "agenticMemoryProjection"));
+    assert!(described
+        .nodes
+        .iter()
+        .any(|node| node.id == "memory/context" && node.factory == "agenticMemoryContext"));
+
+    let _context = bundle.context.subscribe(|_| {});
+    let _sources = bundle.sources.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+    let context = bundle.context.cache().unwrap();
+    assert_eq!(context.state, AgenticMemoryStatusState::Ready);
+    assert!(context.context_ready);
+    assert_eq!(
+        context
+            .entries
+            .iter()
+            .map(|entry| entry.fragment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["near", "far"]
+    );
+    let near_entry = &context.entries[0];
+    assert_eq!(near_entry.payload, "close");
+    assert_eq!(
+        near_entry.metadata.as_ref().unwrap().kind,
+        AgenticMemoryKind::Semantic
+    );
+    assert_eq!(
+        near_entry.metadata.as_ref().unwrap().persistence_level,
+        AgenticMemoryPersistenceLevel::LongTerm
+    );
+    assert_eq!(
+        near_entry.metadata.as_ref().unwrap().artifact_kind,
+        AgenticMemoryArtifactKind::Insight
+    );
+    assert_eq!(bundle.status.cache().unwrap().cursor.result_count, 2);
+    assert_eq!(
+        bundle
+            .sources
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|source| source.fragment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["far", "near"]
+    );
+    assert_eq!(bundle.records_input.cache().unwrap().len(), 2);
+    assert_eq!(bundle.query_input.cache().unwrap().limit, Some(2));
+}
+
+#[test]
+fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors() {
+    let g = graph();
+    let mut invalid = record("", "invalid");
+    invalid.fragment.confidence = f64::NAN;
+    let records = g.state_opts(
+        vec![record("dup", "kept"), record("dup", "duplicate"), invalid],
+        GraphNodeOpts::named("records"),
+    );
+    let query = g.state_opts(
+        MemoryRetrievalQuery::default(),
+        GraphNodeOpts::named("query"),
+    );
+    let bundle = agentic_memory_bundle(
+        &g,
+        AgenticMemoryBundleOptions::new(records, query.clone()).named("memory"),
+    );
+    let _context = bundle.context.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+    let _retrieval_errors = bundle.retrieval_errors.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+
+    let errors = bundle.errors.cache().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].index, Some(2));
+    let projection_error_evaluation = errors[0].cursor.evaluation;
+    assert_eq!(
+        errors[0].validation_errors,
+        vec![
+            "fragment.id must be a non-empty string",
+            "fragment.confidence must be finite in [0, 1]",
+        ]
+    );
+    assert_eq!(
+        bundle
+            .retrieval_errors
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        vec![MemoryRetrievalErrorCode::DuplicateFragmentId]
+    );
+    assert_eq!(
+        bundle.context.cache().unwrap().state,
+        AgenticMemoryStatusState::Partial
+    );
+    assert_eq!(bundle.context.cache().unwrap().entries.len(), 1);
+
+    query.set(MemoryRetrievalQuery {
+        vector: Some(vec![1.0, f64::INFINITY]),
+        ..MemoryRetrievalQuery::default()
+    });
+    assert_eq!(
+        bundle.context.cache().unwrap().state,
+        AgenticMemoryStatusState::Error
+    );
+    assert_eq!(
+        bundle.errors.cache().unwrap()[0].cursor.evaluation,
+        projection_error_evaluation,
+        "query-only reruns must not rewrite the projection cursor on solution validation errors"
+    );
+    assert_eq!(
+        bundle
+            .retrieval_errors
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|error| error.code)
+            .collect::<Vec<_>>(),
+        vec![
+            MemoryRetrievalErrorCode::InvalidQueryVector,
+            MemoryRetrievalErrorCode::DuplicateFragmentId,
+        ]
+    );
+    assert!(bundle.context.cache().unwrap().entries.is_empty());
+
+    query.set(MemoryRetrievalQuery::default());
+    let mut all_invalid = record("", "all-invalid");
+    all_invalid.fragment.confidence = f64::NAN;
+    bundle.records_input.set(vec![all_invalid]);
+    assert_eq!(
+        bundle.context.cache().unwrap().state,
+        AgenticMemoryStatusState::Error,
+        "a batch with only invalid solution records is an agentic-memory error, not partial context"
+    );
+    assert!(!bundle.context.cache().unwrap().context_ready);
 }

@@ -78,6 +78,7 @@ pub mod process;
 pub mod protocol;
 pub mod render;
 pub mod resilience;
+pub mod solutions;
 pub mod sources;
 pub mod storage;
 pub mod time;
@@ -238,6 +239,16 @@ pub use resilience::{
     breaker_status_node, rate_limit_bundle, retry_status_node, timeout_bundle, BackoffPolicy,
     BreakerState, BreakerStatus, RateLimitBundle, RateLimitStatus, RetryEvent, RetryPolicy,
     RetryState, RetryStatus, TimeoutBundle, TimeoutStatus,
+};
+pub use solutions::{
+    agentic_memory_bundle, validate_agentic_memory_artifact_kind, validate_agentic_memory_kind,
+    validate_agentic_memory_persistence_level, validate_agentic_memory_record,
+    validate_agentic_memory_scope, AgenticMemoryArtifactKind, AgenticMemoryBundle,
+    AgenticMemoryBundleOptions, AgenticMemoryContext, AgenticMemoryContextEntry,
+    AgenticMemoryCursor, AgenticMemoryError, AgenticMemoryErrorCode, AgenticMemoryFieldValidation,
+    AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryProjection, AgenticMemoryRecord,
+    AgenticMemoryRecordMetadata, AgenticMemoryRecordValidation, AgenticMemoryScope,
+    AgenticMemorySourceProjection, AgenticMemoryStatus, AgenticMemoryStatusState,
 };
 pub use sources::{
     empty, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
