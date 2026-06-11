@@ -74,6 +74,139 @@ pub struct KnowledgeAssertion {
     pub t_ns: u128,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KnowledgeGraphPolicy {
+    pub allowed_predicates: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphEntity {
+    pub id: FactId,
+    pub assertion_ids: Vec<FactId>,
+    pub subject_assertion_ids: Vec<FactId>,
+    pub object_assertion_ids: Vec<FactId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnowledgeGraphRelation {
+    pub assertion_id: FactId,
+    pub subject_id: FactId,
+    pub predicate: String,
+    pub object: KnowledgeAssertionObject,
+    pub sources: Vec<FactId>,
+    pub confidence: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphTopic {
+    pub predicate: String,
+    pub assertion_ids: Vec<FactId>,
+    pub entity_ids: Vec<FactId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphIndex {
+    pub assertion_ids: Vec<FactId>,
+    pub entity_ids: Vec<FactId>,
+    pub relation_ids: Vec<FactId>,
+    pub predicates: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphCursor {
+    pub evaluation: u64,
+    pub valid_assertions: usize,
+    pub invalid_assertions: usize,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub predicate_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnowledgeGraphStatusState {
+    Ready,
+    Empty,
+    Partial,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphStatus {
+    pub state: KnowledgeGraphStatusState,
+    pub cursor: KnowledgeGraphCursor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnowledgeGraphErrorCode {
+    InvalidAssertion,
+    DuplicateAssertionId,
+    PolicyConflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGraphError {
+    pub code: KnowledgeGraphErrorCode,
+    pub message: String,
+    pub index: Option<usize>,
+    pub assertion_id: Option<FactId>,
+    pub validation_errors: Vec<String>,
+    pub cursor: KnowledgeGraphCursor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnowledgeGraphSnapshot {
+    pub assertions: Vec<KnowledgeAssertion>,
+    pub entities: Vec<KnowledgeGraphEntity>,
+    pub relations: Vec<KnowledgeGraphRelation>,
+    pub topics: Vec<KnowledgeGraphTopic>,
+    pub index: KnowledgeGraphIndex,
+    pub status: KnowledgeGraphStatus,
+    pub errors: Vec<KnowledgeGraphError>,
+    pub cursor: KnowledgeGraphCursor,
+}
+
+#[derive(Clone)]
+pub struct KnowledgeGraphReducerBundleOptions {
+    pub name: Option<String>,
+    pub assertions: Node<Vec<KnowledgeAssertion>>,
+    pub policy: Option<Node<KnowledgeGraphPolicy>>,
+}
+
+impl KnowledgeGraphReducerBundleOptions {
+    pub fn new(assertions: Node<Vec<KnowledgeAssertion>>) -> Self {
+        Self {
+            name: None,
+            assertions,
+            policy: None,
+        }
+    }
+
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn with_policy(mut self, policy: Node<KnowledgeGraphPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct KnowledgeGraphReducerBundle {
+    pub assertions_input: Node<Vec<KnowledgeAssertion>>,
+    pub policy_input: Option<Node<KnowledgeGraphPolicy>>,
+    pub snapshot: Node<KnowledgeGraphSnapshot>,
+    pub assertions: Node<Vec<KnowledgeAssertion>>,
+    pub entities: Node<Vec<KnowledgeGraphEntity>>,
+    pub relations: Node<Vec<KnowledgeGraphRelation>>,
+    pub topics: Node<Vec<KnowledgeGraphTopic>>,
+    pub index: Node<KnowledgeGraphIndex>,
+    pub status: Node<KnowledgeGraphStatus>,
+    pub errors: Node<Vec<KnowledgeGraphError>>,
+    pub cursor: Node<KnowledgeGraphCursor>,
+}
+
 pub type ShardKey = String;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -678,6 +811,351 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
         ),
         snapshot,
     }
+}
+
+pub fn knowledge_graph_reducer_bundle(
+    graph: &Graph,
+    opts: KnowledgeGraphReducerBundleOptions,
+) -> KnowledgeGraphReducerBundle {
+    let name = opts.name.unwrap_or_else(|| "knowledgeGraph".to_owned());
+    let assertions = opts.assertions;
+    let policy = opts.policy;
+    let mut deps = vec![assertions.erased()];
+    if let Some(policy) = &policy {
+        deps.push(policy.erased());
+    }
+    let has_policy = policy.is_some();
+    let snapshot = graph.init_node(
+        Operator::with_opts(
+            "knowledgeGraphReducerSnapshot",
+            pattern_node_config(),
+            move |ctx| {
+                let evaluation = ctx
+                    .state_get::<u64>()
+                    .map(|evaluation| *evaluation + 1)
+                    .unwrap_or(1);
+                let raw_assertions = ctx
+                    .data::<Vec<KnowledgeAssertion>>(0)
+                    .map(|assertions| (*assertions).clone())
+                    .unwrap_or_default();
+                let policy = if has_policy {
+                    ctx.data::<KnowledgeGraphPolicy>(1)
+                        .map(|policy| (*policy).clone())
+                        .unwrap_or_default()
+                } else {
+                    KnowledgeGraphPolicy::default()
+                };
+                let reduced = reduce_knowledge_assertions(raw_assertions, &policy);
+                let cursor = KnowledgeGraphCursor {
+                    evaluation,
+                    valid_assertions: reduced.assertions.len(),
+                    invalid_assertions: reduced.errors.len(),
+                    entity_count: reduced.entities.len(),
+                    relation_count: reduced.relations.len(),
+                    predicate_count: reduced.topics.len(),
+                };
+                let errors = reduced
+                    .errors
+                    .into_iter()
+                    .map(|pending| KnowledgeGraphError {
+                        code: pending.code,
+                        message: pending.message,
+                        index: pending.index,
+                        assertion_id: pending.assertion_id,
+                        validation_errors: pending.validation_errors,
+                        cursor: cursor.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let status = KnowledgeGraphStatus {
+                    state: if reduced.assertions.is_empty() && errors.is_empty() {
+                        KnowledgeGraphStatusState::Empty
+                    } else if errors.is_empty() {
+                        KnowledgeGraphStatusState::Ready
+                    } else if !reduced.assertions.is_empty() {
+                        KnowledgeGraphStatusState::Partial
+                    } else {
+                        KnowledgeGraphStatusState::Error
+                    },
+                    cursor: cursor.clone(),
+                };
+                ctx.state_set(evaluation);
+                ctx.emit(KnowledgeGraphSnapshot {
+                    assertions: reduced.assertions,
+                    entities: reduced.entities,
+                    relations: reduced.relations,
+                    topics: reduced.topics,
+                    index: reduced.index,
+                    status,
+                    errors,
+                    cursor,
+                });
+            },
+        ),
+        deps,
+        named_graph_node_opts(format!("{name}/snapshot")),
+    );
+
+    KnowledgeGraphReducerBundle {
+        assertions_input: assertions,
+        policy_input: policy,
+        assertions: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/assertions"),
+            "knowledgeGraphAssertions",
+            |snapshot| snapshot.assertions.clone(),
+        ),
+        entities: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/entities"),
+            "knowledgeGraphEntities",
+            |snapshot| snapshot.entities.clone(),
+        ),
+        relations: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/relations"),
+            "knowledgeGraphRelations",
+            |snapshot| snapshot.relations.clone(),
+        ),
+        topics: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/topics"),
+            "knowledgeGraphTopics",
+            |snapshot| snapshot.topics.clone(),
+        ),
+        index: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/index"),
+            "knowledgeGraphIndex",
+            |snapshot| snapshot.index.clone(),
+        ),
+        status: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/status"),
+            "knowledgeGraphStatus",
+            |snapshot| snapshot.status.clone(),
+        ),
+        errors: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/errors"),
+            "knowledgeGraphErrors",
+            |snapshot| snapshot.errors.clone(),
+        ),
+        cursor: kg_projection(
+            graph,
+            &snapshot,
+            format!("{name}/cursor"),
+            "knowledgeGraphCursor",
+            |snapshot| snapshot.cursor.clone(),
+        ),
+        snapshot,
+    }
+}
+
+fn kg_projection<U, F>(
+    graph: &Graph,
+    snapshot: &Node<KnowledgeGraphSnapshot>,
+    name: String,
+    factory: &'static str,
+    select: F,
+) -> Node<U>
+where
+    U: 'static,
+    F: Fn(&KnowledgeGraphSnapshot) -> U + 'static,
+{
+    graph.init_node(
+        Operator::with_opts(factory, pattern_node_config(), move |ctx| {
+            for snapshot in ctx.batch::<KnowledgeGraphSnapshot>(0) {
+                ctx.emit(select(snapshot.as_ref()));
+            }
+        }),
+        vec![snapshot.erased()],
+        named_graph_node_opts(name),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct PendingKnowledgeGraphError {
+    code: KnowledgeGraphErrorCode,
+    message: String,
+    index: Option<usize>,
+    assertion_id: Option<FactId>,
+    validation_errors: Vec<String>,
+}
+
+struct ReducedKnowledgeGraph {
+    assertions: Vec<KnowledgeAssertion>,
+    entities: Vec<KnowledgeGraphEntity>,
+    relations: Vec<KnowledgeGraphRelation>,
+    topics: Vec<KnowledgeGraphTopic>,
+    index: KnowledgeGraphIndex,
+    errors: Vec<PendingKnowledgeGraphError>,
+}
+
+fn reduce_knowledge_assertions(
+    raw_assertions: Vec<KnowledgeAssertion>,
+    policy: &KnowledgeGraphPolicy,
+) -> ReducedKnowledgeGraph {
+    let mut assertions = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, assertion) in raw_assertions.into_iter().enumerate() {
+        let validation = validate_knowledge_assertion(&assertion, policy);
+        if !validation.is_empty() {
+            errors.push(PendingKnowledgeGraphError {
+                code: if validation.iter().any(|error| error.contains("policy")) {
+                    KnowledgeGraphErrorCode::PolicyConflict
+                } else {
+                    KnowledgeGraphErrorCode::InvalidAssertion
+                },
+                message: "knowledge_graph_reducer_bundle: assertion is invalid".to_owned(),
+                index: Some(index),
+                assertion_id: Some(assertion.id.clone()),
+                validation_errors: validation,
+            });
+            continue;
+        }
+        if !seen.insert(assertion.id.clone()) {
+            errors.push(PendingKnowledgeGraphError {
+                code: KnowledgeGraphErrorCode::DuplicateAssertionId,
+                message: "knowledge_graph_reducer_bundle: duplicate assertion id".to_owned(),
+                index: Some(index),
+                assertion_id: Some(assertion.id.clone()),
+                validation_errors: vec![format!("duplicate assertion id '{}'", assertion.id)],
+            });
+            continue;
+        }
+        assertions.push(assertion);
+    }
+    let (entities, relations, topics, index) = materialize_knowledge_graph(&assertions);
+    ReducedKnowledgeGraph {
+        assertions,
+        entities,
+        relations,
+        topics,
+        index,
+        errors,
+    }
+}
+
+fn validate_knowledge_assertion(
+    assertion: &KnowledgeAssertion,
+    policy: &KnowledgeGraphPolicy,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if assertion.id.is_empty() {
+        errors.push("id must be a non-empty string".to_owned());
+    }
+    if assertion.subject_id.is_empty() {
+        errors.push("subject_id must be a non-empty string".to_owned());
+    }
+    if assertion.predicate.is_empty() {
+        errors.push("predicate must be a non-empty string".to_owned());
+    }
+    if !policy.allowed_predicates.is_empty()
+        && !policy.allowed_predicates.contains(&assertion.predicate)
+    {
+        errors.push(format!(
+            "predicate '{}' is rejected by policy",
+            assertion.predicate
+        ));
+    }
+    if let KnowledgeAssertionObject::Entity { entity_id } = &assertion.object {
+        if entity_id.is_empty() {
+            errors.push("object entity_id must be a non-empty string".to_owned());
+        }
+    }
+    if !assertion.confidence.is_finite() || !(0.0..=1.0).contains(&assertion.confidence) {
+        errors.push("confidence must be finite in [0, 1]".to_owned());
+    }
+    errors
+}
+
+fn materialize_knowledge_graph(
+    assertions: &[KnowledgeAssertion],
+) -> (
+    Vec<KnowledgeGraphEntity>,
+    Vec<KnowledgeGraphRelation>,
+    Vec<KnowledgeGraphTopic>,
+    KnowledgeGraphIndex,
+) {
+    type EntityBuckets = (HashSet<FactId>, HashSet<FactId>, HashSet<FactId>);
+    type TopicBuckets = (HashSet<FactId>, HashSet<FactId>);
+
+    let mut entity_map: BTreeMap<FactId, EntityBuckets> = BTreeMap::new();
+    let mut topic_map: BTreeMap<String, TopicBuckets> = BTreeMap::new();
+    let mut relations = Vec::new();
+    for assertion in assertions {
+        let subject_entry = entity_map.entry(assertion.subject_id.clone()).or_default();
+        subject_entry.0.insert(assertion.id.clone());
+        subject_entry.1.insert(assertion.id.clone());
+        let topic_entry = topic_map.entry(assertion.predicate.clone()).or_default();
+        topic_entry.0.insert(assertion.id.clone());
+        topic_entry.1.insert(assertion.subject_id.clone());
+        if let KnowledgeAssertionObject::Entity { entity_id } = &assertion.object {
+            let object_entry = entity_map.entry(entity_id.clone()).or_default();
+            object_entry.0.insert(assertion.id.clone());
+            object_entry.2.insert(assertion.id.clone());
+            topic_entry.1.insert(entity_id.clone());
+        }
+        relations.push(KnowledgeGraphRelation {
+            assertion_id: assertion.id.clone(),
+            subject_id: assertion.subject_id.clone(),
+            predicate: assertion.predicate.clone(),
+            object: assertion.object.clone(),
+            sources: assertion.sources.clone(),
+            confidence: assertion.confidence,
+        });
+    }
+    relations.sort_by(|a, b| a.assertion_id.cmp(&b.assertion_id));
+    let entities = entity_map
+        .into_iter()
+        .map(
+            |(id, (assertions, subjects, objects))| KnowledgeGraphEntity {
+                id,
+                assertion_ids: sorted_set(assertions),
+                subject_assertion_ids: sorted_set(subjects),
+                object_assertion_ids: sorted_set(objects),
+            },
+        )
+        .collect::<Vec<_>>();
+    let topics = topic_map
+        .into_iter()
+        .map(|(predicate, (assertions, entities))| KnowledgeGraphTopic {
+            predicate,
+            assertion_ids: sorted_set(assertions),
+            entity_ids: sorted_set(entities),
+        })
+        .collect::<Vec<_>>();
+    let index = KnowledgeGraphIndex {
+        assertion_ids: {
+            let mut ids = assertions
+                .iter()
+                .map(|assertion| assertion.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        },
+        entity_ids: entities.iter().map(|entity| entity.id.clone()).collect(),
+        relation_ids: relations
+            .iter()
+            .map(|relation| relation.assertion_id.clone())
+            .collect(),
+        predicates: topics.iter().map(|topic| topic.predicate.clone()).collect(),
+    };
+    (entities, relations, topics, index)
+}
+
+fn sorted_set(set: HashSet<FactId>) -> Vec<FactId> {
+    let mut out = set.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
 }
 
 fn retrieval_projection<T, U, F>(

@@ -135,6 +135,9 @@ pub enum AgenticMemoryErrorCode {
     DuplicateAssertionId,
     InvalidRetentionCommand,
     DuplicateRetentionCommandId,
+    InvalidConsolidationOutcome,
+    DuplicateConsolidationOutcomeId,
+    MissingConsolidationRequest,
     InvalidPackingPolicy,
     InvalidTextProjection,
     DuplicateTextProjection,
@@ -333,6 +336,128 @@ pub struct AgenticMemoryRetentionBundle<T> {
     pub status: Node<AgenticMemoryRetentionStatus>,
     pub errors: Node<Vec<AgenticMemoryError>>,
     pub cursor: Node<AgenticMemoryRetentionCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgenticMemoryConsolidationOutcome<T> {
+    ProposedRecords {
+        id: FactId,
+        request_id: FactId,
+        records: Vec<AgenticMemoryRecord<T>>,
+        provenance: Option<String>,
+    },
+    Failed {
+        id: FactId,
+        request_id: FactId,
+        message: String,
+        provenance: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgenticMemoryConsolidationRecordDraft<T> {
+    pub id: FactId,
+    pub request_id: FactId,
+    pub outcome_id: FactId,
+    pub record: AgenticMemoryRecord<T>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgenticMemoryConsolidationCommandKind {
+    ProposeRecords,
+    MarkFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgenticMemoryConsolidationCommand {
+    pub id: FactId,
+    pub kind: AgenticMemoryConsolidationCommandKind,
+    pub request_id: FactId,
+    pub outcome_id: FactId,
+    pub draft_ids: Vec<FactId>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgenticMemoryConsolidationResultState {
+    Proposed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgenticMemoryConsolidationResult {
+    pub id: FactId,
+    pub request_id: FactId,
+    pub outcome_id: FactId,
+    pub state: AgenticMemoryConsolidationResultState,
+    pub source_record_ids: Vec<FactId>,
+    pub proposed_record_ids: Vec<FactId>,
+    pub message: Option<String>,
+    pub provenance: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgenticMemoryConsolidationCursor {
+    pub evaluation: u64,
+    pub valid_requests: usize,
+    pub valid_outcomes: usize,
+    pub invalid_outcomes: usize,
+    pub results: usize,
+    pub proposed_record_drafts: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgenticMemoryConsolidationStatus {
+    pub state: AgenticMemoryStatusState,
+    pub cursor: AgenticMemoryConsolidationCursor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgenticMemoryConsolidationSnapshot<T> {
+    pub results: Vec<AgenticMemoryConsolidationResult>,
+    pub proposed_record_drafts: Vec<AgenticMemoryConsolidationRecordDraft<T>>,
+    pub commands: Vec<AgenticMemoryConsolidationCommand>,
+    pub status: AgenticMemoryConsolidationStatus,
+    pub errors: Vec<AgenticMemoryError>,
+    pub cursor: AgenticMemoryConsolidationCursor,
+}
+
+#[derive(Clone)]
+pub struct AgenticMemoryConsolidationBundleOptions<T> {
+    pub name: Option<String>,
+    pub requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
+    pub outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
+}
+
+impl<T> AgenticMemoryConsolidationBundleOptions<T> {
+    pub fn new(
+        requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
+        outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
+    ) -> Self {
+        Self {
+            name: None,
+            requests,
+            outcomes,
+        }
+    }
+
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct AgenticMemoryConsolidationBundle<T> {
+    pub requests_input: Node<Vec<AgenticMemoryConsolidationRequest>>,
+    pub outcomes_input: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
+    pub snapshot: Node<AgenticMemoryConsolidationSnapshot<T>>,
+    pub results: Node<Vec<AgenticMemoryConsolidationResult>>,
+    pub proposed_record_drafts: Node<Vec<AgenticMemoryConsolidationRecordDraft<T>>>,
+    pub commands: Node<Vec<AgenticMemoryConsolidationCommand>>,
+    pub status: Node<AgenticMemoryConsolidationStatus>,
+    pub errors: Node<Vec<AgenticMemoryError>>,
+    pub cursor: Node<AgenticMemoryConsolidationCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1142,6 +1267,139 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
     }
 }
 
+pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
+    graph: &Graph,
+    opts: AgenticMemoryConsolidationBundleOptions<T>,
+) -> AgenticMemoryConsolidationBundle<T> {
+    let name = opts
+        .name
+        .unwrap_or_else(|| "agenticMemoryConsolidation".to_owned());
+    let requests = opts.requests;
+    let outcomes = opts.outcomes;
+    let snapshot = graph.init_node(
+        Operator::with_opts(
+            "agenticMemoryConsolidation",
+            solution_node_config(),
+            |ctx| {
+                let evaluation = ctx
+                    .state_get::<u64>()
+                    .map(|evaluation| *evaluation + 1)
+                    .unwrap_or(1);
+                let requests = ctx
+                    .data::<Vec<AgenticMemoryConsolidationRequest>>(0)
+                    .map(|requests| (*requests).clone())
+                    .unwrap_or_default();
+                let outcomes = ctx
+                    .data::<Vec<AgenticMemoryConsolidationOutcome<T>>>(1)
+                    .map(|outcomes| (*outcomes).clone())
+                    .unwrap_or_default();
+                let projected = project_consolidation_outcomes(requests, outcomes);
+                let cursor = AgenticMemoryConsolidationCursor {
+                    evaluation,
+                    valid_requests: projected.valid_requests,
+                    valid_outcomes: projected.valid_outcomes,
+                    invalid_outcomes: projected.invalid_outcomes,
+                    results: projected.results.len(),
+                    proposed_record_drafts: projected.proposed_record_drafts.len(),
+                };
+                let error_cursor = AgenticMemoryCursor {
+                    evaluation,
+                    valid_records: 0,
+                    invalid_records: cursor.invalid_outcomes,
+                    projected_fragments: 0,
+                    result_count: cursor.results,
+                };
+                let errors = projected
+                    .errors
+                    .into_iter()
+                    .map(|error| AgenticMemoryError {
+                        code: error.code,
+                        message: "agentic_memory_consolidation_bundle: invalid consolidation input"
+                            .to_owned(),
+                        index: error.index,
+                        record_id: error.record_id,
+                        fragment_id: error.fragment_id,
+                        validation_errors: error.validation_errors,
+                        cursor: error_cursor.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let status = AgenticMemoryConsolidationStatus {
+                    state: if errors.is_empty() && !projected.results.is_empty() {
+                        AgenticMemoryStatusState::Ready
+                    } else if errors.is_empty() {
+                        AgenticMemoryStatusState::Empty
+                    } else if !projected.results.is_empty() {
+                        AgenticMemoryStatusState::Partial
+                    } else {
+                        AgenticMemoryStatusState::Error
+                    },
+                    cursor: cursor.clone(),
+                };
+                ctx.state_set(evaluation);
+                ctx.emit(AgenticMemoryConsolidationSnapshot {
+                    results: projected.results,
+                    proposed_record_drafts: projected.proposed_record_drafts,
+                    commands: projected.commands,
+                    status,
+                    errors,
+                    cursor,
+                });
+            },
+        ),
+        vec![requests.erased(), outcomes.erased()],
+        named_solution_node_opts(format!("{name}/snapshot")),
+    );
+    AgenticMemoryConsolidationBundle {
+        requests_input: requests,
+        outcomes_input: outcomes,
+        results: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/results"),
+            "agenticMemoryConsolidationResults",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.results.clone(),
+        ),
+        proposed_record_drafts: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/proposed_record_drafts"),
+            "agenticMemoryConsolidationRecordDrafts",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| {
+                snapshot.proposed_record_drafts.clone()
+            },
+        ),
+        commands: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/commands"),
+            "agenticMemoryConsolidationCommands",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.commands.clone(),
+        ),
+        status: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/status"),
+            "agenticMemoryConsolidationStatus",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.status.clone(),
+        ),
+        errors: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/errors"),
+            "agenticMemoryConsolidationErrors",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.errors.clone(),
+        ),
+        cursor: solution_projection(
+            graph,
+            &snapshot,
+            format!("{name}/cursor"),
+            "agenticMemoryConsolidationCursor",
+            |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.cursor.clone(),
+        ),
+        snapshot,
+    }
+}
+
 pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryContextPackingBundleOptions<T>,
@@ -1433,6 +1691,218 @@ fn validate_retention_command(command: &AgenticMemoryRetentionCommand) -> Vec<St
         .is_some_and(|reason| reason.is_empty())
     {
         errors.push("reason must be non-empty when present".to_owned());
+    }
+    errors
+}
+
+struct ProjectedConsolidation<T> {
+    results: Vec<AgenticMemoryConsolidationResult>,
+    proposed_record_drafts: Vec<AgenticMemoryConsolidationRecordDraft<T>>,
+    commands: Vec<AgenticMemoryConsolidationCommand>,
+    errors: Vec<PendingAgenticMemoryError>,
+    valid_requests: usize,
+    valid_outcomes: usize,
+    invalid_outcomes: usize,
+}
+
+fn project_consolidation_outcomes<T: Clone>(
+    requests: Vec<AgenticMemoryConsolidationRequest>,
+    outcomes: Vec<AgenticMemoryConsolidationOutcome<T>>,
+) -> ProjectedConsolidation<T> {
+    let mut by_request = BTreeMap::new();
+    for request in requests {
+        by_request.insert(request.command_id.clone(), request);
+    }
+    let valid_requests = by_request.len();
+    let mut seen_outcomes = HashSet::new();
+    let mut results = Vec::new();
+    let mut proposed_record_drafts = Vec::new();
+    let mut commands = Vec::new();
+    let mut errors = Vec::new();
+    let mut valid_outcomes = 0usize;
+    let mut invalid_outcomes = 0usize;
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        let (outcome_id, request_id) = consolidation_outcome_ids(&outcome);
+        let mut validation_errors = validate_consolidation_outcome(&outcome);
+        if !seen_outcomes.insert(outcome_id.clone()) {
+            validation_errors.push(format!("duplicate consolidation outcome id '{outcome_id}'"));
+        }
+        let request = by_request.get(&request_id);
+        if request.is_none() {
+            validation_errors.push(format!(
+                "request_id '{request_id}' does not reference a projected request"
+            ));
+        }
+        if !validation_errors.is_empty() {
+            let code = if validation_errors
+                .iter()
+                .any(|error| error.starts_with("duplicate consolidation outcome id"))
+            {
+                AgenticMemoryErrorCode::DuplicateConsolidationOutcomeId
+            } else if validation_errors
+                .iter()
+                .any(|error| error.starts_with("request_id"))
+            {
+                AgenticMemoryErrorCode::MissingConsolidationRequest
+            } else {
+                AgenticMemoryErrorCode::InvalidConsolidationOutcome
+            };
+            invalid_outcomes += 1;
+            errors.push(PendingAgenticMemoryError {
+                code,
+                index: Some(index),
+                record_id: Some(outcome_id),
+                fragment_id: None,
+                validation_errors,
+            });
+            continue;
+        }
+        let request = request.expect("validation checked request existence");
+        valid_outcomes += 1;
+        match outcome {
+            AgenticMemoryConsolidationOutcome::Failed {
+                id,
+                request_id,
+                message,
+                provenance,
+            } => {
+                let result_id = format!("{request_id}:{id}");
+                results.push(AgenticMemoryConsolidationResult {
+                    id: result_id.clone(),
+                    request_id: request_id.clone(),
+                    outcome_id: id.clone(),
+                    state: AgenticMemoryConsolidationResultState::Failed,
+                    source_record_ids: vec![request.record_id.clone()],
+                    proposed_record_ids: Vec::new(),
+                    message: Some(message.clone()),
+                    provenance,
+                });
+                commands.push(AgenticMemoryConsolidationCommand {
+                    id: format!("{result_id}:mark_failed"),
+                    kind: AgenticMemoryConsolidationCommandKind::MarkFailed,
+                    request_id,
+                    outcome_id: id,
+                    draft_ids: Vec::new(),
+                    message: Some(message),
+                });
+            }
+            AgenticMemoryConsolidationOutcome::ProposedRecords {
+                id,
+                request_id,
+                records,
+                provenance,
+            } => {
+                let result_id = format!("{request_id}:{id}");
+                let mut draft_ids = Vec::new();
+                let mut proposed_record_ids = Vec::new();
+                for record in records {
+                    let draft_id = format!("{request_id}:{id}:{}", record.id);
+                    draft_ids.push(draft_id.clone());
+                    proposed_record_ids.push(record.id.clone());
+                    proposed_record_drafts.push(AgenticMemoryConsolidationRecordDraft {
+                        id: draft_id,
+                        request_id: request_id.clone(),
+                        outcome_id: id.clone(),
+                        record,
+                    });
+                }
+                results.push(AgenticMemoryConsolidationResult {
+                    id: result_id.clone(),
+                    request_id: request_id.clone(),
+                    outcome_id: id.clone(),
+                    state: AgenticMemoryConsolidationResultState::Proposed,
+                    source_record_ids: vec![request.record_id.clone()],
+                    proposed_record_ids,
+                    message: None,
+                    provenance,
+                });
+                commands.push(AgenticMemoryConsolidationCommand {
+                    id: format!("{result_id}:propose_records"),
+                    kind: AgenticMemoryConsolidationCommandKind::ProposeRecords,
+                    request_id,
+                    outcome_id: id,
+                    draft_ids,
+                    message: None,
+                });
+            }
+        }
+    }
+    ProjectedConsolidation {
+        results,
+        proposed_record_drafts,
+        commands,
+        errors,
+        valid_requests,
+        valid_outcomes,
+        invalid_outcomes,
+    }
+}
+
+fn consolidation_outcome_ids<T>(
+    outcome: &AgenticMemoryConsolidationOutcome<T>,
+) -> (FactId, FactId) {
+    match outcome {
+        AgenticMemoryConsolidationOutcome::ProposedRecords { id, request_id, .. }
+        | AgenticMemoryConsolidationOutcome::Failed { id, request_id, .. } => {
+            (id.clone(), request_id.clone())
+        }
+    }
+}
+
+fn validate_consolidation_outcome<T>(
+    outcome: &AgenticMemoryConsolidationOutcome<T>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    match outcome {
+        AgenticMemoryConsolidationOutcome::ProposedRecords {
+            id,
+            request_id,
+            records,
+            provenance,
+        } => {
+            if id.is_empty() {
+                errors.push("id must be a non-empty string".to_owned());
+            }
+            if request_id.is_empty() {
+                errors.push("request_id must be a non-empty string".to_owned());
+            }
+            if records.is_empty() {
+                errors.push("records must be non-empty".to_owned());
+            }
+            if provenance.as_ref().is_some_and(|value| value.is_empty()) {
+                errors.push("provenance must be non-empty when present".to_owned());
+            }
+            for (index, record) in records.iter().enumerate() {
+                let validation = validate_agentic_memory_record(record);
+                if !validation.ok {
+                    errors.extend(
+                        validation
+                            .errors
+                            .into_iter()
+                            .map(|error| format!("records[{index}]: {error}")),
+                    );
+                }
+            }
+        }
+        AgenticMemoryConsolidationOutcome::Failed {
+            id,
+            request_id,
+            message,
+            provenance,
+        } => {
+            if id.is_empty() {
+                errors.push("id must be a non-empty string".to_owned());
+            }
+            if request_id.is_empty() {
+                errors.push("request_id must be a non-empty string".to_owned());
+            }
+            if message.is_empty() {
+                errors.push("message must be a non-empty string".to_owned());
+            }
+            if provenance.as_ref().is_some_and(|value| value.is_empty()) {
+                errors.push("provenance must be non-empty when present".to_owned());
+            }
+        }
     }
     errors
 }

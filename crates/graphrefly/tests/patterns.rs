@@ -1,20 +1,29 @@
 use graphrefly::{
     admission_filter_3d, admission_scored, agentic_memory_bundle,
-    agentic_memory_context_packing_bundle, agentic_memory_kg_projection_bundle,
+    agentic_memory_consolidation_bundle, agentic_memory_context_packing_bundle,
+    agentic_memory_kg_projection_bundle, agentic_memory_record_change_frame,
     agentic_memory_record_frame, agentic_memory_record_frame_codec,
+    agentic_memory_record_snapshot_frame, agentic_memory_records_snapshot_key,
     agentic_memory_retention_bundle, cosine_similarity, filter_memory_fragments, graph,
-    memory_fragment_matches_query, memory_fragment_valid_at, memory_retrieval_bundle,
-    shard_by_tenant, validate_agentic_memory_record, validate_agentic_memory_scope,
-    validate_memory_fragment, AdmissionScore3DOptions, AdmissionScoredOptions, AdmissionScores,
-    AgenticMemoryArtifactKind, AgenticMemoryBundleOptions,
+    knowledge_graph_reducer_bundle, load_agentic_memory_records_state, memory_append_log,
+    memory_fragment_matches_query, memory_fragment_valid_at, memory_kv, memory_retrieval_bundle,
+    open_persistent_agentic_memory_records, persist_agentic_memory_records, shard_by_tenant,
+    validate_agentic_memory_record, validate_agentic_memory_scope, validate_memory_fragment,
+    AdmissionScore3DOptions, AdmissionScoredOptions, AdmissionScores, AgenticMemoryArtifactKind,
+    AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
+    AgenticMemoryConsolidationOutcome, AgenticMemoryConsolidationRequest,
     AgenticMemoryContextPackingBundleOptions, AgenticMemoryContextPackingPolicy,
     AgenticMemoryErrorCode, AgenticMemoryKgAssertionDraft, AgenticMemoryKgProjectionBundleOptions,
     AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryRecord,
     AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
     AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
-    AgenticMemoryTextProjection, Codec, FactStore, GraphNodeOpts, KnowledgeAssertionObject,
-    MemoryFragment, MemoryQuery, MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode,
-    MemoryRetrievalQuery, MemoryRetrievalStatusState, ShardByTenantOptions,
+    AgenticMemoryTextProjection, AppendLogStorageTier, Codec, FactStore, GraphNodeOpts,
+    KnowledgeAssertion, KnowledgeAssertionObject, KnowledgeGraphPolicy,
+    KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState, KvStorageTier,
+    LoadAgenticMemoryRecordsStateOptions, MemoryFragment, MemoryQuery,
+    MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode, MemoryRetrievalQuery,
+    MemoryRetrievalStatusState, OpenPersistentAgenticMemoryRecordsOptions,
+    PersistAgenticMemoryRecordsOptions, ShardByTenantOptions,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -49,6 +58,29 @@ fn record(id: &str, payload: &str) -> AgenticMemoryRecord<String> {
             user_id: Some("user-1".to_owned()),
             tenant_id: Some("tenant-1".to_owned()),
         }),
+    }
+}
+
+fn json_record(id: &str, payload: &str) -> AgenticMemoryRecord<serde_json::Value> {
+    AgenticMemoryRecord {
+        id: format!("record-{id}"),
+        fragment: MemoryFragment {
+            id: id.to_owned(),
+            payload: json!({ "text": payload }),
+            t_ns: 1,
+            valid_from: None,
+            valid_to: None,
+            confidence: 1.0,
+            tags: vec!["project".to_owned()],
+            sources: Vec::new(),
+            embedding: None,
+            parent_fragment_id: None,
+            provenance: None,
+        },
+        kind: AgenticMemoryKind::Semantic,
+        persistence_level: AgenticMemoryPersistenceLevel::Project,
+        artifact_kind: AgenticMemoryArtifactKind::Insight,
+        scope: None,
     }
 }
 
@@ -1248,4 +1280,224 @@ fn agentic_memory_context_packing_validates_text_projection_facts() {
         packing.status.cache().unwrap().state,
         AgenticMemoryStatusState::Partial
     );
+}
+
+#[test]
+fn knowledge_graph_reducer_materializes_entities_and_errors() {
+    let g = graph();
+    let assertions = g.state_opts(
+        vec![
+            KnowledgeAssertion {
+                id: "a1".to_owned(),
+                subject_id: "person:ada".to_owned(),
+                predicate: "works_on".to_owned(),
+                object: KnowledgeAssertionObject::Entity {
+                    entity_id: "project:graphrefly".to_owned(),
+                },
+                sources: vec!["fact".to_owned()],
+                confidence: 0.9,
+                t_ns: 1,
+            },
+            KnowledgeAssertion {
+                id: "a1".to_owned(),
+                subject_id: "person:ada".to_owned(),
+                predicate: "works_on".to_owned(),
+                object: KnowledgeAssertionObject::Literal {
+                    value: json!("duplicate"),
+                },
+                sources: Vec::new(),
+                confidence: 0.9,
+                t_ns: 2,
+            },
+            KnowledgeAssertion {
+                id: "blocked".to_owned(),
+                subject_id: "person:ada".to_owned(),
+                predicate: "secret".to_owned(),
+                object: KnowledgeAssertionObject::Literal {
+                    value: json!("hidden"),
+                },
+                sources: Vec::new(),
+                confidence: 0.9,
+                t_ns: 3,
+            },
+        ],
+        GraphNodeOpts::named("assertions"),
+    );
+    let policy = g.state_opts(
+        KnowledgeGraphPolicy {
+            allowed_predicates: vec!["works_on".to_owned()],
+        },
+        GraphNodeOpts::named("policy"),
+    );
+    let bundle = knowledge_graph_reducer_bundle(
+        &g,
+        KnowledgeGraphReducerBundleOptions::new(assertions)
+            .with_policy(policy)
+            .named("kg"),
+    );
+    let described = g.describe();
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "assertions" && edge.to == "kg/snapshot"));
+    assert!(described
+        .edges
+        .iter()
+        .any(|edge| edge.from == "kg/snapshot" && edge.to == "kg/entities"));
+    let _entities = bundle.entities.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+    assert_eq!(
+        bundle
+            .entities
+            .cache()
+            .unwrap()
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["person:ada", "project:graphrefly"]
+    );
+    assert_eq!(bundle.errors.cache().unwrap().len(), 2);
+    assert_eq!(
+        bundle.status.cache().unwrap().state,
+        KnowledgeGraphStatusState::Partial
+    );
+}
+
+#[test]
+fn agentic_memory_consolidation_projects_outcomes_without_creating_records() {
+    let g = graph();
+    let requests = g.state_opts(
+        vec![AgenticMemoryConsolidationRequest {
+            command_id: "request-1".to_owned(),
+            record_id: "record-a".to_owned(),
+            fragment_id: "a".to_owned(),
+            reason: Some("merge".to_owned()),
+        }],
+        GraphNodeOpts::named("requests"),
+    );
+    let outcomes = g.state_opts(
+        vec![
+            AgenticMemoryConsolidationOutcome::ProposedRecords {
+                id: "outcome-1".to_owned(),
+                request_id: "request-1".to_owned(),
+                records: vec![record("merged", "merged")],
+                provenance: Some("external".to_owned()),
+            },
+            AgenticMemoryConsolidationOutcome::Failed {
+                id: "missing".to_owned(),
+                request_id: "missing".to_owned(),
+                message: "no request".to_owned(),
+                provenance: None,
+            },
+        ],
+        GraphNodeOpts::named("outcomes"),
+    );
+    let bundle = agentic_memory_consolidation_bundle(
+        &g,
+        AgenticMemoryConsolidationBundleOptions::new(requests, outcomes).named("consolidation"),
+    );
+    let _drafts = bundle.proposed_record_drafts.subscribe(|_| {});
+    let _commands = bundle.commands.subscribe(|_| {});
+    let _errors = bundle.errors.subscribe(|_| {});
+    assert_eq!(bundle.proposed_record_drafts.cache().unwrap().len(), 1);
+    assert_eq!(bundle.commands.cache().unwrap().len(), 1);
+    assert_eq!(
+        bundle.errors.cache().unwrap()[0].code,
+        AgenticMemoryErrorCode::MissingConsolidationRequest
+    );
+}
+
+#[test]
+fn agentic_memory_record_persistence_loads_and_persists_frames() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    let changes = std::rc::Rc::new(memory_append_log::<serde_json::Value>("agentic-records"));
+    let snapshot_key = agentic_memory_records_snapshot_key("agentic").unwrap();
+    snapshots
+        .set(
+            &snapshot_key,
+            agentic_memory_record_snapshot_frame(&[json_record("base", "base")], None).unwrap(),
+        )
+        .unwrap();
+    changes
+        .append(agentic_memory_record_change_frame(&[json_record("next", "next")]).unwrap())
+        .unwrap();
+    let loaded = load_agentic_memory_records_state(
+        snapshots.as_ref(),
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("agentic"),
+            snapshot_key: None,
+            change_log: Some(changes.as_ref()),
+        },
+    )
+    .unwrap();
+    assert_eq!(loaded.source, "snapshot+changes");
+    assert_eq!(loaded.records[0].id, "record-next");
+
+    let g = graph();
+    let records = g.state_opts(vec![json_record("a", "a")], GraphNodeOpts::named("records"));
+    let persistence = persist_agentic_memory_records(
+        &records,
+        PersistAgenticMemoryRecordsOptions {
+            graph: Some(g.clone()),
+            name: Some("agenticPersistence".to_owned()),
+            storage_prefix: Some("agentic-sidecar".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: Some(changes.clone()),
+            snapshot_on_attach: true,
+        },
+    )
+    .unwrap();
+    records.set(vec![json_record("b", "b")]);
+    persistence.flush().unwrap();
+    assert_eq!(persistence.cursor_fact().unwrap().change_seq, Some(1));
+    persistence.dispose();
+}
+
+#[test]
+fn open_persistent_agentic_memory_records_uses_initial_and_rejects_corruption() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    let changes = std::rc::Rc::new(memory_append_log::<serde_json::Value>("agentic-open"));
+    let g = graph();
+    let opened =
+        open_persistent_agentic_memory_records(OpenPersistentAgenticMemoryRecordsOptions {
+            graph: g.clone(),
+            name: Some("agenticRecords".to_owned()),
+            initial: vec![json_record("initial", "initial")],
+            persistence: PersistAgenticMemoryRecordsOptions {
+                graph: None,
+                name: Some("agenticRecords.persistence".to_owned()),
+                storage_prefix: Some("agentic-open".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots.clone(),
+                change_log: Some(changes),
+                snapshot_on_attach: true,
+            },
+        })
+        .unwrap();
+    assert_eq!(opened.records.cache().unwrap()[0].id, "record-initial");
+    opened.persistence.dispose();
+
+    snapshots
+        .set(
+            &agentic_memory_records_snapshot_key("bad").unwrap(),
+            json!({
+                "format": "graphrefly.agentic-memory.records.snapshot",
+                "version": 1,
+                "changeCursor": -1,
+                "records": [],
+                "storageTier": "cold"
+            }),
+        )
+        .unwrap();
+    assert!(load_agentic_memory_records_state(
+        snapshots.as_ref(),
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("bad"),
+            snapshot_key: None,
+            change_log: None,
+        },
+    )
+    .is_err());
 }
