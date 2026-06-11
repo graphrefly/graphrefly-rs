@@ -21,7 +21,7 @@ use crate::patterns::{
 };
 use serde_json::{Map as JsonMap, Number as JsonNumber};
 
-pub const AGENTIC_MEMORY_RECORD_FRAME_FORMAT: &str = "graphrefly.agentic-memory.record";
+pub const AGENTIC_MEMORY_RECORD_FRAME_FORMAT: &str = "graphrefly.agenticMemoryRecord";
 pub const AGENTIC_MEMORY_RECORD_FRAME_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

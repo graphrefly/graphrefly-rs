@@ -17,13 +17,15 @@ use graphrefly::{
     AgenticMemoryKind, AgenticMemoryPersistenceLevel, AgenticMemoryRecord,
     AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
     AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
-    AgenticMemoryTextProjection, AppendLogStorageTier, Codec, FactStore, GraphNodeOpts,
-    KnowledgeAssertion, KnowledgeAssertionObject, KnowledgeGraphPolicy,
+    AgenticMemoryTextProjection, AppendLogEntry, AppendLogReadOptions, AppendLogStorageTier, Codec,
+    FactStore, GraphNodeOpts, KnowledgeAssertion, KnowledgeAssertionObject, KnowledgeGraphPolicy,
     KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState, KvStorageTier,
     LoadAgenticMemoryRecordsStateOptions, MemoryFragment, MemoryQuery,
     MemoryRetrievalBundleOptions, MemoryRetrievalErrorCode, MemoryRetrievalQuery,
     MemoryRetrievalStatusState, OpenPersistentAgenticMemoryRecordsOptions,
-    PersistAgenticMemoryRecordsOptions, ShardByTenantOptions,
+    PersistAgenticMemoryRecordsOptions, ShardByTenantOptions, StorageError, StorageResult,
+    AGENTIC_MEMORY_RECORD_CHANGE_FORMAT, AGENTIC_MEMORY_RECORD_FRAME_FORMAT,
+    AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -81,6 +83,75 @@ fn json_record(id: &str, payload: &str) -> AgenticMemoryRecord<serde_json::Value
         persistence_level: AgenticMemoryPersistenceLevel::Project,
         artifact_kind: AgenticMemoryArtifactKind::Insight,
         scope: None,
+    }
+}
+
+#[derive(Clone)]
+struct StaticAgenticChangeLog {
+    entries: Vec<AppendLogEntry<serde_json::Value>>,
+}
+
+impl AppendLogStorageTier<serde_json::Value> for StaticAgenticChangeLog {
+    fn append(
+        &self,
+        _value: serde_json::Value,
+    ) -> StorageResult<AppendLogEntry<serde_json::Value>> {
+        Err(StorageError::backend(
+            "static agentic change log is read-only in tests",
+        ))
+    }
+
+    fn read(
+        &self,
+        opts: AppendLogReadOptions,
+    ) -> StorageResult<Vec<AppendLogEntry<serde_json::Value>>> {
+        let mut entries = self
+            .entries
+            .iter()
+            .filter(|entry| opts.after.is_none_or(|after| entry.seq > after))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(limit) = opts.limit {
+            entries.truncate(limit);
+        }
+        Ok(entries)
+    }
+
+    fn truncate_after(&self, _seq: u64) -> StorageResult<()> {
+        Err(StorageError::backend(
+            "static agentic change log is read-only in tests",
+        ))
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        Ok(self.entries.len())
+    }
+}
+
+#[derive(Clone)]
+struct FailingAgenticChangeLog;
+
+impl AppendLogStorageTier<serde_json::Value> for FailingAgenticChangeLog {
+    fn append(
+        &self,
+        _value: serde_json::Value,
+    ) -> StorageResult<AppendLogEntry<serde_json::Value>> {
+        Err(StorageError::backend("agentic test append failed"))
+    }
+
+    fn read(
+        &self,
+        _opts: AppendLogReadOptions,
+    ) -> StorageResult<Vec<AppendLogEntry<serde_json::Value>>> {
+        Ok(Vec::new())
+    }
+
+    fn truncate_after(&self, _seq: u64) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> StorageResult<usize> {
+        Ok(0)
     }
 }
 
@@ -982,7 +1053,7 @@ fn agentic_memory_record_frame_codec_roundtrips_and_rejects_corruption() {
     assert_eq!(codec.decode(&encoded).unwrap(), frame);
 
     let mut corrupt = serde_json::to_value(json!({
-        "format": "graphrefly.agentic-memory.record",
+        "format": AGENTIC_MEMORY_RECORD_FRAME_FORMAT,
         "version": 1,
         "record": {
             "id": "record-json",
@@ -1130,6 +1201,49 @@ fn agentic_memory_retention_invalid_command_does_not_poison_later_valid_id() {
     assert_eq!(
         bundle.errors.cache().unwrap()[0].code,
         AgenticMemoryErrorCode::InvalidRetentionCommand
+    );
+}
+
+#[test]
+fn agentic_memory_retention_restore_command_reopens_an_archived_record_view() {
+    let g = graph();
+    let records = g.state_opts(
+        vec![record("active", "active")],
+        GraphNodeOpts::named("records"),
+    );
+    let commands = g.state_opts(
+        vec![
+            AgenticMemoryRetentionCommand {
+                id: "archive".to_owned(),
+                record_id: "record-active".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Archive,
+                reason: None,
+            },
+            AgenticMemoryRetentionCommand {
+                id: "restore".to_owned(),
+                record_id: "record-active".to_owned(),
+                kind: AgenticMemoryRetentionCommandKind::Restore,
+                reason: Some("needed again".to_owned()),
+            },
+        ],
+        GraphNodeOpts::named("commands"),
+    );
+    let bundle = agentic_memory_retention_bundle(
+        &g,
+        AgenticMemoryRetentionBundleOptions::new(records, commands).named("retention"),
+    );
+    let _active = bundle.active_records.subscribe(|_| {});
+    let _archived = bundle.archived_records.subscribe(|_| {});
+    let _status = bundle.status.subscribe(|_| {});
+
+    assert_eq!(
+        bundle.active_records.cache().unwrap()[0].id,
+        "record-active"
+    );
+    assert!(bundle.archived_records.cache().unwrap().is_empty());
+    assert_eq!(
+        bundle.status.cache().unwrap().state,
+        AgenticMemoryStatusState::Ready
     );
 }
 
@@ -1409,31 +1523,203 @@ fn agentic_memory_consolidation_projects_outcomes_without_creating_records() {
 }
 
 #[test]
-fn agentic_memory_record_persistence_loads_and_persists_frames() {
+fn agentic_memory_record_persistence_loads_empty_snapshot_and_change_log_states() {
+    let snapshots = memory_kv::<serde_json::Value>();
+    let empty = load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("agentic-empty"),
+            snapshot_key: None,
+            change_log: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(empty.source, "empty");
+    assert!(!empty.snapshot_found);
+    assert!(empty.records.is_empty());
+    assert_eq!(empty.cursor, None);
+    assert_eq!(empty.changes_applied, 0);
+
+    let changes = StaticAgenticChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "agentic-empty/changes/00000000000000000000".to_owned(),
+            seq: 0,
+            value: agentic_memory_record_change_frame(&[json_record("change", "change")]).unwrap(),
+        }],
+    };
+    let loaded = load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("agentic-empty"),
+            snapshot_key: None,
+            change_log: Some(&changes),
+        },
+    )
+    .unwrap();
+    assert_eq!(loaded.source, "changes");
+    assert_eq!(loaded.records[0].id, "record-change");
+    assert_eq!(loaded.cursor, Some(0));
+    assert_eq!(loaded.changes_applied, 1);
+}
+
+#[test]
+fn agentic_memory_record_persistence_folds_snapshot_and_change_log_cursor() {
     let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
-    let changes = std::rc::Rc::new(memory_append_log::<serde_json::Value>("agentic-records"));
     let snapshot_key = agentic_memory_records_snapshot_key("agentic").unwrap();
     snapshots
         .set(
             &snapshot_key,
-            agentic_memory_record_snapshot_frame(&[json_record("base", "base")], None).unwrap(),
+            agentic_memory_record_snapshot_frame(&[json_record("base", "base")], Some(0)).unwrap(),
         )
         .unwrap();
-    changes
-        .append(agentic_memory_record_change_frame(&[json_record("next", "next")]).unwrap())
-        .unwrap();
+    let changes = StaticAgenticChangeLog {
+        entries: vec![
+            AppendLogEntry {
+                key: "agentic/changes/00000000000000000000".to_owned(),
+                seq: 0,
+                value: agentic_memory_record_change_frame(&[json_record("old", "old")]).unwrap(),
+            },
+            AppendLogEntry {
+                key: "agentic/changes/00000000000000000001".to_owned(),
+                seq: 1,
+                value: agentic_memory_record_change_frame(&[json_record("next", "next")]).unwrap(),
+            },
+        ],
+    };
     let loaded = load_agentic_memory_records_state(
         snapshots.as_ref(),
         LoadAgenticMemoryRecordsStateOptions {
             storage_prefix: Some("agentic"),
             snapshot_key: None,
-            change_log: Some(changes.as_ref()),
+            change_log: Some(&changes),
         },
     )
     .unwrap();
     assert_eq!(loaded.source, "snapshot+changes");
     assert_eq!(loaded.records[0].id, "record-next");
+    assert_eq!(loaded.cursor, Some(1));
+    assert_eq!(loaded.changes_applied, 1);
+}
 
+#[test]
+fn agentic_memory_record_persistence_rejects_malformed_and_sparse_frames() {
+    let snapshots = memory_kv::<serde_json::Value>();
+    snapshots
+        .set(
+            &agentic_memory_records_snapshot_key("missing-records").unwrap(),
+            json!({
+                "format": AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT,
+                "version": 1,
+                "changeCursor": -1
+            }),
+        )
+        .unwrap();
+    assert!(load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("missing-records"),
+            snapshot_key: None,
+            change_log: None,
+        },
+    )
+    .is_err());
+
+    let malformed_change = StaticAgenticChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "bad-change/00000000000000000000".to_owned(),
+            seq: 0,
+            value: json!({
+                "format": AGENTIC_MEMORY_RECORD_CHANGE_FORMAT,
+                "version": 1,
+                "change": { "kind": "replaceOne", "records": [] }
+            }),
+        }],
+    };
+    assert!(load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("bad-change"),
+            snapshot_key: None,
+            change_log: Some(&malformed_change),
+        },
+    )
+    .is_err());
+
+    let sparse_change_log = StaticAgenticChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "sparse-change/00000000000000000001".to_owned(),
+            seq: 1,
+            value: agentic_memory_record_change_frame(&[json_record("late", "late")]).unwrap(),
+        }],
+    };
+    assert!(load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("sparse-change"),
+            snapshot_key: None,
+            change_log: Some(&sparse_change_log),
+        },
+    )
+    .is_err());
+
+    let mut duplicate_record_id = json_record("dup-a", "a");
+    duplicate_record_id.id = "record-duplicate".to_owned();
+    let mut duplicate_fragment_id = json_record("dup-b", "b");
+    duplicate_fragment_id.id = "record-duplicate".to_owned();
+    snapshots
+        .set(
+            &agentic_memory_records_snapshot_key("duplicate-records").unwrap(),
+            agentic_memory_record_snapshot_frame(
+                &[duplicate_record_id, duplicate_fragment_id],
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("duplicate-records"),
+            snapshot_key: None,
+            change_log: None,
+        },
+    )
+    .is_err());
+
+    let duplicate_fragment_change = StaticAgenticChangeLog {
+        entries: vec![AppendLogEntry {
+            key: "duplicate-fragments/00000000000000000000".to_owned(),
+            seq: 0,
+            value: agentic_memory_record_change_frame(&[
+                json_record("same-fragment", "a"),
+                AgenticMemoryRecord {
+                    id: "record-other-owner".to_owned(),
+                    fragment: json_record("same-fragment", "b").fragment,
+                    kind: AgenticMemoryKind::Semantic,
+                    persistence_level: AgenticMemoryPersistenceLevel::Project,
+                    artifact_kind: AgenticMemoryArtifactKind::Insight,
+                    scope: None,
+                },
+            ])
+            .unwrap(),
+        }],
+    };
+    assert!(load_agentic_memory_records_state(
+        &snapshots,
+        LoadAgenticMemoryRecordsStateOptions {
+            storage_prefix: Some("duplicate-fragments"),
+            snapshot_key: None,
+            change_log: Some(&duplicate_fragment_change),
+        },
+    )
+    .is_err());
+}
+
+#[test]
+fn agentic_memory_record_persistence_writes_frames_flushes_and_disposes() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    let changes = std::rc::Rc::new(memory_append_log::<serde_json::Value>("agentic-records"));
+    let snapshot_key = agentic_memory_records_snapshot_key("agentic-sidecar").unwrap();
     let g = graph();
     let records = g.state_opts(vec![json_record("a", "a")], GraphNodeOpts::named("records"));
     let persistence = persist_agentic_memory_records(
@@ -1449,10 +1735,170 @@ fn agentic_memory_record_persistence_loads_and_persists_frames() {
         },
     )
     .unwrap();
+    let attached_snapshot = snapshots.get(&snapshot_key).unwrap().unwrap();
+    assert_eq!(
+        attached_snapshot["records"][0]["record"]["id"],
+        json!("record-a")
+    );
+
     records.set(vec![json_record("b", "b")]);
+    let change_entries = changes.read(AppendLogReadOptions::default()).unwrap();
+    assert_eq!(change_entries.len(), 1);
+    assert_eq!(
+        change_entries[0].value["change"]["records"][0]["record"]["id"],
+        json!("record-b")
+    );
+    assert_eq!(persistence.cursor_fact().unwrap().change_seq, Some(0));
+    let change_count_before_flush = changes.read(AppendLogReadOptions::default()).unwrap().len();
     persistence.flush().unwrap();
-    assert_eq!(persistence.cursor_fact().unwrap().change_seq, Some(1));
+    let status = persistence.status.cache().unwrap();
+    assert_eq!(status["state"], json!("ready"));
+    assert_eq!(status["pending"], json!(0));
+    assert_eq!(
+        changes.read(AppendLogReadOptions::default()).unwrap().len(),
+        change_count_before_flush
+    );
+
     persistence.dispose();
+    records.set(vec![json_record("c", "c")]);
+    assert_eq!(
+        changes.read(AppendLogReadOptions::default()).unwrap().len(),
+        change_count_before_flush
+    );
+    assert!(persistence.snapshot().is_err());
+    assert_eq!(
+        persistence.status.cache().unwrap()["state"],
+        json!("disposed")
+    );
+}
+
+#[test]
+fn agentic_memory_record_persist_observes_existing_node_without_hydrating_from_storage() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    snapshots
+        .set(
+            &agentic_memory_records_snapshot_key("agentic-no-hydrate").unwrap(),
+            agentic_memory_record_snapshot_frame(&[json_record("stored", "stored")], None).unwrap(),
+        )
+        .unwrap();
+    let g = graph();
+    let records = g.state_opts(
+        vec![json_record("live", "live")],
+        GraphNodeOpts::named("records"),
+    );
+    let persistence = persist_agentic_memory_records(
+        &records,
+        PersistAgenticMemoryRecordsOptions {
+            graph: Some(g),
+            name: Some("agenticNoHydrate".to_owned()),
+            storage_prefix: Some("agentic-no-hydrate".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots.clone(),
+            change_log: None,
+            snapshot_on_attach: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(records.cache().unwrap()[0].id, "record-live");
+    assert_eq!(
+        snapshots
+            .get(&agentic_memory_records_snapshot_key("agentic-no-hydrate").unwrap())
+            .unwrap()
+            .unwrap()["records"][0]["record"]["id"],
+        json!("record-stored")
+    );
+    persistence.dispose();
+}
+
+#[test]
+fn agentic_memory_record_persistence_surfaces_change_write_errors_as_graph_facts() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    let changes: std::rc::Rc<dyn AppendLogStorageTier<serde_json::Value>> =
+        std::rc::Rc::new(FailingAgenticChangeLog);
+    let g = graph();
+    let records = g.state_opts(vec![json_record("a", "a")], GraphNodeOpts::named("records"));
+    let persistence = persist_agentic_memory_records(
+        &records,
+        PersistAgenticMemoryRecordsOptions {
+            graph: Some(g),
+            name: Some("agenticFailingPersistence".to_owned()),
+            storage_prefix: Some("agentic-failing".to_owned()),
+            snapshot_key: None,
+            snapshot_store: snapshots,
+            change_log: Some(changes),
+            snapshot_on_attach: false,
+        },
+    )
+    .unwrap();
+
+    records.set(vec![json_record("b", "b")]);
+
+    assert_eq!(persistence.ready.cache(), Some(false));
+    assert_eq!(
+        persistence.status.cache().unwrap()["state"],
+        json!("errored")
+    );
+    assert_eq!(persistence.status.cache().unwrap()["errors"], json!(1));
+    assert_eq!(persistence.error.cache().unwrap()["phase"], json!("change"));
+    assert!(persistence.error.cache().unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .contains("agentic test append failed"));
+    assert_eq!(persistence.cursor_fact().unwrap().change_writes, 0);
+    assert!(persistence.flush().is_err());
+    assert_eq!(
+        persistence.status.cache().unwrap()["state"],
+        json!("errored")
+    );
+    assert_eq!(persistence.ready.cache(), Some(false));
+    persistence.dispose();
+}
+
+#[test]
+fn open_persistent_agentic_memory_records_preserves_loaded_change_cursor_on_attach() {
+    let snapshots = std::rc::Rc::new(memory_kv::<serde_json::Value>());
+    let changes = std::rc::Rc::new(memory_append_log::<serde_json::Value>(
+        "agentic-open-cursor",
+    ));
+    let snapshot_key = agentic_memory_records_snapshot_key("agentic-open-cursor").unwrap();
+    snapshots
+        .set(
+            &snapshot_key,
+            agentic_memory_record_snapshot_frame(&[json_record("base", "base")], None).unwrap(),
+        )
+        .unwrap();
+    changes
+        .append(agentic_memory_record_change_frame(&[json_record("next", "next")]).unwrap())
+        .unwrap();
+    let g = graph();
+    let opened =
+        open_persistent_agentic_memory_records(OpenPersistentAgenticMemoryRecordsOptions {
+            graph: g,
+            name: Some("agenticOpenCursor".to_owned()),
+            initial: Vec::new(),
+            persistence: PersistAgenticMemoryRecordsOptions {
+                graph: None,
+                name: Some("agenticOpenCursor.persistence".to_owned()),
+                storage_prefix: Some("agentic-open-cursor".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots.clone(),
+                change_log: Some(changes),
+                snapshot_on_attach: true,
+            },
+        })
+        .unwrap();
+
+    assert_eq!(opened.loaded.cursor, Some(0));
+    assert_eq!(
+        opened.persistence.cursor_fact().unwrap().change_seq,
+        Some(0)
+    );
+    assert_eq!(
+        snapshots.get(&snapshot_key).unwrap().unwrap()["changeCursor"],
+        json!(0)
+    );
+    opened.persistence.dispose();
 }
 
 #[test]
@@ -1483,7 +1929,7 @@ fn open_persistent_agentic_memory_records_uses_initial_and_rejects_corruption() 
         .set(
             &agentic_memory_records_snapshot_key("bad").unwrap(),
             json!({
-                "format": "graphrefly.agentic-memory.records.snapshot",
+                "format": AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT,
                 "version": 1,
                 "changeCursor": -1,
                 "records": [],

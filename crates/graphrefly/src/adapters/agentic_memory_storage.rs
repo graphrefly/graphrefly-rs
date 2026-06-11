@@ -2,8 +2,11 @@
 //!
 //! This adapter composes D166 strict record frames with passive storage tiers.
 //! It never restores a live graph and never adds storage fields to records.
+//! The v1 sidecar assumes a single writer per chosen storage prefix/change log;
+//! corrupt, sparse, or non-contiguous durable input fails honestly during load.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use serde_json::{json, Value};
@@ -22,9 +25,8 @@ use crate::storage::{
 
 type Disposer = Box<dyn FnOnce()>;
 
-pub const AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT: &str =
-    "graphrefly.agentic-memory.records.snapshot";
-pub const AGENTIC_MEMORY_RECORD_CHANGE_FORMAT: &str = "graphrefly.agentic-memory.records.change";
+pub const AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT: &str = "graphrefly.agenticMemory.records.snapshot";
+pub const AGENTIC_MEMORY_RECORD_CHANGE_FORMAT: &str = "graphrefly.agenticMemory.records.change";
 pub const AGENTIC_MEMORY_RECORD_STORAGE_FRAME_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +84,11 @@ pub struct PersistAgenticMemoryRecordsOptions {
     pub storage_prefix: Option<String>,
     pub snapshot_key: Option<String>,
     pub snapshot_store: Rc<dyn KvStorageTier<Value>>,
+    /// Optional append-only change log.
+    ///
+    /// D172 v1 assumes one writer per selected log/prefix. Multi-writer merge,
+    /// fencing, and conflict repair belong in a future adapter decision; this
+    /// sidecar loads only contiguous frames and reports gaps as corruption.
     pub change_log: Option<Rc<dyn AppendLogStorageTier<Value>>>,
     pub snapshot_on_attach: bool,
 }
@@ -259,6 +266,14 @@ pub fn persist_agentic_memory_records(
     records: &Node<Vec<AgenticMemoryRecord<JsonValue>>>,
     options: PersistAgenticMemoryRecordsOptions,
 ) -> StorageResult<AgenticMemoryRecordsPersistence> {
+    persist_agentic_memory_records_with_cursor(records, options, None)
+}
+
+fn persist_agentic_memory_records_with_cursor(
+    records: &Node<Vec<AgenticMemoryRecord<JsonValue>>>,
+    options: PersistAgenticMemoryRecordsOptions,
+    initial_change_seq: Option<u64>,
+) -> StorageResult<AgenticMemoryRecordsPersistence> {
     let graph = options.graph.as_ref().ok_or_else(|| {
         StorageError::backend(
             "persistAgenticMemoryRecords: graph is required for graph-visible sidecar facts",
@@ -286,21 +301,22 @@ pub fn persist_agentic_memory_records(
             AgenticMemoryRecordsPersistenceStatus::Starting,
             0,
             0,
-            cursor_json(None, 0, 0),
+            cursor_json(initial_change_seq, 0, 0),
         ),
         GraphNodeOpts::named(format!("{prefix}.status")),
     );
     let error = graph.state_opts(Value::Null, GraphNodeOpts::named(format!("{prefix}.error")));
     let cursor = graph.state_opts(
-        cursor_json(None, 0, 0),
+        cursor_json(initial_change_seq, 0, 0),
         GraphNodeOpts::named(format!("{prefix}.cursor")),
     );
     let latest = Rc::new(RefCell::new(records.cache().unwrap_or_default()));
-    let change_seq = Rc::new(Cell::new(None::<u64>));
+    let change_seq = Rc::new(Cell::new(initial_change_seq));
     let snapshot_writes = Rc::new(Cell::new(0usize));
     let change_writes = Rc::new(Cell::new(0usize));
     let error_count = Rc::new(Cell::new(0usize));
     let disposed = Rc::new(Cell::new(false));
+    let failed_write = Rc::new(RefCell::new(None::<StorageError>));
     let snapshot_store = options.snapshot_store.clone();
     let change_log = options.change_log.clone();
 
@@ -315,9 +331,11 @@ pub fn persist_agentic_memory_records(
         let status = status.clone();
         let error = error.clone();
         let cursor = cursor.clone();
+        let failed_write = failed_write.clone();
         move || {
             let frame = agentic_memory_record_snapshot_frame(&latest.borrow(), change_seq.get())?;
             snapshot_store.set(&snapshot_key, frame)?;
+            failed_write.replace(None);
             snapshot_writes.set(snapshot_writes.get().saturating_add(1));
             let cursor_value =
                 cursor_json(change_seq.get(), snapshot_writes.get(), change_writes.get());
@@ -342,7 +360,7 @@ pub fn persist_agentic_memory_records(
             AgenticMemoryRecordsPersistenceStatus::Ready,
             0,
             0,
-            cursor_json(None, 0, 0),
+            cursor_json(initial_change_seq, 0, 0),
         ));
     }
 
@@ -359,6 +377,7 @@ pub fn persist_agentic_memory_records(
         let error = error.clone();
         let cursor = cursor.clone();
         let error_count = error_count.clone();
+        let failed_write = failed_write.clone();
         let subscribing = subscribing.clone();
         records.subscribe(move |message| {
             let Message::Data(next) = message else {
@@ -382,6 +401,7 @@ pub fn persist_agentic_memory_records(
                 .and_then(|frame| change_log.append(frame).map(|entry| entry.seq))
             {
                 Ok(seq) => {
+                    failed_write.replace(None);
                     change_seq.set(Some(seq));
                     change_writes.set(change_writes.get().saturating_add(1));
                     let cursor_value =
@@ -397,6 +417,7 @@ pub fn persist_agentic_memory_records(
                     cursor.set(cursor_value);
                 }
                 Err(err) => {
+                    failed_write.replace(Some(err.clone()));
                     error_count.set(error_count.get().saturating_add(1));
                     ready.set(false);
                     let cursor_value =
@@ -422,12 +443,25 @@ pub fn persist_agentic_memory_records(
         let change_writes = change_writes.clone();
         let error_count = error_count.clone();
         let disposed = disposed.clone();
+        let error = error.clone();
+        let failed_write = failed_write.clone();
         Rc::new(move || {
             if disposed.get() {
                 return Ok(());
             }
             let cursor_value =
                 cursor_json(change_seq.get(), snapshot_writes.get(), change_writes.get());
+            if let Some(err) = failed_write.borrow().clone() {
+                ready.set(false);
+                status.set(status_json(
+                    AgenticMemoryRecordsPersistenceStatus::Errored,
+                    0,
+                    error_count.get(),
+                    cursor_value.clone(),
+                ));
+                error.set(error_json("flush", &err, cursor_value));
+                return Err(err);
+            }
             ready.set(true);
             status.set(status_json(
                 AgenticMemoryRecordsPersistenceStatus::Ready,
@@ -528,7 +562,8 @@ pub fn open_persistent_agentic_memory_records(
     if persistence_options.graph.is_none() {
         persistence_options.graph = Some(options.graph.clone());
     }
-    let persistence = persist_agentic_memory_records(&records, persistence_options)?;
+    let persistence =
+        persist_agentic_memory_records_with_cursor(&records, persistence_options, loaded.cursor)?;
     Ok(OpenPersistentAgenticMemoryRecords {
         records,
         persistence,
@@ -575,6 +610,7 @@ fn parse_snapshot_frame(value: &Value) -> StorageResult<ParsedSnapshot> {
         .iter()
         .map(record_from_frame_json)
         .collect::<StorageResult<Vec<_>>>()?;
+    validate_unique_record_set(&records, "agentic memory snapshot frame")?;
     Ok(ParsedSnapshot {
         records,
         change_cursor,
@@ -617,7 +653,7 @@ fn parse_change_frame(value: &Value) -> StorageResult<Vec<AgenticMemoryRecord<Js
             "agentic memory change frame: change.kind must be replaceAll",
         ));
     }
-    change
+    let records = change
         .get("records")
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -625,7 +661,32 @@ fn parse_change_frame(value: &Value) -> StorageResult<Vec<AgenticMemoryRecord<Js
         })?
         .iter()
         .map(record_from_frame_json)
-        .collect()
+        .collect::<StorageResult<Vec<_>>>()?;
+    validate_unique_record_set(&records, "agentic memory change frame")?;
+    Ok(records)
+}
+
+fn validate_unique_record_set(
+    records: &[AgenticMemoryRecord<JsonValue>],
+    context: &str,
+) -> StorageResult<()> {
+    let mut record_ids = HashSet::new();
+    let mut fragment_ids = HashSet::new();
+    for record in records {
+        if !record_ids.insert(record.id.as_str()) {
+            return Err(StorageError::backend(format!(
+                "{context}: duplicate record id '{}'",
+                record.id
+            )));
+        }
+        if !fragment_ids.insert(record.fragment.id.as_str()) {
+            return Err(StorageError::backend(format!(
+                "{context}: duplicate fragment id '{}'",
+                record.fragment.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn record_frame_json(record: &AgenticMemoryRecord<JsonValue>) -> StorageResult<Value> {
