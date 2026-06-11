@@ -282,6 +282,30 @@ pub trait LocalWebSocketDriver {
     ) -> Option<DriverCancel> {
         None
     }
+
+    fn connect_session(
+        &self,
+        _request: WebSocketRequest,
+        _callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+    ) -> Option<Rc<dyn LocalWebSocketSession>> {
+        None
+    }
+}
+
+/// Live same-connection WebSocket session handle for D133/D174 SessionBundles.
+///
+/// Drivers create handles; graph-visible bundles own lifecycle, retry, status,
+/// command facts, and callback fencing.
+pub trait LocalWebSocketSession {
+    fn send(
+        &self,
+        message: WebSocketSend,
+        callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
+    ) -> DriverCancel;
+
+    fn close(&self, code: Option<u16>, reason: Option<String>);
+
+    fn cancel(&self);
 }
 
 pub enum WebhookDriverEvent {
@@ -560,6 +584,218 @@ impl LocalWebSocketDriver for TokioWebSocketDriver {
             cancel_task();
         }))
     }
+
+    fn connect_session(
+        &self,
+        request: WebSocketRequest,
+        callback: Rc<dyn Fn(WebSocketDriverEvent)>,
+    ) -> Option<Rc<dyn LocalWebSocketSession>> {
+        let active = Rc::new(std::cell::Cell::new(true));
+        let opened = Rc::new(std::cell::Cell::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TokioWebSocketSessionCommand>(1);
+        let active_for_task = active.clone();
+        let opened_for_task = opened.clone();
+        let cancel_task = TokioLocalDriver.spawn_local(Box::pin(async move {
+            let client_request = match websocket_client_request(request) {
+                Ok(request) => request,
+                Err(error) => {
+                    if active_for_task.get() {
+                        callback(WebSocketDriverEvent::Error(error));
+                    }
+                    return;
+                }
+            };
+            let (mut socket, _response) =
+                match tokio_tungstenite::connect_async(client_request).await {
+                    Ok(connected) => connected,
+                    Err(error) => {
+                        if active_for_task.get() {
+                            callback(WebSocketDriverEvent::Error(Box::new(error)));
+                        }
+                        return;
+                    }
+                };
+            opened_for_task.set(true);
+            if active_for_task.get() {
+                callback(WebSocketDriverEvent::Event(WebSocketEvent::Open));
+            }
+            while active_for_task.get() {
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(TokioWebSocketSessionCommand::Send { message, active, callback }) => {
+                                if !active.get() || !active_for_task.get() {
+                                    continue;
+                                }
+                                let result = match websocket_message_from_send(message) {
+                                    Ok(message) => socket
+                                        .send(message)
+                                        .await
+                                        .map(|()| WebSocketSendResult { sent: true })
+                                        .map_err(|error| Box::new(error) as GraphError),
+                                    Err(error) => Err(error),
+                                };
+                                if active.get() && active_for_task.get() {
+                                    callback(result);
+                                }
+                            }
+                            Some(TokioWebSocketSessionCommand::Close { code, reason }) => {
+                                let frame = websocket_close_frame(code, reason);
+                                let _ = socket.close(frame).await;
+                                active_for_task.set(false);
+                                opened_for_task.set(false);
+                                break;
+                            }
+                            Some(TokioWebSocketSessionCommand::Cancel) | None => {
+                                let _ = socket.close(None).await;
+                                active_for_task.set(false);
+                                opened_for_task.set(false);
+                                break;
+                            }
+                        }
+                    }
+                    message = socket.next() => {
+                        match message {
+                            Some(Ok(message)) => {
+                                if !active_for_task.get() {
+                                    break;
+                                }
+                                if let Some((event, complete)) = websocket_event_from_message(message) {
+                                    callback(WebSocketDriverEvent::Event(event));
+                                    if complete {
+                                        callback(WebSocketDriverEvent::Complete);
+                                        active_for_task.set(false);
+                                        opened_for_task.set(false);
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Err(error)) => {
+                                if active_for_task.get() {
+                                    callback(WebSocketDriverEvent::Error(Box::new(error)));
+                                }
+                                active_for_task.set(false);
+                                opened_for_task.set(false);
+                                break;
+                            }
+                            None => {
+                                if active_for_task.get() {
+                                    callback(WebSocketDriverEvent::Complete);
+                                }
+                                active_for_task.set(false);
+                                opened_for_task.set(false);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        Some(Rc::new(TokioWebSocketSession {
+            active,
+            closing: Rc::new(std::cell::Cell::new(false)),
+            opened,
+            tx,
+            cancel_task: Rc::new(std::cell::RefCell::new(Some(cancel_task))),
+        }))
+    }
+}
+
+#[cfg(feature = "tokio-websocket")]
+enum TokioWebSocketSessionCommand {
+    Send {
+        message: WebSocketSend,
+        active: Rc<std::cell::Cell<bool>>,
+        callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
+    },
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+    Cancel,
+}
+
+#[cfg(feature = "tokio-websocket")]
+struct TokioWebSocketSession {
+    active: Rc<std::cell::Cell<bool>>,
+    closing: Rc<std::cell::Cell<bool>>,
+    opened: Rc<std::cell::Cell<bool>>,
+    tx: tokio::sync::mpsc::Sender<TokioWebSocketSessionCommand>,
+    cancel_task: Rc<std::cell::RefCell<Option<DriverCancel>>>,
+}
+
+#[cfg(feature = "tokio-websocket")]
+impl LocalWebSocketSession for TokioWebSocketSession {
+    fn send(
+        &self,
+        message: WebSocketSend,
+        callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
+    ) -> DriverCancel {
+        let send_active = Rc::new(std::cell::Cell::new(true));
+        if !self.active.get() {
+            send_active.set(false);
+            callback(Err("websocket session is closed".into()));
+            return Box::new(|| {});
+        }
+        match self.tx.try_send(TokioWebSocketSessionCommand::Send {
+            message,
+            active: send_active.clone(),
+            callback,
+        }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                send_active.set(false);
+                let TokioWebSocketSessionCommand::Send { callback, .. } = command else {
+                    return Box::new(|| {});
+                };
+                callback(Err("websocket session send queue is busy".into()));
+                return Box::new(|| {});
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(command)) => {
+                send_active.set(false);
+                let TokioWebSocketSessionCommand::Send { callback, .. } = command else {
+                    return Box::new(|| {});
+                };
+                callback(Err("websocket session is closed".into()));
+                return Box::new(|| {});
+            }
+        }
+        Box::new(move || {
+            send_active.set(false);
+        })
+    }
+
+    fn close(&self, code: Option<u16>, reason: Option<String>) {
+        if self.active.get() {
+            self.closing.set(true);
+            if !self.opened.get()
+                || self
+                    .tx
+                    .try_send(TokioWebSocketSessionCommand::Close { code, reason })
+                    .is_err()
+            {
+                self.cancel();
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        if self.active.replace(false) {
+            let _ = self.tx.try_send(TokioWebSocketSessionCommand::Cancel);
+            if let Some(cancel) = self.cancel_task.borrow_mut().take() {
+                cancel();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tokio-websocket")]
+impl Drop for TokioWebSocketSession {
+    fn drop(&mut self) {
+        if self.active.get() && !self.closing.get() {
+            self.cancel();
+        }
+    }
 }
 
 #[cfg(feature = "tokio-websocket")]
@@ -619,6 +855,23 @@ fn websocket_event_from_message(
         | tokio_tungstenite::tungstenite::Message::Pong(_)
         | tokio_tungstenite::tungstenite::Message::Frame(_) => None,
     }
+}
+
+#[cfg(feature = "tokio-websocket")]
+fn websocket_close_frame(
+    code: Option<u16>,
+    reason: Option<String>,
+) -> Option<tokio_tungstenite::tungstenite::protocol::CloseFrame> {
+    if code.is_none() && reason.is_none() {
+        return None;
+    }
+    let code = code
+        .map(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from)
+        .unwrap_or(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal);
+    Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+        code,
+        reason: reason.unwrap_or_default().into(),
+    })
 }
 
 /// Graph-local environment capabilities for source/adapter boundaries.
@@ -719,7 +972,7 @@ impl fmt::Debug for EnvironmentDrivers {
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::time::Duration;
 
     #[cfg(feature = "tokio")]
@@ -1036,6 +1289,127 @@ mod tests {
             );
             assert_eq!(received.borrow().as_deref(), Some("text:hello"));
             assert_eq!(seen_header.borrow().as_deref(), Some("send"));
+        });
+    }
+
+    #[cfg(feature = "tokio-websocket")]
+    #[test]
+    fn tokio_websocket_driver_session_sends_over_same_connection_and_closes() {
+        run_tokio_local(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback websocket server");
+            let addr = listener.local_addr().expect("loopback addr");
+            let received = Rc::new(RefCell::new(Vec::<String>::new()));
+            let received_for_task = received.clone();
+            let closed = Rc::new(Cell::new(false));
+            let closed_for_task = closed.clone();
+            tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.expect("accept websocket client");
+                let mut socket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept websocket handshake");
+                while let Some(message) = socket.next().await {
+                    match message.expect("websocket message") {
+                        tokio_tungstenite::tungstenite::Message::Text(text) => {
+                            received_for_task.borrow_mut().push(text.to_string());
+                        }
+                        tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                            received_for_task
+                                .borrow_mut()
+                                .push(String::from_utf8_lossy(&bytes).into_owned());
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(_) => {
+                            closed_for_task.set(true);
+                            break;
+                        }
+                        tokio_tungstenite::tungstenite::Message::Ping(_)
+                        | tokio_tungstenite::tungstenite::Message::Pong(_)
+                        | tokio_tungstenite::tungstenite::Message::Frame(_) => {}
+                    }
+                }
+            });
+
+            let events = Rc::new(RefCell::new(Vec::<String>::new()));
+            let events_for_callback = events.clone();
+            let session = TokioWebSocketDriver
+                .connect_session(
+                    WebSocketRequest::new(format!("ws://{addr}")),
+                    Rc::new(move |event| match event {
+                        WebSocketDriverEvent::Event(WebSocketEvent::Open) => {
+                            events_for_callback.borrow_mut().push("open".to_owned());
+                        }
+                        WebSocketDriverEvent::Event(WebSocketEvent::Close { .. }) => {
+                            events_for_callback.borrow_mut().push("close".to_owned());
+                        }
+                        WebSocketDriverEvent::Complete => {
+                            events_for_callback.borrow_mut().push("complete".to_owned());
+                        }
+                        WebSocketDriverEvent::Event(WebSocketEvent::Text(_))
+                        | WebSocketDriverEvent::Event(WebSocketEvent::Binary(_)) => {}
+                        WebSocketDriverEvent::Error(error) => {
+                            events_for_callback
+                                .borrow_mut()
+                                .push(format!("error:{error}"));
+                        }
+                    }),
+                )
+                .expect("session capability installed");
+            wait_until("session open", || {
+                events.borrow().iter().any(|event| event == "open")
+            })
+            .await;
+
+            let first = Rc::new(RefCell::new(None::<Result<WebSocketSendResult, String>>));
+            let first_for_callback = first.clone();
+            let _cancel_first = session.send(
+                WebSocketSend::text("one"),
+                Box::new(move |result| {
+                    *first_for_callback.borrow_mut() =
+                        Some(result.map_err(|error| error.to_string()));
+                }),
+            );
+            wait_until("first session send", || {
+                first.borrow().is_some() && received.borrow().len() == 1
+            })
+            .await;
+            let second = Rc::new(RefCell::new(None::<Result<WebSocketSendResult, String>>));
+            let second_for_callback = second.clone();
+            let _cancel_second = session.send(
+                WebSocketSend::text("two"),
+                Box::new(move |result| {
+                    *second_for_callback.borrow_mut() =
+                        Some(result.map_err(|error| error.to_string()));
+                }),
+            );
+
+            wait_until("second session send", || {
+                second.borrow().is_some() && received.borrow().len() == 2
+            })
+            .await;
+            session.close(Some(1000), Some("done".to_owned()));
+            wait_until("session close reaches server", || closed.get()).await;
+
+            assert_eq!(
+                first
+                    .borrow_mut()
+                    .take()
+                    .expect("first send callback")
+                    .expect("first send result"),
+                WebSocketSendResult { sent: true }
+            );
+            assert_eq!(
+                second
+                    .borrow_mut()
+                    .take()
+                    .expect("second send callback")
+                    .expect("second send result"),
+                WebSocketSendResult { sent: true }
+            );
+            assert_eq!(
+                received.borrow().as_slice(),
+                &["one".to_owned(), "two".to_owned()]
+            );
         });
     }
 }

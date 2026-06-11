@@ -112,8 +112,11 @@ pub use adapters::bridge::{
 };
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
-    to_websocket_with_options, OutboundAdapterOptions, OutboundBundle, OutboundEvent,
-    OutboundState, OutboundStatus,
+    to_websocket_with_options, websocket_session, websocket_session_with_options,
+    OutboundAdapterOptions, OutboundBundle, OutboundEvent, OutboundState, OutboundStatus,
+    WebSocketSessionBundle, WebSocketSessionCommand, WebSocketSessionInbound,
+    WebSocketSessionLifecycle, WebSocketSessionOptions, WebSocketSessionStateKind,
+    WebSocketSessionStatus,
 };
 pub use adapters::reactive_collection_storage::{
     open_persistent_reactive_index, open_persistent_reactive_list, open_persistent_reactive_log,
@@ -179,9 +182,10 @@ pub use environment::TokioProcessDriver;
 pub use environment::TokioWebSocketDriver;
 pub use environment::{
     EnvironmentDrivers, HttpRequest, HttpResponse, LocalHttpDriver, LocalProcessDriver,
-    LocalSseDriver, LocalWebSocketDriver, LocalWebhookDriver, ProcessCommand, ProcessResult,
-    SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
-    WebSocketSend, WebSocketSendResult, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
+    LocalSseDriver, LocalWebSocketDriver, LocalWebSocketSession, LocalWebhookDriver,
+    ProcessCommand, ProcessResult, SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent,
+    WebSocketEvent, WebSocketRequest, WebSocketSend, WebSocketSendResult, WebhookDriverEvent,
+    WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
