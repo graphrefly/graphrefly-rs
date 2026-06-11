@@ -206,10 +206,17 @@ pub use operators::{
     settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
 };
 pub use patterns::{
-    memory_retrieval_bundle, FactId, MemoryAnswer, MemoryFragment, MemoryRetrievalBundle,
-    MemoryRetrievalBundleOptions, MemoryRetrievalCursor, MemoryRetrievalError,
-    MemoryRetrievalErrorCode, MemoryRetrievalFact, MemoryRetrievalIndex, MemoryRetrievalQuery,
-    MemoryRetrievalSnapshot, MemoryRetrievalStatus, MemoryRetrievalStatusState,
+    admission_filter_3d, admission_scored, cosine_similarity, filter_memory_fragments,
+    memory_fragment_matches_query, memory_fragment_valid_at, memory_retrieval_bundle,
+    shard_by_tenant, validate_memory_fragment, AdmissionScore3DFn, AdmissionScore3DOptions,
+    AdmissionScoreFn, AdmissionScoredOptions, AdmissionScores, AdmissionThresholds,
+    CollectionEntry, FactId, FactStore, MemoryAnswer, MemoryFragment, MemoryFragmentValidation,
+    MemoryQuery, MemoryRetrievalBundle, MemoryRetrievalBundleOptions, MemoryRetrievalCursor,
+    MemoryRetrievalError, MemoryRetrievalErrorCode, MemoryRetrievalFact, MemoryRetrievalIndex,
+    MemoryRetrievalQuery, MemoryRetrievalSnapshot, MemoryRetrievalStatus,
+    MemoryRetrievalStatusState, OutcomeSignal, RankedCollectionEntry, RetrievalEntry,
+    RetrievalEntrySource, RetrievalQuery, RetrievalTrace, ShardByFn, ShardByTenantConfig,
+    ShardByTenantOptions, ShardKey, StoreReadHandle, TenantShardFn, VectorSearchResult,
 };
 pub use process::{
     process_bundle, process_effect_runner, ProcessAuditOutcome, ProcessAuditRecord, ProcessBundle,
