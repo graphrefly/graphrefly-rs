@@ -6,13 +6,14 @@ use graphrefly::{
     default_dispatcher, default_restore_registry, describe_to_ascii, describe_to_d2,
     describe_to_d2_with_direction, describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
     describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, explain_path,
-    filter, from_iter, graph, graph_opts, map, merge, of, reachable, reactive_list, restore_graph,
-    restore_registry, scan, take, timeout, topology_diff, validate_no_islands, DescribeEdge,
-    DescribeEvent, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection,
-    Dispatcher, Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge,
-    GraphCheckpointFactory, GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions,
-    GraphRestoreDefinition, GraphRestoreEntry, IslandReport, LockId, Message, Node, NodeOpts,
-    NodeVersion, NodeVersioningPolicy, Pausable, ReachableDirection, ReachableOptions,
+    filter, from_iter, graph, graph_opts, map, merge, of, profile_summary,
+    profile_summary_from_snapshots, reachable, reactive_list, restore_graph, restore_registry,
+    scan, take, timeout, topology_diff, validate_no_islands, DescribeEdge, DescribeEvent,
+    DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher,
+    Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
+    GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions, GraphRestoreDefinition,
+    GraphRestoreEntry, IslandReport, LockId, Message, Node, NodeOpts, NodeVersion,
+    NodeVersioningPolicy, Pausable, ProfileSummaryOptions, ReachableDirection, ReachableOptions,
     ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, TopologyEvent,
     TopologyEventKind, TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
 };
@@ -1734,6 +1735,96 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
     let profile = panics.profile();
     assert_eq!(profile.nodes["bad"].invokes, 1);
     assert_eq!(profile.nodes["bad"].status, Status::Errored);
+}
+
+#[test]
+fn profile_summary_rolls_up_existing_profile_and_describe_facts() {
+    let g = graph_opts(GraphOptions {
+        name: Some("profile-summary".to_owned()),
+        profile: true,
+        dispatcher: Some(Dispatcher::new()),
+        ..GraphOptions::default()
+    });
+    let source = g.state_opts(0i32, GraphNodeOpts::named("source"));
+    let doubled = g.derived_opts(
+        vec![source.erased()],
+        |values| Some(*last_or_prev(values, 0).unwrap() * 2),
+        GraphNodeOpts::named("doubled"),
+    );
+    let _keep_alive = doubled.subscribe(|_| {});
+    source.set(1);
+    source.set(2);
+
+    let described = g.describe();
+    let profile = g.profile();
+    let summary = profile_summary_from_snapshots(
+        &described,
+        &profile,
+        ProfileSummaryOptions { limit: Some(1) },
+    );
+
+    assert_eq!(summary.node_count, described.nodes.len());
+    assert_eq!(summary.total_invokes, profile.total_invokes);
+    assert_eq!(
+        summary
+            .by_status
+            .iter()
+            .find(|entry| entry.status == Status::Settled)
+            .map(|entry| entry.count),
+        Some(2)
+    );
+    assert_eq!(summary.hot_nodes.len(), 1);
+    assert_eq!(summary.hot_nodes[0].path, "doubled");
+    assert_eq!(
+        summary.hot_nodes[0].invokes,
+        profile.nodes["doubled"].invokes
+    );
+
+    let profile_again = g.profile();
+    let described_again = g.describe();
+    assert_eq!(
+        described_again.edges, described.edges,
+        "profile summary is inspection-only and must not change describe-visible edges"
+    );
+    assert_eq!(
+        profile_again.nodes["doubled"].invokes, profile.nodes["doubled"].invokes,
+        "profile summary reads existing counters rather than driving new invokes"
+    );
+}
+
+#[test]
+fn profile_summary_does_not_activate_cold_nodes_or_create_topology_events() {
+    let g = graph_opts(GraphOptions {
+        profile: true,
+        dispatcher: Some(Dispatcher::new()),
+        ..GraphOptions::default()
+    });
+    let runs = Rc::new(Cell::new(0usize));
+    let runs_for_fn = runs.clone();
+    let cold = g.producer_opts::<i32, _>(
+        move |ctx| {
+            runs_for_fn.set(runs_for_fn.get() + 1);
+            ctx.emit(7i32);
+        },
+        GraphNodeOpts::named("cold"),
+    );
+    let topology_events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
+    let topology_sink = topology_events.clone();
+    let observer = g
+        .observe_topology()
+        .subscribe(move |event| topology_sink.borrow_mut().push(event));
+
+    let summary = profile_summary(&g, ProfileSummaryOptions::default());
+
+    observer.unsubscribe();
+    assert_eq!(runs.get(), 0);
+    assert_eq!(cold.cache(), None);
+    assert!(topology_events.borrow().is_empty());
+    assert_eq!(summary.node_count, 1);
+    assert_eq!(summary.total_invokes, 0);
+    assert_eq!(summary.hot_nodes[0].path, "cold");
+    assert_eq!(summary.hot_nodes[0].invokes, 0);
+    assert_eq!(summary.hot_nodes[0].status, Status::Sentinel);
 }
 
 #[test]

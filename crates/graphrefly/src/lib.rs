@@ -169,9 +169,11 @@ pub use data_structures::{
     ReactiveMap, ReactiveMapOptions, ReactiveView,
 };
 pub use diagnostics::{
-    explain_path, reachable, topology_diff, validate_no_islands, CausalChain, CausalStep,
-    DescribeChangeset, DescribeEvent, ExplainPathOptions, ExplainPathReason, IslandReport,
-    ReachableDirection, ReachableOptions, ReachableResult, ValidateNoIslandsResult,
+    explain_path, profile_summary, profile_summary_from_snapshots, reachable, topology_diff,
+    validate_no_islands, CausalChain, CausalStep, DescribeChangeset, DescribeEvent,
+    ExplainPathOptions, ExplainPathReason, IslandReport, ProfileSummary, ProfileSummaryNode,
+    ProfileSummaryOptions, ProfileSummaryStatus, ReachableDirection, ReachableOptions,
+    ReachableResult, ValidateNoIslandsResult,
 };
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 #[cfg(feature = "tokio-http")]

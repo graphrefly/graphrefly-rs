@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue};
+use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, Graph, Profile};
 use crate::node::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +109,34 @@ pub enum DescribeEvent {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DescribeChangeset {
     pub events: Vec<DescribeEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProfileSummaryOptions {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummaryNode {
+    pub path: String,
+    pub invokes: u64,
+    pub total_duration_ns: u128,
+    pub last_duration_ns: u128,
+    pub status: Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummaryStatus {
+    pub status: Status,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub node_count: usize,
+    pub total_invokes: u64,
+    pub by_status: Vec<ProfileSummaryStatus>,
+    pub hot_nodes: Vec<ProfileSummaryNode>,
 }
 
 impl ValidateNoIslandsResult {
@@ -259,6 +287,83 @@ pub fn topology_diff(prev: &DescribeSnapshot, next: &DescribeSnapshot) -> Descri
     }
 
     DescribeChangeset { events }
+}
+
+/// Summarize an opt-in D39/R-profile snapshot using `describe()` for node cardinality.
+///
+/// This helper does not subscribe, emit, or create topology. The graph wrapper only reads the
+/// existing `describe()` and `profile()` snapshots; the actual rollup is pure over those facts.
+#[must_use]
+pub fn profile_summary(graph: &Graph, options: ProfileSummaryOptions) -> ProfileSummary {
+    let snapshot = graph.describe();
+    let profile = graph.profile();
+    profile_summary_from_snapshots(&snapshot, &profile, options)
+}
+
+/// Pure profile rollup over an already-captured describe/profile pair.
+#[must_use]
+pub fn profile_summary_from_snapshots(
+    snapshot: &DescribeSnapshot,
+    profile: &Profile,
+    options: ProfileSummaryOptions,
+) -> ProfileSummary {
+    let mut node_ids = BTreeSet::new();
+    collect_describe_ids(snapshot, &mut node_ids);
+    node_ids.extend(profile.nodes.keys().cloned());
+
+    let mut by_status_counts = BTreeMap::<usize, ProfileSummaryStatus>::new();
+    let mut hot_nodes = Vec::new();
+    for path in &node_ids {
+        let Some(node_profile) = profile.nodes.get(path) else {
+            continue;
+        };
+        let rank = status_rank(node_profile.status);
+        by_status_counts
+            .entry(rank)
+            .and_modify(|summary| summary.count += 1)
+            .or_insert(ProfileSummaryStatus {
+                status: node_profile.status,
+                count: 1,
+            });
+        hot_nodes.push(ProfileSummaryNode {
+            path: path.clone(),
+            invokes: node_profile.invokes,
+            total_duration_ns: node_profile.total_duration_ns,
+            last_duration_ns: node_profile.last_duration_ns,
+            status: node_profile.status,
+        });
+    }
+
+    hot_nodes.sort_by(|a, b| b.invokes.cmp(&a.invokes).then_with(|| a.path.cmp(&b.path)));
+    if let Some(limit) = options.limit {
+        hot_nodes.truncate(limit);
+    }
+
+    ProfileSummary {
+        node_count: node_ids.len(),
+        total_invokes: profile.total_invokes,
+        by_status: by_status_counts.into_values().collect(),
+        hot_nodes,
+    }
+}
+
+fn collect_describe_ids(snapshot: &DescribeSnapshot, ids: &mut BTreeSet<String>) {
+    ids.extend(snapshot.nodes.iter().map(|node| node.id.clone()));
+    for child in snapshot.subgraphs.iter().flatten() {
+        collect_describe_ids(child, ids);
+    }
+}
+
+fn status_rank(status: Status) -> usize {
+    match status {
+        Status::Sentinel => 0,
+        Status::Pending => 1,
+        Status::Dirty => 2,
+        Status::Settled => 3,
+        Status::Resolved => 4,
+        Status::Completed => 5,
+        Status::Errored => 6,
+    }
 }
 
 fn add_edge(map: &mut BTreeMap<String, BTreeSet<String>>, from: &str, to: &str) {
