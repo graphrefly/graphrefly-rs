@@ -6,14 +6,14 @@
 //!
 //! Slice scope: `down` (DATA/DIRTY/RESOLVED/INVALIDATE/terminal), typed `data`/
 //! `emit`, `state`, and the cleanup hooks (`on_deactivation` + `on_invalidate`).
-//! `up` validates control-only (R-ctx-up) and self-handles PAUSE/RESUME; the
+//! `up` validates control/demand-only (R-ctx-up) and self-handles PAUSE/RESUME/PULL; the
 //! INVALIDATE-at-depless-source terminus (D38, C-7) is deferred. See `CLEAN-SLATE.md`.
 
 use std::rc::Rc;
 
 use crate::node::{Core, Node, NodeOpts, RewireRequest};
 use crate::operators::Operator;
-use crate::protocol::{AnyValue, Message, Wave};
+use crate::protocol::{AnyValue, Message, PullDemand, Wave};
 
 /// A dep's terminal state, visible to the fn via [`Ctx::terminal`]
 /// (R-deps-terminal / C-15). `None` ⇔ the dep is live; `Some(..)` ⇔ it COMPLETEd
@@ -79,11 +79,16 @@ pub(crate) struct DepRecord {
 pub struct Ctx {
     pub(crate) node: Core,
     dep_records: Vec<DepRecord>,
+    pull: Option<PullDemand>,
 }
 
 impl Ctx {
-    pub(crate) fn new(node: Core, dep_records: Vec<DepRecord>) -> Self {
-        Self { node, dep_records }
+    pub(crate) fn new(node: Core, dep_records: Vec<DepRecord>, pull: Option<PullDemand>) -> Self {
+        Self {
+            node,
+            dep_records,
+            pull,
+        }
     }
 
     pub(crate) fn dep_records(&self) -> &[DepRecord] {
@@ -165,8 +170,8 @@ impl Ctx {
     }
 
     /// Defer an upstream control wave to the committed wave boundary (R-rewire-deferred).
-    /// This is the self-demand path for pull nodes: `RESUME(pullId)` routes after the
-    /// current fn settles, avoiding D37 mid-wave re-entry.
+    /// This is the self-demand path for pull nodes: `PULL({pullId, params?})` routes
+    /// after the current fn settles, avoiding D37 mid-wave re-entry.
     pub fn up_next(&self, msgs: Wave<AnyValue>) {
         self.node.request_up_next(msgs, None);
     }
@@ -189,6 +194,12 @@ impl Ctx {
     /// Keep `state` across the fresh-lifecycle wipe (R-ctx-state / D29).
     pub fn state_persist(&self, on: bool) {
         self.node.set_state_persist(on);
+    }
+
+    /// Holder-visible context for a PULL-caused invocation (D272). Absent for
+    /// normal dep-settle, activation, pause replay, terminal, and non-pull runs.
+    pub fn pull(&self) -> Option<&PullDemand> {
+        self.pull.as_ref()
     }
 
     /// Release external resources on deactivation (R-cleanup-hooks / D28). Fires once.

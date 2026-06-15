@@ -8,8 +8,8 @@ use std::rc::Rc;
 use graphrefly::{
     graph, merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
     scan_log, GraphNodeOpts, IndexChange, IndexRow, ListChange, LogChange, MapChange, Message,
-    Node, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions,
-    TopologyEvent, TopologyEventKind,
+    Node, PullDemand, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions,
+    ReactiveMapOptions, TopologyEvent, TopologyEventKind,
 };
 
 type DataCollector<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
@@ -40,6 +40,7 @@ fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static 
             Message::Start => "START",
             Message::Pause(_) => "PAUSE",
             Message::Resume(_) => "RESUME",
+            Message::Pull(_) => "PULL",
             Message::Dirty => "DIRTY",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
@@ -54,18 +55,19 @@ fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static 
 
 fn demand_snapshot<T: Clone + 'static>(list: &graphrefly::ReactiveList<T>) {
     list.snapshot
-        .up(vec![Message::Resume(list.pull_id.clone())]);
+        .up(vec![Message::Pull(PullDemand::new(list.pull_id.clone()))]);
 }
 
 fn demand_log_snapshot<T: Clone + 'static>(log: &graphrefly::ReactiveLog<T>) {
-    log.snapshot.up(vec![Message::Resume(log.pull_id.clone())]);
+    log.snapshot
+        .up(vec![Message::Pull(PullDemand::new(log.pull_id.clone()))]);
 }
 
 fn demand_view_snapshot<C: Clone + 'static, S: Clone + 'static>(
     view: &graphrefly::ReactiveView<C, S>,
 ) {
     view.snapshot
-        .up(vec![Message::Resume(view.pull_id.clone())]);
+        .up(vec![Message::Pull(PullDemand::new(view.pull_id.clone()))]);
 }
 
 fn demand_index_snapshot<K, S, V>(index: &graphrefly::ReactiveIndex<K, S, V>)
@@ -76,7 +78,7 @@ where
 {
     index
         .snapshot
-        .up(vec![Message::Resume(index.pull_id.clone())]);
+        .up(vec![Message::Pull(PullDemand::new(index.pull_id.clone()))]);
 }
 
 fn demand_map_snapshot<K, V>(map: &graphrefly::ReactiveMap<K, V>)
@@ -84,7 +86,8 @@ where
     K: Clone + Ord + std::fmt::Debug + 'static,
     V: Clone + 'static,
 {
-    map.snapshot.up(vec![Message::Resume(map.pull_id.clone())]);
+    map.snapshot
+        .up(vec![Message::Pull(PullDemand::new(map.pull_id.clone()))]);
 }
 
 fn btree<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> BTreeMap<K, V> {

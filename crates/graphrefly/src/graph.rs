@@ -17,7 +17,7 @@ use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::environment::EnvironmentDrivers;
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::operators::Operator;
-use crate::protocol::{AnyValue, LockId, Message, Tier};
+use crate::protocol::{AnyValue, LockId, Message, PullDemand, Tier};
 use crate::versioning::{NodeVersion, NodeVersioningPolicy};
 
 /// Graph construction options.
@@ -1555,6 +1555,7 @@ pub enum ObserveMessage {
     Start,
     Pause(LockId),
     Resume(LockId),
+    Pull(PullDemand),
     Dirty,
     Data(AnyValue),
     Resolved,
@@ -1570,6 +1571,7 @@ impl ObserveMessage {
             Message::Start => ObserveMessage::Start,
             Message::Pause(lock) => ObserveMessage::Pause(lock.clone()),
             Message::Resume(lock) => ObserveMessage::Resume(lock.clone()),
+            Message::Pull(demand) => ObserveMessage::Pull(demand.clone()),
             Message::Dirty => ObserveMessage::Dirty,
             Message::Data(value) => ObserveMessage::Data(value.clone()),
             Message::Resolved => ObserveMessage::Resolved,
@@ -1585,6 +1587,7 @@ impl ObserveMessage {
             ObserveMessage::Start => "START",
             ObserveMessage::Pause(_) => "PAUSE",
             ObserveMessage::Resume(_) => "RESUME",
+            ObserveMessage::Pull(_) => "PULL",
             ObserveMessage::Dirty => "DIRTY",
             ObserveMessage::Data(_) => "DATA",
             ObserveMessage::Resolved => "RESOLVED",

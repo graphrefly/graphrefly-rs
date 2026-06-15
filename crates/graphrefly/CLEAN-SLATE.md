@@ -146,7 +146,7 @@ C-11 facet 5 (a fn emitting a bare COMPLETE). The B16 QA-F1 rewire-panic unit te
 to construct its node `error_when_deps_error:false` (the new auto-error-cascade correctly
 TERMINATES a consumer whose dep errors, so "d survives + recovers" is kept observable by
 absorbing). **Catch-up 2026-05-31:** C-11 was updated to D62 terminal-drains semantics,
-and C-16/C-18/C-20/C-21 are now green (pullId/routed RESUME/up_next, routed-demand
+and C-16/C-18/C-20/C-21 are now green (pullId/routed PULL/up_next, routed-demand
 diamond idempotence, terminal TEARDOWN relay, and late async ctx live-edge). **Batch
 slice 2026-06-01:** C-19/C-22 are now green via the batch frame + D64/D67 boundary
 rules. Remaining Rust conformance todo: C-1 (wire-bridge B2, post-1.0).
@@ -187,7 +187,7 @@ SUGAR (a future Rust graph layer, CSP-2-rs).
 | 5 | **C-15** | a dep's terminal releases its in-wave DIRTY (no wedge) | ✅ **GREEN** 2026-05-30 (B35/R-deps-terminal — release + absorbed-terminal settle + terminal_as_real_input + auto-cascade; teeth-verified) |
 | 6 | **C-12** | occurrences stay DATA; RESOLVED undirty-only | ✅ **GREEN** 2026-05-30 (D49 already in substrate; take/distinctUntilChanged as inline ctx.state derived nodes) |
 | 7 | **C-11** | higher-order inner rewire at the wave boundary | ✅ **GREEN** 2026-05-31 (D47/D62 `ctx.rewire_next` — DEFERRED_REWIRE FIFO drained at the WaveScope boundary; terminal drains queued topology while sealing output) |
-| 8 | **C-16** | pull-mode node + routed RESUME demand | ✅ **GREEN** 2026-05-31 (`pull_id`, quiet absorb/no push-on-subscribe, directed/broadcast `up`, boundary-deferred `up_next`) |
+| 8 | **C-16** | pull-mode node + routed PULL demand | ✅ **GREEN** 2026-05-31 (`pull_id`, quiet absorb/no push-on-subscribe, directed/broadcast `up`, boundary-deferred `up_next`) |
 | 9 | **C-18** | routed pull demand over diamond fires holder once | ✅ **GREEN** 2026-05-31 (per-routed-wave holder idempotence) |
 | 10 | **C-20** | TEARDOWN relays through terminal intermediate | ✅ **GREEN** 2026-05-31 |
 | 11 | **C-21** | late async ctx emission uses live deps after rewire | ✅ **GREEN** 2026-05-31 |

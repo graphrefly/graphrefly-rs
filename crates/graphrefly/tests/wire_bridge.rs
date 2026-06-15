@@ -480,6 +480,7 @@ fn remote_responder_invokes_sync_handler_and_sends_response_through_bridge_comma
             Message::Start => "START",
             Message::Pause(_) => "PAUSE",
             Message::Resume(_) => "RESUME",
+            Message::Pull(_) => "PULL",
             Message::Dirty => "DIRTY",
             Message::Resolved => "RESOLVED",
             Message::Invalidate => "INVALIDATE",

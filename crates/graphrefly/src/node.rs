@@ -54,7 +54,7 @@ use crate::checkpoint::{
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
-use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
+use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, PullDemand, Tier, Wave};
 use crate::versioning::{
     advance_node_version, assert_node_version_data_compatible, create_node_version,
     resolve_node_versioning_policy, NodeVersion, NodeVersioningPolicy,
@@ -129,8 +129,8 @@ pub struct NodeOpts {
     /// First-run gate override: allow fn execution with SENTINEL deps (graph-layer
     /// partial combinators / pull consumers). Default false.
     pub partial: bool,
-    /// Pull-mode node id (R-pull / D59). When present, the node starts quiet by
-    /// self-holding this lock; a routed RESUME of the same id demands one delivery.
+    /// Pull-mode node id (R-pull / D269). When present, the node starts quiet; a
+    /// routed PULL({pullId, params?}) of the same id demands one delivery.
     pub pull_id: Option<LockId>,
     /// Auto-emit COMPLETE when ALL deps complete (default `true`; combineLatest
     /// semantics — ALL not ANY). last/reduce/*Map set `false` to ABSORB inner
@@ -921,9 +921,17 @@ struct NodeAux {
     state_persist: bool,
     on_deactivation: Vec<Box<dyn FnOnce()>>,
     on_invalidate: Vec<Rc<dyn Fn()>>,
-    /// A demand arrived but cannot yet fire because a dep is still pending or an
-    /// external pause lock is held. Drained when the node is settle-ready.
-    pull_demand_owed: bool,
+    /// A PULL demand arrived but cannot yet fire because a dep is still pending,
+    /// the first-run gate is closed, or an external pause lock is held. Latest
+    /// params win while owed (D269/D272).
+    pull_demand_owed: Option<PullDemand>,
+    /// Holder-visible demand context installed only during a PULL delivery.
+    active_pull: Option<PullDemand>,
+    /// Guard against synchronous re-entrant demand while serving a demand.
+    in_deliver_demand: bool,
+    /// One-shot flag allowing a PULL-caused run to synthesize DIRTY when it
+    /// actually emits tier-3 while inside run_wave.
+    pull_dirty_owed: bool,
     /// PAUSE lockset (R-pause-lockset). Paused iff non-empty.
     pause_lockset: HashSet<LockId>,
     /// A dep wave was skipped while paused; default true mode fires once on resume.
@@ -942,7 +950,10 @@ impl NodeAux {
             state_persist: false,
             on_deactivation: Vec::new(),
             on_invalidate: Vec::new(),
-            pull_demand_owed: false,
+            pull_demand_owed: None,
+            active_pull: None,
+            in_deliver_demand: false,
+            pull_dirty_owed: false,
             pause_lockset: HashSet::new(),
             paused_dep_wave_occurred: false,
             pause_buffer: Vec::new(),
@@ -2446,17 +2457,12 @@ impl Core {
         if g.pin_count(key) != 0 || g.draining_boundary || !g.deferred_boundary.is_empty() {
             return false;
         }
-        let cfg = g.get_config(key);
         let e = g
             .edge_slots
             .get(key.id.0)
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore edge slot");
         let a = g.get_aux(key);
-        let allowed_pause_lock = cfg
-            .pull_id
-            .as_ref()
-            .is_some_and(|id| a.pause_lockset.len() == 1 && a.pause_lockset.contains(id));
         e.value.status != Status::Dirty
             && e.value.status != Status::Pending
             && e.state.pending == 0
@@ -2464,9 +2470,10 @@ impl Core {
             && !e.wave.in_dep_mutation
             && !e.wave.rewire_run_pending
             && !e.wave.batch_dirty_owed
-            && !a.pull_demand_owed
+            && a.pull_demand_owed.is_none()
+            && a.active_pull.is_none()
             && a.pause_buffer.is_empty()
-            && (a.pause_lockset.is_empty() || allowed_pause_lock)
+            && a.pause_lockset.is_empty()
     }
 
     pub(crate) fn is_quiescent_for_release(&self) -> bool {
@@ -2531,7 +2538,7 @@ impl Core {
     }
 
     pub(crate) fn restore_runtime(&self, state: NodeRestoreRuntime) {
-        self.with_node_state_aux_mut(|_n, _c, cfg, r, e, a| {
+        self.with_node_state_aux_mut(|_n, _c, _cfg, r, e, a| {
             e.value.cache = state.cache;
             e.value.has_data = state.has_data;
             e.value.status = state.status;
@@ -2546,11 +2553,11 @@ impl Core {
             a.state_persist = state.ctx_state_persist;
             a.on_deactivation.clear();
             a.on_invalidate.clear();
-            a.pull_demand_owed = false;
+            a.pull_demand_owed = None;
+            a.active_pull = None;
+            a.in_deliver_demand = false;
+            a.pull_dirty_owed = false;
             a.pause_lockset.clear();
-            if let Some(lock) = cfg.pull_id.clone() {
-                a.pause_lockset.insert(lock);
-            }
             a.paused_dep_wave_occurred = false;
             a.pause_buffer.clear();
         });
@@ -2647,8 +2654,9 @@ impl Core {
     fn configure_pull(&self, pull_id: Option<LockId>) {
         if let Some(id) = pull_id {
             self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
-                a.pause_lockset.insert(id.clone());
                 cfg.pull_id = Some(id);
+                a.pull_demand_owed = None;
+                a.active_pull = None;
             });
         }
     }
@@ -2707,11 +2715,8 @@ impl Core {
     // ── activation / deactivation (lazy; R-rom-ram) ──
 
     fn activate(&self) {
-        let deps = self.with_node_state_aux_mut(|n, _c, cfg, _r, e, a| {
+        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
             a.activated = true;
-            if let Some(id) = cfg.pull_id.clone() {
-                a.pause_lockset.insert(id);
-            }
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
             // real box its callback captures.
@@ -2803,7 +2808,10 @@ impl Core {
             // the next activation re-registers them from the fn body.
             a.on_invalidate.clear();
             a.pause_lockset.clear();
-            a.pull_demand_owed = false;
+            a.pull_demand_owed = None;
+            a.active_pull = None;
+            a.in_deliver_demand = false;
+            a.pull_dirty_owed = false;
             a.paused_dep_wave_occurred = false;
             a.pause_buffer.clear();
             if !a.state_persist {
@@ -2863,7 +2871,8 @@ impl Core {
         // (skip the fn while any lock is held → fire once with latest dep values on
         // final-lock RESUME). `resumeAll` RUNS the fn while paused but buffers output
         // (`down` → `pause_buffer`). `false` runs + emits immediately.
-        if matches!(cfg.pausable, Pausable::True) && !a.pause_lockset.is_empty() {
+        let pull_quiet = cfg.pull_id.is_some() && a.active_pull.is_none();
+        if matches!(cfg.pausable, Pausable::True) && (!a.pause_lockset.is_empty() || pull_quiet) {
             a.paused_dep_wave_occurred = true;
             return MaybeRunDecision::Skip;
         }
@@ -2924,6 +2933,7 @@ impl Core {
             Message::Invalidate => {
                 let (had_data, undirty_no_settle, paused) = {
                     let (_n, e, a) = g.get_node_edges_aux_mut(key);
+                    let pull_quiet = pull_id.is_some() && a.active_pull.is_none();
                     e.state.prev[idx] = None;
                     e.state.has_data[idx] = false;
                     e.state.batch[idx] = None;
@@ -2941,7 +2951,7 @@ impl Core {
                     (
                         e.value.has_data,
                         e.state.pending == 0 && e.wave.emitted_dirty_this_wave,
-                        !a.pause_lockset.is_empty(),
+                        !a.pause_lockset.is_empty() || pull_quiet,
                     )
                 };
                 let buffer_own_invalidate = paused && matches!(pausable, Pausable::ResumeAll);
@@ -2959,7 +2969,6 @@ impl Core {
             }
             Message::Dirty => {
                 action.emit_dirty = {
-                    let pull_id = pull_id.clone();
                     let (_n, e, a) = g.get_node_edges_aux_mut(key);
                     if e.state.dirty[idx] {
                         false
@@ -2967,7 +2976,7 @@ impl Core {
                         e.state.dirty[idx] = true;
                         e.state.pending += 1;
                         e.state.tier[idx] = 2;
-                        let pull_quiet = pull_id.is_some_and(|id| a.pause_lockset.contains(&id));
+                        let pull_quiet = pull_id.is_some() && a.active_pull.is_none();
                         if pull_quiet || e.wave.emitted_dirty_this_wave {
                             false
                         } else {
@@ -3007,7 +3016,8 @@ impl Core {
                     if !pending_drained
                         && matches!(pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
-                        && !a.pause_lockset.is_empty()
+                        && (!a.pause_lockset.is_empty()
+                            || (pull_id.is_some() && a.active_pull.is_none()))
                     {
                         a.paused_dep_wave_occurred = true;
                     }
@@ -3031,7 +3041,8 @@ impl Core {
                     if !pending_drained
                         && matches!(pausable, Pausable::True)
                         && !e.wave.in_dep_mutation
-                        && !a.pause_lockset.is_empty()
+                        && (!a.pause_lockset.is_empty()
+                            || (pull_id.is_some() && a.active_pull.is_none()))
                     {
                         a.paused_dep_wave_occurred = true;
                     }
@@ -3773,7 +3784,7 @@ impl Core {
                     c.handle
                         .map(|h| c.dispatcher.pool_kind(h.pool_id) == PoolKind::Async)
                         .unwrap_or(false),
-                    Ctx::new(self.borrowed_view(), dep_records),
+                    Ctx::new(self.borrowed_view(), dep_records, a.active_pull.clone()),
                     std::mem::take(&mut a.on_invalidate),
                     std::mem::take(&mut a.on_deactivation),
                 )
@@ -3957,9 +3968,10 @@ impl Core {
             "down: a wave cannot mix DATA and RESOLVED (tier-3 exclusivity, R-resolved-undirty / D49)"
         );
 
-        // Synthesize a leading DIRTY for an EXTERNAL tier-3 emit. Inside run_wave the
-        // DIRTY already propagated in phase 1 (or the wave is activation-exempt).
-        if has_tier3 && !inside {
+        // Synthesize a leading DIRTY for an EXTERNAL tier-3 emit, and for a PULL
+        // demand fn only when it actually emits tier-3 (D269/D272).
+        let pull_dirty_owed = self.with_aux(|a| a.pull_dirty_owed);
+        if has_tier3 && (!inside || pull_dirty_owed) {
             self.emit_dirty_once();
         }
 
@@ -4085,7 +4097,10 @@ impl Core {
                 }
                 e.value.terminal = true;
                 e.value.status = Status::Completed;
-                a.pull_demand_owed = false;
+                a.pull_demand_owed = None;
+                a.active_pull = None;
+                a.in_deliver_demand = false;
+                a.pull_dirty_owed = false;
                 a.paused_dep_wave_occurred = false;
                 a.pause_buffer.clear();
                 Some(DownAction::Emit {
@@ -4100,7 +4115,10 @@ impl Core {
                 }
                 edges.value.terminal = true;
                 edges.value.status = Status::Errored;
-                a.pull_demand_owed = false;
+                a.pull_demand_owed = None;
+                a.active_pull = None;
+                a.in_deliver_demand = false;
+                a.pull_dirty_owed = false;
                 a.paused_dep_wave_occurred = false;
                 a.pause_buffer.clear();
                 Some(DownAction::Emit {
@@ -4207,15 +4225,21 @@ impl Core {
         match m {
             Message::Pause(lock) => self.pause_acquire(lock),
             Message::Resume(lock) => {
-                let is_pull_demand = self.with_config(|cfg| cfg.pull_id.as_ref() == Some(&lock));
-                if is_pull_demand {
-                    if !route.mark_demand(&lock, self) {
-                        self.on_demand();
-                    }
-                } else if self.with_aux(|a| a.pause_lockset.contains(&lock)) {
+                if self.with_aux(|a| a.pause_lockset.contains(&lock)) {
                     self.pause_release(lock);
                 } else {
                     self.forward_up(Message::Resume(lock), toward_dep, route);
+                }
+            }
+            Message::Pull(demand) => {
+                let is_pull_holder =
+                    self.with_config(|cfg| cfg.pull_id.as_ref() == Some(&demand.pull_id));
+                if is_pull_holder {
+                    if !route.mark_demand(&demand.pull_id, self) {
+                        self.on_demand(demand);
+                    }
+                } else {
+                    self.forward_up(Message::Pull(demand), toward_dep, route);
                 }
             }
             // R-up-at-source (D38): INVALIDATE/DIRTY/TEARDOWN.
@@ -4307,79 +4331,129 @@ impl Core {
         }) else {
             return;
         };
-        if resumed {
+        if resumed && self.with_config(|cfg| cfg.pull_id.is_none()) {
             self.on_resume();
             if boundary_drains_blocked() {
                 register_boundary_root(self);
             }
+        } else if resumed && boundary_drains_blocked() {
+            register_boundary_root(self);
         }
         self.fire_owed_demand_if_ready();
     }
 
-    fn on_demand(&self) {
-        let has_pull = self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
-            if cfg.pull_id.is_none() {
+    fn can_fire_demand(&self) -> bool {
+        self.with_node_state_aux_mut(|_n, c, cfg, r, e, a| {
+            if cfg.pull_id.is_none()
+                || e.value.terminal
+                || e.state.pending != 0
+                || !a.pause_lockset.is_empty()
+            {
                 return false;
             }
-            a.pull_demand_owed = true;
+            if c.handle.is_some()
+                && !r.has_called_fn_once
+                && !cfg.partial
+                && !cfg.all_deps_settled(&e.state)
+            {
+                return false;
+            }
+            true
+        })
+    }
+
+    fn on_demand(&self, demand: PullDemand) {
+        let should_deliver = self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
+            if cfg.pull_id.is_none() || a.in_deliver_demand {
+                return false;
+            }
+            a.pull_demand_owed = Some(demand);
             true
         });
-        if !has_pull {
-            return;
+        if should_deliver {
+            self.fire_owed_demand_if_ready();
         }
-        self.fire_owed_demand_if_ready();
     }
 
     fn fire_owed_demand_if_ready(&self) {
-        let Some((pull_id, should_mark_dirty)) =
-            self.with_node_state_aux_mut(|_n, c, cfg, r, e, a| {
-                let id = cfg.pull_id.clone()?;
-                if e.value.terminal || !a.pull_demand_owed || e.state.pending != 0 {
-                    return None;
-                }
-                if a.pause_lockset.iter().any(|held| held != &id) {
-                    return None;
-                }
-                if c.handle.is_some()
-                    && !r.has_called_fn_once
-                    && !cfg.partial
-                    && !cfg.all_deps_settled(&e.state)
-                {
-                    return None;
-                }
-                Some((id, a.paused_dep_wave_occurred))
-            })
-        else {
+        if self.with_aux(|a| a.in_deliver_demand) || !self.can_fire_demand() {
+            return;
+        }
+        let Some(demand) = self.with_aux_mut(|a| a.pull_demand_owed.take()) else {
             return;
         };
+        self.deliver_pull_demand(demand);
+    }
+
+    fn deliver_pull_demand(&self, demand: PullDemand) {
         self.with_aux_mut(|a| {
-            a.pull_demand_owed = false;
-            a.pause_lockset.remove(&pull_id);
+            a.active_pull = Some(demand);
+            a.in_deliver_demand = true;
         });
-        struct Requiet<'a> {
+        struct PullDelivery<'a> {
             core: &'a Core,
-            id: Option<LockId>,
         }
-        impl Drop for Requiet<'_> {
+        impl Drop for PullDelivery<'_> {
             fn drop(&mut self) {
-                let Some(id) = self.id.take() else { return };
                 let _ = self
                     .core
-                    .try_with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
-                        if !e.value.terminal && cfg.pull_id.as_ref() == Some(&id) {
-                            a.pause_lockset.insert(id);
-                        }
+                    .try_with_node_state_aux_mut(|_n, _c, _cfg, _r, _e, a| {
+                        a.active_pull = None;
+                        a.in_deliver_demand = false;
+                        a.pull_dirty_owed = false;
                     });
             }
         }
-        let _requiet = Requiet {
-            core: self,
-            id: Some(pull_id),
-        };
-        if should_mark_dirty {
-            self.mark_dirty();
+        let _guard = PullDelivery { core: self };
+        self.fire_pull_demand();
+    }
+
+    fn fire_pull_demand(&self) {
+        let (mut buf, pausable) = self.with_node_state_aux_mut(|_n, _c, cfg, _r, _e, a| {
+            (std::mem::take(&mut a.pause_buffer), cfg.pausable)
+        });
+        if !buf.is_empty() {
+            if matches!(pausable, Pausable::True) {
+                if let Some(wave) = buf.pop() {
+                    self.down(wave);
+                }
+            } else {
+                for wave in buf {
+                    self.down(wave);
+                }
+            }
+            return;
         }
-        self.on_resume();
+
+        let should_run_paused_dep = self.with_aux(|a| a.paused_dep_wave_occurred);
+        if should_run_paused_dep {
+            let gated = self.with_node_state(|_n, c, cfg, r, e| {
+                e.state.pending != 0
+                    || (c.handle.is_some()
+                        && !r.has_called_fn_once
+                        && !cfg.partial
+                        && !cfg.all_deps_settled(&e.state))
+            });
+            if gated {
+                return;
+            }
+            self.with_node_state_aux_mut(|_n, _c, _cfg, _r, e, a| {
+                a.paused_dep_wave_occurred = false;
+                a.pull_dirty_owed = true;
+                e.wave.emitted_dirty_this_wave = false;
+            });
+            self.try_run();
+            return;
+        }
+
+        let has_handle = self.with_call(|c| c.handle.is_some());
+        if has_handle {
+            self.with_inner_edges_aux_mut(|_n, e, a| {
+                a.pull_dirty_owed = true;
+                e.wave.emitted_dirty_this_wave = false;
+            });
+            self.try_run();
+        }
     }
 
     fn on_resume(&self) {
@@ -4387,6 +4461,10 @@ impl Core {
         // and never replays/recomputes (BH3).
         if self.with_inner_edges(|_n, e| e.value.terminal) {
             self.with_aux_mut(|a| {
+                a.pull_demand_owed = None;
+                a.active_pull = None;
+                a.in_deliver_demand = false;
+                a.pull_dirty_owed = false;
                 a.paused_dep_wave_occurred = false;
                 a.pause_buffer.clear();
             });
@@ -4422,7 +4500,12 @@ impl Core {
         self.with_node_state(|n, c, cfg, _r, e| match cfg.pausable {
             // false: ignore PAUSE/RESUME ENTIRELY — never buffer, keep producing (B20).
             Pausable::False => false,
-            _ if self.with_aux(|a| a.pause_lockset.is_empty()) => false,
+            _ if self.with_aux(|a| {
+                a.pause_lockset.is_empty() && !(cfg.pull_id.is_some() && a.active_pull.is_none())
+            }) =>
+            {
+                false
+            }
             // resumeAll: production-gating — buffer the own (sync/async) settle slice too.
             Pausable::ResumeAll => true,
             // true (default): PAUSE gates recomputation/propagation, NOT a leaf source's
@@ -4430,7 +4513,10 @@ impl Core {
             // (C-2); a depless async leaf source delivers immediately (C-10). The
             // leaf-vs-compute discriminator is deps.is_empty().
             Pausable::True => {
-                !e.wave.inside_run_wave && Self::call_is_async(c) && !n.deps.is_empty()
+                let pull_quiet =
+                    cfg.pull_id.is_some() && self.with_aux(|a| a.active_pull.is_none());
+                (pull_quiet && !e.wave.inside_run_wave && n.deps.is_empty())
+                    || (!e.wave.inside_run_wave && Self::call_is_async(c) && !n.deps.is_empty())
             }
         })
     }
@@ -4513,6 +4599,7 @@ fn dup_control(m: &Msg) -> Msg {
     match m {
         Message::Pause(lock) => Message::Pause(lock.clone()),
         Message::Resume(lock) => Message::Resume(lock.clone()),
+        Message::Pull(demand) => Message::Pull(demand.clone()),
         Message::Dirty => Message::Dirty,
         Message::Invalidate => Message::Invalidate,
         Message::Teardown => Message::Teardown,

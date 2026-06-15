@@ -37,7 +37,7 @@ use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
 use graphrefly::{
     batch, graph, restore_graph, restore_registry, AnyValue, Core, Ctx, DeferredCtx, DepTerminal,
     GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreEntry, LockId, Message, Node,
-    NodeOpts, NodeVersion, Pausable, PoolKind, RestoreFactoryMeta, RestoreGraphOptions,
+    NodeOpts, NodeVersion, Pausable, PoolKind, PullDemand, RestoreFactoryMeta, RestoreGraphOptions,
     RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
 };
 use serde_json::json;
@@ -1172,8 +1172,8 @@ fn c15_dep_terminal_settles_dirty() {
     }
 }
 
-/// C-16 — pull-mode node (R-pull / R-up-routing / D55,D59): quiet absorbs upstream
-/// DIRTY, routed RESUME(pullId) demands exactly one delivery, then the node re-quiets.
+/// C-16 — pull-mode node (R-pull / R-up-routing / D269): quiet absorbs upstream
+/// DIRTY, routed PULL({pullId, params?}) demands exactly one delivery, then the node re-quiets.
 #[test]
 fn c16_pull_mode_routed_demand() {
     let psnap = LockId::new("snapshot");
@@ -1202,14 +1202,22 @@ fn c16_pull_mode_routed_demand() {
         acc.set(2);
         assert_eq!(kinds(&log), Vec::<String>::new());
 
-        snap.up(vec![Message::Resume(psnap.clone())]);
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
         assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
         log.borrow_mut().clear();
 
-        snap.up(vec![Message::Resume(psnap.clone())]);
-        assert_eq!(kinds(&log), Vec::<String>::new());
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
+        log.borrow_mut().clear();
         acc.set(3);
         assert_eq!(kinds(&log), Vec::<String>::new());
+
+        snap.up(vec![Message::Resume(psnap.clone())]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "RESUME(pullId) releases only pause locks; PULL owns demand"
+        );
     }
 
     {
@@ -1238,7 +1246,7 @@ fn c16_pull_mode_routed_demand() {
             Vec::<String>::new(),
             "a reactivated pull node re-enters quiet mode before dep replay (R-pull)"
         );
-        snap.up(vec![Message::Resume(psnap.clone())]);
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
         assert_eq!(kinds(&log2), vec!["DIRTY", "DATA"]);
     }
 
@@ -1264,7 +1272,7 @@ fn c16_pull_mode_routed_demand() {
         log.borrow_mut().clear();
 
         a.set(1);
-        snap.up(vec![Message::Resume(psnap.clone())]);
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
         assert_eq!(
             kinds(&log),
             Vec::<String>::new(),
@@ -1294,7 +1302,7 @@ fn c16_pull_mode_routed_demand() {
 
         acc.set(1);
         snap.up(vec![Message::Pause(ext.clone())]);
-        snap.up(vec![Message::Resume(psnap.clone())]); // owed, but external pause still held
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]); // owed, but external pause still held
         assert_eq!(kinds(&log), Vec::<String>::new());
 
         acc.down(vec![Message::Complete]);
@@ -1319,7 +1327,7 @@ fn c16_pull_mode_routed_demand() {
         let (vals, _u) = record_data_i32(&snap);
         acc.set(1);
         acc.set(2);
-        snap.up(vec![Message::Resume(psnap.clone())]);
+        snap.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
         assert_eq!(*vals.borrow(), vec![0, 1, 2]);
     }
 
@@ -1336,6 +1344,59 @@ fn c16_pull_mode_routed_demand() {
             );
         }));
         assert!(result.is_err());
+    }
+
+    {
+        let acc = Node::<i32>::state(0);
+        let seen = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let seen_params = seen.clone();
+        let snap = Node::<i32>::derived_opts(
+            vec![acc.erased()],
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                if let Some(limit) = ctx.pull().and_then(|p| p.params::<usize>()) {
+                    seen_params.borrow_mut().push(*limit);
+                }
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.emit(*v);
+                }
+            },
+        );
+        let (_log, _u) = record(&snap);
+        acc.set(4);
+
+        snap.up(vec![Message::Pull(PullDemand::with_params(
+            psnap.clone(),
+            1usize,
+        ))]);
+        assert_eq!(*seen.borrow(), vec![1]);
+    }
+
+    {
+        let source = Node::<i32>::producer_opts(
+            NodeOpts {
+                pull_id: Some(psnap.clone()),
+                ..NodeOpts::default()
+            },
+            |_ctx| {},
+        );
+        let log = record(&source).0;
+        log.borrow_mut().clear();
+
+        source.down(vec![Message::Data(Rc::new(1i32))]);
+        source.down(vec![Message::Data(Rc::new(2i32))]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "a depless pull holder remains quiet until PULL demand"
+        );
+
+        source.up(vec![Message::Pull(PullDemand::new(psnap.clone()))]);
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
+        assert_eq!(source.cache(), Some(2));
     }
 
     {
@@ -1363,7 +1424,7 @@ fn c16_pull_mode_routed_demand() {
                     rec.borrow_mut().push(*v);
                 }
                 if !ctx.batch::<i32>(0).is_empty() {
-                    ctx.up_next(vec![Message::Resume(pid.clone())]);
+                    ctx.up_next(vec![Message::Pull(PullDemand::new(pid.clone()))]);
                 }
             },
         );
@@ -1412,18 +1473,18 @@ fn c16_pull_mode_routed_demand() {
         );
         let (vals, _u) = record_data_i32(&g);
 
-        g.up(vec![Message::Resume(pf.clone())]);
+        g.up(vec![Message::Pull(PullDemand::new(pf.clone()))]);
         assert_eq!(*vals.borrow(), vec![100]);
         vals.borrow_mut().clear();
 
-        g.up(vec![Message::Resume(ph.clone())]);
+        g.up(vec![Message::Pull(PullDemand::new(ph.clone()))]);
         assert_eq!(*vals.borrow(), vec![200]);
         vals.borrow_mut().clear();
 
-        g.up_toward(1, vec![Message::Resume(pf.clone())]);
+        g.up_toward(1, vec![Message::Pull(PullDemand::new(pf.clone()))]);
         assert_eq!(*vals.borrow(), Vec::<i32>::new());
         acc_f.set(101);
-        g.up_toward(0, vec![Message::Resume(pf)]);
+        g.up_toward(0, vec![Message::Pull(PullDemand::new(pf))]);
         assert_eq!(*vals.borrow(), vec![101]);
     }
 
@@ -1447,7 +1508,7 @@ fn c16_pull_mode_routed_demand() {
             },
             move |ctx| {
                 if !ctx.batch::<i32>(0).is_empty() {
-                    ctx.up(vec![Message::Resume(pid.clone())]);
+                    ctx.up(vec![Message::Pull(PullDemand::new(pid.clone()))]);
                 }
             },
         );
@@ -1667,7 +1728,7 @@ fn c25_deferred_self_boundary_tasks_require_committed_unpaused_boundary() {
                     rec.borrow_mut().push(*v);
                 }
                 if !ctx.batch::<i32>(0).is_empty() {
-                    ctx.up_next(vec![Message::Resume(pid.clone())]);
+                    ctx.up_next(vec![Message::Pull(PullDemand::new(pid.clone()))]);
                 }
             },
         );
@@ -1856,7 +1917,7 @@ fn c25_deferred_self_boundary_tasks_require_committed_unpaused_boundary() {
     }
 }
 
-/// C-18 — a broadcast routed RESUME through a diamond reaches the same pull holder
+/// C-18 — a broadcast routed PULL through a diamond reaches the same pull holder
 /// through two paths, but the holder fires at most once for that routed wave.
 #[test]
 fn c18_routed_pull_demand_over_diamond_fires_once() {
@@ -1910,7 +1971,7 @@ fn c18_routed_pull_demand_over_diamond_fires_once() {
     );
     let (_vals, _u) = record_data_i32(&d);
     acc.set(1);
-    d.up(vec![Message::Resume(psnap)]);
+    d.up(vec![Message::Pull(PullDemand::new(psnap))]);
     assert_eq!(snap_runs.get(), 1);
 }
 

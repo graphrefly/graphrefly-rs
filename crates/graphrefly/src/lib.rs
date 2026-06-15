@@ -252,7 +252,7 @@ pub use process::{
     ProcessEventDraft, ProcessReducer, ProcessReducerFn, ProcessReduction, ProcessRuntimeFact,
     ProcessStatus, ProcessStatusState,
 };
-pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, Tier, Wave};
+pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, PullDemand, Tier, Wave};
 pub use render::{
     describe_to_ascii, describe_to_d2, describe_to_d2_with_direction, describe_to_json,
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,

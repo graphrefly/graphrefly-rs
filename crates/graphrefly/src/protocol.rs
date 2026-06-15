@@ -68,19 +68,61 @@ pub struct Handle {
 /// `Box<dyn Error>` / `Exception`. Single-thread (D22) ⇒ no `Send + Sync` bound.
 pub type GraphError = Box<dyn std::error::Error + 'static>;
 
+/// Explicit pull demand payload (D269/D272).
+///
+/// Params are holder-visible context for the pullId-holder invocation. They are
+/// never DATA-up and never become a second dep-value input channel.
+#[derive(Clone)]
+pub struct PullDemand {
+    pub pull_id: LockId,
+    pub params: Option<AnyValue>,
+}
+
+impl PullDemand {
+    #[must_use]
+    pub fn new(pull_id: impl Into<LockId>) -> Self {
+        Self {
+            pull_id: pull_id.into(),
+            params: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_params<T: 'static>(pull_id: impl Into<LockId>, params: T) -> Self {
+        Self {
+            pull_id: pull_id.into(),
+            params: Some(Rc::new(params)),
+        }
+    }
+
+    #[must_use]
+    pub fn params<T: 'static>(&self) -> Option<Rc<T>> {
+        self.params.clone().and_then(|p| p.downcast::<T>().ok())
+    }
+}
+
+impl std::fmt::Debug for PullDemand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullDemand")
+            .field("pull_id", &self.pull_id)
+            .field("params", &self.params.as_ref().map(|_| "<params>"))
+            .finish()
+    }
+}
+
 /// The 7-tier const table (D34, amends R-tier numbering).
 ///
 /// Ordering encodes **priority + batch timing**: `immediate` (`< Value`) flows
 /// during the current wave; `batch-deferred` (`>= Value`) is held to the batch
 /// commit / wave boundary. PAUSE/RESUME sit *below* DIRTY (control before
-/// notification). `START` is the 10th handshake type; D9's 9 protocol message
-/// types occupy tiers 1–6.
+/// notification); PULL joins that existing control/demand tier (D269). `START`
+/// is the handshake type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Tier {
     /// 0 — subscribe handshake (`START`).
     Start = 0,
-    /// 1 — control (`PAUSE` / `RESUME`).
+    /// 1 — control/demand (`PAUSE` / `RESUME` / `PULL`).
     Control = 1,
     /// 2 — notification (`DIRTY`).
     Notification = 2,
@@ -120,8 +162,8 @@ impl Tier {
 }
 
 /// One protocol message. A `Vec<Message<T>>` ([`Wave`]) is one wave (D8) and may
-/// mix tiers. The closed set is 9 protocol kinds (D9) + the `Start` handshake
-/// (D34); adding a kind is a constitutional change (`/spec-amend`).
+/// mix tiers. The closed set is 11 kinds (D9 + D269 + the `Start` handshake);
+/// adding a kind is a constitutional change (`/spec-amend`).
 ///
 /// `Debug` is hand-written to print only the **kind tag** (not the payload), so
 /// `Message<AnyValue>` — whose payload `Rc<dyn Any>` is not `Debug` — stays
@@ -133,6 +175,9 @@ pub enum Message<T> {
     Pause(LockId),
     /// Release a pause lock (control, up-allowed).
     Resume(LockId),
+    /// Demand one pull delivery from the matching pullId holder (control/demand,
+    /// up-allowed). `RESUME` is pause-lock release only (D269).
+    Pull(PullDemand),
     /// Dirty notification — phase 1 of the two-phase wave (notification, up-allowed).
     Dirty,
     /// A real value (value tier, **down-only**). Absence-of-DATA is the SENTINEL
@@ -156,7 +201,7 @@ impl<T> Message<T> {
     pub fn tier(&self) -> Tier {
         match self {
             Message::Start => Tier::Start,
-            Message::Pause(_) | Message::Resume(_) => Tier::Control,
+            Message::Pause(_) | Message::Resume(_) | Message::Pull(_) => Tier::Control,
             Message::Dirty => Tier::Notification,
             Message::Data(_) | Message::Resolved => Tier::Value,
             Message::Invalidate => Tier::Settle,
@@ -167,7 +212,8 @@ impl<T> Message<T> {
 
     /// Whether this kind may travel **upstream** via `ctx.up` (R-ctx-up).
     ///
-    /// Control-tier only: `DIRTY` / `PAUSE` / `RESUME` / `INVALIDATE` / `TEARDOWN`.
+    /// Control/demand-tier only: `DIRTY` / `PAUSE` / `RESUME` / `PULL` /
+    /// `INVALIDATE` / `TEARDOWN`.
     /// `DATA` / `RESOLVED` / `COMPLETE` / `ERROR` are down-only. `START` is a
     /// substrate handshake, not a user `ctx.up` kind.
     pub fn is_up_allowed(&self) -> bool {
@@ -176,6 +222,7 @@ impl<T> Message<T> {
             Message::Dirty
                 | Message::Pause(_)
                 | Message::Resume(_)
+                | Message::Pull(_)
                 | Message::Invalidate
                 | Message::Teardown
         )
@@ -188,6 +235,7 @@ impl<T> std::fmt::Debug for Message<T> {
             Message::Start => "START",
             Message::Pause(_) => "PAUSE",
             Message::Resume(_) => "RESUME",
+            Message::Pull(_) => "PULL",
             Message::Dirty => "DIRTY",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
@@ -235,6 +283,10 @@ mod tests {
             Message::<i32>::Pause(LockId::new("a")).tier(),
             Tier::Control
         );
+        assert_eq!(
+            Message::<i32>::Pull(PullDemand::new("p")).tier(),
+            Tier::Control
+        );
         assert_eq!(Message::<i32>::Teardown.tier(), Tier::Teardown);
     }
 
@@ -244,6 +296,7 @@ mod tests {
         assert!(Message::<i32>::Dirty.is_up_allowed());
         assert!(Message::<i32>::Pause(LockId::new("l")).is_up_allowed());
         assert!(Message::<i32>::Resume(LockId::new("l")).is_up_allowed());
+        assert!(Message::<i32>::Pull(PullDemand::new("p")).is_up_allowed());
         assert!(Message::<i32>::Invalidate.is_up_allowed());
         assert!(Message::<i32>::Teardown.is_up_allowed());
 

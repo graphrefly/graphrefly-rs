@@ -34,7 +34,7 @@ use graphrefly::{
     ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
     OpenPersistentReactiveIndexOptions, OpenPersistentReactiveListOptions,
     OpenPersistentReactiveLogOptions, OpenPersistentReactiveMapOptions,
-    PersistReactiveCollectionOptions, PromotionPolicy, ReactiveCascadingCacheOptions,
+    PersistReactiveCollectionOptions, PromotionPolicy, PullDemand, ReactiveCascadingCacheOptions,
     ReactiveCollectionChangeFrame, ReactiveCollectionKind, ReactiveCollectionPersistenceStatus,
     ReactiveCollectionRestoreSource, ReactiveCollectionSnapshotFrame, ReactiveIndexOptions,
     ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions, ReadThroughErrorStage,
@@ -111,6 +111,7 @@ fn message_kinds<T: 'static>(node: &Node<T>) -> KindLog {
             Message::Start => "START",
             Message::Pause(_) => "PAUSE",
             Message::Resume(_) => "RESUME",
+            Message::Pull(_) => "PULL",
             Message::Dirty => "DIRTY",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
@@ -1405,7 +1406,7 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
     );
     let view = map.select(|value, _key| *value > 1);
     view.snapshot
-        .up(vec![Message::Resume(view.pull_id.clone())]);
+        .up(vec![Message::Pull(PullDemand::new(view.pull_id.clone()))]);
     let view_checkpoint = view_graph.checkpoint().expect("view checkpoint succeeds");
     let view_by_id = view_checkpoint
         .nodes
