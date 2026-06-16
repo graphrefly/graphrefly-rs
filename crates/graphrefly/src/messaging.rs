@@ -1,17 +1,13 @@
-//! Graph-visible message bus application infrastructure (D132/D135).
+//! Graph-visible messaging application infrastructure.
 //!
-//! Topics are declared up front and represented as graph-owned fan-in nodes.
-//! `publish` is boundary sugar that writes an ordinary DATA fact; `to_topic`
-//! wires an explicit producer node into the topic so the graph topology remains
-//! inspectable (D39/D132).
-//!
-//! Dynamic hubs are facts-dynamic and topology-static (D135): topic lifecycle is
-//! represented by DATA facts on fixed graph-visible nodes; topic keys do not
-//! create or delete graph nodes.
+//! D279/D282/D284/D285/D276 define `messageBus` as a retained topic log plus
+//! independent subscription cursors. DynamicHub is intentionally retired: topic
+//! lifecycle, publish, cursor movement, status, and issues are graph-visible
+//! command/fact streams on one static bus surface.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -20,11 +16,11 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ctx::{Ctx, DepTerminal};
+use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::json::JsonValue;
-use crate::node::{Core, Node};
-use crate::protocol::AnyValue;
+use crate::node::{Core, Node, NodeOpts};
+use crate::protocol::{AnyValue, LockId};
 
 pub const PROMPTS_TOPIC: &str = "prompts";
 pub const RESPONSES_TOPIC: &str = "responses";
@@ -119,6 +115,61 @@ pub struct TopicMessage<T> {
     #[serde(rename = "correlationId", skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     pub payload: T,
+}
+
+/// Passive domain event vocabulary for messageBus/eventFlow composition (D329).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventMessage<T> {
+    pub id: String,
+    pub type_: String,
+    pub payload: T,
+    pub key: Option<String>,
+    pub subject_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub occurred_at_ms: Option<u64>,
+    pub actor: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub schema: Option<JsonSchema>,
+    pub metadata: Option<BTreeMap<String, JsonValue>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventMessageOptions {
+    pub id: String,
+    pub key: Option<String>,
+    pub subject_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub occurred_at_ms: Option<u64>,
+    pub actor: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub schema: Option<JsonSchema>,
+    pub metadata: Option<BTreeMap<String, JsonValue>>,
+}
+
+pub fn event_message<T>(
+    type_: impl Into<String>,
+    payload: T,
+    opts: EventMessageOptions,
+) -> EventMessage<T> {
+    let type_ = type_.into();
+    assert_non_empty(&type_, "eventMessage.type");
+    assert_non_empty(&opts.id, "eventMessage.id");
+    EventMessage {
+        id: opts.id,
+        type_,
+        payload,
+        key: opts.key,
+        subject_id: opts.subject_id,
+        correlation_id: opts.correlation_id,
+        causation_id: opts.causation_id,
+        occurred_at_ms: opts.occurred_at_ms,
+        actor: opts.actor,
+        evidence_refs: opts.evidence_refs,
+        schema: opts.schema,
+        metadata: opts.metadata,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,70 +463,89 @@ fn validate_json_schema_array(
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct MessageEnvelope {
-    pub topic: String,
-    pub seq: u64,
-    pub payload: AnyValue,
-    pub key: Option<String>,
-    pub timestamp_ms: u64,
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataIssue {
+    pub kind: String,
+    pub code: String,
+    pub message: String,
+    pub severity: String,
+    pub source: String,
+    pub topic: Option<String>,
+    pub details: Option<String>,
 }
 
-impl MessageEnvelope {
-    pub fn payload<T: 'static>(&self) -> Option<Rc<T>> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageEnvelope<T = AnyValue> {
+    pub topic: String,
+    pub seq: u64,
+    pub payload: T,
+    pub key: Option<String>,
+    pub timestamp_ms: u64,
+    pub command_id: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+impl MessageEnvelope<AnyValue> {
+    pub fn payload_as<T: 'static>(&self) -> Option<Rc<T>> {
         self.payload.clone().downcast::<T>().ok()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageBusEvent {
-    Publish { topic: String, seq: u64 },
-    Complete { topic: String },
-    Error { topic: String, error: String },
-}
-
-#[derive(Clone)]
-pub struct MessageBus {
-    topics: Rc<Vec<String>>,
-    records: Rc<HashMap<String, TopicRecord>>,
-    next_seq: Rc<Cell<u64>>,
-    now: Rc<dyn Fn() -> u64>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DynamicHubUnknownTopicPolicy {
-    Drop,
-    Error,
-    DeadLetter,
+pub enum MessageBusTopicPolicy {
+    Strict,
     CreateAsFact,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MessageBusRetentionPolicy {
+    pub max_messages: Option<usize>,
+    pub max_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBusDedupeAction {
+    Status,
+    Issue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusDedupePolicy {
+    pub command_id: MessageBusDedupeAction,
+}
+
+impl Default for MessageBusDedupePolicy {
+    fn default() -> Self {
+        Self {
+            command_id: MessageBusDedupeAction::Status,
+        }
+    }
+}
+
 #[derive(Clone)]
-pub struct DynamicHubOptions {
+pub struct MessageBusOptions {
     pub name: String,
     pub topics: Vec<String>,
-    pub unknown_topic: DynamicHubUnknownTopicPolicy,
-    pub dead_letter: bool,
-    pub max_topics: usize,
-    pub max_topic_length: usize,
+    pub topic_policy: MessageBusTopicPolicy,
+    pub retention: MessageBusRetentionPolicy,
+    pub dedupe: MessageBusDedupePolicy,
     pub now: Rc<dyn Fn() -> u64>,
 }
 
-impl Default for DynamicHubOptions {
+impl Default for MessageBusOptions {
     fn default() -> Self {
         Self {
-            name: "dynamicHub".to_owned(),
+            name: "messageBus".to_owned(),
             topics: Vec::new(),
-            unknown_topic: DynamicHubUnknownTopicPolicy::Error,
-            dead_letter: false,
-            max_topics: DEFAULT_DYNAMIC_HUB_MAX_TOPICS,
-            max_topic_length: DEFAULT_DYNAMIC_HUB_MAX_TOPIC_LENGTH,
+            topic_policy: MessageBusTopicPolicy::Strict,
+            retention: MessageBusRetentionPolicy::default(),
+            dedupe: MessageBusDedupePolicy::default(),
             now: Rc::new(|| 0),
         }
     }
 }
 
-impl DynamicHubOptions {
+impl MessageBusOptions {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -488,23 +558,18 @@ impl DynamicHubOptions {
         self
     }
 
-    pub fn with_unknown_topic(mut self, policy: DynamicHubUnknownTopicPolicy) -> Self {
-        self.unknown_topic = policy;
+    pub fn with_topic_policy(mut self, policy: MessageBusTopicPolicy) -> Self {
+        self.topic_policy = policy;
         self
     }
 
-    pub fn with_dead_letter(mut self, on: bool) -> Self {
-        self.dead_letter = on;
+    pub fn with_retention(mut self, retention: MessageBusRetentionPolicy) -> Self {
+        self.retention = retention;
         self
     }
 
-    pub fn with_max_topics(mut self, max_topics: usize) -> Self {
-        self.max_topics = max_topics;
-        self
-    }
-
-    pub fn with_max_topic_length(mut self, max_topic_length: usize) -> Self {
-        self.max_topic_length = max_topic_length;
+    pub fn with_dedupe(mut self, dedupe: MessageBusDedupePolicy) -> Self {
+        self.dedupe = dedupe;
         self
     }
 
@@ -514,122 +579,236 @@ impl DynamicHubOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynamicHubMetadata {
-    pub seq: u64,
-    pub cursor: u64,
-    pub timestamp_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DynamicHubEventKind {
-    Create,
-    Delete,
-    Message,
-    Subscribe,
-    Close,
-    Error,
-    DeadLetter,
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub enum DynamicHubCommand<T = AnyValue> {
-    Create {
+pub enum MessageBusCommand<T = AnyValue> {
+    EnsureTopic {
         topic: String,
-        key: Option<String>,
-        payload: Option<T>,
+        command_id: Option<String>,
     },
-    Delete {
+    CloseTopic {
         topic: String,
-        key: Option<String>,
-        payload: Option<T>,
+        command_id: Option<String>,
     },
     Publish {
         topic: String,
         payload: T,
         key: Option<String>,
+        command_id: Option<String>,
+        idempotency_key: Option<String>,
     },
-    Subscribe {
+    TopicPolicy {
+        topic_policy: MessageBusTopicPolicy,
+        command_id: Option<String>,
+    },
+    Ack {
         topic: String,
-        key: Option<String>,
-        payload: Option<T>,
+        subscription_id: String,
+        seq: u64,
+        command_id: Option<String>,
     },
-    Close {
-        key: Option<String>,
-        payload: Option<T>,
+    Seek {
+        topic: String,
+        subscription_id: String,
+        next_seq: u64,
+        command_id: Option<String>,
     },
+    CloseSubscription {
+        topic: String,
+        subscription_id: String,
+        command_id: Option<String>,
+    },
+}
+
+impl<T> MessageBusCommand<T> {
+    fn topic(&self) -> Option<&str> {
+        match self {
+            Self::EnsureTopic { topic, .. }
+            | Self::CloseTopic { topic, .. }
+            | Self::Publish { topic, .. }
+            | Self::Ack { topic, .. }
+            | Self::Seek { topic, .. }
+            | Self::CloseSubscription { topic, .. } => Some(topic),
+            Self::TopicPolicy { .. } => None,
+        }
+    }
+
+    fn command_id(&self) -> Option<&str> {
+        match self {
+            Self::EnsureTopic { command_id, .. }
+            | Self::CloseTopic { command_id, .. }
+            | Self::Publish { command_id, .. }
+            | Self::TopicPolicy { command_id, .. }
+            | Self::Ack { command_id, .. }
+            | Self::Seek { command_id, .. }
+            | Self::CloseSubscription { command_id, .. } => command_id.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBusStatusKind {
+    TopicCreated,
+    TopicClosed,
+    MessagePublished,
+    RetentionTrimmed,
+    DuplicateCommand,
+    SubscriptionOpened,
+    SubscriptionAcked,
+    SubscriptionSought,
+    SubscriptionClosed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageBusStatus {
+    pub kind: MessageBusStatusKind,
+    pub topic: Option<String>,
+    pub seq: Option<u64>,
+    pub head_seq: Option<u64>,
+    pub subscription_id: Option<String>,
+    pub next_seq: Option<u64>,
+    pub command_id: Option<String>,
+    pub issue_code: Option<String>,
+    pub timestamp_ms: u64,
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynamicHubStatus {
-    pub open: bool,
-    pub topics: Vec<String>,
-    pub seq: u64,
-    pub cursor: u64,
-    pub last_event_kind: Option<DynamicHubEventKind>,
+pub struct MessageBusCatalogEntry {
+    pub topic: String,
+    pub closed: bool,
+    pub head_seq: u64,
+    pub next_seq: u64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusCatalogPage {
+    pub topics: Vec<MessageBusCatalogEntry>,
+    pub next_after_topic: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DynamicHubEvent<T = AnyValue> {
-    pub kind: DynamicHubEventKind,
+pub struct MessageBusDeadLetterEntry<T = AnyValue> {
+    pub entry_seq: u64,
     pub topic: Option<String>,
-    pub payload: Option<T>,
-    pub key: Option<String>,
-    pub error: Option<String>,
-    pub reason: Option<String>,
-    pub command: Option<DynamicHubCommand<T>>,
-    pub meta: DynamicHubMetadata,
-    pub status: DynamicHubStatus,
+    pub command: Option<MessageBusCommand<T>>,
+    pub message: Option<MessageEnvelope<T>>,
+    pub issue: DataIssue,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DynamicHubError<T = AnyValue> {
-    pub topic: Option<String>,
-    pub error: String,
-    pub command: DynamicHubCommand<T>,
-    pub meta: DynamicHubMetadata,
+pub struct MessageBusDeadLetterPage<T = AnyValue> {
+    pub entries: Vec<MessageBusDeadLetterEntry<T>>,
+    pub next_after_entry_seq: Option<u64>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DynamicHubDeadLetter<T = AnyValue> {
+pub struct MessageBusTopicPage<T = AnyValue> {
+    pub topic: String,
+    pub messages: Vec<MessageEnvelope<T>>,
+    pub from_seq: u64,
+    pub through_seq: Option<u64>,
+    pub next_after_seq: Option<u64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusCursor {
+    pub topic: String,
+    pub subscription_id: String,
+    pub next_seq: u64,
+    pub closed: bool,
+    pub retention_gap: bool,
+    pub head_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageBusAvailablePage<T = AnyValue> {
+    pub topic: String,
+    pub subscription_id: String,
+    pub cursor: MessageBusCursor,
+    pub messages: Vec<MessageEnvelope<T>>,
+    pub from_seq: u64,
+    pub through_seq: Option<u64>,
+    pub next_after_seq: Option<u64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusCatalogParams {
+    pub limit: Option<usize>,
+    pub after_topic: Option<String>,
+    pub include_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusDeadLetterParams {
+    pub limit: Option<usize>,
+    pub after_entry_seq: Option<u64>,
     pub topic: Option<String>,
-    pub reason: String,
-    pub command: DynamicHubCommand<T>,
-    pub meta: DynamicHubMetadata,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusTopicParams {
+    pub limit: Option<usize>,
+    pub after_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBusAvailableParams {
+    pub limit: Option<usize>,
+    pub after_seq: Option<u64>,
 }
 
 #[derive(Clone)]
-pub struct DynamicHub<T = AnyValue> {
+pub struct MessageBusPullProjection<TPage> {
+    pub snapshot: Node<TPage>,
+    pub snapshot_pull_id: LockId,
+    pub status: Node<MessageBusStatus>,
+    pub issues: Node<DataIssue>,
+}
+
+pub type MessageBusTopicProjection<T = AnyValue> = MessageBusPullProjection<MessageBusTopicPage<T>>;
+
+#[derive(Clone)]
+pub struct MessageBusSubscription<T = AnyValue> {
+    pub available: Node<MessageBusAvailablePage<T>>,
+    pub available_pull_id: LockId,
+    pub cursor: Node<MessageBusCursor>,
+    pub status: Node<MessageBusStatus>,
+    pub issues: Node<DataIssue>,
+    commands: Node<MessageBusCommand<T>>,
+    topic: String,
+    subscription_id: String,
+}
+
+#[derive(Clone)]
+pub struct MessageBus<T = AnyValue> {
     graph: Graph,
-    pub command: Node<DynamicHubCommand<T>>,
-    pub events: Node<DynamicHubEvent<T>>,
-    pub status: Node<DynamicHubStatus>,
-    pub errors: Node<DynamicHubError<T>>,
-    pub dead_letter: Option<Node<DynamicHubDeadLetter<T>>>,
     name: Rc<String>,
-    max_topic_length: usize,
+    pub commands: Node<MessageBusCommand<T>>,
+    pub messages: Node<MessageEnvelope<T>>,
+    pub status: Node<MessageBusStatus>,
+    pub issues: Node<DataIssue>,
+    state: Rc<RefCell<MessageBusState<T>>>,
     command_sources: Rc<RefCell<Vec<Core>>>,
-    _events_retain: Rc<DynamicHubRetain>,
+    _runtime_retain: Rc<RetainNode>,
 }
 
 #[derive(Clone)]
-pub struct ToHubTopicBundle<T> {
-    pub commands: Node<DynamicHubCommand<T>>,
+pub struct ToTopicBundle<T> {
+    pub commands: Node<MessageBusCommand<T>>,
 }
 
-#[derive(Clone)]
-struct DynamicHubRuntime {
-    topics: Vec<String>,
-    open: bool,
-    seq: u64,
-    cursor: u64,
-}
-
-struct DynamicHubRetain {
+struct RetainNode {
     release: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
-impl DynamicHubRetain {
+impl RetainNode {
     fn new(release: Box<dyn FnOnce()>) -> Self {
         Self {
             release: RefCell::new(Some(release)),
@@ -637,7 +816,7 @@ impl DynamicHubRetain {
     }
 }
 
-impl Drop for DynamicHubRetain {
+impl Drop for RetainNode {
     fn drop(&mut self) {
         if let Some(release) = self.release.borrow_mut().take() {
             release();
@@ -645,395 +824,192 @@ impl Drop for DynamicHubRetain {
     }
 }
 
-const DEFAULT_DYNAMIC_HUB_MAX_TOPICS: usize = 1024;
-const DEFAULT_DYNAMIC_HUB_MAX_TOPIC_LENGTH: usize = 256;
-
 #[derive(Clone)]
-struct TopicRecord {
-    node: Node<MessageEnvelope>,
-    producers: Rc<RefCell<Vec<Core>>>,
+struct TopicState<T> {
+    closed: bool,
+    head_seq: u64,
+    next_seq: u64,
+    messages: Vec<MessageEnvelope<T>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubscriptionState {
+    topic: String,
+    subscription_id: String,
+    next_seq: u64,
+    closed: bool,
+    retention_gap: bool,
+}
+
+struct MessageBusState<T = AnyValue> {
+    now: Rc<dyn Fn() -> u64>,
+    topic_policy: MessageBusTopicPolicy,
+    retention: MessageBusRetentionPolicy,
+    dedupe: MessageBusDedupePolicy,
+    topics: BTreeMap<String, TopicState<T>>,
+    subscriptions: BTreeMap<String, SubscriptionState>,
+    seen_command_ids: HashSet<String>,
+    seen_idempotency_keys: HashSet<String>,
+    dead_letters: Vec<MessageBusDeadLetterEntry<T>>,
+    dead_letter_seq: u64,
 }
 
 #[derive(Clone)]
-enum ProducedTopicMessage {
-    Publish(MessageEnvelope),
+enum RuntimeEvent<T = AnyValue> {
+    Message(MessageEnvelope<T>),
+    Status(MessageBusStatus),
+    Issue(DataIssue),
 }
 
-impl MessageBus {
-    pub fn new(graph: &Graph, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self::with_name(graph, topics, "messageBus", || 0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBusSubscriptionFrom {
+    Earliest,
+    Latest,
+    Seq(u64),
+}
+
+#[derive(Clone)]
+pub struct MessageBusSubscriptionOptions {
+    pub topic: String,
+    pub subscription_id: String,
+    pub from: MessageBusSubscriptionFrom,
+    pub name: Option<String>,
+}
+
+impl MessageBusSubscriptionOptions {
+    pub fn new(topic: impl Into<String>, subscription_id: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            subscription_id: subscription_id.into(),
+            from: MessageBusSubscriptionFrom::Earliest,
+            name: None,
+        }
     }
 
-    pub fn with_name(
-        graph: &Graph,
-        topics: impl IntoIterator<Item = impl Into<String>>,
-        name: impl Into<String>,
-        now: impl Fn() -> u64 + 'static,
-    ) -> Self {
-        let name = name.into();
-        let mut topic_names = Vec::new();
-        let mut records = HashMap::new();
-        for topic in topics {
-            let topic = topic.into();
-            assert!(!topic.is_empty(), "MessageBus: topic must not be empty");
-            assert!(
-                !records.contains_key(&topic),
-                "MessageBus: duplicate topic '{topic}'"
-            );
-            let producers = Rc::new(RefCell::new(Vec::new()));
-            let mut opts = GraphNodeOpts::named(format!("{name}/{topic}"));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            let node =
-                graph.node_opts::<MessageEnvelope, _>(vec![], topic_body(producers.clone()), opts);
-            topic_names.push(topic.clone());
-            records.insert(topic, TopicRecord { node, producers });
-        }
-        assert!(
-            !topic_names.is_empty(),
-            "MessageBus: at least one topic is required"
+    pub fn from(mut self, from: MessageBusSubscriptionFrom) -> Self {
+        self.from = from;
+        self
+    }
+
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+impl<T: Clone + 'static> MessageBus<T> {
+    pub fn new(graph: &Graph, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::with_options(graph, MessageBusOptions::default().with_topics(topics))
+    }
+
+    pub fn with_options(graph: &Graph, opts: MessageBusOptions) -> Self {
+        let name = Rc::new(opts.name);
+        let command_sources = Rc::new(RefCell::new(Vec::new()));
+        let commands = graph.node_opts::<MessageBusCommand<T>, _>(
+            Vec::new(),
+            message_bus_command_body::<T>(0),
+            node_opts(format!("{name}/commands"), "messageBusCommands"),
+        );
+        let initial_topics = unique_topics(opts.topics);
+        let state = Rc::new(RefCell::new(MessageBusState {
+            now: opts.now,
+            topic_policy: opts.topic_policy,
+            retention: opts.retention,
+            dedupe: opts.dedupe,
+            topics: initial_topics
+                .into_iter()
+                .map(|topic| (topic, make_topic_state()))
+                .collect(),
+            subscriptions: BTreeMap::new(),
+            seen_command_ids: HashSet::new(),
+            seen_idempotency_keys: HashSet::new(),
+            dead_letters: Vec::new(),
+            dead_letter_seq: 0,
+        }));
+        let runtime_state = state.clone();
+        let runtime = graph.node_opts::<RuntimeEvent<T>, _>(
+            vec![commands.erased()],
+            move |ctx| {
+                for command in ctx.batch::<MessageBusCommand<T>>(0) {
+                    let events = {
+                        let mut state = runtime_state.borrow_mut();
+                        reduce_message_bus_command(&mut state, (*command).clone())
+                    };
+                    for event in events {
+                        ctx.emit(event);
+                    }
+                }
+            },
+            node_opts(format!("{name}/runtime"), "messageBusRuntime"),
+        );
+        let runtime_retain = Rc::new(RetainNode::new(
+            graph.retain(&runtime, &format!("{name}.messageBus.runtime")),
+        ));
+        let messages = graph.node_opts::<MessageEnvelope<T>, _>(
+            vec![runtime.erased()],
+            move |ctx| {
+                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                    if let RuntimeEvent::Message(message) = event.as_ref() {
+                        ctx.emit(message.clone());
+                    }
+                }
+            },
+            node_opts(format!("{name}/messages"), "messageBusMessages"),
+        );
+        let status = graph.node_opts::<MessageBusStatus, _>(
+            vec![runtime.erased()],
+            move |ctx| {
+                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                    if let RuntimeEvent::Status(status) = event.as_ref() {
+                        ctx.emit(status.clone());
+                    }
+                }
+            },
+            node_opts(format!("{name}/status"), "messageBusStatus"),
+        );
+        let issues = graph.node_opts::<DataIssue, _>(
+            vec![runtime.erased()],
+            move |ctx| {
+                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                    if let RuntimeEvent::Issue(issue) = event.as_ref() {
+                        ctx.emit(issue.clone());
+                    }
+                }
+            },
+            node_opts(format!("{name}/issues"), "messageBusIssues"),
         );
         Self {
-            topics: Rc::new(topic_names),
-            records: Rc::new(records),
-            next_seq: Rc::new(Cell::new(0)),
-            now: Rc::new(now),
+            graph: graph.clone(),
+            name,
+            commands,
+            messages,
+            status,
+            issues,
+            state,
+            command_sources,
+            _runtime_retain: runtime_retain,
         }
     }
 
-    pub fn topics(&self) -> &[String] {
-        self.topics.as_slice()
-    }
-
-    pub fn has(&self, topic: &str) -> bool {
-        self.records.contains_key(topic)
-    }
-
-    pub fn topic(&self, topic: &str) -> Node<MessageEnvelope> {
-        self.records
-            .get(topic)
-            .unwrap_or_else(|| panic!("MessageBus: unknown topic '{topic}'"))
-            .node
-            .clone()
-    }
-
-    pub fn publish<T: 'static>(
-        &self,
-        topic: &str,
-        payload: T,
-        key: Option<String>,
-    ) -> MessageEnvelope {
-        let node = self.topic(topic);
-        let envelope = self.envelope(topic, payload, key);
-        node.set(envelope.clone());
-        envelope
-    }
-
-    fn envelope<T: 'static>(
-        &self,
-        topic: &str,
-        payload: T,
-        key: Option<String>,
-    ) -> MessageEnvelope {
-        let seq = self.next_seq.get() + 1;
-        self.next_seq.set(seq);
-        MessageEnvelope {
-            topic: topic.to_owned(),
-            seq,
-            payload: Rc::new(payload),
-            key,
-            timestamp_ms: (self.now)(),
-        }
-    }
-
-    fn record(&self, topic: &str) -> TopicRecord {
-        self.records
-            .get(topic)
-            .unwrap_or_else(|| panic!("MessageBus: unknown topic '{topic}'"))
-            .clone()
-    }
-}
-
-pub fn message_bus(
-    graph: &Graph,
-    topics: impl IntoIterator<Item = impl Into<String>>,
-) -> MessageBus {
-    MessageBus::new(graph, topics)
-}
-
-pub fn from_topic(bus: &MessageBus, topic: &str) -> Node<MessageEnvelope> {
-    bus.topic(topic)
-}
-
-pub fn to_topic<T: Clone + 'static>(
-    graph: &Graph,
-    source: &Node<T>,
-    bus: MessageBus,
-    topic: impl Into<String>,
-    name: impl Into<String>,
-) -> Node<MessageBusEvent> {
-    let topic = topic.into();
-    let name = name.into();
-    let record = bus.record(&topic);
-    let topic_for_fn = topic.clone();
-    let bus_for_producer = bus.clone();
-    let producer_topic = topic.clone();
-    let producer = graph.node_opts::<ProducedTopicMessage, _>(
-        vec![source.erased()],
-        move |ctx: &Ctx| {
-            for value in ctx.batch::<T>(0) {
-                let envelope = bus_for_producer.envelope(&producer_topic, (*value).clone(), None);
-                ctx.emit(ProducedTopicMessage::Publish(envelope));
-            }
-        },
-        {
-            let mut opts = GraphNodeOpts::named(name.clone());
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
-    );
-    record.producers.borrow_mut().push(producer.erased());
-    let topic_deps = record.producers.borrow().clone();
-    let topic_producers = record.producers.clone();
-    record
-        .node
-        .replace_deps(topic_deps, topic_body(topic_producers));
-
-    graph.node_opts::<MessageBusEvent, _>(
-        vec![producer.erased(), source.erased()],
-        move |ctx: &Ctx| {
-            for produced in ctx.batch::<ProducedTopicMessage>(0) {
-                let ProducedTopicMessage::Publish(envelope) = produced.as_ref();
-                ctx.emit(MessageBusEvent::Publish {
-                    topic: topic_for_fn.clone(),
-                    seq: envelope.seq,
-                });
-            }
-            match ctx.terminal(1) {
-                Some(DepTerminal::Complete) => ctx.emit(MessageBusEvent::Complete {
-                    topic: topic_for_fn.clone(),
-                }),
-                Some(DepTerminal::Error(error)) => ctx.emit(MessageBusEvent::Error {
-                    topic: topic_for_fn.clone(),
-                    error: error.to_string(),
-                }),
-                None => {}
-            }
-        },
-        {
-            let mut opts = GraphNodeOpts::named(format!("{name}/events"));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts.node.terminal_as_real_input = true;
-            opts
-        },
-    )
-}
-
-fn topic_body(producers: Rc<RefCell<Vec<Core>>>) -> impl Fn(&Ctx) + 'static {
-    move |ctx: &Ctx| {
-        let len = producers.borrow().len();
-        for index in 0..len {
-            for produced in ctx.batch::<ProducedTopicMessage>(index) {
-                let ProducedTopicMessage::Publish(envelope) = produced.as_ref();
-                ctx.emit(envelope.clone());
-            }
-        }
-    }
-}
-
-pub fn topic_core(bus: &MessageBus, topic: &str) -> Core {
-    bus.topic(topic).erased()
-}
-
-pub fn dynamic_hub<T: Clone + 'static>(graph: &Graph) -> DynamicHub<T> {
-    dynamic_hub_with_options(graph, DynamicHubOptions::default())
-}
-
-pub fn dynamic_hub_with_options<T: Clone + 'static>(
-    graph: &Graph,
-    opts: DynamicHubOptions,
-) -> DynamicHub<T> {
-    assert!(
-        opts.max_topics > 0,
-        "dynamicHub: maxTopics must be positive"
-    );
-    assert!(
-        opts.max_topic_length > 0,
-        "dynamicHub: maxTopicLength must be positive"
-    );
-    let initial_topics = unique_hub_topics(&opts.topics, opts.max_topic_length);
-    assert!(
-        initial_topics.len() <= opts.max_topics,
-        "dynamicHub: topics exceed maxTopics"
-    );
-
-    let name = Rc::new(opts.name);
-    let command_sources = Rc::new(RefCell::new(Vec::new()));
-    let command =
-        graph.node_opts::<DynamicHubCommand<T>, _>(Vec::new(), dynamic_hub_command_body::<T>(0), {
-            let mut opts = GraphNodeOpts::named(format!("{name}/command"));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        });
-
-    let runtime_seed = DynamicHubRuntime {
-        topics: initial_topics,
-        open: true,
-        seq: 0,
-        cursor: 0,
-    };
-    let unknown_topic = opts.unknown_topic;
-    let max_topics = opts.max_topics;
-    let max_topic_length = opts.max_topic_length;
-    let now = opts.now.clone();
-    let events = graph.node_opts::<DynamicHubEvent<T>, _>(
-        vec![command.erased()],
-        move |ctx: &Ctx| {
-            let mut runtime = ctx
-                .state_get::<DynamicHubRuntime>()
-                .map(|state| (*state).clone())
-                .unwrap_or_else(|| runtime_seed.clone());
-            ctx.state_persist(true);
-            for command in ctx.batch::<DynamicHubCommand<T>>(0) {
-                for event in reduce_dynamic_hub_command(
-                    &mut runtime,
-                    (*command).clone(),
-                    unknown_topic,
-                    max_topics,
-                    max_topic_length,
-                    now.as_ref(),
-                ) {
-                    ctx.emit(event);
-                }
-            }
-            ctx.state_set(runtime);
-        },
-        {
-            let mut opts = GraphNodeOpts::named(format!("{name}/events"));
-            opts.meta
-                .insert("unknownTopic".to_owned(), format!("{:?}", unknown_topic));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
-    );
-
-    let status = graph.node_opts::<DynamicHubStatus, _>(
-        vec![events.erased()],
-        move |ctx: &Ctx| {
-            for event in ctx.batch::<DynamicHubEvent<T>>(0) {
-                ctx.emit(event.status.clone());
-            }
-        },
-        {
-            let mut opts = GraphNodeOpts::named(format!("{name}/status"));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
-    );
-
-    let errors = graph.node_opts::<DynamicHubError<T>, _>(
-        vec![events.erased()],
-        move |ctx: &Ctx| {
-            for event in ctx.batch::<DynamicHubEvent<T>>(0) {
-                if event.kind != DynamicHubEventKind::Error {
-                    continue;
-                }
-                if let (Some(error), Some(command)) = (event.error.clone(), event.command.clone()) {
-                    ctx.emit(DynamicHubError {
-                        topic: event.topic.clone(),
-                        error,
-                        command,
-                        meta: event.meta.clone(),
-                    });
-                }
-            }
-        },
-        {
-            let mut opts = GraphNodeOpts::named(format!("{name}/errors"));
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
-    );
-
-    let dead_letter =
-        if opts.dead_letter || opts.unknown_topic == DynamicHubUnknownTopicPolicy::DeadLetter {
-            Some(graph.node_opts::<DynamicHubDeadLetter<T>, _>(
-                vec![events.erased()],
-                move |ctx: &Ctx| {
-                    for event in ctx.batch::<DynamicHubEvent<T>>(0) {
-                        if event.kind != DynamicHubEventKind::DeadLetter {
-                            continue;
-                        }
-                        if let (Some(reason), Some(command)) =
-                            (event.reason.clone(), event.command.clone())
-                        {
-                            ctx.emit(DynamicHubDeadLetter {
-                                topic: event.topic.clone(),
-                                reason,
-                                command,
-                                meta: event.meta.clone(),
-                            });
-                        }
-                    }
-                },
-                {
-                    let mut opts = GraphNodeOpts::named(format!("{name}/deadLetter"));
-                    opts.node.complete_when_deps_complete = false;
-                    opts.node.error_when_deps_error = false;
-                    opts
-                },
-            ))
-        } else {
-            None
-        };
-    let events_retain = Rc::new(DynamicHubRetain::new(
-        graph.retain(&events, &format!("{name}.dynamicHub.events")),
-    ));
-
-    DynamicHub {
-        graph: graph.clone(),
-        command,
-        events,
-        status,
-        errors,
-        dead_letter,
-        name,
-        max_topic_length,
-        command_sources,
-        _events_retain: events_retain,
-    }
-}
-
-impl<T: Clone + 'static> DynamicHub<T> {
-    pub fn create(
+    pub fn ensure_topic(
         &self,
         topic: impl Into<String>,
-        key: Option<String>,
-        payload: Option<T>,
-    ) -> DynamicHubCommand<T> {
-        self.publish_command(DynamicHubCommand::Create {
+        command_id: Option<String>,
+    ) -> MessageBusCommand<T> {
+        self.publish_command(MessageBusCommand::EnsureTopic {
             topic: topic.into(),
-            key,
-            payload,
+            command_id,
         })
     }
 
-    pub fn delete(
+    pub fn close_topic(
         &self,
         topic: impl Into<String>,
-        key: Option<String>,
-        payload: Option<T>,
-    ) -> DynamicHubCommand<T> {
-        self.publish_command(DynamicHubCommand::Delete {
+        command_id: Option<String>,
+    ) -> MessageBusCommand<T> {
+        self.publish_command(MessageBusCommand::CloseTopic {
             topic: topic.into(),
-            key,
-            payload,
+            command_id,
         })
     }
 
@@ -1042,636 +1018,1245 @@ impl<T: Clone + 'static> DynamicHub<T> {
         topic: impl Into<String>,
         payload: T,
         key: Option<String>,
-    ) -> DynamicHubCommand<T> {
-        self.publish_command(DynamicHubCommand::Publish {
+        command_id: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> MessageBusCommand<T> {
+        self.publish_command(MessageBusCommand::Publish {
             topic: topic.into(),
             payload,
             key,
+            command_id,
+            idempotency_key,
         })
     }
 
-    pub fn subscribe_topic(
+    pub fn set_topic_policy(
+        &self,
+        topic_policy: MessageBusTopicPolicy,
+        command_id: Option<String>,
+    ) -> MessageBusCommand<T> {
+        self.publish_command(MessageBusCommand::TopicPolicy {
+            topic_policy,
+            command_id,
+        })
+    }
+
+    pub fn topic(&self, topic: impl Into<String>) -> MessageBusTopicProjection<T> {
+        self.topic_named(topic, None::<String>)
+    }
+
+    pub fn topic_named(
         &self,
         topic: impl Into<String>,
-        key: Option<String>,
-        payload: Option<T>,
-    ) -> DynamicHubCommand<T> {
-        self.publish_command(DynamicHubCommand::Subscribe {
-            topic: topic.into(),
-            key,
-            payload,
-        })
+        name: Option<impl Into<String>>,
+    ) -> MessageBusTopicProjection<T> {
+        let topic = topic.into();
+        assert_topic_key(&topic, "messageBus.topic");
+        let snapshot_pull_id = LockId::new(format!("{}/{topic}/topicSnapshot", self.name));
+        let state = self.state.clone();
+        let topic_for_fn = topic.clone();
+        let snapshot = self.graph.node_opts::<MessageBusTopicPage<T>, _>(
+            vec![self.messages.erased()],
+            move |ctx| {
+                let params =
+                    pull_params::<MessageBusTopicParams>(ctx).unwrap_or(MessageBusTopicParams {
+                        limit: None,
+                        after_seq: None,
+                    });
+                ctx.emit(topic_page(&state.borrow(), &topic_for_fn, &params));
+            },
+            pull_node_opts(
+                name.map(Into::into)
+                    .unwrap_or_else(|| format!("{}/{topic}/topic", self.name)),
+                "messageBusTopicProjection",
+                snapshot_pull_id.clone(),
+            ),
+        );
+        MessageBusPullProjection {
+            snapshot,
+            snapshot_pull_id,
+            status: self.status.clone(),
+            issues: self.issues.clone(),
+        }
     }
 
-    pub fn close(&self, key: Option<String>, payload: Option<T>) -> DynamicHubCommand<T> {
-        self.publish_command(DynamicHubCommand::Close { key, payload })
+    pub fn catalog(&self) -> MessageBusPullProjection<MessageBusCatalogPage> {
+        self.catalog_named(None::<String>)
     }
 
-    fn publish_command(&self, command: DynamicHubCommand<T>) -> DynamicHubCommand<T> {
-        self.command.set(command.clone());
+    pub fn catalog_named(
+        &self,
+        name: Option<impl Into<String>>,
+    ) -> MessageBusPullProjection<MessageBusCatalogPage> {
+        let snapshot_pull_id = LockId::new(format!("{}/catalogSnapshot", self.name));
+        let state = self.state.clone();
+        let snapshot = self.graph.node_opts::<MessageBusCatalogPage, _>(
+            vec![self.status.erased()],
+            move |ctx| {
+                let params = pull_params::<MessageBusCatalogParams>(ctx).unwrap_or(
+                    MessageBusCatalogParams {
+                        limit: None,
+                        after_topic: None,
+                        include_closed: false,
+                    },
+                );
+                ctx.emit(catalog_page(&state.borrow(), &params));
+            },
+            pull_node_opts(
+                name.map(Into::into)
+                    .unwrap_or_else(|| format!("{}/catalog", self.name)),
+                "messageBusCatalog",
+                snapshot_pull_id.clone(),
+            ),
+        );
+        MessageBusPullProjection {
+            snapshot,
+            snapshot_pull_id,
+            status: self.status.clone(),
+            issues: self.issues.clone(),
+        }
+    }
+
+    pub fn dead_letter(&self) -> MessageBusPullProjection<MessageBusDeadLetterPage<T>> {
+        self.dead_letter_named(None::<String>)
+    }
+
+    pub fn dead_letter_named(
+        &self,
+        name: Option<impl Into<String>>,
+    ) -> MessageBusPullProjection<MessageBusDeadLetterPage<T>> {
+        let snapshot_pull_id = LockId::new(format!("{}/deadLetterSnapshot", self.name));
+        let state = self.state.clone();
+        let snapshot = self.graph.node_opts::<MessageBusDeadLetterPage<T>, _>(
+            vec![self.issues.erased(), self.status.erased()],
+            move |ctx| {
+                let params = pull_params::<MessageBusDeadLetterParams>(ctx).unwrap_or(
+                    MessageBusDeadLetterParams {
+                        limit: None,
+                        after_entry_seq: None,
+                        topic: None,
+                        code: None,
+                    },
+                );
+                ctx.emit(dead_letter_page(&state.borrow(), &params));
+            },
+            pull_node_opts(
+                name.map(Into::into)
+                    .unwrap_or_else(|| format!("{}/deadLetter", self.name)),
+                "messageBusDeadLetter",
+                snapshot_pull_id.clone(),
+            ),
+        );
+        MessageBusPullProjection {
+            snapshot,
+            snapshot_pull_id,
+            status: self.status.clone(),
+            issues: self.issues.clone(),
+        }
+    }
+
+    pub fn subscription(&self, opts: MessageBusSubscriptionOptions) -> MessageBusSubscription<T> {
+        assert_topic_key(&opts.topic, "messageBus.subscription");
+        assert_non_empty(&opts.subscription_id, "messageBus.subscriptionId");
+        let (sub, opened, issue) = ensure_subscription(&mut self.state.borrow_mut(), &opts);
+        let available_pull_id = LockId::new(format!(
+            "{}/{}/{}/available",
+            self.name, opts.topic, opts.subscription_id
+        ));
+        let projection_name = opts
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}/{}", self.name, opts.topic, opts.subscription_id));
+        let available_state = self.state.clone();
+        let available_sub = sub.clone();
+        let available = self.graph.node_opts::<MessageBusAvailablePage<T>, _>(
+            vec![self.messages.erased(), self.status.erased()],
+            move |ctx| {
+                let params = pull_params::<MessageBusAvailableParams>(ctx).unwrap_or(
+                    MessageBusAvailableParams {
+                        limit: None,
+                        after_seq: None,
+                    },
+                );
+                ctx.emit(available_page(
+                    &available_state.borrow(),
+                    &available_sub,
+                    &params,
+                ));
+            },
+            pull_node_opts(
+                format!("{projection_name}/available"),
+                "messageBusSubscriptionAvailable",
+                available_pull_id.clone(),
+            ),
+        );
+        let cursor_state = self.state.clone();
+        let cursor_sub = sub.clone();
+        let cursor = self.graph.node_opts::<MessageBusCursor, _>(
+            vec![self.status.erased()],
+            move |ctx| {
+                for status in ctx.batch::<MessageBusStatus>(0) {
+                    let subscription_moved = status.topic.as_deref()
+                        == Some(cursor_sub.topic.as_str())
+                        && status.subscription_id.as_deref()
+                            == Some(cursor_sub.subscription_id.as_str())
+                        && matches!(
+                            status.kind,
+                            MessageBusStatusKind::SubscriptionOpened
+                                | MessageBusStatusKind::SubscriptionAcked
+                                | MessageBusStatusKind::SubscriptionSought
+                                | MessageBusStatusKind::SubscriptionClosed
+                        );
+                    let retention_changed = status.topic.as_deref()
+                        == Some(cursor_sub.topic.as_str())
+                        && status.kind == MessageBusStatusKind::RetentionTrimmed;
+                    if subscription_moved || retention_changed {
+                        ctx.emit(cursor_snapshot(&cursor_state.borrow(), &cursor_sub));
+                    }
+                }
+            },
+            node_opts(
+                format!("{projection_name}/cursor"),
+                "messageBusSubscriptionCursor",
+            ),
+        );
+        if opened {
+            let opened_status = status_fact(
+                &self.state.borrow(),
+                MessageBusStatusKind::SubscriptionOpened,
+                StatusFields {
+                    topic: Some(sub.topic.clone()),
+                    subscription_id: Some(sub.subscription_id.clone()),
+                    next_seq: Some(sub.next_seq),
+                    details: Some(format!("from={:?}", opts.from)),
+                    ..StatusFields::default()
+                },
+            );
+            self.status.set(opened_status);
+        }
+        if let Some(issue) = issue {
+            self.issues.set(issue);
+        }
+        MessageBusSubscription {
+            available,
+            available_pull_id,
+            cursor,
+            status: self.status.clone(),
+            issues: self.issues.clone(),
+            commands: self.commands.clone(),
+            topic: sub.topic,
+            subscription_id: sub.subscription_id,
+        }
+    }
+
+    fn publish_command(&self, command: MessageBusCommand<T>) -> MessageBusCommand<T> {
+        self.commands.set(command.clone());
         command
     }
 }
 
-pub fn from_hub_topic<T: Clone + 'static>(
-    hub: &DynamicHub<T>,
-    topic: &str,
-) -> Node<MessageEnvelope> {
-    from_hub_topic_with_name(hub, topic, format!("{}/{topic}/fromHubTopic", hub.name))
+impl<T: Clone + 'static> MessageBusSubscription<T> {
+    pub fn ack(&self, seq: u64, command_id: Option<String>) -> MessageBusCommand<T> {
+        let command = MessageBusCommand::Ack {
+            topic: self.topic.clone(),
+            subscription_id: self.subscription_id.clone(),
+            seq,
+            command_id,
+        };
+        self.commands.set(command.clone());
+        command
+    }
+
+    pub fn seek(&self, next_seq: u64, command_id: Option<String>) -> MessageBusCommand<T> {
+        let command = MessageBusCommand::Seek {
+            topic: self.topic.clone(),
+            subscription_id: self.subscription_id.clone(),
+            next_seq,
+            command_id,
+        };
+        self.commands.set(command.clone());
+        command
+    }
+
+    pub fn close(&self, command_id: Option<String>) -> MessageBusCommand<T> {
+        let command = MessageBusCommand::CloseSubscription {
+            topic: self.topic.clone(),
+            subscription_id: self.subscription_id.clone(),
+            command_id,
+        };
+        self.commands.set(command.clone());
+        command
+    }
 }
 
-pub fn from_hub_topic_with_name<T: Clone + 'static>(
-    hub: &DynamicHub<T>,
-    topic: &str,
-    name: impl Into<String>,
-) -> Node<MessageEnvelope> {
-    assert_topic_key(topic, "fromHubTopic", hub.max_topic_length);
-    let topic = topic.to_owned();
-    let topic_for_fn = topic.clone();
-    hub.graph.node_opts::<MessageEnvelope, _>(
-        vec![hub.events.erased()],
-        move |ctx: &Ctx| {
-            for event in ctx.batch::<DynamicHubEvent<T>>(0) {
-                if event.kind != DynamicHubEventKind::Message
-                    || event.topic.as_deref() != Some(topic_for_fn.as_str())
-                {
-                    continue;
-                }
-                if let Some(payload) = event.payload.clone() {
-                    ctx.emit(MessageEnvelope {
-                        topic: topic_for_fn.clone(),
-                        seq: event.meta.seq,
-                        payload: Rc::new(payload),
-                        key: event.key.clone(),
-                        timestamp_ms: event.meta.timestamp_ms,
-                    });
-                }
-            }
-        },
-        {
-            let mut opts = GraphNodeOpts::named(name);
-            opts.meta.insert("topic".to_owned(), topic);
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
-    )
+pub fn message_bus<T: Clone + 'static>(graph: &Graph, opts: MessageBusOptions) -> MessageBus<T> {
+    MessageBus::with_options(graph, opts)
 }
 
-pub fn to_hub_topic<T: Clone + 'static>(
+pub fn to_topic<T: Clone + 'static>(
     graph: &Graph,
     source: &Node<T>,
-    hub: &DynamicHub<T>,
+    bus: &MessageBus<T>,
     topic: impl Into<String>,
     name: impl Into<String>,
-) -> ToHubTopicBundle<T> {
+) -> ToTopicBundle<T> {
     let topic = topic.into();
-    assert_topic_key(&topic, "toHubTopic", hub.max_topic_length);
+    assert_topic_key(&topic, "toTopic");
     assert!(
-        source.erased().same_graph(&hub.command.erased()),
-        "toHubTopic: hub and source graph must match"
+        source.erased().same_graph(&bus.commands.erased()),
+        "toTopic: bus and source graph must match"
     );
     assert!(
-        !is_reachable_upstream(&source.erased(), &hub.command.erased()),
-        "toHubTopic: source already depends on hub command path"
+        !is_reachable_upstream(&source.erased(), &bus.commands.erased()),
+        "toTopic: source already depends on bus command path"
     );
-
     let topic_for_fn = topic.clone();
-    let commands = graph.node_opts::<DynamicHubCommand<T>, _>(
+    let commands = graph.node_opts::<MessageBusCommand<T>, _>(
         vec![source.erased()],
-        move |ctx: &Ctx| {
+        move |ctx| {
             for value in ctx.batch::<T>(0) {
-                ctx.emit(DynamicHubCommand::Publish {
+                ctx.emit(MessageBusCommand::Publish {
                     topic: topic_for_fn.clone(),
                     payload: (*value).clone(),
                     key: None,
+                    command_id: None,
+                    idempotency_key: None,
                 });
             }
         },
-        {
-            let mut opts = GraphNodeOpts::named(name);
-            opts.meta.insert("topic".to_owned(), topic);
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
-            opts
-        },
+        node_opts(name.into(), "messageBusToTopic"),
     );
-
     let command_source = commands.erased();
-    hub.command_sources
+    bus.command_sources
         .borrow_mut()
         .push(command_source.clone());
-    let command_sources = hub.command_sources.borrow().clone();
+    let command_sources = bus.command_sources.borrow().clone();
     let command_source_count = command_sources.len();
     let rewire = catch_unwind(AssertUnwindSafe(|| {
-        hub.command.replace_deps(
+        bus.commands.replace_deps(
             command_sources,
-            dynamic_hub_command_body::<T>(command_source_count),
+            message_bus_command_body::<T>(command_source_count),
         );
     }));
     if let Err(panic) = rewire {
-        hub.command_sources
+        bus.command_sources
             .borrow_mut()
             .retain(|source| !source.ptr_eq(&command_source));
-        graph.release_nodes(&[commands.erased()], "toHubTopic failed command wiring");
+        graph.release_nodes(&[commands.erased()], "toTopic failed command wiring");
         resume_unwind(panic);
     }
-
-    ToHubTopicBundle { commands }
+    ToTopicBundle { commands }
 }
 
-fn dynamic_hub_command_body<T: Clone + 'static>(
+pub(crate) fn attach_message_bus_deferred_command_sink<T: Clone + 'static>(
+    graph: &Graph,
+    bus: &MessageBus<T>,
+    commands: &Node<MessageBusCommand<T>>,
+) -> Box<dyn FnOnce()> {
+    assert!(
+        commands.erased().same_graph(&bus.commands.erased()),
+        "messageBus: command sink graph must match"
+    );
+    let _ = graph;
+    let bus_commands = bus.commands.erased();
+    commands.subscribe(move |msg| {
+        if let crate::protocol::Message::Data(value) = msg {
+            if let Ok(command) = value.clone().downcast::<MessageBusCommand<T>>() {
+                bus_commands.request_down_next(vec![crate::protocol::Message::Data(Rc::new(
+                    (*command).clone(),
+                ))]);
+            }
+        }
+    })
+}
+
+fn message_bus_command_body<T: Clone + 'static>(
     command_source_count: usize,
 ) -> impl Fn(&Ctx) + 'static {
-    move |ctx: &Ctx| {
+    move |ctx| {
         for index in 0..command_source_count {
-            for command in ctx.batch::<DynamicHubCommand<T>>(index) {
+            for command in ctx.batch::<MessageBusCommand<T>>(index) {
                 ctx.emit((*command).clone());
             }
         }
     }
 }
 
-fn reduce_dynamic_hub_command<T: Clone + 'static>(
-    runtime: &mut DynamicHubRuntime,
-    command: DynamicHubCommand<T>,
-    unknown_topic: DynamicHubUnknownTopicPolicy,
-    max_topics: usize,
-    max_topic_length: usize,
-    now: &dyn Fn() -> u64,
-) -> Vec<DynamicHubEvent<T>> {
+fn reduce_message_bus_command<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+) -> Vec<RuntimeEvent<T>> {
     if let Some(topic) = command.topic() {
-        if let Some(error) = validate_topic_key(topic, "dynamicHub", max_topic_length) {
-            return vec![hub_error_now(runtime, command, error, now)];
+        if let Some(error) = validate_topic_key(topic, "messageBus") {
+            return reject_command(state, command, error);
         }
     }
-    if !runtime.open && !matches!(command, DynamicHubCommand::Close { .. }) {
-        return vec![hub_error_now(
-            runtime,
-            command,
-            "dynamicHub: hub is closed".to_owned(),
-            now,
-        )];
+    if let Some(subscription_id) = command_subscription_id(&command) {
+        if subscription_id.is_empty() {
+            return reject_command(
+                state,
+                command,
+                "subscriptionId must be a non-empty string".to_owned(),
+            );
+        }
+    }
+    if let Some(command_id) = command.command_id() {
+        if state.seen_command_ids.contains(command_id) {
+            return duplicate_command_events(state, command, "duplicate commandId");
+        }
+        state.seen_command_ids.insert(command_id.to_owned());
+    }
+    if let MessageBusCommand::Publish {
+        topic,
+        idempotency_key: Some(idempotency_key),
+        ..
+    } = &command
+    {
+        if state
+            .seen_idempotency_keys
+            .contains(&idempotency_key_for(topic, idempotency_key))
+        {
+            return duplicate_command_events(state, command, "duplicate idempotencyKey");
+        }
     }
     match command {
-        DynamicHubCommand::Create {
-            topic,
-            key,
-            payload,
+        MessageBusCommand::EnsureTopic { topic, command_id } => {
+            ensure_topic(state, topic, command_id)
+        }
+        MessageBusCommand::CloseTopic { topic, command_id } => {
+            close_topic(state, topic, command_id)
+        }
+        MessageBusCommand::TopicPolicy {
+            topic_policy,
+            command_id,
         } => {
-            let command = DynamicHubCommand::Create {
-                topic: topic.clone(),
-                key: key.clone(),
-                payload: payload.clone(),
-            };
-            if let Some(error) = can_add_hub_topic(runtime, &topic, max_topics) {
-                return vec![hub_error_now(runtime, command, error, now)];
-            }
-            let timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(events) => return events,
-            };
-            add_hub_topic(runtime, &topic);
-            vec![hub_event(
-                runtime,
-                timestamp_ms,
-                DynamicHubEventDraft {
-                    kind: DynamicHubEventKind::Create,
-                    topic: Some(topic),
-                    payload,
-                    key,
-                    error: None,
-                    reason: None,
-                    command: None,
-                },
-            )]
+            state.topic_policy = topic_policy;
+            let _ = command_id;
+            Vec::new()
         }
-        DynamicHubCommand::Delete {
-            topic,
-            key,
-            payload,
-        } => {
-            let command = DynamicHubCommand::Delete {
-                topic: topic.clone(),
-                key: key.clone(),
-                payload: payload.clone(),
-            };
-            if !has_hub_topic(runtime, &topic) {
-                return unknown_hub_topic(runtime, command, unknown_topic, now);
-            }
-            let timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(events) => return events,
-            };
-            delete_hub_topic(runtime, &topic);
-            vec![hub_event(
-                runtime,
-                timestamp_ms,
-                DynamicHubEventDraft {
-                    kind: DynamicHubEventKind::Delete,
-                    topic: Some(topic),
-                    payload,
-                    key,
-                    error: None,
-                    reason: None,
-                    command: None,
-                },
-            )]
-        }
-        DynamicHubCommand::Publish {
-            topic,
-            payload,
-            key,
-        } => {
-            let command = DynamicHubCommand::Publish {
-                topic: topic.clone(),
-                payload: payload.clone(),
-                key: key.clone(),
-            };
-            if !has_hub_topic(runtime, &topic) {
-                if unknown_topic == DynamicHubUnknownTopicPolicy::CreateAsFact {
-                    if let Some(error) = can_add_hub_topic(runtime, &topic, max_topics) {
-                        return vec![hub_error_now(runtime, command, error, now)];
-                    }
-                    let create_timestamp_ms =
-                        match hub_timestamp_or_error(runtime, command.clone(), now) {
-                            Ok(timestamp_ms) => timestamp_ms,
-                            Err(events) => return events,
-                        };
-                    let message_timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                        Ok(timestamp_ms) => timestamp_ms,
-                        Err(events) => return events,
-                    };
-                    add_hub_topic(runtime, &topic);
-                    return vec![
-                        hub_event(
-                            runtime,
-                            create_timestamp_ms,
-                            DynamicHubEventDraft {
-                                kind: DynamicHubEventKind::Create,
-                                topic: Some(topic.clone()),
-                                payload: None,
-                                key: None,
-                                error: None,
-                                reason: None,
-                                command: None,
-                            },
-                        ),
-                        hub_event(
-                            runtime,
-                            message_timestamp_ms,
-                            DynamicHubEventDraft {
-                                kind: DynamicHubEventKind::Message,
-                                topic: Some(topic),
-                                payload: Some(payload),
-                                key,
-                                error: None,
-                                reason: None,
-                                command: None,
-                            },
-                        ),
-                    ];
-                }
-                return unknown_hub_topic(runtime, command, unknown_topic, now);
-            }
-            let timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(events) => return events,
-            };
-            vec![hub_event(
-                runtime,
-                timestamp_ms,
-                DynamicHubEventDraft {
-                    kind: DynamicHubEventKind::Message,
-                    topic: Some(topic),
-                    payload: Some(payload),
-                    key,
-                    error: None,
-                    reason: None,
-                    command: None,
-                },
-            )]
-        }
-        DynamicHubCommand::Subscribe {
-            topic,
-            key,
-            payload,
-        } => {
-            let command = DynamicHubCommand::Subscribe {
-                topic: topic.clone(),
-                key: key.clone(),
-                payload: payload.clone(),
-            };
-            if !has_hub_topic(runtime, &topic) {
-                if unknown_topic == DynamicHubUnknownTopicPolicy::CreateAsFact {
-                    if let Some(error) = can_add_hub_topic(runtime, &topic, max_topics) {
-                        return vec![hub_error_now(runtime, command, error, now)];
-                    }
-                    let create_timestamp_ms =
-                        match hub_timestamp_or_error(runtime, command.clone(), now) {
-                            Ok(timestamp_ms) => timestamp_ms,
-                            Err(events) => return events,
-                        };
-                    let subscribe_timestamp_ms = match hub_timestamp_or_error(runtime, command, now)
-                    {
-                        Ok(timestamp_ms) => timestamp_ms,
-                        Err(events) => return events,
-                    };
-                    add_hub_topic(runtime, &topic);
-                    return vec![
-                        hub_event(
-                            runtime,
-                            create_timestamp_ms,
-                            DynamicHubEventDraft {
-                                kind: DynamicHubEventKind::Create,
-                                topic: Some(topic.clone()),
-                                payload: None,
-                                key: None,
-                                error: None,
-                                reason: None,
-                                command: None,
-                            },
-                        ),
-                        hub_event(
-                            runtime,
-                            subscribe_timestamp_ms,
-                            DynamicHubEventDraft {
-                                kind: DynamicHubEventKind::Subscribe,
-                                topic: Some(topic),
-                                payload,
-                                key,
-                                error: None,
-                                reason: None,
-                                command: None,
-                            },
-                        ),
-                    ];
-                }
-                return unknown_hub_topic(runtime, command, unknown_topic, now);
-            }
-            let timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(events) => return events,
-            };
-            vec![hub_event(
-                runtime,
-                timestamp_ms,
-                DynamicHubEventDraft {
-                    kind: DynamicHubEventKind::Subscribe,
-                    topic: Some(topic),
-                    payload,
-                    key,
-                    error: None,
-                    reason: None,
-                    command: None,
-                },
-            )]
-        }
-        DynamicHubCommand::Close { key, payload } => {
-            let command = DynamicHubCommand::Close {
-                key: key.clone(),
-                payload: payload.clone(),
-            };
-            let timestamp_ms = match hub_timestamp_or_error(runtime, command, now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(events) => return events,
-            };
-            runtime.open = false;
-            vec![hub_event(
-                runtime,
-                timestamp_ms,
-                DynamicHubEventDraft {
-                    kind: DynamicHubEventKind::Close,
-                    topic: None,
-                    payload,
-                    key,
-                    error: None,
-                    reason: None,
-                    command: None,
-                },
-            )]
-        }
+        MessageBusCommand::Publish { .. } => publish_message(state, command),
+        MessageBusCommand::Ack { .. } => ack_subscription(state, command),
+        MessageBusCommand::Seek { .. } => seek_subscription(state, command),
+        MessageBusCommand::CloseSubscription { .. } => close_subscription(state, command),
     }
 }
 
-impl<T> DynamicHubCommand<T> {
-    fn topic(&self) -> Option<&str> {
-        match self {
-            Self::Create { topic, .. }
-            | Self::Delete { topic, .. }
-            | Self::Publish { topic, .. }
-            | Self::Subscribe { topic, .. } => Some(topic),
-            Self::Close { .. } => None,
-        }
-    }
-}
-
-struct DynamicHubEventDraft<T> {
-    kind: DynamicHubEventKind,
-    topic: Option<String>,
-    payload: Option<T>,
-    key: Option<String>,
-    error: Option<String>,
-    reason: Option<String>,
-    command: Option<DynamicHubCommand<T>>,
-}
-
-fn hub_event<T>(
-    runtime: &mut DynamicHubRuntime,
-    timestamp_ms: u64,
-    draft: DynamicHubEventDraft<T>,
-) -> DynamicHubEvent<T> {
-    let meta = next_hub_metadata(runtime, timestamp_ms);
-    DynamicHubEvent {
-        kind: draft.kind,
-        topic: draft.topic,
-        payload: draft.payload,
-        key: draft.key,
-        error: draft.error,
-        reason: draft.reason,
-        command: draft.command,
-        status: snapshot_hub_status(runtime, &meta, draft.kind),
-        meta,
-    }
-}
-
-fn hub_error<T>(
-    runtime: &mut DynamicHubRuntime,
-    command: DynamicHubCommand<T>,
-    error: String,
-    timestamp_ms: u64,
-) -> DynamicHubEvent<T> {
-    let topic = command.topic().map(str::to_owned);
-    hub_event(
-        runtime,
-        timestamp_ms,
-        DynamicHubEventDraft {
-            kind: DynamicHubEventKind::Error,
-            topic,
-            payload: None,
-            key: None,
-            error: Some(error),
-            reason: None,
-            command: Some(command),
-        },
-    )
-}
-
-fn hub_error_now<T>(
-    runtime: &mut DynamicHubRuntime,
-    command: DynamicHubCommand<T>,
-    error: String,
-    now: &dyn Fn() -> u64,
-) -> DynamicHubEvent<T> {
-    let (error, timestamp_ms) = match hub_timestamp(now) {
-        Ok(timestamp_ms) => (error, timestamp_ms),
-        Err(clock_error) => (format!("{error}; {clock_error}"), 0),
+fn publish_message<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+) -> Vec<RuntimeEvent<T>> {
+    let MessageBusCommand::Publish {
+        topic,
+        payload,
+        key,
+        command_id,
+        idempotency_key,
+    } = command
+    else {
+        return Vec::new();
     };
-    hub_error(runtime, command, error, timestamp_ms)
-}
-
-fn hub_timestamp_or_error<T>(
-    runtime: &mut DynamicHubRuntime,
-    command: DynamicHubCommand<T>,
-    now: &dyn Fn() -> u64,
-) -> Result<u64, Vec<DynamicHubEvent<T>>> {
-    hub_timestamp(now).map_err(|error| vec![hub_error(runtime, command, error, 0)])
-}
-
-fn hub_timestamp(now: &dyn Fn() -> u64) -> Result<u64, String> {
-    catch_unwind(AssertUnwindSafe(now)).map_err(|panic| {
-        format!(
-            "dynamicHub: metadata clock panicked: {}",
-            panic_message(&panic)
-        )
-    })
-}
-
-fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_owned()
+    let mut events = Vec::new();
+    if !state.topics.contains_key(&topic) {
+        if state.topic_policy != MessageBusTopicPolicy::CreateAsFact {
+            return issue_events(
+                state,
+                Some(MessageBusCommand::Publish {
+                    topic,
+                    payload,
+                    key,
+                    command_id,
+                    idempotency_key,
+                }),
+                None,
+                "unknown-topic",
+                "unknown topic",
+            );
+        }
+        events.extend(ensure_topic(state, topic.clone(), command_id.clone()));
     }
+    let Some(topic_state) = state.topics.get(&topic) else {
+        return issue_events::<T>(state, None, None, "unknown-topic", "unknown topic");
+    };
+    if topic_state.closed {
+        return issue_events(
+            state,
+            Some(MessageBusCommand::Publish {
+                topic,
+                payload,
+                key,
+                command_id,
+                idempotency_key,
+            }),
+            None,
+            "closed-topic",
+            "closed topic",
+        );
+    }
+    let timestamp_ms = timestamp_or_zero(state);
+    let topic_state = state
+        .topics
+        .get_mut(&topic)
+        .expect("topic checked immediately above");
+    let message = MessageEnvelope {
+        topic: topic.clone(),
+        seq: topic_state.next_seq,
+        payload,
+        key,
+        timestamp_ms,
+        command_id: command_id.clone(),
+        idempotency_key: idempotency_key.clone(),
+    };
+    topic_state.next_seq += 1;
+    if let Some(idempotency_key) = idempotency_key {
+        state
+            .seen_idempotency_keys
+            .insert(idempotency_key_for(&topic, &idempotency_key));
+    }
+    topic_state.messages.push(message.clone());
+    events.extend([
+        RuntimeEvent::Message(message.clone()),
+        RuntimeEvent::Status(status_fact(
+            state,
+            MessageBusStatusKind::MessagePublished,
+            StatusFields {
+                topic: Some(topic.clone()),
+                seq: Some(message.seq),
+                command_id,
+                ..StatusFields::default()
+            },
+        )),
+    ]);
+    events.extend(trim_retention(state, &topic));
+    events
 }
 
-fn unknown_hub_topic<T: Clone + 'static>(
-    runtime: &mut DynamicHubRuntime,
-    command: DynamicHubCommand<T>,
-    policy: DynamicHubUnknownTopicPolicy,
-    now: &dyn Fn() -> u64,
-) -> Vec<DynamicHubEvent<T>> {
-    let topic = command.topic().map(str::to_owned);
-    let reason = format!(
-        "dynamicHub: unknown topic '{}'",
-        topic.as_deref().unwrap_or("")
-    );
-    match policy {
-        DynamicHubUnknownTopicPolicy::Drop => Vec::new(),
-        DynamicHubUnknownTopicPolicy::DeadLetter => vec![hub_event(
-            runtime,
-            match hub_timestamp(now) {
-                Ok(timestamp_ms) => timestamp_ms,
-                Err(error) => return vec![hub_error(runtime, command, error, 0)],
-            },
-            DynamicHubEventDraft {
-                kind: DynamicHubEventKind::DeadLetter,
-                topic,
-                payload: None,
-                key: None,
-                error: None,
-                reason: Some(reason),
-                command: Some(command),
-            },
-        )],
-        DynamicHubUnknownTopicPolicy::Error | DynamicHubUnknownTopicPolicy::CreateAsFact => {
-            vec![hub_error_now(runtime, command, reason, now)]
+fn ensure_topic<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    topic: String,
+    command_id: Option<String>,
+) -> Vec<RuntimeEvent<T>> {
+    state
+        .topics
+        .entry(topic.clone())
+        .or_insert_with(make_topic_state);
+    vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::TopicCreated,
+        StatusFields {
+            topic: Some(topic),
+            command_id,
+            ..StatusFields::default()
+        },
+    ))]
+}
+
+fn close_topic<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    topic: String,
+    command_id: Option<String>,
+) -> Vec<RuntimeEvent<T>> {
+    let Some(topic_state) = state.topics.get_mut(&topic) else {
+        return issue_events(
+            state,
+            Some(MessageBusCommand::CloseTopic { topic, command_id }),
+            None,
+            "unknown-topic",
+            "unknown topic",
+        );
+    };
+    topic_state.closed = true;
+    vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::TopicClosed,
+        StatusFields {
+            topic: Some(topic),
+            command_id,
+            ..StatusFields::default()
+        },
+    ))]
+}
+
+fn trim_retention<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    topic_name: &str,
+) -> Vec<RuntimeEvent<T>> {
+    let now = timestamp_or_zero(state);
+    let Some(topic) = state.topics.get_mut(topic_name) else {
+        return Vec::new();
+    };
+    let before_head = topic.head_seq;
+    if let Some(max_age_ms) = state.retention.max_age_ms {
+        topic
+            .messages
+            .retain(|message| now.saturating_sub(message.timestamp_ms) <= max_age_ms);
+    }
+    if let Some(max_messages) = state.retention.max_messages {
+        if max_messages == 0 {
+            return issue_events::<T>(
+                state,
+                None,
+                None,
+                "policy-rejected",
+                "retention.maxMessages must be positive",
+            );
+        }
+        if topic.messages.len() > max_messages {
+            let trim_count = topic.messages.len() - max_messages;
+            topic.messages.drain(0..trim_count);
         }
     }
+    topic.head_seq = topic
+        .messages
+        .first()
+        .map_or(topic.next_seq, |message| message.seq);
+    if topic.head_seq == before_head {
+        return Vec::new();
+    }
+    let head_seq = topic.head_seq;
+    let trim_count = head_seq.saturating_sub(before_head);
+    let mut events = vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::RetentionTrimmed,
+        StatusFields {
+            topic: Some(topic_name.to_owned()),
+            head_seq: Some(head_seq),
+            details: Some(format!("trimCount={trim_count}")),
+            ..StatusFields::default()
+        },
+    ))];
+    let affected = state
+        .subscriptions
+        .values_mut()
+        .filter(|sub| {
+            !sub.closed && sub.topic == topic_name && sub.next_seq < head_seq && !sub.retention_gap
+        })
+        .map(|sub| {
+            sub.retention_gap = true;
+            sub.subscription_id.clone()
+        })
+        .collect::<Vec<_>>();
+    for subscription_id in affected {
+        events.extend(issue_events::<T>(
+            state,
+            None,
+            None,
+            "retention-gap",
+            format!("subscription '{subscription_id}' is before retained headSeq"),
+        ));
+    }
+    events
 }
 
-fn next_hub_metadata(runtime: &mut DynamicHubRuntime, timestamp_ms: u64) -> DynamicHubMetadata {
-    runtime.seq += 1;
-    runtime.cursor = runtime.seq;
-    DynamicHubMetadata {
-        seq: runtime.seq,
-        cursor: runtime.cursor,
-        timestamp_ms,
+fn ack_subscription<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+) -> Vec<RuntimeEvent<T>> {
+    let MessageBusCommand::Ack {
+        topic,
+        subscription_id,
+        seq,
+        command_id,
+    } = command
+    else {
+        return Vec::new();
+    };
+    let Some(topic_state) = state.topics.get(&topic) else {
+        return issue_events::<T>(state, None, None, "unknown-topic", "unknown topic");
+    };
+    let key = subscription_key(&topic, &subscription_id);
+    let Some(sub) = state.subscriptions.get_mut(&key) else {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "unknown-subscription",
+            "unknown subscription",
+        );
+    };
+    if sub.closed {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "subscription-closed",
+            "subscription is closed",
+        );
+    }
+    if sub.retention_gap {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "retention-gap",
+            "subscription must seek before ack",
+        );
+    }
+    if seq < sub.next_seq {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "source-cursor-stale",
+            "ack is behind subscription cursor",
+        );
+    }
+    if seq >= topic_state.next_seq {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "cursor-out-of-range",
+            "ack is beyond topic tail",
+        );
+    }
+    sub.next_seq = seq + 1;
+    vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::SubscriptionAcked,
+        StatusFields {
+            topic: Some(topic),
+            subscription_id: Some(subscription_id),
+            next_seq: Some(seq + 1),
+            command_id,
+            ..StatusFields::default()
+        },
+    ))]
+}
+
+fn seek_subscription<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+) -> Vec<RuntimeEvent<T>> {
+    let MessageBusCommand::Seek {
+        topic,
+        subscription_id,
+        next_seq,
+        command_id,
+    } = command
+    else {
+        return Vec::new();
+    };
+    let Some(topic_state) = state.topics.get(&topic) else {
+        return issue_events::<T>(state, None, None, "unknown-topic", "unknown topic");
+    };
+    let key = subscription_key(&topic, &subscription_id);
+    let Some(sub) = state.subscriptions.get_mut(&key) else {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "unknown-subscription",
+            "unknown subscription",
+        );
+    };
+    if sub.closed {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "subscription-closed",
+            "subscription is closed",
+        );
+    }
+    if next_seq < topic_state.head_seq {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "retention-gap",
+            "seek is before retained headSeq",
+        );
+    }
+    if next_seq > topic_state.next_seq {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "cursor-out-of-range",
+            "seek is beyond topic tail",
+        );
+    }
+    sub.next_seq = next_seq;
+    sub.retention_gap = false;
+    vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::SubscriptionSought,
+        StatusFields {
+            topic: Some(topic),
+            subscription_id: Some(subscription_id),
+            next_seq: Some(next_seq),
+            command_id,
+            ..StatusFields::default()
+        },
+    ))]
+}
+
+fn close_subscription<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+) -> Vec<RuntimeEvent<T>> {
+    let MessageBusCommand::CloseSubscription {
+        topic,
+        subscription_id,
+        command_id,
+    } = command
+    else {
+        return Vec::new();
+    };
+    if !state.topics.contains_key(&topic) {
+        return issue_events::<T>(state, None, None, "unknown-topic", "unknown topic");
+    }
+    let key = subscription_key(&topic, &subscription_id);
+    let Some(sub) = state.subscriptions.get_mut(&key) else {
+        return issue_events::<T>(
+            state,
+            None,
+            None,
+            "unknown-subscription",
+            "unknown subscription",
+        );
+    };
+    sub.closed = true;
+    let next_seq = sub.next_seq;
+    vec![RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::SubscriptionClosed,
+        StatusFields {
+            topic: Some(topic),
+            subscription_id: Some(subscription_id),
+            next_seq: Some(next_seq),
+            command_id,
+            ..StatusFields::default()
+        },
+    ))]
+}
+
+fn issue_events<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: Option<MessageBusCommand<T>>,
+    message: Option<MessageEnvelope<T>>,
+    code: &str,
+    issue_message: impl Into<String>,
+) -> Vec<RuntimeEvent<T>> {
+    let topic = command
+        .as_ref()
+        .and_then(MessageBusCommand::topic)
+        .map(str::to_owned)
+        .or_else(|| message.as_ref().map(|message| message.topic.clone()));
+    let issue = DataIssue {
+        kind: "issue".to_owned(),
+        code: code.to_owned(),
+        message: issue_message.into(),
+        severity: "error".to_owned(),
+        source: "messageBus".to_owned(),
+        topic: topic.clone(),
+        details: None,
+    };
+    let entry = MessageBusDeadLetterEntry {
+        entry_seq: state.dead_letter_seq + 1,
+        topic: topic.clone(),
+        command,
+        message,
+        issue: issue.clone(),
+        timestamp_ms: timestamp_or_zero(state),
+    };
+    state.dead_letter_seq = entry.entry_seq;
+    state.dead_letters.push(entry);
+    vec![RuntimeEvent::Issue(issue)]
+}
+
+fn reject_command<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+    reason: String,
+) -> Vec<RuntimeEvent<T>> {
+    issue_events(state, Some(command), None, "malformed-command", reason)
+}
+
+fn duplicate_command_events<T: Clone + 'static>(
+    state: &mut MessageBusState<T>,
+    command: MessageBusCommand<T>,
+    message: &str,
+) -> Vec<RuntimeEvent<T>> {
+    let status = RuntimeEvent::Status(status_fact(
+        state,
+        MessageBusStatusKind::DuplicateCommand,
+        StatusFields {
+            topic: command.topic().map(str::to_owned),
+            command_id: command.command_id().map(str::to_owned),
+            ..StatusFields::default()
+        },
+    ));
+    if state.dedupe.command_id == MessageBusDedupeAction::Issue {
+        return issue_events(state, Some(command), None, "duplicate-command", message);
+    }
+    vec![status]
+}
+
+#[derive(Default)]
+struct StatusFields {
+    topic: Option<String>,
+    seq: Option<u64>,
+    head_seq: Option<u64>,
+    subscription_id: Option<String>,
+    next_seq: Option<u64>,
+    command_id: Option<String>,
+    details: Option<String>,
+}
+
+fn status_fact<T>(
+    state: &MessageBusState<T>,
+    kind: MessageBusStatusKind,
+    fields: StatusFields,
+) -> MessageBusStatus {
+    MessageBusStatus {
+        kind,
+        topic: fields.topic,
+        seq: fields.seq,
+        head_seq: fields.head_seq,
+        subscription_id: fields.subscription_id,
+        next_seq: fields.next_seq,
+        command_id: fields.command_id,
+        issue_code: None,
+        timestamp_ms: timestamp_or_zero(state),
+        details: fields.details,
     }
 }
 
-fn snapshot_hub_status(
-    runtime: &DynamicHubRuntime,
-    meta: &DynamicHubMetadata,
-    kind: DynamicHubEventKind,
-) -> DynamicHubStatus {
-    let mut topics = runtime.topics.clone();
-    topics.sort();
-    DynamicHubStatus {
-        open: runtime.open,
-        topics,
-        seq: meta.seq,
-        cursor: meta.cursor,
-        last_event_kind: Some(kind),
+fn catalog_page<T>(
+    state: &MessageBusState<T>,
+    params: &MessageBusCatalogParams,
+) -> MessageBusCatalogPage {
+    let limit = positive_limit(params.limit);
+    let topics = state
+        .topics
+        .iter()
+        .filter(|(topic, value)| {
+            (params.include_closed || !value.closed)
+                && params
+                    .after_topic
+                    .as_ref()
+                    .is_none_or(|after| *topic > after)
+        })
+        .collect::<Vec<_>>();
+    let has_more = topics.len() > limit;
+    let page = topics
+        .into_iter()
+        .take(limit)
+        .map(|(topic, value)| MessageBusCatalogEntry {
+            topic: topic.clone(),
+            closed: value.closed,
+            head_seq: value.head_seq,
+            next_seq: value.next_seq,
+            message_count: value.messages.len(),
+        })
+        .collect::<Vec<_>>();
+    let next_after_topic = if has_more {
+        page.last().map(|entry| entry.topic.clone())
+    } else {
+        None
+    };
+    MessageBusCatalogPage {
+        topics: page,
+        next_after_topic,
+        has_more,
     }
 }
 
-fn unique_hub_topics(topics: &[String], max_topic_length: usize) -> Vec<String> {
+fn topic_page<T: Clone>(
+    state: &MessageBusState<T>,
+    topic_name: &str,
+    params: &MessageBusTopicParams,
+) -> MessageBusTopicPage<T> {
+    let start = params.after_seq.map_or_else(
+        || {
+            state
+                .topics
+                .get(topic_name)
+                .map_or(1, |topic| topic.head_seq)
+        },
+        |seq| seq + 1,
+    );
+    let limit = positive_limit(params.limit);
+    let all = state
+        .topics
+        .get(topic_name)
+        .map(|topic| {
+            topic
+                .messages
+                .iter()
+                .filter(|message| message.seq >= start)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let has_more = all.len() > limit;
+    let messages = all.into_iter().take(limit).collect::<Vec<_>>();
+    let through_seq = messages.last().map(|message| message.seq);
+    MessageBusTopicPage {
+        topic: topic_name.to_owned(),
+        messages,
+        from_seq: start,
+        through_seq,
+        next_after_seq: if has_more { through_seq } else { None },
+        has_more,
+    }
+}
+
+fn available_page<T: Clone>(
+    state: &MessageBusState<T>,
+    sub_key: &SubscriptionState,
+    params: &MessageBusAvailableParams,
+) -> MessageBusAvailablePage<T> {
+    let key = subscription_key(&sub_key.topic, &sub_key.subscription_id);
+    let sub = state.subscriptions.get(&key).unwrap_or(sub_key);
+    let cursor = cursor_snapshot(state, sub);
+    let start = params.after_seq.map_or(sub.next_seq, |seq| seq + 1);
+    let all = if sub.retention_gap {
+        Vec::new()
+    } else {
+        state
+            .topics
+            .get(&sub.topic)
+            .map(|topic| {
+                topic
+                    .messages
+                    .iter()
+                    .filter(|message| message.seq >= start)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let limit = positive_limit(params.limit);
+    let has_more = all.len() > limit;
+    let messages = all.into_iter().take(limit).collect::<Vec<_>>();
+    let through_seq = messages.last().map(|message| message.seq);
+    MessageBusAvailablePage {
+        topic: sub.topic.clone(),
+        subscription_id: sub.subscription_id.clone(),
+        cursor,
+        messages,
+        from_seq: start,
+        through_seq,
+        next_after_seq: if has_more { through_seq } else { None },
+        has_more,
+    }
+}
+
+fn dead_letter_page<T: Clone>(
+    state: &MessageBusState<T>,
+    params: &MessageBusDeadLetterParams,
+) -> MessageBusDeadLetterPage<T> {
+    let limit = positive_limit(params.limit);
+    let entries = state
+        .dead_letters
+        .iter()
+        .filter(|entry| {
+            params
+                .after_entry_seq
+                .is_none_or(|after| entry.entry_seq > after)
+                && params
+                    .topic
+                    .as_ref()
+                    .is_none_or(|topic| entry.topic.as_ref() == Some(topic))
+                && params
+                    .code
+                    .as_ref()
+                    .is_none_or(|code| &entry.issue.code == code)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = entries.len() > limit;
+    let page = entries.into_iter().take(limit).collect::<Vec<_>>();
+    let next_after_entry_seq = if has_more {
+        page.last().map(|entry| entry.entry_seq)
+    } else {
+        None
+    };
+    MessageBusDeadLetterPage {
+        entries: page,
+        next_after_entry_seq,
+        has_more,
+    }
+}
+
+fn cursor_snapshot<T>(state: &MessageBusState<T>, sub: &SubscriptionState) -> MessageBusCursor {
+    let key = subscription_key(&sub.topic, &sub.subscription_id);
+    let sub = state.subscriptions.get(&key).unwrap_or(sub);
+    MessageBusCursor {
+        topic: sub.topic.clone(),
+        subscription_id: sub.subscription_id.clone(),
+        next_seq: sub.next_seq,
+        closed: sub.closed,
+        retention_gap: sub.retention_gap,
+        head_seq: state
+            .topics
+            .get(&sub.topic)
+            .map_or(1, |topic| topic.head_seq),
+    }
+}
+
+fn ensure_subscription<T>(
+    state: &mut MessageBusState<T>,
+    opts: &MessageBusSubscriptionOptions,
+) -> (SubscriptionState, bool, Option<DataIssue>) {
+    let key = subscription_key(&opts.topic, &opts.subscription_id);
+    if let Some(existing) = state.subscriptions.get(&key) {
+        return (existing.clone(), false, None);
+    }
+    let topic_range = state
+        .topics
+        .get(&opts.topic)
+        .map(|topic| (topic.head_seq, topic.next_seq));
+    let next_seq = match opts.from {
+        MessageBusSubscriptionFrom::Earliest => topic_range.map_or(1, |(head_seq, _)| head_seq),
+        MessageBusSubscriptionFrom::Latest => topic_range.map_or(1, |(_, next_seq)| next_seq),
+        MessageBusSubscriptionFrom::Seq(seq) => seq,
+    };
+    let issue = topic_range.and_then(|(head_seq, tail_seq)| {
+        if next_seq < head_seq || next_seq > tail_seq {
+            Some(DataIssue {
+                kind: "issue".to_owned(),
+                code: "cursor-out-of-range".to_owned(),
+                message: format!(
+                    "subscription start seq {next_seq} is outside retained range {}..={}",
+                    head_seq, tail_seq
+                ),
+                severity: "error".to_owned(),
+                source: "messageBus".to_owned(),
+                topic: Some(opts.topic.clone()),
+                details: Some(format!("subscriptionId={}", opts.subscription_id)),
+            })
+        } else {
+            None
+        }
+    });
+    let next_seq = if issue.is_some() {
+        topic_range.map_or(1, |(head_seq, _)| head_seq)
+    } else {
+        next_seq
+    };
+    if let Some(issue) = issue.clone() {
+        let entry = MessageBusDeadLetterEntry {
+            entry_seq: state.dead_letter_seq + 1,
+            topic: Some(opts.topic.clone()),
+            command: None,
+            message: None,
+            issue,
+            timestamp_ms: timestamp_or_zero(state),
+        };
+        state.dead_letter_seq = entry.entry_seq;
+        state.dead_letters.push(entry);
+    }
+    let sub = SubscriptionState {
+        topic: opts.topic.clone(),
+        subscription_id: opts.subscription_id.clone(),
+        next_seq,
+        closed: false,
+        retention_gap: topic_range.is_some_and(|(head_seq, _)| next_seq < head_seq),
+    };
+    state.subscriptions.insert(key, sub.clone());
+    (sub, true, issue)
+}
+
+fn pull_params<T: Clone + 'static>(ctx: &Ctx) -> Option<T> {
+    ctx.pull()
+        .and_then(|pull| pull.params::<T>())
+        .map(|params| (*params).clone())
+}
+
+fn make_topic_state<T>() -> TopicState<T> {
+    TopicState {
+        closed: false,
+        head_seq: 1,
+        next_seq: 1,
+        messages: Vec::new(),
+    }
+}
+
+fn unique_topics(topics: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut unique = Vec::with_capacity(topics.len());
     for topic in topics {
-        assert_topic_key(topic, "dynamicHub", max_topic_length);
-        assert!(seen.insert(topic.clone()), "dynamicHub: duplicate topic");
-        unique.push(topic.clone());
+        assert_topic_key(&topic, "messageBus");
+        assert!(seen.insert(topic.clone()), "messageBus: duplicate topic");
+        unique.push(topic);
     }
     unique.sort();
     unique
 }
 
-fn assert_topic_key(topic: &str, owner: &str, max_topic_length: usize) {
-    if let Some(error) = validate_topic_key(topic, owner, max_topic_length) {
+fn assert_topic_key(topic: &str, owner: &str) {
+    if let Some(error) = validate_topic_key(topic, owner) {
         panic!("{error}");
     }
 }
 
-fn validate_topic_key(topic: &str, owner: &str, max_topic_length: usize) -> Option<String> {
+fn validate_topic_key(topic: &str, owner: &str) -> Option<String> {
     if topic.is_empty() {
         return Some(format!("{owner}: topic must be a non-empty string"));
     }
-    if topic.len() > max_topic_length {
-        return Some(format!("{owner}: topic exceeds maxTopicLength"));
-    }
     None
 }
 
-fn has_hub_topic(runtime: &DynamicHubRuntime, topic: &str) -> bool {
-    runtime.topics.iter().any(|existing| existing == topic)
+fn assert_non_empty(value: &str, owner: &str) {
+    assert!(!value.is_empty(), "{owner}: must be a non-empty string");
 }
 
-fn add_hub_topic(runtime: &mut DynamicHubRuntime, topic: &str) {
-    if !has_hub_topic(runtime, topic) {
-        runtime.topics.push(topic.to_owned());
+fn positive_limit(limit: Option<usize>) -> usize {
+    let limit = limit.unwrap_or(100);
+    assert!(limit > 0, "messageBus: limit must be positive");
+    limit
+}
+
+fn command_subscription_id<T>(command: &MessageBusCommand<T>) -> Option<&str> {
+    match command {
+        MessageBusCommand::Ack {
+            subscription_id, ..
+        }
+        | MessageBusCommand::Seek {
+            subscription_id, ..
+        }
+        | MessageBusCommand::CloseSubscription {
+            subscription_id, ..
+        } => Some(subscription_id),
+        _ => None,
     }
 }
 
-fn delete_hub_topic(runtime: &mut DynamicHubRuntime, topic: &str) {
-    runtime.topics.retain(|existing| existing != topic);
+fn subscription_key(topic: &str, subscription_id: &str) -> String {
+    format!("{topic}\0{subscription_id}")
 }
 
-fn can_add_hub_topic(
-    runtime: &DynamicHubRuntime,
-    topic: &str,
-    max_topics: usize,
-) -> Option<String> {
-    if has_hub_topic(runtime, topic) {
-        return None;
-    }
-    if runtime.topics.len() >= max_topics {
-        return Some("dynamicHub: topic count exceeds maxTopics".to_owned());
-    }
-    None
+fn idempotency_key_for(topic: &str, idempotency_key: &str) -> String {
+    format!("{topic}\0{idempotency_key}")
+}
+
+fn timestamp_or_zero<T>(state: &MessageBusState<T>) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| (state.now)())).unwrap_or(0)
+}
+
+fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
+    let mut opts = GraphNodeOpts::named(name);
+    opts.node = NodeOpts {
+        factory: Some(factory.into()),
+        complete_when_deps_complete: false,
+        error_when_deps_error: false,
+        ..opts.node
+    };
+    opts
+}
+
+fn pull_node_opts(
+    name: impl Into<String>,
+    factory: impl Into<String>,
+    pull_id: LockId,
+) -> GraphNodeOpts {
+    let mut opts = node_opts(name, factory);
+    opts.node.pull_id = Some(pull_id);
+    opts.node.partial = true;
+    opts
 }
 
 fn is_reachable_upstream(from: &Core, target: &Core) -> bool {
@@ -1690,546 +2275,205 @@ fn is_reachable_upstream(from: &Core, target: &Core) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod clean_slate_tests {
     use super::*;
-    use crate::graph::{graph, GraphNodeOpts};
-    use serde_json::json;
+    use crate::graph::graph;
+    use crate::protocol::{Message, PullDemand};
 
     #[test]
-    fn standard_topic_constants_are_stable_d159_vocabulary() {
-        assert_eq!(PROMPTS_TOPIC, "prompts");
-        assert_eq!(RESPONSES_TOPIC, "responses");
-        assert_eq!(INJECTIONS_TOPIC, "injections");
-        assert_eq!(DEFERRED_TOPIC, "deferred");
-        assert_eq!(SPAWNS_TOPIC, "spawns");
-        assert_eq!(CONTEXT_TOPIC, "context");
-        assert_eq!(TODOS_TOPIC, "todos");
-        assert_eq!(
-            STANDARD_TOPICS,
-            [
-                "prompts",
-                "responses",
-                "injections",
-                "deferred",
-                "spawns",
-                "context",
-                "todos"
-            ]
-        );
-    }
-
-    #[test]
-    fn topic_message_is_passive_metadata_plus_payload() {
-        let message = TopicMessage {
-            id: "msg-1".to_owned(),
-            schema: Some(JsonSchema {
-                schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-                title: Some("Prompt".to_owned()),
-                ..JsonSchema::default()
-            }),
-            expires_at: Some("2026-06-09T00:00:00Z".to_owned()),
-            correlation_id: Some("corr-1".to_owned()),
-            payload: json!({ "prompt": "hello" }),
-        };
-
-        assert_eq!(message.id, "msg-1");
-        assert_eq!(message.expires_at.as_deref(), Some("2026-06-09T00:00:00Z"));
-        assert_eq!(message.correlation_id.as_deref(), Some("corr-1"));
-        assert_eq!(message.payload["prompt"], "hello");
-
-        let encoded = serde_json::to_value(&message).expect("topic message encodes");
-        assert_eq!(encoded["expiresAt"], "2026-06-09T00:00:00Z");
-        assert_eq!(encoded["correlationId"], "corr-1");
-        assert_eq!(encoded["schema"]["type"], "object");
-    }
-
-    #[test]
-    fn json_schema_representation_round_trips_camel_case_fields() {
-        let schema = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-            properties: Some(BTreeMap::from([(
-                "id".to_owned(),
-                JsonSchema {
-                    schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                    ..JsonSchema::default()
-                },
-            )])),
-            required: Some(vec!["id".to_owned()]),
-            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
-            description: Some("payload shape".to_owned()),
-            ..JsonSchema::default()
-        };
-
-        let encoded = serde_json::to_value(&schema).expect("schema encodes");
-        assert_eq!(encoded["type"], "object");
-        assert_eq!(encoded["properties"]["id"]["type"], "string");
-        assert_eq!(encoded["required"], json!(["id"]));
-        assert_eq!(encoded["additionalProperties"], false);
-        assert_eq!(encoded["description"], "payload shape");
-    }
-
-    #[test]
-    fn json_schema_deserialization_rejects_unsupported_keywords() {
-        let error = serde_json::from_value::<JsonSchema>(json!({
-            "type": "string",
-            "minLength": 2
-        }))
-        .expect_err("unsupported schema keywords fail closed");
-
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn explicit_json_schema_validation_accepts_matching_payloads() {
-        let schema = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-            properties: Some(BTreeMap::from([
-                (
-                    "id".to_owned(),
-                    JsonSchema {
-                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                        ..JsonSchema::default()
-                    },
-                ),
-                (
-                    "attempts".to_owned(),
-                    JsonSchema {
-                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Integer)),
-                        ..JsonSchema::default()
-                    },
-                ),
-                (
-                    "tags".to_owned(),
-                    JsonSchema {
-                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Array)),
-                        items: Some(JsonSchemaItems::Schema(Box::new(JsonSchema {
-                            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                            ..JsonSchema::default()
-                        }))),
-                        ..JsonSchema::default()
-                    },
-                ),
-            ])),
-            required: Some(vec!["id".to_owned(), "attempts".to_owned()]),
-            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
-            ..JsonSchema::default()
-        };
-
-        let payload = json!({ "id": "job-1", "attempts": 2, "tags": ["fast", "safe"] });
-
-        validate_json_schema(&schema, &payload).expect("payload matches schema");
-        assert!(is_json_schema_valid(&schema, &payload));
-
-        let integer_schema = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Integer)),
-            ..JsonSchema::default()
-        };
-        validate_json_schema(&integer_schema, &json!(1.0)).expect("1.0 is an integer JSON number");
-    }
-
-    #[test]
-    fn explicit_json_schema_validation_accepts_finite_recursive_refs() {
-        let node_schema = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-            properties: Some(BTreeMap::from([
-                (
-                    "value".to_owned(),
-                    JsonSchema {
-                        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                        ..JsonSchema::default()
-                    },
-                ),
-                (
-                    "child".to_owned(),
-                    JsonSchema {
-                        ref_path: Some("#/definitions/Node".to_owned()),
-                        ..JsonSchema::default()
-                    },
-                ),
-            ])),
-            required: Some(vec!["value".to_owned()]),
-            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
-            ..JsonSchema::default()
-        };
-        let schema = JsonSchema {
-            ref_path: Some("#/definitions/Node".to_owned()),
-            definitions: Some(BTreeMap::from([("Node".to_owned(), node_schema)])),
-            ..JsonSchema::default()
-        };
-
-        validate_json_schema(
-            &schema,
-            &json!({
-                "value": "root",
-                "child": { "value": "leaf" }
-            }),
-        )
-        .expect("finite recursive payload validates");
-    }
-
-    #[test]
-    fn explicit_json_schema_validation_reports_failures_without_side_effects() {
-        let schema = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-            properties: Some(BTreeMap::from([(
-                "id".to_owned(),
-                JsonSchema {
-                    schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                    ..JsonSchema::default()
-                },
-            )])),
-            required: Some(vec!["id".to_owned()]),
-            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
-            ..JsonSchema::default()
-        };
-
-        let missing = validate_json_schema(&schema, &json!({})).expect_err("missing id fails");
-        assert_eq!(missing.path, "$");
-        assert_eq!(missing.message, "missing required property 'id'");
-
-        let wrong_type =
-            validate_json_schema(&schema, &json!({ "id": 42 })).expect_err("wrong type fails");
-        assert_eq!(wrong_type.path, "$.id");
-        assert_eq!(wrong_type.message, "expected string, got number");
-
-        let extra = validate_json_schema(&schema, &json!({ "id": "a", "extra": true }))
-            .expect_err("extra property fails");
-        assert_eq!(extra.path, "$");
-        assert_eq!(extra.message, "unexpected additional property 'extra'");
-
-        let no_declared_properties = JsonSchema {
-            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
-            additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
-            ..JsonSchema::default()
-        };
-        let extra_without_properties =
-            validate_json_schema(&no_declared_properties, &json!({ "extra": true }))
-                .expect_err("additionalProperties applies without properties");
-        assert_eq!(extra_without_properties.path, "$");
-        assert_eq!(
-            extra_without_properties.message,
-            "unexpected additional property 'extra'"
-        );
-    }
-
-    #[test]
-    fn topic_message_payload_validation_is_explicit_and_schema_optional() {
-        let unchecked = TopicMessage {
-            id: "msg-1".to_owned(),
-            schema: None,
-            expires_at: None,
-            correlation_id: None,
-            payload: json!({ "anything": true }),
-        };
-        validate_topic_message_payload(&unchecked).expect("no schema means no validation");
-
-        let checked = TopicMessage {
-            id: "msg-2".to_owned(),
-            schema: Some(JsonSchema {
-                schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
-                ..JsonSchema::default()
-            }),
-            expires_at: None,
-            correlation_id: None,
-            payload: json!(10),
-        };
-
-        let error = validate_topic_message_payload(&checked).expect_err("schema is explicit");
-        assert_eq!(error.path, "$");
-        assert_eq!(error.message, "expected string, got number");
-    }
-
-    #[test]
-    fn message_bus_topic_starts_sentinel_then_publishes_envelope() {
+    fn message_bus_core_exposes_clean_slate_nodes() {
         let g = graph();
-        let bus = MessageBus::with_name(&g, ["orders"], "bus", || 10);
-        let topic = from_topic(&bus, "orders");
-
-        assert!(topic.cache().is_none());
-        let envelope = bus.publish("orders", 7_i32, Some("o1".to_owned()));
-
-        assert_eq!(envelope.topic, "orders");
-        assert_eq!(envelope.seq, 1);
-        assert_eq!(envelope.key.as_deref(), Some("o1"));
-        assert_eq!(envelope.timestamp_ms, 10);
-        assert_eq!(*topic.cache().unwrap().payload::<i32>().unwrap(), 7);
-    }
-
-    #[test]
-    fn to_topic_is_declared_graph_topology() {
-        let g = graph();
-        let bus = MessageBus::with_name(&g, ["orders"], "bus", || 20);
-        let source = g.state_empty_opts::<i32>(GraphNodeOpts::named("source"));
-        let events = to_topic(&g, &source, bus.clone(), "orders", "orders/out");
-        let _sub = events.subscribe(|_| {});
-
-        source.set(9);
-
-        assert!(matches!(
-            events.cache().unwrap(),
-            MessageBusEvent::Publish { seq: 1, .. }
-        ));
-        let snap = g.describe();
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "source" && edge.to == "orders/out"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "orders/out" && edge.to == "bus/orders"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "orders/out" && edge.to == "orders/out/events"));
-    }
-
-    #[test]
-    fn dynamic_hub_is_facts_dynamic_and_topology_static() {
-        let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
+        let _bus = message_bus::<String>(
             &g,
-            DynamicHubOptions::named("hub")
+            MessageBusOptions::named("bus")
                 .with_topics(["orders"])
-                .with_now(|| 100),
+                .with_now(|| 10),
         );
-        let orders = from_hub_topic_with_name(&hub, "orders", "orders/in");
-        let _orders = orders.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
-        let _errors = hub.errors.subscribe(|_| {});
-
-        hub.publish("orders", "o1".to_owned(), Some("k1".to_owned()));
-
-        let envelope = orders.cache().unwrap();
-        assert_eq!(envelope.topic, "orders");
-        assert_eq!(envelope.seq, 1);
-        assert_eq!(envelope.key.as_deref(), Some("k1"));
-        assert_eq!(envelope.timestamp_ms, 100);
-        assert_eq!(&*envelope.payload::<String>().unwrap(), "o1");
-        let status = hub.status.cache().unwrap();
-        assert_eq!(status.topics, vec!["orders"]);
-        assert_eq!(status.seq, 1);
-        assert_eq!(status.cursor, 1);
-        assert_eq!(status.last_event_kind, Some(DynamicHubEventKind::Message));
-        assert!(hub.errors.cache().is_none());
-
         let snap = g.describe();
         for id in [
-            "hub/command",
-            "hub/events",
-            "hub/status",
-            "hub/errors",
-            "orders/in",
+            "bus/commands",
+            "bus/runtime",
+            "bus/messages",
+            "bus/status",
+            "bus/issues",
         ] {
             assert!(snap.nodes.iter().any(|node| node.id == id), "{id}");
         }
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "hub/command" && edge.to == "hub/events"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "hub/events" && edge.to == "hub/status"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "hub/events" && edge.to == "hub/errors"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "hub/events" && edge.to == "orders/in"));
+        assert!(!snap.nodes.iter().any(|node| node.id.contains("dynamicHub")));
     }
 
     #[test]
-    fn dynamic_hub_unknown_topic_defaults_to_graph_visible_error() {
+    fn unknown_topic_is_strict_issue_without_retained_message() {
         let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
-            &g,
-            DynamicHubOptions::named("hub").with_now(|| 200),
+        let bus = message_bus::<String>(&g, MessageBusOptions::named("bus").with_now(|| 20));
+        let _messages = bus.messages.subscribe(|_| {});
+        let _issues = bus.issues.subscribe(|_| {});
+        let _status = bus.status.subscribe(|_| {});
+
+        bus.publish(
+            "missing",
+            "payload".to_owned(),
+            None,
+            Some("c1".to_owned()),
+            None,
         );
-        let _errors = hub.errors.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
 
-        hub.publish("missing", "payload".to_owned(), None);
-
-        let error = hub.errors.cache().unwrap();
-        assert_eq!(error.topic.as_deref(), Some("missing"));
-        assert_eq!(error.error, "dynamicHub: unknown topic 'missing'");
-        assert_eq!(error.meta.seq, 1);
-        assert_eq!(error.meta.cursor, 1);
-        assert_eq!(hub.status.cache().unwrap().topics, Vec::<String>::new());
+        assert!(bus.messages.cache().is_none());
+        assert_eq!(bus.issues.cache().unwrap().code, "unknown-topic");
+        assert!(bus.status.cache().is_none());
     }
 
     #[test]
-    fn dynamic_hub_reduces_helper_commands_before_external_observation() {
+    fn catalog_topic_and_dead_letter_are_pull_read_only_projections() {
         let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
+        let bus = message_bus::<String>(
             &g,
-            DynamicHubOptions::named("hub").with_now(|| 250),
+            MessageBusOptions::named("bus")
+                .with_topics(["orders"])
+                .with_now(|| 30),
         );
+        let catalog = bus.catalog();
+        let topic = bus.topic("orders");
+        let dead = bus.dead_letter();
+        let _catalog = catalog.snapshot.subscribe(|_| {});
+        let _topic = topic.snapshot.subscribe(|_| {});
+        let _dead = dead.snapshot.subscribe(|_| {});
 
-        hub.create("orders", None, None);
-        hub.publish("orders", "o1".to_owned(), None);
+        bus.publish("orders", "o1".to_owned(), None, None, None);
+        bus.publish("missing", "x".to_owned(), None, None, None);
+        catalog.snapshot.up(vec![Message::Pull(PullDemand::new(
+            catalog.snapshot_pull_id.clone(),
+        ))]);
+        topic
+            .snapshot
+            .up(vec![Message::Pull(PullDemand::with_params(
+                topic.snapshot_pull_id.clone(),
+                MessageBusTopicParams {
+                    limit: Some(1),
+                    after_seq: None,
+                },
+            ))]);
+        dead.snapshot.up(vec![Message::Pull(PullDemand::with_params(
+            dead.snapshot_pull_id.clone(),
+            MessageBusDeadLetterParams {
+                limit: None,
+                after_entry_seq: None,
+                topic: None,
+                code: Some("unknown-topic".to_owned()),
+            },
+        ))]);
 
-        let orders = from_hub_topic_with_name(&hub, "orders", "orders/in");
-        let _orders = orders.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
-
-        let envelope = orders.cache().unwrap();
-        assert_eq!(envelope.topic, "orders");
-        assert_eq!(envelope.seq, 2);
-        assert_eq!(&*envelope.payload::<String>().unwrap(), "o1");
-        let status = hub.status.cache().unwrap();
-        assert_eq!(status.topics, vec!["orders"]);
-        assert_eq!(status.seq, 2);
-        assert_eq!(status.cursor, 2);
-        assert_eq!(status.last_event_kind, Some(DynamicHubEventKind::Message));
-    }
-
-    #[test]
-    fn dynamic_hub_reduces_to_topic_commands_before_external_observation() {
-        let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
-            &g,
-            DynamicHubOptions::named("hub")
-                .with_unknown_topic(DynamicHubUnknownTopicPolicy::CreateAsFact)
-                .with_now(|| 275),
-        );
-        let source = g.state_empty_opts::<String>(GraphNodeOpts::named("source"));
-        let _bundle = to_hub_topic(&g, &source, &hub, "orders", "orders/out");
-
-        source.set("o1".to_owned());
-
-        let orders = from_hub_topic_with_name(&hub, "orders", "orders/in");
-        let _orders = orders.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
-
-        let envelope = orders.cache().unwrap();
-        assert_eq!(envelope.topic, "orders");
-        assert_eq!(envelope.seq, 2);
-        assert_eq!(&*envelope.payload::<String>().unwrap(), "o1");
-        let status = hub.status.cache().unwrap();
-        assert_eq!(status.topics, vec!["orders"]);
-        assert_eq!(status.seq, 2);
-        assert_eq!(status.cursor, 2);
-        assert_eq!(status.last_event_kind, Some(DynamicHubEventKind::Message));
-    }
-
-    #[test]
-    fn dynamic_hub_clock_panic_is_graph_visible_error_without_topic_mutation() {
-        let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
-            &g,
-            DynamicHubOptions::named("hub")
-                .with_unknown_topic(DynamicHubUnknownTopicPolicy::CreateAsFact)
-                .with_now(|| panic!("clock boom")),
-        );
-        let _errors = hub.errors.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
-
-        hub.publish("orders", "o1".to_owned(), None);
-
-        let error = hub.errors.cache().unwrap();
-        assert_eq!(error.topic.as_deref(), Some("orders"));
+        assert_eq!(catalog.snapshot.cache().unwrap().topics[0].topic, "orders");
+        assert_eq!(topic.snapshot.cache().unwrap().messages[0].payload, "o1");
         assert_eq!(
-            error.error,
-            "dynamicHub: metadata clock panicked: clock boom"
+            dead.snapshot.cache().unwrap().entries[0].issue.code,
+            "unknown-topic"
         );
-        assert_eq!(error.meta.seq, 1);
-        assert_eq!(error.meta.cursor, 1);
-        assert_eq!(error.meta.timestamp_ms, 0);
-        let status = hub.status.cache().unwrap();
-        assert_eq!(status.topics, Vec::<String>::new());
-        assert_eq!(status.last_event_kind, Some(DynamicHubEventKind::Error));
     }
 
     #[test]
-    fn dynamic_hub_dead_letter_policy_is_visible_without_topic_nodes() {
+    fn available_pull_does_not_move_cursor_ack_seek_close_do() {
         let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
+        let bus = message_bus::<String>(
             &g,
-            DynamicHubOptions::named("hub")
-                .with_unknown_topic(DynamicHubUnknownTopicPolicy::DeadLetter)
-                .with_now(|| 300),
+            MessageBusOptions::named("bus")
+                .with_topics(["orders"])
+                .with_now(|| 40),
         );
-        let dead_letter = hub.dead_letter.clone().expect("dead-letter node");
-        let _dead = dead_letter.subscribe(|_| {});
+        let sub = bus.subscription(MessageBusSubscriptionOptions::new("orders", "s1"));
+        let _available = sub.available.subscribe(|_| {});
+        let _cursor = sub.cursor.subscribe(|_| {});
 
-        hub.publish("missing", "payload".to_owned(), None);
+        bus.publish("orders", "o1".to_owned(), None, None, None);
+        bus.publish("orders", "o2".to_owned(), None, None, None);
+        sub.available.up(vec![Message::Pull(PullDemand::with_params(
+            sub.available_pull_id.clone(),
+            MessageBusAvailableParams {
+                limit: Some(1),
+                after_seq: Some(1),
+            },
+        ))]);
 
-        let letter = dead_letter.cache().unwrap();
-        assert_eq!(letter.topic.as_deref(), Some("missing"));
-        assert_eq!(letter.reason, "dynamicHub: unknown topic 'missing'");
-        assert_eq!(letter.meta.seq, 1);
-        assert!(g
-            .describe()
-            .nodes
-            .iter()
-            .any(|node| node.id == "hub/deadLetter"));
+        let page = sub.available.cache().unwrap();
+        assert_eq!(page.messages[0].seq, 2);
+        assert_eq!(page.cursor.next_seq, 1);
+        let opened_cursor = sub.cursor.cache().unwrap();
+        assert_eq!(opened_cursor.next_seq, 1);
+        assert!(!opened_cursor.retention_gap);
+
+        sub.ack(1, None);
+        assert_eq!(sub.cursor.cache().unwrap().next_seq, 2);
+        sub.seek(1, None);
+        assert_eq!(sub.cursor.cache().unwrap().next_seq, 1);
+        sub.close(None);
+        assert!(sub.cursor.cache().unwrap().closed);
     }
 
     #[test]
-    fn to_hub_topic_is_static_command_helper_and_create_as_fact_bounds_runtime_topics() {
+    fn retention_count_advances_head_and_marks_gap_until_seek() {
         let g = graph();
-        let hub = dynamic_hub_with_options::<String>(
+        let bus = message_bus::<String>(
             &g,
-            DynamicHubOptions::named("hub")
-                .with_unknown_topic(DynamicHubUnknownTopicPolicy::CreateAsFact)
-                .with_max_topics(2)
-                .with_now(|| 400),
+            MessageBusOptions::named("bus")
+                .with_topics(["orders"])
+                .with_retention(MessageBusRetentionPolicy {
+                    max_messages: Some(1),
+                    max_age_ms: None,
+                }),
         );
-        let source = g.state_empty_opts::<String>(GraphNodeOpts::named("source"));
-        let orders = from_hub_topic_with_name(&hub, "orders", "orders/in");
-        let _orders = orders.subscribe(|_| {});
-        let _status = hub.status.subscribe(|_| {});
-        let bundle = to_hub_topic(&g, &source, &hub, "orders", "orders/out");
-        let _commands = bundle.commands.subscribe(|_| {});
+        let sub = bus.subscription(MessageBusSubscriptionOptions::new("orders", "s1"));
+        let _cursor = sub.cursor.subscribe(|_| {});
+        let _issues = bus.issues.subscribe(|_| {});
 
-        source.set("o2".to_owned());
+        bus.publish("orders", "o1".to_owned(), None, None, None);
+        bus.publish("orders", "o2".to_owned(), None, None, None);
 
-        let envelope = orders.cache().unwrap();
-        assert_eq!(envelope.topic, "orders");
-        assert_eq!(envelope.seq, 2);
-        assert_eq!(&*envelope.payload::<String>().unwrap(), "o2");
-        let status = hub.status.cache().unwrap();
-        assert_eq!(status.topics, vec!["orders"]);
-        assert_eq!(status.seq, 2);
-        assert_eq!(status.cursor, 2);
-        assert_eq!(status.last_event_kind, Some(DynamicHubEventKind::Message));
+        assert_eq!(bus.issues.cache().unwrap().code, "retention-gap");
+        assert!(sub.cursor.cache().unwrap().retention_gap);
+        sub.seek(2, None);
+        let cursor = sub.cursor.cache().unwrap();
+        assert_eq!(cursor.next_seq, 2);
+        assert!(!cursor.retention_gap);
+    }
 
-        let snap = g.describe();
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "source" && edge.to == "orders/out"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "orders/out" && edge.to == "hub/command"));
-        assert!(snap
-            .edges
-            .iter()
-            .any(|edge| edge.from == "hub/events" && edge.to == "orders/in"));
+    #[test]
+    fn invalid_subscription_start_seq_is_visible_issue_not_impossible_cursor() {
+        let g = graph();
+        let bus = message_bus::<String>(
+            &g,
+            MessageBusOptions::named("bus")
+                .with_topics(["orders"])
+                .with_retention(MessageBusRetentionPolicy {
+                    max_messages: Some(1),
+                    max_age_ms: None,
+                }),
+        );
+        let _issues = bus.issues.subscribe(|_| {});
+        let dead = bus.dead_letter();
+        let _dead = dead.snapshot.subscribe(|_| {});
 
-        hub.publish("audit", "a1".to_owned(), None);
-        hub.publish("overflow", "x".to_owned(), None);
+        bus.publish("orders", "o1".to_owned(), None, None, None);
+        bus.publish("orders", "o2".to_owned(), None, None, None);
+        let sub = bus.subscription(
+            MessageBusSubscriptionOptions::new("orders", "late")
+                .from(MessageBusSubscriptionFrom::Seq(1)),
+        );
+        let _cursor = sub.cursor.subscribe(|_| {});
+        dead.snapshot.up(vec![Message::Pull(PullDemand::with_params(
+            dead.snapshot_pull_id.clone(),
+            MessageBusDeadLetterParams {
+                limit: None,
+                after_entry_seq: None,
+                topic: Some("orders".to_owned()),
+                code: Some("cursor-out-of-range".to_owned()),
+            },
+        ))]);
+
+        assert_eq!(bus.issues.cache().unwrap().code, "cursor-out-of-range");
+        assert_eq!(sub.cursor.cache().unwrap().next_seq, 2);
         assert_eq!(
-            hub.status.cache().unwrap().last_event_kind,
-            Some(DynamicHubEventKind::Error)
-        );
-        assert_eq!(hub.status.cache().unwrap().topics, vec!["audit", "orders"]);
-    }
-
-    #[test]
-    #[should_panic(expected = "dynamicHub: topic exceeds maxTopicLength")]
-    fn dynamic_hub_validates_initial_topic_bounds() {
-        let g = graph();
-        let _hub = dynamic_hub_with_options::<String>(
-            &g,
-            DynamicHubOptions::named("hub")
-                .with_topics(["toolong"])
-                .with_max_topic_length(3),
+            dead.snapshot.cache().unwrap().entries[0].issue.code,
+            "cursor-out-of-range"
         );
     }
 }

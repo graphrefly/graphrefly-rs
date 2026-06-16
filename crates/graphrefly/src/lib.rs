@@ -83,6 +83,7 @@ pub mod sources;
 pub mod storage;
 pub mod time;
 mod versioning;
+pub mod work_queue;
 #[cfg(feature = "tokio-worker")]
 pub mod worker;
 
@@ -208,15 +209,19 @@ pub use json::{
     JsonCodecResult, JsonValue, NonNegativeDecimalIntegerString, StrictJsonCodec,
 };
 pub use messaging::{
-    dynamic_hub, dynamic_hub_with_options, from_hub_topic, from_hub_topic_with_name, from_topic,
-    is_json_schema_valid, message_bus, to_hub_topic, to_topic, topic_core, validate_json_schema,
-    validate_topic_message_payload, DynamicHub, DynamicHubCommand, DynamicHubDeadLetter,
-    DynamicHubError, DynamicHubEvent, DynamicHubEventKind, DynamicHubMetadata, DynamicHubOptions,
-    DynamicHubStatus, DynamicHubUnknownTopicPolicy, JsonSchema, JsonSchemaAdditionalProperties,
-    JsonSchemaItems, JsonSchemaType, JsonSchemaTypeSpec, JsonSchemaValidationError,
-    JsonSchemaValidationResult, MessageBus, MessageBusEvent, MessageEnvelope, ToHubTopicBundle,
-    TopicMessage, CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC,
-    SPAWNS_TOPIC, STANDARD_TOPICS, TODOS_TOPIC,
+    event_message, is_json_schema_valid, message_bus, to_topic, validate_json_schema,
+    validate_topic_message_payload, DataIssue, EventMessage, EventMessageOptions, JsonSchema,
+    JsonSchemaAdditionalProperties, JsonSchemaItems, JsonSchemaType, JsonSchemaTypeSpec,
+    JsonSchemaValidationError, JsonSchemaValidationResult, MessageBus, MessageBusAvailablePage,
+    MessageBusAvailableParams, MessageBusCatalogEntry, MessageBusCatalogPage,
+    MessageBusCatalogParams, MessageBusCommand, MessageBusCursor, MessageBusDeadLetterEntry,
+    MessageBusDeadLetterPage, MessageBusDeadLetterParams, MessageBusDedupeAction,
+    MessageBusDedupePolicy, MessageBusOptions, MessageBusPullProjection, MessageBusRetentionPolicy,
+    MessageBusStatus, MessageBusStatusKind, MessageBusSubscription, MessageBusSubscriptionFrom,
+    MessageBusSubscriptionOptions, MessageBusTopicPage, MessageBusTopicParams,
+    MessageBusTopicPolicy, MessageBusTopicProjection, MessageEnvelope, ToTopicBundle, TopicMessage,
+    CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC, SPAWNS_TOPIC,
+    STANDARD_TOPICS, TODOS_TOPIC,
 };
 pub use node::{Core, Node, NodeOpts, Pausable, Status};
 pub use operators::{
@@ -342,6 +347,14 @@ pub use time::{
 pub use versioning::{
     default_node_version_hash, NodeVersion, NodeVersionHashFn, NodeVersioningPolicy,
     ResolvedNodeVersioningPolicy,
+};
+pub use work_queue::{
+    work_queue, WorkQueue, WorkQueueActiveLease, WorkQueueAvailableItem, WorkQueueAvailablePage,
+    WorkQueueAvailableParams, WorkQueueAvailableProjection, WorkQueueClaimOptions,
+    WorkQueueCommand, WorkQueueDeadLetterPage, WorkQueueDeadLetterParams, WorkQueueDerivedState,
+    WorkQueueMessageBusRef, WorkQueueOptions, WorkQueueProjection, WorkQueueRecord,
+    WorkQueueStatus, WorkQueueStatusKind, WorkQueueSubmit, WorkQueueSubmitOptions,
+    WorkQueueWorkSnapshot,
 };
 #[cfg(feature = "tokio-worker")]
 pub use worker::worker_derived;

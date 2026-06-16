@@ -1519,6 +1519,140 @@ fn c16_pull_mode_routed_demand() {
     }
 }
 
+/// C-26 — PULL is explicit demand with params; RESUME remains pause-only.
+#[test]
+fn c26_pull_explicit_demand_params_and_resume_pause_only() {
+    let pull_id = LockId::new("snapshot");
+
+    {
+        let a = Node::<i32>::state_empty();
+        let b = Node::<i32>::state_empty();
+        let seen_params = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let seen = seen_params.clone();
+        let snap = Node::<i32>::derived_opts(
+            vec![a.erased(), b.erased()],
+            NodeOpts {
+                pull_id: Some(pull_id.clone()),
+                ..NodeOpts::default()
+            },
+            move |ctx| {
+                if let Some(cursor) = ctx.pull().and_then(|p| p.params::<usize>()) {
+                    seen.borrow_mut().push(*cursor);
+                }
+                let x = *ctx.data::<i32>(0).unwrap();
+                let y = *ctx.data::<i32>(1).unwrap();
+                ctx.emit(x + y);
+            },
+        );
+        let (log, _u) = record(&snap);
+        log.borrow_mut().clear();
+
+        a.set(1);
+        snap.up(vec![Message::Pull(PullDemand::with_params(
+            pull_id.clone(),
+            1usize,
+        ))]);
+        snap.up(vec![Message::Pull(PullDemand::with_params(
+            pull_id.clone(),
+            2usize,
+        ))]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "owed demand waits until the first-run gate is serviceable"
+        );
+
+        b.set(10);
+        assert_eq!(
+            *seen_params.borrow(),
+            vec![2],
+            "later owed PULL params overwrite earlier owed params before delivery"
+        );
+        assert_eq!(kinds(&log), vec!["DIRTY", "DATA"]);
+        log.borrow_mut().clear();
+
+        snap.up(vec![Message::Resume(pull_id.clone())]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "RESUME with the pull token releases pause locks only; it is not demand"
+        );
+
+        snap.up(vec![Message::Pull(PullDemand::new(LockId::new("unknown")))]);
+        assert_eq!(
+            kinds(&log),
+            Vec::<String>::new(),
+            "unknown pull ids drop at the upstream terminus without downstream delivery"
+        );
+    }
+
+    {
+        let trigger = Node::<i32>::state_empty();
+        let bad = Node::<i32>::derived(vec![trigger.erased()], |ctx| {
+            ctx.up(vec![Message::Data(Rc::new(1i32) as AnyValue)]);
+        });
+        let (_log, _u) = record(&bad);
+        trigger.set(1);
+        assert_eq!(
+            bad.status(),
+            Status::Errored,
+            "DATA remains down-only and is rejected by ctx.up"
+        );
+    }
+}
+
+/// C-27 — PULL invokes the holder without dep change and params may drive output.
+#[test]
+fn c27_pull_invokes_holder_without_dep_change_and_params_drive_output() {
+    let pull_id = LockId::new("page");
+    let retained = Node::<i32>::state(10);
+    let seen_params = Rc::new(RefCell::new(Vec::<usize>::new()));
+    let seen = seen_params.clone();
+    let page = Node::<i32>::derived_opts(
+        vec![retained.erased()],
+        NodeOpts {
+            pull_id: Some(pull_id.clone()),
+            ..NodeOpts::default()
+        },
+        move |ctx| {
+            if let Some(limit) = ctx.pull().and_then(|p| p.params::<usize>()) {
+                seen.borrow_mut().push(*limit);
+                if let Some(base) = ctx.data::<i32>(0) {
+                    ctx.emit(*base + *limit as i32);
+                }
+            }
+        },
+    );
+    let (vals, _u) = record_data_i32(&page);
+
+    page.up(vec![Message::Pull(PullDemand::with_params(
+        pull_id.clone(),
+        1usize,
+    ))]);
+    page.up(vec![Message::Pull(PullDemand::with_params(
+        pull_id.clone(),
+        2usize,
+    ))]);
+
+    assert_eq!(
+        *seen_params.borrow(),
+        vec![1, 2],
+        "both no-change PULLs invoke the holder with their own params"
+    );
+    assert_eq!(
+        *vals.borrow(),
+        vec![11, 12],
+        "params may drive retained-view output over unchanged retained state"
+    );
+
+    page.up(vec![Message::Resume(pull_id)]);
+    assert_eq!(
+        *seen_params.borrow(),
+        vec![1, 2],
+        "RESUME does not install ctx.pull or invoke the holder"
+    );
+}
+
 /// C-25 — queued self-triggered boundary tasks apply only once the owner is at a
 /// committed, unpaused boundary view (R-rewire-deferred-committed-boundary / D110).
 #[test]

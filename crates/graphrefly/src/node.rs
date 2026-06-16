@@ -1786,6 +1786,11 @@ enum BoundaryTask {
         toward_dep: Option<usize>,
         committed: Rc<Cell<bool>>,
     },
+    Down {
+        target: CoreToken,
+        msgs: Wave<AnyValue>,
+        committed: Rc<Cell<bool>>,
+    },
 }
 
 impl BoundaryTask {
@@ -1793,7 +1798,8 @@ impl BoundaryTask {
         match self {
             BoundaryTask::Rewire { committed, .. }
             | BoundaryTask::ExternalRewire { committed, .. }
-            | BoundaryTask::Up { committed, .. } => committed.get(),
+            | BoundaryTask::Up { committed, .. }
+            | BoundaryTask::Down { committed, .. } => committed.get(),
         }
     }
 }
@@ -2379,6 +2385,17 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Opti
                     });
                 }
                 node.core.owned_up(msgs, toward_dep);
+            }
+        }
+        BoundaryTask::Down {
+            target,
+            msgs,
+            committed,
+        } => {
+            if committed.get() {
+                if let Some(node) = target.pinned_borrowed_core(graph) {
+                    node.core.owned_down(msgs);
+                }
             }
         }
     }
@@ -3317,6 +3334,18 @@ impl Core {
                 target: CoreToken::from_core(self),
                 msgs,
                 toward_dep,
+                committed: active_batch_committed_token()
+                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
+            },
+        );
+    }
+
+    pub(crate) fn request_down_next(&self, msgs: Wave<AnyValue>) {
+        defer_boundary(
+            self,
+            BoundaryTask::Down {
+                target: CoreToken::from_core(self),
+                msgs,
                 committed: active_batch_committed_token()
                     .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
