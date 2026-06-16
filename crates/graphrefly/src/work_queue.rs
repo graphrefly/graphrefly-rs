@@ -1855,7 +1855,7 @@ fn fail_work<T: Clone + 'static>(
         return events;
     }
     let attempt_for_policy = state.works.get(&work_id).expect("checked lease").attempt;
-    let should_retry = opts.retry.should_retry(attempt_for_policy);
+    let should_retry = retryable.unwrap_or(true) && opts.retry.should_retry(attempt_for_policy);
     let retry_delay_ms = if should_retry {
         opts.retry
             .next_delay_ms(attempt_for_policy.saturating_add(1))
@@ -2862,7 +2862,7 @@ fn dead_letter_page<T: Clone>(
                 && params
                     .after_work_id
                     .as_ref()
-                    .is_none_or(|after| record.work_id() > after)
+                    .is_none_or(|after| record.work_id() > after.as_str())
         })
         .cloned()
         .collect::<Vec<_>>();

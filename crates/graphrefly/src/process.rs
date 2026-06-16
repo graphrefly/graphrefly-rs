@@ -5,6 +5,9 @@
 //! cursor projections are ordinary graph nodes with declared deps. It is not a
 //! workflow engine, effect runner, storage restore path, or hidden process manager.
 
+pub mod messaging;
+pub mod work_queue;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};

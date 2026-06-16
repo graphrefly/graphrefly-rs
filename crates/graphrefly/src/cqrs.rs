@@ -5,6 +5,9 @@
 //! nodes with declared deps; there is no Graph subclass, hidden EventEmitter, or
 //! storage-owned restore path.
 
+pub mod messaging;
+pub mod work_queue;
+
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
