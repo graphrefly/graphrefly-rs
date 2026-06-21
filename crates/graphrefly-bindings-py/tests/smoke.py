@@ -1,4 +1,4 @@
-import graphrefly
+from graphrefly import _native as graphrefly
 
 
 def test_python_callback_sync_wave():
@@ -21,16 +21,16 @@ def test_python_callback_sync_wave():
     assert ("DATA", 5) in seen
 
 
-def test_callback_none_maps_to_error():
+def test_callback_none_is_data():
     seen = []
-    graph = graphrefly.Graph("py-error-smoke")
+    graph = graphrefly.Graph("py-none-smoke")
     source = graph.state(1, "source")
-    bad = graph.derived([source], lambda _value: None, "bad")
+    none_value = graph.derived([source], lambda _value: None, "none_value")
 
-    sub = bad.subscribe(lambda kind, value: seen.append((kind, value)))
+    sub = none_value.subscribe(lambda kind, value: seen.append((kind, value)))
     sub.unsubscribe()
 
-    assert any(kind == "ERROR" and "None is the binding sentinel" in value for kind, value in seen)
+    assert ("DATA", None) in seen
 
 
 def test_batch_callback_exception_rolls_back():
@@ -65,7 +65,7 @@ def test_graph_panic_maps_to_python_runtime_error():
 
 if __name__ == "__main__":
     test_python_callback_sync_wave()
-    test_callback_none_maps_to_error()
+    test_callback_none_is_data()
     test_batch_callback_exception_rolls_back()
     test_graph_panic_maps_to_python_runtime_error()
     print("py-smoke ok")

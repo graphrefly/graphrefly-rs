@@ -11,7 +11,7 @@ homepage.workspace     = true
 authors.workspace      = true
 
 [lib]
-name       = "graphrefly"   # `import graphrefly` on the Python side
+name       = "_native"   # private extension loaded as `graphrefly._native`
 crate-type = ["cdylib", "rlib"]
 test       = false
 

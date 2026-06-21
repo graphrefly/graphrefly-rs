@@ -12,6 +12,8 @@
 //! - Python callbacks are installed as Rust node fns, so invocation goes through
 //!   the dispatcher (F-DISPATCH-ALL).
 //! - Python values are held as owned `Py<PyAny>` payloads inside Rust `AnyValue`.
+//!   `None` is a valid DATA payload; absence-of-DATA is represented by native
+//!   cache presence flags, not by Python `None`.
 //! - Python callback exceptions become graph `ERROR` messages at the Rust graph
 //!   boundary; the richer Python exception hierarchy is a CSP-7 concern.
 
@@ -34,7 +36,7 @@ use graphrefly_rs::{
     AnyValue, Ctx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, Message, Node, Operator,
     Status,
 };
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -45,13 +47,8 @@ struct PyValue {
 }
 
 impl PyValue {
-    fn new(py: Python<'_>, object: Py<PyAny>) -> PyResult<Self> {
-        if object.bind(py).is_none() {
-            return Err(PyValueError::new_err(
-                "None is the binding sentinel and cannot be emitted as DATA in v0",
-            ));
-        }
-        Ok(Self { object })
+    fn new(object: Py<PyAny>) -> Self {
+        Self { object }
     }
 
     fn clone_object(&self, py: Python<'_>) -> Py<PyAny> {
@@ -116,17 +113,13 @@ fn format_callback_error(py: Python<'_>, error: &PyErr) -> String {
         .get_type(py)
         .name()
         .map_or_else(|_| "Exception".to_owned(), |name| name.to_string());
-    format!("{ty}: {error}")
+    format!("{ty}: {}", error.value(py))
 }
 
 fn emit_callback_result(ctx: &Ctx, result: PyResult<Py<PyAny>>) {
     match result {
         Ok(value) => {
-            let value = Python::with_gil(|py| PyValue::new(py, value));
-            match value {
-                Ok(value) => ctx.emit(value),
-                Err(error) => ctx.down(vec![Message::Error(py_exception_to_error(error))]),
-            }
+            ctx.emit(PyValue::new(value));
         }
         Err(error) => ctx.down(vec![Message::Error(py_exception_to_error(error))]),
     }
@@ -158,6 +151,19 @@ fn py_value_from_msg(py: Python<'_>, msg: &Message<AnyValue>) -> PyResult<Py<PyA
 
 fn py_string(py: Python<'_>, value: &str) -> Py<PyAny> {
     PyString::new(py, value).into_any().unbind()
+}
+
+fn dep_args_from_ctx(py: Python<'_>, ctx: &Ctx) -> PyResult<Vec<Py<PyAny>>> {
+    let mut values = Vec::with_capacity(ctx.dep_len());
+    for index in 0..ctx.dep_len() {
+        let Some(value) = ctx.data::<PyValue>(index) else {
+            return Err(PyRuntimeError::new_err(
+                "dependency DATA is absent at the Python callback boundary",
+            ));
+        };
+        values.push(value.clone_object(py));
+    }
+    Ok(values)
 }
 
 fn status_name(status: Status) -> &'static str {
@@ -201,6 +207,7 @@ fn describe_snapshot(py: Python<'_>, snapshot: DescribeSnapshot) -> PyResult<Py<
         entry.set_item("name", node.name)?;
         entry.set_item("factory", node.factory)?;
         entry.set_item("status", status_name(node.status))?;
+        entry.set_item("has_value", node.value.is_some())?;
         entry.set_item(
             "value",
             match node.value.as_ref() {
@@ -254,8 +261,8 @@ impl PyGraph {
     }
 
     #[pyo3(signature = (value, name = None))]
-    fn state(&self, py: Python<'_>, value: Py<PyAny>, name: Option<String>) -> PyResult<PyNode> {
-        let value = PyValue::new(py, value)?;
+    fn state(&self, _py: Python<'_>, value: Py<PyAny>, name: Option<String>) -> PyResult<PyNode> {
+        let value = PyValue::new(value);
         catch_graph_panic(|| PyNode {
             node: self.graph.state_opts(value, graph_node_opts(name)),
         })
@@ -297,14 +304,7 @@ impl PyGraph {
         catch_graph_panic(|| {
             let op = Operator::<PyValue>::new("derived", move |ctx| {
                 let result = Python::with_gil(|py| {
-                    let mut values = Vec::with_capacity(ctx.dep_len());
-                    for index in 0..ctx.dep_len() {
-                        let value = ctx
-                            .data::<PyValue>(index)
-                            .map_or_else(|| py.None(), |value| value.clone_object(py));
-                        values.push(value);
-                    }
-                    let args = PyTuple::new(py, values)?;
+                    let args = PyTuple::new(py, dep_args_from_ctx(py, ctx)?)?;
                     callback.call1(py, args)
                 });
                 emit_callback_result(ctx, result);
@@ -329,14 +329,7 @@ impl PyGraph {
         catch_graph_panic(|| {
             let op = Operator::<PyValue>::new("effect", move |ctx| {
                 let result = Python::with_gil(|py| {
-                    let mut values = Vec::with_capacity(ctx.dep_len());
-                    for index in 0..ctx.dep_len() {
-                        let value = ctx
-                            .data::<PyValue>(index)
-                            .map_or_else(|| py.None(), |value| value.clone_object(py));
-                        values.push(value);
-                    }
-                    let args = PyTuple::new(py, values)?;
+                    let args = PyTuple::new(py, dep_args_from_ctx(py, ctx)?)?;
                     callback.call1(py, args)
                 });
                 if let Err(error) = result {
@@ -376,7 +369,16 @@ impl PyGraph {
                     _ => Ok(py.None()),
                 };
                 match payload.and_then(|payload| {
-                    callback.call1(py, (event.path, event.msg.kind(), payload, event.seq))
+                    callback.call1(
+                        py,
+                        (
+                            event.path,
+                            event.msg.kind(),
+                            payload,
+                            event.tier.as_u8(),
+                            event.seq,
+                        ),
+                    )
                 }) {
                     Ok(_) => {}
                     Err(error) => error.print(py),
@@ -396,19 +398,26 @@ struct PyNode {
 
 #[pymethods]
 impl PyNode {
-    fn set(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
-        self.node.set(PyValue::new(py, value)?);
+    fn set(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.node.set(PyValue::new(value));
         Ok(())
     }
 
-    fn send(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+    fn send(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
         self.node
-            .down(vec![Message::Data(Rc::new(PyValue::new(py, value)?))]);
+            .down(vec![Message::Data(Rc::new(PyValue::new(value)))]);
         Ok(())
     }
 
     fn cache(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.node.cache().map(|value| value.clone_object(py))
+    }
+
+    fn cache_entry(&self, py: Python<'_>) -> PyResult<(bool, Py<PyAny>)> {
+        match self.node.cache() {
+            Some(value) => Ok((true, value.clone_object(py))),
+            None => Ok((false, py.None())),
+        }
     }
 
     fn status(&self) -> &'static str {
@@ -463,7 +472,7 @@ fn version() -> &'static str {
 }
 
 #[pymodule]
-fn graphrefly(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGraph>()?;
     m.add_class::<PyNode>()?;
     m.add_class::<PySubscription>()?;
