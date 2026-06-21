@@ -2,9 +2,11 @@
 
 **GraphReFly** — reactive universal reduction layer (high fan-in/out → information
 reduction → push; not LLM-limited, D1). This repo is the **Rust implementation**
-(`@graphrefly/rust`): a self-contained package (substrate → sugar → operators),
-**no cross-language peer-deps** (D32). Cross-language = a coarse wire bridge, never
-in-process.
+(`@graphrefly/rust`): the native shared engine and reusable graph-infrastructure
+library for Python and future non-TS host-language packages (D415). TypeScript remains
+self-contained; Python/host packages own idiomatic bindings, value/lifetime mapping, and
+ecosystem integration over this Rust layer. Cross-runtime graph collaboration = a coarse
+wire bridge, never hidden distributed same-wave semantics.
 
 > **Clean-slate retired the port model.** The old `main` branch (M1–M5 milestones,
 > handle-protocol cleaving plane, `Arc<Mutex>` actor model, 8-crate workspace,
@@ -30,8 +32,9 @@ Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for th
 | **Sequencer / backlog / anti-patterns** | `~/src/graphrefly/plan/{phases,backlog,antipatterns}.jsonl` (this repo = CSP-5/CSP-6) |
 | **Rendered view** (progress / structure / gaps) | `~/src/graphrefly/dashboard/` (`node dashboard/build.mjs`) |
 
-Sibling self-contained packages: `@graphrefly/ts` (`~/src/graphrefly-ts`, the lead
-spec-hardening impl), `@graphrefly/py` (`~/src/graphrefly-py`).
+Sibling packages: `@graphrefly/ts` (`~/src/graphrefly-ts`) is the self-contained
+TypeScript package and lead spec-hardening impl; `@graphrefly/py` (`~/src/graphrefly-py`)
+is the Python host package layered over the Rust native engine (D415).
 
 ## Clean-slate floor (cite, never violate — full text in DS-1 / `rules.jsonl`)
 
@@ -93,7 +96,7 @@ module status + the C-1..C-11 target map + cross-track sequencing.
 
 ```
 crates/
-└── graphrefly/                # THE self-contained clean-slate package (D32)
+└── graphrefly/                # THE native shared clean-slate engine/library (D415)
     └── src/{protocol,node,dispatcher,ctx,batch}.rs
 crates/graphrefly-{core,graph,operators,storage,structures,bindings-*}/
                                # FROZEN port-model reference (D41 analogue) —

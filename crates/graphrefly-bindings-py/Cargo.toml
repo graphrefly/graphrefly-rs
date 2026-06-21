@@ -1,8 +1,8 @@
 [package]
 name        = "graphrefly-bindings-py"
-description = "GraphReFly Python bindings via PyO3"
-publish     = false   # Built into graphrefly-py via maturin; not a crates.io artifact (PART 14, session-doc D-bindings).
-version.workspace      = true
+description = "GraphReFly clean-slate native Python binding foundation via PyO3"
+publish     = false
+version = "0.0.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -12,33 +12,20 @@ authors.workspace      = true
 
 [lib]
 name       = "graphrefly"   # `import graphrefly` on the Python side
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+test       = false
 
 [dependencies]
-graphrefly-core       = { workspace = true, optional = true }
-graphrefly-graph      = { workspace = true, optional = true }
-graphrefly-operators  = { workspace = true, optional = true }
-graphrefly-storage    = { workspace = true, optional = true }
-graphrefly-structures = { workspace = true, optional = true }
+graphrefly_rs = { package = "graphrefly-rs", path = "../graphrefly" }
 
-# pyo3 — `extension-module` produces a .so/.pyd; `abi3-py39` targets the
-# stable Python ABI from 3.9 onward (one wheel per platform, not per
-# Python minor version).
-# Pinned >= 0.24.1 to fix RUSTSEC-2025-0020 (PyString::from_object buffer
-# overflow). 0.22 → 0.24 introduced the Bound API as default; the scaffold
-# `#[pyfunction]` shape used here is unaffected.
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
+# `extension-module` is an explicit wheel/maturin feature because enabling it
+# while linking Rust test binaries leaves Python symbols unresolved on macOS.
+# `test-python` opts Rust tests into embedding CPython for local smoke coverage.
+pyo3 = { version = "0.25", features = ["abi3-py39"] }
 
 [features]
-default  = ["tracing"]
-
-tracing  = ["dep:graphrefly-core"]
-standard = ["tracing", "graph-codec", "operators"]
-full     = ["standard", "storage", "structures"]
-
-graph-codec = ["dep:graphrefly-graph"]
-operators   = ["dep:graphrefly-operators"]
-storage     = ["dep:graphrefly-storage"]
-structures  = ["dep:graphrefly-structures"]
+default = []
+extension-module = ["pyo3/extension-module"]
+test-python = ["pyo3/auto-initialize"]
 
 # Note: `[profile.release]` lives at the workspace root.

@@ -5,8 +5,9 @@
 # (D#), formal model, and conformance scenarios live there — that repo wins on
 # any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
 #
-# D32: each language is ONE self-contained package (no cross-language peer-deps).
-# The Rust clean-slate package is the single crate `graphrefly`. The previous
+# D415: Rust is the native shared engine / reusable graph-infrastructure library
+# for Python and future non-TS host packages. The Rust clean-slate engine is the
+# single crate `graphrefly`. The previous
 # port-model crates (graphrefly-core / -graph / -operators / -storage /
 # -structures + the 3 bindings) are FROZEN as read-only reference (D41 analogue)
 # and `exclude`d below — they no longer build against this workspace and are
@@ -15,7 +16,10 @@
 
 [workspace]
 resolver = "2"
-members  = ["crates/graphrefly"]
+members  = [
+    "crates/graphrefly",
+    "crates/graphrefly-bindings-py",
+]
 exclude  = [
     # Frozen port-model reference (D41 analogue) — read-only, retired by the
     # clean-slate pivot. Source-as-reference during re-derivation; delete at
@@ -26,7 +30,6 @@ exclude  = [
     "crates/graphrefly-storage",
     "crates/graphrefly-structures",
     "crates/graphrefly-bindings-js",
-    "crates/graphrefly-bindings-py",
     "crates/graphrefly-bindings-wasm",
 ]
 
