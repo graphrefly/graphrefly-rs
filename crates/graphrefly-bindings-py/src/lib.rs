@@ -34,9 +34,9 @@ use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
     AnyValue, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts,
-    LockId, Message, Node, NodeOpts, Operator, Status, WaveData,
+    LockId, Message, Node, NodeOpts, Operator, Pausable, PullDemand, Status, WaveData,
 };
-use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -260,6 +260,36 @@ fn graph_node_opts_with_node(
     opts
 }
 
+fn graph_node_opts_with_conformance(
+    name: Option<String>,
+    partial: bool,
+    complete_when_deps_complete: bool,
+    error_when_deps_error: bool,
+    terminal_as_real_input: bool,
+    pausable: Option<String>,
+    pull_id: Option<String>,
+) -> PyResult<GraphNodeOpts> {
+    let mut opts = graph_node_opts_with_node(
+        name,
+        partial,
+        complete_when_deps_complete,
+        error_when_deps_error,
+        terminal_as_real_input,
+    );
+    opts.node.pausable = match pausable.as_deref() {
+        None | Some("true") => Pausable::True,
+        Some("resumeAll") => Pausable::ResumeAll,
+        Some("false") => Pausable::False,
+        Some(_) => {
+            return Err(PyValueError::new_err(
+                "pausable must be true, 'resumeAll', or false",
+            ));
+        }
+    };
+    opts.node.pull_id = pull_id.map(LockId::new);
+    Ok(opts)
+}
+
 fn py_wave_data(py: Python<'_>, ctx: &DeferredCtx, sentinel: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let outer = PyList::empty(py);
     for dep_waves in ctx.wave_data() {
@@ -290,6 +320,7 @@ fn py_terminal(py: Python<'_>, terminal: Option<&DepTerminal>) -> PyResult<Py<Py
 #[pyclass(name = "Ctx", unsendable)]
 struct PyCtx {
     snapshot: DeferredCtx,
+    pull: Option<PullDemand>,
     initial_state: Option<Py<PyAny>>,
     ops: RefCell<Vec<PyCtxOp>>,
     active: Rc<Cell<bool>>,
@@ -301,6 +332,9 @@ enum PyCtxOp {
     StatePersist(bool),
     OnInvalidate(Py<PyAny>),
     OnDeactivation(Py<PyAny>),
+    UpNextPull(String, Option<Py<PyAny>>, Option<usize>),
+    UpPull(String, Option<Py<PyAny>>, Option<usize>),
+    ConformanceUpData(Py<PyAny>),
 }
 
 #[pymethods]
@@ -332,6 +366,16 @@ impl PyCtx {
             return Err(PyIndexError::new_err("dependency index out of range"));
         }
         py_terminal(py, self.snapshot.terminal(index))
+    }
+
+    fn _pull_context(&self, py: Python<'_>) -> PyResult<Option<(String, Option<Py<PyAny>>)>> {
+        self.assert_active()?;
+        Ok(self.pull.as_ref().map(|pull| {
+            (
+                pull.pull_id.0.clone(),
+                pull.params::<PyValue>().map(|value| value.clone_object(py)),
+            )
+        }))
     }
 
     fn emit(&self, value: Py<PyAny>) -> PyResult<()> {
@@ -379,6 +423,42 @@ impl PyCtx {
             .push(PyCtxOp::OnDeactivation(callback));
         Ok(())
     }
+
+    #[pyo3(signature = (pull_id, params = None, toward_dep = None))]
+    fn _up_next_pull(
+        &self,
+        pull_id: String,
+        params: Option<Py<PyAny>>,
+        toward_dep: Option<usize>,
+    ) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::UpNextPull(pull_id, params, toward_dep));
+        Ok(())
+    }
+
+    #[pyo3(signature = (pull_id, params = None, toward_dep = None))]
+    fn _up_pull(
+        &self,
+        pull_id: String,
+        params: Option<Py<PyAny>>,
+        toward_dep: Option<usize>,
+    ) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::UpPull(pull_id, params, toward_dep));
+        Ok(())
+    }
+
+    fn _conformance_up_data(&self, value: Py<PyAny>) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::ConformanceUpData(value));
+        Ok(())
+    }
 }
 
 impl PyCtx {
@@ -414,7 +494,34 @@ fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &
                     call_py_hook_callback(&callback, &pending_fatal, &hook_ctx);
                 });
             }
+            PyCtxOp::UpNextPull(pull_id, params, toward_dep) => {
+                let wave = vec![private_pull_demand(pull_id, params)];
+                match toward_dep {
+                    Some(toward_dep) => ctx.up_next_toward(toward_dep, wave),
+                    None => ctx.up_next(wave),
+                }
+            }
+            PyCtxOp::UpPull(pull_id, params, toward_dep) => {
+                let wave = vec![private_pull_demand(pull_id, params)];
+                match toward_dep {
+                    Some(toward_dep) => ctx.up_toward(toward_dep, wave),
+                    None => ctx.up(wave),
+                }
+            }
+            PyCtxOp::ConformanceUpData(value) => {
+                ctx.up(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+            }
         }
+    }
+}
+
+fn private_pull_demand(pull_id: String, params: Option<Py<PyAny>>) -> Message<AnyValue> {
+    match params {
+        Some(params) => Message::Pull(PullDemand::with_params(
+            LockId::new(pull_id),
+            PyValue::new(params),
+        )),
+        None => Message::Pull(PullDemand::new(LockId::new(pull_id))),
     }
 }
 
@@ -566,7 +673,9 @@ impl PyGraph {
         partial = false,
         complete_when_deps_complete = true,
         error_when_deps_error = true,
-        terminal_as_real_input = false
+        terminal_as_real_input = false,
+        pausable = None,
+        pull_id = None
     ))]
     fn node(
         &self,
@@ -578,12 +687,23 @@ impl PyGraph {
         complete_when_deps_complete: bool,
         error_when_deps_error: bool,
         terminal_as_real_input: bool,
+        pausable: Option<String>,
+        pull_id: Option<String>,
     ) -> PyResult<PyNode> {
         raise_pending_fatal(&self.pending_fatal)?;
         let deps = deps
             .iter()
             .map(|dep| dep.borrow(py).node.erased())
             .collect::<Vec<_>>();
+        let opts = graph_node_opts_with_conformance(
+            name,
+            partial,
+            complete_when_deps_complete,
+            error_when_deps_error,
+            terminal_as_real_input,
+            pausable,
+            pull_id,
+        )?;
         let pending_fatal = self.pending_fatal.clone();
         let node = catch_graph_panic(&self.pending_fatal, || {
             let callback_pending_fatal = pending_fatal.clone();
@@ -599,6 +719,7 @@ impl PyGraph {
                             py,
                             PyCtx {
                                 snapshot: ctx.defer(),
+                                pull: ctx.pull().cloned(),
                                 initial_state,
                                 ops: RefCell::new(Vec::new()),
                                 active: active.clone(),
@@ -619,13 +740,92 @@ impl PyGraph {
                     });
                     handle_callback_void_result(ctx, &callback_pending_fatal, result);
                 },
-                graph_node_opts_with_node(
-                    name,
-                    partial,
-                    complete_when_deps_complete,
-                    error_when_deps_error,
-                    terminal_as_real_input,
-                ),
+                opts,
+            );
+            PyNode {
+                node,
+                pending_fatal,
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(node)
+    }
+
+    #[pyo3(signature = (
+        deps,
+        callback,
+        name = None,
+        partial = false,
+        complete_when_deps_complete = true,
+        error_when_deps_error = true,
+        terminal_as_real_input = false,
+        pausable = None,
+        pull_id = None
+    ))]
+    fn _conformance_node(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        callback: Py<PyAny>,
+        name: Option<String>,
+        partial: bool,
+        complete_when_deps_complete: bool,
+        error_when_deps_error: bool,
+        terminal_as_real_input: bool,
+        pausable: Option<String>,
+        pull_id: Option<String>,
+    ) -> PyResult<PyNode> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.erased())
+            .collect::<Vec<_>>();
+        let opts = graph_node_opts_with_conformance(
+            name,
+            partial,
+            complete_when_deps_complete,
+            error_when_deps_error,
+            terminal_as_real_input,
+            pausable,
+            pull_id,
+        )?;
+        let pending_fatal = self.pending_fatal.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            let node = self.graph.node_opts::<PyValue, _>(
+                deps,
+                move |ctx| {
+                    let active = Rc::new(Cell::new(true));
+                    let result = Python::with_gil(|py| {
+                        let initial_state = ctx
+                            .state_get::<PyValue>()
+                            .map(|value| value.clone_object(py));
+                        let py_ctx = Py::new(
+                            py,
+                            PyCtx {
+                                snapshot: ctx.defer(),
+                                pull: ctx.pull().cloned(),
+                                initial_state,
+                                ops: RefCell::new(Vec::new()),
+                                active: active.clone(),
+                            },
+                        )?;
+                        let callback_result = callback.call1(py, (py_ctx.clone_ref(py),));
+                        match callback_result {
+                            Ok(value) => {
+                                active.set(false);
+                                commit_py_ctx(py, &py_ctx, ctx, &callback_pending_fatal);
+                                Ok(value)
+                            }
+                            Err(error) => {
+                                active.set(false);
+                                Err(error)
+                            }
+                        }
+                    });
+                    handle_callback_void_result(ctx, &callback_pending_fatal, result);
+                },
+                opts,
             );
             PyNode {
                 node,
@@ -855,6 +1055,42 @@ impl PyNode {
         Ok(())
     }
 
+    #[pyo3(signature = (pull_id, params = None))]
+    fn _conformance_up_pull(&self, pull_id: String, params: Option<Py<PyAny>>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![private_pull_demand(pull_id, params)]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (toward_dep, pull_id, params = None))]
+    fn _conformance_up_pull_toward(
+        &self,
+        toward_dep: usize,
+        pull_id: String,
+        params: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node
+                .up_toward(toward_dep, vec![private_pull_demand(pull_id, params)]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _conformance_up_data_forbidden(&self, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node
+                .up(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
     fn _down_resolved(&self) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
@@ -868,6 +1104,15 @@ impl PyNode {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
             self.node.down(vec![Message::Dirty]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_invalidate(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Invalidate]);
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
@@ -902,6 +1147,15 @@ impl PyNode {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
             self.node.down(vec![Message::Complete]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_teardown(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Teardown]);
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
