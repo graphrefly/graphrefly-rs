@@ -332,8 +332,12 @@ enum PyCtxOp {
     StatePersist(bool),
     OnInvalidate(Py<PyAny>),
     OnDeactivation(Py<PyAny>),
+    RewireNextSubscribeDep(Node<PyValue>, Py<PyAny>),
+    RewireNextUnsubscribeDep(Node<PyValue>, Py<PyAny>),
+    RewireNextReplaceDeps(Vec<Node<PyValue>>, Py<PyAny>),
     UpNextPull(String, Option<Py<PyAny>>, Option<usize>),
     UpPull(String, Option<Py<PyAny>>, Option<usize>),
+    ConformanceDownComplete,
     ConformanceUpData(Py<PyAny>),
 }
 
@@ -424,6 +428,51 @@ impl PyCtx {
         Ok(())
     }
 
+    fn _rewire_next_subscribe_dep(
+        &self,
+        py: Python<'_>,
+        dep: Py<PyNode>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.assert_active()?;
+        let dep = dep.borrow(py).node.clone();
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::RewireNextSubscribeDep(dep, callback));
+        Ok(())
+    }
+
+    fn _rewire_next_unsubscribe_dep(
+        &self,
+        py: Python<'_>,
+        dep: Py<PyNode>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.assert_active()?;
+        let dep = dep.borrow(py).node.clone();
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::RewireNextUnsubscribeDep(dep, callback));
+        Ok(())
+    }
+
+    fn _rewire_next_replace_deps(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.assert_active()?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.clone())
+            .collect::<Vec<_>>();
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::RewireNextReplaceDeps(deps, callback));
+        Ok(())
+    }
+
     #[pyo3(signature = (pull_id, params = None, toward_dep = None))]
     fn _up_next_pull(
         &self,
@@ -457,6 +506,12 @@ impl PyCtx {
         self.ops
             .borrow_mut()
             .push(PyCtxOp::ConformanceUpData(value));
+        Ok(())
+    }
+
+    fn _conformance_down_complete(&self) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops.borrow_mut().push(PyCtxOp::ConformanceDownComplete);
         Ok(())
     }
 }
@@ -494,6 +549,25 @@ fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &
                     call_py_hook_callback(&callback, &pending_fatal, &hook_ctx);
                 });
             }
+            PyCtxOp::RewireNextSubscribeDep(dep, callback) => {
+                let pending_fatal = pending_fatal.clone();
+                ctx.rewire_next_subscribe_dep(dep.erased(), move |ctx| {
+                    invoke_py_ctx_callback(ctx, &callback, &pending_fatal);
+                });
+            }
+            PyCtxOp::RewireNextUnsubscribeDep(dep, callback) => {
+                let pending_fatal = pending_fatal.clone();
+                ctx.rewire_next_unsubscribe_dep(dep.erased(), move |ctx| {
+                    invoke_py_ctx_callback(ctx, &callback, &pending_fatal);
+                });
+            }
+            PyCtxOp::RewireNextReplaceDeps(deps, callback) => {
+                let pending_fatal = pending_fatal.clone();
+                let deps = deps.into_iter().map(|dep| dep.erased()).collect::<Vec<_>>();
+                ctx.rewire_next_replace_deps(deps, move |ctx| {
+                    invoke_py_ctx_callback(ctx, &callback, &pending_fatal);
+                });
+            }
             PyCtxOp::UpNextPull(pull_id, params, toward_dep) => {
                 let wave = vec![private_pull_demand(pull_id, params)];
                 match toward_dep {
@@ -508,11 +582,46 @@ fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &
                     None => ctx.up(wave),
                 }
             }
+            PyCtxOp::ConformanceDownComplete => {
+                ctx.down(vec![Message::Complete]);
+            }
             PyCtxOp::ConformanceUpData(value) => {
                 ctx.up(vec![Message::Data(Rc::new(PyValue::new(value)))]);
             }
         }
     }
+}
+
+fn invoke_py_ctx_callback(ctx: &Ctx, callback: &Py<PyAny>, pending_fatal: &PendingFatal) {
+    let active = Rc::new(Cell::new(true));
+    let result = Python::with_gil(|py| {
+        let initial_state = ctx
+            .state_get::<PyValue>()
+            .map(|value| value.clone_object(py));
+        let py_ctx = Py::new(
+            py,
+            PyCtx {
+                snapshot: ctx.defer(),
+                pull: ctx.pull().cloned(),
+                initial_state,
+                ops: RefCell::new(Vec::new()),
+                active: active.clone(),
+            },
+        )?;
+        let callback_result = callback.call1(py, (py_ctx.clone_ref(py),));
+        match callback_result {
+            Ok(value) => {
+                active.set(false);
+                commit_py_ctx(py, &py_ctx, ctx, pending_fatal);
+                Ok(value)
+            }
+            Err(error) => {
+                active.set(false);
+                Err(error)
+            }
+        }
+    });
+    handle_callback_void_result(ctx, pending_fatal, result);
 }
 
 fn private_pull_demand(pull_id: String, params: Option<Py<PyAny>>) -> Message<AnyValue> {
@@ -1086,6 +1195,25 @@ impl PyNode {
         catch_graph_panic(&self.pending_fatal, || {
             self.node
                 .up(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _conformance_immediate_subscribe_dep(
+        &self,
+        py: Python<'_>,
+        dep: Py<PyNode>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let dep = dep.borrow(py).node.erased();
+        let pending_fatal = self.pending_fatal.clone();
+        catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            self.node.subscribe_dep(dep, move |ctx| {
+                invoke_py_ctx_callback(ctx, &callback, &callback_pending_fatal);
+            });
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())

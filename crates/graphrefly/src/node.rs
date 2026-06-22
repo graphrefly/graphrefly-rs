@@ -3428,6 +3428,9 @@ impl Core {
         // wave-owner; the drain runs outside any live wave).
         let outcome = catch_unwind(AssertUnwindSafe(|| self.rewire_inner(new_deps, fn_, true)));
         if let Err(payload) = outcome {
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                resume_unwind(payload);
+            }
             let err = panic_to_error(payload);
             self.owned_down(vec![Message::Error(err)]);
         }
