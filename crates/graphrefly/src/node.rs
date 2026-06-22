@@ -41,7 +41,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
 use crate::batch::{
@@ -54,6 +54,7 @@ use crate::checkpoint::{
 use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
+use crate::host_boundary::is_host_boundary_abort_payload;
 use crate::protocol::{AnyValue, GraphError, Handle, LockId, Message, PullDemand, Tier, Wave};
 use crate::versioning::{
     advance_node_version, assert_node_version_data_compatible, create_node_version,
@@ -1109,6 +1110,13 @@ impl Core {
         }
     }
 
+    fn boundary_root(&self) -> BoundaryRoot {
+        BoundaryRoot {
+            graph_id: Rc::as_ptr(&self.graph) as usize,
+            graph: Rc::downgrade(&self.graph),
+        }
+    }
+
     fn borrow(&self) -> Ref<'_, NodeTopologySlot> {
         Ref::map(self.graph.borrow(), |g| g.get(self.key()))
     }
@@ -2144,8 +2152,9 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         Ok(r) => r,
         Err(payload) => {
             // The scope is taken (we are outside the wave again). Recover every node
-            // the aborted wave corrupted (B25), then surface the failure as ERROR on a
-            // node ON the cycle (D30) — a fresh terminal wave.
+            // the aborted wave corrupted (B25). D431 host-boundary aborts are not graph
+            // value-level failures: clear stale wave/boundary work, then rethrow without
+            // emitting protocol ERROR.
             for n in &scope.touched {
                 n.reset_wave_flags();
             }
@@ -2154,6 +2163,15 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             // later unrelated wave would resurrect stale dep projections after B25 has
             // already reset the touched nodes.
             clear_deferred_delivery_actions();
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                clear_all_deferred_boundary_root(&owner.boundary_root());
+                for root in &boundary_roots {
+                    clear_all_deferred_boundary_root(root);
+                }
+                std::panic::resume_unwind(payload);
+            }
+            // Non-host Rust/value failures still surface as ERROR on a node ON the
+            // failure path (D30) — a fresh terminal wave.
             let blamed = scope
                 .blamed
                 .and_then(|key| {
@@ -2234,19 +2252,36 @@ pub(crate) fn drain_committed_boundary_root(root: &BoundaryRoot) {
 pub(crate) fn drain_committed_boundaries(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
     let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
     for root in core_roots {
-        remember_first_boundary_panic(
-            &mut escaped,
-            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary(root))),
-        );
+        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary(root)));
+        if let Err(payload) = result {
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                clear_all_deferred_boundaries(core_roots, task_roots);
+                std::panic::resume_unwind(payload);
+            }
+            remember_first_boundary_panic(&mut escaped, Err(payload));
+        }
     }
     for root in task_roots {
-        remember_first_boundary_panic(
-            &mut escaped,
-            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root))),
-        );
+        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
+        if let Err(payload) = result {
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                clear_all_deferred_boundaries(core_roots, task_roots);
+                std::panic::resume_unwind(payload);
+            }
+            remember_first_boundary_panic(&mut escaped, Err(payload));
+        }
     }
     if let Some(e) = escaped {
         std::panic::resume_unwind(e);
+    }
+}
+
+fn clear_all_deferred_boundaries(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
+    for root in core_roots {
+        clear_all_deferred_boundary_root(&root.boundary_root());
+    }
+    for root in task_roots {
+        clear_all_deferred_boundary_root(root);
     }
 }
 
@@ -2267,6 +2302,12 @@ pub(crate) fn clear_deferred_boundary_root(root: &BoundaryRoot) {
             .borrow_mut()
             .deferred_boundary
             .retain(BoundaryTask::committed);
+    }
+}
+
+pub(crate) fn clear_all_deferred_boundary_root(root: &BoundaryRoot) {
+    if let Some(graph) = root.upgrade() {
+        graph.borrow_mut().deferred_boundary.clear();
     }
 }
 
@@ -2321,6 +2362,11 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
             }
             Err(e) => {
                 blocked = 0;
+                if is_host_boundary_abort_payload(e.as_ref()) {
+                    graph.borrow_mut().deferred_boundary.clear();
+                    drain_guard.finish();
+                    std::panic::resume_unwind(e);
+                }
                 if escaped.is_none() {
                     escaped = Some(e);
                 }
@@ -4989,17 +5035,31 @@ impl<T: 'static> Node<T> {
         // unsubscribe instead of leaking the just-registered sink (no orphaned sink).
         let id_cell: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let body_cell = id_cell.clone();
-        with_wave_owner(
-            &self.core,
-            || self.core.subscribe_recording_id(sink, &body_cell),
-            move || match id_cell.get() {
-                Some(id) => {
-                    let err_core = self.core.clone();
-                    Box::new(move || err_core.unsubscribe(id)) as Unsub
+        let abort_cell = id_cell.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_wave_owner(
+                &self.core,
+                || self.core.subscribe_recording_id(sink, &body_cell),
+                move || match id_cell.get() {
+                    Some(id) => {
+                        let err_core = self.core.clone();
+                        Box::new(move || err_core.unsubscribe(id)) as Unsub
+                    }
+                    None => Box::new(|| {}) as Unsub,
+                },
+            )
+        }));
+        match result {
+            Ok(unsub) => unsub,
+            Err(payload) => {
+                if is_host_boundary_abort_payload(payload.as_ref()) {
+                    if let Some(id) = abort_cell.get() {
+                        self.core.unsubscribe(id);
+                    }
                 }
-                None => Box::new(|| {}) as Unsub,
-            },
-        )
+                resume_unwind(payload);
+            }
+        }
     }
 
     /// R-rewire (D42): replace this node's deps atomically (surgical Option-C). Kept deps
@@ -5391,6 +5451,22 @@ mod tests {
         assert!(
             !derived.core.with_inner_edges(|_, e| e.wave.inside_run_wave),
             "WaveGuard must clear inside_run_wave during unwind"
+        );
+    }
+
+    #[test]
+    fn unarmed_host_boundary_abort_is_ordinary_graph_error() {
+        let source = Node::<i32>::state(1);
+        let bad: Node<i32> = Node::derived(vec![source.erased()], |_| {
+            crate::host_boundary::abort_host_boundary();
+        });
+
+        let _u = bad.subscribe(|_| {});
+
+        assert_eq!(
+            bad.status(),
+            Status::Errored,
+            "D431 marker helper is active only inside native host-boundary guards"
         );
     }
 

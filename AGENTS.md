@@ -56,6 +56,9 @@ is the Python host package layered over the Rust native engine (D415).
   via `/conformance`); operators/sugar/sources/inspection are per-language, never parity.
 - **config dissolved (D26):** clock is graph-local (no global singleton); `messageTier`
   is a compile-time const table; `onMessage`/`onSubscribe` are substrate-fixed (D19).
+- **Host fatal boundary (D431):** native bindings may use `HostBoundaryAbort` only to
+  tunnel host process-control exceptions back to the host; it is not DATA, not graph
+  `ERROR`, and not a protocol rollback/TEARDOWN/COMPLETE mechanism.
 - **Forced (F-*):** F-SYNC-CORE (`dispatcher.invoke` sync `()`; async only in pools /
   wire bridge) · F-DISPATCH-ALL (no inline-fn bypass) · F-NO-IMPL-DEFINED (spec-locked
   or explicitly undefined) · F-NO-WEDGE-CUT · F-NO-LLM-ONLY · F-GRAPH-FIRST-API · F-PERF.

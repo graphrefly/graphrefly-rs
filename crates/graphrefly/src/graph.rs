@@ -1334,16 +1334,27 @@ impl Graph {
         for (path, core) in targets {
             let sink = sink.clone();
             let clock = clock.clone();
-            let unsub = Node::<AnyValue>::from_core(core).subscribe(move |msg| {
-                let seq = clock.get();
-                clock.set(seq + 1);
-                sink(ObserveEvent {
-                    path: path.clone(),
-                    msg: ObserveMessage::from_message(msg),
-                    tier: msg.tier(),
-                    seq,
-                });
-            });
+            let subscribed = catch_unwind(AssertUnwindSafe(|| {
+                Node::<AnyValue>::from_core(core).subscribe(move |msg| {
+                    let seq = clock.get();
+                    clock.set(seq + 1);
+                    sink(ObserveEvent {
+                        path: path.clone(),
+                        msg: ObserveMessage::from_message(msg),
+                        tier: msg.tier(),
+                        seq,
+                    });
+                })
+            }));
+            let unsub = match subscribed {
+                Ok(unsub) => unsub,
+                Err(payload) => {
+                    for unsub in observer.unsubs.drain(..).flatten() {
+                        unsub();
+                    }
+                    resume_unwind(payload);
+                }
+            };
             observer.unsubs.push(Some(unsub));
         }
         observer

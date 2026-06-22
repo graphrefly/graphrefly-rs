@@ -20,9 +20,10 @@ use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
+use crate::host_boundary::is_host_boundary_abort_payload;
 use crate::node::{
-    boundary_root_for, clear_deferred_boundary_root, drain_committed_boundary_root, BatchTarget,
-    BoundaryRoot, Core,
+    boundary_root_for, clear_all_deferred_boundary_root, clear_deferred_boundary_root,
+    drain_committed_boundary_root, BatchTarget, BoundaryRoot, Core,
 };
 use crate::protocol::{AnyValue, Wave};
 
@@ -256,19 +257,36 @@ fn clear_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryR
 fn drain_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryRoot]) {
     let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
     for root in core_roots {
-        remember_first_boundary_panic(
-            &mut escaped,
-            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root))),
-        );
+        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
+        if let Err(payload) = result {
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                clear_all_boundary_for_roots(core_roots, task_roots);
+                resume_unwind(payload);
+            }
+            remember_first_boundary_panic(&mut escaped, Err(payload));
+        }
     }
     for root in task_roots {
-        remember_first_boundary_panic(
-            &mut escaped,
-            catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root))),
-        );
+        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
+        if let Err(payload) = result {
+            if is_host_boundary_abort_payload(payload.as_ref()) {
+                clear_all_boundary_for_roots(core_roots, task_roots);
+                resume_unwind(payload);
+            }
+            remember_first_boundary_panic(&mut escaped, Err(payload));
+        }
     }
     if let Some(e) = escaped {
         std::panic::resume_unwind(e);
+    }
+}
+
+fn clear_all_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryRoot]) {
+    for root in core_roots {
+        clear_all_deferred_boundary_root(root);
+    }
+    for root in task_roots {
+        clear_all_deferred_boundary_root(root);
     }
 }
 
