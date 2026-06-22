@@ -80,6 +80,7 @@ pub mod process;
 pub mod protocol;
 pub mod render;
 pub mod resilience;
+pub mod scheduled_readiness;
 pub mod solutions;
 pub mod sources;
 pub mod storage;
@@ -269,6 +270,13 @@ pub use resilience::{
     breaker_status_node, rate_limit_bundle, retry_status_node, timeout_bundle, BackoffPolicy,
     BreakerState, BreakerStatus, RateLimitBundle, RateLimitStatus, RetryEvent, RetryPolicy,
     RetryState, RetryStatus, TimeoutBundle, TimeoutStatus,
+};
+pub use scheduled_readiness::{
+    parse_scheduled_readiness_requested, scheduled_readiness_projector,
+    ScheduledReadinessAuditRecord, ScheduledReadinessBundle, ScheduledReadinessClock,
+    ScheduledReadinessOptions, ScheduledReadinessOverdue, ScheduledReadinessPending,
+    ScheduledReadinessReady, ScheduledReadinessRequested, ScheduledReadinessStatus,
+    ScheduledReadinessStatusState, ScheduledReadinessViews, SourceRef,
 };
 pub use solutions::{
     agentic_memory_bundle, agentic_memory_consolidation_bundle,

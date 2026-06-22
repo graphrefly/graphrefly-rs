@@ -5,6 +5,8 @@
 //! issues, and read projections. It intentionally stays independent of the
 //! higher-layer recipe and orchestration types.
 
+pub mod readiness;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};

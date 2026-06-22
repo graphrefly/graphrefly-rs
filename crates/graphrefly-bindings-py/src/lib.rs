@@ -25,7 +25,7 @@
     clippy::needless_pass_by_value
 )]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, catch_unwind, AssertUnwindSafe};
@@ -33,10 +33,10 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    AnyValue, Ctx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, LockId, Message, Node,
-    Operator, Status,
+    AnyValue, Ctx, DeferredCtx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, LockId,
+    Message, Node, Operator, Status,
 };
-use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -165,6 +165,23 @@ fn emit_callback_result(ctx: &Ctx, pending_fatal: &PendingFatal, result: PyResul
     }
 }
 
+fn handle_callback_void_result(
+    ctx: &Ctx,
+    pending_fatal: &PendingFatal,
+    result: PyResult<Py<PyAny>>,
+) {
+    if let Err(error) = result {
+        Python::with_gil(|py| {
+            if py_error_is_fatal(py, &error) {
+                store_pending_fatal(pending_fatal, error);
+                graphrefly_rs::host_boundary::abort_host_boundary();
+            } else {
+                ctx.down(vec![Message::Error(py_exception_to_error(error))]);
+            }
+        });
+    }
+}
+
 fn value_from_any(py: Python<'_>, value: &AnyValue) -> PyResult<Py<PyAny>> {
     if let Some(value) = value.downcast_ref::<PyValue>() {
         return Ok(value.clone_object(py));
@@ -223,6 +240,141 @@ fn graph_node_opts(name: Option<String>) -> GraphNodeOpts {
         Some(name) => GraphNodeOpts::named(name),
         None => GraphNodeOpts::default(),
     }
+}
+
+#[pyclass(name = "Ctx", unsendable)]
+struct PyCtx {
+    snapshot: DeferredCtx,
+    initial_state: Option<Py<PyAny>>,
+    ops: RefCell<Vec<PyCtxOp>>,
+    active: Rc<Cell<bool>>,
+}
+
+enum PyCtxOp {
+    Emit(Py<PyAny>),
+    StateSet(Py<PyAny>),
+    StatePersist(bool),
+    OnInvalidate(Py<PyAny>),
+    OnDeactivation(Py<PyAny>),
+}
+
+#[pymethods]
+impl PyCtx {
+    fn dep_len(&self) -> PyResult<usize> {
+        self.assert_active()?;
+        Ok(self.snapshot.wave_data().len())
+    }
+
+    fn data_entry(&self, py: Python<'_>, index: usize) -> PyResult<(bool, Py<PyAny>)> {
+        self.assert_active()?;
+        if index >= self.snapshot.wave_data().len() {
+            return Err(PyIndexError::new_err("dependency index out of range"));
+        }
+        match self.snapshot.data::<PyValue>(index) {
+            Some(value) => Ok((true, value.clone_object(py))),
+            None => Ok((false, py.None())),
+        }
+    }
+
+    fn emit(&self, value: Py<PyAny>) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops.borrow_mut().push(PyCtxOp::Emit(value));
+        Ok(())
+    }
+
+    fn state_entry(&self, py: Python<'_>) -> PyResult<(bool, Py<PyAny>)> {
+        self.assert_active()?;
+        for op in self.ops.borrow().iter().rev() {
+            if let PyCtxOp::StateSet(value) = op {
+                return Ok((true, value.clone_ref(py)));
+            }
+        }
+        match self.initial_state.as_ref() {
+            Some(value) => Ok((true, value.clone_ref(py))),
+            None => Ok((false, py.None())),
+        }
+    }
+
+    fn set_state(&self, value: Py<PyAny>) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops.borrow_mut().push(PyCtxOp::StateSet(value));
+        Ok(())
+    }
+
+    #[pyo3(signature = (on = true))]
+    fn state_persist(&self, on: bool) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops.borrow_mut().push(PyCtxOp::StatePersist(on));
+        Ok(())
+    }
+
+    fn on_invalidate(&self, callback: Py<PyAny>) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops.borrow_mut().push(PyCtxOp::OnInvalidate(callback));
+        Ok(())
+    }
+
+    fn on_deactivation(&self, callback: Py<PyAny>) -> PyResult<()> {
+        self.assert_active()?;
+        self.ops
+            .borrow_mut()
+            .push(PyCtxOp::OnDeactivation(callback));
+        Ok(())
+    }
+}
+
+impl PyCtx {
+    fn assert_active(&self) -> PyResult<()> {
+        if self.active.get() {
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err(
+                "ctx is only valid during its Python node callback",
+            ))
+        }
+    }
+}
+
+fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &PendingFatal) {
+    let py_ctx = py_ctx.borrow(py);
+    for op in py_ctx.ops.borrow_mut().drain(..) {
+        match op {
+            PyCtxOp::Emit(value) => ctx.emit(PyValue::new(value)),
+            PyCtxOp::StateSet(value) => ctx.state_set(PyValue::new(value)),
+            PyCtxOp::StatePersist(on) => ctx.state_persist(on),
+            PyCtxOp::OnInvalidate(callback) => {
+                let pending_fatal = pending_fatal.clone();
+                let hook_ctx = ctx.defer();
+                ctx.on_invalidate(move || {
+                    call_py_hook_callback(&callback, &pending_fatal, &hook_ctx);
+                });
+            }
+            PyCtxOp::OnDeactivation(callback) => {
+                let pending_fatal = pending_fatal.clone();
+                let hook_ctx = ctx.defer();
+                ctx.on_deactivation(move || {
+                    call_py_hook_callback(&callback, &pending_fatal, &hook_ctx);
+                });
+            }
+        }
+    }
+}
+
+fn call_py_hook_callback(
+    callback: &Py<PyAny>,
+    pending_fatal: &PendingFatal,
+    hook_ctx: &DeferredCtx,
+) {
+    Python::with_gil(|py| {
+        if let Err(error) = callback.call0(py) {
+            if py_error_is_fatal(py, &error) {
+                store_pending_fatal(pending_fatal, error);
+                graphrefly_rs::host_boundary::abort_host_boundary();
+            } else {
+                hook_ctx.down(vec![Message::Error(py_exception_to_error(error))]);
+            }
+        }
+    });
 }
 
 fn describe_value(py: Python<'_>, value: &DescribeValue) -> PyResult<Py<PyAny>> {
@@ -337,6 +489,65 @@ impl PyGraph {
                 move |ctx| {
                     let result = Python::with_gil(|py| callback.call0(py));
                     emit_callback_result(ctx, &callback_pending_fatal, result);
+                },
+                graph_node_opts(name),
+            );
+            PyNode {
+                node,
+                pending_fatal,
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(node)
+    }
+
+    #[pyo3(signature = (deps, callback, name = None))]
+    fn node(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        callback: Py<PyAny>,
+        name: Option<String>,
+    ) -> PyResult<PyNode> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.erased())
+            .collect::<Vec<_>>();
+        let pending_fatal = self.pending_fatal.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            let node = self.graph.node_opts::<PyValue, _>(
+                deps,
+                move |ctx| {
+                    let active = Rc::new(Cell::new(true));
+                    let result = Python::with_gil(|py| {
+                        let initial_state = ctx
+                            .state_get::<PyValue>()
+                            .map(|value| value.clone_object(py));
+                        let py_ctx = Py::new(
+                            py,
+                            PyCtx {
+                                snapshot: ctx.defer(),
+                                initial_state,
+                                ops: RefCell::new(Vec::new()),
+                                active: active.clone(),
+                            },
+                        )?;
+                        let callback_result = callback.call1(py, (py_ctx.clone_ref(py),));
+                        match callback_result {
+                            Ok(value) => {
+                                active.set(false);
+                                commit_py_ctx(py, &py_ctx, ctx, &callback_pending_fatal);
+                                Ok(value)
+                            }
+                            Err(error) => {
+                                active.set(false);
+                                Err(error)
+                            }
+                        }
+                    });
+                    handle_callback_void_result(ctx, &callback_pending_fatal, result);
                 },
                 graph_node_opts(name),
             );
@@ -484,9 +695,10 @@ impl PyGraph {
         })?;
         let subscription = PySubscription {
             unsubscribe: RefCell::new(Some(Box::new(move || drop(observer)))),
+            pending_fatal: self.pending_fatal.clone(),
         };
         if let Err(error) = raise_pending_fatal(&self.pending_fatal) {
-            subscription.unsubscribe();
+            let _ = subscription.unsubscribe();
             return Err(error);
         }
         Ok(subscription)
@@ -615,6 +827,7 @@ impl PyNode {
         }
         Ok(PySubscription {
             unsubscribe: RefCell::new(Some(unsubscribe)),
+            pending_fatal: self.pending_fatal.clone(),
         })
     }
 }
@@ -622,21 +835,28 @@ impl PyNode {
 #[pyclass(name = "Subscription", unsendable)]
 struct PySubscription {
     unsubscribe: RefCell<Option<Box<dyn FnOnce()>>>,
+    pending_fatal: PendingFatal,
 }
 
 #[pymethods]
 impl PySubscription {
-    fn unsubscribe(&self) {
-        if let Some(unsubscribe) = self.unsubscribe.borrow_mut().take() {
-            unsubscribe();
-        }
+    fn unsubscribe(&self) -> PyResult<()> {
+        catch_graph_panic(&self.pending_fatal, || {
+            if let Some(unsubscribe) = self.unsubscribe.borrow_mut().take() {
+                unsubscribe();
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
     }
 }
 
 impl Drop for PySubscription {
     fn drop(&mut self) {
         if let Some(unsubscribe) = self.unsubscribe.get_mut().take() {
-            unsubscribe();
+            let pending_fatal = self.pending_fatal.clone();
+            let _ = catch_graph_panic(&pending_fatal, unsubscribe);
+            let _ = pending_fatal.borrow_mut().take();
         }
     }
 }
@@ -648,6 +868,7 @@ fn version() -> &'static str {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyCtx>()?;
     m.add_class::<PyGraph>()?;
     m.add_class::<PyNode>()?;
     m.add_class::<PySubscription>()?;
