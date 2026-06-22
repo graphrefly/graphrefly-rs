@@ -33,8 +33,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    AnyValue, Ctx, DeferredCtx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, LockId,
-    Message, Node, Operator, Status,
+    AnyValue, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts,
+    LockId, Message, Node, NodeOpts, Operator, Status, WaveData,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -242,6 +242,51 @@ fn graph_node_opts(name: Option<String>) -> GraphNodeOpts {
     }
 }
 
+fn graph_node_opts_with_node(
+    name: Option<String>,
+    partial: bool,
+    complete_when_deps_complete: bool,
+    error_when_deps_error: bool,
+    terminal_as_real_input: bool,
+) -> GraphNodeOpts {
+    let mut opts = graph_node_opts(name);
+    opts.node = NodeOpts {
+        partial,
+        complete_when_deps_complete,
+        error_when_deps_error,
+        terminal_as_real_input,
+        ..NodeOpts::default()
+    };
+    opts
+}
+
+fn py_wave_data(py: Python<'_>, ctx: &DeferredCtx, sentinel: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let outer = PyList::empty(py);
+    for dep_waves in ctx.wave_data() {
+        let py_dep_waves = PyList::empty(py);
+        for wave in dep_waves {
+            let py_wave = PyList::empty(py);
+            for item in wave {
+                match item {
+                    WaveData::Data(value) => py_wave.append(value_from_any(py, value)?)?,
+                    WaveData::Sentinel => py_wave.append(sentinel.clone_ref(py))?,
+                }
+            }
+            py_dep_waves.append(py_wave)?;
+        }
+        outer.append(py_dep_waves)?;
+    }
+    Ok(outer.into())
+}
+
+fn py_terminal(py: Python<'_>, terminal: Option<&DepTerminal>) -> PyResult<Py<PyAny>> {
+    match terminal {
+        None => false.into_py_any(py),
+        Some(DepTerminal::Complete) => true.into_py_any(py),
+        Some(DepTerminal::Error(error)) => error.to_string().into_py_any(py),
+    }
+}
+
 #[pyclass(name = "Ctx", unsendable)]
 struct PyCtx {
     snapshot: DeferredCtx,
@@ -274,6 +319,19 @@ impl PyCtx {
             Some(value) => Ok((true, value.clone_object(py))),
             None => Ok((false, py.None())),
         }
+    }
+
+    fn wave_data(&self, py: Python<'_>, sentinel: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        self.assert_active()?;
+        py_wave_data(py, &self.snapshot, &sentinel)
+    }
+
+    fn terminal(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+        self.assert_active()?;
+        if index >= self.snapshot.wave_data().len() {
+            return Err(PyIndexError::new_err("dependency index out of range"));
+        }
+        py_terminal(py, self.snapshot.terminal(index))
     }
 
     fn emit(&self, value: Py<PyAny>) -> PyResult<()> {
@@ -501,13 +559,25 @@ impl PyGraph {
         Ok(node)
     }
 
-    #[pyo3(signature = (deps, callback, name = None))]
+    #[pyo3(signature = (
+        deps,
+        callback,
+        name = None,
+        partial = false,
+        complete_when_deps_complete = true,
+        error_when_deps_error = true,
+        terminal_as_real_input = false
+    ))]
     fn node(
         &self,
         py: Python<'_>,
         deps: Vec<Py<PyNode>>,
         callback: Py<PyAny>,
         name: Option<String>,
+        partial: bool,
+        complete_when_deps_complete: bool,
+        error_when_deps_error: bool,
+        terminal_as_real_input: bool,
     ) -> PyResult<PyNode> {
         raise_pending_fatal(&self.pending_fatal)?;
         let deps = deps
@@ -549,7 +619,13 @@ impl PyGraph {
                     });
                     handle_callback_void_result(ctx, &callback_pending_fatal, result);
                 },
-                graph_node_opts(name),
+                graph_node_opts_with_node(
+                    name,
+                    partial,
+                    complete_when_deps_complete,
+                    error_when_deps_error,
+                    terminal_as_real_input,
+                ),
             );
             PyNode {
                 node,
@@ -774,6 +850,46 @@ impl PyNode {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
             self.node.up(vec![Message::Teardown]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_resolved(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Resolved]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_data_data_invalidate(&self, first: Py<PyAny>, second: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![
+                Message::Data(Rc::new(PyValue::new(first))),
+                Message::Data(Rc::new(PyValue::new(second))),
+                Message::Invalidate,
+            ]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_complete(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Complete]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_error(&self, message: String) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Error(message.into())]);
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
