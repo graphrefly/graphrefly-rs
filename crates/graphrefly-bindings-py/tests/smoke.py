@@ -42,6 +42,28 @@ def test_state_empty_cache_entry_distinguishes_absent_from_cached_none():
     assert none_value.cache_entry() == (True, None)
 
 
+def test_native_control_methods_pause_resume_and_invalidate():
+    graph = graphrefly.Graph("py-native-control-smoke")
+    source = graph.state(1, "source")
+    derived = graph.derived([source], lambda value: value + 1, "derived")
+    seen = []
+    sub = derived.subscribe(lambda kind, value: seen.append((kind, value)))
+
+    assert derived.cache() == 2
+    derived.pause("lock")
+    source.set(2)
+    assert derived.cache() == 2
+
+    derived.resume("lock")
+    assert derived.cache() == 3
+
+    seen.clear()
+    derived.invalidate()
+    assert derived.cache_entry() == (False, None)
+    assert any(kind == "INVALIDATE" for kind, _value in seen)
+    sub.unsubscribe()
+
+
 def test_callback_system_exit_reraises_without_graph_error():
     graph = graphrefly.Graph("py-fatal-smoke")
     source = graph.state(1, "source")
@@ -59,6 +81,41 @@ def test_callback_system_exit_reraises_without_graph_error():
         raise AssertionError("fatal BaseException should re-raise to the Python caller")
 
     assert bad.status() != "errored"
+
+
+def test_callback_keyboard_interrupt_reraises_without_graph_error():
+    graph = graphrefly.Graph("py-keyboard-interrupt-smoke")
+    source = graph.state(1, "source")
+
+    def boom(_value):
+        raise KeyboardInterrupt
+
+    bad = graph.derived([source], boom, "bad")
+
+    try:
+        bad.subscribe(lambda kind, value: None)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("KeyboardInterrupt should re-raise to the Python caller")
+
+    assert bad.status() != "errored"
+
+
+def test_callback_exception_emits_graph_error():
+    seen = []
+    graph = graphrefly.Graph("py-exception-error-smoke")
+    source = graph.state(1, "source")
+
+    def boom(_value):
+        raise ValueError("boom")
+
+    bad = graph.derived([source], boom, "bad")
+    sub = bad.subscribe(lambda kind, value: seen.append((kind, value)))
+    assert bad.status() == "errored"
+    sub.unsubscribe()
+
+    assert any(kind == "ERROR" and "ValueError: boom" in value for kind, value in seen)
 
 
 def test_callback_system_exit_during_batch_commit_reraises_without_graph_error():
@@ -84,7 +141,30 @@ def test_callback_system_exit_during_batch_commit_reraises_without_graph_error()
     assert not any(kind == "ERROR" for kind, _value in seen)
 
 
-def test_observe_system_exit_during_registration_unsubscribes():
+def test_callback_keyboard_interrupt_during_batch_commit_reraises_without_graph_error():
+    graph = graphrefly.Graph("py-batch-commit-keyboard-interrupt-smoke")
+    source = graph.state_empty("source")
+    seen = []
+
+    def boom(_value):
+        raise KeyboardInterrupt
+
+    bad = graph.derived([source], boom, "bad")
+    sub = bad.subscribe(lambda kind, value: seen.append((kind, value)))
+    try:
+        graph.batch(lambda: source.set(1))
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("KeyboardInterrupt should re-raise during batch commit")
+    finally:
+        sub.unsubscribe()
+
+    assert bad.status() != "errored"
+    assert not any(kind == "ERROR" for kind, _value in seen)
+
+
+def test_observe_system_exit_during_registration_reraises():
     graph = graphrefly.Graph("py-observe-eager-fatal-smoke")
     source = graph.state(1, "source")
     source.subscribe(lambda kind, value: None)
@@ -102,9 +182,28 @@ def test_observe_system_exit_during_registration_unsubscribes():
     else:
         raise AssertionError("fatal observe callback should re-raise during registration")
 
-    calls_after_registration = calls
-    source.set(2)
-    assert calls == calls_after_registration
+    assert calls == 1
+
+
+def test_observe_keyboard_interrupt_during_registration_reraises():
+    graph = graphrefly.Graph("py-observe-eager-keyboard-interrupt-smoke")
+    source = graph.state(1, "source")
+    source.subscribe(lambda kind, value: None)
+    calls = 0
+
+    def observer(_path, _kind, _value, _tier, _seq):
+        nonlocal calls
+        calls += 1
+        raise KeyboardInterrupt
+
+    try:
+        graph.observe(observer)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("fatal observe callback should re-raise during registration")
+
+    assert calls == 1
 
 
 def test_batch_callback_exception_rolls_back():
@@ -140,7 +239,12 @@ def test_graph_panic_maps_to_python_runtime_error():
 if __name__ == "__main__":
     test_python_callback_sync_wave()
     test_callback_none_is_data()
+    test_native_control_methods_pause_resume_and_invalidate()
+    test_callback_keyboard_interrupt_reraises_without_graph_error()
+    test_callback_exception_emits_graph_error()
     test_callback_system_exit_during_batch_commit_reraises_without_graph_error()
+    test_callback_keyboard_interrupt_during_batch_commit_reraises_without_graph_error()
+    test_observe_keyboard_interrupt_during_registration_reraises()
     test_batch_callback_exception_rolls_back()
     test_graph_panic_maps_to_python_runtime_error()
     print("py-smoke ok")

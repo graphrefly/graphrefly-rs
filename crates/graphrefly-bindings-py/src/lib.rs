@@ -33,8 +33,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    AnyValue, Ctx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, Message, Node, Operator,
-    Status,
+    AnyValue, Ctx, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts, LockId, Message, Node,
+    Operator, Status,
 };
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -517,6 +517,51 @@ impl PyNode {
         catch_graph_panic(&self.pending_fatal, || {
             self.node
                 .down(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn pause(&self, lock_id: String) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![Message::Pause(LockId::new(lock_id))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn resume(&self, lock_id: String) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![Message::Resume(LockId::new(lock_id))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn invalidate(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![Message::Invalidate]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _up_dirty(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![Message::Dirty]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _up_teardown(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.up(vec![Message::Teardown]);
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
