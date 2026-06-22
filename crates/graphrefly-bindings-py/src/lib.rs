@@ -864,6 +864,15 @@ impl PyNode {
         Ok(())
     }
 
+    fn _down_dirty(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![Message::Dirty]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
     fn _down_data_data_invalidate(&self, first: Py<PyAny>, second: Py<PyAny>) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
@@ -871,6 +880,18 @@ impl PyNode {
                 Message::Data(Rc::new(PyValue::new(first))),
                 Message::Data(Rc::new(PyValue::new(second))),
                 Message::Invalidate,
+            ]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _down_data_complete(&self, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![
+                Message::Data(Rc::new(PyValue::new(value))),
+                Message::Complete,
             ]);
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
