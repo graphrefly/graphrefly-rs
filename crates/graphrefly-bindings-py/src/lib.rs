@@ -22,7 +22,9 @@
 #![allow(
     clippy::missing_errors_doc,
     clippy::module_name_repetitions,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
 )]
 
 use std::cell::{Cell, RefCell};
@@ -330,6 +332,116 @@ struct PyCtx {
 struct PyConformanceAsyncHandle {
     pending: Rc<RefCell<Option<DeferredCtx>>>,
     pending_fatal: PendingFatal,
+}
+
+enum PyAsyncCtxOp {
+    OnDeactivation(Py<PyAny>),
+}
+
+#[pyclass(name = "AsyncCtx", unsendable)]
+struct PyAsyncCtx {
+    deferred: DeferredCtx,
+    ops: RefCell<Vec<PyAsyncCtxOp>>,
+    active: Rc<Cell<bool>>,
+    pending_fatal: PendingFatal,
+}
+
+#[pymethods]
+impl PyAsyncCtx {
+    fn emit(&self, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        self.assert_live()?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.deferred.emit(PyValue::new(value));
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn complete(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        self.assert_live()?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.deferred.down(vec![Message::Complete]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn resolve(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        self.assert_live()?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.deferred.down(vec![
+                Message::Data(Rc::new(PyValue::new(value))),
+                Message::Complete,
+            ]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn error(&self, message: String) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        self.assert_live()?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.deferred.down(vec![Message::Error(message.into())]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn is_live(&self) -> PyResult<bool> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(self.active.get())
+    }
+
+    fn on_deactivation(&self, callback: Py<PyAny>) -> PyResult<()> {
+        self.assert_configuring()?;
+        self.ops
+            .borrow_mut()
+            .push(PyAsyncCtxOp::OnDeactivation(callback));
+        Ok(())
+    }
+}
+
+impl PyAsyncCtx {
+    fn assert_configuring(&self) -> PyResult<()> {
+        if self.active.get() {
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err(
+                "async ctx setup is only valid during activation",
+            ))
+        }
+    }
+
+    fn assert_live(&self) -> PyResult<()> {
+        if self.active.get() {
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err(
+                "async ctx is no longer live for this activation",
+            ))
+        }
+    }
+}
+
+fn commit_py_async_ctx(py: Python<'_>, py_ctx: &Py<PyAsyncCtx>, ctx: &Ctx) {
+    let py_ctx = py_ctx.borrow(py);
+    for op in py_ctx.ops.borrow_mut().drain(..) {
+        match op {
+            PyAsyncCtxOp::OnDeactivation(callback) => {
+                let pending_fatal = py_ctx.pending_fatal.clone();
+                let active = py_ctx.active.clone();
+                let hook_ctx = ctx.defer();
+                ctx.on_deactivation(move || {
+                    active.set(false);
+                    call_py_hook_callback(&callback, &pending_fatal, &hook_ctx);
+                });
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -1058,6 +1170,122 @@ impl PyGraph {
         ))
     }
 
+    #[pyo3(signature = (callback, name = None, pausable = None))]
+    fn _async_source(
+        &self,
+        callback: Py<PyAny>,
+        name: Option<String>,
+        pausable: Option<String>,
+    ) -> PyResult<PyNode> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let mut opts =
+            graph_node_opts_with_conformance(name, false, true, true, false, pausable, None)?;
+        opts.node.pool = PoolKind::Async;
+        let pending_fatal = self.pending_fatal.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            let node = self.graph.producer_opts::<PyValue, _>(
+                move |ctx| {
+                    let active = Rc::new(Cell::new(true));
+                    let result = Python::with_gil(|py| {
+                        let py_ctx = Py::new(
+                            py,
+                            PyAsyncCtx {
+                                deferred: ctx.defer(),
+                                ops: RefCell::new(Vec::new()),
+                                active: active.clone(),
+                                pending_fatal: callback_pending_fatal.clone(),
+                            },
+                        )?;
+                        let callback_result = callback.call1(py, (py_ctx.clone_ref(py),));
+                        match callback_result {
+                            Ok(value) => {
+                                commit_py_async_ctx(py, &py_ctx, ctx);
+                                Ok(value)
+                            }
+                            Err(error) => {
+                                active.set(false);
+                                Err(error)
+                            }
+                        }
+                    });
+                    handle_callback_void_result(ctx, &callback_pending_fatal, result);
+                },
+                opts,
+            );
+            PyNode {
+                node,
+                pending_fatal,
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(node)
+    }
+
+    #[pyo3(signature = (deps, callback, name = None, pausable = None))]
+    fn _async_node(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        callback: Py<PyAny>,
+        name: Option<String>,
+        pausable: Option<String>,
+    ) -> PyResult<PyNode> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.erased())
+            .collect::<Vec<_>>();
+        let mut opts =
+            graph_node_opts_with_conformance(name, false, true, true, false, pausable, None)?;
+        opts.node.pool = PoolKind::Async;
+        let pending_fatal = self.pending_fatal.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            let node = self.graph.node_opts::<PyValue, _>(
+                deps,
+                move |ctx| {
+                    let active = Rc::new(Cell::new(true));
+                    let result = Python::with_gil(|py| {
+                        let args = dep_args_from_ctx(py, ctx)?;
+                        let py_ctx = Py::new(
+                            py,
+                            PyAsyncCtx {
+                                deferred: ctx.defer(),
+                                ops: RefCell::new(Vec::new()),
+                                active: active.clone(),
+                                pending_fatal: callback_pending_fatal.clone(),
+                            },
+                        )?;
+                        let mut call_args = Vec::with_capacity(args.len() + 1);
+                        call_args.push(py_ctx.clone_ref(py).into_any());
+                        call_args.extend(args);
+                        let tuple = PyTuple::new(py, call_args)?;
+                        let callback_result = callback.call1(py, tuple);
+                        match callback_result {
+                            Ok(value) => {
+                                commit_py_async_ctx(py, &py_ctx, ctx);
+                                Ok(value)
+                            }
+                            Err(error) => {
+                                active.set(false);
+                                Err(error)
+                            }
+                        }
+                    });
+                    handle_callback_void_result(ctx, &callback_pending_fatal, result);
+                },
+                opts,
+            );
+            PyNode {
+                node,
+                pending_fatal,
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(node)
+    }
+
     #[pyo3(signature = (deps, callback, name = None))]
     fn derived(
         &self,
@@ -1522,6 +1750,7 @@ fn version() -> &'static str {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyAsyncCtx>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyGraph>()?;
     m.add_class::<PyNode>()?;

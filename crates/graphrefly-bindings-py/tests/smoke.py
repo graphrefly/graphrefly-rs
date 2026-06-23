@@ -164,6 +164,28 @@ def test_callback_keyboard_interrupt_during_batch_commit_reraises_without_graph_
     assert not any(kind == "ERROR" for kind, _value in seen)
 
 
+def test_native_async_source_hidden_gate_smoke():
+    graph = graphrefly.Graph("py-native-async-source-smoke")
+    gates = []
+    seen = []
+
+    def activate(ctx):
+        gates.append(ctx)
+
+    node = graph._async_source(activate, "async_source", "true")
+    sub = node.subscribe(lambda kind, value: seen.append((kind, value)))
+
+    assert len(gates) == 1
+    gates[0].resolve(7)
+    assert node.cache() == 7
+    sub.unsubscribe()
+
+    factories = {entry["name"]: entry["factory"] for entry in graph.describe()["nodes"]}
+    assert factories["async_source"] == "producer"
+    assert ("DATA", 7) in seen
+    assert ("COMPLETE", None) in seen
+
+
 def test_observe_system_exit_during_registration_reraises():
     graph = graphrefly.Graph("py-observe-eager-fatal-smoke")
     source = graph.state(1, "source")
