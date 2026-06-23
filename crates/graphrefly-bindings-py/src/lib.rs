@@ -34,7 +34,7 @@ use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
     AnyValue, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts,
-    LockId, Message, Node, NodeOpts, Operator, Pausable, PullDemand, Status, WaveData,
+    LockId, Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand, Status, WaveData,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -324,6 +324,44 @@ struct PyCtx {
     initial_state: Option<Py<PyAny>>,
     ops: RefCell<Vec<PyCtxOp>>,
     active: Rc<Cell<bool>>,
+}
+
+#[pyclass(name = "ConformanceAsyncHandle", unsendable)]
+struct PyConformanceAsyncHandle {
+    pending: Rc<RefCell<Option<DeferredCtx>>>,
+    pending_fatal: PendingFatal,
+}
+
+#[pymethods]
+impl PyConformanceAsyncHandle {
+    fn has_pending(&self) -> PyResult<bool> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(self.pending.borrow().is_some())
+    }
+
+    fn resolve(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deferred = self.pending.borrow_mut().take().ok_or_else(|| {
+            PyRuntimeError::new_err("no pending conformance async ctx to resolve")
+        })?;
+        catch_graph_panic(&self.pending_fatal, || {
+            deferred.emit(PyValue::new(value));
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn invalidate_live_deps(&self) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deferred = self.pending.borrow_mut().take().ok_or_else(|| {
+            PyRuntimeError::new_err("no pending conformance async ctx to invalidate")
+        })?;
+        catch_graph_panic(&self.pending_fatal, || {
+            deferred.up(vec![Message::Invalidate]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
 }
 
 enum PyCtxOp {
@@ -945,6 +983,81 @@ impl PyGraph {
         Ok(node)
     }
 
+    #[pyo3(signature = (deps, name = None, pausable = None))]
+    fn _conformance_async_node(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        name: Option<String>,
+        pausable: Option<String>,
+    ) -> PyResult<(PyNode, PyConformanceAsyncHandle)> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.erased())
+            .collect::<Vec<_>>();
+        let mut opts =
+            graph_node_opts_with_conformance(name, false, true, true, false, pausable, None)?;
+        opts.node.pool = PoolKind::Async;
+        let pending: Rc<RefCell<Option<DeferredCtx>>> = Rc::new(RefCell::new(None));
+        let node_pending = pending.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let node = self.graph.node_opts::<PyValue, _>(
+                deps,
+                move |ctx| {
+                    *node_pending.borrow_mut() = Some(ctx.defer());
+                },
+                opts,
+            );
+            PyNode {
+                node,
+                pending_fatal: self.pending_fatal.clone(),
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok((
+            node,
+            PyConformanceAsyncHandle {
+                pending,
+                pending_fatal: self.pending_fatal.clone(),
+            },
+        ))
+    }
+
+    #[pyo3(signature = (name = None, pausable = None))]
+    fn _conformance_async_source(
+        &self,
+        name: Option<String>,
+        pausable: Option<String>,
+    ) -> PyResult<(PyNode, PyConformanceAsyncHandle)> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let mut opts =
+            graph_node_opts_with_conformance(name, false, true, true, false, pausable, None)?;
+        opts.node.pool = PoolKind::Async;
+        let pending: Rc<RefCell<Option<DeferredCtx>>> = Rc::new(RefCell::new(None));
+        let node_pending = pending.clone();
+        let node = catch_graph_panic(&self.pending_fatal, || {
+            let node = self.graph.producer_opts::<PyValue, _>(
+                move |ctx| {
+                    *node_pending.borrow_mut() = Some(ctx.defer());
+                },
+                opts,
+            );
+            PyNode {
+                node,
+                pending_fatal: self.pending_fatal.clone(),
+            }
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok((
+            node,
+            PyConformanceAsyncHandle {
+                pending,
+                pending_fatal: self.pending_fatal.clone(),
+            },
+        ))
+    }
+
     #[pyo3(signature = (deps, callback, name = None))]
     fn derived(
         &self,
@@ -1213,6 +1326,28 @@ impl PyNode {
             let callback_pending_fatal = pending_fatal.clone();
             self.node.subscribe_dep(dep, move |ctx| {
                 invoke_py_ctx_callback(ctx, &callback, &callback_pending_fatal);
+            });
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _conformance_c21_replace_with_live_dep(
+        &self,
+        py: Python<'_>,
+        dep: Py<PyNode>,
+        async_handle: Py<PyConformanceAsyncHandle>,
+    ) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let dep = dep.borrow(py).node.erased();
+        let node_pending = {
+            let async_handle = async_handle.borrow(py);
+            raise_pending_fatal(&async_handle.pending_fatal)?;
+            async_handle.pending.clone()
+        };
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.replace_deps(vec![dep], move |ctx| {
+                *node_pending.borrow_mut() = Some(ctx.defer());
             });
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
