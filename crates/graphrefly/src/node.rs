@@ -1033,6 +1033,7 @@ pub(crate) struct NodeRestoreRuntime {
     pub version: RestoredNodeVersion,
     pub status: Status,
     pub terminal: bool,
+    pub activated: bool,
     pub has_called_fn_once: bool,
     pub ctx_state: Option<AnyValue>,
     pub ctx_state_persist: bool,
@@ -2652,7 +2653,8 @@ impl Core {
     }
 
     pub(crate) fn restore_runtime(&self, state: NodeRestoreRuntime) {
-        self.with_node_state_aux_mut(|_n, _c, _cfg, r, e, a| {
+        let should_activate = state.activated;
+        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, r, e, a| {
             e.value.cache = state.cache;
             e.value.has_data = state.has_data;
             e.value.status = state.status;
@@ -2662,7 +2664,7 @@ impl Core {
             e.restored_activation_handshake =
                 vec![state.has_data || state.has_called_fn_once; e.unsubs.len()];
             r.has_called_fn_once = state.has_called_fn_once;
-            a.activated = false;
+            a.activated = should_activate;
             a.state = state.ctx_state;
             a.state_persist = state.ctx_state_persist;
             a.on_deactivation.clear();
@@ -2674,7 +2676,13 @@ impl Core {
             a.pause_lockset.clear();
             a.paused_dep_wave_occurred = false;
             a.pause_buffer.clear();
+            n.deps.clone()
         });
+        if should_activate {
+            for (idx, dep) in deps.iter().enumerate() {
+                self.subscribe_dep(idx, dep);
+            }
+        }
         let mut graph = self.graph.borrow_mut();
         let version_state = graph.get_version_mut(self.key());
         match state.version {

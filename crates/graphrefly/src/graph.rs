@@ -747,7 +747,7 @@ impl Graph {
     pub(crate) fn restore_node_with_id(
         &self,
         id: String,
-        factory: &'static str,
+        factory: String,
         deps: Vec<Core>,
         f: NodeFn,
         opts: GraphNodeOpts,
@@ -760,7 +760,7 @@ impl Graph {
             self.apply_default_node_opts(opts.node.clone()),
             move |ctx| f(ctx),
         );
-        self.add_with_id(node, factory, id, opts)
+        self.add_with_id(node, &factory, id, opts)
     }
 
     pub(crate) fn mount_restored(&self, child: Graph, at: String) {

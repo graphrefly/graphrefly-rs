@@ -2848,7 +2848,7 @@ struct C24StatefulMapDescriptor {
 }
 
 impl GraphRestoreDescriptor for C24StatefulMapDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "c24-stateful-map"
     }
 
@@ -2859,7 +2859,7 @@ impl GraphRestoreDescriptor for C24StatefulMapDescriptor {
         assert_eq!(ctx.deps.len(), 1);
         let runs = self.runs.clone();
         Ok(RestoreNodeDefinition {
-            factory: "c24-stateful-map",
+            factory: "c24-stateful-map".to_owned(),
             kind: RestoreNodeKind::NodeJson(Rc::new(move |ctx: &Ctx| {
                 runs.set(runs.get() + 1);
                 let prev = ctx

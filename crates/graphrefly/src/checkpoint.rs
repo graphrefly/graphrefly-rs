@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -155,12 +156,14 @@ type RestoreResult<T> = GraphRestoreResult<T>;
 type JsonDefinitionFn = dyn Fn(&GraphCheckpointJson) -> RestoreResult<GraphCheckpointJson>;
 type BackendStateContributor = dyn Fn(&str) -> Result<GraphCheckpointJson, String>;
 type CustomRestoreFn = dyn Fn(&Graph) -> RestoreResult<Core>;
-type CheckpointJsonEncoder = dyn Fn(&dyn Any, &str) -> RestoreResult<GraphCheckpointJson>;
+type CheckpointJsonEncoder =
+    dyn Fn(&dyn Any, &str) -> RestoreResult<GraphCheckpointJson> + Send + Sync;
+
+static CHECKPOINT_JSON_ENCODERS: OnceLock<Mutex<HashMap<TypeId, Arc<CheckpointJsonEncoder>>>> =
+    OnceLock::new();
 
 thread_local! {
     static BACKEND_STATE_CONTRIBUTORS: RefCell<HashMap<(usize, usize, u64), Rc<BackendStateContributor>>> =
-        RefCell::new(HashMap::new());
-    static CHECKPOINT_JSON_ENCODERS: RefCell<HashMap<TypeId, Rc<CheckpointJsonEncoder>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -168,13 +171,17 @@ thread_local! {
 ///
 /// This keeps host-language values out of the Rust core while letting a binding
 /// such as PyO3 make its own payload wrapper checkpointable under D90.
+#[doc(hidden)]
 pub fn register_checkpoint_json_encoder<T: 'static>(
-    encoder: impl Fn(&T, &str) -> RestoreResult<GraphCheckpointJson> + 'static,
+    encoder: impl Fn(&T, &str) -> RestoreResult<GraphCheckpointJson> + Send + Sync + 'static,
 ) {
-    CHECKPOINT_JSON_ENCODERS.with(|encoders| {
-        encoders.borrow_mut().insert(
+    let encoders = CHECKPOINT_JSON_ENCODERS.get_or_init(|| Mutex::new(HashMap::new()));
+    encoders
+        .lock()
+        .expect("checkpoint JSON encoder registry poisoned")
+        .insert(
             TypeId::of::<T>(),
-            Rc::new(move |value, path| {
+            Arc::new(move |value, path| {
                 let typed = value.downcast_ref::<T>().ok_or_else(|| {
                     GraphRestoreError::new(format!(
                         "checkpoint: value at {path} did not match registered checkpoint encoder type"
@@ -183,7 +190,6 @@ pub fn register_checkpoint_json_encoder<T: 'static>(
                 encoder(typed, path)
             }),
         );
-    });
 }
 
 /// D160 collection-owned backend checkpoint contributor for graph checkpoint.
@@ -245,7 +251,7 @@ impl GraphRestoreDefinition {
 }
 
 pub trait GraphRestoreDescriptor {
-    fn ref_(&self) -> &'static str;
+    fn ref_(&self) -> &str;
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition>;
 }
 
@@ -271,19 +277,24 @@ pub struct GraphRestoreRegistry {
 }
 
 impl GraphRestoreRegistry {
-    pub fn new(entries: impl IntoIterator<Item = GraphRestoreEntry>) -> Self {
+    pub fn try_new(entries: impl IntoIterator<Item = GraphRestoreEntry>) -> RestoreResult<Self> {
         let mut out = Self::default();
         for entry in entries {
             let key = match &entry {
                 GraphRestoreEntry::Descriptor(d) => d.ref_().to_owned(),
                 GraphRestoreEntry::Definition(d) => d.ref_.clone(),
             };
-            assert!(
-                out.entries.insert(key.clone(), entry).is_none(),
-                "duplicate restore registry ref '{key}'"
-            );
+            if out.entries.insert(key.clone(), entry).is_some() {
+                return Err(GraphRestoreError::new(format!(
+                    "duplicate restore registry ref '{key}'"
+                )));
+            }
         }
-        out
+        Ok(out)
+    }
+
+    pub fn new(entries: impl IntoIterator<Item = GraphRestoreEntry>) -> Self {
+        Self::try_new(entries).expect("restore registry must not contain duplicate refs")
     }
 
     fn descriptor(&self, ref_: &str) -> Option<Rc<dyn GraphRestoreDescriptor>> {
@@ -349,7 +360,7 @@ pub enum RestoreNodeKind {
 }
 
 pub struct RestoreNodeDefinition {
-    pub factory: &'static str,
+    pub factory: String,
     pub kind: RestoreNodeKind,
     pub opts: GraphNodeOpts,
 }
@@ -357,7 +368,7 @@ pub struct RestoreNodeDefinition {
 pub struct StateRestoreDescriptor;
 
 impl GraphRestoreDescriptor for StateRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "state"
     }
 
@@ -379,7 +390,7 @@ impl GraphRestoreDescriptor for StateRestoreDescriptor {
             ));
         }
         Ok(RestoreNodeDefinition {
-            factory: "state",
+            factory: "state".to_owned(),
             kind: RestoreNodeKind::StateJson,
             opts: restored_opts(ctx.checkpoint)?,
         })
@@ -389,7 +400,7 @@ impl GraphRestoreDescriptor for StateRestoreDescriptor {
 pub struct MapJsonRestoreDescriptor;
 
 impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "map"
     }
 
@@ -421,7 +432,7 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
             }
         });
         Ok(RestoreNodeDefinition {
-            factory: "map",
+            factory: "map".to_owned(),
             kind: RestoreNodeKind::NodeJson(body),
             opts: restored_opts(ctx.checkpoint)?,
         })
@@ -622,7 +633,7 @@ pub struct ReactiveIndexDeltaRestoreDescriptor;
 pub struct ReactiveIndexSnapshotRestoreDescriptor;
 
 impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveList.delta"
     }
 
@@ -644,7 +655,7 @@ impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveListSnapshotRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveList.snapshot"
     }
 
@@ -654,7 +665,7 @@ impl GraphRestoreDescriptor for ReactiveListSnapshotRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveLog.delta"
     }
 
@@ -689,7 +700,7 @@ impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveLogSnapshotRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveLog.snapshot"
     }
 
@@ -699,7 +710,7 @@ impl GraphRestoreDescriptor for ReactiveLogSnapshotRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveMapDeltaRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveMap.delta"
     }
 
@@ -723,7 +734,7 @@ impl GraphRestoreDescriptor for ReactiveMapDeltaRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveMapSnapshotRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveMap.snapshot"
     }
 
@@ -733,7 +744,7 @@ impl GraphRestoreDescriptor for ReactiveMapSnapshotRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveIndexDeltaRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveIndex.delta"
     }
 
@@ -759,7 +770,7 @@ impl GraphRestoreDescriptor for ReactiveIndexDeltaRestoreDescriptor {
 }
 
 impl GraphRestoreDescriptor for ReactiveIndexSnapshotRestoreDescriptor {
-    fn ref_(&self) -> &'static str {
+    fn ref_(&self) -> &str {
         "reactiveIndex.snapshot"
     }
 
@@ -787,7 +798,7 @@ fn collection_delta_definition(
     let base = collection_base_id(ctx.id, suffix, ref_)?;
     let checkpoint = ctx.checkpoint.clone();
     Ok(RestoreNodeDefinition {
-        factory: ref_,
+        factory: ref_.to_owned(),
         kind: RestoreNodeKind::Custom(Rc::new(move |graph| {
             restore(graph, base.clone(), &checkpoint)
         })),
@@ -804,7 +815,7 @@ fn collection_existing_definition(
     let id = ctx.id.to_owned();
     let _base = collection_base_id(ctx.id, suffix, ref_)?;
     Ok(RestoreNodeDefinition {
-        factory: ref_,
+        factory: ref_.to_owned(),
         kind: RestoreNodeKind::Custom(Rc::new(move |graph| {
             graph.find(&id).map(|node| node.core()).ok_or_else(|| {
                 GraphRestoreError::new(format!(
@@ -1033,13 +1044,13 @@ fn checkpoint_value(
 }
 
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
-    let registered = CHECKPOINT_JSON_ENCODERS.with(|encoders| {
-        encoders
-            .borrow()
-            .get(&value.as_ref().type_id())
-            .cloned()
-    });
-    if let Some(encoder) = registered {
+    let encoder = CHECKPOINT_JSON_ENCODERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| GraphRestoreError::new("checkpoint JSON encoder registry poisoned"))?
+        .get(&value.as_ref().type_id())
+        .cloned();
+    if let Some(encoder) = encoder {
         let out = encoder(value.as_ref(), path)?;
         validate_checkpoint_json(&out, path)?;
         return Ok(out);
@@ -1349,6 +1360,7 @@ fn construct_prepared(
             version: restored_version,
             status,
             terminal,
+            activated: node.lifecycle.activated,
             has_called_fn_once: node.lifecycle.has_called_fn_once,
             ctx_state,
             ctx_state_persist,
@@ -1519,14 +1531,14 @@ mod tests {
     struct StatefulJsonDescriptor;
 
     impl GraphRestoreDescriptor for StatefulJsonDescriptor {
-        fn ref_(&self) -> &'static str {
+        fn ref_(&self) -> &str {
             "stateful-json"
         }
 
         fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
             assert_eq!(ctx.deps.len(), 1);
             Ok(RestoreNodeDefinition {
-                factory: "stateful-json",
+                factory: "stateful-json".to_owned(),
                 kind: RestoreNodeKind::NodeJson(Rc::new(|ctx: &Ctx| {
                     let mut acc = ctx
                         .state_get::<GraphCheckpointJson>()
@@ -1577,8 +1589,24 @@ mod tests {
         let restored_memo = Node::<GraphCheckpointJson>::from_core(
             restored.find("memo").expect("memo restored").core(),
         );
+        let restored_source = Node::<GraphCheckpointJson>::from_core(
+            restored.find("source").expect("source restored").core(),
+        );
 
         assert_eq!(restored_memo.cache(), Some(json!(41)));
+        let restored_checkpoint = restored.checkpoint().expect("re-checkpoint succeeds");
+        let memo_checkpoint = restored_checkpoint
+            .nodes
+            .iter()
+            .find(|node| node.id == "memo")
+            .expect("memo checkpoint exists");
+        assert_eq!(
+            memo_checkpoint.lifecycle,
+            GraphCheckpointLifecycle {
+                activated: true,
+                has_called_fn_once: true
+            }
+        );
         let runtime = restored_memo.erased().checkpoint_runtime();
         assert_eq!(
             runtime
@@ -1586,6 +1614,16 @@ mod tests {
                 .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
                 .as_deref(),
             Some(&json!(41))
+        );
+        restored_source.set(json!(2));
+        assert_eq!(restored_memo.cache(), Some(json!(42)));
+        let runtime = restored_memo.erased().checkpoint_runtime();
+        assert_eq!(
+            runtime
+                .ctx_state
+                .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
+                .as_deref(),
+            Some(&json!(42))
         );
     }
 
