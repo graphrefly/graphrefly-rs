@@ -1560,6 +1560,47 @@ impl PyNode {
         Ok(())
     }
 
+    fn _conformance_immediate_unsubscribe_dep(
+        &self,
+        py: Python<'_>,
+        dep: Py<PyNode>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let dep = dep.borrow(py).node.erased();
+        let pending_fatal = self.pending_fatal.clone();
+        catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            self.node.unsubscribe_dep(dep, move |ctx| {
+                invoke_py_ctx_callback(ctx, &callback, &callback_pending_fatal);
+            });
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
+    fn _conformance_immediate_replace_deps(
+        &self,
+        py: Python<'_>,
+        deps: Vec<Py<PyNode>>,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let deps = deps
+            .iter()
+            .map(|dep| dep.borrow(py).node.erased())
+            .collect::<Vec<_>>();
+        let pending_fatal = self.pending_fatal.clone();
+        catch_graph_panic(&self.pending_fatal, || {
+            let callback_pending_fatal = pending_fatal.clone();
+            self.node.replace_deps(deps, move |ctx| {
+                invoke_py_ctx_callback(ctx, &callback, &callback_pending_fatal);
+            });
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
     fn _conformance_c21_replace_with_live_dep(
         &self,
         py: Python<'_>,
