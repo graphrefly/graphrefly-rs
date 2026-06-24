@@ -35,13 +35,18 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    AnyValue, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphNodeOpts,
-    LockId, Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand, Status, WaveData,
+    restored_opts, AnyValue, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph,
+    GraphCheckpoint, GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreDescriptor,
+    GraphRestoreEntry, GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult, LockId,
+    MapJsonRestoreDescriptor, Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand,
+    RestoreDefineCtx, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
+    RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
+use serde_json::{Map as JsonMap, Number as JsonNumber};
 
 type PendingFatal = Rc<RefCell<Option<PyErr>>>;
 
@@ -66,6 +71,18 @@ impl Clone for PyValue {
             object: self.object.clone_ref(py),
         })
     }
+}
+
+fn register_py_checkpoint_encoder() {
+    graphrefly_rs::register_checkpoint_json_encoder::<PyValue>(|value, path| {
+        Python::with_gil(|py| {
+            py_to_checkpoint_json(py, &value.object).map_err(|err| {
+                GraphRestoreError::new(format!(
+                    "checkpoint: value at {path} is not strict JSON compatible: {err}"
+                ))
+            })
+        })
+    });
 }
 
 #[derive(Debug)]
@@ -188,9 +205,46 @@ fn value_from_any(py: Python<'_>, value: &AnyValue) -> PyResult<Py<PyAny>> {
     if let Some(value) = value.downcast_ref::<PyValue>() {
         return Ok(value.clone_object(py));
     }
+    if let Some(value) = value.downcast_ref::<GraphCheckpointJson>() {
+        return checkpoint_json_to_py(py, value);
+    }
     Err(PyTypeError::new_err(
         "cached value is not owned by the Python binding foundation",
     ))
+}
+
+fn ctx_data_value(py: Python<'_>, ctx: &Ctx, index: usize) -> PyResult<Option<Py<PyAny>>> {
+    if let Some(value) = ctx.data::<PyValue>(index) {
+        return Ok(Some(value.clone_object(py)));
+    }
+    if let Some(value) = ctx.data::<GraphCheckpointJson>(index) {
+        return checkpoint_json_to_py(py, value.as_ref()).map(Some);
+    }
+    Ok(None)
+}
+
+fn deferred_data_value(
+    py: Python<'_>,
+    ctx: &DeferredCtx,
+    index: usize,
+) -> PyResult<Option<Py<PyAny>>> {
+    if let Some(value) = ctx.data::<PyValue>(index) {
+        return Ok(Some(value.clone_object(py)));
+    }
+    if let Some(value) = ctx.data::<GraphCheckpointJson>(index) {
+        return checkpoint_json_to_py(py, value.as_ref()).map(Some);
+    }
+    Ok(None)
+}
+
+fn ctx_state_value(py: Python<'_>, ctx: &Ctx) -> PyResult<Option<Py<PyAny>>> {
+    if let Some(value) = ctx.state_get::<PyValue>() {
+        return Ok(Some(value.clone_object(py)));
+    }
+    if let Some(value) = ctx.state_get::<GraphCheckpointJson>() {
+        return checkpoint_json_to_py(py, value.as_ref()).map(Some);
+    }
+    Ok(None)
 }
 
 fn py_value_from_msg(py: Python<'_>, msg: &Message<AnyValue>) -> PyResult<Py<PyAny>> {
@@ -212,15 +266,128 @@ fn py_string(py: Python<'_>, value: &str) -> Py<PyAny> {
     PyString::new(py, value).into_any().unbind()
 }
 
+fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
+    py_bound_to_checkpoint_json(py, value.bind(py))
+}
+
+fn py_bound_to_checkpoint_json(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<GraphCheckpointJson> {
+    if value.is_none() {
+        return Ok(GraphCheckpointJson::Null);
+    }
+    if let Ok(value) = value.extract::<bool>() {
+        return Ok(GraphCheckpointJson::Bool(value));
+    }
+    if let Ok(value) = value.extract::<i64>() {
+        return Ok(GraphCheckpointJson::Number(JsonNumber::from(value)));
+    }
+    if let Ok(value) = value.extract::<u64>() {
+        return Ok(GraphCheckpointJson::Number(JsonNumber::from(value)));
+    }
+    if let Ok(value) = value.extract::<f64>() {
+        return JsonNumber::from_f64(value).map_or_else(
+            || {
+                Err(PyValueError::new_err(
+                    "checkpoint value must be finite strict JSON",
+                ))
+            },
+            |number| Ok(GraphCheckpointJson::Number(number)),
+        );
+    }
+    if let Ok(value) = value.extract::<String>() {
+        return Ok(GraphCheckpointJson::String(value));
+    }
+    if let Ok(sequence) = value.downcast::<PyList>() {
+        let mut out = Vec::with_capacity(sequence.len());
+        for item in sequence {
+            out.push(py_bound_to_checkpoint_json(py, &item)?);
+        }
+        return Ok(GraphCheckpointJson::Array(out));
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        let mut out = Vec::with_capacity(tuple.len());
+        for item in tuple {
+            out.push(py_bound_to_checkpoint_json(py, &item)?);
+        }
+        return Ok(GraphCheckpointJson::Array(out));
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        let mut out = JsonMap::new();
+        for (key, item) in dict {
+            let key = key
+                .extract::<String>()
+                .map_err(|_| PyValueError::new_err("checkpoint object keys must be strings"))?;
+            if out
+                .insert(key, py_bound_to_checkpoint_json(py, &item)?)
+                .is_some()
+            {
+                return Err(PyValueError::new_err("checkpoint object has duplicate key"));
+            }
+        }
+        return Ok(GraphCheckpointJson::Object(out));
+    }
+    Err(PyValueError::new_err(
+        "checkpoint value is not strict JSON compatible",
+    ))
+}
+
+fn checkpoint_json_to_py(py: Python<'_>, value: &GraphCheckpointJson) -> PyResult<Py<PyAny>> {
+    match value {
+        GraphCheckpointJson::Null => Ok(py.None()),
+        GraphCheckpointJson::Bool(value) => value.into_py_any(py),
+        GraphCheckpointJson::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                value.into_py_any(py)
+            } else if let Some(value) = value.as_u64() {
+                value.into_py_any(py)
+            } else if let Some(value) = value.as_f64() {
+                value.into_py_any(py)
+            } else {
+                Err(PyValueError::new_err(
+                    "checkpoint number is not representable",
+                ))
+            }
+        }
+        GraphCheckpointJson::String(value) => value.clone().into_py_any(py),
+        GraphCheckpointJson::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(checkpoint_json_to_py(py, item)?)?;
+            }
+            Ok(list.into())
+        }
+        GraphCheckpointJson::Object(map) => {
+            let dict = PyDict::new(py);
+            for (key, value) in map {
+                dict.set_item(key, checkpoint_json_to_py(py, value)?)?;
+            }
+            Ok(dict.into())
+        }
+    }
+}
+
+fn py_checkpoint_to_native(py: Python<'_>, checkpoint: &Py<PyAny>) -> PyResult<GraphCheckpoint> {
+    let value = py_to_checkpoint_json(py, checkpoint)?;
+    serde_json::from_value(value).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+fn native_checkpoint_to_py(py: Python<'_>, checkpoint: &GraphCheckpoint) -> PyResult<Py<PyAny>> {
+    let value =
+        serde_json::to_value(checkpoint).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    checkpoint_json_to_py(py, &value)
+}
+
 fn dep_args_from_ctx(py: Python<'_>, ctx: &Ctx) -> PyResult<Vec<Py<PyAny>>> {
     let mut values = Vec::with_capacity(ctx.dep_len());
     for index in 0..ctx.dep_len() {
-        let Some(value) = ctx.data::<PyValue>(index) else {
+        let Some(value) = ctx_data_value(py, ctx, index)? else {
             return Err(PyRuntimeError::new_err(
                 "dependency DATA is absent at the Python callback boundary",
             ));
         };
-        values.push(value.clone_object(py));
+        values.push(value);
     }
     Ok(values)
 }
@@ -290,6 +457,32 @@ fn graph_node_opts_with_conformance(
     };
     opts.node.pull_id = pull_id.map(LockId::new);
     Ok(opts)
+}
+
+fn apply_restore_opts(
+    py: Python<'_>,
+    opts: &mut GraphNodeOpts,
+    restore_ref: Option<String>,
+    restore_config: Option<Py<PyAny>>,
+    restore_config_version: Option<Py<PyAny>>,
+) -> PyResult<()> {
+    let Some(restore_ref) = restore_ref else {
+        if restore_config.is_some() || restore_config_version.is_some() {
+            return Err(PyValueError::new_err(
+                "restore config requires a restore ref",
+            ));
+        }
+        return Ok(());
+    };
+    let mut restore = RestoreFactoryMeta::registry_ref(restore_ref);
+    if let Some(config) = restore_config {
+        restore = restore.with_config(py_to_checkpoint_json(py, &config)?);
+    }
+    if let Some(config_version) = restore_config_version {
+        restore = restore.with_config_version(py_to_checkpoint_json(py, &config_version)?);
+    }
+    opts.restore = Some(restore);
+    Ok(())
 }
 
 fn py_wave_data(py: Python<'_>, ctx: &DeferredCtx, sentinel: &Py<PyAny>) -> PyResult<Py<PyAny>> {
@@ -503,8 +696,8 @@ impl PyCtx {
         if index >= self.snapshot.wave_data().len() {
             return Err(PyIndexError::new_err("dependency index out of range"));
         }
-        match self.snapshot.data::<PyValue>(index) {
-            Some(value) => Ok((true, value.clone_object(py))),
+        match deferred_data_value(py, &self.snapshot, index)? {
+            Some(value) => Ok((true, value)),
             None => Ok((false, py.None())),
         }
     }
@@ -745,9 +938,7 @@ fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &
 fn invoke_py_ctx_callback(ctx: &Ctx, callback: &Py<PyAny>, pending_fatal: &PendingFatal) {
     let active = Rc::new(Cell::new(true));
     let result = Python::with_gil(|py| {
-        let initial_state = ctx
-            .state_get::<PyValue>()
-            .map(|value| value.clone_object(py));
+        let initial_state = ctx_state_value(py, ctx)?;
         let py_ctx = Py::new(
             py,
             PyCtx {
@@ -859,10 +1050,188 @@ fn describe_snapshot(py: Python<'_>, snapshot: DescribeSnapshot) -> PyResult<Py<
     Ok(dict.into())
 }
 
+fn leak_static_str(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+enum PyRestoreRecordedKind {
+    State,
+    Node {
+        callback: Py<PyAny>,
+        factory: &'static str,
+    },
+}
+
+struct PyRestoreRecorded {
+    kind: PyRestoreRecordedKind,
+}
+
+#[pyclass(name = "RestoreContext", unsendable)]
+struct PyRestoreContext {
+    id: String,
+    name: Option<String>,
+    deps: Vec<String>,
+    config: Py<PyAny>,
+    config_version: Py<PyAny>,
+    checkpoint: Py<PyAny>,
+    recorded: Rc<RefCell<Option<PyRestoreRecorded>>>,
+}
+
+#[pymethods]
+impl PyRestoreContext {
+    #[getter]
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[getter]
+    fn name(&self) -> Option<String> {
+        self.name.clone()
+    }
+
+    #[getter]
+    fn deps(&self) -> Vec<String> {
+        self.deps.clone()
+    }
+
+    #[getter]
+    fn config(&self, py: Python<'_>) -> Py<PyAny> {
+        self.config.clone_ref(py)
+    }
+
+    #[getter]
+    fn config_version(&self, py: Python<'_>) -> Py<PyAny> {
+        self.config_version.clone_ref(py)
+    }
+
+    #[getter]
+    fn checkpoint(&self, py: Python<'_>) -> Py<PyAny> {
+        self.checkpoint.clone_ref(py)
+    }
+
+    fn register_state(&self) -> PyResult<()> {
+        self.record(PyRestoreRecorded {
+            kind: PyRestoreRecordedKind::State,
+        })
+    }
+
+    #[pyo3(signature = (callback, factory = None))]
+    fn register_node(&self, callback: Py<PyAny>, factory: Option<String>) -> PyResult<()> {
+        self.record(PyRestoreRecorded {
+            kind: PyRestoreRecordedKind::Node {
+                callback,
+                factory: leak_static_str(factory.unwrap_or_else(|| "node".to_owned())),
+            },
+        })
+    }
+}
+
+impl PyRestoreContext {
+    fn record(&self, recorded: PyRestoreRecorded) -> PyResult<()> {
+        let mut slot = self.recorded.borrow_mut();
+        if slot.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "restore descriptor registered more than one node",
+            ));
+        }
+        *slot = Some(recorded);
+        Ok(())
+    }
+}
+
+struct PyRestoreDescriptorBridge {
+    ref_: &'static str,
+    descriptor: Py<PyAny>,
+    pending_fatal: PendingFatal,
+}
+
+impl GraphRestoreDescriptor for PyRestoreDescriptorBridge {
+    fn ref_(&self) -> &'static str {
+        self.ref_
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> GraphRestoreResult<RestoreNodeDefinition> {
+        let recorded = Rc::new(RefCell::new(None));
+        Python::with_gil(|py| -> GraphRestoreResult<()> {
+            let py_ctx = Py::new(
+                py,
+                PyRestoreContext {
+                    id: ctx.id.to_owned(),
+                    name: ctx.checkpoint.name.clone(),
+                    deps: ctx.deps.to_vec(),
+                    config: ctx
+                        .config
+                        .map_or_else(|| Ok(py.None()), |value| checkpoint_json_to_py(py, value))
+                        .map_err(|err| GraphRestoreError::new(err.to_string()))?,
+                    config_version: ctx
+                        .config_version
+                        .map_or_else(|| Ok(py.None()), |value| checkpoint_json_to_py(py, value))
+                        .map_err(|err| GraphRestoreError::new(err.to_string()))?,
+                    checkpoint: native_checkpoint_node_to_py(py, ctx.checkpoint)
+                        .map_err(|err| GraphRestoreError::new(err.to_string()))?,
+                    recorded: recorded.clone(),
+                },
+            )
+            .map_err(|err| GraphRestoreError::new(err.to_string()))?;
+            self.descriptor
+                .call_method1(py, "create", (py_ctx,))
+                .map_err(|err| GraphRestoreError::new(err.to_string()))?;
+            Ok(())
+        })?;
+        let recorded = recorded.borrow_mut().take().ok_or_else(|| {
+            GraphRestoreError::new(format!(
+                "restore_graph: descriptor '{}' did not register a node for '{}'",
+                self.ref_, ctx.id
+            ))
+        })?;
+        let opts = restored_opts(ctx.checkpoint)?;
+        match recorded.kind {
+            PyRestoreRecordedKind::State => Ok(RestoreNodeDefinition {
+                factory: "state",
+                kind: RestoreNodeKind::StateJson,
+                opts,
+            }),
+            PyRestoreRecordedKind::Node { callback, factory } => {
+                let pending_fatal = self.pending_fatal.clone();
+                Ok(RestoreNodeDefinition {
+                    factory,
+                    kind: RestoreNodeKind::NodeJson(Rc::new(move |ctx: &Ctx| {
+                        invoke_py_ctx_callback(ctx, &callback, &pending_fatal);
+                    })),
+                    opts,
+                })
+            }
+        }
+    }
+}
+
+fn native_checkpoint_node_to_py(
+    py: Python<'_>,
+    node: &graphrefly_rs::GraphCheckpointNode,
+) -> PyResult<Py<PyAny>> {
+    let value = serde_json::to_value(node).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    checkpoint_json_to_py(py, &value)
+}
+
+#[pyclass(name = "RestoreRegistry", unsendable)]
+struct PyRestoreRegistry {
+    registry: GraphRestoreRegistry,
+    pending_fatal: PendingFatal,
+}
+
 #[pyclass(name = "Graph", unsendable)]
 struct PyGraph {
     graph: Graph,
     pending_fatal: PendingFatal,
+}
+
+impl PyGraph {
+    fn restored(graph: Graph, pending_fatal: PendingFatal) -> Self {
+        Self {
+            graph,
+            pending_fatal,
+        }
+    }
 }
 
 #[pymethods]
@@ -880,12 +1249,20 @@ impl PyGraph {
         }
     }
 
+    fn checkpoint(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let checkpoint = catch_graph_panic(&self.pending_fatal, || self.graph.checkpoint())?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        native_checkpoint_to_py(py, &checkpoint)
+    }
+
     #[pyo3(signature = (value, name = None))]
     fn state(&self, _py: Python<'_>, value: Py<PyAny>, name: Option<String>) -> PyResult<PyNode> {
         raise_pending_fatal(&self.pending_fatal)?;
         let value = PyValue::new(value);
         let node = catch_graph_panic(&self.pending_fatal, || PyNode {
             node: self.graph.state_opts(value, graph_node_opts(name)),
+            graph_node: None,
             pending_fatal: self.pending_fatal.clone(),
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
@@ -897,6 +1274,7 @@ impl PyGraph {
         raise_pending_fatal(&self.pending_fatal)?;
         let node = catch_graph_panic(&self.pending_fatal, || PyNode {
             node: self.graph.state_empty_opts(graph_node_opts(name)),
+            graph_node: None,
             pending_fatal: self.pending_fatal.clone(),
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
@@ -918,6 +1296,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -934,7 +1313,10 @@ impl PyGraph {
         error_when_deps_error = true,
         terminal_as_real_input = false,
         pausable = None,
-        pull_id = None
+        pull_id = None,
+        restore_ref = None,
+        restore_config = None,
+        restore_config_version = None
     ))]
     fn node(
         &self,
@@ -948,13 +1330,16 @@ impl PyGraph {
         terminal_as_real_input: bool,
         pausable: Option<String>,
         pull_id: Option<String>,
+        restore_ref: Option<String>,
+        restore_config: Option<Py<PyAny>>,
+        restore_config_version: Option<Py<PyAny>>,
     ) -> PyResult<PyNode> {
         raise_pending_fatal(&self.pending_fatal)?;
         let deps = deps
             .iter()
             .map(|dep| dep.borrow(py).node.erased())
             .collect::<Vec<_>>();
-        let opts = graph_node_opts_with_conformance(
+        let mut opts = graph_node_opts_with_conformance(
             name,
             partial,
             complete_when_deps_complete,
@@ -962,6 +1347,13 @@ impl PyGraph {
             terminal_as_real_input,
             pausable,
             pull_id,
+        )?;
+        apply_restore_opts(
+            py,
+            &mut opts,
+            restore_ref,
+            restore_config,
+            restore_config_version,
         )?;
         let pending_fatal = self.pending_fatal.clone();
         let node = catch_graph_panic(&self.pending_fatal, || {
@@ -971,9 +1363,7 @@ impl PyGraph {
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
                     let result = Python::with_gil(|py| {
-                        let initial_state = ctx
-                            .state_get::<PyValue>()
-                            .map(|value| value.clone_object(py));
+                        let initial_state = ctx_state_value(py, ctx)?;
                         let py_ctx = Py::new(
                             py,
                             PyCtx {
@@ -1003,6 +1393,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1056,9 +1447,7 @@ impl PyGraph {
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
                     let result = Python::with_gil(|py| {
-                        let initial_state = ctx
-                            .state_get::<PyValue>()
-                            .map(|value| value.clone_object(py));
+                        let initial_state = ctx_state_value(py, ctx)?;
                         let py_ctx = Py::new(
                             py,
                             PyCtx {
@@ -1088,6 +1477,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1123,6 +1513,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal: self.pending_fatal.clone(),
             }
         })?;
@@ -1157,6 +1548,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal: self.pending_fatal.clone(),
             }
         })?;
@@ -1215,6 +1607,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1279,6 +1672,7 @@ impl PyGraph {
             );
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1312,6 +1706,7 @@ impl PyGraph {
             let node = self.graph.init_node(op, deps, graph_node_opts(name));
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1354,6 +1749,7 @@ impl PyGraph {
             let node = self.graph.init_node(op, deps, graph_node_opts(name));
             PyNode {
                 node,
+                graph_node: None,
                 pending_fatal,
             }
         })?;
@@ -1379,6 +1775,15 @@ impl PyGraph {
     fn describe(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         raise_pending_fatal(&self.pending_fatal)?;
         describe_snapshot(py, self.graph.describe())
+    }
+
+    fn _find(&self, id: String) -> PyResult<Option<PyNode>> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(self.graph.find(&id).map(|node| PyNode {
+            node: Node::<PyValue>::state_empty(),
+            graph_node: Some(node),
+            pending_fatal: self.pending_fatal.clone(),
+        }))
     }
 
     fn observe(&self, callback: Py<PyAny>) -> PyResult<PySubscription> {
@@ -1438,6 +1843,7 @@ impl PyGraph {
 #[pyclass(name = "Node", unsendable)]
 struct PyNode {
     node: Node<PyValue>,
+    graph_node: Option<GraphNode>,
     pending_fatal: PendingFatal,
 }
 
@@ -1445,7 +1851,14 @@ struct PyNode {
 impl PyNode {
     fn set(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
-        catch_graph_panic(&self.pending_fatal, || self.node.set(PyValue::new(value)))?;
+        catch_graph_panic(&self.pending_fatal, || {
+            if let Some(node) = &self.graph_node {
+                let value: AnyValue = Rc::new(PyValue::new(value));
+                node.down(vec![Message::Data(value)]);
+            } else {
+                self.node.set(PyValue::new(value));
+            }
+        })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
     }
@@ -1453,8 +1866,13 @@ impl PyNode {
     fn send(&self, _py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
-            self.node
-                .down(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+            let value: AnyValue = Rc::new(PyValue::new(value));
+            let msg = vec![Message::Data(value)];
+            if let Some(node) = &self.graph_node {
+                node.down(msg);
+            } else {
+                self.node.down(msg);
+            }
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(())
@@ -1726,19 +2144,37 @@ impl PyNode {
 
     fn cache(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         raise_pending_fatal(&self.pending_fatal)?;
-        Ok(self.node.cache().map(|value| value.clone_object(py)))
+        if let Some(node) = &self.graph_node {
+            return node
+                .cache_any()
+                .map(|value| value_from_any(py, &value))
+                .transpose();
+        }
+        if let Some(value) = self.node.cache() {
+            return Ok(Some(value.clone_object(py)));
+        }
+        Ok(None)
     }
 
     fn cache_entry(&self, py: Python<'_>) -> PyResult<(bool, Py<PyAny>)> {
         raise_pending_fatal(&self.pending_fatal)?;
-        match self.node.cache() {
-            Some(value) => Ok((true, value.clone_object(py))),
-            None => Ok((false, py.None())),
+        if let Some(node) = &self.graph_node {
+            return match node.cache_any() {
+                Some(value) => Ok((true, value_from_any(py, &value)?)),
+                None => Ok((false, py.None())),
+            };
         }
+        if let Some(value) = self.node.cache() {
+            return Ok((true, value.clone_object(py)));
+        }
+        Ok((false, py.None()))
     }
 
     fn status(&self) -> PyResult<&'static str> {
         raise_pending_fatal(&self.pending_fatal)?;
+        if let Some(node) = &self.graph_node {
+            return Ok(status_name(node.status()));
+        }
         Ok(status_name(self.node.status()))
     }
 
@@ -1747,7 +2183,7 @@ impl PyNode {
         let pending_fatal = self.pending_fatal.clone();
         let unsubscribe = catch_graph_panic(&self.pending_fatal, || {
             let callback_pending_fatal = pending_fatal.clone();
-            self.node.subscribe(move |msg| {
+            let callback = move |msg: &Message<AnyValue>| {
                 Python::with_gil(|py| {
                     let kind = format!("{msg:?}");
                     match py_value_from_msg(py, msg)
@@ -1764,7 +2200,12 @@ impl PyNode {
                         }
                     }
                 });
-            })
+            };
+            if let Some(node) = &self.graph_node {
+                node.subscribe(callback)
+            } else {
+                self.node.subscribe(callback)
+            }
         })?;
         if let Err(error) = raise_pending_fatal(&self.pending_fatal) {
             unsubscribe();
@@ -1807,17 +2248,69 @@ impl Drop for PySubscription {
 }
 
 #[pyfunction]
+#[pyo3(signature = (entries, include_builtins = true))]
+fn restore_registry(
+    py: Python<'_>,
+    entries: Vec<Py<PyAny>>,
+    include_builtins: bool,
+) -> PyResult<PyRestoreRegistry> {
+    let pending_fatal = Rc::new(RefCell::new(None));
+    let mut native_entries = Vec::new();
+    if include_builtins {
+        native_entries.push(GraphRestoreEntry::descriptor(StateRestoreDescriptor));
+        native_entries.push(GraphRestoreEntry::descriptor(MapJsonRestoreDescriptor));
+    }
+    for entry in entries {
+        let ref_obj = entry.getattr(py, "ref").map_err(|_| {
+            PyValueError::new_err("restore registry entries must expose a string 'ref'")
+        })?;
+        let ref_: String = ref_obj
+            .extract(py)
+            .map_err(|_| PyValueError::new_err("restore registry entry 'ref' must be a string"))?;
+        native_entries.push(GraphRestoreEntry::descriptor(PyRestoreDescriptorBridge {
+            ref_: leak_static_str(ref_),
+            descriptor: entry,
+            pending_fatal: pending_fatal.clone(),
+        }));
+    }
+    Ok(PyRestoreRegistry {
+        registry: GraphRestoreRegistry::new(native_entries),
+        pending_fatal,
+    })
+}
+
+#[pyfunction]
+fn restore_graph(
+    py: Python<'_>,
+    checkpoint: Py<PyAny>,
+    registry: PyRef<'_, PyRestoreRegistry>,
+) -> PyResult<PyGraph> {
+    let checkpoint = py_checkpoint_to_native(py, &checkpoint)?;
+    let restored = graphrefly_rs::restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(registry.registry.clone()),
+    )
+    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    Ok(PyGraph::restored(restored, registry.pending_fatal.clone()))
+}
+
+#[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_py_checkpoint_encoder();
     m.add_class::<PyAsyncCtx>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyGraph>()?;
     m.add_class::<PyNode>()?;
+    m.add_class::<PyRestoreContext>()?;
+    m.add_class::<PyRestoreRegistry>()?;
     m.add_class::<PySubscription>()?;
+    m.add_function(wrap_pyfunction!(restore_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(restore_registry, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

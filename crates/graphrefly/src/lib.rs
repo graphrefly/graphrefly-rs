@@ -142,12 +142,13 @@ pub use cascading_cache::{
     ReactiveCascadingCache, ReactiveCascadingCacheLoadFn, ReactiveCascadingCacheOptions,
 };
 pub use checkpoint::{
-    default_restore_registry, restore_graph, restore_registry, GraphCheckpoint,
-    GraphCheckpointCtxState, GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson,
-    GraphCheckpointLifecycle, GraphCheckpointMount, GraphCheckpointNode, GraphCheckpointTerminal,
-    GraphCheckpointValue, GraphRestoreDefinition, GraphRestoreEntry, GraphRestoreError,
-    GraphRestoreRegistry, GraphRestoreResult, MapJsonRestoreDescriptor, RestoreGraphOptions,
-    RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, GRAPH_CHECKPOINT_VERSION,
+    default_restore_registry, register_checkpoint_json_encoder, restore_graph, restore_registry,
+    GraphCheckpoint, GraphCheckpointCtxState, GraphCheckpointEdge, GraphCheckpointFactory,
+    GraphCheckpointJson, GraphCheckpointLifecycle, GraphCheckpointMount, GraphCheckpointNode,
+    GraphCheckpointTerminal, GraphCheckpointValue, GraphRestoreDefinition, GraphRestoreDescriptor,
+    GraphRestoreEntry, GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult,
+    MapJsonRestoreDescriptor, RestoreDefineCtx, RestoreGraphOptions, RestoreNodeDefinition,
+    RestoreNodeKind, StateRestoreDescriptor, restored_opts, GRAPH_CHECKPOINT_VERSION,
 };
 pub use combinators::{
     buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,

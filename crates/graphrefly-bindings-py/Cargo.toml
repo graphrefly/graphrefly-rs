@@ -17,6 +17,7 @@ test       = false
 
 [dependencies]
 graphrefly_rs = { package = "graphrefly-rs", path = "../graphrefly" }
+serde_json = { workspace = true }
 
 # `extension-module` is an explicit wheel/maturin feature because enabling it
 # while linking Rust test binaries leaves Python symbols unresolved on macOS.

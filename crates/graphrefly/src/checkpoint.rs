@@ -4,6 +4,7 @@
 //! load/decode checkpoint JSON outside the sync core, then pass the already-loaded
 //! value to [`restore_graph`].
 
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -136,7 +137,7 @@ pub(crate) struct CheckpointEntry {
 pub struct GraphRestoreError(String);
 
 impl GraphRestoreError {
-    fn new(msg: impl Into<String>) -> Self {
+    pub fn new(msg: impl Into<String>) -> Self {
         Self(msg.into())
     }
 }
@@ -154,10 +155,35 @@ type RestoreResult<T> = GraphRestoreResult<T>;
 type JsonDefinitionFn = dyn Fn(&GraphCheckpointJson) -> RestoreResult<GraphCheckpointJson>;
 type BackendStateContributor = dyn Fn(&str) -> Result<GraphCheckpointJson, String>;
 type CustomRestoreFn = dyn Fn(&Graph) -> RestoreResult<Core>;
+type CheckpointJsonEncoder = dyn Fn(&dyn Any, &str) -> RestoreResult<GraphCheckpointJson>;
 
 thread_local! {
     static BACKEND_STATE_CONTRIBUTORS: RefCell<HashMap<(usize, usize, u64), Rc<BackendStateContributor>>> =
         RefCell::new(HashMap::new());
+    static CHECKPOINT_JSON_ENCODERS: RefCell<HashMap<TypeId, Rc<CheckpointJsonEncoder>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Register a host-owned strict-JSON checkpoint encoder for an opaque DATA type.
+///
+/// This keeps host-language values out of the Rust core while letting a binding
+/// such as PyO3 make its own payload wrapper checkpointable under D90.
+pub fn register_checkpoint_json_encoder<T: 'static>(
+    encoder: impl Fn(&T, &str) -> RestoreResult<GraphCheckpointJson> + 'static,
+) {
+    CHECKPOINT_JSON_ENCODERS.with(|encoders| {
+        encoders.borrow_mut().insert(
+            TypeId::of::<T>(),
+            Rc::new(move |value, path| {
+                let typed = value.downcast_ref::<T>().ok_or_else(|| {
+                    GraphRestoreError::new(format!(
+                        "checkpoint: value at {path} did not match registered checkpoint encoder type"
+                    ))
+                })?;
+                encoder(typed, path)
+            }),
+        );
+    });
 }
 
 /// D160 collection-owned backend checkpoint contributor for graph checkpoint.
@@ -1007,6 +1033,17 @@ fn checkpoint_value(
 }
 
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
+    let registered = CHECKPOINT_JSON_ENCODERS.with(|encoders| {
+        encoders
+            .borrow()
+            .get(&value.as_ref().type_id())
+            .cloned()
+    });
+    if let Some(encoder) = registered {
+        let out = encoder(value.as_ref(), path)?;
+        validate_checkpoint_json(&out, path)?;
+        return Ok(out);
+    }
     if let Some(v) = value.downcast_ref::<GraphCheckpointJson>() {
         validate_checkpoint_json(v, path)?;
         return Ok(v.clone());
@@ -1049,7 +1086,7 @@ fn validate_checkpoint_json(value: &GraphCheckpointJson, path: &str) -> RestoreR
         .map_err(|err| GraphRestoreError::new(format!("checkpoint: {err}")))
 }
 
-fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts> {
+pub fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts> {
     let meta = node
         .meta
         .clone()
