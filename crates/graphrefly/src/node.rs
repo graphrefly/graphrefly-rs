@@ -224,6 +224,59 @@ impl RewireRequest {
     pub(crate) fn remove(dep: &Core, f: NodeFn) -> Self {
         Self::Remove(CoreIdentity::from_core(dep), f)
     }
+
+    fn validate_deps_same_graph(&self, owner: &Core) {
+        match self {
+            RewireRequest::Set(deps, _) => {
+                for dep in deps {
+                    assert!(
+                        dep.same_graph(owner),
+                        "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
+                    );
+                }
+            }
+            RewireRequest::Add(dep, _) => {
+                assert!(
+                    dep.same_graph(owner),
+                    "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
+                );
+            }
+            RewireRequest::Remove(_, _) => {}
+        }
+    }
+
+    fn project_deps(&self, current: Vec<Core>) -> Vec<Core> {
+        match self {
+            RewireRequest::Set(deps, _) => deps.clone(),
+            RewireRequest::Add(dep, _) => {
+                let mut next = current;
+                if !next.iter().any(|d| d.ptr_eq(dep)) {
+                    next.push(dep.clone());
+                }
+                next
+            }
+            RewireRequest::Remove(dep, _) => {
+                current.into_iter().filter(|d| !dep.matches(d)).collect()
+            }
+        }
+    }
+
+    fn into_deps_and_fn(self, current: Vec<Core>) -> (Vec<Core>, NodeFn) {
+        match self {
+            RewireRequest::Set(deps, f) => (deps, f),
+            RewireRequest::Add(dep, f) => {
+                let mut next = current;
+                if !next.iter().any(|d| d.ptr_eq(&dep)) {
+                    next.push(dep);
+                }
+                (next, f)
+            }
+            RewireRequest::Remove(dep, f) => {
+                let next = current.into_iter().filter(|d| !dep.matches(d)).collect();
+                (next, f)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1784,8 +1837,7 @@ enum BoundaryTask {
     },
     ExternalRewire {
         target: CoreToken,
-        new_deps: Vec<Core>,
-        fn_: NodeFn,
+        req: RewireRequest,
         committed: Rc<Cell<bool>>,
     },
     Up {
@@ -2402,13 +2454,12 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Opti
         }
         BoundaryTask::ExternalRewire {
             target,
-            new_deps,
-            fn_,
+            req,
             committed,
         } => {
             if committed.get() {
                 if let Some(node) = target.pinned_borrowed_core(graph) {
-                    node.core.rewire_inner(new_deps, fn_, false);
+                    node.core.apply_external_rewire(req);
                 }
             }
         }
@@ -3286,7 +3337,49 @@ impl Core {
     /// FRESH wave-owner so a user-fn panic during dep-activation/settle becomes ERROR
     /// (D30). INTRA-graph only (D22). Requires an explicit fn (SD-1 fn-deps pairing).
     pub(crate) fn rewire(&self, new_deps: Vec<Core>, fn_: NodeFn) {
+        self.external_rewire(RewireRequest::Set(new_deps, fn_));
+    }
+
+    fn external_rewire(&self, req: RewireRequest) {
+        req.validate_deps_same_graph(self);
+        if let Some(committed) = committed_after_batch_for_target(self) {
+            defer_boundary(
+                self,
+                BoundaryTask::ExternalRewire {
+                    target: CoreToken::from_core(self),
+                    req,
+                    committed,
+                },
+            );
+            return;
+        }
+        self.apply_external_rewire(req);
+    }
+
+    fn apply_external_rewire(&self, req: RewireRequest) {
+        let current = self.deps();
+        let (new_deps, fn_) = req.into_deps_and_fn(current);
         self.rewire_inner(new_deps, fn_, false);
+    }
+
+    fn project_pending_external_rewire_deps(&self) -> Vec<Core> {
+        let target = CoreToken::from_core(self);
+        let mut deps = self.deps();
+        let graph = self.graph.borrow();
+        for task in &graph.deferred_boundary {
+            let BoundaryTask::ExternalRewire {
+                target: queued_target,
+                req,
+                ..
+            } = task
+            else {
+                continue;
+            };
+            if queued_target.graph_id == target.graph_id && queued_target.key == target.key {
+                deps = req.project_deps(deps);
+            }
+        }
+        deps
     }
 
     fn rewire_inner(&self, new_deps: Vec<Core>, fn_: NodeFn, allow_terminal_owner: bool) {
@@ -3303,8 +3396,7 @@ impl Core {
                     self,
                     BoundaryTask::ExternalRewire {
                         target: CoreToken::from_core(self),
-                        new_deps,
-                        fn_,
+                        req: RewireRequest::Set(new_deps, fn_),
                         committed,
                     },
                 );
@@ -5081,30 +5173,24 @@ impl<T: 'static> Node<T> {
 
     /// Subscribe to one dep (special case of [`Node::replace_deps`]); returns its index. fn required (SD-1).
     pub fn subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
-        let mut next = self.core.deps();
+        let mut next = self.core.project_pending_external_rewire_deps();
         if !next.iter().any(|d| d.ptr_eq(&dep)) {
             next.push(dep.clone());
         }
-        self.core.rewire(next, Rc::new(f));
-        self.core
-            .borrow()
-            .deps
+        let index = next
             .iter()
             .position(|d| d.ptr_eq(&dep))
-            .expect("added dep present after rewire")
+            .expect("subscribe_dep next shape contains dep");
+        self.core
+            .external_rewire(RewireRequest::Add(dep, Rc::new(f)));
+        index
     }
 
     /// Unsubscribe from one dep (special case of [`Node::replace_deps`]); idempotent if absent (the fn
     /// swap still applies). fn required (SD-1).
     pub fn unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
-        let next: Vec<Core> = self
-            .core
-            .deps()
-            .iter()
-            .filter(|d| !d.ptr_eq(&dep))
-            .cloned()
-            .collect();
-        self.core.rewire(next, Rc::new(f));
+        self.core
+            .external_rewire(RewireRequest::remove(&dep, Rc::new(f)));
     }
 
     /// The erased core, for wiring this node as a dep of a `derived` node.
@@ -7667,6 +7753,93 @@ mod tests {
     }
 
     #[test]
+    fn batch_deferred_subscribe_dep_returns_intended_index_while_queued() {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let c = Node::<i32>::state(3);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+
+        crate::batch::batch(|_| {
+            d.down(vec![Message::Data(Rc::new(5i32))]);
+            let index = d.subscribe_dep(b.erased(), |ctx| {
+                ctx.emit(*ctx.data::<i32>(1).unwrap() * 10)
+            });
+            assert_eq!(
+                index, 1,
+                "queued subscribe_dep returns the requested next-shape index"
+            );
+            let c_index = d.subscribe_dep(c.erased(), |ctx| {
+                ctx.emit(*ctx.data::<i32>(2).unwrap() * 100)
+            });
+            assert_eq!(
+                c_index, 2,
+                "queued subscribe_dep composes with earlier queued external rewire intents"
+            );
+            assert_eq!(
+                d.core.deps().len(),
+                1,
+                "D67 keeps the live dep shape old until batch commit"
+            );
+        });
+
+        assert_eq!(
+            d.cache(),
+            Some(300),
+            "old-shape batch commit precedes fresh subscribeDep boundary waves in FIFO order"
+        );
+        assert_eq!(
+            d.core.deps().len(),
+            3,
+            "queued subscribeDep requests compose instead of replacing one another"
+        );
+    }
+
+    #[test]
+    fn batch_deferred_subscribe_then_unsubscribe_composes_while_queued() {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let _u = d.subscribe(|_| {});
+
+        crate::batch::batch(|_| {
+            d.down(vec![Message::Data(Rc::new(5i32))]);
+            d.subscribe_dep(b.erased(), |ctx| {
+                ctx.emit(*ctx.data::<i32>(1).unwrap() * 10)
+            });
+            d.unsubscribe_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
+            assert_eq!(
+                d.core.deps().len(),
+                1,
+                "D67 keeps the live dep shape old until batch commit"
+            );
+        });
+
+        assert_eq!(
+            d.core.deps().len(),
+            1,
+            "queued unsubscribeDep composes with an earlier queued subscribeDep"
+        );
+        let before_removed_dep_set = d.cache();
+        b.set(9);
+        assert_eq!(
+            d.cache(),
+            before_removed_dep_set,
+            "removed queued dep no longer drives"
+        );
+        a.set(6);
+        assert_eq!(
+            d.cache(),
+            Some(6),
+            "original dep remains live after composed drain"
+        );
+    }
+
+    #[test]
     fn batch_boundary_task_executes_after_last_public_owner_drops() {
         // DR-8/B54: a queued boundary task can run while the public handle is gone,
         // as long as the batch target pin keeps the arena slot live during commit.
@@ -7870,8 +8043,7 @@ mod tests {
             &old.core,
             BoundaryTask::ExternalRewire {
                 target: CoreToken::from_core(&old.core),
-                new_deps: vec![],
-                fn_: Rc::new(|ctx| ctx.emit(999i32)),
+                req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(999i32))),
                 committed,
             },
         );
@@ -7962,8 +8134,7 @@ mod tests {
                         &a.core,
                         BoundaryTask::ExternalRewire {
                             target: CoreToken::from_core(&a.core),
-                            new_deps: vec![a.erased()],
-                            fn_: Rc::new(|_| {}),
+                            req: RewireRequest::Set(vec![a.erased()], Rc::new(|_| {})),
                             committed: committed.clone(),
                         },
                     );
@@ -7971,8 +8142,7 @@ mod tests {
                         &b.core,
                         BoundaryTask::ExternalRewire {
                             target: CoreToken::from_core(&b.core),
-                            new_deps: vec![],
-                            fn_: Rc::new(|ctx| ctx.emit(99i32)),
+                            req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(99i32))),
                             committed: committed.clone(),
                         },
                     );
@@ -8011,8 +8181,7 @@ mod tests {
                     &a.core,
                     BoundaryTask::ExternalRewire {
                         target: CoreToken::from_core(&a.core),
-                        new_deps: vec![a.erased()],
-                        fn_: Rc::new(|_| {}),
+                        req: RewireRequest::Set(vec![a.erased()], Rc::new(|_| {})),
                         committed: committed.clone(),
                     },
                 );
@@ -8020,8 +8189,7 @@ mod tests {
                     &b.core,
                     BoundaryTask::ExternalRewire {
                         target: CoreToken::from_core(&b.core),
-                        new_deps: vec![],
-                        fn_: Rc::new(|ctx| ctx.emit(99i32)),
+                        req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(99i32))),
                         committed: committed.clone(),
                     },
                 );

@@ -1641,6 +1641,16 @@ impl PyNode {
         Ok(())
     }
 
+    fn _conformance_c22_down_data(&self, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node
+                .down(vec![Message::Data(Rc::new(PyValue::new(value)))]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
     fn _down_invalidate(&self) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
