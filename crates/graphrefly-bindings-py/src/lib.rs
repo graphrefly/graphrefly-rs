@@ -1673,6 +1673,18 @@ impl PyNode {
         Ok(())
     }
 
+    fn _conformance_c12_down_data_resolved(&self, value: Py<PyAny>) -> PyResult<()> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        catch_graph_panic(&self.pending_fatal, || {
+            self.node.down(vec![
+                Message::Data(Rc::new(PyValue::new(value))),
+                Message::Resolved,
+            ]);
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(())
+    }
+
     fn _down_data_complete(&self, value: Py<PyAny>) -> PyResult<()> {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
