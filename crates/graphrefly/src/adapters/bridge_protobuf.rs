@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
+use super::bridge::WireBridgeMetadata as SemanticWireBridgeMetadata;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalProtobufErrorCategory {
     UnknownField,
@@ -109,6 +111,88 @@ pub struct CanonicalWireBridgeEnvelope {
     pub payload: CanonicalWireBridgePayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireBridgeProtobufHelperShape {
+    pub byte_specific: bool,
+    pub semantic_wire_bridge_dto: bool,
+    pub core_wire_bridge_options: bool,
+    pub protocol_surface: bool,
+    pub value_codec_registry: bool,
+}
+
+pub const WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE: WireBridgeProtobufHelperShape =
+    WireBridgeProtobufHelperShape {
+        byte_specific: true,
+        semantic_wire_bridge_dto: true,
+        core_wire_bridge_options: false,
+        protocol_surface: false,
+        value_codec_registry: false,
+    };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireBridgeProtobufDataBody {
+    Value(Vec<u8>),
+    WireEdge(CanonicalWireEdgeFrame),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireBridgeProtobufPayload {
+    Start,
+    Data(WireBridgeProtobufDataBody),
+    Ack,
+    Nack { error: Option<Vec<u8>> },
+    Status { status: Vec<u8> },
+    Error { error: Vec<u8> },
+    Close { reason: Option<Vec<u8>> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeProtobufEnvelope {
+    pub session_id: String,
+    pub metadata: SemanticWireBridgeMetadata,
+    pub payload: WireBridgeProtobufPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireBridgeProtobufStatusKind {
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeProtobufStatus {
+    pub kind: WireBridgeProtobufStatusKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeProtobufIssue {
+    pub category: CanonicalProtobufErrorCategory,
+    pub message: String,
+}
+
+impl From<CanonicalProtobufError> for WireBridgeProtobufIssue {
+    fn from(error: CanonicalProtobufError) -> Self {
+        Self {
+            category: error.category,
+            message: error.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeProtobufDecode {
+    pub envelope: Option<WireBridgeProtobufEnvelope>,
+    pub status: WireBridgeProtobufStatus,
+    pub issues: Vec<WireBridgeProtobufIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeProtobufEncode {
+    pub bytes: Option<Vec<u8>>,
+    pub status: WireBridgeProtobufStatus,
+    pub issues: Vec<WireBridgeProtobufIssue>,
+}
+
 pub fn encode_canonical_wire_bridge_envelope(
     envelope: &CanonicalWireBridgeEnvelope,
 ) -> Result<Vec<u8>, CanonicalProtobufError> {
@@ -173,6 +257,132 @@ pub fn decode_canonical_wire_edge_frame(
         ));
     }
     Ok(frame)
+}
+
+#[must_use]
+pub fn decode_wire_bridge_protobuf_bytes(bytes: &[u8]) -> WireBridgeProtobufDecode {
+    match decode_canonical_wire_bridge_envelope(bytes) {
+        Ok(envelope) => WireBridgeProtobufDecode {
+            envelope: Some(canonical_to_protobuf_envelope(envelope)),
+            status: WireBridgeProtobufStatus {
+                kind: WireBridgeProtobufStatusKind::Valid,
+            },
+            issues: Vec::new(),
+        },
+        Err(error) => WireBridgeProtobufDecode {
+            envelope: None,
+            status: WireBridgeProtobufStatus {
+                kind: WireBridgeProtobufStatusKind::Invalid,
+            },
+            issues: vec![error.into()],
+        },
+    }
+}
+
+#[must_use]
+pub fn encode_wire_bridge_protobuf_bytes(
+    envelope: &WireBridgeProtobufEnvelope,
+) -> WireBridgeProtobufEncode {
+    match protobuf_to_canonical_envelope(envelope)
+        .and_then(|canonical| encode_canonical_wire_bridge_envelope(&canonical))
+    {
+        Ok(bytes) => WireBridgeProtobufEncode {
+            bytes: Some(bytes),
+            status: WireBridgeProtobufStatus {
+                kind: WireBridgeProtobufStatusKind::Valid,
+            },
+            issues: Vec::new(),
+        },
+        Err(error) => WireBridgeProtobufEncode {
+            bytes: None,
+            status: WireBridgeProtobufStatus {
+                kind: WireBridgeProtobufStatusKind::Invalid,
+            },
+            issues: vec![error.into()],
+        },
+    }
+}
+
+fn canonical_to_protobuf_envelope(
+    envelope: CanonicalWireBridgeEnvelope,
+) -> WireBridgeProtobufEnvelope {
+    WireBridgeProtobufEnvelope {
+        session_id: envelope.session_id,
+        metadata: SemanticWireBridgeMetadata {
+            seq: envelope.metadata.seq,
+            cursor: envelope.metadata.cursor,
+            idempotency_key: envelope.metadata.idempotency_key,
+            attempt: envelope.metadata.attempt,
+            max_attempts: envelope.metadata.max_attempts,
+            timestamp_ms: envelope.metadata.timestamp_ms,
+            ack_for_seq: envelope.metadata.ack_for_seq,
+            request_id: envelope.metadata.request_id,
+        },
+        payload: match envelope.payload {
+            CanonicalWireBridgePayload::Start => WireBridgeProtobufPayload::Start,
+            CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::Value(value)) => {
+                WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::Value(value))
+            }
+            CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) => {
+                WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))
+            }
+            CanonicalWireBridgePayload::Ack => WireBridgeProtobufPayload::Ack,
+            CanonicalWireBridgePayload::Nack { error } => WireBridgeProtobufPayload::Nack { error },
+            CanonicalWireBridgePayload::Status { status } => {
+                WireBridgeProtobufPayload::Status { status }
+            }
+            CanonicalWireBridgePayload::Error { error } => {
+                WireBridgeProtobufPayload::Error { error }
+            }
+            CanonicalWireBridgePayload::Close { reason } => {
+                WireBridgeProtobufPayload::Close { reason }
+            }
+        },
+    }
+}
+
+fn protobuf_to_canonical_envelope(
+    envelope: &WireBridgeProtobufEnvelope,
+) -> Result<CanonicalWireBridgeEnvelope, CanonicalProtobufError> {
+    let canonical = CanonicalWireBridgeEnvelope {
+        session_id: envelope.session_id.clone(),
+        metadata: CanonicalWireBridgeMetadata {
+            seq: envelope.metadata.seq,
+            cursor: envelope.metadata.cursor,
+            idempotency_key: envelope.metadata.idempotency_key.clone(),
+            attempt: envelope.metadata.attempt,
+            max_attempts: envelope.metadata.max_attempts,
+            timestamp_ms: envelope.metadata.timestamp_ms,
+            ack_for_seq: envelope.metadata.ack_for_seq,
+            request_id: envelope.metadata.request_id.clone(),
+        },
+        payload: match &envelope.payload {
+            WireBridgeProtobufPayload::Start => CanonicalWireBridgePayload::Start,
+            WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::Value(value)) => {
+                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::Value(value.clone()))
+            }
+            WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame)) => {
+                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(
+                    frame.clone(),
+                ))
+            }
+            WireBridgeProtobufPayload::Ack => CanonicalWireBridgePayload::Ack,
+            WireBridgeProtobufPayload::Nack { error } => CanonicalWireBridgePayload::Nack {
+                error: error.clone(),
+            },
+            WireBridgeProtobufPayload::Status { status } => CanonicalWireBridgePayload::Status {
+                status: status.clone(),
+            },
+            WireBridgeProtobufPayload::Error { error } => CanonicalWireBridgePayload::Error {
+                error: error.clone(),
+            },
+            WireBridgeProtobufPayload::Close { reason } => CanonicalWireBridgePayload::Close {
+                reason: reason.clone(),
+            },
+        },
+    };
+    validate_wire_bridge_envelope(&canonical)?;
+    Ok(canonical)
 }
 
 fn parse_wire_bridge_envelope(

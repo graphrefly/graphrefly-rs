@@ -116,10 +116,14 @@ pub use adapters::bridge::{
 };
 pub use adapters::bridge_protobuf::{
     decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
-    encode_canonical_wire_bridge_envelope, encode_canonical_wire_edge_frame,
-    CanonicalProtobufError, CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody,
-    CanonicalWireBridgeEnvelope, CanonicalWireBridgeMetadata, CanonicalWireBridgePayload,
-    CanonicalWireEdgeFrame, CanonicalWireEdgeKind,
+    decode_wire_bridge_protobuf_bytes, encode_canonical_wire_bridge_envelope,
+    encode_canonical_wire_edge_frame, encode_wire_bridge_protobuf_bytes, CanonicalProtobufError,
+    CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody, CanonicalWireBridgeEnvelope,
+    CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeFrame,
+    CanonicalWireEdgeKind, WireBridgeProtobufDataBody, WireBridgeProtobufDecode,
+    WireBridgeProtobufEncode, WireBridgeProtobufEnvelope, WireBridgeProtobufHelperShape,
+    WireBridgeProtobufIssue, WireBridgeProtobufPayload, WireBridgeProtobufStatus,
+    WireBridgeProtobufStatusKind, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
 };
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
