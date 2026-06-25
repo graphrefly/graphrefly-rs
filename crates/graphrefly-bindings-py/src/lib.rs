@@ -336,11 +336,10 @@ fn _validate_canonical_wire_edge_frame(
 
 fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
     let mut seen = HashSet::new();
-    py_bound_to_checkpoint_json(py, value.bind(py), &mut seen, 0)
+    py_bound_to_checkpoint_json(value.bind(py), &mut seen, 0)
 }
 
 fn py_bound_to_checkpoint_json(
-    py: Python<'_>,
     value: &Bound<'_, PyAny>,
     seen: &mut HashSet<usize>,
     depth: usize,
@@ -392,7 +391,7 @@ fn py_bound_to_checkpoint_json(
         }
         let mut out = Vec::with_capacity(sequence.len());
         for item in sequence {
-            out.push(py_bound_to_checkpoint_json(py, &item, seen, depth + 1)?);
+            out.push(py_bound_to_checkpoint_json(&item, seen, depth + 1)?);
         }
         seen.remove(&ptr);
         return Ok(GraphCheckpointJson::Array(out));
@@ -415,10 +414,7 @@ fn py_bound_to_checkpoint_json(
                 .extract::<String>()
                 .map_err(|_| PyValueError::new_err("checkpoint object keys must be strings"))?;
             if out
-                .insert(
-                    key,
-                    py_bound_to_checkpoint_json(py, &item, seen, depth + 1)?,
-                )
+                .insert(key, py_bound_to_checkpoint_json(&item, seen, depth + 1)?)
                 .is_some()
             {
                 return Err(PyValueError::new_err("checkpoint object has duplicate key"));
