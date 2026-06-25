@@ -2,6 +2,7 @@
 
 pub mod agentic_memory_storage;
 pub mod bridge;
+pub mod bridge_protobuf;
 pub mod environment;
 pub mod observe_storage;
 pub mod reactive_collection_storage;

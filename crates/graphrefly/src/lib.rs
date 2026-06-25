@@ -114,6 +114,13 @@ pub use adapters::bridge::{
     WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeReceipt,
     WireBridgeStatus, WireBridgeStatusState,
 };
+pub use adapters::bridge_protobuf::{
+    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
+    encode_canonical_wire_bridge_envelope, encode_canonical_wire_edge_frame,
+    CanonicalProtobufError, CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody,
+    CanonicalWireBridgeEnvelope, CanonicalWireBridgeMetadata, CanonicalWireBridgePayload,
+    CanonicalWireEdgeFrame, CanonicalWireEdgeKind,
+};
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
     to_websocket_with_options, websocket_session, websocket_session_with_options,
