@@ -104,15 +104,17 @@ pub use adapters::agentic_memory_storage::{
 };
 pub use adapters::bridge::{
     remote_call, remote_call_with_options, remote_responder, remote_responder_handler, wire_bridge,
-    wire_bridge_envelope, wire_bridge_idempotency_key, RemoteCallBundle, RemoteCallError,
-    RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatus,
-    RemoteCallStatusState, RemoteCallTimeout, RemoteResponderBundle, RemoteResponderEvent,
-    RemoteResponderHandlerDefinition, RemoteResponderOptions, RemoteResponderStatus,
-    RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt, WireBridgeBundle,
-    WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError, WireBridgeEnvelopeInput,
-    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound, WireBridgeIngress,
-    WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeReceipt,
-    WireBridgeStatus, WireBridgeStatusState,
+    wire_bridge_envelope, wire_bridge_idempotency_key, wire_edge_group, RemoteCallBundle,
+    RemoteCallError, RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult,
+    RemoteCallStatus, RemoteCallStatusState, RemoteCallTimeout, RemoteResponderBundle,
+    RemoteResponderEvent, RemoteResponderHandlerDefinition, RemoteResponderOptions,
+    RemoteResponderStatus, RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt,
+    WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError,
+    WireBridgeEnvelopeInput, WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound,
+    WireBridgeIngress, WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload,
+    WireBridgeReceipt, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
+    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
+    WireEdgeGroupStatus, WireEdgeGroupStatusState,
 };
 pub use adapters::bridge_protobuf::{
     decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,

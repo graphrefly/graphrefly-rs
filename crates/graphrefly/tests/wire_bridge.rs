@@ -3,11 +3,13 @@ use std::rc::Rc;
 
 use graphrefly::{
     batch, graph, remote_call, remote_call_with_options, remote_responder,
-    remote_responder_handler, wire_bridge, wire_bridge_envelope, Message, RemoteCallOptions,
+    remote_responder_handler, wire_bridge, wire_bridge_envelope, wire_edge_group,
+    CanonicalWireEdgeFrame, CanonicalWireEdgeKind, GraphNodeOpts, Message, RemoteCallOptions,
     RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatusState,
     RemoteResponderOptions, RemoteResponderStatusState, WireBridgeCommand, WireBridgeEnvelopeInput,
     WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeOptions, WireBridgePayload,
-    WireBridgeStatusState,
+    WireBridgeProtobufDataBody, WireBridgeStatusState, WireEdgeGroupEdge, WireEdgeGroupIssueCode,
+    WireEdgeGroupOptions, WireEdgeGroupStatusState,
 };
 
 fn envelope<T>(
@@ -92,6 +94,605 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
         }
     });
     seen
+}
+
+fn wire_edge_envelope(
+    seq: u64,
+    kind: CanonicalWireEdgeKind,
+    edge_id: &str,
+    cause_id: &str,
+    value: Option<Vec<u8>>,
+) -> graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody> {
+    envelope(
+        "session-a",
+        WireBridgeEnvelopeType::Data,
+        seq,
+        Some(WireBridgePayload::Data(
+            WireBridgeProtobufDataBody::WireEdge(CanonicalWireEdgeFrame {
+                kind,
+                edge_id: edge_id.to_owned(),
+                cause_id: cause_id.to_owned(),
+                value,
+            }),
+        )),
+        None,
+        None,
+    )
+}
+
+#[test]
+fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+    let status = collect_data(&group.status);
+    let issues = collect_data(&group.issues);
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    let frames = outbound
+        .borrow()
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))) => {
+                Some(frame.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        frames,
+        vec![
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: "a".to_owned(),
+                cause_id: "group:cause:1".to_owned(),
+                value: None,
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: "b".to_owned(),
+                cause_id: "group:cause:1".to_owned(),
+                value: None,
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Data,
+                edge_id: "a".to_owned(),
+                cause_id: "group:cause:1".to_owned(),
+                value: Some(vec![1]),
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Data,
+                edge_id: "b".to_owned(),
+                cause_id: "group:cause:1".to_owned(),
+                value: Some(vec![2]),
+            },
+        ]
+    );
+
+    bridge.inbound.set(wire_edge_envelope(
+        1,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        2,
+        CanonicalWireEdgeKind::Data,
+        "a",
+        "c1",
+        Some(vec![10]),
+    ));
+    assert!(
+        inbound_a.borrow().is_empty(),
+        "DATA must not release before every DIRTY arrives"
+    );
+
+    bridge.inbound.set(wire_edge_envelope(
+        3,
+        CanonicalWireEdgeKind::Dirty,
+        "b",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        4,
+        CanonicalWireEdgeKind::Data,
+        "b",
+        "c1",
+        Some(vec![20]),
+    ));
+    assert_eq!(*inbound_a.borrow(), vec![vec![10]]);
+    assert!(issues.borrow().is_empty());
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Released
+    );
+
+    let snap = g.describe();
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "bridge/inbound" && edge.to == "group/events"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/events" && edge.to == "group/gate"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/gate" && edge.to == "group/inbound/a"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/commands" && edge.to == "bridge/command"));
+
+    let bridge2 = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-b", "bridge2"),
+    );
+    let group2 = wire_edge_group(
+        &g,
+        &bridge2,
+        WireEdgeGroupOptions::named(
+            "group2",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a),
+                WireEdgeGroupEdge::outbound("b", source_b),
+            ],
+        ),
+    );
+    assert!(g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group2/commands" && edge.to == "bridge2/command"));
+    group2.release();
+    assert!(!g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group2/commands" && edge.to == "bridge2/command"));
+}
+
+#[test]
+#[should_panic(
+    expected = "wire_edge_group: inbound and outbound edges must be declared in separate groups"
+)]
+fn wire_edge_group_rejects_mixed_inbound_outbound_edges() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("mixed/edge/a"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "mixed/bridge"),
+    );
+
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "mixed/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_invalidate_clears_snapshot_before_next_cause() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("invalidate/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("invalidate/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "invalidate/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "invalidate/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    let issues = collect_data(&group.issues);
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    outbound.borrow_mut().clear();
+
+    source_a.down(vec![Message::Invalidate]);
+    assert!(
+        outbound.borrow().is_empty(),
+        "INVALIDATE must not resend the stale a=1 snapshot"
+    );
+
+    source_b.set(vec![3]);
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::MissingSnapshot));
+    assert!(outbound.borrow().is_empty());
+    source_a.set(vec![4]);
+
+    let data_frames = outbound
+        .borrow()
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::WireEdge(frame)))
+                if frame.kind == CanonicalWireEdgeKind::Data =>
+            {
+                Some((frame.edge_id.clone(), frame.value.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_frames,
+        vec![
+            ("a".to_owned(), Some(vec![4])),
+            ("b".to_owned(), Some(vec![3])),
+        ]
+    );
+}
+
+#[test]
+fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
+    let cases: Vec<(&str, WireEdgeGroupIssueCode, Vec<CanonicalWireEdgeFrame>)> = vec![
+        (
+            "unknown",
+            WireEdgeGroupIssueCode::UnknownEdge,
+            vec![CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: "z".to_owned(),
+                cause_id: "c1".to_owned(),
+                value: None,
+            }],
+        ),
+        (
+            "duplicate-dirty",
+            WireEdgeGroupIssueCode::DuplicateDirty,
+            vec![
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+            ],
+        ),
+        (
+            "duplicate-data",
+            WireEdgeGroupIssueCode::DuplicateData,
+            vec![
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![1]),
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![2]),
+                },
+            ],
+        ),
+        (
+            "data-before-dirty",
+            WireEdgeGroupIssueCode::DataBeforeDirty,
+            vec![CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Data,
+                edge_id: "a".to_owned(),
+                cause_id: "c1".to_owned(),
+                value: Some(vec![1]),
+            }],
+        ),
+        (
+            "competing",
+            WireEdgeGroupIssueCode::CompetingCause,
+            vec![
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c2".to_owned(),
+                    value: None,
+                },
+            ],
+        ),
+        (
+            "malformed-poisons-cause",
+            WireEdgeGroupIssueCode::MalformedFrame,
+            vec![
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![1]),
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![2]),
+                },
+            ],
+        ),
+        (
+            "unknown-competing-cause",
+            WireEdgeGroupIssueCode::CompetingCause,
+            vec![
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "z".to_owned(),
+                    cause_id: "c2".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Dirty,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: None,
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "a".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![1]),
+                },
+                CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: "b".to_owned(),
+                    cause_id: "c1".to_owned(),
+                    value: Some(vec![2]),
+                },
+            ],
+        ),
+    ];
+    for (name, code, frames) in cases {
+        let g = graph();
+        let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+            &g,
+            WireBridgeOptions::named("session-a", format!("{name}/bridge")),
+        );
+        let group = wire_edge_group(
+            &g,
+            &bridge,
+            WireEdgeGroupOptions::named(
+                name,
+                vec![
+                    WireEdgeGroupEdge::inbound("a"),
+                    WireEdgeGroupEdge::inbound("b"),
+                ],
+            ),
+        );
+        let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+        let issues = collect_data(&group.issues);
+        for (index, frame) in frames.into_iter().enumerate() {
+            bridge.inbound.set(envelope(
+                "session-a",
+                WireBridgeEnvelopeType::Data,
+                u64::try_from(index + 1).unwrap(),
+                Some(WireBridgePayload::Data(
+                    WireBridgeProtobufDataBody::WireEdge(frame),
+                )),
+                None,
+                None,
+            ));
+        }
+        assert!(inbound_a.borrow().is_empty());
+        assert!(issues.borrow().iter().any(|issue| issue.code == code));
+        assert_ne!(group.issues.status(), graphrefly::Status::Errored);
+        assert_ne!(group.status.status(), graphrefly::Status::Errored);
+    }
+}
+
+#[test]
+fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "replay/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "replay",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+    let issues = collect_data(&group.issues);
+    let status = collect_data(&group.status);
+
+    for (seq, kind, edge_id, value) in [
+        (1, CanonicalWireEdgeKind::Dirty, "a", None),
+        (2, CanonicalWireEdgeKind::Dirty, "b", None),
+        (3, CanonicalWireEdgeKind::Data, "a", Some(vec![1])),
+        (4, CanonicalWireEdgeKind::Data, "b", Some(vec![2])),
+    ] {
+        bridge
+            .inbound
+            .set(wire_edge_envelope(seq, kind, edge_id, "c1", value));
+    }
+    assert_eq!(*inbound_a.borrow(), vec![vec![1]]);
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Released
+    );
+    assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
+    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().data, 0);
+
+    for (seq, kind, edge_id, value) in [
+        (5, CanonicalWireEdgeKind::Dirty, "a", None),
+        (6, CanonicalWireEdgeKind::Dirty, "b", None),
+        (7, CanonicalWireEdgeKind::Data, "a", Some(vec![10])),
+        (8, CanonicalWireEdgeKind::Data, "b", Some(vec![20])),
+    ] {
+        bridge
+            .inbound
+            .set(wire_edge_envelope(seq, kind, edge_id, "c1", value));
+    }
+
+    assert_eq!(*inbound_a.borrow(), vec![vec![1]]);
+    assert!(issues.borrow().iter().any(|issue| {
+        issue.cause_id.as_deref() == Some("c1")
+            && matches!(
+                issue.code,
+                WireEdgeGroupIssueCode::DuplicateDirty | WireEdgeGroupIssueCode::DuplicateData
+            )
+    }));
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Issues
+    );
+    assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
+    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().data, 0);
+}
+
+#[test]
+fn wire_edge_group_status_first_subscription_still_releases_inbound() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "order/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "order",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let status = collect_data(&group.status);
+    let issues = collect_data(&group.issues);
+    let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+
+    bridge.inbound.set(wire_edge_envelope(
+        1,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        2,
+        CanonicalWireEdgeKind::Dirty,
+        "b",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        3,
+        CanonicalWireEdgeKind::Data,
+        "a",
+        "c1",
+        Some(vec![1]),
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        4,
+        CanonicalWireEdgeKind::Data,
+        "b",
+        "c1",
+        Some(vec![2]),
+    ));
+
+    assert_eq!(*inbound_a.borrow(), vec![vec![1]]);
+    assert!(issues.borrow().is_empty());
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Released
+    );
+    assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
+    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().data, 0);
 }
 
 #[test]

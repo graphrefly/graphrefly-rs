@@ -5,14 +5,15 @@
 //! Remote ERROR/COMPLETE are bridge facts, never local protocol terminals.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::time::Duration;
 
-use crate::async_driver::{DriverCancel, LocalAsyncDriver};
+use super::bridge_protobuf::{
+    CanonicalWireEdgeFrame, CanonicalWireEdgeKind, WireBridgeProtobufDataBody,
+};
 use crate::ctx::{Ctx, DepTerminal, WaveData};
-use crate::graph::{Graph, GraphNodeOpts};
+use crate::graph::{Graph, GraphNodeOpts, TopologyGroup, TopologyGroupOptions};
 use crate::node::{Core, Node, NodeOpts};
 use crate::protocol::{AnyValue, Message};
 use crate::resilience::RetryPolicy;
@@ -189,6 +190,11 @@ pub enum WireBridgeCommand<T> {
         reason: Option<String>,
         idempotency_key: Option<String>,
     },
+    AckTimeout {
+        seq: u64,
+        attempt: u32,
+        observed_at_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,7 +312,6 @@ pub struct WireBridgeOptions {
     pub name: Option<String>,
     pub session_id: String,
     pub retry: RetryPolicy,
-    pub ack_timeout: Option<Duration>,
     pub now_ms: Option<Rc<dyn Fn() -> u64>>,
 }
 
@@ -316,7 +321,6 @@ impl WireBridgeOptions {
             name: None,
             session_id: session_id.into(),
             retry: RetryPolicy::default(),
-            ack_timeout: None,
             now_ms: None,
         }
     }
@@ -788,7 +792,8 @@ fn data_msg<T: 'static>(value: T) -> Message<AnyValue> {
 
 struct PendingEnvelope<T> {
     envelope: WireBridgeEnvelope<T>,
-    cancel: Option<DriverCancel>,
+    timeout_reported_attempt: Option<u32>,
+    retry_due_at_ms: Option<u64>,
 }
 
 struct BridgeState<T> {
@@ -849,6 +854,1013 @@ where
         cursor,
         attempts,
         command_sources,
+    }
+}
+
+#[derive(Clone)]
+pub struct WireEdgeGroupEdge {
+    pub edge_id: String,
+    pub outbound: Option<Node<Vec<u8>>>,
+}
+
+impl WireEdgeGroupEdge {
+    #[must_use]
+    pub fn inbound(edge_id: impl Into<String>) -> Self {
+        Self {
+            edge_id: edge_id.into(),
+            outbound: None,
+        }
+    }
+
+    #[must_use]
+    pub fn outbound(edge_id: impl Into<String>, outbound: Node<Vec<u8>>) -> Self {
+        Self {
+            edge_id: edge_id.into(),
+            outbound: Some(outbound),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WireEdgeGroupOptions {
+    pub name: Option<String>,
+    pub edges: Vec<WireEdgeGroupEdge>,
+}
+
+impl WireEdgeGroupOptions {
+    #[must_use]
+    pub fn new(edges: Vec<WireEdgeGroupEdge>) -> Self {
+        Self { name: None, edges }
+    }
+
+    #[must_use]
+    pub fn named(name: impl Into<String>, edges: Vec<WireEdgeGroupEdge>) -> Self {
+        Self {
+            name: Some(name.into()),
+            edges,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireEdgeGroupIssueCode {
+    MissingSnapshot,
+    UnknownEdge,
+    DuplicateDirty,
+    DuplicateData,
+    DataBeforeDirty,
+    CompetingCause,
+    MalformedFrame,
+    IncompleteCause,
+}
+
+impl WireEdgeGroupIssueCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingSnapshot => "wire-edge-group-missing-snapshot",
+            Self::UnknownEdge => "wire-edge-group-unknown-edge",
+            Self::DuplicateDirty => "wire-edge-group-duplicate-dirty",
+            Self::DuplicateData => "wire-edge-group-duplicate-data",
+            Self::DataBeforeDirty => "wire-edge-group-data-before-dirty",
+            Self::CompetingCause => "wire-edge-group-competing-cause",
+            Self::MalformedFrame => "wire-edge-group-malformed-frame",
+            Self::IncompleteCause => "wire-edge-group-incomplete-cause",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireEdgeGroupIssue {
+    pub code: WireEdgeGroupIssueCode,
+    pub message: String,
+    pub edge_id: Option<String>,
+    pub cause_id: Option<String>,
+    pub active_cause_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireEdgeGroupStatusState {
+    Idle,
+    Collecting,
+    Released,
+    Issues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireEdgeGroupStatus {
+    pub state: WireEdgeGroupStatusState,
+    pub expected_edges: Vec<String>,
+    pub active_cause_id: Option<String>,
+    pub dirty: usize,
+    pub data: usize,
+    pub released: u64,
+    pub issues: u64,
+    pub last_issue: Option<WireEdgeGroupIssue>,
+}
+
+pub struct WireEdgeGroupBundle {
+    pub inbound: BTreeMap<String, Node<Vec<u8>>>,
+    pub status: Node<WireEdgeGroupStatus>,
+    pub issues: Node<WireEdgeGroupIssue>,
+    topology: TopologyGroup,
+    bridge_command: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
+    command_sources: Rc<RefCell<Vec<Core>>>,
+    commands: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
+    released: Cell<bool>,
+}
+
+impl WireEdgeGroupBundle {
+    pub fn release(&self) {
+        if self.released.get() {
+            return;
+        }
+        detach_wire_bridge_command_source(
+            &self.bridge_command,
+            &self.command_sources,
+            self.commands.erased(),
+        );
+        let release = catch_unwind(AssertUnwindSafe(|| {
+            self.topology.release_with_reason("wire_edge_group release");
+        }));
+        if let Err(panic) = release {
+            attach_wire_bridge_command_source_parts(
+                &self.bridge_command,
+                &self.command_sources,
+                self.commands.erased(),
+            );
+            resume_unwind(panic);
+        }
+        self.released.set(true);
+    }
+}
+
+pub fn wire_edge_group(
+    graph: &Graph,
+    bridge: &WireBridgeBundle<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>,
+    opts: WireEdgeGroupOptions,
+) -> WireEdgeGroupBundle {
+    let name = opts.name.unwrap_or_else(|| "wireEdgeGroup".to_owned());
+    let edges = normalize_wire_edge_group_edges(opts.edges);
+    let expected = edges
+        .iter()
+        .map(|edge| edge.edge_id.clone())
+        .collect::<Vec<_>>();
+    let outbound = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(edge_index, edge)| {
+            edge.outbound
+                .as_ref()
+                .map(|node| (edge_index, node.erased()))
+        })
+        .collect::<Vec<_>>();
+    let mut deps = outbound
+        .iter()
+        .map(|(_, core)| core.clone())
+        .collect::<Vec<_>>();
+    deps.push(bridge.inbound.erased());
+    let topology =
+        graph.topology_group_opts(TopologyGroupOptions::named(format!("{name}.wireEdgeGroup")));
+    let events = topology.node_opts::<WireEdgeGroupEvent, _>(
+        deps,
+        wire_edge_group_events_fn(
+            name.clone(),
+            edges.clone(),
+            bridge.inbound.session_id().to_owned(),
+            outbound
+                .iter()
+                .map(|(edge_index, _)| *edge_index)
+                .collect::<Vec<_>>(),
+        ),
+        graph_node_opts(format!("{name}/events"), "wireEdgeGroupEvents"),
+    );
+    let gate = topology.node_opts::<WireEdgeGroupGate, _>(
+        vec![events.erased()],
+        wire_edge_group_gate_fn(name.clone(), expected.clone()),
+        graph_node_opts(format!("{name}/gate"), "wireEdgeGroupGate"),
+    );
+    let commands = topology.node_opts::<WireBridgeCommand<WireBridgeProtobufDataBody>, _>(
+        vec![events.erased()],
+        |ctx| {
+            for event in ctx.batch::<WireEdgeGroupEvent>(0) {
+                if let WireEdgeGroupEvent::Outbound { command } = event.as_ref() {
+                    ctx.emit(command.clone());
+                }
+            }
+        },
+        graph_node_opts(format!("{name}/commands"), "wireEdgeGroupCommands"),
+    );
+    let issues = topology.node_opts::<WireEdgeGroupIssue, _>(
+        vec![events.erased(), gate.erased()],
+        |ctx| {
+            for event in ctx.batch::<WireEdgeGroupEvent>(0) {
+                if let WireEdgeGroupEvent::Issue { issue } = event.as_ref() {
+                    ctx.emit(issue.clone());
+                }
+            }
+            for event in ctx.batch::<WireEdgeGroupGate>(1) {
+                if let WireEdgeGroupGate::Issue { issue } = event.as_ref() {
+                    ctx.emit(issue.clone());
+                }
+            }
+        },
+        graph_node_opts(format!("{name}/issues"), "wireEdgeGroupIssues"),
+    );
+    let status = topology.node_opts::<WireEdgeGroupStatus, _>(
+        vec![events.erased(), gate.erased()],
+        wire_edge_group_status_fn(expected.clone()),
+        graph_node_opts(format!("{name}/status"), "wireEdgeGroupStatus"),
+    );
+    let inbound = expected
+        .iter()
+        .map(|edge_id| {
+            let edge_id_for_node = edge_id.clone();
+            let node = topology.node_opts::<Vec<u8>, _>(
+                vec![gate.erased()],
+                move |ctx| {
+                    for event in ctx.batch::<WireEdgeGroupGate>(0) {
+                        if let WireEdgeGroupGate::Release { edge_id, value, .. } = event.as_ref() {
+                            if edge_id == &edge_id_for_node {
+                                ctx.emit(value.clone());
+                            }
+                        }
+                    }
+                },
+                graph_node_opts(
+                    format!("{name}/inbound/{edge_id}"),
+                    "wireEdgeGroupInboundEdge",
+                ),
+            );
+            (edge_id.clone(), node)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let attach = catch_unwind(AssertUnwindSafe(|| {
+        attach_wire_bridge_command_source(bridge, commands.erased());
+    }));
+    if let Err(panic) = attach {
+        topology.release_with_reason("wire_edge_group failed command wiring");
+        resume_unwind(panic);
+    }
+    WireEdgeGroupBundle {
+        inbound,
+        status,
+        issues,
+        topology,
+        bridge_command: bridge.command.clone(),
+        command_sources: bridge.command_sources.clone(),
+        commands,
+        released: Cell::new(false),
+    }
+}
+
+#[derive(Clone)]
+enum WireEdgeGroupEvent {
+    Outbound {
+        command: WireBridgeCommand<WireBridgeProtobufDataBody>,
+    },
+    Frame {
+        frame: CanonicalWireEdgeFrame,
+    },
+    Issue {
+        issue: WireEdgeGroupIssue,
+    },
+    BridgeEnd,
+}
+
+#[derive(Clone)]
+enum WireEdgeGroupGate {
+    Issue {
+        issue: WireEdgeGroupIssue,
+    },
+    Progress {
+        cause_id: String,
+        dirty: usize,
+        data: usize,
+    },
+    Release {
+        edge_id: String,
+        value: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Default)]
+struct WireEdgeGroupOutState {
+    next_cause: u64,
+    snapshots: BTreeMap<String, Vec<u8>>,
+}
+
+const WIRE_EDGE_GROUP_CAUSE_TOMBSTONE_LIMIT: usize = 1024;
+
+#[derive(Clone)]
+struct WireEdgeGroupCauseTombstones {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+impl Default for WireEdgeGroupCauseTombstones {
+    fn default() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            limit: WIRE_EDGE_GROUP_CAUSE_TOMBSTONE_LIMIT,
+        }
+    }
+}
+
+impl WireEdgeGroupCauseTombstones {
+    fn insert(&mut self, cause_id: String) {
+        if !self.seen.insert(cause_id.clone()) {
+            return;
+        }
+        self.order.push_back(cause_id);
+        while self.order.len() > self.limit {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+    }
+
+    fn contains(&self, cause_id: &str) -> bool {
+        self.seen.contains(cause_id)
+    }
+}
+
+#[derive(Clone, Default)]
+struct WireEdgeGroupGateState {
+    active_cause_id: Option<String>,
+    dirty: HashSet<String>,
+    data: BTreeMap<String, Vec<u8>>,
+    failed: WireEdgeGroupCauseTombstones,
+    released: WireEdgeGroupCauseTombstones,
+}
+
+fn graph_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
+    let mut opts = GraphNodeOpts::named(name);
+    opts.node.factory = Some(factory.into());
+    opts.node.partial = true;
+    opts.node.complete_when_deps_complete = false;
+    opts.node.error_when_deps_error = false;
+    opts
+}
+
+fn normalize_wire_edge_group_edges(edges: Vec<WireEdgeGroupEdge>) -> Vec<WireEdgeGroupEdge> {
+    assert!(
+        !edges.is_empty(),
+        "wire_edge_group: edges must be non-empty"
+    );
+    let mut seen = HashSet::new();
+    let mut has_inbound = false;
+    let mut has_outbound = false;
+    for edge in &edges {
+        assert!(
+            !edge.edge_id.is_empty(),
+            "wire_edge_group: edge_id must be non-empty"
+        );
+        assert!(
+            seen.insert(edge.edge_id.clone()),
+            "wire_edge_group: duplicate edge_id '{}'",
+            edge.edge_id
+        );
+        if edge.outbound.is_some() {
+            has_outbound = true;
+        } else {
+            has_inbound = true;
+        }
+    }
+    assert!(
+        !(has_inbound && has_outbound),
+        "wire_edge_group: inbound and outbound edges must be declared in separate groups"
+    );
+    edges
+}
+
+fn wire_edge_group_issue(
+    code: WireEdgeGroupIssueCode,
+    message: impl Into<String>,
+    edge_id: Option<String>,
+    cause_id: Option<String>,
+    active_cause_id: Option<String>,
+) -> WireEdgeGroupIssue {
+    WireEdgeGroupIssue {
+        code,
+        message: message.into(),
+        edge_id,
+        cause_id,
+        active_cause_id,
+    }
+}
+
+fn wire_edge_group_send(
+    frame: CanonicalWireEdgeFrame,
+) -> WireBridgeCommand<WireBridgeProtobufDataBody> {
+    WireBridgeCommand::Send {
+        payload: WireBridgeProtobufDataBody::WireEdge(frame),
+        idempotency_key: None,
+        request_id: None,
+    }
+}
+
+fn wire_edge_group_events_fn(
+    name: String,
+    edges: Vec<WireEdgeGroupEdge>,
+    session_id: String,
+    outbound_indexes: Vec<usize>,
+) -> impl Fn(&Ctx) + 'static {
+    let inbound_index = outbound_indexes.len();
+    move |ctx| {
+        let state = wire_edge_group_out_state(ctx);
+        ctx.on_invalidate({
+            let state = state.clone();
+            move || state.borrow_mut().snapshots.clear()
+        });
+        let mut triggered = false;
+        for (dep_index, edge_index) in outbound_indexes.iter().enumerate() {
+            let edge = &edges[*edge_index];
+            if let Some(waves) = ctx.wave_data().get(dep_index) {
+                for wave in waves.iter() {
+                    for item in wave {
+                        match item {
+                            WaveData::Data(value) => match value.clone().downcast::<Vec<u8>>() {
+                                Ok(value) => {
+                                    state
+                                        .borrow_mut()
+                                        .snapshots
+                                        .insert(edge.edge_id.clone(), (*value).clone());
+                                    triggered = true;
+                                }
+                                Err(_) => {
+                                    ctx.emit(WireEdgeGroupEvent::Issue {
+                                        issue: wire_edge_group_issue(
+                                            WireEdgeGroupIssueCode::MalformedFrame,
+                                            format!(
+                                                "{name}: outbound edge {} must emit Vec<u8> bytes",
+                                                edge.edge_id
+                                            ),
+                                            Some(edge.edge_id.clone()),
+                                            None,
+                                            None,
+                                        ),
+                                    });
+                                }
+                            },
+                            WaveData::Sentinel => {
+                                state.borrow_mut().snapshots.remove(&edge.edge_id);
+                                triggered = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if triggered {
+            emit_wire_edge_group_outbound(ctx, &name, &edges, &state);
+        }
+        for ingress in ctx.batch::<WireBridgeIngress<WireBridgeProtobufDataBody>>(inbound_index) {
+            if let Some(event) = wire_edge_group_frame_event(&name, &session_id, ingress.as_ref()) {
+                ctx.emit(event);
+            }
+        }
+    }
+}
+
+fn wire_edge_group_out_state(ctx: &Ctx) -> Rc<RefCell<WireEdgeGroupOutState>> {
+    if let Some(state) = ctx.state_get::<RefCell<WireEdgeGroupOutState>>() {
+        return state;
+    }
+    ctx.state_set(RefCell::new(WireEdgeGroupOutState {
+        next_cause: 1,
+        snapshots: BTreeMap::new(),
+    }));
+    ctx.state_get::<RefCell<WireEdgeGroupOutState>>()
+        .expect("wire-edge out state was just installed")
+}
+
+fn emit_wire_edge_group_outbound(
+    ctx: &Ctx,
+    name: &str,
+    edges: &[WireEdgeGroupEdge],
+    state: &Rc<RefCell<WireEdgeGroupOutState>>,
+) {
+    let missing = {
+        let state = state.borrow();
+        edges
+            .iter()
+            .filter(|edge| !state.snapshots.contains_key(&edge.edge_id))
+            .map(|edge| edge.edge_id.clone())
+            .collect::<Vec<_>>()
+    };
+    if !missing.is_empty() {
+        for edge_id in missing {
+            ctx.emit(WireEdgeGroupEvent::Issue {
+                issue: wire_edge_group_issue(
+                    WireEdgeGroupIssueCode::MissingSnapshot,
+                    format!("{name}: missing outbound snapshot for edge {edge_id}"),
+                    Some(edge_id),
+                    None,
+                    None,
+                ),
+            });
+        }
+        return;
+    }
+    let cause_id = {
+        let mut state = state.borrow_mut();
+        let cause_id = format!("{name}:cause:{}", state.next_cause);
+        state.next_cause = state.next_cause.saturating_add(1);
+        cause_id
+    };
+    for edge in edges {
+        ctx.emit(WireEdgeGroupEvent::Outbound {
+            command: wire_edge_group_send(CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: edge.edge_id.clone(),
+                cause_id: cause_id.clone(),
+                value: None,
+            }),
+        });
+    }
+    let snapshots = state.borrow().snapshots.clone();
+    for edge in edges {
+        if let Some(value) = snapshots.get(&edge.edge_id) {
+            ctx.emit(WireEdgeGroupEvent::Outbound {
+                command: wire_edge_group_send(CanonicalWireEdgeFrame {
+                    kind: CanonicalWireEdgeKind::Data,
+                    edge_id: edge.edge_id.clone(),
+                    cause_id: cause_id.clone(),
+                    value: Some(value.clone()),
+                }),
+            });
+        }
+    }
+}
+
+fn wire_edge_group_frame_event(
+    name: &str,
+    session_id: &str,
+    ingress: &WireBridgeIngress<WireBridgeProtobufDataBody>,
+) -> Option<WireEdgeGroupEvent> {
+    let envelope = match ingress {
+        WireBridgeIngress::Envelope(envelope) => envelope,
+        WireBridgeIngress::Invalid(error) => {
+            return Some(WireEdgeGroupEvent::Issue {
+                issue: wire_edge_group_issue(
+                    WireEdgeGroupIssueCode::MalformedFrame,
+                    format!("{name}: bridge invalid wire-edge ingress: {error}"),
+                    None,
+                    None,
+                    None,
+                ),
+            });
+        }
+    };
+    if let Err(error) = validate_inbound_envelope(envelope) {
+        return Some(WireEdgeGroupEvent::Issue {
+            issue: wire_edge_group_issue(
+                WireEdgeGroupIssueCode::MalformedFrame,
+                format!("{name}: bridge invalid wire-edge envelope: {error}"),
+                None,
+                None,
+                None,
+            ),
+        });
+    }
+    if envelope.session_id != session_id {
+        return Some(WireEdgeGroupEvent::Issue {
+            issue: wire_edge_group_issue(
+                WireEdgeGroupIssueCode::MalformedFrame,
+                format!(
+                    "{name}: bridge session {} did not match expected {session_id}",
+                    envelope.session_id
+                ),
+                None,
+                None,
+                None,
+            ),
+        });
+    }
+    match envelope.envelope_type {
+        WireBridgeEnvelopeType::Close | WireBridgeEnvelopeType::Error => {
+            Some(WireEdgeGroupEvent::BridgeEnd)
+        }
+        WireBridgeEnvelopeType::Data => match &envelope.payload {
+            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))) => {
+                validate_wire_edge_group_frame(name, frame).map_or_else(
+                    || {
+                        Some(WireEdgeGroupEvent::Frame {
+                            frame: frame.clone(),
+                        })
+                    },
+                    |issue| Some(WireEdgeGroupEvent::Issue { issue }),
+                )
+            }
+            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::Value(_))) => None,
+            _ => Some(WireEdgeGroupEvent::Issue {
+                issue: wire_edge_group_issue(
+                    WireEdgeGroupIssueCode::MalformedFrame,
+                    format!("{name}: wire-edge payload must be a wire_edge frame"),
+                    None,
+                    None,
+                    None,
+                ),
+            }),
+        },
+        WireBridgeEnvelopeType::Start
+        | WireBridgeEnvelopeType::Ack
+        | WireBridgeEnvelopeType::Nack
+        | WireBridgeEnvelopeType::Status => None,
+    }
+}
+
+fn validate_wire_edge_group_frame(
+    name: &str,
+    frame: &CanonicalWireEdgeFrame,
+) -> Option<WireEdgeGroupIssue> {
+    if frame.edge_id.is_empty() {
+        return Some(wire_edge_group_issue(
+            WireEdgeGroupIssueCode::MalformedFrame,
+            format!("{name}: wire-edge frame edge_id must be non-empty"),
+            None,
+            Some(frame.cause_id.clone()),
+            None,
+        ));
+    }
+    if frame.cause_id.is_empty() {
+        return Some(wire_edge_group_issue(
+            WireEdgeGroupIssueCode::MalformedFrame,
+            format!("{name}: wire-edge frame cause_id must be non-empty"),
+            Some(frame.edge_id.clone()),
+            None,
+            None,
+        ));
+    }
+    match frame.kind {
+        CanonicalWireEdgeKind::Dirty if frame.value.is_some() => Some(wire_edge_group_issue(
+            WireEdgeGroupIssueCode::MalformedFrame,
+            format!("{name}: DIRTY wire-edge frame must not carry value bytes"),
+            Some(frame.edge_id.clone()),
+            Some(frame.cause_id.clone()),
+            None,
+        )),
+        CanonicalWireEdgeKind::Data if frame.value.is_none() => Some(wire_edge_group_issue(
+            WireEdgeGroupIssueCode::MalformedFrame,
+            format!("{name}: DATA wire-edge frame requires value bytes"),
+            Some(frame.edge_id.clone()),
+            Some(frame.cause_id.clone()),
+            None,
+        )),
+        CanonicalWireEdgeKind::Dirty | CanonicalWireEdgeKind::Data => None,
+    }
+}
+
+fn wire_edge_group_gate_fn(name: String, expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'static {
+    let expected = expected_ids.iter().cloned().collect::<HashSet<_>>();
+    move |ctx| {
+        let state = wire_edge_group_gate_state(ctx);
+        for event in ctx.batch::<WireEdgeGroupEvent>(0) {
+            match event.as_ref() {
+                WireEdgeGroupEvent::Issue { issue } => {
+                    ctx.emit(WireEdgeGroupGate::Issue {
+                        issue: issue.clone(),
+                    });
+                    fail_wire_edge_group_issue_cause(ctx, &name, &state, issue);
+                }
+                WireEdgeGroupEvent::Outbound { .. } => {}
+                WireEdgeGroupEvent::BridgeEnd => {
+                    let active = state.borrow().active_cause_id.clone();
+                    if let Some(cause_id) = active {
+                        ctx.emit(WireEdgeGroupGate::Issue {
+                            issue: wire_edge_group_issue(
+                                WireEdgeGroupIssueCode::IncompleteCause,
+                                format!(
+                                    "{name}: cause {cause_id} ended before all expected edge frames arrived"
+                                ),
+                                None,
+                                Some(cause_id.clone()),
+                                None,
+                            ),
+                        });
+                        wire_edge_group_gate_fail(&state, Some(cause_id));
+                    }
+                }
+                WireEdgeGroupEvent::Frame { frame } => {
+                    reduce_wire_edge_group_frame(
+                        ctx,
+                        &name,
+                        &expected,
+                        &expected_ids,
+                        &state,
+                        frame,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn wire_edge_group_gate_state(ctx: &Ctx) -> Rc<RefCell<WireEdgeGroupGateState>> {
+    if let Some(state) = ctx.state_get::<RefCell<WireEdgeGroupGateState>>() {
+        return state;
+    }
+    ctx.state_set(RefCell::new(WireEdgeGroupGateState::default()));
+    ctx.state_get::<RefCell<WireEdgeGroupGateState>>()
+        .expect("wire-edge gate state was just installed")
+}
+
+fn wire_edge_group_gate_reset(state: &Rc<RefCell<WireEdgeGroupGateState>>) {
+    let mut state = state.borrow_mut();
+    state.active_cause_id = None;
+    state.dirty.clear();
+    state.data.clear();
+}
+
+fn wire_edge_group_gate_fail(
+    state: &Rc<RefCell<WireEdgeGroupGateState>>,
+    cause_id: Option<String>,
+) {
+    if let Some(cause_id) = cause_id {
+        state.borrow_mut().failed.insert(cause_id);
+    }
+    wire_edge_group_gate_reset(state);
+}
+
+fn fail_wire_edge_group_issue_cause(
+    ctx: &Ctx,
+    name: &str,
+    state: &Rc<RefCell<WireEdgeGroupGateState>>,
+    issue: &WireEdgeGroupIssue,
+) {
+    let Some(cause_id) = issue.cause_id.clone() else {
+        return;
+    };
+    let active = state.borrow().active_cause_id.clone();
+    if let Some(active_cause_id) = active {
+        if active_cause_id != cause_id {
+            emit_wire_edge_group_competing_cause(
+                ctx,
+                name,
+                state,
+                issue.edge_id.clone(),
+                cause_id,
+                active_cause_id,
+            );
+            return;
+        }
+        wire_edge_group_gate_fail(state, Some(cause_id));
+    } else {
+        state.borrow_mut().failed.insert(cause_id);
+    }
+}
+
+fn emit_wire_edge_group_competing_cause(
+    ctx: &Ctx,
+    name: &str,
+    state: &Rc<RefCell<WireEdgeGroupGateState>>,
+    edge_id: Option<String>,
+    cause_id: String,
+    active_cause_id: String,
+) {
+    ctx.emit(WireEdgeGroupGate::Issue {
+        issue: wire_edge_group_issue(
+            WireEdgeGroupIssueCode::CompetingCause,
+            format!("{name}: competing cause {cause_id} arrived while {active_cause_id} is active"),
+            edge_id,
+            Some(cause_id.clone()),
+            Some(active_cause_id.clone()),
+        ),
+    });
+    ctx.emit(WireEdgeGroupGate::Issue {
+        issue: wire_edge_group_issue(
+            WireEdgeGroupIssueCode::IncompleteCause,
+            format!("{name}: active cause {active_cause_id} is incomplete"),
+            None,
+            Some(active_cause_id.clone()),
+            None,
+        ),
+    });
+    wire_edge_group_gate_fail(state, Some(active_cause_id));
+    state.borrow_mut().failed.insert(cause_id);
+}
+
+fn wire_edge_group_progress(
+    ctx: &Ctx,
+    cause_id: String,
+    state: &Rc<RefCell<WireEdgeGroupGateState>>,
+) {
+    let state = state.borrow();
+    ctx.emit(WireEdgeGroupGate::Progress {
+        cause_id,
+        dirty: state.dirty.len(),
+        data: state.data.len(),
+    });
+}
+
+fn emit_replayed_wire_edge_group_cause(ctx: &Ctx, name: &str, frame: &CanonicalWireEdgeFrame) {
+    let code = match frame.kind {
+        CanonicalWireEdgeKind::Dirty => WireEdgeGroupIssueCode::DuplicateDirty,
+        CanonicalWireEdgeKind::Data => WireEdgeGroupIssueCode::DuplicateData,
+    };
+    ctx.emit(WireEdgeGroupGate::Issue {
+        issue: wire_edge_group_issue(
+            code,
+            format!("{name}: cause {} was already released", frame.cause_id),
+            Some(frame.edge_id.clone()),
+            Some(frame.cause_id.clone()),
+            None,
+        ),
+    });
+}
+
+fn reduce_wire_edge_group_frame(
+    ctx: &Ctx,
+    name: &str,
+    expected: &HashSet<String>,
+    expected_ids: &[String],
+    state: &Rc<RefCell<WireEdgeGroupGateState>>,
+    frame: &CanonicalWireEdgeFrame,
+) {
+    if state.borrow().failed.contains(&frame.cause_id) {
+        ctx.emit(WireEdgeGroupGate::Issue {
+            issue: wire_edge_group_issue(
+                WireEdgeGroupIssueCode::IncompleteCause,
+                format!(
+                    "{}: cause {} was already failed closed",
+                    name, frame.cause_id
+                ),
+                Some(frame.edge_id.clone()),
+                Some(frame.cause_id.clone()),
+                None,
+            ),
+        });
+        return;
+    }
+    if state.borrow().released.contains(&frame.cause_id) {
+        emit_replayed_wire_edge_group_cause(ctx, name, frame);
+        return;
+    }
+    let active = state.borrow().active_cause_id.clone();
+    if active.as_deref() != Some(frame.cause_id.as_str()) {
+        if let Some(active_cause_id) = active {
+            emit_wire_edge_group_competing_cause(
+                ctx,
+                name,
+                state,
+                Some(frame.edge_id.clone()),
+                frame.cause_id.clone(),
+                active_cause_id,
+            );
+            return;
+        }
+    }
+    if !expected.contains(&frame.edge_id) {
+        ctx.emit(WireEdgeGroupGate::Issue {
+            issue: wire_edge_group_issue(
+                WireEdgeGroupIssueCode::UnknownEdge,
+                format!("{name}: unknown edge {}", frame.edge_id),
+                Some(frame.edge_id.clone()),
+                Some(frame.cause_id.clone()),
+                None,
+            ),
+        });
+        wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
+        return;
+    }
+    {
+        let mut state_mut = state.borrow_mut();
+        if state_mut.active_cause_id.is_none() {
+            state_mut.active_cause_id = Some(frame.cause_id.clone());
+        }
+    }
+    match frame.kind {
+        CanonicalWireEdgeKind::Dirty => {
+            if !state.borrow_mut().dirty.insert(frame.edge_id.clone()) {
+                ctx.emit(WireEdgeGroupGate::Issue {
+                    issue: wire_edge_group_issue(
+                        WireEdgeGroupIssueCode::DuplicateDirty,
+                        format!("{name}: duplicate DIRTY for edge {}", frame.edge_id),
+                        Some(frame.edge_id.clone()),
+                        Some(frame.cause_id.clone()),
+                        None,
+                    ),
+                });
+                wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
+                return;
+            }
+            wire_edge_group_progress(ctx, frame.cause_id.clone(), state);
+        }
+        CanonicalWireEdgeKind::Data => {
+            if !state.borrow().dirty.contains(&frame.edge_id) {
+                ctx.emit(WireEdgeGroupGate::Issue {
+                    issue: wire_edge_group_issue(
+                        WireEdgeGroupIssueCode::DataBeforeDirty,
+                        format!(
+                            "{name}: DATA for edge {} arrived before DIRTY",
+                            frame.edge_id
+                        ),
+                        Some(frame.edge_id.clone()),
+                        Some(frame.cause_id.clone()),
+                        None,
+                    ),
+                });
+                wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
+                return;
+            }
+            let value = frame.value.clone().unwrap_or_default();
+            if state
+                .borrow_mut()
+                .data
+                .insert(frame.edge_id.clone(), value)
+                .is_some()
+            {
+                ctx.emit(WireEdgeGroupGate::Issue {
+                    issue: wire_edge_group_issue(
+                        WireEdgeGroupIssueCode::DuplicateData,
+                        format!("{name}: duplicate DATA for edge {}", frame.edge_id),
+                        Some(frame.edge_id.clone()),
+                        Some(frame.cause_id.clone()),
+                        None,
+                    ),
+                });
+                wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
+                return;
+            }
+            let ready = {
+                let state = state.borrow();
+                state.dirty.len() == expected_ids.len() && state.data.len() == expected_ids.len()
+            };
+            if ready {
+                let data = state.borrow().data.clone();
+                for edge_id in expected_ids {
+                    if let Some(value) = data.get(edge_id) {
+                        ctx.emit(WireEdgeGroupGate::Release {
+                            edge_id: edge_id.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                }
+                state.borrow_mut().released.insert(frame.cause_id.clone());
+                wire_edge_group_gate_reset(state);
+            } else {
+                wire_edge_group_progress(ctx, frame.cause_id.clone(), state);
+            }
+        }
+    }
+}
+
+fn wire_edge_group_status_fn(expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'static {
+    move |ctx| {
+        let mut status = ctx.state_get::<WireEdgeGroupStatus>().map_or_else(
+            || WireEdgeGroupStatus {
+                state: WireEdgeGroupStatusState::Idle,
+                expected_edges: expected_ids.clone(),
+                active_cause_id: None,
+                dirty: 0,
+                data: 0,
+                released: 0,
+                issues: 0,
+                last_issue: None,
+            },
+            |status| (*status).clone(),
+        );
+        for event in ctx.batch::<WireEdgeGroupEvent>(0) {
+            if let WireEdgeGroupEvent::Issue { issue } = event.as_ref() {
+                status.state = WireEdgeGroupStatusState::Issues;
+                status.issues = status.issues.saturating_add(1);
+                status.last_issue = Some(issue.clone());
+            }
+        }
+        for event in ctx.batch::<WireEdgeGroupGate>(1) {
+            match event.as_ref() {
+                WireEdgeGroupGate::Issue { issue } => {
+                    status.state = WireEdgeGroupStatusState::Issues;
+                    status.active_cause_id = None;
+                    status.dirty = 0;
+                    status.data = 0;
+                    status.issues = status.issues.saturating_add(1);
+                    status.last_issue = Some(issue.clone());
+                }
+                WireEdgeGroupGate::Progress {
+                    cause_id,
+                    dirty,
+                    data,
+                } => {
+                    status.state = WireEdgeGroupStatusState::Collecting;
+                    status.active_cause_id = Some(cause_id.clone());
+                    status.dirty = *dirty;
+                    status.data = *data;
+                }
+                WireEdgeGroupGate::Release { .. } => {
+                    status.state = WireEdgeGroupStatusState::Released;
+                    status.active_cause_id = None;
+                    status.dirty = 0;
+                    status.data = 0;
+                    status.released = status.released.saturating_add(1);
+                }
+            }
+        }
+        ctx.state_set(status.clone());
+        ctx.emit(status);
     }
 }
 
@@ -2056,15 +3068,10 @@ fn install_cleanup<T: Clone + 'static>(ctx: &Ctx, state: Rc<RefCell<BridgeState<
     }
     state.borrow_mut().cleanup_installed = true;
     ctx.on_deactivation(move || {
-        let cancels = {
-            let mut state = state.borrow_mut();
-            state.active = false;
-            state.cleanup_installed = false;
-            take_pending_cancels(&mut state)
-        };
-        for cancel in cancels {
-            run_driver_cancel(cancel);
-        }
+        let mut state = state.borrow_mut();
+        state.active = false;
+        state.cleanup_installed = false;
+        state.pending.clear();
     });
 }
 
@@ -2214,7 +3221,29 @@ fn process_command<TOutbound, TInbound>(
                 now,
             );
         }
+        WireBridgeCommand::AckTimeout {
+            seq,
+            attempt,
+            observed_at_ms,
+        } => process_ack_timeout_command::<TOutbound, TInbound>(
+            ctx,
+            state,
+            AckTimeoutCommandInput {
+                seq,
+                attempt,
+                observed_at_ms,
+            },
+            opts,
+            policy,
+            now,
+        ),
     }
+}
+
+struct AckTimeoutCommandInput {
+    seq: u64,
+    attempt: u32,
+    observed_at_ms: Option<u64>,
 }
 
 struct OutboundSpec<T> {
@@ -2280,39 +3309,25 @@ fn emit_outbound<TOutbound, TInbound>(
         envelope: envelope.clone(),
     });
     if spec.track_ack {
-        arm_ack_timeout::<TOutbound, TInbound>(ctx, state, envelope, opts, policy, now);
+        state.borrow_mut().pending.insert(
+            envelope.metadata.seq,
+            PendingEnvelope {
+                envelope,
+                timeout_reported_attempt: None,
+                retry_due_at_ms: None,
+            },
+        );
     }
 }
 
 fn clear_pending<T>(state: &Rc<RefCell<BridgeState<T>>>) {
-    let cancels = {
-        let mut state = state.borrow_mut();
-        take_pending_cancels(&mut state)
-    };
-    for cancel in cancels {
-        run_driver_cancel(cancel);
-    }
+    state.borrow_mut().pending.clear();
 }
 
-fn take_pending_cancels<T>(state: &mut BridgeState<T>) -> Vec<DriverCancel> {
-    let mut cancels = Vec::new();
-    for pending in state.pending.values_mut() {
-        if let Some(cancel) = pending.cancel.take() {
-            cancels.push(cancel);
-        }
-    }
-    state.pending.clear();
-    cancels
-}
-
-fn run_driver_cancel(cancel: DriverCancel) {
-    let _ = catch_unwind(AssertUnwindSafe(cancel));
-}
-
-fn arm_ack_timeout<TOutbound, TInbound>(
+fn process_ack_timeout_command<TOutbound, TInbound>(
     ctx: &Ctx,
     state: &Rc<RefCell<BridgeState<TOutbound>>>,
-    envelope: WireBridgeEnvelope<TOutbound>,
+    input: AckTimeoutCommandInput,
     opts: &WireBridgeOptions,
     policy: &RetryPolicy,
     now: &Rc<dyn Fn() -> u64>,
@@ -2320,193 +3335,125 @@ fn arm_ack_timeout<TOutbound, TInbound>(
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    let Some(timeout) = opts.ack_timeout else {
-        state.borrow_mut().pending.insert(
-            envelope.metadata.seq,
-            PendingEnvelope {
-                envelope,
-                cancel: None,
-            },
-        );
-        return;
-    };
-    let Some(driver) = ctx.local_async_driver() else {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Exhausted {
-            seq: envelope.metadata.seq,
-            attempt: envelope.metadata.attempt,
-            error: "wireBridge: missing LocalAsyncDriver for ack timeout".to_owned(),
+    let AckTimeoutCommandInput {
+        seq,
+        attempt,
+        observed_at_ms,
+    } = input;
+    if seq == 0 {
+        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+            error: "wireBridge: ack-timeout command seq must be positive".to_owned(),
         });
         return;
+    }
+    if attempt == 0 {
+        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+            error: "wireBridge: ack-timeout command attempt must be positive".to_owned(),
+        });
+        return;
+    }
+    let current = {
+        let state_ref = state.borrow();
+        let Some(pending) = state_ref.pending.get(&seq) else {
+            return;
+        };
+        if pending.envelope.metadata.attempt != attempt {
+            return;
+        }
+        pending.envelope.clone()
     };
-    let out = Rc::new(ctx.defer());
-    state.borrow_mut().pending.insert(
-        envelope.metadata.seq,
-        PendingEnvelope {
-            envelope: envelope.clone(),
-            cancel: None,
-        },
-    );
-    schedule_ack_timeout::<TOutbound, TInbound>(
-        state.clone(),
-        out,
-        driver,
-        timeout,
-        policy.clone(),
-        now.clone(),
-        envelope,
-    );
+    let retry_due = {
+        let pending = state.borrow();
+        if let Some(pending) = pending.pending.get(&seq) {
+            if pending.timeout_reported_attempt == Some(attempt) {
+                if let (Some(retry_due_at_ms), Some(observed_at_ms)) =
+                    (pending.retry_due_at_ms, observed_at_ms)
+                {
+                    if observed_at_ms < retry_due_at_ms {
+                        return;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if retry_due {
+        emit_retry_outbound::<TOutbound, TInbound>(ctx, state, policy, now, current);
+        return;
+    }
+    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Timeout { seq, attempt });
+    if !policy.should_retry(attempt) {
+        state.borrow_mut().pending.remove(&seq);
+        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Exhausted {
+            seq,
+            attempt,
+            error: format!("{}: ack timeout for seq {seq}", opts.session_id),
+        });
+        return;
+    }
+    let next_attempt = attempt.saturating_add(1);
+    let delay_ms = policy.next_delay_ms(next_attempt).unwrap_or_default();
+    if let Some(pending) = state.borrow_mut().pending.get_mut(&seq) {
+        pending.timeout_reported_attempt = Some(attempt);
+        if delay_ms > 0 {
+            pending.retry_due_at_ms = observed_at_ms.map(|ms| ms.saturating_add(delay_ms));
+        }
+    }
+    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Retry {
+        seq,
+        attempt: next_attempt,
+        delay_ms,
+        error: format!("{}: ack timeout for seq {seq}", opts.session_id),
+    });
+    let should_wait = state
+        .borrow()
+        .pending
+        .get(&seq)
+        .and_then(|pending| pending.retry_due_at_ms)
+        .is_some();
+    if !should_wait {
+        emit_retry_outbound::<TOutbound, TInbound>(ctx, state, policy, now, current);
+    }
 }
 
-fn schedule_ack_timeout<TOutbound, TInbound>(
-    state: Rc<RefCell<BridgeState<TOutbound>>>,
-    out: Rc<crate::ctx::DeferredCtx>,
-    driver: Rc<dyn LocalAsyncDriver>,
-    timeout: Duration,
-    policy: RetryPolicy,
-    now: Rc<dyn Fn() -> u64>,
-    envelope: WireBridgeEnvelope<TOutbound>,
+fn emit_retry_outbound<TOutbound, TInbound>(
+    ctx: &Ctx,
+    state: &Rc<RefCell<BridgeState<TOutbound>>>,
+    policy: &RetryPolicy,
+    now: &Rc<dyn Fn() -> u64>,
+    current: WireBridgeEnvelope<TOutbound>,
 ) where
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    enum TimeoutFollowUp<T> {
-        None,
-        Exhausted {
-            seq: u64,
-            attempt: u32,
-            error: String,
-        },
-        Retry {
-            retry: WireBridgeEnvelope<T>,
-            delay_ms: u64,
-            error: String,
-        },
-    }
-
-    let seq = envelope.metadata.seq;
-    let state_for_callback = state.clone();
-    let out_for_callback = out.clone();
-    let driver_for_callback = driver.clone();
-    let policy_for_callback = policy.clone();
-    let now_for_callback = now.clone();
-    let cancel = driver.sleep(
-        timeout,
-        Box::new(move || {
-            let timeout_attempt = envelope.metadata.attempt;
-            let follow_up = {
-                let mut state = state_for_callback.borrow_mut();
-                if !state.active || !state.pending.contains_key(&seq) {
-                    TimeoutFollowUp::None
-                } else if !policy_for_callback.should_retry(envelope.metadata.attempt) {
-                    state.pending.remove(&seq);
-                    TimeoutFollowUp::Exhausted {
-                        seq,
-                        attempt: envelope.metadata.attempt,
-                        error: format!("{}: ack timeout for seq {seq}", envelope.session_id),
-                    }
-                } else {
-                    let attempt = envelope.metadata.attempt.saturating_add(1);
-                    let delay_ms = policy_for_callback
-                        .next_delay_ms(attempt)
-                        .unwrap_or_default();
-                    let retry = wire_bridge_envelope(WireBridgeEnvelopeInput {
-                        session_id: envelope.session_id.clone(),
-                        envelope_type: envelope.envelope_type,
-                        seq,
-                        cursor: state.cursor,
-                        payload: envelope.payload.clone(),
-                        idempotency_key: Some(envelope.metadata.idempotency_key.clone()),
-                        attempt,
-                        max_attempts: policy_for_callback.max_attempts,
-                        timestamp_ms: Some(now_for_callback()),
-                        ack_for_seq: envelope.metadata.ack_for_seq,
-                        request_id: envelope.metadata.request_id.clone(),
-                    })
-                    .expect("retry envelope keeps validated metadata");
-                    if let Some(pending) = state.pending.get_mut(&seq) {
-                        pending.envelope = retry.clone();
-                        pending.cancel = None;
-                    }
-                    TimeoutFollowUp::Retry {
-                        retry,
-                        delay_ms,
-                        error: format!("{}: ack timeout for seq {seq}", envelope.session_id),
-                    }
-                }
-            };
-            if matches!(follow_up, TimeoutFollowUp::None) {
-                return;
-            }
-            out_for_callback.emit(WireBridgeEvent::<TOutbound, TInbound>::Timeout {
-                seq,
-                attempt: timeout_attempt,
-            });
-            match follow_up {
-                TimeoutFollowUp::None => {}
-                TimeoutFollowUp::Exhausted {
-                    seq,
-                    attempt,
-                    error,
-                } => {
-                    out_for_callback.emit(WireBridgeEvent::<TOutbound, TInbound>::Exhausted {
-                        seq,
-                        attempt,
-                        error,
-                    });
-                }
-                TimeoutFollowUp::Retry {
-                    retry,
-                    delay_ms,
-                    error,
-                } => {
-                    let retry_seq = retry.metadata.seq;
-                    let retry_attempt = retry.metadata.attempt;
-                    out_for_callback.emit(WireBridgeEvent::<TOutbound, TInbound>::Retry {
-                        seq: retry_seq,
-                        attempt: retry_attempt,
-                        delay_ms,
-                        error,
-                    });
-                    let emit_retry = {
-                        let state = state_for_callback.clone();
-                        let out = out_for_callback.clone();
-                        let driver = driver_for_callback.clone();
-                        let policy = policy_for_callback.clone();
-                        let now = now_for_callback.clone();
-                        move || {
-                            let should_emit = {
-                                let state = state.borrow();
-                                state.active && state.pending.contains_key(&retry_seq)
-                            };
-                            if !should_emit {
-                                return;
-                            }
-                            out.emit(WireBridgeEvent::<TOutbound, TInbound>::Outbound {
-                                envelope: retry.clone(),
-                            });
-                            schedule_ack_timeout::<TOutbound, TInbound>(
-                                state, out, driver, timeout, policy, now, retry,
-                            );
-                        }
-                    };
-                    if delay_ms == 0 {
-                        emit_retry();
-                    } else {
-                        let delay_cancel = driver_for_callback
-                            .sleep(Duration::from_millis(delay_ms), Box::new(emit_retry));
-                        if let Some(pending) =
-                            state_for_callback.borrow_mut().pending.get_mut(&retry_seq)
-                        {
-                            pending.cancel = Some(delay_cancel);
-                        }
-                    }
-                }
-            }
-        }),
-    );
+    let seq = current.metadata.seq;
+    let attempt = current.metadata.attempt.saturating_add(1);
+    let cursor = state.borrow().cursor;
+    let timestamp_ms = now();
+    let retry = wire_bridge_envelope(WireBridgeEnvelopeInput {
+        session_id: current.session_id.clone(),
+        envelope_type: current.envelope_type,
+        seq,
+        cursor,
+        payload: current.payload.clone(),
+        idempotency_key: Some(current.metadata.idempotency_key.clone()),
+        attempt,
+        max_attempts: policy.max_attempts,
+        timestamp_ms: Some(timestamp_ms),
+        ack_for_seq: current.metadata.ack_for_seq,
+        request_id: current.metadata.request_id.clone(),
+    })
+    .expect("retry envelope keeps validated metadata");
     if let Some(pending) = state.borrow_mut().pending.get_mut(&seq) {
-        pending.cancel = Some(cancel);
+        pending.envelope = retry.clone();
+        pending.timeout_reported_attempt = None;
+        pending.retry_due_at_ms = None;
     }
+    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Outbound { envelope: retry });
 }
 
 fn process_inbound<TOutbound, TInbound>(
@@ -2659,10 +3606,7 @@ fn process_ack<TOutbound, TInbound>(
         .expect("validated ack has ack_for_seq");
     let pending = state.borrow_mut().pending.remove(&ack_for_seq);
     match pending {
-        Some(mut pending) => {
-            if let Some(cancel) = pending.cancel.take() {
-                run_driver_cancel(cancel);
-            }
+        Some(pending) => {
             ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Ack {
                 ack_for_seq,
                 envelope,
@@ -2691,10 +3635,7 @@ fn process_nack<TOutbound, TInbound>(
     let pending = state.borrow_mut().pending.remove(&ack_for_seq);
     let error = payload_error_string(&envelope.payload, "remote nack");
     match pending {
-        Some(mut pending) => {
-            if let Some(cancel) = pending.cancel.take() {
-                run_driver_cancel(cancel);
-            }
+        Some(pending) => {
             ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Nack {
                 ack_for_seq,
                 envelope,
@@ -3051,69 +3992,7 @@ fn payload_error_string<T>(payload: &Option<WireBridgePayload<T>>, fallback: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    use crate::environment::EnvironmentDrivers;
-    use crate::graph::{graph, graph_opts, GraphOptions};
-
-    type SleepCallback = Box<dyn FnOnce()>;
-    type SleepQueue = Rc<RefCell<Vec<SleepCallback>>>;
-
-    struct ManualAsyncDriver {
-        sleeps: SleepQueue,
-    }
-
-    struct PanickingCancelDriver;
-
-    impl ManualAsyncDriver {
-        fn new() -> (Rc<Self>, SleepQueue) {
-            let sleeps = Rc::new(RefCell::new(Vec::new()));
-            (
-                Rc::new(Self {
-                    sleeps: sleeps.clone(),
-                }),
-                sleeps,
-            )
-        }
-    }
-
-    impl LocalAsyncDriver for ManualAsyncDriver {
-        fn sleep(&self, _duration: Duration, callback: Box<dyn FnOnce()>) -> DriverCancel {
-            self.sleeps.borrow_mut().push(callback);
-            Box::new(|| {})
-        }
-
-        fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
-            Box::new(|| {})
-        }
-
-        fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
-            Box::new(|| {})
-        }
-    }
-
-    impl LocalAsyncDriver for PanickingCancelDriver {
-        fn sleep(&self, _duration: Duration, _callback: Box<dyn FnOnce()>) -> DriverCancel {
-            Box::new(|| panic!("cancel failed"))
-        }
-
-        fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
-            Box::new(|| {})
-        }
-
-        fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
-            Box::new(|| {})
-        }
-    }
-
-    fn env_with_manual_async() -> (EnvironmentDrivers, SleepQueue) {
-        let (driver, sleeps) = ManualAsyncDriver::new();
-        (
-            EnvironmentDrivers::new().with_local_async(driver as Rc<dyn LocalAsyncDriver>),
-            sleeps,
-        )
-    }
+    use crate::graph::graph;
 
     fn envelope<T>(
         session_id: &str,
@@ -3601,12 +4480,8 @@ mod tests {
     }
 
     #[test]
-    fn ack_timeout_retries_through_local_async_driver_when_enabled() {
-        let (environment, sleeps) = env_with_manual_async();
-        let g = graph_opts(GraphOptions {
-            environment,
-            ..GraphOptions::default()
-        });
+    fn explicit_ack_timeout_command_retries_and_exhausts_without_hidden_driver() {
+        let g = graph();
         let bridge = wire_bridge::<String, String>(
             &g,
             WireBridgeOptions {
@@ -3616,7 +4491,6 @@ mod tests {
                     2,
                     crate::resilience::BackoffPolicy::Constant { delay_ms: 10 },
                 ),
-                ack_timeout: Some(Duration::from_millis(5)),
                 now_ms: Some(Rc::new(|| 1000)),
             },
         );
@@ -3627,17 +4501,41 @@ mod tests {
 
         bridge.send("work".to_owned(), None, None);
         assert_eq!(bridge.attempts.cache().unwrap().attempt, 1);
-        let timeout = sleeps.borrow_mut().pop().expect("ack timeout scheduled");
-        timeout();
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 1,
+                observed_at_ms: Some(1000),
+            })]);
         assert_eq!(
             bridge.status.cache().unwrap().state,
             WireBridgeStatusState::Waiting
         );
-        let retry_delay = sleeps.borrow_mut().pop().expect("retry delay scheduled");
-        retry_delay();
+        assert_eq!(bridge.attempts.cache().unwrap().attempt, 1);
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 1,
+                observed_at_ms: Some(1005),
+            })]);
+        assert_eq!(bridge.attempts.cache().unwrap().attempt, 1);
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 1,
+                observed_at_ms: Some(1010),
+            })]);
         assert_eq!(bridge.attempts.cache().unwrap().attempt, 2);
-        let second_timeout = sleeps.borrow_mut().pop().expect("second timeout scheduled");
-        second_timeout();
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 2,
+                observed_at_ms: Some(1020),
+            })]);
         assert_eq!(
             bridge.status.cache().unwrap().state,
             WireBridgeStatusState::Exhausted
@@ -3649,23 +4547,19 @@ mod tests {
     }
 
     #[test]
-    fn ack_cancel_panic_does_not_suppress_receipt_facts() {
-        let g = graph_opts(GraphOptions {
-            environment: EnvironmentDrivers::new()
-                .with_local_async(Rc::new(PanickingCancelDriver) as Rc<dyn LocalAsyncDriver>),
-            ..GraphOptions::default()
-        });
+    fn stale_ack_timeout_command_is_fail_closed_noop_after_ack() {
+        let g = graph();
         let bridge = wire_bridge::<String, String>(
             &g,
             WireBridgeOptions {
                 name: Some("bridge".to_owned()),
                 session_id: "session-a".to_owned(),
-                ack_timeout: Some(Duration::from_millis(5)),
                 ..WireBridgeOptions::new("session-a")
             },
         );
         let _acks = bridge.acks.subscribe(|_| {});
         let _status = bridge.status.subscribe(|_| {});
+        let _attempts = bridge.attempts.subscribe(|_| {});
 
         bridge.send("work".to_owned(), None, None);
         bridge.inbound.set(envelope(
@@ -3678,35 +4572,46 @@ mod tests {
         ));
 
         assert_eq!(bridge.acks.cache().unwrap().ack_for_seq, 1);
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 1,
+                observed_at_ms: Some(1000),
+            })]);
         let status = bridge.status.cache().unwrap();
         assert_eq!(status.pending, 0);
         assert_eq!(status.acked, 1);
         assert_eq!(status.last_seq, Some(1));
+        assert_eq!(bridge.attempts.cache().unwrap().attempt, 1);
     }
 
     #[test]
-    fn ack_timeout_missing_async_driver_clears_pending_as_error_fact() {
+    fn malformed_ack_timeout_command_is_invalid_fact_not_terminal() {
         let g = graph();
         let bridge = wire_bridge::<String, String>(
             &g,
             WireBridgeOptions {
                 name: Some("bridge".to_owned()),
                 session_id: "session-a".to_owned(),
-                ack_timeout: Some(Duration::from_millis(5)),
                 ..WireBridgeOptions::new("session-a")
             },
         );
-        let _status = bridge.status.subscribe(|_| {});
         let _errors = bridge.errors.subscribe(|_| {});
 
         bridge.send("work".to_owned(), None, None);
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 1,
+                attempt: 0,
+                observed_at_ms: Some(1000),
+            })]);
 
-        let status = bridge.status.cache().unwrap();
-        assert_eq!(status.state, WireBridgeStatusState::Exhausted);
-        assert_eq!(status.pending, 0);
         assert_eq!(
             bridge.errors.cache(),
-            Some("wireBridge: missing LocalAsyncDriver for ack timeout".to_owned())
+            Some("wireBridge: ack-timeout command attempt must be positive".to_owned())
         );
+        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
     }
 }
