@@ -36,12 +36,13 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    restored_opts, AnyValue, Core, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue,
-    Graph, GraphCheckpoint, GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreDescriptor,
-    GraphRestoreEntry, GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult, LockId,
-    MapJsonRestoreDescriptor, Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand,
-    RestoreDefineCtx, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
-    RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
+    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame, restored_opts,
+    AnyValue, CanonicalProtobufError, Core, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot,
+    DescribeValue, Graph, GraphCheckpoint, GraphCheckpointJson, GraphNode, GraphNodeOpts,
+    GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError, GraphRestoreRegistry,
+    GraphRestoreResult, LockId, MapJsonRestoreDescriptor, Message, Node, NodeOpts, Operator,
+    Pausable, PoolKind, PullDemand, RestoreDefineCtx, RestoreFactoryMeta, RestoreGraphOptions,
+    RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -265,6 +266,72 @@ fn py_value_from_msg(py: Python<'_>, msg: &Message<AnyValue>) -> PyResult<Py<PyA
 
 fn py_string(py: Python<'_>, value: &str) -> Py<PyAny> {
     PyString::new(py, value).into_any().unbind()
+}
+
+#[pyclass(name = "CanonicalProtobufValidation", unsendable)]
+struct PyCanonicalProtobufValidation {
+    ok: bool,
+    category: Option<String>,
+    message: Option<String>,
+}
+
+#[pymethods]
+impl PyCanonicalProtobufValidation {
+    #[getter]
+    fn ok(&self) -> bool {
+        self.ok
+    }
+
+    #[getter]
+    fn category(&self) -> Option<String> {
+        self.category.clone()
+    }
+
+    #[getter]
+    fn message(&self) -> Option<String> {
+        self.message.clone()
+    }
+}
+
+fn canonical_protobuf_validation(
+    py: Python<'_>,
+    result: Result<(), CanonicalProtobufError>,
+) -> PyResult<Py<PyCanonicalProtobufValidation>> {
+    let validation = match result {
+        Ok(()) => PyCanonicalProtobufValidation {
+            ok: true,
+            category: None,
+            message: None,
+        },
+        Err(error) => PyCanonicalProtobufValidation {
+            ok: false,
+            category: Some(error.category.as_str().to_owned()),
+            message: Some(error.to_string()),
+        },
+    };
+    Py::new(py, validation)
+}
+
+#[pyfunction]
+fn _validate_canonical_wire_bridge_envelope(
+    py: Python<'_>,
+    bytes: &Bound<'_, pyo3::types::PyBytes>,
+) -> PyResult<Py<PyCanonicalProtobufValidation>> {
+    canonical_protobuf_validation(
+        py,
+        decode_canonical_wire_bridge_envelope(bytes.as_bytes()).map(|_| ()),
+    )
+}
+
+#[pyfunction]
+fn _validate_canonical_wire_edge_frame(
+    py: Python<'_>,
+    bytes: &Bound<'_, pyo3::types::PyBytes>,
+) -> PyResult<Py<PyCanonicalProtobufValidation>> {
+    canonical_protobuf_validation(
+        py,
+        decode_canonical_wire_edge_frame(bytes.as_bytes()).map(|_| ()),
+    )
 }
 
 fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
@@ -2393,6 +2460,7 @@ fn version() -> &'static str {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_py_checkpoint_encoder();
+    m.add_class::<PyCanonicalProtobufValidation>()?;
     m.add_class::<PyAsyncCtx>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyGraph>()?;
@@ -2400,6 +2468,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRestoreContext>()?;
     m.add_class::<PyRestoreRegistry>()?;
     m.add_class::<PySubscription>()?;
+    m.add_function(wrap_pyfunction!(
+        _validate_canonical_wire_bridge_envelope,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(_validate_canonical_wire_edge_frame, m)?)?;
     m.add_function(wrap_pyfunction!(restore_graph, m)?)?;
     m.add_function(wrap_pyfunction!(restore_registry, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
