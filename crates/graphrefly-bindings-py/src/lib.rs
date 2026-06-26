@@ -493,8 +493,11 @@ impl PyWireBridgeProtobuf {
 
 #[pyclass(name = "_WireEdgeGroup", unsendable)]
 struct PyWireEdgeGroup {
-    _group: Rc<WireEdgeGroupBundle>,
-    _adapter_topology: Option<TopologyGroup>,
+    group: Rc<WireEdgeGroupBundle>,
+    facade_topology: TopologyGroup,
+    adapter_topology: Option<TopologyGroup>,
+    adapter_projection_topology: Option<TopologyGroup>,
+    inbound_keepalives: RefCell<Vec<Box<dyn FnOnce()>>>,
     inbound_edges: Py<PyDict>,
     status: PyNode,
     issues: PyNode,
@@ -521,6 +524,18 @@ impl PyWireEdgeGroup {
     fn release(&self) {
         if self.released.get() {
             return;
+        }
+        self.facade_topology
+            .release_with_reason("wire_edge_group python facade release");
+        if let Some(topology) = &self.adapter_projection_topology {
+            topology.release_with_reason("wire_edge_group python adapter projection release");
+        }
+        for unsubscribe in self.inbound_keepalives.borrow_mut().drain(..) {
+            unsubscribe();
+        }
+        self.group.release();
+        if let Some(topology) = &self.adapter_topology {
+            topology.release_with_reason("wire_edge_group python adapter release");
         }
         self.released.set(true);
     }
@@ -696,13 +711,39 @@ fn py_status_node<T: Clone + 'static>(
     py_node(node, pending_fatal)
 }
 
-fn py_bytes_node(
-    graph: &Graph,
+fn py_status_node_in_topology<T: Clone + 'static>(
+    topology: &TopologyGroup,
+    dep: &Node<T>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    map: impl Fn(Python<'_>, &T) -> PyResult<Py<PyAny>> + 'static,
+) -> PyNode {
+    let pending = pending_fatal.clone();
+    let node = topology.node_opts::<PyValue, _>(
+        vec![dep.erased()],
+        move |ctx| {
+            for value in ctx.batch::<T>(0) {
+                Python::with_gil(|py| match map(py, value.as_ref()) {
+                    Ok(value) => ctx.emit(PyValue::new(value)),
+                    Err(error) => {
+                        store_pending_fatal(&pending, error);
+                        graphrefly_rs::host_boundary::abort_host_boundary();
+                    }
+                });
+            }
+        },
+        graph_node_opts(Some(name)),
+    );
+    py_node(node, pending_fatal)
+}
+
+fn py_bytes_node_in_topology(
+    topology: &TopologyGroup,
     dep: &Node<Vec<u8>>,
     name: String,
     pending_fatal: &PendingFatal,
 ) -> PyNode {
-    py_status_node(graph, dep, name, pending_fatal, |py, bytes| {
+    py_status_node_in_topology(topology, dep, name, pending_fatal, |py, bytes| {
         Ok(PyBytes::new(py, bytes).into_any().unbind())
     })
 }
@@ -2155,37 +2196,47 @@ impl PyGraph {
                 ),
             ))
         })?;
-        let status = py_status_node(
-            &self.graph,
+        let facade_topology = self
+            .graph
+            .topology_group_opts(TopologyGroupOptions::named(format!(
+                "{group_name}.pythonWireEdgeGroupFacade"
+            )));
+        let status = py_status_node_in_topology(
+            &facade_topology,
             &group.status,
             format!("{group_name}/py/status"),
             &self.pending_fatal,
             py_wire_edge_group_status,
         );
-        let issues = py_status_node(
-            &self.graph,
+        let issues = py_status_node_in_topology(
+            &facade_topology,
             &group.issues,
             format!("{group_name}/py/issues"),
             &self.pending_fatal,
             py_wire_edge_group_issue,
         );
+        let mut inbound_keepalives = Vec::new();
         let inbound_edges_dict = Python::with_gil(|py| -> PyResult<Py<PyDict>> {
             let dict = PyDict::new(py);
             for (edge_id, node) in &group.inbound {
-                let py_edge = py_bytes_node(
-                    &self.graph,
+                let py_edge = py_bytes_node_in_topology(
+                    &facade_topology,
                     node,
                     format!("{group_name}/py/inbound/{edge_id}"),
                     &self.pending_fatal,
                 );
+                inbound_keepalives.push(node.subscribe(|_| {}));
                 dict.set_item(edge_id, py_edge)?;
             }
             Ok(dict.unbind())
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireEdgeGroup {
-            _group: group,
-            _adapter_topology: None,
+            group,
+            facade_topology,
+            adapter_topology: None,
+            adapter_projection_topology: None,
+            inbound_keepalives: RefCell::new(inbound_keepalives),
             inbound_edges: inbound_edges_dict,
             status,
             issues,
@@ -2263,10 +2314,15 @@ impl PyGraph {
                 WireEdgeGroupOptions::named(group_name.clone(), edges),
             ))
         })?;
+        let adapter_projection_topology =
+            self.graph
+                .topology_group_opts(TopologyGroupOptions::named(format!(
+                    "{group_name}.pythonWireEdgeGroupOutboundProjection"
+                )));
         let merged_issues = {
             let mut deps = vec![group.issues.erased()];
             deps.extend(adapter_issues.iter().map(Node::erased));
-            adapter_topology.node_opts::<WireEdgeGroupIssue, _>(
+            adapter_projection_topology.node_opts::<WireEdgeGroupIssue, _>(
                 deps,
                 {
                     let adapter_issue_count = adapter_issues.len();
@@ -2293,7 +2349,7 @@ impl PyGraph {
         let merged_status = {
             let mut deps = vec![group.status.erased()];
             deps.extend(adapter_issues.iter().map(Node::erased));
-            adapter_topology.node_opts::<WireEdgeGroupStatus, _>(
+            adapter_projection_topology.node_opts::<WireEdgeGroupStatus, _>(
                 deps,
                 {
                     let adapter_issue_count = adapter_issues.len();
@@ -2333,15 +2389,20 @@ impl PyGraph {
                 graph_node_opts(Some(format!("{group_name}/py/merged_status"))),
             )
         };
-        let status = py_status_node(
-            &self.graph,
+        let facade_topology = self
+            .graph
+            .topology_group_opts(TopologyGroupOptions::named(format!(
+                "{group_name}.pythonWireEdgeGroupFacade"
+            )));
+        let status = py_status_node_in_topology(
+            &facade_topology,
             &merged_status,
             format!("{group_name}/py/status"),
             &self.pending_fatal,
             py_wire_edge_group_status,
         );
-        let issues = py_status_node(
-            &self.graph,
+        let issues = py_status_node_in_topology(
+            &facade_topology,
             &merged_issues,
             format!("{group_name}/py/issues"),
             &self.pending_fatal,
@@ -2351,8 +2412,11 @@ impl PyGraph {
             Python::with_gil(|py| -> PyResult<Py<PyDict>> { Ok(PyDict::new(py).unbind()) })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireEdgeGroup {
-            _group: group,
-            _adapter_topology: Some(adapter_topology),
+            group,
+            facade_topology,
+            adapter_topology: Some(adapter_topology),
+            adapter_projection_topology: Some(adapter_projection_topology),
+            inbound_keepalives: RefCell::new(Vec::new()),
             inbound_edges: inbound_edges_dict,
             status,
             issues,
