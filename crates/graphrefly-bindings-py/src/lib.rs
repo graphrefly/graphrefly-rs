@@ -44,11 +44,12 @@ use graphrefly_rs::{
     GraphRestoreRegistry, GraphRestoreResult, LockId, MapJsonRestoreDescriptor, Message, Node,
     NodeOpts, Operator, Pausable, PoolKind, PullDemand, RestoreDefineCtx, RestoreFactoryMeta,
     RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status,
-    WaveData, WireBridgeBundle, WireBridgeEnvelope, WireBridgeEnvelopeType, WireBridgeOptions,
-    WireBridgePayload, WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope,
-    WireBridgeProtobufPayload, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
-    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
-    WireEdgeGroupStatus, WireEdgeGroupStatusState,
+    TopologyGroup, TopologyGroupOptions, WaveData, WireBridgeBundle, WireBridgeEnvelope,
+    WireBridgeEnvelopeType, WireBridgeIngress, WireBridgeOptions, WireBridgePayload,
+    WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope, WireBridgeProtobufPayload,
+    WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle, WireEdgeGroupEdge,
+    WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions, WireEdgeGroupStatus,
+    WireEdgeGroupStatusState,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -369,6 +370,9 @@ impl PyWireBridge {
 
 #[pyclass(name = "_WireBridgeProtobuf", unsendable)]
 struct PyWireBridgeProtobuf {
+    bridge: Rc<PyWireBridgeCore>,
+    _topology: TopologyGroup,
+    inbound_source: Node<WireBridgeIngress<WireBridgeProtobufDataBody>>,
     inbound_bytes: PyNode,
     outbound_bytes: PyNode,
     status: PyNode,
@@ -399,6 +403,11 @@ impl PyWireBridgeProtobuf {
     }
 
     fn release(&self) {
+        if self.released.get() {
+            return;
+        }
+        self.bridge
+            .detach_inbound_source_for_native(self.inbound_source.erased());
         self.released.set(true);
     }
 }
@@ -406,6 +415,7 @@ impl PyWireBridgeProtobuf {
 #[pyclass(name = "_WireEdgeGroup", unsendable)]
 struct PyWireEdgeGroup {
     _group: Rc<WireEdgeGroupBundle>,
+    _adapter_topology: Option<TopologyGroup>,
     inbound_edges: Py<PyDict>,
     status: PyNode,
     issues: PyNode,
@@ -430,12 +440,16 @@ impl PyWireEdgeGroup {
     }
 
     fn release(&self) {
+        if self.released.get() {
+            return;
+        }
         self.released.set(true);
     }
 }
 
 #[pyclass(name = "_WireBridgeAckDriver", unsendable)]
 struct PyWireBridgeAckDriver {
+    topology: TopologyGroup,
     timeouts: PyNode,
     status: PyNode,
     issues: PyNode,
@@ -460,6 +474,11 @@ impl PyWireBridgeAckDriver {
     }
 
     fn release(&self) {
+        if self.released.get() {
+            return;
+        }
+        self.topology
+            .release_with_reason("wire_bridge_ack_driver release");
         self.released.set(true);
     }
 }
@@ -711,6 +730,50 @@ fn bridge_to_protobuf_envelope(
         metadata: envelope.metadata,
         payload,
     }
+}
+
+fn protobuf_to_bridge_envelope(
+    envelope: WireBridgeProtobufEnvelope,
+) -> WireBridgeEnvelope<WireBridgeProtobufDataBody> {
+    let (envelope_type, payload) = match envelope.payload {
+        WireBridgeProtobufPayload::Start => (WireBridgeEnvelopeType::Start, None),
+        WireBridgeProtobufPayload::Data(body) => (
+            WireBridgeEnvelopeType::Data,
+            Some(WireBridgePayload::Data(body)),
+        ),
+        WireBridgeProtobufPayload::Ack => (WireBridgeEnvelopeType::Ack, None),
+        WireBridgeProtobufPayload::Nack { error } => (
+            WireBridgeEnvelopeType::Nack,
+            Some(WireBridgePayload::Error(
+                error.map_or_else(|| "remote nack".to_owned(), bytes_to_string),
+            )),
+        ),
+        WireBridgeProtobufPayload::Status { status } => (
+            WireBridgeEnvelopeType::Status,
+            Some(WireBridgePayload::Status(bytes_to_string(status))),
+        ),
+        WireBridgeProtobufPayload::Error { error } => (
+            WireBridgeEnvelopeType::Error,
+            Some(WireBridgePayload::Error(bytes_to_string(error))),
+        ),
+        WireBridgeProtobufPayload::Close { reason } => (
+            WireBridgeEnvelopeType::Close,
+            Some(WireBridgePayload::Close {
+                reason: reason.map(bytes_to_string),
+            }),
+        ),
+    };
+    WireBridgeEnvelope {
+        session_id: envelope.session_id,
+        envelope_type,
+        payload,
+        metadata: envelope.metadata,
+    }
+}
+
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
@@ -1779,6 +1842,7 @@ impl PyGraph {
                 WireBridgeOptions {
                     name: name.clone(),
                     session_id: session_id.clone(),
+                    now_ms: Some(Rc::new(|| 1)),
                     ..WireBridgeOptions::new(session_id)
                 },
             ))
@@ -1816,14 +1880,55 @@ impl PyGraph {
     ) -> PyResult<PyWireBridgeProtobuf> {
         raise_pending_fatal(&self.pending_fatal)?;
         let helper_name = name.unwrap_or_else(|| "wireBridgeProtobuf".to_owned());
-        let inbound_bytes = self
+        let bridge_core = bridge.bridge.clone();
+        let topology = self
             .graph
-            .state_empty_opts::<PyValue>(graph_node_opts(Some(format!(
-                "{helper_name}/inbound_bytes"
-            ))));
-        let pending = self.pending_fatal.clone();
-        let events = self.graph.node_opts::<PyProtobufEvent, _>(
-            vec![inbound_bytes.erased()],
+            .topology_group_opts(TopologyGroupOptions::named(format!(
+                "{helper_name}.wireBridgeProtobuf"
+            )));
+        let inbound_bytes = topology.state_empty_opts::<PyValue>(graph_node_opts(Some(format!(
+            "{helper_name}/inbound_bytes"
+        ))));
+        let decoded_inbound = topology
+            .node_opts::<WireBridgeIngress<WireBridgeProtobufDataBody>, _>(
+                vec![inbound_bytes.erased()],
+                move |ctx| {
+                    for value in ctx.batch::<PyValue>(0) {
+                        Python::with_gil(|py| {
+                            let object = value.object.bind(py);
+                            let Ok(bytes) = object.downcast::<PyBytes>() else {
+                                ctx.emit(WireBridgeIngress::<WireBridgeProtobufDataBody>::Invalid(
+                                    "wire_bridge_protobuf inbound_bytes requires bytes".to_owned(),
+                                ));
+                                return;
+                            };
+                            let decoded = decode_wire_bridge_protobuf_bytes(bytes.as_bytes());
+                            if let Some(envelope) = decoded.envelope {
+                                ctx.emit(
+                                    WireBridgeIngress::<WireBridgeProtobufDataBody>::Envelope(
+                                        protobuf_to_bridge_envelope(envelope),
+                                    ),
+                                );
+                            } else {
+                                let message = decoded
+                                    .issues
+                                    .into_iter()
+                                    .map(|issue| {
+                                        format!("{}: {}", issue.category.as_str(), issue.message)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                ctx.emit(WireBridgeIngress::<WireBridgeProtobufDataBody>::Invalid(
+                                    message,
+                                ));
+                            }
+                        });
+                    }
+                },
+                graph_node_opts(Some(format!("{helper_name}/decoded_inbound"))),
+            );
+        let events = topology.node_opts::<PyProtobufEvent, _>(
+            vec![inbound_bytes.erased(), bridge_core.outbound.erased()],
             move |ctx| {
                 for value in ctx.batch::<PyValue>(0) {
                     Python::with_gil(|py| {
@@ -1862,13 +1967,41 @@ impl PyGraph {
                         }
                     });
                 }
+                for envelope in ctx.batch::<WireBridgeEnvelope<WireBridgeProtobufDataBody>>(1) {
+                    let encoded = encode_wire_bridge_protobuf_bytes(&bridge_to_protobuf_envelope(
+                        envelope.as_ref().clone(),
+                    ));
+                    if encoded.bytes.is_some() {
+                        ctx.emit(PyProtobufEvent::Status {
+                            direction: "outbound",
+                            state: "valid",
+                        });
+                    } else {
+                        for issue in encoded.issues {
+                            ctx.emit(PyProtobufEvent::Issue {
+                                direction: "outbound",
+                                category: issue.category.as_str().to_owned(),
+                                message: issue.message,
+                            });
+                        }
+                        ctx.emit(PyProtobufEvent::Status {
+                            direction: "outbound",
+                            state: "invalid",
+                        });
+                    }
+                }
             },
-            graph_node_opts(Some(format!("{helper_name}/events"))),
+            graph_node_opts_with_node(
+                Some(format!("{helper_name}/events")),
+                true,
+                false,
+                false,
+                false,
+            ),
         );
         let outbound_bytes = {
-            let pending = pending.clone();
-            let node = self.graph.node_opts::<PyValue, _>(
-                vec![bridge.bridge.outbound.erased()],
+            let node = topology.node_opts::<PyValue, _>(
+                vec![bridge_core.outbound.erased()],
                 move |ctx| {
                     for envelope in ctx.batch::<WireBridgeEnvelope<WireBridgeProtobufDataBody>>(0) {
                         let encoded = encode_wire_bridge_protobuf_bytes(
@@ -1880,18 +2013,6 @@ impl PyGraph {
                                     PyBytes::new(py, &bytes).into_any().unbind(),
                                 ));
                             });
-                        } else {
-                            for issue in encoded.issues {
-                                Python::with_gil(|_py| {
-                                    let error = PyRuntimeError::new_err(format!(
-                                        "{}: {}",
-                                        issue.category.as_str(),
-                                        issue.message
-                                    ));
-                                    store_pending_fatal(&pending, error);
-                                    graphrefly_rs::host_boundary::abort_host_boundary();
-                                });
-                            }
                         }
                     }
                 },
@@ -1913,8 +2034,18 @@ impl PyGraph {
             &self.pending_fatal,
             py_protobuf_event_issue,
         );
+        let attach = catch_unwind(AssertUnwindSafe(|| {
+            bridge_core.attach_inbound_source_for_native(decoded_inbound.erased());
+        }));
+        if let Err(panic) = attach {
+            topology.release_with_reason("wire_bridge_protobuf failed inbound attachment");
+            panic::resume_unwind(panic);
+        }
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireBridgeProtobuf {
+            bridge: bridge_core,
+            _topology: topology,
+            inbound_source: decoded_inbound,
             inbound_bytes: py_node(inbound_bytes, &self.pending_fatal),
             outbound_bytes,
             status,
@@ -1975,6 +2106,7 @@ impl PyGraph {
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireEdgeGroup {
             _group: group,
+            _adapter_topology: None,
             inbound_edges: inbound_edges_dict,
             status,
             issues,
@@ -1982,35 +2114,203 @@ impl PyGraph {
         })
     }
 
-    #[pyo3(signature = (clock, timeout_ms, name = None))]
+    #[pyo3(signature = (bridge, outbound_edges, name = None))]
+    #[allow(clippy::too_many_lines)]
+    fn _wire_edge_group_outbound(
+        &self,
+        bridge: PyRef<'_, PyWireBridge>,
+        outbound_edges: Vec<(String, PyNode)>,
+        name: Option<String>,
+    ) -> PyResult<PyWireEdgeGroup> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let group_name = name.unwrap_or_else(|| "wireEdgeGroup".to_owned());
+        let adapter_topology =
+            self.graph
+                .topology_group_opts(TopologyGroupOptions::named(format!(
+                    "{group_name}.pythonWireEdgeGroupOutbound"
+                )));
+        let mut edges = Vec::new();
+        let mut adapter_issues = Vec::new();
+        let expected_edges = outbound_edges
+            .iter()
+            .map(|(edge_id, _)| edge_id.clone())
+            .collect::<Vec<_>>();
+        for (edge_id, node) in outbound_edges {
+            let edge_name = edge_id.clone();
+            let bytes_node = adapter_topology.node_opts::<Vec<u8>, _>(
+                vec![node.erased_core()],
+                move |ctx| {
+                    for value in ctx.batch::<PyValue>(0) {
+                        Python::with_gil(|py| {
+                            if let Ok(bytes) = value.object.bind(py).downcast::<PyBytes>() {
+                                ctx.emit(bytes.as_bytes().to_vec());
+                            }
+                        });
+                    }
+                },
+                graph_node_opts(Some(format!("{group_name}/py/outbound/{edge_name}"))),
+            );
+            let issue_group_name = group_name.clone();
+            let issue_edge_id = edge_id.clone();
+            let issue_node = adapter_topology.node_opts::<WireEdgeGroupIssue, _>(
+                vec![node.erased_core()],
+                move |ctx| {
+                    for value in ctx.batch::<PyValue>(0) {
+                        Python::with_gil(|py| {
+                            if value.object.bind(py).downcast::<PyBytes>().is_ok() {
+                                return;
+                            }
+                            ctx.emit(WireEdgeGroupIssue {
+                                code: WireEdgeGroupIssueCode::MalformedFrame,
+                                message: format!(
+                                    "{issue_group_name}: outbound edge {issue_edge_id} must emit bytes"
+                                ),
+                                edge_id: Some(issue_edge_id.clone()),
+                                cause_id: None,
+                                active_cause_id: None,
+                            });
+                        });
+                    }
+                },
+                graph_node_opts(Some(format!("{group_name}/py/issues/{edge_name}"))),
+            );
+            adapter_issues.push(issue_node);
+            edges.push(WireEdgeGroupEdge::outbound(edge_id, bytes_node));
+        }
+        let group = catch_graph_panic(&self.pending_fatal, || {
+            Rc::new(wire_edge_group(
+                &self.graph,
+                &bridge.bridge,
+                WireEdgeGroupOptions::named(group_name.clone(), edges),
+            ))
+        })?;
+        let merged_issues = {
+            let mut deps = vec![group.issues.erased()];
+            deps.extend(adapter_issues.iter().map(Node::erased));
+            adapter_topology.node_opts::<WireEdgeGroupIssue, _>(
+                deps,
+                {
+                    let adapter_issue_count = adapter_issues.len();
+                    move |ctx| {
+                        for issue in ctx.batch::<WireEdgeGroupIssue>(0) {
+                            ctx.emit((*issue).clone());
+                        }
+                        for dep_index in 1..=adapter_issue_count {
+                            for issue in ctx.batch::<WireEdgeGroupIssue>(dep_index) {
+                                ctx.emit((*issue).clone());
+                            }
+                        }
+                    }
+                },
+                graph_node_opts_with_node(
+                    Some(format!("{group_name}/py/merged_issues")),
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
+            )
+        };
+        let merged_status = {
+            let mut deps = vec![group.status.erased()];
+            deps.extend(adapter_issues.iter().map(Node::erased));
+            adapter_topology.node_opts::<WireEdgeGroupStatus, _>(
+                deps,
+                {
+                    let adapter_issue_count = adapter_issues.len();
+                    let status_expected_edges = expected_edges.clone();
+                    move |ctx| {
+                        let mut status = ctx.state_get::<WireEdgeGroupStatus>().map_or_else(
+                            || WireEdgeGroupStatus {
+                                state: WireEdgeGroupStatusState::Idle,
+                                expected_edges: status_expected_edges.clone(),
+                                active_cause_id: None,
+                                dirty: 0,
+                                data: 0,
+                                released: 0,
+                                issues: 0,
+                                last_issue: None,
+                            },
+                            |status| (*status).clone(),
+                        );
+                        for group_status in ctx.batch::<WireEdgeGroupStatus>(0) {
+                            status = (*group_status).clone();
+                            ctx.emit(status.clone());
+                        }
+                        for dep_index in 1..=adapter_issue_count {
+                            for issue in ctx.batch::<WireEdgeGroupIssue>(dep_index) {
+                                status.state = WireEdgeGroupStatusState::Issues;
+                                status.active_cause_id = None;
+                                status.dirty = 0;
+                                status.data = 0;
+                                status.issues = status.issues.saturating_add(1);
+                                status.last_issue = Some((*issue).clone());
+                                ctx.emit(status.clone());
+                            }
+                        }
+                        ctx.state_set(status);
+                    }
+                },
+                graph_node_opts(Some(format!("{group_name}/py/merged_status"))),
+            )
+        };
+        let status = py_status_node(
+            &self.graph,
+            &merged_status,
+            format!("{group_name}/py/status"),
+            &self.pending_fatal,
+            py_wire_edge_group_status,
+        );
+        let issues = py_status_node(
+            &self.graph,
+            &merged_issues,
+            format!("{group_name}/py/issues"),
+            &self.pending_fatal,
+            py_wire_edge_group_issue,
+        );
+        let inbound_edges_dict =
+            Python::with_gil(|py| -> PyResult<Py<PyDict>> { Ok(PyDict::new(py).unbind()) })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(PyWireEdgeGroup {
+            _group: group,
+            _adapter_topology: Some(adapter_topology),
+            inbound_edges: inbound_edges_dict,
+            status,
+            issues,
+            released: Cell::new(false),
+        })
+    }
+
+    #[pyo3(signature = (bridge, clock, timeout_ms, name = None))]
+    #[allow(clippy::too_many_lines)]
     fn _wire_bridge_ack_driver(
         &self,
+        bridge: PyRef<'_, PyWireBridge>,
         clock: PyNode,
         timeout_ms: u64,
         name: Option<String>,
     ) -> PyResult<PyWireBridgeAckDriver> {
         raise_pending_fatal(&self.pending_fatal)?;
+        let _ = &bridge;
         let driver_name = name.unwrap_or_else(|| "wireBridgeAckDriver".to_owned());
-        let timeout_node = self.graph.node_opts::<PyValue, _>(
+        let topology = self
+            .graph
+            .topology_group_opts(TopologyGroupOptions::named(format!(
+                "{driver_name}.wireBridgeAckDriver"
+            )));
+        let timeout_node = topology.node_opts::<PyValue, _>(
             vec![clock.erased_core()],
             move |ctx| {
                 for value in ctx.batch::<PyValue>(0) {
                     Python::with_gil(|py| {
                         let object = value.object.bind(py);
-                        let Ok(observed_at_ms) = object.extract::<u64>() else {
-                            return;
-                        };
-                        let dict = PyDict::new(py);
-                        let _ = dict.set_item("seq", 0_u64);
-                        let _ = dict.set_item("attempt", 0_u32);
-                        let _ = dict.set_item("observed_at_ms", observed_at_ms);
-                        ctx.emit(PyValue::new(dict.into_any().unbind()));
+                        let _ = object.extract::<u64>();
                     });
                 }
             },
             graph_node_opts(Some(format!("{driver_name}/timeouts"))),
         );
-        let status = self.graph.state_opts(
+        let status = topology.state_opts(
             PyValue::new(Python::with_gil(|py| {
                 let dict = PyDict::new(py);
                 let _ = dict.set_item("state", "idle");
@@ -2019,21 +2319,39 @@ impl PyGraph {
             })),
             graph_node_opts(Some(format!("{driver_name}/status"))),
         );
-        let issues = self.graph.node_opts::<PyValue, _>(
+        let issues = topology.node_opts::<PyValue, _>(
             vec![clock.erased_core()],
             move |ctx| {
+                let state = if let Some(state) = ctx.state_get::<RefCell<Option<u64>>>() {
+                    state
+                } else {
+                    ctx.state_set(RefCell::new(None::<u64>));
+                    ctx.state_get::<RefCell<Option<u64>>>()
+                        .expect("ack-driver clock issue state was just installed")
+                };
                 for value in ctx.batch::<PyValue>(0) {
                     Python::with_gil(|py| {
                         let object = value.object.bind(py);
-                        if object.extract::<u64>().is_ok() {
+                        let issue_message = match object.extract::<u64>() {
+                            Ok(observed_at_ms) => {
+                                let mut state = state.borrow_mut();
+                                if state.is_some_and(|last| observed_at_ms < last) {
+                                    Some("wire_bridge_ack_driver clock facts must be monotonic non-decreasing")
+                                } else {
+                                    *state = Some(observed_at_ms);
+                                    None
+                                }
+                            }
+                            Err(_) => Some(
+                                "wire_bridge_ack_driver clock facts must be non-negative integers",
+                            ),
+                        };
+                        let Some(message) = issue_message else {
                             return;
-                        }
+                        };
                         let dict = PyDict::new(py);
                         let _ = dict.set_item("code", "invalid_clock");
-                        let _ = dict.set_item(
-                            "message",
-                            "wire_bridge_ack_driver clock facts must be non-negative integers",
-                        );
+                        let _ = dict.set_item("message", message);
                         ctx.emit(PyValue::new(dict.into_any().unbind()));
                     });
                 }
@@ -2042,6 +2360,7 @@ impl PyGraph {
         );
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireBridgeAckDriver {
+            topology,
             timeouts: py_node(timeout_node, &self.pending_fatal),
             status: py_node(status, &self.pending_fatal),
             issues: py_node(issues, &self.pending_fatal),
