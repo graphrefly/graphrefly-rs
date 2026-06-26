@@ -4613,5 +4613,52 @@ mod tests {
             Some("wireBridge: ack-timeout command attempt must be positive".to_owned())
         );
         assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 0,
+                attempt: 1,
+                observed_at_ms: Some(1000),
+            })]);
+        assert_eq!(
+            bridge.errors.cache(),
+            Some("wireBridge: ack-timeout command seq must be positive".to_owned())
+        );
+        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+    }
+
+    #[test]
+    fn unknown_ack_timeout_command_is_fail_closed_noop_without_pending_state() {
+        let g = graph();
+        let bridge = wire_bridge::<String, String>(
+            &g,
+            WireBridgeOptions {
+                name: Some("bridge".to_owned()),
+                session_id: "session-a".to_owned(),
+                ..WireBridgeOptions::new("session-a")
+            },
+        );
+        let _outbound = bridge.outbound.subscribe(|_| {});
+        let _attempts = bridge.attempts.subscribe(|_| {});
+        let _errors = bridge.errors.subscribe(|_| {});
+        let _status = bridge.status.subscribe(|_| {});
+
+        bridge
+            .command
+            .down(vec![data_msg(WireBridgeCommand::<String>::AckTimeout {
+                seq: 99,
+                attempt: 1,
+                observed_at_ms: Some(1000),
+            })]);
+
+        assert!(bridge.outbound.cache().is_none());
+        assert!(bridge.attempts.cache().is_none());
+        assert!(bridge.errors.cache().is_none());
+        assert!(bridge
+            .status
+            .cache()
+            .is_none_or(|status| status.state == WireBridgeStatusState::Idle));
+        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
     }
 }

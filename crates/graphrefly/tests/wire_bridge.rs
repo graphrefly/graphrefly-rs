@@ -237,7 +237,31 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
     assert!(snap
         .edges
         .iter()
+        .any(|edge| edge.from == "edge/a" && edge.to == "group/events"));
+    assert!(snap
+        .edges
+        .iter()
         .any(|edge| edge.from == "group/events" && edge.to == "group/gate"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/events" && edge.to == "group/commands"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/events" && edge.to == "group/issues"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/events" && edge.to == "group/status"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/gate" && edge.to == "group/issues"));
+    assert!(snap
+        .edges
+        .iter()
+        .any(|edge| edge.from == "group/gate" && edge.to == "group/status"));
     assert!(snap
         .edges
         .iter()
@@ -631,6 +655,132 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
     assert_eq!(status.borrow().last().unwrap().dirty, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
+}
+
+#[test]
+fn wire_edge_group_replay_tombstones_are_bounded_recent_memory() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "bounded-replay/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named("bounded-replay", vec![WireEdgeGroupEdge::inbound("a")]),
+    );
+    let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+    let issues = collect_data(&group.issues);
+    let mut seq = 1_u64;
+    let release = |seq: &mut u64, cause_id: &str, value: u8| {
+        bridge.inbound.set(wire_edge_envelope(
+            *seq,
+            CanonicalWireEdgeKind::Dirty,
+            "a",
+            cause_id,
+            None,
+        ));
+        *seq += 1;
+        bridge.inbound.set(wire_edge_envelope(
+            *seq,
+            CanonicalWireEdgeKind::Data,
+            "a",
+            cause_id,
+            Some(vec![value]),
+        ));
+        *seq += 1;
+    };
+
+    release(&mut seq, "c1", 1);
+    bridge.inbound.set(wire_edge_envelope(
+        seq,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c1",
+        None,
+    ));
+    assert!(issues.borrow().iter().any(|issue| {
+        issue.cause_id.as_deref() == Some("c1")
+            && issue.code == WireEdgeGroupIssueCode::DuplicateDirty
+    }));
+
+    for n in 2_u16..=1026 {
+        release(&mut seq, &format!("c{n}"), (n % 256) as u8);
+    }
+    let release_count_before_old_replay = inbound_a.borrow().len();
+    release(&mut seq, "c1", 99);
+
+    assert_eq!(
+        inbound_a.borrow().len(),
+        release_count_before_old_replay + 1
+    );
+    assert_eq!(inbound_a.borrow().last(), Some(&vec![99]));
+}
+
+#[test]
+fn wire_edge_group_status_and_issues_only_cover_malformed_and_competing_causes() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "status-only/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "status-only",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let status = collect_data(&group.status);
+    let issues = collect_data(&group.issues);
+
+    bridge.inbound.set(wire_edge_envelope(
+        1,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        2,
+        CanonicalWireEdgeKind::Data,
+        "b",
+        "c1",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        3,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c2",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        4,
+        CanonicalWireEdgeKind::Dirty,
+        "b",
+        "c3",
+        None,
+    ));
+
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::MalformedFrame));
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::CompetingCause));
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Issues
+    );
+    assert_ne!(group.issues.status(), graphrefly::Status::Errored);
+    assert_ne!(group.status.status(), graphrefly::Status::Errored);
 }
 
 #[test]

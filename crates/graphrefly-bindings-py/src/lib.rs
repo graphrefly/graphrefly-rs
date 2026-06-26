@@ -36,17 +36,23 @@ use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
-    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame, restored_opts,
-    AnyValue, CanonicalProtobufError, Core, Ctx, DeferredCtx, DepTerminal, DescribeSnapshot,
-    DescribeValue, Graph, GraphCheckpoint, GraphCheckpointJson, GraphNode, GraphNodeOpts,
-    GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError, GraphRestoreRegistry,
-    GraphRestoreResult, LockId, MapJsonRestoreDescriptor, Message, Node, NodeOpts, Operator,
-    Pausable, PoolKind, PullDemand, RestoreDefineCtx, RestoreFactoryMeta, RestoreGraphOptions,
-    RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status, WaveData,
+    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
+    decode_wire_bridge_protobuf_bytes, encode_wire_bridge_protobuf_bytes, restored_opts,
+    wire_bridge, wire_edge_group, AnyValue, CanonicalProtobufError, Core, Ctx, DeferredCtx,
+    DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphCheckpoint, GraphCheckpointJson,
+    GraphNode, GraphNodeOpts, GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError,
+    GraphRestoreRegistry, GraphRestoreResult, LockId, MapJsonRestoreDescriptor, Message, Node,
+    NodeOpts, Operator, Pausable, PoolKind, PullDemand, RestoreDefineCtx, RestoreFactoryMeta,
+    RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status,
+    WaveData, WireBridgeBundle, WireBridgeEnvelope, WireBridgeEnvelopeType, WireBridgeOptions,
+    WireBridgePayload, WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope,
+    WireBridgeProtobufPayload, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
+    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
+    WireEdgeGroupStatus, WireEdgeGroupStatusState,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
 use serde_json::{Map as JsonMap, Number as JsonNumber};
 
@@ -332,6 +338,379 @@ fn _validate_canonical_wire_edge_frame(
         py,
         decode_canonical_wire_edge_frame(bytes.as_bytes()).map(|_| ()),
     )
+}
+
+type PyWireBridgeCore = WireBridgeBundle<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>;
+
+#[pyclass(name = "_WireBridge", unsendable)]
+struct PyWireBridge {
+    bridge: Rc<PyWireBridgeCore>,
+    status: PyNode,
+    issues: PyNode,
+    released: Cell<bool>,
+}
+
+#[pymethods]
+impl PyWireBridge {
+    #[getter]
+    fn status(&self) -> PyNode {
+        self.status.clone()
+    }
+
+    #[getter]
+    fn issues(&self) -> PyNode {
+        self.issues.clone()
+    }
+
+    fn release(&self) {
+        self.released.set(true);
+    }
+}
+
+#[pyclass(name = "_WireBridgeProtobuf", unsendable)]
+struct PyWireBridgeProtobuf {
+    inbound_bytes: PyNode,
+    outbound_bytes: PyNode,
+    status: PyNode,
+    issues: PyNode,
+    released: Cell<bool>,
+}
+
+#[pymethods]
+impl PyWireBridgeProtobuf {
+    #[getter]
+    fn inbound_bytes(&self) -> PyNode {
+        self.inbound_bytes.clone()
+    }
+
+    #[getter]
+    fn outbound_bytes(&self) -> PyNode {
+        self.outbound_bytes.clone()
+    }
+
+    #[getter]
+    fn status(&self) -> PyNode {
+        self.status.clone()
+    }
+
+    #[getter]
+    fn issues(&self) -> PyNode {
+        self.issues.clone()
+    }
+
+    fn release(&self) {
+        self.released.set(true);
+    }
+}
+
+#[pyclass(name = "_WireEdgeGroup", unsendable)]
+struct PyWireEdgeGroup {
+    _group: Rc<WireEdgeGroupBundle>,
+    inbound_edges: Py<PyDict>,
+    status: PyNode,
+    issues: PyNode,
+    released: Cell<bool>,
+}
+
+#[pymethods]
+impl PyWireEdgeGroup {
+    #[getter]
+    fn inbound_edges(&self, py: Python<'_>) -> Py<PyAny> {
+        self.inbound_edges.clone_ref(py).into_any()
+    }
+
+    #[getter]
+    fn status(&self) -> PyNode {
+        self.status.clone()
+    }
+
+    #[getter]
+    fn issues(&self) -> PyNode {
+        self.issues.clone()
+    }
+
+    fn release(&self) {
+        self.released.set(true);
+    }
+}
+
+#[pyclass(name = "_WireBridgeAckDriver", unsendable)]
+struct PyWireBridgeAckDriver {
+    timeouts: PyNode,
+    status: PyNode,
+    issues: PyNode,
+    released: Cell<bool>,
+}
+
+#[pymethods]
+impl PyWireBridgeAckDriver {
+    #[getter]
+    fn timeouts(&self) -> PyNode {
+        self.timeouts.clone()
+    }
+
+    #[getter]
+    fn status(&self) -> PyNode {
+        self.status.clone()
+    }
+
+    #[getter]
+    fn issues(&self) -> PyNode {
+        self.issues.clone()
+    }
+
+    fn release(&self) {
+        self.released.set(true);
+    }
+}
+
+#[derive(Clone)]
+enum PyProtobufEvent {
+    Status {
+        direction: &'static str,
+        state: &'static str,
+    },
+    Issue {
+        direction: &'static str,
+        category: String,
+        message: String,
+    },
+}
+
+impl Clone for PyNode {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            graph_node: self.graph_node.clone(),
+            pending_fatal: self.pending_fatal.clone(),
+        }
+    }
+}
+
+fn py_node(node: Node<PyValue>, pending_fatal: &PendingFatal) -> PyNode {
+    PyNode {
+        node,
+        graph_node: None,
+        pending_fatal: pending_fatal.clone(),
+    }
+}
+
+fn py_bridge_status(py: Python<'_>, status: &WireBridgeStatus) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("state", wire_bridge_status_state(status.state))?;
+    dict.set_item("session_id", status.session_id.clone())?;
+    dict.set_item("cursor", status.cursor)?;
+    dict.set_item("next_seq", status.next_seq)?;
+    dict.set_item("pending", status.pending)?;
+    dict.set_item("attempts", status.attempts)?;
+    dict.set_item("acked", status.acked)?;
+    dict.set_item("nacked", status.nacked)?;
+    dict.set_item("errors", status.errors)?;
+    dict.set_item("last_seq", status.last_seq)?;
+    dict.set_item("last_delay_ms", status.last_delay_ms)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn wire_bridge_status_state(state: WireBridgeStatusState) -> &'static str {
+    match state {
+        WireBridgeStatusState::Idle => "idle",
+        WireBridgeStatusState::Started => "started",
+        WireBridgeStatusState::Open => "open",
+        WireBridgeStatusState::Waiting => "waiting",
+        WireBridgeStatusState::Closed => "closed",
+        WireBridgeStatusState::Errored => "errored",
+        WireBridgeStatusState::Exhausted => "exhausted",
+    }
+}
+
+fn py_wire_edge_group_status(py: Python<'_>, status: &WireEdgeGroupStatus) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("state", wire_edge_group_status_state(status.state))?;
+    dict.set_item("expected_edges", status.expected_edges.clone())?;
+    dict.set_item("active_cause_id", status.active_cause_id.clone())?;
+    dict.set_item("dirty", status.dirty)?;
+    dict.set_item("data", status.data)?;
+    dict.set_item("released", status.released)?;
+    dict.set_item("issues", status.issues)?;
+    if let Some(issue) = &status.last_issue {
+        dict.set_item("last_issue", py_wire_edge_group_issue(py, issue)?)?;
+    } else {
+        dict.set_item("last_issue", py.None())?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn wire_edge_group_status_state(state: WireEdgeGroupStatusState) -> &'static str {
+    match state {
+        WireEdgeGroupStatusState::Idle => "idle",
+        WireEdgeGroupStatusState::Collecting => "collecting",
+        WireEdgeGroupStatusState::Released => "released",
+        WireEdgeGroupStatusState::Issues => "issues",
+    }
+}
+
+fn py_wire_edge_group_issue(py: Python<'_>, issue: &WireEdgeGroupIssue) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("code", wire_edge_group_issue_code(issue.code))?;
+    dict.set_item("message", issue.message.clone())?;
+    dict.set_item("edge_id", issue.edge_id.clone())?;
+    dict.set_item("cause_id", issue.cause_id.clone())?;
+    dict.set_item("active_cause_id", issue.active_cause_id.clone())?;
+    Ok(dict.into_any().unbind())
+}
+
+fn wire_edge_group_issue_code(code: WireEdgeGroupIssueCode) -> &'static str {
+    match code {
+        WireEdgeGroupIssueCode::MissingSnapshot => "missing_snapshot",
+        WireEdgeGroupIssueCode::UnknownEdge => "unknown_edge",
+        WireEdgeGroupIssueCode::DuplicateDirty => "duplicate_dirty",
+        WireEdgeGroupIssueCode::DuplicateData => "duplicate_data",
+        WireEdgeGroupIssueCode::DataBeforeDirty => "data_before_dirty",
+        WireEdgeGroupIssueCode::CompetingCause => "competing_cause",
+        WireEdgeGroupIssueCode::MalformedFrame => "malformed_frame",
+        WireEdgeGroupIssueCode::IncompleteCause => "incomplete_cause",
+    }
+}
+
+fn py_status_node<T: Clone + 'static>(
+    graph: &Graph,
+    dep: &Node<T>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    map: impl Fn(Python<'_>, &T) -> PyResult<Py<PyAny>> + 'static,
+) -> PyNode {
+    let pending = pending_fatal.clone();
+    let node = graph.node_opts::<PyValue, _>(
+        vec![dep.erased()],
+        move |ctx| {
+            for value in ctx.batch::<T>(0) {
+                Python::with_gil(|py| match map(py, value.as_ref()) {
+                    Ok(value) => ctx.emit(PyValue::new(value)),
+                    Err(error) => {
+                        store_pending_fatal(&pending, error);
+                        graphrefly_rs::host_boundary::abort_host_boundary();
+                    }
+                });
+            }
+        },
+        graph_node_opts(Some(name)),
+    );
+    py_node(node, pending_fatal)
+}
+
+fn py_bytes_node(
+    graph: &Graph,
+    dep: &Node<Vec<u8>>,
+    name: String,
+    pending_fatal: &PendingFatal,
+) -> PyNode {
+    py_status_node(graph, dep, name, pending_fatal, |py, bytes| {
+        Ok(PyBytes::new(py, bytes).into_any().unbind())
+    })
+}
+
+fn py_error_issue_node(
+    graph: &Graph,
+    dep: &Node<String>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    code: &'static str,
+) -> PyNode {
+    py_status_node(graph, dep, name, pending_fatal, move |py, message| {
+        let dict = PyDict::new(py);
+        dict.set_item("code", code)?;
+        dict.set_item("message", message.clone())?;
+        Ok(dict.into_any().unbind())
+    })
+}
+
+fn py_protobuf_event_status(
+    py: Python<'_>,
+    event: &PyProtobufEvent,
+) -> PyResult<Option<Py<PyAny>>> {
+    if let PyProtobufEvent::Status { direction, state } = event {
+        let dict = PyDict::new(py);
+        dict.set_item("direction", *direction)?;
+        dict.set_item("state", *state)?;
+        Ok(Some(dict.into_any().unbind()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn py_protobuf_event_issue(py: Python<'_>, event: &PyProtobufEvent) -> PyResult<Option<Py<PyAny>>> {
+    if let PyProtobufEvent::Issue {
+        direction,
+        category,
+        message,
+    } = event
+    {
+        let dict = PyDict::new(py);
+        dict.set_item("direction", *direction)?;
+        dict.set_item("category", category.clone())?;
+        dict.set_item("message", message.clone())?;
+        Ok(Some(dict.into_any().unbind()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn py_protobuf_filter_node(
+    graph: &Graph,
+    events: &Node<PyProtobufEvent>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    filter: impl Fn(Python<'_>, &PyProtobufEvent) -> PyResult<Option<Py<PyAny>>> + 'static,
+) -> PyNode {
+    let pending = pending_fatal.clone();
+    let node = graph.node_opts::<PyValue, _>(
+        vec![events.erased()],
+        move |ctx| {
+            for event in ctx.batch::<PyProtobufEvent>(0) {
+                Python::with_gil(|py| match filter(py, event.as_ref()) {
+                    Ok(Some(value)) => ctx.emit(PyValue::new(value)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        store_pending_fatal(&pending, error);
+                        graphrefly_rs::host_boundary::abort_host_boundary();
+                    }
+                });
+            }
+        },
+        graph_node_opts(Some(name)),
+    );
+    py_node(node, pending_fatal)
+}
+
+fn bridge_to_protobuf_envelope(
+    envelope: WireBridgeEnvelope<WireBridgeProtobufDataBody>,
+) -> WireBridgeProtobufEnvelope {
+    let payload = match envelope.payload {
+        Some(WireBridgePayload::Data(body)) => WireBridgeProtobufPayload::Data(body),
+        Some(WireBridgePayload::Error(error)) => WireBridgeProtobufPayload::Error {
+            error: error.into_bytes(),
+        },
+        Some(WireBridgePayload::Status(status)) => WireBridgeProtobufPayload::Status {
+            status: status.into_bytes(),
+        },
+        Some(WireBridgePayload::Close { reason }) => WireBridgeProtobufPayload::Close {
+            reason: reason.map(String::into_bytes),
+        },
+        None => match envelope.envelope_type {
+            WireBridgeEnvelopeType::Ack => WireBridgeProtobufPayload::Ack,
+            WireBridgeEnvelopeType::Nack => WireBridgeProtobufPayload::Nack { error: None },
+            WireBridgeEnvelopeType::Close => WireBridgeProtobufPayload::Close { reason: None },
+            WireBridgeEnvelopeType::Start
+            | WireBridgeEnvelopeType::Data
+            | WireBridgeEnvelopeType::Status
+            | WireBridgeEnvelopeType::Error => WireBridgeProtobufPayload::Start,
+        },
+    };
+    WireBridgeProtobufEnvelope {
+        session_id: envelope.session_id,
+        metadata: envelope.metadata,
+        payload,
+    }
 }
 
 fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
@@ -1386,6 +1765,288 @@ impl PyGraph {
         })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(node)
+    }
+
+    #[pyo3(signature = (session_id, name = None))]
+    fn _wire_bridge(&self, session_id: String, name: Option<String>) -> PyResult<PyWireBridge> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let bridge = catch_graph_panic(&self.pending_fatal, || {
+            Rc::new(wire_bridge::<
+                WireBridgeProtobufDataBody,
+                WireBridgeProtobufDataBody,
+            >(
+                &self.graph,
+                WireBridgeOptions {
+                    name: name.clone(),
+                    session_id: session_id.clone(),
+                    ..WireBridgeOptions::new(session_id)
+                },
+            ))
+        })?;
+        let bridge_name = name.unwrap_or_else(|| "wireBridge".to_owned());
+        let status = py_status_node(
+            &self.graph,
+            &bridge.status,
+            format!("{bridge_name}/py/status"),
+            &self.pending_fatal,
+            py_bridge_status,
+        );
+        let issues = py_error_issue_node(
+            &self.graph,
+            &bridge.errors,
+            format!("{bridge_name}/py/issues"),
+            &self.pending_fatal,
+            "bridge_error",
+        );
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(PyWireBridge {
+            bridge,
+            status,
+            issues,
+            released: Cell::new(false),
+        })
+    }
+
+    #[pyo3(signature = (bridge, name = None))]
+    #[allow(clippy::too_many_lines)]
+    fn _wire_bridge_protobuf(
+        &self,
+        bridge: PyRef<'_, PyWireBridge>,
+        name: Option<String>,
+    ) -> PyResult<PyWireBridgeProtobuf> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let helper_name = name.unwrap_or_else(|| "wireBridgeProtobuf".to_owned());
+        let inbound_bytes = self
+            .graph
+            .state_empty_opts::<PyValue>(graph_node_opts(Some(format!(
+                "{helper_name}/inbound_bytes"
+            ))));
+        let pending = self.pending_fatal.clone();
+        let events = self.graph.node_opts::<PyProtobufEvent, _>(
+            vec![inbound_bytes.erased()],
+            move |ctx| {
+                for value in ctx.batch::<PyValue>(0) {
+                    Python::with_gil(|py| {
+                        let object = value.object.bind(py);
+                        let Ok(bytes) = object.downcast::<PyBytes>() else {
+                            ctx.emit(PyProtobufEvent::Issue {
+                                direction: "inbound",
+                                category: "malformed".to_owned(),
+                                message: "wire_bridge_protobuf inbound_bytes requires bytes"
+                                    .to_owned(),
+                            });
+                            ctx.emit(PyProtobufEvent::Status {
+                                direction: "inbound",
+                                state: "invalid",
+                            });
+                            return;
+                        };
+                        let decoded = decode_wire_bridge_protobuf_bytes(bytes.as_bytes());
+                        if decoded.envelope.is_some() {
+                            ctx.emit(PyProtobufEvent::Status {
+                                direction: "inbound",
+                                state: "valid",
+                            });
+                        } else {
+                            for issue in decoded.issues {
+                                ctx.emit(PyProtobufEvent::Issue {
+                                    direction: "inbound",
+                                    category: issue.category.as_str().to_owned(),
+                                    message: issue.message,
+                                });
+                            }
+                            ctx.emit(PyProtobufEvent::Status {
+                                direction: "inbound",
+                                state: "invalid",
+                            });
+                        }
+                    });
+                }
+            },
+            graph_node_opts(Some(format!("{helper_name}/events"))),
+        );
+        let outbound_bytes = {
+            let pending = pending.clone();
+            let node = self.graph.node_opts::<PyValue, _>(
+                vec![bridge.bridge.outbound.erased()],
+                move |ctx| {
+                    for envelope in ctx.batch::<WireBridgeEnvelope<WireBridgeProtobufDataBody>>(0) {
+                        let encoded = encode_wire_bridge_protobuf_bytes(
+                            &bridge_to_protobuf_envelope(envelope.as_ref().clone()),
+                        );
+                        if let Some(bytes) = encoded.bytes {
+                            Python::with_gil(|py| {
+                                ctx.emit(PyValue::new(
+                                    PyBytes::new(py, &bytes).into_any().unbind(),
+                                ));
+                            });
+                        } else {
+                            for issue in encoded.issues {
+                                Python::with_gil(|_py| {
+                                    let error = PyRuntimeError::new_err(format!(
+                                        "{}: {}",
+                                        issue.category.as_str(),
+                                        issue.message
+                                    ));
+                                    store_pending_fatal(&pending, error);
+                                    graphrefly_rs::host_boundary::abort_host_boundary();
+                                });
+                            }
+                        }
+                    }
+                },
+                graph_node_opts(Some(format!("{helper_name}/outbound_bytes"))),
+            );
+            py_node(node, &self.pending_fatal)
+        };
+        let status = py_protobuf_filter_node(
+            &self.graph,
+            &events,
+            format!("{helper_name}/status"),
+            &self.pending_fatal,
+            py_protobuf_event_status,
+        );
+        let issues = py_protobuf_filter_node(
+            &self.graph,
+            &events,
+            format!("{helper_name}/issues"),
+            &self.pending_fatal,
+            py_protobuf_event_issue,
+        );
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(PyWireBridgeProtobuf {
+            inbound_bytes: py_node(inbound_bytes, &self.pending_fatal),
+            outbound_bytes,
+            status,
+            issues,
+            released: Cell::new(false),
+        })
+    }
+
+    #[pyo3(signature = (bridge, inbound_edges, name = None))]
+    fn _wire_edge_group(
+        &self,
+        bridge: PyRef<'_, PyWireBridge>,
+        inbound_edges: Vec<String>,
+        name: Option<String>,
+    ) -> PyResult<PyWireEdgeGroup> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let group_name = name.unwrap_or_else(|| "wireEdgeGroup".to_owned());
+        let group = catch_graph_panic(&self.pending_fatal, || {
+            Rc::new(wire_edge_group(
+                &self.graph,
+                &bridge.bridge,
+                WireEdgeGroupOptions::named(
+                    group_name.clone(),
+                    inbound_edges
+                        .iter()
+                        .map(|edge| WireEdgeGroupEdge::inbound(edge.clone()))
+                        .collect(),
+                ),
+            ))
+        })?;
+        let status = py_status_node(
+            &self.graph,
+            &group.status,
+            format!("{group_name}/py/status"),
+            &self.pending_fatal,
+            py_wire_edge_group_status,
+        );
+        let issues = py_status_node(
+            &self.graph,
+            &group.issues,
+            format!("{group_name}/py/issues"),
+            &self.pending_fatal,
+            py_wire_edge_group_issue,
+        );
+        let inbound_edges_dict = Python::with_gil(|py| -> PyResult<Py<PyDict>> {
+            let dict = PyDict::new(py);
+            for (edge_id, node) in &group.inbound {
+                let py_edge = py_bytes_node(
+                    &self.graph,
+                    node,
+                    format!("{group_name}/py/inbound/{edge_id}"),
+                    &self.pending_fatal,
+                );
+                dict.set_item(edge_id, py_edge)?;
+            }
+            Ok(dict.unbind())
+        })?;
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(PyWireEdgeGroup {
+            _group: group,
+            inbound_edges: inbound_edges_dict,
+            status,
+            issues,
+            released: Cell::new(false),
+        })
+    }
+
+    #[pyo3(signature = (clock, timeout_ms, name = None))]
+    fn _wire_bridge_ack_driver(
+        &self,
+        clock: PyNode,
+        timeout_ms: u64,
+        name: Option<String>,
+    ) -> PyResult<PyWireBridgeAckDriver> {
+        raise_pending_fatal(&self.pending_fatal)?;
+        let driver_name = name.unwrap_or_else(|| "wireBridgeAckDriver".to_owned());
+        let timeout_node = self.graph.node_opts::<PyValue, _>(
+            vec![clock.erased_core()],
+            move |ctx| {
+                for value in ctx.batch::<PyValue>(0) {
+                    Python::with_gil(|py| {
+                        let object = value.object.bind(py);
+                        let Ok(observed_at_ms) = object.extract::<u64>() else {
+                            return;
+                        };
+                        let dict = PyDict::new(py);
+                        let _ = dict.set_item("seq", 0_u64);
+                        let _ = dict.set_item("attempt", 0_u32);
+                        let _ = dict.set_item("observed_at_ms", observed_at_ms);
+                        ctx.emit(PyValue::new(dict.into_any().unbind()));
+                    });
+                }
+            },
+            graph_node_opts(Some(format!("{driver_name}/timeouts"))),
+        );
+        let status = self.graph.state_opts(
+            PyValue::new(Python::with_gil(|py| {
+                let dict = PyDict::new(py);
+                let _ = dict.set_item("state", "idle");
+                let _ = dict.set_item("timeout_ms", timeout_ms);
+                dict.into_any().unbind()
+            })),
+            graph_node_opts(Some(format!("{driver_name}/status"))),
+        );
+        let issues = self.graph.node_opts::<PyValue, _>(
+            vec![clock.erased_core()],
+            move |ctx| {
+                for value in ctx.batch::<PyValue>(0) {
+                    Python::with_gil(|py| {
+                        let object = value.object.bind(py);
+                        if object.extract::<u64>().is_ok() {
+                            return;
+                        }
+                        let dict = PyDict::new(py);
+                        let _ = dict.set_item("code", "invalid_clock");
+                        let _ = dict.set_item(
+                            "message",
+                            "wire_bridge_ack_driver clock facts must be non-negative integers",
+                        );
+                        ctx.emit(PyValue::new(dict.into_any().unbind()));
+                    });
+                }
+            },
+            graph_node_opts(Some(format!("{driver_name}/issues"))),
+        );
+        raise_pending_fatal(&self.pending_fatal)?;
+        Ok(PyWireBridgeAckDriver {
+            timeouts: py_node(timeout_node, &self.pending_fatal),
+            status: py_node(status, &self.pending_fatal),
+            issues: py_node(issues, &self.pending_fatal),
+            released: Cell::new(false),
+        })
     }
 
     #[pyo3(signature = (callback, name = None))]
@@ -2457,6 +3118,10 @@ fn version() -> &'static str {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_py_checkpoint_encoder();
     m.add_class::<PyCanonicalProtobufValidation>()?;
+    m.add_class::<PyWireBridge>()?;
+    m.add_class::<PyWireBridgeProtobuf>()?;
+    m.add_class::<PyWireEdgeGroup>()?;
+    m.add_class::<PyWireBridgeAckDriver>()?;
     m.add_class::<PyAsyncCtx>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyGraph>()?;
