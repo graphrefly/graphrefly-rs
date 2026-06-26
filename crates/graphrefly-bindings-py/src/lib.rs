@@ -37,7 +37,8 @@ use std::sync::{Mutex, OnceLock};
 
 use graphrefly_rs::{
     decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
-    decode_wire_bridge_protobuf_bytes, encode_wire_bridge_protobuf_bytes, restored_opts,
+    decode_wire_bridge_protobuf_bytes, encode_canonical_wire_bridge_envelope,
+    encode_canonical_wire_edge_frame, encode_wire_bridge_protobuf_bytes, restored_opts,
     wire_bridge, wire_edge_group, AnyValue, CanonicalProtobufError, Core, Ctx, DeferredCtx,
     DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphCheckpoint, GraphCheckpointJson,
     GraphNode, GraphNodeOpts, GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError,
@@ -282,11 +283,44 @@ struct PyCanonicalProtobufValidation {
     message: Option<String>,
 }
 
+#[pyclass(name = "CanonicalProtobufRoundtrip", unsendable)]
+struct PyCanonicalProtobufRoundtrip {
+    ok: bool,
+    bytes: Option<Vec<u8>>,
+    category: Option<String>,
+    message: Option<String>,
+}
+
 #[pymethods]
 impl PyCanonicalProtobufValidation {
     #[getter]
     fn ok(&self) -> bool {
         self.ok
+    }
+
+    #[getter]
+    fn category(&self) -> Option<String> {
+        self.category.clone()
+    }
+
+    #[getter]
+    fn message(&self) -> Option<String> {
+        self.message.clone()
+    }
+}
+
+#[pymethods]
+impl PyCanonicalProtobufRoundtrip {
+    #[getter]
+    fn ok(&self) -> bool {
+        self.ok
+    }
+
+    #[getter]
+    fn bytes(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.bytes
+            .as_deref()
+            .map(|bytes| PyBytes::new(py, bytes).into_any().unbind())
     }
 
     #[getter]
@@ -319,6 +353,27 @@ fn canonical_protobuf_validation(
     Py::new(py, validation)
 }
 
+fn canonical_protobuf_roundtrip(
+    py: Python<'_>,
+    result: Result<Vec<u8>, CanonicalProtobufError>,
+) -> PyResult<Py<PyCanonicalProtobufRoundtrip>> {
+    let roundtrip = match result {
+        Ok(bytes) => PyCanonicalProtobufRoundtrip {
+            ok: true,
+            bytes: Some(bytes),
+            category: None,
+            message: None,
+        },
+        Err(error) => PyCanonicalProtobufRoundtrip {
+            ok: false,
+            bytes: None,
+            category: Some(error.category.as_str().to_owned()),
+            message: Some(error.to_string()),
+        },
+    };
+    Py::new(py, roundtrip)
+}
+
 #[pyfunction]
 fn _validate_canonical_wire_bridge_envelope(
     py: Python<'_>,
@@ -331,6 +386,18 @@ fn _validate_canonical_wire_bridge_envelope(
 }
 
 #[pyfunction]
+fn _roundtrip_canonical_wire_bridge_envelope(
+    py: Python<'_>,
+    bytes: &Bound<'_, pyo3::types::PyBytes>,
+) -> PyResult<Py<PyCanonicalProtobufRoundtrip>> {
+    canonical_protobuf_roundtrip(
+        py,
+        decode_canonical_wire_bridge_envelope(bytes.as_bytes())
+            .and_then(|envelope| encode_canonical_wire_bridge_envelope(&envelope)),
+    )
+}
+
+#[pyfunction]
 fn _validate_canonical_wire_edge_frame(
     py: Python<'_>,
     bytes: &Bound<'_, pyo3::types::PyBytes>,
@@ -338,6 +405,18 @@ fn _validate_canonical_wire_edge_frame(
     canonical_protobuf_validation(
         py,
         decode_canonical_wire_edge_frame(bytes.as_bytes()).map(|_| ()),
+    )
+}
+
+#[pyfunction]
+fn _roundtrip_canonical_wire_edge_frame(
+    py: Python<'_>,
+    bytes: &Bound<'_, pyo3::types::PyBytes>,
+) -> PyResult<Py<PyCanonicalProtobufRoundtrip>> {
+    canonical_protobuf_roundtrip(
+        py,
+        decode_canonical_wire_edge_frame(bytes.as_bytes())
+            .and_then(|frame| encode_canonical_wire_edge_frame(&frame)),
     )
 }
 
@@ -3437,6 +3516,7 @@ fn version() -> &'static str {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_py_checkpoint_encoder();
     m.add_class::<PyCanonicalProtobufValidation>()?;
+    m.add_class::<PyCanonicalProtobufRoundtrip>()?;
     m.add_class::<PyWireBridge>()?;
     m.add_class::<PyWireBridgeProtobuf>()?;
     m.add_class::<PyWireEdgeGroup>()?;
@@ -3453,6 +3533,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(_validate_canonical_wire_edge_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        _roundtrip_canonical_wire_bridge_envelope,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(_roundtrip_canonical_wire_edge_frame, m)?)?;
     m.add_function(wrap_pyfunction!(restore_graph, m)?)?;
     m.add_function(wrap_pyfunction!(restore_registry, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
