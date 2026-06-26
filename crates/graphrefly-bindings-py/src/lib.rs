@@ -28,7 +28,7 @@
 )]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, catch_unwind, AssertUnwindSafe};
@@ -39,18 +39,19 @@ use graphrefly_rs::{
     decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
     decode_wire_bridge_protobuf_bytes, encode_canonical_wire_bridge_envelope,
     encode_canonical_wire_edge_frame, encode_wire_bridge_protobuf_bytes, restored_opts,
-    wire_bridge, wire_edge_group, AnyValue, CanonicalProtobufError, Core, Ctx, DeferredCtx,
-    DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphCheckpoint, GraphCheckpointJson,
-    GraphNode, GraphNodeOpts, GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError,
-    GraphRestoreRegistry, GraphRestoreResult, LockId, MapJsonRestoreDescriptor, Message, Node,
-    NodeOpts, Operator, Pausable, PoolKind, PullDemand, RestoreDefineCtx, RestoreFactoryMeta,
-    RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor, Status,
-    TopologyGroup, TopologyGroupOptions, WaveData, WireBridgeBundle, WireBridgeEnvelope,
-    WireBridgeEnvelopeType, WireBridgeIngress, WireBridgeOptions, WireBridgePayload,
-    WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope, WireBridgeProtobufPayload,
-    WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle, WireEdgeGroupEdge,
-    WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions, WireEdgeGroupStatus,
-    WireEdgeGroupStatusState,
+    wire_bridge, wire_edge_group, AnyValue, BackoffPolicy, CanonicalProtobufError, Core, Ctx,
+    DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphCheckpoint,
+    GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreDescriptor, GraphRestoreEntry,
+    GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult, LockId, MapJsonRestoreDescriptor,
+    Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand, RestoreDefineCtx,
+    RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, RetryPolicy,
+    StateRestoreDescriptor, Status, TopologyGroup, TopologyGroupOptions, WaveData, WireBridgeAck,
+    WireBridgeAttempt, WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope,
+    WireBridgeEnvelopeType, WireBridgeIngress, WireBridgeNack, WireBridgeOptions,
+    WireBridgePayload, WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope,
+    WireBridgeProtobufPayload, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
+    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
+    WireEdgeGroupStatus, WireEdgeGroupStatusState,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -543,7 +544,10 @@ impl PyWireEdgeGroup {
 
 #[pyclass(name = "_WireBridgeAckDriver", unsendable)]
 struct PyWireBridgeAckDriver {
+    bridge: Rc<PyWireBridgeCore>,
     topology: TopologyGroup,
+    command_source: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
+    subscriptions: RefCell<Vec<Box<dyn FnOnce()>>>,
     timeouts: PyNode,
     status: PyNode,
     issues: PyNode,
@@ -571,9 +575,25 @@ impl PyWireBridgeAckDriver {
         if self.released.get() {
             return;
         }
+        self.bridge
+            .detach_command_source_for_native(self.command_source.erased());
         self.topology
             .release_with_reason("wire_bridge_ack_driver release");
+        for unsubscribe in self.subscriptions.borrow_mut().drain(..) {
+            unsubscribe();
+        }
         self.released.set(true);
+    }
+
+    fn _conformance_ack_timeout(&self, seq: u64, attempt: u32, observed_at_ms: Option<u64>) {
+        if self.released.get() {
+            return;
+        }
+        self.command_source.set(WireBridgeCommand::AckTimeout {
+            seq,
+            attempt,
+            observed_at_ms,
+        });
     }
 }
 
@@ -587,6 +607,70 @@ enum PyProtobufEvent {
         direction: &'static str,
         category: String,
         message: String,
+    },
+}
+
+#[derive(Clone)]
+struct PyAckDriverPending {
+    seq: u64,
+    attempt: u32,
+    observed_at_ms: Option<u64>,
+    timed_out_attempt: Option<u32>,
+    timed_out_at_ms: Option<u64>,
+    retry_due_at_ms: Option<u64>,
+    retry_released_attempt: Option<u32>,
+}
+
+#[derive(Clone, Default)]
+struct PyAckDriverState {
+    now_ms: Option<u64>,
+    pending: BTreeMap<u64, PyAckDriverPending>,
+}
+
+struct PySubscriptionDrainGuard {
+    subscriptions: Option<Vec<Box<dyn FnOnce()>>>,
+}
+
+impl PySubscriptionDrainGuard {
+    fn new(subscriptions: Vec<Box<dyn FnOnce()>>) -> Self {
+        Self {
+            subscriptions: Some(subscriptions),
+        }
+    }
+
+    fn disarm(mut self) -> Vec<Box<dyn FnOnce()>> {
+        self.subscriptions.take().unwrap_or_default()
+    }
+}
+
+impl Drop for PySubscriptionDrainGuard {
+    fn drop(&mut self) {
+        if let Some(subscriptions) = self.subscriptions.take() {
+            for unsubscribe in subscriptions {
+                unsubscribe();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PyAckDriverEvent {
+    State {
+        pending: usize,
+        now_ms: Option<u64>,
+    },
+    Timeout {
+        seq: u64,
+        attempt: u32,
+        observed_at_ms: u64,
+        pending: usize,
+        now_ms: u64,
+    },
+    Issue {
+        code: &'static str,
+        message: &'static str,
+        pending: usize,
+        now_ms: Option<u64>,
     },
 }
 
@@ -809,6 +893,126 @@ fn py_protobuf_filter_node(
                 Python::with_gil(|py| match filter(py, event.as_ref()) {
                     Ok(Some(value)) => ctx.emit(PyValue::new(value)),
                     Ok(None) => {}
+                    Err(error) => {
+                        store_pending_fatal(&pending, error);
+                        graphrefly_rs::host_boundary::abort_host_boundary();
+                    }
+                });
+            }
+        },
+        graph_node_opts(Some(name)),
+    );
+    py_node(node, pending_fatal)
+}
+
+fn py_ack_timeout(py: Python<'_>, event: &PyAckDriverEvent) -> PyResult<Option<Py<PyAny>>> {
+    if let PyAckDriverEvent::Timeout {
+        seq,
+        attempt,
+        observed_at_ms,
+        ..
+    } = event
+    {
+        let dict = PyDict::new(py);
+        dict.set_item("seq", *seq)?;
+        dict.set_item("attempt", *attempt)?;
+        dict.set_item("observed_at_ms", *observed_at_ms)?;
+        Ok(Some(dict.into_any().unbind()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn py_ack_issue(py: Python<'_>, event: &PyAckDriverEvent) -> PyResult<Option<Py<PyAny>>> {
+    if let PyAckDriverEvent::Issue { code, message, .. } = event {
+        let dict = PyDict::new(py);
+        dict.set_item("code", *code)?;
+        dict.set_item("message", *message)?;
+        Ok(Some(dict.into_any().unbind()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn py_ack_status(py: Python<'_>, event: &PyAckDriverEvent, timeout_ms: u64) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("timeout_ms", timeout_ms)?;
+    match event {
+        PyAckDriverEvent::Timeout {
+            seq,
+            attempt,
+            observed_at_ms,
+            pending,
+            now_ms,
+        } => {
+            dict.set_item("state", "ready")?;
+            dict.set_item("pending", *pending)?;
+            dict.set_item("now_ms", *now_ms)?;
+            let timeout = PyDict::new(py);
+            timeout.set_item("seq", *seq)?;
+            timeout.set_item("attempt", *attempt)?;
+            timeout.set_item("observed_at_ms", *observed_at_ms)?;
+            dict.set_item("last_timeout", timeout)?;
+        }
+        PyAckDriverEvent::Issue {
+            pending, now_ms, ..
+        } => {
+            dict.set_item("state", "issues")?;
+            dict.set_item("pending", *pending)?;
+            dict.set_item("now_ms", *now_ms)?;
+            dict.set_item("last_timeout", py.None())?;
+        }
+        PyAckDriverEvent::State { pending, now_ms } => {
+            dict.set_item("state", "ready")?;
+            dict.set_item("pending", *pending)?;
+            dict.set_item("now_ms", *now_ms)?;
+            dict.set_item("last_timeout", py.None())?;
+        }
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn py_ack_filter_node(
+    topology: &TopologyGroup,
+    events: &Node<PyAckDriverEvent>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    filter: impl Fn(Python<'_>, &PyAckDriverEvent) -> PyResult<Option<Py<PyAny>>> + 'static,
+) -> PyNode {
+    let pending = pending_fatal.clone();
+    let node = topology.node_opts::<PyValue, _>(
+        vec![events.erased()],
+        move |ctx| {
+            for event in ctx.batch::<PyAckDriverEvent>(0) {
+                Python::with_gil(|py| match filter(py, event.as_ref()) {
+                    Ok(Some(value)) => ctx.emit(PyValue::new(value)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        store_pending_fatal(&pending, error);
+                        graphrefly_rs::host_boundary::abort_host_boundary();
+                    }
+                });
+            }
+        },
+        graph_node_opts(Some(name)),
+    );
+    py_node(node, pending_fatal)
+}
+
+fn py_ack_status_node(
+    topology: &TopologyGroup,
+    events: &Node<PyAckDriverEvent>,
+    name: String,
+    pending_fatal: &PendingFatal,
+    timeout_ms: u64,
+) -> PyNode {
+    let pending = pending_fatal.clone();
+    let node = topology.node_opts::<PyValue, _>(
+        vec![events.erased()],
+        move |ctx| {
+            for event in ctx.batch::<PyAckDriverEvent>(0) {
+                Python::with_gil(|py| match py_ack_status(py, event.as_ref(), timeout_ms) {
+                    Ok(value) => ctx.emit(PyValue::new(value)),
                     Err(error) => {
                         store_pending_fatal(&pending, error);
                         graphrefly_rs::host_boundary::abort_host_boundary();
@@ -1963,6 +2167,7 @@ impl PyGraph {
                     name: name.clone(),
                     session_id: session_id.clone(),
                     now_ms: Some(Rc::new(|| 1)),
+                    retry: RetryPolicy::new(2, BackoffPolicy::None),
                     ..WireBridgeOptions::new(session_id)
                 },
             ))
@@ -2434,79 +2639,268 @@ impl PyGraph {
         name: Option<String>,
     ) -> PyResult<PyWireBridgeAckDriver> {
         raise_pending_fatal(&self.pending_fatal)?;
-        let _ = &bridge;
         let driver_name = name.unwrap_or_else(|| "wireBridgeAckDriver".to_owned());
+        let bridge_core = bridge.bridge.clone();
+        let state = Rc::new(RefCell::new(PyAckDriverState::default()));
+        let mut subscriptions: Vec<Box<dyn FnOnce()>> = Vec::new();
+        {
+            let state = state.clone();
+            subscriptions.push(bridge_core.attempts.subscribe(move |msg| {
+                if let Message::Data(value) = msg {
+                    let Some(attempt) = value.downcast_ref::<WireBridgeAttempt>() else {
+                        return;
+                    };
+                    let mut state = state.borrow_mut();
+                    let observed_at_ms = state.now_ms;
+                    state.pending.insert(
+                        attempt.seq,
+                        PyAckDriverPending {
+                            seq: attempt.seq,
+                            attempt: attempt.attempt,
+                            observed_at_ms,
+                            timed_out_attempt: None,
+                            timed_out_at_ms: None,
+                            retry_due_at_ms: None,
+                            retry_released_attempt: None,
+                        },
+                    );
+                }
+            }));
+        }
+        {
+            let state = state.clone();
+            subscriptions.push(bridge_core.acks.subscribe(move |msg| {
+                if let Message::Data(value) = msg {
+                    let Some(ack) =
+                        value.downcast_ref::<WireBridgeAck<WireBridgeProtobufDataBody>>()
+                    else {
+                        return;
+                    };
+                    state.borrow_mut().pending.remove(&ack.ack_for_seq);
+                }
+            }));
+        }
+        {
+            let state = state.clone();
+            subscriptions.push(bridge_core.nacks.subscribe(move |msg| {
+                if let Message::Data(value) = msg {
+                    let Some(nack) =
+                        value.downcast_ref::<WireBridgeNack<WireBridgeProtobufDataBody>>()
+                    else {
+                        return;
+                    };
+                    state.borrow_mut().pending.remove(&nack.ack_for_seq);
+                }
+            }));
+        }
+        {
+            let state = state.clone();
+            subscriptions.push(bridge_core.status.subscribe(move |msg| {
+                if let Message::Data(value) = msg {
+                    let Some(status) = value.downcast_ref::<WireBridgeStatus>() else {
+                        return;
+                    };
+                    let mut state = state.borrow_mut();
+                    if status.pending == 0 {
+                        state.pending.clear();
+                    } else if status.state == WireBridgeStatusState::Exhausted {
+                        if let Some(seq) = status.last_seq {
+                            state.pending.remove(&seq);
+                        }
+                    } else if status.state == WireBridgeStatusState::Waiting {
+                        if let (Some(seq), Some(delay_ms)) = (status.last_seq, status.last_delay_ms)
+                        {
+                            if let Some(pending) = state.pending.get_mut(&seq) {
+                                if pending.timed_out_at_ms.is_some()
+                                    && pending.retry_released_attempt != Some(pending.attempt)
+                                {
+                                    pending.retry_due_at_ms = pending
+                                        .timed_out_at_ms
+                                        .map(|ms| ms.saturating_add(delay_ms));
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        let subscription_guard = PySubscriptionDrainGuard::new(subscriptions);
         let topology = self
             .graph
             .topology_group_opts(TopologyGroupOptions::named(format!(
                 "{driver_name}.wireBridgeAckDriver"
             )));
-        let timeout_node = topology.node_opts::<PyValue, _>(
+        let events = topology.node_opts::<PyAckDriverEvent, _>(
             vec![clock.erased_core()],
-            move |ctx| {
-                for value in ctx.batch::<PyValue>(0) {
-                    Python::with_gil(|py| {
-                        let object = value.object.bind(py);
-                        let _ = object.extract::<u64>();
-                    });
-                }
-            },
-            graph_node_opts(Some(format!("{driver_name}/timeouts"))),
-        );
-        let status = topology.state_opts(
-            PyValue::new(Python::with_gil(|py| {
-                let dict = PyDict::new(py);
-                let _ = dict.set_item("state", "idle");
-                let _ = dict.set_item("timeout_ms", timeout_ms);
-                dict.into_any().unbind()
-            })),
-            graph_node_opts(Some(format!("{driver_name}/status"))),
-        );
-        let issues = topology.node_opts::<PyValue, _>(
-            vec![clock.erased_core()],
-            move |ctx| {
-                let state = if let Some(state) = ctx.state_get::<RefCell<Option<u64>>>() {
-                    state
-                } else {
-                    ctx.state_set(RefCell::new(None::<u64>));
-                    ctx.state_get::<RefCell<Option<u64>>>()
-                        .expect("ack-driver clock issue state was just installed")
-                };
-                for value in ctx.batch::<PyValue>(0) {
-                    Python::with_gil(|py| {
-                        let object = value.object.bind(py);
-                        let issue_message = match object.extract::<u64>() {
-                            Ok(observed_at_ms) => {
-                                let mut state = state.borrow_mut();
-                                if state.is_some_and(|last| observed_at_ms < last) {
-                                    Some("wire_bridge_ack_driver clock facts must be monotonic non-decreasing")
-                                } else {
-                                    *state = Some(observed_at_ms);
-                                    None
+            {
+                let state = state.clone();
+                move |ctx| {
+                    let mut emitted = false;
+                    for value in ctx.batch::<PyValue>(0) {
+                        let mut valid_clock = true;
+                        Python::with_gil(|py| {
+                            let object = value.object.bind(py);
+                            let issue_message = if object.is_instance_of::<PyBool>() {
+                                Some("wire_bridge_ack_driver clock facts must be non-negative integers")
+                            } else {
+                                match object.extract::<u64>() {
+                                    Ok(observed_at_ms) => {
+                                        let mut state = state.borrow_mut();
+                                        if state.now_ms.is_some_and(|last| observed_at_ms < last) {
+                                            Some("wire_bridge_ack_driver clock facts must be monotonic non-decreasing")
+                                        } else {
+                                            state.now_ms = Some(observed_at_ms);
+                                            None
+                                        }
+                                    }
+                                    Err(_) => Some(
+                                        "wire_bridge_ack_driver clock facts must be non-negative integers",
+                                    ),
+                                }
+                            };
+                            if let Some(message) = issue_message {
+                                let state = state.borrow();
+                                ctx.emit(PyAckDriverEvent::Issue {
+                                    code: "invalid_clock",
+                                    message,
+                                    pending: state.pending.len(),
+                                    now_ms: state.now_ms,
+                                });
+                                emitted = true;
+                                valid_clock = false;
+                            }
+                        });
+                        if !valid_clock {
+                            continue;
+                        }
+                        let now_ms = state.borrow().now_ms;
+                        let Some(now_ms) = now_ms else {
+                            continue;
+                        };
+                        let events = {
+                            let mut state = state.borrow_mut();
+                            let pending_len = state.pending.len();
+                            let mut events = Vec::new();
+                            for pending in state.pending.values_mut() {
+                                if pending.observed_at_ms.is_none() {
+                                    pending.observed_at_ms = Some(now_ms);
+                                }
+                                if pending.observed_at_ms.is_some_and(|observed| {
+                                    now_ms.saturating_sub(observed) >= timeout_ms
+                                        && pending.timed_out_attempt != Some(pending.attempt)
+                                }) {
+                                    pending.timed_out_attempt = Some(pending.attempt);
+                                    pending.timed_out_at_ms = Some(now_ms);
+                                    events.push(PyAckDriverEvent::Timeout {
+                                        seq: pending.seq,
+                                        attempt: pending.attempt,
+                                        observed_at_ms: now_ms,
+                                        pending: pending_len,
+                                        now_ms,
+                                    });
+                                } else if pending.retry_due_at_ms.is_some_and(|due| {
+                                    now_ms >= due
+                                        && pending.retry_released_attempt != Some(pending.attempt)
+                                }) {
+                                    pending.retry_released_attempt = Some(pending.attempt);
+                                    events.push(PyAckDriverEvent::Timeout {
+                                        seq: pending.seq,
+                                        attempt: pending.attempt,
+                                        observed_at_ms: now_ms,
+                                        pending: pending_len,
+                                        now_ms,
+                                    });
                                 }
                             }
-                            Err(_) => Some(
-                                "wire_bridge_ack_driver clock facts must be non-negative integers",
-                            ),
+                            if events.is_empty() {
+                                events.push(PyAckDriverEvent::State {
+                                    pending: state.pending.len(),
+                                    now_ms: state.now_ms,
+                                });
+                            }
+                            events
                         };
-                        let Some(message) = issue_message else {
-                            return;
-                        };
-                        let dict = PyDict::new(py);
-                        let _ = dict.set_item("code", "invalid_clock");
-                        let _ = dict.set_item("message", message);
-                        ctx.emit(PyValue::new(dict.into_any().unbind()));
-                    });
+                        for event in events {
+                            emitted = true;
+                            ctx.emit(event);
+                        }
+                    }
                 }
             },
-            graph_node_opts(Some(format!("{driver_name}/issues"))),
+            graph_node_opts_with_node(
+                Some(format!("{driver_name}/events")),
+                true,
+                false,
+                false,
+                false,
+            ),
         );
-        raise_pending_fatal(&self.pending_fatal)?;
+        let command_source = topology
+            .node_opts::<WireBridgeCommand<WireBridgeProtobufDataBody>, _>(
+                vec![events.erased()],
+                move |ctx| {
+                    for event in ctx.batch::<PyAckDriverEvent>(0) {
+                        if let PyAckDriverEvent::Timeout {
+                            seq,
+                            attempt,
+                            observed_at_ms,
+                            ..
+                        } = event.as_ref()
+                        {
+                            ctx.emit::<WireBridgeCommand<WireBridgeProtobufDataBody>>(
+                                WireBridgeCommand::AckTimeout {
+                                    seq: *seq,
+                                    attempt: *attempt,
+                                    observed_at_ms: Some(*observed_at_ms),
+                                },
+                            );
+                        }
+                    }
+                },
+                graph_node_opts(Some(format!("{driver_name}/commands"))),
+            );
+        let timeout_node = py_ack_filter_node(
+            &topology,
+            &events,
+            format!("{driver_name}/timeouts"),
+            &self.pending_fatal,
+            py_ack_timeout,
+        );
+        let status = py_ack_status_node(
+            &topology,
+            &events,
+            format!("{driver_name}/status"),
+            &self.pending_fatal,
+            timeout_ms,
+        );
+        let issues = py_ack_filter_node(
+            &topology,
+            &events,
+            format!("{driver_name}/issues"),
+            &self.pending_fatal,
+            py_ack_issue,
+        );
+        let attach = catch_unwind(AssertUnwindSafe(|| {
+            bridge_core.attach_command_source_for_native(command_source.erased());
+        }));
+        if let Err(panic) = attach {
+            topology.release_with_reason("wire_bridge_ack_driver failed command attachment");
+            panic::resume_unwind(panic);
+        }
+        if let Err(error) = raise_pending_fatal(&self.pending_fatal) {
+            bridge_core.detach_command_source_for_native(command_source.erased());
+            topology.release_with_reason("wire_bridge_ack_driver failed after command attachment");
+            return Err(error);
+        }
+        let subscriptions = subscription_guard.disarm();
         Ok(PyWireBridgeAckDriver {
+            bridge: bridge_core,
             topology,
-            timeouts: py_node(timeout_node, &self.pending_fatal),
-            status: py_node(status, &self.pending_fatal),
-            issues: py_node(issues, &self.pending_fatal),
+            command_source,
+            subscriptions: RefCell::new(subscriptions),
+            timeouts: timeout_node,
+            status,
+            issues,
             released: Cell::new(false),
         })
     }
