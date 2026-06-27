@@ -1910,9 +1910,18 @@ where
     let name = opts.name;
     let timeouts = graph
         .state_empty_opts::<RemoteCallTimeout>(GraphNodeOpts::named(format!("{name}/timeouts")));
-    let responses = remote_call_responses_node(graph, &bridge.events, &timeouts, &name);
+    let responses =
+        remote_call_responses_node(graph, &bridge.command, &bridge.events, &timeouts, &name);
     let results = remote_call_results_node(graph, &responses, &name);
-    let status = remote_call_status_node(graph, &bridge.events, &responses, &timeouts, &name);
+    let status = remote_call_status_node(
+        graph,
+        &bridge.command,
+        &bridge.events,
+        &responses,
+        &results,
+        &timeouts,
+        &name,
+    );
     let errors = remote_call_errors_node(graph, &responses, &timeouts, &bridge.events, &name);
     RemoteCallBundle {
         bridge_command: bridge.command.clone(),
@@ -1987,6 +1996,7 @@ fn normalize_remote_handlers<TRequest, TResponse>(
 
 fn remote_call_responses_node<TRequest, TResponse>(
     graph: &Graph,
+    commands: &Node<WireBridgeCommand<RemoteCallRequest<TRequest>>>,
     events: &Node<WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>>,
     timeouts: &Node<RemoteCallTimeout>,
     name: &str,
@@ -1996,49 +2006,64 @@ where
     TResponse: Clone + 'static,
 {
     graph.node_opts::<RemoteCallResponse<TResponse>, _>(
-        vec![events.erased(), timeouts.erased()],
+        vec![commands.erased(), events.erased(), timeouts.erased()],
         |ctx| {
-            let state = remote_call_responses_state::<TResponse>(ctx);
+            let state = remote_call_responses_state(ctx);
             let mut ready = Vec::new();
             {
                 let mut state = state.borrow_mut();
+                let preview_requests = ctx
+                    .batch::<WireBridgeCommand<RemoteCallRequest<TRequest>>>(0)
+                    .into_iter()
+                    .filter_map(|command| pending_request_from_command(command.as_ref()))
+                    .collect::<Vec<_>>();
+                let has_invalid_bridge_event = ctx.batch::<
+                    WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+                >(1)
+                .into_iter()
+                .any(|event| {
+                    matches!(
+                        event.as_ref(),
+                        WireBridgeEvent::Invalid { .. }
+                            | WireBridgeEvent::SessionMismatch { .. }
+                            | WireBridgeEvent::OutOfOrder { .. }
+                            | WireBridgeEvent::LateReceipt { .. }
+                    )
+                });
+                if !has_invalid_bridge_event {
+                    for request in preview_requests.iter().cloned() {
+                        let _ = state.pending.insert(request);
+                    }
+                }
                 for event in ctx.batch::<
                     WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >(0) {
+                >(1) {
                     if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                         if let Some(request) = pending_request_from_envelope(envelope) {
-                            state.closed.remove(&request.request_id);
-                            let request_id = request.request_id.clone();
-                            state.pending.insert(request);
-                            if let Some(buffered) = state.buffered.remove(&request_id) {
-                                drain_remote_call_buffered_responses(
-                                    &mut state,
-                                    buffered,
-                                    &mut ready,
-                                );
-                            }
+                            let _ = state.pending.insert(request);
                         }
                     }
                 }
                 for event in ctx.batch::<
                     WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >(0) {
+                >(1) {
                     match event.as_ref() {
+                        WireBridgeEvent::Invalid { .. } => {
+                            state.pending.remove_all_unbound();
+                        }
                         WireBridgeEvent::Inbound { envelope } => {
                             if let Some(WireBridgePayload::Data(response)) = &envelope.payload {
                                 let request_id = remote_call_response_request_id(response);
-                                if state.pending.contains(request_id) {
+                                if let Some(request) =
+                                    state.pending.get_by_request_id(request_id)
+                                {
+                                    if !remote_call_response_matches_pending(response, request) {
+                                        continue;
+                                    }
                                     if remote_call_response_is_terminal(response) {
                                         state.pending.remove_by_request_id(request_id);
-                                        state.closed.insert(request_id.to_owned());
                                     }
                                     ready.push(response.clone());
-                                } else if !state.closed.contains(request_id) {
-                                    state
-                                        .buffered
-                                        .entry(request_id.to_owned())
-                                        .or_default()
-                                        .push(response.clone());
                                 }
                             }
                         }
@@ -2048,24 +2073,17 @@ where
                                 .remove_by_seq(outbound.metadata.seq)
                                 .or_else(|| pending_request_from_envelope(outbound));
                             if let Some(request) = request {
-                                state.buffered.remove(&request.request_id);
-                                state.closed.insert(request.request_id);
+                                let _ = request;
                             }
                         }
                         WireBridgeEvent::Exhausted { seq, .. } => {
-                            if let Some(request) = state.pending.remove_by_seq(*seq) {
-                                state.buffered.remove(&request.request_id);
-                                state.closed.insert(request.request_id);
-                            }
+                            state.pending.remove_by_seq(*seq);
                         }
                         _ => {}
                     }
                 }
-                for timeout in ctx.batch::<RemoteCallTimeout>(1) {
-                    if let Some(request) = state.pending.remove_by_request_id(&timeout.request_id) {
-                        state.buffered.remove(&request.request_id);
-                        state.closed.insert(request.request_id);
-                    }
+                for timeout in ctx.batch::<RemoteCallTimeout>(2) {
+                    state.pending.remove_by_request_id(&timeout.request_id);
                 }
             }
             for response in ready {
@@ -2077,91 +2095,103 @@ where
 }
 
 #[derive(Clone)]
-struct RemoteCallResponsesState<TResponse> {
+struct RemoteCallResponsesState {
     pending: RemoteCallPendingState,
-    buffered: HashMap<String, Vec<RemoteCallResponse<TResponse>>>,
-    closed: HashSet<String>,
 }
 
-impl<TResponse> Default for RemoteCallResponsesState<TResponse> {
+impl Default for RemoteCallResponsesState {
     fn default() -> Self {
         Self {
             pending: RemoteCallPendingState::default(),
-            buffered: HashMap::new(),
-            closed: HashSet::new(),
         }
     }
 }
 
-fn remote_call_responses_state<TResponse: Clone + 'static>(
-    ctx: &Ctx,
-) -> Rc<RefCell<RemoteCallResponsesState<TResponse>>> {
-    if let Some(state) = ctx.state_get::<RefCell<RemoteCallResponsesState<TResponse>>>() {
+fn remote_call_responses_state(ctx: &Ctx) -> Rc<RefCell<RemoteCallResponsesState>> {
+    if let Some(state) = ctx.state_get::<RefCell<RemoteCallResponsesState>>() {
         return state;
     }
-    ctx.state_set(RefCell::new(
-        RemoteCallResponsesState::<TResponse>::default(),
-    ));
-    ctx.state_get::<RefCell<RemoteCallResponsesState<TResponse>>>()
+    ctx.state_set(RefCell::new(RemoteCallResponsesState::default()));
+    ctx.state_get::<RefCell<RemoteCallResponsesState>>()
         .expect("remote call responses state was just installed")
-}
-
-fn drain_remote_call_buffered_responses<TResponse: Clone>(
-    state: &mut RemoteCallResponsesState<TResponse>,
-    buffered: Vec<RemoteCallResponse<TResponse>>,
-    ready: &mut Vec<RemoteCallResponse<TResponse>>,
-) {
-    for response in buffered {
-        let request_id = remote_call_response_request_id(&response);
-        if !state.pending.contains(request_id) {
-            break;
-        }
-        if remote_call_response_is_terminal(&response) {
-            state.pending.remove_by_request_id(request_id);
-            state.closed.insert(request_id.to_owned());
-        }
-        ready.push(response);
-    }
 }
 
 #[derive(Clone)]
 struct RemoteCallPendingRequest {
     operation: String,
     request_id: String,
-    seq: u64,
+    seq: Option<u64>,
 }
 
 #[derive(Clone, Default)]
 struct RemoteCallPendingState {
     request_ids: HashSet<String>,
+    by_request_id: HashMap<String, RemoteCallPendingRequest>,
     by_seq: HashMap<u64, RemoteCallPendingRequest>,
 }
 
 impl RemoteCallPendingState {
-    fn contains(&self, request_id: &str) -> bool {
-        self.request_ids.contains(request_id)
+    fn get_by_request_id(&self, request_id: &str) -> Option<&RemoteCallPendingRequest> {
+        self.by_request_id.get(request_id)
     }
 
-    fn insert(&mut self, request: RemoteCallPendingRequest) {
+    fn insert(&mut self, request: RemoteCallPendingRequest) -> bool {
+        if let Some(existing) = self.by_request_id.get_mut(&request.request_id) {
+            if existing.operation == request.operation && existing.seq.is_none() {
+                if let Some(seq) = request.seq {
+                    if self.by_seq.contains_key(&seq) {
+                        return false;
+                    }
+                    existing.seq = Some(seq);
+                    self.by_seq.insert(seq, existing.clone());
+                    return true;
+                }
+            }
+            return false;
+        }
+        if request
+            .seq
+            .is_some_and(|seq| self.by_seq.contains_key(&seq))
+        {
+            return false;
+        }
         self.request_ids.insert(request.request_id.clone());
-        self.by_seq.insert(request.seq, request);
+        self.by_request_id
+            .insert(request.request_id.clone(), request.clone());
+        if let Some(seq) = request.seq {
+            self.by_seq.insert(seq, request);
+        }
+        true
     }
 
     fn remove_by_request_id(&mut self, request_id: &str) -> Option<RemoteCallPendingRequest> {
         if !self.request_ids.remove(request_id) {
             return None;
         }
-        let seq = self
-            .by_seq
-            .iter()
-            .find_map(|(seq, request)| (request.request_id == request_id).then_some(*seq));
-        seq.and_then(|seq| self.by_seq.remove(&seq))
+        let request = self.by_request_id.remove(request_id)?;
+        if let Some(seq) = request.seq {
+            self.by_seq.remove(&seq);
+        }
+        Some(request)
     }
 
     fn remove_by_seq(&mut self, seq: u64) -> Option<RemoteCallPendingRequest> {
         let request = self.by_seq.remove(&seq)?;
         self.request_ids.remove(&request.request_id);
+        self.by_request_id.remove(&request.request_id);
         Some(request)
+    }
+
+    fn remove_all_unbound(&mut self) {
+        let request_ids = self
+            .by_request_id
+            .values()
+            .filter_map(|request| request.seq.is_none().then_some(request.request_id.clone()))
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.request_ids.remove(&request_id);
+            self.by_request_id.remove(&request_id);
+        }
     }
 
     fn len(&self) -> usize {
@@ -2176,7 +2206,21 @@ fn pending_request_from_envelope<T>(
         Some(RemoteCallPendingRequest {
             operation: request.operation.clone(),
             request_id: request.request_id.clone(),
-            seq: envelope.metadata.seq,
+            seq: Some(envelope.metadata.seq),
+        })
+    } else {
+        None
+    }
+}
+
+fn pending_request_from_command<T>(
+    command: &WireBridgeCommand<RemoteCallRequest<T>>,
+) -> Option<RemoteCallPendingRequest> {
+    if let WireBridgeCommand::Send { payload, .. } = command {
+        Some(RemoteCallPendingRequest {
+            operation: payload.operation.clone(),
+            request_id: payload.request_id.clone(),
+            seq: None,
         })
     } else {
         None
@@ -2196,6 +2240,33 @@ fn remote_call_response_is_terminal<T>(response: &RemoteCallResponse<T>) -> bool
         response,
         RemoteCallResponse::Result { .. } | RemoteCallResponse::Error { .. }
     )
+}
+
+fn remote_call_response_operation<T>(response: &RemoteCallResponse<T>) -> &str {
+    match response {
+        RemoteCallResponse::Result { operation, .. }
+        | RemoteCallResponse::Error { operation, .. }
+        | RemoteCallResponse::Status { operation, .. } => operation,
+    }
+}
+
+fn remote_call_response_matches_pending<T>(
+    response: &RemoteCallResponse<T>,
+    request: &RemoteCallPendingRequest,
+) -> bool {
+    remote_call_response_operation(response) == request.operation
+}
+
+fn remote_call_response_key<T>(response: &RemoteCallResponse<T>) -> String {
+    format!(
+        "{}\u{0}{}",
+        remote_call_response_operation(response),
+        remote_call_response_request_id(response)
+    )
+}
+
+fn remote_call_request_key(request: &RemoteCallPendingRequest) -> String {
+    format!("{}\u{0}{}", request.operation, request.request_id)
 }
 
 #[derive(Clone, Default)]
@@ -2305,8 +2376,10 @@ where
 
 fn remote_call_status_node<TRequest, TResponse>(
     graph: &Graph,
+    commands: &Node<WireBridgeCommand<RemoteCallRequest<TRequest>>>,
     events: &Node<WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>>,
     responses: &Node<RemoteCallResponse<TResponse>>,
+    results: &Node<RemoteCallResult<TResponse>>,
     timeouts: &Node<RemoteCallTimeout>,
     name: &str,
 ) -> Node<RemoteCallStatus>
@@ -2315,31 +2388,63 @@ where
     TResponse: Clone + 'static,
 {
     graph.node_opts::<RemoteCallStatus, _>(
-        vec![events.erased(), responses.erased(), timeouts.erased()],
+        vec![
+            commands.erased(),
+            events.erased(),
+            responses.erased(),
+            results.erased(),
+            timeouts.erased(),
+        ],
         |ctx| {
             let mut reducer = ctx
                 .state_get::<RemoteCallStatusReducer>()
                 .map_or_else(RemoteCallStatusReducer::default, |reducer| {
                     (*reducer).clone()
                 });
-            for event in ctx.batch::<
-                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(0) {
-                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
-                    if let Some(request) = pending_request_from_envelope(envelope) {
-                        reducer.status.state = RemoteCallStatusState::Requested;
-                        reducer.status.operation = Some(request.operation.clone());
-                        reducer.status.request_id = Some(request.request_id.clone());
-                        reducer.pending.insert(request);
+            for command in ctx.batch::<WireBridgeCommand<RemoteCallRequest<TRequest>>>(0) {
+                if let Some(request) = pending_request_from_command(command.as_ref()) {
+                    reducer.status.state = RemoteCallStatusState::Requested;
+                    reducer.status.operation = Some(request.operation.clone());
+                    reducer.status.request_id = Some(request.request_id.clone());
+                    if !reducer
+                        .terminal_before_request
+                        .contains(&remote_call_request_key(&request))
+                    {
+                        let _ = reducer.pending.insert(request);
                     }
                 }
             }
             for event in ctx.batch::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(0) {
+            >(1) {
+                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+                    if let Some(request) = pending_request_from_envelope(envelope) {
+                        reducer.status.state = RemoteCallStatusState::Requested;
+                        reducer.status.operation = Some(request.operation.clone());
+                        reducer.status.request_id = Some(request.request_id.clone());
+                        if reducer
+                            .terminal_before_request
+                            .remove(&remote_call_request_key(&request))
+                        {
+                            continue;
+                        }
+                        if !reducer.pending.insert(request) {
+                            reducer.status.state = RemoteCallStatusState::Errored;
+                            reducer.status.errors = reducer.status.errors.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            for event in ctx.batch::<
+                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+            >(1) {
                 match event.as_ref() {
-                    WireBridgeEvent::Invalid { .. }
-                    | WireBridgeEvent::SessionMismatch { .. }
+                    WireBridgeEvent::Invalid { .. } => {
+                        reducer.pending.remove_all_unbound();
+                        reducer.status.state = RemoteCallStatusState::BridgeErrored;
+                        reducer.status.errors = reducer.status.errors.saturating_add(1);
+                    }
+                    WireBridgeEvent::SessionMismatch { .. }
                     | WireBridgeEvent::OutOfOrder { .. }
                     | WireBridgeEvent::LateReceipt { .. } => {
                         reducer.status.state = RemoteCallStatusState::BridgeErrored;
@@ -2372,31 +2477,68 @@ where
                             reducer.status.errors = reducer.status.errors.saturating_add(1);
                         }
                     }
+                    WireBridgeEvent::Inbound { envelope } => {
+                        if let Some(WireBridgePayload::Data(response)) = &envelope.payload {
+                            let request_id = remote_call_response_request_id(response);
+                            if let Some(request) = reducer.pending.get_by_request_id(request_id) {
+                                if !remote_call_response_matches_pending(response, request) {
+                                    reducer.status.state = RemoteCallStatusState::Errored;
+                                    reducer.status.operation = Some(request.operation.clone());
+                                    reducer.status.request_id = Some(request.request_id.clone());
+                                    reducer.status.errors =
+                                        reducer.status.errors.saturating_add(1);
+                                    continue;
+                                }
+                            } else {
+                                reducer.status.state = RemoteCallStatusState::Errored;
+                                reducer.status.operation =
+                                    Some(remote_call_response_operation(response).to_owned());
+                                reducer.status.request_id = Some(request_id.to_owned());
+                                reducer.status.errors = reducer.status.errors.saturating_add(1);
+                                continue;
+                            }
+                            match response {
+                                RemoteCallResponse::Result {
+                                    ..
+                                } => {
+                                    // Terminal status is projected from the accepted responses dep below.
+                                }
+                                RemoteCallResponse::Error {
+                                    ..
+                                } => {
+                                    // Terminal status is projected from the accepted responses dep below.
+                                }
+                                RemoteCallResponse::Status {
+                                    operation,
+                                    request_id,
+                                    ..
+                                } => {
+                                    reducer.status.operation = Some(operation.clone());
+                                    reducer.status.request_id = Some(request_id.clone());
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
-            for response in ctx.batch::<RemoteCallResponse<TResponse>>(1) {
+            for response in ctx.batch::<RemoteCallResponse<TResponse>>(2) {
                 match response.as_ref() {
-                    RemoteCallResponse::Result {
-                        operation,
-                        request_id,
-                        ..
-                    } => {
-                        reducer.status.state = RemoteCallStatusState::Responded;
-                        reducer.status.operation = Some(operation.clone());
-                        reducer.status.request_id = Some(request_id.clone());
-                        reducer.pending.remove_by_request_id(request_id);
-                        reducer.status.completed = reducer.status.completed.saturating_add(1);
-                    }
+                    RemoteCallResponse::Result { .. } => {}
                     RemoteCallResponse::Error {
                         operation,
                         request_id,
                         ..
                     } => {
+                        let removed = reducer.pending.remove_by_request_id(request_id);
+                        if removed.as_ref().is_none_or(|request| request.seq.is_none()) {
+                            reducer
+                                .terminal_before_request
+                                .insert(format!("{}\u{0}{}", operation, request_id));
+                        }
                         reducer.status.state = RemoteCallStatusState::Errored;
                         reducer.status.operation = Some(operation.clone());
                         reducer.status.request_id = Some(request_id.clone());
-                        reducer.pending.remove_by_request_id(request_id);
                         reducer.status.errors = reducer.status.errors.saturating_add(1);
                     }
                     RemoteCallResponse::Status {
@@ -2404,12 +2546,26 @@ where
                         request_id,
                         ..
                     } => {
-                        reducer.status.operation = Some(operation.clone());
-                        reducer.status.request_id = Some(request_id.clone());
+                        if reducer.pending.get_by_request_id(request_id).is_some() {
+                            reducer.status.operation = Some(operation.clone());
+                            reducer.status.request_id = Some(request_id.clone());
+                        }
                     }
                 }
             }
-            for timeout in ctx.batch::<RemoteCallTimeout>(2) {
+            for result in ctx.batch::<RemoteCallResult<TResponse>>(3) {
+                let removed = reducer.pending.remove_by_request_id(&result.request_id);
+                if removed.as_ref().is_none_or(|request| request.seq.is_none()) {
+                    reducer
+                        .terminal_before_request
+                        .insert(format!("{}\u{0}{}", result.operation, result.request_id));
+                }
+                reducer.status.state = RemoteCallStatusState::Responded;
+                reducer.status.operation = Some(result.operation.clone());
+                reducer.status.request_id = Some(result.request_id.clone());
+                reducer.status.completed = reducer.status.completed.saturating_add(1);
+            }
+            for timeout in ctx.batch::<RemoteCallTimeout>(4) {
                 reducer.status.state = RemoteCallStatusState::TimedOut;
                 reducer.status.operation = timeout.operation.clone();
                 reducer.status.request_id = Some(timeout.request_id.clone());
@@ -2429,6 +2585,7 @@ where
 struct RemoteCallStatusReducer {
     status: RemoteCallStatus,
     pending: RemoteCallPendingState,
+    terminal_before_request: HashSet<String>,
 }
 
 impl Default for RemoteCallStatusReducer {
@@ -2436,6 +2593,7 @@ impl Default for RemoteCallStatusReducer {
         Self {
             status: initial_remote_call_status(),
             pending: RemoteCallPendingState::default(),
+            terminal_before_request: HashSet::new(),
         }
     }
 }
@@ -2476,11 +2634,24 @@ where
             >(2) {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     if let Some(request) = pending_request_from_envelope(envelope) {
-                        pending.insert(request);
+                        if !pending.insert(request.clone()) {
+                            ctx.emit(RemoteCallError {
+                                operation: Some(request.operation),
+                                request_id: Some(request.request_id.clone()),
+                                error: format!(
+                                    "remote_call: duplicate in-flight request_id '{}'",
+                                    request.request_id
+                                ),
+                            });
+                        }
                     }
                 }
             }
+            let mut accepted_response_counts = HashMap::new();
             for response in ctx.batch::<RemoteCallResponse<TResponse>>(0) {
+                *accepted_response_counts
+                    .entry(remote_call_response_key(response.as_ref()))
+                    .or_insert(0usize) += 1;
                 match response.as_ref() {
                     RemoteCallResponse::Error {
                         operation,
@@ -2537,6 +2708,39 @@ where
                         request_id: None,
                         error: error.clone(),
                     }),
+                    WireBridgeEvent::Inbound { envelope } => {
+                        if let Some(WireBridgePayload::Data(response)) = &envelope.payload {
+                            let response_key = remote_call_response_key(response);
+                            if let Some(count) = accepted_response_counts.get_mut(&response_key) {
+                                if *count > 0 {
+                                    *count -= 1;
+                                    continue;
+                                }
+                            }
+                            let request_id = remote_call_response_request_id(response);
+                            if let Some(request) = pending.get_by_request_id(request_id) {
+                                if !remote_call_response_matches_pending(response, request) {
+                                    ctx.emit(RemoteCallError {
+                                        operation: Some(request.operation.clone()),
+                                        request_id: Some(request.request_id.clone()),
+                                        error: format!(
+                                            "remote_call: response operation '{}' did not match pending operation '{}'",
+                                            remote_call_response_operation(response),
+                                            request.operation
+                                        ),
+                                    });
+                                }
+                            } else {
+                                ctx.emit(RemoteCallError {
+                                    operation: Some(remote_call_response_operation(response).to_owned()),
+                                    request_id: Some(request_id.to_owned()),
+                                    error:
+                                        "remote_call: orphan response for unknown or completed request"
+                                            .to_owned(),
+                                });
+                            }
+                        }
+                    }
                     WireBridgeEvent::SessionMismatch { .. }
                     | WireBridgeEvent::OutOfOrder { .. }
                     | WireBridgeEvent::LateReceipt { .. } => ctx.emit(RemoteCallError {
@@ -4770,5 +4974,201 @@ mod tests {
             .cache()
             .is_none_or(|status| status.state == WireBridgeStatusState::Idle));
         assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+    }
+
+    #[test]
+    fn remote_call_orphan_response_is_visible_and_not_buffered_for_future_request() {
+        let g = graph();
+        let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+            &g,
+            WireBridgeOptions::named("session-a", "bridge"),
+        );
+        let remote = remote_call::<String, String>(&g, &bridge);
+        let _results = remote.results.subscribe(|_| {});
+        let _errors = remote.errors.subscribe(|_| {});
+        let _status = remote.status.subscribe(|_| {});
+
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            1,
+            0,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "STALE".to_owned(),
+            })),
+            None,
+        ));
+        remote.call("upper", "req-1", "hello".to_owned());
+
+        assert!(remote.results.cache().is_none());
+        assert_eq!(
+            remote.errors.cache(),
+            Some(RemoteCallError {
+                operation: Some("upper".to_owned()),
+                request_id: Some("req-1".to_owned()),
+                error: "remote_call: orphan response for unknown or completed request".to_owned(),
+            })
+        );
+        assert_eq!(
+            remote.status.cache().unwrap().state,
+            RemoteCallStatusState::Requested
+        );
+
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            2,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "HELLO".to_owned(),
+            })),
+            None,
+        ));
+
+        assert_eq!(
+            remote.results.cache(),
+            Some(RemoteCallResult {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "HELLO".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_call_requires_operation_match_and_status_response_is_non_terminal() {
+        let g = graph();
+        let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+            &g,
+            WireBridgeOptions::named("session-a", "bridge"),
+        );
+        let remote = remote_call::<String, String>(&g, &bridge);
+        let _responses = remote.responses.subscribe(|_| {});
+        let _results = remote.results.subscribe(|_| {});
+        let _errors = remote.errors.subscribe(|_| {});
+        let _status = remote.status.subscribe(|_| {});
+
+        remote.call("upper", "req-1", "hello".to_owned());
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            1,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "lower".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "wrong".to_owned(),
+            })),
+            None,
+        ));
+
+        assert!(remote.results.cache().is_none());
+        assert_eq!(
+            remote.errors.cache(),
+            Some(RemoteCallError {
+                operation: Some("upper".to_owned()),
+                request_id: Some("req-1".to_owned()),
+                error:
+                    "remote_call: response operation 'lower' did not match pending operation 'upper'"
+                        .to_owned(),
+            })
+        );
+
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            2,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Status {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                status: "working".to_owned(),
+            })),
+            None,
+        ));
+        assert_eq!(
+            remote.responses.cache(),
+            Some(RemoteCallResponse::Status {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                status: "working".to_owned(),
+            })
+        );
+        assert_eq!(remote.status.cache().unwrap().pending, 1);
+
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            3,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "HELLO".to_owned(),
+            })),
+            None,
+        ));
+        assert_eq!(
+            remote.results.cache(),
+            Some(RemoteCallResult {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "HELLO".to_owned(),
+            })
+        );
+        assert_eq!(remote.status.cache().unwrap().pending, 0);
+    }
+
+    #[test]
+    fn remote_call_duplicate_request_id_is_visible_and_does_not_corrupt_pending() {
+        let g = graph();
+        let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+            &g,
+            WireBridgeOptions::named("session-a", "bridge"),
+        );
+        let remote = remote_call::<String, String>(&g, &bridge);
+        let _results = remote.results.subscribe(|_| {});
+        let _errors = remote.errors.subscribe(|_| {});
+        let _status = remote.status.subscribe(|_| {});
+
+        remote.call("upper", "req-1", "first".to_owned());
+        remote.call("upper", "req-1", "second".to_owned());
+
+        assert_eq!(
+            remote.errors.cache(),
+            Some(RemoteCallError {
+                operation: Some("upper".to_owned()),
+                request_id: Some("req-1".to_owned()),
+                error: "remote_call: duplicate in-flight request_id 'req-1'".to_owned(),
+            })
+        );
+        assert_eq!(remote.status.cache().unwrap().pending, 1);
+
+        bridge.inbound.set(envelope(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            1,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "FIRST".to_owned(),
+            })),
+            None,
+        ));
+
+        assert_eq!(
+            remote.results.cache(),
+            Some(RemoteCallResult {
+                operation: "upper".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "FIRST".to_owned(),
+            })
+        );
+        assert_eq!(remote.status.cache().unwrap().pending, 0);
     }
 }

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -1000,6 +1001,49 @@ fn remote_call_sends_request_facts_and_projects_later_response() {
 }
 
 #[test]
+fn remote_call_invalid_outbound_command_does_not_register_unsent_pending_request() {
+    let g = graph();
+    let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let remote = remote_call(&g, &bridge);
+    let results = collect_data(&remote.results);
+    let status = collect_data(&remote.status);
+    let errors = collect_data(&remote.errors);
+
+    remote.call_with_options("echo", "req-1", "payload".to_owned(), Some(String::new()));
+
+    let current_status = status.borrow().last().unwrap().clone();
+    assert_eq!(current_status.state, RemoteCallStatusState::BridgeErrored);
+    assert_eq!(current_status.pending, 0);
+    assert!(errors
+        .borrow()
+        .last()
+        .unwrap()
+        .error
+        .contains("idempotency"));
+
+    bridge.inbound.set(envelope_with_request(
+        "session-a",
+        WireBridgeEnvelopeType::Data,
+        1,
+        Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+            operation: "echo".to_owned(),
+            request_id: "req-1".to_owned(),
+            payload: "done".to_owned(),
+        })),
+        Some("req-1"),
+    ));
+
+    assert!(
+        results.borrow().is_empty(),
+        "a request rejected before outbound emission must not accept a later response"
+    );
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
+}
+
+#[test]
 fn remote_call_status_response_keeps_request_pending_until_result() {
     let g = graph();
     let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
@@ -1048,6 +1092,51 @@ fn remote_call_status_response_keeps_request_pending_until_result() {
 }
 
 #[test]
+fn remote_call_wrong_session_response_does_not_consume_pending_request() {
+    let g = graph();
+    let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let remote = remote_call(&g, &bridge);
+    let results = collect_data(&remote.results);
+    let status = collect_data(&remote.status);
+
+    remote.call("echo", "req-1", "payload".to_owned());
+    bridge.inbound.set(envelope_with_request(
+        "wrong-session",
+        WireBridgeEnvelopeType::Data,
+        1,
+        Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+            operation: "echo".to_owned(),
+            request_id: "req-1".to_owned(),
+            payload: "wrong".to_owned(),
+        })),
+        Some("req-1"),
+    ));
+
+    let mismatch_status = status.borrow().last().unwrap().clone();
+    assert_eq!(mismatch_status.state, RemoteCallStatusState::BridgeErrored);
+    assert_eq!(mismatch_status.pending, 1);
+    assert!(results.borrow().is_empty());
+
+    bridge.inbound.set(envelope_with_request(
+        "session-a",
+        WireBridgeEnvelopeType::Data,
+        1,
+        Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+            operation: "echo".to_owned(),
+            request_id: "req-1".to_owned(),
+            payload: "done".to_owned(),
+        })),
+        Some("req-1"),
+    ));
+
+    assert_eq!(results.borrow().len(), 1);
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
+}
+
+#[test]
 fn remote_call_accepts_same_wave_response_after_request_registration() {
     let g = graph();
     let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
@@ -1082,6 +1171,67 @@ fn remote_call_accepts_same_wave_response_after_request_registration() {
         }]
     );
     assert_eq!(status.borrow().last().unwrap().pending, 0);
+}
+
+#[test]
+fn remote_call_duplicate_after_completion_is_visible_in_same_event_batch() {
+    let g = graph();
+    let bridge = wire_bridge::<RemoteCallRequest<String>, RemoteCallResponse<String>>(
+        &g,
+        WireBridgeOptions::named("session-a", "bridge"),
+    );
+    let remote = remote_call(&g, &bridge);
+    let results = collect_data(&remote.results);
+    let errors = collect_data(&remote.errors);
+
+    remote.call("echo", "req-1", "payload".to_owned());
+    let inbound_events: Vec<Message<Rc<dyn Any>>> = vec![
+        Message::Data(Rc::new(WireBridgeEvent::<
+            RemoteCallRequest<String>,
+            RemoteCallResponse<String>,
+        >::Inbound {
+            envelope: envelope_with_request(
+                "session-a",
+                WireBridgeEnvelopeType::Data,
+                1,
+                Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                    operation: "echo".to_owned(),
+                    request_id: "req-1".to_owned(),
+                    payload: "first".to_owned(),
+                })),
+                Some("req-1"),
+            ),
+        }) as Rc<dyn Any>),
+        Message::Data(Rc::new(WireBridgeEvent::<
+            RemoteCallRequest<String>,
+            RemoteCallResponse<String>,
+        >::Inbound {
+            envelope: envelope_with_request(
+                "session-a",
+                WireBridgeEnvelopeType::Data,
+                2,
+                Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                    operation: "echo".to_owned(),
+                    request_id: "req-1".to_owned(),
+                    payload: "duplicate".to_owned(),
+                })),
+                Some("req-1"),
+            ),
+        }) as Rc<dyn Any>),
+    ];
+    bridge.events.down(inbound_events);
+
+    assert_eq!(
+        *results.borrow(),
+        vec![RemoteCallResult {
+            operation: "echo".to_owned(),
+            request_id: "req-1".to_owned(),
+            payload: "first".to_owned(),
+        }]
+    );
+    assert!(errors.borrow().iter().any(
+        |error| error.error == "remote_call: orphan response for unknown or completed request"
+    ));
 }
 
 #[test]

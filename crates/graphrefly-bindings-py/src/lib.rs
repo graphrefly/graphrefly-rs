@@ -55,7 +55,9 @@ use graphrefly_rs::{
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple,
+};
 use pyo3::IntoPyObjectExt;
 use serde_json::{Map as JsonMap, Number as JsonNumber};
 
@@ -1107,6 +1109,18 @@ fn protobuf_to_bridge_envelope(
 fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+fn py_bytes_like_to_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
+    if let Ok(bytes) = value.downcast::<PyBytes>() {
+        return Some(bytes.as_bytes().to_vec());
+    }
+    if let Ok(bytes) = value.downcast::<PyByteArray>() {
+        // SAFETY: the bytearray slice is used only long enough to copy into an
+        // owned Vec; no Python code or PyO3 API is called while the slice lives.
+        return Some(unsafe { bytes.as_bytes() }.to_vec());
+    }
+    None
 }
 
 fn py_to_checkpoint_json(py: Python<'_>, value: &Py<PyAny>) -> PyResult<GraphCheckpointJson> {
@@ -2230,13 +2244,13 @@ impl PyGraph {
                     for value in ctx.batch::<PyValue>(0) {
                         Python::with_gil(|py| {
                             let object = value.object.bind(py);
-                            let Ok(bytes) = object.downcast::<PyBytes>() else {
+                            let Some(bytes) = py_bytes_like_to_vec(object) else {
                                 ctx.emit(WireBridgeIngress::<WireBridgeProtobufDataBody>::Invalid(
                                     "wire_bridge_protobuf inbound_bytes requires bytes".to_owned(),
                                 ));
                                 return;
                             };
-                            let decoded = decode_wire_bridge_protobuf_bytes(bytes.as_bytes());
+                            let decoded = decode_wire_bridge_protobuf_bytes(&bytes);
                             if let Some(envelope) = decoded.envelope {
                                 ctx.emit(
                                     WireBridgeIngress::<WireBridgeProtobufDataBody>::Envelope(
@@ -2267,7 +2281,7 @@ impl PyGraph {
                 for value in ctx.batch::<PyValue>(0) {
                     Python::with_gil(|py| {
                         let object = value.object.bind(py);
-                        let Ok(bytes) = object.downcast::<PyBytes>() else {
+                        let Some(bytes) = py_bytes_like_to_vec(object) else {
                             ctx.emit(PyProtobufEvent::Issue {
                                 direction: "inbound",
                                 category: "malformed".to_owned(),
@@ -2280,7 +2294,7 @@ impl PyGraph {
                             });
                             return;
                         };
-                        let decoded = decode_wire_bridge_protobuf_bytes(bytes.as_bytes());
+                        let decoded = decode_wire_bridge_protobuf_bytes(&bytes);
                         if decoded.envelope.is_some() {
                             ctx.emit(PyProtobufEvent::Status {
                                 direction: "inbound",
@@ -2486,8 +2500,8 @@ impl PyGraph {
                 move |ctx| {
                     for value in ctx.batch::<PyValue>(0) {
                         Python::with_gil(|py| {
-                            if let Ok(bytes) = value.object.bind(py).downcast::<PyBytes>() {
-                                ctx.emit(bytes.as_bytes().to_vec());
+                            if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
+                                ctx.emit(bytes);
                             }
                         });
                     }
@@ -2501,7 +2515,7 @@ impl PyGraph {
                 move |ctx| {
                     for value in ctx.batch::<PyValue>(0) {
                         Python::with_gil(|py| {
-                            if value.object.bind(py).downcast::<PyBytes>().is_ok() {
+                            if py_bytes_like_to_vec(value.object.bind(py)).is_some() {
                                 return;
                             }
                             ctx.emit(WireEdgeGroupIssue {
