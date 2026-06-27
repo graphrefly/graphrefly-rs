@@ -488,6 +488,15 @@ impl PyWireBridgeProtobuf {
         }
         self.bridge
             .detach_inbound_source_for_native(self.inbound_source.erased());
+        let release = catch_unwind(AssertUnwindSafe(|| {
+            self._topology
+                .release_with_reason("wire_bridge_protobuf release");
+        }));
+        if let Err(panic) = release {
+            self.bridge
+                .attach_inbound_source_for_native(self.inbound_source.erased());
+            panic::resume_unwind(panic);
+        }
         self.released.set(true);
     }
 }
@@ -879,14 +888,14 @@ fn py_protobuf_event_issue(py: Python<'_>, event: &PyProtobufEvent) -> PyResult<
 }
 
 fn py_protobuf_filter_node(
-    graph: &Graph,
+    topology: &TopologyGroup,
     events: &Node<PyProtobufEvent>,
     name: String,
     pending_fatal: &PendingFatal,
     filter: impl Fn(Python<'_>, &PyProtobufEvent) -> PyResult<Option<Py<PyAny>>> + 'static,
 ) -> PyNode {
     let pending = pending_fatal.clone();
-    let node = graph.node_opts::<PyValue, _>(
+    let node = topology.node_opts::<PyValue, _>(
         vec![events.erased()],
         move |ctx| {
             for event in ctx.batch::<PyProtobufEvent>(0) {
@@ -2346,14 +2355,14 @@ impl PyGraph {
             py_node(node, &self.pending_fatal)
         };
         let status = py_protobuf_filter_node(
-            &self.graph,
+            &topology,
             &events,
             format!("{helper_name}/status"),
             &self.pending_fatal,
             py_protobuf_event_status,
         );
         let issues = py_protobuf_filter_node(
-            &self.graph,
+            &topology,
             &events,
             format!("{helper_name}/issues"),
             &self.pending_fatal,
