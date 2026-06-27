@@ -171,6 +171,18 @@ type Msg = Message<AnyValue>;
 type Sink = Rc<dyn Fn(&Msg)>;
 type Unsub = Box<dyn FnOnce()>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriberKind {
+    External,
+    GraphObserver,
+}
+
+struct SubscriberEntry {
+    id: u64,
+    kind: SubscriberKind,
+    sink: Sink,
+}
+
 enum SubscriberSnapshot {
     Empty,
     One(Sink),
@@ -188,8 +200,8 @@ enum MaybeRunDecision {
 fn snapshot_subscribers(a: &NodeAux) -> SubscriberSnapshot {
     match a.subscribers.as_slice() {
         [] => SubscriberSnapshot::Empty,
-        [(_, sink)] => SubscriberSnapshot::One(sink.clone()),
-        many => SubscriberSnapshot::Many(many.iter().map(|(_, s)| s.clone()).collect()),
+        [entry] => SubscriberSnapshot::One(entry.sink.clone()),
+        many => SubscriberSnapshot::Many(many.iter().map(|entry| entry.sink.clone()).collect()),
     }
 }
 
@@ -968,7 +980,7 @@ impl NodeRunState {
 /// Node-local sidecars that are NOT part of dep-slot wave bookkeeping. Keeping these
 /// in a side-table continues the B49 thinning path without changing observable behavior.
 struct NodeAux {
-    subscribers: Vec<(u64, Sink)>,
+    subscribers: Vec<SubscriberEntry>,
     next_sub_id: u64,
     activated: bool,
     state: Option<AnyValue>,
@@ -2792,11 +2804,24 @@ impl Core {
     /// the sink is already registered, so the caller can still detach it (the error path
     /// reconstructs the real unsub from `id_out`) — no orphaned subscriber.
     fn subscribe_recording_id(&self, sink: Sink, id_out: &Cell<Option<u64>>) -> Unsub {
+        self.subscribe_recording_id_with_kind(sink, SubscriberKind::External, id_out)
+    }
+
+    fn subscribe_recording_id_with_kind(
+        &self,
+        sink: Sink,
+        kind: SubscriberKind,
+        id_out: &Cell<Option<u64>>,
+    ) -> Unsub {
         let (id, push) = {
             self.with_node_state_aux_mut(|_n, _c, cfg, _r, e, a| {
                 let id = a.next_sub_id;
                 a.next_sub_id += 1;
-                a.subscribers.push((id, sink.clone()));
+                a.subscribers.push(SubscriberEntry {
+                    id,
+                    kind,
+                    sink: sink.clone(),
+                });
                 let push = if cfg.pull_id.is_some() {
                     None
                 } else if e.value.has_data {
@@ -2824,14 +2849,38 @@ impl Core {
     }
 
     fn unsubscribe(&self, id: u64) {
+        if !self.graph.borrow().is_live_key(self.key()) {
+            return;
+        }
         let became_empty = self.with_aux_mut(|a| {
             let before = a.subscribers.len();
-            a.subscribers.retain(|(sid, _)| *sid != id);
+            a.subscribers.retain(|entry| entry.id != id);
             a.subscribers.len() < before && a.subscribers.is_empty()
         });
         if became_empty {
             self.deactivate();
         }
+    }
+
+    pub(crate) fn external_subscriber_count_for_release(&self) -> usize {
+        self.with_aux(|a| {
+            a.subscribers
+                .iter()
+                .filter(|entry| entry.kind != SubscriberKind::GraphObserver)
+                .count()
+        })
+    }
+
+    pub(crate) fn detach_graph_observer_subscribers_for_release(&self) -> usize {
+        if !self.graph.borrow().is_live_key(self.key()) {
+            return 0;
+        }
+        self.with_aux_mut(|a| {
+            let before = a.subscribers.len();
+            a.subscribers
+                .retain(|entry| entry.kind != SubscriberKind::GraphObserver);
+            before - a.subscribers.len()
+        })
     }
 
     // ── activation / deactivation (lazy; R-rom-ram) ──
@@ -5129,6 +5178,14 @@ impl<T: 'static> Node<T> {
     /// is rejected — the stream is permanently over. (Resubscribable opt-in reset is a
     /// later slice.)
     pub fn subscribe(&self, sink: impl Fn(&Msg) + 'static) -> Unsub {
+        self.subscribe_with_kind(sink, SubscriberKind::External)
+    }
+
+    pub(crate) fn subscribe_graph_observer(&self, sink: impl Fn(&Msg) + 'static) -> Unsub {
+        self.subscribe_with_kind(sink, SubscriberKind::GraphObserver)
+    }
+
+    fn subscribe_with_kind(&self, sink: impl Fn(&Msg) + 'static, kind: SubscriberKind) -> Unsub {
         assert!(
             !self.core.with_inner_edges(|_n, e| e.value.terminal),
             "subscribe: node is terminal and non-resubscribable — the stream is permanently over (R-terminal / D17)"
@@ -5142,7 +5199,10 @@ impl<T: 'static> Node<T> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             with_wave_owner(
                 &self.core,
-                || self.core.subscribe_recording_id(sink, &body_cell),
+                || {
+                    self.core
+                        .subscribe_recording_id_with_kind(sink, kind, &body_cell)
+                },
                 move || match id_cell.get() {
                     Some(id) => {
                         let err_core = self.core.clone();

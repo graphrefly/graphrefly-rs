@@ -896,7 +896,7 @@ impl Graph {
                 .filter(|dep| dep.ptr_eq(core))
                 .count();
             assert!(
-                core.subscriber_count() <= internal_subscribers,
+                core.external_subscriber_count_for_release() <= internal_subscribers,
                 "graph: cannot release node group for {reason}; '{id}' still has live subscribers (D124)"
             );
         }
@@ -932,6 +932,9 @@ impl Graph {
                 by_id.remove(id);
                 retired.insert(id.clone());
             }
+        }
+        for core in &release_cores {
+            core.detach_graph_observer_subscribers_for_release();
         }
         let mut pending = release_cores.iter().rev().cloned().collect::<Vec<_>>();
         let mut first_panic = None;
@@ -1335,7 +1338,7 @@ impl Graph {
             let sink = sink.clone();
             let clock = clock.clone();
             let subscribed = catch_unwind(AssertUnwindSafe(|| {
-                Node::<AnyValue>::from_core(core).subscribe(move |msg| {
+                Node::<AnyValue>::from_core(core).subscribe_graph_observer(move |msg| {
                     let seq = clock.get();
                     clock.set(seq + 1);
                     sink(ObserveEvent {
@@ -1932,5 +1935,84 @@ mod tests {
         assert_eq!(events[0].deps, Vec::<String>::new());
         assert_eq!(events[0].seq, 0);
         assert!(g.find("panic").is_none());
+    }
+
+    #[test]
+    fn release_nodes_detaches_only_graph_observer_subscribers() {
+        let g = graph();
+        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
+        let child = group.state_opts(1, GraphNodeOpts::named("child/value"));
+        let unrelated = g.state_opts(10, GraphNodeOpts::named("unrelated"));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let event_sink = events.clone();
+        let observer = g
+            .observe()
+            .subscribe(move |event| event_sink.borrow_mut().push(event));
+
+        group.release();
+
+        assert!(
+            g.find("child/value").is_none(),
+            "D122: released group nodes disappear from find"
+        );
+        assert!(
+            !g.describe()
+                .nodes
+                .iter()
+                .any(|entry| entry.id == "child/value"),
+            "D122: released group nodes disappear from describe"
+        );
+
+        unrelated.set(11);
+        observer.unsubscribe();
+
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.path == "unrelated"
+                    && matches!(event.msg, ObserveMessage::Data(_))),
+            "D557: graph observer remains an ordinary observer and keeps unrelated subscriptions"
+        );
+        assert!(
+            events.iter().all(|event| event.path != "child/value"
+                || !matches!(
+                    event.msg,
+                    ObserveMessage::Complete | ObserveMessage::Error(_) | ObserveMessage::Teardown
+                )),
+            "D527: release does not synthesize protocol terminals"
+        );
+        drop(child);
+    }
+
+    #[test]
+    fn release_nodes_still_rejects_public_subscribers() {
+        let g = graph();
+        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
+        let child = group.state_opts(1, GraphNodeOpts::named("child/value"));
+        let public_subscriber = child.subscribe(|_| {});
+        let observer = g.observe().subscribe(|_| {});
+
+        let result = catch_unwind(AssertUnwindSafe(|| group.release()));
+
+        observer.unsubscribe();
+        public_subscriber();
+        group.release();
+        assert!(result.is_err());
+        assert!(
+            g.find("child/value").is_none(),
+            "after public subscriber detaches, release can proceed"
+        );
+    }
+
+    #[test]
+    fn graph_observer_unsubscribe_after_release_is_stale_safe() {
+        let g = graph();
+        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
+        let _child = group.state_opts(1, GraphNodeOpts::named("child/value"));
+        let observer = g.observe().subscribe(|_| {});
+
+        group.release();
+        observer.unsubscribe();
     }
 }
