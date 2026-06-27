@@ -1724,7 +1724,7 @@ fn reduce_wire_edge_group_frame(
     }
     let active = state.borrow().active_cause_id.clone();
     if active.as_deref() != Some(frame.cause_id.as_str()) {
-        if let Some(active_cause_id) = active {
+        if let Some(active_cause_id) = active.clone() {
             emit_wire_edge_group_competing_cause(
                 ctx,
                 name,
@@ -1749,14 +1749,11 @@ fn reduce_wire_edge_group_frame(
         wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
         return;
     }
-    {
-        let mut state_mut = state.borrow_mut();
-        if state_mut.active_cause_id.is_none() {
-            state_mut.active_cause_id = Some(frame.cause_id.clone());
-        }
-    }
     match frame.kind {
         CanonicalWireEdgeKind::Dirty => {
+            if active.is_none() {
+                state.borrow_mut().active_cause_id = Some(frame.cause_id.clone());
+            }
             if !state.borrow_mut().dirty.insert(frame.edge_id.clone()) {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
@@ -1773,6 +1770,22 @@ fn reduce_wire_edge_group_frame(
             wire_edge_group_progress(ctx, frame.cause_id.clone(), state);
         }
         CanonicalWireEdgeKind::Data => {
+            if state.borrow().active_cause_id.is_none() {
+                ctx.emit(WireEdgeGroupGate::Issue {
+                    issue: wire_edge_group_issue(
+                        WireEdgeGroupIssueCode::DataBeforeDirty,
+                        format!(
+                            "{name}: DATA for edge {} arrived without an active cause",
+                            frame.edge_id
+                        ),
+                        Some(frame.edge_id.clone()),
+                        Some(frame.cause_id.clone()),
+                        None,
+                    ),
+                });
+                wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
+                return;
+            }
             if !state.borrow().dirty.contains(&frame.edge_id) {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
@@ -1789,13 +1802,7 @@ fn reduce_wire_edge_group_frame(
                 wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
                 return;
             }
-            let value = frame.value.clone().unwrap_or_default();
-            if state
-                .borrow_mut()
-                .data
-                .insert(frame.edge_id.clone(), value)
-                .is_some()
-            {
+            if state.borrow().data.contains_key(&frame.edge_id) {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
                         WireEdgeGroupIssueCode::DuplicateData,
@@ -1808,6 +1815,8 @@ fn reduce_wire_edge_group_frame(
                 wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
                 return;
             }
+            let value = frame.value.clone().unwrap_or_default();
+            state.borrow_mut().data.insert(frame.edge_id.clone(), value);
             let ready = {
                 let state = state.borrow();
                 state.dirty.len() == expected_ids.len() && state.data.len() == expected_ids.len()

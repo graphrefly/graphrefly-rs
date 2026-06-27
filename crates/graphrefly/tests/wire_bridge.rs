@@ -659,6 +659,66 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
 }
 
 #[test]
+fn wire_edge_group_failed_cause_replay_is_issue_not_resurrection() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "failed-replay/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "failed-replay",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let inbound_a = collect_data(group.inbound.get("a").expect("edge a exists"));
+    let inbound_b = collect_data(group.inbound.get("b").expect("edge b exists"));
+    let issues = collect_data(&group.issues);
+    let status = collect_data(&group.status);
+
+    for (seq, kind, edge_id, value) in [
+        (1, CanonicalWireEdgeKind::Dirty, "a", None),
+        (2, CanonicalWireEdgeKind::Dirty, "b", None),
+        (3, CanonicalWireEdgeKind::Data, "a", Some(vec![1])),
+        (4, CanonicalWireEdgeKind::Data, "a", Some(vec![2])),
+        (5, CanonicalWireEdgeKind::Data, "b", Some(vec![3])),
+        (6, CanonicalWireEdgeKind::Dirty, "a", None),
+        (7, CanonicalWireEdgeKind::Dirty, "b", None),
+        (8, CanonicalWireEdgeKind::Data, "a", Some(vec![4])),
+        (9, CanonicalWireEdgeKind::Data, "b", Some(vec![5])),
+    ] {
+        bridge
+            .inbound
+            .set(wire_edge_envelope(seq, kind, edge_id, "c1", value));
+    }
+
+    assert!(inbound_a.borrow().is_empty());
+    assert!(inbound_b.borrow().is_empty());
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::DuplicateData));
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::IncompleteCause));
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Issues
+    );
+    assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
+    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().data, 0);
+    assert_ne!(group.issues.status(), graphrefly::Status::Errored);
+    assert_ne!(group.status.status(), graphrefly::Status::Errored);
+}
+
+#[test]
 fn wire_edge_group_replay_tombstones_are_bounded_recent_memory() {
     let g = graph();
     let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
