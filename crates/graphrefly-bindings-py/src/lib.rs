@@ -43,15 +43,15 @@ use graphrefly_rs::{
     DeferredCtx, DepTerminal, DescribeSnapshot, DescribeValue, Graph, GraphCheckpoint,
     GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreDescriptor, GraphRestoreEntry,
     GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult, LockId, MapJsonRestoreDescriptor,
-    Message, Node, NodeOpts, Operator, Pausable, PoolKind, PullDemand, RestoreDefineCtx,
-    RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, RetryPolicy,
-    StateRestoreDescriptor, Status, TopologyGroup, TopologyGroupOptions, WaveData, WireBridgeAck,
-    WireBridgeAttempt, WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope,
-    WireBridgeEnvelopeType, WireBridgeIngress, WireBridgeNack, WireBridgeOptions,
-    WireBridgePayload, WireBridgeProtobufDataBody, WireBridgeProtobufEnvelope,
-    WireBridgeProtobufPayload, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
-    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
-    WireEdgeGroupStatus, WireEdgeGroupStatusState,
+    Message, Node, NodeOpts, NodeVersion, Operator, Pausable, PoolKind, PullDemand,
+    RestoreDefineCtx, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
+    RestoreNodeKind, RetryPolicy, StateRestoreDescriptor, Status, TopologyGroup,
+    TopologyGroupOptions, WaveData, WireBridgeAck, WireBridgeAttempt, WireBridgeBundle,
+    WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeType, WireBridgeIngress,
+    WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeProtobufDataBody,
+    WireBridgeProtobufEnvelope, WireBridgeProtobufPayload, WireBridgeStatus, WireBridgeStatusState,
+    WireEdgeGroupBundle, WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode,
+    WireEdgeGroupOptions, WireEdgeGroupStatus, WireEdgeGroupStatusState,
 };
 use pyo3::exceptions::{PyException, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -2482,6 +2482,17 @@ impl PyGraph {
     ) -> PyResult<PyWireEdgeGroup> {
         raise_pending_fatal(&self.pending_fatal)?;
         let group_name = name.unwrap_or_else(|| "wireEdgeGroup".to_owned());
+        for (edge_id, node) in &outbound_edges {
+            let current_version = node
+                .graph_node
+                .as_ref()
+                .map_or_else(|| node.node.version(), GraphNode::version);
+            if current_version.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "wire_edge_group outbound edge {edge_id} requires node runtime versioning for D561 fresh-source admission"
+                )));
+            }
+        }
         let adapter_topology =
             self.graph
                 .topology_group_opts(TopologyGroupOptions::named(format!(
@@ -2495,15 +2506,29 @@ impl PyGraph {
             .collect::<Vec<_>>();
         for (edge_id, node) in outbound_edges {
             let edge_name = edge_id.clone();
+            let version_source_node = node.node.clone();
+            let version_source_graph_node = node.graph_node.clone();
+            let admitted_version: Rc<RefCell<Option<Option<NodeVersion>>>> =
+                Rc::new(RefCell::new(None));
             let bytes_node = adapter_topology.node_opts::<Vec<u8>, _>(
                 vec![node.erased_core()],
-                move |ctx| {
-                    for value in ctx.batch::<PyValue>(0) {
-                        Python::with_gil(|py| {
-                            if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
-                                ctx.emit(bytes);
+                {
+                    let admitted_version = admitted_version.clone();
+                    move |ctx| {
+                        for value in ctx.batch::<PyValue>(0) {
+                            let version = version_source_graph_node
+                                .as_ref()
+                                .map_or_else(|| version_source_node.version(), GraphNode::version);
+                            if admitted_version.borrow().as_ref() == Some(&version) {
+                                continue;
                             }
-                        });
+                            Python::with_gil(|py| {
+                                if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
+                                    *admitted_version.borrow_mut() = Some(version.clone());
+                                    ctx.emit(bytes);
+                                }
+                            });
+                        }
                     }
                 },
                 graph_node_opts(Some(format!("{group_name}/py/outbound/{edge_name}"))),
@@ -2515,7 +2540,8 @@ impl PyGraph {
                 move |ctx| {
                     for value in ctx.batch::<PyValue>(0) {
                         Python::with_gil(|py| {
-                            if py_bytes_like_to_vec(value.object.bind(py)).is_some() {
+                            if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
+                                drop(bytes);
                                 return;
                             }
                             ctx.emit(WireEdgeGroupIssue {

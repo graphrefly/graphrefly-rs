@@ -5,12 +5,12 @@ use std::rc::Rc;
 use graphrefly::{
     batch, graph, remote_call, remote_call_with_options, remote_responder,
     remote_responder_handler, wire_bridge, wire_bridge_envelope, wire_edge_group,
-    CanonicalWireEdgeFrame, CanonicalWireEdgeKind, GraphNodeOpts, Message, RemoteCallOptions,
-    RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatusState,
-    RemoteResponderOptions, RemoteResponderStatusState, WireBridgeCommand, WireBridgeEnvelopeInput,
-    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeOptions, WireBridgePayload,
-    WireBridgeProtobufDataBody, WireBridgeStatusState, WireEdgeGroupEdge, WireEdgeGroupIssueCode,
-    WireEdgeGroupOptions, WireEdgeGroupStatusState,
+    CanonicalWireEdgeFrame, CanonicalWireEdgeKind, GraphNodeOpts, Message, NodeVersioningPolicy,
+    RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult,
+    RemoteCallStatusState, RemoteResponderOptions, RemoteResponderStatusState, WireBridgeCommand,
+    WireBridgeEnvelopeInput, WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeOptions,
+    WireBridgePayload, WireBridgeProtobufDataBody, WireBridgeStatusState, WireEdgeGroupEdge,
+    WireEdgeGroupIssueCode, WireEdgeGroupOptions, WireEdgeGroupStatusState,
 };
 
 fn envelope<T>(
@@ -442,6 +442,116 @@ fn wire_edge_group_outbound_edge_invalidate_preserves_other_pending_fresh_data()
 }
 
 #[test]
+fn wire_edge_group_outbound_initial_bootstrap_allows_one_current_cohort() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("bootstrap/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("bootstrap/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "bootstrap/bridge"),
+    );
+    let outbound = collect_data(&bridge.outbound);
+
+    source_a.set(vec![1]);
+    source_b.set(vec![2]);
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "bootstrap/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+
+    let frames = wire_edge_frames(&outbound);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.kind, frame.edge_id.as_str(), frame.cause_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (CanonicalWireEdgeKind::Dirty, "a", "bootstrap/group:cause:1"),
+            (CanonicalWireEdgeKind::Dirty, "b", "bootstrap/group:cause:1"),
+            (CanonicalWireEdgeKind::Data, "a", "bootstrap/group:cause:1"),
+            (CanonicalWireEdgeKind::Data, "b", "bootstrap/group:cause:1"),
+        ],
+        "D561: the first complete activation/current cohort is the only legal bootstrap"
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_late_subscriber_current_drain_does_not_admit_cause() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("late-drain/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("late-drain/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "late-drain/bridge"),
+    );
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "late-drain/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    assert_eq!(wire_edge_frames(&outbound).len(), 4);
+    outbound.borrow_mut().clear();
+
+    let late_seen = collect_data(&bridge.outbound);
+    assert_eq!(
+        late_seen.borrow().len(),
+        1,
+        "late subscriber receives bridge.outbound current DATA directly"
+    );
+    assert!(
+        outbound.borrow().is_empty(),
+        "D561: late-subscriber current drain must not cause WireEdgeGroup to admit a new cohort"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "wire_edge_group: outbound edge 'a' requires node runtime versioning for D561 fresh-source admission"
+)]
+fn wire_edge_group_outbound_rejects_disabled_versioning_edges() {
+    let g = graph();
+    let mut disabled_opts = GraphNodeOpts::named("disabled-version/edge/a");
+    disabled_opts.node.versioning = Some(NodeVersioningPolicy::Disabled);
+    let source_a = g.state_empty_opts::<Vec<u8>>(disabled_opts);
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("disabled-version/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "disabled-version/bridge"),
+    );
+
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "disabled-version/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a),
+                WireEdgeGroupEdge::outbound("b", source_b),
+            ],
+        ),
+    );
+}
+
+#[test]
 fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
     let g = graph();
     let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("fresh/edge/a"));
@@ -515,6 +625,61 @@ fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
                 value: Some(vec![20]),
             },
         ]
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_same_bytes_from_fresh_events_still_form_cause() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("same-bytes/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("same-bytes/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "same-bytes/bridge"),
+    );
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "same-bytes/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    outbound.borrow_mut().clear();
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    let data_frames = wire_edge_frames(&outbound)
+        .into_iter()
+        .filter(|frame| frame.kind == CanonicalWireEdgeKind::Data)
+        .map(|frame| (frame.edge_id, frame.cause_id, frame.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_frames,
+        vec![
+            (
+                "a".to_owned(),
+                "same-bytes/group:cause:2".to_owned(),
+                Some(vec![1])
+            ),
+            (
+                "b".to_owned(),
+                "same-bytes/group:cause:2".to_owned(),
+                Some(vec![2])
+            ),
+        ],
+        "D561: freshness is occurrence/version based, not payload equality"
     );
 }
 

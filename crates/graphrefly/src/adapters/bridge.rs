@@ -17,6 +17,7 @@ use crate::graph::{Graph, GraphNodeOpts, TopologyGroup, TopologyGroupOptions};
 use crate::node::{Core, Node, NodeOpts};
 use crate::protocol::{AnyValue, Message};
 use crate::resilience::RetryPolicy;
+use crate::versioning::NodeVersion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireBridgeEnvelopeType {
@@ -1025,6 +1026,7 @@ pub fn wire_edge_group(
 ) -> WireEdgeGroupBundle {
     let name = opts.name.unwrap_or_else(|| "wireEdgeGroup".to_owned());
     let edges = normalize_wire_edge_group_edges(opts.edges);
+    validate_wire_edge_group_outbound_versions(&edges);
     let expected = edges
         .iter()
         .map(|edge| edge.edge_id.clone())
@@ -1170,7 +1172,15 @@ enum WireEdgeGroupGate {
 #[derive(Clone, Default)]
 struct WireEdgeGroupOutState {
     next_cause: u64,
-    pending: BTreeMap<String, Vec<u8>>,
+    emitted_once: bool,
+    pending: BTreeMap<String, WireEdgeGroupPendingOutbound>,
+    last_emitted_versions: BTreeMap<String, Option<NodeVersion>>,
+}
+
+#[derive(Clone)]
+struct WireEdgeGroupPendingOutbound {
+    value: Vec<u8>,
+    version: Option<NodeVersion>,
 }
 
 const WIRE_EDGE_GROUP_CAUSE_TOMBSTONE_LIMIT: usize = 1024;
@@ -1259,6 +1269,21 @@ fn normalize_wire_edge_group_edges(edges: Vec<WireEdgeGroupEdge>) -> Vec<WireEdg
     edges
 }
 
+fn validate_wire_edge_group_outbound_versions(edges: &[WireEdgeGroupEdge]) {
+    for edge in edges {
+        if edge
+            .outbound
+            .as_ref()
+            .is_some_and(|node| node.version().is_none())
+        {
+            panic!(
+                "wire_edge_group: outbound edge '{}' requires node runtime versioning for D561 fresh-source admission",
+                edge.edge_id
+            );
+        }
+    }
+}
+
 fn wire_edge_group_issue(
     code: WireEdgeGroupIssueCode,
     message: impl Into<String>,
@@ -1303,11 +1328,21 @@ fn wire_edge_group_events_fn(
                         match item {
                             WaveData::Data(value) => match value.clone().downcast::<Vec<u8>>() {
                                 Ok(value) => {
-                                    state
-                                        .borrow_mut()
-                                        .pending
-                                        .insert(edge.edge_id.clone(), (*value).clone());
-                                    triggered = true;
+                                    let version = edge.outbound.as_ref().and_then(Node::version);
+                                    if wire_edge_group_should_admit_outbound_data(
+                                        &state,
+                                        &edge.edge_id,
+                                        version.as_ref(),
+                                    ) {
+                                        state.borrow_mut().pending.insert(
+                                            edge.edge_id.clone(),
+                                            WireEdgeGroupPendingOutbound {
+                                                value: (*value).clone(),
+                                                version,
+                                            },
+                                        );
+                                        triggered = true;
+                                    }
                                 }
                                 Err(_) => {
                                     ctx.emit(WireEdgeGroupEvent::Issue {
@@ -1351,10 +1386,71 @@ fn wire_edge_group_out_state(ctx: &Ctx) -> Rc<RefCell<WireEdgeGroupOutState>> {
     }
     ctx.state_set(RefCell::new(WireEdgeGroupOutState {
         next_cause: 1,
+        emitted_once: false,
         pending: BTreeMap::new(),
+        last_emitted_versions: BTreeMap::new(),
     }));
     ctx.state_get::<RefCell<WireEdgeGroupOutState>>()
         .expect("wire-edge out state was just installed")
+}
+
+fn wire_edge_group_should_admit_outbound_data(
+    state: &Rc<RefCell<WireEdgeGroupOutState>>,
+    edge_id: &str,
+    version: Option<&NodeVersion>,
+) -> bool {
+    let state = state.borrow();
+    if !state.emitted_once {
+        return true;
+    }
+    let Some(version) = version else {
+        return false;
+    };
+    if state
+        .pending
+        .get(edge_id)
+        .is_some_and(|pending| pending.version.as_ref() == Some(version))
+    {
+        return false;
+    }
+    state
+        .last_emitted_versions
+        .get(edge_id)
+        .is_none_or(|last| last.as_ref() != Some(version))
+}
+
+#[cfg(test)]
+mod wire_edge_group_outbound_admission_tests {
+    use super::*;
+
+    fn version(counter: u64) -> NodeVersion {
+        NodeVersion::V0 { counter }
+    }
+
+    #[test]
+    fn pending_version_replay_is_not_re_admitted() {
+        let state = Rc::new(RefCell::new(WireEdgeGroupOutState {
+            next_cause: 2,
+            emitted_once: true,
+            pending: BTreeMap::from([(
+                "a".to_owned(),
+                WireEdgeGroupPendingOutbound {
+                    value: vec![2],
+                    version: Some(version(2)),
+                },
+            )]),
+            last_emitted_versions: BTreeMap::from([("a".to_owned(), Some(version(1)))]),
+        }));
+
+        assert!(
+            !wire_edge_group_should_admit_outbound_data(&state, "a", Some(&version(2))),
+            "D561: replay of the already-pending source occurrence is not fresh"
+        );
+        assert!(
+            wire_edge_group_should_admit_outbound_data(&state, "a", Some(&version(3))),
+            "D561: a later source occurrence remains eligible before cohort completion"
+        );
+    }
 }
 
 fn emit_wire_edge_group_outbound(
@@ -1409,12 +1505,22 @@ fn emit_wire_edge_group_outbound(
                     kind: CanonicalWireEdgeKind::Data,
                     edge_id: edge.edge_id.clone(),
                     cause_id: cause_id.clone(),
-                    value: Some(value.clone()),
+                    value: Some(value.value.clone()),
                 }),
             });
         }
     }
-    state.borrow_mut().pending.clear();
+    let mut state = state.borrow_mut();
+    state.last_emitted_versions.clear();
+    for edge in edges {
+        if let Some(pending) = pending.get(&edge.edge_id) {
+            state
+                .last_emitted_versions
+                .insert(edge.edge_id.clone(), pending.version.clone());
+        }
+    }
+    state.pending.clear();
+    state.emitted_once = true;
 }
 
 fn wire_edge_group_frame_event(
