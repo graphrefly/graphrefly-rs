@@ -1170,7 +1170,7 @@ enum WireEdgeGroupGate {
 #[derive(Clone, Default)]
 struct WireEdgeGroupOutState {
     next_cause: u64,
-    snapshots: BTreeMap<String, Vec<u8>>,
+    pending: BTreeMap<String, Vec<u8>>,
 }
 
 const WIRE_EDGE_GROUP_CAUSE_TOMBSTONE_LIMIT: usize = 1024;
@@ -1294,10 +1294,6 @@ fn wire_edge_group_events_fn(
     let inbound_index = outbound_indexes.len();
     move |ctx| {
         let state = wire_edge_group_out_state(ctx);
-        ctx.on_invalidate({
-            let state = state.clone();
-            move || state.borrow_mut().snapshots.clear()
-        });
         let mut triggered = false;
         for (dep_index, edge_index) in outbound_indexes.iter().enumerate() {
             let edge = &edges[*edge_index];
@@ -1309,7 +1305,7 @@ fn wire_edge_group_events_fn(
                                 Ok(value) => {
                                     state
                                         .borrow_mut()
-                                        .snapshots
+                                        .pending
                                         .insert(edge.edge_id.clone(), (*value).clone());
                                     triggered = true;
                                 }
@@ -1326,10 +1322,11 @@ fn wire_edge_group_events_fn(
                                             None,
                                         ),
                                     });
+                                    state.borrow_mut().pending.remove(&edge.edge_id);
                                 }
                             },
                             WaveData::Sentinel => {
-                                state.borrow_mut().snapshots.remove(&edge.edge_id);
+                                state.borrow_mut().pending.remove(&edge.edge_id);
                                 triggered = true;
                             }
                         }
@@ -1354,7 +1351,7 @@ fn wire_edge_group_out_state(ctx: &Ctx) -> Rc<RefCell<WireEdgeGroupOutState>> {
     }
     ctx.state_set(RefCell::new(WireEdgeGroupOutState {
         next_cause: 1,
-        snapshots: BTreeMap::new(),
+        pending: BTreeMap::new(),
     }));
     ctx.state_get::<RefCell<WireEdgeGroupOutState>>()
         .expect("wire-edge out state was just installed")
@@ -1370,7 +1367,7 @@ fn emit_wire_edge_group_outbound(
         let state = state.borrow();
         edges
             .iter()
-            .filter(|edge| !state.snapshots.contains_key(&edge.edge_id))
+            .filter(|edge| !state.pending.contains_key(&edge.edge_id))
             .map(|edge| edge.edge_id.clone())
             .collect::<Vec<_>>()
     };
@@ -1404,9 +1401,9 @@ fn emit_wire_edge_group_outbound(
             }),
         });
     }
-    let snapshots = state.borrow().snapshots.clone();
+    let pending = state.borrow().pending.clone();
     for edge in edges {
-        if let Some(value) = snapshots.get(&edge.edge_id) {
+        if let Some(value) = pending.get(&edge.edge_id) {
             ctx.emit(WireEdgeGroupEvent::Outbound {
                 command: wire_edge_group_send(CanonicalWireEdgeFrame {
                     kind: CanonicalWireEdgeKind::Data,
@@ -1417,6 +1414,7 @@ fn emit_wire_edge_group_outbound(
             });
         }
     }
+    state.borrow_mut().pending.clear();
 }
 
 fn wire_edge_group_frame_event(

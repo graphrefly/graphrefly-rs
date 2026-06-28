@@ -121,6 +121,21 @@ fn wire_edge_envelope(
     )
 }
 
+fn wire_edge_frames(
+    outbound: &Rc<RefCell<Vec<graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>>>>,
+) -> Vec<CanonicalWireEdgeFrame> {
+    outbound
+        .borrow()
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))) => {
+                Some(frame.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases() {
     let g = graph();
@@ -150,16 +165,7 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
         source_a.set(vec![1]);
         source_b.set(vec![2]);
     });
-    let frames = outbound
-        .borrow()
-        .iter()
-        .filter_map(|envelope| match &envelope.payload {
-            Some(WireBridgePayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))) => {
-                Some(frame.clone())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let frames = wire_edge_frames(&outbound);
     assert_eq!(
         frames,
         vec![
@@ -384,6 +390,225 @@ fn wire_edge_group_outbound_invalidate_clears_snapshot_before_next_cause() {
         data_frames,
         vec![
             ("a".to_owned(), Some(vec![4])),
+            ("b".to_owned(), Some(vec![3])),
+        ]
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_edge_invalidate_preserves_other_pending_fresh_data() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("edge-invalidate/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("edge-invalidate/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "edge-invalidate/bridge"),
+    );
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "edge-invalidate/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+
+    source_b.set(vec![3]);
+    assert!(outbound.borrow().is_empty());
+
+    source_a.down(vec![Message::Invalidate]);
+    assert!(
+        outbound.borrow().is_empty(),
+        "D560: invalidating one edge must not emit or clear unrelated pending fresh DATA"
+    );
+
+    source_a.set(vec![4]);
+    let data_frames = wire_edge_frames(&outbound)
+        .into_iter()
+        .filter(|frame| frame.kind == CanonicalWireEdgeKind::Data)
+        .map(|frame| (frame.edge_id, frame.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_frames,
+        vec![
+            ("a".to_owned(), Some(vec![4])),
+            ("b".to_owned(), Some(vec![3])),
+        ]
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("fresh/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("fresh/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "fresh/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "fresh/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    let issues = collect_data(&group.issues);
+    let status = collect_data(&group.status);
+
+    batch(|_| {
+        source_a.set(vec![1]);
+        source_b.set(vec![2]);
+    });
+    assert_eq!(wire_edge_frames(&outbound).len(), 4);
+    outbound.borrow_mut().clear();
+
+    source_a.set(vec![10]);
+    assert!(
+        outbound.borrow().is_empty(),
+        "D560: stale b=2 retained snapshot must not fill a new outbound cohort"
+    );
+    assert!(issues.borrow().iter().any(|issue| issue.code
+        == WireEdgeGroupIssueCode::MissingSnapshot
+        && issue.edge_id.as_deref() == Some("b")));
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Issues
+    );
+
+    source_b.set(vec![20]);
+    let frames = wire_edge_frames(&outbound);
+    assert_eq!(
+        frames,
+        vec![
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: "a".to_owned(),
+                cause_id: "fresh/group:cause:2".to_owned(),
+                value: None,
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Dirty,
+                edge_id: "b".to_owned(),
+                cause_id: "fresh/group:cause:2".to_owned(),
+                value: None,
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Data,
+                edge_id: "a".to_owned(),
+                cause_id: "fresh/group:cause:2".to_owned(),
+                value: Some(vec![10]),
+            },
+            CanonicalWireEdgeFrame {
+                kind: CanonicalWireEdgeKind::Data,
+                edge_id: "b".to_owned(),
+                cause_id: "fresh/group:cause:2".to_owned(),
+                value: Some(vec![20]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_duplicate_edge_data_latest_wins_before_cohort_completion() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("latest/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("latest/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "latest/bridge"),
+    );
+    let _group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "latest/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+
+    source_a.set(vec![1]);
+    source_a.set(vec![2]);
+    assert!(
+        outbound.borrow().is_empty(),
+        "partial fresh cohort must not emit DIRTY/DATA wire frames"
+    );
+
+    source_b.set(vec![3]);
+    let data_frames = wire_edge_frames(&outbound)
+        .into_iter()
+        .filter(|frame| frame.kind == CanonicalWireEdgeKind::Data)
+        .map(|frame| (frame.edge_id, frame.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_frames,
+        vec![
+            ("a".to_owned(), Some(vec![2])),
+            ("b".to_owned(), Some(vec![3])),
+        ]
+    );
+}
+
+#[test]
+fn wire_edge_group_outbound_malformed_data_clears_that_edge_pending_material() {
+    let g = graph();
+    let source_a = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("malformed/edge/a"));
+    let source_b = g.state_empty_opts::<Vec<u8>>(GraphNodeOpts::named("malformed/edge/b"));
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "malformed/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "malformed/group",
+            vec![
+                WireEdgeGroupEdge::outbound("a", source_a.clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+            ],
+        ),
+    );
+    let outbound = collect_data(&bridge.outbound);
+    let issues = collect_data(&group.issues);
+
+    source_a.set(vec![1]);
+    source_a.down(vec![Message::Data(Rc::new("not-bytes".to_owned()))]);
+    assert!(issues
+        .borrow()
+        .iter()
+        .any(|issue| issue.code == WireEdgeGroupIssueCode::MalformedFrame
+            && issue.edge_id.as_deref() == Some("a")));
+
+    source_b.set(vec![3]);
+    assert!(
+        outbound.borrow().is_empty(),
+        "malformed outbound DATA must clear stale pending bytes for that edge"
+    );
+
+    source_a.set(vec![2]);
+    let data_frames = wire_edge_frames(&outbound)
+        .into_iter()
+        .filter(|frame| frame.kind == CanonicalWireEdgeKind::Data)
+        .map(|frame| (frame.edge_id, frame.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        data_frames,
+        vec![
+            ("a".to_owned(), Some(vec![2])),
             ("b".to_owned(), Some(vec![3])),
         ]
     );
