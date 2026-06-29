@@ -272,7 +272,7 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
     assert!(snap
         .edges
         .iter()
-        .any(|edge| edge.from == "group/gate" && edge.to == "group/inbound/a"));
+        .any(|edge| edge.from == "group/release" && edge.to == "group/inbound/a"));
     assert!(snap
         .edges
         .iter()
@@ -777,6 +777,125 @@ fn wire_edge_group_outbound_malformed_data_clears_that_edge_pending_material() {
             ("b".to_owned(), Some(vec![3])),
         ]
     );
+}
+
+#[test]
+fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_in() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "cohort/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "cohort/group",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let inbound_a = group.inbound.get("a").expect("edge a exists");
+    let inbound_b = group.inbound.get("b").expect("edge b exists");
+    let join = g.node_opts::<Vec<u8>, _>(
+        vec![inbound_a.erased(), inbound_b.erased()],
+        |ctx| {
+            let a = ctx.data::<Vec<u8>>(0).expect("edge a data");
+            let b = ctx.data::<Vec<u8>>(1).expect("edge b data");
+            ctx.emit(vec![a[0], b[0]]);
+        },
+        GraphNodeOpts::named("cohort/join"),
+    );
+    let seen_a = collect_data(inbound_a);
+    let seen_b = collect_data(inbound_b);
+    let seen_join = collect_data(&join);
+    let status = collect_data(&group.status);
+    let issues = collect_data(&group.issues);
+
+    for (seq, kind, edge_id, cause_id, value) in [
+        (1, CanonicalWireEdgeKind::Dirty, "a", "c1", None),
+        (2, CanonicalWireEdgeKind::Dirty, "b", "c1", None),
+        (3, CanonicalWireEdgeKind::Data, "a", "c1", Some(vec![1])),
+        (4, CanonicalWireEdgeKind::Data, "b", "c1", Some(vec![2])),
+    ] {
+        bridge
+            .inbound
+            .set(wire_edge_envelope(seq, kind, edge_id, cause_id, value));
+    }
+    assert_eq!(*seen_a.borrow(), vec![vec![1]]);
+    assert_eq!(*seen_b.borrow(), vec![vec![2]]);
+    assert_eq!(*seen_join.borrow(), vec![vec![1, 2]]);
+
+    bridge.inbound.set(wire_edge_envelope(
+        5,
+        CanonicalWireEdgeKind::Dirty,
+        "a",
+        "c2",
+        None,
+    ));
+    bridge.inbound.set(wire_edge_envelope(
+        6,
+        CanonicalWireEdgeKind::Data,
+        "a",
+        "c2",
+        Some(vec![10]),
+    ));
+
+    assert_eq!(
+        *seen_a.borrow(),
+        vec![vec![1]],
+        "partial inbound DATA must not re-emit cached edge a"
+    );
+    assert_eq!(
+        *seen_b.borrow(),
+        vec![vec![2]],
+        "partial inbound progress must not re-emit cached edge b"
+    );
+    assert_eq!(
+        *seen_join.borrow(),
+        vec![vec![1, 2]],
+        "partial inbound progress must not re-run downstream fan-in with old values"
+    );
+    assert!(issues.borrow().is_empty());
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Collecting
+    );
+
+    bridge.inbound.set(wire_edge_envelope(
+        7,
+        CanonicalWireEdgeKind::Dirty,
+        "b",
+        "c2",
+        None,
+    ));
+    assert_eq!(
+        *seen_join.borrow(),
+        vec![vec![1, 2]],
+        "second partial DIRTY still must not release a mixed local fan-in"
+    );
+
+    bridge.inbound.set(wire_edge_envelope(
+        8,
+        CanonicalWireEdgeKind::Data,
+        "b",
+        "c2",
+        Some(vec![20]),
+    ));
+    assert_eq!(*seen_a.borrow(), vec![vec![1], vec![10]]);
+    assert_eq!(*seen_b.borrow(), vec![vec![2], vec![20]]);
+    assert_eq!(
+        *seen_join.borrow(),
+        vec![vec![1, 2], vec![10, 20]],
+        "complete inbound cause must release one coherent all-edge cohort"
+    );
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Released
+    );
+    assert_eq!(status.borrow().last().unwrap().released, 4);
 }
 
 #[test]

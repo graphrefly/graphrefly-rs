@@ -987,10 +987,13 @@ pub struct WireEdgeGroupBundle {
     pub inbound: BTreeMap<String, Node<Vec<u8>>>,
     pub status: Node<WireEdgeGroupStatus>,
     pub issues: Node<WireEdgeGroupIssue>,
+    graph: Graph,
     topology: TopologyGroup,
+    gate: Node<WireEdgeGroupGate>,
     bridge_command: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
     command_sources: Rc<RefCell<Vec<Core>>>,
     commands: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
+    gate_retain: RefCell<Option<Box<dyn FnOnce()>>>,
     released: Cell<bool>,
 }
 
@@ -1004,7 +1007,12 @@ impl WireEdgeGroupBundle {
             &self.command_sources,
             self.commands.erased(),
         );
+        let had_gate_retain = self.gate_retain.borrow().is_some();
+        let mut gate_retain = self.gate_retain.borrow_mut().take();
         let release = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(release) = gate_retain.take() {
+                release();
+            }
             self.topology.release_with_reason("wire_edge_group release");
         }));
         if let Err(panic) = release {
@@ -1013,6 +1021,12 @@ impl WireEdgeGroupBundle {
                 &self.command_sources,
                 self.commands.erased(),
             );
+            if had_gate_retain {
+                self.gate_retain.replace(Some(
+                    self.graph
+                        .retain(&self.gate, "wire_edge_group release rollback"),
+                ));
+            }
             resume_unwind(panic);
         }
         self.released.set(true);
@@ -1060,9 +1074,13 @@ pub fn wire_edge_group(
         ),
         graph_node_opts(format!("{name}/events"), "wireEdgeGroupEvents"),
     );
+    let release = topology.state_empty_opts::<WireEdgeGroupReleaseCohort>(graph_node_opts(
+        format!("{name}/release"),
+        "wireEdgeGroupReleaseCohort",
+    ));
     let gate = topology.node_opts::<WireEdgeGroupGate, _>(
         vec![events.erased()],
-        wire_edge_group_gate_fn(name.clone(), expected.clone()),
+        wire_edge_group_gate_fn(name.clone(), expected.clone(), release.clone()),
         graph_node_opts(format!("{name}/gate"), "wireEdgeGroupGate"),
     );
     let commands = topology.node_opts::<WireBridgeCommand<WireBridgeProtobufDataBody>, _>(
@@ -1102,13 +1120,12 @@ pub fn wire_edge_group(
         .map(|edge_id| {
             let edge_id_for_node = edge_id.clone();
             let node = topology.node_opts::<Vec<u8>, _>(
-                vec![gate.erased()],
+                vec![release.erased()],
                 move |ctx| {
-                    for event in ctx.batch::<WireEdgeGroupGate>(0) {
-                        if let WireEdgeGroupGate::Release { edge_id, value, .. } = event.as_ref() {
-                            if edge_id == &edge_id_for_node {
-                                ctx.emit(value.clone());
-                            }
+                    for cohort in ctx.batch::<WireEdgeGroupReleaseCohort>(0) {
+                        let _ = &cohort.cause_id;
+                        if let Some(value) = cohort.values.get(&edge_id_for_node) {
+                            ctx.emit(value.clone());
                         }
                     }
                 },
@@ -1127,14 +1144,22 @@ pub fn wire_edge_group(
         topology.release_with_reason("wire_edge_group failed command wiring");
         resume_unwind(panic);
     }
+    let gate_retain = RefCell::new(if outbound.is_empty() {
+        Some(graph.retain(&gate, &format!("{name}.wireEdgeGroup.gate")))
+    } else {
+        None
+    });
     WireEdgeGroupBundle {
         inbound,
         status,
         issues,
+        graph: graph.clone(),
         topology,
+        gate,
         bridge_command: bridge.command.clone(),
         command_sources: bridge.command_sources.clone(),
         commands,
+        gate_retain,
         released: Cell::new(false),
     }
 }
@@ -1164,9 +1189,15 @@ enum WireEdgeGroupGate {
         data: usize,
     },
     Release {
-        edge_id: String,
-        value: Vec<u8>,
+        cause_id: String,
+        count: usize,
     },
+}
+
+#[derive(Clone)]
+struct WireEdgeGroupReleaseCohort {
+    cause_id: String,
+    values: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Default)]
@@ -1641,7 +1672,11 @@ fn validate_wire_edge_group_frame(
     }
 }
 
-fn wire_edge_group_gate_fn(name: String, expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'static {
+fn wire_edge_group_gate_fn(
+    name: String,
+    expected_ids: Vec<String>,
+    release: Node<WireEdgeGroupReleaseCohort>,
+) -> impl Fn(&Ctx) + 'static {
     let expected = expected_ids.iter().cloned().collect::<HashSet<_>>();
     move |ctx| {
         let state = wire_edge_group_gate_state(ctx);
@@ -1678,6 +1713,7 @@ fn wire_edge_group_gate_fn(name: String, expected_ids: Vec<String>) -> impl Fn(&
                         &expected,
                         &expected_ids,
                         &state,
+                        &release,
                         frame,
                     );
                 }
@@ -1805,6 +1841,7 @@ fn reduce_wire_edge_group_frame(
     expected: &HashSet<String>,
     expected_ids: &[String],
     state: &Rc<RefCell<WireEdgeGroupGateState>>,
+    release: &Node<WireEdgeGroupReleaseCohort>,
     frame: &CanonicalWireEdgeFrame,
 ) {
     if state.borrow().failed.contains(&frame.cause_id) {
@@ -1927,16 +1964,23 @@ fn reduce_wire_edge_group_frame(
             };
             if ready {
                 let data = state.borrow().data.clone();
-                for edge_id in expected_ids {
-                    if let Some(value) = data.get(edge_id) {
-                        ctx.emit(WireEdgeGroupGate::Release {
-                            edge_id: edge_id.clone(),
-                            value: value.clone(),
-                        });
-                    }
-                }
+                let values = expected_ids
+                    .iter()
+                    .filter_map(|edge_id| {
+                        data.get(edge_id)
+                            .map(|value| (edge_id.clone(), value.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 state.borrow_mut().released.insert(frame.cause_id.clone());
                 wire_edge_group_gate_reset(state);
+                ctx.emit(WireEdgeGroupGate::Release {
+                    cause_id: frame.cause_id.clone(),
+                    count: values.len(),
+                });
+                release.set(WireEdgeGroupReleaseCohort {
+                    cause_id: frame.cause_id.clone(),
+                    values,
+                });
             } else {
                 wire_edge_group_progress(ctx, frame.cause_id.clone(), state);
             }
@@ -1986,12 +2030,15 @@ fn wire_edge_group_status_fn(expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'stat
                     status.dirty = *dirty;
                     status.data = *data;
                 }
-                WireEdgeGroupGate::Release { .. } => {
+                WireEdgeGroupGate::Release { cause_id, count } => {
                     status.state = WireEdgeGroupStatusState::Released;
                     status.active_cause_id = None;
                     status.dirty = 0;
                     status.data = 0;
-                    status.released = status.released.saturating_add(1);
+                    status.released = status
+                        .released
+                        .saturating_add(u64::try_from(*count).unwrap_or(u64::MAX));
+                    let _ = cause_id;
                 }
             }
         }
