@@ -1957,13 +1957,14 @@ fn reduce_wire_edge_group_frame(
                 return;
             }
             let value = frame.value.clone().unwrap_or_default();
-            state.borrow_mut().data.insert(frame.edge_id.clone(), value);
             let ready = {
                 let state = state.borrow();
-                state.dirty.len() == expected_ids.len() && state.data.len() == expected_ids.len()
+                state.dirty.len() == expected_ids.len()
+                    && state.data.len().saturating_add(1) == expected_ids.len()
             };
             if ready {
-                let data = state.borrow().data.clone();
+                let mut data = state.borrow().data.clone();
+                data.insert(frame.edge_id.clone(), value);
                 let values = expected_ids
                     .iter()
                     .filter_map(|edge_id| {
@@ -1971,8 +1972,6 @@ fn reduce_wire_edge_group_frame(
                             .map(|value| (edge_id.clone(), value.clone()))
                     })
                     .collect::<BTreeMap<_, _>>();
-                state.borrow_mut().released.insert(frame.cause_id.clone());
-                wire_edge_group_gate_reset(state);
                 ctx.emit(WireEdgeGroupGate::Release {
                     cause_id: frame.cause_id.clone(),
                     count: values.len(),
@@ -1981,7 +1980,10 @@ fn reduce_wire_edge_group_frame(
                     cause_id: frame.cause_id.clone(),
                     values,
                 });
+                state.borrow_mut().released.insert(frame.cause_id.clone());
+                wire_edge_group_gate_reset(state);
             } else {
+                state.borrow_mut().data.insert(frame.edge_id.clone(), value);
                 wire_edge_group_progress(ctx, frame.cause_id.clone(), state);
             }
         }

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use graphrefly::{
@@ -896,6 +896,83 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
         WireEdgeGroupStatusState::Released
     );
     assert_eq!(status.borrow().last().unwrap().released, 4);
+}
+
+#[test]
+fn wire_edge_group_release_delivery_abort_does_not_tombstone_cause_before_cohort_lands() {
+    let g = graph();
+    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+        &g,
+        WireBridgeOptions::named("session-a", "rollback/bridge"),
+    );
+    let group = wire_edge_group(
+        &g,
+        &bridge,
+        WireEdgeGroupOptions::named(
+            "rollback/group",
+            vec![
+                WireEdgeGroupEdge::inbound("a"),
+                WireEdgeGroupEdge::inbound("b"),
+            ],
+        ),
+    );
+    let inbound_a = group.inbound.get("a").expect("edge a exists");
+    let inbound_b = group.inbound.get("b").expect("edge b exists");
+    let seen_a = collect_data(inbound_a);
+    let seen_b = collect_data(inbound_b);
+    let status = collect_data(&group.status);
+    let issues = collect_data(&group.issues);
+
+    let panic_once = Rc::new(Cell::new(true));
+    let panic_once_sink = panic_once.clone();
+    let aborting_observer = g.node_opts::<(), _>(
+        vec![inbound_a.erased()],
+        move |ctx| {
+            let _ = ctx.data::<Vec<u8>>(0).expect("edge a data");
+            if panic_once_sink.replace(false) {
+                panic!("release delivery abort before cohort lands");
+            }
+            ctx.emit(());
+        },
+        GraphNodeOpts::named("rollback/aborting-observer"),
+    );
+    let _keep_aborting_observer = aborting_observer.subscribe(|_| {});
+
+    for (seq, kind, edge_id, cause_id, value) in [
+        (1, CanonicalWireEdgeKind::Dirty, "a", "c1", None),
+        (2, CanonicalWireEdgeKind::Dirty, "b", "c1", None),
+        (3, CanonicalWireEdgeKind::Data, "a", "c1", Some(vec![1])),
+        (4, CanonicalWireEdgeKind::Data, "b", "c1", Some(vec![2])),
+    ] {
+        bridge
+            .inbound
+            .set(wire_edge_envelope(seq, kind, edge_id, cause_id, value));
+    }
+
+    assert_eq!(*seen_a.borrow(), vec![vec![1]]);
+    assert!(
+        seen_b.borrow().is_empty(),
+        "the one-shot abort happens before the full cohort lands"
+    );
+
+    bridge.inbound.set(wire_edge_envelope(
+        5,
+        CanonicalWireEdgeKind::Data,
+        "b",
+        "c1",
+        Some(vec![2]),
+    ));
+
+    assert_eq!(*seen_a.borrow(), vec![vec![1], vec![1]]);
+    assert_eq!(*seen_b.borrow(), vec![vec![2]]);
+    assert!(
+        issues.borrow().is_empty(),
+        "replayed final DATA must not be rejected as an already released or duplicate cause"
+    );
+    assert_eq!(
+        status.borrow().last().unwrap().state,
+        WireEdgeGroupStatusState::Released
+    );
 }
 
 #[test]

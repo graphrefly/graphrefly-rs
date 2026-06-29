@@ -600,7 +600,7 @@ fn c1_rust_two_graph_mixed_locality_bridge_diamond_is_coherent() {
     assert_eq!(classification, ReplayClass::NoOldCauseReplayObserved);
     assert!(
         g1_to_g2_queue.borrow().is_empty() && g2_to_g1_queue.borrow().is_empty(),
-        "C-1 FIFO host pump leaves no hidden repair/dedupe work queued"
+        "C-1 FIFO host pump leaves no outbound frames queued in this scenario"
     );
     assert_eq!(
         trace_data_values(&trace, "stimulus", "g1_to_g2"),
