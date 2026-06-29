@@ -1,7 +1,7 @@
 # =============================================================================
 # graphrefly-rs — clean-slate workspace
 #
-# Authority: ~/src/graphrefly (branch clean-slate). The protocol spec, decisions
+# Authority: ~/src/graphrefly (branch main). The protocol spec, decisions
 # (D#), formal model, and conformance scenarios live there — that repo wins on
 # any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
 #

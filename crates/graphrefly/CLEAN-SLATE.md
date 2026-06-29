@@ -1,6 +1,6 @@
 # `graphrefly` — Rust clean-slate substrate (CSP-5)
 
-> **Authority:** `~/src/graphrefly` (branch `clean-slate`). This crate implements
+> **Authority:** `~/src/graphrefly` (branch `main`). This crate implements
 > the language-neutral protocol; that repo wins on any disagreement. Do not
 > duplicate its content here — cite D#/R-IDs and point.
 

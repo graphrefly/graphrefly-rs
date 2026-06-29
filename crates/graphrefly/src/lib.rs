@@ -3,7 +3,7 @@
 //! Reactive **universal reduction layer**: high fan-in/fan-out → information
 //! reduction → push. Not LLM-limited; performance first-class (D1).
 //!
-//! ## Authority — the truth lives in `~/src/graphrefly` (branch `clean-slate`)
+//! ## Authority — the truth lives in `~/src/graphrefly` (branch `main`)
 //!
 //! This crate is the Rust **implementation**. The language-neutral authority —
 //! protocol spec, decisions, formal model, conformance scenarios — is in the
