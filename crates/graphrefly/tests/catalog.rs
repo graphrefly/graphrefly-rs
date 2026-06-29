@@ -15,19 +15,20 @@ use futures_core::Stream;
 use graphrefly::{
     audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
     combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
-    element_at, empty, exhaust_map, filter, find, first, first_any, flat_map, from_cron,
-    from_cron_with_options, from_fs_watch, from_fs_watch_with_options, from_git_hook,
-    from_git_hook_with_options, from_http, from_iter, from_process, from_sse, from_timer,
-    from_webhook, from_webhook_with_options, from_websocket, future_local, graph, interval, last,
-    last_any, map, matches_cron, merge_map, merge_map_with_options, never, of, on_first_data,
-    on_first_data_where, pairwise, parse_cron, race, reduce, repeat, rescue, run_process, sample,
-    scan, settle, settle_by, skip, stream_local, switch_map, take, take_until, take_while, tap,
-    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
-    CronInstant, CronTick, Dispatcher, EnvironmentDrivers, FromCronOptions, FromFsWatchOptions,
-    FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest,
-    HttpResponse, LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver,
-    LocalWebSocketDriver, LocalWebhookDriver, MergeMapOptions, Message, Node, ProcessCommand,
-    ProcessResult, SseDriverEvent, SseEvent, WebSocketDriverEvent, WebSocketEvent,
+    element_at, empty, exhaust_map, filter, find, first, first_any, first_sync_value_from,
+    flat_map, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
+    from_git_hook, from_git_hook_with_options, from_http, from_iter, from_process, from_sse,
+    from_timer, from_webhook, from_webhook_with_options, from_websocket, future_local, graph,
+    interval, last, last_any, map, matches_cron, merge_map, merge_map_with_options, never, of,
+    on_first_data, on_first_data_where, pairwise, parse_cron, race, reduce, repeat, rescue,
+    run_process, sample, scan, settle, settle_by, single_sync_value_from, skip, stream_local,
+    switch_map, take, take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error,
+    timeout, timer, valve, with_latest_from, zip, CronInstant, CronTick, Dispatcher,
+    EnvironmentDrivers, FromCronOptions, FromFsWatchOptions, FromGitHookOptions, FsEvent,
+    FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
+    LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver, LocalWebSocketDriver,
+    LocalWebhookDriver, MergeMapOptions, Message, Node, Operator, ProcessCommand, ProcessResult,
+    SseDriverEvent, SseEvent, SyncValueFromError, WebSocketDriverEvent, WebSocketEvent,
     WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 
@@ -523,6 +524,203 @@ fn source_primitives_cover_empty_never_and_throw_error() {
     });
     assert_eq!(*failed_events.borrow(), vec!["ERROR:boom"]);
     assert_eq!(failed.status(), graphrefly::Status::Errored);
+}
+
+#[test]
+fn sync_value_from_helpers_are_host_boundary_reads_without_runtime() {
+    let g = graph();
+
+    let first_source = g.init_node(
+        from_iter(vec![1i32, 2, 3]),
+        vec![],
+        GraphNodeOpts::named("sync_first"),
+    );
+    assert_eq!(first_sync_value_from(&first_source), Ok(1));
+
+    let single_source = g.init_node(of(7i32), vec![], GraphNodeOpts::named("sync_single"));
+    assert_eq!(single_sync_value_from(&single_source), Ok(7));
+
+    let many_source = g.init_node(
+        from_iter(vec![4i32, 5]),
+        vec![],
+        GraphNodeOpts::named("sync_many"),
+    );
+    assert_eq!(
+        single_sync_value_from(&many_source),
+        Err(SyncValueFromError::TooManyValues)
+    );
+
+    let empty_source = g.init_node(
+        empty::<i32>(),
+        vec![],
+        GraphNodeOpts::named("sync_empty_first"),
+    );
+    assert_eq!(
+        first_sync_value_from(&empty_source),
+        Err(SyncValueFromError::CompleteWithoutData)
+    );
+    let empty_single = g.init_node(
+        empty::<i32>(),
+        vec![],
+        GraphNodeOpts::named("sync_empty_single"),
+    );
+    assert_eq!(
+        single_sync_value_from(&empty_single),
+        Err(SyncValueFromError::CompleteWithoutData)
+    );
+
+    let failed = g.init_node(
+        throw_error::<i32>("sync boom"),
+        vec![],
+        GraphNodeOpts::named("sync_error"),
+    );
+    assert_eq!(
+        first_sync_value_from(&failed),
+        Err(SyncValueFromError::Error("sync boom".to_owned()))
+    );
+
+    let state = g.state_opts(10i32, GraphNodeOpts::named("sync_live_state"));
+    assert_eq!(first_sync_value_from(&state), Ok(10));
+    assert_eq!(
+        single_sync_value_from(&state),
+        Err(SyncValueFromError::Pending),
+        "single_sync_value_from must not invent completion or wait on a live node"
+    );
+    state.set(11);
+    assert_eq!(
+        state.cache(),
+        Some(11),
+        "host-boundary read helper unsubscribes instead of retaining the source"
+    );
+}
+
+#[test]
+fn sync_value_from_helpers_fail_closed_on_terminal_mixed_windows() {
+    let g = graph();
+
+    let data_then_error_first: Node<i32> = g.init_node(
+        Operator::new("syncDataThenError", |ctx| {
+            ctx.emit(1i32);
+            ctx.down(vec![Message::Error("after data".into())]);
+        }),
+        vec![],
+        GraphNodeOpts::named("sync_data_then_error"),
+    );
+    assert_eq!(
+        first_sync_value_from(&data_then_error_first),
+        Err(SyncValueFromError::Error("after data".to_owned())),
+        "ERROR in the synchronous window outranks a convenient DATA value"
+    );
+    let data_then_error_single: Node<i32> = g.init_node(
+        Operator::new("syncDataThenErrorSingle", |ctx| {
+            ctx.emit(1i32);
+            ctx.down(vec![Message::Error("after data".into())]);
+        }),
+        vec![],
+        GraphNodeOpts::named("sync_data_then_error_single"),
+    );
+    assert_eq!(
+        single_sync_value_from(&data_then_error_single),
+        Err(SyncValueFromError::Error("after data".to_owned()))
+    );
+
+    let teardown: Node<i32> = g.init_node(
+        Operator::new("syncTeardown", |ctx| {
+            ctx.down(vec![Message::Teardown]);
+        }),
+        vec![],
+        GraphNodeOpts::named("sync_teardown"),
+    );
+    assert_eq!(
+        first_sync_value_from(&teardown),
+        Err(SyncValueFromError::Teardown)
+    );
+    let teardown_single: Node<i32> = g.init_node(
+        Operator::new("syncTeardownSingle", |ctx| {
+            ctx.down(vec![Message::Teardown]);
+        }),
+        vec![],
+        GraphNodeOpts::named("sync_teardown_single"),
+    );
+    assert_eq!(
+        single_sync_value_from(&teardown_single),
+        Err(SyncValueFromError::Teardown)
+    );
+}
+
+#[test]
+fn sync_value_from_helpers_bound_sync_data_capture() {
+    #[derive(Debug)]
+    struct CloneProbe {
+        value: i32,
+        clones: Rc<Cell<usize>>,
+    }
+
+    impl Clone for CloneProbe {
+        fn clone(&self) -> Self {
+            self.clones.set(self.clones.get() + 1);
+            Self {
+                value: self.value,
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    let g = graph();
+    let first_clones = Rc::new(Cell::new(0));
+    let first_source = g.init_node(
+        from_iter(vec![
+            CloneProbe {
+                value: 1,
+                clones: first_clones.clone(),
+            },
+            CloneProbe {
+                value: 2,
+                clones: first_clones.clone(),
+            },
+            CloneProbe {
+                value: 3,
+                clones: first_clones.clone(),
+            },
+        ]),
+        vec![],
+        GraphNodeOpts::named("sync_first_bounded_capture"),
+    );
+    assert_eq!(first_sync_value_from(&first_source).unwrap().value, 1);
+    assert_eq!(
+        first_clones.get(),
+        4,
+        "from_iter clones three DATA payloads; first_sync_value_from captures only the first"
+    );
+
+    let single_clones = Rc::new(Cell::new(0));
+    let single_source = g.init_node(
+        from_iter(vec![
+            CloneProbe {
+                value: 1,
+                clones: single_clones.clone(),
+            },
+            CloneProbe {
+                value: 2,
+                clones: single_clones.clone(),
+            },
+            CloneProbe {
+                value: 3,
+                clones: single_clones.clone(),
+            },
+        ]),
+        vec![],
+        GraphNodeOpts::named("sync_single_bounded_capture"),
+    );
+    assert!(matches!(
+        single_sync_value_from(&single_source),
+        Err(SyncValueFromError::TooManyValues)
+    ));
+    assert_eq!(
+        single_clones.get(),
+        4,
+        "single_sync_value_from only needs the first value plus a count"
+    );
 }
 
 #[test]

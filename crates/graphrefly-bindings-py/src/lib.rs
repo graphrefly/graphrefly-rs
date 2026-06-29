@@ -453,7 +453,7 @@ impl PyWireBridge {
 #[pyclass(name = "_WireBridgeProtobuf", unsendable)]
 struct PyWireBridgeProtobuf {
     bridge: Rc<PyWireBridgeCore>,
-    _topology: TopologyGroup,
+    topology: TopologyGroup,
     inbound_source: Node<WireBridgeIngress<WireBridgeProtobufDataBody>>,
     inbound_bytes: PyNode,
     outbound_bytes: PyNode,
@@ -491,7 +491,7 @@ impl PyWireBridgeProtobuf {
         self.bridge
             .detach_inbound_source_for_native(self.inbound_source.erased());
         let release = catch_unwind(AssertUnwindSafe(|| {
-            self._topology
+            self.topology
                 .release_with_reason("wire_bridge_protobuf release");
         }));
         if let Err(panic) = release {
@@ -2191,7 +2191,6 @@ impl PyGraph {
                     session_id: session_id.clone(),
                     now_ms: Some(Rc::new(|| 1)),
                     retry: RetryPolicy::new(2, BackoffPolicy::None),
-                    ..WireBridgeOptions::new(session_id)
                 },
             ))
         })?;
@@ -2392,7 +2391,7 @@ impl PyGraph {
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireBridgeProtobuf {
             bridge: bridge_core,
-            _topology: topology,
+            topology,
             inbound_source: decoded_inbound,
             inbound_bytes: py_node(inbound_bytes, &self.pending_fatal),
             outbound_bytes,

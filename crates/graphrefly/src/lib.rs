@@ -329,13 +329,14 @@ pub use solutions::{
     AGENTIC_MEMORY_RECORD_FRAME_VERSION,
 };
 pub use sources::{
-    empty, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
-    from_git_hook, from_git_hook_with_options, from_http, from_http_with_options, from_iter,
-    from_process, from_sse, from_sse_with_options, from_timer, from_webhook,
-    from_webhook_with_options, from_websocket, from_websocket_with_options, future_local, interval,
-    matches_cron, never, of, parse_cron, run_process, run_process_with_options, stream_local,
-    throw_error, timer, CronInstant, CronParseError, CronSchedule, CronTick, FromCronOptions,
-    FromFsWatchOptions, FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GitHookType,
+    empty, first_sync_value_from, from_cron, from_cron_with_options, from_fs_watch,
+    from_fs_watch_with_options, from_git_hook, from_git_hook_with_options, from_http,
+    from_http_with_options, from_iter, from_process, from_sse, from_sse_with_options, from_timer,
+    from_webhook, from_webhook_with_options, from_websocket, from_websocket_with_options,
+    future_local, interval, matches_cron, never, of, parse_cron, run_process,
+    run_process_with_options, single_sync_value_from, stream_local, throw_error, timer,
+    CronInstant, CronParseError, CronSchedule, CronTick, FromCronOptions, FromFsWatchOptions,
+    FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GitHookType, SyncValueFromError,
 };
 pub use storage::{
     append_log_key, append_log_storage, assert_wal_frame, change_envelope_codec, codec_kv_storage,

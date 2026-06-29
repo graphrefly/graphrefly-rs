@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ use crate::environment::{
     WebSocketDriverEvent, WebSocketEvent, WebSocketRequest, WebhookDriverEvent, WebhookEvent,
     WebhookRegistration,
 };
+use crate::node::Node;
 use crate::node::{NodeOpts, Pausable};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, Message};
@@ -68,6 +70,178 @@ pub fn throw_error<T: 'static>(err: impl Into<String>) -> Operator<T> {
     Operator::new("throwError", move |ctx| {
         ctx.down(vec![Message::Error(err.clone().into())]);
     })
+}
+
+/// Host-boundary result for [`first_sync_value_from`] and [`single_sync_value_from`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncValueFromError {
+    /// The node completed before emitting a DATA value.
+    CompleteWithoutData,
+    /// The node emitted a protocol ERROR before the helper could return a value.
+    Error(String),
+    /// The node stayed live after the synchronous subscribe/current-drain window.
+    Pending,
+    /// The node synchronously tore down without a successful value result.
+    Teardown,
+    /// The node emitted more than one DATA value before completing.
+    TooManyValues,
+    /// The typed node delivered DATA that could not be downcast to `T`.
+    ValueTypeMismatch,
+}
+
+impl fmt::Display for SyncValueFromError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompleteWithoutData => f.write_str("node completed before emitting DATA"),
+            Self::Error(error) => write!(f, "node emitted ERROR: {error}"),
+            Self::Pending => f.write_str("node did not synchronously emit a final value"),
+            Self::Teardown => f.write_str("node tore down before emitting a value result"),
+            Self::TooManyValues => f.write_str("node emitted more than one DATA value"),
+            Self::ValueTypeMismatch => f.write_str("node emitted DATA with an unexpected type"),
+        }
+    }
+}
+
+impl Error for SyncValueFromError {}
+
+/// Read the first DATA value delivered during the synchronous subscribe window.
+///
+/// This is a host-boundary convenience for already-synchronous sources such as
+/// [`of`] and [`from_iter`]. It does not wait, spawn, poll, or install a hidden
+/// scheduler: if the node remains live without a DATA value, it returns
+/// [`SyncValueFromError::Pending`] after immediately unsubscribing.
+pub fn first_sync_value_from<T>(node: &Node<T>) -> Result<T, SyncValueFromError>
+where
+    T: Clone + 'static,
+{
+    let state = Rc::new(RefCell::new(SyncValueCapture::<T>::default()));
+    let sink_state = state.clone();
+    let unsubscribe = node.subscribe(move |msg| {
+        sink_state.borrow_mut().record(msg);
+    });
+    unsubscribe();
+    let result = state.borrow_mut().first_result();
+    result
+}
+
+/// Read exactly one DATA value from a synchronously completing source.
+///
+/// The helper returns [`SyncValueFromError::Pending`] if the node does not
+/// complete during the synchronous subscribe/current-drain window. It is not a
+/// Promise/Future analogue and owns no runtime.
+pub fn single_sync_value_from<T>(node: &Node<T>) -> Result<T, SyncValueFromError>
+where
+    T: Clone + 'static,
+{
+    let state = Rc::new(RefCell::new(SyncValueCapture::<T>::default()));
+    let sink_state = state.clone();
+    let unsubscribe = node.subscribe(move |msg| {
+        sink_state.borrow_mut().record(msg);
+    });
+    unsubscribe();
+    let result = state.borrow_mut().single_result();
+    result
+}
+
+struct SyncValueCapture<T> {
+    first: Option<T>,
+    value_count: usize,
+    error: Option<String>,
+    completed: bool,
+    torn_down: bool,
+    type_mismatch: bool,
+}
+
+impl<T> Default for SyncValueCapture<T> {
+    fn default() -> Self {
+        Self {
+            first: None,
+            value_count: 0,
+            error: None,
+            completed: false,
+            torn_down: false,
+            type_mismatch: false,
+        }
+    }
+}
+
+impl<T> SyncValueCapture<T>
+where
+    T: Clone + 'static,
+{
+    fn record(&mut self, msg: &Message<AnyValue>) {
+        match msg {
+            Message::Data(value) => match value.as_ref().downcast_ref::<T>() {
+                Some(value) => {
+                    if self.value_count == 0 {
+                        self.first = Some(value.clone());
+                    }
+                    self.value_count = self.value_count.saturating_add(1);
+                }
+                None => self.type_mismatch = true,
+            },
+            Message::Error(error) => {
+                if self.error.is_none() {
+                    self.error = Some(error.to_string());
+                }
+            }
+            Message::Complete => {
+                self.completed = true;
+            }
+            Message::Teardown => {
+                self.torn_down = true;
+            }
+            Message::Start
+            | Message::Dirty
+            | Message::Resolved
+            | Message::Invalidate
+            | Message::Pause(_)
+            | Message::Resume(_)
+            | Message::Pull(_) => {}
+        }
+    }
+
+    fn first_result(&mut self) -> Result<T, SyncValueFromError> {
+        if self.type_mismatch {
+            return Err(SyncValueFromError::ValueTypeMismatch);
+        }
+        if let Some(error) = &self.error {
+            return Err(SyncValueFromError::Error(error.clone()));
+        }
+        if self.torn_down {
+            return Err(SyncValueFromError::Teardown);
+        }
+        if let Some(value) = self.first.take() {
+            return Ok(value);
+        }
+        if self.completed {
+            return Err(SyncValueFromError::CompleteWithoutData);
+        }
+        Err(SyncValueFromError::Pending)
+    }
+
+    fn single_result(&mut self) -> Result<T, SyncValueFromError> {
+        if self.type_mismatch {
+            return Err(SyncValueFromError::ValueTypeMismatch);
+        }
+        if let Some(error) = &self.error {
+            return Err(SyncValueFromError::Error(error.clone()));
+        }
+        if self.torn_down {
+            return Err(SyncValueFromError::Teardown);
+        }
+        if !self.completed {
+            return Err(SyncValueFromError::Pending);
+        }
+        match self.value_count {
+            0 => Err(SyncValueFromError::CompleteWithoutData),
+            1 => self
+                .first
+                .take()
+                .ok_or(SyncValueFromError::ValueTypeMismatch),
+            _ => Err(SyncValueFromError::TooManyValues),
+        }
+    }
 }
 
 /// run_process: execute one process via the graph-local environment process driver.

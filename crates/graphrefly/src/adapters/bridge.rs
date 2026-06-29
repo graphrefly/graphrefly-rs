@@ -2256,17 +2256,9 @@ where
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct RemoteCallResponsesState {
     pending: RemoteCallPendingState,
-}
-
-impl Default for RemoteCallResponsesState {
-    fn default() -> Self {
-        Self {
-            pending: RemoteCallPendingState::default(),
-        }
-    }
 }
 
 fn remote_call_responses_state(ctx: &Ctx) -> Rc<RefCell<RemoteCallResponsesState>> {
