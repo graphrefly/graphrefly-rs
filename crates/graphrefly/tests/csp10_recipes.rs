@@ -440,3 +440,106 @@ fn process_work_queue_maps_terminal_record_to_evidence() {
     assert_eq!(evidence[0].queue_record_kind, "work-completed");
     assert_eq!(evidence[0].result.as_deref(), Some("ok"));
 }
+
+#[test]
+fn messaging_work_queue_and_cqrs_visible_handoff_reaches_queue_disposition() {
+    let g = graph();
+    let now = Rc::new(Cell::new(0));
+    let bus = message_bus::<WorkQueueSubmit<CqrsQueuedCommandPayload<String>>>(
+        &g,
+        MessageBusOptions::named("test/d566Bus")
+            .with_topics(["cqrs-work"])
+            .with_now({
+                let now = now.clone();
+                move || now.get()
+            }),
+    );
+    let queue = work_queue(
+        &g,
+        WorkQueueOptions::new("cqrs-q", bus, "cqrs-work", "cqrs-admit").with_now({
+            let now = now.clone();
+            move || now.get()
+        }),
+    );
+    let cqrs = graphrefly::cqrs_with_options::<String, String>(
+        &g,
+        graphrefly::CqrsOptions::named("test/d566Cqrs")
+            .with_handlers(vec![graphrefly::cqrs_command_handler(
+                "PlaceOrder",
+                |command: &CqrsCommand<String>| {
+                    vec![graphrefly::CqrsEventDraft::new(
+                        "OrderPlaced",
+                        command.payload.clone(),
+                    )]
+                },
+            )])
+            .with_events(["OrderPlaced"]),
+    );
+    let records = collect_data(&queue.records);
+
+    queue.submit(
+        CqrsQueuedCommandPayload::new(CqrsCommand::new(
+            "cmd-1",
+            "PlaceOrder",
+            "payload".to_owned(),
+        )),
+        WorkQueueSubmitOptions {
+            work_id: Some("work-1".to_owned()),
+            ..WorkQueueSubmitOptions::default()
+        },
+    );
+    queue.claim(WorkQueueClaimOptions::new("cqrs-worker").command_id("claim-1"));
+
+    let admitted_payload = records
+        .borrow()
+        .iter()
+        .find_map(|record| match record {
+            WorkQueueRecord::WorkAdmitted { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .expect("messageBus admission creates visible CQRS work payload");
+    let attempt = records
+        .borrow()
+        .iter()
+        .find_map(|record| match record {
+            WorkQueueRecord::WorkClaimed {
+                work_id,
+                lease_id,
+                attempt,
+                worker_id,
+                ..
+            } => Some(CqrsWorkQueueAttempt {
+                kind: "cqrs-work-queue-attempt".to_owned(),
+                work_id: work_id.clone(),
+                lease_id: lease_id.clone(),
+                queue_attempt: *attempt,
+                worker_id: worker_id.clone(),
+                command: admitted_payload.command.clone(),
+                payload: admitted_payload.clone(),
+                source_refs: Vec::new(),
+            }),
+            _ => None,
+        })
+        .expect("workQueue claim creates visible CQRS attempt coordinates");
+
+    cqrs.dispatch(admitted_payload.command.clone());
+    let status = cqrs
+        .status
+        .cache()
+        .expect("CQRS command dispatch emits visible status");
+    let disposition = cqrs_work_queue_disposition_command(
+        &attempt,
+        CqrsWorkQueueOutcome::Accepted { status },
+        &CqrsWorkQueuePolicy::default(),
+    );
+    queue.commands.set(disposition);
+
+    assert!(records.borrow().iter().any(|record| matches!(
+        record,
+        WorkQueueRecord::WorkCompleted {
+            result: Some(result),
+            ..
+        } if result.contains("cqrs-accepted")
+    )));
+    assert!(cqrs.events.cache().is_some());
+}

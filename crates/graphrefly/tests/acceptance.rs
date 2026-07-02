@@ -3,20 +3,40 @@ use graphrefly::{
     agentic_memory_context_packing_bundle, agentic_memory_kg_projection_bundle,
     agentic_memory_record_frame, agentic_memory_record_frame_codec,
     agentic_memory_records_snapshot_key, agentic_memory_retention_bundle, graph,
-    knowledge_graph_reducer_bundle, memory_append_log, memory_kv, persist_agentic_memory_records,
+    knowledge_graph_reducer_bundle, memory_append_log, memory_kv, message_bus,
+    persist_agentic_memory_records, scheduled_readiness_projector, work_queue,
+    work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
     AgenticMemoryArtifactKind, AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
     AgenticMemoryConsolidationOutcome, AgenticMemoryContextPackingBundleOptions,
     AgenticMemoryContextPackingPolicy, AgenticMemoryKgAssertionDraft,
     AgenticMemoryKgProjectionBundleOptions, AgenticMemoryKind, AgenticMemoryPersistenceLevel,
     AgenticMemoryRecord, AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
     AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
-    AgenticMemoryTextProjection, AppendLogReadOptions, AppendLogStorageTier, Codec, GraphNodeOpts,
+    AgenticMemoryTextProjection, AppendLogReadOptions, AppendLogStorageTier, BackoffPolicy, Codec,
+    CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, GraphNodeOpts,
     KnowledgeAssertionObject, KnowledgeGraphPolicy, KnowledgeGraphReducerBundleOptions,
-    KnowledgeGraphStatusState, KvStorageTier, MemoryFragment, MemoryRetrievalQuery,
-    PersistAgenticMemoryRecordsOptions,
+    KnowledgeGraphStatusState, KvStorageTier, MemoryFragment, MemoryRetrievalQuery, Message,
+    MessageBusOptions, PersistAgenticMemoryRecordsOptions, RetryPolicy, ScheduledReadinessClock,
+    ScheduledReadinessOptions, WorkQueueClaimOptions, WorkQueueOptions,
+    WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffOptions, WorkQueueRecord,
+    WorkQueueScheduledReadinessOptions, WorkQueueSubmit, WorkQueueSubmitOptions,
 };
 use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let _keep = node.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                sink.borrow_mut().push(value.clone());
+            }
+        }
+    });
+    seen
+}
 
 fn record(id: &str, text: &str) -> AgenticMemoryRecord<Value> {
     AgenticMemoryRecord {
@@ -287,4 +307,100 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
     );
     persistence.flush().unwrap();
     persistence.dispose();
+}
+
+#[test]
+fn public_crate_root_d566_app_infra_acceptance() {
+    let g = graph();
+    let now = Rc::new(Cell::new(0_u64));
+    let bus = message_bus::<WorkQueueSubmit<String>>(
+        &g,
+        MessageBusOptions::named("acceptance/d566Bus")
+            .with_topics(["work"])
+            .with_now({
+                let now = now.clone();
+                move || now.get()
+            }),
+    );
+    let queue = work_queue(
+        &g,
+        WorkQueueOptions::new("q", bus, "work", "q-admit")
+            .with_now({
+                let now = now.clone();
+                move || now.get()
+            })
+            .with_retry(RetryPolicy::new(
+                3,
+                BackoffPolicy::Constant { delay_ms: 10 },
+            )),
+    );
+    let schedules = work_queue_scheduled_readiness_projector(
+        &g,
+        WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()])
+            .named("acceptance/d566Schedules"),
+    );
+    let clock = g.state_empty::<ScheduledReadinessClock>();
+    let readiness = scheduled_readiness_projector(
+        &g,
+        ScheduledReadinessOptions::new(vec![schedules.readiness_schedules.clone()])
+            .with_clocks(vec![clock.clone()])
+            .named("acceptance/d566Readiness"),
+    );
+    let handoff = work_queue_readiness_handoff_projector(
+        &g,
+        WorkQueueReadinessHandoffOptions::new(
+            vec![queue.records.clone()],
+            vec![readiness.ready.clone()],
+        )
+        .named("acceptance/d566Handoff"),
+    );
+    let candidates = collect_data(&handoff.candidates);
+
+    let cqrs = graphrefly::cqrs_with_options::<String, String>(
+        &g,
+        CqrsOptions::named("acceptance/d566Cqrs")
+            .with_handlers(vec![graphrefly::cqrs_command_handler(
+                "PlaceOrder",
+                |command: &CqrsCommand<String>| {
+                    vec![CqrsEventDraft::new("OrderPlaced", command.payload.clone())]
+                },
+            )])
+            .with_events(["OrderPlaced"]),
+    );
+
+    queue.submit(
+        "payload".to_owned(),
+        WorkQueueSubmitOptions {
+            work_id: Some("work-1".to_owned()),
+            not_before_ms: Some(10),
+            ..WorkQueueSubmitOptions::default()
+        },
+    );
+    clock.set(ScheduledReadinessClock {
+        clock_id: "clock".to_owned(),
+        now_ms: 10,
+        source_refs: Vec::new(),
+        metadata: None,
+    });
+    now.set(10);
+    let records = collect_data(&queue.records);
+    queue.claim(WorkQueueClaimOptions::new("worker").command_id("claim-1"));
+    cqrs.dispatch(CqrsCommand::new(
+        "cmd-1",
+        "PlaceOrder",
+        "payload".to_owned(),
+    ));
+
+    assert!(candidates.borrow().iter().any(|candidate| {
+        candidate.work_id == "work-1"
+            && candidate.candidate_kind == WorkQueueReadinessCandidateKind::ClaimEligible
+    }));
+    assert!(records
+        .borrow()
+        .iter()
+        .any(|record| matches!(record, WorkQueueRecord::WorkClaimed { .. })));
+    assert!(cqrs
+        .status
+        .cache()
+        .is_some_and(|status| { status.state == CqrsStatusState::Accepted }));
 }

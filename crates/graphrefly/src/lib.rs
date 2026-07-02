@@ -378,6 +378,15 @@ pub use versioning::{
     default_node_version_hash, NodeVersion, NodeVersionHashFn, NodeVersioningPolicy,
     ResolvedNodeVersioningPolicy,
 };
+pub use work_queue::readiness::{
+    work_queue_lease_expiration_command, work_queue_lease_expiration_command_projector,
+    work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
+    WorkQueueLeaseExpirationCommandProjectorOptions, WorkQueueReadinessCandidate,
+    WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffBundle,
+    WorkQueueReadinessHandoffOptions, WorkQueueReadinessScheduleKind, WorkQueueReadinessStatus,
+    WorkQueueReadinessStatusState, WorkQueueReadinessViews, WorkQueueScheduledReadinessBundle,
+    WorkQueueScheduledReadinessOptions,
+};
 pub use work_queue::{
     work_queue, WorkQueue, WorkQueueActiveLease, WorkQueueAvailableItem, WorkQueueAvailablePage,
     WorkQueueAvailableParams, WorkQueueAvailableProjection, WorkQueueClaimOptions,
