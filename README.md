@@ -1,121 +1,116 @@
 # graphrefly-rs
 
-Rust implementation of the [GraphReFly](https://graphrefly.dev) reactive graph protocol.
+Rust implementation of GraphReFly's clean-slate reactive graph engine and reusable
+application-infrastructure surface.
 
-**Status:** Substrate-complete (2026-05-25). M1–M5 crates are implemented and gate-green; [`@graphrefly/native`](crates/graphrefly-bindings-js/) ships the async JS substrate (`createNativeImpl()`). Milestone tracker: [`docs/migration-status.md`](docs/migration-status.md). Migration plan: [`SESSION-rust-port-architecture.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) in graphrefly-ts.
+GraphReFly is a reactive universal reduction layer: high fan-in/fan-out,
+information reduction, then push. The language-neutral authority for protocol,
+decisions, conformance, formal models, and phase sequencing lives in
+`~/src/graphrefly`; this repository implements the Rust package.
 
-## Architectural premise
+## Current Shape
 
-The Core operates entirely on opaque `HandleId` integers. Per-language SDK harnesses (napi-rs for JS, pyo3 for Python, wasm-bindgen for browser/edge) own the value-to-handle registry. Equals-substitution under `equals: 'identity'` is a u64 compare with zero FFI; user-fn invocation is the only mandatory boundary crossing per fn fire.
+The active crate is `crates/graphrefly` (`lib` name `graphrefly`, package
+`graphrefly-rs`). The old port-model crates under `crates/graphrefly-core`,
+`crates/graphrefly-graph`, `crates/graphrefly-operators`,
+`crates/graphrefly-storage`, `crates/graphrefly-structures`, and old JS/WASM
+bindings are frozen reference material and are excluded from the workspace.
 
-This split is what makes the Rust port viable without losing language ergonomics. See `~/src/graphrefly/formal/wave_protocol.tla` (canonical TLA+ spec) and `~/src/graphrefly-ts/docs/research/handle-protocol-audit-input.md` for the validated cleaving plane.
+The clean-slate crate includes:
 
-## Workspace layout
+- Sync wave-protocol substrate: protocol, node, dispatcher, ctx, batch, rewire.
+- Graph-layer Rust API: `graph`, state/producer/derived/effect/mount helpers,
+  describe/observe/profile, operators, sources, and passive storage helpers.
+- CSP-10 baseline app-infra: messaging, work queue, scheduled readiness,
+  CQRS/process recipes, graph-visible environment adapters, and resilience
+  policy/status bundles.
+- Native host binding foundation for Python under `crates/graphrefly-bindings-py`.
 
+## CSP-10 App-Infra Baseline
+
+The baseline app-infra surface is intentionally reusable and graph-visible. It
+does not add protocol tiers/messages, hidden schedulers, provider runtimes, or
+product-specific WorkItem/Canvas/agent semantics.
+
+Useful entry points:
+
+- `graphrefly::message_bus`, `graphrefly::to_topic`, topic/catalog/cursor facts.
+- `graphrefly::work_queue` plus `graphrefly::work_queue_scheduled_readiness_projector`,
+  `graphrefly::work_queue_readiness_handoff_projector`, and
+  `graphrefly::work_queue_lease_expiration_command_projector`.
+- `graphrefly::scheduled_readiness_projector` with canonical
+  `subject_refs` + `ready_at_ms` schedule facts.
+- Focused recipe modules:
+  `graphrefly::cqrs::messaging`, `graphrefly::cqrs::work_queue`,
+  `graphrefly::process::messaging`, and `graphrefly::process::work_queue`.
+- `graphrefly::EnvironmentDrivers`, `graphrefly::to_http`,
+  `graphrefly::to_process`, `graphrefly::to_websocket`, and
+  `graphrefly::websocket_session` for graph-local environment boundaries.
+- `graphrefly::BackoffPolicy`, `graphrefly::RetryPolicy`,
+  `graphrefly::retry_status_node`, `graphrefly::breaker_status_node`,
+  `graphrefly::rate_limit_bundle`, and `graphrefly::timeout_bundle`.
+
+Run the app-infra example:
+
+```bash
+mise exec -- cargo run -p graphrefly-rs --example csp10_baseline_app_infra
 ```
-crates/
-├── graphrefly-core/              # M1: dispatcher, message tiers, batch, wave engine
-├── graphrefly-graph/             # M2: Graph container, snapshot, content addressing (CIDs)
-├── graphrefly-operators/         # M3: built-in operator node types
-├── graphrefly-storage/           # M4: tiers + Node-side persistence (redb-backed)
-├── graphrefly-structures/        # M5: reactiveMap, reactiveList, reactiveLog, reactiveIndex
-├── graphrefly-bindings-js/       # M1+: napi-rs JS bindings (cdylib)
-├── graphrefly-bindings-py/       # M6: pyo3 Python bindings (cdylib, abi3)
-└── graphrefly-bindings-wasm/     # WASM target (browser, Cloudflare Workers, Deno, Bun)
-```
 
-## Distribution
-
-**Published today:** `@graphrefly/native` (single Node-only package; per-platform `.node` binaries via napi-rs OIDC trusted publishing). All M1–M5 substrate features (core, graph, operators, storage, structures) are baked into one binary; the cargo `lite` / `standard` / `full` feature gates in `crates/graphrefly-bindings-js/Cargo.toml` exist for future split-bundle builds but no `@graphrefly/lite|standard|full` package ships yet.
-
-**Future bundle splits (deferred per D196 consumer-pressure gate):**
-
-| Variant | npm package | Approx size | Use case |
-|---|---|---:|---|
-| lite | `@graphrefly/lite` *(not yet published)* | ~400 KB / platform | Tracing injection, instrumentation, edge runtimes (via WASM) |
-| standard | `@graphrefly/standard` *(not yet published)* | ~1.4 MB / platform | Typical agent harnesses |
-| full | `@graphrefly/full` *(not yet published)* | ~3.5 MB / platform | Heavy server workloads with persistence + structures |
-| WASM | `@graphrefly/wasm` *(deferred until a browser-Rust consumer surfaces)* | ~250–900 KB | Edge runtimes, browser |
-
-Python bindings (`graphrefly-bindings-py`, pyo3) are scaffolded but post-1.0 per the migration plan; no PyPI artifact yet.
+The example wires messaging -> work queue -> scheduled readiness -> CQRS queue
+disposition, and includes focused process work-queue recipe composition without
+making queue completion domain truth.
 
 ## Setup
 
-Install the toolchain via [mise](https://mise.jdx.dev) (recommended — pinned in `.mise.toml`):
+Toolchains are managed with `mise`:
 
 ```bash
 mise trust
 mise install
 ```
 
-Or via [rustup](https://rustup.rs) directly (honors `rust-toolchain.toml`):
+Rust is also pinned by `rust-toolchain.toml` for direct `rustup` users.
+
+## Build And Test
+
+Preferred agent/developer commands:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+mise exec -- cargo test -p graphrefly-rs
+mise exec -- cargo clippy -p graphrefly-rs --all-targets
+mise exec -- cargo build -p graphrefly-rs
 ```
 
-Verify:
+Focused CSP-10 checks:
 
 ```bash
-cargo --version
-cargo check --workspace
+mise exec -- cargo test -p graphrefly-rs --test acceptance public_crate_root_d566
+mise exec -- cargo test -p graphrefly-rs --test csp10_recipes
+mise exec -- cargo run -p graphrefly-rs --example csp10_baseline_app_infra
 ```
 
-## Build / test commands
+Optional runtime-driver features:
 
 ```bash
-# Build core crates (default-members; bindings excluded)
-cargo build
-
-# Test loop (cargo-nextest — install: `cargo install cargo-nextest --locked`
-# or prebuilt: `curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ~/.cargo/bin`)
-cargo nextest run                       # default-members; fast inner loop
-cargo nextest run -p graphrefly-core    # only one crate
-
-# Full suite incl. the cascade_depth stack-safety stress tests
-# (quarantined from the default loop — see .config/nextest.toml). Run
-# before merge / after touching cascade/terminate/teardown/invalidate:
-cargo nextest run --profile ci          # == `cargo tc`
-
-# Parallel sessions: use the isolated wrapper so a second run never
-# blocks on the shared `target/` build lock:
-scripts/dev-test.sh                     # default loop, per-worktree target
-
-# Property-test with concurrency permutations (loom — stays on `cargo
-# test`: loom needs the `--cfg loom` build, not a nextest run):
-cargo test -p graphrefly-core --features loom-checked
-
-# Lint
-cargo clippy --workspace --all-targets
-
-# Format
-cargo fmt --all
-
-# Supply-chain audit (requires `cargo install cargo-deny`)
-cargo deny check
+mise exec -- cargo test -p graphrefly-rs --features tokio-http,tokio-websocket
+mise exec -- cargo test -p graphrefly-rs --features tokio-worker
 ```
 
-Bindings have their own toolchains (not built by `cargo build`):
+## Authority And Guardrails
 
-```bash
-# JS bindings (requires Node 22+ and pnpm)
-cd crates/graphrefly-bindings-js && pnpm build
+When code and docs disagree with `~/src/graphrefly`, the authority repo wins.
+Important clean-slate guardrails:
 
-# Python bindings (requires maturin)
-cd crates/graphrefly-bindings-py && maturin develop --release
-
-# WASM bindings (requires wasm-pack)
-cd crates/graphrefly-bindings-wasm && wasm-pack build
-```
-
-## Spec sources
-
-- `~/src/graphrefly/GRAPHREFLY-SPEC.md` — protocol spec (canonical)
-- `~/src/graphrefly/COMPOSITION-GUIDE.md` + `COMPOSITION-GUIDE-{PROTOCOL,GRAPH,PATTERNS,SOLUTIONS}.md` — composition guides (single + per-layer splits)
-- `~/src/graphrefly/formal/wave_protocol.tla` + `wave_protocol_MC.tla` (+ `_bufferall`, `_custom_equals`, `_equals_false` variants) — TLA+ spec; this workspace's invariants must verify against the same model
-- `~/src/graphrefly-ts/docs/research/handle-protocol-audit-input.md` — handle-protocol cleaving rationale (companion to the canonical TLA+ spec)
-- `~/src/graphrefly-ts/docs/cross-track-ledger.md` — single source of truth for any `Impl`-contract widening that couples this workspace to graphrefly-ts
+- The wave-protocol core is synchronous; async lives only at source, pool, driver,
+  or wire-bridge boundaries.
+- All node functions go through the dispatcher.
+- A graph is a single-thread causal/concurrency domain.
+- Cross-runtime parity is behavioral conformance, not structural symbol parity.
+- Environment/resilience adapters expose graph-visible attempts, status, errors,
+  lifecycle, and bounded retry material.
+- Scheduled readiness projects eligibility only; domain projectors own claiming,
+  materialization, cancellation, and execution.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
+Dual-licensed under MIT OR Apache-2.0, at your option.

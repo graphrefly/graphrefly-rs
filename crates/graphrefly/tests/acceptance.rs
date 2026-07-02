@@ -2,9 +2,10 @@ use graphrefly::{
     agentic_memory_bundle, agentic_memory_consolidation_bundle,
     agentic_memory_context_packing_bundle, agentic_memory_kg_projection_bundle,
     agentic_memory_record_frame, agentic_memory_record_frame_codec,
-    agentic_memory_records_snapshot_key, agentic_memory_retention_bundle, graph,
+    agentic_memory_records_snapshot_key, agentic_memory_retention_bundle, graph, graph_opts,
     knowledge_graph_reducer_bundle, memory_append_log, memory_kv, message_bus,
-    persist_agentic_memory_records, scheduled_readiness_projector, work_queue,
+    persist_agentic_memory_records, retry_status_node, scheduled_readiness_projector,
+    timeout_bundle, to_http_with_options, to_process_with_options, work_queue,
     work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
     AgenticMemoryArtifactKind, AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
     AgenticMemoryConsolidationOutcome, AgenticMemoryContextPackingBundleOptions,
@@ -13,17 +14,25 @@ use graphrefly::{
     AgenticMemoryRecord, AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
     AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
     AgenticMemoryTextProjection, AppendLogReadOptions, AppendLogStorageTier, BackoffPolicy, Codec,
-    CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, GraphNodeOpts,
-    KnowledgeAssertionObject, KnowledgeGraphPolicy, KnowledgeGraphReducerBundleOptions,
-    KnowledgeGraphStatusState, KvStorageTier, MemoryFragment, MemoryRetrievalQuery, Message,
-    MessageBusOptions, PersistAgenticMemoryRecordsOptions, RetryPolicy, ScheduledReadinessClock,
-    ScheduledReadinessOptions, WorkQueueClaimOptions, WorkQueueOptions,
-    WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffOptions, WorkQueueRecord,
-    WorkQueueScheduledReadinessOptions, WorkQueueSubmit, WorkQueueSubmitOptions,
+    CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, DriverCancel, EnvironmentDrivers,
+    GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse, KnowledgeAssertionObject,
+    KnowledgeGraphPolicy, KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState,
+    KvStorageTier, LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, MemoryFragment,
+    MemoryRetrievalQuery, Message, MessageBusOptions, OutboundAdapterOptions, OutboundEvent,
+    OutboundState, OutboundStatus, PersistAgenticMemoryRecordsOptions, ProcessCommand,
+    ProcessResult, RetryEvent, RetryPolicy, RetryState, ScheduledReadinessClock,
+    ScheduledReadinessOptions, TimeoutStatus, WebSocketRequest, WebSocketSend,
+    WorkQueueClaimOptions, WorkQueueOptions, WorkQueueReadinessCandidateKind,
+    WorkQueueReadinessHandoffOptions, WorkQueueRecord, WorkQueueScheduledReadinessOptions,
+    WorkQueueSubmit, WorkQueueSubmitOptions,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::time::Duration;
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -36,6 +45,89 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
         }
     });
     seen
+}
+
+#[derive(Default)]
+struct D566HttpDriver {
+    attempts: Cell<u32>,
+    requests: RefCell<Vec<HttpRequest>>,
+}
+
+impl LocalHttpDriver for D566HttpDriver {
+    fn request(
+        &self,
+        request: HttpRequest,
+        callback: Box<dyn FnOnce(Result<HttpResponse, graphrefly::GraphError>)>,
+    ) -> DriverCancel {
+        let attempt = self.attempts.get().saturating_add(1);
+        self.attempts.set(attempt);
+        self.requests.borrow_mut().push(request);
+        if attempt == 1 {
+            callback(Err("temporary http outage".into()));
+        } else {
+            callback(Ok(HttpResponse {
+                status: 202,
+                headers: Vec::new(),
+                body: b"accepted".to_vec(),
+            }));
+        }
+        Box::new(|| {})
+    }
+}
+
+#[derive(Default)]
+struct D566ProcessDriver {
+    commands: RefCell<Vec<ProcessCommand>>,
+}
+
+impl LocalProcessDriver for D566ProcessDriver {
+    fn run(
+        &self,
+        command: ProcessCommand,
+        callback: Box<dyn FnOnce(Result<ProcessResult, graphrefly::GraphError>)>,
+    ) -> DriverCancel {
+        self.commands.borrow_mut().push(command);
+        callback(Ok(ProcessResult {
+            stdout: "process accepted".to_owned(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            signal: None,
+        }));
+        Box::new(|| {})
+    }
+}
+
+type D566Sleep = (Rc<Cell<bool>>, Box<dyn FnOnce()>);
+
+#[derive(Default)]
+struct D566AsyncDriver {
+    sleeps: RefCell<Vec<D566Sleep>>,
+}
+
+impl D566AsyncDriver {
+    fn fire_sleepers(&self) {
+        for (active, callback) in self.sleeps.borrow_mut().drain(..) {
+            if active.get() {
+                callback();
+            }
+        }
+    }
+}
+
+impl LocalAsyncDriver for D566AsyncDriver {
+    fn sleep(&self, _duration: Duration, callback: Box<dyn FnOnce()>) -> DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.sleeps.borrow_mut().push((active.clone(), callback));
+        Box::new(move || active.set(false))
+    }
+
+    fn interval(&self, _period: Duration, _callback: Rc<dyn Fn()>) -> DriverCancel {
+        Box::new(|| {})
+    }
+
+    fn spawn_local(&self, _fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel {
+        Box::new(|| {})
+    }
 }
 
 fn record(id: &str, text: &str) -> AgenticMemoryRecord<Value> {
@@ -403,4 +495,186 @@ fn public_crate_root_d566_app_infra_acceptance() {
         .status
         .cache()
         .is_some_and(|status| { status.state == CqrsStatusState::Accepted }));
+}
+
+#[test]
+fn public_crate_root_d566_environment_resilience_acceptance() {
+    let http_driver = Rc::new(D566HttpDriver::default());
+    let process_driver = Rc::new(D566ProcessDriver::default());
+    let async_driver = Rc::new(D566AsyncDriver::default());
+    let g = graph_opts(GraphOptions {
+        name: Some("acceptance/d566Environment".to_owned()),
+        environment: EnvironmentDrivers::new()
+            .with_local_async(async_driver.clone())
+            .with_http(http_driver.clone())
+            .with_process(process_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let source = g.state_empty_opts::<String>(GraphNodeOpts::named("acceptance/env/source"));
+    let bundle = to_http_with_options(
+        &g,
+        &source,
+        |value| {
+            HttpRequest::new("POST", format!("https://example.test/{value}"))
+                .header("x-graphrefly", "d566")
+                .body(value.as_bytes().to_vec())
+        },
+        OutboundAdapterOptions {
+            name: Some("acceptance/env/http".to_owned()),
+            retry: RetryPolicy::new(2, BackoffPolicy::None),
+        },
+    );
+    let events = collect_data(&bundle.events);
+    let attempts = collect_data(&bundle.attempts);
+    let errors = collect_data(&bundle.errors);
+    let _status = bundle.status.subscribe(|_| {});
+
+    let retry_events = g.state_empty::<RetryEvent>();
+    let retry_status = retry_status_node(
+        &g,
+        &retry_events,
+        RetryPolicy::new(2, BackoffPolicy::Constant { delay_ms: 25 }),
+        "acceptance/env/retry",
+    );
+    let _retry_status = retry_status.subscribe(|_| {});
+    let process_source =
+        g.state_empty_opts::<String>(GraphNodeOpts::named("acceptance/env/processSource"));
+    let process_bundle = to_process_with_options(
+        &g,
+        &process_source,
+        |value| {
+            ProcessCommand::new("accept-process")
+                .args([value.clone()])
+                .cwd(PathBuf::from("/tmp/graphrefly-d566"))
+                .env("GRAPHREFLY_ENV", "acceptance")
+        },
+        OutboundAdapterOptions {
+            name: Some("acceptance/env/process".to_owned()),
+            ..OutboundAdapterOptions::default()
+        },
+    );
+    let _process_status = process_bundle.status.subscribe(|_| {});
+
+    source.set("order".to_owned());
+    process_source.set("process-payload".to_owned());
+    retry_events.set(RetryEvent::Attempt { attempt: 1 });
+    retry_events.set(RetryEvent::Failure {
+        attempt: 1,
+        error: "temporary http outage".to_owned(),
+    });
+    async_driver.fire_sleepers();
+    async_driver.fire_sleepers();
+
+    assert_eq!(
+        http_driver.attempts.get(),
+        2,
+        "D130-D132: retry stays bounded and observable at the adapter boundary"
+    );
+    assert_eq!(
+        http_driver.requests.borrow()[0].url,
+        "https://example.test/order"
+    );
+    assert_eq!(
+        http_driver.requests.borrow()[0].headers,
+        vec![("x-graphrefly".to_owned(), "d566".to_owned())]
+    );
+    assert_eq!(http_driver.requests.borrow()[0].body, b"order".to_vec());
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        OutboundEvent::Retry {
+            value,
+            attempt: 1,
+            error,
+            ..
+        } if value == "order" && error == "temporary http outage"
+    )));
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        OutboundEvent::Sent {
+            value,
+            attempt: 2,
+            result,
+        } if value == "order" && result.status == 202
+    )));
+    assert_eq!(attempts.borrow().as_slice(), &[1, 1, 2, 2]);
+    assert_eq!(
+        errors.borrow().as_slice(),
+        &["temporary http outage".to_owned()]
+    );
+    assert_eq!(
+        bundle.status.cache(),
+        Some(OutboundStatus {
+            state: OutboundState::Succeeded,
+            in_flight: 0,
+            attempt: 2,
+            sent: 1,
+            failed: 0,
+            last_delay_ms: None,
+        })
+    );
+    assert!(retry_status.cache().is_some_and(|status| {
+        status.state == RetryState::Failed && status.delay_ms == Some(25)
+    }));
+    assert_eq!(
+        process_driver.commands.borrow()[0].program,
+        "accept-process"
+    );
+    assert_eq!(
+        process_driver.commands.borrow()[0].args,
+        vec!["process-payload".to_owned()]
+    );
+    assert_eq!(
+        process_driver.commands.borrow()[0].cwd,
+        Some(PathBuf::from("/tmp/graphrefly-d566"))
+    );
+    assert_eq!(
+        process_driver.commands.borrow()[0].env,
+        vec![("GRAPHREFLY_ENV".to_owned(), "acceptance".to_owned())]
+    );
+    assert!(matches!(
+        process_bundle.events.cache(),
+        Some(OutboundEvent::Sent {
+            value,
+            attempt: 1,
+            result,
+        }) if value == "process-payload" && result.stdout == "process accepted"
+    ));
+    assert_eq!(
+        WebSocketRequest::new("wss://example.test")
+            .header("x-graphrefly", "d566")
+            .headers,
+        vec![("x-graphrefly".to_owned(), "d566".to_owned())]
+    );
+    assert_eq!(WebSocketSend::binary([1_u8, 2, 3]).data, vec![1, 2, 3]);
+    assert!(g
+        .describe()
+        .edges
+        .iter()
+        .any(|edge| { edge.from == "acceptance/env/source" && edge.to == "acceptance/env/http" }));
+}
+
+#[test]
+fn public_crate_root_d566_timeout_bundle_acceptance() {
+    let async_driver = Rc::new(D566AsyncDriver::default());
+    let g = graph_opts(GraphOptions {
+        name: Some("acceptance/d566Timeout".to_owned()),
+        environment: EnvironmentDrivers::new().with_local_async(async_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let source = g.state_empty_opts::<String>(GraphNodeOpts::named("acceptance/timeout/source"));
+    let timeout = timeout_bundle(&g, &source, 5, "acceptance/timeout");
+    let values = collect_data(&timeout.node);
+    let errors = collect_data(&timeout.errors);
+    let _status = timeout.status.subscribe(|_| {});
+
+    source.set("slow".to_owned());
+    async_driver.fire_sleepers();
+    async_driver.fire_sleepers();
+
+    assert_eq!(values.borrow().as_slice(), &["slow".to_owned()]);
+    assert_eq!(timeout.status.cache(), Some(TimeoutStatus::Errored));
+    assert!(errors
+        .borrow()
+        .iter()
+        .any(|error| error.contains("timeout: no value within 5ms")));
 }

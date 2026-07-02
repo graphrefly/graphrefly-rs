@@ -1,3 +1,10 @@
+//! CSP-10 baseline app-infra acceptance example.
+//!
+//! This keeps the story at the reusable infrastructure layer locked by D566:
+//! messageBus admits generic work, workQueue owns queue lifecycle, scheduled
+//! readiness projects eligibility, and focused CQRS/process recipes translate
+//! visible graph facts without making queue completion domain truth.
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -212,4 +219,7 @@ fn main() {
         .status
         .cache()
         .is_some_and(|status| { status.state == graphrefly::CqrsStatusState::Accepted }));
+    println!(
+        "CSP-10 baseline app-infra wired successfully: work-1 became ready, CQRS accepted cmd-1, and the queue recorded CQRS disposition evidence."
+    );
 }

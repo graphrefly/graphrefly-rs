@@ -429,7 +429,7 @@ where
                 }
             }
         },
-        GraphNodeOpts::named(format!("{name}/status")),
+        timeout_projection_opts(format!("{name}/status")),
     );
     let errors = graph.node_opts::<String, _>(
         vec![node.erased()],
@@ -438,12 +438,25 @@ where
                 ctx.emit(error.to_string());
             }
         },
-        GraphNodeOpts::named(format!("{name}/errors")),
+        timeout_projection_opts(format!("{name}/errors")),
     );
     TimeoutBundle {
         node,
         status,
         errors,
+    }
+}
+
+fn timeout_projection_opts(name: String) -> GraphNodeOpts {
+    GraphNodeOpts {
+        name: Some(name),
+        node: crate::node::NodeOpts {
+            complete_when_deps_complete: false,
+            error_when_deps_error: false,
+            terminal_as_real_input: true,
+            ..crate::node::NodeOpts::default()
+        },
+        ..GraphNodeOpts::default()
     }
 }
 
