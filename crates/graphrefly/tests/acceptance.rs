@@ -2,10 +2,11 @@ use graphrefly::{
     agentic_memory_bundle, agentic_memory_consolidation_bundle,
     agentic_memory_context_packing_bundle, agentic_memory_kg_projection_bundle,
     agentic_memory_record_frame, agentic_memory_record_frame_codec,
-    agentic_memory_records_snapshot_key, agentic_memory_retention_bundle, graph, graph_opts,
-    knowledge_graph_reducer_bundle, memory_append_log, memory_kv, message_bus,
-    persist_agentic_memory_records, retry_status_node, scheduled_readiness_projector,
-    timeout_bundle, to_http_with_options, to_process_with_options, work_queue,
+    agentic_memory_records_snapshot_key, agentic_memory_retention_bundle, first_sync_value_from,
+    from_iter, from_sse_with_options, graph, graph_opts, knowledge_graph_reducer_bundle, map,
+    memory_append_log, memory_kv, message_bus, persist_agentic_memory_records, pipe, reactive_map,
+    retry_status_node, scheduled_readiness_projector, single_sync_value_from, timeout_bundle,
+    to_http_with_options, to_process_with_options, topology_diff, work_queue,
     work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
     AgenticMemoryArtifactKind, AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
     AgenticMemoryConsolidationOutcome, AgenticMemoryContextPackingBundleOptions,
@@ -14,17 +15,18 @@ use graphrefly::{
     AgenticMemoryRecord, AgenticMemoryRetentionBundleOptions, AgenticMemoryRetentionCommand,
     AgenticMemoryRetentionCommandKind, AgenticMemoryScope, AgenticMemoryStatusState,
     AgenticMemoryTextProjection, AppendLogReadOptions, AppendLogStorageTier, BackoffPolicy, Codec,
-    CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, DriverCancel, EnvironmentDrivers,
-    GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse, KnowledgeAssertionObject,
-    KnowledgeGraphPolicy, KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState,
-    KvStorageTier, LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, MemoryFragment,
+    CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, DescribeEvent, DriverCancel,
+    EnvironmentDrivers, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
+    HttpStreamDriverEvent, HttpStreamHead, KnowledgeAssertionObject, KnowledgeGraphPolicy,
+    KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState, KvStorageTier, LocalAsyncDriver,
+    LocalHttpDriver, LocalHttpStreamDriver, LocalProcessDriver, MemoryFragment,
     MemoryRetrievalQuery, Message, MessageBusOptions, OutboundAdapterOptions, OutboundEvent,
     OutboundState, OutboundStatus, PersistAgenticMemoryRecordsOptions, ProcessCommand,
-    ProcessResult, RetryEvent, RetryPolicy, RetryState, ScheduledReadinessClock,
-    ScheduledReadinessOptions, TimeoutStatus, WebSocketRequest, WebSocketSend,
-    WorkQueueClaimOptions, WorkQueueOptions, WorkQueueReadinessCandidateKind,
-    WorkQueueReadinessHandoffOptions, WorkQueueRecord, WorkQueueScheduledReadinessOptions,
-    WorkQueueSubmit, WorkQueueSubmitOptions,
+    ProcessResult, PullDemand, ReactiveMapOptions, RetryEvent, RetryPolicy, RetryState,
+    ScheduledReadinessClock, ScheduledReadinessOptions, SseEvent, SseRequest, SyncValueFromError,
+    TimeoutStatus, WebSocketRequest, WebSocketSend, WorkQueueClaimOptions, WorkQueueOptions,
+    WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffOptions, WorkQueueRecord,
+    WorkQueueScheduledReadinessOptions, WorkQueueSubmit, WorkQueueSubmitOptions,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
@@ -72,6 +74,38 @@ impl LocalHttpDriver for D566HttpDriver {
             }));
         }
         Box::new(|| {})
+    }
+}
+
+type B72HttpStreamCallback = Rc<dyn Fn(HttpStreamDriverEvent)>;
+type B72PendingHttpStream = (HttpRequest, Rc<Cell<bool>>, B72HttpStreamCallback);
+
+#[derive(Default)]
+struct B72HttpStreamDriver {
+    streams: RefCell<Vec<B72PendingHttpStream>>,
+}
+
+impl B72HttpStreamDriver {
+    fn request(&self) -> HttpRequest {
+        self.streams.borrow()[0].0.clone()
+    }
+
+    fn emit(&self, event: HttpStreamDriverEvent) {
+        let streams = self.streams.borrow();
+        let (_, active, callback) = &streams[0];
+        if active.get() {
+            callback(event);
+        }
+    }
+}
+
+impl LocalHttpStreamDriver for B72HttpStreamDriver {
+    fn stream(&self, request: HttpRequest, callback: B72HttpStreamCallback) -> DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.streams
+            .borrow_mut()
+            .push((request, active.clone(), callback));
+        Box::new(move || active.set(false))
     }
 }
 
@@ -399,6 +433,208 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
     );
     persistence.flush().unwrap();
     persistence.dispose();
+}
+
+#[test]
+fn public_crate_root_b72_sources_io_and_resilience_acceptance() {
+    let http_stream_driver = Rc::new(B72HttpStreamDriver::default());
+    let g = graph_opts(GraphOptions {
+        name: Some("acceptance/b72".to_owned()),
+        profile: true,
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+
+    let first = g.init_node(
+        from_iter(vec![10_i32, 20]),
+        vec![],
+        GraphNodeOpts::named("acceptance/b72/first"),
+    );
+    assert_eq!(first_sync_value_from(&first), Ok(10));
+    let single = g.init_node(
+        from_iter(vec!["only".to_owned()]),
+        vec![],
+        GraphNodeOpts::named("acceptance/b72/single"),
+    );
+    assert_eq!(single_sync_value_from(&single), Ok("only".to_owned()));
+    let live = g.state_opts(7_i32, GraphNodeOpts::named("acceptance/b72/live"));
+    assert_eq!(
+        single_sync_value_from(&live),
+        Err(SyncValueFromError::Pending),
+        "host-boundary source helper must not wait, poll, or install a runtime"
+    );
+
+    let sse = g.init_node(
+        from_sse_with_options(
+            SseRequest::new("https://example.test/events").header("x-source", "b72"),
+        ),
+        vec![],
+        GraphNodeOpts::named("acceptance/b72/sse"),
+    );
+    let events = Rc::new(RefCell::new(Vec::<SseEvent>::new()));
+    let completed = Rc::new(Cell::new(false));
+    let events_sink = events.clone();
+    let completed_sink = completed.clone();
+    let unsubscribe_sse = sse.subscribe(move |msg| match msg {
+        Message::Data(value) => {
+            if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
+                events_sink.borrow_mut().push(event.clone());
+            }
+        }
+        Message::Complete => completed_sink.set(true),
+        _ => {}
+    });
+
+    assert_eq!(http_stream_driver.request().method, "GET");
+    assert_eq!(
+        http_stream_driver.request().url,
+        "https://example.test/events"
+    );
+    assert!(http_stream_driver
+        .request()
+        .headers
+        .iter()
+        .any(|(key, value)| key == "x-source" && value == "b72"));
+    assert!(http_stream_driver
+        .request()
+        .headers
+        .iter()
+        .any(|(key, value)| key.eq_ignore_ascii_case("accept") && value == "text/event-stream"));
+
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![(
+            "content-type".to_owned(),
+            "text/event-stream; charset=utf-8".to_owned(),
+        )],
+    }));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(
+        b"id: evt-1\nevent: patch\ndata: hello".to_vec(),
+    ));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(
+        b"\ndata: world\nretry: 50\n\n".to_vec(),
+    ));
+    http_stream_driver.emit(HttpStreamDriverEvent::Complete);
+
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[SseEvent {
+            event: Some("patch".to_owned()),
+            data: "hello\nworld".to_owned(),
+            id: Some("evt-1".to_owned()),
+            retry_ms: Some(50),
+        }]
+    );
+    assert!(completed.get());
+    assert!(g
+        .describe()
+        .nodes
+        .iter()
+        .any(|node| { node.id == "acceptance/b72/sse" && node.factory == "fromSSE" }));
+    assert!(g.profile().nodes.contains_key("acceptance/b72/sse"));
+
+    unsubscribe_sse();
+}
+
+#[test]
+fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
+    let g = graph_opts(GraphOptions {
+        name: Some("acceptance/b70-b71".to_owned()),
+        profile: true,
+        ..GraphOptions::default()
+    });
+    let source = g.state_opts(1_i32, GraphNodeOpts::named("acceptance/source"));
+    let before_pipe = g.describe();
+
+    let doubled = pipe(&g, source.clone())
+        .through(map::<i32, i32>(|value| value * 2))
+        .done();
+    let doubled_values = Rc::new(RefCell::new(Vec::new()));
+    let doubled_sink = doubled_values.clone();
+    let unsubscribe_doubled = doubled.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(value) = value.as_ref().downcast_ref::<i32>() {
+                doubled_sink.borrow_mut().push(*value);
+            }
+        }
+    });
+    source.set(2);
+
+    assert_eq!(doubled_values.borrow().as_slice(), &[2, 4]);
+    let after_pipe = g.describe();
+    let pipe_diff = topology_diff(&before_pipe, &after_pipe);
+    assert!(pipe_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeAdded { id, node }
+            if id == "map#0" && node.factory == "map"
+    )));
+    assert!(pipe_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::EdgeAdded { from, to }
+            if from == "acceptance/source" && to == "map#0"
+    )));
+    unsubscribe_doubled();
+
+    let map_store = reactive_map::<String, i32>(
+        vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
+        ReactiveMapOptions::named("acceptance/items").graph(g.clone()),
+    );
+    let selected = map_store.select(|value, _key| *value >= 2);
+    let selected_snapshots = Rc::new(RefCell::new(Vec::new()));
+    let selected_snapshot_sink = selected_snapshots.clone();
+    let unsubscribe_selected_snapshot = selected.snapshot.subscribe(move |msg| {
+        if let Message::Data(value) = msg {
+            if let Some(snapshot) = value
+                .as_ref()
+                .downcast_ref::<std::collections::BTreeMap<String, i32>>()
+            {
+                selected_snapshot_sink.borrow_mut().push(snapshot.clone());
+            }
+        }
+    });
+
+    map_store.set("c".to_owned(), 3);
+    selected.snapshot.up(vec![Message::Pull(PullDemand::new(
+        selected.pull_id.clone(),
+    ))]);
+
+    assert_eq!(
+        selected_snapshots.borrow().last().cloned().unwrap(),
+        [("b".to_owned(), 2), ("c".to_owned(), 3)]
+            .into_iter()
+            .collect()
+    );
+    let with_view = g.describe();
+    assert!(with_view.nodes.iter().any(|node| {
+        node.id == "acceptance/items.select#0.delta" && node.factory == "reactiveMap.select.delta"
+    }));
+    assert!(with_view.edges.iter().any(|edge| {
+        edge.from == "acceptance/items.delta" && edge.to == "acceptance/items.select#0.delta"
+    }));
+    assert!(g
+        .profile()
+        .nodes
+        .contains_key("acceptance/items.select#0.delta"));
+    assert!(g
+        .checkpoint()
+        .unwrap()
+        .nodes
+        .iter()
+        .any(|node| node.id == "acceptance/items.select#0.snapshot"));
+
+    unsubscribe_selected_snapshot();
+    selected.dispose();
+    let after_dispose = g.describe();
+    let dispose_diff = topology_diff(&with_view, &after_dispose);
+    assert!(dispose_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeRemoved { id } if id == "acceptance/items.select#0.delta"
+    )));
+    assert!(dispose_diff.events.iter().any(|event| matches!(
+        event,
+        DescribeEvent::NodeRemoved { id } if id == "acceptance/items.select#0.snapshot"
+    )));
+    assert!(g.find("acceptance/items.select#0.delta").is_none());
 }
 
 #[test]

@@ -21,6 +21,12 @@ The clean-slate crate includes:
 - Sync wave-protocol substrate: protocol, node, dispatcher, ctx, batch, rewire.
 - Graph-layer Rust API: `graph`, state/producer/derived/effect/mount helpers,
   describe/observe/profile, operators, sources, and passive storage helpers.
+- Composition and diagnostics helpers such as `pipe`, `stratify`, and
+  `topology_diff`, all derived from declared graph topology or `describe()`
+  snapshots.
+- Reactive data structures and views: `reactive_list`, `reactive_log`,
+  `reactive_index`, `reactive_map`, pull-driven snapshots, and graph-visible
+  `ReactiveView` helper nodes.
 - CSP-10 baseline app-infra: messaging, work queue, scheduled readiness,
   CQRS/process recipes, graph-visible environment adapters, and resilience
   policy/status bundles.
@@ -34,6 +40,16 @@ product-specific WorkItem/Canvas/agent semantics.
 
 Useful entry points:
 
+- `graphrefly::pipe`, `graphrefly::stratify`, and
+  `graphrefly::topology_diff` for Rust-native composition and snapshot
+  diagnostics.
+- `graphrefly::reactive_list`, `graphrefly::reactive_log`,
+  `graphrefly::reactive_index`, and `graphrefly::reactive_map` for collection
+  deltas, lazy snapshots, and retained views.
+- `graphrefly::first_sync_value_from`, `graphrefly::single_sync_value_from`,
+  `graphrefly::from_http`, `graphrefly::from_sse`, and the graph-owned
+  `LocalHttpStreamDriver` boundary for source/IO ergonomics without a hidden
+  runtime.
 - `graphrefly::message_bus`, `graphrefly::to_topic`, topic/catalog/cursor facts.
 - `graphrefly::work_queue` plus `graphrefly::work_queue_scheduled_readiness_projector`,
   `graphrefly::work_queue_readiness_handoff_projector`, and
