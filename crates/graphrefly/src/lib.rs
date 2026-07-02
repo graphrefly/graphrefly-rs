@@ -201,16 +201,18 @@ pub use diagnostics::{
 pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
 #[cfg(feature = "tokio-http")]
 pub use environment::TokioHttpDriver;
+#[cfg(feature = "tokio-http-stream")]
+pub use environment::TokioHttpStreamDriver;
 #[cfg(feature = "tokio")]
 pub use environment::TokioProcessDriver;
 #[cfg(feature = "tokio-websocket")]
 pub use environment::TokioWebSocketDriver;
 pub use environment::{
-    EnvironmentDrivers, HttpRequest, HttpResponse, LocalHttpDriver, LocalProcessDriver,
-    LocalSseDriver, LocalWebSocketDriver, LocalWebSocketSession, LocalWebhookDriver,
-    ProcessCommand, ProcessResult, SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent,
-    WebSocketEvent, WebSocketRequest, WebSocketSend, WebSocketSendResult, WebhookDriverEvent,
-    WebhookEvent, WebhookRegistration,
+    EnvironmentDrivers, HttpRequest, HttpResponse, HttpStreamDriverEvent, HttpStreamHead,
+    LocalHttpDriver, LocalHttpStreamDriver, LocalProcessDriver, LocalSseDriver,
+    LocalWebSocketDriver, LocalWebSocketSession, LocalWebhookDriver, ProcessCommand, ProcessResult,
+    SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent, WebSocketEvent, WebSocketRequest,
+    WebSocketSend, WebSocketSendResult, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
     graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,

@@ -23,14 +23,14 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::async_driver::DriverCancel;
 use crate::environment::{
-    HttpRequest, HttpResponse, ProcessCommand, ProcessResult, SseDriverEvent, SseEvent, SseRequest,
-    WebSocketDriverEvent, WebSocketEvent, WebSocketRequest, WebhookDriverEvent, WebhookEvent,
-    WebhookRegistration,
+    HttpRequest, HttpResponse, HttpStreamDriverEvent, HttpStreamHead, ProcessCommand,
+    ProcessResult, SseDriverEvent, SseEvent, SseRequest, WebSocketDriverEvent, WebSocketEvent,
+    WebSocketRequest, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 use crate::node::Node;
 use crate::node::{NodeOpts, Pausable};
 use crate::operators::Operator;
-use crate::protocol::{AnyValue, Message};
+use crate::protocol::{AnyValue, GraphError, Message};
 
 /// of: emit one value and COMPLETE on activation.
 pub fn of<T: Clone + 'static>(value: T) -> Operator<T> {
@@ -388,10 +388,6 @@ pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
             ..NodeOpts::default()
         },
         move |ctx| {
-            let Some(driver) = ctx.environment().sse_driver() else {
-                ctx.down(vec![Message::Error("fromSSE: missing sse driver".into())]);
-                return;
-            };
             let active = Rc::new(Cell::new(true));
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
@@ -400,31 +396,317 @@ pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
+            if let Some(driver) = ctx.environment().sse_driver() {
+                let callback_active = active.clone();
+                let callback_cancel = cancel_slot.clone();
+                let callback = Rc::new(move |event| match event {
+                    SseDriverEvent::Event(event) => {
+                        if callback_active.get() {
+                            out.down(vec![Message::Data(Rc::new(event))]);
+                        }
+                    }
+                    SseDriverEvent::Error(error) => {
+                        if callback_active.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(error)]);
+                        }
+                    }
+                    SseDriverEvent::Complete => {
+                        if callback_active.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Complete]);
+                        }
+                    }
+                });
+                let cancel = driver.connect(request.clone(), callback);
+                install_driver_cancel(&active, &cancel_slot, cancel);
+                return;
+            }
+
+            let Some(driver) = ctx.environment().http_stream_driver() else {
+                ctx.down(vec![Message::Error(
+                    "fromSSE: missing sse or http stream driver".into(),
+                )]);
+                return;
+            };
+            let parser = Rc::new(RefCell::new(SseParser::default()));
+            let saw_head = Rc::new(Cell::new(false));
             let callback_active = active.clone();
             let callback_cancel = cancel_slot.clone();
-            let callback = Rc::new(move |event| match event {
-                SseDriverEvent::Event(event) => {
-                    if callback_active.get() {
-                        out.down(vec![Message::Data(Rc::new(event))]);
-                    }
+            let callback_parser = parser.clone();
+            let callback_saw_head = saw_head.clone();
+            let callback = Rc::new(move |event| {
+                if !callback_active.get() {
+                    return;
                 }
-                SseDriverEvent::Error(error) => {
-                    if callback_active.get() {
-                        cleanup_driver_work(&callback_active, &callback_cancel);
-                        out.down(vec![Message::Error(error)]);
+                match event {
+                    HttpStreamDriverEvent::Head(head) => {
+                        if callback_saw_head.replace(true) {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(
+                                "fromSSE: http stream emitted duplicate response head".into(),
+                            )]);
+                            return;
+                        }
+                        if let Err(error) = validate_sse_head(&head) {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(error)]);
+                        }
                     }
-                }
-                SseDriverEvent::Complete => {
-                    if callback_active.get() {
-                        cleanup_driver_work(&callback_active, &callback_cancel);
-                        out.down(vec![Message::Complete]);
+                    HttpStreamDriverEvent::Chunk(chunk) => {
+                        if chunk.is_empty() {
+                            return;
+                        }
+                        if !callback_saw_head.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(
+                                "fromSSE: http stream chunk arrived before response head".into(),
+                            )]);
+                            return;
+                        }
+                        match callback_parser.borrow_mut().push(&chunk) {
+                            Ok(events) => {
+                                for event in events {
+                                    if callback_active.get() {
+                                        out.down(vec![Message::Data(Rc::new(event))]);
+                                    }
+                                }
+                            }
+                            Err(SseParserError { events, error }) => {
+                                for event in events {
+                                    if callback_active.get() {
+                                        out.down(vec![Message::Data(Rc::new(event))]);
+                                    }
+                                }
+                                if callback_active.get() {
+                                    cleanup_driver_work(&callback_active, &callback_cancel);
+                                    out.down(vec![Message::Error(error)]);
+                                }
+                            }
+                        }
+                    }
+                    HttpStreamDriverEvent::Error(error) => {
+                        if callback_active.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(error)]);
+                        }
+                    }
+                    HttpStreamDriverEvent::Complete => {
+                        if !callback_saw_head.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Error(
+                                "fromSSE: http stream completed before response head".into(),
+                            )]);
+                            return;
+                        }
+                        match callback_parser.borrow_mut().complete() {
+                            Ok(events) => {
+                                for event in events {
+                                    if callback_active.get() {
+                                        out.down(vec![Message::Data(Rc::new(event))]);
+                                    }
+                                }
+                            }
+                            Err(SseParserError { events, error }) => {
+                                for event in events {
+                                    if callback_active.get() {
+                                        out.down(vec![Message::Data(Rc::new(event))]);
+                                    }
+                                }
+                                if callback_active.get() {
+                                    cleanup_driver_work(&callback_active, &callback_cancel);
+                                    out.down(vec![Message::Error(error)]);
+                                }
+                                return;
+                            }
+                        }
+                        if callback_active.get() {
+                            cleanup_driver_work(&callback_active, &callback_cancel);
+                            out.down(vec![Message::Complete]);
+                        }
                     }
                 }
             });
-            let cancel = driver.connect(request.clone(), callback);
+            let cancel = driver.stream(
+                sse_request_to_http_stream_request(request.clone()),
+                callback,
+            );
             install_driver_cancel(&active, &cancel_slot, cancel);
         },
     )
+}
+
+const SSE_PARSER_MAX_BUFFER_BYTES: usize = 64 * 1024;
+
+fn sse_request_to_http_stream_request(request: SseRequest) -> HttpRequest {
+    let mut headers = request.headers;
+    if !headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("accept"))
+    {
+        headers.push(("Accept".to_owned(), "text/event-stream".to_owned()));
+    }
+    HttpRequest {
+        method: "GET".to_owned(),
+        url: request.url,
+        headers,
+        body: Vec::new(),
+    }
+}
+
+fn validate_sse_head(head: &HttpStreamHead) -> Result<(), GraphError> {
+    if !(200..=299).contains(&head.status) {
+        return Err(format!("fromSSE: unacceptable http status {}", head.status).into());
+    }
+    let Some(content_type) = head
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value)
+    else {
+        return Err("fromSSE: missing text/event-stream content-type".into());
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("text/event-stream") {
+        return Err(format!("fromSSE: unacceptable content-type {content_type}").into());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SseParser {
+    line_buffer: Vec<u8>,
+    drop_next_lf: bool,
+    event: Option<String>,
+    data_lines: Vec<String>,
+    data_bytes: usize,
+    id: Option<String>,
+    retry_ms: Option<u64>,
+}
+
+struct SseParserError {
+    events: Vec<SseEvent>,
+    error: GraphError,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseParserError> {
+        let mut events = Vec::new();
+        for &byte in chunk {
+            if self.drop_next_lf {
+                self.drop_next_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    if let Err(error) = self.finish_line_into(&mut events) {
+                        return Err(SseParserError { events, error });
+                    }
+                    self.drop_next_lf = true;
+                }
+                b'\n' => {
+                    if let Err(error) = self.finish_line_into(&mut events) {
+                        return Err(SseParserError { events, error });
+                    }
+                }
+                byte => {
+                    self.line_buffer.push(byte);
+                    if self.line_buffer.len() > SSE_PARSER_MAX_BUFFER_BYTES {
+                        return Err(SseParserError {
+                            events,
+                            error: "fromSSE: parser overflow".into(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn complete(&mut self) -> Result<Vec<SseEvent>, SseParserError> {
+        let mut events = Vec::new();
+        if !self.line_buffer.is_empty() {
+            if let Err(error) = self.finish_line_into(&mut events) {
+                return Err(SseParserError { events, error });
+            }
+        }
+        if let Some(event) = self.dispatch_event() {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn finish_line_into(&mut self, events: &mut Vec<SseEvent>) -> Result<(), GraphError> {
+        if let Some(event) = self.finish_line()? {
+            events.push(event);
+        }
+        Ok(())
+    }
+
+    fn finish_line(&mut self) -> Result<Option<SseEvent>, GraphError> {
+        let line = String::from_utf8(std::mem::take(&mut self.line_buffer))
+            .map_err(|_| -> GraphError { "fromSSE: invalid utf-8 in event stream".into() })?;
+        self.process_line(&line)
+    }
+
+    fn process_line(&mut self, line: &str) -> Result<Option<SseEvent>, GraphError> {
+        if line.is_empty() {
+            return Ok(self.dispatch_event());
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "data" => {
+                let added = value.len() + usize::from(!self.data_lines.is_empty());
+                if self.data_bytes + added > SSE_PARSER_MAX_BUFFER_BYTES {
+                    return Err("fromSSE: parser overflow".into());
+                }
+                self.data_bytes += added;
+                self.data_lines.push(value.to_owned());
+            }
+            "event" => self.event = Some(value.to_owned()),
+            "id" => self.id = Some(value.to_owned()),
+            "retry" if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                if let Ok(retry_ms) = value.parse::<u64>() {
+                    self.retry_ms = Some(retry_ms);
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn dispatch_event(&mut self) -> Option<SseEvent> {
+        if self.data_lines.is_empty() {
+            self.clear_event();
+            return None;
+        }
+        let event = SseEvent {
+            event: self.event.take(),
+            data: self.data_lines.join("\n"),
+            id: self.id.take(),
+            retry_ms: self.retry_ms.take(),
+        };
+        self.clear_event();
+        Some(event)
+    }
+
+    fn clear_event(&mut self) {
+        self.event = None;
+        self.data_lines.clear();
+        self.data_bytes = 0;
+        self.id = None;
+        self.retry_ms = None;
+    }
 }
 
 pub fn from_websocket(url: impl Into<String>) -> Operator<WebSocketEvent> {

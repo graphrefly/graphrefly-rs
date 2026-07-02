@@ -106,6 +106,12 @@ pub struct HttpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpStreamHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -248,6 +254,21 @@ pub trait LocalHttpDriver {
         &self,
         request: HttpRequest,
         callback: Box<dyn FnOnce(Result<HttpResponse, GraphError>)>,
+    ) -> DriverCancel;
+}
+
+pub enum HttpStreamDriverEvent {
+    Head(HttpStreamHead),
+    Chunk(Vec<u8>),
+    Error(GraphError),
+    Complete,
+}
+
+pub trait LocalHttpStreamDriver {
+    fn stream(
+        &self,
+        request: HttpRequest,
+        callback: Rc<dyn Fn(HttpStreamDriverEvent)>,
     ) -> DriverCancel;
 }
 
@@ -456,6 +477,102 @@ impl LocalHttpDriver for TokioHttpDriver {
                 Err(error) => {
                     if active_for_task.get() {
                         callback(Err(Box::new(error)));
+                    }
+                }
+            }
+        }));
+        Box::new(move || {
+            active.set(false);
+            cancel_task();
+        })
+    }
+}
+
+#[cfg(feature = "tokio-http-stream")]
+#[derive(Debug, Clone, Default)]
+pub struct TokioHttpStreamDriver {
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "tokio-http-stream")]
+impl TokioHttpStreamDriver {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[cfg(feature = "tokio-http-stream")]
+impl LocalHttpStreamDriver for TokioHttpStreamDriver {
+    fn stream(
+        &self,
+        request: HttpRequest,
+        callback: Rc<dyn Fn(HttpStreamDriverEvent)>,
+    ) -> DriverCancel {
+        let active = Rc::new(std::cell::Cell::new(true));
+        let active_for_task = active.clone();
+        let client = self.client.clone();
+        let cancel_task = TokioLocalDriver.spawn_local(Box::pin(async move {
+            let method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
+                Ok(method) => method,
+                Err(error) => {
+                    if active_for_task.replace(false) {
+                        callback(HttpStreamDriverEvent::Error(Box::new(error)));
+                    }
+                    return;
+                }
+            };
+            let mut builder = client.request(method, request.url);
+            for (key, value) in request.headers {
+                builder = builder.header(key, value);
+            }
+            if !request.body.is_empty() {
+                builder = builder.body(request.body);
+            }
+            let mut response = match builder.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if active_for_task.replace(false) {
+                        callback(HttpStreamDriverEvent::Error(Box::new(error)));
+                    }
+                    return;
+                }
+            };
+            let head = HttpStreamHead {
+                status: response.status().as_u16(),
+                headers: response
+                    .headers()
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.as_str().to_owned(),
+                            value.to_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect(),
+            };
+            if active_for_task.get() {
+                callback(HttpStreamDriverEvent::Head(head));
+            }
+            while active_for_task.get() {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if !chunk.is_empty() && active_for_task.get() {
+                            callback(HttpStreamDriverEvent::Chunk(chunk.to_vec()));
+                        }
+                    }
+                    Ok(None) => {
+                        if active_for_task.replace(false) {
+                            callback(HttpStreamDriverEvent::Complete);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        if active_for_task.replace(false) {
+                            callback(HttpStreamDriverEvent::Error(Box::new(error)));
+                        }
+                        break;
                     }
                 }
             }
@@ -884,6 +1001,7 @@ pub struct EnvironmentDrivers {
     local_async: Option<Rc<dyn LocalAsyncDriver>>,
     process: Option<Rc<dyn LocalProcessDriver>>,
     http: Option<Rc<dyn LocalHttpDriver>>,
+    http_stream: Option<Rc<dyn LocalHttpStreamDriver>>,
     sse: Option<Rc<dyn LocalSseDriver>>,
     websocket: Option<Rc<dyn LocalWebSocketDriver>>,
     webhook: Option<Rc<dyn LocalWebhookDriver>>,
@@ -906,6 +1024,11 @@ impl EnvironmentDrivers {
 
     pub fn with_http(mut self, driver: Rc<dyn LocalHttpDriver>) -> Self {
         self.http = Some(driver);
+        self
+    }
+
+    pub fn with_http_stream(mut self, driver: Rc<dyn LocalHttpStreamDriver>) -> Self {
+        self.http_stream = Some(driver);
         self
     }
 
@@ -936,6 +1059,10 @@ impl EnvironmentDrivers {
         self.http.clone()
     }
 
+    pub fn http_stream_driver(&self) -> Option<Rc<dyn LocalHttpStreamDriver>> {
+        self.http_stream.clone()
+    }
+
     pub fn sse_driver(&self) -> Option<Rc<dyn LocalSseDriver>> {
         self.sse.clone()
     }
@@ -962,6 +1089,10 @@ impl fmt::Debug for EnvironmentDrivers {
             )
             .field("process", &self.process.as_ref().map(|_| "<installed>"))
             .field("http", &self.http.as_ref().map(|_| "<installed>"))
+            .field(
+                "http_stream",
+                &self.http_stream.as_ref().map(|_| "<installed>"),
+            )
             .field("sse", &self.sse.as_ref().map(|_| "<installed>"))
             .field("websocket", &self.websocket.as_ref().map(|_| "<installed>"))
             .field("webhook", &self.webhook.as_ref().map(|_| "<installed>"))
@@ -972,7 +1103,7 @@ impl fmt::Debug for EnvironmentDrivers {
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::time::Duration;
 
     #[cfg(feature = "tokio")]
@@ -1149,6 +1280,71 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "tokio-http-stream")]
+    #[test]
+    fn tokio_http_stream_driver_streams_loopback_response_body() {
+        run_tokio_local(async {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback http stream server");
+            let addr = listener.local_addr().expect("loopback addr");
+            let seen_request = Rc::new(RefCell::new(String::new()));
+            let seen_request_for_task = seen_request.clone();
+            tokio::task::spawn_local(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept http client");
+                *seen_request_for_task.borrow_mut() = read_http_request(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nContent-Length: 5\r\n\r\nhello",
+                    )
+                    .await
+                    .expect("write http stream response");
+            });
+
+            let events = Rc::new(RefCell::new(Vec::<String>::new()));
+            let events_for_callback = events.clone();
+            let cancel = TokioHttpStreamDriver::new().stream(
+                HttpRequest::get(format!("http://{addr}/events"))
+                    .header("accept", "text/event-stream"),
+                Rc::new(move |event| match event {
+                    HttpStreamDriverEvent::Head(head) => {
+                        events_for_callback
+                            .borrow_mut()
+                            .push(format!("head:{}", head.status));
+                    }
+                    HttpStreamDriverEvent::Chunk(chunk) => {
+                        events_for_callback
+                            .borrow_mut()
+                            .push(format!("chunk:{}", String::from_utf8_lossy(&chunk)));
+                    }
+                    HttpStreamDriverEvent::Error(error) => {
+                        events_for_callback
+                            .borrow_mut()
+                            .push(format!("error:{error}"));
+                    }
+                    HttpStreamDriverEvent::Complete => {
+                        events_for_callback.borrow_mut().push("complete".to_owned());
+                    }
+                }),
+            );
+
+            wait_until("http stream complete", || {
+                events.borrow().iter().any(|event| event == "complete")
+            })
+            .await;
+            cancel();
+
+            assert_eq!(events.borrow().first(), Some(&"head:200".to_owned()));
+            assert!(events.borrow().contains(&"chunk:hello".to_owned()));
+            assert_eq!(events.borrow().last(), Some(&"complete".to_owned()));
+            let request = seen_request.borrow();
+            assert!(request.starts_with("GET /events HTTP/1.1"));
+            assert!(request.contains("accept: text/event-stream"));
+        });
+    }
+
     #[cfg(feature = "tokio-websocket")]
     #[test]
     fn tokio_websocket_driver_connects_and_streams_events() {
@@ -1302,7 +1498,7 @@ mod tests {
             let addr = listener.local_addr().expect("loopback addr");
             let received = Rc::new(RefCell::new(Vec::<String>::new()));
             let received_for_task = received.clone();
-            let closed = Rc::new(Cell::new(false));
+            let closed = Rc::new(std::cell::Cell::new(false));
             let closed_for_task = closed.clone();
             tokio::task::spawn_local(async move {
                 let (stream, _) = listener.accept().await.expect("accept websocket client");

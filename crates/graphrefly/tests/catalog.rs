@@ -18,17 +18,18 @@ use graphrefly::{
     element_at, empty, exhaust_map, filter, find, first, first_any, first_sync_value_from,
     flat_map, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
     from_git_hook, from_git_hook_with_options, from_http, from_iter, from_process, from_sse,
-    from_timer, from_webhook, from_webhook_with_options, from_websocket, future_local, graph,
-    interval, last, last_any, map, matches_cron, merge_map, merge_map_with_options, never, of,
-    on_first_data, on_first_data_where, pairwise, parse_cron, race, reduce, repeat, rescue,
-    run_process, sample, scan, settle, settle_by, single_sync_value_from, skip, stream_local,
-    switch_map, take, take_until, take_while, tap, tap_first, throttle, throttle_time, throw_error,
-    timeout, timer, valve, with_latest_from, zip, CronInstant, CronTick, Dispatcher,
-    EnvironmentDrivers, FromCronOptions, FromFsWatchOptions, FromGitHookOptions, FsEvent,
-    FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
-    LocalAsyncDriver, LocalHttpDriver, LocalProcessDriver, LocalSseDriver, LocalWebSocketDriver,
+    from_sse_with_options, from_timer, from_webhook, from_webhook_with_options, from_websocket,
+    future_local, graph, interval, last, last_any, map, matches_cron, merge_map,
+    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, parse_cron,
+    race, reduce, repeat, rescue, run_process, sample, scan, settle, settle_by,
+    single_sync_value_from, skip, stream_local, switch_map, take, take_until, take_while, tap,
+    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
+    CronInstant, CronTick, Dispatcher, EnvironmentDrivers, FromCronOptions, FromFsWatchOptions,
+    FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest,
+    HttpResponse, HttpStreamDriverEvent, HttpStreamHead, LocalAsyncDriver, LocalHttpDriver,
+    LocalHttpStreamDriver, LocalProcessDriver, LocalSseDriver, LocalWebSocketDriver,
     LocalWebhookDriver, MergeMapOptions, Message, Node, Operator, ProcessCommand, ProcessResult,
-    SseDriverEvent, SseEvent, SyncValueFromError, WebSocketDriverEvent, WebSocketEvent,
+    SseDriverEvent, SseEvent, SseRequest, SyncValueFromError, WebSocketDriverEvent, WebSocketEvent,
     WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 
@@ -122,6 +123,8 @@ type ProcessCallback = Box<dyn FnOnce(Result<ProcessResult, graphrefly::GraphErr
 type PendingProcess = (ProcessCommand, Rc<Cell<bool>>, Option<ProcessCallback>);
 type HttpCallback = Box<dyn FnOnce(Result<HttpResponse, graphrefly::GraphError>)>;
 type PendingHttp = (HttpRequest, Rc<Cell<bool>>, Option<HttpCallback>);
+type HttpStreamCallback = Rc<dyn Fn(HttpStreamDriverEvent)>;
+type PendingHttpStream = (HttpRequest, Rc<Cell<bool>>, HttpStreamCallback);
 type SseCallback = Rc<dyn Fn(SseDriverEvent)>;
 type PendingSse = (String, Rc<Cell<bool>>, SseCallback);
 type WebSocketCallback = Rc<dyn Fn(WebSocketDriverEvent)>;
@@ -294,6 +297,85 @@ impl LocalHttpDriver for EagerHttpDriver {
             headers: Vec::new(),
             body: request.url.into_bytes(),
         }));
+        let canceled = self.canceled.clone();
+        Box::new(move || canceled.set(canceled.get() + 1))
+    }
+}
+
+#[derive(Default)]
+struct ManualHttpStreamDriver {
+    streams: RefCell<Vec<PendingHttpStream>>,
+    canceled: Rc<Cell<usize>>,
+}
+
+impl ManualHttpStreamDriver {
+    fn requests(&self) -> Vec<HttpRequest> {
+        self.streams
+            .borrow()
+            .iter()
+            .map(|(request, _, _)| request.clone())
+            .collect()
+    }
+
+    fn emit(&self, event: HttpStreamDriverEvent) {
+        let (_, active, callback) = &self.streams.borrow()[0];
+        if active.get() {
+            callback(event);
+        }
+    }
+
+    fn emit_ignoring_cancel(&self, event: HttpStreamDriverEvent) {
+        let (_, _, callback) = &self.streams.borrow()[0];
+        callback(event);
+    }
+
+    fn active_count(&self) -> usize {
+        self.streams
+            .borrow()
+            .iter()
+            .filter(|(_, active, _)| active.get())
+            .count()
+    }
+
+    fn cancel_count(&self) -> usize {
+        self.canceled.get()
+    }
+}
+
+impl LocalHttpStreamDriver for ManualHttpStreamDriver {
+    fn stream(
+        &self,
+        request: HttpRequest,
+        callback: HttpStreamCallback,
+    ) -> graphrefly::DriverCancel {
+        let active = Rc::new(Cell::new(true));
+        self.streams
+            .borrow_mut()
+            .push((request, active.clone(), callback));
+        let canceled = self.canceled.clone();
+        Box::new(move || {
+            active.set(false);
+            canceled.set(canceled.get() + 1);
+        })
+    }
+}
+
+struct EagerHttpStreamDriver {
+    canceled: Rc<Cell<usize>>,
+}
+
+impl LocalHttpStreamDriver for EagerHttpStreamDriver {
+    fn stream(
+        &self,
+        _request: HttpRequest,
+        callback: HttpStreamCallback,
+    ) -> graphrefly::DriverCancel {
+        callback(HttpStreamDriverEvent::Head(HttpStreamHead {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        }));
+        callback(HttpStreamDriverEvent::Chunk(b"data: eager\n\n".to_vec()));
+        callback(HttpStreamDriverEvent::Complete);
         let canceled = self.canceled.clone();
         Box::new(move || canceled.set(canceled.get() + 1))
     }
@@ -1385,7 +1467,7 @@ fn missing_driver_reports_source_activation_error() {
     );
     assert_eq!(
         *collect_errors::<SseEvent>(&sse).borrow(),
-        vec!["fromSSE: missing sse driver".to_owned()]
+        vec!["fromSSE: missing sse or http stream driver".to_owned()]
     );
 
     let websocket = g.init_node(
@@ -1576,6 +1658,310 @@ fn eager_http_driver_cleanup_installs_returned_cancel_after_sync_completion() {
         http.cache().expect("http response is cached").body,
         b"https://example.test/eager".to_vec()
     );
+}
+
+#[test]
+fn from_sse_prefers_typed_sse_driver_over_http_stream_fallback() {
+    let sse_driver = Rc::new(ManualSseDriver::default());
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new()
+            .with_sse(sse_driver.clone())
+            .with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/events"),
+        vec![],
+        GraphNodeOpts::named("sse_override"),
+    );
+    let seen = collect_data::<SseEvent>(&sse);
+
+    assert_eq!(sse_driver.connections.borrow().len(), 1);
+    assert_eq!(http_stream_driver.requests().len(), 0);
+    sse_driver.emit(SseDriverEvent::Event(SseEvent {
+        event: Some("typed".to_owned()),
+        data: "override".to_owned(),
+        id: None,
+        retry_ms: None,
+    }));
+    sse_driver.emit(SseDriverEvent::Complete);
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![SseEvent {
+            event: Some("typed".to_owned()),
+            data: "override".to_owned(),
+            id: None,
+            retry_ms: None,
+        }]
+    );
+    assert_eq!(http_stream_driver.requests().len(), 0);
+}
+
+#[test]
+fn from_sse_falls_back_to_http_stream_and_parses_chunked_events() {
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse_with_options(
+            SseRequest::new("https://example.test/events").header("x-test", "yes"),
+        ),
+        vec![],
+        GraphNodeOpts::named("sse_http_stream"),
+    );
+    let seen = collect_data::<SseEvent>(&sse);
+    let shapes = collect_shapes::<SseEvent>(&sse);
+
+    let requests = http_stream_driver.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].url, "https://example.test/events");
+    assert!(requests[0]
+        .headers
+        .iter()
+        .any(|(key, value)| key == "x-test" && value == "yes"));
+    assert!(requests[0].headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("accept") && value == "text/event-stream"
+    }));
+
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![(
+            "content-type".to_owned(),
+            "text/event-stream; charset=utf-8".to_owned(),
+        )],
+    }));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(
+        b"event: add\r\nid: 7\r\nretry: 15\r\ndata: hel".to_vec(),
+    ));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(
+        b"lo\r\ndata: world\r\n\r\n".to_vec(),
+    ));
+    http_stream_driver.emit(HttpStreamDriverEvent::Complete);
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![SseEvent {
+            event: Some("add".to_owned()),
+            data: "hello\nworld".to_owned(),
+            id: Some("7".to_owned()),
+            retry_ms: Some(15),
+        }]
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(http_stream_driver.active_count(), 0);
+    assert_eq!(http_stream_driver.cancel_count(), 1);
+    assert_eq!(
+        http_stream_driver.requests().len(),
+        1,
+        "retry field is parsed data only; no hidden reconnect"
+    );
+}
+
+#[test]
+fn from_sse_http_stream_rejected_head_cancels_and_ignores_late_chunks() {
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/events"),
+        vec![],
+        GraphNodeOpts::named("sse_bad_head"),
+    );
+    let seen = collect_data::<SseEvent>(&sse);
+    let shapes = collect_shapes::<SseEvent>(&sse);
+    let errors = collect_errors::<SseEvent>(&sse);
+
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 404,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+    }));
+    assert_eq!(http_stream_driver.cancel_count(), 1);
+    assert_eq!(http_stream_driver.active_count(), 0);
+    http_stream_driver
+        .emit_ignoring_cancel(HttpStreamDriverEvent::Chunk(b"data: late\n\n".to_vec()));
+    http_stream_driver.emit_ignoring_cancel(HttpStreamDriverEvent::Complete);
+
+    assert!(seen.borrow().is_empty());
+    assert_eq!(*shapes.borrow(), vec!["ERROR"]);
+    assert_eq!(
+        *errors.borrow(),
+        vec!["fromSSE: unacceptable http status 404".to_owned()]
+    );
+}
+
+#[test]
+fn from_sse_http_stream_callback_can_complete_before_cancel_is_returned() {
+    let canceled = Rc::new(Cell::new(0));
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(Rc::new(EagerHttpStreamDriver {
+            canceled: canceled.clone(),
+        })),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/eager"),
+        vec![],
+        GraphNodeOpts::named("sse_eager_http_stream"),
+    );
+    let seen = Rc::new(RefCell::new(Vec::<SseEvent>::new()));
+    let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
+    let seen_sink = seen.clone();
+    let shapes_sink = shapes.clone();
+    let _subscription = sse.subscribe(move |msg| match msg {
+        Message::Data(value) => {
+            if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
+                seen_sink.borrow_mut().push(event.clone());
+                shapes_sink.borrow_mut().push("DATA".to_owned());
+            }
+        }
+        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
+        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+    });
+
+    assert_eq!(
+        canceled.get(),
+        1,
+        "sync stream completion must still release the returned cancel handle"
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![SseEvent {
+            event: None,
+            data: "eager".to_owned(),
+            id: None,
+            retry_ms: None,
+        }]
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
+    assert_eq!(sse.status(), graphrefly::Status::Completed);
+}
+
+#[test]
+fn from_sse_http_stream_rejects_invalid_utf8_and_parser_overflow() {
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let invalid = g.init_node(
+        from_sse("https://example.test/invalid"),
+        vec![],
+        GraphNodeOpts::named("sse_invalid_utf8"),
+    );
+    let invalid_errors = collect_errors::<SseEvent>(&invalid);
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+    }));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(vec![0xff, b'\n']));
+    assert_eq!(
+        *invalid_errors.borrow(),
+        vec!["fromSSE: invalid utf-8 in event stream".to_owned()]
+    );
+
+    let overflow_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(overflow_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let overflow = g.init_node(
+        from_sse("https://example.test/overflow"),
+        vec![],
+        GraphNodeOpts::named("sse_overflow"),
+    );
+    let overflow_errors = collect_errors::<SseEvent>(&overflow);
+    overflow_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+    }));
+    overflow_driver.emit(HttpStreamDriverEvent::Chunk(vec![b'a'; 70 * 1024]));
+    assert_eq!(
+        *overflow_errors.borrow(),
+        vec!["fromSSE: parser overflow".to_owned()]
+    );
+}
+
+#[test]
+fn from_sse_http_stream_dispatches_completed_events_before_same_chunk_parser_error() {
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/mixed"),
+        vec![],
+        GraphNodeOpts::named("sse_mixed_chunk_error"),
+    );
+    let seen = collect_data::<SseEvent>(&sse);
+    let shapes = collect_shapes::<SseEvent>(&sse);
+    let errors = collect_errors::<SseEvent>(&sse);
+
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+    }));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(b"data: ok\n\n\xff\n".to_vec()));
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![SseEvent {
+            event: None,
+            data: "ok".to_owned(),
+            id: None,
+            retry_ms: None,
+        }]
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
+    assert_eq!(
+        *errors.borrow(),
+        vec!["fromSSE: invalid utf-8 in event stream".to_owned()]
+    );
+}
+
+#[test]
+fn from_sse_http_stream_complete_flushes_buffered_data_event() {
+    let http_stream_driver = Rc::new(ManualHttpStreamDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_http_stream(http_stream_driver.clone()),
+        ..GraphOptions::default()
+    });
+    let sse = g.init_node(
+        from_sse("https://example.test/tail"),
+        vec![],
+        GraphNodeOpts::named("sse_tail"),
+    );
+    let seen = collect_data::<SseEvent>(&sse);
+    let shapes = collect_shapes::<SseEvent>(&sse);
+
+    http_stream_driver.emit(HttpStreamDriverEvent::Head(HttpStreamHead {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+    }));
+    http_stream_driver.emit(HttpStreamDriverEvent::Chunk(
+        b"event: tail\ndata: final".to_vec(),
+    ));
+    http_stream_driver.emit(HttpStreamDriverEvent::Complete);
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![SseEvent {
+            event: Some("tail".to_owned()),
+            data: "final".to_owned(),
+            id: None,
+            retry_ms: None,
+        }]
+    );
+    assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
 }
 
 #[test]

@@ -16,6 +16,7 @@ name = "graphrefly"
 default          = []
 tokio            = ["dep:tokio"]
 tokio-http       = ["tokio", "dep:reqwest"]
+tokio-http-stream = ["tokio-http"]
 tokio-websocket  = ["tokio", "dep:futures-util", "dep:tokio-tungstenite"]
 tokio-worker     = ["tokio"]
 
