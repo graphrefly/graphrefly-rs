@@ -51,6 +51,11 @@ Useful entry points:
   `LocalHttpStreamDriver` boundary for source/IO ergonomics without a hidden
   runtime.
 - `graphrefly::message_bus`, `graphrefly::to_topic`, topic/catalog/cursor facts.
+- `graphrefly::TopicMessage`, `graphrefly::JsonSchema`,
+  `graphrefly::STANDARD_TOPICS`, and explicit
+  `graphrefly::validate_topic_message_payload` helpers for passive topic
+  vocabulary. The bus does not auto-validate schemas or own topic auth,
+  expiration, compatibility, registry, storage, or provider behavior.
 - `graphrefly::work_queue` plus `graphrefly::work_queue_scheduled_readiness_projector`,
   `graphrefly::work_queue_readiness_handoff_projector`, and
   `graphrefly::work_queue_lease_expiration_command_projector`.
@@ -75,6 +80,14 @@ mise exec -- cargo run -p graphrefly-rs --example csp10_baseline_app_infra
 The example wires messaging -> work queue -> scheduled readiness -> CQRS queue
 disposition, and includes focused process work-queue recipe composition without
 making queue completion domain truth.
+
+Semantic and agentic-memory utilities are also available as passive/domain
+facts and graph-visible bundles: lower memory fragments, retrieval, KG reducers,
+agentic records, retention, consolidation, context packing, and the D172
+persistence sidecar. Real LLM/vector/provider runtimes, ontology policy,
+alias/provenance repair, multi-writer conflict repair, provider-specific context
+adapters, and vertical solution runtimes remain explicit follow-ups, not hidden
+crate behavior.
 
 ## Setup
 

@@ -6,8 +6,8 @@ use graphrefly::{
     from_iter, from_sse_with_options, graph, graph_opts, knowledge_graph_reducer_bundle, map,
     memory_append_log, memory_kv, message_bus, persist_agentic_memory_records, pipe, reactive_map,
     retry_status_node, scheduled_readiness_projector, single_sync_value_from, timeout_bundle,
-    to_http_with_options, to_process_with_options, topology_diff, work_queue,
-    work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
+    to_http_with_options, to_process_with_options, topology_diff, validate_topic_message_payload,
+    work_queue, work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
     AgenticMemoryArtifactKind, AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
     AgenticMemoryConsolidationOutcome, AgenticMemoryContextPackingBundleOptions,
     AgenticMemoryContextPackingPolicy, AgenticMemoryKgAssertionDraft,
@@ -17,19 +17,22 @@ use graphrefly::{
     AgenticMemoryTextProjection, AppendLogReadOptions, AppendLogStorageTier, BackoffPolicy, Codec,
     CqrsCommand, CqrsEventDraft, CqrsOptions, CqrsStatusState, DescribeEvent, DriverCancel,
     EnvironmentDrivers, GraphNodeOpts, GraphOptions, HttpRequest, HttpResponse,
-    HttpStreamDriverEvent, HttpStreamHead, KnowledgeAssertionObject, KnowledgeGraphPolicy,
+    HttpStreamDriverEvent, HttpStreamHead, JsonSchema, JsonSchemaAdditionalProperties,
+    JsonSchemaType, JsonSchemaTypeSpec, KnowledgeAssertionObject, KnowledgeGraphPolicy,
     KnowledgeGraphReducerBundleOptions, KnowledgeGraphStatusState, KvStorageTier, LocalAsyncDriver,
     LocalHttpDriver, LocalHttpStreamDriver, LocalProcessDriver, MemoryFragment,
-    MemoryRetrievalQuery, Message, MessageBusOptions, OutboundAdapterOptions, OutboundEvent,
-    OutboundState, OutboundStatus, PersistAgenticMemoryRecordsOptions, ProcessCommand,
-    ProcessResult, PullDemand, ReactiveMapOptions, RetryEvent, RetryPolicy, RetryState,
-    ScheduledReadinessClock, ScheduledReadinessOptions, SseEvent, SseRequest, SyncValueFromError,
-    TimeoutStatus, WebSocketRequest, WebSocketSend, WorkQueueClaimOptions, WorkQueueOptions,
-    WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffOptions, WorkQueueRecord,
-    WorkQueueScheduledReadinessOptions, WorkQueueSubmit, WorkQueueSubmitOptions,
+    MemoryRetrievalQuery, Message, MessageBusOptions, MessageBusStatusKind, OutboundAdapterOptions,
+    OutboundEvent, OutboundState, OutboundStatus, PersistAgenticMemoryRecordsOptions,
+    ProcessCommand, ProcessResult, PullDemand, ReactiveMapOptions, RetryEvent, RetryPolicy,
+    RetryState, ScheduledReadinessClock, ScheduledReadinessOptions, SseEvent, SseRequest,
+    SyncValueFromError, TimeoutStatus, TopicMessage, WebSocketRequest, WebSocketSend,
+    WorkQueueClaimOptions, WorkQueueOptions, WorkQueueReadinessCandidateKind,
+    WorkQueueReadinessHandoffOptions, WorkQueueRecord, WorkQueueScheduledReadinessOptions,
+    WorkQueueSubmit, WorkQueueSubmitOptions, PROMPTS_TOPIC, STANDARD_TOPICS,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -190,6 +193,99 @@ fn record(id: &str, text: &str) -> AgenticMemoryRecord<Value> {
             tenant_id: None,
         }),
     }
+}
+
+#[test]
+fn public_crate_root_b74_messaging_vocabulary_is_passive() {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "text".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::String)),
+            ..JsonSchema::default()
+        },
+    );
+    let schema = JsonSchema {
+        schema_type: Some(JsonSchemaTypeSpec::Single(JsonSchemaType::Object)),
+        properties: Some(properties),
+        required: Some(vec!["text".to_owned()]),
+        additional_properties: Some(JsonSchemaAdditionalProperties::Bool(false)),
+        ..JsonSchema::default()
+    };
+    let valid = TopicMessage {
+        id: "msg-valid".to_owned(),
+        schema: Some(schema.clone()),
+        expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+        correlation_id: Some("corr-1".to_owned()),
+        payload: json!({ "text": "schema checks are explicit" }),
+    };
+    let invalid = TopicMessage {
+        id: "msg-invalid".to_owned(),
+        schema: Some(schema),
+        expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+        correlation_id: Some("corr-2".to_owned()),
+        payload: json!({ "text": 7, "extra": true }),
+    };
+    let expired = TopicMessage {
+        id: "msg-expired".to_owned(),
+        schema: valid.schema.clone(),
+        expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+        correlation_id: Some("corr-3".to_owned()),
+        payload: json!({ "text": "expiration is an application fact" }),
+    };
+
+    assert!(
+        STANDARD_TOPICS.contains(&PROMPTS_TOPIC),
+        "D159 standard topic vocabulary should be available from the crate root"
+    );
+    validate_topic_message_payload(&valid).unwrap();
+    assert!(
+        validate_topic_message_payload(&invalid).is_err(),
+        "D159 validation is caller-invoked, not a bus/hub side effect"
+    );
+    validate_topic_message_payload(&expired).unwrap();
+
+    let g = graph();
+    let bus = message_bus::<TopicMessage<Value>>(
+        &g,
+        MessageBusOptions::named("acceptance/b74Bus").with_topics([PROMPTS_TOPIC]),
+    );
+    let messages = collect_data(&bus.messages);
+    let statuses = collect_data(&bus.status);
+    let issues = collect_data(&bus.issues);
+    bus.publish(
+        PROMPTS_TOPIC,
+        invalid.clone(),
+        None,
+        Some("publish-invalid-schema".to_owned()),
+        None,
+    );
+    bus.publish(
+        PROMPTS_TOPIC,
+        expired.clone(),
+        None,
+        Some("publish-expired-application-fact".to_owned()),
+        None,
+    );
+
+    assert_eq!(
+        messages
+            .borrow()
+            .iter()
+            .map(|message| message.payload.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg-invalid", "msg-expired"],
+        "messageBus must carry TopicMessage payload facts without auto-validation"
+    );
+    assert!(statuses.borrow().iter().any(|status| {
+        status.kind == MessageBusStatusKind::MessagePublished
+            && status.topic.as_deref() == Some(PROMPTS_TOPIC)
+    }));
+    assert_eq!(
+        issues.borrow().len(),
+        0,
+        "schema metadata must not create a registry, topic auth, expiration, or validation hub"
+    );
 }
 
 #[test]
