@@ -79,6 +79,47 @@ pub trait ByteStorageBackend {
 
 const FILE_STEM_PREFIX: &str = "k-";
 const DEFAULT_FILE_EXTENSION: &str = ".bin";
+const STORAGE_NAMESPACE_PREFIX: &str = "storage-namespace";
+const STORAGE_NAMESPACE_PREFIX_WITH_COLON: &str = "storage-namespace:";
+
+fn storage_tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("storage tuple key encoding cannot fail")
+}
+
+fn parse_storage_tuple_key(value: &str) -> Option<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(value).ok()
+}
+
+fn storage_physical_key(namespace: &str, logical_key: &str) -> String {
+    format!(
+        "{STORAGE_NAMESPACE_PREFIX}:{}",
+        storage_tuple_key(&[namespace, logical_key])
+    )
+}
+
+fn decode_storage_physical_key(
+    namespace: &str,
+    raw_key: &str,
+    malformed_message: &'static str,
+) -> StorageResult<Option<String>> {
+    let Some(tuple_key) = raw_key.strip_prefix(STORAGE_NAMESPACE_PREFIX_WITH_COLON) else {
+        return Ok(None);
+    };
+    let Some(tuple) = parse_storage_tuple_key(tuple_key) else {
+        return Err(StorageError::backend(malformed_message));
+    };
+    if tuple.first().map(String::as_str) != Some(namespace) {
+        return Ok(None);
+    }
+    if tuple.len() != 2 {
+        return Err(StorageError::backend(malformed_message));
+    }
+    Ok(Some(tuple[1].clone()))
+}
+
+fn content_addressed_storage_key(prefix: &str, hash_hex: &str) -> String {
+    format!("{prefix}:{}", storage_tuple_key(&[hash_hex]))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileBackendOptions {
@@ -136,17 +177,9 @@ impl FileBackend {
         &self.dir
     }
 
-    fn namespace_prefix(&self) -> String {
-        if self.namespace.is_empty() {
-            String::new()
-        } else {
-            format!("{}\0", self.namespace)
-        }
-    }
-
     fn storage_key(&self, key: &str) -> StorageResult<String> {
         validate_logical_key("fileBackend", key)?;
-        Ok(format!("{}{}", self.namespace_prefix(), key))
+        Ok(storage_physical_key(&self.namespace, key))
     }
 
     fn path_for(&self, key: &str) -> StorageResult<PathBuf> {
@@ -167,20 +200,7 @@ impl FileBackend {
         let Some(key) = file_stem_to_key(raw_stem) else {
             return Ok(None);
         };
-        let namespace_prefix = self.namespace_prefix();
-        if !key.starts_with(&namespace_prefix) {
-            return Ok(None);
-        }
-        let logical = key[namespace_prefix.len()..].to_owned();
-        if namespace_prefix.is_empty() && logical.contains('\0') {
-            return Ok(None);
-        }
-        if logical.contains('\0') {
-            return Err(StorageError::backend(
-                "fileBackend: malformed stored key contains U+0000",
-            ));
-        }
-        Ok(Some(logical))
+        decode_storage_physical_key(&self.namespace, &key, "fileBackend: malformed stored key")
     }
 }
 
@@ -272,29 +292,17 @@ impl ByteStorageBackend for FileBackend {
 }
 
 fn validate_namespace(label: &str, value: &str) -> StorageResult<()> {
-    if value.contains('\0') {
-        return Err(StorageError::backend(format!(
-            "{label}: namespace must not contain U+0000"
-        )));
-    }
+    let _ = (label, value);
     Ok(())
 }
 
 fn validate_logical_key(label: &str, value: &str) -> StorageResult<()> {
-    if value.contains('\0') {
-        return Err(StorageError::backend(format!(
-            "{label}: key must not contain U+0000"
-        )));
-    }
+    let _ = (label, value);
     Ok(())
 }
 
 fn validate_list_prefix(label: &str, value: &str) -> StorageResult<()> {
-    if value.contains('\0') {
-        return Err(StorageError::backend(format!(
-            "{label}: list prefix must not contain U+0000"
-        )));
-    }
+    let _ = (label, value);
     Ok(())
 }
 
@@ -853,7 +861,7 @@ impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
         let bytes = strict_canonical_json_bytes(&context).map_err(storage_json_error)?;
         let hex = sha256_hex(&bytes);
         Ok(match &self.key_prefix {
-            Some(prefix) => format!("{prefix}:{hex}"),
+            Some(prefix) => content_addressed_storage_key(prefix, &hex),
             None => hex,
         })
     }

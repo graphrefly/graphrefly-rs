@@ -37,6 +37,24 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
     seen
 }
 
+fn tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("test tuple key serializes")
+}
+
+fn default_work_id(seq: u64) -> String {
+    format!(
+        "work-queue-work:{}",
+        tuple_key(&["q", "work", &seq.to_string()])
+    )
+}
+
+fn default_lease_id(work_id: &str, lease_seq: u64) -> String {
+    format!(
+        "work-queue-lease:{}",
+        tuple_key(&[work_id, &lease_seq.to_string()])
+    )
+}
+
 fn cqrs_cursor() -> CqrsCursor {
     CqrsCursor {
         event_seq: 0,
@@ -352,15 +370,10 @@ fn work_queue_nonretryable_fail_dead_letters_without_retry() {
     let records = collect_data(&queue.records);
 
     queue.submit("payload".to_owned(), WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
+    let lease_id = default_lease_id(&work_id, 1);
     queue.claim(WorkQueueClaimOptions::new("worker-a").command_id("claim-1"));
-    queue.fail(
-        "q:work:1",
-        "q:work:1:lease:1",
-        1,
-        "worker-a",
-        "fail-1",
-        Some(false),
-    );
+    queue.fail(&work_id, &lease_id, 1, "worker-a", "fail-1", Some(false));
 
     assert!(records.borrow().iter().any(|record| matches!(
         record,

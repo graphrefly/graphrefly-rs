@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::json::JsonValue;
 use crate::messaging::DataIssue;
 use crate::node::{Node, NodeOpts};
@@ -62,6 +63,15 @@ pub enum WorkQueueReadinessStatusState {
 pub enum WorkQueueReadinessCandidateKind {
     ClaimEligible,
     LeaseExpirationEligible,
+}
+
+impl WorkQueueReadinessCandidateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaimEligible => "claim-eligible",
+            Self::LeaseExpirationEligible => "lease-expiration-eligible",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -486,9 +496,12 @@ pub fn work_queue_lease_expiration_command<T>(
         return None;
     }
     Some(WorkQueueCommand::ExpireLeases {
-        command_id: format!("{command_prefix}:{}", candidate.candidate_id),
+        command_id: compound_tuple_key(command_prefix, &[&candidate.candidate_id]),
         queue_id: Some(candidate.queue_id.clone()),
-        idempotency_key: Some(format!("{}:{}", command_prefix, candidate.candidate_id)),
+        idempotency_key: Some(compound_tuple_key(
+            command_prefix,
+            &[&candidate.candidate_id],
+        )),
         work_ids: vec![candidate.work_id.clone()],
         limit: Some(1),
         now_ms: Some(candidate.now_ms),
@@ -508,7 +521,10 @@ fn schedule_from_record<T>(record: &WorkQueueRecord<T>) -> Option<ScheduledReadi
             queue_id,
             work_id,
             kind: WorkQueueReadinessScheduleKind::AdmissionDelay,
-            schedule_id: format!("work-queue:{queue_id}:{work_id}:admission:{record_seq}"),
+            schedule_id: compound_tuple_key(
+                "work-queue-admission-readiness",
+                &[queue_id, work_id, &record_seq.to_string()],
+            ),
             ready_at_ms: *ready_at_ms,
             deadline_ms: *deadline_ms,
             record_seq: *record_seq,
@@ -527,9 +543,14 @@ fn schedule_from_record<T>(record: &WorkQueueRecord<T>) -> Option<ScheduledReadi
             queue_id,
             work_id,
             kind: WorkQueueReadinessScheduleKind::WorkScheduled,
-            schedule_id: format!(
-                "work-queue:{queue_id}:{work_id}:schedule:{}:{record_seq}",
-                schedule_id.as_deref().unwrap_or(command_id)
+            schedule_id: compound_tuple_key(
+                "work-queue-scheduled-readiness",
+                &[
+                    queue_id,
+                    work_id,
+                    schedule_id.as_deref().unwrap_or(command_id),
+                    &record_seq.to_string(),
+                ],
             ),
             ready_at_ms: *not_before_ms,
             deadline_ms: *deadline_ms,
@@ -547,7 +568,10 @@ fn schedule_from_record<T>(record: &WorkQueueRecord<T>) -> Option<ScheduledReadi
             queue_id,
             work_id,
             kind: WorkQueueReadinessScheduleKind::RetryScheduled,
-            schedule_id: format!("work-queue:{queue_id}:{work_id}:retry:{command_id}:{record_seq}"),
+            schedule_id: compound_tuple_key(
+                "work-queue-retry-readiness",
+                &[queue_id, work_id, command_id, &record_seq.to_string()],
+            ),
             ready_at_ms: *retry_at_ms,
             deadline_ms: None,
             record_seq: *record_seq,
@@ -576,8 +600,15 @@ fn schedule_from_record<T>(record: &WorkQueueRecord<T>) -> Option<ScheduledReadi
             queue_id,
             work_id,
             kind: WorkQueueReadinessScheduleKind::LeaseExpiration,
-            schedule_id: format!(
-                "work-queue:{queue_id}:{work_id}:lease:{lease_id}:{attempt}:{record_seq}"
+            schedule_id: compound_tuple_key(
+                "work-queue-lease-readiness",
+                &[
+                    queue_id,
+                    work_id,
+                    lease_id,
+                    &attempt.to_string(),
+                    &record_seq.to_string(),
+                ],
             ),
             ready_at_ms: *lease_expires_at_ms,
             deadline_ms: None,
@@ -654,7 +685,7 @@ fn emit_translated_schedule(
             ctx,
             state,
             WorkQueueReadinessStatus {
-                status_id: format!("{schedule_id}:work-queue-readiness:translated"),
+                status_id: compound_tuple_key("work-queue-readiness-translated", &[&schedule_id]),
                 queue_id: metadata_string(&schedule, "queueId").unwrap_or_default(),
                 work_id: metadata_string(&schedule, "workId"),
                 schedule_id: Some(schedule_id),
@@ -948,7 +979,13 @@ fn handoff_ready_inner(ctx: &Ctx, state: &mut HandoffState, ready: &ScheduledRea
                 return;
             }
             WorkQueueReadinessCandidate {
-                candidate_id: format!("{}:claim-candidate", ready.schedule_id),
+                candidate_id: compound_tuple_key(
+                    "work-queue-readiness-candidate",
+                    &[
+                        &ready.schedule_id,
+                        WorkQueueReadinessCandidateKind::ClaimEligible.as_str(),
+                    ],
+                ),
                 queue_id,
                 work_id,
                 schedule_id: ready.schedule_id.clone(),
@@ -986,7 +1023,13 @@ fn handoff_ready_inner(ctx: &Ctx, state: &mut HandoffState, ready: &ScheduledRea
                 return;
             }
             WorkQueueReadinessCandidate {
-                candidate_id: format!("{}:lease-expiration-candidate", ready.schedule_id),
+                candidate_id: compound_tuple_key(
+                    "work-queue-readiness-candidate",
+                    &[
+                        &ready.schedule_id,
+                        WorkQueueReadinessCandidateKind::LeaseExpirationEligible.as_str(),
+                    ],
+                ),
                 queue_id,
                 work_id,
                 schedule_id: ready.schedule_id.clone(),
@@ -1023,7 +1066,7 @@ fn handoff_overdue(ctx: &Ctx, state: &mut HandoffState, overdue: &ScheduledReadi
         ctx,
         state,
         WorkQueueReadinessStatus {
-            status_id: format!("{}:work-queue-readiness:overdue", overdue.schedule_id),
+            status_id: compound_tuple_key("work-queue-readiness-overdue", &[&overdue.schedule_id]),
             queue_id,
             work_id,
             schedule_id: Some(overdue.schedule_id.clone()),
@@ -1043,14 +1086,17 @@ fn emit_candidate(ctx: &Ctx, state: &mut HandoffState, candidate: WorkQueueReadi
         .insert(candidate.candidate_id.clone(), candidate.clone());
     if state
         .emitted
-        .insert(format!("candidate:{}", candidate.candidate_id))
+        .insert(compound_tuple_key("candidate", &[&candidate.candidate_id]))
     {
         emit_fact(ctx, WorkQueueReadinessFact::Candidate(candidate.clone()));
         emit_handoff_status(
             ctx,
             state,
             WorkQueueReadinessStatus {
-                status_id: format!("{}:work-queue-readiness:candidate", candidate.schedule_id),
+                status_id: compound_tuple_key(
+                    "work-queue-readiness-candidate-status",
+                    &[&candidate.candidate_id],
+                ),
                 queue_id: candidate.queue_id.clone(),
                 work_id: Some(candidate.work_id.clone()),
                 schedule_id: Some(candidate.schedule_id.clone()),
@@ -1070,7 +1116,10 @@ fn emit_status(ctx: &Ctx, state: &mut TranslatorState, status: WorkQueueReadines
     state
         .status_by_id
         .insert(status.status_id.clone(), status.clone());
-    if state.emitted.insert(format!("status:{status:?}")) {
+    if state
+        .emitted
+        .insert(compound_tuple_key("status", &[&format!("{status:?}")]))
+    {
         emit_fact(ctx, WorkQueueReadinessFact::Status(status));
     }
 }
@@ -1079,7 +1128,10 @@ fn emit_handoff_status(ctx: &Ctx, state: &mut HandoffState, status: WorkQueueRea
     state
         .status_by_id
         .insert(status.status_id.clone(), status.clone());
-    if state.emitted.insert(format!("status:{status:?}")) {
+    if state
+        .emitted
+        .insert(compound_tuple_key("status", &[&format!("{status:?}")]))
+    {
         emit_fact(ctx, WorkQueueReadinessFact::Status(status));
     }
 }
@@ -1094,7 +1146,7 @@ fn emit_handoff_issue(ctx: &Ctx, state: &mut HandoffState, schedule_id: String, 
     );
     if state
         .emitted
-        .insert(format!("issue:{schedule_id}:{detail}"))
+        .insert(canonical_tuple_key(&["issue", &schedule_id, detail]))
     {
         emit_fact(ctx, WorkQueueReadinessFact::Issue(issue));
     }
@@ -1155,9 +1207,9 @@ fn ignored_status(
     detail: &str,
 ) -> WorkQueueReadinessStatus {
     WorkQueueReadinessStatus {
-        status_id: format!(
-            "{}:work-queue-readiness:ignored:{detail}",
-            ready.schedule_id
+        status_id: compound_tuple_key(
+            "work-queue-readiness-ignored",
+            &[&ready.schedule_id, detail],
         ),
         queue_id: queue_id.to_owned(),
         work_id: Some(work_id.to_owned()),

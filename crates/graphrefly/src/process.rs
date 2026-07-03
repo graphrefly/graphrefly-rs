@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::compound_tuple_key;
 use crate::node::{Core, Node};
 use crate::operators::Operator;
 
@@ -1065,10 +1066,12 @@ fn process_effect_outcome_command<TCommand, TResult: Clone>(
         causation_id: outcome.causation_id.clone(),
     };
     let command = ProcessCommand {
-        id: outcome
-            .command_id
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", outcome.effect_id, command_type.as_str())),
+        id: outcome.command_id.clone().unwrap_or_else(|| {
+            compound_tuple_key(
+                "process-effect-command",
+                &[&outcome.effect_id, command_type.as_str()],
+            )
+        }),
         command_type: command_type.as_str().to_owned(),
         payload: map_payload(payload.clone()),
         process_id: outcome.process_id.clone(),
@@ -1561,10 +1564,12 @@ fn prepare_events<TCommand, TEvent: Clone>(
             .filter(|id| !id.is_empty())
             .cloned()
             .unwrap_or_else(|| {
-                format!(
-                    "{}:event:{}",
-                    command.id,
-                    state.event_seq + index as u64 + 1
+                compound_tuple_key(
+                    "process-event",
+                    &[
+                        &command.id,
+                        &(state.event_seq + index as u64 + 1).to_string(),
+                    ],
                 )
             });
         if seen.contains(&id) || state.seen_event_ids.contains(&id) {
@@ -1600,10 +1605,12 @@ fn prepare_effects<TCommand, TEffect: Clone>(
             .filter(|id| !id.is_empty())
             .cloned()
             .unwrap_or_else(|| {
-                format!(
-                    "{}:effect:{}",
-                    command.id,
-                    state.effect_seq + index as u64 + 1
+                compound_tuple_key(
+                    "process-effect",
+                    &[
+                        &command.id,
+                        &(state.effect_seq + index as u64 + 1).to_string(),
+                    ],
                 )
             });
         if seen.contains(&id) || state.seen_effect_ids.contains(&id) {

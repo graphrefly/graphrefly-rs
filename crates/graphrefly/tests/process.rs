@@ -32,6 +32,31 @@ fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
         .or_else(|| values.prev::<i32>(i))
 }
 
+fn tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("test tuple key serializes")
+}
+
+fn process_event_id(command_id: &str, seq: u64) -> String {
+    format!(
+        "process-event:{}",
+        tuple_key(&[command_id, &seq.to_string()])
+    )
+}
+
+fn process_effect_id(command_id: &str, seq: u64) -> String {
+    format!(
+        "process-effect:{}",
+        tuple_key(&[command_id, &seq.to_string()])
+    )
+}
+
+fn process_effect_command_id(effect_id: &str, command_type: &str) -> String {
+    format!(
+        "process-effect-command:{}",
+        tuple_key(&[effect_id, command_type])
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct CommandPayload {
     amount: i32,
@@ -120,7 +145,9 @@ fn process_bundle_reduces_commands_into_graph_visible_facts() {
 
     assert_eq!(process.state.cache(), Some(ProcessState { total: 7 }));
     let event = events.borrow().last().unwrap().clone();
-    assert_eq!(event.id, "cmd-1:event:1");
+    let event_id = process_event_id("cmd-1", 1);
+    let effect_id = process_effect_id("cmd-1", 1);
+    assert_eq!(event.id, event_id);
     assert_eq!(event.event_type, "amount-added");
     assert_eq!(event.seq, 1);
     assert_eq!(event.cursor, 1);
@@ -130,7 +157,7 @@ fn process_bundle_reduces_commands_into_graph_visible_facts() {
     assert_eq!(event.timestamp_ms, 123);
 
     let effect = effect_requests.borrow().last().unwrap().clone();
-    assert_eq!(effect.id, "cmd-1:effect:1");
+    assert_eq!(effect.id, effect_id);
     assert_eq!(effect.effect_type, "notify");
     assert_eq!(effect.seq, 1);
     assert_eq!(effect.cursor, 1);
@@ -151,8 +178,8 @@ fn process_bundle_reduces_commands_into_graph_visible_facts() {
     let audit = audit.borrow().last().unwrap().clone();
     assert_eq!(audit.seq, 1);
     assert_eq!(audit.outcome, ProcessAuditOutcome::Success);
-    assert_eq!(audit.event_ids, vec!["cmd-1:event:1".to_owned()]);
-    assert_eq!(audit.effect_ids, vec!["cmd-1:effect:1".to_owned()]);
+    assert_eq!(audit.event_ids, vec![event_id]);
+    assert_eq!(audit.effect_ids, vec![effect_id]);
     assert_eq!(process.cursor.cache().unwrap().audit_seq, 1);
     assert!(process.error.cache().is_none());
 }
@@ -288,7 +315,7 @@ fn process_bundle_keeps_runtime_state_checkpoint_friendly() {
     assert!(runtime.ctx_state.persist);
     assert_eq!(data["eventSeq"], 1);
     assert_eq!(data["commandCount"], 1);
-    assert_eq!(data["seenEventIds"][0], "cmd-1:event:1");
+    assert_eq!(data["seenEventIds"][0], process_event_id("cmd-1", 1));
     assert_eq!(data["state"]["total"], 3);
 }
 
@@ -453,23 +480,27 @@ fn process_effect_runner_projects_result_commands_through_declared_process_edge(
     });
     assert_eq!(
         runner.requests.cache().unwrap().id,
-        "cmd-1:effect:1".to_owned()
+        process_effect_id("cmd-1", 1)
     );
+    let effect_id = process_effect_id("cmd-1", 1);
 
     outcomes.down(vec![Message::Data(Rc::new(
-        ProcessEffectOutcome::result("cmd-1:effect:1", "notify", EffectResult { delivered: true })
+        ProcessEffectOutcome::result(&effect_id, "notify", EffectResult { delivered: true })
             .with_process_id("p-1")
             .with_correlation_id("corr-1"),
     ))]);
 
     let command = commands.borrow().last().unwrap().clone();
-    assert_eq!(command.id, "cmd-1:effect:1:effect.result");
+    assert_eq!(
+        command.id,
+        process_effect_command_id(&effect_id, "effect.result")
+    );
     assert_eq!(command.command_type, "effect.result");
     assert_eq!(command.process_id.as_deref(), Some("p-1"));
     match command.payload {
         RunnerCommandPayload::Effect(payload) => {
             assert_eq!(payload.kind, ProcessEffectOutcomeKind::Result);
-            assert_eq!(payload.effect_id, "cmd-1:effect:1");
+            assert_eq!(payload.effect_id, effect_id);
             assert_eq!(payload.effect_type, "notify");
             assert!(payload.value.unwrap().delivered);
         }

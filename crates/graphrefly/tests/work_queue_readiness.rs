@@ -30,6 +30,24 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
     seen
 }
 
+fn tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("test tuple key serializes")
+}
+
+fn default_work_id(seq: u64) -> String {
+    format!(
+        "work-queue-work:{}",
+        tuple_key(&["q", "work", &seq.to_string()])
+    )
+}
+
+fn generated_lease_id(work_id: &str, lease_seq: u64) -> String {
+    format!(
+        "work-queue-lease:{}",
+        tuple_key(&[work_id, &lease_seq.to_string()])
+    )
+}
+
 fn test_queue(g: &graphrefly::Graph, now: Rc<Cell<u64>>) -> WorkQueue<Payload> {
     test_queue_named(g, now, "q", "work", "q-admit")
 }
@@ -81,12 +99,13 @@ fn translator_lowers_scheduled_retry_and_lease_to_ready_at_ms() {
         },
     );
     now.set(20);
+    let delayed_lease = generated_lease_id("delayed", 1);
     queue.claim(
         WorkQueueClaimOptions::new("w")
             .command_id("claim-delayed")
             .requested_work_ids(["delayed"]),
     );
-    queue.fail("delayed", "delayed:lease:1", 1, "w", "fail-1", Some(true));
+    queue.fail("delayed", &delayed_lease, 1, "w", "fail-1", Some(true));
     queue.claim(
         WorkQueueClaimOptions::new("w")
             .command_id("claim-retry-too-soon")
@@ -436,6 +455,7 @@ fn lease_expiration_candidate_lowers_only_to_existing_expire_leases_command() {
     let records = collect_data::<WorkQueueRecord<Payload>>(&queue.records);
 
     queue.submit(Payload { id: "lease" }, WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
     queue.claim(WorkQueueClaimOptions::new("w").command_id("claim-lease"));
     clocks.set(ScheduledReadinessClock {
         clock_id: "clock".to_owned(),
@@ -447,7 +467,7 @@ fn lease_expiration_candidate_lowers_only_to_existing_expire_leases_command() {
     assert!(emitted_commands
         .borrow()
         .iter()
-        .any(|command| matches!(command, WorkQueueCommand::ExpireLeases { work_ids, .. } if work_ids == &vec!["q:work:1".to_owned()])));
+        .any(|command| matches!(command, WorkQueueCommand::ExpireLeases { work_ids, .. } if work_ids == &vec![work_id.clone()])));
     assert!(!records
         .borrow()
         .iter()
@@ -480,6 +500,8 @@ fn stale_lease_expiration_candidate_is_pruned_after_release() {
     let views = collect_data(&handoff.views);
 
     queue.submit(Payload { id: "lease" }, WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
+    let lease_id = generated_lease_id(&work_id, 1);
     queue.claim(WorkQueueClaimOptions::new("w").command_id("claim-lease"));
     clocks.set(ScheduledReadinessClock {
         clock_id: "clock".to_owned(),
@@ -491,7 +513,7 @@ fn stale_lease_expiration_candidate_is_pruned_after_release() {
         candidate.candidate_kind == WorkQueueReadinessCandidateKind::LeaseExpirationEligible
     }));
 
-    queue.release("q:work:1", "q:work:1:lease:1", 1, "w", "release-lease");
+    queue.release(&work_id, &lease_id, 1, "w", "release-lease");
     clocks.set(ScheduledReadinessClock {
         clock_id: "clock".to_owned(),
         now_ms: 30_001,

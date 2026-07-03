@@ -71,6 +71,7 @@ pub mod graph;
 pub mod higher_order;
 #[doc(hidden)]
 pub mod host_boundary;
+mod identity;
 pub mod json;
 pub mod messaging;
 pub mod node;

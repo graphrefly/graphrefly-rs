@@ -38,6 +38,13 @@ enum ReplayClass {
     WarmupActivationDrainBoundary,
 }
 
+fn wire_edge_cause_id(group_id: &str, seq: u64) -> String {
+    format!(
+        "wire-edge-group-cause:{}",
+        serde_json::to_string(&[group_id, &seq.to_string()]).expect("tuple key encodes")
+    )
+}
+
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
@@ -300,7 +307,7 @@ fn classify_replay_source(trace: &[TraceRow]) -> ReplayClass {
             && row
                 .cause_id
                 .as_deref()
-                .is_some_and(|cause_id| cause_id.ends_with(":1"))
+                .is_some_and(|cause_id| cause_id == wire_edge_cause_id("group", 1))
     }) {
         return ReplayClass::WarmupActivationDrainBoundary;
     }

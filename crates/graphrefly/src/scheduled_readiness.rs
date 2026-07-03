@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::json::{stable_json_string, JsonValue};
 use crate::messaging::DataIssue;
 use crate::node::{Node, NodeOpts};
@@ -582,14 +583,18 @@ fn emit_status(ctx: &Ctx, state: &mut ScheduledReadinessState, status: Scheduled
     state
         .status_by_id
         .insert(status.schedule_id.clone(), status.clone());
-    let key = format!("status:{}", status_identity(&status));
+    let key = compound_tuple_key("status", &[&status_identity(&status)]);
     if state.emitted_keys.insert(key) {
         emit_fact(ctx, ScheduledReadinessFact::Status(status));
     }
 }
 
 fn emit_issue(ctx: &Ctx, state: &mut ScheduledReadinessState, issue: DataIssue) {
-    let key = format!("{}:{}:{:?}", issue.source, issue.code, issue.details);
+    let key = canonical_tuple_key(&[
+        &issue.source,
+        &issue.code,
+        issue.details.as_deref().unwrap_or(""),
+    ]);
     if state.issue_keys.insert(key) {
         emit_fact(ctx, ScheduledReadinessFact::Issue(issue));
     }
@@ -607,7 +612,7 @@ fn emit_audit(
     emit_fact(
         ctx,
         ScheduledReadinessFact::Audit(ScheduledReadinessAuditRecord {
-            id: format!("scheduled-readiness-audit-{}", state.audit_seq),
+            id: compound_tuple_key("scheduled-readiness-audit", &[&state.audit_seq.to_string()]),
             kind: kind.into(),
             subject_id,
             source_refs: canonical_source_refs(source_refs),
@@ -629,9 +634,9 @@ fn status_for(
         ScheduledReadinessStatusState::Issue => "issue",
     };
     ScheduledReadinessStatus {
-        status_id: format!(
-            "{}:scheduled-readiness-status:{status_name}",
-            schedule.schedule_id
+        status_id: compound_tuple_key(
+            "scheduled-readiness-status",
+            &[&schedule.schedule_id, status_name],
         ),
         schedule_id: schedule.schedule_id.clone(),
         state,
@@ -740,7 +745,7 @@ fn canonical_source_refs(refs: Vec<SourceRef>) -> Vec<SourceRef> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for source_ref in refs {
-        let key = format!("{}:{}", source_ref.kind, source_ref.id);
+        let key = canonical_tuple_key(&[&source_ref.kind, &source_ref.id]);
         if seen.insert(key) {
             out.push(source_ref);
         }

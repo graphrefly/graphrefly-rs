@@ -14,6 +14,7 @@ use super::bridge_protobuf::{
 };
 use crate::ctx::{Ctx, DepTerminal, WaveData};
 use crate::graph::{Graph, GraphNodeOpts, TopologyGroup, TopologyGroupOptions};
+use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::node::{Core, Node, NodeOpts};
 use crate::protocol::{AnyValue, Message};
 use crate::resilience::RetryPolicy;
@@ -113,7 +114,7 @@ pub struct WireBridgeEnvelopeInput<T> {
 }
 
 pub fn wire_bridge_idempotency_key(session_id: &str, seq: u64) -> String {
-    format!("{session_id}:{seq}")
+    canonical_tuple_key(&[session_id, &seq.to_string()])
 }
 
 pub fn wire_bridge_envelope<T>(
@@ -1514,7 +1515,10 @@ fn emit_wire_edge_group_outbound(
     }
     let cause_id = {
         let mut state = state.borrow_mut();
-        let cause_id = format!("{name}:cause:{}", state.next_cause);
+        let cause_id = compound_tuple_key(
+            "wire-edge-group-cause",
+            &[name, &state.next_cause.to_string()],
+        );
         state.next_cause = state.next_cause.saturating_add(1);
         cause_id
     };
@@ -4488,7 +4492,10 @@ mod tests {
 
     #[test]
     fn wire_bridge_envelope_validates_metadata_and_idempotency() {
-        assert_eq!(wire_bridge_idempotency_key("session-a", 7), "session-a:7");
+        assert_eq!(
+            wire_bridge_idempotency_key("session-a", 7),
+            canonical_tuple_key(&["session-a", "7"])
+        );
         let env = wire_bridge_envelope(WireBridgeEnvelopeInput {
             session_id: "session-a".to_owned(),
             envelope_type: WireBridgeEnvelopeType::Data,
@@ -4503,7 +4510,10 @@ mod tests {
             request_id: Some("req-1".to_owned()),
         })
         .expect("valid envelope");
-        assert_eq!(env.metadata.idempotency_key, "session-a:7");
+        assert_eq!(
+            env.metadata.idempotency_key,
+            canonical_tuple_key(&["session-a", "7"])
+        );
         assert_eq!(env.metadata.request_id.as_deref(), Some("req-1"));
         assert!(matches!(
             wire_bridge_envelope::<()>(WireBridgeEnvelopeInput {
@@ -4604,7 +4614,7 @@ mod tests {
                 metadata: WireBridgeMetadata {
                     seq: 5,
                     cursor: 0,
-                    idempotency_key: "session-a:5".to_owned(),
+                    idempotency_key: canonical_tuple_key(&["session-a", "5"]),
                     attempt: 1,
                     max_attempts: 1,
                     timestamp_ms: Some(42),

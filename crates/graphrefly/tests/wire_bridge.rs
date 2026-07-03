@@ -136,6 +136,17 @@ fn wire_edge_frames(
         .collect()
 }
 
+fn tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("test tuple key serializes")
+}
+
+fn wire_edge_cause_id(group_id: &str, seq: u64) -> String {
+    format!(
+        "wire-edge-group-cause:{}",
+        tuple_key(&[group_id, &seq.to_string()])
+    )
+}
+
 #[test]
 fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases() {
     let g = graph();
@@ -166,31 +177,32 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
         source_b.set(vec![2]);
     });
     let frames = wire_edge_frames(&outbound);
+    let cause_id = wire_edge_cause_id("group", 1);
     assert_eq!(
         frames,
         vec![
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Dirty,
                 edge_id: "a".to_owned(),
-                cause_id: "group:cause:1".to_owned(),
+                cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Dirty,
                 edge_id: "b".to_owned(),
-                cause_id: "group:cause:1".to_owned(),
+                cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Data,
                 edge_id: "a".to_owned(),
-                cause_id: "group:cause:1".to_owned(),
+                cause_id: cause_id.clone(),
                 value: Some(vec![1]),
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Data,
                 edge_id: "b".to_owned(),
-                cause_id: "group:cause:1".to_owned(),
+                cause_id,
                 value: Some(vec![2]),
             },
         ]
@@ -467,16 +479,17 @@ fn wire_edge_group_outbound_initial_bootstrap_allows_one_current_cohort() {
     );
 
     let frames = wire_edge_frames(&outbound);
+    let cause_id = wire_edge_cause_id("bootstrap/group", 1);
     assert_eq!(
         frames
             .iter()
             .map(|frame| (frame.kind, frame.edge_id.as_str(), frame.cause_id.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (CanonicalWireEdgeKind::Dirty, "a", "bootstrap/group:cause:1"),
-            (CanonicalWireEdgeKind::Dirty, "b", "bootstrap/group:cause:1"),
-            (CanonicalWireEdgeKind::Data, "a", "bootstrap/group:cause:1"),
-            (CanonicalWireEdgeKind::Data, "b", "bootstrap/group:cause:1"),
+            (CanonicalWireEdgeKind::Dirty, "a", cause_id.as_str()),
+            (CanonicalWireEdgeKind::Dirty, "b", cause_id.as_str()),
+            (CanonicalWireEdgeKind::Data, "a", cause_id.as_str()),
+            (CanonicalWireEdgeKind::Data, "b", cause_id.as_str()),
         ],
         "D561: the first complete activation/current cohort is the only legal bootstrap"
     );
@@ -597,31 +610,32 @@ fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
 
     source_b.set(vec![20]);
     let frames = wire_edge_frames(&outbound);
+    let cause_id = wire_edge_cause_id("fresh/group", 2);
     assert_eq!(
         frames,
         vec![
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Dirty,
                 edge_id: "a".to_owned(),
-                cause_id: "fresh/group:cause:2".to_owned(),
+                cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Dirty,
                 edge_id: "b".to_owned(),
-                cause_id: "fresh/group:cause:2".to_owned(),
+                cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Data,
                 edge_id: "a".to_owned(),
-                cause_id: "fresh/group:cause:2".to_owned(),
+                cause_id: cause_id.clone(),
                 value: Some(vec![10]),
             },
             CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Data,
                 edge_id: "b".to_owned(),
-                cause_id: "fresh/group:cause:2".to_owned(),
+                cause_id,
                 value: Some(vec![20]),
             },
         ]
@@ -665,19 +679,12 @@ fn wire_edge_group_outbound_same_bytes_from_fresh_events_still_form_cause() {
         .filter(|frame| frame.kind == CanonicalWireEdgeKind::Data)
         .map(|frame| (frame.edge_id, frame.cause_id, frame.value))
         .collect::<Vec<_>>();
+    let cause_id = wire_edge_cause_id("same-bytes/group", 2);
     assert_eq!(
         data_frames,
         vec![
-            (
-                "a".to_owned(),
-                "same-bytes/group:cause:2".to_owned(),
-                Some(vec![1])
-            ),
-            (
-                "b".to_owned(),
-                "same-bytes/group:cause:2".to_owned(),
-                Some(vec![2])
-            ),
+            ("a".to_owned(), cause_id.clone(), Some(vec![1])),
+            ("b".to_owned(), cause_id, Some(vec![2])),
         ],
         "D561: freshness is occurrence/version based, not payload equality"
     );

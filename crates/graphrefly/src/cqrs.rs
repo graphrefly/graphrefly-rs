@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::compound_tuple_key;
 use crate::node::Node;
 use crate::operators::Operator;
 
@@ -842,7 +843,9 @@ fn prepare_events<TCommand, TEvent: Clone + 'static>(
             .id
             .clone()
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| format!("{}:{}", command.id, index + 1));
+            .unwrap_or_else(|| {
+                compound_tuple_key("cqrs-event", &[&command.id, &(index + 1).to_string()])
+            });
         if state.seen_event_ids.contains(&id) || seen_in_command.contains(&id) {
             return Err((
                 CqrsErrorCode::DuplicateEvent,

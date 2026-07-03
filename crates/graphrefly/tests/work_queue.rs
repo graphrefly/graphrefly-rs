@@ -49,6 +49,24 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
     seen
 }
 
+fn tuple_key(parts: &[&str]) -> String {
+    serde_json::to_string(parts).expect("test tuple key serializes")
+}
+
+fn default_work_id(seq: u64) -> String {
+    format!(
+        "work-queue-work:{}",
+        tuple_key(&["q", "work", &seq.to_string()])
+    )
+}
+
+fn default_lease_id(work_id: &str, lease_seq: u64) -> String {
+    format!(
+        "work-queue-lease:{}",
+        tuple_key(&[work_id, &lease_seq.to_string()])
+    )
+}
+
 #[test]
 fn admits_submitted_work_through_message_bus_and_acks_after_record() {
     let g = graph();
@@ -64,6 +82,7 @@ fn admits_submitted_work_through_message_bus_and_acks_after_record() {
     );
 
     queue.submit(Payload { id: "a" }, WorkQueueSubmitOptions::default());
+    let expected_work_id = default_work_id(1);
 
     assert!(records.borrow().iter().any(|record| matches!(
         record,
@@ -74,7 +93,7 @@ fn admits_submitted_work_through_message_bus_and_acks_after_record() {
             message_bus,
             ..
         } if queue_id == "q"
-            && work_id == "q:work:1"
+            && work_id == &expected_work_id
             && payload.id == "a"
             && message_bus.topic == "work"
             && message_bus.seq == 1
@@ -119,7 +138,7 @@ fn admits_retained_backlog_through_subscription_available() {
     assert!(records.borrow().iter().any(|record| matches!(
         record,
         WorkQueueRecord::WorkAdmitted { work_id, payload, .. }
-            if work_id == "q:work:1" && payload.id == "before"
+            if work_id == &default_work_id(1) && payload.id == "before"
     )));
     assert_eq!(
         cursor.borrow().last().map(|cursor| cursor.next_seq),
@@ -137,29 +156,32 @@ fn claim_race_emits_issue_and_lease_lifecycle_records() {
     let issues = collect_data::<DataIssue>(&queue.issues);
 
     queue.submit(Payload { id: "a" }, WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
+    let lease_1 = default_lease_id(&work_id, 1);
+    let lease_2 = default_lease_id(&work_id, 2);
     queue.claim(WorkQueueClaimOptions::new("w1").command_id("claim-1"));
     queue.claim(
         WorkQueueClaimOptions::new("w2")
-            .requested_work_ids(["q:work:1"])
+            .requested_work_ids([work_id.clone()])
             .command_id("claim-2"),
     );
-    queue.renew_lease("q:work:1", "q:work:1:lease:1", 1, "w1", "renew-1");
-    queue.release("q:work:1", "q:work:1:lease:1", 1, "w1", "release-1");
+    queue.renew_lease(&work_id, &lease_1, 1, "w1", "renew-1");
+    queue.release(&work_id, &lease_1, 1, "w1", "release-1");
     queue.claim(WorkQueueClaimOptions::new("w2").command_id("claim-3"));
     queue.complete(
-        "q:work:1",
-        "q:work:1:lease:2",
+        &work_id,
+        &lease_2,
         2,
         "w2",
         "complete-1",
         Some("ok".to_owned()),
     );
-    queue.fail("q:work:1", "q:work:1:lease:2", 2, "w2", "fail-stale", None);
+    queue.fail(&work_id, &lease_2, 2, "w2", "fail-stale", None);
 
     assert!(records.borrow().iter().any(|record| matches!(
         record,
         WorkQueueRecord::WorkClaimed { worker_id, lease_id, .. }
-            if worker_id == "w1" && lease_id == "q:work:1:lease:1"
+            if worker_id == "w1" && lease_id == &lease_1
     )));
     assert!(records
         .borrow()
@@ -201,15 +223,18 @@ fn explicit_expiry_retry_and_dead_letter_are_recorded() {
     let records = collect_data(&queue.records);
 
     queue.submit(Payload { id: "a" }, WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
+    let lease_1 = default_lease_id(&work_id, 1);
+    let lease_2 = default_lease_id(&work_id, 2);
     queue.claim(WorkQueueClaimOptions::new("w1").command_id("claim-1"));
     now.set(6);
     queue.expire_leases("expire-1");
     queue.claim(WorkQueueClaimOptions::new("w2").command_id("claim-2"));
-    queue.fail("q:work:1", "q:work:1:lease:2", 2, "w2", "fail-2", None);
+    queue.fail(&work_id, &lease_2, 2, "w2", "fail-2", None);
 
     assert!(records.borrow().iter().any(|record| matches!(
         record,
-        WorkQueueRecord::LeaseExpired { lease_id, .. } if lease_id == "q:work:1:lease:1"
+        WorkQueueRecord::LeaseExpired { lease_id, .. } if lease_id == &lease_1
     )));
     assert!(records.borrow().iter().any(|record| matches!(
         record,
@@ -380,8 +405,9 @@ fn leased_work_cannot_be_scheduled_and_clock_overflow_is_visible_issue() {
     let issues = collect_data::<DataIssue>(&queue.issues);
 
     queue.submit(Payload { id: "a" }, WorkQueueSubmitOptions::default());
+    let work_id = default_work_id(1);
     queue.claim(WorkQueueClaimOptions::new("w").command_id("claim-1"));
-    queue.schedule("q:work:1", 10, "schedule-while-leased");
+    queue.schedule(&work_id, 10, "schedule-while-leased");
 
     assert!(issues
         .borrow()

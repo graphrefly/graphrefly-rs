@@ -29,6 +29,14 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
     seen
 }
 
+fn cqrs_event_id(command_id: &str, seq: u64) -> String {
+    let parts = [command_id.to_owned(), seq.to_string()];
+    format!(
+        "cqrs-event:{}",
+        serde_json::to_string(&parts).expect("test tuple key serializes")
+    )
+}
+
 #[test]
 fn cqrs_dispatch_emits_ordered_graph_visible_facts() {
     let g = graph();
@@ -55,10 +63,10 @@ fn cqrs_dispatch_emits_ordered_graph_visible_facts() {
 
     let events = events.borrow();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].id, "cmd-1:1");
+    assert_eq!(events[0].id, cqrs_event_id("cmd-1", 1));
     assert_eq!(events[0].seq, 1);
     assert_eq!(events[0].timestamp_ms, 20);
-    assert_eq!(events[1].id, "cmd-1:2");
+    assert_eq!(events[1].id, cqrs_event_id("cmd-1", 2));
     assert_eq!(events[1].seq, 2);
     assert_eq!(
         status.borrow().last().unwrap().state,
@@ -68,7 +76,7 @@ fn cqrs_dispatch_emits_ordered_graph_visible_facts() {
     assert_eq!(audit.last().unwrap().outcome, CqrsAuditOutcome::Success);
     assert_eq!(
         audit.last().unwrap().event_ids,
-        vec!["cmd-1:1".to_owned(), "cmd-1:2".to_owned()]
+        vec![cqrs_event_id("cmd-1", 1), cqrs_event_id("cmd-1", 2)]
     );
 }
 
@@ -304,7 +312,10 @@ fn cqrs_projection_is_declared_and_reducer_panics_are_error_facts() {
         errors.borrow().last().unwrap().code,
         CqrsProjectionErrorCode::ProjectionThrew
     );
-    assert_eq!(errors.borrow().last().unwrap().event_id, "cmd-1:2");
+    assert_eq!(
+        errors.borrow().last().unwrap().event_id,
+        cqrs_event_id("cmd-1", 2)
+    );
 
     let snap = g.describe();
     assert!(snap

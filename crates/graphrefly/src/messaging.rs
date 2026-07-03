@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::canonical_tuple_key;
 use crate::json::JsonValue;
 use crate::node::{Core, Node, NodeOpts};
 use crate::protocol::{AnyValue, LockId};
@@ -2226,11 +2227,11 @@ fn command_subscription_id<T>(command: &MessageBusCommand<T>) -> Option<&str> {
 }
 
 fn subscription_key(topic: &str, subscription_id: &str) -> String {
-    format!("{topic}\0{subscription_id}")
+    canonical_tuple_key(&[topic, subscription_id])
 }
 
 fn idempotency_key_for(topic: &str, idempotency_key: &str) -> String {
-    format!("{topic}\0{idempotency_key}")
+    canonical_tuple_key(&[topic, idempotency_key])
 }
 
 fn timestamp_or_zero<T>(state: &MessageBusState<T>) -> u64 {

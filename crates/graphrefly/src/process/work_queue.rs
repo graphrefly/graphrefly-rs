@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::canonical_tuple_key;
 use crate::messaging::DataIssue;
 use crate::node::Node;
 use crate::process::ProcessEffectRequest;
@@ -250,7 +251,7 @@ fn reduce_record<TEffect: Clone + 'static>(
             }
         }
         _ if is_terminal_record(record) => {
-            let key = format!("{}:{}", record_kind(record), record.record_seq());
+            let key = canonical_tuple_key(&[record_kind(record), &record.record_seq().to_string()]);
             if !state.terminal_records.insert(key) {
                 return;
             }

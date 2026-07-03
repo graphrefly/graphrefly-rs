@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::messaging::{DataIssue, MessageBusAvailablePage, MessageBusCommand, MessageEnvelope};
 use crate::node::Node;
 use crate::process::{ProcessCommand, ProcessEvent, ProcessStatus, ProcessStatusState};
@@ -233,10 +234,7 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
                 if let Some(delivery) = shift_delivery(&mut state.deliveries, command_id) {
                     ctx.emit(ack_command::<TCommand>(
                         &delivery,
-                        format!(
-                            "process:{}:{}:{}:status-ack",
-                            delivery.topic, delivery.subscription_id, delivery.seq
-                        ),
+                        process_ack_id(&delivery, "status-ack"),
                     ));
                 }
             }
@@ -245,10 +243,7 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
                     if let Some(delivery) = issue_delivery(&issue) {
                         ctx.emit(ack_command::<TCommand>(
                             &delivery,
-                            format!(
-                                "process:{}:{}:{}:issue-ack",
-                                delivery.topic, delivery.subscription_id, delivery.seq
-                            ),
+                            process_ack_id(&delivery, "issue-ack"),
                         ));
                     }
                 }
@@ -257,6 +252,18 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
             ctx.state_persist(true);
         },
         GraphNodeOpts::named(opts.name),
+    )
+}
+
+fn process_ack_id(delivery: &MessageBusDelivery, reason: &str) -> String {
+    compound_tuple_key(
+        "process-message-ack",
+        &[
+            &delivery.topic,
+            &delivery.subscription_id,
+            &delivery.seq.to_string(),
+            reason,
+        ],
     )
 }
 
@@ -275,7 +282,7 @@ pub fn process_event_outbox_commands<TEvent: Clone + 'static>(
                     topic: topic.clone(),
                     payload: (*event).clone(),
                     key: event.process_id.clone(),
-                    command_id: Some(format!("{}:process-outbox", event.id)),
+                    command_id: Some(compound_tuple_key("process-outbox", &[&event.id])),
                     idempotency_key: Some(event.id.clone()),
                 });
             }
@@ -314,7 +321,7 @@ fn message_delivery<T>(
         command_id: message
             .command_id
             .clone()
-            .unwrap_or_else(|| format!("{}:{}", page.topic, message.seq)),
+            .unwrap_or_else(|| canonical_tuple_key(&[&page.topic, &message.seq.to_string()])),
     }
 }
 

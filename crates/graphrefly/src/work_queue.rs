@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
+use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::messaging::{
     attach_message_bus_deferred_command_sink, DataIssue, MessageBus, MessageBusAvailablePage,
     MessageBusAvailableParams, MessageBusCommand, MessageBusStatus, MessageBusStatusKind,
@@ -972,7 +973,10 @@ impl<T: Clone + 'static> WorkQueue<T> {
     fn next_command_id(&self, kind: &str) -> String {
         let next = self.command_seq.get() + 1;
         self.command_seq.set(next);
-        format!("{}:{kind}:{next}", self.queue_id)
+        compound_tuple_key(
+            "work-queue-command",
+            &[&self.queue_id, kind, &next.to_string()],
+        )
     }
 }
 
@@ -1269,12 +1273,14 @@ fn admission_ack_command<T>(
         topic: message_bus.topic.clone(),
         subscription_id: message_bus.subscription_id.clone(),
         seq: message_bus.seq,
-        command_id: Some(format!(
-            "{}:admission-ack:{}:{}:{}",
-            record_queue_id(record),
-            message_bus.topic,
-            message_bus.subscription_id,
-            message_bus.seq
+        command_id: Some(compound_tuple_key(
+            "work-queue-admission-ack",
+            &[
+                record_queue_id(record),
+                &message_bus.topic,
+                &message_bus.subscription_id,
+                &message_bus.seq.to_string(),
+            ],
         )),
     })
 }
@@ -1285,15 +1291,17 @@ fn admit_message<T: Clone + 'static>(
     message: &MessageEnvelope<WorkQueueSubmit<T>>,
     now_ms: u64,
 ) -> Vec<QueueEvent<T>> {
-    let source = format!("{}:{}", message.topic, message.seq);
+    let source = canonical_tuple_key(&[&message.topic, &message.seq.to_string()]);
     if !state.source_seqs.insert(source) {
         return Vec::new();
     }
     let submit = &message.payload;
-    let work_id = submit
-        .work_id
-        .clone()
-        .unwrap_or_else(|| format!("{}:{}:{}", opts.queue_id, message.topic, message.seq));
+    let work_id = submit.work_id.clone().unwrap_or_else(|| {
+        compound_tuple_key(
+            "work-queue-work",
+            &[&opts.queue_id, &message.topic, &message.seq.to_string()],
+        )
+    });
     let message_bus = WorkQueueMessageBusRef {
         topic: message.topic.clone(),
         seq: message.seq,
@@ -1534,7 +1542,10 @@ fn claim_work<T: Clone + 'static>(
         claimed.insert(work_id.clone());
         work.state = WorkQueueDerivedState::Leased;
         work.attempt += 1;
-        work.lease_id = Some(format!("{}:lease:{lease_seq}", work.work_id));
+        work.lease_id = Some(compound_tuple_key(
+            "work-queue-lease",
+            &[&work.work_id, &lease_seq.to_string()],
+        ));
         work.worker_id = Some(worker_id.clone());
         work.lease_expires_at_ms = Some(lease_expires_at_ms);
         let lease_id = work.lease_id.clone().expect("lease just set");
