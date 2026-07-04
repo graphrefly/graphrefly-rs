@@ -93,6 +93,9 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
+      - name: Rustdoc mechanical generator check
+        run: scripts/generate-rustdoc-comments.py --check-stale
+
       - name: Cargo doc (graphrefly-rs all features; missing docs + links)
         run: cargo doc -p graphrefly-rs --all-features --no-deps
         env:

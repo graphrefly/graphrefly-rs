@@ -75,6 +75,20 @@ tests. If an example is illustrative only, mark it as such in the rustdoc block.
 Run `mise exec -- cargo fmt --all --check` after touching Rust files, including
 rustdoc comments.
 
+For broad missing-doc coverage, use the mechanical generator instead of
+hand-editing large comment batches:
+
+```bash
+scripts/generate-rustdoc-comments.py --apply
+mise exec -- cargo fmt --all
+```
+
+The generator runs rustdoc with `-D missing_docs`, parses the resulting
+diagnostics, and inserts neutral template comments only for items rustdoc reports.
+It preserves existing docs and is a no-op when the public surface is already
+covered. Use `scripts/generate-rustdoc-comments.py --check-stale` to combine the
+missing-doc gate with the active-source stale-phrase scan used in CI.
+
 ## Docs.rs And Releases
 
 The publishable crate is `crates/graphrefly` (`package = "graphrefly-rs"`,
