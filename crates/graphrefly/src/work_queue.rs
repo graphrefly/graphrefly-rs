@@ -25,17 +25,26 @@ use crate::protocol::{LockId, Message, PullDemand};
 use crate::resilience::{BackoffPolicy, RetryPolicy};
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueSubmit` data container.
 pub struct WorkQueueSubmit<T> {
+    /// `payload` field for payload.
     pub payload: T,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `priority` field for priority.
     pub priority: Option<i64>,
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `requirements` field for requirements.
     pub requirements: Vec<String>,
+    /// `not_before_ms` field for not before ms.
     pub not_before_ms: Option<u64>,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
 }
 
 impl<T> WorkQueueSubmit<T> {
+    /// Creates or computes `new`.
     pub fn new(payload: T) -> Self {
         Self {
             payload,
@@ -48,16 +57,19 @@ impl<T> WorkQueueSubmit<T> {
         }
     }
 
+    /// Updates or reads `with_work_id`.
     pub fn with_work_id(mut self, work_id: impl Into<String>) -> Self {
         self.work_id = Some(work_id.into());
         self
     }
 
+    /// Updates or reads `with_priority`.
     pub fn with_priority(mut self, priority: i64) -> Self {
         self.priority = Some(priority);
         self
     }
 
+    /// Updates or reads `with_not_before_ms`.
     pub fn with_not_before_ms(mut self, not_before_ms: u64) -> Self {
         self.not_before_ms = Some(not_before_ms);
         self
@@ -65,19 +77,30 @@ impl<T> WorkQueueSubmit<T> {
 }
 
 #[derive(Clone)]
+/// `WorkQueueOptions` data container.
 pub struct WorkQueueOptions<T> {
+    /// `queue_id` field for queue id.
     pub queue_id: String,
+    /// `bus` field for bus.
     pub bus: MessageBus<WorkQueueSubmit<T>>,
+    /// `topic` field for topic.
     pub topic: String,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
+    /// `from` field for from.
     pub from: MessageBusSubscriptionFrom,
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `now` field for now.
     pub now: Rc<dyn Fn() -> u64>,
+    /// `lease_duration_ms` field for lease duration ms.
     pub lease_duration_ms: u64,
+    /// `retry` field for retry.
     pub retry: RetryPolicy,
 }
 
 impl<T> WorkQueueOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         queue_id: impl Into<String>,
         bus: MessageBus<WorkQueueSubmit<T>>,
@@ -97,21 +120,25 @@ impl<T> WorkQueueOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Updates or reads `with_now`.
     pub fn with_now(mut self, now: impl Fn() -> u64 + 'static) -> Self {
         self.now = Rc::new(now);
         self
     }
 
+    /// Updates or reads `with_lease_duration_ms`.
     pub fn with_lease_duration_ms(mut self, lease_duration_ms: u64) -> Self {
         self.lease_duration_ms = lease_duration_ms;
         self
     }
 
+    /// Updates or reads `with_retry`.
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
@@ -119,94 +146,175 @@ impl<T> WorkQueueOptions<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueCommand` variants.
 pub enum WorkQueueCommand<T = ()> {
+    /// `Submit` variant.
     Submit {
+        /// `payload` field for payload.
         payload: T,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
     },
+    /// `Claim` variant.
     Claim {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `requested_work_ids` field for requested work ids.
         requested_work_ids: Vec<String>,
+        /// `limit` field for limit.
         limit: Option<usize>,
+        /// `lease_duration_ms` field for lease duration ms.
         lease_duration_ms: Option<u64>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `RenewLease` variant.
     RenewLease {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `lease_duration_ms` field for lease duration ms.
         lease_duration_ms: Option<u64>,
+        /// `lease_expires_at_ms` field for lease expires at ms.
         lease_expires_at_ms: Option<u64>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `Release` variant.
     Release {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `Complete` variant.
     Complete {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `result` field for result.
         result: Option<String>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `Fail` variant.
     Fail {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `error` field for error.
         error: Option<String>,
+        /// `retryable` field for retryable.
         retryable: Option<bool>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `Cancel` variant.
     Cancel {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `Schedule` variant.
     Schedule {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `schedule_id` field for schedule id.
         schedule_id: Option<String>,
+        /// `not_before_ms` field for not before ms.
         not_before_ms: u64,
+        /// `deadline_ms` field for deadline ms.
         deadline_ms: Option<u64>,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
+    /// `ExpireLeases` variant.
     ExpireLeases {
+        /// `command_id` field for command id.
         command_id: String,
+        /// `queue_id` field for queue id.
         queue_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `work_ids` field for work ids.
         work_ids: Vec<String>,
+        /// `limit` field for limit.
         limit: Option<usize>,
+        /// `now_ms` field for now ms.
         now_ms: Option<u64>,
     },
 }
@@ -288,169 +396,311 @@ impl<T> WorkQueueCommand<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WorkQueueMessageBusRef` data container.
 pub struct WorkQueueMessageBusRef {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WorkQueueDerivedState` variants.
 pub enum WorkQueueDerivedState {
+    /// `Scheduled` variant.
     Scheduled,
+    /// `Ready` variant.
     Ready,
+    /// `Leased` variant.
     Leased,
+    /// `RetryWait` variant.
     RetryWait,
+    /// `Completed` variant.
     Completed,
+    /// `Canceled` variant.
     Canceled,
+    /// `DeadLettered` variant.
     DeadLettered,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueRecord` variants.
 pub enum WorkQueueRecord<T> {
+    /// `WorkAdmitted` variant.
     WorkAdmitted {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `payload` field for payload.
         payload: T,
+        /// `message_bus` field for message bus.
         message_bus: WorkQueueMessageBusRef,
+        /// `priority` field for priority.
         priority: Option<i64>,
+        /// `tags` field for tags.
         tags: Vec<String>,
+        /// `requirements` field for requirements.
         requirements: Vec<String>,
+        /// `not_before_ms` field for not before ms.
         not_before_ms: Option<u64>,
+        /// `deadline_ms` field for deadline ms.
         deadline_ms: Option<u64>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `AdmissionDeduped` variant.
     AdmissionDeduped {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `message_bus` field for message bus.
         message_bus: WorkQueueMessageBusRef,
+        /// `reason` field for reason.
         reason: String,
+        /// `existing_work_id` field for existing work id.
         existing_work_id: String,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `WorkScheduled` variant.
     WorkScheduled {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `schedule_id` field for schedule id.
         schedule_id: Option<String>,
+        /// `not_before_ms` field for not before ms.
         not_before_ms: u64,
+        /// `deadline_ms` field for deadline ms.
         deadline_ms: Option<u64>,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `WorkClaimed` variant.
     WorkClaimed {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `claimed_at_ms` field for claimed at ms.
         claimed_at_ms: u64,
+        /// `lease_expires_at_ms` field for lease expires at ms.
         lease_expires_at_ms: u64,
     },
+    /// `LeaseRenewed` variant.
     LeaseRenewed {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `previous_lease_expires_at_ms` field for previous lease expires at ms.
         previous_lease_expires_at_ms: u64,
+        /// `lease_expires_at_ms` field for lease expires at ms.
         lease_expires_at_ms: u64,
+        /// `renewed_at_ms` field for renewed at ms.
         renewed_at_ms: u64,
     },
+    /// `WorkReleased` variant.
     WorkReleased {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `released_at_ms` field for released at ms.
         released_at_ms: u64,
+        /// `reason` field for reason.
         reason: Option<String>,
     },
+    /// `LeaseExpired` variant.
     LeaseExpired {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: Option<String>,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `lease_expires_at_ms` field for lease expires at ms.
         lease_expires_at_ms: u64,
+        /// `expired_at_ms` field for expired at ms.
         expired_at_ms: u64,
     },
+    /// `AttemptCompleted` variant.
     AttemptCompleted {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `result` field for result.
         result: Option<String>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `WorkCompleted` variant.
     WorkCompleted {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `result` field for result.
         result: Option<String>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `AttemptFailed` variant.
     AttemptFailed {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `lease_id` field for lease id.
         lease_id: String,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `worker_id` field for worker id.
         worker_id: String,
+        /// `error` field for error.
         error: Option<String>,
+        /// `retryable` field for retryable.
         retryable: Option<bool>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `RetryScheduled` variant.
     RetryScheduled {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `retry_at_ms` field for retry at ms.
         retry_at_ms: u64,
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `WorkDeadLettered` variant.
     WorkDeadLettered {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `reason` field for reason.
         reason: String,
+        /// `exhausted_attempts` field for exhausted attempts.
         exhausted_attempts: Option<u32>,
+        /// `recorded_at_ms` field for recorded at ms.
         recorded_at_ms: u64,
     },
+    /// `WorkCanceled` variant.
     WorkCanceled {
+        /// `record_seq` field for record seq.
         record_seq: u64,
+        /// `queue_id` field for queue id.
         queue_id: String,
+        /// `work_id` field for work id.
         work_id: String,
+        /// `command_id` field for command id.
         command_id: String,
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `canceled_at_ms` field for canceled at ms.
         canceled_at_ms: u64,
+        /// `canceled_lease_id` field for canceled lease id.
         canceled_lease_id: Option<String>,
+        /// `attempt` field for attempt.
         attempt: Option<u32>,
     },
 }
 
 impl<T> WorkQueueRecord<T> {
+    /// Updates or reads `record_seq`.
     pub fn record_seq(&self) -> u64 {
         match self {
             Self::WorkAdmitted { record_seq, .. }
@@ -469,6 +719,7 @@ impl<T> WorkQueueRecord<T> {
         }
     }
 
+    /// Updates or reads `work_id`.
     pub fn work_id(&self) -> &str {
         match self {
             Self::WorkAdmitted { work_id, .. }
@@ -498,121 +749,199 @@ impl<T> WorkQueueRecord<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WorkQueueStatusKind` variants.
 pub enum WorkQueueStatusKind {
+    /// `CommandAccepted` variant.
     CommandAccepted,
+    /// `CommandRejected` variant.
     CommandRejected,
+    /// `AdmissionAccepted` variant.
     AdmissionAccepted,
+    /// `AdmissionRejected` variant.
     AdmissionRejected,
+    /// `ProjectionReady` variant.
     ProjectionReady,
+    /// `ProjectionPartial` variant.
     ProjectionPartial,
+    /// `MaintenanceApplied` variant.
     MaintenanceApplied,
+    /// `MaintenanceNoop` variant.
     MaintenanceNoop,
+    /// `PolicyWarning` variant.
     PolicyWarning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WorkQueueStatus` data container.
 pub struct WorkQueueStatus {
+    /// `kind` field for kind.
     pub kind: WorkQueueStatusKind,
+    /// `queue_id` field for queue id.
     pub queue_id: String,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `record_seq` field for record seq.
     pub record_seq: Option<u64>,
+    /// `as_of_record_seq` field for as of record seq.
     pub as_of_record_seq: Option<u64>,
+    /// `issue_code` field for issue code.
     pub issue_code: Option<String>,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `details` field for details.
     pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueAvailableItem` data container.
 pub struct WorkQueueAvailableItem<T> {
+    /// `work_id` field for work id.
     pub work_id: String,
+    /// `state` field for state.
     pub state: WorkQueueDerivedState,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `admission_seq` field for admission seq.
     pub admission_seq: u64,
+    /// `priority` field for priority.
     pub priority: Option<i64>,
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `requirements` field for requirements.
     pub requirements: Vec<String>,
+    /// `not_before_ms` field for not before ms.
     pub not_before_ms: Option<u64>,
+    /// `retry_at_ms` field for retry at ms.
     pub retry_at_ms: Option<u64>,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueAvailablePage` data container.
 pub struct WorkQueueAvailablePage<T> {
+    /// `items` field for items.
     pub items: Vec<WorkQueueAvailableItem<T>>,
+    /// `next_after_work_id` field for next after work id.
     pub next_after_work_id: Option<String>,
+    /// `next_after_admission_seq` field for next after admission seq.
     pub next_after_admission_seq: Option<u64>,
+    /// `has_more` field for has more.
     pub has_more: bool,
+    /// `as_of_record_seq` field for as of record seq.
     pub as_of_record_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WorkQueueActiveLease` data container.
 pub struct WorkQueueActiveLease {
+    /// `lease_id` field for lease id.
     pub lease_id: String,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `worker_id` field for worker id.
     pub worker_id: String,
+    /// `lease_expires_at_ms` field for lease expires at ms.
     pub lease_expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueWorkSnapshot` data container.
 pub struct WorkQueueWorkSnapshot<T> {
+    /// `work_id` field for work id.
     pub work_id: String,
+    /// `state` field for state.
     pub state: Option<WorkQueueDerivedState>,
+    /// `payload` field for payload.
     pub payload: Option<T>,
+    /// `active_lease` field for active lease.
     pub active_lease: Option<WorkQueueActiveLease>,
+    /// `records` field for records.
     pub records: Vec<WorkQueueRecord<T>>,
+    /// `as_of_record_seq` field for as of record seq.
     pub as_of_record_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueDeadLetterPage` data container.
 pub struct WorkQueueDeadLetterPage<T> {
+    /// `entries` field for entries.
     pub entries: Vec<WorkQueueRecord<T>>,
+    /// `next_after_dead_letter_seq` field for next after dead letter seq.
     pub next_after_dead_letter_seq: Option<u64>,
+    /// `has_more` field for has more.
     pub has_more: bool,
+    /// `as_of_record_seq` field for as of record seq.
     pub as_of_record_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `WorkQueueAvailableParams` data container.
 pub struct WorkQueueAvailableParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_work_id` field for after work id.
     pub after_work_id: Option<String>,
+    /// `after_admission_seq` field for after admission seq.
     pub after_admission_seq: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `WorkQueueDeadLetterParams` data container.
 pub struct WorkQueueDeadLetterParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_dead_letter_seq` field for after dead letter seq.
     pub after_dead_letter_seq: Option<u64>,
+    /// `after_work_id` field for after work id.
     pub after_work_id: Option<String>,
 }
 
 #[derive(Clone)]
+/// `WorkQueueProjection` data container.
 pub struct WorkQueueProjection<TPage> {
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<TPage>,
+    /// `snapshot_pull_id` field for snapshot pull id.
     pub snapshot_pull_id: LockId,
+    /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
 }
 
 #[derive(Clone)]
+/// `WorkQueueAvailableProjection` data container.
 pub struct WorkQueueAvailableProjection<T> {
+    /// `available` field for available.
     pub available: Node<WorkQueueAvailablePage<T>>,
+    /// `available_pull_id` field for available pull id.
     pub available_pull_id: LockId,
+    /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
 }
 
 #[derive(Clone)]
+/// `WorkQueue` data container.
 pub struct WorkQueue<T> {
     name: Rc<String>,
     queue_id: Rc<String>,
     topic: Rc<String>,
     bus: MessageBus<WorkQueueSubmit<T>>,
     command_seq: Rc<Cell<u64>>,
+    /// `commands` field for commands.
     pub commands: Node<WorkQueueCommand<T>>,
+    /// `records` field for records.
     pub records: Node<WorkQueueRecord<T>>,
+    /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
     state: Rc<RefCell<RuntimeState<T>>>,
     graph: Graph,
@@ -692,6 +1021,7 @@ impl<T> Default for RuntimeState<T> {
 }
 
 impl<T: Clone + 'static> WorkQueue<T> {
+    /// Updates or reads `submit`.
     pub fn submit(
         &self,
         payload: T,
@@ -717,6 +1047,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         )
     }
 
+    /// Updates or reads `claim`.
     pub fn claim(&self, opts: WorkQueueClaimOptions) -> WorkQueueCommand<T> {
         self.publish_command(WorkQueueCommand::Claim {
             command_id: opts
@@ -732,6 +1063,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `renew_lease`.
     pub fn renew_lease(
         &self,
         work_id: impl Into<String>,
@@ -754,6 +1086,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `release`.
     pub fn release(
         &self,
         work_id: impl Into<String>,
@@ -775,6 +1108,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `complete`.
     pub fn complete(
         &self,
         work_id: impl Into<String>,
@@ -797,6 +1131,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `fail`.
     pub fn fail(
         &self,
         work_id: impl Into<String>,
@@ -820,6 +1155,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `cancel`.
     pub fn cancel(
         &self,
         work_id: impl Into<String>,
@@ -836,6 +1172,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `schedule`.
     pub fn schedule(
         &self,
         work_id: impl Into<String>,
@@ -855,6 +1192,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `expire_leases`.
     pub fn expire_leases(&self, command_id: impl Into<String>) -> WorkQueueCommand<T> {
         self.publish_command(WorkQueueCommand::ExpireLeases {
             command_id: command_id.into(),
@@ -866,10 +1204,12 @@ impl<T: Clone + 'static> WorkQueue<T> {
         })
     }
 
+    /// Updates or reads `available`.
     pub fn available(&self) -> WorkQueueAvailableProjection<T> {
         self.available_named(None::<String>)
     }
 
+    /// Updates or reads `available_named`.
     pub fn available_named(
         &self,
         name: Option<impl Into<String>>,
@@ -897,6 +1237,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         }
     }
 
+    /// Updates or reads `work`.
     pub fn work(
         &self,
         work_id: impl Into<String>,
@@ -904,6 +1245,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         self.work_named(work_id, None::<String>)
     }
 
+    /// Updates or reads `work_named`.
     pub fn work_named(
         &self,
         work_id: impl Into<String>,
@@ -934,10 +1276,12 @@ impl<T: Clone + 'static> WorkQueue<T> {
         }
     }
 
+    /// Updates or reads `dead_letter`.
     pub fn dead_letter(&self) -> WorkQueueProjection<WorkQueueDeadLetterPage<T>> {
         self.dead_letter_named(None::<String>)
     }
 
+    /// Updates or reads `dead_letter_named`.
     pub fn dead_letter_named(
         &self,
         name: Option<impl Into<String>>,
@@ -981,30 +1325,49 @@ impl<T: Clone + 'static> WorkQueue<T> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `WorkQueueSubmitOptions` data container.
 pub struct WorkQueueSubmitOptions {
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `priority` field for priority.
     pub priority: Option<i64>,
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `requirements` field for requirements.
     pub requirements: Vec<String>,
+    /// `not_before_ms` field for not before ms.
     pub not_before_ms: Option<u64>,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WorkQueueClaimOptions` data container.
 pub struct WorkQueueClaimOptions {
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `queue_id` field for queue id.
     pub queue_id: Option<String>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
+    /// `worker_id` field for worker id.
     pub worker_id: String,
+    /// `requested_work_ids` field for requested work ids.
     pub requested_work_ids: Vec<String>,
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `lease_duration_ms` field for lease duration ms.
     pub lease_duration_ms: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
 }
 
 impl WorkQueueClaimOptions {
+    /// Creates or computes `new`.
     pub fn new(worker_id: impl Into<String>) -> Self {
         Self {
             command_id: None,
@@ -1018,27 +1381,32 @@ impl WorkQueueClaimOptions {
         }
     }
 
+    /// Updates or reads `command_id`.
     pub fn command_id(mut self, command_id: impl Into<String>) -> Self {
         self.command_id = Some(command_id.into());
         self
     }
 
+    /// Updates or reads `requested_work_ids`.
     pub fn requested_work_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.requested_work_ids = ids.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Updates or reads `idempotency_key`.
     pub fn idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
         self.idempotency_key = Some(idempotency_key.into());
         self
     }
 
+    /// Updates or reads `now_ms`.
     pub fn now_ms(mut self, now_ms: u64) -> Self {
         self.now_ms = Some(now_ms);
         self
     }
 }
 
+/// Creates or computes `work_queue`.
 pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) -> WorkQueue<T> {
     assert_non_empty(&opts.queue_id, "workQueue.queueId");
     assert_non_empty(&opts.topic, "workQueue.topic");

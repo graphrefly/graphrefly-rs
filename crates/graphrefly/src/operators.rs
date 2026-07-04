@@ -14,8 +14,11 @@ use crate::protocol::{AnyValue, Message};
 
 /// A free-standing operator/source definition.
 pub struct Operator<T> {
+    /// `factory` field for factory.
     pub factory: &'static str,
+    /// `body` field for body.
     pub body: Rc<dyn Fn(&Ctx)>,
+    /// `opts` field for opts.
     pub opts: NodeOpts,
     _t: PhantomData<fn() -> T>,
 }
@@ -32,10 +35,12 @@ impl<T> Clone for Operator<T> {
 }
 
 impl<T> Operator<T> {
+    /// Creates or computes `new`.
     pub fn new(factory: &'static str, body: impl Fn(&Ctx) + 'static) -> Self {
         Self::with_opts(factory, NodeOpts::default(), body)
     }
 
+    /// Creates or computes `with_opts`.
     pub fn with_opts(
         factory: &'static str,
         mut opts: NodeOpts,

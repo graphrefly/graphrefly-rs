@@ -5161,6 +5161,7 @@ impl<T: 'static> Node<T> {
         self.core.version()
     }
 
+    /// Updates or reads `pull_id`.
     pub fn pull_id(&self) -> Option<LockId> {
         self.core.with_config(|cfg| cfg.pull_id.clone())
     }

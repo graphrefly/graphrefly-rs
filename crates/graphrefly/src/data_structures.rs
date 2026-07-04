@@ -43,71 +43,169 @@ struct ViewFactories {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+/// `ListChange` variants.
 pub enum ListChange<T> {
     #[serde(rename = "append")]
-    Append { value: T },
+    /// `Append` variant.
+    Append {
+        /// `value` field for `Append`.
+        value: T,
+    },
     #[serde(rename = "appendMany")]
-    AppendMany { values: Vec<T> },
+    /// `AppendMany` variant.
+    AppendMany {
+        /// `values` field for `AppendMany`.
+        values: Vec<T>,
+    },
     #[serde(rename = "insert")]
-    Insert { index: usize, value: T },
+    /// `Insert` variant.
+    Insert {
+        /// `index` field for `Insert`.
+        index: usize,
+        /// `value` field for `Insert`.
+        value: T,
+    },
     #[serde(rename = "insertMany")]
-    InsertMany { index: usize, values: Vec<T> },
+    /// `InsertMany` variant.
+    InsertMany {
+        /// `index` field for `InsertMany`.
+        index: usize,
+        /// `values` field for `InsertMany`.
+        values: Vec<T>,
+    },
     #[serde(rename = "pop")]
-    Pop { index: usize, value: T },
+    /// `Pop` variant.
+    Pop {
+        /// `index` field for `Pop`.
+        index: usize,
+        /// `value` field for `Pop`.
+        value: T,
+    },
     #[serde(rename = "trimHead")]
-    TrimHead { n: usize },
+    /// `TrimHead` variant.
+    TrimHead {
+        /// `n` field for `TrimHead`.
+        n: usize,
+    },
     #[serde(rename = "clear")]
-    Clear { count: usize },
+    /// `Clear` variant.
+    Clear {
+        /// `count` field for `Clear`.
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+/// `LogChange` variants.
 pub enum LogChange<T> {
     #[serde(rename = "append")]
-    Append { value: T },
+    /// `Append` variant.
+    Append {
+        /// `value` field for `Append`.
+        value: T,
+    },
     #[serde(rename = "appendMany")]
-    AppendMany { values: Vec<T> },
+    /// `AppendMany` variant.
+    AppendMany {
+        /// `values` field for `AppendMany`.
+        values: Vec<T>,
+    },
     #[serde(rename = "trimHead")]
-    TrimHead { n: usize },
+    /// `TrimHead` variant.
+    TrimHead {
+        /// `n` field for `TrimHead`.
+        n: usize,
+    },
     #[serde(rename = "clear")]
-    Clear { count: usize },
+    /// `Clear` variant.
+    Clear {
+        /// `count` field for `Clear`.
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+/// `IndexChange` variants.
 pub enum IndexChange<K, S, V> {
     #[serde(rename = "upsert")]
-    Upsert { primary: K, secondary: S, value: V },
+    /// `Upsert` variant.
+    Upsert {
+        /// `primary` field for `Upsert`.
+        primary: K,
+        /// `secondary` field for `Upsert`.
+        secondary: S,
+        /// `value` field for `Upsert`.
+        value: V,
+    },
     #[serde(rename = "delete")]
-    Delete { primary: K },
+    /// `Delete` variant.
+    Delete {
+        /// `primary` field for `Delete`.
+        primary: K,
+    },
     #[serde(rename = "deleteMany")]
-    DeleteMany { primaries: Vec<K> },
+    /// `DeleteMany` variant.
+    DeleteMany {
+        /// `primaries` field for `DeleteMany`.
+        primaries: Vec<K>,
+    },
     #[serde(rename = "clear")]
-    Clear { count: usize },
+    /// `Clear` variant.
+    Clear {
+        /// `count` field for `Clear`.
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+/// `MapChange` variants.
 pub enum MapChange<K, V> {
     #[serde(rename = "set")]
-    Set { key: K, value: V },
+    /// `Set` variant.
+    Set {
+        /// `key` field for `Set`.
+        key: K,
+        /// `value` field for `Set`.
+        value: V,
+    },
     #[serde(rename = "delete")]
-    Delete { key: K, previous: V },
+    /// `Delete` variant.
+    Delete {
+        /// `key` field for `Delete`.
+        key: K,
+        /// `previous` field for `Delete`.
+        previous: V,
+    },
     #[serde(rename = "clear")]
-    Clear { count: usize },
+    /// `Clear` variant.
+    Clear {
+        /// `count` field for `Clear`.
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `IndexRow` data container.
 pub struct IndexRow<K, S, V> {
+    /// `primary` field for primary.
     pub primary: K,
+    /// `secondary` field for secondary.
     pub secondary: S,
+    /// `value` field for value.
     pub value: V,
 }
 
 #[derive(Clone, Default)]
+/// `ReactiveListOptions` data container.
 pub struct ReactiveListOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `graph` field for graph.
     pub graph: Option<Graph>,
+    /// `max_size` field for max size.
     pub max_size: Option<usize>,
 }
 
@@ -122,6 +220,7 @@ impl fmt::Debug for ReactiveListOptions {
 }
 
 impl ReactiveListOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -129,11 +228,13 @@ impl ReactiveListOptions {
         }
     }
 
+    /// Updates or reads `graph`.
     pub fn graph(mut self, graph: Graph) -> Self {
         self.graph = Some(graph);
         self
     }
 
+    /// Updates or reads `max_size`.
     pub fn max_size(mut self, max_size: usize) -> Self {
         self.max_size = Some(max_size);
         self
@@ -141,21 +242,31 @@ impl ReactiveListOptions {
 }
 
 #[derive(Clone, Default)]
+/// `ReactiveLogOptions` data container.
 pub struct ReactiveLogOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `graph` field for graph.
     pub graph: Option<Graph>,
+    /// `max_size` field for max size.
     pub max_size: Option<usize>,
 }
 
 #[derive(Clone, Default)]
+/// `ReactiveIndexOptions` data container.
 pub struct ReactiveIndexOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `graph` field for graph.
     pub graph: Option<Graph>,
 }
 
 #[derive(Clone, Default)]
+/// `ReactiveMapOptions` data container.
 pub struct ReactiveMapOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `graph` field for graph.
     pub graph: Option<Graph>,
 }
 
@@ -178,6 +289,7 @@ impl fmt::Debug for ReactiveMapOptions {
 }
 
 impl ReactiveIndexOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -185,6 +297,7 @@ impl ReactiveIndexOptions {
         }
     }
 
+    /// Updates or reads `graph`.
     pub fn graph(mut self, graph: Graph) -> Self {
         self.graph = Some(graph);
         self
@@ -192,6 +305,7 @@ impl ReactiveIndexOptions {
 }
 
 impl ReactiveMapOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -199,6 +313,7 @@ impl ReactiveMapOptions {
         }
     }
 
+    /// Updates or reads `graph`.
     pub fn graph(mut self, graph: Graph) -> Self {
         self.graph = Some(graph);
         self
@@ -216,6 +331,7 @@ impl fmt::Debug for ReactiveLogOptions {
 }
 
 impl ReactiveLogOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -223,11 +339,13 @@ impl ReactiveLogOptions {
         }
     }
 
+    /// Updates or reads `graph`.
     pub fn graph(mut self, graph: Graph) -> Self {
         self.graph = Some(graph);
         self
     }
 
+    /// Updates or reads `max_size`.
     pub fn max_size(mut self, max_size: usize) -> Self {
         self.max_size = Some(max_size);
         self
@@ -640,9 +758,13 @@ impl<T: Clone> LogBackend<T> {
 }
 
 #[derive(Clone)]
+/// `ReactiveList` data container.
 pub struct ReactiveList<T> {
+    /// `delta` field for delta.
     pub delta: Node<ListChange<T>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<T>>,
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
     backend: ListBackend<T>,
     max_size: Option<usize>,
@@ -653,6 +775,7 @@ pub struct ReactiveList<T> {
 }
 
 impl<T: Clone + 'static> ReactiveList<T> {
+    /// Creates or computes `new`.
     pub fn new(initial: Vec<T>, options: ReactiveListOptions) -> Self {
         if matches!(options.max_size, Some(0)) {
             panic!("reactive_list: max_size must be a positive integer");
@@ -697,28 +820,34 @@ impl<T: Clone + 'static> ReactiveList<T> {
         }
     }
 
+    /// Updates or reads `len`.
     pub fn len(&self) -> usize {
         self.backend.len()
     }
 
+    /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Updates or reads `at`.
     pub fn at(&self, index: isize) -> Option<T> {
         self.backend.at(index)
     }
 
+    /// Updates or reads `to_vec`.
     pub fn to_vec(&self) -> Vec<T> {
         self.backend.snapshot()
     }
 
+    /// Updates or reads `append`.
     pub fn append(&self, value: T) {
         self.backend.append(value.clone());
         self.emit(ListChange::Append { value });
         self.enforce_capacity();
     }
 
+    /// Updates or reads `append_many`.
     pub fn append_many(&self, values: Vec<T>) {
         if values.is_empty() {
             return;
@@ -728,12 +857,14 @@ impl<T: Clone + 'static> ReactiveList<T> {
         self.enforce_capacity();
     }
 
+    /// Updates or reads `insert`.
     pub fn insert(&self, index: usize, value: T) {
         self.backend.insert(index, value.clone());
         self.emit(ListChange::Insert { index, value });
         self.enforce_capacity();
     }
 
+    /// Updates or reads `insert_many`.
     pub fn insert_many(&self, index: usize, values: Vec<T>) {
         self.backend.insert_many(index, &values);
         if values.is_empty() {
@@ -743,6 +874,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
         self.enforce_capacity();
     }
 
+    /// Updates or reads `pop`.
     pub fn pop(&self, index: Option<isize>) -> T {
         let (index, value) = self.backend.pop(index);
         self.emit(ListChange::Pop {
@@ -752,6 +884,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
         value
     }
 
+    /// Updates or reads `clear`.
     pub fn clear(&self) {
         let count = self.backend.clear();
         if count > 0 {
@@ -759,6 +892,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
         }
     }
 
+    /// Updates or reads `append_from`.
     pub fn append_from(&self, src: &Node<T>) -> Disposer {
         let graph = self.graph.as_ref().unwrap_or_else(|| {
             panic!("reactive_list.append_from requires options.graph so the input fold is describe-visible (D61)")
@@ -807,6 +941,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
         })
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         for disposer in self.disposers.borrow_mut().iter_mut() {
             if let Some(disposer) = disposer.take() {
@@ -825,9 +960,13 @@ impl<T: Clone + 'static> ReactiveList<T> {
 }
 
 #[derive(Clone)]
+/// `ReactiveLog` data container.
 pub struct ReactiveLog<T> {
+    /// `delta` field for delta.
     pub delta: Node<LogChange<T>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<T>>,
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
     backend: LogBackend<T>,
     graph: Option<Graph>,
@@ -838,18 +977,26 @@ pub struct ReactiveLog<T> {
     disposers: DisposerSlots,
 }
 
+/// `ReactiveView` data container.
 pub struct ReactiveView<C, S> {
+    /// `delta` field for delta.
     pub delta: Node<C>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<S>,
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
     disposed: Rc<Cell<bool>>,
     dispose_action: ViewDisposeAction,
 }
 
 #[derive(Clone)]
+/// `ReactiveIndex` data container.
 pub struct ReactiveIndex<K, S, V> {
+    /// `delta` field for delta.
     pub delta: Node<IndexChange<K, S, V>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<IndexRow<K, S, V>>>,
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
     backend: IndexBackend<K, S, V>,
     graph: Option<Graph>,
@@ -859,9 +1006,13 @@ pub struct ReactiveIndex<K, S, V> {
 }
 
 #[derive(Clone)]
+/// `ReactiveMap` data container.
 pub struct ReactiveMap<K, V> {
+    /// `delta` field for delta.
     pub delta: Node<MapChange<K, V>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<BTreeMap<K, V>>,
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
     backend: MapBackend<K, V>,
     graph: Option<Graph>,
@@ -876,6 +1027,7 @@ where
     S: Clone + Ord + 'static,
     V: Clone + 'static,
 {
+    /// Creates or computes `new`.
     pub fn new(initial: Vec<IndexRow<K, S, V>>, options: ReactiveIndexOptions) -> Self {
         let backend = IndexBackend::new(initial);
         let token = backend.instance_token();
@@ -916,30 +1068,37 @@ where
         }
     }
 
+    /// Updates or reads `len`.
     pub fn len(&self) -> usize {
         self.backend.len()
     }
 
+    /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Updates or reads `has`.
     pub fn has(&self, primary: &K) -> bool {
         self.backend.has(primary)
     }
 
+    /// Updates or reads `get`.
     pub fn get(&self, primary: &K) -> Option<V> {
         self.backend.get(primary)
     }
 
+    /// Updates or reads `to_vec`.
     pub fn to_vec(&self) -> Vec<IndexRow<K, S, V>> {
         self.backend.snapshot()
     }
 
+    /// Updates or reads `range_by_primary`.
     pub fn range_by_primary(&self, start: &K, end: &K) -> Vec<V> {
         self.backend.range_by_primary(start, end)
     }
 
+    /// Updates or reads `upsert`.
     pub fn upsert(&self, primary: K, secondary: S, value: V) {
         self.backend
             .upsert(primary.clone(), secondary.clone(), value.clone());
@@ -951,6 +1110,7 @@ where
             }))]);
     }
 
+    /// Updates or reads `delete`.
     pub fn delete(&self, primary: &K) {
         if self.backend.delete(primary) {
             self.delta
@@ -961,6 +1121,7 @@ where
         }
     }
 
+    /// Updates or reads `delete_many`.
     pub fn delete_many(&self, primaries: Vec<K>) {
         let removed = self.backend.delete_many(&primaries);
         if !removed.is_empty() {
@@ -971,6 +1132,7 @@ where
         }
     }
 
+    /// Updates or reads `clear`.
     pub fn clear(&self) {
         let count = self.backend.clear();
         if count > 0 {
@@ -980,6 +1142,7 @@ where
         }
     }
 
+    /// Updates or reads `range`.
     pub fn range(&self, start: K, end: K) -> ReactiveView<IndexChange<K, S, V>, Vec<V>> {
         let key = (start.clone(), end.clone());
         if let Some((_, view)) = self
@@ -1018,6 +1181,7 @@ where
         view
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         let views = self
             .range_memo
@@ -1037,6 +1201,7 @@ where
     K: Clone + Ord + fmt::Debug + 'static,
     V: Clone + 'static,
 {
+    /// Creates or computes `new`.
     pub fn new(initial: Vec<(K, V)>, options: ReactiveMapOptions) -> Self {
         let backend = MapBackend::new(initial);
         let token = backend.instance_token();
@@ -1076,38 +1241,46 @@ where
         }
     }
 
+    /// Updates or reads `len`.
     pub fn len(&self) -> usize {
         self.backend.len()
     }
 
+    /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Updates or reads `has`.
     pub fn has(&self, key: &K) -> bool {
         self.backend.has(key)
     }
 
+    /// Updates or reads `get`.
     pub fn get(&self, key: &K) -> Option<V> {
         self.backend.get(key)
     }
 
+    /// Updates or reads `to_map`.
     pub fn to_map(&self) -> BTreeMap<K, V> {
         self.backend.snapshot()
     }
 
+    /// Updates or reads `set`.
     pub fn set(&self, key: K, value: V) {
         self.backend.set(key.clone(), value.clone());
         self.delta
             .down(vec![Message::Data(Rc::new(MapChange::Set { key, value }))]);
     }
 
+    /// Updates or reads `set_many`.
     pub fn set_many(&self, entries: Vec<(K, V)>) {
         for (key, value) in entries {
             self.set(key, value);
         }
     }
 
+    /// Updates or reads `delete`.
     pub fn delete(&self, key: &K) {
         if let Some(previous) = self.backend.delete(key) {
             self.delta
@@ -1119,12 +1292,14 @@ where
         }
     }
 
+    /// Updates or reads `delete_many`.
     pub fn delete_many(&self, keys: Vec<K>) {
         for key in keys {
             self.delete(&key);
         }
     }
 
+    /// Updates or reads `clear`.
     pub fn clear(&self) {
         let count = self.backend.clear();
         if count > 0 {
@@ -1134,6 +1309,7 @@ where
         }
     }
 
+    /// Updates or reads `select`.
     pub fn select<F>(&self, predicate: F) -> ReactiveView<MapChange<K, V>, BTreeMap<K, V>>
     where
         F: Fn(&V, &K) -> bool + 'static,
@@ -1142,6 +1318,7 @@ where
         self.select_by(predicate)
     }
 
+    /// Updates or reads `select_by`.
     pub fn select_by(
         &self,
         predicate: MapSelectPredicate<K, V>,
@@ -1185,6 +1362,7 @@ where
         view
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         let views = self
             .select_memo
@@ -1212,6 +1390,7 @@ impl<C, S> Clone for ReactiveView<C, S> {
 }
 
 impl<C, S> ReactiveView<C, S> {
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         if self.disposed.get() {
             return;
@@ -1222,6 +1401,7 @@ impl<C, S> ReactiveView<C, S> {
 }
 
 impl<T: Clone + 'static> ReactiveLog<T> {
+    /// Creates or computes `new`.
     pub fn new(initial: Vec<T>, options: ReactiveLogOptions) -> Self {
         if matches!(options.max_size, Some(0)) {
             panic!("reactive_log: max_size must be a positive integer");
@@ -1271,28 +1451,34 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         }
     }
 
+    /// Updates or reads `len`.
     pub fn len(&self) -> usize {
         self.backend.len()
     }
 
+    /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Updates or reads `at`.
     pub fn at(&self, index: isize) -> Option<T> {
         self.backend.at(index)
     }
 
+    /// Updates or reads `to_vec`.
     pub fn to_vec(&self) -> Vec<T> {
         self.backend.snapshot()
     }
 
+    /// Updates or reads `append`.
     pub fn append(&self, value: T) {
         let trimmed = self.backend.append(value.clone());
         self.emit(LogChange::Append { value });
         self.emit_trimmed(trimmed);
     }
 
+    /// Updates or reads `append_many`.
     pub fn append_many(&self, values: Vec<T>) {
         if values.is_empty() {
             return;
@@ -1302,6 +1488,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         self.emit_trimmed(trimmed);
     }
 
+    /// Updates or reads `clear`.
     pub fn clear(&self) {
         let count = self.backend.clear();
         if count > 0 {
@@ -1309,11 +1496,13 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         }
     }
 
+    /// Updates or reads `trim_head`.
     pub fn trim_head(&self, n: usize) {
         let removed = self.backend.trim_head(n);
         self.emit_trimmed(removed);
     }
 
+    /// Updates or reads `tail`.
     pub fn tail(&self, n: usize) -> Node<Vec<T>> {
         let backend = self.backend.clone();
         Node::derived_opts(
@@ -1331,6 +1520,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         )
     }
 
+    /// Updates or reads `slice`.
     pub fn slice(&self, start: usize, stop: Option<usize>) -> Node<Vec<T>> {
         let backend = self.backend.clone();
         Node::derived_opts(
@@ -1349,6 +1539,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         )
     }
 
+    /// Updates or reads `page`.
     pub fn page(&self, offset: usize, limit: usize) -> ReactiveView<LogChange<T>, Vec<T>> {
         let key = format!("{offset}:{limit}");
         if let Some((_, view)) = self
@@ -1392,6 +1583,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         view
     }
 
+    /// Updates or reads `scan`.
     pub fn scan<A: Clone + 'static, F: Fn(A, &T) -> A + 'static>(
         &self,
         initial: A,
@@ -1452,6 +1644,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         )
     }
 
+    /// Updates or reads `attach`.
     pub fn attach(&self, src: &Node<T>) -> Disposer {
         let graph = self.graph.as_ref().unwrap_or_else(|| {
             panic!("reactive_log.attach requires options.graph so the input fold is describe-visible (D61)")
@@ -1499,6 +1692,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         })
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         let views = self
             .page_memo
@@ -1531,6 +1725,7 @@ struct LogScanState<A> {
     processed: usize,
 }
 
+/// Creates or computes `reactive_list`.
 pub fn reactive_list<T: Clone + 'static>(
     initial: Vec<T>,
     options: ReactiveListOptions,
@@ -1538,6 +1733,7 @@ pub fn reactive_list<T: Clone + 'static>(
     ReactiveList::new(initial, options)
 }
 
+/// Creates or computes `reactive_log`.
 pub fn reactive_log<T: Clone + 'static>(
     initial: Vec<T>,
     options: ReactiveLogOptions,
@@ -1545,6 +1741,7 @@ pub fn reactive_log<T: Clone + 'static>(
     ReactiveLog::new(initial, options)
 }
 
+/// Creates or computes `restore_reactive_list`.
 pub fn restore_reactive_list<T: Clone + 'static>(
     state: crate::storage::ReactiveListRestoreState<T>,
     options: ReactiveListOptions,
@@ -1557,6 +1754,7 @@ pub fn restore_reactive_list<T: Clone + 'static>(
     Ok(ReactiveList::new(state.state, options))
 }
 
+/// Creates or computes `restore_reactive_log`.
 pub fn restore_reactive_log<T: Clone + 'static>(
     state: crate::storage::ReactiveLogRestoreState<T>,
     options: ReactiveLogOptions,
@@ -1569,6 +1767,7 @@ pub fn restore_reactive_log<T: Clone + 'static>(
     Ok(ReactiveLog::new(state.state, options))
 }
 
+/// Creates or computes `restore_reactive_map`.
 pub fn restore_reactive_map<K, V>(
     state: crate::storage::ReactiveMapRestoreState<K, V>,
     options: ReactiveMapOptions,
@@ -1586,6 +1785,7 @@ where
     Ok(ReactiveMap::new(state.state, options))
 }
 
+/// Creates or computes `restore_reactive_index`.
 pub fn restore_reactive_index<K, S, V>(
     state: crate::storage::ReactiveIndexRestoreState<K, S, V>,
     options: ReactiveIndexOptions,
@@ -1604,6 +1804,7 @@ where
     Ok(ReactiveIndex::new(state.state, options))
 }
 
+/// Creates or computes `reactive_index`.
 pub fn reactive_index<K, S, V>(
     initial: Vec<IndexRow<K, S, V>>,
     options: ReactiveIndexOptions,
@@ -1616,6 +1817,7 @@ where
     ReactiveIndex::new(initial, options)
 }
 
+/// Creates or computes `reactive_map`.
 pub fn reactive_map<K, V>(initial: Vec<(K, V)>, options: ReactiveMapOptions) -> ReactiveMap<K, V>
 where
     K: Clone + Ord + fmt::Debug + 'static,
@@ -1624,6 +1826,7 @@ where
     ReactiveMap::new(initial, options)
 }
 
+/// Creates or computes `merge_reactive_logs`.
 pub fn merge_reactive_logs<T: Clone + 'static>(logs: Vec<ReactiveLog<T>>) -> Node<LogChange<T>> {
     let deps = logs
         .iter()
@@ -1646,6 +1849,7 @@ pub fn merge_reactive_logs<T: Clone + 'static>(logs: Vec<ReactiveLog<T>>) -> Nod
     )
 }
 
+/// Creates or computes `scan_log`.
 pub fn scan_log<T: Clone + 'static, A: Clone + 'static, F: Fn(A, &T) -> A + 'static>(
     log: &ReactiveLog<T>,
     initial: A,

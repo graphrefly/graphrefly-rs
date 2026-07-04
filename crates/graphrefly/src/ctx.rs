@@ -21,7 +21,7 @@ use crate::protocol::{AnyValue, Message, PullDemand, Wave};
 /// treat an inner terminal as a real input rather than an absorbed settle.
 ///
 /// `Error` carries the dep's error **message** (an `Rc<str>`), not the original
-/// [`GraphError`]: `Box<dyn Error>` is not `Clone`, and a message crosses a dep
+/// `GraphError`: `Box<dyn Error>` is not `Clone`, and a message crosses a dep
 /// subscription as a borrow (`&Message`), so the concrete error type cannot be
 /// preserved into this per-wave-cloneable record. Per-language (D24, D31
 /// error=unknown — the top type); the message survives, the downcast does not.

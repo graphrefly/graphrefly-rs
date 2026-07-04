@@ -130,7 +130,7 @@ struct DispatcherInner {
 }
 
 /// First-class dispatcher (D21), cloneable handle over shared inner state. A graph
-/// binds one; the default is the process(thread)-global singleton (D26).
+/// binds one; the default is a thread-local singleton (D26).
 #[derive(Clone)]
 pub struct Dispatcher(Rc<RefCell<DispatcherInner>>);
 
@@ -143,8 +143,11 @@ impl fmt::Debug for Dispatcher {
 /// Per-handle accumulated profile counters (D39).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProfileStat {
+    /// `invokes` field for invokes.
     pub invokes: u64,
+    /// `total_duration_ns` field for total duration ns.
     pub total_duration_ns: u128,
+    /// `last_duration_ns` field for last duration ns.
     pub last_duration_ns: u128,
 }
 
@@ -204,6 +207,7 @@ pub const SYNC_POOL_ID: u32 = 0;
 pub const ASYNC_POOL_ID: u32 = 1;
 
 impl Dispatcher {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Dispatcher(Rc::new(RefCell::new(DispatcherInner {
             // index order MUST match SYNC_POOL_ID / ASYNC_POOL_ID.

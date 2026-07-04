@@ -21,150 +21,247 @@ use crate::patterns::{
 };
 use serde_json::{Map as JsonMap, Number as JsonNumber};
 
+/// `constant` constant.
 pub const AGENTIC_MEMORY_RECORD_FRAME_FORMAT: &str = "graphrefly.agenticMemoryRecord";
+/// `constant` constant.
 pub const AGENTIC_MEMORY_RECORD_FRAME_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryKind` variants.
 pub enum AgenticMemoryKind {
+    /// `Working` variant.
     Working,
+    /// `Episodic` variant.
     Episodic,
+    /// `Semantic` variant.
     Semantic,
+    /// `Procedural` variant.
     Procedural,
+    /// `Profile` variant.
     Profile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryPersistenceLevel` variants.
 pub enum AgenticMemoryPersistenceLevel {
+    /// `Turn` variant.
     Turn,
+    /// `Session` variant.
     Session,
+    /// `Project` variant.
     Project,
+    /// `LongTerm` variant.
     LongTerm,
+    /// `Permanent` variant.
     Permanent,
+    /// `Archived` variant.
     Archived,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryArtifactKind` variants.
 pub enum AgenticMemoryArtifactKind {
+    /// `Raw` variant.
     Raw,
+    /// `Insight` variant.
     Insight,
+    /// `Profile` variant.
     Profile,
+    /// `Procedure` variant.
     Procedure,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `AgenticMemoryScope` data container.
 pub struct AgenticMemoryScope {
+    /// `session_id` field for session id.
     pub session_id: Option<String>,
+    /// `project_id` field for project id.
     pub project_id: Option<String>,
+    /// `user_id` field for user id.
     pub user_id: Option<String>,
+    /// `tenant_id` field for tenant id.
     pub tenant_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryRecord` data container.
 pub struct AgenticMemoryRecord<T> {
+    /// `id` field for id.
     pub id: FactId,
+    /// `fragment` field for fragment.
     pub fragment: MemoryFragment<T>,
+    /// `kind` field for kind.
     pub kind: AgenticMemoryKind,
+    /// `persistence_level` field for persistence level.
     pub persistence_level: AgenticMemoryPersistenceLevel,
+    /// `artifact_kind` field for artifact kind.
     pub artifact_kind: AgenticMemoryArtifactKind,
+    /// `scope` field for scope.
     pub scope: Option<AgenticMemoryScope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryFieldValidation` data container.
 pub struct AgenticMemoryFieldValidation {
+    /// `ok` field for ok.
     pub ok: bool,
+    /// `errors` field for errors.
     pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryRecordValidation` data container.
 pub struct AgenticMemoryRecordValidation {
+    /// `ok` field for ok.
     pub ok: bool,
+    /// `errors` field for errors.
     pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryRecordMetadata` data container.
 pub struct AgenticMemoryRecordMetadata {
+    /// `record_id` field for record id.
     pub record_id: FactId,
+    /// `kind` field for kind.
     pub kind: AgenticMemoryKind,
+    /// `persistence_level` field for persistence level.
     pub persistence_level: AgenticMemoryPersistenceLevel,
+    /// `artifact_kind` field for artifact kind.
     pub artifact_kind: AgenticMemoryArtifactKind,
+    /// `scope` field for scope.
     pub scope: Option<AgenticMemoryScope>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemorySourceProjection` data container.
 pub struct AgenticMemorySourceProjection {
+    /// `fragment_id` field for fragment id.
     pub fragment_id: FactId,
+    /// `sources` field for sources.
     pub sources: Vec<FactId>,
+    /// `parent_fragment_id` field for parent fragment id.
     pub parent_fragment_id: Option<FactId>,
+    /// `provenance` field for provenance.
     pub provenance: Option<String>,
+    /// `metadata` field for metadata.
     pub metadata: AgenticMemoryRecordMetadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryStatusState` variants.
 pub enum AgenticMemoryStatusState {
+    /// `Ready` variant.
     Ready,
+    /// `Empty` variant.
     Empty,
+    /// `Partial` variant.
     Partial,
+    /// `Error` variant.
     Error,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryCursor` data container.
 pub struct AgenticMemoryCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_records` field for valid records.
     pub valid_records: usize,
+    /// `invalid_records` field for invalid records.
     pub invalid_records: usize,
+    /// `projected_fragments` field for projected fragments.
     pub projected_fragments: usize,
+    /// `result_count` field for result count.
     pub result_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryStatus` data container.
 pub struct AgenticMemoryStatus {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `query` field for query.
     pub query: MemoryRetrievalQuery,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryCursor,
+    /// `retrieval_status` field for retrieval status.
     pub retrieval_status: MemoryRetrievalStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryErrorCode` variants.
 pub enum AgenticMemoryErrorCode {
+    /// `DuplicateRecordId` variant.
     DuplicateRecordId,
+    /// `DuplicateFragmentId` variant.
     DuplicateFragmentId,
+    /// `InvalidRecord` variant.
     InvalidRecord,
+    /// `InvalidScope` variant.
     InvalidScope,
+    /// `InvalidFragment` variant.
     InvalidFragment,
+    /// `InvalidKgDraft` variant.
     InvalidKgDraft,
+    /// `DuplicateAssertionId` variant.
     DuplicateAssertionId,
+    /// `InvalidRetentionCommand` variant.
     InvalidRetentionCommand,
+    /// `DuplicateRetentionCommandId` variant.
     DuplicateRetentionCommandId,
+    /// `InvalidConsolidationOutcome` variant.
     InvalidConsolidationOutcome,
+    /// `DuplicateConsolidationOutcomeId` variant.
     DuplicateConsolidationOutcomeId,
+    /// `MissingConsolidationRequest` variant.
     MissingConsolidationRequest,
+    /// `InvalidPackingPolicy` variant.
     InvalidPackingPolicy,
+    /// `InvalidTextProjection` variant.
     InvalidTextProjection,
+    /// `DuplicateTextProjection` variant.
     DuplicateTextProjection,
+    /// `MissingTextProjection` variant.
     MissingTextProjection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryError` data container.
 pub struct AgenticMemoryError {
+    /// `code` field for code.
     pub code: AgenticMemoryErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `index` field for index.
     pub index: Option<usize>,
+    /// `record_id` field for record id.
     pub record_id: Option<FactId>,
+    /// `fragment_id` field for fragment id.
     pub fragment_id: Option<FactId>,
+    /// `validation_errors` field for validation errors.
     pub validation_errors: Vec<String>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryRecordFrame` data container.
 pub struct AgenticMemoryRecordFrame {
+    /// `format` field for format.
     pub format: String,
+    /// `version` field for version.
     pub version: u32,
+    /// `record` field for record.
     pub record: AgenticMemoryRecord<JsonValue>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+/// `AgenticMemoryRecordFrameCodec` data container.
 pub struct AgenticMemoryRecordFrameCodec;
 
+/// Creates or computes `agentic_memory_record_frame`.
 pub fn agentic_memory_record_frame(
     record: AgenticMemoryRecord<JsonValue>,
 ) -> AgenticMemoryRecordFrame {
@@ -175,53 +272,82 @@ pub fn agentic_memory_record_frame(
     }
 }
 
+/// Creates or computes `agentic_memory_record_frame_codec`.
 pub fn agentic_memory_record_frame_codec() -> AgenticMemoryRecordFrameCodec {
     AgenticMemoryRecordFrameCodec
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryKgAssertionDraft` data container.
 pub struct AgenticMemoryKgAssertionDraft {
+    /// `id` field for id.
     pub id: FactId,
+    /// `record_id` field for record id.
     pub record_id: Option<FactId>,
+    /// `fragment_id` field for fragment id.
     pub fragment_id: Option<FactId>,
+    /// `subject_id` field for subject id.
     pub subject_id: FactId,
+    /// `predicate` field for predicate.
     pub predicate: String,
+    /// `object` field for object.
     pub object: KnowledgeAssertionObject,
+    /// `confidence` field for confidence.
     pub confidence: f64,
+    /// `t_ns` field for t ns.
     pub t_ns: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryKgProjectionCursor` data container.
 pub struct AgenticMemoryKgProjectionCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_records` field for valid records.
     pub valid_records: usize,
+    /// `valid_drafts` field for valid drafts.
     pub valid_drafts: usize,
+    /// `invalid_drafts` field for invalid drafts.
     pub invalid_drafts: usize,
+    /// `projected_assertions` field for projected assertions.
     pub projected_assertions: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryKgProjectionStatus` data container.
 pub struct AgenticMemoryKgProjectionStatus {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryKgProjectionCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryKgProjectionSnapshot` data container.
 pub struct AgenticMemoryKgProjectionSnapshot {
+    /// `assertions` field for assertions.
     pub assertions: Vec<KnowledgeAssertion>,
+    /// `status` field for status.
     pub status: AgenticMemoryKgProjectionStatus,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryKgProjectionCursor,
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryKgProjectionBundleOptions` data container.
 pub struct AgenticMemoryKgProjectionBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `records` field for records.
     pub records: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `drafts` field for drafts.
     pub drafts: Node<Vec<AgenticMemoryKgAssertionDraft>>,
 }
 
 impl<T> AgenticMemoryKgProjectionBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         records: Node<Vec<AgenticMemoryRecord<T>>>,
         drafts: Node<Vec<AgenticMemoryKgAssertionDraft>>,
@@ -233,6 +359,7 @@ impl<T> AgenticMemoryKgProjectionBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -240,74 +367,119 @@ impl<T> AgenticMemoryKgProjectionBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryKgProjectionBundle` data container.
 pub struct AgenticMemoryKgProjectionBundle<T> {
+    /// `records_input` field for records input.
     pub records_input: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `drafts_input` field for drafts input.
     pub drafts_input: Node<Vec<AgenticMemoryKgAssertionDraft>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<AgenticMemoryKgProjectionSnapshot>,
+    /// `assertions` field for assertions.
     pub assertions: Node<Vec<KnowledgeAssertion>>,
+    /// `status` field for status.
     pub status: Node<AgenticMemoryKgProjectionStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<AgenticMemoryError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryKgProjectionCursor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `AgenticMemoryRetentionCommandKind` variants.
 pub enum AgenticMemoryRetentionCommandKind {
+    /// `Archive` variant.
     Archive,
+    /// `Restore` variant.
     Restore,
+    /// `RequestConsolidation` variant.
     RequestConsolidation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryRetentionCommand` data container.
 pub struct AgenticMemoryRetentionCommand {
+    /// `id` field for id.
     pub id: FactId,
+    /// `record_id` field for record id.
     pub record_id: FactId,
+    /// `kind` field for kind.
     pub kind: AgenticMemoryRetentionCommandKind,
+    /// `reason` field for reason.
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationRequest` data container.
 pub struct AgenticMemoryConsolidationRequest {
+    /// `command_id` field for command id.
     pub command_id: FactId,
+    /// `record_id` field for record id.
     pub record_id: FactId,
+    /// `fragment_id` field for fragment id.
     pub fragment_id: FactId,
+    /// `reason` field for reason.
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryRetentionCursor` data container.
 pub struct AgenticMemoryRetentionCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_records` field for valid records.
     pub valid_records: usize,
+    /// `valid_commands` field for valid commands.
     pub valid_commands: usize,
+    /// `invalid_commands` field for invalid commands.
     pub invalid_commands: usize,
+    /// `active_records` field for active records.
     pub active_records: usize,
+    /// `archived_records` field for archived records.
     pub archived_records: usize,
+    /// `consolidation_requests` field for consolidation requests.
     pub consolidation_requests: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryRetentionStatus` data container.
 pub struct AgenticMemoryRetentionStatus {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryRetentionCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryRetentionSnapshot` data container.
 pub struct AgenticMemoryRetentionSnapshot<T> {
+    /// `active_records` field for active records.
     pub active_records: Vec<AgenticMemoryRecord<T>>,
+    /// `archived_records` field for archived records.
     pub archived_records: Vec<AgenticMemoryRecord<T>>,
+    /// `consolidation_requests` field for consolidation requests.
     pub consolidation_requests: Vec<AgenticMemoryConsolidationRequest>,
+    /// `status` field for status.
     pub status: AgenticMemoryRetentionStatus,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryRetentionCursor,
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryRetentionBundleOptions` data container.
 pub struct AgenticMemoryRetentionBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `records` field for records.
     pub records: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `commands` field for commands.
     pub commands: Node<Vec<AgenticMemoryRetentionCommand>>,
 }
 
 impl<T> AgenticMemoryRetentionBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         records: Node<Vec<AgenticMemoryRecord<T>>>,
         commands: Node<Vec<AgenticMemoryRetentionCommand>>,
@@ -319,6 +491,7 @@ impl<T> AgenticMemoryRetentionBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -326,110 +499,180 @@ impl<T> AgenticMemoryRetentionBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryRetentionBundle` data container.
 pub struct AgenticMemoryRetentionBundle<T> {
+    /// `records_input` field for records input.
     pub records_input: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `commands_input` field for commands input.
     pub commands_input: Node<Vec<AgenticMemoryRetentionCommand>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<AgenticMemoryRetentionSnapshot<T>>,
+    /// `active_records` field for active records.
     pub active_records: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `archived_records` field for archived records.
     pub archived_records: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `consolidation_requests` field for consolidation requests.
     pub consolidation_requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
+    /// `status` field for status.
     pub status: Node<AgenticMemoryRetentionStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<AgenticMemoryError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryRetentionCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryConsolidationOutcome` variants.
 pub enum AgenticMemoryConsolidationOutcome<T> {
+    /// `ProposedRecords` variant.
     ProposedRecords {
+        /// `id` field for id.
         id: FactId,
+        /// `request_id` field for request id.
         request_id: FactId,
+        /// `records` field for records.
         records: Vec<AgenticMemoryRecord<T>>,
+        /// `provenance` field for provenance.
         provenance: Option<String>,
     },
+    /// `Failed` variant.
     Failed {
+        /// `id` field for id.
         id: FactId,
+        /// `request_id` field for request id.
         request_id: FactId,
+        /// `message` field for message.
         message: String,
+        /// `provenance` field for provenance.
         provenance: Option<String>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryConsolidationRecordDraft` data container.
 pub struct AgenticMemoryConsolidationRecordDraft<T> {
+    /// `id` field for id.
     pub id: FactId,
+    /// `request_id` field for request id.
     pub request_id: FactId,
+    /// `outcome_id` field for outcome id.
     pub outcome_id: FactId,
+    /// `record` field for record.
     pub record: AgenticMemoryRecord<T>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationCommandKind` variants.
 pub enum AgenticMemoryConsolidationCommandKind {
+    /// `ProposeRecords` variant.
     ProposeRecords,
+    /// `MarkFailed` variant.
     MarkFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationCommand` data container.
 pub struct AgenticMemoryConsolidationCommand {
+    /// `id` field for id.
     pub id: FactId,
+    /// `kind` field for kind.
     pub kind: AgenticMemoryConsolidationCommandKind,
+    /// `request_id` field for request id.
     pub request_id: FactId,
+    /// `outcome_id` field for outcome id.
     pub outcome_id: FactId,
+    /// `draft_ids` field for draft ids.
     pub draft_ids: Vec<FactId>,
+    /// `message` field for message.
     pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationResultState` variants.
 pub enum AgenticMemoryConsolidationResultState {
+    /// `Proposed` variant.
     Proposed,
+    /// `Failed` variant.
     Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationResult` data container.
 pub struct AgenticMemoryConsolidationResult {
+    /// `id` field for id.
     pub id: FactId,
+    /// `request_id` field for request id.
     pub request_id: FactId,
+    /// `outcome_id` field for outcome id.
     pub outcome_id: FactId,
+    /// `state` field for state.
     pub state: AgenticMemoryConsolidationResultState,
+    /// `source_record_ids` field for source record ids.
     pub source_record_ids: Vec<FactId>,
+    /// `proposed_record_ids` field for proposed record ids.
     pub proposed_record_ids: Vec<FactId>,
+    /// `message` field for message.
     pub message: Option<String>,
+    /// `provenance` field for provenance.
     pub provenance: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryConsolidationCursor` data container.
 pub struct AgenticMemoryConsolidationCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_requests` field for valid requests.
     pub valid_requests: usize,
+    /// `valid_outcomes` field for valid outcomes.
     pub valid_outcomes: usize,
+    /// `invalid_outcomes` field for invalid outcomes.
     pub invalid_outcomes: usize,
+    /// `results` field for results.
     pub results: usize,
+    /// `proposed_record_drafts` field for proposed record drafts.
     pub proposed_record_drafts: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryConsolidationStatus` data container.
 pub struct AgenticMemoryConsolidationStatus {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryConsolidationCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryConsolidationSnapshot` data container.
 pub struct AgenticMemoryConsolidationSnapshot<T> {
+    /// `results` field for results.
     pub results: Vec<AgenticMemoryConsolidationResult>,
+    /// `proposed_record_drafts` field for proposed record drafts.
     pub proposed_record_drafts: Vec<AgenticMemoryConsolidationRecordDraft<T>>,
+    /// `commands` field for commands.
     pub commands: Vec<AgenticMemoryConsolidationCommand>,
+    /// `status` field for status.
     pub status: AgenticMemoryConsolidationStatus,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryConsolidationCursor,
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryConsolidationBundleOptions` data container.
 pub struct AgenticMemoryConsolidationBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `requests` field for requests.
     pub requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
+    /// `outcomes` field for outcomes.
     pub outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
 }
 
 impl<T> AgenticMemoryConsolidationBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
         outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
@@ -441,6 +684,7 @@ impl<T> AgenticMemoryConsolidationBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -448,28 +692,45 @@ impl<T> AgenticMemoryConsolidationBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryConsolidationBundle` data container.
 pub struct AgenticMemoryConsolidationBundle<T> {
+    /// `requests_input` field for requests input.
     pub requests_input: Node<Vec<AgenticMemoryConsolidationRequest>>,
+    /// `outcomes_input` field for outcomes input.
     pub outcomes_input: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<AgenticMemoryConsolidationSnapshot<T>>,
+    /// `results` field for results.
     pub results: Node<Vec<AgenticMemoryConsolidationResult>>,
+    /// `proposed_record_drafts` field for proposed record drafts.
     pub proposed_record_drafts: Node<Vec<AgenticMemoryConsolidationRecordDraft<T>>>,
+    /// `commands` field for commands.
     pub commands: Node<Vec<AgenticMemoryConsolidationCommand>>,
+    /// `status` field for status.
     pub status: Node<AgenticMemoryConsolidationStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<AgenticMemoryError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryConsolidationCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryTextProjection` data container.
 pub struct AgenticMemoryTextProjection {
+    /// `fragment_id` field for fragment id.
     pub fragment_id: FactId,
+    /// `text` field for text.
     pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryContextPackingPolicy` data container.
 pub struct AgenticMemoryContextPackingPolicy {
+    /// `max_chars` field for max chars.
     pub max_chars: Option<usize>,
+    /// `separator` field for separator.
     pub separator: String,
+    /// `include_fragment_ids` field for include fragment ids.
     pub include_fragment_ids: bool,
 }
 
@@ -484,46 +745,72 @@ impl Default for AgenticMemoryContextPackingPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryContextPackingCursor` data container.
 pub struct AgenticMemoryContextPackingCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `context_entries` field for context entries.
     pub context_entries: usize,
+    /// `text_projection_count` field for text projection count.
     pub text_projection_count: usize,
+    /// `packed_entries` field for packed entries.
     pub packed_entries: usize,
+    /// `missing_text` field for missing text.
     pub missing_text: usize,
+    /// `char_count` field for char count.
     pub char_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `AgenticMemoryPackedContext` data container.
 pub struct AgenticMemoryPackedContext {
+    /// `text` field for text.
     pub text: String,
+    /// `fragment_ids` field for fragment ids.
     pub fragment_ids: Vec<FactId>,
+    /// `truncated` field for truncated.
     pub truncated: bool,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryContextPackingCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryContextPackingStatus` data container.
 pub struct AgenticMemoryContextPackingStatus {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryContextPackingCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryContextPackingSnapshot` data container.
 pub struct AgenticMemoryContextPackingSnapshot {
+    /// `packed_context` field for packed context.
     pub packed_context: AgenticMemoryPackedContext,
+    /// `status` field for status.
     pub status: AgenticMemoryContextPackingStatus,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryContextPackingCursor,
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryContextPackingBundleOptions` data container.
 pub struct AgenticMemoryContextPackingBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `context` field for context.
     pub context: Node<AgenticMemoryContext<T>>,
+    /// `texts` field for texts.
     pub texts: Node<Vec<AgenticMemoryTextProjection>>,
+    /// `policy` field for policy.
     pub policy: Node<AgenticMemoryContextPackingPolicy>,
 }
 
 impl<T> AgenticMemoryContextPackingBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         context: Node<AgenticMemoryContext<T>>,
         texts: Node<Vec<AgenticMemoryTextProjection>>,
@@ -537,6 +824,7 @@ impl<T> AgenticMemoryContextPackingBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -544,58 +832,96 @@ impl<T> AgenticMemoryContextPackingBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryContextPackingBundle` data container.
 pub struct AgenticMemoryContextPackingBundle<T> {
+    /// `context_input` field for context input.
     pub context_input: Node<AgenticMemoryContext<T>>,
+    /// `texts_input` field for texts input.
     pub texts_input: Node<Vec<AgenticMemoryTextProjection>>,
+    /// `policy_input` field for policy input.
     pub policy_input: Node<AgenticMemoryContextPackingPolicy>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<AgenticMemoryContextPackingSnapshot>,
+    /// `packed_context` field for packed context.
     pub packed_context: Node<AgenticMemoryPackedContext>,
+    /// `status` field for status.
     pub status: Node<AgenticMemoryContextPackingStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<AgenticMemoryError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryContextPackingCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryContextEntry` data container.
 pub struct AgenticMemoryContextEntry<T> {
+    /// `fragment_id` field for fragment id.
     pub fragment_id: FactId,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `confidence` field for confidence.
     pub confidence: f64,
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `sources` field for sources.
     pub sources: Vec<FactId>,
+    /// `fragment` field for fragment.
     pub fragment: MemoryFragment<T>,
+    /// `metadata` field for metadata.
     pub metadata: Option<AgenticMemoryRecordMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryContext` data container.
 pub struct AgenticMemoryContext<T> {
+    /// `state` field for state.
     pub state: AgenticMemoryStatusState,
+    /// `query` field for query.
     pub query: MemoryRetrievalQuery,
+    /// `entries` field for entries.
     pub entries: Vec<AgenticMemoryContextEntry<T>>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryCursor,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `retrieval_status` field for retrieval status.
     pub retrieval_status: MemoryRetrievalStatus,
+    /// `retrieval_errors` field for retrieval errors.
     pub retrieval_errors: Vec<MemoryRetrievalError>,
+    /// `context_ready` field for context ready.
     pub context_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AgenticMemoryProjection` data container.
 pub struct AgenticMemoryProjection<T> {
+    /// `records` field for records.
     pub records: Vec<AgenticMemoryRecord<T>>,
+    /// `fragments` field for fragments.
     pub fragments: Vec<MemoryFragment<T>>,
+    /// `metadata_by_fragment_id` field for metadata by fragment id.
     pub metadata_by_fragment_id: BTreeMap<FactId, AgenticMemoryRecordMetadata>,
+    /// `sources` field for sources.
     pub sources: Vec<AgenticMemorySourceProjection>,
+    /// `errors` field for errors.
     pub errors: Vec<AgenticMemoryError>,
+    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryCursor,
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryBundleOptions` data container.
 pub struct AgenticMemoryBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `records` field for records.
     pub records: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `query` field for query.
     pub query: Node<MemoryRetrievalQuery>,
 }
 
 impl<T> AgenticMemoryBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         records: Node<Vec<AgenticMemoryRecord<T>>>,
         query: Node<MemoryRetrievalQuery>,
@@ -607,6 +933,7 @@ impl<T> AgenticMemoryBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -614,24 +941,41 @@ impl<T> AgenticMemoryBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `AgenticMemoryBundle` data container.
 pub struct AgenticMemoryBundle<T> {
+    /// `records_input` field for records input.
     pub records_input: Node<Vec<AgenticMemoryRecord<T>>>,
+    /// `query_input` field for query input.
     pub query_input: Node<MemoryRetrievalQuery>,
+    /// `projection` field for projection.
     pub projection: Node<AgenticMemoryProjection<T>>,
+    /// `retrieval` field for retrieval.
     pub retrieval: MemoryRetrievalBundle<T>,
+    /// `retrieval_snapshot` field for retrieval snapshot.
     pub retrieval_snapshot: Node<MemoryRetrievalSnapshot<T>>,
+    /// `retrieval_status` field for retrieval status.
     pub retrieval_status: Node<MemoryRetrievalStatus>,
+    /// `retrieval_errors` field for retrieval errors.
     pub retrieval_errors: Node<Vec<MemoryRetrievalError>>,
+    /// `fragments` field for fragments.
     pub fragments: Node<Vec<MemoryFragment<T>>>,
+    /// `sources` field for sources.
     pub sources: Node<Vec<AgenticMemorySourceProjection>>,
+    /// `indexed` field for indexed.
     pub indexed: Node<MemoryRetrievalIndex<T>>,
+    /// `ranked` field for ranked.
     pub ranked: Node<MemoryAnswer<T>>,
+    /// `context` field for context.
     pub context: Node<AgenticMemoryContext<T>>,
+    /// `status` field for status.
     pub status: Node<AgenticMemoryStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<AgenticMemoryError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryCursor>,
 }
 
+/// Creates or computes `validate_agentic_memory_kind`.
 pub fn validate_agentic_memory_kind(_kind: &AgenticMemoryKind) -> AgenticMemoryFieldValidation {
     AgenticMemoryFieldValidation {
         ok: true,
@@ -639,6 +983,7 @@ pub fn validate_agentic_memory_kind(_kind: &AgenticMemoryKind) -> AgenticMemoryF
     }
 }
 
+/// Creates or computes `validate_agentic_memory_persistence_level`.
 pub fn validate_agentic_memory_persistence_level(
     _level: &AgenticMemoryPersistenceLevel,
 ) -> AgenticMemoryFieldValidation {
@@ -648,6 +993,7 @@ pub fn validate_agentic_memory_persistence_level(
     }
 }
 
+/// Creates or computes `validate_agentic_memory_artifact_kind`.
 pub fn validate_agentic_memory_artifact_kind(
     _kind: &AgenticMemoryArtifactKind,
 ) -> AgenticMemoryFieldValidation {
@@ -657,6 +1003,7 @@ pub fn validate_agentic_memory_artifact_kind(
     }
 }
 
+/// Creates or computes `validate_agentic_memory_scope`.
 pub fn validate_agentic_memory_scope(scope: &AgenticMemoryScope) -> AgenticMemoryFieldValidation {
     let mut errors = Vec::new();
     if scope
@@ -689,6 +1036,7 @@ pub fn validate_agentic_memory_scope(scope: &AgenticMemoryScope) -> AgenticMemor
     }
 }
 
+/// Creates or computes `validate_agentic_memory_record`.
 pub fn validate_agentic_memory_record<T>(
     record: &AgenticMemoryRecord<T>,
 ) -> AgenticMemoryRecordValidation {
@@ -902,6 +1250,7 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `agentic_memory_kg_projection_bundle`.
 pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryKgProjectionBundleOptions<T>,
@@ -1082,6 +1431,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `agentic_memory_retention_bundle`.
 pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryRetentionBundleOptions<T>,
@@ -1267,6 +1617,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `agentic_memory_consolidation_bundle`.
 pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryConsolidationBundleOptions<T>,
@@ -1400,6 +1751,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `agentic_memory_context_packing_bundle`.
 pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryContextPackingBundleOptions<T>,

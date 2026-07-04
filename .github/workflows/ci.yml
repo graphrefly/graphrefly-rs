@@ -93,21 +93,12 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Cargo doc (no deps; catches broken intra-doc links)
-        run: cargo doc --no-deps
+      - name: Cargo doc (graphrefly-rs all features; missing docs + links)
+        run: cargo doc -p graphrefly-rs --all-features --no-deps
         env:
-          # `-D warnings` keeps real doc errors fatal (unparseable doc, missing
-          # docs on must-document items, etc.) but allows the three noisy
-          # doc-link lint families that pre-1.0 internal modules legitimately
-          # trigger:
-          #   - private_intra_doc_links: links from public docs to private
-          #     items (informative for maintainers, fine for pre-1.0).
-          #   - broken_intra_doc_links: typos / unresolved paths in doc
-          #     comments. Should be cleaned up but isn't blocking.
-          #   - redundant_explicit_links: explicit target same as label.
-          # Tightening these to deny is a separate doc-quality slice (track
-          # in `docs/porting-deferred.md` if/when prioritized).
-          RUSTDOCFLAGS: "-D warnings -A rustdoc::private_intra_doc_links -A rustdoc::broken_intra_doc_links -A rustdoc::redundant_explicit_links"
+          # `-D warnings` keeps rustdoc warnings fatal; the crate also has
+          # `#![deny(missing_docs)]`, so every public Rust API must carry docs.
+          RUSTDOCFLAGS: "-D warnings"
 
   # ---------------------------------------------------------------------
   # Supply-chain audit via cargo-deny — license allowlist, advisory
@@ -131,17 +122,10 @@ jobs:
   # (the binding's tests are JS-side and live in graphrefly-ts's
   # bench harness). The build verifies the cdylib link works.
   #
-  # S6 reconciled 2026-05-19 (D255/D256/D257/D258 — α/γ-converged actor
-  # model). `crates/graphrefly-bindings-js/src/core_actor.rs` owns
-  # `Core` on a dedicated worker thread; `Bench*` napi classes store
-  # `Arc<CoreActor>` (Send+Sync) instead of `Core` by value; the
-  # `invoke_fn_with_core` (D245/D246-r5) override threads `&dyn
-  # CoreFull` to producer build closures; `Subscription` → owner-
-  # invoked `(NodeId, SubscriptionId)`-pair detach. `!Send` resources
-  # (Graph, StorageHandle, LogView/ScanHandle/ReactiveSub) live in
-  # the actor's `WORKER_EXTRAS` thread-local registry. Gate restored
-  # to the prior bot/release condition; the post-S6 binding compiles
-  # green against the post-S2c substrate.
+  # Frozen JS binding reference retained for CI coverage only. Its old
+  # CoreActor/napi structure is historical binding machinery, not current
+  # clean-slate substrate guidance. Gate restored to the prior bot/release
+  # condition so the retained binding still compiles against the Rust crate.
   # ---------------------------------------------------------------------
   bindings-js:
     name: napi-rs binding (cdylib build + clippy)

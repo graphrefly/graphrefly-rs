@@ -10,136 +10,215 @@ use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, 
 use crate::node::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ReachableDirection` variants.
 pub enum ReachableDirection {
+    /// `Upstream` variant.
     Upstream,
+    /// `Downstream` variant.
     Downstream,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `ReachableOptions` data container.
 pub struct ReachableOptions {
+    /// `max_depth` field for max depth.
     pub max_depth: Option<usize>,
+    /// `both` field for both.
     pub both: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `ReachableResult` data container.
 pub struct ReachableResult {
+    /// `paths` field for paths.
     pub paths: Vec<String>,
+    /// `depths` field for depths.
     pub depths: BTreeMap<String, usize>,
+    /// `truncated` field for truncated.
     pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ExplainPathReason` variants.
 pub enum ExplainPathReason {
+    /// `Ok` variant.
     Ok,
+    /// `NoSuchFrom` variant.
     NoSuchFrom,
+    /// `NoSuchTo` variant.
     NoSuchTo,
+    /// `NoPath` variant.
     NoPath,
+    /// `MaxDepthExceeded` variant.
     MaxDepthExceeded,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `ExplainPathOptions` data container.
 pub struct ExplainPathOptions {
+    /// `max_depth` field for max depth.
     pub max_depth: Option<usize>,
+    /// `find_cycle` field for find cycle.
     pub find_cycle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CausalStep` data container.
 pub struct CausalStep {
+    /// `id` field for id.
     pub id: String,
+    /// `factory` field for factory.
     pub factory: String,
+    /// `status` field for status.
     pub status: Status,
+    /// `value` field for value.
     pub value: Option<DescribeValue>,
+    /// `hop` field for hop.
     pub hop: usize,
+    /// `dep_index` field for dep index.
     pub dep_index: Option<usize>,
+    /// `dep_indices` field for dep indices.
     pub dep_indices: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CausalChain` data container.
 pub struct CausalChain {
+    /// `from` field for from.
     pub from: String,
+    /// `to` field for to.
     pub to: String,
+    /// `found` field for found.
     pub found: bool,
+    /// `reason` field for reason.
     pub reason: ExplainPathReason,
+    /// `steps` field for steps.
     pub steps: Vec<CausalStep>,
+    /// `text` field for text.
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `IslandReport` data container.
 pub struct IslandReport {
+    /// `id` field for id.
     pub id: String,
+    /// `factory` field for factory.
     pub factory: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ValidateNoIslandsResult` data container.
 pub struct ValidateNoIslandsResult {
+    /// `ok` field for ok.
     pub ok: bool,
+    /// `orphans` field for orphans.
     pub orphans: Vec<IslandReport>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `DescribeEvent` variants.
 pub enum DescribeEvent {
+    /// `NodeAdded` variant.
     NodeAdded {
+        /// `id` field for id.
         id: String,
+        /// `node` field for node.
         node: DescribeNode,
     },
+    /// `NodeRemoved` variant.
     NodeRemoved {
+        /// `id` field for id.
         id: String,
     },
+    /// `NodeMetaChanged` variant.
     NodeMetaChanged {
+        /// `id` field for id.
         id: String,
+        /// `prev_meta` field for prev meta.
         prev_meta: BTreeMap<String, String>,
+        /// `next_meta` field for next meta.
         next_meta: BTreeMap<String, String>,
     },
+    /// `EdgeAdded` variant.
     EdgeAdded {
+        /// `from` field for from.
         from: String,
+        /// `to` field for to.
         to: String,
     },
+    /// `EdgeRemoved` variant.
     EdgeRemoved {
+        /// `from` field for from.
         from: String,
+        /// `to` field for to.
         to: String,
     },
+    /// `SubgraphMounted` variant.
     SubgraphMounted {
+        /// `path` field for path.
         path: String,
     },
+    /// `SubgraphUnmounted` variant.
     SubgraphUnmounted {
+        /// `path` field for path.
         path: String,
     },
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+/// `DescribeChangeset` data container.
 pub struct DescribeChangeset {
+    /// `events` field for events.
     pub events: Vec<DescribeEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `ProfileSummaryOptions` data container.
 pub struct ProfileSummaryOptions {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProfileSummaryNode` data container.
 pub struct ProfileSummaryNode {
+    /// `path` field for path.
     pub path: String,
+    /// `invokes` field for invokes.
     pub invokes: u64,
+    /// `total_duration_ns` field for total duration ns.
     pub total_duration_ns: u128,
+    /// `last_duration_ns` field for last duration ns.
     pub last_duration_ns: u128,
+    /// `status` field for status.
     pub status: Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProfileSummaryStatus` data container.
 pub struct ProfileSummaryStatus {
+    /// `status` field for status.
     pub status: Status,
+    /// `count` field for count.
     pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProfileSummary` data container.
 pub struct ProfileSummary {
+    /// `node_count` field for node count.
     pub node_count: usize,
+    /// `total_invokes` field for total invokes.
     pub total_invokes: u64,
+    /// `by_status` field for by status.
     pub by_status: Vec<ProfileSummaryStatus>,
+    /// `hot_nodes` field for hot nodes.
     pub hot_nodes: Vec<ProfileSummaryNode>,
 }
 
 impl ValidateNoIslandsResult {
+    /// Updates or reads `summary`.
     pub fn summary(&self) -> String {
         if self.orphans.is_empty() {
             return "validate_no_islands: ok (no islands)".to_owned();
@@ -425,6 +504,7 @@ fn adjacent(
     }
 }
 
+/// Creates or computes `reachable`.
 pub fn reachable(
     snapshot: &DescribeSnapshot,
     from: &str,
@@ -621,6 +701,7 @@ fn materialize_path(idx: &SnapshotIndex, path: &[String]) -> Vec<CausalStep> {
         .collect()
 }
 
+/// Creates or computes `explain_path`.
 pub fn explain_path(
     snapshot: &DescribeSnapshot,
     from: &str,
@@ -674,6 +755,7 @@ pub fn explain_path(
     }
 }
 
+/// Creates or computes `validate_no_islands`.
 pub fn validate_no_islands(snapshot: &DescribeSnapshot) -> ValidateNoIslandsResult {
     let idx = index_snapshot(snapshot);
     let mut orphans = Vec::new();

@@ -20,29 +20,45 @@ use crate::storage::{
 /// Dynamic promotion policy for [`reactive_cascading_cache`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CascadingCachePolicy {
+    /// `promote_to` field for promote to.
     pub promote_to: Option<PromotionPolicy>,
 }
 
 /// Visible cache status emitted by [`ReactiveCascadingCache::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadingCacheStatus {
+    /// `Idle` variant.
     Idle,
+    /// `Loading` variant.
     Loading {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
     },
+    /// `Hit` variant.
     Hit {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `tier` field for tier.
         tier: Option<ReadThroughLookupTier>,
     },
+    /// `Miss` variant.
     Miss {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
     },
+    /// `Error` variant.
     Error {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `error` field for error.
         error: StorageError,
     },
 }
@@ -50,62 +66,105 @@ pub enum CascadingCacheStatus {
 /// Visible cache facts emitted by [`ReactiveCascadingCache::events`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum CascadingCacheEvent<V> {
+    /// `Request` variant.
     Request {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
     },
+    /// `Invalidate` variant.
     Invalidate {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
     },
+    /// `Lookup` variant.
     Lookup {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `outcome` field for outcome.
         outcome: ReadThroughOutcome,
+        /// `tier` field for tier.
         tier: ReadThroughLookupTier,
+        /// `value` field for value.
         value: Option<V>,
+        /// `error` field for error.
         error: Option<StorageError>,
     },
+    /// `Promotion` variant.
     Promotion {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `tier` field for tier.
         tier: ReadThroughLookupTier,
+        /// `ok` field for ok.
         ok: bool,
+        /// `error` field for error.
         error: Option<StorageError>,
     },
+    /// `Fill` variant.
     Fill {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `status` field for status.
         status: TieredReadThroughStatus,
+        /// `value` field for value.
         value: Option<V>,
+        /// `tier` field for tier.
         tier: Option<ReadThroughLookupTier>,
+        /// `error` field for error.
         error: Option<StorageError>,
     },
+    /// `Error` variant.
     Error {
+        /// `key` field for key.
         key: String,
+        /// `request_seq` field for request seq.
         request_seq: u64,
+        /// `stage` field for stage.
         stage: ReadThroughErrorStage,
+        /// `tier` field for tier.
         tier: Option<ReadThroughLookupTier>,
+        /// `error` field for error.
         error: StorageError,
     },
 }
 
+/// `ReactiveCascadingCacheLoadFn` type alias.
 pub type ReactiveCascadingCacheLoadFn<V> = dyn Fn(&str) -> StorageResult<Option<V>>;
 
 /// Options for the Rust graph-layer cache factory.
 pub struct ReactiveCascadingCacheOptions<V: Clone + 'static> {
+    /// `request` field for request.
     pub request: Node<String>,
+    /// `policy` field for policy.
     pub policy: Option<Node<CascadingCachePolicy>>,
+    /// `invalidate` field for invalidate.
     pub invalidate: Option<Node<String>>,
+    /// `tiers` field for tiers.
     pub tiers: Vec<Rc<dyn KvStorageTier<V>>>,
+    /// `load` field for load.
     pub load: Option<Rc<ReactiveCascadingCacheLoadFn<V>>>,
+    /// `tier_names` field for tier names.
     pub tier_names: Vec<String>,
+    /// `promote_to` field for promote to.
     pub promote_to: PromotionPolicy,
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `meta` field for meta.
     pub meta: BTreeMap<String, String>,
 }
 
 impl<V: Clone + 'static> ReactiveCascadingCacheOptions<V> {
+    /// Creates or computes `new`.
     pub fn new(request: Node<String>, tiers: Vec<Rc<dyn KvStorageTier<V>>>) -> Self {
         Self {
             request,
@@ -123,8 +182,11 @@ impl<V: Clone + 'static> ReactiveCascadingCacheOptions<V> {
 
 /// Graph-visible bundle returned by [`reactive_cascading_cache`].
 pub struct ReactiveCascadingCache<V: Clone + 'static> {
+    /// `value` field for value.
     pub value: Node<V>,
+    /// `status` field for status.
     pub status: Node<CascadingCacheStatus>,
+    /// `events` field for events.
     pub events: Node<CascadingCacheEvent<V>>,
 }
 

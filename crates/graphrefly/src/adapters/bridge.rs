@@ -21,17 +21,26 @@ use crate::resilience::RetryPolicy;
 use crate::versioning::NodeVersion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireBridgeEnvelopeType` variants.
 pub enum WireBridgeEnvelopeType {
+    /// `Start` variant.
     Start,
+    /// `Data` variant.
     Data,
+    /// `Ack` variant.
     Ack,
+    /// `Nack` variant.
     Nack,
+    /// `Status` variant.
     Status,
+    /// `Error` variant.
     Error,
+    /// `Close` variant.
     Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeMetadata` data container.
 pub struct WireBridgeMetadata {
     /// Monotonic envelope sequence within the bridge session.
     pub seq: u64,
@@ -39,41 +48,69 @@ pub struct WireBridgeMetadata {
     pub cursor: u64,
     /// D151: correlation/idempotency metadata, not an authoritative duplicate lookup key.
     pub idempotency_key: String,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: Option<u64>,
     /// D151 ack/nack correlation target; receipt duplicate recognition still uses seq/cursor.
     pub ack_for_seq: Option<u64>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgePayload` variants.
 pub enum WireBridgePayload<T> {
+    /// `Data` variant.
     Data(T),
+    /// `Error` variant.
     Error(String),
+    /// `Status` variant.
     Status(String),
-    Close { reason: Option<String> },
+    /// `Close` variant.
+    Close {
+        /// `reason` field for `Close`.
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeEnvelope` data container.
 pub struct WireBridgeEnvelope<T> {
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `envelope_type` field for envelope type.
     pub envelope_type: WireBridgeEnvelopeType,
+    /// `payload` field for payload.
     pub payload: Option<WireBridgePayload<T>>,
+    /// `metadata` field for metadata.
     pub metadata: WireBridgeMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeEnvelopeError` variants.
 pub enum WireBridgeEnvelopeError {
+    /// `EmptySessionId` variant.
     EmptySessionId,
+    /// `ZeroSeq` variant.
     ZeroSeq,
+    /// `EmptyIdempotencyKey` variant.
     EmptyIdempotencyKey,
+    /// `ZeroAttempt` variant.
     ZeroAttempt,
+    /// `MaxAttemptsBeforeAttempt` variant.
     MaxAttemptsBeforeAttempt,
+    /// `ZeroAckForSeq` variant.
     ZeroAckForSeq,
+    /// `MissingAckForSeq` variant.
     MissingAckForSeq,
+    /// `MissingPayload` variant.
     MissingPayload,
+    /// `UnexpectedPayload` variant.
     UnexpectedPayload,
+    /// `PayloadTypeMismatch` variant.
     PayloadTypeMismatch,
 }
 
@@ -99,24 +136,38 @@ impl std::fmt::Display for WireBridgeEnvelopeError {
 impl std::error::Error for WireBridgeEnvelopeError {}
 
 #[derive(Debug, Clone)]
+/// `WireBridgeEnvelopeInput` data container.
 pub struct WireBridgeEnvelopeInput<T> {
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `envelope_type` field for envelope type.
     pub envelope_type: WireBridgeEnvelopeType,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `payload` field for payload.
     pub payload: Option<WireBridgePayload<T>>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: Option<u64>,
+    /// `ack_for_seq` field for ack for seq.
     pub ack_for_seq: Option<u64>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
 }
 
+/// Creates or computes `wire_bridge_idempotency_key`.
 pub fn wire_bridge_idempotency_key(session_id: &str, seq: u64) -> String {
     canonical_tuple_key(&[session_id, &seq.to_string()])
 }
 
+/// Creates or computes `wire_bridge_envelope`.
 pub fn wire_bridge_envelope<T>(
     input: WireBridgeEnvelopeInput<T>,
 ) -> Result<WireBridgeEnvelope<T>, WireBridgeEnvelopeError> {
@@ -167,157 +218,263 @@ pub fn wire_bridge_envelope<T>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeCommand` variants.
 pub enum WireBridgeCommand<T> {
+    /// `Start` variant.
     Start {
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `request_id` field for request id.
         request_id: Option<String>,
     },
+    /// `Send` variant.
     Send {
+        /// `payload` field for payload.
         payload: T,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `request_id` field for request id.
         request_id: Option<String>,
     },
+    /// `Ack` variant.
     Ack {
+        /// `ack_for_seq` field for ack for seq.
         ack_for_seq: u64,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `request_id` field for request id.
         request_id: Option<String>,
     },
+    /// `Nack` variant.
     Nack {
+        /// `ack_for_seq` field for ack for seq.
         ack_for_seq: u64,
+        /// `error` field for error.
         error: String,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
+        /// `request_id` field for request id.
         request_id: Option<String>,
     },
+    /// `Close` variant.
     Close {
+        /// `reason` field for reason.
         reason: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
     },
+    /// `AckTimeout` variant.
     AckTimeout {
+        /// `seq` field for seq.
         seq: u64,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `observed_at_ms` field for observed at ms.
         observed_at_ms: Option<u64>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeReceipt` variants.
 pub enum WireBridgeReceipt {
+    /// `Ack` variant.
     Ack,
+    /// `Nack` variant.
     Nack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeEvent` variants.
 pub enum WireBridgeEvent<TOutbound, TInbound> {
+    /// `Outbound` variant.
     Outbound {
+        /// `envelope` field for envelope.
         envelope: WireBridgeEnvelope<TOutbound>,
     },
+    /// `Inbound` variant.
     Inbound {
+        /// `envelope` field for envelope.
         envelope: WireBridgeEnvelope<TInbound>,
     },
+    /// `Ack` variant.
     Ack {
+        /// `ack_for_seq` field for ack for seq.
         ack_for_seq: u64,
+        /// `envelope` field for envelope.
         envelope: WireBridgeEnvelope<TInbound>,
+        /// `outbound` field for outbound.
         outbound: WireBridgeEnvelope<TOutbound>,
     },
+    /// `Nack` variant.
     Nack {
+        /// `ack_for_seq` field for ack for seq.
         ack_for_seq: u64,
+        /// `envelope` field for envelope.
         envelope: WireBridgeEnvelope<TInbound>,
+        /// `outbound` field for outbound.
         outbound: WireBridgeEnvelope<TOutbound>,
+        /// `error` field for error.
         error: String,
     },
+    /// `Timeout` variant.
     Timeout {
+        /// `seq` field for seq.
         seq: u64,
+        /// `attempt` field for attempt.
         attempt: u32,
     },
+    /// `Retry` variant.
     Retry {
+        /// `seq` field for seq.
         seq: u64,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
+        /// `error` field for error.
         error: String,
     },
+    /// `Exhausted` variant.
     Exhausted {
+        /// `seq` field for seq.
         seq: u64,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `error` field for error.
         error: String,
     },
+    /// `Cursor` variant.
     Cursor {
+        /// `cursor` field for cursor.
         cursor: u64,
     },
+    /// `Duplicate` variant.
     Duplicate {
+        /// `seq` field for seq.
         seq: u64,
+        /// `cursor` field for cursor.
         cursor: u64,
     },
+    /// `OutOfOrder` variant.
     OutOfOrder {
+        /// `seq` field for seq.
         seq: u64,
+        /// `expected` field for expected.
         expected: u64,
     },
+    /// `SessionMismatch` variant.
     SessionMismatch {
+        /// `expected` field for expected.
         expected: String,
+        /// `actual` field for actual.
         actual: String,
     },
+    /// `LateReceipt` variant.
     LateReceipt {
+        /// `receipt` field for receipt.
         receipt: WireBridgeReceipt,
+        /// `ack_for_seq` field for ack for seq.
         ack_for_seq: u64,
     },
+    /// `Invalid` variant.
     Invalid {
+        /// `error` field for error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeAck` data container.
 pub struct WireBridgeAck<TInbound> {
+    /// `ack_for_seq` field for ack for seq.
     pub ack_for_seq: u64,
+    /// `envelope` field for envelope.
     pub envelope: WireBridgeEnvelope<TInbound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeNack` data container.
 pub struct WireBridgeNack<TInbound> {
+    /// `ack_for_seq` field for ack for seq.
     pub ack_for_seq: u64,
+    /// `envelope` field for envelope.
     pub envelope: WireBridgeEnvelope<TInbound>,
+    /// `error` field for error.
     pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeAttempt` data container.
 pub struct WireBridgeAttempt {
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireBridgeStatusState` variants.
 pub enum WireBridgeStatusState {
+    /// `Idle` variant.
     Idle,
+    /// `Started` variant.
     Started,
+    /// `Open` variant.
     Open,
+    /// `Waiting` variant.
     Waiting,
+    /// `Closed` variant.
     Closed,
+    /// `Errored` variant.
     Errored,
+    /// `Exhausted` variant.
     Exhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeStatus` data container.
 pub struct WireBridgeStatus {
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `state` field for state.
     pub state: WireBridgeStatusState,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `next_seq` field for next seq.
     pub next_seq: u64,
+    /// `pending` field for pending.
     pub pending: u64,
+    /// `attempts` field for attempts.
     pub attempts: u64,
+    /// `acked` field for acked.
     pub acked: u64,
+    /// `nacked` field for nacked.
     pub nacked: u64,
+    /// `errors` field for errors.
     pub errors: u64,
+    /// `last_seq` field for last seq.
     pub last_seq: Option<u64>,
+    /// `last_delay_ms` field for last delay ms.
     pub last_delay_ms: Option<u64>,
 }
 
 #[derive(Clone)]
+/// `WireBridgeOptions` data container.
 pub struct WireBridgeOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `retry` field for retry.
     pub retry: RetryPolicy,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<Rc<dyn Fn() -> u64>>,
 }
 
 impl WireBridgeOptions {
+    /// Creates or computes `new`.
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             name: None,
@@ -327,6 +484,7 @@ impl WireBridgeOptions {
         }
     }
 
+    /// Creates or computes `named`.
     pub fn named(session_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -335,22 +493,34 @@ impl WireBridgeOptions {
     }
 }
 
+/// `WireBridgeBundle` data container.
 pub struct WireBridgeBundle<TOutbound: Clone + 'static, TInbound: Clone + 'static> {
+    /// `command` field for command.
     pub command: Node<WireBridgeCommand<TOutbound>>,
+    /// `outbound` field for outbound.
     pub outbound: Node<WireBridgeEnvelope<TOutbound>>,
+    /// `inbound` field for inbound.
     pub inbound: WireBridgeInbound<TInbound>,
+    /// `events` field for events.
     pub events: Node<WireBridgeEvent<TOutbound, TInbound>>,
+    /// `acks` field for acks.
     pub acks: Node<WireBridgeAck<TInbound>>,
+    /// `nacks` field for nacks.
     pub nacks: Node<WireBridgeNack<TInbound>>,
+    /// `status` field for status.
     pub status: Node<WireBridgeStatus>,
+    /// `errors` field for errors.
     pub errors: Node<String>,
+    /// `cursor` field for cursor.
     pub cursor: Node<u64>,
+    /// `attempts` field for attempts.
     pub attempts: Node<WireBridgeAttempt>,
     command_sources: Rc<RefCell<Vec<Core>>>,
     inbound_sources: Rc<RefCell<Vec<Core>>>,
 }
 
 impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOutbound, TInbound> {
+    /// Updates or reads `start`.
     pub fn start(&self) {
         self.command.set(WireBridgeCommand::Start {
             idempotency_key: None,
@@ -358,6 +528,7 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
         });
     }
 
+    /// Updates or reads `send`.
     pub fn send(
         &self,
         payload: TOutbound,
@@ -371,6 +542,7 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
         });
     }
 
+    /// Updates or reads `ack`.
     pub fn ack(
         &self,
         ack_for_seq: u64,
@@ -384,6 +556,7 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
         });
     }
 
+    /// Updates or reads `nack`.
     pub fn nack(
         &self,
         ack_for_seq: u64,
@@ -399,6 +572,7 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
         });
     }
 
+    /// Updates or reads `close`.
     pub fn close(&self, reason: Option<String>, idempotency_key: Option<String>) {
         self.command.set(WireBridgeCommand::Close {
             reason,
@@ -428,13 +602,18 @@ impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOu
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallRequest` data container.
 pub struct RemoteCallRequest<T> {
+    /// `operation` field for operation.
     pub operation: String,
+    /// `request_id` field for request id.
     pub request_id: String,
+    /// `payload` field for payload.
     pub payload: T,
 }
 
 impl<T> RemoteCallRequest<T> {
+    /// Creates or computes `new`.
     pub fn new(operation: impl Into<String>, request_id: impl Into<String>, payload: T) -> Self {
         Self {
             operation: operation.into(),
@@ -445,68 +624,110 @@ impl<T> RemoteCallRequest<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallResponse` variants.
 pub enum RemoteCallResponse<T> {
+    /// `Result` variant.
     Result {
+        /// `operation` field for operation.
         operation: String,
+        /// `request_id` field for request id.
         request_id: String,
+        /// `payload` field for payload.
         payload: T,
     },
+    /// `Error` variant.
     Error {
+        /// `operation` field for operation.
         operation: String,
+        /// `request_id` field for request id.
         request_id: String,
+        /// `error` field for error.
         error: String,
     },
+    /// `Status` variant.
     Status {
+        /// `operation` field for operation.
         operation: String,
+        /// `request_id` field for request id.
         request_id: String,
+        /// `status` field for status.
         status: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallResult` data container.
 pub struct RemoteCallResult<T> {
+    /// `operation` field for operation.
     pub operation: String,
+    /// `request_id` field for request id.
     pub request_id: String,
+    /// `payload` field for payload.
     pub payload: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallError` data container.
 pub struct RemoteCallError {
+    /// `operation` field for operation.
     pub operation: Option<String>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
+    /// `error` field for error.
     pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `RemoteCallStatusState` variants.
 pub enum RemoteCallStatusState {
+    /// `Idle` variant.
     Idle,
+    /// `Requested` variant.
     Requested,
+    /// `Responded` variant.
     Responded,
+    /// `Errored` variant.
     Errored,
+    /// `TimedOut` variant.
     TimedOut,
+    /// `BridgeErrored` variant.
     BridgeErrored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallStatus` data container.
 pub struct RemoteCallStatus {
+    /// `state` field for state.
     pub state: RemoteCallStatusState,
+    /// `operation` field for operation.
     pub operation: Option<String>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
+    /// `pending` field for pending.
     pub pending: usize,
+    /// `completed` field for completed.
     pub completed: u64,
+    /// `errors` field for errors.
     pub errors: u64,
+    /// `timeouts` field for timeouts.
     pub timeouts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteCallTimeout` data container.
 pub struct RemoteCallTimeout {
+    /// `operation` field for operation.
     pub operation: Option<String>,
+    /// `request_id` field for request id.
     pub request_id: String,
+    /// `error` field for error.
     pub error: String,
 }
 
 #[derive(Clone)]
+/// `RemoteCallOptions` data container.
 pub struct RemoteCallOptions {
+    /// `name` field for name.
     pub name: String,
 }
 
@@ -519,21 +740,29 @@ impl Default for RemoteCallOptions {
 }
 
 impl RemoteCallOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
 }
 
+/// `RemoteCallBundle` data container.
 pub struct RemoteCallBundle<TRequest: Clone + 'static, TResponse: Clone + 'static> {
     bridge_command: Node<WireBridgeCommand<RemoteCallRequest<TRequest>>>,
+    /// `responses` field for responses.
     pub responses: Node<RemoteCallResponse<TResponse>>,
+    /// `results` field for results.
     pub results: Node<RemoteCallResult<TResponse>>,
+    /// `status` field for status.
     pub status: Node<RemoteCallStatus>,
+    /// `errors` field for errors.
     pub errors: Node<RemoteCallError>,
+    /// `timeouts` field for timeouts.
     pub timeouts: Node<RemoteCallTimeout>,
 }
 
 impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRequest, TResponse> {
+    /// Updates or reads `call`.
     pub fn call(
         &self,
         operation: impl Into<String>,
@@ -543,6 +772,7 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRe
         self.call_with_options(operation, request_id, payload, None)
     }
 
+    /// Updates or reads `call_with_options`.
     pub fn call_with_options(
         &self,
         operation: impl Into<String>,
@@ -567,6 +797,7 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRe
         request
     }
 
+    /// Updates or reads `timeout`.
     pub fn timeout(
         &self,
         request_id: impl Into<String>,
@@ -592,54 +823,86 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRe
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteResponderEvent` variants.
 pub enum RemoteResponderEvent<TRequest, TResponse> {
+    /// `Request` variant.
     Request {
+        /// `request` field for request.
         request: RemoteCallRequest<TRequest>,
+        /// `seq` field for seq.
         seq: u64,
     },
+    /// `Response` variant.
     Response {
+        /// `request_id` field for request id.
         request_id: String,
+        /// `operation` field for operation.
         operation: String,
+        /// `command` field for command.
         command: WireBridgeCommand<RemoteCallResponse<TResponse>>,
     },
+    /// `Rejected` variant.
     Rejected {
+        /// `request_id` field for request id.
         request_id: Option<String>,
+        /// `operation` field for operation.
         operation: Option<String>,
+        /// `error` field for error.
         error: String,
+        /// `command` field for command.
         command: Option<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
     },
+    /// `Invalid` variant.
     Invalid {
+        /// `error` field for error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `RemoteResponderStatusState` variants.
 pub enum RemoteResponderStatusState {
+    /// `Idle` variant.
     Idle,
+    /// `Responded` variant.
     Responded,
+    /// `Rejected` variant.
     Rejected,
+    /// `Errored` variant.
     Errored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RemoteResponderStatus` data container.
 pub struct RemoteResponderStatus {
+    /// `state` field for state.
     pub state: RemoteResponderStatusState,
+    /// `operation` field for operation.
     pub operation: Option<String>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
+    /// `handled` field for handled.
     pub handled: u64,
+    /// `rejected` field for rejected.
     pub rejected: u64,
+    /// `errors` field for errors.
     pub errors: u64,
 }
 
+/// `RemoteResponderHandler` type alias.
 pub type RemoteResponderHandler<TRequest, TResponse> =
     Rc<dyn Fn(&RemoteCallRequest<TRequest>) -> Result<TResponse, String>>;
 
 #[derive(Clone)]
+/// `RemoteResponderHandlerDefinition` data container.
 pub struct RemoteResponderHandlerDefinition<TRequest, TResponse> {
+    /// `operation` field for operation.
     pub operation: String,
+    /// `handle` field for handle.
     pub handle: RemoteResponderHandler<TRequest, TResponse>,
 }
 
+/// Creates or computes `remote_responder_handler`.
 pub fn remote_responder_handler<TRequest, TResponse>(
     operation: impl Into<String>,
     handle: impl Fn(&RemoteCallRequest<TRequest>) -> Result<TResponse, String> + 'static,
@@ -656,9 +919,13 @@ pub fn remote_responder_handler<TRequest, TResponse>(
 }
 
 #[derive(Clone)]
+/// `RemoteResponderOptions` data container.
 pub struct RemoteResponderOptions<TRequest, TResponse> {
+    /// `name` field for name.
     pub name: String,
+    /// `handlers` field for handlers.
     pub handlers: Vec<RemoteResponderHandlerDefinition<TRequest, TResponse>>,
+    /// `reject_unknown` field for reject unknown.
     pub reject_unknown: bool,
 }
 
@@ -673,6 +940,7 @@ impl<TRequest, TResponse> Default for RemoteResponderOptions<TRequest, TResponse
 }
 
 impl<TRequest, TResponse> RemoteResponderOptions<TRequest, TResponse> {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -680,6 +948,7 @@ impl<TRequest, TResponse> RemoteResponderOptions<TRequest, TResponse> {
         }
     }
 
+    /// Updates or reads `with_handlers`.
     pub fn with_handlers(
         mut self,
         handlers: Vec<RemoteResponderHandlerDefinition<TRequest, TResponse>>,
@@ -688,17 +957,24 @@ impl<TRequest, TResponse> RemoteResponderOptions<TRequest, TResponse> {
         self
     }
 
+    /// Updates or reads `with_reject_unknown`.
     pub fn with_reject_unknown(mut self, reject: bool) -> Self {
         self.reject_unknown = reject;
         self
     }
 }
 
+/// `RemoteResponderBundle` data container.
 pub struct RemoteResponderBundle<TRequest: Clone + 'static, TResponse: Clone + 'static> {
+    /// `events` field for events.
     pub events: Node<RemoteResponderEvent<TRequest, TResponse>>,
+    /// `response_commands` field for response commands.
     pub response_commands: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
+    /// `requests` field for requests.
     pub requests: Node<RemoteCallRequest<TRequest>>,
+    /// `status` field for status.
     pub status: Node<RemoteResponderStatus>,
+    /// `errors` field for errors.
     pub errors: Node<RemoteCallError>,
     graph: Graph,
     bridge_command: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
@@ -744,22 +1020,28 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeIngress` variants.
 pub enum WireBridgeIngress<T> {
+    /// `Envelope` variant.
     Envelope(WireBridgeEnvelope<T>),
+    /// `Invalid` variant.
     Invalid(String),
 }
 
 #[derive(Clone)]
+/// `WireBridgeInbound` data container.
 pub struct WireBridgeInbound<T: Clone + 'static> {
     node: Node<WireBridgeIngress<T>>,
     session_id: String,
 }
 
 impl<T: Clone + 'static> WireBridgeInbound<T> {
+    /// Updates or reads `session_id`.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
+    /// Updates or reads `down`.
     pub fn down(&self, msgs: Vec<Message<AnyValue>>) {
         for msg in msgs {
             self.node.down(vec![self.guard_msg(msg)]);
@@ -796,14 +1078,17 @@ impl<T: Clone + 'static> WireBridgeInbound<T> {
         }
     }
 
+    /// Updates or reads `set`.
     pub fn set(&self, envelope: WireBridgeEnvelope<T>) {
         self.down(vec![Message::Data(Rc::new(envelope))]);
     }
 
+    /// Updates or reads `subscribe`.
     pub fn subscribe(&self, sink: impl Fn(&Message<AnyValue>) + 'static) -> Box<dyn FnOnce()> {
         self.node.subscribe(sink)
     }
 
+    /// Updates or reads `erased`.
     pub fn erased(&self) -> crate::node::Core {
         self.node.erased()
     }
@@ -828,6 +1113,7 @@ struct BridgeState<T> {
     pending: BTreeMap<u64, PendingEnvelope<T>>,
 }
 
+/// Creates or computes `wire_bridge`.
 pub fn wire_bridge<TOutbound, TInbound>(
     graph: &Graph,
     opts: WireBridgeOptions,
@@ -883,13 +1169,17 @@ where
 }
 
 #[derive(Clone)]
+/// `WireEdgeGroupEdge` data container.
 pub struct WireEdgeGroupEdge {
+    /// `edge_id` field for edge id.
     pub edge_id: String,
+    /// `outbound` field for outbound.
     pub outbound: Option<Node<Vec<u8>>>,
 }
 
 impl WireEdgeGroupEdge {
     #[must_use]
+    /// Creates or computes `inbound`.
     pub fn inbound(edge_id: impl Into<String>) -> Self {
         Self {
             edge_id: edge_id.into(),
@@ -898,6 +1188,7 @@ impl WireEdgeGroupEdge {
     }
 
     #[must_use]
+    /// Creates or computes `outbound`.
     pub fn outbound(edge_id: impl Into<String>, outbound: Node<Vec<u8>>) -> Self {
         Self {
             edge_id: edge_id.into(),
@@ -907,18 +1198,23 @@ impl WireEdgeGroupEdge {
 }
 
 #[derive(Clone)]
+/// `WireEdgeGroupOptions` data container.
 pub struct WireEdgeGroupOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `edges` field for edges.
     pub edges: Vec<WireEdgeGroupEdge>,
 }
 
 impl WireEdgeGroupOptions {
     #[must_use]
+    /// Creates or computes `new`.
     pub fn new(edges: Vec<WireEdgeGroupEdge>) -> Self {
         Self { name: None, edges }
     }
 
     #[must_use]
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>, edges: Vec<WireEdgeGroupEdge>) -> Self {
         Self {
             name: Some(name.into()),
@@ -928,19 +1224,29 @@ impl WireEdgeGroupOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireEdgeGroupIssueCode` variants.
 pub enum WireEdgeGroupIssueCode {
+    /// `MissingSnapshot` variant.
     MissingSnapshot,
+    /// `UnknownEdge` variant.
     UnknownEdge,
+    /// `DuplicateDirty` variant.
     DuplicateDirty,
+    /// `DuplicateData` variant.
     DuplicateData,
+    /// `DataBeforeDirty` variant.
     DataBeforeDirty,
+    /// `CompetingCause` variant.
     CompetingCause,
+    /// `MalformedFrame` variant.
     MalformedFrame,
+    /// `IncompleteCause` variant.
     IncompleteCause,
 }
 
 impl WireEdgeGroupIssueCode {
     #[must_use]
+    /// Updates or reads `as_str`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MissingSnapshot => "wire-edge-group-missing-snapshot",
@@ -956,37 +1262,61 @@ impl WireEdgeGroupIssueCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireEdgeGroupIssue` data container.
 pub struct WireEdgeGroupIssue {
+    /// `code` field for code.
     pub code: WireEdgeGroupIssueCode,
+    /// `message` field for message.
     pub message: String,
+    /// `edge_id` field for edge id.
     pub edge_id: Option<String>,
+    /// `cause_id` field for cause id.
     pub cause_id: Option<String>,
+    /// `active_cause_id` field for active cause id.
     pub active_cause_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireEdgeGroupStatusState` variants.
 pub enum WireEdgeGroupStatusState {
+    /// `Idle` variant.
     Idle,
+    /// `Collecting` variant.
     Collecting,
+    /// `Released` variant.
     Released,
+    /// `Issues` variant.
     Issues,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireEdgeGroupStatus` data container.
 pub struct WireEdgeGroupStatus {
+    /// `state` field for state.
     pub state: WireEdgeGroupStatusState,
+    /// `expected_edges` field for expected edges.
     pub expected_edges: Vec<String>,
+    /// `active_cause_id` field for active cause id.
     pub active_cause_id: Option<String>,
+    /// `dirty` field for dirty.
     pub dirty: usize,
+    /// `data` field for data.
     pub data: usize,
+    /// `released` field for released.
     pub released: u64,
+    /// `issues` field for issues.
     pub issues: u64,
+    /// `last_issue` field for last issue.
     pub last_issue: Option<WireEdgeGroupIssue>,
 }
 
+/// `WireEdgeGroupBundle` data container.
 pub struct WireEdgeGroupBundle {
+    /// `inbound` field for inbound.
     pub inbound: BTreeMap<String, Node<Vec<u8>>>,
+    /// `status` field for status.
     pub status: Node<WireEdgeGroupStatus>,
+    /// `issues` field for issues.
     pub issues: Node<WireEdgeGroupIssue>,
     graph: Graph,
     topology: TopologyGroup,
@@ -999,6 +1329,7 @@ pub struct WireEdgeGroupBundle {
 }
 
 impl WireEdgeGroupBundle {
+    /// Updates or reads `release`.
     pub fn release(&self) {
         if self.released.get() {
             return;
@@ -1034,6 +1365,7 @@ impl WireEdgeGroupBundle {
     }
 }
 
+/// Creates or computes `wire_edge_group`.
 pub fn wire_edge_group(
     graph: &Graph,
     bridge: &WireBridgeBundle<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>,
@@ -2053,6 +2385,7 @@ fn wire_edge_group_status_fn(expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'stat
     }
 }
 
+/// Creates or computes `remote_call`.
 pub fn remote_call<TRequest, TResponse>(
     graph: &Graph,
     bridge: &WireBridgeBundle<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
@@ -2064,6 +2397,7 @@ where
     remote_call_with_options(graph, bridge, RemoteCallOptions::default())
 }
 
+/// Creates or computes `remote_call_with_options`.
 pub fn remote_call_with_options<TRequest, TResponse>(
     graph: &Graph,
     bridge: &WireBridgeBundle<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
@@ -2099,6 +2433,7 @@ where
     }
 }
 
+/// Creates or computes `remote_responder`.
 pub fn remote_responder<TRequest, TResponse>(
     graph: &Graph,
     bridge: &WireBridgeBundle<RemoteCallResponse<TResponse>, RemoteCallRequest<TRequest>>,

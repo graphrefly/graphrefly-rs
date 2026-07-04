@@ -1,12 +1,14 @@
 # graphrefly-rs — agent context (Rust implementation, clean-slate)
 
 **GraphReFly** — reactive universal reduction layer (high fan-in/out → information
-reduction → push; not LLM-limited, D1). This repo is the **Rust implementation**
-(`@graphrefly/rust`): the native shared engine and reusable graph-infrastructure
-library for Python and future non-TS host-language packages (D415). TypeScript remains
-self-contained; Python/host packages own idiomatic bindings, value/lifetime mapping, and
-ecosystem integration over this Rust layer. Cross-runtime graph collaboration = a coarse
-wire bridge, never hidden distributed same-wave semantics.
+reduction → push; not LLM-limited, D1). This repo is the **Rust implementation**:
+the Cargo package `graphrefly-rs`, lib crate `graphrefly`, a self-contained Rust
+package (D32), and the native shared engine/reusable graph-infrastructure library
+for Python and future non-TS host-language packages (D415). TypeScript remains
+self-contained; Python/host packages own idiomatic bindings, value/lifetime
+mapping, and ecosystem integration over this Rust layer. Cross-runtime graph
+collaboration = a coarse wire bridge, never hidden distributed same-wave
+semantics.
 
 > **Clean-slate retired the port model.** The old `main` branch (M1–M5 milestones,
 > handle-protocol cleaving plane, `Arc<Mutex>` actor model, 8-crate workspace,
@@ -30,11 +32,25 @@ Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for th
 | **Conformance scenarios (parity)** | `~/src/graphrefly/spec/conformance.jsonl` (driven via `/conformance`) |
 | **Formal model** | `~/src/graphrefly/formal/*.tla` (+ MC configs) |
 | **Sequencer / backlog / anti-patterns** | `~/src/graphrefly/plan/{phases,backlog,antipatterns}.jsonl` (this repo = CSP-5/CSP-6) |
-| **Rendered view** (progress / structure / gaps) | `~/src/graphrefly/dashboard/` (`node dashboard/build.mjs`) |
+| **Shared public docs / graphrefly.dev architecture** | `~/src/graphrefly/docs` + guide records (D563) |
+| **Rendered authority view** (progress / structure / gaps) | `~/src/graphrefly/dashboard/` (`node dashboard/build.mjs`) |
 
 Sibling packages: `@graphrefly/ts` (`~/src/graphrefly-ts`) is the self-contained
 TypeScript package and lead spec-hardening impl; `@graphrefly/py` (`~/src/graphrefly-py`)
 is the Python host package layered over the Rust native engine (D415).
+
+## Rust package-local documentation boundary
+
+`docs/docs.jsonl` is this repo's package-local docs policy. It exists to keep
+D32 and D563 boundaries sharp:
+
+- `~/src/graphrefly` owns shared public docs, guide records, graphrefly.dev
+  website/blog architecture, protocol authority, and dashboard/control views.
+- `~/src/graphrefly-rs` owns Rust rustdoc comments, crate README material,
+  Rust examples, development docs, crate release notes, docs.rs output, and
+  Rust package-local docs checks.
+- This repo must not hand-maintain mirrors of shared public docs, TypeScript
+  docs, Python docs, public blog posts, or the internal dashboard.
 
 ## Clean-slate floor (cite, never violate — full text in DS-1 / `rules.jsonl`)
 
@@ -139,10 +155,12 @@ mise exec -- cargo fmt --all
 # from the port era; rewire them to the single crate before relying on them.
 ```
 
-## Memory principles (inherited; live in graphrefly-ts memory dir, not duplicated here)
+## Durable principles
 
-`~/.claude/projects/-Users-davidchenallio-src-graphrefly-ts/memory/` — esp.
-`feedback_no_autonomous_decisions`, `feedback_no_implement_without_approval`,
-`feedback_single_source_of_truth`, `feedback_long_command_observation`,
-`project_clean_slate_pivot`, `project_rust_clean_slate_kickoff`,
-`feedback_three_gate_substrate_convergence`.
+Follow the durable project values named in the clean-slate skills and
+`~/src/graphrefly` authority docs, especially `feedback_no_autonomous_decisions`,
+`feedback_no_implement_without_approval`, `feedback_single_source_of_truth`,
+`feedback_long_command_observation`, `project_clean_slate_pivot`,
+`project_rust_clean_slate_kickoff`, and
+`feedback_three_gate_substrate_convergence`. Do not treat any TypeScript memory
+directory as a Rust documentation authority.

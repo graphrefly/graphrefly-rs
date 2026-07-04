@@ -1,13 +1,20 @@
 # `@graphrefly/native`
 
-Rust-native substrate for [`@graphrefly/graphrefly`](https://github.com/clfhhc/graphrefly-ts)
-— same `Impl` contract as `@graphrefly/pure-ts`, implemented in Rust via
-[napi-rs](https://napi.rs).
+> **Historical port-era binding package.** This crate is excluded from the
+> clean-slate workspace and retained as frozen reference material. It is not
+> current Rust package API guidance. Current Rust package docs are governed by
+> [`../../docs/docs.jsonl`](../../docs/docs.jsonl); shared public docs live in
+> `~/src/graphrefly` under D563.
+
+Rust-native preview substrate for the retired `@graphrefly/graphrefly` /
+`@graphrefly/pure-ts` port-era stack, implemented in Rust via
+[napi-rs](https://napi.rs). Treat references to the old parity harness as
+historical behavior-test context, not structural `Impl` parity guidance.
 
 This package is an **async preview** (D206/D207): every Core-touching call
 returns a `Promise`. Direct sync consumers stay on `@graphrefly/pure-ts`
-for the time being; this package exists for async-tolerant Node consumers
-and is the parity-arm in `packages/parity-tests`.
+for the time being; this package existed for async-tolerant Node consumers
+and as a historical participant in `packages/parity-tests`.
 
 ## Install
 

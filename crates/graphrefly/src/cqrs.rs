@@ -21,16 +21,24 @@ use crate::node::Node;
 use crate::operators::Operator;
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsCommand` data container.
 pub struct CqrsCommand<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: String,
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `aggregate_id` field for aggregate id.
     pub aggregate_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<T> CqrsCommand<T> {
+    /// Creates or computes `new`.
     pub fn new(id: impl Into<String>, command_type: impl Into<String>, payload: T) -> Self {
         Self {
             id: id.into(),
@@ -44,16 +52,24 @@ impl<T> CqrsCommand<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsEventDraft` data container.
 pub struct CqrsEventDraft<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: Option<String>,
+    /// `event_type` field for event type.
     pub event_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `aggregate_id` field for aggregate id.
     pub aggregate_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<T> CqrsEventDraft<T> {
+    /// Creates or computes `new`.
     pub fn new(event_type: impl Into<String>, payload: T) -> Self {
         Self {
             id: None,
@@ -67,99 +83,166 @@ impl<T> CqrsEventDraft<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsEvent` data container.
 pub struct CqrsEvent<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: String,
+    /// `event_type` field for event type.
     pub event_type: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `runtime_cursor` field for runtime cursor.
     pub runtime_cursor: CqrsCursor,
+    /// `command_id` field for command id.
     pub command_id: String,
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `aggregate_id` field for aggregate id.
     pub aggregate_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsErrorCode` variants.
 pub enum CqrsErrorCode {
+    /// `MalformedCommand` variant.
     MalformedCommand,
+    /// `DuplicateCommand` variant.
     DuplicateCommand,
+    /// `UnknownCommand` variant.
     UnknownCommand,
+    /// `HandlerThrew` variant.
     HandlerThrew,
+    /// `ClockThrew` variant.
     ClockThrew,
+    /// `MalformedEvent` variant.
     MalformedEvent,
+    /// `UnknownEvent` variant.
     UnknownEvent,
+    /// `DuplicateEvent` variant.
     DuplicateEvent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsError` data container.
 pub struct CqrsError<TCommand = crate::protocol::AnyValue> {
+    /// `code` field for code.
     pub code: CqrsErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `command` field for command.
     pub command: Option<CqrsCommand<TCommand>>,
+    /// `cursor` field for cursor.
     pub cursor: CqrsCursor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsDedupeSnapshot` data container.
 pub struct CqrsDedupeSnapshot {
+    /// `command_ids_retained` field for command ids retained.
     pub command_ids_retained: usize,
+    /// `event_ids_retained` field for event ids retained.
     pub event_ids_retained: usize,
+    /// `command_ids_evicted` field for command ids evicted.
     pub command_ids_evicted: u64,
+    /// `event_ids_evicted` field for event ids evicted.
     pub event_ids_evicted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsCursor` data container.
 pub struct CqrsCursor {
+    /// `event_seq` field for event seq.
     pub event_seq: u64,
+    /// `command_count` field for command count.
     pub command_count: u64,
+    /// `error_count` field for error count.
     pub error_count: u64,
+    /// `audit_seq` field for audit seq.
     pub audit_seq: u64,
+    /// `dedupe` field for dedupe.
     pub dedupe: Option<CqrsDedupeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsStatus` data container.
 pub struct CqrsStatus {
+    /// `state` field for state.
     pub state: CqrsStatusState,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `command_type` field for command type.
     pub command_type: Option<String>,
+    /// `event_count` field for event count.
     pub event_count: usize,
+    /// `error_code` field for error code.
     pub error_code: Option<CqrsErrorCode>,
+    /// `cursor` field for cursor.
     pub cursor: CqrsCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsStatusState` variants.
 pub enum CqrsStatusState {
+    /// `Accepted` variant.
     Accepted,
+    /// `Rejected` variant.
     Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsAuditRecord` data container.
 pub struct CqrsAuditRecord {
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `command_type` field for command type.
     pub command_type: Option<String>,
+    /// `outcome` field for outcome.
     pub outcome: CqrsAuditOutcome,
+    /// `event_ids` field for event ids.
     pub event_ids: Vec<String>,
+    /// `event_types` field for event types.
     pub event_types: Vec<String>,
+    /// `error_code` field for error code.
     pub error_code: Option<CqrsErrorCode>,
+    /// `error_message` field for error message.
     pub error_message: Option<String>,
+    /// `cursor` field for cursor.
     pub cursor: CqrsCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsAuditOutcome` variants.
 pub enum CqrsAuditOutcome {
+    /// `Success` variant.
     Success,
+    /// `Failure` variant.
     Failure,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsRuntimeFact` variants.
 pub enum CqrsRuntimeFact<TCommand = crate::protocol::AnyValue, TEvent = crate::protocol::AnyValue> {
+    /// `Event` variant.
     Event(CqrsEvent<TEvent>),
+    /// `Status` variant.
     Status(CqrsStatus),
+    /// `Error` variant.
     Error(CqrsError<TCommand>),
+    /// `Audit` variant.
     Audit(CqrsAuditRecord),
+    /// `Cursor` variant.
     Cursor(CqrsCursor),
 }
 
@@ -169,13 +252,21 @@ pub enum CqrsRuntimeFact<TCommand = crate::protocol::AnyValue, TEvent = crate::p
 /// commands and events each own their own id membership window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CqrsDedupeWindow {
+    /// `Unbounded` variant.
     Unbounded,
-    Bounded { max_entries: usize },
+    /// `Bounded` variant.
+    Bounded {
+        /// `max_entries` field for `Bounded`.
+        max_entries: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsDedupePolicy` data container.
 pub struct CqrsDedupePolicy {
+    /// `commands` field for commands.
     pub commands: CqrsDedupeWindow,
+    /// `events` field for events.
     pub events: CqrsDedupeWindow,
 }
 
@@ -189,6 +280,7 @@ impl Default for CqrsDedupePolicy {
 }
 
 impl CqrsDedupePolicy {
+    /// Creates or computes `bounded`.
     pub fn bounded(command_max_entries: usize, event_max_entries: usize) -> Self {
         Self {
             commands: CqrsDedupeWindow::Bounded {
@@ -206,15 +298,20 @@ impl CqrsDedupePolicy {
     }
 }
 
+/// `CqrsCommandHandler` type alias.
 pub type CqrsCommandHandler<TCommand, TEvent> =
     Rc<dyn Fn(&CqrsCommand<TCommand>) -> Vec<CqrsEventDraft<TEvent>>>;
 
 #[derive(Clone)]
+/// `CqrsCommandHandlerDefinition` data container.
 pub struct CqrsCommandHandlerDefinition<TCommand, TEvent> {
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `handle` field for handle.
     pub handle: CqrsCommandHandler<TCommand, TEvent>,
 }
 
+/// Creates or computes `cqrs_command_handler`.
 pub fn cqrs_command_handler<TCommand, TEvent>(
     command_type: impl Into<String>,
     handle: impl Fn(&CqrsCommand<TCommand>) -> Vec<CqrsEventDraft<TEvent>> + 'static,
@@ -231,11 +328,17 @@ pub fn cqrs_command_handler<TCommand, TEvent>(
 }
 
 #[derive(Clone)]
+/// `CqrsOptions` data container.
 pub struct CqrsOptions<TCommand, TEvent> {
+    /// `name` field for name.
     pub name: String,
+    /// `handlers` field for handlers.
     pub handlers: Vec<CqrsCommandHandlerDefinition<TCommand, TEvent>>,
+    /// `events` field for events.
     pub events: Option<Vec<String>>,
+    /// `now` field for now.
     pub now: Rc<dyn Fn() -> u64>,
+    /// `dedupe` field for dedupe.
     pub dedupe: CqrsDedupePolicy,
 }
 
@@ -252,6 +355,7 @@ impl<TCommand, TEvent> Default for CqrsOptions<TCommand, TEvent> {
 }
 
 impl<TCommand, TEvent> CqrsOptions<TCommand, TEvent> {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -259,6 +363,7 @@ impl<TCommand, TEvent> CqrsOptions<TCommand, TEvent> {
         }
     }
 
+    /// Updates or reads `with_handlers`.
     pub fn with_handlers(
         mut self,
         handlers: Vec<CqrsCommandHandlerDefinition<TCommand, TEvent>>,
@@ -267,16 +372,19 @@ impl<TCommand, TEvent> CqrsOptions<TCommand, TEvent> {
         self
     }
 
+    /// Updates or reads `with_events`.
     pub fn with_events(mut self, events: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.events = Some(events.into_iter().map(Into::into).collect());
         self
     }
 
+    /// Updates or reads `with_now`.
     pub fn with_now(mut self, now: impl Fn() -> u64 + 'static) -> Self {
         self.now = Rc::new(now);
         self
     }
 
+    /// Updates or reads `with_dedupe`.
     pub fn with_dedupe(mut self, dedupe: CqrsDedupePolicy) -> Self {
         self.dedupe = dedupe;
         self
@@ -284,18 +392,27 @@ impl<TCommand, TEvent> CqrsOptions<TCommand, TEvent> {
 }
 
 #[derive(Clone)]
+/// `CqrsBundle` data container.
 pub struct CqrsBundle<TCommand = crate::protocol::AnyValue, TEvent = crate::protocol::AnyValue> {
+    /// `command` field for command.
     pub command: Node<CqrsCommand<TCommand>>,
+    /// `runtime` field for runtime.
     pub runtime: Node<CqrsRuntimeFact<TCommand, TEvent>>,
+    /// `events` field for events.
     pub events: Node<CqrsEvent<TEvent>>,
+    /// `status` field for status.
     pub status: Node<CqrsStatus>,
+    /// `errors` field for errors.
     pub errors: Node<CqrsError<TCommand>>,
+    /// `audit` field for audit.
     pub audit: Node<CqrsAuditRecord>,
+    /// `cursor` field for cursor.
     pub cursor: Node<CqrsCursor>,
     _retains: Rc<Vec<CqrsRetain>>,
 }
 
 impl<TCommand: Clone + 'static, TEvent: Clone + 'static> CqrsBundle<TCommand, TEvent> {
+    /// Updates or reads `dispatch`.
     pub fn dispatch(&self, command: CqrsCommand<TCommand>) -> CqrsCommand<TCommand> {
         self.command.set(command.clone());
         command
@@ -322,12 +439,14 @@ impl Drop for CqrsRetain {
     }
 }
 
+/// Creates or computes `cqrs`.
 pub fn cqrs<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     graph: &Graph,
 ) -> CqrsBundle<TCommand, TEvent> {
     cqrs_with_options(graph, CqrsOptions::default())
 }
 
+/// Creates or computes `cqrs_with_options`.
 pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     graph: &Graph,
     opts: CqrsOptions<TCommand, TEvent>,
@@ -453,63 +572,97 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     }
 }
 
+/// `CqrsProjectionReducer` type alias.
 pub type CqrsProjectionReducer<TState, TEvent> = Rc<dyn Fn(TState, &CqrsEvent<TEvent>) -> TState>;
 
 #[derive(Clone)]
+/// `CqrsProjectionOptions` data container.
 pub struct CqrsProjectionOptions<TState, TEvent> {
+    /// `name` field for name.
     pub name: String,
+    /// `events` field for events.
     pub events: Option<Vec<String>>,
+    /// `initial` field for initial.
     pub initial: TState,
+    /// `reducer` field for reducer.
     pub reducer: CqrsProjectionReducer<TState, TEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsProjectionFrame` variants.
 pub enum CqrsProjectionFrame<TState> {
+    /// `Value` variant.
     Value {
+        /// `state` field for state.
         state: TState,
+        /// `event_id` field for event id.
         event_id: String,
+        /// `cursor` field for cursor.
         cursor: CqrsCursor,
     },
+    /// `Error` variant.
     Error(CqrsProjectionError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsProjectionError` data container.
 pub struct CqrsProjectionError {
+    /// `code` field for code.
     pub code: CqrsProjectionErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `event_id` field for event id.
     pub event_id: String,
+    /// `event_type` field for event type.
     pub event_type: String,
+    /// `cursor` field for cursor.
     pub cursor: CqrsCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsProjectionErrorCode` variants.
 pub enum CqrsProjectionErrorCode {
+    /// `ProjectionThrew` variant.
     ProjectionThrew,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CqrsProjectionStatus` data container.
 pub struct CqrsProjectionStatus {
+    /// `state` field for state.
     pub state: CqrsProjectionStatusState,
+    /// `event_id` field for event id.
     pub event_id: String,
+    /// `event_type` field for event type.
     pub event_type: Option<String>,
+    /// `cursor` field for cursor.
     pub cursor: CqrsCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CqrsProjectionStatusState` variants.
 pub enum CqrsProjectionStatusState {
+    /// `Updated` variant.
     Updated,
+    /// `Errored` variant.
     Errored,
 }
 
 #[derive(Clone)]
+/// `CqrsProjection` data container.
 pub struct CqrsProjection<TState> {
+    /// `frames` field for frames.
     pub frames: Node<CqrsProjectionFrame<TState>>,
+    /// `value` field for value.
     pub value: Node<TState>,
+    /// `status` field for status.
     pub status: Node<CqrsProjectionStatus>,
+    /// `errors` field for errors.
     pub errors: Node<CqrsProjectionError>,
     _retains: Rc<Vec<CqrsRetain>>,
 }
 
+/// Creates or computes `cqrs_projection`.
 pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
     graph: &Graph,
     source: &CqrsBundle<impl Clone + 'static, TEvent>,

@@ -22,10 +22,15 @@ use crate::scheduled_readiness::{
 use crate::work_queue::{WorkQueueCommand, WorkQueueDerivedState, WorkQueueRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WorkQueueReadinessScheduleKind` variants.
 pub enum WorkQueueReadinessScheduleKind {
+    /// `AdmissionDelay` variant.
     AdmissionDelay,
+    /// `WorkScheduled` variant.
     WorkScheduled,
+    /// `RetryScheduled` variant.
     RetryScheduled,
+    /// `LeaseExpiration` variant.
     LeaseExpiration,
 }
 
@@ -51,17 +56,26 @@ impl WorkQueueReadinessScheduleKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WorkQueueReadinessStatusState` variants.
 pub enum WorkQueueReadinessStatusState {
+    /// `Translated` variant.
     Translated,
+    /// `Candidate` variant.
     Candidate,
+    /// `Ignored` variant.
     Ignored,
+    /// `Overdue` variant.
     Overdue,
+    /// `Issue` variant.
     Issue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WorkQueueReadinessCandidateKind` variants.
 pub enum WorkQueueReadinessCandidateKind {
+    /// `ClaimEligible` variant.
     ClaimEligible,
+    /// `LeaseExpirationEligible` variant.
     LeaseExpirationEligible,
 }
 
@@ -75,49 +89,81 @@ impl WorkQueueReadinessCandidateKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueReadinessStatus` data container.
 pub struct WorkQueueReadinessStatus {
+    /// `status_id` field for status id.
     pub status_id: String,
+    /// `queue_id` field for queue id.
     pub queue_id: String,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `schedule_id` field for schedule id.
     pub schedule_id: Option<String>,
+    /// `state` field for state.
     pub state: WorkQueueReadinessStatusState,
+    /// `schedule_kind` field for schedule kind.
     pub schedule_kind: Option<WorkQueueReadinessScheduleKind>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
+    /// `issue_code` field for issue code.
     pub issue_code: Option<String>,
+    /// `details` field for details.
     pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `WorkQueueReadinessCandidate` data container.
 pub struct WorkQueueReadinessCandidate {
+    /// `candidate_id` field for candidate id.
     pub candidate_id: String,
+    /// `queue_id` field for queue id.
     pub queue_id: String,
+    /// `work_id` field for work id.
     pub work_id: String,
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `candidate_kind` field for candidate kind.
     pub candidate_kind: WorkQueueReadinessCandidateKind,
+    /// `schedule_kind` field for schedule kind.
     pub schedule_kind: WorkQueueReadinessScheduleKind,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: u64,
+    /// `now_ms` field for now ms.
     pub now_ms: u64,
+    /// `lease_id` field for lease id.
     pub lease_id: Option<String>,
+    /// `attempt` field for attempt.
     pub attempt: Option<u32>,
+    /// `worker_id` field for worker id.
     pub worker_id: Option<String>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+/// `WorkQueueReadinessViews` data container.
 pub struct WorkQueueReadinessViews {
+    /// `schedules_by_id` field for schedules by id.
     pub schedules_by_id: BTreeMap<String, ScheduledReadinessRequested>,
+    /// `candidates_by_id` field for candidates by id.
     pub candidates_by_id: BTreeMap<String, WorkQueueReadinessCandidate>,
+    /// `status_by_id` field for status by id.
     pub status_by_id: BTreeMap<String, WorkQueueReadinessStatus>,
 }
 
 #[derive(Clone)]
+/// `WorkQueueScheduledReadinessOptions` data container.
 pub struct WorkQueueScheduledReadinessOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `records` field for records.
     pub records: Vec<Node<WorkQueueRecord<T>>>,
 }
 
 impl<T> WorkQueueScheduledReadinessOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(records: Vec<Node<WorkQueueRecord<T>>>) -> Self {
         Self {
             name: None,
@@ -125,6 +171,7 @@ impl<T> WorkQueueScheduledReadinessOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -132,14 +179,20 @@ impl<T> WorkQueueScheduledReadinessOptions<T> {
 }
 
 #[derive(Clone)]
+/// `WorkQueueReadinessHandoffOptions` data container.
 pub struct WorkQueueReadinessHandoffOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `records` field for records.
     pub records: Vec<Node<WorkQueueRecord<T>>>,
+    /// `ready` field for ready.
     pub ready: Vec<Node<ScheduledReadinessReady>>,
+    /// `overdue` field for overdue.
     pub overdue: Vec<Node<ScheduledReadinessOverdue>>,
 }
 
 impl<T> WorkQueueReadinessHandoffOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(
         records: Vec<Node<WorkQueueRecord<T>>>,
         ready: Vec<Node<ScheduledReadinessReady>>,
@@ -152,11 +205,13 @@ impl<T> WorkQueueReadinessHandoffOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Updates or reads `with_overdue`.
     pub fn with_overdue(mut self, overdue: Vec<Node<ScheduledReadinessOverdue>>) -> Self {
         self.overdue = overdue;
         self
@@ -164,31 +219,48 @@ impl<T> WorkQueueReadinessHandoffOptions<T> {
 }
 
 #[derive(Clone)]
+/// `WorkQueueScheduledReadinessBundle` data container.
 pub struct WorkQueueScheduledReadinessBundle {
+    /// `readiness_schedules` field for readiness schedules.
     pub readiness_schedules: Node<ScheduledReadinessRequested>,
+    /// `status` field for status.
     pub status: Node<WorkQueueReadinessStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// `audit` field for audit.
     pub audit: Node<ScheduledReadinessAuditRecord>,
+    /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
 }
 
 #[derive(Clone)]
+/// `WorkQueueReadinessHandoffBundle` data container.
 pub struct WorkQueueReadinessHandoffBundle {
+    /// `candidates` field for candidates.
     pub candidates: Node<WorkQueueReadinessCandidate>,
+    /// `status` field for status.
     pub status: Node<WorkQueueReadinessStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// `audit` field for audit.
     pub audit: Node<ScheduledReadinessAuditRecord>,
+    /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
 }
 
 #[derive(Clone)]
+/// `WorkQueueLeaseExpirationCommandProjectorOptions` data container.
 pub struct WorkQueueLeaseExpirationCommandProjectorOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `candidates` field for candidates.
     pub candidates: Vec<Node<WorkQueueReadinessCandidate>>,
+    /// `command_prefix` field for command prefix.
     pub command_prefix: Option<String>,
 }
 
 impl WorkQueueLeaseExpirationCommandProjectorOptions {
+    /// Creates or computes `new`.
     pub fn new(candidates: Vec<Node<WorkQueueReadinessCandidate>>) -> Self {
         Self {
             name: None,
@@ -197,11 +269,13 @@ impl WorkQueueLeaseExpirationCommandProjectorOptions {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Updates or reads `command_prefix`.
     pub fn command_prefix(mut self, command_prefix: impl Into<String>) -> Self {
         self.command_prefix = Some(command_prefix.into());
         self
@@ -248,6 +322,7 @@ struct HandoffState {
     audit_seq: u64,
 }
 
+/// Creates or computes `work_queue_scheduled_readiness_projector`.
 pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
     graph: &Graph,
     opts: WorkQueueScheduledReadinessOptions<T>,
@@ -345,6 +420,7 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `work_queue_readiness_handoff_projector`.
 pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
     graph: &Graph,
     opts: WorkQueueReadinessHandoffOptions<T>,
@@ -458,6 +534,7 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `work_queue_lease_expiration_command_projector`.
 pub fn work_queue_lease_expiration_command_projector<T: Clone + 'static>(
     graph: &Graph,
     opts: WorkQueueLeaseExpirationCommandProjectorOptions,
@@ -488,6 +565,7 @@ pub fn work_queue_lease_expiration_command_projector<T: Clone + 'static>(
     )
 }
 
+/// Creates or computes `work_queue_lease_expiration_command`.
 pub fn work_queue_lease_expiration_command<T>(
     candidate: &WorkQueueReadinessCandidate,
     command_prefix: &str,

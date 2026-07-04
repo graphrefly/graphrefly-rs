@@ -26,20 +26,35 @@ use crate::json::{strict_canonical_json_bytes, strict_json_decode, Codec, JsonCo
 
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `StorageResult` type alias.
 pub type StorageResult<T> = Result<T, StorageError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `StorageError` variants.
 pub enum StorageError {
-    Unsupported { label: String, capability: String },
-    ContentAddressedMiss { key: String },
+    /// `Unsupported` variant.
+    Unsupported {
+        /// `label` field for `Unsupported`.
+        label: String,
+        /// `capability` field for `Unsupported`.
+        capability: String,
+    },
+    /// `ContentAddressedMiss` variant.
+    ContentAddressedMiss {
+        /// `key` field for `ContentAddressedMiss`.
+        key: String,
+    },
+    /// `Backend` variant.
     Backend(String),
 }
 
 impl StorageError {
+    /// Creates or computes `backend`.
     pub fn backend(message: impl Into<String>) -> Self {
         Self::Backend(message.into())
     }
 
+    /// Creates or computes `unsupported`.
     pub fn unsupported(label: impl Into<String>, capability: impl Into<String>) -> Self {
         Self::Unsupported {
             label: label.into(),
@@ -67,13 +82,19 @@ impl fmt::Display for StorageError {
 
 impl Error for StorageError {}
 
+/// `ByteStorageBackend` behavior contract.
 pub trait ByteStorageBackend {
+    /// Updates or reads `get`.
     fn get(&self, key: &str) -> StorageResult<Option<Vec<u8>>>;
+    /// Updates or reads `put`.
     fn put(&self, key: &str, value: &[u8]) -> StorageResult<()>;
+    /// Updates or reads `put_if_absent`.
     fn put_if_absent(&self, _key: &str, _value: &[u8]) -> StorageResult<bool> {
         Err(StorageError::unsupported("byteStorage", "put-if-absent"))
     }
+    /// Updates or reads `delete`.
     fn delete(&self, key: &str) -> StorageResult<()>;
+    /// Updates or reads `list`.
     fn list(&self, prefix: &str) -> StorageResult<Vec<String>>;
 }
 
@@ -122,8 +143,11 @@ fn content_addressed_storage_key(prefix: &str, hash_hex: &str) -> String {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `FileBackendOptions` data container.
 pub struct FileBackendOptions {
+    /// `namespace` field for namespace.
     pub namespace: String,
+    /// `extension` field for extension.
     pub extension: String,
 }
 
@@ -137,15 +161,18 @@ impl Default for FileBackendOptions {
 }
 
 impl FileBackendOptions {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Updates or reads `with_namespace`.
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = namespace.into();
         self
     }
 
+    /// Updates or reads `with_extension`.
     pub fn with_extension(mut self, extension: impl Into<String>) -> Self {
         self.extension = extension.into();
         self
@@ -153,12 +180,14 @@ impl FileBackendOptions {
 }
 
 #[derive(Clone, Debug)]
+/// `FileBackend` data container.
 pub struct FileBackend {
     dir: PathBuf,
     namespace: String,
     extension: String,
 }
 
+/// Creates or computes `file_backend`.
 pub fn file_backend(
     dir: impl Into<PathBuf>,
     opts: FileBackendOptions,
@@ -173,6 +202,7 @@ pub fn file_backend(
 }
 
 impl FileBackend {
+    /// Updates or reads `dir`.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -435,12 +465,24 @@ impl fmt::Debug for KvGeneration {
 }
 
 #[derive(Clone, Debug)]
+/// `KvVersionedRead` variants.
 pub enum KvVersionedRead<T> {
-    Hit { value: T, generation: KvGeneration },
-    Miss { generation: KvGeneration },
+    /// `Hit` variant.
+    Hit {
+        /// `value` field for `Hit`.
+        value: T,
+        /// `generation` field for `Hit`.
+        generation: KvGeneration,
+    },
+    /// `Miss` variant.
+    Miss {
+        /// `generation` field for `Miss`.
+        generation: KvGeneration,
+    },
 }
 
 impl<T> KvVersionedRead<T> {
+    /// Updates or reads `generation`.
     pub fn generation(&self) -> &KvGeneration {
         match self {
             Self::Hit { generation, .. } | Self::Miss { generation } => generation,
@@ -450,18 +492,25 @@ impl<T> KvVersionedRead<T> {
 
 /// Typed string-key KV tier. Versioning is a narrow optional D108 capability.
 pub trait KvStorageTier<T: Clone> {
+    /// Updates or reads `get`.
     fn get(&self, key: &str) -> StorageResult<Option<T>>;
+    /// Updates or reads `set`.
     fn set(&self, key: &str, value: T) -> StorageResult<()>;
+    /// Updates or reads `put_if_absent`.
     fn put_if_absent(&self, _key: &str, _value: T) -> StorageResult<bool> {
         Err(StorageError::unsupported("kvStorage", "put-if-absent"))
     }
+    /// Updates or reads `delete`.
     fn delete(&self, key: &str) -> StorageResult<()>;
+    /// Updates or reads `list`.
     fn list(&self, prefix: &str) -> StorageResult<Vec<String>>;
 
+    /// Updates or reads `supports_versioned`.
     fn supports_versioned(&self) -> bool {
         false
     }
 
+    /// Updates or reads `get_versioned`.
     fn get_versioned(&self, _key: &str) -> StorageResult<KvVersionedRead<T>> {
         Err(StorageError::unsupported(
             "kvStorage",
@@ -469,6 +518,7 @@ pub trait KvStorageTier<T: Clone> {
         ))
     }
 
+    /// Updates or reads `set_if_match`.
     fn set_if_match(
         &self,
         _key: &str,
@@ -503,6 +553,7 @@ pub struct MemoryKv<T: Clone> {
     inner: Rc<MemoryKvInner<T>>,
 }
 
+/// Creates or computes `memory_kv`.
 pub fn memory_kv<T: Clone>() -> MemoryKv<T> {
     MemoryKv {
         inner: Rc::new(MemoryKvInner {
@@ -515,6 +566,7 @@ pub fn memory_kv<T: Clone>() -> MemoryKv<T> {
     }
 }
 
+/// Creates or computes `dict_kv`.
 pub fn dict_kv<T: Clone>(entries: impl IntoIterator<Item = (impl Into<String>, T)>) -> MemoryKv<T> {
     let kv = memory_kv();
     for (key, value) in entries {
@@ -553,6 +605,7 @@ impl<T: Clone> MemoryKv<T> {
         )
     }
 
+    /// Updates or reads `clear`.
     pub fn clear(&self) {
         self.inner.entries.borrow_mut().clear();
         self.inner.tombstones.borrow_mut().clear();
@@ -648,12 +701,14 @@ impl<T: Clone> KvStorageTier<T> for MemoryKv<T> {
 }
 
 #[derive(Clone, Debug)]
+/// `CodecKvStorage` data container.
 pub struct CodecKvStorage<B, C, T> {
     backend: B,
     codec: C,
     marker: std::marker::PhantomData<T>,
 }
 
+/// Creates or computes `codec_kv_storage`.
 pub fn codec_kv_storage<B, C, T>(backend: B, codec: C) -> CodecKvStorage<B, C, T>
 where
     B: ByteStorageBackend + Clone,
@@ -699,8 +754,10 @@ where
     }
 }
 
+/// `FileKv` type alias.
 pub type FileKv<T, C> = CodecKvStorage<FileBackend, C, T>;
 
+/// Creates or computes `file_kv`.
 pub fn file_kv<T, C>(
     dir: impl Into<PathBuf>,
     opts: FileBackendOptions,
@@ -714,8 +771,11 @@ where
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `FileAppendLogOptions` data container.
 pub struct FileAppendLogOptions {
+    /// `backend` field for backend.
     pub backend: FileBackendOptions,
+    /// `prefix` field for prefix.
     pub prefix: String,
 }
 
@@ -729,21 +789,25 @@ impl Default for FileAppendLogOptions {
 }
 
 impl FileAppendLogOptions {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Updates or reads `with_backend`.
     pub fn with_backend(mut self, backend: FileBackendOptions) -> Self {
         self.backend = backend;
         self
     }
 
+    /// Updates or reads `with_prefix`.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 }
 
+/// Creates or computes `file_append_log`.
 pub fn file_append_log<T, C>(
     dir: impl Into<PathBuf>,
     opts: FileAppendLogOptions,
@@ -758,24 +822,36 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// `ContentAddressedMode` variants.
 pub enum ContentAddressedMode {
+    /// `Read` variant.
     Read,
+    /// `Write` variant.
     Write,
     #[default]
+    /// `ReadWrite` variant.
     ReadWrite,
+    /// `ReadStrict` variant.
     ReadStrict,
 }
 
+/// `ContentAddressedKeyContext` type alias.
 pub type ContentAddressedKeyContext<Ctx> = dyn Fn(&Ctx) -> Result<Value, JsonCodecError>;
 
+/// `ContentAddressedKvOptions` data container.
 pub struct ContentAddressedKvOptions<Ctx, V: Clone> {
+    /// `kv` field for kv.
     pub kv: Rc<dyn KvStorageTier<V>>,
+    /// `key_context` field for key context.
     pub key_context: Rc<ContentAddressedKeyContext<Ctx>>,
+    /// `key_prefix` field for key prefix.
     pub key_prefix: Option<String>,
+    /// `mode` field for mode.
     pub mode: ContentAddressedMode,
 }
 
 impl<V: Clone> ContentAddressedKvOptions<Value, V> {
+    /// Creates or computes `new`.
     pub fn new(kv: Rc<dyn KvStorageTier<V>>) -> Self {
         Self {
             kv,
@@ -787,6 +863,7 @@ impl<V: Clone> ContentAddressedKvOptions<Value, V> {
 }
 
 impl<Ctx, V: Clone> ContentAddressedKvOptions<Ctx, V> {
+    /// Creates or computes `from_key_context`.
     pub fn from_key_context(
         kv: Rc<dyn KvStorageTier<V>>,
         f: impl Fn(&Ctx) -> Result<Value, JsonCodecError> + 'static,
@@ -799,6 +876,7 @@ impl<Ctx, V: Clone> ContentAddressedKvOptions<Ctx, V> {
         }
     }
 
+    /// Updates or reads `with_key_context`.
     pub fn with_key_context(
         mut self,
         f: impl Fn(&Ctx) -> Result<Value, JsonCodecError> + 'static,
@@ -807,11 +885,13 @@ impl<Ctx, V: Clone> ContentAddressedKvOptions<Ctx, V> {
         self
     }
 
+    /// Updates or reads `with_key_prefix`.
     pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.key_prefix = Some(prefix.into());
         self
     }
 
+    /// Updates or reads `with_mode`.
     pub fn with_mode(mut self, mode: ContentAddressedMode) -> Self {
         self.mode = mode;
         self
@@ -819,6 +899,7 @@ impl<Ctx, V: Clone> ContentAddressedKvOptions<Ctx, V> {
 }
 
 #[derive(Clone)]
+/// `ContentAddressedKv` data container.
 pub struct ContentAddressedKv<Ctx, V: Clone> {
     kv: Rc<dyn KvStorageTier<V>>,
     key_context: Rc<ContentAddressedKeyContext<Ctx>>,
@@ -835,9 +916,12 @@ impl<Ctx, V: Clone> fmt::Debug for ContentAddressedKv<Ctx, V> {
     }
 }
 
+/// `ContentAddressedStorage` type alias.
 pub type ContentAddressedStorage<Ctx, V> = ContentAddressedKv<Ctx, V>;
+/// `ContentAddressedStorageOptions` type alias.
 pub type ContentAddressedStorageOptions<Ctx, V> = ContentAddressedKvOptions<Ctx, V>;
 
+/// Creates or computes `content_addressed_kv`.
 pub fn content_addressed_kv<Ctx, V: Clone>(
     opts: ContentAddressedKvOptions<Ctx, V>,
 ) -> ContentAddressedKv<Ctx, V> {
@@ -849,6 +933,7 @@ pub fn content_addressed_kv<Ctx, V: Clone>(
     }
 }
 
+/// Creates or computes `content_addressed_storage`.
 pub fn content_addressed_storage<Ctx, V: Clone>(
     opts: ContentAddressedStorageOptions<Ctx, V>,
 ) -> ContentAddressedStorage<Ctx, V> {
@@ -856,6 +941,7 @@ pub fn content_addressed_storage<Ctx, V: Clone>(
 }
 
 impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
+    /// Updates or reads `key_for`.
     pub fn key_for(&self, ctx: &Ctx) -> StorageResult<String> {
         let context = (self.key_context)(ctx).map_err(storage_json_error)?;
         let bytes = strict_canonical_json_bytes(&context).map_err(storage_json_error)?;
@@ -866,6 +952,7 @@ impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
         })
     }
 
+    /// Updates or reads `lookup`.
     pub fn lookup(&self, ctx: &Ctx) -> StorageResult<Option<V>> {
         if self.mode == ContentAddressedMode::Write {
             return Ok(None);
@@ -878,6 +965,7 @@ impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
         Ok(value)
     }
 
+    /// Updates or reads `store`.
     pub fn store(&self, ctx: &Ctx, value: V) -> StorageResult<()> {
         if self.mode == ContentAddressedMode::Read {
             return Ok(());
@@ -886,6 +974,7 @@ impl<Ctx, V: Clone> ContentAddressedKv<Ctx, V> {
         self.kv.set(&key, value)
     }
 
+    /// Updates or reads `forget`.
     pub fn forget(&self, ctx: &Ctx) -> StorageResult<()> {
         if matches!(
             self.mode,
@@ -915,51 +1004,83 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// `ChangeLifecycle` variants.
 pub enum ChangeLifecycle {
+    /// `Spec` variant.
     Spec,
+    /// `Data` variant.
     Data,
+    /// `Ownership` variant.
     Ownership,
 }
 
+/// `constant` constant.
 pub const WAL_KEY_SEGMENT: &str = "wal";
+/// `constant` constant.
 pub const WAL_FRAME_SEQ_PAD: usize = 20;
+/// `constant` constant.
 pub const WAL_FORMAT_VERSION: u64 = 1;
 
+/// `WalFrameTimestampNs` type alias.
 pub type WalFrameTimestampNs = String;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `WalFrameBody` data container.
 pub struct WalFrameBody<T> {
+    /// `t` field for t.
     pub t: String,
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `path` field for path.
     pub path: String,
+    /// `change` field for change.
     pub change: T,
+    /// `frame_seq` field for frame seq.
     pub frame_seq: u64,
+    /// `frame_t_ns` field for frame t ns.
     pub frame_t_ns: WalFrameTimestampNs,
+    /// `format_version` field for format version.
     pub format_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `WalFrame` data container.
 pub struct WalFrame<T> {
+    /// `t` field for t.
     pub t: String,
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `path` field for path.
     pub path: String,
+    /// `change` field for change.
     pub change: T,
+    /// `frame_seq` field for frame seq.
     pub frame_seq: u64,
+    /// `frame_t_ns` field for frame t ns.
     pub frame_t_ns: WalFrameTimestampNs,
+    /// `format_version` field for format version.
     pub format_version: u64,
+    /// `checksum` field for checksum.
     pub checksum: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `WalFrameOptions` data container.
 pub struct WalFrameOptions<T> {
+    /// `path` field for path.
     pub path: String,
+    /// `change` field for change.
     pub change: T,
+    /// `frame_seq` field for frame seq.
     pub frame_seq: u64,
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `frame_t_ns` field for frame t ns.
     pub frame_t_ns: Option<String>,
 }
 
 impl<T> WalFrameOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(path: impl Into<String>, change: T, frame_seq: u64) -> Self {
         Self {
             path: path.into(),
@@ -970,17 +1091,20 @@ impl<T> WalFrameOptions<T> {
         }
     }
 
+    /// Updates or reads `with_lifecycle`.
     pub fn with_lifecycle(mut self, lifecycle: ChangeLifecycle) -> Self {
         self.lifecycle = lifecycle;
         self
     }
 
+    /// Updates or reads `with_frame_t_ns`.
     pub fn with_frame_t_ns(mut self, frame_t_ns: impl Into<String>) -> Self {
         self.frame_t_ns = Some(frame_t_ns.into());
         self
     }
 }
 
+/// Creates or computes `wal_frame_prefix`.
 pub fn wal_frame_prefix(namespace: &str) -> String {
     if namespace.is_empty() {
         WAL_KEY_SEGMENT.to_owned()
@@ -989,10 +1113,12 @@ pub fn wal_frame_prefix(namespace: &str) -> String {
     }
 }
 
+/// Creates or computes `wal_frame_key`.
 pub fn wal_frame_key(prefix: &str, frame_seq: u64) -> String {
     format!("{prefix}/{frame_seq:0>width$}", width = WAL_FRAME_SEQ_PAD)
 }
 
+/// Creates or computes `wal_frame_checksum`.
 pub fn wal_frame_checksum<T: Serialize>(body: &WalFrameBody<T>) -> StorageResult<String> {
     assert_wal_frame_body(body).map_err(storage_json_error)?;
     let value = serde_json::to_value(body).map_err(|err| StorageError::backend(err.to_string()))?;
@@ -1001,6 +1127,7 @@ pub fn wal_frame_checksum<T: Serialize>(body: &WalFrameBody<T>) -> StorageResult
     Ok(sha256_hex(&bytes))
 }
 
+/// Creates or computes `wal_frame`.
 pub fn wal_frame<T: Serialize>(opts: WalFrameOptions<T>) -> StorageResult<WalFrame<T>> {
     let body = WalFrameBody {
         t: "c".to_owned(),
@@ -1031,6 +1158,7 @@ pub fn wal_frame<T: Serialize>(opts: WalFrameOptions<T>) -> StorageResult<WalFra
     })
 }
 
+/// Creates or computes `assert_wal_frame`.
 pub fn assert_wal_frame<T: Serialize>(frame: &WalFrame<T>) -> crate::json::JsonCodecResult<()> {
     assert_wal_frame_body(&WalFrameBody {
         t: frame.t.clone(),
@@ -1049,6 +1177,7 @@ pub fn assert_wal_frame<T: Serialize>(frame: &WalFrame<T>) -> crate::json::JsonC
     Ok(())
 }
 
+/// Creates or computes `verify_wal_frame_checksum`.
 pub fn verify_wal_frame_checksum<T: Serialize>(frame: &WalFrame<T>) -> StorageResult<bool> {
     assert_wal_frame(frame).map_err(storage_json_error)?;
     let body = WalFrameBody {
@@ -1064,10 +1193,12 @@ pub fn verify_wal_frame_checksum<T: Serialize>(frame: &WalFrame<T>) -> StorageRe
 }
 
 #[derive(Clone, Debug, Default)]
+/// `WalFrameCodec` data container.
 pub struct WalFrameCodec<T> {
     marker: std::marker::PhantomData<T>,
 }
 
+/// Creates or computes `wal_frame_codec`.
 pub fn wal_frame_codec<T>() -> WalFrameCodec<T> {
     WalFrameCodec {
         marker: std::marker::PhantomData,
@@ -1213,26 +1344,40 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `ChangeEnvelope` data container.
 pub struct ChangeEnvelope<T> {
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `structure` field for structure.
     pub structure: String,
+    /// `version` field for version.
     pub version: Value,
+    /// `t_ns` field for t ns.
     pub t_ns: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `seq` field for seq.
     pub seq: Option<u64>,
+    /// `change` field for change.
     pub change: T,
 }
 
 #[derive(Clone, Debug)]
+/// `ChangeEnvelopeOptions` data container.
 pub struct ChangeEnvelopeOptions {
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `structure` field for structure.
     pub structure: String,
+    /// `version` field for version.
     pub version: Value,
+    /// `t_ns` field for t ns.
     pub t_ns: Option<String>,
+    /// `seq` field for seq.
     pub seq: Option<u64>,
 }
 
 impl ChangeEnvelopeOptions {
+    /// Creates or computes `new`.
     pub fn new(structure: impl Into<String>) -> Self {
         Self {
             lifecycle: ChangeLifecycle::Data,
@@ -1243,27 +1388,32 @@ impl ChangeEnvelopeOptions {
         }
     }
 
+    /// Updates or reads `with_lifecycle`.
     pub fn with_lifecycle(mut self, lifecycle: ChangeLifecycle) -> Self {
         self.lifecycle = lifecycle;
         self
     }
 
+    /// Updates or reads `with_version`.
     pub fn with_version(mut self, version: impl Into<Value>) -> Self {
         self.version = version.into();
         self
     }
 
+    /// Updates or reads `with_t_ns`.
     pub fn with_t_ns(mut self, t_ns: impl Into<String>) -> Self {
         self.t_ns = Some(t_ns.into());
         self
     }
 
+    /// Updates or reads `with_seq`.
     pub fn with_seq(mut self, seq: u64) -> Self {
         self.seq = Some(seq);
         self
     }
 }
 
+/// Creates or computes `now_ns`.
 pub fn now_ns() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1271,6 +1421,7 @@ pub fn now_ns() -> String {
         .unwrap_or_else(|_| "0".to_owned())
 }
 
+/// Creates or computes `envelope_change`.
 pub fn envelope_change<T>(
     change: T,
     opts: ChangeEnvelopeOptions,
@@ -1301,10 +1452,12 @@ pub fn envelope_change<T>(
 }
 
 #[derive(Clone, Debug, Default)]
+/// `ChangeEnvelopeCodec` data container.
 pub struct ChangeEnvelopeCodec<T> {
     marker: std::marker::PhantomData<T>,
 }
 
+/// Creates or computes `change_envelope_codec`.
 pub fn change_envelope_codec<T>() -> ChangeEnvelopeCodec<T> {
     ChangeEnvelopeCodec {
         marker: std::marker::PhantomData,
@@ -1329,6 +1482,7 @@ where
     }
 }
 
+/// Creates or computes `assert_change_envelope`.
 pub fn assert_change_envelope<T>(value: &ChangeEnvelope<T>) -> crate::json::JsonCodecResult<()> {
     if value.structure.is_empty() {
         return Err(JsonCodecError::validation(
@@ -1397,33 +1551,47 @@ fn assert_change_envelope_value(value: &Value, label: &str) -> crate::json::Json
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `ObserveEventFrame` data container.
 pub struct ObserveEventFrame<T> {
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: ChangeLifecycle,
+    /// `structure` field for structure.
     pub structure: String,
+    /// `version` field for version.
     pub version: Value,
+    /// `t_ns` field for t ns.
     pub t_ns: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `seq` field for seq.
     pub seq: Option<u64>,
+    /// `change` field for change.
     pub change: T,
     #[serde(rename = "observeSeq")]
+    /// `observe_seq` field for observe seq.
     pub observe_seq: u64,
+    /// `path` field for path.
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `stream` field for stream.
     pub stream: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// `ObserveEventFrameOptions` data container.
 pub struct ObserveEventFrameOptions {
+    /// `stream` field for stream.
     pub stream: Option<String>,
 }
 
 impl ObserveEventFrameOptions {
+    /// Updates or reads `with_stream`.
     pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
         self.stream = Some(stream.into());
         self
     }
 }
 
+/// Creates or computes `observe_event_frame`.
 pub fn observe_event_frame<T>(
     observe_seq: u64,
     path: impl Into<String>,
@@ -1447,6 +1615,7 @@ pub fn observe_event_frame<T>(
     })
 }
 
+/// Creates or computes `assert_observe_event_frame`.
 pub fn assert_observe_event_frame<T>(
     value: &ObserveEventFrame<T>,
 ) -> crate::json::JsonCodecResult<()> {
@@ -1467,10 +1636,12 @@ pub fn assert_observe_event_frame<T>(
 }
 
 #[derive(Clone, Debug, Default)]
+/// `ObserveEventFrameCodec` data container.
 pub struct ObserveEventFrameCodec<T> {
     marker: std::marker::PhantomData<T>,
 }
 
+/// Creates or computes `observe_event_frame_codec`.
 pub fn observe_event_frame_codec<T>() -> ObserveEventFrameCodec<T> {
     ObserveEventFrameCodec {
         marker: std::marker::PhantomData,
@@ -1528,8 +1699,10 @@ fn assert_observe_event_frame_value(value: &Value) -> crate::json::JsonCodecResu
     Ok(())
 }
 
+/// `ObserveEventLogPage` type alias.
 pub type ObserveEventLogPage<T> = AppendLogPage<ObserveEventFrame<T>>;
 
+/// Creates or computes `read_observe_event_log_page`.
 pub fn read_observe_event_log_page<T: Clone>(
     log: &dyn AppendLogStorageTier<ObserveEventFrame<T>>,
     opts: AppendLogReadOptions,
@@ -1537,36 +1710,54 @@ pub fn read_observe_event_log_page<T: Clone>(
     read_append_log_page(log, opts)
 }
 
+/// `constant` constant.
 pub const APPEND_LOG_SEQ_PAD: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AppendLogEntry` data container.
 pub struct AppendLogEntry<T> {
+    /// `key` field for key.
     pub key: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `value` field for value.
     pub value: T,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// `AppendLogReadOptions` data container.
 pub struct AppendLogReadOptions {
+    /// `after` field for after.
     pub after: Option<u64>,
+    /// `limit` field for limit.
     pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `AppendLogPage` data container.
 pub struct AppendLogPage<T> {
+    /// `entries` field for entries.
     pub entries: Vec<AppendLogEntry<T>>,
+    /// `next_after` field for next after.
     pub next_after: Option<u64>,
+    /// `done` field for done.
     pub done: bool,
 }
 
+/// `AppendLogStorageTier` behavior contract.
 pub trait AppendLogStorageTier<T: Clone> {
+    /// Updates or reads `append`.
     fn append(&self, value: T) -> StorageResult<AppendLogEntry<T>>;
+    /// Updates or reads `read`.
     fn read(&self, opts: AppendLogReadOptions) -> StorageResult<Vec<AppendLogEntry<T>>>;
+    /// Updates or reads `truncate_after`.
     fn truncate_after(&self, seq: u64) -> StorageResult<()>;
+    /// Updates or reads `size`.
     fn size(&self) -> StorageResult<usize>;
 }
 
 #[derive(Clone)]
+/// `AppendLogStorage` data container.
 pub struct AppendLogStorage<T: Clone> {
     kv: Rc<dyn KvStorageTier<T>>,
     prefix: String,
@@ -1581,6 +1772,7 @@ impl<T: Clone> fmt::Debug for AppendLogStorage<T> {
 }
 
 #[derive(Clone)]
+/// `MultiWriterAppendLogStorage` data container.
 pub struct MultiWriterAppendLogStorage<T: Clone> {
     kv: Rc<dyn KvStorageTier<T>>,
     prefix: String,
@@ -1596,10 +1788,12 @@ impl<T: Clone> fmt::Debug for MultiWriterAppendLogStorage<T> {
     }
 }
 
+/// Creates or computes `append_log_key`.
 pub fn append_log_key(prefix: &str, seq: u64) -> String {
     format!("{prefix}/{seq:0APPEND_LOG_SEQ_PAD$}")
 }
 
+/// Creates or computes `append_log_storage`.
 pub fn append_log_storage<T: Clone>(
     kv: Rc<dyn KvStorageTier<T>>,
     prefix: impl Into<String>,
@@ -1610,10 +1804,12 @@ pub fn append_log_storage<T: Clone>(
     }
 }
 
+/// Creates or computes `memory_append_log`.
 pub fn memory_append_log<T: Clone + 'static>(prefix: impl Into<String>) -> AppendLogStorage<T> {
     append_log_storage(Rc::new(memory_kv()), prefix)
 }
 
+/// Creates or computes `multi_writer_append_log_storage`.
 pub fn multi_writer_append_log_storage<T: Clone>(
     kv: Rc<dyn KvStorageTier<T>>,
     prefix: impl Into<String>,
@@ -1631,6 +1827,7 @@ pub fn multi_writer_append_log_storage<T: Clone>(
     })
 }
 
+/// Creates or computes `memory_multi_writer_append_log`.
 pub fn memory_multi_writer_append_log<T: Clone + 'static>(
     prefix: impl Into<String>,
 ) -> MultiWriterAppendLogStorage<T> {
@@ -1638,6 +1835,7 @@ pub fn memory_multi_writer_append_log<T: Clone + 'static>(
         .expect("memory_kv supports put-if-absent")
 }
 
+/// Creates or computes `read_append_log_page`.
 pub fn read_append_log_page<T: Clone>(
     log: &dyn AppendLogStorageTier<T>,
     opts: AppendLogReadOptions,
@@ -1668,57 +1866,89 @@ pub fn read_append_log_page<T: Clone>(
     })
 }
 
+/// `constant` constant.
 pub const REACTIVE_COLLECTION_SNAPSHOT_FORMAT: &str = "graphrefly.reactive-collection.snapshot.v1";
+/// `constant` constant.
 pub const REACTIVE_COLLECTION_CHANGE_FORMAT: &str = "graphrefly.reactive-collection.change.v1";
+/// `constant` constant.
 pub const REACTIVE_COLLECTION_FRAME_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// `ReactiveCollectionKind` variants.
 pub enum ReactiveCollectionKind {
     #[serde(rename = "reactiveList")]
+    /// `ReactiveList` variant.
     ReactiveList,
     #[serde(rename = "reactiveLog")]
+    /// `ReactiveLog` variant.
     ReactiveLog,
     #[serde(rename = "reactiveMap")]
+    /// `ReactiveMap` variant.
     ReactiveMap,
     #[serde(rename = "reactiveIndex")]
+    /// `ReactiveIndex` variant.
     ReactiveIndex,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// `ReactiveCollectionSnapshotFrame` data container.
 pub struct ReactiveCollectionSnapshotFrame {
+    /// `format` field for format.
     pub format: String,
+    /// `version` field for version.
     pub version: u8,
+    /// `kind` field for kind.
     pub kind: ReactiveCollectionKind,
     #[serde(rename = "changeCursor")]
+    /// `change_cursor` field for change cursor.
     pub change_cursor: i64,
+    /// `snapshot` field for snapshot.
     pub snapshot: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// `ReactiveCollectionChangeFrame` data container.
 pub struct ReactiveCollectionChangeFrame {
+    /// `format` field for format.
     pub format: String,
+    /// `version` field for version.
     pub version: u8,
+    /// `kind` field for kind.
     pub kind: ReactiveCollectionKind,
+    /// `change` field for change.
     pub change: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `ReactiveCollectionRestoreState` data container.
 pub struct ReactiveCollectionRestoreState<T> {
+    /// `kind` field for kind.
     pub kind: ReactiveCollectionKind,
+    /// `state` field for state.
     pub state: T,
+    /// `source` field for source.
     pub source: ReactiveCollectionRestoreSource,
+    /// `snapshot` field for snapshot.
     pub snapshot: ReactiveCollectionSnapshotRestoreMeta,
+    /// `changes` field for changes.
     pub changes: ReactiveCollectionChangesRestoreMeta,
+    /// `cursor` field for cursor.
     pub cursor: Option<u64>,
+    /// `snapshot_found` field for snapshot found.
     pub snapshot_found: bool,
+    /// `changes_applied` field for changes applied.
     pub changes_applied: usize,
 }
 
+/// `ReactiveListRestoreState` type alias.
 pub type ReactiveListRestoreState<T> = ReactiveCollectionRestoreState<Vec<T>>;
+/// `ReactiveLogRestoreState` type alias.
 pub type ReactiveLogRestoreState<T> = ReactiveCollectionRestoreState<Vec<T>>;
+/// `ReactiveMapRestoreState` type alias.
 pub type ReactiveMapRestoreState<K, V> = ReactiveCollectionRestoreState<Vec<(K, V)>>;
+/// `ReactiveIndexRestoreState` type alias.
 pub type ReactiveIndexRestoreState<K, S, V> =
     ReactiveCollectionRestoreState<Vec<IndexRow<K, S, V>>>;
 
@@ -1729,38 +1959,56 @@ struct FoldedCollectionState<T> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionRestoreSource` variants.
 pub enum ReactiveCollectionRestoreSource {
+    /// `Empty` variant.
     Empty,
+    /// `Changes` variant.
     Changes,
+    /// `Snapshot` variant.
     Snapshot,
+    /// `SnapshotAndChanges` variant.
     SnapshotAndChanges,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionSnapshotRestoreMeta` data container.
 pub struct ReactiveCollectionSnapshotRestoreMeta {
+    /// `found` field for found.
     pub found: bool,
+    /// `change_cursor` field for change cursor.
     pub change_cursor: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionChangesRestoreMeta` data container.
 pub struct ReactiveCollectionChangesRestoreMeta {
+    /// `applied` field for applied.
     pub applied: usize,
+    /// `cursor` field for cursor.
     pub cursor: i64,
 }
 
 #[derive(Clone, Default)]
+/// `LoadReactiveCollectionStateOptions` data container.
 pub struct LoadReactiveCollectionStateOptions<'a> {
+    /// `storage_prefix` field for storage prefix.
     pub storage_prefix: Option<&'a str>,
+    /// `snapshot_key` field for snapshot key.
     pub snapshot_key: Option<&'a str>,
+    /// `change_log` field for change log.
     pub change_log: Option<&'a dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+/// `ReactiveCollectionSnapshotFrameCodec` data container.
 pub struct ReactiveCollectionSnapshotFrameCodec;
 
 #[derive(Clone, Copy, Debug, Default)]
+/// `ReactiveCollectionChangeFrameCodec` data container.
 pub struct ReactiveCollectionChangeFrameCodec;
 
+/// Creates or computes `reactive_collection_snapshot_key`.
 pub fn reactive_collection_snapshot_key(prefix: &str) -> StorageResult<String> {
     if prefix.is_empty() {
         return Err(StorageError::backend(
@@ -1770,6 +2018,7 @@ pub fn reactive_collection_snapshot_key(prefix: &str) -> StorageResult<String> {
     Ok(format!("{prefix}/snapshot"))
 }
 
+/// Creates or computes `reactive_collection_snapshot_frame`.
 pub fn reactive_collection_snapshot_frame(
     kind: ReactiveCollectionKind,
     change_cursor: i64,
@@ -1786,6 +2035,7 @@ pub fn reactive_collection_snapshot_frame(
     Ok(frame)
 }
 
+/// Creates or computes `reactive_collection_change_frame`.
 pub fn reactive_collection_change_frame(
     kind: ReactiveCollectionKind,
     change: Value,
@@ -1800,14 +2050,17 @@ pub fn reactive_collection_change_frame(
     Ok(frame)
 }
 
+/// Creates or computes `reactive_collection_snapshot_frame_codec`.
 pub fn reactive_collection_snapshot_frame_codec() -> ReactiveCollectionSnapshotFrameCodec {
     ReactiveCollectionSnapshotFrameCodec
 }
 
+/// Creates or computes `reactive_collection_change_frame_codec`.
 pub fn reactive_collection_change_frame_codec() -> ReactiveCollectionChangeFrameCodec {
     ReactiveCollectionChangeFrameCodec
 }
 
+/// Creates or computes `assert_reactive_collection_snapshot_frame`.
 pub fn assert_reactive_collection_snapshot_frame(
     frame: &ReactiveCollectionSnapshotFrame,
 ) -> StorageResult<()> {
@@ -1833,6 +2086,7 @@ pub fn assert_reactive_collection_snapshot_frame(
     Ok(())
 }
 
+/// Creates or computes `assert_reactive_collection_change_frame`.
 pub fn assert_reactive_collection_change_frame(
     frame: &ReactiveCollectionChangeFrame,
 ) -> StorageResult<()> {
@@ -1896,6 +2150,7 @@ impl Codec<ReactiveCollectionChangeFrame> for ReactiveCollectionChangeFrameCodec
     }
 }
 
+/// Creates or computes `load_reactive_list_state`.
 pub fn load_reactive_list_state<T>(
     snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
     options: LoadReactiveCollectionStateOptions<'_>,
@@ -1927,6 +2182,7 @@ where
     )
 }
 
+/// Creates or computes `load_reactive_log_state`.
 pub fn load_reactive_log_state<T>(
     snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
     options: LoadReactiveCollectionStateOptions<'_>,
@@ -1958,6 +2214,7 @@ where
     )
 }
 
+/// Creates or computes `load_reactive_map_state`.
 pub fn load_reactive_map_state<K, V>(
     snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
     options: LoadReactiveCollectionStateOptions<'_>,
@@ -1992,6 +2249,7 @@ where
     )
 }
 
+/// Creates or computes `load_reactive_index_state`.
 pub fn load_reactive_index_state<K, S, V>(
     snapshot_store: &dyn KvStorageTier<ReactiveCollectionSnapshotFrame>,
     options: LoadReactiveCollectionStateOptions<'_>,
@@ -2637,93 +2895,149 @@ fn seq_from_key(prefix: &str, key: &str) -> StorageResult<u64> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReadThroughLookupTier` data container.
 pub struct ReadThroughLookupTier {
+    /// `index` field for index.
     pub index: isize,
+    /// `name` field for name.
     pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReadThroughOutcome` variants.
 pub enum ReadThroughOutcome {
+    /// `Hit` variant.
     Hit,
+    /// `Miss` variant.
     Miss,
+    /// `Error` variant.
     Error,
 }
 
 #[derive(Clone, Debug)]
+/// `ReadThroughLookupFact` data container.
 pub struct ReadThroughLookupFact<T> {
+    /// `outcome` field for outcome.
     pub outcome: ReadThroughOutcome,
+    /// `key` field for key.
     pub key: String,
+    /// `tier` field for tier.
     pub tier: ReadThroughLookupTier,
+    /// `value` field for value.
     pub value: Option<T>,
+    /// `generation` field for generation.
     pub generation: Option<KvGeneration>,
+    /// `error` field for error.
     pub error: Option<StorageError>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `ReadThroughPromotionFact` data container.
 pub struct ReadThroughPromotionFact {
+    /// `tier` field for tier.
     pub tier: ReadThroughLookupTier,
+    /// `ok` field for ok.
     pub ok: bool,
+    /// `error` field for error.
     pub error: Option<StorageError>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `TieredReadThroughStatus` variants.
 pub enum TieredReadThroughStatus {
+    /// `Hit` variant.
     Hit,
+    /// `Miss` variant.
     Miss,
+    /// `Error` variant.
     Error,
 }
 
 #[derive(Clone, Debug)]
+/// `TieredReadThroughResult` data container.
 pub struct TieredReadThroughResult<T> {
+    /// `status` field for status.
     pub status: TieredReadThroughStatus,
+    /// `key` field for key.
     pub key: String,
+    /// `value` field for value.
     pub value: Option<T>,
+    /// `hit_tier` field for hit tier.
     pub hit_tier: Option<ReadThroughLookupTier>,
+    /// `facts` field for facts.
     pub facts: Vec<ReadThroughLookupFact<T>>,
+    /// `promotions` field for promotions.
     pub promotions: Vec<ReadThroughPromotionFact>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// `PromotionPolicy` variants.
 pub enum PromotionPolicy {
     #[default]
+    /// `AllEarlier` variant.
     AllEarlier,
+    /// `Disabled` variant.
     Disabled,
+    /// `Indices` variant.
     Indices(Vec<usize>),
 }
 
+/// `ReadThroughMissContext` data container.
 pub struct ReadThroughMissContext {
+    /// `key` field for key.
     pub key: String,
+    /// `tier` field for tier.
     pub tier: ReadThroughLookupTier,
 }
 
+/// `ReadThroughErrorContext` data container.
 pub struct ReadThroughErrorContext {
+    /// `key` field for key.
     pub key: String,
+    /// `tier` field for tier.
     pub tier: ReadThroughLookupTier,
+    /// `stage` field for stage.
     pub stage: ReadThroughErrorStage,
+    /// `error` field for error.
     pub error: StorageError,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `ReadThroughErrorStage` variants.
 pub enum ReadThroughErrorStage {
+    /// `Lookup` variant.
     Lookup,
+    /// `Promotion` variant.
     Promotion,
 }
 
+/// `ReadThroughLoadFn` type alias.
 pub type ReadThroughLoadFn<'a, T> = dyn Fn(&str) -> StorageResult<Option<T>> + 'a;
+/// `ReadThroughMissFn` type alias.
 pub type ReadThroughMissFn<'a> = dyn Fn(ReadThroughMissContext) + 'a;
+/// `ReadThroughErrorFn` type alias.
 pub type ReadThroughErrorFn<'a> = dyn Fn(ReadThroughErrorContext) + 'a;
 
+/// `TieredReadThroughOptions` data container.
 pub struct TieredReadThroughOptions<'a, T: Clone> {
+    /// `key` field for key.
     pub key: String,
+    /// `tiers` field for tiers.
     pub tiers: Vec<&'a dyn KvStorageTier<T>>,
+    /// `tier_names` field for tier names.
     pub tier_names: Vec<String>,
+    /// `load` field for load.
     pub load: Option<Box<ReadThroughLoadFn<'a, T>>>,
+    /// `promote_to` field for promote to.
     pub promote_to: PromotionPolicy,
+    /// `on_miss` field for on miss.
     pub on_miss: Option<Box<ReadThroughMissFn<'a>>>,
+    /// `on_error` field for on error.
     pub on_error: Option<Box<ReadThroughErrorFn<'a>>>,
 }
 
 impl<'a, T: Clone> TieredReadThroughOptions<'a, T> {
+    /// Creates or computes `new`.
     pub fn new(key: impl Into<String>, tiers: Vec<&'a dyn KvStorageTier<T>>) -> Self {
         Self {
             key: key.into(),
@@ -2737,6 +3051,7 @@ impl<'a, T: Clone> TieredReadThroughOptions<'a, T> {
     }
 }
 
+/// Creates or computes `read_through_kv`.
 pub fn read_through_kv<T: Clone>(
     opts: TieredReadThroughOptions<'_, T>,
 ) -> TieredReadThroughResult<T> {

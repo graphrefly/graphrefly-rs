@@ -13,18 +13,28 @@ use crate::node::Node;
 use crate::work_queue::{WorkQueueCommand, WorkQueueRecord};
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsQueuedCommandPayload` data container.
 pub struct CqrsQueuedCommandPayload<TCommand> {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `command` field for command.
     pub command: CqrsCommand<TCommand>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<String>,
+    /// `policy_refs` field for policy refs.
     pub policy_refs: Vec<String>,
+    /// `actor_refs` field for actor refs.
     pub actor_refs: Vec<String>,
+    /// `audit_refs` field for audit refs.
     pub audit_refs: Vec<String>,
+    /// `metadata` field for metadata.
     pub metadata: Option<String>,
 }
 
 impl<TCommand> CqrsQueuedCommandPayload<TCommand> {
+    /// Creates or computes `new`.
     pub fn new(command: CqrsCommand<TCommand>) -> Self {
         Self {
             kind: "cqrs-queued-command".to_owned(),
@@ -40,37 +50,57 @@ impl<TCommand> CqrsQueuedCommandPayload<TCommand> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsWorkQueueAttempt` data container.
 pub struct CqrsWorkQueueAttempt<TCommand> {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `work_id` field for work id.
     pub work_id: String,
+    /// `lease_id` field for lease id.
     pub lease_id: String,
+    /// `queue_attempt` field for queue attempt.
     pub queue_attempt: u32,
+    /// `worker_id` field for worker id.
     pub worker_id: String,
+    /// `command` field for command.
     pub command: CqrsCommand<TCommand>,
+    /// `payload` field for payload.
     pub payload: CqrsQueuedCommandPayload<TCommand>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `CqrsWorkQueueOutcome` variants.
 pub enum CqrsWorkQueueOutcome<TCommand> {
+    /// `Accepted` variant.
     Accepted {
+        /// `status` field for status.
         status: CqrsStatus,
     },
+    /// `Rejected` variant.
     Rejected {
+        /// `status` field for status.
         status: CqrsStatus,
+        /// `error` field for error.
         error: Option<Box<CqrsError<TCommand>>>,
     },
+    /// `Release` variant.
     Release {
+        /// `reason` field for reason.
         reason: Option<String>,
     },
 }
 
 #[derive(Clone, Default)]
+/// `CqrsWorkQueuePolicy` data container.
 pub struct CqrsWorkQueuePolicy {
+    /// `deterministic_handler_failures` field for deterministic handler failures.
     pub deterministic_handler_failures: Vec<CqrsErrorCode>,
 }
 
 impl CqrsWorkQueuePolicy {
+    /// Updates or reads `deterministic_handler_failure`.
     pub fn deterministic_handler_failure(mut self, code: CqrsErrorCode) -> Self {
         if !self.deterministic_handler_failures.contains(&code) {
             self.deterministic_handler_failures.push(code);
@@ -90,16 +120,24 @@ impl CqrsWorkQueuePolicy {
 }
 
 #[derive(Clone)]
+/// `CqrsWorkQueueRecipeOptions` data container.
 pub struct CqrsWorkQueueRecipeOptions<TCommand> {
+    /// `name` field for name.
     pub name: String,
+    /// `records` field for records.
     pub records: Node<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>,
+    /// `status` field for status.
     pub status: Node<CqrsStatus>,
+    /// `errors` field for errors.
     pub errors: Option<Node<CqrsError<TCommand>>>,
+    /// `worker_id` field for worker id.
     pub worker_id: Option<String>,
+    /// `policy` field for policy.
     pub policy: CqrsWorkQueuePolicy,
 }
 
 impl<TCommand> CqrsWorkQueueRecipeOptions<TCommand> {
+    /// Creates or computes `new`.
     pub fn new(
         records: Node<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>,
         status: Node<CqrsStatus>,
@@ -114,21 +152,25 @@ impl<TCommand> CqrsWorkQueueRecipeOptions<TCommand> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Updates or reads `with_errors`.
     pub fn with_errors(mut self, errors: Node<CqrsError<TCommand>>) -> Self {
         self.errors = Some(errors);
         self
     }
 
+    /// Updates or reads `for_worker`.
     pub fn for_worker(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = Some(worker_id.into());
         self
     }
 
+    /// Updates or reads `with_policy`.
     pub fn with_policy(mut self, policy: CqrsWorkQueuePolicy) -> Self {
         self.policy = policy;
         self
@@ -136,10 +178,15 @@ impl<TCommand> CqrsWorkQueueRecipeOptions<TCommand> {
 }
 
 #[derive(Clone)]
+/// `CqrsWorkQueueRecipeBundle` data container.
 pub struct CqrsWorkQueueRecipeBundle<TCommand> {
+    /// `attempts` field for attempts.
     pub attempts: Node<CqrsWorkQueueAttempt<TCommand>>,
+    /// `dispatches` field for dispatches.
     pub dispatches: Node<CqrsCommand<TCommand>>,
+    /// `commands` field for commands.
     pub commands: Node<WorkQueueCommand<CqrsQueuedCommandPayload<TCommand>>>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
 }
 
@@ -170,6 +217,7 @@ impl<TCommand> Default for CqrsQueueState<TCommand> {
     }
 }
 
+/// Creates or computes `cqrs_work_queue_recipe`.
 pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
     graph: &Graph,
     opts: CqrsWorkQueueRecipeOptions<TCommand>,
@@ -244,6 +292,7 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
     }
 }
 
+/// Creates or computes `cqrs_submit_command`.
 pub fn cqrs_submit_command<TCommand: Clone>(
     command: CqrsCommand<TCommand>,
 ) -> WorkQueueCommand<CqrsQueuedCommandPayload<TCommand>> {
@@ -258,6 +307,7 @@ pub fn cqrs_submit_command<TCommand: Clone>(
     }
 }
 
+/// Creates or computes `cqrs_work_queue_disposition_command`.
 pub fn cqrs_work_queue_disposition_command<TCommand: Clone>(
     attempt: &CqrsWorkQueueAttempt<TCommand>,
     outcome: CqrsWorkQueueOutcome<TCommand>,

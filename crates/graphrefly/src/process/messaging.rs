@@ -11,30 +11,44 @@ use crate::node::Node;
 use crate::process::{ProcessCommand, ProcessEvent, ProcessStatus, ProcessStatusState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusDelivery` data container.
 pub struct MessageBusDelivery {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
+    /// `command_id` field for command id.
     pub command_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessDeliveredCommand` data container.
 pub struct ProcessDeliveredCommand<TCommand> {
+    /// `command` field for command.
     pub command: ProcessCommand<TCommand>,
+    /// `delivery` field for delivery.
     pub delivery: MessageBusDelivery,
 }
 
+/// `ProcessMessageCommandFn` type alias.
 pub type ProcessMessageCommandFn<TPayload, TCommand> =
     Rc<dyn Fn(&MessageEnvelope<TPayload>, &MessageBusDelivery) -> Option<ProcessCommand<TCommand>>>;
 
 #[derive(Clone)]
+/// `ProcessMessagingPolicy` data container.
 pub struct ProcessMessagingPolicy<TPayload, TCommand> {
+    /// `command` field for command.
     pub command: ProcessMessageCommandFn<TPayload, TCommand>,
+    /// `ack_rejected` field for ack rejected.
     pub ack_rejected: bool,
+    /// `outbox_topic` field for outbox topic.
     pub outbox_topic: Option<String>,
 }
 
 impl<TPayload, TCommand> ProcessMessagingPolicy<TPayload, TCommand> {
+    /// Creates or computes `new`.
     pub fn new(
         command: impl Fn(&MessageEnvelope<TPayload>, &MessageBusDelivery) -> Option<ProcessCommand<TCommand>>
             + 'static,
@@ -46,11 +60,13 @@ impl<TPayload, TCommand> ProcessMessagingPolicy<TPayload, TCommand> {
         }
     }
 
+    /// Updates or reads `ack_rejected`.
     pub fn ack_rejected(mut self, ack_rejected: bool) -> Self {
         self.ack_rejected = ack_rejected;
         self
     }
 
+    /// Updates or reads `with_outbox_topic`.
     pub fn with_outbox_topic(mut self, topic: impl Into<String>) -> Self {
         self.outbox_topic = Some(topic.into());
         self
@@ -58,15 +74,22 @@ impl<TPayload, TCommand> ProcessMessagingPolicy<TPayload, TCommand> {
 }
 
 #[derive(Clone)]
+/// `ProcessMessagingRecipeOptions` data container.
 pub struct ProcessMessagingRecipeOptions<TPayload, TCommand, TEvent> {
+    /// `name` field for name.
     pub name: String,
+    /// `deliveries` field for deliveries.
     pub deliveries: Node<MessageBusAvailablePage<TPayload>>,
+    /// `status` field for status.
     pub status: Node<ProcessStatus>,
+    /// `events` field for events.
     pub events: Option<Node<ProcessEvent<TEvent>>>,
+    /// `policy` field for policy.
     pub policy: ProcessMessagingPolicy<TPayload, TCommand>,
 }
 
 impl<TPayload, TCommand, TEvent> ProcessMessagingRecipeOptions<TPayload, TCommand, TEvent> {
+    /// Creates or computes `new`.
     pub fn new(
         deliveries: Node<MessageBusAvailablePage<TPayload>>,
         status: Node<ProcessStatus>,
@@ -81,11 +104,13 @@ impl<TPayload, TCommand, TEvent> ProcessMessagingRecipeOptions<TPayload, TComman
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Updates or reads `with_events`.
     pub fn with_events(mut self, events: Node<ProcessEvent<TEvent>>) -> Self {
         self.events = Some(events);
         self
@@ -93,11 +118,17 @@ impl<TPayload, TCommand, TEvent> ProcessMessagingRecipeOptions<TPayload, TComman
 }
 
 #[derive(Clone)]
+/// `ProcessMessagingRecipeBundle` data container.
 pub struct ProcessMessagingRecipeBundle<TCommand, TEvent> {
+    /// `delivered_commands` field for delivered commands.
     pub delivered_commands: Node<ProcessDeliveredCommand<TCommand>>,
+    /// `commands` field for commands.
     pub commands: Node<ProcessCommand<TCommand>>,
+    /// `ack_commands` field for ack commands.
     pub ack_commands: Node<MessageBusCommand<TCommand>>,
+    /// `outbox_commands` field for outbox commands.
     pub outbox_commands: Option<Node<MessageBusCommand<ProcessEvent<TEvent>>>>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
 }
 
@@ -112,6 +143,7 @@ struct AckState {
     deliveries: BTreeMap<String, Vec<MessageBusDelivery>>,
 }
 
+/// Creates or computes `process_messaging_recipe`.
 pub fn process_messaging_recipe<
     TPayload: Clone + 'static,
     TCommand: Clone + 'static,
@@ -194,14 +226,21 @@ pub fn process_messaging_recipe<
     }
 }
 
+/// `ProcessMessageAckOptions` data container.
 pub struct ProcessMessageAckOptions<TCommand> {
+    /// `name` field for name.
     pub name: String,
+    /// `delivered_commands` field for delivered commands.
     pub delivered_commands: Node<ProcessDeliveredCommand<TCommand>>,
+    /// `status` field for status.
     pub status: Node<ProcessStatus>,
+    /// `issues` field for issues.
     pub issues: Option<Node<DataIssue>>,
+    /// `ack_rejected` field for ack rejected.
     pub ack_rejected: bool,
 }
 
+/// Creates or computes `process_message_ack_commands`.
 pub fn process_message_ack_commands<TCommand: Clone + 'static>(
     graph: &Graph,
     opts: ProcessMessageAckOptions<TCommand>,
@@ -267,6 +306,7 @@ fn process_ack_id(delivery: &MessageBusDelivery, reason: &str) -> String {
     )
 }
 
+/// Creates or computes `process_event_outbox_commands`.
 pub fn process_event_outbox_commands<TEvent: Clone + 'static>(
     graph: &Graph,
     events: Node<ProcessEvent<TEvent>>,

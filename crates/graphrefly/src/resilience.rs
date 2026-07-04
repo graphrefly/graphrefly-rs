@@ -13,27 +13,42 @@ use crate::time::timeout;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BackoffPolicy {
     #[default]
+    /// `None` variant.
     None,
+    /// `Constant` variant.
     Constant {
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
     },
+    /// `Linear` variant.
     Linear {
+        /// `initial_ms` field for initial ms.
         initial_ms: u64,
+        /// `step_ms` field for step ms.
         step_ms: u64,
+        /// `max_ms` field for max ms.
         max_ms: Option<u64>,
     },
+    /// `Exponential` variant.
     Exponential {
+        /// `initial_ms` field for initial ms.
         initial_ms: u64,
+        /// `factor` field for factor.
         factor: u32,
+        /// `max_ms` field for max ms.
         max_ms: Option<u64>,
     },
+    /// `Fibonacci` variant.
     Fibonacci {
+        /// `unit_ms` field for unit ms.
         unit_ms: u64,
+        /// `max_ms` field for max ms.
         max_ms: Option<u64>,
     },
 }
 
 impl BackoffPolicy {
+    /// Updates or reads `delay_ms`.
     pub fn delay_ms(&self, attempt: u32) -> u64 {
         match self {
             BackoffPolicy::None => 0,
@@ -64,11 +79,14 @@ impl BackoffPolicy {
 /// Passive retry policy shared by environment adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `backoff` field for backoff.
     pub backoff: BackoffPolicy,
 }
 
 impl RetryPolicy {
+    /// Creates or computes `new`.
     pub fn new(max_attempts: u32, backoff: BackoffPolicy) -> Self {
         assert!(max_attempts > 0, "RetryPolicy: max_attempts must be > 0");
         Self {
@@ -77,10 +95,12 @@ impl RetryPolicy {
         }
     }
 
+    /// Updates or reads `should_retry`.
     pub fn should_retry(&self, failed_attempt: u32) -> bool {
         failed_attempt < self.max_attempts
     }
 
+    /// Updates or reads `next_delay_ms`.
     pub fn next_delay_ms(&self, next_attempt: u32) -> Option<u64> {
         if next_attempt == 0 || next_attempt > self.max_attempts {
             return None;
@@ -101,83 +121,134 @@ impl Default for RetryPolicy {
 /// Graph-visible retry/reconnect status payload shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryStatus {
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `delay_ms` field for delay ms.
     pub delay_ms: Option<u64>,
+    /// `state` field for state.
     pub state: RetryState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RetryState` variants.
 pub enum RetryState {
+    /// `Idle` variant.
     Idle,
+    /// `Running` variant.
     Running,
+    /// `Waiting` variant.
     Waiting,
+    /// `Succeeded` variant.
     Succeeded,
+    /// `Failed` variant.
     Failed,
+    /// `Exhausted` variant.
     Exhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RetryEvent` variants.
 pub enum RetryEvent {
+    /// `Attempt` variant.
     Attempt {
+        /// `attempt` field for attempt.
         attempt: u32,
     },
+    /// `Retry` variant.
     Retry {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
+        /// `error` field for error.
         error: String,
     },
+    /// `Success` variant.
     Success {
+        /// `attempt` field for attempt.
         attempt: u32,
     },
+    /// `Failure` variant.
     Failure {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `error` field for error.
         error: String,
     },
+    /// `Exhausted` variant.
     Exhausted {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `error` field for error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `BreakerStatus` data container.
 pub struct BreakerStatus {
+    /// `state` field for state.
     pub state: BreakerState,
+    /// `failures` field for failures.
     pub failures: u32,
+    /// `opened_at_ms` field for opened at ms.
     pub opened_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `BreakerState` variants.
 pub enum BreakerState {
+    /// `Closed` variant.
     Closed,
+    /// `Open` variant.
     Open,
+    /// `HalfOpen` variant.
     HalfOpen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `RateLimitStatus` data container.
 pub struct RateLimitStatus {
+    /// `allowed` field for allowed.
     pub allowed: u64,
+    /// `dropped` field for dropped.
     pub dropped: u64,
+    /// `remaining` field for remaining.
     pub remaining: u32,
+    /// `reset_at_ms` field for reset at ms.
     pub reset_at_ms: u64,
 }
 
+/// `RateLimitBundle` data container.
 pub struct RateLimitBundle<T: 'static> {
+    /// `allowed` field for allowed.
     pub allowed: Node<T>,
+    /// `dropped` field for dropped.
     pub dropped: Node<T>,
+    /// `status` field for status.
     pub status: Node<RateLimitStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `TimeoutStatus` variants.
 pub enum TimeoutStatus {
+    /// `Running` variant.
     Running,
+    /// `Completed` variant.
     Completed,
+    /// `Errored` variant.
     Errored,
 }
 
+/// `TimeoutBundle` data container.
 pub struct TimeoutBundle<T: 'static> {
+    /// `node` field for node.
     pub node: Node<T>,
+    /// `status` field for status.
     pub status: Node<TimeoutStatus>,
+    /// `errors` field for errors.
     pub errors: Node<String>,
 }
 
@@ -202,6 +273,7 @@ struct RateLimitState {
     dropped: u64,
 }
 
+/// Creates or computes `retry_status_node`.
 pub fn retry_status_node(
     graph: &Graph,
     events: &Node<RetryEvent>,
@@ -264,6 +336,7 @@ pub fn retry_status_node(
     )
 }
 
+/// Creates or computes `breaker_status_node`.
 pub fn breaker_status_node(
     graph: &Graph,
     events: &Node<RetryEvent>,
@@ -313,6 +386,7 @@ pub fn breaker_status_node(
     )
 }
 
+/// Creates or computes `rate_limit_bundle`.
 pub fn rate_limit_bundle<T>(
     graph: &Graph,
     source: &Node<T>,
@@ -407,6 +481,7 @@ where
     }
 }
 
+/// Creates or computes `timeout_bundle`.
 pub fn timeout_bundle<T>(
     graph: &Graph,
     source: &Node<T>,

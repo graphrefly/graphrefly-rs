@@ -14,16 +14,24 @@ use crate::process::ProcessEffectRequest;
 use crate::work_queue::{WorkQueueCommand, WorkQueueRecord};
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessQueuedEffectPayload` data container.
 pub struct ProcessQueuedEffectPayload<TEffect> {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `effect` field for effect.
     pub effect: ProcessEffectRequest<TEffect>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<String>,
+    /// `policy_refs` field for policy refs.
     pub policy_refs: Vec<String>,
+    /// `metadata` field for metadata.
     pub metadata: Option<String>,
 }
 
 impl<TEffect> ProcessQueuedEffectPayload<TEffect> {
+    /// Creates or computes `new`.
     pub fn new(effect: ProcessEffectRequest<TEffect>) -> Self {
         Self {
             kind: "process-queued-effect".to_owned(),
@@ -37,50 +45,83 @@ impl<TEffect> ProcessQueuedEffectPayload<TEffect> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessQueueEvidence` data container.
 pub struct ProcessQueueEvidence {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `evidence_id` field for evidence id.
     pub evidence_id: String,
+    /// `effect_id` field for effect id.
     pub effect_id: String,
+    /// `effect_type` field for effect type.
     pub effect_type: String,
+    /// `work_id` field for work id.
     pub work_id: String,
+    /// `queue_record_kind` field for queue record kind.
     pub queue_record_kind: String,
+    /// `result` field for result.
     pub result: Option<String>,
+    /// `error` field for error.
     pub error: Option<String>,
+    /// `recorded_at_ms` field for recorded at ms.
     pub recorded_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessQueueStatus` data container.
 pub struct ProcessQueueStatus {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `state` field for state.
     pub state: String,
+    /// `effect_id` field for effect id.
     pub effect_id: Option<String>,
+    /// `effect_type` field for effect type.
     pub effect_type: Option<String>,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `queue_record_kind` field for queue record kind.
     pub queue_record_kind: Option<String>,
+    /// `evidence_id` field for evidence id.
     pub evidence_id: Option<String>,
+    /// `issue_codes` field for issue codes.
     pub issue_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessQueueAuditRecord` data container.
 pub struct ProcessQueueAuditRecord {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `outcome` field for outcome.
     pub outcome: String,
+    /// `effect_id` field for effect id.
     pub effect_id: Option<String>,
+    /// `effect_type` field for effect type.
     pub effect_type: Option<String>,
+    /// `work_id` field for work id.
     pub work_id: Option<String>,
+    /// `queue_record_kind` field for queue record kind.
     pub queue_record_kind: Option<String>,
+    /// `evidence_id` field for evidence id.
     pub evidence_id: Option<String>,
 }
 
 #[derive(Clone)]
+/// `ProcessWorkQueueRecipeOptions` data container.
 pub struct ProcessWorkQueueRecipeOptions<TEffect> {
+    /// `name` field for name.
     pub name: String,
+    /// `effect_requests` field for effect requests.
     pub effect_requests: Option<Node<ProcessEffectRequest<TEffect>>>,
+    /// `records` field for records.
     pub records: Node<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>,
 }
 
 impl<TEffect> ProcessWorkQueueRecipeOptions<TEffect> {
+    /// Creates or computes `new`.
     pub fn new(records: Node<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>) -> Self {
         Self {
             name: "processWorkQueue".to_owned(),
@@ -89,11 +130,13 @@ impl<TEffect> ProcessWorkQueueRecipeOptions<TEffect> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Updates or reads `with_effect_requests`.
     pub fn with_effect_requests(
         mut self,
         effect_requests: Node<ProcessEffectRequest<TEffect>>,
@@ -104,11 +147,17 @@ impl<TEffect> ProcessWorkQueueRecipeOptions<TEffect> {
 }
 
 #[derive(Clone)]
+/// `ProcessWorkQueueRecipeBundle` data container.
 pub struct ProcessWorkQueueRecipeBundle<TEffect> {
+    /// `submit_commands` field for submit commands.
     pub submit_commands: Option<Node<WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>>>>,
+    /// `evidence` field for evidence.
     pub evidence: Node<ProcessQueueEvidence>,
+    /// `status` field for status.
     pub status: Node<ProcessQueueStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// `audit` field for audit.
     pub audit: Node<ProcessQueueAuditRecord>,
 }
 
@@ -137,6 +186,7 @@ impl<TEffect> Default for ProcessQueueState<TEffect> {
     }
 }
 
+/// Creates or computes `process_work_queue_recipe`.
 pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
     graph: &Graph,
     opts: ProcessWorkQueueRecipeOptions<TEffect>,
@@ -205,6 +255,7 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
     }
 }
 
+/// Creates or computes `process_effect_submit_command`.
 pub fn process_effect_submit_command<TEffect: Clone>(
     effect: ProcessEffectRequest<TEffect>,
 ) -> WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>> {
@@ -219,6 +270,7 @@ pub fn process_effect_submit_command<TEffect: Clone>(
     }
 }
 
+/// Creates or computes `process_effect_submit_commands`.
 pub fn process_effect_submit_commands<TEffect: Clone + 'static>(
     graph: &Graph,
     effect_requests: Node<ProcessEffectRequest<TEffect>>,

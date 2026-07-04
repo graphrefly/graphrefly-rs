@@ -24,51 +24,86 @@ type OutboundSend<T, R> =
     Rc<dyn Fn(T, Box<dyn FnOnce(Result<R, GraphError>)>) -> Option<DriverCancel>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `OutboundEvent` variants.
 pub enum OutboundEvent<T, R> {
+    /// `Attempt` variant.
     Attempt {
+        /// `value` field for value.
         value: T,
+        /// `attempt` field for attempt.
         attempt: u32,
     },
+    /// `Retry` variant.
     Retry {
+        /// `value` field for value.
         value: T,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
+        /// `error` field for error.
         error: String,
     },
+    /// `Sent` variant.
     Sent {
+        /// `value` field for value.
         value: T,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `result` field for result.
         result: R,
     },
+    /// `Exhausted` variant.
     Exhausted {
+        /// `value` field for value.
         value: T,
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `error` field for error.
         error: String,
     },
+    /// `UpstreamComplete` variant.
     UpstreamComplete,
+    /// `UpstreamError` variant.
     UpstreamError {
+        /// `error` field for error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `OutboundState` variants.
 pub enum OutboundState {
+    /// `Idle` variant.
     Idle,
+    /// `Running` variant.
     Running,
+    /// `Waiting` variant.
     Waiting,
+    /// `Succeeded` variant.
     Succeeded,
+    /// `Exhausted` variant.
     Exhausted,
+    /// `Failed` variant.
     Failed,
+    /// `Completed` variant.
     Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `OutboundStatus` data container.
 pub struct OutboundStatus {
+    /// `state` field for state.
     pub state: OutboundState,
+    /// `in_flight` field for in flight.
     pub in_flight: u32,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `sent` field for sent.
     pub sent: u64,
+    /// `failed` field for failed.
     pub failed: u64,
+    /// `last_delay_ms` field for last delay ms.
     pub last_delay_ms: Option<u64>,
 }
 
@@ -85,143 +120,230 @@ impl Default for OutboundStatus {
     }
 }
 
+/// `OutboundBundle` data container.
 pub struct OutboundBundle<T: 'static, R: 'static> {
+    /// `events` field for events.
     pub events: Node<OutboundEvent<T, R>>,
+    /// `status` field for status.
     pub status: Node<OutboundStatus>,
+    /// `attempts` field for attempts.
     pub attempts: Node<u32>,
+    /// `errors` field for errors.
     pub errors: Node<String>,
 }
 
 #[derive(Clone, Default)]
+/// `OutboundAdapterOptions` data container.
 pub struct OutboundAdapterOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `retry` field for retry.
     pub retry: RetryPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionCommand` variants.
 pub enum WebSocketSessionCommand {
+    /// `Start` variant.
     Start,
+    /// `Send` variant.
     Send(WebSocketSend),
+    /// `Close` variant.
     Close {
+        /// `code` field for code.
         code: Option<u16>,
+        /// `reason` field for reason.
         reason: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionInbound` variants.
 pub enum WebSocketSessionInbound {
+    /// `Text` variant.
     Text(String),
+    /// `Binary` variant.
     Binary(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionLifecycle` variants.
 pub enum WebSocketSessionLifecycle {
+    /// `Starting` variant.
     Starting {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `max_attempts` field for max attempts.
         max_attempts: u32,
     },
+    /// `Open` variant.
     Open {
+        /// `attempt` field for attempt.
         attempt: u32,
     },
+    /// `Sent` variant.
     Sent {
+        /// `message` field for message.
         message: WebSocketSend,
     },
+    /// `Closing` variant.
     Closing {
+        /// `code` field for code.
         code: Option<u16>,
+        /// `reason` field for reason.
         reason: Option<String>,
     },
+    /// `Closed` variant.
     Closed {
+        /// `code` field for code.
         code: Option<u16>,
+        /// `reason` field for reason.
         reason: Option<String>,
     },
+    /// `Retrying` variant.
     Retrying {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `next_attempt` field for next attempt.
         next_attempt: u32,
+        /// `delay_ms` field for delay ms.
         delay_ms: u64,
+        /// `error` field for error.
         error: String,
     },
+    /// `Exhausted` variant.
     Exhausted {
+        /// `attempt` field for attempt.
         attempt: u32,
+        /// `error` field for error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionStateKind` variants.
 pub enum WebSocketSessionStateKind {
+    /// `Idle` variant.
     Idle,
+    /// `Connecting` variant.
     Connecting,
+    /// `Open` variant.
     Open,
+    /// `Closing` variant.
     Closing,
+    /// `Closed` variant.
     Closed,
+    /// `Waiting` variant.
     Waiting,
+    /// `Exhausted` variant.
     Exhausted,
+    /// `Errored` variant.
     Errored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionStatus` data container.
 pub struct WebSocketSessionStatus {
+    /// `state` field for state.
     pub state: WebSocketSessionStateKind,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `sent` field for sent.
     pub sent: u64,
+    /// `received` field for received.
     pub received: u64,
+    /// `errors` field for errors.
     pub errors: u64,
+    /// `last_delay_ms` field for last delay ms.
     pub last_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSessionOutbound` variants.
 pub enum WebSocketSessionOutbound {
+    /// `Queued` variant.
     Queued {
+        /// `seq` field for seq.
         seq: u64,
+        /// `message` field for message.
         message: WebSocketSend,
     },
+    /// `Sending` variant.
     Sending {
+        /// `seq` field for seq.
         seq: u64,
+        /// `message` field for message.
         message: WebSocketSend,
     },
+    /// `Sent` variant.
     Sent {
+        /// `seq` field for seq.
         seq: u64,
+        /// `message` field for message.
         message: WebSocketSend,
     },
+    /// `Rejected` variant.
     Rejected {
+        /// `seq` field for seq.
         seq: u64,
+        /// `message` field for message.
         message: WebSocketSend,
+        /// `error` field for error.
         error: String,
     },
+    /// `Canceled` variant.
     Canceled {
+        /// `seq` field for seq.
         seq: u64,
+        /// `message` field for message.
         message: WebSocketSend,
+        /// `reason` field for reason.
         reason: String,
     },
 }
 
+/// `WebSocketSessionBundle` data container.
 pub struct WebSocketSessionBundle {
+    /// `command` field for command.
     pub command: Node<WebSocketSessionCommand>,
+    /// `inbound` field for inbound.
     pub inbound: Node<WebSocketSessionInbound>,
+    /// `lifecycle` field for lifecycle.
     pub lifecycle: Node<WebSocketSessionLifecycle>,
+    /// `outbound` field for outbound.
     pub outbound: Node<WebSocketSessionOutbound>,
+    /// `status` field for status.
     pub status: Node<WebSocketSessionStatus>,
+    /// `errors` field for errors.
     pub errors: Node<String>,
+    /// `attempts` field for attempts.
     pub attempts: Node<u32>,
 }
 
 impl WebSocketSessionBundle {
+    /// Updates or reads `start`.
     pub fn start(&self) {
         self.command.set(WebSocketSessionCommand::Start);
     }
 
+    /// Updates or reads `send`.
     pub fn send(&self, message: WebSocketSend) {
         self.command.set(WebSocketSessionCommand::Send(message));
     }
 
+    /// Updates or reads `send_text`.
     pub fn send_text(&self, text: impl Into<String>) {
         self.send(WebSocketSend::text(text));
     }
 
+    /// Updates or reads `send_binary`.
     pub fn send_binary(&self, bytes: impl Into<Vec<u8>>) {
         self.send(WebSocketSend::binary(bytes));
     }
 
+    /// Updates or reads `close`.
     pub fn close(&self, code: Option<u16>, reason: Option<String>) {
         self.command
             .set(WebSocketSessionCommand::Close { code, reason });
@@ -229,18 +351,26 @@ impl WebSocketSessionBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `WebSocketSessionSendPolicy` variants.
 pub enum WebSocketSessionSendPolicy {
     #[default]
+    /// `Reject` variant.
     Reject,
+    /// `Buffer` variant.
     Buffer {
+        /// `max_pending` field for max pending.
         max_pending: usize,
     },
 }
 
 #[derive(Clone, Default)]
+/// `WebSocketSessionOptions` data container.
 pub struct WebSocketSessionOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `retry` field for retry.
     pub retry: RetryPolicy,
+    /// `send_policy` field for send policy.
     pub send_policy: WebSocketSessionSendPolicy,
 }
 
@@ -317,10 +447,12 @@ struct LiveWebSocketOutbound {
     item: PendingWebSocketOutbound,
 }
 
+/// Creates or computes `websocket_session`.
 pub fn websocket_session(graph: &Graph, request: WebSocketRequest) -> WebSocketSessionBundle {
     websocket_session_with_options(graph, request, WebSocketSessionOptions::default())
 }
 
+/// Creates or computes `websocket_session_with_options`.
 pub fn websocket_session_with_options(
     graph: &Graph,
     request: WebSocketRequest,
@@ -1224,6 +1356,7 @@ fn deactivate_websocket_session_state(state: &WebSocketSessionStateCell) {
     let _cleanup = close_websocket_session_connection(state, true);
 }
 
+/// Creates or computes `to_http`.
 pub fn to_http<T, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -1236,6 +1369,7 @@ where
     to_http_with_options(graph, source, request_of, OutboundAdapterOptions::default())
 }
 
+/// Creates or computes `to_http_with_options`.
 pub fn to_http_with_options<T, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -1259,6 +1393,7 @@ where
     outbound_bundle(graph, events, name)
 }
 
+/// Creates or computes `to_process`.
 pub fn to_process<T, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -1271,6 +1406,7 @@ where
     to_process_with_options(graph, source, command_of, OutboundAdapterOptions::default())
 }
 
+/// Creates or computes `to_process_with_options`.
 pub fn to_process_with_options<T, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -1294,6 +1430,7 @@ where
     outbound_bundle(graph, events, name)
 }
 
+/// Creates or computes `to_websocket`.
 pub fn to_websocket<T, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -1313,6 +1450,7 @@ where
     )
 }
 
+/// Creates or computes `to_websocket_with_options`.
 pub fn to_websocket_with_options<T, F>(
     graph: &Graph,
     source: &Node<T>,

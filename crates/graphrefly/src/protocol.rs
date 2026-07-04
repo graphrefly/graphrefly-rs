@@ -27,6 +27,7 @@ pub type AnyValue = Rc<dyn std::any::Any>;
 pub struct LockId(pub String);
 
 impl LockId {
+    /// Creates or computes `new`.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -55,7 +56,9 @@ impl From<&str> for LockId {
 /// (see `CLEAN-SLATE.md`). A node is NOT a handle; a handle is inert routing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle {
+    /// `pool_id` field for pool id.
     pub pool_id: u32,
+    /// `handle_id` field for handle id.
     pub handle_id: u32,
     /// Local slotmap generation (B32, per-language) — NOT in the protocol IDL.
     pub generation: u32,
@@ -74,12 +77,15 @@ pub type GraphError = Box<dyn std::error::Error + 'static>;
 /// never DATA-up and never become a second dep-value input channel.
 #[derive(Clone)]
 pub struct PullDemand {
+    /// `pull_id` field for pull id.
     pub pull_id: LockId,
+    /// `params` field for params.
     pub params: Option<AnyValue>,
 }
 
 impl PullDemand {
     #[must_use]
+    /// Creates or computes `new`.
     pub fn new(pull_id: impl Into<LockId>) -> Self {
         Self {
             pull_id: pull_id.into(),
@@ -88,6 +94,7 @@ impl PullDemand {
     }
 
     #[must_use]
+    /// Creates or computes `with_params`.
     pub fn with_params<T: 'static>(pull_id: impl Into<LockId>, params: T) -> Self {
         Self {
             pull_id: pull_id.into(),
@@ -96,6 +103,7 @@ impl PullDemand {
     }
 
     #[must_use]
+    /// Updates or reads `params`.
     pub fn params<T: 'static>(&self) -> Option<Rc<T>> {
         self.params.clone().and_then(|p| p.downcast::<T>().ok())
     }
@@ -138,6 +146,7 @@ pub enum Tier {
 
 impl Tier {
     #[inline]
+    /// Updates or reads `as_u8`.
     pub fn as_u8(self) -> u8 {
         self as u8
     }

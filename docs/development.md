@@ -1,215 +1,117 @@
-# Development guide
+# Development Guide
 
-How to set up the toolchain, build, test, lint, and ship contributions to graphrefly-rs.
+How to set up the toolchain, build, test, lint, and maintain Rust package-local
+documentation for graphrefly-rs.
 
-This guide is the substantive companion to [`../CONTRIBUTING.md`](../CONTRIBUTING.md). For the spec sources you must honor while developing, see [`architecture.md`](architecture.md). For Claude session orientation, see [`../CLAUDE.md`](../CLAUDE.md).
+For the authority map, see [`architecture.md`](architecture.md). For the docs
+ownership boundary, see [`docs.jsonl`](docs.jsonl). For agent/session
+orientation, see [`../AGENTS.md`](../AGENTS.md).
 
 ## Toolchain
 
-The Rust version is pinned in two places:
-- [`rust-toolchain.toml`](../rust-toolchain.toml) — honored automatically by [rustup](https://rustup.rs)
-- [`.mise.toml`](../.mise.toml) — honored by [mise](https://mise.jdx.dev)
+Rust is pinned in two places:
 
-Both pin the same version. Pick whichever toolchain manager you already use.
+- [`rust-toolchain.toml`](../rust-toolchain.toml) for rustup.
+- [`.mise.toml`](../.mise.toml) for mise.
 
-### Option 1: mise (recommended)
+Use mise in agent shells unless you have a reason not to:
 
 ```bash
-mise trust          # one-time, after cloning (mise refuses untrusted configs)
-mise install        # installs the pinned Rust version
-eval "$(mise env)"  # adds cargo/rustc to PATH for this shell
+mise trust
+mise install
+mise exec -- cargo --version
 ```
 
-### Option 2: rustup
+Direct rustup also works from the repo root:
 
 ```bash
-# One-time install of rustup itself
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# rustup automatically reads rust-toolchain.toml when you cd into the repo
-cd ~/src/graphrefly-rs
-rustc --version  # should match the pinned version
-```
-
-### Option 3: Homebrew / system package manager
-
-Discouraged. System Rust is often outdated or version-mismatched against the pin. Use mise or rustup.
-
-### Verify
-
-```bash
-rustc --version    # must match rust-toolchain.toml
+rustc --version
 cargo --version
 ```
 
-## Build, test, lint
+## Build, Test, Lint
 
-The default-members of the workspace exclude binding crates so daily commands don't pull in napi-rs, pyo3, or wasm-bindgen toolchains.
-
-```bash
-# Type-check (fast; no codegen)
-cargo check --workspace
-
-# Build everything (default-members; bindings excluded)
-cargo build
-
-# Run tests (cargo-nextest — the canonical loop; install via
-# `cargo install cargo-nextest --locked` or the prebuilt tarball at
-# https://get.nexte.st). `cargo test` is a legacy fallback only.
-cargo nextest run                    # fast default loop (cascade_depth quarantined)
-cargo nextest run --profile ci       # full suite incl. cascade_depth guards (== `cargo tc`)
-scripts/dev-test.sh                  # default loop, per-worktree-isolated target
-
-# Run tests for one crate
-cargo nextest run -p graphrefly-core
-
-# Lint (clippy::pedantic warn-by-default — see CLAUDE.md "Rust-specific invariants")
-cargo clippy --workspace --all-targets
-
-# Format (rustfmt; CI fails if --check would diff)
-cargo fmt --all --check     # check only
-cargo fmt --all             # apply
-
-# Apply clippy auto-fixes (review the diff before committing)
-cargo clippy --workspace --all-targets --fix
-```
-
-### Concurrency permutation testing (loom)
-
-The Core dispatcher's per-subgraph `parking_lot::ReentrantMutex` and the version-counter atomics warrant model-checked concurrency tests. Loom permutes thread interleavings to catch races the runtime might miss.
+Preferred commands:
 
 ```bash
-cargo test -p graphrefly-core --features loom-checked
+mise exec -- cargo test -p graphrefly-rs
+mise exec -- cargo build -p graphrefly-rs
+mise exec -- cargo clippy -p graphrefly-rs --all-targets
+mise exec -- cargo fmt --all --check
 ```
 
-Loom tests are slower than regular tests; CI runs them on every PR but locally you can skip unless touching dispatch internals.
-
-### Benchmarks
+Optional feature checks:
 
 ```bash
-cargo bench -p graphrefly-core   # criterion benches
+mise exec -- cargo test -p graphrefly-rs --features tokio-http,tokio-websocket
+mise exec -- cargo test -p graphrefly-rs --features tokio-worker
 ```
 
-Benches land alongside M1 implementation (not in the scaffold).
-
-### Supply-chain audit
-
-Once-per-machine: `cargo install cargo-deny`. Then:
+Focused CSP-10 checks:
 
 ```bash
-cargo deny check          # license + advisory + version-unification audit
-cargo deny check licenses
-cargo deny check advisories
+mise exec -- cargo test -p graphrefly-rs --test acceptance public_crate_root_d566
+mise exec -- cargo test -p graphrefly-rs --test csp10_recipes
+mise exec -- cargo run -p graphrefly-rs --example csp10_baseline_app_infra
 ```
 
-Config lives in [`../deny.toml`](../deny.toml). CI runs this on every PR.
+## Documentation Work
 
-## Bindings — separate toolchains
+Rust package docs live here:
 
-The three binding crates (`graphrefly-bindings-{js,py,wasm}`) require their own non-Cargo build tools. They are NOT compiled by `cargo build` or `cargo nextest run` (both scoped to workspace `default-members`). Build them via their toolchains:
+- Rustdoc comments on exported crate items.
+- `README.md`.
+- Rust examples and package-local development docs under `docs/`.
+- Crate release notes and docs.rs/rustdoc generation material.
+- Package-local docs checks recorded in `docs/docs.jsonl`.
 
-### JavaScript (napi-rs)
+Shared graphrefly.dev pages, shared guide records, public blog storage/rendering,
+protocol authority, and dashboard/control views live in `~/src/graphrefly`
+under D563. Do not copy rustdoc output into the shared authority repo by hand,
+and do not copy shared public docs back into this repo as mirrors.
 
-```bash
-# One-time toolchain setup
-mise install node@22
-mise install pnpm
+When editing rustdoc examples, prefer examples that compile or are covered by
+tests. If an example is illustrative only, mark it as such in the rustdoc block.
+Run `mise exec -- cargo fmt --all --check` after touching Rust files, including
+rustdoc comments.
 
-cd crates/graphrefly-bindings-js
-pnpm install
-pnpm build              # produces .node binary in ./
-pnpm test               # JS-side smoke tests
-```
+## Docs.rs And Releases
 
-CI publishes per-platform binaries to npm under `@graphrefly/lite`, `@graphrefly/standard`, `@graphrefly/full`. See [`SESSION-rust-port-architecture.md`](https://github.com/graphrefly/graphrefly-ts/blob/main/archive/docs/SESSION-rust-port-architecture.md) Part 9 for the multi-distribution model.
+The publishable crate is `crates/graphrefly` (`package = "graphrefly-rs"`,
+`lib = "graphrefly"`). Its `package.metadata.docs.rs` enables all features so
+feature-gated public APIs appear in generated docs.rs/rustdoc output.
 
-### Python (pyo3 + maturin)
+Before a crate release:
 
-```bash
-# One-time toolchain setup
-mise install python@3.13
-mise install uv
-uv tool install maturin
+1. Confirm package-local release notes or changelog material is current.
+2. Run `mise exec -- cargo fmt --all --check`.
+3. Run `mise exec -- cargo test -p graphrefly-rs`.
+4. Run `mise exec -- cargo build -p graphrefly-rs`.
+5. Run `mise exec -- cargo clippy -p graphrefly-rs --all-targets`.
+6. For docs-affecting feature work, check docs with all features:
+   `mise exec -- cargo doc -p graphrefly-rs --all-features --no-deps`.
 
-cd crates/graphrefly-bindings-py
-maturin develop --release   # builds + installs into the active Python env
-pytest                      # PY-side smoke tests
-```
+The GitHub Pages rustdoc deployment workflow lives at
+`.github/workflows/pages.yml`. It builds `cargo doc -p graphrefly-rs
+--all-features --no-deps`, fails on rustdoc warnings, uploads `target/doc`, and
+adds a root redirect to the `graphrefly` crate docs.
 
-CI publishes to PyPI as `graphrefly` with extras (`pip install graphrefly[full]`).
+## Adding A Dependency
 
-### WASM (wasm-bindgen + wasm-pack)
+1. Add the dependency to `[workspace.dependencies]` in the root
+   [`Cargo.toml`](../Cargo.toml).
+2. Reference it from the member crate with `workspace = true`.
+3. Add or adjust feature flags if the dependency is optional.
+4. Run the focused build/test/lint commands above.
 
-```bash
-# One-time toolchain setup
-cargo install wasm-pack
+## When Tests Break
 
-cd crates/graphrefly-bindings-wasm
-wasm-pack build --target web      # for browser
-wasm-pack build --target nodejs   # for Node / edge runtimes
-wasm-pack test --node             # WASM-side smoke tests
-```
+First determine whether the failure is a Rust implementation bug or a protocol
+authority question:
 
-CI publishes to npm as `@graphrefly/lite-wasm`, `@graphrefly/standard-wasm`.
-
-## Pre-commit checklist
-
-Before opening a PR, run all of:
-
-```bash
-cargo check --workspace
-cargo nextest run --profile ci           # full suite incl. cascade_depth guards
-cargo clippy --workspace --all-targets   # zero warnings
-cargo fmt --all --check                  # zero diffs
-cargo deny check                         # if cargo-deny installed
-```
-
-CI enforces all five. Failing locally is faster to fix than failing in CI.
-
-## Adding a new dependency
-
-1. Add to `[workspace.dependencies]` in the root [`Cargo.toml`](../Cargo.toml) — never directly in a member crate's `Cargo.toml`. This is how the workspace keeps versions unified.
-2. In the member crate's `Cargo.toml`, reference via `workspace = true`:
-   ```toml
-   [dependencies]
-   new_crate = { workspace = true, features = ["specific-feature"] }
-   ```
-3. If the crate has multiple feature-gated paths, add a feature to the member crate's `[features]` block:
-   ```toml
-   [features]
-   default = ["..."]
-   new-capability = ["dep:new_crate"]
-   ```
-4. Run `cargo deny check licenses` to confirm the new transitive deps are allowed.
-
-## Bumping a dep version
-
-1. Edit `[workspace.dependencies]` in the root `Cargo.toml`.
-2. `cargo update` to refresh `Cargo.lock`.
-3. `cargo check --workspace` to confirm no API breaks.
-4. `cargo nextest run --profile ci` to confirm behavior intact.
-5. Commit `Cargo.toml` + `Cargo.lock` together.
-
-For the Rust toolchain itself, edit BOTH `rust-toolchain.toml` AND `.mise.toml` (and the `rust-version` field in `Cargo.toml`'s `[workspace.package]`). Three files, same version.
-
-## When tests break
-
-The Core implementation must verify against `~/src/graphrefly/formal/wave_protocol.tla` (TLA+ spec) and the [property tests in graphrefly-ts](https://github.com/graphrefly/graphrefly-ts/tree/main/src/__tests__/properties) (fast-check). If a Rust test fails:
-
-1. **Read [COMPOSITION-GUIDE-PROTOCOL.md](https://github.com/graphrefly/graphrefly/blob/main/COMPOSITION-GUIDE-PROTOCOL.md) FIRST** before improvising fixes. Per the project memory rule: skipping leads to null-guard violations and layer-breaking optimizations.
-2. Isolate the failing test (`cargo nextest run -p <crate> -E 'test(<test_name>)' --no-capture`; nextest names a SLOW test by name and hard-kills a deadlock — so a hang is unambiguous vs a legitimately long test).
-3. Run the equivalent TLC scenario MC against `wave_protocol.tla` to see if the bug exists in the spec interpretation.
-4. Decide: protocol bug (file against `graphrefly/graphrefly`) vs Rust impl bug (fix here).
-
-## Working with multiple crates
-
-When changing the Core protocol surface, multiple crates often need coordinated updates:
-
-```bash
-# Find every crate that depends on the changed type
-cargo tree -i graphrefly-core
-
-# Make a single PR that touches all affected crates
-```
-
-Per the project's "no autonomous decisions" memory rule: surface conflicts file-by-file, don't silently rewrite multiple files in one pass without raising flags.
+1. Check the governing rule in `~/src/graphrefly/spec/rules.jsonl`.
+2. Check the governing decision in
+   `~/src/graphrefly/decisions/decisions.jsonl`.
+3. If the rule is clear, fix the Rust implementation or docs to match it.
+4. If the rule is silent or contradictory, stop and route through the
+   spec/decision process instead of choosing silently.

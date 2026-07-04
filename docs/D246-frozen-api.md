@@ -1,5 +1,11 @@
 # D246 boundary-1 — FROZEN API contract (consumer-cascade spec)
 
+> **Historical port-era document.** This file is retained as an audit trail for
+> the retired Rust port model. It is not current package API guidance and is not
+> a shared docs authority. Current Rust package docs are governed by
+> [`docs.jsonl`](docs.jsonl); language-neutral authority lives in
+> `~/src/graphrefly`.
+
 The keystone landed in `graphrefly-core` + `graphrefly-graph` (both
 compile). Every consumer must be rewritten to THIS surface. Do **not**
 re-introduce `SubgraphRef`/`GraphOps`/`NamespaceHandle`/`'g` graph

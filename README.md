@@ -32,6 +32,20 @@ The clean-slate crate includes:
   policy/status bundles.
 - Native host binding foundation for Python under `crates/graphrefly-bindings-py`.
 
+## Documentation Boundary
+
+This repo owns Rust package-local documentation: rustdoc on exported crate
+items, examples, crate README material, development docs, crate release notes,
+docs.rs output, and Rust package-local docs checks. The package-local policy is
+recorded in [`docs/docs.jsonl`](docs/docs.jsonl), with D32 and D563 as the
+governing decisions.
+
+Shared public docs for graphrefly.dev, shared guide records, public blog
+storage/rendering, protocol authority, and maintainer dashboard/control views
+belong to `~/src/graphrefly`. Those shared docs may link to Rust package docs,
+but this repo must not hand-maintain mirrors of shared docs, TypeScript docs,
+Python docs, public blog posts, or generated dashboard state.
+
 ## CSP-10 App-Infra Baseline
 
 The baseline app-infra surface is intentionally reusable and graph-visible. It
@@ -124,6 +138,19 @@ Optional runtime-driver features:
 mise exec -- cargo test -p graphrefly-rs --features tokio-http,tokio-websocket
 mise exec -- cargo test -p graphrefly-rs --features tokio-worker
 ```
+
+## API Docs And Release Notes
+
+Rust API docs are package-local rustdoc. The public docs gate is:
+
+```bash
+RUSTDOCFLAGS="-D warnings" mise exec -- cargo doc -p graphrefly-rs --all-features --no-deps
+```
+
+Docs.rs builds use the crate metadata in `crates/graphrefly/Cargo.toml`; GitHub Pages
+builds the same rustdoc via `.github/workflows/pages.yml`. Package release notes and
+crate-specific development notes stay in this repo, while shared docs/blog content
+stays in `~/src/graphrefly`.
 
 ## Authority And Guardrails
 

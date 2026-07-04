@@ -5,11 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `DiagramDirection` variants.
 pub enum DiagramDirection {
+    /// `Td` variant.
     Td,
     #[default]
+    /// `Lr` variant.
     Lr,
+    /// `Bt` variant.
     Bt,
+    /// `Rl` variant.
     Rl,
 }
 
@@ -33,10 +38,12 @@ impl DiagramDirection {
     }
 }
 
+/// Creates or computes `describe_to_mermaid`.
 pub fn describe_to_mermaid(snapshot: &DescribeSnapshot) -> String {
     describe_to_mermaid_with_direction(snapshot, DiagramDirection::default())
 }
 
+/// Creates or computes `describe_to_mermaid_with_direction`.
 pub fn describe_to_mermaid_with_direction(
     snapshot: &DescribeSnapshot,
     direction: DiagramDirection,
@@ -63,6 +70,7 @@ pub fn describe_to_mermaid_with_direction(
     lines.join("\n")
 }
 
+/// Creates or computes `mermaid_live_url`.
 pub fn mermaid_live_url(source: &str) -> String {
     let payload = format!(
         "{{\"autoSync\":true,\"code\":\"{}\",\"mermaid\":{{\"theme\":\"default\"}}}}",
@@ -74,14 +82,17 @@ pub fn mermaid_live_url(source: &str) -> String {
     )
 }
 
+/// Creates or computes `describe_to_mermaid_url`.
 pub fn describe_to_mermaid_url(snapshot: &DescribeSnapshot) -> String {
     mermaid_live_url(&describe_to_mermaid(snapshot))
 }
 
+/// Creates or computes `describe_to_d2`.
 pub fn describe_to_d2(snapshot: &DescribeSnapshot) -> String {
     describe_to_d2_with_direction(snapshot, DiagramDirection::default())
 }
 
+/// Creates or computes `describe_to_d2_with_direction`.
 pub fn describe_to_d2_with_direction(
     snapshot: &DescribeSnapshot,
     direction: DiagramDirection,
@@ -108,6 +119,7 @@ pub fn describe_to_d2_with_direction(
     lines.join("\n")
 }
 
+/// Creates or computes `describe_to_pretty`.
 pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut lines = vec![
@@ -133,6 +145,7 @@ pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
     lines.join("\n")
 }
 
+/// Creates or computes `describe_to_ascii`.
 pub fn describe_to_ascii(snapshot: &DescribeSnapshot, include_values: bool) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut outgoing: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -161,6 +174,7 @@ pub fn describe_to_ascii(snapshot: &DescribeSnapshot, include_values: bool) -> S
     lines.join("\n")
 }
 
+/// Creates or computes `describe_to_json`.
 pub fn describe_to_json(snapshot: &DescribeSnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut out = String::new();

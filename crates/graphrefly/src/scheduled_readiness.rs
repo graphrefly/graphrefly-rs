@@ -18,13 +18,18 @@ use crate::messaging::DataIssue;
 use crate::node::{Node, NodeOpts};
 
 #[derive(Debug, Clone, PartialEq)]
+/// `SourceRef` data container.
 pub struct SourceRef {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `id` field for id.
     pub id: String,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 impl SourceRef {
+    /// Creates or computes `new`.
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
@@ -35,118 +40,198 @@ impl SourceRef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessRequested` data container.
 pub struct ScheduledReadinessRequested {
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `subject_refs` field for subject refs.
     pub subject_refs: Vec<SourceRef>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: u64,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
+    /// `reason` field for reason.
     pub reason: Option<String>,
+    /// `policy_refs` field for policy refs.
     pub policy_refs: Vec<SourceRef>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessClock` data container.
 pub struct ScheduledReadinessClock {
+    /// `clock_id` field for clock id.
     pub clock_id: String,
+    /// `now_ms` field for now ms.
     pub now_ms: u64,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessPending` data container.
 pub struct ScheduledReadinessPending {
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `subject_refs` field for subject refs.
     pub subject_refs: Vec<SourceRef>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: u64,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessReady` data container.
 pub struct ScheduledReadinessReady {
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `subject_refs` field for subject refs.
     pub subject_refs: Vec<SourceRef>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: u64,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: u64,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessOverdue` data container.
 pub struct ScheduledReadinessOverdue {
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `subject_refs` field for subject refs.
     pub subject_refs: Vec<SourceRef>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: u64,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: u64,
+    /// `now_ms` field for now ms.
     pub now_ms: u64,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ScheduledReadinessStatusState` variants.
 pub enum ScheduledReadinessStatusState {
+    /// `Pending` variant.
     Pending,
+    /// `Ready` variant.
     Ready,
+    /// `Overdue` variant.
     Overdue,
+    /// `Issue` variant.
     Issue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessStatus` data container.
 pub struct ScheduledReadinessStatus {
+    /// `status_id` field for status id.
     pub status_id: String,
+    /// `schedule_id` field for schedule id.
     pub schedule_id: String,
+    /// `state` field for state.
     pub state: ScheduledReadinessStatusState,
+    /// `subject_refs` field for subject refs.
     pub subject_refs: Vec<SourceRef>,
+    /// `ready_at_ms` field for ready at ms.
     pub ready_at_ms: Option<u64>,
+    /// `deadline_ms` field for deadline ms.
     pub deadline_ms: Option<u64>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `issue_codes` field for issue codes.
     pub issue_codes: Vec<String>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ScheduledReadinessAuditRecord` data container.
 pub struct ScheduledReadinessAuditRecord {
+    /// `id` field for id.
     pub id: String,
+    /// `kind` field for kind.
     pub kind: String,
+    /// `subject_id` field for subject id.
     pub subject_id: Option<String>,
+    /// `source_refs` field for source refs.
     pub source_refs: Vec<SourceRef>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+/// `ScheduledReadinessViews` data container.
 pub struct ScheduledReadinessViews {
+    /// `schedules_by_id` field for schedules by id.
     pub schedules_by_id: BTreeMap<String, ScheduledReadinessRequested>,
+    /// `pending_by_id` field for pending by id.
     pub pending_by_id: BTreeMap<String, ScheduledReadinessPending>,
+    /// `ready_by_id` field for ready by id.
     pub ready_by_id: BTreeMap<String, ScheduledReadinessReady>,
+    /// `overdue_by_id` field for overdue by id.
     pub overdue_by_id: BTreeMap<String, ScheduledReadinessOverdue>,
+    /// `status_by_id` field for status by id.
     pub status_by_id: BTreeMap<String, ScheduledReadinessStatus>,
+    /// `now_ms` field for now ms.
     pub now_ms: Option<u64>,
 }
 
 #[derive(Clone)]
+/// `ScheduledReadinessBundle` data container.
 pub struct ScheduledReadinessBundle {
+    /// `pending` field for pending.
     pub pending: Node<ScheduledReadinessPending>,
+    /// `ready` field for ready.
     pub ready: Node<ScheduledReadinessReady>,
+    /// `overdue` field for overdue.
     pub overdue: Node<ScheduledReadinessOverdue>,
+    /// `status` field for status.
     pub status: Node<ScheduledReadinessStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// `audit` field for audit.
     pub audit: Node<ScheduledReadinessAuditRecord>,
+    /// `views` field for views.
     pub views: Node<ScheduledReadinessViews>,
 }
 
 #[derive(Clone)]
+/// `ScheduledReadinessOptions` data container.
 pub struct ScheduledReadinessOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `schedules` field for schedules.
     pub schedules: Vec<Node<ScheduledReadinessRequested>>,
+    /// `clocks` field for clocks.
     pub clocks: Vec<Node<ScheduledReadinessClock>>,
 }
 
 impl ScheduledReadinessOptions {
+    /// Creates or computes `new`.
     pub fn new(schedules: Vec<Node<ScheduledReadinessRequested>>) -> Self {
         Self {
             name: None,
@@ -155,11 +240,13 @@ impl ScheduledReadinessOptions {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Updates or reads `with_clocks`.
     pub fn with_clocks(mut self, clocks: Vec<Node<ScheduledReadinessClock>>) -> Self {
         self.clocks = clocks;
         self
@@ -191,6 +278,7 @@ struct ScheduledReadinessState {
     clock_source_refs: Vec<SourceRef>,
 }
 
+/// Creates or computes `scheduled_readiness_projector`.
 pub fn scheduled_readiness_projector(
     graph: &Graph,
     opts: ScheduledReadinessOptions,
@@ -314,6 +402,7 @@ pub fn scheduled_readiness_projector(
     }
 }
 
+/// Creates or computes `parse_scheduled_readiness_requested`.
 pub fn parse_scheduled_readiness_requested(
     value: &JsonValue,
 ) -> Result<ScheduledReadinessRequested, Box<DataIssue>> {
@@ -712,6 +801,7 @@ fn status_identity(status: &ScheduledReadinessStatus) -> String {
     stable_json_string(&value).unwrap_or_else(|_| format!("{status:?}"))
 }
 
+/// Creates or computes `readiness_issue`.
 pub fn readiness_issue(
     code: impl Into<String>,
     message: impl Into<String>,

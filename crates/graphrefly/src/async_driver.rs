@@ -17,13 +17,17 @@ pub type DriverCancel = Box<dyn FnOnce()>;
 ///
 /// No `Send`/`Sync` bounds: a graph is one single-thread concurrency domain (D22).
 pub trait LocalAsyncDriver {
+    /// Updates or reads `sleep`.
     fn sleep(&self, duration: Duration, callback: Box<dyn FnOnce()>) -> DriverCancel;
+    /// Updates or reads `interval`.
     fn interval(&self, period: Duration, callback: Rc<dyn Fn()>) -> DriverCancel;
+    /// Updates or reads `spawn_local`.
     fn spawn_local(&self, fut: Pin<Box<dyn Future<Output = ()> + 'static>>) -> DriverCancel;
 }
 
 #[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, Default)]
+/// `TokioLocalDriver` data container.
 pub struct TokioLocalDriver;
 
 #[cfg(feature = "tokio")]

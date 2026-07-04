@@ -12,6 +12,10 @@ authors      = { workspace = true }
 [lib]
 name = "graphrefly"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default          = []
 tokio            = ["dep:tokio"]

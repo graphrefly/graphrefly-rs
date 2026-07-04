@@ -1,5 +1,11 @@
 # Decision-Consistency Audit — 2026-05-21
 
+> **Historical port-era audit.** This file records a point-in-time audit of the
+> retired port model. It is not current package API guidance and is not a shared
+> docs authority. Current Rust package docs are governed by
+> [`docs.jsonl`](docs.jsonl); language-neutral authority lives in
+> `~/src/graphrefly`.
+
 ## Methodology
 
 Applied 8 audit lenses (L1 vestigial-surface from earlier relaxations; L2 invariant-watch violations; L3 D196 misapplications; L4 stale rationale references; L5 cross-D contradictions; L6 scope-gap findings; L7 TRASH/ hygiene; L8 doc-vs-code drift) against ~200 D-numbered decisions D047–D271. Sources read: `~/src/graphrefly-ts/docs/rust-port-decisions.md` (2118 LOC, all D# headers), `~/src/graphrefly-rs/docs/porting-deferred.md` (4354 LOC, all section headers + §7 + D266-D270 follow-on + S7 closing), `~/src/graphrefly-rs/docs/migration-status.md` (lines 1–120 NEXT-BATCH + D271 + D266-D270 closure blocks), `~/src/graphrefly-ts/docs/cross-track-ledger.md` (entire), `~/src/graphrefly-ts/archive/optimizations/cross-language-notes.jsonl` (14 `divergence-*` ids enumerated), `~/src/graphrefly-ts/.claude/skills/decision-guard/SKILL.md` (entire). Live-code corroboration via grep across `~/src/graphrefly-rs/crates/**` for invariant-watch items #3–#10/#13, vestigial Send+Sync, deleted-machinery comment leakage, and §7-B/C/D/E/F status. `cargo metadata --no-deps` confirmed TRASH-dir exclusion. Scope: all locked D-numbers + the active porting-deferred + cross-track-ledger rows. Outside scope: implementation of fixes (audit is read-only).

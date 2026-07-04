@@ -1,9 +1,9 @@
-//! # GraphReFly — Rust clean-slate substrate (`@graphrefly/rust`)
+//! # GraphReFly — Rust clean-slate package (`graphrefly-rs`, lib `graphrefly`)
 //!
 //! Reactive **universal reduction layer**: high fan-in/fan-out → information
 //! reduction → push. Not LLM-limited; performance first-class (D1).
 //!
-//! ## Authority — the truth lives in `~/src/graphrefly` (branch `main`)
+//! ## Authority — the truth lives in `~/src/graphrefly` (branch `clean-slate`)
 //!
 //! This crate is the Rust **implementation**. The language-neutral authority —
 //! protocol spec, decisions, formal model, conformance scenarios — is in the
@@ -20,6 +20,12 @@
 //! Sibling self-contained packages: `@graphrefly/ts` (`~/src/graphrefly-ts`),
 //! `@graphrefly/py` (`~/src/graphrefly-py`). Cross-language = a coarse wire
 //! bridge, never in-process (D32, no cross-language peer-deps).
+//!
+//! Rust package docs are intentionally package-local: rustdoc, examples, crate
+//! README material, release notes, and docs.rs output live with this repo. The
+//! shared public website/blog/docs architecture for graphrefly.dev lives in
+//! `~/src/graphrefly` under D563; this crate may link there, but does not mirror
+//! shared public docs by hand.
 //!
 //! ## Floor (cite, never violate)
 //!
@@ -47,12 +53,13 @@
 //!
 //! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
 //! > (kernel + control/terminal + async + rewire + dep-terminal + `ctx.rewire_next`
-//! > slices, plus pull/routed-up, terminal/later-async catch-up, and batch). [`graph`]
+//! > slices, plus pull/routed-up, terminal/later-async catch-up, and batch). [`mod@graph`]
 //! > adds the first product-completeness layer (B53). The Rust conformance arm is green
 //! > for **C-2..C-22 except C-1**; **C-1** remains wire-bridge-blocked. See
 //! > `CLEAN-SLATE.md` for the per-module status + conformance target map.
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 pub mod adapters;
 pub mod async_driver;

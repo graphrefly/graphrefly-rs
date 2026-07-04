@@ -322,10 +322,12 @@ fn process_source(factory: &'static str, command: ProcessCommand) -> Operator<Pr
     )
 }
 
+/// Creates or computes `from_http`.
 pub fn from_http(url: impl Into<String>) -> Operator<HttpResponse> {
     from_http_with_options(HttpRequest::get(url))
 }
 
+/// Creates or computes `from_http_with_options`.
 pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
     assert!(!request.url.is_empty(), "fromHttp: url must be non-empty");
     assert!(
@@ -374,10 +376,12 @@ pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
     )
 }
 
+/// Creates or computes `from_sse`.
 pub fn from_sse(url: impl Into<String>) -> Operator<SseEvent> {
     from_sse_with_options(SseRequest::new(url))
 }
 
+/// Creates or computes `from_sse_with_options`.
 pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
     assert!(!request.url.is_empty(), "fromSSE: url must be non-empty");
     Operator::with_opts(
@@ -709,10 +713,12 @@ impl SseParser {
     }
 }
 
+/// Creates or computes `from_websocket`.
 pub fn from_websocket(url: impl Into<String>) -> Operator<WebSocketEvent> {
     from_websocket_with_options(WebSocketRequest::new(url))
 }
 
+/// Creates or computes `from_websocket_with_options`.
 pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSocketEvent> {
     assert!(
         !request.url.is_empty(),
@@ -834,37 +840,54 @@ pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<
 /// Filesystem event kind emitted by [`from_fs_watch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEventKind {
+    /// `Change` variant.
     Change,
+    /// `Rename` variant.
     Rename,
+    /// `Create` variant.
     Create,
+    /// `Delete` variant.
     Delete,
 }
 
 /// Filesystem event emitted by [`from_fs_watch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsEvent {
+    /// `kind` field for kind.
     pub kind: FsEventKind,
+    /// `path` field for path.
     pub path: PathBuf,
+    /// `root` field for root.
     pub root: PathBuf,
+    /// `relative_path` field for relative path.
     pub relative_path: PathBuf,
 }
 
 /// Options for [`from_fs_watch_with_options`].
 #[derive(Debug, Clone)]
 pub struct FromFsWatchOptions {
+    /// `recursive` field for recursive.
     pub recursive: bool,
+    /// `debounce_ms` field for debounce ms.
     pub debounce_ms: u64,
+    /// `initial_scan` field for initial scan.
     pub initial_scan: bool,
+    /// `include` field for include.
     pub include: Vec<String>,
+    /// `exclude` field for exclude.
     pub exclude: Vec<String>,
 }
 
 /// Minimal five-field cron schedule: minute hour day-of-month month day-of-week.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronSchedule {
+    /// `minutes` field for minutes.
     pub minutes: BTreeSet<u8>,
+    /// `hours` field for hours.
     pub hours: BTreeSet<u8>,
+    /// `days_of_month` field for days of month.
     pub days_of_month: BTreeSet<u8>,
+    /// `months` field for months.
     pub months: BTreeSet<u8>,
     /// Sunday = 0, matching common five-field cron and JavaScript Date#getDay.
     pub days_of_week: BTreeSet<u8>,
@@ -873,10 +896,15 @@ pub struct CronSchedule {
 /// Fieldized instant used by [`matches_cron`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CronInstant {
+    /// `year` field for year.
     pub year: i32,
+    /// `month` field for month.
     pub month: u8,
+    /// `day_of_month` field for day of month.
     pub day_of_month: u8,
+    /// `hour` field for hour.
     pub hour: u8,
+    /// `minute` field for minute.
     pub minute: u8,
     /// Sunday = 0.
     pub day_of_week: u8,
@@ -884,6 +912,7 @@ pub struct CronInstant {
 
 impl CronInstant {
     #[must_use]
+    /// Creates or computes `new`.
     pub fn new(
         year: i32,
         month: u8,
@@ -906,6 +935,7 @@ impl CronInstant {
 /// Value emitted by [`from_cron`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronTick {
+    /// `instant` field for instant.
     pub instant: CronInstant,
     /// Decimal nanoseconds since the Unix epoch.
     pub timestamp_ns: String,
@@ -913,6 +943,7 @@ pub struct CronTick {
 
 impl CronTick {
     #[must_use]
+    /// Creates or computes `new`.
     pub fn new(instant: CronInstant, timestamp_ns: impl Into<String>) -> Self {
         Self {
             instant,
@@ -922,8 +953,11 @@ impl CronTick {
 }
 
 #[derive(Clone)]
+/// `FromCronOptions` data container.
 pub struct FromCronOptions {
+    /// `tick_ms` field for tick ms.
     pub tick_ms: u64,
+    /// `now` field for now.
     pub now: Option<Rc<dyn Fn() -> CronTick>>,
 }
 
@@ -959,26 +993,39 @@ impl std::fmt::Display for CronParseError {
 impl Error for CronParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `GitHookType` variants.
 pub enum GitHookType {
+    /// `PostCommit` variant.
     PostCommit,
 }
 
 /// Git event emitted by [`from_git_hook`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitEvent {
+    /// `hook` field for hook.
     pub hook: GitHookType,
+    /// `commit` field for commit.
     pub commit: String,
+    /// `files` field for files.
     pub files: Vec<String>,
+    /// `message` field for message.
     pub message: String,
+    /// `author` field for author.
     pub author: String,
+    /// `timestamp_ns` field for timestamp ns.
     pub timestamp_ns: String,
 }
 
 #[derive(Debug, Clone)]
+/// `FromGitHookOptions` data container.
 pub struct FromGitHookOptions {
+    /// `poll_ms` field for poll ms.
     pub poll_ms: u64,
+    /// `include` field for include.
     pub include: Vec<String>,
+    /// `exclude` field for exclude.
     pub exclude: Vec<String>,
+    /// `max_consecutive_errors` field for max consecutive errors.
     pub max_consecutive_errors: usize,
 }
 

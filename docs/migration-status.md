@@ -1,5 +1,10 @@
 # Migration status
 
+> **Historical port-era tracker.** This file records the retired 6-milestone Rust
+> port and is not current sequencing or package API guidance. Current sequencing
+> lives in `~/src/graphrefly/plan/*.jsonl`; current Rust package docs policy
+> lives in [`docs.jsonl`](docs.jsonl).
+
 Live tracker for the 6-milestone Rust port. Update after each milestone closes. The full migration plan lives in `~/src/graphrefly-ts/archive/docs/SESSION-rust-port-architecture.md`.
 
 ## Track-status snapshot — substrate-complete (2026-05-26)

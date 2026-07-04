@@ -23,10 +23,15 @@ use crate::versioning::{NodeVersion, NodeVersioningPolicy};
 /// Graph construction options.
 #[derive(Clone, Default)]
 pub struct GraphOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `profile` field for profile.
     pub profile: bool,
+    /// `dispatcher` field for dispatcher.
     pub dispatcher: Option<Dispatcher>,
+    /// `environment` field for environment.
     pub environment: EnvironmentDrivers,
+    /// `versioning` field for versioning.
     pub versioning: Option<NodeVersioningPolicy>,
 }
 
@@ -43,6 +48,7 @@ impl fmt::Debug for GraphOptions {
 }
 
 impl GraphOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -58,13 +64,18 @@ impl GraphOptions {
 /// threaded through to the substrate [`NodeOpts`].
 #[derive(Debug, Clone, Default)]
 pub struct GraphNodeOpts {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `meta` field for meta.
     pub meta: BTreeMap<String, String>,
+    /// `node` field for node.
     pub node: NodeOpts,
+    /// `restore` field for restore.
     pub restore: Option<RestoreFactoryMeta>,
 }
 
 impl GraphNodeOpts {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -76,10 +87,12 @@ impl GraphNodeOpts {
 /// Graph-owned topology/release group options (D152).
 #[derive(Debug, Clone, Default)]
 pub struct TopologyGroupOptions {
+    /// `name` field for name.
     pub name: Option<String>,
 }
 
 impl TopologyGroupOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -88,13 +101,18 @@ impl TopologyGroupOptions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `RestoreFactoryMeta` data container.
 pub struct RestoreFactoryMeta {
+    /// `ref_` field for ref.
     pub ref_: String,
+    /// `config` field for config.
     pub config: Option<GraphCheckpointJson>,
+    /// `config_version` field for config version.
     pub config_version: Option<GraphCheckpointJson>,
 }
 
 impl RestoreFactoryMeta {
+    /// Creates or computes `registry_ref`.
     pub fn registry_ref(ref_: impl Into<String>) -> Self {
         Self {
             ref_: ref_.into(),
@@ -103,11 +121,13 @@ impl RestoreFactoryMeta {
         }
     }
 
+    /// Updates or reads `with_config`.
     pub fn with_config(mut self, config: GraphCheckpointJson) -> Self {
         self.config = Some(config);
         self
     }
 
+    /// Updates or reads `with_config_version`.
     pub fn with_config_version(mut self, config_version: GraphCheckpointJson) -> Self {
         self.config_version = Some(config_version);
         self
@@ -192,14 +212,17 @@ impl TopologyGroup {
         }
     }
 
+    /// Updates or reads `name`.
     pub fn name(&self) -> Option<&str> {
         self.inner.name.as_deref()
     }
 
+    /// Updates or reads `is_released`.
     pub fn is_released(&self) -> bool {
         self.inner.released.get()
     }
 
+    /// Updates or reads `add`.
     pub fn add<T: 'static>(&self, node: &Node<T>) -> Node<T> {
         self.assert_live();
         self.inner.graph.assert_registered_core(
@@ -210,10 +233,12 @@ impl TopologyGroup {
         node.clone()
     }
 
+    /// Updates or reads `node`.
     pub fn node<T: 'static, F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) -> Node<T> {
         self.node_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `node_opts`.
     pub fn node_opts<T: 'static, F: Fn(&Ctx) + 'static>(
         &self,
         deps: Vec<Core>,
@@ -224,28 +249,34 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.node_opts(deps, f, opts))
     }
 
+    /// Updates or reads `state`.
     pub fn state<T: 'static>(&self, initial: T) -> Node<T> {
         self.state_opts(initial, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `state_opts`.
     pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
         self.assert_live();
         self.track_node(self.inner.graph.state_opts(initial, opts))
     }
 
+    /// Updates or reads `state_empty`.
     pub fn state_empty<T: 'static>(&self) -> Node<T> {
         self.state_empty_opts(GraphNodeOpts::default())
     }
 
+    /// Updates or reads `state_empty_opts`.
     pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
         self.assert_live();
         self.track_node(self.inner.graph.state_empty_opts(opts))
     }
 
+    /// Updates or reads `producer`.
     pub fn producer<T: 'static, F: Fn(&Ctx) + 'static>(&self, f: F) -> Node<T> {
         self.producer_opts(f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `producer_opts`.
     pub fn producer_opts<T: 'static, F: Fn(&Ctx) + 'static>(
         &self,
         f: F,
@@ -255,6 +286,7 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.producer_opts(f, opts))
     }
 
+    /// Updates or reads `derived`.
     pub fn derived<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -263,6 +295,7 @@ impl TopologyGroup {
         self.derived_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `derived_opts`.
     pub fn derived_opts<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -273,6 +306,7 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.derived_opts(deps, f, opts))
     }
 
+    /// Updates or reads `effect`.
     pub fn effect<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -281,6 +315,7 @@ impl TopologyGroup {
         self.effect_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `effect_opts`.
     pub fn effect_opts<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -291,6 +326,7 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.effect_opts(deps, f, opts))
     }
 
+    /// Updates or reads `init_node`.
     pub fn init_node<T: 'static>(
         &self,
         op: Operator<T>,
@@ -301,6 +337,7 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.init_node(op, deps, opts))
     }
 
+    /// Updates or reads `release`.
     pub fn release(&self) {
         let reason = self
             .inner
@@ -310,6 +347,7 @@ impl TopologyGroup {
         self.release_with_reason(&reason);
     }
 
+    /// Updates or reads `release_with_reason`.
     pub fn release_with_reason(&self, reason: &str) {
         if self.inner.released.get() {
             return;
@@ -343,6 +381,7 @@ impl TopologyGroup {
 }
 
 impl Graph {
+    /// Creates or computes `new`.
     pub fn new(opts: GraphOptions) -> Self {
         let dispatcher = opts.dispatcher.unwrap_or_else(default_dispatcher);
         let mut environment = opts.environment;
@@ -377,6 +416,7 @@ impl Graph {
         }
     }
 
+    /// Updates or reads `name`.
     pub fn name(&self) -> Option<&str> {
         self.inner.name.as_deref()
     }
@@ -387,6 +427,7 @@ impl Graph {
         self.topology_group_opts(TopologyGroupOptions::default())
     }
 
+    /// Updates or reads `topology_group_opts`.
     pub fn topology_group_opts(&self, opts: TopologyGroupOptions) -> TopologyGroup {
         TopologyGroup::new(self.clone(), opts)
     }
@@ -406,6 +447,7 @@ impl Graph {
         self.node_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `node_opts`.
     pub fn node_opts<T: 'static, F: Fn(&Ctx) + 'static>(
         &self,
         deps: Vec<Core>,
@@ -439,6 +481,7 @@ impl Graph {
         self.state_opts(initial, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `state_opts`.
     pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
         let node = Node::state_opts_in_arena_with_dispatcher(
             &self.inner.arena,
@@ -454,6 +497,7 @@ impl Graph {
         self.state_empty_opts(GraphNodeOpts::default())
     }
 
+    /// Updates or reads `state_empty_opts`.
     pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
         let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
@@ -468,6 +512,7 @@ impl Graph {
         self.producer_opts(f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `producer_opts`.
     pub fn producer_opts<T: 'static, F: Fn(&Ctx) + 'static>(
         &self,
         f: F,
@@ -492,6 +537,7 @@ impl Graph {
         self.derived_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `derived_opts`.
     pub fn derived_opts<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -523,6 +569,7 @@ impl Graph {
         self.effect_opts(deps, f, GraphNodeOpts::default())
     }
 
+    /// Updates or reads `effect_opts`.
     pub fn effect_opts<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -599,6 +646,7 @@ impl Graph {
         self.describe_opts(DescribeOpts::default())
     }
 
+    /// Updates or reads `describe_opts`.
     pub fn describe_opts(&self, opts: DescribeOpts) -> DescribeSnapshot {
         let snap = self.describe_with_prefix("");
         if let Some(explain) = opts.explain {
@@ -1407,18 +1455,24 @@ pub fn graph() -> Graph {
     Graph::new(GraphOptions::default())
 }
 
+/// Creates or computes `graph_opts`.
 pub fn graph_opts(opts: GraphOptions) -> Graph {
     Graph::new(opts)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `DescribeOpts` data container.
 pub struct DescribeOpts {
+    /// `explain` field for explain.
     pub explain: Option<Explain>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `Explain` data container.
 pub struct Explain {
+    /// `from` field for from.
     pub from: String,
+    /// `to` field for to.
     pub to: String,
 }
 
@@ -1437,10 +1491,12 @@ impl<'a> Values<'a> {
         Self { records }
     }
 
+    /// Updates or reads `len`.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
+    /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -1487,26 +1543,32 @@ impl GraphNode {
         Self { core }
     }
 
+    /// Updates or reads `core`.
     pub fn core(&self) -> Core {
         self.core.clone()
     }
 
+    /// Updates or reads `status`.
     pub fn status(&self) -> Status {
         self.core.status()
     }
 
+    /// Updates or reads `version`.
     pub fn version(&self) -> Option<NodeVersion> {
         self.core.version()
     }
 
+    /// Updates or reads `cache_any`.
     pub fn cache_any(&self) -> Option<AnyValue> {
         self.core.cache_any()
     }
 
+    /// Updates or reads `deps`.
     pub fn deps(&self) -> Vec<Core> {
         self.core.deps()
     }
 
+    /// Updates or reads `subscribe`.
     pub fn subscribe(&self, sink: impl Fn(&Message<AnyValue>) + 'static) -> Box<dyn FnOnce()> {
         Node::<AnyValue>::from_core(self.core.clone()).subscribe(sink)
     }
@@ -1522,60 +1584,100 @@ impl GraphNode {
 /// D39 describe snapshot: flat nodes/edges plus mounted subgraphs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribeSnapshot {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `nodes` field for nodes.
     pub nodes: Vec<DescribeNode>,
+    /// `edges` field for edges.
     pub edges: Vec<DescribeEdge>,
+    /// `subgraphs` field for subgraphs.
     pub subgraphs: Option<Vec<DescribeSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `DescribeNode` data container.
 pub struct DescribeNode {
+    /// `id` field for id.
     pub id: String,
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `factory` field for factory.
     pub factory: String,
+    /// `status` field for status.
     pub status: Status,
+    /// `value` field for value.
     pub value: Option<DescribeValue>,
+    /// `version` field for version.
     pub version: Option<NodeVersion>,
+    /// `deps` field for deps.
     pub deps: Vec<String>,
+    /// `meta` field for meta.
     pub meta: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `DescribeEdge` data container.
 pub struct DescribeEdge {
+    /// `from` field for from.
     pub from: String,
+    /// `to` field for to.
     pub to: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `DescribeValue` variants.
 pub enum DescribeValue {
+    /// `Bool` variant.
     Bool(bool),
+    /// `I64` variant.
     I64(i64),
+    /// `U64` variant.
     U64(u64),
+    /// `F64` variant.
     F64(f64),
+    /// `String` variant.
     String(String),
+    /// `Opaque` variant.
     Opaque,
 }
 
 #[derive(Clone)]
+/// `ObserveEvent` data container.
 pub struct ObserveEvent {
+    /// `path` field for path.
     pub path: String,
+    /// `msg` field for msg.
     pub msg: ObserveMessage,
+    /// `tier` field for tier.
     pub tier: Tier,
+    /// `seq` field for seq.
     pub seq: u64,
 }
 
 #[derive(Clone)]
+/// `ObserveMessage` variants.
 pub enum ObserveMessage {
+    /// `Start` variant.
     Start,
+    /// `Pause` variant.
     Pause(LockId),
+    /// `Resume` variant.
     Resume(LockId),
+    /// `Pull` variant.
     Pull(PullDemand),
+    /// `Dirty` variant.
     Dirty,
+    /// `Data` variant.
     Data(AnyValue),
+    /// `Resolved` variant.
     Resolved,
+    /// `Invalidate` variant.
     Invalidate,
+    /// `Complete` variant.
     Complete,
+    /// `Error` variant.
     Error(String),
+    /// `Teardown` variant.
     Teardown,
 }
 
@@ -1596,6 +1698,7 @@ impl ObserveMessage {
         }
     }
 
+    /// Updates or reads `kind`.
     pub fn kind(&self) -> &'static str {
         match self {
             ObserveMessage::Start => "START",
@@ -1614,27 +1717,41 @@ impl ObserveMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `TopologyEventKind` variants.
 pub enum TopologyEventKind {
+    /// `NodeRegistered` variant.
     NodeRegistered,
+    /// `DepsChanged` variant.
     DepsChanged,
+    /// `NodeReleased` variant.
     NodeReleased,
+    /// `MountChanged` variant.
     MountChanged,
 }
 
 #[derive(Clone)]
+/// `TopologyEvent` data container.
 pub struct TopologyEvent {
+    /// `kind` field for kind.
     pub kind: TopologyEventKind,
+    /// `path` field for path.
     pub path: String,
+    /// `deps` field for deps.
     pub deps: Vec<String>,
+    /// `prev_deps` field for prev deps.
     pub prev_deps: Option<Vec<String>>,
+    /// `factory` field for factory.
     pub factory: Option<String>,
+    /// `seq` field for seq.
     pub seq: u64,
 }
 
+/// `GraphObserver` data container.
 pub struct GraphObserver {
     unsubs: Vec<Option<Box<dyn FnOnce()>>>,
 }
 
+/// `GraphTopologyObserver` data container.
 pub struct GraphTopologyObserver {
     graph: Graph,
     id: usize,
@@ -1642,24 +1759,28 @@ pub struct GraphTopologyObserver {
 }
 
 #[derive(Clone)]
+/// `ObserveStream` data container.
 pub struct ObserveStream {
     graph: Graph,
     path: Option<String>,
 }
 
 #[derive(Clone)]
+/// `TopologyStream` data container.
 pub struct TopologyStream {
     graph: Graph,
     path: Option<String>,
 }
 
 impl ObserveStream {
+    /// Updates or reads `subscribe`.
     pub fn subscribe(&self, sink: impl Fn(ObserveEvent) + 'static) -> GraphObserver {
         self.graph.observe_targets(self.path.as_deref(), sink)
     }
 }
 
 impl TopologyStream {
+    /// Updates or reads `subscribe`.
     pub fn subscribe(&self, sink: impl Fn(TopologyEvent) + 'static) -> GraphTopologyObserver {
         let id = self
             .graph
@@ -1692,6 +1813,7 @@ impl TopologyStream {
 }
 
 impl GraphObserver {
+    /// Updates or reads `unsubscribe`.
     pub fn unsubscribe(mut self) {
         self.unsubscribe_all();
     }
@@ -1706,6 +1828,7 @@ impl GraphObserver {
 }
 
 impl GraphTopologyObserver {
+    /// Updates or reads `unsubscribe`.
     pub fn unsubscribe(mut self) {
         self.unsubscribe_inner();
     }
@@ -1758,16 +1881,24 @@ impl Drop for GraphObserver {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `NodeProfile` data container.
 pub struct NodeProfile {
+    /// `invokes` field for invokes.
     pub invokes: u64,
+    /// `total_duration_ns` field for total duration ns.
     pub total_duration_ns: u128,
+    /// `last_duration_ns` field for last duration ns.
     pub last_duration_ns: u128,
+    /// `status` field for status.
     pub status: Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `Profile` data container.
 pub struct Profile {
+    /// `total_invokes` field for total invokes.
     pub total_invokes: u64,
+    /// `nodes` field for nodes.
     pub nodes: BTreeMap<String, NodeProfile>,
 }
 

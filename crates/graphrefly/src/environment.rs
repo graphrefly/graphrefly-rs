@@ -20,13 +20,18 @@ use futures_util::{SinkExt, StreamExt};
 /// Process command request for graph environment process drivers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCommand {
+    /// `program` field for program.
     pub program: String,
+    /// `args` field for args.
     pub args: Vec<String>,
+    /// `cwd` field for cwd.
     pub cwd: Option<PathBuf>,
+    /// `env` field for env.
     pub env: Vec<(String, String)>,
 }
 
 impl ProcessCommand {
+    /// Creates or computes `new`.
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
@@ -36,6 +41,7 @@ impl ProcessCommand {
         }
     }
 
+    /// Updates or reads `args`.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -45,11 +51,13 @@ impl ProcessCommand {
         self
     }
 
+    /// Updates or reads `cwd`.
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
+    /// Updates or reads `env`.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
@@ -59,21 +67,31 @@ impl ProcessCommand {
 /// Completed process result. Exit status is DATA, including non-zero exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessResult {
+    /// `stdout` field for stdout.
     pub stdout: String,
+    /// `stderr` field for stderr.
     pub stderr: String,
+    /// `exit_code` field for exit code.
     pub exit_code: Option<i32>,
+    /// `signal` field for signal.
     pub signal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `HttpRequest` data container.
 pub struct HttpRequest {
+    /// `method` field for method.
     pub method: String,
+    /// `url` field for url.
     pub url: String,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
+    /// `body` field for body.
     pub body: Vec<u8>,
 }
 
 impl HttpRequest {
+    /// Creates or computes `new`.
     pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             method: method.into(),
@@ -83,15 +101,18 @@ impl HttpRequest {
         }
     }
 
+    /// Creates or computes `get`.
     pub fn get(url: impl Into<String>) -> Self {
         Self::new("GET", url)
     }
 
+    /// Updates or reads `header`.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((key.into(), value.into()));
         self
     }
 
+    /// Updates or reads `body`.
     pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
@@ -99,25 +120,36 @@ impl HttpRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `HttpResponse` data container.
 pub struct HttpResponse {
+    /// `status` field for status.
     pub status: u16,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
+    /// `body` field for body.
     pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `HttpStreamHead` data container.
 pub struct HttpStreamHead {
+    /// `status` field for status.
     pub status: u16,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `SseRequest` data container.
 pub struct SseRequest {
+    /// `url` field for url.
     pub url: String,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
 }
 
 impl SseRequest {
+    /// Creates or computes `new`.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -125,6 +157,7 @@ impl SseRequest {
         }
     }
 
+    /// Updates or reads `header`.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((key.into(), value.into()));
         self
@@ -132,20 +165,29 @@ impl SseRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `SseEvent` data container.
 pub struct SseEvent {
+    /// `event` field for event.
     pub event: Option<String>,
+    /// `data` field for data.
     pub data: String,
+    /// `id` field for id.
     pub id: Option<String>,
+    /// `retry_ms` field for retry ms.
     pub retry_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketRequest` data container.
 pub struct WebSocketRequest {
+    /// `url` field for url.
     pub url: String,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
 }
 
 impl WebSocketRequest {
+    /// Creates or computes `new`.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -153,6 +195,7 @@ impl WebSocketRequest {
         }
     }
 
+    /// Updates or reads `header`.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((key.into(), value.into()));
         self
@@ -160,18 +203,27 @@ impl WebSocketRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketEvent` variants.
 pub enum WebSocketEvent {
+    /// `Open` variant.
     Open,
+    /// `Text` variant.
     Text(String),
+    /// `Binary` variant.
     Binary(Vec<u8>),
+    /// `Close` variant.
     Close {
+        /// `code` field for code.
         code: Option<u16>,
+        /// `reason` field for reason.
         reason: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebSocketSend` data container.
 pub struct WebSocketSend {
+    /// `data` field for data.
     pub data: Vec<u8>,
     frame_kind: WebSocketFrameKind,
 }
@@ -183,6 +235,7 @@ enum WebSocketFrameKind {
 }
 
 impl WebSocketSend {
+    /// Creates or computes `text`.
     pub fn text(data: impl Into<String>) -> Self {
         Self {
             data: data.into().into_bytes(),
@@ -190,6 +243,7 @@ impl WebSocketSend {
         }
     }
 
+    /// Creates or computes `binary`.
     pub fn binary(data: impl Into<Vec<u8>>) -> Self {
         Self {
             data: data.into(),
@@ -199,18 +253,25 @@ impl WebSocketSend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WebSocketSendResult` data container.
 pub struct WebSocketSendResult {
+    /// `sent` field for sent.
     pub sent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebhookRegistration` data container.
 pub struct WebhookRegistration {
+    /// `id` field for id.
     pub id: String,
+    /// `method` field for method.
     pub method: Option<String>,
+    /// `path` field for path.
     pub path: Option<String>,
 }
 
 impl WebhookRegistration {
+    /// Creates or computes `new`.
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -219,11 +280,13 @@ impl WebhookRegistration {
         }
     }
 
+    /// Updates or reads `method`.
     pub fn method(mut self, method: impl Into<String>) -> Self {
         self.method = Some(method.into());
         self
     }
 
+    /// Updates or reads `path`.
     pub fn path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
         self
@@ -231,17 +294,25 @@ impl WebhookRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WebhookEvent` data container.
 pub struct WebhookEvent {
+    /// `registration_id` field for registration id.
     pub registration_id: String,
+    /// `method` field for method.
     pub method: String,
+    /// `path` field for path.
     pub path: String,
+    /// `headers` field for headers.
     pub headers: Vec<(String, String)>,
+    /// `query` field for query.
     pub query: Vec<(String, String)>,
+    /// `body` field for body.
     pub body: Vec<u8>,
 }
 
 /// Graph-local process driver. Implementations own process/runtime details.
 pub trait LocalProcessDriver {
+    /// Updates or reads `run`.
     fn run(
         &self,
         command: ProcessCommand,
@@ -249,7 +320,9 @@ pub trait LocalProcessDriver {
     ) -> DriverCancel;
 }
 
+/// `LocalHttpDriver` behavior contract.
 pub trait LocalHttpDriver {
+    /// Updates or reads `request`.
     fn request(
         &self,
         request: HttpRequest,
@@ -257,14 +330,21 @@ pub trait LocalHttpDriver {
     ) -> DriverCancel;
 }
 
+/// `HttpStreamDriverEvent` variants.
 pub enum HttpStreamDriverEvent {
+    /// `Head` variant.
     Head(HttpStreamHead),
+    /// `Chunk` variant.
     Chunk(Vec<u8>),
+    /// `Error` variant.
     Error(GraphError),
+    /// `Complete` variant.
     Complete,
 }
 
+/// `LocalHttpStreamDriver` behavior contract.
 pub trait LocalHttpStreamDriver {
+    /// Updates or reads `stream`.
     fn stream(
         &self,
         request: HttpRequest,
@@ -272,29 +352,42 @@ pub trait LocalHttpStreamDriver {
     ) -> DriverCancel;
 }
 
+/// `SseDriverEvent` variants.
 pub enum SseDriverEvent {
+    /// `Event` variant.
     Event(SseEvent),
+    /// `Error` variant.
     Error(GraphError),
+    /// `Complete` variant.
     Complete,
 }
 
+/// `LocalSseDriver` behavior contract.
 pub trait LocalSseDriver {
+    /// Updates or reads `connect`.
     fn connect(&self, request: SseRequest, callback: Rc<dyn Fn(SseDriverEvent)>) -> DriverCancel;
 }
 
+/// `WebSocketDriverEvent` variants.
 pub enum WebSocketDriverEvent {
+    /// `Event` variant.
     Event(WebSocketEvent),
+    /// `Error` variant.
     Error(GraphError),
+    /// `Complete` variant.
     Complete,
 }
 
+/// `LocalWebSocketDriver` behavior contract.
 pub trait LocalWebSocketDriver {
+    /// Updates or reads `connect`.
     fn connect(
         &self,
         request: WebSocketRequest,
         callback: Rc<dyn Fn(WebSocketDriverEvent)>,
     ) -> DriverCancel;
 
+    /// Updates or reads `send`.
     fn send(
         &self,
         _request: WebSocketRequest,
@@ -304,6 +397,7 @@ pub trait LocalWebSocketDriver {
         None
     }
 
+    /// Updates or reads `connect_session`.
     fn connect_session(
         &self,
         _request: WebSocketRequest,
@@ -318,24 +412,33 @@ pub trait LocalWebSocketDriver {
 /// Drivers create handles; graph-visible bundles own lifecycle, retry, status,
 /// command facts, and callback fencing.
 pub trait LocalWebSocketSession {
+    /// Updates or reads `send`.
     fn send(
         &self,
         message: WebSocketSend,
         callback: Box<dyn FnOnce(Result<WebSocketSendResult, GraphError>)>,
     ) -> DriverCancel;
 
+    /// Updates or reads `close`.
     fn close(&self, code: Option<u16>, reason: Option<String>);
 
+    /// Updates or reads `cancel`.
     fn cancel(&self);
 }
 
+/// `WebhookDriverEvent` variants.
 pub enum WebhookDriverEvent {
+    /// `Event` variant.
     Event(WebhookEvent),
+    /// `Error` variant.
     Error(GraphError),
+    /// `Complete` variant.
     Complete,
 }
 
+/// `LocalWebhookDriver` behavior contract.
 pub trait LocalWebhookDriver {
+    /// Updates or reads `register`.
     fn register(
         &self,
         registration: WebhookRegistration,
@@ -345,6 +448,7 @@ pub trait LocalWebhookDriver {
 
 #[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, Default)]
+/// `TokioProcessDriver` data container.
 pub struct TokioProcessDriver;
 
 #[cfg(feature = "tokio")]
@@ -404,12 +508,14 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
 
 #[cfg(feature = "tokio-http")]
 #[derive(Debug, Clone, Default)]
+/// `TokioHttpDriver` data container.
 pub struct TokioHttpDriver {
     client: reqwest::Client,
 }
 
 #[cfg(feature = "tokio-http")]
 impl TokioHttpDriver {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -490,12 +596,14 @@ impl LocalHttpDriver for TokioHttpDriver {
 
 #[cfg(feature = "tokio-http-stream")]
 #[derive(Debug, Clone, Default)]
+/// `TokioHttpStreamDriver` data container.
 pub struct TokioHttpStreamDriver {
     client: reqwest::Client,
 }
 
 #[cfg(feature = "tokio-http-stream")]
 impl TokioHttpStreamDriver {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -586,6 +694,7 @@ impl LocalHttpStreamDriver for TokioHttpStreamDriver {
 
 #[cfg(feature = "tokio-websocket")]
 #[derive(Debug, Clone, Copy, Default)]
+/// `TokioWebSocketDriver` data container.
 pub struct TokioWebSocketDriver;
 
 #[cfg(feature = "tokio-websocket")]
@@ -1008,69 +1117,84 @@ pub struct EnvironmentDrivers {
 }
 
 impl EnvironmentDrivers {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Updates or reads `with_local_async`.
     pub fn with_local_async(mut self, driver: Rc<dyn LocalAsyncDriver>) -> Self {
         self.local_async = Some(driver);
         self
     }
 
+    /// Updates or reads `with_process`.
     pub fn with_process(mut self, driver: Rc<dyn LocalProcessDriver>) -> Self {
         self.process = Some(driver);
         self
     }
 
+    /// Updates or reads `with_http`.
     pub fn with_http(mut self, driver: Rc<dyn LocalHttpDriver>) -> Self {
         self.http = Some(driver);
         self
     }
 
+    /// Updates or reads `with_http_stream`.
     pub fn with_http_stream(mut self, driver: Rc<dyn LocalHttpStreamDriver>) -> Self {
         self.http_stream = Some(driver);
         self
     }
 
+    /// Updates or reads `with_sse`.
     pub fn with_sse(mut self, driver: Rc<dyn LocalSseDriver>) -> Self {
         self.sse = Some(driver);
         self
     }
 
+    /// Updates or reads `with_websocket`.
     pub fn with_websocket(mut self, driver: Rc<dyn LocalWebSocketDriver>) -> Self {
         self.websocket = Some(driver);
         self
     }
 
+    /// Updates or reads `with_webhook`.
     pub fn with_webhook(mut self, driver: Rc<dyn LocalWebhookDriver>) -> Self {
         self.webhook = Some(driver);
         self
     }
 
+    /// Updates or reads `local_async_driver`.
     pub fn local_async_driver(&self) -> Option<Rc<dyn LocalAsyncDriver>> {
         self.local_async.clone()
     }
 
+    /// Updates or reads `process_driver`.
     pub fn process_driver(&self) -> Option<Rc<dyn LocalProcessDriver>> {
         self.process.clone()
     }
 
+    /// Updates or reads `http_driver`.
     pub fn http_driver(&self) -> Option<Rc<dyn LocalHttpDriver>> {
         self.http.clone()
     }
 
+    /// Updates or reads `http_stream_driver`.
     pub fn http_stream_driver(&self) -> Option<Rc<dyn LocalHttpStreamDriver>> {
         self.http_stream.clone()
     }
 
+    /// Updates or reads `sse_driver`.
     pub fn sse_driver(&self) -> Option<Rc<dyn LocalSseDriver>> {
         self.sse.clone()
     }
 
+    /// Updates or reads `websocket_driver`.
     pub fn websocket_driver(&self) -> Option<Rc<dyn LocalWebSocketDriver>> {
         self.websocket.clone()
     }
 
+    /// Updates or reads `webhook_driver`.
     pub fn webhook_driver(&self) -> Option<Rc<dyn LocalWebhookDriver>> {
         self.webhook.clone()
     }

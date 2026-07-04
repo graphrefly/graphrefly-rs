@@ -23,14 +23,22 @@ use crate::json::JsonValue;
 use crate::node::{Core, Node, NodeOpts};
 use crate::protocol::{AnyValue, LockId};
 
+/// `constant` constant.
 pub const PROMPTS_TOPIC: &str = "prompts";
+/// `constant` constant.
 pub const RESPONSES_TOPIC: &str = "responses";
+/// `constant` constant.
 pub const INJECTIONS_TOPIC: &str = "injections";
+/// `constant` constant.
 pub const DEFERRED_TOPIC: &str = "deferred";
+/// `constant` constant.
 pub const SPAWNS_TOPIC: &str = "spawns";
+/// `constant` constant.
 pub const CONTEXT_TOPIC: &str = "context";
+/// `constant` constant.
 pub const TODOS_TOPIC: &str = "todos";
 
+/// `constant` constant.
 pub const STANDARD_TOPICS: [&str; 7] = [
     PROMPTS_TOPIC,
     RESPONSES_TOPIC,
@@ -43,34 +51,51 @@ pub const STANDARD_TOPICS: [&str; 7] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// `JsonSchemaType` variants.
 pub enum JsonSchemaType {
+    /// `String` variant.
     String,
+    /// `Number` variant.
     Number,
+    /// `Integer` variant.
     Integer,
+    /// `Boolean` variant.
     Boolean,
+    /// `Object` variant.
     Object,
+    /// `Array` variant.
     Array,
+    /// `Null` variant.
     Null,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+/// `JsonSchemaTypeSpec` variants.
 pub enum JsonSchemaTypeSpec {
+    /// `Single` variant.
     Single(JsonSchemaType),
+    /// `AnyOf` variant.
     AnyOf(Vec<JsonSchemaType>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+/// `JsonSchemaAdditionalProperties` variants.
 pub enum JsonSchemaAdditionalProperties {
+    /// `Bool` variant.
     Bool(bool),
+    /// `Schema` variant.
     Schema(Box<JsonSchema>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+/// `JsonSchemaItems` variants.
 pub enum JsonSchemaItems {
+    /// `Schema` variant.
     Schema(Box<JsonSchema>),
+    /// `Tuple` variant.
     Tuple(Vec<JsonSchema>),
 }
 
@@ -79,76 +104,116 @@ pub enum JsonSchemaItems {
 #[serde(deny_unknown_fields)]
 pub struct JsonSchema {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    /// `schema_type` field for schema type.
     pub schema_type: Option<JsonSchemaTypeSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `properties` field for properties.
     pub properties: Option<BTreeMap<String, JsonSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `required` field for required.
     pub required: Option<Vec<String>>,
     #[serde(
         rename = "additionalProperties",
         skip_serializing_if = "Option::is_none"
     )]
+    /// `additional_properties` field for additional properties.
     pub additional_properties: Option<JsonSchemaAdditionalProperties>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `items` field for items.
     pub items: Option<JsonSchemaItems>,
     #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    /// `enum_values` field for enum values.
     pub enum_values: Option<Vec<JsonValue>>,
     #[serde(rename = "const", skip_serializing_if = "Option::is_none")]
+    /// `const_value` field for const value.
     pub const_value: Option<JsonValue>,
     #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
+    /// `ref_path` field for ref path.
     pub ref_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `definitions` field for definitions.
     pub definitions: Option<BTreeMap<String, JsonSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `description` field for description.
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `title` field for title.
     pub title: Option<String>,
 }
 
 /// Passive D159 envelope for payloads that cross topic, agent, or graph boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicMessage<T> {
+    /// `id` field for id.
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `schema` field for schema.
     pub schema: Option<JsonSchema>,
     #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    /// `expires_at` field for expires at.
     pub expires_at: Option<String>,
     #[serde(rename = "correlationId", skip_serializing_if = "Option::is_none")]
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `payload` field for payload.
     pub payload: T,
 }
 
 /// Passive domain event vocabulary for messageBus/eventFlow composition (D329).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventMessage<T> {
+    /// `id` field for id.
     pub id: String,
+    /// `type_` field for type.
     pub type_: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `key` field for key.
     pub key: Option<String>,
+    /// `subject_id` field for subject id.
     pub subject_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
+    /// `occurred_at_ms` field for occurred at ms.
     pub occurred_at_ms: Option<u64>,
+    /// `actor` field for actor.
     pub actor: Option<String>,
+    /// `evidence_refs` field for evidence refs.
     pub evidence_refs: Vec<String>,
+    /// `schema` field for schema.
     pub schema: Option<JsonSchema>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// `EventMessageOptions` data container.
 pub struct EventMessageOptions {
+    /// `id` field for id.
     pub id: String,
+    /// `key` field for key.
     pub key: Option<String>,
+    /// `subject_id` field for subject id.
     pub subject_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
+    /// `occurred_at_ms` field for occurred at ms.
     pub occurred_at_ms: Option<u64>,
+    /// `actor` field for actor.
     pub actor: Option<String>,
+    /// `evidence_refs` field for evidence refs.
     pub evidence_refs: Vec<String>,
+    /// `schema` field for schema.
     pub schema: Option<JsonSchema>,
+    /// `metadata` field for metadata.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
+/// Creates or computes `event_message`.
 pub fn event_message<T>(
     type_: impl Into<String>,
     payload: T,
@@ -174,8 +239,11 @@ pub fn event_message<T>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `JsonSchemaValidationError` data container.
 pub struct JsonSchemaValidationError {
+    /// `path` field for path.
     pub path: String,
+    /// `message` field for message.
     pub message: String,
 }
 
@@ -196,6 +264,7 @@ impl fmt::Display for JsonSchemaValidationError {
 
 impl Error for JsonSchemaValidationError {}
 
+/// `JsonSchemaValidationResult` type alias.
 pub type JsonSchemaValidationResult<T> = Result<T, JsonSchemaValidationError>;
 
 /// Caller-invoked, side-effect-free validation for JSON-like payload values (D159).
@@ -206,6 +275,7 @@ pub fn validate_json_schema(
     validate_json_schema_inner(schema, schema, value, "$", &mut Vec::new())
 }
 
+/// Creates or computes `is_json_schema_valid`.
 pub fn is_json_schema_valid(schema: &JsonSchema, value: &JsonValue) -> bool {
     validate_json_schema(schema, value).is_ok()
 }
@@ -465,53 +535,81 @@ fn validate_json_schema_array(
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `DataIssue` data container.
 pub struct DataIssue {
+    /// `kind` field for kind.
     pub kind: String,
+    /// `code` field for code.
     pub code: String,
+    /// `message` field for message.
     pub message: String,
+    /// `severity` field for severity.
     pub severity: String,
+    /// `source` field for source.
     pub source: String,
+    /// `topic` field for topic.
     pub topic: Option<String>,
+    /// `details` field for details.
     pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageEnvelope` data container.
 pub struct MessageEnvelope<T = AnyValue> {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `key` field for key.
     pub key: Option<String>,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: Option<String>,
 }
 
 impl MessageEnvelope<AnyValue> {
+    /// Updates or reads `payload_as`.
     pub fn payload_as<T: 'static>(&self) -> Option<Rc<T>> {
         self.payload.clone().downcast::<T>().ok()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `MessageBusTopicPolicy` variants.
 pub enum MessageBusTopicPolicy {
+    /// `Strict` variant.
     Strict,
+    /// `CreateAsFact` variant.
     CreateAsFact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `MessageBusRetentionPolicy` data container.
 pub struct MessageBusRetentionPolicy {
+    /// `max_messages` field for max messages.
     pub max_messages: Option<usize>,
+    /// `max_age_ms` field for max age ms.
     pub max_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `MessageBusDedupeAction` variants.
 pub enum MessageBusDedupeAction {
+    /// `Status` variant.
     Status,
+    /// `Issue` variant.
     Issue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusDedupePolicy` data container.
 pub struct MessageBusDedupePolicy {
+    /// `command_id` field for command id.
     pub command_id: MessageBusDedupeAction,
 }
 
@@ -524,12 +622,19 @@ impl Default for MessageBusDedupePolicy {
 }
 
 #[derive(Clone)]
+/// `MessageBusOptions` data container.
 pub struct MessageBusOptions {
+    /// `name` field for name.
     pub name: String,
+    /// `topics` field for topics.
     pub topics: Vec<String>,
+    /// `topic_policy` field for topic policy.
     pub topic_policy: MessageBusTopicPolicy,
+    /// `retention` field for retention.
     pub retention: MessageBusRetentionPolicy,
+    /// `dedupe` field for dedupe.
     pub dedupe: MessageBusDedupePolicy,
+    /// `now` field for now.
     pub now: Rc<dyn Fn() -> u64>,
 }
 
@@ -547,6 +652,7 @@ impl Default for MessageBusOptions {
 }
 
 impl MessageBusOptions {
+    /// Creates or computes `named`.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -554,26 +660,31 @@ impl MessageBusOptions {
         }
     }
 
+    /// Updates or reads `with_topics`.
     pub fn with_topics(mut self, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.topics = topics.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Updates or reads `with_topic_policy`.
     pub fn with_topic_policy(mut self, policy: MessageBusTopicPolicy) -> Self {
         self.topic_policy = policy;
         self
     }
 
+    /// Updates or reads `with_retention`.
     pub fn with_retention(mut self, retention: MessageBusRetentionPolicy) -> Self {
         self.retention = retention;
         self
     }
 
+    /// Updates or reads `with_dedupe`.
     pub fn with_dedupe(mut self, dedupe: MessageBusDedupePolicy) -> Self {
         self.dedupe = dedupe;
         self
     }
 
+    /// Updates or reads `with_now`.
     pub fn with_now(mut self, now: impl Fn() -> u64 + 'static) -> Self {
         self.now = Rc::new(now);
         self
@@ -581,41 +692,71 @@ impl MessageBusOptions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusCommand` variants.
 pub enum MessageBusCommand<T = AnyValue> {
+    /// `EnsureTopic` variant.
     EnsureTopic {
+        /// `topic` field for topic.
         topic: String,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
+    /// `CloseTopic` variant.
     CloseTopic {
+        /// `topic` field for topic.
         topic: String,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
+    /// `Publish` variant.
     Publish {
+        /// `topic` field for topic.
         topic: String,
+        /// `payload` field for payload.
         payload: T,
+        /// `key` field for key.
         key: Option<String>,
+        /// `command_id` field for command id.
         command_id: Option<String>,
+        /// `idempotency_key` field for idempotency key.
         idempotency_key: Option<String>,
     },
+    /// `TopicPolicy` variant.
     TopicPolicy {
+        /// `topic_policy` field for topic policy.
         topic_policy: MessageBusTopicPolicy,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
+    /// `Ack` variant.
     Ack {
+        /// `topic` field for topic.
         topic: String,
+        /// `subscription_id` field for subscription id.
         subscription_id: String,
+        /// `seq` field for seq.
         seq: u64,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
+    /// `Seek` variant.
     Seek {
+        /// `topic` field for topic.
         topic: String,
+        /// `subscription_id` field for subscription id.
         subscription_id: String,
+        /// `next_seq` field for next seq.
         next_seq: u64,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
+    /// `CloseSubscription` variant.
     CloseSubscription {
+        /// `topic` field for topic.
         topic: String,
+        /// `subscription_id` field for subscription id.
         subscription_id: String,
+        /// `command_id` field for command id.
         command_id: Option<String>,
     },
 }
@@ -647,140 +788,232 @@ impl<T> MessageBusCommand<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `MessageBusStatusKind` variants.
 pub enum MessageBusStatusKind {
+    /// `TopicCreated` variant.
     TopicCreated,
+    /// `TopicClosed` variant.
     TopicClosed,
+    /// `MessagePublished` variant.
     MessagePublished,
+    /// `RetentionTrimmed` variant.
     RetentionTrimmed,
+    /// `DuplicateCommand` variant.
     DuplicateCommand,
+    /// `SubscriptionOpened` variant.
     SubscriptionOpened,
+    /// `SubscriptionAcked` variant.
     SubscriptionAcked,
+    /// `SubscriptionSought` variant.
     SubscriptionSought,
+    /// `SubscriptionClosed` variant.
     SubscriptionClosed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusStatus` data container.
 pub struct MessageBusStatus {
+    /// `kind` field for kind.
     pub kind: MessageBusStatusKind,
+    /// `topic` field for topic.
     pub topic: Option<String>,
+    /// `seq` field for seq.
     pub seq: Option<u64>,
+    /// `head_seq` field for head seq.
     pub head_seq: Option<u64>,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: Option<String>,
+    /// `next_seq` field for next seq.
     pub next_seq: Option<u64>,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `issue_code` field for issue code.
     pub issue_code: Option<String>,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `details` field for details.
     pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusCatalogEntry` data container.
 pub struct MessageBusCatalogEntry {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `closed` field for closed.
     pub closed: bool,
+    /// `head_seq` field for head seq.
     pub head_seq: u64,
+    /// `next_seq` field for next seq.
     pub next_seq: u64,
+    /// `message_count` field for message count.
     pub message_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusCatalogPage` data container.
 pub struct MessageBusCatalogPage {
+    /// `topics` field for topics.
     pub topics: Vec<MessageBusCatalogEntry>,
+    /// `next_after_topic` field for next after topic.
     pub next_after_topic: Option<String>,
+    /// `has_more` field for has more.
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusDeadLetterEntry` data container.
 pub struct MessageBusDeadLetterEntry<T = AnyValue> {
+    /// `entry_seq` field for entry seq.
     pub entry_seq: u64,
+    /// `topic` field for topic.
     pub topic: Option<String>,
+    /// `command` field for command.
     pub command: Option<MessageBusCommand<T>>,
+    /// `message` field for message.
     pub message: Option<MessageEnvelope<T>>,
+    /// `issue` field for issue.
     pub issue: DataIssue,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusDeadLetterPage` data container.
 pub struct MessageBusDeadLetterPage<T = AnyValue> {
+    /// `entries` field for entries.
     pub entries: Vec<MessageBusDeadLetterEntry<T>>,
+    /// `next_after_entry_seq` field for next after entry seq.
     pub next_after_entry_seq: Option<u64>,
+    /// `has_more` field for has more.
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusTopicPage` data container.
 pub struct MessageBusTopicPage<T = AnyValue> {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `messages` field for messages.
     pub messages: Vec<MessageEnvelope<T>>,
+    /// `from_seq` field for from seq.
     pub from_seq: u64,
+    /// `through_seq` field for through seq.
     pub through_seq: Option<u64>,
+    /// `next_after_seq` field for next after seq.
     pub next_after_seq: Option<u64>,
+    /// `has_more` field for has more.
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusCursor` data container.
 pub struct MessageBusCursor {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
+    /// `next_seq` field for next seq.
     pub next_seq: u64,
+    /// `closed` field for closed.
     pub closed: bool,
+    /// `retention_gap` field for retention gap.
     pub retention_gap: bool,
+    /// `head_seq` field for head seq.
     pub head_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `MessageBusAvailablePage` data container.
 pub struct MessageBusAvailablePage<T = AnyValue> {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
+    /// `cursor` field for cursor.
     pub cursor: MessageBusCursor,
+    /// `messages` field for messages.
     pub messages: Vec<MessageEnvelope<T>>,
+    /// `from_seq` field for from seq.
     pub from_seq: u64,
+    /// `through_seq` field for through seq.
     pub through_seq: Option<u64>,
+    /// `next_after_seq` field for next after seq.
     pub next_after_seq: Option<u64>,
+    /// `has_more` field for has more.
     pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusCatalogParams` data container.
 pub struct MessageBusCatalogParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_topic` field for after topic.
     pub after_topic: Option<String>,
+    /// `include_closed` field for include closed.
     pub include_closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusDeadLetterParams` data container.
 pub struct MessageBusDeadLetterParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_entry_seq` field for after entry seq.
     pub after_entry_seq: Option<u64>,
+    /// `topic` field for topic.
     pub topic: Option<String>,
+    /// `code` field for code.
     pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusTopicParams` data container.
 pub struct MessageBusTopicParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_seq` field for after seq.
     pub after_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `MessageBusAvailableParams` data container.
 pub struct MessageBusAvailableParams {
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `after_seq` field for after seq.
     pub after_seq: Option<u64>,
 }
 
 #[derive(Clone)]
+/// `MessageBusPullProjection` data container.
 pub struct MessageBusPullProjection<TPage> {
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<TPage>,
+    /// `snapshot_pull_id` field for snapshot pull id.
     pub snapshot_pull_id: LockId,
+    /// `status` field for status.
     pub status: Node<MessageBusStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
 }
 
+/// `MessageBusTopicProjection` type alias.
 pub type MessageBusTopicProjection<T = AnyValue> = MessageBusPullProjection<MessageBusTopicPage<T>>;
 
 #[derive(Clone)]
+/// `MessageBusSubscription` data container.
 pub struct MessageBusSubscription<T = AnyValue> {
+    /// `available` field for available.
     pub available: Node<MessageBusAvailablePage<T>>,
+    /// `available_pull_id` field for available pull id.
     pub available_pull_id: LockId,
+    /// `cursor` field for cursor.
     pub cursor: Node<MessageBusCursor>,
+    /// `status` field for status.
     pub status: Node<MessageBusStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
     commands: Node<MessageBusCommand<T>>,
     topic: String,
@@ -788,12 +1021,17 @@ pub struct MessageBusSubscription<T = AnyValue> {
 }
 
 #[derive(Clone)]
+/// `MessageBus` data container.
 pub struct MessageBus<T = AnyValue> {
     graph: Graph,
     name: Rc<String>,
+    /// `commands` field for commands.
     pub commands: Node<MessageBusCommand<T>>,
+    /// `messages` field for messages.
     pub messages: Node<MessageEnvelope<T>>,
+    /// `status` field for status.
     pub status: Node<MessageBusStatus>,
+    /// `issues` field for issues.
     pub issues: Node<DataIssue>,
     state: Rc<RefCell<MessageBusState<T>>>,
     command_sources: Rc<RefCell<Vec<Core>>>,
@@ -801,7 +1039,9 @@ pub struct MessageBus<T = AnyValue> {
 }
 
 #[derive(Clone)]
+/// `ToTopicBundle` data container.
 pub struct ToTopicBundle<T> {
+    /// `commands` field for commands.
     pub commands: Node<MessageBusCommand<T>>,
 }
 
@@ -863,21 +1103,31 @@ enum RuntimeEvent<T = AnyValue> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `MessageBusSubscriptionFrom` variants.
 pub enum MessageBusSubscriptionFrom {
+    /// `Earliest` variant.
     Earliest,
+    /// `Latest` variant.
     Latest,
+    /// `Seq` variant.
     Seq(u64),
 }
 
 #[derive(Clone)]
+/// `MessageBusSubscriptionOptions` data container.
 pub struct MessageBusSubscriptionOptions {
+    /// `topic` field for topic.
     pub topic: String,
+    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
+    /// `from` field for from.
     pub from: MessageBusSubscriptionFrom,
+    /// `name` field for name.
     pub name: Option<String>,
 }
 
 impl MessageBusSubscriptionOptions {
+    /// Creates or computes `new`.
     pub fn new(topic: impl Into<String>, subscription_id: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
@@ -887,11 +1137,13 @@ impl MessageBusSubscriptionOptions {
         }
     }
 
+    /// Updates or reads `from`.
     pub fn from(mut self, from: MessageBusSubscriptionFrom) -> Self {
         self.from = from;
         self
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -899,10 +1151,12 @@ impl MessageBusSubscriptionOptions {
 }
 
 impl<T: Clone + 'static> MessageBus<T> {
+    /// Creates or computes `new`.
     pub fn new(graph: &Graph, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self::with_options(graph, MessageBusOptions::default().with_topics(topics))
     }
 
+    /// Creates or computes `with_options`.
     pub fn with_options(graph: &Graph, opts: MessageBusOptions) -> Self {
         let name = Rc::new(opts.name);
         let command_sources = Rc::new(RefCell::new(Vec::new()));
@@ -992,6 +1246,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         }
     }
 
+    /// Updates or reads `ensure_topic`.
     pub fn ensure_topic(
         &self,
         topic: impl Into<String>,
@@ -1003,6 +1258,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         })
     }
 
+    /// Updates or reads `close_topic`.
     pub fn close_topic(
         &self,
         topic: impl Into<String>,
@@ -1014,6 +1270,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         })
     }
 
+    /// Updates or reads `publish`.
     pub fn publish(
         &self,
         topic: impl Into<String>,
@@ -1031,6 +1288,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         })
     }
 
+    /// Updates or reads `set_topic_policy`.
     pub fn set_topic_policy(
         &self,
         topic_policy: MessageBusTopicPolicy,
@@ -1042,10 +1300,12 @@ impl<T: Clone + 'static> MessageBus<T> {
         })
     }
 
+    /// Updates or reads `topic`.
     pub fn topic(&self, topic: impl Into<String>) -> MessageBusTopicProjection<T> {
         self.topic_named(topic, None::<String>)
     }
 
+    /// Updates or reads `topic_named`.
     pub fn topic_named(
         &self,
         topic: impl Into<String>,
@@ -1081,10 +1341,12 @@ impl<T: Clone + 'static> MessageBus<T> {
         }
     }
 
+    /// Updates or reads `catalog`.
     pub fn catalog(&self) -> MessageBusPullProjection<MessageBusCatalogPage> {
         self.catalog_named(None::<String>)
     }
 
+    /// Updates or reads `catalog_named`.
     pub fn catalog_named(
         &self,
         name: Option<impl Into<String>>,
@@ -1118,10 +1380,12 @@ impl<T: Clone + 'static> MessageBus<T> {
         }
     }
 
+    /// Updates or reads `dead_letter`.
     pub fn dead_letter(&self) -> MessageBusPullProjection<MessageBusDeadLetterPage<T>> {
         self.dead_letter_named(None::<String>)
     }
 
+    /// Updates or reads `dead_letter_named`.
     pub fn dead_letter_named(
         &self,
         name: Option<impl Into<String>>,
@@ -1156,6 +1420,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         }
     }
 
+    /// Updates or reads `subscription`.
     pub fn subscription(&self, opts: MessageBusSubscriptionOptions) -> MessageBusSubscription<T> {
         assert_topic_key(&opts.topic, "messageBus.subscription");
         assert_non_empty(&opts.subscription_id, "messageBus.subscriptionId");
@@ -1257,6 +1522,7 @@ impl<T: Clone + 'static> MessageBus<T> {
 }
 
 impl<T: Clone + 'static> MessageBusSubscription<T> {
+    /// Updates or reads `ack`.
     pub fn ack(&self, seq: u64, command_id: Option<String>) -> MessageBusCommand<T> {
         let command = MessageBusCommand::Ack {
             topic: self.topic.clone(),
@@ -1268,6 +1534,7 @@ impl<T: Clone + 'static> MessageBusSubscription<T> {
         command
     }
 
+    /// Updates or reads `seek`.
     pub fn seek(&self, next_seq: u64, command_id: Option<String>) -> MessageBusCommand<T> {
         let command = MessageBusCommand::Seek {
             topic: self.topic.clone(),
@@ -1279,6 +1546,7 @@ impl<T: Clone + 'static> MessageBusSubscription<T> {
         command
     }
 
+    /// Updates or reads `close`.
     pub fn close(&self, command_id: Option<String>) -> MessageBusCommand<T> {
         let command = MessageBusCommand::CloseSubscription {
             topic: self.topic.clone(),
@@ -1290,10 +1558,12 @@ impl<T: Clone + 'static> MessageBusSubscription<T> {
     }
 }
 
+/// Creates or computes `message_bus`.
 pub fn message_bus<T: Clone + 'static>(graph: &Graph, opts: MessageBusOptions) -> MessageBus<T> {
     MessageBus::with_options(graph, opts)
 }
 
+/// Creates or computes `to_topic`.
 pub fn to_topic<T: Clone + 'static>(
     graph: &Graph,
     source: &Node<T>,

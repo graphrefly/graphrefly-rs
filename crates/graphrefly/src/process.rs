@@ -23,16 +23,24 @@ use crate::node::{Core, Node};
 use crate::operators::Operator;
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessCommand` data container.
 pub struct ProcessCommand<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: String,
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<T> ProcessCommand<T> {
+    /// Creates or computes `new`.
     pub fn new(id: impl Into<String>, command_type: impl Into<String>, payload: T) -> Self {
         Self {
             id: id.into(),
@@ -46,16 +54,24 @@ impl<T> ProcessCommand<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEventDraft` data container.
 pub struct ProcessEventDraft<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: Option<String>,
+    /// `event_type` field for event type.
     pub event_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<T> ProcessEventDraft<T> {
+    /// Creates or computes `new`.
     pub fn new(event_type: impl Into<String>, payload: T) -> Self {
         Self {
             id: None,
@@ -69,31 +85,51 @@ impl<T> ProcessEventDraft<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEvent` data container.
 pub struct ProcessEvent<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: String,
+    /// `event_type` field for event type.
     pub event_type: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `command_id` field for command id.
     pub command_id: String,
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEffectRequestDraft` data container.
 pub struct ProcessEffectRequestDraft<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: Option<String>,
+    /// `effect_type` field for effect type.
     pub effect_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<T> ProcessEffectRequestDraft<T> {
+    /// Creates or computes `new`.
     pub fn new(effect_type: impl Into<String>, payload: T) -> Self {
         Self {
             id: None,
@@ -107,37 +143,60 @@ impl<T> ProcessEffectRequestDraft<T> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEffectRequest` data container.
 pub struct ProcessEffectRequest<T = crate::protocol::AnyValue> {
+    /// `id` field for id.
     pub id: String,
+    /// `effect_type` field for effect type.
     pub effect_type: String,
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `command_id` field for command id.
     pub command_id: String,
+    /// `command_type` field for command type.
     pub command_type: String,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: u64,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessEffectOutcomeKind` variants.
 pub enum ProcessEffectOutcomeKind {
+    /// `Result` variant.
     Result,
+    /// `Failure` variant.
     Failure,
+    /// `Cancel` variant.
     Cancel,
+    /// `Timeout` variant.
     Timeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessEffectCommandType` variants.
 pub enum ProcessEffectCommandType {
+    /// `Result` variant.
     Result,
+    /// `Failure` variant.
     Failure,
+    /// `Cancel` variant.
     Cancel,
+    /// `Timeout` variant.
     Timeout,
 }
 
 impl ProcessEffectCommandType {
+    /// Updates or reads `as_str`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Result => "effect.result",
@@ -149,20 +208,32 @@ impl ProcessEffectCommandType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEffectOutcome` data container.
 pub struct ProcessEffectOutcome<TResult = crate::protocol::AnyValue> {
+    /// `kind` field for kind.
     pub kind: ProcessEffectOutcomeKind,
+    /// `effect_id` field for effect id.
     pub effect_id: String,
+    /// `effect_type` field for effect type.
     pub effect_type: String,
+    /// `value` field for value.
     pub value: Option<TResult>,
+    /// `error` field for error.
     pub error: Option<String>,
+    /// `reason` field for reason.
     pub reason: Option<String>,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 impl<TResult> ProcessEffectOutcome<TResult> {
+    /// Creates or computes `result`.
     pub fn result(
         effect_id: impl Into<String>,
         effect_type: impl Into<String>,
@@ -182,6 +253,7 @@ impl<TResult> ProcessEffectOutcome<TResult> {
         }
     }
 
+    /// Creates or computes `failure`.
     pub fn failure(
         effect_id: impl Into<String>,
         effect_type: impl Into<String>,
@@ -201,6 +273,7 @@ impl<TResult> ProcessEffectOutcome<TResult> {
         }
     }
 
+    /// Creates or computes `cancel`.
     pub fn cancel(effect_id: impl Into<String>, effect_type: impl Into<String>) -> Self {
         Self {
             kind: ProcessEffectOutcomeKind::Cancel,
@@ -216,6 +289,7 @@ impl<TResult> ProcessEffectOutcome<TResult> {
         }
     }
 
+    /// Creates or computes `timeout`.
     pub fn timeout(
         effect_id: impl Into<String>,
         effect_type: impl Into<String>,
@@ -235,26 +309,31 @@ impl<TResult> ProcessEffectOutcome<TResult> {
         }
     }
 
+    /// Updates or reads `with_command_id`.
     pub fn with_command_id(mut self, command_id: impl Into<String>) -> Self {
         self.command_id = Some(command_id.into());
         self
     }
 
+    /// Updates or reads `with_process_id`.
     pub fn with_process_id(mut self, process_id: impl Into<String>) -> Self {
         self.process_id = Some(process_id.into());
         self
     }
 
+    /// Updates or reads `with_correlation_id`.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
         self.correlation_id = Some(correlation_id.into());
         self
     }
 
+    /// Updates or reads `with_causation_id`.
     pub fn with_causation_id(mut self, causation_id: impl Into<String>) -> Self {
         self.causation_id = Some(causation_id.into());
         self
     }
 
+    /// Updates or reads `with_reason`.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
@@ -262,143 +341,233 @@ impl<TResult> ProcessEffectOutcome<TResult> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEffectCommandPayload` data container.
 pub struct ProcessEffectCommandPayload<TResult = crate::protocol::AnyValue> {
+    /// `kind` field for kind.
     pub kind: ProcessEffectOutcomeKind,
+    /// `effect_id` field for effect id.
     pub effect_id: String,
+    /// `effect_type` field for effect type.
     pub effect_type: String,
+    /// `value` field for value.
     pub value: Option<TResult>,
+    /// `error` field for error.
     pub error: Option<String>,
+    /// `reason` field for reason.
     pub reason: Option<String>,
+    /// `process_id` field for process id.
     pub process_id: Option<String>,
+    /// `correlation_id` field for correlation id.
     pub correlation_id: Option<String>,
+    /// `causation_id` field for causation id.
     pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessEffectRunnerStatusState` variants.
 pub enum ProcessEffectRunnerStatusState {
+    /// `Requested` variant.
     Requested,
+    /// `Commanded` variant.
     Commanded,
+    /// `Rejected` variant.
     Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessEffectRunnerStatus` data container.
 pub struct ProcessEffectRunnerStatus {
+    /// `state` field for state.
     pub state: ProcessEffectRunnerStatusState,
+    /// `effect_id` field for effect id.
     pub effect_id: Option<String>,
+    /// `effect_type` field for effect type.
     pub effect_type: Option<String>,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `command_type` field for command type.
     pub command_type: Option<ProcessEffectCommandType>,
+    /// `requested` field for requested.
     pub requested: u64,
+    /// `commanded` field for commanded.
     pub commanded: u64,
+    /// `rejected` field for rejected.
     pub rejected: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessEffectRunnerErrorCode` variants.
 pub enum ProcessEffectRunnerErrorCode {
+    /// `MalformedOutcome` variant.
     MalformedOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessEffectRunnerError` data container.
 pub struct ProcessEffectRunnerError<TResult = crate::protocol::AnyValue> {
+    /// `code` field for code.
     pub code: ProcessEffectRunnerErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `outcome` field for outcome.
     pub outcome: Option<ProcessEffectOutcome<TResult>>,
+    /// `effect_id` field for effect id.
     pub effect_id: Option<String>,
+    /// `effect_type` field for effect type.
     pub effect_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessErrorCode` variants.
 pub enum ProcessErrorCode {
+    /// `MalformedCommand` variant.
     MalformedCommand,
+    /// `ReducerThrew` variant.
     ReducerThrew,
+    /// `ClockThrew` variant.
     ClockThrew,
+    /// `MalformedState` variant.
     MalformedState,
+    /// `MalformedEvent` variant.
     MalformedEvent,
+    /// `MalformedEffect` variant.
     MalformedEffect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessError` data container.
 pub struct ProcessError<TCommand = crate::protocol::AnyValue> {
+    /// `code` field for code.
     pub code: ProcessErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `command` field for command.
     pub command: Option<ProcessCommand<TCommand>>,
+    /// `cursor` field for cursor.
     pub cursor: ProcessCursor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessCursor` data container.
 pub struct ProcessCursor {
+    /// `event_seq` field for event seq.
     pub event_seq: u64,
+    /// `effect_seq` field for effect seq.
     pub effect_seq: u64,
+    /// `command_count` field for command count.
     pub command_count: u64,
+    /// `error_count` field for error count.
     pub error_count: u64,
+    /// `audit_seq` field for audit seq.
     pub audit_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessStatus` data container.
 pub struct ProcessStatus {
+    /// `state` field for state.
     pub state: ProcessStatusState,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `command_type` field for command type.
     pub command_type: Option<String>,
+    /// `event_count` field for event count.
     pub event_count: usize,
+    /// `effect_count` field for effect count.
     pub effect_count: usize,
+    /// `error_code` field for error code.
     pub error_code: Option<ProcessErrorCode>,
+    /// `cursor` field for cursor.
     pub cursor: ProcessCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessStatusState` variants.
 pub enum ProcessStatusState {
+    /// `Accepted` variant.
     Accepted,
+    /// `Rejected` variant.
     Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ProcessAuditRecord` data container.
 pub struct ProcessAuditRecord {
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `command_id` field for command id.
     pub command_id: Option<String>,
+    /// `command_type` field for command type.
     pub command_type: Option<String>,
+    /// `outcome` field for outcome.
     pub outcome: ProcessAuditOutcome,
+    /// `event_ids` field for event ids.
     pub event_ids: Vec<String>,
+    /// `event_types` field for event types.
     pub event_types: Vec<String>,
+    /// `effect_ids` field for effect ids.
     pub effect_ids: Vec<String>,
+    /// `effect_types` field for effect types.
     pub effect_types: Vec<String>,
+    /// `error_code` field for error code.
     pub error_code: Option<ProcessErrorCode>,
+    /// `error_message` field for error message.
     pub error_message: Option<String>,
+    /// `cursor` field for cursor.
     pub cursor: ProcessCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ProcessAuditOutcome` variants.
 pub enum ProcessAuditOutcome {
+    /// `Success` variant.
     Success,
+    /// `Failure` variant.
     Failure,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessRuntimeFact` variants.
 pub enum ProcessRuntimeFact<
     TState = crate::protocol::AnyValue,
     TEvent = crate::protocol::AnyValue,
     TEffect = crate::protocol::AnyValue,
     TCommand = crate::protocol::AnyValue,
 > {
+    /// `State` variant.
     State {
+        /// `state` field for state.
         state: TState,
+        /// `cursor` field for cursor.
         cursor: ProcessCursor,
     },
+    /// `Event` variant.
     Event(ProcessEvent<TEvent>),
+    /// `EffectRequest` variant.
     EffectRequest(ProcessEffectRequest<TEffect>),
+    /// `Status` variant.
     Status(ProcessStatus),
+    /// `Error` variant.
     Error(ProcessError<TCommand>),
+    /// `Audit` variant.
     Audit(ProcessAuditRecord),
+    /// `Cursor` variant.
     Cursor(ProcessCursor),
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// `ProcessReduction` data container.
 pub struct ProcessReduction<TState, TEvent, TEffect> {
+    /// `state` field for state.
     pub state: TState,
+    /// `events` field for events.
     pub events: Vec<ProcessEventDraft<TEvent>>,
+    /// `effects` field for effects.
     pub effects: Vec<ProcessEffectRequestDraft<TEffect>>,
 }
 
 impl<TState, TEvent, TEffect> ProcessReduction<TState, TEvent, TEffect> {
+    /// Creates or computes `new`.
     pub fn new(state: TState) -> Self {
         Self {
             state,
@@ -407,32 +576,42 @@ impl<TState, TEvent, TEffect> ProcessReduction<TState, TEvent, TEffect> {
         }
     }
 
+    /// Updates or reads `with_events`.
     pub fn with_events(mut self, events: Vec<ProcessEventDraft<TEvent>>) -> Self {
         self.events = events;
         self
     }
 
+    /// Updates or reads `with_effects`.
     pub fn with_effects(mut self, effects: Vec<ProcessEffectRequestDraft<TEffect>>) -> Self {
         self.effects = effects;
         self
     }
 }
 
+/// `ProcessReducerFn` type alias.
 pub type ProcessReducerFn<TCommand, TState, TEvent, TEffect> =
     dyn Fn(&ProcessCommand<TCommand>, TState) -> ProcessReduction<TState, TEvent, TEffect>;
 
+/// `ProcessReducer` type alias.
 pub type ProcessReducer<TCommand, TState, TEvent, TEffect> =
     Rc<ProcessReducerFn<TCommand, TState, TEvent, TEffect>>;
 
 #[derive(Clone)]
+/// `ProcessBundleOptions` data container.
 pub struct ProcessBundleOptions<TCommand, TState, TEvent, TEffect> {
+    /// `name` field for name.
     pub name: String,
+    /// `initial_state` field for initial state.
     pub initial_state: TState,
+    /// `reduce` field for reduce.
     pub reduce: ProcessReducer<TCommand, TState, TEvent, TEffect>,
+    /// `now` field for now.
     pub now: Rc<dyn Fn() -> u64>,
 }
 
 impl<TCommand, TState, TEvent, TEffect> ProcessBundleOptions<TCommand, TState, TEvent, TEffect> {
+    /// Creates or computes `new`.
     pub fn new(
         initial_state: TState,
         reduce: impl Fn(&ProcessCommand<TCommand>, TState) -> ProcessReduction<TState, TEvent, TEffect>
@@ -446,11 +625,13 @@ impl<TCommand, TState, TEvent, TEffect> ProcessBundleOptions<TCommand, TState, T
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Updates or reads `with_now`.
     pub fn with_now(mut self, now: impl Fn() -> u64 + 'static) -> Self {
         self.now = Rc::new(now);
         self
@@ -458,19 +639,28 @@ impl<TCommand, TState, TEvent, TEffect> ProcessBundleOptions<TCommand, TState, T
 }
 
 #[derive(Clone)]
+/// `ProcessBundle` data container.
 pub struct ProcessBundle<
     TCommand = crate::protocol::AnyValue,
     TState = crate::protocol::AnyValue,
     TEvent = crate::protocol::AnyValue,
     TEffect = crate::protocol::AnyValue,
 > {
+    /// `command` field for command.
     pub command: Node<ProcessCommand<TCommand>>,
+    /// `state` field for state.
     pub state: Node<TState>,
+    /// `events` field for events.
     pub events: Node<ProcessEvent<TEvent>>,
+    /// `audit` field for audit.
     pub audit: Node<ProcessAuditRecord>,
+    /// `effect_request` field for effect request.
     pub effect_request: Node<ProcessEffectRequest<TEffect>>,
+    /// `status` field for status.
     pub status: Node<ProcessStatus>,
+    /// `error` field for error.
     pub error: Node<ProcessError<TCommand>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<ProcessCursor>,
     command_sources: Rc<RefCell<Vec<Core>>>,
     command_id: String,
@@ -480,6 +670,7 @@ pub struct ProcessBundle<
 impl<TCommand: Clone + 'static, TState, TEvent, TEffect>
     ProcessBundle<TCommand, TState, TEvent, TEffect>
 {
+    /// Updates or reads `dispatch`.
     pub fn dispatch(&self, command: ProcessCommand<TCommand>) -> ProcessCommand<TCommand> {
         self.command.set(command.clone());
         command
@@ -506,8 +697,11 @@ impl Drop for ProcessRetain {
     }
 }
 
+/// `ProcessEffectRunnerOptions` data container.
 pub struct ProcessEffectRunnerOptions<TCommand, TResult = crate::protocol::AnyValue> {
+    /// `name` field for name.
     pub name: String,
+    /// `outcomes` field for outcomes.
     pub outcomes: Vec<Node<ProcessEffectOutcome<TResult>>>,
     command_payload: Rc<dyn Fn(ProcessEffectCommandPayload<TResult>) -> TCommand>,
 }
@@ -515,6 +709,7 @@ pub struct ProcessEffectRunnerOptions<TCommand, TResult = crate::protocol::AnyVa
 impl<TResult: Clone + 'static>
     ProcessEffectRunnerOptions<ProcessEffectCommandPayload<TResult>, TResult>
 {
+    /// Creates or computes `new`.
     pub fn new(outcomes: Vec<Node<ProcessEffectOutcome<TResult>>>) -> Self {
         Self {
             name: "processEffectRunner".to_owned(),
@@ -525,11 +720,13 @@ impl<TResult: Clone + 'static>
 }
 
 impl<TCommand, TResult> ProcessEffectRunnerOptions<TCommand, TResult> {
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Updates or reads `map_command_payload`.
     pub fn map_command_payload<TNext>(
         self,
         map: impl Fn(ProcessEffectCommandPayload<TResult>) -> TNext + 'static,
@@ -552,15 +749,21 @@ enum ProcessEffectRunnerFact<TCommand, TResult = crate::protocol::AnyValue> {
     Error(ProcessEffectRunnerError<TResult>),
 }
 
+/// `ProcessEffectRunnerBundle` data container.
 pub struct ProcessEffectRunnerBundle<
     TCommand = ProcessEffectCommandPayload<crate::protocol::AnyValue>,
     TEffect = crate::protocol::AnyValue,
     TResult = crate::protocol::AnyValue,
 > {
+    /// `requests` field for requests.
     pub requests: Node<ProcessEffectRequest<TEffect>>,
+    /// `outcomes` field for outcomes.
     pub outcomes: Node<ProcessEffectOutcome<TResult>>,
+    /// `commands` field for commands.
     pub commands: Node<ProcessCommand<TCommand>>,
+    /// `status` field for status.
     pub status: Node<ProcessEffectRunnerStatus>,
+    /// `errors` field for errors.
     pub errors: Node<ProcessEffectRunnerError<TResult>>,
     runtime: Node<ProcessEffectRunnerFact<TCommand, TResult>>,
     graph: Graph,
@@ -664,6 +867,7 @@ impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'stat
     }
 }
 
+/// Creates or computes `process_bundle`.
 pub fn process_bundle<
     TCommand: Clone + 'static,
     TState: Clone + Serialize + DeserializeOwned + 'static,
@@ -837,6 +1041,7 @@ pub fn process_bundle<
     }
 }
 
+/// Creates or computes `process_effect_runner`.
 pub fn process_effect_runner<TCommand, TState, TEvent, TEffect, TResult>(
     graph: &Graph,
     process: &ProcessBundle<TCommand, TState, TEvent, TEffect>,

@@ -31,51 +31,82 @@ use crate::storage::{
 type Disposer = Box<dyn FnOnce()>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionPersistenceStatus` variants.
 pub enum ReactiveCollectionPersistenceStatus {
+    /// `Starting` variant.
     Starting,
+    /// `Ready` variant.
     Ready,
+    /// `Flushing` variant.
     Flushing,
+    /// `Errored` variant.
     Errored,
+    /// `Disposed` variant.
     Disposed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionPersistenceCursor` data container.
 pub struct ReactiveCollectionPersistenceCursor {
+    /// `collection` field for collection.
     pub collection: ReactiveCollectionKind,
+    /// `change_seq` field for change seq.
     pub change_seq: Option<u64>,
+    /// `snapshot_writes` field for snapshot writes.
     pub snapshot_writes: usize,
+    /// `change_writes` field for change writes.
     pub change_writes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionPersistenceStatusFact` data container.
 pub struct ReactiveCollectionPersistenceStatusFact {
+    /// `state` field for state.
     pub state: ReactiveCollectionPersistenceStatus,
+    /// `pending` field for pending.
     pub pending: usize,
+    /// `writes` field for writes.
     pub writes: usize,
+    /// `errors` field for errors.
     pub errors: usize,
+    /// `cursor` field for cursor.
     pub cursor: ReactiveCollectionPersistenceCursor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ReactiveCollectionPersistenceErrorFact` data container.
 pub struct ReactiveCollectionPersistenceErrorFact {
+    /// `phase` field for phase.
     pub phase: String,
+    /// `message` field for message.
     pub message: String,
+    /// `cursor` field for cursor.
     pub cursor: ReactiveCollectionPersistenceCursor,
 }
 
 #[derive(Clone)]
+/// `PersistReactiveCollectionOptions` data container.
 pub struct PersistReactiveCollectionOptions {
+    /// `graph` field for graph.
     pub graph: Option<Graph>,
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `storage_prefix` field for storage prefix.
     pub storage_prefix: Option<String>,
+    /// `snapshot_key` field for snapshot key.
     pub snapshot_key: Option<String>,
+    /// `snapshot_store` field for snapshot store.
     pub snapshot_store: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>>,
+    /// `change_log` field for change log.
     pub change_log: Option<Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>>>,
+    /// `snapshot_on_attach` field for snapshot on attach.
     pub snapshot_on_attach: bool,
+    /// `snapshot_every_changes` field for snapshot every changes.
     pub snapshot_every_changes: Option<usize>,
 }
 
 impl PersistReactiveCollectionOptions {
+    /// Creates or computes `new`.
     pub fn new(
         snapshot_store: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>>,
         storage_prefix: impl Into<String>,
@@ -93,10 +124,15 @@ impl PersistReactiveCollectionOptions {
     }
 }
 
+/// `ReactiveCollectionPersistence` data container.
 pub struct ReactiveCollectionPersistence {
+    /// `ready` field for ready.
     pub ready: Node<bool>,
+    /// `status` field for status.
     pub status: Node<Value>,
+    /// `error` field for error.
     pub error: Node<Value>,
+    /// `cursor` field for cursor.
     pub cursor: Node<Value>,
     flush: Rc<dyn Fn() -> StorageResult<()>>,
     snapshot: Rc<dyn Fn() -> StorageResult<()>>,
@@ -104,20 +140,24 @@ pub struct ReactiveCollectionPersistence {
 }
 
 impl ReactiveCollectionPersistence {
+    /// Updates or reads `flush`.
     pub fn flush(&self) -> StorageResult<()> {
         (self.flush)()
     }
 
+    /// Updates or reads `snapshot`.
     pub fn snapshot(&self) -> StorageResult<()> {
         (self.snapshot)()
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         if let Some(dispose) = self.dispose.borrow_mut().take() {
             dispose();
         }
     }
 
+    /// Updates or reads `status_fact`.
     pub fn status_fact(&self) -> StorageResult<ReactiveCollectionPersistenceStatusFact> {
         let value = self
             .status
@@ -126,6 +166,7 @@ impl ReactiveCollectionPersistence {
         parse_status_fact(&value)
     }
 
+    /// Updates or reads `cursor_fact`.
     pub fn cursor_fact(&self) -> StorageResult<ReactiveCollectionPersistenceCursor> {
         let value = self
             .cursor
@@ -134,6 +175,7 @@ impl ReactiveCollectionPersistence {
         parse_cursor_fact(&value)
     }
 
+    /// Updates or reads `error_fact`.
     pub fn error_fact(&self) -> StorageResult<Option<ReactiveCollectionPersistenceErrorFact>> {
         let Some(value) = self.error.cache() else {
             return Ok(None);
@@ -153,50 +195,79 @@ impl Drop for ReactiveCollectionPersistence {
     }
 }
 
+/// `OpenPersistentReactiveList` data container.
 pub struct OpenPersistentReactiveList<T> {
+    /// `collection` field for collection.
     pub collection: ReactiveList<T>,
+    /// `persistence` field for persistence.
     pub persistence: ReactiveCollectionPersistence,
 }
 
+/// `OpenPersistentReactiveLog` data container.
 pub struct OpenPersistentReactiveLog<T> {
+    /// `collection` field for collection.
     pub collection: ReactiveLog<T>,
+    /// `persistence` field for persistence.
     pub persistence: ReactiveCollectionPersistence,
 }
 
+/// `OpenPersistentReactiveMap` data container.
 pub struct OpenPersistentReactiveMap<K, V> {
+    /// `collection` field for collection.
     pub collection: ReactiveMap<K, V>,
+    /// `persistence` field for persistence.
     pub persistence: ReactiveCollectionPersistence,
 }
 
+/// `OpenPersistentReactiveIndex` data container.
 pub struct OpenPersistentReactiveIndex<K, S, V> {
+    /// `collection` field for collection.
     pub collection: ReactiveIndex<K, S, V>,
+    /// `persistence` field for persistence.
     pub persistence: ReactiveCollectionPersistence,
 }
 
+/// `OpenPersistentReactiveListOptions` data container.
 pub struct OpenPersistentReactiveListOptions<T> {
+    /// `initial` field for initial.
     pub initial: Vec<T>,
+    /// `collection` field for collection.
     pub collection: ReactiveListOptions,
+    /// `persistence` field for persistence.
     pub persistence: PersistReactiveCollectionOptions,
 }
 
+/// `OpenPersistentReactiveLogOptions` data container.
 pub struct OpenPersistentReactiveLogOptions<T> {
+    /// `initial` field for initial.
     pub initial: Vec<T>,
+    /// `collection` field for collection.
     pub collection: ReactiveLogOptions,
+    /// `persistence` field for persistence.
     pub persistence: PersistReactiveCollectionOptions,
 }
 
+/// `OpenPersistentReactiveMapOptions` data container.
 pub struct OpenPersistentReactiveMapOptions<K, V> {
+    /// `initial` field for initial.
     pub initial: Vec<(K, V)>,
+    /// `collection` field for collection.
     pub collection: ReactiveMapOptions,
+    /// `persistence` field for persistence.
     pub persistence: PersistReactiveCollectionOptions,
 }
 
+/// `OpenPersistentReactiveIndexOptions` data container.
 pub struct OpenPersistentReactiveIndexOptions<K, S, V> {
+    /// `initial` field for initial.
     pub initial: Vec<IndexRow<K, S, V>>,
+    /// `collection` field for collection.
     pub collection: ReactiveIndexOptions,
+    /// `persistence` field for persistence.
     pub persistence: PersistReactiveCollectionOptions,
 }
 
+/// Creates or computes `persist_reactive_list`.
 pub fn persist_reactive_list<T>(
     collection: &ReactiveList<T>,
     options: PersistReactiveCollectionOptions,
@@ -215,6 +286,7 @@ where
     )
 }
 
+/// Creates or computes `persist_reactive_log`.
 pub fn persist_reactive_log<T>(
     collection: &ReactiveLog<T>,
     options: PersistReactiveCollectionOptions,
@@ -233,6 +305,7 @@ where
     )
 }
 
+/// Creates or computes `persist_reactive_map`.
 pub fn persist_reactive_map<K, V>(
     collection: &ReactiveMap<K, V>,
     options: PersistReactiveCollectionOptions,
@@ -252,6 +325,7 @@ where
     )
 }
 
+/// Creates or computes `persist_reactive_index`.
 pub fn persist_reactive_index<K, S, V>(
     collection: &ReactiveIndex<K, S, V>,
     options: PersistReactiveCollectionOptions,
@@ -351,6 +425,7 @@ where
     )
 }
 
+/// Creates or computes `open_persistent_reactive_list`.
 pub fn open_persistent_reactive_list<T>(
     options: OpenPersistentReactiveListOptions<T>,
 ) -> StorageResult<OpenPersistentReactiveList<T>>
@@ -378,6 +453,7 @@ where
     })
 }
 
+/// Creates or computes `open_persistent_reactive_log`.
 pub fn open_persistent_reactive_log<T>(
     options: OpenPersistentReactiveLogOptions<T>,
 ) -> StorageResult<OpenPersistentReactiveLog<T>>
@@ -405,6 +481,7 @@ where
     })
 }
 
+/// Creates or computes `open_persistent_reactive_map`.
 pub fn open_persistent_reactive_map<K, V>(
     options: OpenPersistentReactiveMapOptions<K, V>,
 ) -> StorageResult<OpenPersistentReactiveMap<K, V>>
@@ -436,6 +513,7 @@ where
     })
 }
 
+/// Creates or computes `open_persistent_reactive_index`.
 pub fn open_persistent_reactive_index<K, S, V>(
     options: OpenPersistentReactiveIndexOptions<K, S, V>,
 ) -> StorageResult<OpenPersistentReactiveIndex<K, S, V>>

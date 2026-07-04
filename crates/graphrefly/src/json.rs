@@ -10,7 +10,9 @@ use std::fmt;
 
 use serde_json::Value;
 
+/// `JsonValue` type alias.
 pub type JsonValue = Value;
+/// `JsonCodecResult` type alias.
 pub type JsonCodecResult<T> = Result<T, JsonCodecError>;
 
 const JS_MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
@@ -18,21 +20,28 @@ const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
 const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `JsonCodecError` variants.
 pub enum JsonCodecError {
+    /// `Encode` variant.
     Encode(String),
+    /// `Decode` variant.
     Decode(String),
+    /// `Validation` variant.
     Validation(String),
 }
 
 impl JsonCodecError {
+    /// Creates or computes `encode`.
     pub fn encode(message: impl Into<String>) -> Self {
         Self::Encode(message.into())
     }
 
+    /// Creates or computes `decode`.
     pub fn decode(message: impl Into<String>) -> Self {
         Self::Decode(message.into())
     }
 
+    /// Creates or computes `validation`.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation(message.into())
     }
@@ -52,11 +61,14 @@ impl Error for JsonCodecError {}
 
 /// Typed byte codec for D82 storage binding helpers and D96 JSON surfaces.
 pub trait Codec<T> {
+    /// Updates or reads `encode`.
     fn encode(&self, value: &T) -> JsonCodecResult<Vec<u8>>;
+    /// Updates or reads `decode`.
     fn decode(&self, bytes: &[u8]) -> JsonCodecResult<T>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+/// `JsonCodec` data container.
 pub struct JsonCodec;
 
 impl Codec<JsonValue> for JsonCodec {
@@ -70,6 +82,7 @@ impl Codec<JsonValue> for JsonCodec {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+/// `StrictJsonCodec` data container.
 pub struct StrictJsonCodec;
 
 impl Codec<JsonValue> for StrictJsonCodec {
@@ -82,11 +95,13 @@ impl Codec<JsonValue> for StrictJsonCodec {
     }
 }
 
+/// Creates or computes `json_codec_for`.
 pub fn json_codec_for<T>() -> JsonCodec {
     let _ = std::marker::PhantomData::<T>;
     JsonCodec
 }
 
+/// Creates or computes `strict_json_codec_for`.
 pub fn strict_json_codec_for<T>() -> StrictJsonCodec {
     let _ = std::marker::PhantomData::<T>;
     StrictJsonCodec
@@ -445,9 +460,12 @@ fn assert_no_duplicate_json_object_keys(text: &str) -> JsonCodecResult<()> {
     Ok(())
 }
 
+/// `DecimalIntegerString` type alias.
 pub type DecimalIntegerString = String;
+/// `NonNegativeDecimalIntegerString` type alias.
 pub type NonNegativeDecimalIntegerString = String;
 
+/// Creates or computes `is_decimal_integer_string`.
 pub fn is_decimal_integer_string(value: &str) -> bool {
     if value == "0" {
         return true;
@@ -459,6 +477,7 @@ pub fn is_decimal_integer_string(value: &str) -> bool {
         && value != "-0"
 }
 
+/// Creates or computes `is_non_negative_decimal_integer_string`.
 pub fn is_non_negative_decimal_integer_string(value: &str) -> bool {
     if value == "0" {
         return true;
@@ -469,6 +488,7 @@ pub fn is_non_negative_decimal_integer_string(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Creates or computes `assert_decimal_integer_string`.
 pub fn assert_decimal_integer_string(
     value: impl Into<String>,
     label: &str,
@@ -483,6 +503,7 @@ pub fn assert_decimal_integer_string(
     }
 }
 
+/// Creates or computes `assert_non_negative_decimal_integer_string`.
 pub fn assert_non_negative_decimal_integer_string(
     value: impl Into<String>,
     label: &str,
@@ -497,14 +518,17 @@ pub fn assert_non_negative_decimal_integer_string(
     }
 }
 
+/// Creates or computes `i128_to_decimal_string`.
 pub fn i128_to_decimal_string(value: i128) -> DecimalIntegerString {
     value.to_string()
 }
 
+/// Creates or computes `u128_to_non_negative_decimal_string`.
 pub fn u128_to_non_negative_decimal_string(value: u128) -> NonNegativeDecimalIntegerString {
     value.to_string()
 }
 
+/// Creates or computes `decimal_string_to_i128`.
 pub fn decimal_string_to_i128(value: &str) -> JsonCodecResult<i128> {
     assert_decimal_integer_string(value, "decimal integer")?
         .parse::<i128>()
@@ -513,6 +537,7 @@ pub fn decimal_string_to_i128(value: &str) -> JsonCodecResult<i128> {
         })
 }
 
+/// Creates or computes `non_negative_decimal_string_to_u128`.
 pub fn non_negative_decimal_string_to_u128(value: &str) -> JsonCodecResult<u128> {
     assert_non_negative_decimal_integer_string(value, "decimal integer")?
         .parse::<u128>()

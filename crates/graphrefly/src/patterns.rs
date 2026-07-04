@@ -20,20 +20,32 @@ pub type FactId = String;
 /// message, storage record owner, restore contract, or agentic runtime.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryFragment<T> {
+    /// `id` field for id.
     pub id: FactId,
+    /// `payload` field for payload.
     pub payload: T,
+    /// `t_ns` field for t ns.
     pub t_ns: u128,
+    /// `valid_from` field for valid from.
     pub valid_from: Option<u128>,
+    /// `valid_to` field for valid to.
     pub valid_to: Option<u128>,
+    /// `confidence` field for confidence.
     pub confidence: f64,
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `sources` field for sources.
     pub sources: Vec<FactId>,
+    /// `embedding` field for embedding.
     pub embedding: Option<Vec<f64>>,
+    /// `parent_fragment_id` field for parent fragment id.
     pub parent_fragment_id: Option<FactId>,
+    /// `provenance` field for provenance.
     pub provenance: Option<String>,
 }
 
 impl<T> MemoryFragment<T> {
+    /// Creates or computes `new`.
     pub fn new(id: impl Into<String>, payload: T, t_ns: u128) -> Self {
         Self {
             id: id.into(),
@@ -58,121 +70,199 @@ impl<T> MemoryFragment<T> {
 /// reducers do not need `AgenticMemoryRecord`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum KnowledgeAssertionObject {
-    Entity { entity_id: FactId },
-    Literal { value: JsonValue },
+    /// `Entity` variant.
+    Entity {
+        /// `entity_id` field for `Entity`.
+        entity_id: FactId,
+    },
+    /// `Literal` variant.
+    Literal {
+        /// `value` field for `Literal`.
+        value: JsonValue,
+    },
 }
 
 /// Passive KG assertion fact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KnowledgeAssertion {
+    /// `id` field for id.
     pub id: FactId,
+    /// `subject_id` field for subject id.
     pub subject_id: FactId,
+    /// `predicate` field for predicate.
     pub predicate: String,
+    /// `object` field for object.
     pub object: KnowledgeAssertionObject,
+    /// `sources` field for sources.
     pub sources: Vec<FactId>,
+    /// `confidence` field for confidence.
     pub confidence: f64,
+    /// `t_ns` field for t ns.
     pub t_ns: u128,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `KnowledgeGraphPolicy` data container.
 pub struct KnowledgeGraphPolicy {
+    /// `allowed_predicates` field for allowed predicates.
     pub allowed_predicates: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphEntity` data container.
 pub struct KnowledgeGraphEntity {
+    /// `id` field for id.
     pub id: FactId,
+    /// `assertion_ids` field for assertion ids.
     pub assertion_ids: Vec<FactId>,
+    /// `subject_assertion_ids` field for subject assertion ids.
     pub subject_assertion_ids: Vec<FactId>,
+    /// `object_assertion_ids` field for object assertion ids.
     pub object_assertion_ids: Vec<FactId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `KnowledgeGraphRelation` data container.
 pub struct KnowledgeGraphRelation {
+    /// `assertion_id` field for assertion id.
     pub assertion_id: FactId,
+    /// `subject_id` field for subject id.
     pub subject_id: FactId,
+    /// `predicate` field for predicate.
     pub predicate: String,
+    /// `object` field for object.
     pub object: KnowledgeAssertionObject,
+    /// `sources` field for sources.
     pub sources: Vec<FactId>,
+    /// `confidence` field for confidence.
     pub confidence: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphTopic` data container.
 pub struct KnowledgeGraphTopic {
+    /// `predicate` field for predicate.
     pub predicate: String,
+    /// `assertion_ids` field for assertion ids.
     pub assertion_ids: Vec<FactId>,
+    /// `entity_ids` field for entity ids.
     pub entity_ids: Vec<FactId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphIndex` data container.
 pub struct KnowledgeGraphIndex {
+    /// `assertion_ids` field for assertion ids.
     pub assertion_ids: Vec<FactId>,
+    /// `entity_ids` field for entity ids.
     pub entity_ids: Vec<FactId>,
+    /// `relation_ids` field for relation ids.
     pub relation_ids: Vec<FactId>,
+    /// `predicates` field for predicates.
     pub predicates: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphCursor` data container.
 pub struct KnowledgeGraphCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_assertions` field for valid assertions.
     pub valid_assertions: usize,
+    /// `invalid_assertions` field for invalid assertions.
     pub invalid_assertions: usize,
+    /// `entity_count` field for entity count.
     pub entity_count: usize,
+    /// `relation_count` field for relation count.
     pub relation_count: usize,
+    /// `predicate_count` field for predicate count.
     pub predicate_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphStatusState` variants.
 pub enum KnowledgeGraphStatusState {
+    /// `Ready` variant.
     Ready,
+    /// `Empty` variant.
     Empty,
+    /// `Partial` variant.
     Partial,
+    /// `Error` variant.
     Error,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphStatus` data container.
 pub struct KnowledgeGraphStatus {
+    /// `state` field for state.
     pub state: KnowledgeGraphStatusState,
+    /// `cursor` field for cursor.
     pub cursor: KnowledgeGraphCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphErrorCode` variants.
 pub enum KnowledgeGraphErrorCode {
+    /// `InvalidAssertion` variant.
     InvalidAssertion,
+    /// `DuplicateAssertionId` variant.
     DuplicateAssertionId,
+    /// `PolicyConflict` variant.
     PolicyConflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `KnowledgeGraphError` data container.
 pub struct KnowledgeGraphError {
+    /// `code` field for code.
     pub code: KnowledgeGraphErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `index` field for index.
     pub index: Option<usize>,
+    /// `assertion_id` field for assertion id.
     pub assertion_id: Option<FactId>,
+    /// `validation_errors` field for validation errors.
     pub validation_errors: Vec<String>,
+    /// `cursor` field for cursor.
     pub cursor: KnowledgeGraphCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `KnowledgeGraphSnapshot` data container.
 pub struct KnowledgeGraphSnapshot {
+    /// `assertions` field for assertions.
     pub assertions: Vec<KnowledgeAssertion>,
+    /// `entities` field for entities.
     pub entities: Vec<KnowledgeGraphEntity>,
+    /// `relations` field for relations.
     pub relations: Vec<KnowledgeGraphRelation>,
+    /// `topics` field for topics.
     pub topics: Vec<KnowledgeGraphTopic>,
+    /// `index` field for index.
     pub index: KnowledgeGraphIndex,
+    /// `status` field for status.
     pub status: KnowledgeGraphStatus,
+    /// `errors` field for errors.
     pub errors: Vec<KnowledgeGraphError>,
+    /// `cursor` field for cursor.
     pub cursor: KnowledgeGraphCursor,
 }
 
 #[derive(Clone)]
+/// `KnowledgeGraphReducerBundleOptions` data container.
 pub struct KnowledgeGraphReducerBundleOptions {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `assertions` field for assertions.
     pub assertions: Node<Vec<KnowledgeAssertion>>,
+    /// `policy` field for policy.
     pub policy: Option<Node<KnowledgeGraphPolicy>>,
 }
 
 impl KnowledgeGraphReducerBundleOptions {
+    /// Creates or computes `new`.
     pub fn new(assertions: Node<Vec<KnowledgeAssertion>>) -> Self {
         Self {
             name: None,
@@ -181,11 +271,13 @@ impl KnowledgeGraphReducerBundleOptions {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Updates or reads `with_policy`.
     pub fn with_policy(mut self, policy: Node<KnowledgeGraphPolicy>) -> Self {
         self.policy = Some(policy);
         self
@@ -193,156 +285,239 @@ impl KnowledgeGraphReducerBundleOptions {
 }
 
 #[derive(Clone)]
+/// `KnowledgeGraphReducerBundle` data container.
 pub struct KnowledgeGraphReducerBundle {
+    /// `assertions_input` field for assertions input.
     pub assertions_input: Node<Vec<KnowledgeAssertion>>,
+    /// `policy_input` field for policy input.
     pub policy_input: Option<Node<KnowledgeGraphPolicy>>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<KnowledgeGraphSnapshot>,
+    /// `assertions` field for assertions.
     pub assertions: Node<Vec<KnowledgeAssertion>>,
+    /// `entities` field for entities.
     pub entities: Node<Vec<KnowledgeGraphEntity>>,
+    /// `relations` field for relations.
     pub relations: Node<Vec<KnowledgeGraphRelation>>,
+    /// `topics` field for topics.
     pub topics: Node<Vec<KnowledgeGraphTopic>>,
+    /// `index` field for index.
     pub index: Node<KnowledgeGraphIndex>,
+    /// `status` field for status.
     pub status: Node<KnowledgeGraphStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<KnowledgeGraphError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<KnowledgeGraphCursor>,
 }
 
+/// `ShardKey` type alias.
 pub type ShardKey = String;
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// `FactStore` data container.
 pub struct FactStore<T> {
+    /// `by_id` field for by id.
     pub by_id: BTreeMap<FactId, MemoryFragment<T>>,
 }
 
 impl<T> FactStore<T> {
+    /// Updates or reads `read_handle`.
     pub fn read_handle(&self) -> StoreReadHandle<'_, T> {
         StoreReadHandle { by_id: &self.by_id }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
+/// `StoreReadHandle` data container.
 pub struct StoreReadHandle<'a, T> {
     by_id: &'a BTreeMap<FactId, MemoryFragment<T>>,
 }
 
 impl<'a, T> StoreReadHandle<'a, T> {
+    /// Updates or reads `get`.
     pub fn get(&self, id: &str) -> Option<&'a MemoryFragment<T>> {
         self.by_id.get(id)
     }
 
+    /// Updates or reads `has`.
     pub fn has(&self, id: &str) -> bool {
         self.by_id.contains_key(id)
     }
 
+    /// Updates or reads `size`.
     pub fn size(&self) -> usize {
         self.by_id.len()
     }
 
+    /// Updates or reads `values`.
     pub fn values(&self) -> impl Iterator<Item = &'a MemoryFragment<T>> {
         self.by_id.values()
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// `MemoryQuery` data container.
 pub struct MemoryQuery {
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `as_of` field for as of.
     pub as_of: Option<u128>,
+    /// `min_confidence` field for min confidence.
     pub min_confidence: Option<f64>,
+    /// `limit` field for limit.
     pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `MemoryFragmentValidation` data container.
 pub struct MemoryFragmentValidation {
+    /// `ok` field for ok.
     pub ok: bool,
+    /// `errors` field for errors.
     pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `OutcomeSignal` data container.
 pub struct OutcomeSignal {
+    /// `fact_id` field for fact id.
     pub fact_id: FactId,
+    /// `reward` field for reward.
     pub reward: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `CollectionEntry` data container.
 pub struct CollectionEntry<T> {
+    /// `id` field for id.
     pub id: String,
+    /// `value` field for value.
     pub value: T,
+    /// `created_at_ns` field for created at ns.
     pub created_at_ns: u128,
+    /// `last_access_ns` field for last access ns.
     pub last_access_ns: u128,
+    /// `base_score` field for base score.
     pub base_score: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `RankedCollectionEntry` data container.
 pub struct RankedCollectionEntry<T> {
+    /// `entry` field for entry.
     pub entry: CollectionEntry<T>,
+    /// `score` field for score.
     pub score: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// `RetrievalQuery` data container.
 pub struct RetrievalQuery {
+    /// `text` field for text.
     pub text: Option<String>,
+    /// `vector` field for vector.
     pub vector: Option<Vec<f64>>,
+    /// `entity_ids` field for entity ids.
     pub entity_ids: Vec<String>,
+    /// `context` field for context.
     pub context: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `VectorSearchResult` data container.
 pub struct VectorSearchResult<TMeta> {
+    /// `id` field for id.
     pub id: String,
+    /// `score` field for score.
     pub score: f64,
+    /// `meta` field for meta.
     pub meta: Option<TMeta>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `RetrievalEntrySource` variants.
 pub enum RetrievalEntrySource {
+    /// `Vector` variant.
     Vector,
+    /// `Graph` variant.
     Graph,
+    /// `Store` variant.
     Store,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `RetrievalEntry` data container.
 pub struct RetrievalEntry<TMem> {
+    /// `key` field for key.
     pub key: String,
+    /// `value` field for value.
     pub value: TMem,
+    /// `score` field for score.
     pub score: f64,
+    /// `sources` field for sources.
     pub sources: Vec<RetrievalEntrySource>,
+    /// `context` field for context.
     pub context: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `RetrievalTrace` data container.
 pub struct RetrievalTrace<TMem> {
+    /// `vector_candidates` field for vector candidates.
     pub vector_candidates: Vec<VectorSearchResult<TMem>>,
+    /// `graph_expanded` field for graph expanded.
     pub graph_expanded: Vec<String>,
+    /// `ranked` field for ranked.
     pub ranked: Vec<RetrievalEntry<TMem>>,
+    /// `packed` field for packed.
     pub packed: Vec<RetrievalEntry<TMem>>,
 }
 
+/// `AdmissionThresholds` type alias.
 pub type AdmissionThresholds = BTreeMap<String, f64>;
+/// `AdmissionScoreFn` type alias.
 pub type AdmissionScoreFn<TRaw> = Rc<dyn Fn(&TRaw) -> BTreeMap<String, f64>>;
+/// `AdmissionScore3DFn` type alias.
 pub type AdmissionScore3DFn<TRaw> = Rc<dyn Fn(&TRaw) -> AdmissionScores>;
+/// `TenantShardFn` type alias.
 pub type TenantShardFn<T> = Rc<dyn Fn(&MemoryFragment<T>) -> String>;
+/// `ShardByFn` type alias.
 pub type ShardByFn<T> = Rc<dyn Fn(&MemoryFragment<T>) -> ShardKey>;
 
+/// `AdmissionScoredOptions` data container.
 pub struct AdmissionScoredOptions<TRaw> {
+    /// `score_fn` field for score fn.
     pub score_fn: AdmissionScoreFn<TRaw>,
+    /// `thresholds` field for thresholds.
     pub thresholds: AdmissionThresholds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// `AdmissionScores` data container.
 pub struct AdmissionScores {
+    /// `persistence` field for persistence.
     pub persistence: f64,
+    /// `structure` field for structure.
     pub structure: f64,
+    /// `personal_value` field for personal value.
     pub personal_value: f64,
 }
 
+/// `AdmissionScore3DOptions` data container.
 pub struct AdmissionScore3DOptions<TRaw> {
+    /// `score_fn` field for score fn.
     pub score_fn: AdmissionScore3DFn<TRaw>,
+    /// `persistence_threshold` field for persistence threshold.
     pub persistence_threshold: f64,
+    /// `personal_value_threshold` field for personal value threshold.
     pub personal_value_threshold: f64,
+    /// `require_structured` field for require structured.
     pub require_structured: bool,
 }
 
 impl<TRaw> AdmissionScore3DOptions<TRaw> {
+    /// Creates or computes `new`.
     pub fn new(score_fn: AdmissionScore3DFn<TRaw>) -> Self {
         Self {
             score_fn,
@@ -354,16 +529,23 @@ impl<TRaw> AdmissionScore3DOptions<TRaw> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `ShardByTenantOptions` data container.
 pub struct ShardByTenantOptions {
+    /// `tenants` field for tenants.
     pub tenants: Vec<String>,
+    /// `shard_count` field for shard count.
     pub shard_count: Option<usize>,
 }
 
+/// `ShardByTenantConfig` data container.
 pub struct ShardByTenantConfig<T> {
+    /// `shard_by` field for shard by.
     pub shard_by: ShardByFn<T>,
+    /// `shard_count` field for shard count.
     pub shard_count: usize,
 }
 
+/// Creates or computes `cosine_similarity`.
 pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len().max(b.len());
     let mut dot = 0.0;
@@ -387,6 +569,7 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     }
 }
 
+/// Creates or computes `memory_fragment_valid_at`.
 pub fn memory_fragment_valid_at<T>(fragment: &MemoryFragment<T>, as_of: Option<u128>) -> bool {
     match as_of {
         None => fragment.valid_from.is_none() && fragment.valid_to.is_none(),
@@ -405,6 +588,7 @@ pub fn memory_fragment_valid_at<T>(fragment: &MemoryFragment<T>, as_of: Option<u
     }
 }
 
+/// Creates or computes `memory_fragment_matches_query`.
 pub fn memory_fragment_matches_query<T>(fragment: &MemoryFragment<T>, query: &MemoryQuery) -> bool {
     if !memory_fragment_valid_at(fragment, query.as_of) {
         return false;
@@ -426,6 +610,7 @@ pub fn memory_fragment_matches_query<T>(fragment: &MemoryFragment<T>, query: &Me
     true
 }
 
+/// Creates or computes `filter_memory_fragments`.
 pub fn filter_memory_fragments<T: Clone>(
     fragments: impl IntoIterator<Item = MemoryFragment<T>>,
     query: &MemoryQuery,
@@ -445,6 +630,7 @@ pub fn filter_memory_fragments<T: Clone>(
     ranked
 }
 
+/// Creates or computes `validate_memory_fragment`.
 pub fn validate_memory_fragment<T>(fragment: &MemoryFragment<T>) -> MemoryFragmentValidation {
     let errors = validate_fragment(fragment);
     MemoryFragmentValidation {
@@ -453,6 +639,7 @@ pub fn validate_memory_fragment<T>(fragment: &MemoryFragment<T>) -> MemoryFragme
     }
 }
 
+/// Creates or computes `admission_scored`.
 pub fn admission_scored<TRaw>(opts: AdmissionScoredOptions<TRaw>) -> impl Fn(&TRaw) -> bool {
     move |raw| {
         let scores = (opts.score_fn)(raw);
@@ -466,6 +653,7 @@ pub fn admission_scored<TRaw>(opts: AdmissionScoredOptions<TRaw>) -> impl Fn(&TR
     }
 }
 
+/// Creates or computes `admission_filter_3d`.
 pub fn admission_filter_3d<TRaw>(opts: AdmissionScore3DOptions<TRaw>) -> impl Fn(&TRaw) -> bool {
     move |raw| {
         let scores = (opts.score_fn)(raw);
@@ -475,6 +663,7 @@ pub fn admission_filter_3d<TRaw>(opts: AdmissionScore3DOptions<TRaw>) -> impl Fn
     }
 }
 
+/// Creates or computes `shard_by_tenant`.
 pub fn shard_by_tenant<T: 'static>(
     tenant_of: TenantShardFn<T>,
     opts: ShardByTenantOptions,
@@ -516,14 +705,20 @@ fn score_at_least(score: f64, min: f64) -> bool {
 /// Structured query over semantic-memory facts.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryRetrievalQuery {
+    /// `tags` field for tags.
     pub tags: Vec<String>,
+    /// `as_of` field for as of.
     pub as_of: Option<u128>,
+    /// `min_confidence` field for min confidence.
     pub min_confidence: Option<f64>,
+    /// `limit` field for limit.
     pub limit: Option<usize>,
+    /// `vector` field for vector.
     pub vector: Option<Vec<f64>>,
 }
 
 impl MemoryRetrievalQuery {
+    /// Updates or reads `memory_query`.
     pub fn memory_query(&self) -> MemoryQuery {
         MemoryQuery {
             tags: self.tags.clone(),
@@ -535,66 +730,106 @@ impl MemoryRetrievalQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `MemoryRetrievalCursor` data container.
 pub struct MemoryRetrievalCursor {
+    /// `evaluation` field for evaluation.
     pub evaluation: u64,
+    /// `valid_fragments` field for valid fragments.
     pub valid_fragments: usize,
+    /// `invalid_fragments` field for invalid fragments.
     pub invalid_fragments: usize,
+    /// `result_count` field for result count.
     pub result_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `MemoryRetrievalStatusState` variants.
 pub enum MemoryRetrievalStatusState {
+    /// `Ready` variant.
     Ready,
+    /// `Empty` variant.
     Empty,
+    /// `Partial` variant.
     Partial,
+    /// `Error` variant.
     Error,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `MemoryRetrievalStatus` data container.
 pub struct MemoryRetrievalStatus {
+    /// `state` field for state.
     pub state: MemoryRetrievalStatusState,
+    /// `query` field for query.
     pub query: MemoryRetrievalQuery,
+    /// `cursor` field for cursor.
     pub cursor: MemoryRetrievalCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `MemoryRetrievalIndex` data container.
 pub struct MemoryRetrievalIndex<T> {
+    /// `ids` field for ids.
     pub ids: Vec<FactId>,
+    /// `by_id` field for by id.
     pub by_id: BTreeMap<FactId, MemoryFragment<T>>,
+    /// `cursor` field for cursor.
     pub cursor: MemoryRetrievalCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `MemoryRetrievalErrorCode` variants.
 pub enum MemoryRetrievalErrorCode {
+    /// `DuplicateFragmentId` variant.
     DuplicateFragmentId,
+    /// `InvalidFragment` variant.
     InvalidFragment,
+    /// `InvalidQuery` variant.
     InvalidQuery,
+    /// `InvalidQueryVector` variant.
     InvalidQueryVector,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// `MemoryRetrievalError` data container.
 pub struct MemoryRetrievalError {
+    /// `code` field for code.
     pub code: MemoryRetrievalErrorCode,
+    /// `message` field for message.
     pub message: String,
+    /// `index` field for index.
     pub index: Option<usize>,
+    /// `fragment_id` field for fragment id.
     pub fragment_id: Option<FactId>,
+    /// `validation_errors` field for validation errors.
     pub validation_errors: Vec<String>,
+    /// `cursor` field for cursor.
     pub cursor: MemoryRetrievalCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `MemoryAnswer` data container.
 pub struct MemoryAnswer<T> {
+    /// `query` field for query.
     pub query: MemoryRetrievalQuery,
+    /// `results` field for results.
     pub results: Vec<MemoryFragment<T>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `MemoryRetrievalSnapshot` data container.
 pub struct MemoryRetrievalSnapshot<T> {
+    /// `fragments` field for fragments.
     pub fragments: Vec<MemoryFragment<T>>,
+    /// `indexed` field for indexed.
     pub indexed: MemoryRetrievalIndex<T>,
+    /// `ranked` field for ranked.
     pub ranked: MemoryAnswer<T>,
+    /// `status` field for status.
     pub status: MemoryRetrievalStatus,
+    /// `errors` field for errors.
     pub errors: Vec<MemoryRetrievalError>,
+    /// `cursor` field for cursor.
     pub cursor: MemoryRetrievalCursor,
 }
 
@@ -602,13 +837,18 @@ pub struct MemoryRetrievalSnapshot<T> {
 pub type MemoryRetrievalFact<T> = MemoryRetrievalSnapshot<T>;
 
 #[derive(Clone)]
+/// `MemoryRetrievalBundleOptions` data container.
 pub struct MemoryRetrievalBundleOptions<T> {
+    /// `name` field for name.
     pub name: Option<String>,
+    /// `fragments` field for fragments.
     pub fragments: Node<Vec<MemoryFragment<T>>>,
+    /// `query` field for query.
     pub query: Node<MemoryRetrievalQuery>,
 }
 
 impl<T> MemoryRetrievalBundleOptions<T> {
+    /// Creates or computes `new`.
     pub fn new(fragments: Node<Vec<MemoryFragment<T>>>, query: Node<MemoryRetrievalQuery>) -> Self {
         Self {
             name: None,
@@ -617,6 +857,7 @@ impl<T> MemoryRetrievalBundleOptions<T> {
         }
     }
 
+    /// Updates or reads `named`.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -624,15 +865,25 @@ impl<T> MemoryRetrievalBundleOptions<T> {
 }
 
 #[derive(Clone)]
+/// `MemoryRetrievalBundle` data container.
 pub struct MemoryRetrievalBundle<T> {
+    /// `fragments_input` field for fragments input.
     pub fragments_input: Node<Vec<MemoryFragment<T>>>,
+    /// `query_input` field for query input.
     pub query_input: Node<MemoryRetrievalQuery>,
+    /// `snapshot` field for snapshot.
     pub snapshot: Node<MemoryRetrievalSnapshot<T>>,
+    /// `fragments` field for fragments.
     pub fragments: Node<Vec<MemoryFragment<T>>>,
+    /// `indexed` field for indexed.
     pub indexed: Node<MemoryRetrievalIndex<T>>,
+    /// `ranked` field for ranked.
     pub ranked: Node<MemoryAnswer<T>>,
+    /// `status` field for status.
     pub status: Node<MemoryRetrievalStatus>,
+    /// `errors` field for errors.
     pub errors: Node<Vec<MemoryRetrievalError>>,
+    /// `cursor` field for cursor.
     pub cursor: Node<MemoryRetrievalCursor>,
 }
 
@@ -813,6 +1064,7 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
     }
 }
 
+/// Creates or computes `knowledge_graph_reducer_bundle`.
 pub fn knowledge_graph_reducer_bundle(
     graph: &Graph,
     opts: KnowledgeGraphReducerBundleOptions,

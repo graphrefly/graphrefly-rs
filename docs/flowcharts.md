@@ -1,5 +1,11 @@
 # GraphReFly Rust Port Flowcharts
 
+> **Historical port-era diagrams.** These diagrams document the retired
+> multi-crate Rust port model and are retained as an audit trail. They are not
+> current architecture guidance. Current Rust package docs are governed by
+> [`docs.jsonl`](docs.jsonl); language-neutral authority lives in
+> `~/src/graphrefly`.
+
 *Mermaid diagrams covering the Rust port's distinctive shape: workspace layout, the handle-protocol cleaving plane, lock discipline, RAII patterns, wave-engine state machine, and Graph container — all for the surface that's actually landed.*
 
 **Companion docs:**

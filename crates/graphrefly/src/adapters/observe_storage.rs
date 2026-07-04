@@ -15,29 +15,46 @@ use crate::storage::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// `ObserveEventLogErrorPhase` variants.
 pub enum ObserveEventLogErrorPhase {
+    /// `Map` variant.
     Map,
+    /// `Write` variant.
     Write,
+    /// `Flush` variant.
     Flush,
+    /// `Rollback` variant.
     Rollback,
+    /// `Dispose` variant.
     Dispose,
 }
 
 #[derive(Clone)]
+/// `ObserveEventLogErrorContext` data container.
 pub struct ObserveEventLogErrorContext<T> {
+    /// `phase` field for phase.
     pub phase: ObserveEventLogErrorPhase,
+    /// `event` field for event.
     pub event: Option<ObserveEvent>,
+    /// `value` field for value.
     pub value: Option<ObserveEventFrame<T>>,
 }
 
+/// `ObserveEventLogMap` type alias.
 pub type ObserveEventLogMap<T> = dyn Fn(&ObserveEvent) -> Option<T>;
+/// `ObserveEventLogErrorFn` type alias.
 pub type ObserveEventLogErrorFn<T> = dyn Fn(StorageError, ObserveEventLogErrorContext<T>);
 
 #[derive(Clone)]
+/// `AttachObserveEventLogOptions` data container.
 pub struct AttachObserveEventLogOptions<T: Clone> {
+    /// `path` field for path.
     pub path: Option<String>,
+    /// `stream` field for stream.
     pub stream: Option<String>,
+    /// `map` field for map.
     pub map: Rc<ObserveEventLogMap<T>>,
+    /// `on_error` field for on error.
     pub on_error: Option<Rc<ObserveEventLogErrorFn<T>>>,
 }
 
@@ -45,6 +62,7 @@ impl<T> AttachObserveEventLogOptions<T>
 where
     T: Clone + From<ObserveEvent> + 'static,
 {
+    /// Creates or computes `new`.
     pub fn new() -> Self {
         Self {
             path: None,
@@ -65,6 +83,7 @@ where
 }
 
 impl<T: Clone> AttachObserveEventLogOptions<T> {
+    /// Creates or computes `from_map`.
     pub fn from_map(map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
         Self {
             path: None,
@@ -74,21 +93,25 @@ impl<T: Clone> AttachObserveEventLogOptions<T> {
         }
     }
 
+    /// Updates or reads `with_path`.
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
         self
     }
 
+    /// Updates or reads `with_stream`.
     pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
         self.stream = Some(stream.into());
         self
     }
 
+    /// Updates or reads `with_map`.
     pub fn with_map(mut self, map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
         self.map = Rc::new(map);
         self
     }
 
+    /// Updates or reads `with_on_error`.
     pub fn with_on_error(
         mut self,
         on_error: impl Fn(StorageError, ObserveEventLogErrorContext<T>) + 'static,
@@ -98,6 +121,7 @@ impl<T: Clone> AttachObserveEventLogOptions<T> {
     }
 }
 
+/// `ObserveEventLogHandle` data container.
 pub struct ObserveEventLogHandle {
     observer: Option<GraphObserver>,
     flush: Rc<dyn Fn() -> StorageResult<()>>,
@@ -105,14 +129,17 @@ pub struct ObserveEventLogHandle {
 }
 
 impl ObserveEventLogHandle {
+    /// Updates or reads `flush`.
     pub fn flush(&self) -> StorageResult<()> {
         (self.flush)()
     }
 
+    /// Updates or reads `rollback`.
     pub fn rollback(&self) -> StorageResult<()> {
         (self.rollback)()
     }
 
+    /// Updates or reads `dispose`.
     pub fn dispose(&mut self) -> StorageResult<()> {
         self.observer.take();
         (self.flush)()
@@ -125,6 +152,7 @@ impl Drop for ObserveEventLogHandle {
     }
 }
 
+/// Creates or computes `attach_observe_event_log`.
 pub fn attach_observe_event_log<T: Clone + 'static>(
     graph: &Graph,
     log: Rc<dyn AppendLogStorageTier<ObserveEventFrame<T>>>,

@@ -13,13 +13,21 @@ use crate::protocol::AnyValue;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// `NodeVersionHashFn` type alias.
 pub type NodeVersionHashFn = Rc<dyn Fn(&[u8]) -> String>;
 
 #[derive(Clone)]
+/// `NodeVersioningPolicy` variants.
 pub enum NodeVersioningPolicy {
+    /// `Disabled` variant.
     Disabled,
+    /// `Level0` variant.
     Level0,
-    Level1 { hash: Option<NodeVersionHashFn> },
+    /// `Level1` variant.
+    Level1 {
+        /// `hash` field for `Level1`.
+        hash: Option<NodeVersionHashFn>,
+    },
 }
 
 impl fmt::Debug for NodeVersioningPolicy {
@@ -36,10 +44,17 @@ impl fmt::Debug for NodeVersioningPolicy {
 }
 
 #[derive(Clone)]
+/// `ResolvedNodeVersioningPolicy` variants.
 pub enum ResolvedNodeVersioningPolicy {
+    /// `Disabled` variant.
     Disabled,
+    /// `Level0` variant.
     Level0,
-    Level1 { hash: NodeVersionHashFn },
+    /// `Level1` variant.
+    Level1 {
+        /// `hash` field for `Level1`.
+        hash: NodeVersionHashFn,
+    },
 }
 
 impl fmt::Debug for ResolvedNodeVersioningPolicy {
@@ -53,13 +68,20 @@ impl fmt::Debug for ResolvedNodeVersioningPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `NodeVersion` variants.
 pub enum NodeVersion {
+    /// `V0` variant.
     V0 {
+        /// `counter` field for counter.
         counter: u64,
     },
+    /// `V1` variant.
     V1 {
+        /// `counter` field for counter.
         counter: u64,
+        /// `cid` field for cid.
         cid: String,
+        /// `prev` field for prev.
         prev: Option<String>,
     },
 }
@@ -107,6 +129,7 @@ fn default_node_version_hash_fn() -> NodeVersionHashFn {
     Rc::new(default_node_version_hash)
 }
 
+/// Creates or computes `default_node_version_hash`.
 pub fn default_node_version_hash(bytes: &[u8]) -> String {
     format!("fnv1a64:{}", fnv1a64(bytes))
 }
@@ -416,6 +439,7 @@ fn any_to_strict_json(value: &AnyValue, path: &str) -> Result<Value, NodeVersion
 }
 
 impl NodeVersion {
+    /// Updates or reads `level`.
     pub fn level(&self) -> u8 {
         match self {
             Self::V0 { .. } => 0,
@@ -423,6 +447,7 @@ impl NodeVersion {
         }
     }
 
+    /// Updates or reads `counter`.
     pub fn counter(&self) -> u64 {
         match self {
             Self::V0 { counter } | Self::V1 { counter, .. } => *counter,

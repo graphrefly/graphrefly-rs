@@ -11,19 +11,29 @@ use std::fmt;
 use super::bridge::WireBridgeMetadata as SemanticWireBridgeMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CanonicalProtobufErrorCategory` variants.
 pub enum CanonicalProtobufErrorCategory {
+    /// `UnknownField` variant.
     UnknownField,
+    /// `DuplicateSingular` variant.
     DuplicateSingular,
+    /// `NoncanonicalBytes` variant.
     NoncanonicalBytes,
+    /// `InvalidOneof` variant.
     InvalidOneof,
+    /// `MissingRequired` variant.
     MissingRequired,
+    /// `InvalidWireEdge` variant.
     InvalidWireEdge,
+    /// `DefaultEmission` variant.
     DefaultEmission,
+    /// `Malformed` variant.
     Malformed,
 }
 
 impl CanonicalProtobufErrorCategory {
     #[must_use]
+    /// Updates or reads `as_str`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UnknownField => "unknown_field",
@@ -39,7 +49,9 @@ impl CanonicalProtobufErrorCategory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalProtobufError` data container.
 pub struct CanonicalProtobufError {
+    /// `category` field for category.
     pub category: CanonicalProtobufErrorCategory,
     message: String,
 }
@@ -62,64 +74,115 @@ impl fmt::Display for CanonicalProtobufError {
 impl Error for CanonicalProtobufError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalWireBridgeMetadata` data container.
 pub struct CanonicalWireBridgeMetadata {
+    /// `seq` field for seq.
     pub seq: u64,
+    /// `cursor` field for cursor.
     pub cursor: u64,
+    /// `idempotency_key` field for idempotency key.
     pub idempotency_key: String,
+    /// `attempt` field for attempt.
     pub attempt: u32,
+    /// `max_attempts` field for max attempts.
     pub max_attempts: u32,
+    /// `timestamp_ms` field for timestamp ms.
     pub timestamp_ms: Option<u64>,
+    /// `ack_for_seq` field for ack for seq.
     pub ack_for_seq: Option<u64>,
+    /// `request_id` field for request id.
     pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalWireBridgeDataBody` variants.
 pub enum CanonicalWireBridgeDataBody {
+    /// `Value` variant.
     Value(Vec<u8>),
+    /// `WireEdge` variant.
     WireEdge(CanonicalWireEdgeFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalWireEdgeFrame` data container.
 pub struct CanonicalWireEdgeFrame {
+    /// `kind` field for kind.
     pub kind: CanonicalWireEdgeKind,
+    /// `edge_id` field for edge id.
     pub edge_id: String,
+    /// `cause_id` field for cause id.
     pub cause_id: String,
+    /// `value` field for value.
     pub value: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CanonicalWireEdgeKind` variants.
 pub enum CanonicalWireEdgeKind {
+    /// `Dirty` variant.
     Dirty,
+    /// `Data` variant.
     Data,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalWireBridgePayload` variants.
 pub enum CanonicalWireBridgePayload {
+    /// `Start` variant.
     Start,
+    /// `Data` variant.
     Data(CanonicalWireBridgeDataBody),
+    /// `Ack` variant.
     Ack,
-    Nack { error: Option<Vec<u8>> },
-    Status { status: Vec<u8> },
-    Error { error: Vec<u8> },
-    Close { reason: Option<Vec<u8>> },
+    /// `Nack` variant.
+    Nack {
+        /// `error` field for `Nack`.
+        error: Option<Vec<u8>>,
+    },
+    /// `Status` variant.
+    Status {
+        /// `status` field for `Status`.
+        status: Vec<u8>,
+    },
+    /// `Error` variant.
+    Error {
+        /// `error` field for `Error`.
+        error: Vec<u8>,
+    },
+    /// `Close` variant.
+    Close {
+        /// `reason` field for `Close`.
+        reason: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `CanonicalWireBridgeEnvelope` data container.
 pub struct CanonicalWireBridgeEnvelope {
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `metadata` field for metadata.
     pub metadata: CanonicalWireBridgeMetadata,
+    /// `payload` field for payload.
     pub payload: CanonicalWireBridgePayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireBridgeProtobufHelperShape` data container.
 pub struct WireBridgeProtobufHelperShape {
+    /// `byte_specific` field for byte specific.
     pub byte_specific: bool,
+    /// `semantic_wire_bridge_dto` field for semantic wire bridge dto.
     pub semantic_wire_bridge_dto: bool,
+    /// `core_wire_bridge_options` field for core wire bridge options.
     pub core_wire_bridge_options: bool,
+    /// `protocol_surface` field for protocol surface.
     pub protocol_surface: bool,
+    /// `value_codec_registry` field for value codec registry.
     pub value_codec_registry: bool,
 }
 
+/// `constant` constant.
 pub const WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE: WireBridgeProtobufHelperShape =
     WireBridgeProtobufHelperShape {
         byte_specific: true,
@@ -130,43 +193,78 @@ pub const WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE: WireBridgeProtobufHelperShape =
     };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufDataBody` variants.
 pub enum WireBridgeProtobufDataBody {
+    /// `Value` variant.
     Value(Vec<u8>),
+    /// `WireEdge` variant.
     WireEdge(CanonicalWireEdgeFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufPayload` variants.
 pub enum WireBridgeProtobufPayload {
+    /// `Start` variant.
     Start,
+    /// `Data` variant.
     Data(WireBridgeProtobufDataBody),
+    /// `Ack` variant.
     Ack,
-    Nack { error: Option<Vec<u8>> },
-    Status { status: Vec<u8> },
-    Error { error: Vec<u8> },
-    Close { reason: Option<Vec<u8>> },
+    /// `Nack` variant.
+    Nack {
+        /// `error` field for `Nack`.
+        error: Option<Vec<u8>>,
+    },
+    /// `Status` variant.
+    Status {
+        /// `status` field for `Status`.
+        status: Vec<u8>,
+    },
+    /// `Error` variant.
+    Error {
+        /// `error` field for `Error`.
+        error: Vec<u8>,
+    },
+    /// `Close` variant.
+    Close {
+        /// `reason` field for `Close`.
+        reason: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufEnvelope` data container.
 pub struct WireBridgeProtobufEnvelope {
+    /// `session_id` field for session id.
     pub session_id: String,
+    /// `metadata` field for metadata.
     pub metadata: SemanticWireBridgeMetadata,
+    /// `payload` field for payload.
     pub payload: WireBridgeProtobufPayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `WireBridgeProtobufStatusKind` variants.
 pub enum WireBridgeProtobufStatusKind {
+    /// `Valid` variant.
     Valid,
+    /// `Invalid` variant.
     Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufStatus` data container.
 pub struct WireBridgeProtobufStatus {
+    /// `kind` field for kind.
     pub kind: WireBridgeProtobufStatusKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufIssue` data container.
 pub struct WireBridgeProtobufIssue {
+    /// `category` field for category.
     pub category: CanonicalProtobufErrorCategory,
+    /// `message` field for message.
     pub message: String,
 }
 
@@ -180,19 +278,28 @@ impl From<CanonicalProtobufError> for WireBridgeProtobufIssue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufDecode` data container.
 pub struct WireBridgeProtobufDecode {
+    /// `envelope` field for envelope.
     pub envelope: Option<WireBridgeProtobufEnvelope>,
+    /// `status` field for status.
     pub status: WireBridgeProtobufStatus,
+    /// `issues` field for issues.
     pub issues: Vec<WireBridgeProtobufIssue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `WireBridgeProtobufEncode` data container.
 pub struct WireBridgeProtobufEncode {
+    /// `bytes` field for bytes.
     pub bytes: Option<Vec<u8>>,
+    /// `status` field for status.
     pub status: WireBridgeProtobufStatus,
+    /// `issues` field for issues.
     pub issues: Vec<WireBridgeProtobufIssue>,
 }
 
+/// Creates or computes `encode_canonical_wire_bridge_envelope`.
 pub fn encode_canonical_wire_bridge_envelope(
     envelope: &CanonicalWireBridgeEnvelope,
 ) -> Result<Vec<u8>, CanonicalProtobufError> {
@@ -222,6 +329,7 @@ pub fn encode_canonical_wire_bridge_envelope(
     Ok(out.finish())
 }
 
+/// Creates or computes `decode_canonical_wire_bridge_envelope`.
 pub fn decode_canonical_wire_bridge_envelope(
     bytes: &[u8],
 ) -> Result<CanonicalWireBridgeEnvelope, CanonicalProtobufError> {
@@ -237,6 +345,7 @@ pub fn decode_canonical_wire_bridge_envelope(
     Ok(envelope)
 }
 
+/// Creates or computes `encode_canonical_wire_edge_frame`.
 pub fn encode_canonical_wire_edge_frame(
     frame: &CanonicalWireEdgeFrame,
 ) -> Result<Vec<u8>, CanonicalProtobufError> {
@@ -244,6 +353,7 @@ pub fn encode_canonical_wire_edge_frame(
     Ok(encode_wire_edge_frame(frame))
 }
 
+/// Creates or computes `decode_canonical_wire_edge_frame`.
 pub fn decode_canonical_wire_edge_frame(
     bytes: &[u8],
 ) -> Result<CanonicalWireEdgeFrame, CanonicalProtobufError> {
@@ -260,6 +370,7 @@ pub fn decode_canonical_wire_edge_frame(
 }
 
 #[must_use]
+/// Creates or computes `decode_wire_bridge_protobuf_bytes`.
 pub fn decode_wire_bridge_protobuf_bytes(bytes: &[u8]) -> WireBridgeProtobufDecode {
     match decode_canonical_wire_bridge_envelope(bytes) {
         Ok(envelope) => WireBridgeProtobufDecode {
@@ -280,6 +391,7 @@ pub fn decode_wire_bridge_protobuf_bytes(bytes: &[u8]) -> WireBridgeProtobufDeco
 }
 
 #[must_use]
+/// Creates or computes `encode_wire_bridge_protobuf_bytes`.
 pub fn encode_wire_bridge_protobuf_bytes(
     envelope: &WireBridgeProtobufEnvelope,
 ) -> WireBridgeProtobufEncode {
