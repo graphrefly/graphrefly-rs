@@ -19,11 +19,9 @@ The active workspace members are:
 | `crates/graphrefly` | The clean-slate Rust package, with lib crate name `graphrefly` and Cargo package `graphrefly-rs`. |
 | `crates/graphrefly-bindings-py` | Native binding foundation for Python host integration. |
 
-The old port-model crates under `crates/graphrefly-core`,
-`crates/graphrefly-graph`, `crates/graphrefly-operators`,
-`crates/graphrefly-storage`, `crates/graphrefly-structures`, and old JS/WASM
-bindings are excluded from the workspace. They are frozen historical reference
-material, not current architecture.
+The old port-model crate directories and old JS/WASM binding directories have
+been deleted from the active tree. They are historical material only; use git
+history for archaeology.
 
 The current Rust crate is self-contained per D32. It implements the sync
 wave-protocol substrate, graph-layer Rust API, per-language operators/sources,

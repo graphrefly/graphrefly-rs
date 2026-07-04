@@ -1,9 +1,9 @@
-# cargo-nextest configuration for the GraphReFly Rust port.
+# cargo-nextest configuration for graphrefly-rs.
 #
-# Why nextest: `cargo test` runs each of the ~27 graphrefly-core integration
-# test binaries one-at-a-time, only parallelising the `#[test]` fns *within*
-# a binary. nextest builds every binary, then runs ALL tests across ALL
-# binaries in a single global thread pool — true cross-binary parallelism.
+# Why nextest: `cargo test` runs each integration-test binary one-at-a-time,
+# only parallelising the `#[test]` fns *within* a binary. nextest builds every
+# binary, then runs ALL tests across ALL binaries in a single global thread
+# pool — true cross-binary parallelism.
 #
 # The `slow-timeout` here is deliberate: a deadlocked cross-thread test
 # (e.g. the §7 serialization-group concurrency tests) previously hung a

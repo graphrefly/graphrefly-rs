@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 7f22fd116d8638c03581cb9d792f086004b1e212de21a4d70191a3336c704c16 # shrinks to initial = 0
-cc 46c20f8f85d76d0cfb46765641d79f75003498d89436a77df98bb8c5838ea31e # shrinks to events = [Batch([0, 1])]
-cc 607f503109b5b5b55c095ba72675e3c0f278c8575cc236d4d9835e34dc5152a3 # shrinks to prefix = [Emit(1), Batch([0, 0])], suffix = [Emit(0)]

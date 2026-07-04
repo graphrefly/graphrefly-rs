@@ -16,9 +16,9 @@
 # kills hung tests; see .config/nextest.toml).
 #
 # Usage:
-#   scripts/dev-test.sh                       # all default-members tests
-#   scripts/dev-test.sh -p graphrefly-core    # one crate
-#   scripts/dev-test.sh -p graphrefly-core serialization_groups   # filter
+#   scripts/dev-test.sh                       # all workspace tests
+#   scripts/dev-test.sh -p graphrefly-rs      # active Rust crate
+#   scripts/dev-test.sh -p graphrefly-rs public_crate_root_d566   # filter
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"

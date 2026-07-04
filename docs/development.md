@@ -95,6 +95,20 @@ The publishable crate is `crates/graphrefly` (`package = "graphrefly-rs"`,
 `lib = "graphrefly"`). Its `package.metadata.docs.rs` enables all features so
 feature-gated public APIs appear in generated docs.rs/rustdoc output.
 
+The first crates.io release is a local bootstrap because crates.io trusted
+publishing must be configured after the crate exists:
+
+```bash
+mise exec -- cargo publish -p graphrefly-rs --dry-run
+mise exec -- cargo publish -p graphrefly-rs
+```
+
+After that, configure crates.io Trusted Publishing for
+`graphrefly/graphrefly-rs` and `.github/workflows/release.yml`. Future releases
+are driven by Conventional Commits: push `feat:`, `fix:`, `perf:`, or breaking
+change commits to `main`; release-plz opens/updates a release PR, and merging
+that PR publishes after CI succeeds.
+
 Before a crate release:
 
 1. Confirm package-local release notes or changelog material is current.

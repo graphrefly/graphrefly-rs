@@ -6,12 +6,10 @@
 # any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
 #
 # D415: Rust is the native shared engine / reusable graph-infrastructure library
-# for Python and future non-TS host packages. The Rust clean-slate engine is the
-# single crate `graphrefly`. The previous
-# port-model crates (graphrefly-core / -graph / -operators / -storage /
-# -structures + the 3 bindings) are FROZEN as read-only reference (D41 analogue)
-# and `exclude`d below — they no longer build against this workspace and are
-# deleted once `graphrefly` reaches intent-parity.
+# for Python and future non-TS host packages. The active workspace now contains
+# only the clean-slate Rust crate plus the Python binding foundation. The old
+# port-model crate directories have been deleted; use git history for
+# archaeology.
 # =============================================================================
 
 [workspace]
@@ -19,18 +17,6 @@ resolver = "2"
 members  = [
     "crates/graphrefly",
     "crates/graphrefly-bindings-py",
-]
-exclude  = [
-    # Frozen port-model reference (D41 analogue) — read-only, retired by the
-    # clean-slate pivot. Source-as-reference during re-derivation; delete at
-    # intent-parity. These intentionally no longer build in this workspace.
-    "crates/graphrefly-core",
-    "crates/graphrefly-graph",
-    "crates/graphrefly-operators",
-    "crates/graphrefly-storage",
-    "crates/graphrefly-structures",
-    "crates/graphrefly-bindings-js",
-    "crates/graphrefly-bindings-wasm",
 ]
 
 [workspace.package]
@@ -44,9 +30,9 @@ authors      = ["David Chen<clfhhc@gmail.com>"]
 # ---------------------------------------------------------------------------
 # Shared dependencies — the clean-slate substrate is sync-core (F-SYNC-CORE)
 # and single-thread (D22), so it carries NO concurrency primitives. The async
-# pool (LocalAsync, D20) lands later behind a `tokio` feature. The old deep
-# storage/CID/serde stack belongs to the frozen upper-layer crates and is
-# re-introduced per-phase if/when those subsystems are re-derived (CSP-2.8-rs).
+# pool (LocalAsync, D20) lands behind a `tokio` feature. Additional package
+# surfaces are reintroduced in the clean-slate crate only when re-derived from
+# the language-neutral authority.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 # Errors / logging

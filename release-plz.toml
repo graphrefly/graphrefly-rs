@@ -1,11 +1,10 @@
 # release-plz workspace config. See https://release-plz.dev/docs/config
 #
-# By default release-plz operates on every workspace member. The bindings
-# crates are marked `publish = false` in their Cargo.toml. release-plz
-# requires the release-plz config to AGREE with each Cargo.toml's publish
-# setting — if Cargo.toml says publish=false, the release-plz config must
-# also say publish=false (the default is publish=true). Without this match
-# release-plz fails with:
+# By default release-plz operates on every workspace member. The Python binding
+# crate is marked `publish = false` in its Cargo.toml. release-plz requires this
+# config to AGREE with each Cargo.toml's publish setting — if Cargo.toml says
+# publish=false, the release-plz config must also say publish=false (the default
+# is publish=true). Without this match release-plz fails with:
 #   "Package `X` has `publish = false` ... in Cargo.toml, but it has
 #    `publish = true` in the release-plz configuration."
 #
@@ -17,29 +16,14 @@
 semver_check        = true
 # Generate CHANGELOG.md per crate. Default true; explicit for clarity.
 changelog_update    = true
-# Per-package tag template. The workspace has 5 publishable crates that
-# release-plz tags individually. With "v{{ version }}" all 5 try to create
-# the same `v0.0.2` tag — the first succeeds, the rest fail with
-# `422 Reference already exists` and the run aborts before publishing the
-# remaining crates. `{{ package }}-v{{ version }}` gives each crate a unique
-# tag (`graphrefly-core-v0.0.2`, `graphrefly-graph-v0.0.2`, etc.) and also
-# preserves the option to version each crate independently in the future.
+# Per-package tag template. Keep package-scoped tags so future publishable
+# workspace members can version independently without tag collisions.
 git_tag_name        = "{{ package }}-v{{ version }}"
 
-# Per-crate overrides for the bindings crates: skip cargo publish AND
-# skip the GitHub release. They build into npm/PyPI artifacts via
-# napi-rs / wasm-pack / maturin, not crates.io.
-[[package]]
-name    = "graphrefly-bindings-js"
-publish = false
-release = false
-
+# Per-crate override for the Python binding foundation: skip cargo publish AND
+# skip the GitHub release. It builds into Python artifacts via maturin, not
+# crates.io.
 [[package]]
 name    = "graphrefly-bindings-py"
-publish = false
-release = false
-
-[[package]]
-name    = "graphrefly-bindings-wasm"
 publish = false
 release = false

@@ -117,10 +117,11 @@ module status and conformance map.
 crates/
 └── graphrefly/                # THE native shared clean-slate engine/library (D415)
     └── src/{protocol,node,dispatcher,ctx,batch}.rs
-crates/graphrefly-{core,graph,operators,storage,structures,bindings-*}/
-                               # FROZEN port-model reference (D41 analogue) —
-                               # `exclude`d from the workspace, read-only, delete
-                               # at intent-parity. Do NOT develop against them.
+└── graphrefly-bindings-py/    # Python native binding foundation
+
+The old port-model crate directories and old JS/WASM binding directories have
+been deleted from the active tree. Use git history for archaeology; do not
+develop against or reintroduce them.
 ```
 
 ## Workflow rules

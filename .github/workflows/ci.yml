@@ -15,10 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # `RUSTFLAGS: -D warnings` is applied per-step in the `rust` job below
-  # rather than globally — the napi-rs binding crate has macro-generated
-  # FFI items that trip pedantic-tier lints that don't apply to FFI
-  # surfaces.
+  # `RUSTFLAGS: -D warnings` is applied per-step in the `rust` job below.
 
 # Skip CI on PR sync events from the release-plz bot. Rationale:
 #   - User pushes commit to main → CI runs on push (verifies the change).
@@ -26,12 +23,9 @@ env:
 #     entries on top of that commit → would re-trigger CI on pull_request
 #     synchronize, but the only diff vs the just-tested main is mechanical
 #     (Cargo.toml version, CHANGELOG.md additions) — testing it is redundant.
-#   - After PR merge, push of "chore: release vX.Y.Z" to main runs CI again
-#     (verifies the merged release state before release-plz publishes).
-# Trade-off: if release-plz ever produces a broken Cargo.toml/CHANGELOG (e.g.
-# malformed semver), we'd catch it post-merge instead of pre-merge. Acceptable
-# since release-plz output is mechanical and the post-merge run still gates
-# the publish step in release.yml.
+#   - After PR merge, the push of "chore: release vX.Y.Z" to main DOES run CI.
+#     release.yml publishes only after the CI workflow_run succeeds for that
+#     commit.
 #
 # Applied as a per-job `if:` because GitHub Actions doesn't support workflow-
 # level conditional triggering by author. The expression below excludes ONLY
@@ -41,14 +35,11 @@ env:
 jobs:
   # ---------------------------------------------------------------------
   # Rust: check + test + clippy + fmt + cargo-deny on the pinned 1.95
-  # toolchain (workspace `rust-toolchain.toml`). Excludes binding crates
-  # from `cargo nextest`/`cargo build` via workspace `default-members` —
-  # they need their own toolchains (napi-rs, maturin, wasm-pack) and
-  # land separately in the binding-specific jobs below.
+  # toolchain (workspace `rust-toolchain.toml`).
   # ---------------------------------------------------------------------
   rust:
     name: Rust ${{ matrix.toolchain }}
-    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
+    if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -71,13 +62,13 @@ jobs:
       - name: Cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: Cargo check (default-members)
-        run: cargo check
+      - name: Cargo check (workspace)
+        run: cargo check --workspace
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Cargo clippy (default-members, all targets, pedantic-tier)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Cargo clippy (graphrefly-rs, all targets, pedantic-tier)
+        run: cargo clippy -p graphrefly-rs --all-targets -- -D warnings
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -88,8 +79,8 @@ jobs:
       # no-stack-overflow invariant is merge-gated. The profile's
       # slow-timeout also kills a deadlocked test after 4×60s instead of
       # burning the whole job's wall-clock budget.
-      - name: Cargo nextest (default-members, ci profile — incl. cascade_depth)
-        run: cargo nextest run --profile ci --all-targets
+      - name: Cargo nextest (graphrefly-rs, ci profile — incl. cascade_depth)
+        run: cargo nextest run -p graphrefly-rs --profile ci --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 
@@ -111,7 +102,7 @@ jobs:
   # ---------------------------------------------------------------------
   deny:
     name: cargo deny (supply-chain audit)
-    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
+    if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -121,18 +112,12 @@ jobs:
           arguments: --all-features
 
   # ---------------------------------------------------------------------
-  # napi-rs JavaScript binding — builds + lints. Doesn't run tests
-  # (the binding's tests are JS-side and live in graphrefly-ts's
-  # bench harness). The build verifies the cdylib link works.
-  #
-  # Frozen JS binding reference retained for CI coverage only. Its old
-  # CoreActor/napi structure is historical binding machinery, not current
-  # clean-slate substrate guidance. Gate restored to the prior bot/release
-  # condition so the retained binding still compiles against the Rust crate.
+  # Python binding foundation: keep the retained binding crate compiling
+  # after the JS/WASM/native binding crates were retired.
   # ---------------------------------------------------------------------
-  bindings-js:
-    name: napi-rs binding (cdylib build + clippy)
-    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
+  bindings-py:
+    name: Python binding smoke
+    if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -143,134 +128,27 @@ jobs:
           toolchain: "1.95"
           components: clippy
 
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Cache cargo
+      - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: bindings-js
+          shared-key: bindings-py
 
-      - name: Build napi-rs binding (lib + cdylib)
-        run: cargo build -p graphrefly-bindings-js --features tracing
-
-      # Clippy here is informational — napi-rs macro-generated code +
-      # FFI-exported `pub fn` items trip clippy::pedantic warnings that
-      # don't apply to FFI surfaces. Build success is the bar; clippy
-      # output is captured for review.
-      - name: Clippy on bindings-js (informational)
-        run: cargo clippy -p graphrefly-bindings-js --features tracing
-        continue-on-error: true
+      - name: Cargo check (Python binding test feature)
+        run: cargo check -p graphrefly-bindings-py --features test-python
+        env:
+          RUSTFLAGS: "-D warnings"
 
   # ---------------------------------------------------------------------
-  # Cross-platform napi build matrix (Phase E rustImpl activation slice,
-  # D075). Builds the `.node` artifact for each target triple and uploads
-  # as a workflow artifact. NOT published to npm — that's a separate
-  # release-engineering slice. Downstream parity-tests in graphrefly-ts
-  # download the host artifact for activation testing.
+  # TLA+ model checks — runs selected canonical models from
+  # `graphrefly/formal`, the language-neutral authority repo.
   #
-  # Matrix mirrors `crates/graphrefly-bindings-js/package.json`'s
-  # `napi.targets`. linux-arm64 + win-arm64 are emitted but not yet
-  # tested in parity (host runner constraint); when GitHub Actions
-  # offers ARM runners more broadly we'll wire those into parity too.
-  # ---------------------------------------------------------------------
-  napi-build-matrix:
-    name: napi build (${{ matrix.target }})
-    # S6 reconciled 2026-05-19 — see the `bindings-js` job comment
-    # above. This matrix builds the cross-platform `.node` artifacts
-    # against the post-S6 binding.
-    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
-    needs: bindings-js
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # x86_64-apple-darwin dropped 2026-05-09 — Apple stopped selling
-          # Intel Macs in 2023, install base shrinking, and macos-13 runner
-          # pool was queueing for minutes per build. Re-add later if user
-          # demand surfaces (could cross-compile from macos-14 to avoid the
-          # macos-13 deprecated-pool problem).
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            artifact: graphrefly-native.darwin-arm64.node
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            artifact: graphrefly-native.linux-x64-gnu.node
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            artifact: graphrefly-native.linux-arm64-gnu.node
-            cross: true
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            artifact: graphrefly-native.win32-x64-msvc.node
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95"
-          targets: ${{ matrix.target }}
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v5
-        with:
-          version: "10"
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: napi-${{ matrix.target }}
-
-      - name: Install cross (linux-arm64 only)
-        if: matrix.cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
-      - name: Install @napi-rs/cli + workspace deps
-        working-directory: crates/graphrefly-bindings-js
-        run: |
-          pnpm install --no-frozen-lockfile
-
-      - name: Build napi binding (${{ matrix.target }})
-        working-directory: crates/graphrefly-bindings-js
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            pnpm exec napi build --platform --release --target ${{ matrix.target }} --features standard --use-cross
-          else
-            pnpm exec napi build --platform --release --target ${{ matrix.target }} --features standard
-          fi
-        shell: bash
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: napi-${{ matrix.target }}
-          path: crates/graphrefly-bindings-js/${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 7
-
-  # ---------------------------------------------------------------------
-  # TLA+ model checks — runs the canonical handle-protocol scenarios
-  # from `~/src/graphrefly-ts/docs/research/`. The Rust port refines
-  # the same wave_protocol invariants; any drift between the Rust
-  # impl and the spec MUST surface here too.
-  #
-  # The MC harnesses live in graphrefly-ts. CI fetches them via raw
-  # GitHub URLs so this workflow doesn't need a sibling-repo checkout.
-  # When TS's MC files change, this CI picks them up on next run.
-  #
-  # Each TLC run uses ~10s of CPU on a small state space (the MCs are
-  # tuned for fast verification — diamond + rewire scenarios).
+  # CI fetches the models via raw GitHub URLs so this workflow doesn't need a
+  # sibling-repo checkout. When the formal models change, this CI picks them up
+  # on the next run.
   # ---------------------------------------------------------------------
   tlc:
     name: TLA+ model check (wave_protocol scenarios)
-    if: "${{ (github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]') && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
+    if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -287,26 +165,17 @@ jobs:
             https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
           test -s /tmp/tla2tools.jar
 
-      - name: Fetch MC harnesses from graphrefly-ts (handle-protocol + wave-protocol-rewire)
+      - name: Fetch formal models from graphrefly/formal
         # NOTE: pinned via the `TLA_REF` env var. `main` is the Rust port's
         # default tracking branch — it picks up canonical-spec amendments
-        # immediately. Pin to a release SHA / tag once graphrefly-ts cuts
-        # versioned releases (post-v1.0). Tracked in
-        # `docs/porting-deferred.md` under "CI hardening".
+        # immediately. Pin to a release SHA / tag once the authority repo cuts
+        # versioned releases.
         env:
           TLA_REF: main
         shell: bash -euo pipefail {0}
         run: |
           mkdir -p /tmp/tla
-          # Two source repos:
-          #   - graphrefly-ts/docs/research/ — handle_protocol + wave_protocol_rewire MC harnesses
-          #   - graphrefly/formal/           — base wave_protocol.tla that handle_protocol EXTENDS
-          BASE_TS="https://raw.githubusercontent.com/graphrefly/graphrefly-ts/${TLA_REF}/docs/research"
           BASE_SPEC="https://raw.githubusercontent.com/graphrefly/graphrefly/${TLA_REF}/formal"
-          # Note: handle_protocol.tla uses underscore — TLA+ requires the
-          # filename to match the MODULE name exactly (`MODULE handle_protocol`).
-          # An earlier hyphenated `handle-protocol.tla` filename was renamed
-          # in graphrefly-ts for this reason.
           fetch() {
             # `--retry-all-errors` retries on 404 too — covers the case where
             # raw.githubusercontent.com's CDN edge hasn't propagated a fresh
@@ -317,21 +186,12 @@ jobs:
               -o "$out" "$url"
             test -s "$out"
           }
-          # From graphrefly-ts (handle-protocol refinement + rewire harness
-          # + Phase I partitioned-protocol harness).
-          for f in handle_protocol.tla handle_protocol_MC.tla handle_protocol_MC.cfg \
-                   wave_protocol_rewire.tla wave_protocol_rewire_MC.tla \
-                   wave_protocol_rewire_MC.cfg \
-                   wave_protocol_partitioned.tla wave_protocol_partitioned_MC.tla \
-                   wave_protocol_partitioned_MC.cfg; do
-            fetch "$BASE_TS/$f" "/tmp/tla/$f"
-          done
-          # From graphrefly (spec repo) — base modules that the above EXTEND.
-          for f in wave_protocol.tla; do
+          for f in wave_protocol.tla wave_protocol_MC.tla wave_protocol.cfg \
+                   wave_rewire.tla wave_rewire.cfg; do
             fetch "$BASE_SPEC/$f" "/tmp/tla/$f"
           done
 
-      - name: TLC — handle_protocol_MC (diamond + handle-protocol refinement)
+      - name: TLC — wave_protocol_MC
         working-directory: /tmp/tla
         # `set -euo pipefail` ensures a failed `java` invocation (OOM,
         # classpath error, etc.) propagates through `tee` instead of being
@@ -340,38 +200,21 @@ jobs:
         shell: bash -euo pipefail {0}
         run: |
           java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-            -tool -workers auto -config handle_protocol_MC.cfg handle_protocol_MC.tla \
-            | tee handle.log
+            -tool -workers auto -config wave_protocol.cfg wave_protocol_MC.tla \
+            | tee wave_protocol.log
           # TLC reports "Model checking completed" on success; "Error:" or
           # "Invariant ... is violated" on failure.
-          grep -q "Model checking completed" handle.log
-          ! grep -q "is violated" handle.log
-          ! grep -qi "^error:" handle.log
+          grep -q "Model checking completed" wave_protocol.log
+          ! grep -q "is violated" wave_protocol.log
+          ! grep -qi "^error:" wave_protocol.log
 
-      - name: TLC — wave_protocol_rewire_MC (set_deps substrate)
+      - name: TLC — wave_rewire
         working-directory: /tmp/tla
         shell: bash -euo pipefail {0}
         run: |
           java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-            -tool -workers auto -config wave_protocol_rewire_MC.cfg wave_protocol_rewire_MC.tla \
+            -tool -workers auto -config wave_rewire.cfg wave_rewire.tla \
             | tee rewire.log
           grep -q "Model checking completed" rewire.log
           ! grep -q "is violated" rewire.log
           ! grep -qi "^error:" rewire.log
-
-      - name: TLC — wave_protocol_partitioned_MC (Phase I — D3 closure)
-        # Per-partition wave_owner protocol verification (Slice Y1+Y2,
-        # 2026-05-09). Encodes Q6 invariants from
-        # `archive/docs/SESSION-rust-port-d3-per-subgraph-parallelism.md`:
-        # cross-partition deadlock-freedom, ascending-`SubgraphId`
-        # acquisition ordering, `Subscription::Drop` cleanup cascade,
-        # union/split discipline, mid-wave reentrancy rejection.
-        working-directory: /tmp/tla
-        shell: bash -euo pipefail {0}
-        run: |
-          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-            -tool -workers auto -config wave_protocol_partitioned_MC.cfg wave_protocol_partitioned_MC.tla \
-            | tee partitioned.log
-          grep -q "Model checking completed" partitioned.log
-          ! grep -q "is violated" partitioned.log
-          ! grep -qi "^error:" partitioned.log

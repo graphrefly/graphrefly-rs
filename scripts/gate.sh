@@ -46,10 +46,10 @@
 # ─── Usage ──────────────────────────────────────────────────────────────────
 #   scripts/gate.sh                 # FULL gate: fmt --check, clippy,
 #                                   #   `cargo nextest run --profile ci`
-#                                   #   (default-members, incl. cascade_depth)
+#                                   #   (workspace, incl. cascade_depth)
 #   scripts/gate.sh core            # FAST variant: fmt --check, clippy
-#                                   #   (-p graphrefly-core), `cargo nextest
-#                                   #   run -p graphrefly-core` (default profile)
+#                                   #   (-p graphrefly-rs), `cargo nextest
+#                                   #   run -p graphrefly-rs` (default profile)
 #   scripts/gate.sh [core] -- ARGS  # ARGS appended to the nextest step
 #                                   #   (e.g. a filter: -- serialization_groups)
 #
@@ -282,38 +282,29 @@ case "${GATE_CLIPPY_DENY:-1}" in
   *) CLIPPY_DENY=(-- -D warnings) ;;
 esac
 
-# Step 0 — D288 Q2 / D289 QA F2 tripwire-wiring hygiene check (fast;
-# fail before any expensive compile). Every `fn bridge_sync*` in the
-# bindings-js crate MUST call `assert_no_batch_handle(...)` somewhere
-# in its body. See `scripts/check-tripwire-wiring.sh` for rationale.
-rl_run "tripwire-wiring hygiene (D288 Q2 / D289 QA F2)" \
-  bash "$ROOT/scripts/check-tripwire-wiring.sh" || exit $?
-
 # Step 1 — formatting (fast; fail before any expensive compile).
 rl_run "rustfmt --check" \
   cargo fmt --all --check || exit $?
 
-# Step 2 — clippy. default-members only (NO --workspace): the binding
-# crates need napi-rs/maturin/wasm-pack toolchains and are excluded from
-# default-members by design (see Cargo.toml).
+# Step 2 — clippy.
 if [ "$MODE" = "core" ]; then
-  rl_run "clippy (-p graphrefly-core)" \
-    cargo clippy -p graphrefly-core --all-targets \
+  rl_run "clippy (-p graphrefly-rs)" \
+    cargo clippy -p graphrefly-rs --all-targets \
       ${CLIPPY_DENY[@]+"${CLIPPY_DENY[@]}"} || exit $?
 else
-  rl_run "clippy (default-members, --all-targets)" \
-    cargo clippy --all-targets \
+  rl_run "clippy (-p graphrefly-rs, --all-targets)" \
+    cargo clippy -p graphrefly-rs --all-targets \
       ${CLIPPY_DENY[@]+"${CLIPPY_DENY[@]}"} || exit $?
 fi
 
 # Step 3 — the test suite. ONE nextest invocation, bounded threads.
 if [ "$MODE" = "core" ]; then
-  rl_run "nextest -p graphrefly-core (default profile)" \
-    cargo nextest run -p graphrefly-core --test-threads "$GATE_TEST_THREADS" \
+  rl_run "nextest -p graphrefly-rs (default profile)" \
+    cargo nextest run -p graphrefly-rs --test-threads "$GATE_TEST_THREADS" \
       ${NEXTEST_EXTRA[@]+"${NEXTEST_EXTRA[@]}"} || exit $?
 else
-  rl_run "nextest --profile ci (default-members, incl. cascade_depth)" \
-    cargo nextest run --profile ci --test-threads "$GATE_TEST_THREADS" \
+  rl_run "nextest --profile ci (-p graphrefly-rs, incl. cascade_depth)" \
+    cargo nextest run -p graphrefly-rs --profile ci --test-threads "$GATE_TEST_THREADS" \
       ${NEXTEST_EXTRA[@]+"${NEXTEST_EXTRA[@]}"} || exit $?
 fi
 

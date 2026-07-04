@@ -11,10 +11,9 @@ decisions, conformance, formal models, and phase sequencing lives in
 ## Current Shape
 
 The active crate is `crates/graphrefly` (`lib` name `graphrefly`, package
-`graphrefly-rs`). The old port-model crates under `crates/graphrefly-core`,
-`crates/graphrefly-graph`, `crates/graphrefly-operators`,
-`crates/graphrefly-storage`, `crates/graphrefly-structures`, and old JS/WASM
-bindings are frozen reference material and are excluded from the workspace.
+`graphrefly-rs`). The old port-model crate directories and old JS/WASM binding
+directories have been deleted from the active tree; use git history for
+archaeology.
 
 The clean-slate crate includes:
 
