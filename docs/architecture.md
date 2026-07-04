@@ -59,9 +59,9 @@ JSONL authority records.
   per-language surfaces unless the protocol/conformance records say otherwise.
 - No `unsafe`; the crate root forbids unsafe code.
 
-## Historical Port Docs
+## Historical Port Material
 
-`migration-status.md`, `porting-deferred.md`, `rust-port-decisions.md`,
-`D246-frozen-api.md`, `flowcharts.md`, and `decision-audit-2026-05-21.md`
-preserve the old port-era audit trail. Treat them as historical unless a current
-authority record or `docs/docs.jsonl` explicitly promotes a specific entry.
+Old port-era migration notes, frozen API snapshots, audit reports, flowcharts,
+and review reports are no longer kept in the active docs tree. Use git history
+for archaeology; current guidance lives in this file, [`development.md`](development.md),
+[`docs.jsonl`](docs.jsonl), rustdoc, and the language-neutral authority repo.

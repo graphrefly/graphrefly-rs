@@ -18,25 +18,15 @@
 //! dispatcher fns, dep handles). Short `borrow_mut` scopes mutate; calls happen
 //! borrow-free.
 //!
-//! ## Slice scope
+//! ## Current substrate scope
 //!
-//! **CSP-5 first cut:** state / producer / derived nodes · two-phase DIRTY→DATA ·
-//! diamond pending-counter join (R-diamond/R-two-phase) · first-run gate
-//! (R-first-run-gate) · every occurrence is DATA + substrate-synthesized undirty
-//! RESOLVED for a no-emit fn (R-resolved-undirty / D49, supersedes D15 — no
-//! equals-substitution) · push-on-subscribe (R-push-subscribe) · lazy activation ·
-//! ROM/RAM (R-rom-ram).
-//!
-//! **Control/terminal slice (this cut):** INVALIDATE + `ctx.on_invalidate`
-//! (R-invalidate-idempotent / R-cleanup-hooks, C-3) · PAUSE/RESUME lockset +
-//! default-mode coalesce (R-pause-lockset / R-pause-modes, C-5) · COMPLETE/ERROR
-//! terminal (terminal-is-forever, D17) · the **D30 catch boundary** = a
-//! `catch_unwind` at the wave-owner that converts a panic (the Rust analogue of a
-//! value-level `throw`) into `[[ERROR,e]]` on a node ON the cycle (R-reentrancy /
-//! D37, C-6), with whole-cascade wave-flag recovery (the touched-set reset — closes
-//! **B25**). **Deferred:** TEARDOWN, batch, LocalAsync, rewire, dynamicNode,
-//! replay-buffer, the resumeAll/false pause modes + async-paused buffering
-//! (C-2/C-9/C-10), up-at-source INVALIDATE terminus (C-7).
+//! The active substrate covers state / producer / derived nodes, two-phase
+//! DIRTY-to-DATA delivery, diamond joins, first-run gating, push-on-subscribe,
+//! lazy activation, ROM/RAM, INVALIDATE, PAUSE/RESUME locksets and pause modes,
+//! COMPLETE/ERROR/TEARDOWN terminal behavior, batch commit/rollback, LocalAsync
+//! boundaries, runtime rewire, pull/routed-up demand, `ctx.rewire_next`, and
+//! panic-to-ERROR recovery at the wave boundary. Every occurrence remains DATA;
+//! no-emit functions settle with substrate-synthesized undirty RESOLVED (D49).
 
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -322,7 +312,7 @@ impl CoreIdentity {
     }
 }
 
-/// B49 / D71 first migration slice: graph-local arena for node bookkeeping. The
+/// B49 / D71 transition slice: graph-local arena for node bookkeeping. The
 /// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
 /// `Rc<RefCell<NodeInner>>`. Topology is already graph-owned in `NodeTopologySlot`;
 /// this keeps the public API stable while moving ownership toward arena-index execution.
@@ -885,7 +875,7 @@ impl NodeValueState {
 }
 
 /// Per-dependency edge bookkeeping (subscription ownership + callback index indirection).
-/// Kept in GraphCore side-tables as part of the B49 migration path.
+/// Kept in GraphCore side-tables as part of the B49 arena transition.
 struct DepEdges {
     value: NodeValueState,
     wave: NodeWaveState,

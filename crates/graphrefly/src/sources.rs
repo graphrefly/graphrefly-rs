@@ -1922,7 +1922,7 @@ pub fn timer(ms: u64) -> Operator<u64> {
     timer_source("timer", ms)
 }
 
-/// from_timer: frozen source-name alias for [`timer`].
+/// from_timer: stable source-name alias for [`timer`].
 ///
 /// Preserves the real factory name (`fromTimer`) in describe/render output.
 pub fn from_timer(ms: u64) -> Operator<u64> {

@@ -4,12 +4,18 @@ Contributions welcome. This file is a brief pointer; the substantive setup and a
 
 ## Status before contributing
 
-The **M1–M5 substrate** is implemented; [`@graphrefly/native`](crates/graphrefly-bindings-js/) is the published napi-rs package. **pyo3** (`graphrefly-bindings-py`) and **wasm-bindgen** (`graphrefly-bindings-wasm`) remain scaffolds until M6 / consumer pressure. See [`docs/migration-status.md`](docs/migration-status.md) for the live tracker and [`docs/porting-deferred.md`](docs/porting-deferred.md) for open follow-ons.
+The active Rust package is `crates/graphrefly` (`package = "graphrefly-rs"`,
+`lib = "graphrefly"`). The package includes the sync wave substrate, graph-layer
+Rust API, operators, sources, storage helpers, app-infra helpers, environment
+adapters, and the native binding foundation for Python. See
+[`docs/architecture.md`](docs/architecture.md) for the current boundary map and
+[`docs/development.md`](docs/development.md) for local build and release checks.
 
 High-leverage contribution paths today:
-- Closing a [`porting-deferred.md`](docs/porting-deferred.md) item with a parity scenario + napi binding (D196)
-- Cross-arm fixes surfaced by `pnpm test:parity` in [graphrefly-ts](https://github.com/graphrefly/graphrefly-ts)
-- Audit-dashboard findings in [`docs/audit/`](docs/audit/) (see migration-status open-findings roll-up)
+- Rust package API docs and examples that stay package-local.
+- Conformance fixes surfaced by the language-neutral scenarios in
+  [graphrefly](https://github.com/graphrefly/graphrefly).
+- Python binding integration work over the Rust native engine.
 
 ## Quick start
 
@@ -45,7 +51,10 @@ Per the project's [single-source-of-truth principle](CLAUDE.md#memory-principles
 
 ## Code review pace
 
-This repo's owner reviews on a personal cadence. For non-trivial PRs, please link the relevant SESSION doc or design discussion in graphrefly-ts so context is preserved.
+This repo's owner reviews on a personal cadence. For non-trivial protocol or
+architecture work, link the relevant decision, spec amendment, or design
+discussion from the language-neutral `graphrefly` authority repo so context is
+preserved.
 
 ## License
 

@@ -3,7 +3,7 @@
 //! Reactive **universal reduction layer**: high fan-in/fan-out → information
 //! reduction → push. Not LLM-limited; performance first-class (D1).
 //!
-//! ## Authority — the truth lives in `~/src/graphrefly` (branch `clean-slate`)
+//! ## Authority — the truth lives in `~/src/graphrefly`
 //!
 //! This crate is the Rust **implementation**. The language-neutral authority —
 //! protocol spec, decisions, formal model, conformance scenarios — is in the
@@ -15,7 +15,7 @@
 //! | Protocol rules (宪法) | `~/src/graphrefly/spec/rules.jsonl` |
 //! | Conformance (parity) | `~/src/graphrefly/spec/conformance.jsonl` |
 //! | Formal model | `~/src/graphrefly/formal/*.tla` |
-//! | Phase plan | `~/src/graphrefly/plan/phases.jsonl` (this crate = CSP-5) |
+//! | Phase plan | `~/src/graphrefly/plan/phases.jsonl` |
 //!
 //! Sibling self-contained packages: `@graphrefly/ts` (`~/src/graphrefly-ts`),
 //! `@graphrefly/py` (`~/src/graphrefly-py`). Cross-language = a coarse wire
@@ -46,17 +46,15 @@
 //! ## Clean-slate scope (what this crate builds)
 //!
 //! A self-contained Rust package (D32): protocol + node + dispatcher (LocalSync +
-//! LocalAsync pools) + ctx + batch + rewire, plus the B53 graph-layer MVP
-//! (Graph/graph, graph-owned 8-verb sugar, find/describe/observe first cut).
-//! Operators remain per-language graph-layer sugar (D6/D24) and are re-derived
-//! after this MVP rather than shimmed from the retired port model.
+//! LocalAsync pools) + ctx + batch + rewire, graph-layer Rust API, graph-owned
+//! 8-verb sugar, find/describe/observe/profile, operators, sources, storage
+//! helpers, app-infra helpers, environment adapters, and wire-bridge helpers.
+//! Operators remain per-language graph-layer sugar (D6/D24), not protocol verbs.
 //!
-//! > **Status:** [`protocol`], [`node`], [`dispatcher`], [`ctx`] are implemented
-//! > (kernel + control/terminal + async + rewire + dep-terminal + `ctx.rewire_next`
-//! > slices, plus pull/routed-up, terminal/later-async catch-up, and batch). [`mod@graph`]
-//! > adds the first product-completeness layer (B53). The Rust conformance arm is green
-//! > for **C-2..C-22 except C-1**; **C-1** remains wire-bridge-blocked. See
-//! > `CLEAN-SLATE.md` for the per-module status + conformance target map.
+//! > **Status:** the Rust package-local API surface is implemented in this crate;
+//! > the language-neutral authority remains `~/src/graphrefly`. Use this rustdoc
+//! > for Rust API syntax and package-local behavior notes, and use the shared
+//! > authority repo for protocol rules and cross-runtime conformance status.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

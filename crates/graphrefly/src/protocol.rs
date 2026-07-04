@@ -1,7 +1,7 @@
 //! Wave-protocol data types — the decision-locked, language-neutral core.
 //!
-//! These types are pinned by the spec and the D# log, so they are scaffolded
-//! **concretely** (unlike the runtime modules, which are CSP-5 contract stubs).
+//! These types are pinned by the spec and the D# log, so they are concrete Rust
+//! representations of the current protocol surface.
 //! Representation is per-language (D11: in-process tuple vs wire protobuf are
 //! decoupled); the *semantics* below match `~/src/graphrefly/spec/rules.jsonl`.
 

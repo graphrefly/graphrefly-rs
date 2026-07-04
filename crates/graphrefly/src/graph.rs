@@ -1,4 +1,4 @@
-//! Graph layer MVP (B53): graph-owned factories + first inspection surface.
+//! Graph-layer Rust API: graph-owned factories, topology, and inspection.
 //!
 //! This module is per-language product surface (D24/D32), not behavioral
 //! conformance. It keeps naming/find/describe/observe on the graph side

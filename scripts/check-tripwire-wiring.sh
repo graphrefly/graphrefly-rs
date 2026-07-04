@@ -21,8 +21,8 @@
 #   1 — at least one violation (offender printed to stderr).
 #   2 — invocation/repo error.
 #
-# Source: `~/src/graphrefly-rs/docs/porting-deferred.md` D289 follow-on
-# "CI grep guard for `bridge_sync*` tripwire wiring (QA F2)".
+# Source: D289/D291 binding tripwire follow-on. Historical port-era notes were
+# deleted from the active docs tree; keep this script self-contained.
 # D291 /qa A6 (2026-05-25): strict mode (`set -euo pipefail`) + nullglob
 # so empty `*.rs` globs don't iterate the literal pattern. The directory
 # guard above catches the typical missing-dir case, but a renamed crate

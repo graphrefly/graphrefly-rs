@@ -10,15 +10,15 @@ mapping, and ecosystem integration over this Rust layer. Cross-runtime graph
 collaboration = a coarse wire bridge, never hidden distributed same-wave
 semantics.
 
-> **Clean-slate retired the port model.** The old `main` branch (M1–M5 milestones,
+> **Clean-slate retired the port model.** The old port-era line (M1–M5 milestones,
 > handle-protocol cleaving plane, `Arc<Mutex>` actor model, 8-crate workspace,
 > 3-digit D193–D301, parity `Impl` interface) is **history**. This branch
 > (`clean-slate`) rebuilds the substrate from the language-neutral spec. Do not
 > reach for port-model docs/decisions.
 
 > **This file points, it does not host.** The language-neutral authority — protocol
-> spec, decisions, conformance, formal model — lives in `~/src/graphrefly` (branch
-> `clean-slate`). When anything here disagrees with that repo, **that repo wins.**
+> spec, decisions, conformance, formal model — lives in `~/src/graphrefly`. When
+> anything here disagrees with that repo, **that repo wins.**
 
 ## Authority — where the truth lives (`~/src/graphrefly`)
 
@@ -107,11 +107,11 @@ premise before greenfield.
 
 ## CSP-5 scope + layout
 
-This branch builds the **substrate only** (CSP-5): `protocol` + `node` + `dispatcher`
-(LocalSync + LocalAsync) + `ctx` + `batch` + rewire. The graph layer / 8-verb sugar /
-operators / sources / inspection are later per-language phases. The conformance arm is
-**CSP-6** (deps CSP-3 done + CSP-5). See **`crates/graphrefly/CLEAN-SLATE.md`** for the
-module status + the C-1..C-11 target map + cross-track sequencing.
+This branch now carries the clean-slate Rust package beyond the initial CSP-5
+substrate: `crates/graphrefly` includes the protocol core, graph-layer Rust API,
+operators, sources, storage helpers, app-infra helpers, environment adapters, and
+wire-bridge helpers. See **`crates/graphrefly/CLEAN-SLATE.md`** for the detailed
+module status and conformance map.
 
 ```
 crates/
