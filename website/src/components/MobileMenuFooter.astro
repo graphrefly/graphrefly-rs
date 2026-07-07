@@ -4,20 +4,22 @@ import SocialIcons from 'virtual:starlight/components/SocialIcons';
 import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
 
 const base = import.meta.env.BASE_URL;
-const apiHref = `${base}api/rustdoc/graphrefly/`;
+const sharedPackages = 'https://graphrefly.dev/packages/';
+const navLinks = [
+	{ href: `${base}api/`, label: 'API' },
+	{ href: `${base}quickstart/`, label: 'QUICK START' },
+	{ href: `${base}examples/`, label: 'EXAMPLES' },
+	{ href: `${base}recipes/`, label: 'RECIPES' },
+	{ href: `${base}integrations/`, label: 'INTEGRATIONS' },
+	{ href: `${base}release/`, label: 'RELEASE' },
+	{ href: sharedPackages, label: 'PACKAGES' },
+];
 ---
 
 <nav class="gr-mobile-nav" aria-label="Quick links">
-	<a href={apiHref} class="gr-mobile-nav-link">API</a>
-	<a href={`${base}quickstart/`} class="gr-mobile-nav-link">QUICK START</a>
-	<a href={`${base}examples/`} class="gr-mobile-nav-link">EXAMPLES</a>
-	<a href={`${base}recipes/`} class="gr-mobile-nav-link">RECIPES</a>
-	<a href={`${base}release/`} class="gr-mobile-nav-link">RELEASE</a>
-</nav>
-<nav class="gr-mobile-lang" aria-label="Language">
-	<a href="https://ts.graphrefly.dev/" class="gr-mobile-lang-link">TS</a>
-	<a href="https://py.graphrefly.dev/" class="gr-mobile-lang-link">PY</a>
-	<span class="gr-mobile-lang-link gr-mobile-lang-active">RS</span>
+	{navLinks.map(({ href, label }) => (
+		<a href={href} class="gr-mobile-nav-link">{label}</a>
+	))}
 </nav>
 <div class="mobile-preferences sl-flex">
 	<div class="social-icons">
@@ -49,33 +51,6 @@ const apiHref = `${base}api/rustdoc/graphrefly/`;
 		.gr-mobile-nav-link:hover {
 			color: var(--sl-color-text-accent);
 			border-color: var(--sl-color-text-accent);
-		}
-		.gr-mobile-lang {
-			display: flex;
-			gap: 0.25rem;
-			align-items: center;
-			padding: 0.5rem 0;
-		}
-		.gr-mobile-lang-link {
-			font-size: var(--sl-text-xs);
-			font-weight: 700;
-			letter-spacing: 0.05em;
-			text-decoration: none;
-			color: var(--sl-color-gray-3);
-			padding: 0.25em 0.6em;
-			border-radius: 0.25rem;
-			border: 1px solid var(--sl-color-gray-5);
-		}
-		.gr-mobile-lang-link:hover {
-			color: var(--sl-color-text-accent);
-		}
-		.gr-mobile-lang-active {
-			background: var(--sl-color-text-accent);
-			color: var(--sl-color-black);
-			border-color: var(--sl-color-text-accent);
-		}
-		.gr-mobile-lang-active:hover {
-			color: var(--sl-color-black);
 		}
 		.social-icons {
 			display: flex;
