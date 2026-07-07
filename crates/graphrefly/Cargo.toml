@@ -1,6 +1,6 @@
 [package]
 name        = "graphrefly-rs"
-version     = "0.0.1"          # first clean-slate crates.io release
+version     = "0.0.2"
 description  = "GraphReFly — reactive universal reduction layer (Rust clean-slate substrate)"
 edition      = { workspace = true }
 rust-version = { workspace = true }
