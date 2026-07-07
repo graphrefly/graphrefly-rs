@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "graphrefly-rs"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "futures-core",
  "futures-util",
