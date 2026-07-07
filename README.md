@@ -157,10 +157,12 @@ mise exec -- cargo fmt --all
 The generator is idempotent and uses rustdoc's own `missing_docs` diagnostics as
 the source of truth; when the crate is already covered it exits without editing.
 
-Docs.rs builds use the crate metadata in `crates/graphrefly/Cargo.toml`; GitHub Pages
-builds the same rustdoc via `.github/workflows/pages.yml`. Package release notes and
-crate-specific development notes stay in this repo, while shared docs/blog content
-stays in `~/src/graphrefly`.
+Docs.rs builds use the crate metadata in `crates/graphrefly/Cargo.toml`. GitHub
+Pages builds the package-local Astro/Starlight site in `website/`, then copies
+generated rustdoc into `/api/rustdoc/` and publishes the artifact to
+`https://rs.graphrefly.dev/`. Package release notes and crate-specific
+development notes stay in this repo, while shared docs/blog content stays in
+`~/src/graphrefly`.
 
 ## Authority And Guardrails
 

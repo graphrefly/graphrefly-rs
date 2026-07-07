@@ -118,11 +118,14 @@ Before a crate release:
 5. Run `mise exec -- cargo clippy -p graphrefly-rs --all-targets`.
 6. For docs-affecting feature work, check docs with all features:
    `mise exec -- cargo doc -p graphrefly-rs --all-features --no-deps`.
+7. For package-site changes, build the Starlight artifact:
+   `pnpm --dir website build`.
 
-The GitHub Pages rustdoc deployment workflow lives at
-`.github/workflows/pages.yml`. It builds `cargo doc -p graphrefly-rs
---all-features --no-deps`, fails on rustdoc warnings, uploads `target/doc`, and
-adds a root redirect to the `graphrefly` crate docs.
+The GitHub Pages docs deployment workflow lives at
+`.github/workflows/pages.yml`. It builds the package-local Astro/Starlight site,
+generates rustdoc with `RUSTDOCFLAGS="-D warnings" cargo doc -p graphrefly-rs
+--all-features --no-deps`, copies rustdoc into `/api/rustdoc/`, writes the
+`rs.graphrefly.dev` CNAME, and uploads `website/dist`.
 
 ## Adding A Dependency
 

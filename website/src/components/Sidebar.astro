@@ -1,0 +1,73 @@
+---
+import MobileMenuFooter from 'virtual:starlight/components/MobileMenuFooter';
+import SidebarPersister from '@astrojs/starlight/components/SidebarPersister.astro';
+import SidebarSublist from '@astrojs/starlight/components/SidebarSublist.astro';
+import type { SidebarEntry } from '@astrojs/starlight/utils/routing/types';
+
+const { sidebar } = Astro.locals.starlightRoute;
+
+const base = import.meta.env.BASE_URL;
+let pathname = Astro.url.pathname;
+if (base !== '/') {
+	const b = base.endsWith('/') ? base.slice(0, -1) : base;
+	if (pathname.startsWith(b)) pathname = pathname.slice(b.length) || '/';
+}
+if (!pathname.startsWith('/')) pathname = `/${pathname}`;
+pathname = pathname.replace(/\/$/, '') || '/';
+
+type Mode =
+	| 'api'
+	| 'quickstart'
+	| 'examples'
+	| 'recipes'
+	| 'integrations'
+	| 'release'
+	| 'all';
+
+function routeMode(path: string): Mode {
+	if (path.startsWith('/api')) return 'api';
+	if (path === '/quickstart' || path.startsWith('/quickstart/')) return 'quickstart';
+	if (path === '/examples' || path.startsWith('/examples/')) return 'examples';
+	if (path.startsWith('/recipes')) return 'recipes';
+	if (path.startsWith('/integrations')) return 'integrations';
+	if (path === '/release' || path.startsWith('/release/')) return 'release';
+	return 'all';
+}
+
+/** Check if a sidebar group contains links matching the given path prefix. */
+function groupMatchesPrefix(entry: SidebarEntry, prefix: string): boolean {
+	if (entry.type === 'link') return entry.href.startsWith(prefix);
+	// group — check recursively
+	return entry.entries.some((child) => groupMatchesPrefix(child, prefix));
+}
+
+function filterSidebar(entries: SidebarEntry[], m: Mode): SidebarEntry[] {
+	if (m === 'all') return entries;
+	const prefix =
+		m === 'api'
+			? '/api'
+				: m === 'quickstart'
+					? '/quickstart'
+					: m === 'examples'
+						? '/examples'
+						: m === 'recipes'
+							? '/recipes'
+							: m === 'integrations'
+								? '/integrations'
+								: m === 'release'
+									? '/release'
+									: '/';
+	return entries.filter((e) => groupMatchesPrefix(e, prefix));
+}
+
+const mode = routeMode(pathname);
+const sublist = filterSidebar(sidebar, mode);
+---
+
+<SidebarPersister>
+	<SidebarSublist sublist={sublist} />
+</SidebarPersister>
+
+<div class="md:sl-hidden">
+	<MobileMenuFooter />
+</div>

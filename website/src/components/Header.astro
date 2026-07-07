@@ -1,0 +1,335 @@
+---
+import LanguageSelect from 'virtual:starlight/components/LanguageSelect';
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import SocialIcons from 'virtual:starlight/components/SocialIcons';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import config from 'virtual:starlight/user-config';
+
+const shouldRenderSearch =
+	config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
+
+const base = import.meta.env.BASE_URL;
+
+const navLinks = [
+	{ href: `${base}api/`, label: 'API' },
+	{ href: `${base}quickstart/`, label: 'QUICK START' },
+	{ href: `${base}examples/`, label: 'EXAMPLES' },
+	{ href: `${base}recipes/`, label: 'RECIPES' },
+	{ href: `${base}integrations/`, label: 'INTEGRATIONS' },
+	{ href: `${base}release/`, label: 'RELEASE' },
+];
+---
+
+<div class="header">
+	<div class="title-wrapper sl-flex">
+		<SiteTitle />
+	</div>
+	<div class="sl-flex print:hidden">
+		{shouldRenderSearch && <Search />}
+	</div>
+	<div class="right-group sl-flex print:hidden">
+		<nav class="gr-docs-nav" aria-label="Specification and API">
+			{navLinks.map(({ href, label }) => (
+				<a href={href} class="gr-docs-nav-link">{label}</a>
+			))}
+		</nav>
+		<nav class="gr-lang-nav" aria-label="Language">
+			<a href="https://ts.graphrefly.dev/" class="gr-lang-link">TS</a>
+			<a href="https://py.graphrefly.dev/" class="gr-lang-link">PY</a>
+			<span class="gr-lang-link gr-lang-active">RS</span>
+		</nav>
+		<div class="sub-right sl-hidden md:sl-flex">
+			<div class="sl-flex social-icons">
+				<SocialIcons />
+			</div>
+			<ThemeSelect />
+			<LanguageSelect />
+		</div>
+
+		<!-- Mobile hamburger (visible < 50rem, only when Starlight's own toggle is absent) -->
+		<button
+			type="button"
+			class="gr-mobile-toggle print:hidden"
+			aria-label="Open navigation menu"
+			aria-expanded="false"
+			aria-controls="gr-mobile-drawer">
+			<svg class="gr-burger-open" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+			<svg class="gr-burger-close" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+		</button>
+	</div>
+</div>
+
+<!-- Mobile drawer (slides in from right) -->
+<div id="gr-mobile-drawer" class="gr-mobile-drawer print:hidden" aria-hidden="true">
+	<nav class="gr-drawer-nav" aria-label="Mobile navigation">
+		{navLinks.map(({ href, label }) => (
+			<a href={href} class="gr-drawer-link">{label}</a>
+		))}
+	</nav>
+	<nav class="gr-drawer-lang" aria-label="Language">
+		<a href="https://ts.graphrefly.dev/" class="gr-drawer-lang-link">TS</a>
+		<a href="https://py.graphrefly.dev/" class="gr-drawer-lang-link">PY</a>
+		<span class="gr-drawer-lang-link gr-drawer-lang-active">RS</span>
+	</nav>
+	<div class="gr-drawer-social">
+		<SocialIcons />
+	</div>
+</div>
+
+<style>
+	@layer starlight.core {
+		.header {
+			display: flex;
+			gap: var(--sl-nav-gap);
+			justify-content: space-between;
+			align-items: center;
+			height: 100%;
+		}
+
+		.title-wrapper {
+			overflow: clip;
+			padding: 0.25rem;
+			margin: -0.25rem;
+			min-width: 0;
+		}
+
+		.right-group,
+		.social-icons,
+		.sub-right {
+			gap: 1rem;
+			align-items: center;
+		}
+
+		.gr-docs-nav {
+			display: flex;
+			gap: 0.65rem;
+			align-items: center;
+		}
+
+		.gr-docs-nav-link {
+			font-family: var(--gr-mono);
+			font-size: var(--sl-text-xs);
+			font-weight: 500;
+			letter-spacing: 0.1em;
+			text-decoration: none;
+			color: var(--sl-color-gray-2);
+			padding: 0.35em 0.2em;
+		}
+
+		.gr-docs-nav-link:hover,
+		.gr-docs-nav-link:focus-visible {
+			color: var(--sl-color-text-accent);
+		}
+
+		.gr-lang-nav {
+			display: flex;
+			gap: 0.25rem;
+			align-items: center;
+			border: 1px solid var(--sl-color-gray-5);
+			border-radius: 0.375rem;
+			padding: 0.15em 0.15em;
+		}
+
+		.gr-lang-link {
+			font-size: var(--sl-text-xs);
+			font-weight: 700;
+			letter-spacing: 0.05em;
+			text-decoration: none;
+			color: var(--sl-color-gray-3);
+			padding: 0.2em 0.45em;
+			border-radius: 0.25rem;
+		}
+
+		.gr-lang-link:hover,
+		.gr-lang-link:focus-visible {
+			color: var(--sl-color-text-accent);
+		}
+
+		.gr-lang-active {
+			background: var(--sl-color-text-accent);
+			color: var(--sl-color-black);
+		}
+
+		.gr-lang-active:hover {
+			color: var(--sl-color-black);
+		}
+
+		.social-icons::after {
+			content: '';
+			height: 2rem;
+			border-inline-end: 1px solid var(--sl-color-gray-5);
+		}
+
+		/* ── Mobile hamburger button ── */
+		.gr-mobile-toggle {
+			display: none;
+			align-items: center;
+			justify-content: center;
+			width: 2.5rem;
+			height: 2.5rem;
+			padding: 0;
+			border: none;
+			background: none;
+			color: var(--sl-color-white);
+			cursor: pointer;
+			-webkit-tap-highlight-color: transparent;
+		}
+		.gr-mobile-toggle .gr-burger-close { display: none; }
+		.gr-mobile-toggle[aria-expanded="true"] .gr-burger-open { display: none; }
+		.gr-mobile-toggle[aria-expanded="true"] .gr-burger-close { display: block; }
+
+		/* ── Mobile drawer ── */
+		.gr-mobile-drawer {
+			display: none;
+			position: fixed;
+			top: var(--sl-nav-height);
+			right: 0;
+			bottom: 0;
+			left: 0;
+			z-index: 100;
+			flex-direction: column;
+			gap: 1.5rem;
+			padding: 1.5rem;
+			background: rgba(244, 247, 249, 0.97);
+			backdrop-filter: blur(20px);
+			-webkit-backdrop-filter: blur(20px);
+			overflow-y: auto;
+			-webkit-overflow-scrolling: touch;
+		}
+		:global(:root[data-theme="dark"]) .gr-mobile-drawer {
+			background: rgba(10, 22, 40, 0.97);
+		}
+		.gr-mobile-drawer[aria-hidden="false"] {
+			display: flex;
+		}
+
+		.gr-drawer-nav {
+			display: flex;
+			flex-direction: column;
+			gap: 0.25rem;
+		}
+		.gr-drawer-link {
+			font-size: 0.9rem;
+			font-weight: 700;
+			letter-spacing: 0.1em;
+			text-decoration: none;
+			color: var(--sl-color-gray-2);
+			padding: 0.75rem 1rem;
+			border-radius: 0.5rem;
+			transition: background 0.15s, color 0.15s;
+		}
+		.gr-drawer-link:hover {
+			color: var(--sl-color-text-accent);
+			background: rgba(255, 255, 255, 0.06);
+		}
+
+		.gr-drawer-lang {
+			display: flex;
+			gap: 0.5rem;
+			padding: 0 1rem;
+		}
+		.gr-drawer-lang-link {
+			font-size: var(--sl-text-xs);
+			font-weight: 700;
+			letter-spacing: 0.05em;
+			text-decoration: none;
+			color: var(--sl-color-gray-3);
+			padding: 0.35em 0.75em;
+			border-radius: 0.375rem;
+			border: 1px solid var(--sl-color-gray-5);
+		}
+		.gr-drawer-lang-link:hover {
+			color: var(--sl-color-text-accent);
+		}
+		.gr-drawer-lang-active {
+			background: var(--sl-color-text-accent);
+			color: var(--sl-color-black);
+			border-color: var(--sl-color-text-accent);
+		}
+		.gr-drawer-lang-active:hover {
+			color: var(--sl-color-black);
+		}
+
+		.gr-drawer-social {
+			display: flex;
+			gap: 1rem;
+			padding: 0 1rem;
+		}
+
+		@media (min-width: 50rem) {
+			:global(:root[data-has-sidebar]) {
+				--__sidebar-pad: calc(2 * var(--sl-nav-pad-x));
+			}
+			:global(:root:not([data-has-toc])) {
+				--__toc-width: 0rem;
+			}
+			.header {
+				--__sidebar-width: max(0rem, var(--sl-content-inline-start, 0rem) - var(--sl-nav-pad-x));
+				--__main-column-fr: calc(
+					(
+							100% + var(--__sidebar-pad, 0rem) - var(--__toc-width, var(--sl-sidebar-width)) -
+								(2 * var(--__toc-width, var(--sl-nav-pad-x))) - var(--sl-content-inline-start, 0rem) -
+								var(--sl-content-width)
+						) / 2
+				);
+				display: grid;
+				grid-template-columns:
+					minmax(
+						calc(var(--__sidebar-width) + max(0rem, var(--__main-column-fr) - var(--sl-nav-gap))),
+						auto
+					)
+					1fr
+					auto;
+				align-content: center;
+			}
+		}
+	}
+
+	/* ── Mobile responsive (outside @layer to beat Starlight utility classes) ── */
+	@media (max-width: 49.99rem) {
+		.gr-docs-nav,
+		.gr-lang-nav {
+			display: none !important;
+		}
+		/* Show hamburger only when Starlight's own sidebar toggle is absent (no-sidebar pages) */
+		:global(:root:not([data-has-sidebar])) .gr-mobile-toggle {
+			display: flex !important;
+		}
+	}
+
+	@media (min-width: 50rem) {
+		.gr-mobile-toggle { display: none !important; }
+		.gr-mobile-drawer { display: none !important; }
+	}
+</style>
+
+<script>
+	const toggle = document.querySelector('.gr-mobile-toggle');
+	const drawer = document.getElementById('gr-mobile-drawer');
+	if (toggle && drawer) {
+		toggle.addEventListener('click', () => {
+			const open = toggle.getAttribute('aria-expanded') === 'true';
+			toggle.setAttribute('aria-expanded', String(!open));
+			drawer.setAttribute('aria-hidden', String(open));
+			document.body.style.overflow = open ? '' : 'hidden';
+		});
+		// Close on link click
+		drawer.querySelectorAll('a').forEach((link) => {
+			link.addEventListener('click', () => {
+				toggle.setAttribute('aria-expanded', 'false');
+				drawer.setAttribute('aria-hidden', 'true');
+				document.body.style.overflow = '';
+			});
+		});
+		// Close on Escape
+		document.addEventListener('keydown', (e) => {
+			if (e.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
+				toggle.setAttribute('aria-expanded', 'false');
+				drawer.setAttribute('aria-hidden', 'true');
+				document.body.style.overflow = '';
+				toggle.focus();
+			}
+		});
+	}
+</script>

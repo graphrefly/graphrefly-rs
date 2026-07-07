@@ -1,9 +1,22 @@
-name: Rust API Docs
+name: Deploy docs to GitHub Pages
 
 on:
+  pull_request:
   push:
     branches: [main]
+    paths:
+      - "website/**"
+      - "docs/**"
+      - "crates/graphrefly/src/**"
+      - "crates/graphrefly/Cargo.toml"
+      - "Cargo.toml"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
+
+env:
+  ASTRO_SITE_URL: "https://rs.graphrefly.dev"
+  ASTRO_BASE_PATH: "/"
+  RS_DOCS_CUSTOM_DOMAIN: "rs.graphrefly.dev"
 
 permissions:
   contents: read
@@ -11,12 +24,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: rust-api-docs-pages
-  cancel-in-progress: true
+  group: rust-pages-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build rustdoc
+    name: Build Rust Starlight docs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,42 +40,43 @@ jobs:
         with:
           toolchain: "1.95"
 
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Enable Corepack (pnpm)
+        working-directory: website
+        run: |
+          corepack enable
+          corepack install
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-api-docs
+          shared-key: rust-docs-site
 
-      - name: Build public Rust API docs
-        run: cargo doc -p graphrefly-rs --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: "-D warnings"
+      - name: Install docs website dependencies
+        working-directory: website
+        run: pnpm install --frozen-lockfile
 
-      - name: Add Pages root redirect
-        run: |
-          cat > target/doc/index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-            <head>
-              <meta charset="utf-8">
-              <meta http-equiv="refresh" content="0; url=graphrefly/index.html">
-              <title>GraphReFly Rust API Docs</title>
-            </head>
-            <body>
-              <a href="graphrefly/index.html">Open GraphReFly Rust API docs</a>
-            </body>
-          </html>
-          HTML
+      - name: Build Rust docs site
+        working-directory: website
+        run: pnpm build
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: website/dist
 
   deploy:
-    name: Deploy rustdoc to Pages
+    if: github.event_name != 'pull_request'
+    name: Deploy docs to Pages
     needs: build
     runs-on: ubuntu-latest
     environment:

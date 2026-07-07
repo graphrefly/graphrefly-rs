@@ -1,0 +1,52 @@
+/* GraphReFly Rust docs tokens — aligned with the package Starlight sites. */
+
+@import url("https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;500;600;700;800;900&family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+	/* Shared GraphReFly docs palette */
+	--gr-ice: #f4f7f9;
+	--gr-ice-warm: #eceff2;
+	--gr-paper: #ffffff;
+	--gr-navy: #0a1628;
+	--gr-navy-deep: #050e1a;
+	--gr-navy-mid: #1a2940;
+	--gr-ink: #07121e;
+	--gr-ink-mute: #5c6675;
+	--gr-ink-faint: #98a0ac;
+	--gr-rule: rgba(7, 18, 30, 0.1);
+	--gr-rule-deep: rgba(7, 18, 30, 0.22);
+	--gr-lime: #c8ff00;
+	--gr-lime-deep: #9bc400;
+	--gr-magenta: #ff2d75;
+	--gr-red: #ff3b30;
+
+	--gr-display: "Big Shoulders Display", system-ui, sans-serif;
+	--gr-sans: "Sora", system-ui, sans-serif;
+	--gr-mono: "JetBrains Mono", ui-monospace, monospace;
+
+	--gr-deep: var(--gr-ink);
+	--gr-on-accent: var(--gr-ink);
+	--gr-preview-bg: var(--gr-ice-warm);
+	--gr-surface: var(--gr-paper);
+	--gr-surface-raised: var(--gr-ice-warm);
+	--gr-text: var(--gr-ink);
+	--gr-text-muted: var(--gr-ink-mute);
+	--gr-border: var(--gr-rule-deep);
+	--gr-border-subtle: var(--gr-rule);
+
+	/* Semantic aliases used by the docs chrome */
+	--color-bg: var(--gr-ice);
+	--color-surface: var(--gr-paper);
+	--color-surface2: var(--gr-ice-warm);
+	--color-border: var(--gr-rule-deep);
+	--color-text: var(--gr-ink);
+	--color-text-dim: var(--gr-ink-mute);
+	--color-accent: var(--gr-lime-deep);
+	--font-sans: var(--gr-sans);
+	--font-mono: var(--gr-mono);
+	--font-display: var(--gr-display);
+
+	/* Status accents */
+	--gr-warn: #f0c86a;
+	--gr-danger: #ef6e7a;
+}
