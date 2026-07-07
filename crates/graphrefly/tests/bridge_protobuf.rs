@@ -25,13 +25,18 @@ struct VectorRecord {
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../graphrefly/spec/fixtures/protobuf/wire_bridge_envelope.v1.jsonl")
+    spec_root().join("fixtures/protobuf/wire_bridge_envelope.v1.jsonl")
 }
 
 fn wire_edge_fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../graphrefly/spec/fixtures/protobuf/wire_edge_frame.v1.jsonl")
+    spec_root().join("fixtures/protobuf/wire_edge_frame.v1.jsonl")
+}
+
+fn spec_root() -> PathBuf {
+    std::env::var_os("GRAPHREFLY_SPEC_ROOT").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../graphrefly/spec"),
+        PathBuf::from,
+    )
 }
 
 fn vectors(path: PathBuf, message: &str) -> Vec<VectorRecord> {

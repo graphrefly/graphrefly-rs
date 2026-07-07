@@ -73,6 +73,13 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Checkout graphrefly authority fixtures
+        uses: actions/checkout@v5
+        with:
+          repository: graphrefly/graphrefly
+          ref: main
+          path: graphrefly-authority
+
       # nextest `ci` profile: `default-filter = "all()"` so the
       # cascade_depth stack-safety stress tests (quarantined out of the
       # local default loop in .config/nextest.toml) DO run here — the
@@ -82,6 +89,7 @@ jobs:
       - name: Cargo nextest (graphrefly-rs, ci profile — incl. cascade_depth)
         run: cargo nextest run -p graphrefly-rs --profile ci --all-targets
         env:
+          GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec
           RUSTFLAGS: "-D warnings"
 
       - name: Rustdoc mechanical generator check
