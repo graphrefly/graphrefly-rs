@@ -80,7 +80,7 @@ impl PyValue {
 
 impl Clone for PyValue {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
+        Python::attach(|py| Self {
             object: self.object.clone_ref(py),
         })
     }
@@ -88,7 +88,7 @@ impl Clone for PyValue {
 
 fn register_py_checkpoint_encoder() {
     graphrefly_rs::__binding_private::register_checkpoint_json_encoder::<PyValue>(|value, path| {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             py_to_checkpoint_json(py, &value.object).map_err(|err| {
                 GraphRestoreError::new(format!(
                     "checkpoint: value at {path} is not strict JSON compatible: {err}"
@@ -112,7 +112,7 @@ impl fmt::Display for PyCallbackError {
 impl Error for PyCallbackError {}
 
 fn py_exception_to_error(error: PyErr) -> graphrefly_rs::GraphError {
-    let message = Python::with_gil(|py| format_callback_error(py, &error));
+    let message = Python::attach(|py| format_callback_error(py, &error));
     Box::new(PyCallbackError { message })
 }
 
@@ -185,7 +185,7 @@ fn emit_callback_result(ctx: &Ctx, pending_fatal: &PendingFatal, result: PyResul
             ctx.emit(PyValue::new(value));
         }
         Err(error) => {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 if py_error_is_fatal(py, &error) {
                     store_pending_fatal(pending_fatal, error);
                     graphrefly_rs::host_boundary::abort_host_boundary();
@@ -203,7 +203,7 @@ fn handle_callback_void_result(
     result: PyResult<Py<PyAny>>,
 ) {
     if let Err(error) = result {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             if py_error_is_fatal(py, &error) {
                 store_pending_fatal(pending_fatal, error);
                 graphrefly_rs::host_boundary::abort_host_boundary();
@@ -792,7 +792,7 @@ fn py_status_node<T: Clone + 'static>(
         vec![dep.erased()],
         move |ctx| {
             for value in ctx.batch::<T>(0) {
-                Python::with_gil(|py| match map(py, value.as_ref()) {
+                Python::attach(|py| match map(py, value.as_ref()) {
                     Ok(value) => ctx.emit(PyValue::new(value)),
                     Err(error) => {
                         store_pending_fatal(&pending, error);
@@ -818,7 +818,7 @@ fn py_status_node_in_topology<T: Clone + 'static>(
         vec![dep.erased()],
         move |ctx| {
             for value in ctx.batch::<T>(0) {
-                Python::with_gil(|py| match map(py, value.as_ref()) {
+                Python::attach(|py| match map(py, value.as_ref()) {
                     Ok(value) => ctx.emit(PyValue::new(value)),
                     Err(error) => {
                         store_pending_fatal(&pending, error);
@@ -901,7 +901,7 @@ fn py_protobuf_filter_node(
         vec![events.erased()],
         move |ctx| {
             for event in ctx.batch::<PyProtobufEvent>(0) {
-                Python::with_gil(|py| match filter(py, event.as_ref()) {
+                Python::attach(|py| match filter(py, event.as_ref()) {
                     Ok(Some(value)) => ctx.emit(PyValue::new(value)),
                     Ok(None) => {}
                     Err(error) => {
@@ -995,7 +995,7 @@ fn py_ack_filter_node(
         vec![events.erased()],
         move |ctx| {
             for event in ctx.batch::<PyAckDriverEvent>(0) {
-                Python::with_gil(|py| match filter(py, event.as_ref()) {
+                Python::attach(|py| match filter(py, event.as_ref()) {
                     Ok(Some(value)) => ctx.emit(PyValue::new(value)),
                     Ok(None) => {}
                     Err(error) => {
@@ -1022,7 +1022,7 @@ fn py_ack_status_node(
         vec![events.erased()],
         move |ctx| {
             for event in ctx.batch::<PyAckDriverEvent>(0) {
-                Python::with_gil(|py| match py_ack_status(py, event.as_ref(), timeout_ms) {
+                Python::attach(|py| match py_ack_status(py, event.as_ref(), timeout_ms) {
                     Ok(value) => ctx.emit(PyValue::new(value)),
                     Err(error) => {
                         store_pending_fatal(&pending, error);
@@ -1112,10 +1112,10 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 }
 
 fn py_bytes_like_to_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
-    if let Ok(bytes) = value.downcast::<PyBytes>() {
+    if let Ok(bytes) = value.cast::<PyBytes>() {
         return Some(bytes.as_bytes().to_vec());
     }
-    if let Ok(bytes) = value.downcast::<PyByteArray>() {
+    if let Ok(bytes) = value.cast::<PyByteArray>() {
         // SAFETY: the bytearray slice is used only long enough to copy into an
         // owned Vec; no Python code or PyO3 API is called while the slice lives.
         return Some(unsafe { bytes.as_bytes() }.to_vec());
@@ -1171,7 +1171,7 @@ fn py_bound_to_checkpoint_json(
         let value = value.extract::<String>()?;
         return Ok(GraphCheckpointJson::String(value));
     }
-    if let Ok(sequence) = value.downcast_exact::<PyList>() {
+    if let Ok(sequence) = value.cast_exact::<PyList>() {
         let ptr = sequence.as_ptr() as usize;
         if !seen.insert(ptr) {
             return Err(PyValueError::new_err(
@@ -1185,7 +1185,7 @@ fn py_bound_to_checkpoint_json(
         seen.remove(&ptr);
         return Ok(GraphCheckpointJson::Array(out));
     }
-    if let Ok(dict) = value.downcast_exact::<PyDict>() {
+    if let Ok(dict) = value.cast_exact::<PyDict>() {
         let ptr = dict.as_ptr() as usize;
         if !seen.insert(ptr) {
             return Err(PyValueError::new_err(
@@ -1821,7 +1821,7 @@ fn commit_py_ctx(py: Python<'_>, py_ctx: &Py<PyCtx>, ctx: &Ctx, pending_fatal: &
 
 fn invoke_py_ctx_callback(ctx: &Ctx, callback: &Py<PyAny>, pending_fatal: &PendingFatal) {
     let active = Rc::new(Cell::new(true));
-    let result = Python::with_gil(|py| {
+    let result = Python::attach(|py| {
         let initial_state = ctx_state_value(py, ctx)?;
         let py_ctx = Py::new(
             py,
@@ -1864,7 +1864,7 @@ fn call_py_hook_callback(
     pending_fatal: &PendingFatal,
     hook_ctx: &DeferredCtx,
 ) {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         if let Err(error) = callback.call0(py) {
             if py_error_is_fatal(py, &error) {
                 store_pending_fatal(pending_fatal, error);
@@ -2039,7 +2039,7 @@ impl GraphRestoreDescriptor for PyRestoreDescriptorBridge {
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> GraphRestoreResult<RestoreNodeDefinition> {
         let recorded = Rc::new(RefCell::new(None));
         let active = Rc::new(Cell::new(true));
-        Python::with_gil(|py| -> GraphRestoreResult<()> {
+        Python::attach(|py| -> GraphRestoreResult<()> {
             let py_ctx = Py::new(
                 py,
                 PyRestoreContext {
@@ -2241,7 +2241,7 @@ impl PyGraph {
                 vec![inbound_bytes.erased()],
                 move |ctx| {
                     for value in ctx.batch::<PyValue>(0) {
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let object = value.object.bind(py);
                             let Some(bytes) = py_bytes_like_to_vec(object) else {
                                 ctx.emit(WireBridgeIngress::<WireBridgeProtobufDataBody>::Invalid(
@@ -2278,7 +2278,7 @@ impl PyGraph {
             vec![inbound_bytes.erased(), bridge_core.outbound.erased()],
             move |ctx| {
                 for value in ctx.batch::<PyValue>(0) {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         let object = value.object.bind(py);
                         let Some(bytes) = py_bytes_like_to_vec(object) else {
                             ctx.emit(PyProtobufEvent::Issue {
@@ -2355,7 +2355,7 @@ impl PyGraph {
                             &bridge_to_protobuf_envelope(envelope.as_ref().clone()),
                         );
                         if let Some(bytes) = encoded.bytes {
-                            Python::with_gil(|py| {
+                            Python::attach(|py| {
                                 ctx.emit(PyValue::new(
                                     PyBytes::new(py, &bytes).into_any().unbind(),
                                 ));
@@ -2443,7 +2443,7 @@ impl PyGraph {
             py_wire_edge_group_issue,
         );
         let mut inbound_keepalives = Vec::new();
-        let inbound_edges_dict = Python::with_gil(|py| -> PyResult<Py<PyDict>> {
+        let inbound_edges_dict = Python::attach(|py| -> PyResult<Py<PyDict>> {
             let dict = PyDict::new(py);
             for (edge_id, node) in &group.inbound {
                 let py_edge = py_bytes_node_in_topology(
@@ -2521,7 +2521,7 @@ impl PyGraph {
                             if admitted_version.borrow().as_ref() == Some(&version) {
                                 continue;
                             }
-                            Python::with_gil(|py| {
+                            Python::attach(|py| {
                                 if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
                                     *admitted_version.borrow_mut() = Some(version.clone());
                                     ctx.emit(bytes);
@@ -2538,7 +2538,7 @@ impl PyGraph {
                 vec![node.erased_core()],
                 move |ctx| {
                     for value in ctx.batch::<PyValue>(0) {
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             if let Some(bytes) = py_bytes_like_to_vec(value.object.bind(py)) {
                                 drop(bytes);
                                 return;
@@ -2662,7 +2662,7 @@ impl PyGraph {
             py_wire_edge_group_issue,
         );
         let inbound_edges_dict =
-            Python::with_gil(|py| -> PyResult<Py<PyDict>> { Ok(PyDict::new(py).unbind()) })?;
+            Python::attach(|py| -> PyResult<Py<PyDict>> { Ok(PyDict::new(py).unbind()) })?;
         raise_pending_fatal(&self.pending_fatal)?;
         Ok(PyWireEdgeGroup {
             group,
@@ -2786,7 +2786,7 @@ impl PyGraph {
                     let mut emitted = false;
                     for value in ctx.batch::<PyValue>(0) {
                         let mut valid_clock = true;
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let object = value.object.bind(py);
                             let issue_message = if object.is_instance_of::<PyBool>() {
                                 Some("wire_bridge_ack_driver clock facts must be non-negative integers")
@@ -2961,7 +2961,7 @@ impl PyGraph {
             let callback_pending_fatal = pending_fatal.clone();
             let node = self.graph.producer_opts(
                 move |ctx| {
-                    let result = Python::with_gil(|py| callback.call0(py));
+                    let result = Python::attach(|py| callback.call0(py));
                     emit_callback_result(ctx, &callback_pending_fatal, result);
                 },
                 graph_node_opts(name),
@@ -3034,7 +3034,7 @@ impl PyGraph {
                 deps,
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
-                    let result = Python::with_gil(|py| {
+                    let result = Python::attach(|py| {
                         let initial_state = ctx_state_value(py, ctx)?;
                         let py_ctx = Py::new(
                             py,
@@ -3118,7 +3118,7 @@ impl PyGraph {
                 deps,
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
-                    let result = Python::with_gil(|py| {
+                    let result = Python::attach(|py| {
                         let initial_state = ctx_state_value(py, ctx)?;
                         let py_ctx = Py::new(
                             py,
@@ -3251,7 +3251,7 @@ impl PyGraph {
             let node = self.graph.producer_opts::<PyValue, _>(
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
-                    let result = Python::with_gil(|py| {
+                    let result = Python::attach(|py| {
                         let py_ctx = Py::new(
                             py,
                             PyAsyncCtx {
@@ -3311,7 +3311,7 @@ impl PyGraph {
                 deps,
                 move |ctx| {
                     let active = Rc::new(Cell::new(true));
-                    let result = Python::with_gil(|py| {
+                    let result = Python::attach(|py| {
                         let args = dep_args_from_ctx(py, ctx)?;
                         let py_ctx = Py::new(
                             py,
@@ -3369,7 +3369,7 @@ impl PyGraph {
         let node = catch_graph_panic(&self.pending_fatal, || {
             let callback_pending_fatal = pending_fatal.clone();
             let op = Operator::<PyValue>::new("derived", move |ctx| {
-                let result = Python::with_gil(|py| {
+                let result = Python::attach(|py| {
                     let args = PyTuple::new(py, dep_args_from_ctx(py, ctx)?)?;
                     callback.call1(py, args)
                 });
@@ -3403,12 +3403,12 @@ impl PyGraph {
         let node = catch_graph_panic(&self.pending_fatal, || {
             let callback_pending_fatal = pending_fatal.clone();
             let op = Operator::<PyValue>::new("effect", move |ctx| {
-                let result = Python::with_gil(|py| {
+                let result = Python::attach(|py| {
                     let args = PyTuple::new(py, dep_args_from_ctx(py, ctx)?)?;
                     callback.call1(py, args)
                 });
                 if let Err(error) = result {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         if py_error_is_fatal(py, &error) {
                             store_pending_fatal(&callback_pending_fatal, error);
                             graphrefly_rs::host_boundary::abort_host_boundary();
@@ -3433,7 +3433,7 @@ impl PyGraph {
         raise_pending_fatal(&self.pending_fatal)?;
         catch_graph_panic(&self.pending_fatal, || {
             self.graph.batch(|batch| {
-                let result = Python::with_gil(|py| callback.call0(py));
+                let result = Python::attach(|py| callback.call0(py));
                 if result.is_err() {
                     batch.rollback();
                 }
@@ -3487,7 +3487,7 @@ impl PyGraph {
         let pending_fatal = self.pending_fatal.clone();
         let observer = catch_graph_panic(&self.pending_fatal, || {
             self.graph.observe().subscribe(move |event| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let payload = match &event.msg {
                         graphrefly_rs::ObserveMessage::Data(value) => value_from_any(py, value),
                         graphrefly_rs::ObserveMessage::Error(error) => {
@@ -3536,7 +3536,7 @@ impl PyGraph {
     }
 }
 
-#[pyclass(name = "Node", unsendable)]
+#[pyclass(name = "Node", unsendable, from_py_object)]
 struct PyNode {
     node: Node<PyValue>,
     graph_node: Option<GraphNode>,
@@ -3894,7 +3894,7 @@ impl PyNode {
         let unsubscribe = catch_graph_panic(&self.pending_fatal, || {
             let callback_pending_fatal = pending_fatal.clone();
             let callback = move |msg: &Message<AnyValue>| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let kind = format!("{msg:?}");
                     match py_value_from_msg(py, msg)
                         .and_then(|payload| callback.call1(py, (kind, payload)))
@@ -4058,7 +4058,7 @@ mod tests {
 
     #[test]
     fn python_callback_runs_through_rust_graph_and_subscriber_observes_wave() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let module = PyModule::from_code(
                 py,
                 c_str!(

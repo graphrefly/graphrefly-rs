@@ -16,18 +16,10 @@
 # `--test-threads N` or `NEXTEST_TEST_THREADS`.
 test-threads = "num-cpus"
 
-# Quarantine the `cascade_depth` stress tests out of the inner dev loop.
-# They are NOT benchmarks — they are stack-safety regression guards (deep
-# 5000-node chain must not overflow the OS thread stack; iterative-walk
-# invariant for terminate/teardown/invalidate cascades). But that
-# guarantee is binary and only needs re-checking when cascade code
-# changes / before merge, not on every `cargo nextest run`. They are ~95%
-# of suite wall time (4 tests × ~13.6s vs 304 tests ≤0.11s each), so
-# excluding them takes the default loop from ~14s → ~1s.
-#
-# Run them explicitly with the full suite via:  cargo tc          (ci profile)
-#                                       or:  cargo nextest run --profile stress
-default-filter = "not binary(cascade_depth)"
+# Run the active suite by default. The old `cascade_depth` stress-test
+# binary was removed with the retired crate layout; keeping a filter for
+# it makes newer nextest versions reject the config before discovery.
+default-filter = "all()"
 
 # A correct unit/integration test in this suite finishes in well under a
 # second. If one runs 60s it is almost certainly deadlocked or busy-waiting
@@ -44,8 +36,7 @@ status-level = "pass"
 final-status-level = "slow"
 
 [profile.ci]
-# CI runs EVERYTHING, including the quarantined cascade_depth stress
-# tests — the stack-safety invariant must be gated before merge.
+# CI runs every active test target.
 default-filter = "all()"
 # CI wants the full failure picture, not first-failure.
 fail-fast = false
@@ -57,9 +48,7 @@ failure-output = "immediate-final"
 path = "junit.xml"
 
 [profile.stress]
-# On-demand full run from the dev box (e.g. after touching cascade /
-# terminate / teardown / invalidate code). Same as default but WITHOUT
-# the cascade_depth quarantine, so the stack-safety guards execute.
+# On-demand full run from the dev box.
 default-filter = "all()"
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = true
