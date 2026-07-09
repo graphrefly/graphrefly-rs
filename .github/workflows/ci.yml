@@ -46,7 +46,7 @@ jobs:
       matrix:
         toolchain: ["1.95"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -74,7 +74,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Checkout graphrefly authority fixtures
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: graphrefly/graphrefly
           ref: main
@@ -113,7 +113,7 @@ jobs:
     if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -128,7 +128,7 @@ jobs:
     if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -159,10 +159,10 @@ jobs:
     if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Java (TLC requires JRE 11+)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"

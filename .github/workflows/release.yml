@@ -33,7 +33,7 @@
 #      (Release-plz opens a version-bump PR, which the default
 #      GITHUB_TOKEN can't do under the org's default policy.) The
 #      App-token path below requires:
-#        - Org var:    GRAPHREFLY_WRITE_CONTENT_APP_ID
+#        - Org var:    GRAPHREFLY_WRITE_CONTENT_APP_CLIENT_ID
 #        - Org secret: GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY
 #        - App installed on graphrefly/graphrefly-rs with permissions:
 #          Contents=write, Issues=write, Pull requests=write,
@@ -79,13 +79,13 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_ID }}
+          client-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_CLIENT_ID }}
           private-key: ${{ secrets.GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -126,13 +126,13 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_ID }}
+          client-id: ${{ vars.GRAPHREFLY_WRITE_CONTENT_APP_CLIENT_ID }}
           private-key: ${{ secrets.GRAPHREFLY_WRITE_CONTENT_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
