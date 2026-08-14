@@ -141,8 +141,8 @@ First determine whether the failure is a Rust implementation bug or a protocol
 authority question:
 
 1. Check the governing rule in `~/src/graphrefly/spec/rules.jsonl`.
-2. Check the governing decision in
-   `~/src/graphrefly/decisions/decisions.jsonl`.
+2. Resolve the governing origin-qualified decision through
+   `~/src/graphrefly/authority/ledgers.jsonl` and read its unique owner ledger.
 3. If the rule is clear, fix the Rust implementation or docs to match it.
 4. If the rule is silent or contradictory, stop and route through the
    spec/decision process instead of choosing silently.

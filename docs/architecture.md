@@ -34,7 +34,7 @@ depending on a TypeScript substrate or reviving structural `Impl` parity.
 | Concern | Authority |
 |---|---|
 | Protocol rules | `~/src/graphrefly/spec/rules.jsonl` |
-| Decisions | `~/src/graphrefly/decisions/decisions.jsonl` |
+| Decisions | `~/src/graphrefly/authority/ledgers.jsonl` → uniquely resolved owner ledger |
 | Sequencing | `~/src/graphrefly/plan/*.jsonl` |
 | Conformance | `~/src/graphrefly/spec/conformance.jsonl` |
 | Formal model | `~/src/graphrefly/formal/*.tla` |

@@ -26,7 +26,10 @@ Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for th
 
 | Concern | Source of truth |
 |---|---|
-| **Decisions (why)** — unified D# log | `~/src/graphrefly/decisions/decisions.jsonl` |
+| **Decision locator / global resolver** | `~/src/graphrefly/authority/ledgers.jsonl` + `authority/federation.mjs` |
+| **Root language-neutral / cross-project decisions** | `~/src/graphrefly/decisions/decisions.jsonl` |
+| **Rust package-local decisions** | `decisions/decisions.jsonl` (`graphrefly-rs:<D#>`) |
+| **Relocated root-origin Rust history** | `decisions/root-origin-history.jsonl` (`graphrefly:<D#>`, locator-owned; never for new records) |
 | **Design narrative** — L0–L6 locks, F-* constraints, spec-amendment list | `~/src/graphrefly/sessions/active/SESSION-clean-slate-redesign.md` (DS-1) |
 | **Protocol rules (宪法)** | `~/src/graphrefly/spec/rules.jsonl` (changed via `/spec-amend`) |
 | **Conformance scenarios (parity)** | `~/src/graphrefly/spec/conformance.jsonl` (driven via `/conformance`) |
@@ -129,10 +132,12 @@ develop against or reintroduce them.
 - **spec-first** (F-NO-IMPL-DEFINED): any protocol-behavior change → amend
   `~/src/graphrefly` `spec/rules.jsonl` + `formal/*.tla` + `spec/conformance.jsonl`
   **before** code (`/spec-amend`). The substrate must satisfy the conformance scenarios.
-- **decision-first**: any architectural lock → a `D#` in `decisions.jsonl` before code
-  (`/design-review` → user approval → append).
+- **decision-first + owner-first**: protocol, cross-runtime and cross-project locks stay in
+  `graphrefly`; Rust-only package/implementation locks go to `graphrefly-rs:decisions/decisions.jsonl`.
+  Never duplicate a body between ledgers; qualify cross-repo refs.
 - **consistency gate**: `node ~/src/graphrefly/dashboard/build.mjs --check` after
   touching any spec/decision/plan jsonl.
+  After owner-ledger changes run `npm --prefix ~/src/graphrefly run authority:check:workspace`.
 
 ## Commands
 
@@ -165,3 +170,6 @@ Follow the durable project values named in the clean-slate skills and
 `project_rust_clean_slate_kickoff`, and
 `feedback_three_gate_substrate_convergence`. Do not treat any TypeScript memory
 directory as a Rust documentation authority.
+
+New Rust-local decisions must satisfy ~/src/graphrefly/authority/README.md. The
+root-origin-history ledger is relocation-only.
