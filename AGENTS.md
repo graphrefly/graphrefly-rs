@@ -34,7 +34,8 @@ Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for th
 | **Protocol rules (宪法)** | `~/src/graphrefly/spec/rules.jsonl` (changed via `/spec-amend`) |
 | **Conformance scenarios (parity)** | `~/src/graphrefly/spec/conformance.jsonl` (driven via `/conformance`) |
 | **Formal model** | `~/src/graphrefly/formal/*.tla` (+ MC configs) |
-| **Sequencer / backlog / anti-patterns** | `~/src/graphrefly/plan/{phases,backlog,antipatterns}.jsonl` (this repo = CSP-5/CSP-6) |
+| **Cross-project program / backlog / anti-patterns** | `~/src/graphrefly/plan/{phases,backlog,antipatterns}.jsonl` |
+| **Rust implementation sequencer** | `plan/work.jsonl` (`graphrefly-rs:<work-id>`; currently empty, registered by root `authority/work-ledgers.jsonl`) |
 | **Shared public docs / graphrefly.dev architecture** | `~/src/graphrefly/docs` + guide records (D563) |
 | **Rendered authority view** (progress / structure / gaps) | `~/src/graphrefly/dashboard/` (`node dashboard/build.mjs`) |
 
