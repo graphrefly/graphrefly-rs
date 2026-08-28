@@ -88,6 +88,16 @@ triggers · single source of truth · **no autonomous decisions** (surface spec�
 conflicts, don't silently pick) · no implement without explicit approval · verify
 premise before greenfield.
 
+## Personal project governance
+
+Before decision or work admission, design review, dispatch, QA, long-running goal progression,
+live/provider/spend authorization, retry, or stalled-work recovery, load and follow the personal
+`$project-governance` skill at `~/.codex/skills/project-governance/SKILL.md`. It governs
+cross-project record and permission classification; Rust-local and root GraphReFly authorities remain
+canonical for their own concerns. The concrete GraphReFly family mapping is proposed as
+`graphrefly:B137`; do not invent that schema or migrate history before its separate approval, and do
+not mint a D# merely for an attempt, rerun, receipt, incident, provider/model change, or spend grant.
+
 ## Rust-specific floor (clean-slate)
 
 1. **Single-thread = `Rc<RefCell<…>>`, NOT `Arc<Mutex<…>>` (D22).** A graph is one
