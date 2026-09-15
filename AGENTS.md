@@ -22,7 +22,8 @@ semantics.
 
 ## Authority — where the truth lives (`~/src/graphrefly`)
 
-Read `~/src/graphrefly/CLAUDE.md` first — it is the single-source index for the design.
+For protocol or cross-project work, use `~/src/graphrefly/AGENTS.md` to locate the governing
+authority. Read only the records relevant to this task.
 
 | Concern | Source of truth |
 |---|---|
@@ -85,13 +86,13 @@ D32 and D563 boundaries sharp:
 
 Durable values (memory `feedback_*`): no backward compat (pre-1.0) · no imperative
 triggers · single source of truth · **no autonomous decisions** (surface spec↔code
-conflicts, don't silently pick) · no implement without explicit approval · verify
+conflicts, don't silently pick) · implement within the user’s requested scope; retain approval for new semantic or architectural locks · verify
 premise before greenfield.
 
 ## Personal project governance
 
-Before decision or work admission, design review, dispatch, QA, long-running goal progression,
-live/provider/spend authorization, retry, or stalled-work recovery, load and follow the personal
+When changing authority records or resolving an execution, spend, retry, or stalled-work
+authorization boundary, load and follow the personal
 `$project-governance` skill at `~/.codex/skills/project-governance/SKILL.md`. It governs
 cross-project record and permission classification; Rust-local and root GraphReFly authorities remain
 canonical for their own concerns. The concrete GraphReFly family mapping is proposed as
@@ -184,3 +185,13 @@ directory as a Rust documentation authority.
 
 New Rust-local decisions must satisfy ~/src/graphrefly/authority/README.md. The
 root-origin-history ledger is relocation-only.
+
+## Shared build and human review
+
+Use the personal `~/.codex/skills/bmad-build/SKILL.md` inside the work selected by this repository's
+dispatch/Goal workflow. Use `~/.codex/skills/bmad-build/references/qa.md` for machine-review lenses,
+finding triage and repairs, together with this repository's own QA checks and completion gates.
+Use `~/.codex/skills/bmad-checkpoint-preview/SKILL.md` for the human review trail; it replaces the old
+repository-ownership-practice checks. Ordinary delivery uses build-handoff mode; explicit checkpoint
+or `--practice` requests use interactive review. The shared skills own only this personal workflow;
+project authority, semantic approvals, execution permissions and work records remain locally governed.
