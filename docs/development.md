@@ -146,3 +146,44 @@ authority question:
 3. If the rule is clear, fix the Rust implementation or docs to match it.
 4. If the rule is silent or contradictory, stop and route through the
    spec/decision process instead of choosing silently.
+
+## Rust contributor constraints
+
+Relocated from AGENTS under the user-approved B142 editorial batch. These retain
+existing constraints; root rules and owner decisions still govern meaning.
+
+
+1. **Single-thread = `Rc<RefCell<…>>`, NOT `Arc<Mutex<…>>` (D22).** A graph is one
+   causal/concurrency domain; the substrate is `!Send + !Sync`. The actor model and
+   per-partition `ReentrantMutex` machinery of the old port are **gone** — they were
+   the ~9.5× concurrency tax (memory `project_rust_perf_value_investigation`). Lock the
+   `!Send`/`!Sync` boundary with `static_assertions` once types stabilize.
+2. **No async runtime in the core (F-SYNC-CORE).** `dispatcher.invoke` is sync. `tokio`
+   enters only behind the `LocalAsync` pool (D20) and the wire bridge.
+3. **No `unsafe`. Anywhere.** `#![forbid(unsafe_code)]` at the crate root. Find a safe
+   abstraction; if you truly cannot, escalate to spec-level discussion first.
+4. **Error = unknown, single value generic (D31).** `Node<T>` carries one value
+   generic; the error channel is `Box<dyn Error>` (`GraphError`). No typed-error
+   combinatorial explosion.
+5. **No `unwrap()`/`expect()` on user-facing paths.** `thiserror` enums for domain
+   errors; `unwrap` only in tests or genuinely-impossible-by-construction paths (with a
+   comment).
+6. **`#[must_use]` on value-returning public fns; `clippy::pedantic` warn-by-default.**
+   Allow per-need with a comment, never silently.
+7. **Public ids behind newtypes** (`LockId`, `Handle`, future `NodeId`) — never raw ints.
+
+
+## Workflow and command observation
+
+Follow [root contributor guidance](../../graphrefly/guide/contribute.jsonl),
+[the authority contract](../../graphrefly/authority/README.md), personal governance
+and the [local workflow routing](../AGENTS.md). Keep package-local decisions local;
+root-origin history is relocation-only. Do not restore retired port models or
+structural parity. Surface spec/code conflicts; do not pick new semantics.
+
+Long commands use `scripts/run-logged.sh` and its `<<<RUN-LOGGED:DONE>>>` sentinel.
+Run the actual single-crate command through it; do not use the old port-era gate
+sequence, background cargo, buffered output pipelines or sleep-based completion
+inference. Use mise in agent shells; `~/.cargo/bin/cargo` is the PATH fallback.
+
+[Documentation categories](README.md) locate work, drafts and dated evidence.
