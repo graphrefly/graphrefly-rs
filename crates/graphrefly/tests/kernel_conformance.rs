@@ -2481,3 +2481,556 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     assert!(reports.borrow().iter().any(|r| r.error == "sink boom"));
     graphrefly::set_host_reporter(previous);
 }
+
+// ── Checkpoint stage: R-checkpoint@1 (graphrefly:D802) ───────────────────────
+
+mod c38 {
+    use super::*;
+    use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
+    use graphrefly::{
+        graph, restore_graph, restore_registry, restored_opts, Graph, GraphCheckpoint,
+        GraphCheckpointJson, GraphNodeOpts, GraphRestoreEntry, GraphRestoreResult,
+        RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind,
+        StateRestoreDescriptor,
+    };
+    use serde_json::json;
+
+    type Json = GraphCheckpointJson;
+
+    /// Counters a test reads: function runs per recipe, timer starts and stops.
+    #[derive(Default, Clone)]
+    pub(super) struct Counters {
+        pub p_runs: Rc<Cell<usize>>,
+        pub p_inputs: Rc<RefCell<Vec<(usize, bool)>>>,
+        pub timer_runs: Rc<Cell<usize>>,
+        pub timers_started: Rc<Cell<usize>>,
+        pub timers_stopped: Rc<Cell<usize>>,
+        pub timer: Rc<RefCell<Option<graphrefly::DeferredCtx>>>,
+    }
+
+    /// p: sums the values it receives into its private state and sends the total.
+    fn p_fn(counters: &Counters) -> impl Fn(&graphrefly::Ctx) + 'static {
+        let counters = counters.clone();
+        move |ctx| {
+            counters.p_runs.set(counters.p_runs.get() + 1);
+            for i in 0..ctx.dep_len() {
+                counters
+                    .p_inputs
+                    .borrow_mut()
+                    .push((ctx.batch::<Json>(i).len(), ctx.terminal(i).is_some()));
+            }
+            let mut total = ctx
+                .state_get::<Json>()
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let batch = ctx.batch::<Json>(0);
+            for v in &batch {
+                total += v.as_i64().unwrap_or(0);
+            }
+            ctx.state_set(json!(total));
+            if !batch.is_empty() {
+                ctx.emit(json!(total));
+            }
+        }
+    }
+
+    fn fwd(ctx: &graphrefly::Ctx) {
+        if let Some(v) = ctx.batch::<Json>(0).last() {
+            ctx.emit((**v).clone());
+        }
+    }
+
+    fn timer_opts(counters: &Counters, base: graphrefly::NodeOpts) -> graphrefly::NodeOpts {
+        let counters = counters.clone();
+        base.with_setup(move |ctx| {
+            counters
+                .timers_started
+                .set(counters.timers_started.get() + 1);
+            *counters.timer.borrow_mut() = Some(ctx.defer());
+            let stopped = counters.timers_stopped.clone();
+            graphrefly::cleanup(move |_| stopped.set(stopped.get() + 1))
+        })
+    }
+
+    fn timer_fn(counters: &Counters) -> impl Fn(&graphrefly::Ctx) + 'static {
+        let runs = counters.timer_runs.clone();
+        move |_| runs.set(runs.get() + 1)
+    }
+
+    /// Fires the timer source's timer: it counts on in private state and sends it.
+    pub(super) fn fire(counters: &Counters) {
+        let ctx = counters.timer.borrow_mut().take().expect("timer started");
+        let n = ctx
+            .state_get::<Json>()
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + 1;
+        ctx.state_set(json!(n));
+        ctx.down(vec![Message::Data(Rc::new(json!(n)) as AnyValue)]);
+        counters.timer.borrow_mut().get_or_insert(ctx);
+    }
+
+    struct Recipe {
+        ref_: &'static str,
+        counters: Counters,
+    }
+
+    impl GraphRestoreDescriptor for Recipe {
+        fn ref_(&self) -> &str {
+            self.ref_
+        }
+
+        fn define(&self, ctx: RestoreDefineCtx<'_>) -> GraphRestoreResult<RestoreNodeDefinition> {
+            let mut opts = restored_opts(ctx.checkpoint)?;
+            let kind = match self.ref_ {
+                "c38-p" => RestoreNodeKind::NodeJson(Rc::new(p_fn(&self.counters))),
+                "c38-p2" => RestoreNodeKind::NodeJson(Rc::new(fwd)),
+                "c38-fwd" => RestoreNodeKind::NodeJson(Rc::new(fwd)),
+                "c38-timer" => {
+                    opts.node = timer_opts(&self.counters, opts.node);
+                    RestoreNodeKind::NodeJson(Rc::new(timer_fn(&self.counters)))
+                }
+                other => panic!("unknown recipe {other}"),
+            };
+            Ok(RestoreNodeDefinition {
+                factory: self.ref_.to_owned(),
+                kind,
+                opts,
+            })
+        }
+    }
+
+    pub(super) fn registry(counters: &Counters) -> graphrefly::GraphRestoreRegistry {
+        restore_registry(
+            std::iter::once(GraphRestoreEntry::descriptor(StateRestoreDescriptor)).chain(
+                ["c38-p", "c38-p2", "c38-fwd", "c38-timer"].map(|ref_| {
+                    GraphRestoreEntry::descriptor(Recipe {
+                        ref_,
+                        counters: counters.clone(),
+                    })
+                }),
+            ),
+        )
+    }
+
+    pub(super) fn with_recipe(name: &str, ref_: &str) -> GraphNodeOpts {
+        let mut opts = GraphNodeOpts::named(name);
+        opts.restore = Some(RestoreFactoryMeta::registry_ref(ref_));
+        opts
+    }
+
+    pub(super) fn restore(checkpoint: &GraphCheckpoint, counters: &Counters) -> Graph {
+        restore_graph(
+            checkpoint.clone(),
+            RestoreGraphOptions::new(registry(counters)),
+        )
+        .expect("restore succeeds")
+    }
+
+    pub(super) fn state_of(g: &Graph, id: &str) -> graphrefly::State<Json> {
+        g.find(id)
+            .and_then(|n| n.as_state::<Json>())
+            .unwrap_or_else(|| panic!("{id} is a restored state"))
+    }
+
+    pub(super) fn json_node(g: &Graph, id: &str) -> Node<Json> {
+        g.find(id)
+            .unwrap_or_else(|| panic!("{id} restored"))
+            .as_node::<Json>()
+    }
+
+    /// The original graph: state a; p over a; an ended fan-out; the timer source.
+    pub(super) fn build(counters: &Counters) -> (Graph, Node<Json>, Vec<Unsub>) {
+        let g = graph();
+        let a = g.state_opts(json!(1), GraphNodeOpts::named("a"));
+        let p = g.node_opts::<Json, _>(vec![a.erased()], p_fn(counters), with_recipe("p", "c38-p"));
+        let z = g.state_opts(json!(7), GraphNodeOpts::named("z"));
+        let ended = g.node_opts::<Json, _>(vec![z.erased()], fwd, with_recipe("ended", "c38-fwd"));
+        let timer = g.node_opts::<Json, _>(Vec::new(), timer_fn(counters), {
+            let mut opts = with_recipe("timer", "c38-timer");
+            opts.node = timer_opts(counters, opts.node);
+            opts
+        });
+        let mut keep = vec![
+            p.subscribe(|_| {}),
+            ended.subscribe(|_| {}),
+            timer.subscribe(|_| {}),
+        ];
+        z.complete();
+        fire(counters);
+        fire(counters);
+        keep.push(Box::new(|| {}));
+        (g, p, keep)
+    }
+}
+
+/// C-38 — capture and restore (R-checkpoint@1).
+#[test]
+fn c38_capture_and_restore() {
+    use c38::*;
+    use graphrefly::restore_graph;
+    use graphrefly::GraphCheckpointFactory;
+    use serde_json::json;
+    let counters = Counters::default();
+    let (g, p, _keep) = build(&counters);
+    assert_eq!(p.cache(), Some(json!(1)));
+    assert_eq!(counters.timers_started.get(), 1);
+    let checkpoint = g.checkpoint().expect("capture at a wave boundary");
+    let serialized = serde_json::to_value(&checkpoint).unwrap();
+    for node in serialized["nodes"].as_array().unwrap() {
+        assert!(node.get("version").is_none(), "no version evidence");
+        assert!(node.get("status").is_none());
+    }
+
+    // Restore runs no function, sends nothing, and gives the same topology.
+    let runs_before = counters.p_runs.get();
+    let restored = restore(&checkpoint, &counters);
+    assert_eq!(
+        counters.p_runs.get(),
+        runs_before,
+        "no function runs at restore"
+    );
+    let edges = |g: &graphrefly::Graph| {
+        let mut e: Vec<(String, String)> = g
+            .describe()
+            .edges
+            .into_iter()
+            .map(|e| (e.from, e.to))
+            .collect();
+        e.sort();
+        e
+    };
+    let mut saved: Vec<(String, String)> = checkpoint
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    saved.sort();
+    assert_eq!(edges(&restored), saved);
+
+    // The first subscription gets p's saved values; p keeps its private state and
+    // does not run.
+    let rp = json_node(&restored, "p");
+    let (log, _u) = record_arrays(&rp);
+    assert_eq!(arrays(&log), vec![shape(&["START", "DATA"])]);
+    assert_eq!(rp.cache(), Some(json!(1)));
+    assert_eq!(
+        counters.p_runs.get(),
+        runs_before,
+        "unchanged input: no run"
+    );
+    state_of(&restored, "a").set(json!(5));
+    assert_eq!(
+        rp.cache(),
+        Some(json!(6)),
+        "the saved private state continued"
+    );
+
+    // A changed a before the first subscription: one run with only a as input.
+    let restored = restore(&checkpoint, &counters);
+    state_of(&restored, "a").set(json!(3));
+    counters.p_inputs.borrow_mut().clear();
+    let runs = counters.p_runs.get();
+    let rp = json_node(&restored, "p");
+    let _u = rp.subscribe(|_| {});
+    assert_eq!(counters.p_runs.get(), runs + 1);
+    assert_eq!(*counters.p_inputs.borrow(), vec![(1, false)]);
+    assert_eq!(rp.cache(), Some(json!(4)));
+
+    // INVALIDATE then a set before the first subscription is seen as the set alone.
+    let restored = restore(&checkpoint, &counters);
+    let ra = state_of(&restored, "a");
+    ra.invalidate();
+    ra.set(json!(2));
+    counters.p_inputs.borrow_mut().clear();
+    let rp = json_node(&restored, "p");
+    let _u = rp.subscribe(|_| {});
+    assert_eq!(*counters.p_inputs.borrow(), vec![(1, false)]);
+    assert_eq!(rp.cache(), Some(json!(3)));
+
+    // A dependency that only completed brings its COMPLETE without its values.
+    let restored = restore(&checkpoint, &counters);
+    state_of(&restored, "a").complete();
+    let runs = counters.p_runs.get();
+    let rp = json_node(&restored, "p");
+    let (log, _u) = record_arrays(&rp);
+    assert_eq!(
+        counters.p_runs.get(),
+        runs,
+        "auto COMPLETE: the end alone runs nothing"
+    );
+    assert_eq!(rp.status().output, OutputStatus::Completed);
+    assert_eq!(rp.cache(), Some(json!(1)), "the saved value is kept");
+    assert!(arrays(&log).iter().flatten().any(|k| k == "COMPLETE"));
+
+    // The ended node comes back ended, with its dependencies, without private state.
+    let ended = checkpoint.nodes.iter().find(|n| n.id == "ended").unwrap();
+    assert_eq!(
+        ended.terminal,
+        graphrefly::GraphCheckpointTerminal::Complete
+    );
+    assert_eq!(ended.deps, vec!["z".to_owned()]);
+    assert_eq!(ended.private_state, None);
+    let restored = restore(&checkpoint, &counters);
+    let (log, _u) = record_arrays(&json_node(&restored, "ended"));
+    assert_eq!(arrays(&log), vec![shape(&["START", "DATA", "COMPLETE"])]);
+
+    // The timer source: its setup runs once at the first activation, its function
+    // does not run, and it counts on from its saved private state.
+    let restored = restore(&checkpoint, &counters);
+    let started = counters.timers_started.get();
+    let timer_runs = counters.timer_runs.get();
+    let rt = json_node(&restored, "timer");
+    let (tlog, _ut) = record_values_json(&rt);
+    assert_eq!(
+        counters.timers_started.get(),
+        started + 1,
+        "one timer started"
+    );
+    assert_eq!(
+        counters.timer_runs.get(),
+        timer_runs,
+        "its function does not run"
+    );
+    fire(&counters);
+    assert_eq!(tlog.borrow().last(), Some(&vec![json!(3)]));
+
+    // A restored graph captured again before anything subscribes restores the same.
+    let restored = restore(&checkpoint, &counters);
+    let again = restored.checkpoint().expect("capture of a restored graph");
+    assert_eq!(again.nodes, checkpoint.nodes);
+
+    // Capture is refused inside a wave and inside a batch body.
+    let in_batch = graphrefly::batch(|_| g.checkpoint().map(|_| ()));
+    assert!(in_batch.is_err());
+    let in_wave: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+    let trigger = Node::<i32>::state_empty();
+    let _ut = {
+        let (g, in_wave) = (g.clone(), in_wave.clone());
+        trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                *in_wave.borrow_mut() = Some(g.checkpoint().is_err());
+            }
+        })
+    };
+    trigger.set(1);
+    assert_eq!(*in_wave.borrow(), Some(true), "refused inside a wave");
+
+    // Refusals: a missing recipe, a local-only node, a missing received record, and
+    // values or private state that are not JSON.
+    let missing = restore_graph(
+        checkpoint.clone(),
+        graphrefly::RestoreGraphOptions::new(graphrefly::restore_registry([
+            graphrefly::GraphRestoreEntry::descriptor(graphrefly::StateRestoreDescriptor),
+        ])),
+    );
+    assert!(missing.is_err());
+    let mut old_format = checkpoint.clone();
+    old_format
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "p")
+        .unwrap()
+        .received = None;
+    let refused = restore_graph(
+        old_format,
+        graphrefly::RestoreGraphOptions::new(registry(&counters)),
+    );
+    assert!(refused.is_err_and(|e| e.to_string().contains("received")));
+    let mut v1 = checkpoint.clone();
+    v1.version = "graphrefly.checkpoint.v1".into();
+    assert!(restore_graph(
+        v1,
+        graphrefly::RestoreGraphOptions::new(registry(&counters))
+    )
+    .is_err());
+
+    let local = graphrefly::graph();
+    let la = local.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
+    let ln = local.node_opts::<serde_json::Value, _>(
+        vec![la.erased()],
+        |ctx| {
+            if let Some(v) = ctx.batch::<serde_json::Value>(0).last() {
+                ctx.emit((**v).clone());
+            }
+        },
+        graphrefly::GraphNodeOpts::named("local"),
+    );
+    let _ul = ln.subscribe(|_| {});
+    let cp = local.checkpoint().unwrap();
+    assert!(matches!(
+        cp.nodes.iter().find(|n| n.id == "local").unwrap().factory,
+        GraphCheckpointFactory::LocalOnly { .. }
+    ));
+    assert!(restore_graph(
+        cp,
+        graphrefly::RestoreGraphOptions::new(registry(&counters))
+    )
+    .is_err());
+
+    let bad = graphrefly::graph();
+    bad.state_opts(
+        std::time::Duration::from_secs(1),
+        graphrefly::GraphNodeOpts::named("typed"),
+    );
+    assert!(bad
+        .checkpoint()
+        .unwrap_err()
+        .to_string()
+        .contains("not strict JSON"));
+    let bad_state = graphrefly::graph();
+    let src = bad_state.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
+    let holder = bad_state.node_opts::<serde_json::Value, _>(
+        vec![src.erased()],
+        |ctx| ctx.state_set(std::time::Duration::from_secs(1)),
+        with_recipe("holder", "c38-fwd"),
+    );
+    let _uh = holder.subscribe(|_| {});
+    assert!(bad_state
+        .checkpoint()
+        .unwrap_err()
+        .to_string()
+        .contains("not strict JSON"));
+}
+
+/// C-38 — the replace and rewire clauses: the recipe belongs to the instance, a node
+/// replaced onto a later dependency is restored after it, and a rewired node is
+/// restored onto its lifetime's dependencies.
+#[test]
+fn c38_replace_and_rewire_are_restored_as_the_instance() {
+    use c38::*;
+    use graphrefly::restore_graph;
+    use graphrefly::GraphCheckpointFactory;
+    use serde_json::json;
+    let counters = Counters::default();
+    let g = graphrefly::graph();
+    let a = g.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
+    let fwd = |ctx: &graphrefly::Ctx| {
+        if let Some(v) = ctx.batch::<serde_json::Value>(0).last() {
+            ctx.emit((**v).clone());
+        }
+    };
+    let n1 =
+        g.node_opts::<serde_json::Value, _>(vec![a.erased()], fwd, with_recipe("n1", "c38-fwd"));
+    let n2 =
+        g.node_opts::<serde_json::Value, _>(vec![a.erased()], fwd, with_recipe("n2", "c38-fwd"));
+    let n3 =
+        g.node_opts::<serde_json::Value, _>(vec![a.erased()], fwd, with_recipe("n3", "c38-fwd"));
+    let later = g.state_opts(json!(9), graphrefly::GraphNodeOpts::named("later"));
+    let b = g.state_opts(json!(100), graphrefly::GraphNodeOpts::named("b"));
+    let kept: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let r = {
+        let kept = kept.clone();
+        g.node_opts::<serde_json::Value, _>(
+            vec![a.erased()],
+            move |ctx| {
+                *kept.borrow_mut() = Some(ctx.defer());
+                fwd(ctx);
+            },
+            with_recipe("r", "c38-fwd"),
+        )
+    };
+    let _keep: Vec<Unsub> = [&n1, &n2, &n3, &r]
+        .iter()
+        .map(|n| n.subscribe(|_| {}))
+        .collect();
+    // Replace keeping deps with a recipe; replace without a recipe; replace onto a
+    // dependency made after the node.
+    n1.replace(
+        vec![a.erased()],
+        fwd,
+        graphrefly::ReplaceOpts {
+            recipe: Some(json!({ "ref": "c38-p2" })),
+            ..graphrefly::ReplaceOpts::default()
+        },
+    );
+    n2.replace(vec![a.erased()], fwd, graphrefly::ReplaceOpts::default());
+    n3.replace(
+        vec![later.erased()],
+        fwd,
+        graphrefly::ReplaceOpts {
+            recipe: Some(json!({ "ref": "c38-fwd" })),
+            ..graphrefly::ReplaceOpts::default()
+        },
+    );
+    let r_ctx = kept.borrow_mut().take().unwrap();
+    r_ctx.rewire(vec![a.erased(), b.erased()]);
+
+    let checkpoint = g.checkpoint().unwrap();
+    let node = |id: &str| {
+        checkpoint
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        matches!(&node("n1").factory, GraphCheckpointFactory::RegistryRef { ref_, .. } if ref_ == "c38-p2")
+    );
+    assert!(matches!(
+        node("n2").factory,
+        GraphCheckpointFactory::LocalOnly { .. }
+    ));
+    assert_eq!(node("n3").deps, vec!["later".to_owned()]);
+    assert_eq!(
+        node("r").deps,
+        vec!["a".to_owned()],
+        "declared dependencies"
+    );
+    assert_eq!(
+        node("r").lifetime_deps,
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+
+    // n2 is local-only, so this checkpoint does not restore; without it, it does.
+    assert!(restore_graph(
+        checkpoint.clone(),
+        graphrefly::RestoreGraphOptions::new(registry(&counters))
+    )
+    .is_err());
+    let mut without_local = checkpoint.clone();
+    without_local.nodes.retain(|n| n.id != "n2");
+    without_local.edges.retain(|e| e.to != "n2");
+    let restored = restore_graph(
+        without_local,
+        graphrefly::RestoreGraphOptions::new(registry(&counters)),
+    )
+    .expect("restores after each node's dependencies");
+    let rr = json_node(&restored, "r");
+    let _ur = rr.subscribe(|_| {});
+    let deps: Vec<String> = restored
+        .describe()
+        .edges
+        .into_iter()
+        .filter(|e| e.to == "r")
+        .map(|e| e.from)
+        .collect();
+    assert_eq!(
+        deps,
+        vec!["a".to_owned(), "b".to_owned()],
+        "restored onto the lifetime's deps"
+    );
+    let rn3 = json_node(&restored, "n3");
+    let _u3 = rn3.subscribe(|_| {});
+    assert_eq!(rn3.cache(), Some(json!(9)));
+}
+
+/// The DATA payloads (as JSON) of every array a sink received.
+fn record_values_json(
+    node: &Node<serde_json::Value>,
+) -> (Rc<RefCell<Vec<Vec<serde_json::Value>>>>, Unsub) {
+    let log: Rc<RefCell<Vec<Vec<serde_json::Value>>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = log.clone();
+    let unsub = node.subscribe(move |msgs: &[Message<AnyValue>]| {
+        sink.borrow_mut().push(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    Message::Data(v) => v.downcast_ref::<serde_json::Value>().cloned(),
+                    _ => None,
+                })
+                .collect(),
+        );
+    });
+    (log, unsub)
+}

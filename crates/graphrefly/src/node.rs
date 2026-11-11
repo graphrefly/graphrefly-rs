@@ -48,7 +48,7 @@ use crate::protocol::{reject_kernel_only_output, AnyValue, GraphError, Handle, M
 use crate::versioning::{
     advance_node_version, assert_node_version_data_compatible, create_node_version,
     resolve_node_versioning_policy, NodeVersion, NodeVersioningPolicy,
-    ResolvedNodeVersioningPolicy, RestoredNodeVersion,
+    ResolvedNodeVersioningPolicy,
 };
 
 /// A node's cache status (R-node): no retained value, a pending mark it received or
@@ -834,6 +834,13 @@ enum InMsg {
 }
 
 impl InMsg {
+    fn from_terminal(ended: &DepTerminal) -> Self {
+        match ended {
+            DepTerminal::Complete => Self::Complete,
+            DepTerminal::Error(err) => Self::Error(err.clone()),
+        }
+    }
+
     fn from_message(msg: &Msg) -> Option<Self> {
         match msg {
             Message::Start | Message::Pending => None,
@@ -872,6 +879,9 @@ struct DepInput {
     /// The latest value as it was before this wave's arrays (the `Values::prev` sugar).
     value_before_wave: Option<AnyValue>,
     ended: Option<DepTerminal>,
+    /// The values of the last array that carried DATA, as the dependency's snapshot
+    /// holds them: what a checkpoint saves as received (R-checkpoint).
+    last_values: Vec<AnyValue>,
     /// This wave's arrays from the dependency, each kept whole (R-wave).
     frames: Vec<Vec<InMsg>>,
     /// Marked pending in this wave and not settled yet.
@@ -887,19 +897,26 @@ impl DepInput {
         if self.frames.is_empty() {
             self.value_before_wave = self.value.clone();
         }
+        let mut array_values = Vec::new();
         for m in &frame {
             match m {
                 InMsg::Data(v) => {
                     self.has = true;
                     self.value = Some(v.clone());
+                    array_values.push(v.clone());
                 }
                 InMsg::Invalidate => {
                     self.has = false;
                     self.value = None;
+                    self.last_values.clear();
+                    array_values.clear();
                 }
                 InMsg::Complete | InMsg::Error(_) => self.ended = m.terminal(),
                 InMsg::Resolved => {}
             }
+        }
+        if !array_values.is_empty() {
+            self.last_values = array_values;
         }
         let settles = frame.iter().any(InMsg::settles);
         if !frame.is_empty() {
@@ -1110,6 +1127,16 @@ struct NodeAux {
     lifetime: Option<crate::lifetime::Lifetime>,
     /// The closing lifetime's cleanup is running.
     closing: bool,
+    /// A restored node's construction seed, consumed by its first activation
+    /// (R-checkpoint).
+    seed: Option<NodeSeedRuntime>,
+}
+
+/// What a restored computed node starts its first lifetime with (R-checkpoint).
+struct NodeSeedRuntime {
+    private_state: Option<AnyValue>,
+    lifetime_deps: Option<Vec<Core>>,
+    received: Vec<SeedInput>,
 }
 
 impl NodeAux {
@@ -1121,29 +1148,40 @@ impl NodeAux {
             state: None,
             lifetime: None,
             closing: false,
+            seed: None,
         }
     }
 }
 
-pub(crate) struct NodeCheckpointRuntime {
-    pub cache: Option<AnyValue>,
-    pub has_data: bool,
-    pub version: Option<NodeVersion>,
-    pub status: Status,
-    pub terminal: bool,
-    pub activated: bool,
-    pub has_called_fn_once: bool,
-    pub ctx_state: Option<AnyValue>,
+/// What a node received from one dependency: the values of the dependency's last
+/// array and its terminal (R-checkpoint).
+#[derive(Clone)]
+pub(crate) struct SeedInput {
+    pub values: Vec<AnyValue>,
+    pub ended: Option<DepTerminal>,
 }
 
-pub(crate) struct NodeRestoreRuntime {
-    pub cache: Option<AnyValue>,
-    pub has_data: bool,
-    pub version: RestoredNodeVersion,
-    pub terminal: bool,
-    pub activated: bool,
-    pub has_called_fn_once: bool,
-    pub ctx_state: Option<AnyValue>,
+/// What a checkpoint reads from a node at a wave boundary (R-checkpoint).
+pub(crate) struct NodeCheckpointRuntime {
+    pub is_state: bool,
+    pub values: Vec<AnyValue>,
+    pub ended: Option<DepTerminal>,
+    pub private_state: Option<AnyValue>,
+    /// For a computed node with a lifetime (or an unconsumed seed).
+    pub received: Option<Vec<SeedInput>>,
+    pub declared: Vec<Core>,
+    /// The current lifetime's dependencies when a ctx.rewire changed them.
+    pub lifetime_deps: Option<Vec<Core>>,
+}
+
+/// What a restore gives a node (R-checkpoint): a state its values and terminal; a
+/// computed node a construction seed.
+pub(crate) struct NodeSeed {
+    pub values: Vec<AnyValue>,
+    pub ended: Option<DepTerminal>,
+    pub private_state: Option<AnyValue>,
+    pub lifetime_deps: Option<Vec<Core>>,
+    pub received: Option<Vec<SeedInput>>,
 }
 
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
@@ -2546,10 +2584,6 @@ impl Core {
         self.graph.borrow().get_version(self.key()).value.clone()
     }
 
-    pub(crate) fn versioning_policy(&self) -> ResolvedNodeVersioningPolicy {
-        self.graph.borrow().get_version(self.key()).policy.clone()
-    }
-
     pub(crate) fn handle(&self) -> Option<Handle> {
         self.with_call(|c| c.handle)
     }
@@ -2624,62 +2658,136 @@ impl Core {
     }
 
     pub(crate) fn checkpoint_runtime(&self) -> NodeCheckpointRuntime {
-        let version = self.version();
-        let status = self.status();
-        self.with_node_state_aux_mut(|_n, _c, _cfg, r, e, a| NodeCheckpointRuntime {
-            cache: e.value.cache.clone(),
-            has_data: e.value.has_data,
-            version,
-            status,
-            terminal: e.value.terminal,
-            activated: a.activated,
-            has_called_fn_once: r.has_called_fn_once,
-            ctx_state: a.state.clone(),
+        let is_state = self.is_state();
+        self.with_inner_edges_aux_mut(|n, e, a| {
+            let declared = n.declared.clone();
+            let changed =
+                |deps: &[Core]| (!same_ordered_deps(deps, &declared)).then(|| deps.to_vec());
+            let mut out = NodeCheckpointRuntime {
+                is_state,
+                values: e.value.values.clone(),
+                ended: e.value.ended.clone(),
+                private_state: None,
+                received: None,
+                declared: declared.clone(),
+                lifetime_deps: None,
+            };
+            if is_state {
+                return out;
+            }
+            if let Some(seed) = &a.seed {
+                // Restored and not activated since: the seed is the saved state.
+                out.private_state = seed.private_state.clone();
+                out.received = Some(seed.received.clone());
+                out.lifetime_deps = seed.lifetime_deps.clone();
+            } else if a.lifetime.is_some() {
+                out.private_state = a.state.clone();
+                out.received = Some(
+                    e.state
+                        .inputs
+                        .iter()
+                        .map(|input| SeedInput {
+                            values: input.last_values.clone(),
+                            ended: input.ended.clone(),
+                        })
+                        .collect(),
+                );
+                out.lifetime_deps = changed(&n.deps);
+            } else if e.value.ended.is_none() {
+                // A computed node without a lifetime holds nothing.
+                out.values.clear();
+            }
+            out
         })
     }
 
-    pub(crate) fn restore_runtime(&self, state: NodeRestoreRuntime) {
-        let should_activate = state.activated;
+    /// Gives a restored node its saved state (R-checkpoint): a state its values and
+    /// terminal; a computed node its values and terminal, and, unless it has ended,
+    /// a seed its first activation consumes.
+    pub(crate) fn restore_seed(&self, seed: NodeSeed) {
+        let is_state = self.is_state();
+        self.with_inner_edges_aux_mut(|_n, e, a| {
+            e.value.cache = seed.values.last().cloned();
+            e.value.has_data = !seed.values.is_empty();
+            e.value.values = seed.values;
+            e.value.terminal = seed.ended.is_some();
+            e.value.ended = seed.ended.clone();
+            if !is_state && seed.ended.is_none() && seed.received.is_some() {
+                a.seed = Some(NodeSeedRuntime {
+                    private_state: seed.private_state,
+                    lifetime_deps: seed.lifetime_deps,
+                    received: seed.received.unwrap_or_default(),
+                });
+            }
+        });
+    }
+
+    /// A seeded node's first activation (R-checkpoint): its setup runs; its function
+    /// runs once, on only the dependencies that no longer hold what it had received,
+    /// and otherwise does not run; a run that sends nothing keeps the saved value.
+    fn activate_seeded(&self, seed: NodeSeedRuntime) {
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, r, e, a| {
-            e.value.cache = state.cache;
-            e.value.has_data = state.has_data;
-            e.value.terminal = state.terminal;
-            e.value.values = e.value.cache.iter().cloned().collect();
-            e.wave = NodeWaveState::new();
-            e.state = DepState::new(e.unsubs.len());
-            // Restored nodes take their dependencies' snapshots without running.
+            if let Some(lifetime_deps) = seed.lifetime_deps {
+                n.deps = lifetime_deps;
+            }
+            a.activated = true;
+            a.lifetime = Some(crate::lifetime::Lifetime::open());
+            a.state = seed.private_state;
+            r.has_called_fn_once = true;
+            e.unsubs = (0..n.deps.len()).map(|_| None).collect();
+            e.idx_boxes = (0..n.deps.len())
+                .map(|_| Rc::new(Cell::new(-1i64)))
+                .collect();
+            e.state = DepState::new(n.deps.len());
             e.wave.in_dep_mutation = true;
-            r.has_called_fn_once = state.has_called_fn_once;
-            a.activated = should_activate;
-            a.state = state.ctx_state;
-            a.lifetime = should_activate.then(crate::lifetime::Lifetime::open);
             n.deps.clone()
         });
-        if should_activate {
+        {
+            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
             for (idx, dep) in deps.iter().enumerate() {
                 self.subscribe_dep(idx, dep);
             }
         }
-        self.with_inner_edges_mut(|_, e| {
-            e.state.clear_frames();
-            e.wave.in_dep_mutation = false;
-        });
-        let mut graph = self.graph.borrow_mut();
-        let version_state = graph.get_version_mut(self.key());
-        match state.version {
-            RestoredNodeVersion::Disabled => {
-                version_state.policy = ResolvedNodeVersioningPolicy::Disabled;
-                version_state.value = None;
-            }
-            RestoredNodeVersion::Version(version) => {
-                if matches!(version, NodeVersion::V0 { .. }) {
-                    version_state.policy = ResolvedNodeVersioningPolicy::Level0;
+        let changed = self.with_inner_edges_mut(|_, e| {
+            let mut any = false;
+            for (i, input) in e.state.inputs.iter_mut().enumerate() {
+                let saved = seed.received.get(i);
+                let values_same = saved.map_or(input.last_values.is_empty(), |s| {
+                    crate::checkpoint::same_values(&s.values, &input.last_values)
+                });
+                let ended_same = saved.map_or(input.ended.is_none(), |s| {
+                    same_terminal(s.ended.as_ref(), input.ended.as_ref())
+                });
+                if values_same && ended_same {
+                    input.frames.clear();
+                    continue;
                 }
-                version_state.value = Some(version);
+                any = true;
+                if values_same {
+                    // An end alone, without the values already received.
+                    input.frames = input
+                        .ended
+                        .iter()
+                        .map(|ended| vec![InMsg::from_terminal(ended)])
+                        .collect();
+                }
+            }
+            any
+        });
+        if changed {
+            self.settle();
+        }
+        let setup_pending = self.with_config(|cfg| cfg.setup.is_some())
+            && self.with_call(|c| c.handle.is_some())
+            && self.with_aux(|a| a.lifetime.as_ref().is_some_and(|lt| !lt.setup_done));
+        if setup_pending {
+            let out = self.invoke_setup_only();
+            if !out.is_empty() {
+                self.publish(out);
             }
         }
+        self.with_inner_edges_mut(|_, e| e.state.clear_frames());
     }
-
     pub(crate) fn local_async_driver(
         &self,
     ) -> Option<Rc<dyn crate::async_driver::LocalAsyncDriver>> {
@@ -2832,6 +2940,10 @@ impl Core {
             // An ended node is connected and gives its snapshot, but never runs again
             // and holds nothing upstream (R-terminals).
             self.with_aux_mut(|a| a.activated = true);
+            return;
+        }
+        if let Some(seed) = self.with_aux_mut(|a| a.seed.take()) {
+            self.activate_seeded(seed);
             return;
         }
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
@@ -3012,6 +3124,8 @@ impl Core {
                 if let Some(lt) = &lifetime {
                     lt.signal.abort();
                 }
+                // Only the seeded instance's first run uses the seed.
+                a.seed = None;
                 for b in &e.idx_boxes {
                     b.set(-1);
                 }
@@ -3082,6 +3196,18 @@ impl Core {
         }
     }
 
+    /// Sets the instance's recipe unless it already has one.
+    pub(crate) fn set_recipe_if_absent(&self, recipe: serde_json::Value) {
+        self.with_node_state_mut(|_n, _c, cfg, _r, _e| {
+            cfg.recipe.get_or_insert(recipe);
+        });
+    }
+
+    /// The current instance's recipe.
+    pub(crate) fn recipe(&self) -> Option<serde_json::Value> {
+        self.with_config(|cfg| cfg.recipe.clone())
+    }
+
     /// Whether `id` is this node's open lifetime: output and requests through a ctx
     /// of a closed lifetime are dropped (R-lifetime@2).
     pub(crate) fn lifetime_open(&self, id: u64) -> bool {
@@ -3113,6 +3239,7 @@ impl Core {
                 input.has = false;
                 input.value = None;
                 input.ended = None;
+                input.last_values.clear();
             }
             let settles = input.record(frame);
             if settles && input.pending {
@@ -3541,6 +3668,16 @@ impl Core {
     /// function is the node's ERROR, and what it sent before the panic is dropped
     /// (R-failure).
     fn invoke(&self) -> Vec<Wave<AnyValue>> {
+        self.invoke_inner(true)
+    }
+
+    /// The lifetime's setup alone, for a seeded first activation whose function does
+    /// not run (R-checkpoint).
+    fn invoke_setup_only(&self) -> Vec<Wave<AnyValue>> {
+        self.invoke_inner(false)
+    }
+
+    fn invoke_inner(&self, run_fn: bool) -> Vec<Wave<AnyValue>> {
         // B25: enroll in the wave touched-set before any mutation so a panic-abort
         // can reset our flags.
         wave_register(self);
@@ -3634,7 +3771,9 @@ impl Core {
                     run_reported("cleanup", move || cleanup(&cctx));
                 }
             }
-            dispatcher.invoke(handle, &ctx)
+            if run_fn {
+                dispatcher.invoke(handle, &ctx);
+            }
         }));
         drop(guard); // clears inside_run_wave
         let out = self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.run_out));
@@ -4008,6 +4147,14 @@ pub(crate) enum LifetimeRewire {
     Set(Vec<Core>),
     Add(Core),
     Remove(Core),
+}
+
+fn same_terminal(a: Option<&DepTerminal>, b: Option<&DepTerminal>) -> bool {
+    match (a, b) {
+        (None, None) | (Some(DepTerminal::Complete), Some(DepTerminal::Complete)) => true,
+        (Some(DepTerminal::Error(x)), Some(DepTerminal::Error(y))) => x == y,
+        _ => false,
+    }
 }
 
 /// Puts a closing lifetime's declared dependencies back (R-request-order@2); returns

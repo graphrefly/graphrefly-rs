@@ -121,6 +121,33 @@ pub struct RestoreFactoryMeta {
 }
 
 impl RestoreFactoryMeta {
+    /// The recipe JSON this factory reference stands for: `{ ref, config?,
+    /// configVersion? }` (R-node, R-checkpoint).
+    pub fn to_recipe(&self) -> GraphCheckpointJson {
+        let mut recipe = serde_json::Map::new();
+        recipe.insert(
+            "ref".to_owned(),
+            GraphCheckpointJson::String(self.ref_.clone()),
+        );
+        if let Some(config) = &self.config {
+            recipe.insert("config".to_owned(), config.clone());
+        }
+        if let Some(config_version) = &self.config_version {
+            recipe.insert("configVersion".to_owned(), config_version.clone());
+        }
+        GraphCheckpointJson::Object(recipe)
+    }
+
+    /// Reads a recipe JSON back as a factory reference; `None` if it has no `ref`.
+    pub fn from_recipe(recipe: &GraphCheckpointJson) -> Option<Self> {
+        let ref_ = recipe.get("ref")?.as_str()?.to_owned();
+        Some(Self {
+            ref_,
+            config: recipe.get("config").cloned(),
+            config_version: recipe.get("configVersion").cloned(),
+        })
+    }
+
     /// Creates or computes `registry_ref`.
     pub fn registry_ref(ref_: impl Into<String>) -> Self {
         Self {
@@ -150,7 +177,6 @@ struct Entry {
     name: Option<String>,
     factory: String,
     meta: BTreeMap<String, String>,
-    restore: Option<RestoreFactoryMeta>,
 }
 
 struct Mount {
@@ -775,7 +801,6 @@ impl Graph {
                 name: entry.name.clone(),
                 factory: entry.factory.clone(),
                 meta: entry.meta.clone(),
-                restore: entry.restore.clone(),
                 core: entry.core.clone(),
                 unregistered: false,
             })
@@ -879,6 +904,11 @@ impl Graph {
         );
         let core = node.erased();
         core.set_environment(self.inner.environment.clone());
+        // A registered factory reference is the instance's recipe (R-node,
+        // R-checkpoint); an explicit NodeOpts.recipe wins.
+        if let Some(restore) = &opts.restore {
+            core.set_recipe_if_absent(restore.to_recipe());
+        }
         assert!(
             !self.inner.by_id.borrow().contains_key(&id),
             "duplicate graph node id '{id}'"
@@ -893,7 +923,6 @@ impl Graph {
             name: opts.name,
             factory: factory.to_owned(),
             meta: opts.meta,
-            restore: opts.restore,
         };
         let weak_inner = Rc::downgrade(&self.inner);
         let topology_id = id.clone();
@@ -1589,6 +1618,13 @@ impl GraphNode {
         self.core
             .is_state()
             .then(|| State::from_node(Node::from_core(self.core.clone())))
+    }
+
+    /// The typed handle of a found node, for reading and subscribing; the value type
+    /// is the caller's to know, as with every erased read.
+    #[must_use]
+    pub fn as_node<T: 'static>(&self) -> Node<T> {
+        Node::from_core(self.core.clone())
     }
 
     /// Updates or reads `status`.

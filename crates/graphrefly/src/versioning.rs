@@ -86,12 +86,6 @@ pub enum NodeVersion {
     },
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum RestoredNodeVersion {
-    Disabled,
-    Version(NodeVersion),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeVersioningError {
     message: String,
@@ -200,133 +194,6 @@ pub(crate) fn advance_node_version(
     }
 }
 
-pub(crate) fn validate_node_version_json(
-    value: &Value,
-    path: &str,
-) -> Result<NodeVersion, NodeVersioningError> {
-    validate_strict_json_value(value, path).map_err(|err| {
-        NodeVersioningError::new(format!(
-            "restore_graph: node version metadata is not strict canonical JSON compatible (D112): {err}"
-        ))
-    })?;
-    let Value::Object(record) = value else {
-        return Err(NodeVersioningError::new(format!(
-            "restore_graph: {path} must be an object"
-        )));
-    };
-    match record.get("level").and_then(Value::as_u64) {
-        Some(0) => {
-            require_fields(record, &["level", "counter"], path)?;
-            let counter = read_counter(record.get("counter"), path)?;
-            Ok(NodeVersion::V0 { counter })
-        }
-        Some(1) => {
-            require_fields(record, &["level", "counter", "cid", "prev"], path)?;
-            let counter = read_counter(record.get("counter"), path)?;
-            let cid = record
-                .get("cid")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    NodeVersioningError::new(format!("restore_graph: {path}.cid must be a string"))
-                })?
-                .to_owned();
-            let prev = match record.get("prev") {
-                Some(Value::Null) => None,
-                Some(Value::String(value)) => Some(value.clone()),
-                _ => {
-                    return Err(NodeVersioningError::new(format!(
-                        "restore_graph: {path}.prev must be a string or null"
-                    )));
-                }
-            };
-            if counter == 0 && prev.is_some() {
-                return Err(NodeVersioningError::new(format!(
-                    "restore_graph: {path}.prev must be null when counter is 0"
-                )));
-            }
-            if counter > 0 && prev.is_none() {
-                return Err(NodeVersioningError::new(format!(
-                    "restore_graph: {path}.prev must be a string when counter is > 0"
-                )));
-            }
-            Ok(NodeVersion::V1 { counter, cid, prev })
-        }
-        _ => Err(NodeVersioningError::new(format!(
-            "restore_graph: {path}.level must be 0 or 1"
-        ))),
-    }
-}
-
-pub(crate) fn node_version_to_json(version: &NodeVersion) -> Value {
-    let mut record = serde_json::Map::new();
-    match version {
-        NodeVersion::V0 { counter } => {
-            record.insert("level".to_owned(), Value::Number(Number::from(0)));
-            record.insert("counter".to_owned(), Value::Number(Number::from(*counter)));
-        }
-        NodeVersion::V1 { counter, cid, prev } => {
-            record.insert("level".to_owned(), Value::Number(Number::from(1)));
-            record.insert("counter".to_owned(), Value::Number(Number::from(*counter)));
-            record.insert("cid".to_owned(), Value::String(cid.clone()));
-            record.insert(
-                "prev".to_owned(),
-                prev.clone().map_or(Value::Null, Value::String),
-            );
-        }
-    }
-    Value::Object(record)
-}
-
-pub(crate) fn verify_restored_node_version(
-    policy: &ResolvedNodeVersioningPolicy,
-    restored: Option<&Value>,
-    has_data: bool,
-    cache: Option<&AnyValue>,
-    path: &str,
-) -> Result<RestoredNodeVersion, NodeVersioningError> {
-    let Some(restored) = restored else {
-        return match policy {
-            ResolvedNodeVersioningPolicy::Disabled => Ok(RestoredNodeVersion::Disabled),
-            _ => Err(NodeVersioningError::new(
-                "restore_graph: checkpoint node version metadata is required by the selected node versioning policy (D109)",
-            )),
-        };
-    };
-    let version = validate_node_version_json(restored, path)?;
-    match (policy, &version) {
-        (ResolvedNodeVersioningPolicy::Disabled, _) => Err(NodeVersioningError::new(
-            "restore_graph: checkpoint node version metadata is present but node versioning is disabled",
-        )),
-        (ResolvedNodeVersioningPolicy::Level0, NodeVersion::V0 { .. }) => {
-            Ok(RestoredNodeVersion::Version(version))
-        }
-        (ResolvedNodeVersioningPolicy::Level0, NodeVersion::V1 { .. }) => Err(
-            NodeVersioningError::new(
-                "restore_graph: checkpoint node version level 1 requires matching node versioning policy",
-            ),
-        ),
-        (ResolvedNodeVersioningPolicy::Level1 { .. }, NodeVersion::V0 { .. }) => Err(
-            NodeVersioningError::new(
-                "restore_graph: checkpoint node version level 0 requires matching node versioning policy",
-            ),
-        ),
-        (ResolvedNodeVersioningPolicy::Level1 { hash }, NodeVersion::V1 { counter, cid, .. }) => {
-            if !has_data && *counter > 0 {
-                return Err(NodeVersioningError::new(
-                    "restore_graph: checkpoint node version cid cannot be verified without current DATA under V1 versioning (D109)",
-                ));
-            }
-            let expected = hash_node_data(hash, if has_data { cache } else { None })?;
-            if &expected != cid {
-                return Err(NodeVersioningError::new(
-                    "restore_graph: checkpoint node version cid does not match the selected node versioning hash policy (D109)",
-                ));
-            }
-            Ok(RestoredNodeVersion::Version(version))
-        }
-    }
-}
-
 fn next_counter(current: Option<&NodeVersion>) -> Result<u64, NodeVersioningError> {
     let Some(current) = current else {
         return Ok(1);
@@ -348,33 +215,6 @@ fn next_counter(current: Option<&NodeVersion>) -> Result<u64, NodeVersioningErro
                 Ok(counter)
             }
         })
-}
-
-fn require_fields(
-    record: &serde_json::Map<String, Value>,
-    fields: &[&str],
-    path: &str,
-) -> Result<(), NodeVersioningError> {
-    if record.len() != fields.len() || fields.iter().any(|field| !record.contains_key(*field)) {
-        return Err(NodeVersioningError::new(format!(
-            "restore_graph: {path} has unexpected node version fields"
-        )));
-    }
-    Ok(())
-}
-
-fn read_counter(value: Option<&Value>, path: &str) -> Result<u64, NodeVersioningError> {
-    let counter = value.and_then(Value::as_u64).ok_or_else(|| {
-        NodeVersioningError::new(format!(
-            "restore_graph: {path}.counter must be a non-negative safe integer"
-        ))
-    })?;
-    if counter > MAX_SAFE_INTEGER {
-        return Err(NodeVersioningError::new(format!(
-            "restore_graph: {path}.counter must be a non-negative safe integer"
-        )));
-    }
-    Ok(counter)
 }
 
 fn hash_node_data(

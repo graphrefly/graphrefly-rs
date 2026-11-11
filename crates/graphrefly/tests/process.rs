@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use graphrefly::process::ProcessCommand;
 use graphrefly::{
-    graph, GraphCheckpointValue, GraphNodeOpts, Message, ProcessAuditOutcome, ProcessBundleOptions,
+    graph, GraphNodeOpts, Message, ProcessAuditOutcome, ProcessBundleOptions,
     ProcessEffectCommandPayload, ProcessEffectCommandType, ProcessEffectOutcome,
     ProcessEffectOutcomeKind, ProcessEffectRequestDraft, ProcessEffectRunnerErrorCode,
     ProcessEffectRunnerOptions, ProcessEffectRunnerStatusState, ProcessErrorCode,
@@ -291,8 +291,10 @@ fn process_bundle_surfaces_reducer_failures_without_mutating_state() {
 }
 
 #[test]
-#[ignore = "checkpoint stage of graphrefly-rs:D797-KERNEL-MIGRATION-RS (graphrefly:D802, graphrefly-rs:D5): the process command input and fact nodes retain their last non-JSON value under R-subscription@3, so whether and how a process bundle is checkpointed is decided with R-checkpoint@1"]
-fn process_bundle_keeps_runtime_state_checkpoint_friendly() {
+fn process_bundle_checkpoint_is_refused_for_non_json_values() {
+    // R-checkpoint@1: values must be JSON, otherwise capture is refused. The process
+    // command input and fact nodes retain their last typed (non-JSON) value
+    // (R-subscription@3), so a process bundle over typed values is not checkpointed.
     let g = graph();
     let process = graphrefly::process_bundle::<i32, ProcessState, String, String>(
         &g,
@@ -307,20 +309,13 @@ fn process_bundle_keeps_runtime_state_checkpoint_friendly() {
 
     process.dispatch(ProcessCommand::new("cmd-1", "add", 3));
 
-    let checkpoint = g.checkpoint().expect("checkpoint succeeds");
-    let runtime = checkpoint
-        .nodes
-        .iter()
-        .find(|node| node.id == "orders/runtime")
-        .expect("runtime node checkpointed");
-    let data = match &runtime.ctx_state.value {
-        GraphCheckpointValue::Data { data } => data,
-        GraphCheckpointValue::Sentinel => panic!("runtime ctx state is persisted"),
-    };
-    assert_eq!(data["eventSeq"], 1);
-    assert_eq!(data["commandCount"], 1);
-    assert_eq!(data["seenEventIds"][0], process_event_id("cmd-1", 1));
-    assert_eq!(data["state"]["total"], 3);
+    let err = g
+        .checkpoint()
+        .expect_err("typed process values are not JSON");
+    assert!(
+        err.to_string().contains("not strict JSON compatible"),
+        "{err}"
+    );
 }
 
 #[test]

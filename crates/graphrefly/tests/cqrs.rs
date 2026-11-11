@@ -364,10 +364,10 @@ fn cqrs_runtime_state_is_checkpoint_json_friendly() {
         .iter()
         .find(|node| node.id == "orders/runtime")
         .expect("runtime node checkpointed");
-    let data = match &runtime.ctx_state.value {
-        graphrefly::GraphCheckpointValue::Data { data } => data,
-        graphrefly::GraphCheckpointValue::Sentinel => panic!("runtime ctx state is persisted"),
-    };
+    let data = runtime
+        .private_state
+        .as_ref()
+        .expect("runtime private state is saved");
     assert_eq!(data["eventSeq"], 1);
     assert_eq!(data["commandCount"], 1);
     assert_eq!(data["seenCommandIds"][0], "cmd-1");

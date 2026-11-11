@@ -165,12 +165,12 @@ pub use cascading_cache::{
 };
 pub use checkpoint::{
     default_restore_registry, restore_graph, restore_registry, restored_opts, GraphCheckpoint,
-    GraphCheckpointCtxState, GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointJson,
-    GraphCheckpointLifecycle, GraphCheckpointMount, GraphCheckpointNode, GraphCheckpointTerminal,
-    GraphCheckpointValue, GraphRestoreDefinition, GraphRestoreDescriptor, GraphRestoreEntry,
-    GraphRestoreError, GraphRestoreRegistry, GraphRestoreResult, MapJsonRestoreDescriptor,
-    RestoreDefineCtx, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind,
-    StateRestoreDescriptor, GRAPH_CHECKPOINT_VERSION,
+    GraphCheckpointEdge, GraphCheckpointFactory, GraphCheckpointInput, GraphCheckpointJson,
+    GraphCheckpointMount, GraphCheckpointNode, GraphCheckpointTerminal, GraphCheckpointValue,
+    GraphRestoreDefinition, GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError,
+    GraphRestoreRegistry, GraphRestoreResult, MapJsonRestoreDescriptor, RestoreDefineCtx,
+    RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind, StateRestoreDescriptor,
+    GRAPH_CHECKPOINT_VERSION,
 };
 
 #[doc(hidden)]

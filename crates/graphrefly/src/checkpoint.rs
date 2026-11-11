@@ -1,4 +1,17 @@
-//! Fresh graph checkpoint/restore (R-snapshot/R-restore, D83/D94/D116).
+//! Graph capture and restore (R-checkpoint@1, graphrefly:D802).
+//!
+//! [`Graph::checkpoint`] is taken only at a wave boundary and saves, for each node in
+//! creation order, its declared dependencies, its current instance's recipe (a
+//! registered factory reference and JSON configuration; a node whose instance has no
+//! recipe is local-only), the values of its last array and its terminal; for a
+//! computed node with a lifetime also its private state, what it received from each
+//! dependency and its lifetime's dependencies when a ctx.rewire changed them. Every
+//! saved value must be JSON. [`restore_graph`] builds a new graph with no subscribers,
+//! each node after its declared dependencies, and runs no recipe function: each node
+//! gets its saved state as a seed, and at its first activation its setup runs and its
+//! function runs once only if a dependency no longer holds what it had received. The
+//! layout (`graphrefly.checkpoint.v2`) carries no version evidence; earlier
+//! checkpoints are refused.
 //!
 //! Checkpoint-owned storage integration is deliberately absent here: callers
 //! load/decode checkpoint JSON outside the sync core, then pass the already-loaded
@@ -17,17 +30,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
 use crate::ctx::Ctx;
+use crate::ctx::DepTerminal;
 use crate::dispatcher::NodeFn;
 use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
 use crate::json::validate_strict_json_value;
-use crate::node::{Core, NodeRestoreRuntime, OutputStatus};
+use crate::node::{Core, NodeSeed, SeedInput};
 use crate::protocol::AnyValue;
-use crate::versioning::{
-    node_version_to_json, validate_node_version_json, verify_restored_node_version,
-};
 
 /// `constant` constant.
-pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly.checkpoint.v1";
+///
+/// v2 (R-checkpoint@1, graphrefly:D802): each node's last-array values, terminal (an
+/// ERROR payload included), private state, received inputs and lifetime dependencies;
+/// no status, lifecycle or version evidence. Earlier checkpoints are refused.
+pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly.checkpoint.v2";
 
 /// `GraphCheckpointJson` type alias.
 pub type GraphCheckpointJson = Value;
@@ -93,54 +108,46 @@ pub enum GraphCheckpointFactory {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// `GraphCheckpointNode` data container.
+/// One node of a checkpoint (R-checkpoint@1).
 pub struct GraphCheckpointNode {
-    /// `id` field for id.
+    /// The node's id.
     pub id: String,
+    /// The node's display name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// `name` field for name.
     pub name: Option<String>,
-    /// `factory` field for factory.
+    /// The current instance's recipe, or local-only.
     pub factory: GraphCheckpointFactory,
-    /// `status` field for status.
-    pub status: String,
-    /// `deps` field for deps.
+    /// The declared dependencies.
     pub deps: Vec<String>,
-    /// `value` field for value.
-    pub value: GraphCheckpointValue,
-    #[serde(rename = "backendState", skip_serializing_if = "Option::is_none")]
-    /// `backend_state` field for backend state.
-    pub backend_state: Option<GraphCheckpointJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// `version` field for version.
-    pub version: Option<GraphCheckpointJson>,
-    /// `terminal` field for terminal.
+    /// The current lifetime's dependencies, when a ctx.rewire changed them.
+    #[serde(rename = "lifetimeDeps", skip_serializing_if = "Option::is_none")]
+    pub lifetime_deps: Option<Vec<String>>,
+    /// The values of the node's last array.
+    pub values: Vec<GraphCheckpointJson>,
+    /// The node's terminal, with an ERROR payload.
     pub terminal: GraphCheckpointTerminal,
-    /// `lifecycle` field for lifecycle.
-    pub lifecycle: GraphCheckpointLifecycle,
-    #[serde(rename = "ctxState")]
-    /// `ctx_state` field for ctx state.
-    pub ctx_state: GraphCheckpointCtxState,
+    /// A computed node's private state.
+    #[serde(rename = "privateState", skip_serializing_if = "Option::is_none")]
+    pub private_state: Option<GraphCheckpointJson>,
+    /// What a computed node with a lifetime received from each current dependency.
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// `meta` field for meta.
+    pub received: Option<Vec<GraphCheckpointInput>>,
+    /// A collection's backend (Rust-local, graphrefly-rs:D9).
+    #[serde(rename = "backendState", skip_serializing_if = "Option::is_none")]
+    pub backend_state: Option<GraphCheckpointJson>,
+    /// The node's graph metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<BTreeMap<String, GraphCheckpointJson>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// `GraphCheckpointLifecycle` data container.
-pub struct GraphCheckpointLifecycle {
-    /// `activated` field for activated.
-    pub activated: bool,
-    #[serde(rename = "hasCalledFnOnce")]
-    /// `has_called_fn_once` field for has called fn once.
-    pub has_called_fn_once: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// `GraphCheckpointCtxState` data container.
-pub struct GraphCheckpointCtxState {
-    /// `value` field for value.
-    pub value: GraphCheckpointValue,
+/// What a node received from one dependency: the values of the dependency's last
+/// array and its terminal (R-checkpoint@1).
+pub struct GraphCheckpointInput {
+    /// The values of the dependency's last array.
+    pub values: Vec<GraphCheckpointJson>,
+    /// The dependency's terminal.
+    pub terminal: GraphCheckpointTerminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,7 +191,6 @@ pub(crate) struct CheckpointEntry {
     pub name: Option<String>,
     pub factory: String,
     pub meta: BTreeMap<String, String>,
-    pub restore: Option<RestoreFactoryMeta>,
     pub core: Core,
     pub unregistered: bool,
 }
@@ -988,6 +994,17 @@ pub fn restore_graph(
 }
 
 fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
+    // A checkpoint is taken only at a wave boundary (R-checkpoint@1).
+    if crate::node::in_wave() {
+        return Err(GraphRestoreError::new(
+            "checkpoint: refused inside a wave (R-checkpoint)",
+        ));
+    }
+    if crate::batch::collecting_batch() {
+        return Err(GraphRestoreError::new(
+            "checkpoint: refused inside a batch body (R-checkpoint)",
+        ));
+    }
     let mut entries = graph.checkpoint_entries();
     let mut i = 0;
     while i < entries.len() {
@@ -1001,7 +1018,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                 name: None,
                 factory: dep.factory().unwrap_or_else(|| "?".to_owned()),
                 meta: BTreeMap::new(),
-                restore: None,
                 core: dep,
                 unregistered: true,
             });
@@ -1010,79 +1026,85 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
     }
     let mut nodes = Vec::with_capacity(entries.len());
     let mut edges = Vec::new();
+    let id_of = |core: &Core, owner: &str| -> RestoreResult<String> {
+        entries
+            .iter()
+            .find(|candidate| candidate.core.ptr_eq(core))
+            .map(|candidate| candidate.id.clone())
+            .ok_or_else(|| {
+                GraphRestoreError::new(format!(
+                    "checkpoint: node '{owner}' has an unregistered dep; local-only auto-discovery restore is not implemented"
+                ))
+            })
+    };
     for entry in &entries {
         let runtime = entry.core.checkpoint_runtime();
-        ensure_quiescent_status(
-            status_from_str(runtime.status.label(), &entry.id)?,
-            &entry.id,
-            "checkpoint",
-        )?;
-        let deps = entry.core.deps();
-        let dep_ids = deps
+        let dep_ids = runtime
+            .declared
             .iter()
-            .map(|dep| {
-                entries
-                    .iter()
-                    .find(|candidate| candidate.core.ptr_eq(dep))
-                    .map(|candidate| candidate.id.clone())
-                    .ok_or_else(|| {
-                        GraphRestoreError::new(format!(
-                            "checkpoint: node '{}' has an unregistered dep; local-only auto-discovery restore is not implemented",
-                            entry.id
-                        ))
-                    })
-            })
+            .map(|dep| id_of(dep, &entry.id))
             .collect::<RestoreResult<Vec<_>>>()?;
+        let lifetime_deps = runtime
+            .lifetime_deps
+            .as_ref()
+            .map(|deps| {
+                deps.iter()
+                    .map(|dep| id_of(dep, &entry.id))
+                    .collect::<RestoreResult<Vec<_>>>()
+            })
+            .transpose()?;
         edges.extend(dep_ids.iter().map(|dep| GraphCheckpointEdge {
             from: dep.clone(),
             to: entry.id.clone(),
         }));
         let backend_state =
             checkpoint_backend_state(&entry.core, &format!("{}.backendState", entry.id))?;
-        let non_authoritative_collection_helper =
-            is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
+        let helper = is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
+        let values = if helper {
+            Vec::new()
+        } else {
+            values_to_json(&runtime.values, &format!("{}.values", entry.id))?
+        };
+        let private_state = match (&runtime.private_state, helper) {
+            (Some(state), false) => {
+                Some(any_to_json(state, &format!("{}.privateState", entry.id))?)
+            }
+            _ => None,
+        };
+        let received = runtime
+            .received
+            .as_ref()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, input)| {
+                        Ok(GraphCheckpointInput {
+                            values: if helper {
+                                Vec::new()
+                            } else {
+                                values_to_json(
+                                    &input.values,
+                                    &format!("{}.received[{i}]", entry.id),
+                                )?
+                            },
+                            terminal: terminal_to_json(input.ended.as_ref()),
+                        })
+                    })
+                    .collect::<RestoreResult<Vec<_>>>()
+            })
+            .transpose()?;
         nodes.push(GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
-            factory: checkpoint_factory(entry),
-            status: runtime.status.label().to_owned(),
+            factory: checkpoint_factory(entry, runtime.is_state),
             deps: dep_ids,
-            value: if non_authoritative_collection_helper {
-                GraphCheckpointValue::Sentinel
-            } else {
-                checkpoint_value(runtime.cache.as_ref(), runtime.has_data, &entry.id)?
-            },
+            lifetime_deps,
+            values,
+            terminal: terminal_to_json(runtime.ended.as_ref()),
+            private_state,
+            received,
             backend_state,
-            version: runtime.version.as_ref().map(node_version_to_json),
-            terminal: if runtime.terminal {
-                match runtime.status.output {
-                    OutputStatus::Completed => GraphCheckpointTerminal::Complete,
-                    OutputStatus::Errored => {
-                        return Err(GraphRestoreError::new(format!(
-                            "checkpoint: ERROR payload for node '{}' is unavailable; cannot serialize a placeholder",
-                            entry.id
-                        )));
-                    }
-                    _ => GraphCheckpointTerminal::None,
-                }
-            } else {
-                GraphCheckpointTerminal::None
-            },
-            lifecycle: GraphCheckpointLifecycle {
-                activated: runtime.activated,
-                has_called_fn_once: runtime.has_called_fn_once,
-            },
-            ctx_state: GraphCheckpointCtxState {
-                value: if non_authoritative_collection_helper {
-                    GraphCheckpointValue::Sentinel
-                } else {
-                    checkpoint_value(
-                        runtime.ctx_state.as_ref(),
-                        runtime.ctx_state.is_some(),
-                        &format!("{}.ctxState", entry.id),
-                    )?
-                },
-            },
             meta: if entry.meta.is_empty() {
                 None
             } else {
@@ -1135,7 +1157,7 @@ fn is_non_authoritative_helper(kind: Option<&str>) -> bool {
     )
 }
 
-fn checkpoint_factory(entry: &CheckpointEntry) -> GraphCheckpointFactory {
+fn checkpoint_factory(entry: &CheckpointEntry, is_state: bool) -> GraphCheckpointFactory {
     if entry.unregistered {
         return GraphCheckpointFactory::LocalOnly {
             name: entry.factory.clone(),
@@ -1143,14 +1165,21 @@ fn checkpoint_factory(entry: &CheckpointEntry) -> GraphCheckpointFactory {
                 .to_owned(),
         };
     }
-    if let Some(restore) = &entry.restore {
+    // The current instance's recipe (R-node): a replace without one makes the node
+    // local-only.
+    if let Some(recipe) = entry
+        .core
+        .recipe()
+        .as_ref()
+        .and_then(RestoreFactoryMeta::from_recipe)
+    {
         return GraphCheckpointFactory::RegistryRef {
-            ref_: restore.ref_.clone(),
-            config: restore.config.clone(),
-            config_version: restore.config_version.clone(),
+            ref_: recipe.ref_,
+            config: recipe.config,
+            config_version: recipe.config_version,
         };
     }
-    if entry.factory == "state" {
+    if is_state && entry.factory == "state" {
         return GraphCheckpointFactory::RegistryRef {
             ref_: "state".to_owned(),
             config: None,
@@ -1159,26 +1188,53 @@ fn checkpoint_factory(entry: &CheckpointEntry) -> GraphCheckpointFactory {
     }
     GraphCheckpointFactory::LocalOnly {
         name: entry.factory.clone(),
-        reason: "node was not constructed with restore metadata".to_owned(),
+        reason: "the node's instance carries no recipe".to_owned(),
     }
 }
 
-fn checkpoint_value(
-    value: Option<&AnyValue>,
-    has_data: bool,
-    path: &str,
-) -> RestoreResult<GraphCheckpointValue> {
-    if !has_data {
-        return Ok(GraphCheckpointValue::Sentinel);
+fn values_to_json(values: &[AnyValue], path: &str) -> RestoreResult<Vec<GraphCheckpointJson>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| any_to_json(v, &format!("{path}[{i}]")))
+        .collect()
+}
+
+fn terminal_to_json(ended: Option<&DepTerminal>) -> GraphCheckpointTerminal {
+    match ended {
+        None => GraphCheckpointTerminal::None,
+        Some(DepTerminal::Complete) => GraphCheckpointTerminal::Complete,
+        Some(DepTerminal::Error(message)) => GraphCheckpointTerminal::Error {
+            error: GraphCheckpointJson::String(message.to_string()),
+        },
     }
-    let value = value.ok_or_else(|| {
-        GraphRestoreError::new(format!(
-            "checkpoint: value at {path} is marked DATA but absent"
-        ))
-    })?;
-    Ok(GraphCheckpointValue::Data {
-        data: any_to_json(value, path)?,
-    })
+}
+
+fn terminal_from_json(terminal: &GraphCheckpointTerminal) -> Option<DepTerminal> {
+    match terminal {
+        GraphCheckpointTerminal::None => None,
+        GraphCheckpointTerminal::Complete => Some(DepTerminal::Complete),
+        GraphCheckpointTerminal::Error { error } => Some(DepTerminal::Error(
+            match error {
+                GraphCheckpointJson::String(message) => message.clone(),
+                other => other.to_string(),
+            }
+            .into(),
+        )),
+    }
+}
+
+/// Whether two value lists hold the same JSON (R-checkpoint: a restored node compares
+/// what it received with what its dependencies hold at its first activation).
+pub(crate) fn same_values(a: &[AnyValue], b: &[AnyValue]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            Rc::ptr_eq(x, y)
+                || matches!(
+                    (any_to_json(x, "compare"), any_to_json(y, "compare")),
+                    (Ok(x), Ok(y)) if x == y
+                )
+        })
 }
 
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
@@ -1329,12 +1385,23 @@ fn prepare_checkpoint(
                 })?
             }
         };
-        let status = status_from_str(&node.status, &node.id)?;
-        ensure_quiescent_status(status, &node.id, "restore_graph")?;
         validate_checkpoint_node_json(node)?;
-        if let Some(version) = &node.version {
-            validate_node_version_json(version, &format!("{}.version", node.id))
-                .map_err(|err| GraphRestoreError::new(err.to_string()))?;
+        // A computed node with private state saved without what it received is from
+        // an earlier format: refused, never completed from its dependencies.
+        if node.private_state.is_some() && node.received.is_none() {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: node '{}' lacks the record of what it received (R-checkpoint)",
+                node.id
+            )));
+        }
+        if let Some(received) = &node.received {
+            let current = node.lifetime_deps.as_ref().unwrap_or(&node.deps);
+            if received.len() != current.len() {
+                return Err(GraphRestoreError::new(format!(
+                    "restore_graph: node '{}' received records do not match its dependencies",
+                    node.id
+                )));
+            }
         }
         nodes.insert(
             node.id.clone(),
@@ -1434,11 +1501,16 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
             )?;
         }
     }
-    if let GraphCheckpointValue::Data { data } = &node.value {
-        validate_checkpoint_json(data, &format!("{}.value", node.id))?;
+    for (i, value) in node.values.iter().enumerate() {
+        validate_checkpoint_json(value, &format!("{}.values[{i}]", node.id))?;
     }
-    if let GraphCheckpointValue::Data { data } = &node.ctx_state.value {
-        validate_checkpoint_json(data, &format!("{}.ctxState", node.id))?;
+    if let Some(state) = &node.private_state {
+        validate_checkpoint_json(state, &format!("{}.privateState", node.id))?;
+    }
+    for (i, input) in node.received.iter().flatten().enumerate() {
+        for value in &input.values {
+            validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))?;
+        }
     }
     if let Some(backend_state) = &node.backend_state {
         validate_checkpoint_json(backend_state, &format!("{}.backendState", node.id))?;
@@ -1463,9 +1535,10 @@ fn construct_prepared(
     let graph = crate::graph::graph_opts(opts);
     let mut built = BTreeMap::<String, Core>::new();
     let mut visiting = BTreeSet::<String>::new();
-    for id in prepared.nodes.keys() {
+    // Each node after its declared dependencies, and otherwise in checkpoint order.
+    for node in &prepared.checkpoint.nodes {
         build_node(
-            id,
+            &node.id,
             prepared,
             &options.registry,
             &graph,
@@ -1476,31 +1549,51 @@ fn construct_prepared(
     for (at, child) in &prepared.mounts {
         graph.mount_restored(construct_prepared(child, options)?, at.clone());
     }
+    // No recipe function runs: each node gets its saved state as a seed.
+    let json_values = |values: &[GraphCheckpointJson]| -> Vec<AnyValue> {
+        values
+            .iter()
+            .map(|v| Rc::new(v.clone()) as AnyValue)
+            .collect()
+    };
     for (id, core) in &built {
         let node = &prepared
             .nodes
             .get(id)
             .expect("built map only contains prepared nodes")
             .checkpoint;
-        let (cache, has_data) = restore_value(&node.value);
-        let terminal = restore_terminal(node)?;
-        let ctx_state = restore_ctx_state(&node.ctx_state);
-        let restored_version = verify_restored_node_version(
-            &core.versioning_policy(),
-            node.version.as_ref(),
-            has_data,
-            cache.as_ref(),
-            &format!("{}.version", node.id),
-        )
-        .map_err(|err| GraphRestoreError::new(err.to_string()))?;
-        core.restore_runtime(NodeRestoreRuntime {
-            cache,
-            has_data,
-            version: restored_version,
-            terminal,
-            activated: node.lifecycle.activated,
-            has_called_fn_once: node.lifecycle.has_called_fn_once,
-            ctx_state,
+        let lifetime_deps = node
+            .lifetime_deps
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .map(|dep| {
+                        built.get(dep).cloned().ok_or_else(|| {
+                            GraphRestoreError::new(format!(
+                                "restore_graph: node '{id}' lifetime dependency '{dep}' is missing"
+                            ))
+                        })
+                    })
+                    .collect::<RestoreResult<Vec<_>>>()
+            })
+            .transpose()?;
+        core.restore_seed(NodeSeed {
+            values: json_values(&node.values),
+            ended: terminal_from_json(&node.terminal),
+            private_state: node
+                .private_state
+                .as_ref()
+                .map(|state| Rc::new(state.clone()) as AnyValue),
+            lifetime_deps,
+            received: node.received.as_ref().map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|input| SeedInput {
+                        values: json_values(&input.values),
+                        ended: terminal_from_json(&input.terminal),
+                    })
+                    .collect()
+            }),
         });
     }
     Ok(graph)
@@ -1579,89 +1672,12 @@ fn build_node(
     Ok(core)
 }
 
-fn restore_value(value: &GraphCheckpointValue) -> (Option<AnyValue>, bool) {
-    match value {
-        GraphCheckpointValue::Sentinel => (None, false),
-        GraphCheckpointValue::Data { data } => (Some(Rc::new(data.clone()) as AnyValue), true),
-    }
-}
-
-fn restore_ctx_state(state: &GraphCheckpointCtxState) -> Option<AnyValue> {
-    let (value, has_data) = restore_value(&state.value);
-    if has_data {
-        value
-    } else {
-        None
-    }
-}
-
-fn restore_terminal(node: &GraphCheckpointNode) -> RestoreResult<bool> {
-    let status = status_from_str(&node.status, &node.id)?;
-    match &node.terminal {
-        GraphCheckpointTerminal::None => {
-            if matches!(status, SavedStatus::Completed | SavedStatus::Errored) {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' terminal status requires terminal state",
-                    node.id
-                )));
-            }
-            Ok(false)
-        }
-        GraphCheckpointTerminal::Complete => {
-            if status != SavedStatus::Completed {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' COMPLETE terminal requires completed status",
-                    node.id
-                )));
-            }
-            Ok(true)
-        }
-        GraphCheckpointTerminal::Error { .. } => Err(GraphRestoreError::new(format!(
-            "restore_graph: node '{}' carries ERROR terminal payload, which Rust restore cannot preserve yet",
-            node.id
-        ))),
-    }
-}
-
-/// The saved form of a node's derived status ([`Status::label`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SavedStatus {
-    Empty,
-    Stale,
-    Ready,
-    Completed,
-    Errored,
-}
-
-fn status_from_str(status: &str, id: &str) -> RestoreResult<SavedStatus> {
-    match status {
-        "empty" => Ok(SavedStatus::Empty),
-        "stale" => Ok(SavedStatus::Stale),
-        "ready" => Ok(SavedStatus::Ready),
-        "completed" => Ok(SavedStatus::Completed),
-        "errored" => Ok(SavedStatus::Errored),
-        _ => Err(GraphRestoreError::new(format!(
-            "restore_graph: node '{id}' has invalid status '{status}'"
-        ))),
-    }
-}
-
-fn ensure_quiescent_status(status: SavedStatus, id: &str, op: &str) -> RestoreResult<()> {
-    if status == SavedStatus::Stale {
-        return Err(GraphRestoreError::new(format!(
-            "{op}: node '{id}' has non-quiescent status 'stale' that cannot be checkpoint-restored yet"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::RestoreFactoryMeta;
     use crate::node::Node;
     use crate::protocol::Message;
-    use crate::versioning::{NodeVersion, NodeVersioningPolicy};
     use serde_json::json;
 
     struct StatefulJsonDescriptor;
@@ -1730,247 +1746,31 @@ mod tests {
         );
 
         assert_eq!(restored_memo.cache(), Some(json!(41)));
+        // Captured again before anything subscribes, the seed is the saved state.
         let restored_checkpoint = restored.checkpoint().expect("re-checkpoint succeeds");
         let memo_checkpoint = restored_checkpoint
             .nodes
             .iter()
             .find(|node| node.id == "memo")
             .expect("memo checkpoint exists");
+        assert_eq!(memo_checkpoint.private_state, Some(json!(41)));
+        // A restored node receives nothing until it is activated.
+        let _sub = restored_memo.subscribe(|_| {});
         assert_eq!(
-            memo_checkpoint.lifecycle,
-            GraphCheckpointLifecycle {
-                activated: true,
-                has_called_fn_once: true
-            }
-        );
-        let runtime = restored_memo.erased().checkpoint_runtime();
-        assert_eq!(
-            runtime
-                .ctx_state
-                .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
-                .as_deref(),
-            Some(&json!(41))
+            restored_memo.cache(),
+            Some(json!(41)),
+            "unchanged source: no run"
         );
         restored_source.set(json!(2));
         assert_eq!(restored_memo.cache(), Some(json!(42)));
         let runtime = restored_memo.erased().checkpoint_runtime();
         assert_eq!(
             runtime
-                .ctx_state
+                .private_state
                 .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
                 .as_deref(),
             Some(&json!(42))
         );
-    }
-
-    #[test]
-    fn checkpoints_and_restores_node_runtime_versions() {
-        let g = crate::graph::graph();
-        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        source.set(json!(2));
-        let checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        assert_eq!(
-            checkpoint.nodes[0].version,
-            Some(json!({ "level": 0, "counter": 1 }))
-        );
-
-        let restored = restore_graph(
-            checkpoint,
-            RestoreGraphOptions::new(default_restore_registry()),
-        )
-        .expect("V0 restore succeeds");
-        let restored_source = restored.find("source").expect("source restored");
-        assert_eq!(
-            restored_source.version(),
-            Some(NodeVersion::V0 { counter: 1 })
-        );
-
-        restored_source
-            .as_state::<serde_json::Value>()
-            .expect("restored source is a state")
-            .set(json!(3));
-        assert_eq!(
-            restored_source.version(),
-            Some(NodeVersion::V0 { counter: 2 })
-        );
-    }
-
-    #[test]
-    fn restore_rejects_v0_metadata_when_selected_policy_is_not_v0() {
-        let g = crate::graph::graph();
-        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        source.set(json!(2));
-        let checkpoint = g.checkpoint().expect("checkpoint succeeds");
-
-        let disabled_err = match restore_graph(
-            checkpoint.clone(),
-            RestoreGraphOptions {
-                registry: default_restore_registry(),
-                graph: GraphOptions {
-                    versioning: Some(NodeVersioningPolicy::Disabled),
-                    ..GraphOptions::default()
-                },
-            },
-        ) {
-            Ok(_) => panic!("V0 metadata must not restore into disabled versioning"),
-            Err(err) => err,
-        };
-        assert!(disabled_err.to_string().contains("versioning is disabled"));
-
-        let level1_err = match restore_graph(
-            checkpoint,
-            RestoreGraphOptions {
-                registry: default_restore_registry(),
-                graph: GraphOptions {
-                    versioning: Some(NodeVersioningPolicy::Level1 {
-                        hash: Some(Rc::new(|bytes: &[u8]| {
-                            format!(
-                                "h:{}",
-                                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
-                            )
-                        })),
-                    }),
-                    ..GraphOptions::default()
-                },
-            },
-        ) {
-            Ok(_) => panic!("V0 metadata must not restore into a V1 lane"),
-            Err(err) => err,
-        };
-        assert!(level1_err
-            .to_string()
-            .contains("level 0 requires matching node versioning policy"));
-    }
-
-    #[test]
-    fn restores_v1_only_with_matching_hash_lane() {
-        let hash = Rc::new(|bytes: &[u8]| {
-            format!(
-                "h:{}",
-                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
-            )
-        });
-        let graph = crate::graph::graph_opts(GraphOptions {
-            versioning: Some(NodeVersioningPolicy::Level1 {
-                hash: Some(hash.clone()),
-            }),
-            ..GraphOptions::default()
-        });
-        let source = graph.state_opts(json!(1), GraphNodeOpts::named("source"));
-        source.set(json!(2));
-        let checkpoint = graph.checkpoint().expect("checkpoint succeeds");
-        assert_eq!(
-            checkpoint.nodes[0].version,
-            Some(json!({ "level": 1, "counter": 1, "cid": "h:2", "prev": "h:1" }))
-        );
-
-        let err = match restore_graph(
-            checkpoint.clone(),
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("V1 restore without a matching lane must fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("matching node versioning policy"));
-
-        let err = match restore_graph(
-            checkpoint.clone(),
-            RestoreGraphOptions {
-                registry: default_restore_registry(),
-                graph: GraphOptions {
-                    versioning: Some(NodeVersioningPolicy::Level1 {
-                        hash: Some(Rc::new(|bytes: &[u8]| {
-                            format!(
-                                "other:{}",
-                                std::str::from_utf8(bytes).expect("canonical JSON is UTF-8")
-                            )
-                        })),
-                    }),
-                    ..GraphOptions::default()
-                },
-            },
-        ) {
-            Ok(_) => panic!("wrong hash lane must fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("hash policy"));
-
-        let restored = restore_graph(
-            checkpoint,
-            RestoreGraphOptions {
-                registry: default_restore_registry(),
-                graph: GraphOptions {
-                    versioning: Some(NodeVersioningPolicy::Level1 { hash: Some(hash) }),
-                    ..GraphOptions::default()
-                },
-            },
-        )
-        .expect("matching V1 lane restores");
-        let restored_source = restored.find("source").expect("source restored");
-        assert_eq!(
-            restored_source.version(),
-            Some(NodeVersion::V1 {
-                counter: 1,
-                cid: "h:2".to_owned(),
-                prev: Some("h:1".to_owned()),
-            })
-        );
-        restored_source
-            .as_state::<serde_json::Value>()
-            .expect("restored source is a state")
-            .set(json!(3));
-        assert_eq!(
-            restored_source.version(),
-            Some(NodeVersion::V1 {
-                counter: 2,
-                cid: "h:3".to_owned(),
-                prev: Some("h:2".to_owned()),
-            })
-        );
-    }
-
-    #[test]
-    fn restore_requires_version_metadata_when_versioning_is_enabled() {
-        let graph = crate::graph::graph();
-        graph.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut checkpoint = graph.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].version = None;
-
-        let err = match restore_graph(
-            checkpoint,
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("missing version metadata must fail under default V0 versioning"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("version metadata is required"));
-    }
-
-    #[test]
-    fn restore_rejects_invalid_node_version_metadata_shape() {
-        let graph = crate::graph::graph();
-        graph.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let checkpoint = graph.checkpoint().expect("checkpoint succeeds");
-
-        let mut extra = checkpoint.clone();
-        extra.nodes[0].version = Some(json!({ "level": 0, "counter": 1, "extra": true }));
-        let err = match restore_graph(extra, RestoreGraphOptions::new(default_restore_registry())) {
-            Ok(_) => panic!("extra node version fields must fail honestly"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("unexpected node version fields"));
-
-        let mut unsafe_counter = checkpoint;
-        unsafe_counter.nodes[0].version =
-            Some(json!({ "level": 0, "counter": 9_007_199_254_740_992u64 }));
-        let err = match restore_graph(
-            unsafe_counter,
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("unsafe node version counters must fail honestly"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("safe integer"));
     }
 
     #[test]
@@ -1986,9 +1786,9 @@ mod tests {
         let g = crate::graph::graph();
         g.state_opts(json!(1), GraphNodeOpts::named("source"));
         let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].value = GraphCheckpointValue::Data {
-            data: Value::Number(Number::from_f64(f64::MIN_POSITIVE / 2.0).unwrap()),
-        };
+        checkpoint.nodes[0].values = vec![Value::Number(
+            Number::from_f64(f64::MIN_POSITIVE / 2.0).unwrap(),
+        )];
         let err = match restore_graph(
             checkpoint,
             RestoreGraphOptions::new(default_restore_registry()),
@@ -1997,26 +1797,6 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("subnormal"));
-    }
-
-    #[test]
-    fn restore_rejects_error_terminal_payload_until_preservation_lands() {
-        let g = crate::graph::graph();
-        g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].status = "errored".to_owned();
-        checkpoint.nodes[0].terminal = GraphCheckpointTerminal::Error {
-            error: json!("boom"),
-        };
-
-        let err = match restore_graph(
-            checkpoint,
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("ERROR terminal payload restore must fail honestly"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("cannot preserve yet"));
     }
 
     #[test]
@@ -2135,25 +1915,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_and_restore_reject_non_quiescent_statuses() {
-        // A host cannot leave a node pending between waves (PENDING is the kernel's,
-        // R-wave), so only a tampered checkpoint carries a non-quiescent status.
-        let g = crate::graph::graph();
-        g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].status = "stale".to_owned();
-
-        let err = match restore_graph(
-            checkpoint,
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("restore must reject non-quiescent checkpoint status"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("non-quiescent status 'stale'"));
-    }
-
-    #[test]
     fn restore_rejects_empty_mount_path_without_panicking() {
         let parent = crate::graph::graph();
         let child = crate::graph::graph();
@@ -2175,16 +1936,43 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_rejects_unavailable_error_payload_instead_of_inventing_one() {
+    fn checkpoint_saves_and_restores_an_error_payload() {
         let g = crate::graph::graph();
         let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        source.down(vec![Message::Error(Box::new(std::io::Error::other(
-            "boom",
-        )))]);
+        source.error("boom");
+        let checkpoint = g.checkpoint().expect("checkpoint succeeds");
+        assert_eq!(
+            checkpoint.nodes[0].terminal,
+            GraphCheckpointTerminal::Error {
+                error: json!("boom")
+            }
+        );
+        let restored = restore_graph(
+            checkpoint,
+            RestoreGraphOptions::new(default_restore_registry()),
+        )
+        .expect("restore succeeds");
+        let node = restored.find("source").expect("source restored");
+        assert_eq!(node.status().output, crate::OutputStatus::Errored);
+    }
 
-        let err = g
-            .checkpoint()
-            .expect_err("Rust cannot serialize the original GraphError payload yet");
-        assert!(err.to_string().contains("ERROR payload"));
+    #[test]
+    fn checkpoint_is_refused_inside_a_wave_or_a_batch_body() {
+        let g = crate::graph::graph();
+        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
+        let in_batch = crate::batch(|_| g.checkpoint().map(|_| ()));
+        assert!(in_batch.unwrap_err().to_string().contains("batch body"));
+        let in_wave = Rc::new(RefCell::new(None));
+        let _sub = {
+            let (g, in_wave) = (g.clone(), in_wave.clone());
+            source.subscribe(move |msgs: &[Message<AnyValue>]| {
+                if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                    *in_wave.borrow_mut() = Some(g.checkpoint().map(|_| ()));
+                }
+            })
+        };
+        source.set(json!(2));
+        let refused = in_wave.borrow_mut().take().expect("callback ran");
+        assert!(refused.unwrap_err().to_string().contains("inside a wave"));
     }
 }

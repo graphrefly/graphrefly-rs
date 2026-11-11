@@ -30,16 +30,16 @@ use graphrefly::{
     AppendLogStorageTier, ByteStorageBackend, CascadingCacheEvent, CascadingCachePolicy,
     CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
     ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, GraphCheckpointFactory,
-    GraphCheckpointValue, JsonCodec, KvStorageTier, KvVersionedRead, Message, Node,
-    ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
-    OpenPersistentReactiveIndexOptions, OpenPersistentReactiveListOptions,
-    OpenPersistentReactiveLogOptions, OpenPersistentReactiveMapOptions,
-    PersistReactiveCollectionOptions, PromotionPolicy, ReactiveCascadingCacheOptions,
-    ReactiveCollectionChangeFrame, ReactiveCollectionKind, ReactiveCollectionPersistenceStatus,
-    ReactiveCollectionRestoreSource, ReactiveCollectionSnapshotFrame, ReactiveIndexOptions,
-    ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions, ReadThroughErrorStage,
-    ReadThroughOutcome, RestoreGraphOptions, StorageError, StorageResult, TieredReadThroughOptions,
-    TieredReadThroughStatus, WalFrame, WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
+    JsonCodec, KvStorageTier, KvVersionedRead, Message, Node, ObserveEventFrame,
+    ObserveEventFrameOptions, ObserveMessage, OpenPersistentReactiveIndexOptions,
+    OpenPersistentReactiveListOptions, OpenPersistentReactiveLogOptions,
+    OpenPersistentReactiveMapOptions, PersistReactiveCollectionOptions, PromotionPolicy,
+    ReactiveCascadingCacheOptions, ReactiveCollectionChangeFrame, ReactiveCollectionKind,
+    ReactiveCollectionPersistenceStatus, ReactiveCollectionRestoreSource,
+    ReactiveCollectionSnapshotFrame, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions,
+    ReactiveMapOptions, ReadThroughErrorStage, ReadThroughOutcome, RestoreGraphOptions,
+    StorageError, StorageResult, TieredReadThroughOptions, TieredReadThroughStatus, WalFrame,
+    WalFrameBody, WalFrameOptions, WAL_FORMAT_VERSION,
 };
 use serde_json::json;
 
@@ -1379,11 +1379,10 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(by_id["list.delta"].backend_state, Some(json!([1, 2])));
-    assert_eq!(by_id["list.snapshot"].value, GraphCheckpointValue::Sentinel);
+    assert!(by_id["list.snapshot"].values.is_empty());
     assert_eq!(
-        by_id["list.snapshot"].ctx_state.value,
-        GraphCheckpointValue::Sentinel,
-        "R-snapshot/D160: collection helper ctxState is a non-authoritative derived cache"
+        by_id["list.snapshot"].private_state, None,
+        "collection helper private state is a non-authoritative derived cache"
     );
 
     let mut stale = checkpoint.clone();
@@ -1392,9 +1391,7 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         .iter_mut()
         .find(|node| node.id == "list.snapshot")
         .expect("snapshot node exists")
-        .value = GraphCheckpointValue::Data {
-        data: json!(["stale"]),
-    };
+        .values = vec![json!(["stale"])];
     let restored = restore_graph(stale, RestoreGraphOptions::new(default_restore_registry()))
         .expect("collection backendState restores");
     let restored_checkpoint = restored.checkpoint().expect("re-checkpoint succeeds");
@@ -1418,17 +1415,10 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(view_by_id["map.select#0.delta"].values.is_empty());
+    assert!(view_by_id["map.select#0.snapshot"].values.is_empty());
     assert_eq!(
-        view_by_id["map.select#0.delta"].value,
-        GraphCheckpointValue::Sentinel
-    );
-    assert_eq!(
-        view_by_id["map.select#0.snapshot"].value,
-        GraphCheckpointValue::Sentinel
-    );
-    assert_eq!(
-        view_by_id["map.select#0.snapshot"].ctx_state.value,
-        GraphCheckpointValue::Sentinel,
+        view_by_id["map.select#0.snapshot"].private_state, None,
         "collection light-view helper caches are also non-authoritative"
     );
 }

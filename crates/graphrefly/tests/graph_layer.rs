@@ -11,8 +11,8 @@ use graphrefly::{
     scan, take, timeout, topology_diff, validate_no_islands, DescribeEdge, DescribeEvent,
     DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher,
     Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
-    GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions, GraphRestoreDefinition,
-    GraphRestoreEntry, IslandReport, Message, Node, NodeOpts, NodeVersion, NodeVersioningPolicy,
+    GraphCheckpointJson, GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry,
+    IslandReport, Message, Node, NodeOpts, NodeVersion, NodeVersioningPolicy,
     ProfileSummaryOptions, ReachableDirection, ReachableOptions, ReactiveListOptions,
     RestoreFactoryMeta, RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind,
     TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
@@ -1097,10 +1097,7 @@ fn checkpoint_uses_neutral_schema_and_restores_fresh_json_state() {
         .iter()
         .find(|node| node.id == "count")
         .expect("count checkpoint exists");
-    assert_eq!(
-        count_checkpoint.value,
-        GraphCheckpointValue::Data { data: json!(2) }
-    );
+    assert_eq!(count_checkpoint.values, vec![json!(2)]);
     serde_json::to_string(&checkpoint).expect("checkpoint is JSON serializable");
 
     let restored = restore_graph(

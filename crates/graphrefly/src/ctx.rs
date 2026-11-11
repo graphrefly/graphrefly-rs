@@ -328,6 +328,21 @@ impl DeferredCtx {
         self.signal.clone()
     }
 
+    /// The lifetime's private state, typed; `None` once the lifetime has closed.
+    pub fn state_get<S: 'static>(&self) -> Option<Rc<S>> {
+        if !self.node.lifetime_open(self.lifetime) {
+            return None;
+        }
+        self.node.get_state().and_then(|a| a.downcast::<S>().ok())
+    }
+
+    /// Sets the lifetime's private state; dropped once the lifetime has closed.
+    pub fn state_set<S: 'static>(&self, v: S) {
+        if self.node.lifetime_open(self.lifetime) {
+            self.node.set_state(Rc::new(v));
+        }
+    }
+
     /// [`Ctx::rewire`] through this kept ctx: a request scoped to its lifetime, dropped
     /// if the lifetime has closed.
     ///
