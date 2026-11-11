@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::batch::BatchCtx;
 use crate::checkpoint::GraphCheckpointJson;
-use crate::ctx::{Ctx, DepRecord, DepTerminal};
+use crate::ctx::{Ctx, DepRecord};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::environment::EnvironmentDrivers;
 use crate::node::{Core, GraphArena, Node, NodeOpts, State, Status};
@@ -1570,10 +1570,27 @@ fn sugar_gate(ctx: &Ctx) -> bool {
 
 /// Read-only value-level view over a node fn's dependency snapshot (D27/R-primary-api-clean).
 ///
-/// `Values` exposes DATA-oriented dep state (`latest`, `prev`, `batch`, terminal state)
-/// without the ctx-level power surface (`down`, `rewire`). Graph `derived` and
-/// `effect` use this canonical Rust value API; `node`/`producer` remain the ctx-level
-/// escape hatch.
+/// Value-level sugar sees values only (R-primary-api-clean@2): each dependency's
+/// latest value and the one before it. Arrays, terminals given as input, a manual
+/// INVALIDATE and the policies belong to the ctx-level node ([`Graph::node`]).
+///
+/// ```compile_fail
+/// let g = graphrefly::graph();
+/// let s = g.state(1i32);
+/// let _ = g.derived::<i32, _>(vec![s.erased()], |values| {
+///     let _arrays = values.batches::<i32>(0); // arrays are ctx-level
+///     None
+/// });
+/// ```
+///
+/// ```compile_fail
+/// let g = graphrefly::graph();
+/// let s = g.state(1i32);
+/// let _ = g.derived::<i32, _>(vec![s.erased()], |values| {
+///     let _ended = values.terminal(0); // a terminal given as input is ctx-level
+///     None
+/// });
+/// ```
 pub struct Values<'a> {
     records: &'a [DepRecord],
 }
@@ -1609,28 +1626,6 @@ impl<'a> Values<'a> {
             .get(i)
             .and_then(|r| r.prev_data.clone())
             .and_then(|a| a.downcast::<T>().ok())
-    }
-
-    /// DATA payloads dep `i` delivered before this run, grouped by upstream wave.
-    pub fn batches<T: 'static>(&self, i: usize) -> Vec<Vec<Rc<T>>> {
-        self.records
-            .get(i)
-            .map(|r| {
-                r.wave_data
-                    .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|v| v.clone().downcast::<T>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Terminal state for dep `i`, when terminal-as-real-input sugar needs it.
-    pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
-        self.records.get(i).and_then(|r| r.terminal.as_ref())
     }
 }
 

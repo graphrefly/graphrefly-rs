@@ -54,11 +54,7 @@ fn observe_log(g: &graphrefly::Graph, ids: &[&str]) -> (Observed, Box<dyn FnOnce
 }
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
-    values
-        .batches::<i32>(i)
-        .last()
-        .and_then(|wave| wave.last().cloned())
-        .or_else(|| values.prev::<i32>(i))
+    values.value::<i32>(i)
 }
 
 fn json_cache(node: graphrefly::GraphNode) -> GraphCheckpointJson {
@@ -1297,53 +1293,35 @@ fn graph_rejects_cross_graph_deps_by_arena_identity() {
     });
 }
 
+/// R-primary-api-clean@2 (graphrefly:D805) — derived sees values only: each
+/// dependency's latest value and the one before it; no arrays, terminals or policies.
 #[test]
-fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpers() {
+fn derived_values_give_the_latest_and_previous_values_only() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
-    let seen_wave_batches = Rc::new(RefCell::new(Vec::new()));
-    let seen_prev = Rc::new(RefCell::new(Vec::new()));
-    let wave_batches = seen_wave_batches.clone();
-    let prev = seen_prev.clone();
-    let sum = g.derived_opts(
-        vec![source.erased()],
-        move |values| {
-            assert_eq!(values.len(), 1);
-            wave_batches.borrow_mut().push(
-                values
-                    .batches::<i32>(0)
-                    .iter()
-                    .map(|wave| wave.iter().map(|v| **v).collect::<Vec<_>>())
-                    .collect::<Vec<_>>(),
-            );
-            prev.borrow_mut().push(values.prev::<i32>(0).map(|v| *v));
-            Some(
-                values
-                    .batches::<i32>(0)
-                    .iter()
-                    .flat_map(|wave| wave.iter())
-                    .map(|v| **v)
-                    .sum::<i32>(),
-            )
-        },
-        GraphNodeOpts::named("sum"),
-    );
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let sum = {
+        let seen = seen.clone();
+        g.derived_opts(
+            vec![source.erased()],
+            move |values| {
+                assert_eq!(values.len(), 1);
+                let latest = values.value::<i32>(0).map(|v| *v);
+                seen.borrow_mut()
+                    .push((latest, values.prev::<i32>(0).map(|v| *v)));
+                latest
+            },
+            GraphNodeOpts::named("sum"),
+        )
+    };
     let _keep_alive = sum.subscribe(|_| {});
     assert_eq!(sum.cache(), Some(1));
-    assert_eq!(*seen_wave_batches.borrow(), vec![vec![vec![1]]]);
-    assert_eq!(*seen_prev.borrow(), vec![None]);
-
     g.batch(|_| {
         source.set(2i32);
         source.set(3i32);
     });
-
-    assert_eq!(sum.cache(), Some(5));
-    assert_eq!(
-        *seen_wave_batches.borrow(),
-        vec![vec![vec![1]], vec![vec![2, 3]]]
-    );
-    assert_eq!(*seen_prev.borrow(), vec![None, Some(1)]);
+    assert_eq!(sum.cache(), Some(3));
+    assert_eq!(*seen.borrow(), vec![(Some(1), None), (Some(3), Some(1))]);
 }
 
 #[test]

@@ -9,11 +9,7 @@ use graphrefly::{
 };
 
 fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
-    values
-        .batches::<i32>(i)
-        .last()
-        .and_then(|wave| wave.last().cloned())
-        .or_else(|| values.prev::<i32>(i))
+    values.value::<i32>(i)
 }
 
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
