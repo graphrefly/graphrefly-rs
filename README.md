@@ -1,6 +1,6 @@
 # GraphReFly Rust
 
-The Rust graph engine and native foundation used by Python host bindings.
+The Rust graph engine: a self-contained Rust package of the GraphReFly kernel.
 Cargo package `graphrefly-rs`, library crate `graphrefly`.
 
 ## Where things are
@@ -8,7 +8,7 @@ Cargo package `graphrefly-rs`, library crate `graphrefly`.
 | Path | Contents |
 |---|---|
 | [crates/graphrefly/](crates/graphrefly/) | Rust package, source and examples |
-| [crates/graphrefly-bindings-py/](crates/graphrefly-bindings-py/) | Python native binding foundation |
+| [crates/graphrefly-bindings-py/](crates/graphrefly-bindings-py/) | Former Python binding, outside the workspace; removed once the Python kernel merges (graphrefly:D800) |
 | [docs/](docs/README.md) | Documentation map, architecture and development |
 | [website/](website/) | Package-local site and rustdoc integration |
 

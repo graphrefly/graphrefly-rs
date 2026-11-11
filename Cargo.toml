@@ -5,11 +5,10 @@
 # (D#), formal model, and conformance scenarios live there — that repo wins on
 # any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
 #
-# D415: Rust is the native shared engine / reusable graph-infrastructure library
-# for Python and future non-TS host packages. The active workspace now contains
-# only the clean-slate Rust crate plus the Python binding foundation. The old
-# port-model crate directories have been deleted; use git history for
-# archaeology.
+# The workspace is the one Rust package. graphrefly:D800 superseded D415: Python
+# writes its own kernel, so the Python binding below is excluded and is removed
+# once the Python branch merges. The old port-model crate directories have been
+# deleted; use git history for archaeology.
 # =============================================================================
 
 [workspace]

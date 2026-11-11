@@ -80,13 +80,11 @@ jobs:
           ref: main
           path: graphrefly-authority
 
-      # nextest `ci` profile: `default-filter = "all()"` so the
-      # cascade_depth stack-safety stress tests (quarantined out of the
-      # local default loop in .config/nextest.toml) DO run here — the
-      # no-stack-overflow invariant is merge-gated. The profile's
-      # slow-timeout also kills a deadlocked test after 4×60s instead of
-      # burning the whole job's wall-clock budget.
-      - name: Cargo nextest (graphrefly-rs, ci profile — incl. cascade_depth)
+      # nextest `ci` profile: `default-filter = "all()"`, so every test runs
+      # here, the long-chain stack test included. The profile's slow-timeout
+      # kills a deadlocked test after 4×60s instead of burning the whole job's
+      # wall-clock budget.
+      - name: Cargo nextest (graphrefly-rs, ci profile)
         run: cargo nextest run -p graphrefly-rs --profile ci --all-targets
         env:
           GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec

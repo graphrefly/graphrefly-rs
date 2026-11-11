@@ -1,8 +1,10 @@
 # Rust agent entrypoint
 
 Start with [README](README.md) and the [documentation map](docs/README.md).
-Rust owns its engine/package and Python native foundation; Python owns its host
-facade. [Root authority](../graphrefly/AGENTS.md) governs protocol/cross-project work.
+Rust owns its engine and package. Under graphrefly:D800 Python writes its own
+kernel; `crates/graphrefly-bindings-py` is out of the workspace, gets no new work,
+and is removed once the Python branch merges (Python builds against `cf02fc9`
+until then). [Root authority](../graphrefly/AGENTS.md) governs protocol/cross-project work.
 
 - [Architecture](docs/architecture.md) locates crate ownership and package scope.
 - [Development](docs/development.md) owns Rust contributor constraints, shell

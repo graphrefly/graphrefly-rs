@@ -3,16 +3,14 @@ title: "Integrations"
 description: "Rust native host, IO, and bridge integration surfaces."
 ---
 
-Rust is the native shared engine and reusable graph-infrastructure library for
-Python and future non-TypeScript host packages. Host-language packages own their
-idiomatic public facade, value and lifetime mapping, exception policy, and
-runtime adapters.
+Rust is a self-contained GraphReFly package. Other languages have their own
+kernels and talk to a Rust graph through the wire bridge, never in process.
 
-## Python native binding foundation
+## Python
 
-The active binding crate is `crates/graphrefly-bindings-py`. It exposes an
-opaque native foundation over the Rust graph engine while Python keeps ownership
-of the public host facade.
+Python writes its own kernel (graphrefly:D800). The former binding crate,
+`crates/graphrefly-bindings-py`, is outside the workspace and is removed once the
+Python kernel merges.
 
 ## Optional runtime features
 

@@ -7,7 +7,7 @@ Contributions welcome. This file is a brief pointer; the substantive setup and a
 The active Rust package is `crates/graphrefly` (`package = "graphrefly-rs"`,
 `lib = "graphrefly"`). The package includes the sync wave substrate, graph-layer
 Rust API, operators, sources, storage helpers, app-infra helpers, environment
-adapters, and the native binding foundation for Python. See
+adapters, and the wire bridge. See
 [`docs/architecture.md`](docs/architecture.md) for the current boundary map and
 [`docs/development.md`](docs/development.md) for local build and release checks.
 
@@ -15,7 +15,6 @@ High-leverage contribution paths today:
 - Rust package API docs and examples that stay package-local.
 - Conformance fixes surfaced by the language-neutral scenarios in
   [graphrefly](https://github.com/graphrefly/graphrefly).
-- Python binding integration work over the Rust native engine.
 
 ## Quick start
 
@@ -28,7 +27,7 @@ mise trust && mise install
 
 # Verify the workspace compiles
 cargo check --workspace
-cargo nextest run --profile ci     # full suite incl. cascade_depth guards
+cargo nextest run --profile ci     # the full suite, as CI runs it
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -45,7 +44,7 @@ Per the project's [single-source-of-truth principle](CLAUDE.md#memory-principles
 
 - Branch from `main`. Open PRs against `main`.
 - One logical change per PR. Multi-crate refactors are fine; mixing unrelated concerns is not.
-- Commits should pass: `cargo check --workspace`, `cargo nextest run --profile ci` (full suite incl. cascade_depth stack-safety guards), `cargo clippy --workspace --all-targets`, `cargo fmt --all --check`. CI enforces.
+- Commits should pass: `cargo check --workspace`, `cargo nextest run --profile ci` (the full suite, the long-chain stack test included), `cargo clippy --workspace --all-targets`, `cargo fmt --all --check`. CI enforces.
 - Pre-1.0: **no backward-compatibility shims.** Rename freely; update all call sites in the same PR. See [`CLAUDE.md`](CLAUDE.md) → "Memory principles" for the full discipline.
 - Conventional commits style optional but appreciated (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`).
 

@@ -17,7 +17,11 @@ The active workspace members are:
 | Path | Role |
 |---|---|
 | `crates/graphrefly` | The clean-slate Rust package, with lib crate name `graphrefly` and Cargo package `graphrefly-rs`. |
-| `crates/graphrefly-bindings-py` | Native binding foundation for Python host integration. |
+
+`crates/graphrefly-bindings-py` is not a workspace member: under graphrefly:D800
+Python writes its own kernel and, until that branch merges, builds against
+graphrefly-rs `cf02fc9`. The crate gets no new work and is removed once Python no
+longer imports `graphrefly._native`.
 
 The old port-model crate directories and old JS/WASM binding directories have
 been deleted from the active tree. They are historical material only; use git
@@ -90,7 +94,6 @@ The clean-slate crate includes:
 - CSP-10 baseline app-infra: messaging, work queue, scheduled readiness,
   CQRS/process recipes, graph-visible environment adapters, and resilience
   policy/status bundles.
-- Native host binding foundation for Python under `crates/graphrefly-bindings-py`.
 
 ### CSP-10 package surface
 
