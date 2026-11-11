@@ -87,9 +87,6 @@ pub enum GraphCheckpointFactory {
         #[serde(skip_serializing_if = "Option::is_none")]
         /// `config` field for config.
         config: Option<GraphCheckpointJson>,
-        #[serde(rename = "configVersion", skip_serializing_if = "Option::is_none")]
-        /// `config_version` field for config version.
-        config_version: Option<GraphCheckpointJson>,
     },
     #[serde(rename = "local-only")]
     /// `LocalOnly` variant.
@@ -439,8 +436,6 @@ pub struct RestoreDefineCtx<'a> {
     pub deps: &'a [String],
     /// `config` field for config.
     pub config: Option<&'a GraphCheckpointJson>,
-    /// `config_version` field for config version.
-    pub config_version: Option<&'a GraphCheckpointJson>,
     /// `checkpoint` field for checkpoint.
     pub checkpoint: &'a GraphCheckpointNode,
     registry: &'a GraphRestoreRegistry,
@@ -503,11 +498,6 @@ impl GraphRestoreDescriptor for StateRestoreDescriptor {
         if ctx.config.is_some() {
             return Err(GraphRestoreError::new(
                 "restore_graph: built-in state descriptor does not accept config",
-            ));
-        }
-        if ctx.config_version.is_some() {
-            return Err(GraphRestoreError::new(
-                "restore_graph: built-in state descriptor does not accept configVersion",
             ));
         }
         Ok(RestoreNodeDefinition {
@@ -603,11 +593,6 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
         let config = ctx.config.and_then(Value::as_object).ok_or_else(|| {
             GraphRestoreError::new("restore_graph: 'map' descriptor requires object config")
         })?;
-        if ctx.config_version.is_some() {
-            return Err(GraphRestoreError::new(
-                "restore_graph: built-in map descriptor does not accept configVersion",
-            ));
-        }
         let fn_ref = config.get("fn").and_then(Value::as_str).ok_or_else(|| {
             GraphRestoreError::new("restore_graph: 'map' config.fn must be a string definition ref")
         })?;
@@ -667,12 +652,8 @@ fn collection_base_id(id: &str, suffix: &str, ref_: &str) -> RestoreResult<Strin
     Ok(base.to_owned())
 }
 
-fn reject_collection_config(
-    config: Option<&GraphCheckpointJson>,
-    config_version: Option<&GraphCheckpointJson>,
-    ref_: &str,
-) -> RestoreResult<()> {
-    if config.is_some() || config_version.is_some() {
+fn reject_collection_config(config: Option<&GraphCheckpointJson>, ref_: &str) -> RestoreResult<()> {
+    if config.is_some() {
         return Err(GraphRestoreError::new(format!(
             "restore_graph: '{ref_}' descriptor does not accept config"
         )));
@@ -682,14 +663,8 @@ fn reject_collection_config(
 
 fn collection_log_max_size_config(
     config: Option<&GraphCheckpointJson>,
-    config_version: Option<&GraphCheckpointJson>,
     ref_: &str,
 ) -> RestoreResult<Option<usize>> {
-    if config_version.is_some() {
-        return Err(GraphRestoreError::new(format!(
-            "restore_graph: '{ref_}' descriptor does not accept configVersion"
-        )));
-    }
     let Some(config) = config else {
         return Ok(None);
     };
@@ -851,7 +826,7 @@ impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        let max_size = collection_log_max_size_config(ctx.config, ctx.config_version, self.ref_())?;
+        let max_size = collection_log_max_size_config(ctx.config, self.ref_())?;
         collection_delta_definition(
             ctx,
             "reactiveList.delta",
@@ -894,7 +869,7 @@ impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        let max_size = collection_log_max_size_config(ctx.config, ctx.config_version, self.ref_())?;
+        let max_size = collection_log_max_size_config(ctx.config, self.ref_())?;
         collection_delta_definition(
             ctx,
             "reactiveLog.delta",
@@ -1018,7 +993,7 @@ fn collection_delta_definition(
         )));
     }
     if !allow_config {
-        reject_collection_config(ctx.config, ctx.config_version, ref_)?;
+        reject_collection_config(ctx.config, ref_)?;
     }
     let base = collection_base_id(ctx.id, suffix, ref_)?;
     let checkpoint = ctx.checkpoint.clone();
@@ -1036,7 +1011,7 @@ fn collection_existing_definition(
     ref_: &'static str,
     suffix: &str,
 ) -> RestoreResult<RestoreNodeDefinition> {
-    reject_collection_config(ctx.config, ctx.config_version, ref_)?;
+    reject_collection_config(ctx.config, ref_)?;
     let id = ctx.id.to_owned();
     let _base = collection_base_id(ctx.id, suffix, ref_)?;
     Ok(RestoreNodeDefinition {
@@ -1281,14 +1256,12 @@ fn checkpoint_factory(entry: &CheckpointEntry, is_state: bool) -> GraphCheckpoin
         return GraphCheckpointFactory::RegistryRef {
             ref_: recipe.ref_,
             config: recipe.config,
-            config_version: recipe.config_version,
         };
     }
     if is_state && entry.factory == "state" {
         return GraphCheckpointFactory::RegistryRef {
             ref_: "state".to_owned(),
             config: None,
-            config_version: None,
         };
     }
     GraphCheckpointFactory::LocalOnly {
@@ -1430,14 +1403,9 @@ pub fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts>
         })
         .collect::<RestoreResult<BTreeMap<_, _>>>()?;
     let restore = match &node.factory {
-        GraphCheckpointFactory::RegistryRef {
-            ref_,
-            config,
-            config_version,
-        } => Some(RestoreFactoryMeta {
+        GraphCheckpointFactory::RegistryRef { ref_, config } => Some(RestoreFactoryMeta {
             ref_: ref_.clone(),
             config: config.clone(),
-            config_version: config_version.clone(),
         }),
         GraphCheckpointFactory::LocalOnly { .. } => None,
     };
@@ -1599,20 +1567,11 @@ fn prepare_checkpoint(
 
 fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()> {
     if let GraphCheckpointFactory::RegistryRef {
-        config,
-        config_version,
+        config: Some(config),
         ..
     } = &node.factory
     {
-        if let Some(config) = config {
-            validate_checkpoint_json(config, &format!("{}.factory.config", node.id))?;
-        }
-        if let Some(config_version) = config_version {
-            validate_checkpoint_json(
-                config_version,
-                &format!("{}.factory.configVersion", node.id),
-            )?;
-        }
+        validate_checkpoint_json(config, &format!("{}.factory.config", node.id))?;
     }
     for (i, value) in node.values.iter().enumerate() {
         validate_checkpoint_json(value, &format!("{}.values[{i}]", node.id))?;
@@ -1750,19 +1709,14 @@ fn build_node(
         .iter()
         .map(|dep| build_node(dep, prepared, registry, graph, built, visiting))
         .collect::<RestoreResult<Vec<_>>>()?;
-    let (config, config_version) = match &item.checkpoint.factory {
-        GraphCheckpointFactory::RegistryRef {
-            config,
-            config_version,
-            ..
-        } => (config.as_ref(), config_version.as_ref()),
-        GraphCheckpointFactory::LocalOnly { .. } => (None, None),
+    let config = match &item.checkpoint.factory {
+        GraphCheckpointFactory::RegistryRef { config, .. } => config.as_ref(),
+        GraphCheckpointFactory::LocalOnly { .. } => None,
     };
     let definition = item.descriptor.define(RestoreDefineCtx {
         id,
         deps: &item.deps,
         config,
-        config_version,
         checkpoint: &item.checkpoint,
         registry,
     })?;
@@ -1952,27 +1906,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_descriptors_reject_unsupported_config_version() {
-        let g = crate::graph::graph();
-        g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        if let GraphCheckpointFactory::RegistryRef { config_version, .. } =
-            &mut checkpoint.nodes[0].factory
-        {
-            *config_version = Some(json!("v2"));
-        }
-
-        let err = match restore_graph(
-            checkpoint,
-            RestoreGraphOptions::new(default_restore_registry()),
-        ) {
-            Ok(_) => panic!("built-in state rejects configVersion"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("configVersion"));
-    }
-
-    #[test]
     fn restore_preserves_registry_metadata_for_later_checkpoints() {
         let g = crate::graph::graph();
         let source = g.state_opts(json!(3), GraphNodeOpts::named("source"));
@@ -2015,7 +1948,6 @@ mod tests {
             GraphCheckpointFactory::RegistryRef {
                 ref_: "map".to_owned(),
                 config: Some(json!({ "fn": "double-json" })),
-                config_version: None,
             }
         );
     }

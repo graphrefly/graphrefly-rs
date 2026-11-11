@@ -126,13 +126,11 @@ pub struct RestoreFactoryMeta {
     pub ref_: String,
     /// `config` field for config.
     pub config: Option<GraphCheckpointJson>,
-    /// `config_version` field for config version.
-    pub config_version: Option<GraphCheckpointJson>,
 }
 
 impl RestoreFactoryMeta {
-    /// The recipe JSON this factory reference stands for: `{ ref, config?,
-    /// configVersion? }` (R-node, R-checkpoint).
+    /// The recipe JSON this factory reference stands for: `{ ref, config? }` (R-node,
+    /// R-checkpoint@1).
     pub fn to_recipe(&self) -> GraphCheckpointJson {
         let mut recipe = serde_json::Map::new();
         recipe.insert(
@@ -141,9 +139,6 @@ impl RestoreFactoryMeta {
         );
         if let Some(config) = &self.config {
             recipe.insert("config".to_owned(), config.clone());
-        }
-        if let Some(config_version) = &self.config_version {
-            recipe.insert("configVersion".to_owned(), config_version.clone());
         }
         GraphCheckpointJson::Object(recipe)
     }
@@ -154,7 +149,6 @@ impl RestoreFactoryMeta {
         Some(Self {
             ref_,
             config: recipe.get("config").cloned(),
-            config_version: recipe.get("configVersion").cloned(),
         })
     }
 
@@ -163,19 +157,12 @@ impl RestoreFactoryMeta {
         Self {
             ref_: ref_.into(),
             config: None,
-            config_version: None,
         }
     }
 
     /// Updates or reads `with_config`.
     pub fn with_config(mut self, config: GraphCheckpointJson) -> Self {
         self.config = Some(config);
-        self
-    }
-
-    /// Updates or reads `with_config_version`.
-    pub fn with_config_version(mut self, config_version: GraphCheckpointJson) -> Self {
-        self.config_version = Some(config_version);
         self
     }
 }

@@ -68,7 +68,6 @@ impl<T> Operator<T> {
         self.recipe = Some(crate::graph::RestoreFactoryMeta {
             ref_: ref_.to_owned(),
             config,
-            config_version: None,
         });
         self
     }
