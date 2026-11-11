@@ -259,9 +259,7 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&runtime, "CqrsWorkQueueRecipeBundle runtime")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     CqrsWorkQueueRecipeBundle {
         attempts: project(
             graph,

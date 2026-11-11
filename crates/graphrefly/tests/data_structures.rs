@@ -547,7 +547,7 @@ fn reactive_index_range_dispose_releases_graph_registered_nodes() {
     );
     let range = index.range(1, 3);
 
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .nodes
         .iter()
@@ -557,11 +557,11 @@ fn reactive_index_range_dispose_releases_graph_registered_nodes() {
         .iter()
         .any(|node| node.id == "idx.range#0.snapshot"
             && node.factory == "reactiveIndex.range.snapshot"));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "idx.delta".to_owned(),
         to: "idx.range#0.delta".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "idx.range#0.delta".to_owned(),
         to: "idx.range#0.snapshot".to_owned(),
     }));
@@ -601,7 +601,7 @@ fn reactive_log_page_dispose_releases_graph_registered_nodes() {
     let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
 
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .nodes
         .iter()
@@ -609,18 +609,18 @@ fn reactive_log_page_dispose_releases_graph_registered_nodes() {
     assert!(snap.nodes.iter().any(
         |node| node.id == "log.page#0.snapshot" && node.factory == "reactiveLog.page.snapshot"
     ));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "log.delta".to_owned(),
         to: "log.page#0.delta".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "log.page#0.delta".to_owned(),
         to: "log.page#0.snapshot".to_owned(),
     }));
 
     page.dispose();
 
-    let after = g.describe();
+    let after = g.topology();
     assert!(!after.nodes.iter().any(|node| node.id == "log.page#0.delta"));
     assert!(!after
         .nodes
@@ -628,7 +628,7 @@ fn reactive_log_page_dispose_releases_graph_registered_nodes() {
         .any(|node| node.id == "log.page#0.snapshot"));
     assert!(g.find("log.page#0.delta").is_none());
     let rebuilt = log.page(1, 2);
-    let rebuilt_snap = g.describe();
+    let rebuilt_snap = g.topology();
     assert!(rebuilt_snap
         .nodes
         .iter()
@@ -785,7 +785,7 @@ fn reactive_map_select_dispose_releases_graph_registered_nodes() {
     );
     let select = map.select(|value, _| *value > 1);
 
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .nodes
         .iter()
@@ -795,18 +795,18 @@ fn reactive_map_select_dispose_releases_graph_registered_nodes() {
         .iter()
         .any(|node| node.id == "map.select#0.snapshot"
             && node.factory == "reactiveMap.select.snapshot"));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "map.delta".to_owned(),
         to: "map.select#0.delta".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "map.select#0.delta".to_owned(),
         to: "map.select#0.snapshot".to_owned(),
     }));
 
     select.dispose();
 
-    let after = g.describe();
+    let after = g.topology();
     assert!(!after
         .nodes
         .iter()
@@ -817,7 +817,7 @@ fn reactive_map_select_dispose_releases_graph_registered_nodes() {
         .any(|node| node.id == "map.select#0.snapshot"));
     assert!(g.find("map.select#0.delta").is_none());
     let rebuilt = map.select(|value, _| *value > 1);
-    let rebuilt_snap = g.describe();
+    let rebuilt_snap = g.topology();
     assert!(rebuilt_snap
         .nodes
         .iter()
@@ -879,7 +879,7 @@ fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
     );
     assert!(g.find("map.select#0.delta").is_none());
     assert!(g.find("map.select#0.snapshot").is_none());
-    let describe = g.describe();
+    let describe = g.topology();
     let describe_ids = describe
         .nodes
         .iter()
@@ -955,7 +955,7 @@ fn failed_reactive_log_page_dispose_emits_no_node_released_and_keeps_topology() 
     assert!(events.borrow().is_empty());
     assert!(g.find("log.page#0.delta").is_some());
     assert!(g.find("log.page#0.snapshot").is_some());
-    let describe = g.describe();
+    let describe = g.topology();
     let describe_ids = describe
         .nodes
         .iter()
@@ -994,8 +994,8 @@ fn reactive_log_attach_is_graph_visible_declared_dep() {
         ]
     );
     assert_eq!(log.to_vec(), vec![0, 1, 2]);
-    let snap = g.describe();
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    let snap = g.topology();
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "src".to_owned(),
         to: "log.bind#0".to_owned(),
     }));
@@ -1008,10 +1008,10 @@ fn reactive_log_attach_is_graph_visible_declared_dep() {
     );
 
     dispose();
-    let snap_after_dispose = g.describe();
+    let snap_after_dispose = g.topology();
     assert!(!snap_after_dispose
         .edges
-        .contains(&graphrefly::DescribeEdge {
+        .contains(&graphrefly::TopologyEdge {
             from: "src".to_owned(),
             to: "log.bind#0".to_owned(),
         }));
@@ -1075,8 +1075,8 @@ fn reactive_list_append_from_is_graph_visible_declared_dep() {
         ]
     );
     assert_eq!(list.to_vec(), vec![0, 1, 2]);
-    let snap = g.describe();
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    let snap = g.topology();
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "src".to_owned(),
         to: "list.bind#0".to_owned(),
     }));
@@ -1089,10 +1089,10 @@ fn reactive_list_append_from_is_graph_visible_declared_dep() {
     );
 
     dispose();
-    let snap_after_dispose = g.describe();
+    let snap_after_dispose = g.topology();
     assert!(!snap_after_dispose
         .edges
-        .contains(&graphrefly::DescribeEdge {
+        .contains(&graphrefly::TopologyEdge {
             from: "src".to_owned(),
             to: "list.bind#0".to_owned(),
         }));
@@ -1110,7 +1110,7 @@ fn unnamed_graph_reactive_lists_get_distinct_public_ids() {
         .snapshot_request
         .erased()
         .ptr_eq(&b.snapshot_request.erased()));
-    let snap = g.describe();
+    let snap = g.topology();
     let ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
     assert_eq!(ids.iter().filter(|id| id.ends_with(".delta")).count(), 2);
     assert_eq!(ids.iter().filter(|id| id.ends_with(".snapshot")).count(), 2);

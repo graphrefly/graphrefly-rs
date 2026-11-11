@@ -1,4 +1,4 @@
-//! Pure graph diagnostics over `DescribeSnapshot` (D39/R-describe).
+//! Pure graph diagnostics over `TopologySnapshot` (D39/R-describe).
 //!
 //! These helpers are product-surface catch-up with the TypeScript clean-slate graph
 //! diagnostics. They never read live nodes or mutate graph state; `describe()` remains
@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue, Graph, Profile};
+use crate::graph::{Graph, Profile, TopologyEdge, TopologyNode, TopologySnapshot};
 use crate::node::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +69,6 @@ pub struct CausalStep {
     pub id: String,
     /// `factory` field for factory.
     pub factory: String,
-    /// `status` field for status.
-    pub status: Status,
-    /// `value` field for value.
-    pub value: Option<DescribeValue>,
     /// `hop` field for hop.
     pub hop: usize,
     /// `dep_index` field for dep index.
@@ -124,7 +120,7 @@ pub enum DescribeEvent {
         /// `id` field for id.
         id: String,
         /// `node` field for node.
-        node: DescribeNode,
+        node: TopologyNode,
     },
     /// `NodeRemoved` variant.
     NodeRemoved {
@@ -241,27 +237,27 @@ impl ValidateNoIslandsResult {
 
 #[derive(Debug, Default)]
 struct FlatSnapshot {
-    nodes: BTreeMap<String, DescribeNode>,
-    edges: BTreeMap<(String, String), DescribeEdge>,
+    nodes: BTreeMap<String, TopologyNode>,
+    edges: BTreeMap<(String, String), TopologyEdge>,
     subgraphs: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
 struct SnapshotIndex {
-    nodes: BTreeMap<String, DescribeNode>,
+    nodes: BTreeMap<String, TopologyNode>,
     outgoing: BTreeMap<String, BTreeSet<String>>,
     incoming: BTreeMap<String, BTreeSet<String>>,
 }
 
-fn flatten(snapshot: &DescribeSnapshot, nodes: &mut Vec<DescribeNode>) {
+fn flatten(snapshot: &TopologySnapshot, nodes: &mut Vec<TopologyNode>) {
     nodes.extend(snapshot.nodes.clone());
     for child in snapshot.subgraphs.iter().flatten() {
         flatten(child, nodes);
     }
 }
 
-fn flatten_for_diff(snapshot: &DescribeSnapshot) -> FlatSnapshot {
-    fn visit(snapshot: &DescribeSnapshot, index_path: &str, flat: &mut FlatSnapshot) {
+fn flatten_for_diff(snapshot: &TopologySnapshot) -> FlatSnapshot {
+    fn visit(snapshot: &TopologySnapshot, index_path: &str, flat: &mut FlatSnapshot) {
         for node in &snapshot.nodes {
             flat.nodes.insert(node.id.clone(), node.clone());
         }
@@ -293,7 +289,7 @@ fn flatten_for_diff(snapshot: &DescribeSnapshot) -> FlatSnapshot {
     flat
 }
 
-fn meta_or_empty(node: &DescribeNode) -> BTreeMap<String, String> {
+fn meta_or_empty(node: &TopologyNode) -> BTreeMap<String, String> {
     node.meta.clone().unwrap_or_default()
 }
 
@@ -301,7 +297,7 @@ fn meta_or_empty(node: &DescribeNode) -> BTreeMap<String, String> {
 ///
 /// Values/status changes are intentionally not topology events; use observe/profile for runtime
 /// data. This helper never reads live nodes and does not create a topology stream.
-pub fn topology_diff(prev: &DescribeSnapshot, next: &DescribeSnapshot) -> DescribeChangeset {
+pub fn topology_diff(prev: &TopologySnapshot, next: &TopologySnapshot) -> DescribeChangeset {
     let prev = flatten_for_diff(prev);
     let next = flatten_for_diff(next);
     let mut events = Vec::new();
@@ -374,7 +370,7 @@ pub fn topology_diff(prev: &DescribeSnapshot, next: &DescribeSnapshot) -> Descri
 /// existing `describe()` and `profile()` snapshots; the actual rollup is pure over those facts.
 #[must_use]
 pub fn profile_summary(graph: &Graph, options: ProfileSummaryOptions) -> ProfileSummary {
-    let snapshot = graph.describe();
+    let snapshot = graph.topology();
     let profile = graph.profile();
     profile_summary_from_snapshots(&snapshot, &profile, options)
 }
@@ -382,7 +378,7 @@ pub fn profile_summary(graph: &Graph, options: ProfileSummaryOptions) -> Profile
 /// Pure profile rollup over an already-captured describe/profile pair.
 #[must_use]
 pub fn profile_summary_from_snapshots(
-    snapshot: &DescribeSnapshot,
+    snapshot: &TopologySnapshot,
     profile: &Profile,
     options: ProfileSummaryOptions,
 ) -> ProfileSummary {
@@ -426,7 +422,7 @@ pub fn profile_summary_from_snapshots(
     }
 }
 
-fn collect_describe_ids(snapshot: &DescribeSnapshot, ids: &mut BTreeSet<String>) {
+fn collect_describe_ids(snapshot: &TopologySnapshot, ids: &mut BTreeSet<String>) {
     ids.extend(snapshot.nodes.iter().map(|node| node.id.clone()));
     for child in snapshot.subgraphs.iter().flatten() {
         collect_describe_ids(child, ids);
@@ -449,7 +445,7 @@ fn add_edge(map: &mut BTreeMap<String, BTreeSet<String>>, from: &str, to: &str) 
         .insert(to.to_owned());
 }
 
-fn index_snapshot(snapshot: &DescribeSnapshot) -> SnapshotIndex {
+fn index_snapshot(snapshot: &TopologySnapshot) -> SnapshotIndex {
     let mut flat_nodes = Vec::new();
     flatten(snapshot, &mut flat_nodes);
     let mut idx = SnapshotIndex::default();
@@ -473,7 +469,7 @@ fn index_snapshot(snapshot: &DescribeSnapshot) -> SnapshotIndex {
     idx
 }
 
-fn index_snapshot_edges(snapshot: &DescribeSnapshot, idx: &mut SnapshotIndex) {
+fn index_snapshot_edges(snapshot: &TopologySnapshot, idx: &mut SnapshotIndex) {
     for edge in &snapshot.edges {
         if idx.nodes.contains_key(&edge.from) && idx.nodes.contains_key(&edge.to) {
             add_edge(&mut idx.outgoing, &edge.from, &edge.to);
@@ -504,7 +500,7 @@ fn adjacent(
 
 /// Creates or computes `reachable`.
 pub fn reachable(
-    snapshot: &DescribeSnapshot,
+    snapshot: &TopologySnapshot,
     from: &str,
     direction: ReachableDirection,
     options: ReachableOptions,
@@ -550,7 +546,7 @@ pub fn reachable(
     }
 }
 
-fn dep_indices(next: Option<&DescribeNode>, prev_id: &str) -> Option<Vec<usize>> {
+fn dep_indices(next: Option<&TopologyNode>, prev_id: &str) -> Option<Vec<usize>> {
     let next = next?;
     let indices = next
         .deps
@@ -562,16 +558,14 @@ fn dep_indices(next: Option<&DescribeNode>, prev_id: &str) -> Option<Vec<usize>>
 }
 
 fn step_for(
-    node: &DescribeNode,
+    node: &TopologyNode,
     hop: usize,
-    edge_to_next: Option<(&DescribeNode, &str)>,
+    edge_to_next: Option<(&TopologyNode, &str)>,
 ) -> CausalStep {
     let indices = edge_to_next.and_then(|(next, prev_id)| dep_indices(Some(next), prev_id));
     CausalStep {
         id: node.id.clone(),
         factory: node.factory.clone(),
-        status: node.status,
-        value: node.value.clone(),
         hop,
         dep_index: indices.as_ref().and_then(|xs| xs.first().copied()),
         dep_indices: indices.as_ref().filter(|xs| xs.len() > 1).cloned(),
@@ -701,7 +695,7 @@ fn materialize_path(idx: &SnapshotIndex, path: &[String]) -> Vec<CausalStep> {
 
 /// Creates or computes `explain_path`.
 pub fn explain_path(
-    snapshot: &DescribeSnapshot,
+    snapshot: &TopologySnapshot,
     from: &str,
     to: &str,
     options: ExplainPathOptions,
@@ -754,7 +748,7 @@ pub fn explain_path(
 }
 
 /// Creates or computes `validate_no_islands`.
-pub fn validate_no_islands(snapshot: &DescribeSnapshot) -> ValidateNoIslandsResult {
+pub fn validate_no_islands(snapshot: &TopologySnapshot) -> ValidateNoIslandsResult {
     let idx = index_snapshot(snapshot);
     let mut orphans = Vec::new();
     for node in idx.nodes.values() {

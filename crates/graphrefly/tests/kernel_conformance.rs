@@ -1763,7 +1763,7 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
 
 /// The current dependencies of `name`, as the graph describes them.
 fn deps_of(g: &graphrefly::Graph, name: &str) -> Vec<String> {
-    g.describe()
+    g.topology()
         .edges
         .iter()
         .filter(|e| e.to == name)
@@ -2736,7 +2736,7 @@ fn c38_capture_and_restore() {
     );
     let edges = |g: &graphrefly::Graph| {
         let mut e: Vec<(String, String)> = g
-            .describe()
+            .topology()
             .edges
             .into_iter()
             .map(|e| (e.from, e.to))
@@ -3072,7 +3072,7 @@ fn c38_replace_and_rewire_are_restored_as_the_instance() {
     let rr = json_node(&restored, "r");
     let _ur = rr.subscribe(|_| {});
     let deps: Vec<String> = restored
-        .describe()
+        .topology()
         .edges
         .into_iter()
         .filter(|e| e.to == "r")
@@ -3549,7 +3549,7 @@ fn definition_and_describe_give_the_r_node_content() {
     assert!(!Rc::ptr_eq(&first, &second), "replace gives a new function");
 
     let described: Vec<(String, graphrefly::DescribeKind, Vec<String>, bool)> = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| (n.id, n.kind, n.deps, n.quiet))
@@ -3805,4 +3805,242 @@ fn auto_complete_runs_the_function_on_the_last_terminal() {
     );
     assert_eq!(n.status().output, graphrefly::OutputStatus::Completed);
     assert!(arrays(&log).iter().flatten().any(|k| k == "COMPLETE"));
+}
+
+/// The DATA payloads of an observed array, as i32.
+fn i32s(msgs: &[Message<AnyValue>]) -> Vec<i32> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            Message::Data(v) => v.downcast_ref::<i32>().copied(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// C-48 (R-graph-surface@1, graphrefly:D805) — find, describe, observe and retain.
+#[test]
+fn c48_find_describe_observe_and_retain() {
+    use graphrefly::{DescribeKind, DescribeNode, Lifecycle};
+    let g = graphrefly::graph();
+    let a = g.state_opts(1i32, named("a"));
+    let b_runs = Rc::new(Cell::new(0usize));
+    let b = {
+        let b_runs = b_runs.clone();
+        g.node_opts::<i32, _>(
+            vec![a.erased()],
+            move |ctx| {
+                b_runs.set(b_runs.get() + 1);
+                if let Some(v) = ctx.dep(0).value::<i32>() {
+                    ctx.emit(*v * 10);
+                }
+            },
+            named("b"),
+        )
+    };
+    let c = g.node_opts::<i32, _>(vec![a.erased()], forward_i32, named("c"));
+    let d_ctx: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let d = {
+        let d_ctx = d_ctx.clone();
+        g.node_opts::<i32, _>(
+            vec![a.erased()],
+            move |ctx| {
+                *d_ctx.borrow_mut() = Some(ctx.defer());
+            },
+            named("d"),
+        )
+    };
+
+    assert!(g.find("b").is_some());
+    assert!(g.find("nope").is_none());
+    let node = |id: &str, kind, deps: &[&str]| DescribeNode {
+        id: id.to_owned(),
+        kind,
+        deps: deps.iter().map(|d| (*d).to_owned()).collect(),
+        quiet: false,
+    };
+    assert_eq!(
+        g.describe(),
+        vec![
+            node("a", DescribeKind::State, &[]),
+            node("b", DescribeKind::Node, &["a"]),
+            node("c", DescribeKind::Node, &["a"]),
+            node("d", DescribeKind::Node, &["a"]),
+        ],
+        "creation order, exactly {{ id, kind, deps, quiet }}"
+    );
+    assert_eq!(b_runs.get(), 0, "find and describe activate nothing");
+    assert_eq!(b.status().lifecycle, Lifecycle::Inactive);
+
+    type Events = Rc<RefCell<Vec<(String, usize, Vec<i32>)>>>;
+    let record = |events: &Events| {
+        let events = events.clone();
+        move |e: &graphrefly::ObserveEvent<'_>| {
+            events
+                .borrow_mut()
+                .push((e.id.to_owned(), e.msgs.len(), i32s(e.msgs)));
+        }
+    };
+    let events: Events = Rc::new(RefCell::new(Vec::new()));
+    let stop = g.observe(&["b"], record(&events));
+    assert_eq!(
+        b.status().lifecycle,
+        Lifecycle::Active,
+        "observe activates b"
+    );
+    a.set(2);
+    assert_eq!(
+        *events.borrow(),
+        vec![("b".to_owned(), 2, vec![10]), ("b".to_owned(), 2, vec![20])],
+        "one event per array: [START, DATA 10], then [PENDING, DATA 20]"
+    );
+    let other: Events = Rc::new(RefCell::new(Vec::new()));
+    let stop2 = g.observe(&["b"], record(&other));
+    stop();
+    a.set(3);
+    assert_eq!(events.borrow().len(), 2, "nothing after stop");
+    assert_eq!(
+        other.borrow().last().unwrap().2,
+        vec![30],
+        "another observer goes on"
+    );
+    stop2();
+    assert_eq!(b.status().lifecycle, Lifecycle::Inactive);
+
+    let r1 = g.retain("c");
+    let r2 = g.retain("c");
+    assert_eq!(c.status().lifecycle, Lifecycle::Active, "retain activates");
+    r1();
+    assert_eq!(
+        c.status().lifecycle,
+        Lifecycle::Active,
+        "each retain is its own subscription"
+    );
+    r2();
+    assert_eq!(c.status().lifecycle, Lifecycle::Inactive);
+
+    let _rd = g.retain("d");
+    let d_ctx = d_ctx.borrow_mut().take().unwrap();
+    d_ctx.rewire(vec![a.erased(), c.erased()]);
+    assert_eq!(
+        g.describe().into_iter().find(|n| n.id == "d").unwrap().deps,
+        vec!["a".to_owned(), "c".to_owned()],
+        "describe gives the current dependencies"
+    );
+    assert_eq!(
+        d.definition().deps.len(),
+        1,
+        "definition gives the declared ones"
+    );
+}
+
+/// A stop or release kept where a sink can reach it.
+type StopSlot = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+/// A node that sends two arrays in one run, when its trigger sends 1.
+fn two_arrays(g: &graphrefly::Graph) -> (graphrefly::State<i32>, Node<i32>) {
+    let t = g.state_opts(0i32, named("t"));
+    let n = g.node_opts::<i32, _>(
+        vec![t.erased()],
+        |ctx| {
+            if ctx.dep(0).values::<i32>().iter().any(|v| **v == 1) {
+                ctx.down(vec![data(1)]);
+                ctx.down(vec![data(2)]);
+            }
+        },
+        named("n"),
+    );
+    (t, n)
+}
+
+/// Stopping from inside a sink in the middle of a wave. An observe stops at once:
+/// nothing more is handed on (R-graph-surface@1), so the run's second array does not
+/// reach it. A plain unsubscribe is a request (R-request-order@2, C-33): it waits until
+/// the wave ends, so the second array of the same run still reaches that sink, and
+/// nothing after the wave does. A retain released mid-wave is gone after the wave.
+#[test]
+fn stop_in_the_middle_of_a_wave() {
+    // subscribe
+    let g = graphrefly::graph();
+    let (t, n) = two_arrays(&g);
+    let seen = Rc::new(RefCell::new(Vec::<Vec<i32>>::new()));
+    let stop: StopSlot = Rc::new(RefCell::new(None));
+    let unsub = {
+        let (seen, stop) = (seen.clone(), stop.clone());
+        n.subscribe(move |msgs: &[Message<AnyValue>]| {
+            let values = i32s(msgs);
+            if values == vec![1] {
+                if let Some(stop) = stop.borrow_mut().take() {
+                    stop();
+                }
+            }
+            seen.borrow_mut().push(values);
+        })
+    };
+    *stop.borrow_mut() = Some(unsub);
+    t.set(1);
+    assert!(seen.borrow().contains(&vec![1]));
+    assert!(
+        seen.borrow().contains(&vec![2]),
+        "subscribe: the unsubscribe waits until the wave ends (C-33)"
+    );
+    let before = seen.borrow().len();
+    t.set(1);
+    assert_eq!(
+        seen.borrow().len(),
+        before,
+        "subscribe: nothing after the wave"
+    );
+
+    // observe
+    let g = graphrefly::graph();
+    let (t, _n) = two_arrays(&g);
+    let seen = Rc::new(RefCell::new(Vec::<Vec<i32>>::new()));
+    let stop: StopSlot = Rc::new(RefCell::new(None));
+    let observer = {
+        let (seen, stop) = (seen.clone(), stop.clone());
+        g.observe(&["n"], move |e| {
+            let values = i32s(e.msgs);
+            if values == vec![1] {
+                if let Some(stop) = stop.borrow_mut().take() {
+                    stop();
+                }
+            }
+            seen.borrow_mut().push(values);
+        })
+    };
+    *stop.borrow_mut() = Some(observer);
+    t.set(1);
+    assert!(seen.borrow().contains(&vec![1]));
+    assert!(
+        !seen.borrow().contains(&vec![2]),
+        "observe: no array after stop"
+    );
+
+    // retain: a release from inside a wave takes effect; the node closes once its
+    // other subscriber leaves too.
+    let g = graphrefly::graph();
+    let (t, n) = two_arrays(&g);
+    let release: StopSlot = Rc::new(RefCell::new(Some(g.retain("n"))));
+    let witness = {
+        let release = release.clone();
+        n.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if i32s(msgs) == vec![1] {
+                if let Some(release) = release.borrow_mut().take() {
+                    release();
+                }
+            }
+        })
+    };
+    t.set(1);
+    assert!(
+        release.borrow().is_none(),
+        "the retain was released mid-wave"
+    );
+    assert_eq!(n.status().lifecycle, graphrefly::Lifecycle::Active);
+    witness();
+    assert_eq!(
+        n.status().lifecycle,
+        graphrefly::Lifecycle::Inactive,
+        "retain: the released subscription is gone"
+    );
 }

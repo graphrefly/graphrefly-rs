@@ -937,7 +937,7 @@ fn source_factory_names_are_stable_in_describe() {
         GraphNodeOpts::named("from_webhook"),
     );
 
-    let snap = g.describe();
+    let snap = g.topology();
     let factory = |id: &str| {
         snap.nodes
             .iter()
@@ -1090,7 +1090,7 @@ fn from_cron_emits_once_per_matching_minute_and_cleans_up_driver_interval() {
         1
     );
     assert_eq!(
-        g.describe()
+        g.topology()
             .nodes
             .iter()
             .find(|node| node.id == "cron")
@@ -1158,7 +1158,7 @@ fn from_git_hook_records_baseline_then_emits_filtered_commit_events() {
     assert!(!events[0].commit.is_empty());
     assert!(!events[0].timestamp_ns.is_empty());
     assert_eq!(
-        g.describe()
+        g.topology()
             .nodes
             .iter()
             .find(|node| node.id == "git_hook")
@@ -1258,7 +1258,7 @@ fn fs_watch_source_initial_scan_is_inspectable_and_filtered() {
     assert_eq!(event.relative_path, PathBuf::from("a.txt"));
     assert!(event.path.ends_with("a.txt"));
     assert_eq!(
-        g.describe()
+        g.topology()
             .nodes
             .iter()
             .find(|node| node.id == "fs")
@@ -2498,7 +2498,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     assert!(delayed_seen.borrow().is_empty());
     assert_eq!(driver.sleepers.borrow().len(), 2);
     assert!(
-        g.describe().nodes.iter().any(|n| n.factory == "timer"),
+        g.topology().nodes.iter().any(|n| n.factory == "timer"),
         "time operators should expose pending helper timer nodes through describe discovery"
     );
     driver.fire_sleepers();
@@ -2561,7 +2561,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     );
 
     let factories = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -2592,7 +2592,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
         GraphNodeOpts::named("audit"),
     );
     let alias_factories = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -3123,7 +3123,7 @@ fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
         GraphNodeOpts::named("buffer_time_sink"),
     );
     let factories = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -3597,7 +3597,7 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
     assert_eq!(*merged_seen.borrow(), vec![1, 10, 11]);
 
     let factories = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -3713,7 +3713,7 @@ fn side_effect_error_and_gate_operators_are_graph_visible() {
     control.set(true);
     assert_eq!(*gated_seen.borrow(), vec![10, 11, 12]);
 
-    let snap = g.describe();
+    let snap = g.topology();
     let factories = snap
         .nodes
         .iter()
@@ -4136,7 +4136,7 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
     );
 
     let factories = g
-        .describe()
+        .topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -4253,7 +4253,7 @@ fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
     );
     let _seen = collect_shapes::<i32>(&repeated);
 
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap.nodes.iter().any(|n| n.id == "repeat_live_1"));
     assert!(snap
         .edges
@@ -4262,7 +4262,7 @@ fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
 
     let first_inner = inners.borrow()[0].clone();
     first_inner.complete();
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap.nodes.iter().any(|n| n.id == "repeat_live_2"));
     assert!(snap
         .edges
@@ -4341,7 +4341,7 @@ fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
     exhaust_source.set(3);
     assert_eq!(*exhaust_seen.borrow(), vec![10, 30]);
 
-    let snap = g.describe();
+    let snap = g.topology();
     let factories = snap
         .nodes
         .iter()
@@ -4430,7 +4430,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
     );
     assert_eq!(*collect_data(&flattened).borrow(), vec![30]);
 
-    let snap = g.describe();
+    let snap = g.topology();
     let factories = snap
         .nodes
         .iter()

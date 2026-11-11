@@ -326,9 +326,7 @@ pub fn scheduled_readiness_projector(
         },
         node_opts(format!("{name}/runtime"), "scheduledReadinessProjector"),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&runtime, "ScheduledReadinessBundle runtime")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     ScheduledReadinessBundle {
         pending: project_fact(
             graph,

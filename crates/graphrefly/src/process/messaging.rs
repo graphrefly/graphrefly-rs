@@ -224,9 +224,7 @@ pub fn process_messaging_recipe<
             process_event_outbox_commands(graph, events, topic, format!("{name}/outboxCommands"))
         })
     });
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&ack_commands, "ProcessMessagingRecipeBundle ack_commands")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&ack_commands)]);
     ProcessMessagingRecipeBundle {
         delivered_commands,
         commands,

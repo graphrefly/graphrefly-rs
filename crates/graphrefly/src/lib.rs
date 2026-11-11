@@ -225,11 +225,10 @@ pub use environment::{
     WebSocketSend, WebSocketSendResult, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
-    graph, graph_opts, DescribeEdge, DescribeKind, DescribeNode, DescribeOpts, DescribeSnapshot,
-    DescribeValue, Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions,
-    GraphTopologyObserver, NodeProfile, ObserveEvent, ObserveMessage, ObserveStream, Profile,
-    RestoreFactoryMeta, TopologyEvent, TopologyEventKind, TopologyGroup, TopologyGroupOptions,
-    TopologyStream, Values,
+    graph, graph_opts, DescribeKind, DescribeNode, Explain, Graph, GraphNode, GraphNodeOpts,
+    GraphOptions, GraphTopologyObserver, NodeProfile, ObserveEvent, Profile, RestoreFactoryMeta,
+    TopologyEdge, TopologyEvent, TopologyEventKind, TopologyGroup, TopologyGroupOptions,
+    TopologyNode, TopologyOpts, TopologySnapshot, TopologyStream, Values,
 };
 pub use higher_order::{
     concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,
@@ -298,9 +297,9 @@ pub use process::{
 };
 pub use protocol::{AnyValue, GraphError, Handle, Message, Wave};
 pub use render::{
-    describe_to_ascii, describe_to_d2, describe_to_d2_with_direction, describe_to_json,
-    describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
-    describe_to_pretty, mermaid_live_url, DiagramDirection,
+    mermaid_live_url, topology_to_ascii, topology_to_d2, topology_to_d2_with_direction,
+    topology_to_json, topology_to_mermaid, topology_to_mermaid_url,
+    topology_to_mermaid_with_direction, topology_to_pretty, DiagramDirection,
 };
 pub use report::{HostFailure, HostReporter};
 pub use resilience::{

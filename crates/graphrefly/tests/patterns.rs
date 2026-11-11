@@ -324,7 +324,7 @@ fn memory_retrieval_bundle_exposes_snapshot_and_projection_topology() {
         MemoryRetrievalBundleOptions::new(fragments.clone(), query.clone()).named("memory"),
     );
 
-    let edges = g.describe().edges;
+    let edges = g.topology().edges;
     assert!(edges
         .iter()
         .any(|edge| edge.from == "fragments" && edge.to == "memory/snapshot"));
@@ -337,7 +337,7 @@ fn memory_retrieval_bundle_exposes_snapshot_and_projection_topology() {
     assert!(edges
         .iter()
         .any(|edge| edge.from == "memory/snapshot" && edge.to == "memory/status"));
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .nodes
         .iter()
@@ -682,7 +682,7 @@ fn agentic_memory_bundle_projects_records_to_retrieval_and_context_metadata() {
         AgenticMemoryBundleOptions::new(records.clone(), query.clone()).named("memory"),
     );
 
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .edges
         .iter()
@@ -938,7 +938,7 @@ fn agentic_memory_kg_projection_validates_drafts_and_exposes_topology() {
         &g,
         AgenticMemoryKgProjectionBundleOptions::new(records, drafts).named("kg"),
     );
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .edges
         .iter()
@@ -1297,7 +1297,7 @@ fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
         )
         .named("packing"),
     );
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .edges
         .iter()
@@ -1455,7 +1455,7 @@ fn knowledge_graph_reducer_materializes_entities_and_errors() {
             .with_policy(policy.node().clone())
             .named("kg"),
     );
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .edges
         .iter()

@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::graph::{Graph, GraphObserver, ObserveEvent};
+use crate::graph::{Graph, ObserveEvent};
 use crate::storage::{
     observe_event_frame, AppendLogStorageTier, ObserveEventFrame, ObserveEventFrameOptions,
     StorageError, StorageResult,
@@ -34,22 +34,22 @@ pub enum ObserveEventLogErrorPhase {
 pub struct ObserveEventLogErrorContext<T> {
     /// `phase` field for phase.
     pub phase: ObserveEventLogErrorPhase,
-    /// `event` field for event.
-    pub event: Option<ObserveEvent>,
+    /// The id of the observed node whose array failed, if any.
+    pub id: Option<String>,
     /// `value` field for value.
     pub value: Option<ObserveEventFrame<T>>,
 }
 
 /// `ObserveEventLogMap` type alias.
-pub type ObserveEventLogMap<T> = dyn Fn(&ObserveEvent) -> Option<T>;
+pub type ObserveEventLogMap<T> = dyn Fn(&ObserveEvent<'_>) -> Option<T>;
 /// `ObserveEventLogErrorFn` type alias.
 pub type ObserveEventLogErrorFn<T> = dyn Fn(StorageError, ObserveEventLogErrorContext<T>);
 
 #[derive(Clone)]
 /// `AttachObserveEventLogOptions` data container.
 pub struct AttachObserveEventLogOptions<T: Clone> {
-    /// `path` field for path.
-    pub path: Option<String>,
+    /// The ids to observe; `None` observes every node [`Graph::describe`] gives.
+    pub ids: Option<Vec<String>>,
     /// `stream` field for stream.
     pub stream: Option<String>,
     /// `map` field for map.
@@ -58,44 +58,20 @@ pub struct AttachObserveEventLogOptions<T: Clone> {
     pub on_error: Option<Rc<ObserveEventLogErrorFn<T>>>,
 }
 
-impl<T> AttachObserveEventLogOptions<T>
-where
-    T: Clone + From<ObserveEvent> + 'static,
-{
-    /// Creates or computes `new`.
-    pub fn new() -> Self {
-        Self {
-            path: None,
-            stream: None,
-            map: Rc::new(|event| Some(event.clone().into())),
-            on_error: None,
-        }
-    }
-}
-
-impl<T> Default for AttachObserveEventLogOptions<T>
-where
-    T: Clone + From<ObserveEvent> + 'static,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T: Clone> AttachObserveEventLogOptions<T> {
     /// Creates or computes `from_map`.
-    pub fn from_map(map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
+    pub fn from_map(map: impl Fn(&ObserveEvent<'_>) -> Option<T> + 'static) -> Self {
         Self {
-            path: None,
+            ids: None,
             stream: None,
             map: Rc::new(map),
             on_error: None,
         }
     }
 
-    /// Updates or reads `with_path`.
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
+    /// Observes only the nodes `ids` names.
+    pub fn with_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.ids = Some(ids.into_iter().map(Into::into).collect());
         self
     }
 
@@ -106,7 +82,7 @@ impl<T: Clone> AttachObserveEventLogOptions<T> {
     }
 
     /// Updates or reads `with_map`.
-    pub fn with_map(mut self, map: impl Fn(&ObserveEvent) -> Option<T> + 'static) -> Self {
+    pub fn with_map(mut self, map: impl Fn(&ObserveEvent<'_>) -> Option<T> + 'static) -> Self {
         self.map = Rc::new(map);
         self
     }
@@ -123,7 +99,7 @@ impl<T: Clone> AttachObserveEventLogOptions<T> {
 
 /// `ObserveEventLogHandle` data container.
 pub struct ObserveEventLogHandle {
-    observer: Option<GraphObserver>,
+    observer: Option<Box<dyn FnOnce()>>,
     flush: Rc<dyn Fn() -> StorageResult<()>>,
     rollback: Rc<dyn Fn() -> StorageResult<()>>,
 }
@@ -141,7 +117,9 @@ impl ObserveEventLogHandle {
 
     /// Updates or reads `dispose`.
     pub fn dispose(&mut self) -> StorageResult<()> {
-        self.observer.take();
+        if let Some(stop) = self.observer.take() {
+            stop();
+        }
         (self.flush)()
     }
 }
@@ -158,17 +136,19 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
     log: Rc<dyn AppendLogStorageTier<ObserveEventFrame<T>>>,
     opts: AttachObserveEventLogOptions<T>,
 ) -> ObserveEventLogHandle {
-    let stream = match &opts.path {
-        Some(path) => graph.observe_path(path),
-        None => graph.observe(),
-    };
+    let ids = opts
+        .ids
+        .clone()
+        .unwrap_or_else(|| graph.describe().into_iter().map(|node| node.id).collect());
+    // The log's own order: one sequence number per observed array it appends.
+    let observe_seq = Rc::new(std::cell::Cell::new(0u64));
     let map = opts.map.clone();
     let on_error = opts.on_error.clone();
     let frame_opts = ObserveEventFrameOptions {
         stream: opts.stream.clone(),
     };
     let pending = Rc::new(RefCell::new(
-        VecDeque::<(ObserveEvent, ObserveEventFrame<T>)>::new(),
+        VecDeque::<(String, ObserveEventFrame<T>)>::new(),
     ));
     let flush_pending = {
         let pending = pending.clone();
@@ -177,7 +157,7 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
         Rc::new(move || {
             let mut first_error = None;
             loop {
-                let Some((event, frame)) = pending.borrow().front().cloned() else {
+                let Some((id, frame)) = pending.borrow().front().cloned() else {
                     break;
                 };
                 if let Err(error) = log.append(frame.clone()) {
@@ -186,7 +166,7 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
                         error.clone(),
                         ObserveEventLogErrorContext {
                             phase: ObserveEventLogErrorPhase::Write,
-                            event: Some(event),
+                            id: Some(id),
                             value: Some(frame),
                         },
                     );
@@ -210,8 +190,9 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
             Ok(())
         }) as Rc<dyn Fn() -> StorageResult<()>>
     };
-    let observer = stream.subscribe(move |event| {
-        let mapped = match catch_unwind(AssertUnwindSafe(|| (map)(&event))) {
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let observer = graph.observe(&id_refs, move |event| {
+        let mapped = match catch_unwind(AssertUnwindSafe(|| (map)(event))) {
             Ok(mapped) => mapped,
             Err(_) => {
                 report_observe_event_log_error(
@@ -219,7 +200,7 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
                     StorageError::backend("attach_observe_event_log: map panicked"),
                     ObserveEventLogErrorContext {
                         phase: ObserveEventLogErrorPhase::Map,
-                        event: Some(event),
+                        id: Some(event.id.to_owned()),
                         value: None,
                     },
                 );
@@ -229,9 +210,11 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
         let Some(value) = mapped else {
             return;
         };
+        let seq = observe_seq.get();
+        observe_seq.set(seq + 1);
         let frame = match observe_event_frame(
-            event.seq,
-            event.path.clone(),
+            seq,
+            event.id.to_owned(),
             value,
             ObserveEventFrameOptions {
                 stream: frame_opts.stream.clone(),
@@ -244,14 +227,14 @@ pub fn attach_observe_event_log<T: Clone + 'static>(
                     error,
                     ObserveEventLogErrorContext {
                         phase: ObserveEventLogErrorPhase::Map,
-                        event: Some(event),
+                        id: Some(event.id.to_owned()),
                         value: None,
                     },
                 );
                 return;
             }
         };
-        pending.borrow_mut().push_back((event, frame));
+        pending.borrow_mut().push_back((event.id.to_owned(), frame));
     });
     ObserveEventLogHandle {
         observer: Some(observer),

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use graphrefly::{
-    filter, graph, map, pipe, stratify, stratify_branch, DescribeEdge, GraphNodeOpts, Message,
-    Node, StratifyOptions, StratifyRule,
+    filter, graph, map, pipe, stratify, stratify_branch, GraphNodeOpts, Message, Node,
+    StratifyOptions, StratifyRule, TopologyEdge,
 };
 
 fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
@@ -40,7 +40,7 @@ fn pipe_registers_each_operator_through_graph_init_funnel() {
     source.set(3);
 
     assert_eq!(*seen.borrow(), vec!["v2".to_owned(), "v4".to_owned()]);
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .nodes
         .iter()
@@ -53,15 +53,15 @@ fn pipe_registers_each_operator_through_graph_init_funnel() {
         .nodes
         .iter()
         .any(|node| node.id == "map#2" && node.factory == "map"));
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "source".to_owned(),
         to: "map#0".to_owned(),
     }));
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "map#0".to_owned(),
         to: "filter#1".to_owned(),
     }));
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "filter#1".to_owned(),
         to: "map#2".to_owned(),
     }));
@@ -77,7 +77,7 @@ fn pipe_zero_steps_returns_the_original_source_node() {
     source.set(2);
 
     assert_eq!(*seen.borrow(), vec![1, 2]);
-    assert_eq!(g.describe().nodes.len(), 1);
+    assert_eq!(g.topology().nodes.len(), 1);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,12 +106,12 @@ fn stratify_branch_routes_source_values_through_declared_deps() {
 
     // The first run classifies the source's snapshot, 0 (R-subscription).
     assert_eq!(*seen.borrow(), vec![0, 2, 3]);
-    let snap = g.describe();
-    assert!(snap.edges.contains(&DescribeEdge {
+    let snap = g.topology();
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "source".to_owned(),
         to: "branch/evenish".to_owned(),
     }));
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "rules".to_owned(),
         to: "branch/evenish".to_owned(),
     }));
@@ -189,7 +189,7 @@ fn stratify_builds_static_named_branches_with_metadata() {
     // The first run classifies the source's snapshot, 0 (R-subscription).
     assert_eq!(*even_seen.borrow(), vec![0, 2, 3]);
     assert_eq!(*odd_seen.borrow(), vec![1, 4]);
-    let snap = g.describe();
+    let snap = g.topology();
     let even_node = snap
         .nodes
         .iter()
@@ -209,11 +209,11 @@ fn stratify_builds_static_named_branches_with_metadata() {
         odd_node.meta.as_ref().and_then(|meta| meta.get("priority")),
         Some(&"high".to_owned())
     );
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "source".to_owned(),
         to: "topic/even".to_owned(),
     }));
-    assert!(snap.edges.contains(&DescribeEdge {
+    assert!(snap.edges.contains(&TopologyEdge {
         from: "topic/rules".to_owned(),
         to: "topic/odd".to_owned(),
     }));
@@ -299,7 +299,7 @@ fn stratify_unknown_later_rule_does_not_create_a_branch_or_mutate_topology() {
             ..StratifyOptions::default()
         },
     );
-    let before = g.describe();
+    let before = g.topology();
     let before_node_ids: Vec<_> = before.nodes.iter().map(|node| node.id.clone()).collect();
 
     stratified.rules.set(vec![
@@ -308,7 +308,7 @@ fn stratify_unknown_later_rule_does_not_create_a_branch_or_mutate_topology() {
     ]);
     source.set(1);
 
-    let after = g.describe();
+    let after = g.topology();
     let after_node_ids: Vec<_> = after.nodes.iter().map(|node| node.id.clone()).collect();
     assert!(stratified.branches.contains_key("even"));
     assert!(!stratified.branches.contains_key("odd"));

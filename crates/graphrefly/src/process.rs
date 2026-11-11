@@ -795,7 +795,7 @@ impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'stat
         ];
         let release_ids = self.release_node_ids();
         let release_id_set = release_ids.iter().cloned().collect::<HashSet<_>>();
-        for edge in self.graph.describe().edges {
+        for edge in self.graph.topology().edges {
             if !release_id_set.contains(&edge.from) || release_id_set.contains(&edge.to) {
                 continue;
             }
@@ -997,14 +997,14 @@ pub fn process_bundle<
     );
 
     let retains = crate::graph::Held::new(vec![
-        graph.retain(&runtime, &format!("{name}.process.runtime")),
-        graph.retain(&state, &format!("{name}.process.state")),
-        graph.retain(&events, &format!("{name}.process.events")),
-        graph.retain(&audit, &format!("{name}.process.audit")),
-        graph.retain(&effect_request, &format!("{name}.process.effect_request")),
-        graph.retain(&status, &format!("{name}.process.status")),
-        graph.retain(&error, &format!("{name}.process.error")),
-        graph.retain(&cursor, &format!("{name}.process.cursor")),
+        graph.hold(&runtime),
+        graph.hold(&state),
+        graph.hold(&events),
+        graph.hold(&audit),
+        graph.hold(&effect_request),
+        graph.hold(&status),
+        graph.hold(&error),
+        graph.hold(&cursor),
     ]);
 
     ProcessBundle {
@@ -1210,7 +1210,6 @@ where
             status: &status,
             errors: &errors,
         },
-        &name,
     );
 
     ProcessEffectRunnerBundle {
@@ -1395,7 +1394,6 @@ struct EffectRunnerNodeRefs<'a, TCommand, TEffect, TResult> {
 fn retain_effect_runner_nodes<TCommand, TEffect, TResult>(
     graph: &Graph,
     nodes: EffectRunnerNodeRefs<'_, TCommand, TEffect, TResult>,
-    name: &str,
 ) -> Vec<Box<dyn FnOnce()>>
 where
     TCommand: 'static,
@@ -1403,12 +1401,12 @@ where
     TResult: 'static,
 {
     vec![
-        graph.retain(nodes.requests, &format!("{name}.effect_runner.requests")),
-        graph.retain(nodes.outcomes, &format!("{name}.effect_runner.outcomes")),
-        graph.retain(nodes.runtime, &format!("{name}.effect_runner.runtime")),
-        graph.retain(nodes.commands, &format!("{name}.effect_runner.commands")),
-        graph.retain(nodes.status, &format!("{name}.effect_runner.status")),
-        graph.retain(nodes.errors, &format!("{name}.effect_runner.errors")),
+        graph.hold(nodes.requests),
+        graph.hold(nodes.outcomes),
+        graph.hold(nodes.runtime),
+        graph.hold(nodes.commands),
+        graph.hold(nodes.status),
+        graph.hold(nodes.errors),
     ]
 }
 

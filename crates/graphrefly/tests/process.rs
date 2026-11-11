@@ -231,7 +231,7 @@ fn process_bundle_topology_is_describe_visible_with_declared_deps() {
         }),
     );
 
-    let snap = g.describe();
+    let snap = g.topology();
     let process_command = snap
         .nodes
         .iter()
@@ -513,7 +513,7 @@ fn process_effect_runner_projects_result_commands_through_declared_process_edge(
         })
     );
 
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .edges
         .iter()
@@ -707,7 +707,7 @@ fn process_effect_runner_command_source_fan_in_accepts_multiple_runners() {
         process.state.cache(),
         Some(vec!["left-effect".to_owned(), "right-effect".to_owned()])
     );
-    let snap = g.describe();
+    let snap = g.topology();
     assert!(snap
         .edges
         .iter()
@@ -757,7 +757,7 @@ fn process_effect_runner_release_is_idempotent_and_retryable_after_release_failu
         "release rollback must not replay cached runner.commands"
     );
     assert!(g
-        .describe()
+        .topology()
         .edges
         .iter()
         .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));
@@ -775,7 +775,7 @@ fn process_effect_runner_release_is_idempotent_and_retryable_after_release_failu
     assert!(g.find("work/runtime").is_none());
     assert!(g.find("work/commands").is_none());
     assert!(!g
-        .describe()
+        .topology()
         .edges
         .iter()
         .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));

@@ -1186,9 +1186,7 @@ impl<T: Clone + 'static> MessageBus<T> {
             },
             node_opts(format!("{name}/runtime"), "messageBusRuntime"),
         );
-        let runtime_retain = crate::graph::Held::new(vec![
-            graph.retain(&runtime, &format!("{name}.messageBus.runtime"))
-        ]);
+        let runtime_retain = crate::graph::Held::new(vec![graph.hold(&runtime)]);
         let messages = graph.node_opts::<MessageEnvelope<T>, _>(
             vec![runtime.erased()],
             move |ctx| {
@@ -2521,7 +2519,7 @@ mod clean_slate_tests {
                 .with_topics(["orders"])
                 .with_now(|| 10),
         );
-        let snap = g.describe();
+        let snap = g.topology();
         for id in [
             "bus/commands",
             "bus/runtime",

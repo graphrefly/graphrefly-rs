@@ -532,12 +532,12 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     );
 
     let retains = crate::graph::Held::new(vec![
-        graph.retain(&runtime, &format!("{name}.cqrs.runtime")),
-        graph.retain(&events, &format!("{name}.cqrs.events")),
-        graph.retain(&status, &format!("{name}.cqrs.status")),
-        graph.retain(&errors, &format!("{name}.cqrs.errors")),
-        graph.retain(&audit, &format!("{name}.cqrs.audit")),
-        graph.retain(&cursor, &format!("{name}.cqrs.cursor")),
+        graph.hold(&runtime),
+        graph.hold(&events),
+        graph.hold(&status),
+        graph.hold(&errors),
+        graph.hold(&audit),
+        graph.hold(&cursor),
     ]);
 
     CqrsBundle {
@@ -760,10 +760,10 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
         GraphNodeOpts::named(format!("{name}/errors")),
     );
     let retains = crate::graph::Held::new(vec![
-        graph.retain(&frames, &format!("{name}.cqrsProjection.frames")),
-        graph.retain(&value, &format!("{name}.cqrsProjection.value")),
-        graph.retain(&status, &format!("{name}.cqrsProjection.status")),
-        graph.retain(&errors, &format!("{name}.cqrsProjection.errors")),
+        graph.hold(&frames),
+        graph.hold(&value),
+        graph.hold(&status),
+        graph.hold(&errors),
     ]);
     CqrsProjection {
         frames,

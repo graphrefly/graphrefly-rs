@@ -2178,7 +2178,7 @@ mod tests {
                 last_delay_ms: None,
             })
         );
-        let snap = g.describe();
+        let snap = g.topology();
         assert!(snap
             .edges
             .iter()

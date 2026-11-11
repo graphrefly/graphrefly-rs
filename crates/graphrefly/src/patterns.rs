@@ -1028,9 +1028,7 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
         named_graph_node_opts(format!("{name}/snapshot")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "MemoryRetrievalBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     MemoryRetrievalBundle {
         fragments_input: fragments,
@@ -1168,9 +1166,7 @@ pub fn knowledge_graph_reducer_bundle(
         named_graph_node_opts(format!("{name}/snapshot")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "KnowledgeGraphReducerBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     KnowledgeGraphReducerBundle {
         assertions_input: assertions,

@@ -228,9 +228,7 @@ pub fn cqrs_messaging_recipe<
             cqrs_event_outbox_commands(graph, events, topic, format!("{name}/outboxCommands"))
         })
     });
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&ack_commands, "CqrsMessagingRecipeBundle ack_commands")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&ack_commands)]);
     CqrsMessagingRecipeBundle {
         delivered_commands,
         commands,

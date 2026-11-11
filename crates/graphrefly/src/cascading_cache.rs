@@ -446,9 +446,9 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
     );
 
     let held = crate::graph::Held::new(vec![
-        graph.retain(&events, "ReactiveCascadingCache events"),
-        graph.retain(&status, "ReactiveCascadingCache status"),
-        graph.retain(&value, "ReactiveCascadingCache value"),
+        graph.hold(&events),
+        graph.hold(&status),
+        graph.hold(&value),
     ]);
 
     ReactiveCascadingCache {

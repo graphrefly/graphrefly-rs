@@ -207,7 +207,6 @@ type Unsub = Box<dyn FnOnce()>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubscriberKind {
     External,
-    GraphObserver,
     /// A dependent node's input edge. Only these receive the kernel's lone `[PENDING]`
     /// mark (R-wave).
     Dependent,
@@ -2537,24 +2536,7 @@ impl Core {
     }
 
     pub(crate) fn external_subscriber_count_for_release(&self) -> usize {
-        self.with_aux(|a| {
-            a.subscribers
-                .iter()
-                .filter(|entry| entry.kind != SubscriberKind::GraphObserver)
-                .count()
-        })
-    }
-
-    pub(crate) fn detach_graph_observer_subscribers_for_release(&self) -> usize {
-        if !self.graph.borrow().is_live_key(self.key()) {
-            return 0;
-        }
-        self.with_aux_mut(|a| {
-            let before = a.subscribers.len();
-            a.subscribers
-                .retain(|entry| entry.kind != SubscriberKind::GraphObserver);
-            before - a.subscribers.len()
-        })
+        self.with_aux(|a| a.subscribers.len())
     }
 
     // ── activation / deactivation (lazy; R-lifetime) ──
@@ -4038,10 +4020,6 @@ impl<T: 'static> Node<T> {
     /// later slice.)
     pub fn subscribe(&self, sink: impl Fn(&[Msg]) + 'static) -> Unsub {
         self.subscribe_with_kind(sink, SubscriberKind::External)
-    }
-
-    pub(crate) fn subscribe_graph_observer(&self, sink: impl Fn(&[Msg]) + 'static) -> Unsub {
-        self.subscribe_with_kind(sink, SubscriberKind::GraphObserver)
     }
 
     fn subscribe_with_kind(&self, sink: impl Fn(&[Msg]) + 'static, kind: SubscriberKind) -> Unsub {

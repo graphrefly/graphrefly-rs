@@ -510,7 +510,7 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
         .text
         .contains("[near] Durable project memory"));
 
-    let described = g.describe();
+    let described = g.topology();
     assert!(described
         .edges
         .iter()
@@ -634,7 +634,7 @@ fn public_crate_root_b72_sources_io_and_resilience_acceptance() {
     );
     assert!(completed.get());
     assert!(g
-        .describe()
+        .topology()
         .nodes
         .iter()
         .any(|node| { node.id == "acceptance/b72/sse" && node.factory == "fromSSE" }));
@@ -651,7 +651,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
         ..GraphOptions::default()
     });
     let source = g.state_opts(1_i32, GraphNodeOpts::named("acceptance/source"));
-    let before_pipe = g.describe();
+    let before_pipe = g.topology();
 
     let doubled = pipe(&g, source.node().clone())
         .through(map::<i32, i32>(|value| value * 2))
@@ -674,7 +674,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     source.set(2);
 
     assert_eq!(doubled_values.borrow().as_slice(), &[2, 4]);
-    let after_pipe = g.describe();
+    let after_pipe = g.topology();
     let pipe_diff = topology_diff(&before_pipe, &after_pipe);
     assert!(pipe_diff.events.iter().any(|event| matches!(
         event,
@@ -724,7 +724,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
             .into_iter()
             .collect()
     );
-    let with_view = g.describe();
+    let with_view = g.topology();
     assert!(with_view.nodes.iter().any(|node| {
         node.id == "acceptance/items.select#0.delta" && node.factory == "reactiveMap.select.delta"
     }));
@@ -744,7 +744,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
 
     unsubscribe_selected_snapshot();
     selected.dispose();
-    let after_dispose = g.describe();
+    let after_dispose = g.topology();
     let dispose_diff = topology_diff(&with_view, &after_dispose);
     assert!(dispose_diff.events.iter().any(|event| matches!(
         event,
@@ -1003,7 +1003,7 @@ fn public_crate_root_d566_environment_resilience_acceptance() {
     );
     assert_eq!(WebSocketSend::binary([1_u8, 2, 3]).data, vec![1, 2, 3]);
     assert!(g
-        .describe()
+        .topology()
         .edges
         .iter()
         .any(|edge| { edge.from == "acceptance/env/source" && edge.to == "acceptance/env/http" }));

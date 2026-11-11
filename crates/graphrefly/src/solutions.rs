@@ -1224,9 +1224,7 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/context")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&projection, "AgenticMemoryBundle projection")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&projection)]);
 
     AgenticMemoryBundle {
         records_input: records,
@@ -1424,9 +1422,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "AgenticMemoryKgProjectionBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryKgProjectionBundle {
         records_input: records,
@@ -1604,9 +1600,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "AgenticMemoryRetentionBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryRetentionBundle {
         records_input: records,
@@ -1744,9 +1738,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
         vec![requests.erased(), outcomes.erased()],
         named_solution_node_opts(format!("{name}/snapshot")),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "AgenticMemoryConsolidationBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
     AgenticMemoryConsolidationBundle {
         requests_input: requests,
         outcomes_input: outcomes,
@@ -1866,9 +1858,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&snapshot, "AgenticMemoryContextPackingBundle snapshot")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryContextPackingBundle {
         context_input: context,

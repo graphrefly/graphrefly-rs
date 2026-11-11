@@ -1101,10 +1101,7 @@ where
     let errors = project_errors(graph, &events, &name);
     let cursor = project_cursor(graph, &events, &name);
     let attempts = project_attempts(graph, &events, &name);
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&events, "wire_bridge events ledger"),
-        graph.retain(&status, "wire_bridge status ledger"),
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&events), graph.hold(&status)]);
     WireBridgeBundle {
         command,
         outbound,
@@ -1160,9 +1157,9 @@ where
     );
     let errors = remote_call_errors_node(graph, &responses, &timeouts, &bridge.events, &name);
     let held = crate::graph::Held::new(vec![
-        graph.retain(&responses, "remote_call responses ledger"),
-        graph.retain(&status, "remote_call status ledger"),
-        graph.retain(&errors, "remote_call errors ledger"),
+        graph.hold(&responses),
+        graph.hold(&status),
+        graph.hold(&errors),
     ]);
     RemoteCallBundle {
         bridge_command: bridge.command.clone(),
@@ -1196,8 +1193,7 @@ where
     // The response commands reach the bridge as writes of its command state, from a
     // sink (graphrefly:D803): no edge, no host-level rewire.
     let command_writer = write_commands_into(&response_commands, &bridge.command);
-    let held =
-        crate::graph::Held::new(vec![graph.retain(&status, "remote_responder status ledger")]);
+    let held = crate::graph::Held::new(vec![graph.hold(&status)]);
     RemoteResponderBundle {
         events,
         response_commands,
@@ -3568,7 +3564,7 @@ mod tests {
             bridge.status.cache().unwrap().state,
             WireBridgeStatusState::Closed
         );
-        let snap = g.describe();
+        let snap = g.topology();
         let mut ids = snap
             .nodes
             .iter()

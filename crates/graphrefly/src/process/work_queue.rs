@@ -222,9 +222,7 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&runtime, "ProcessWorkQueueRecipeBundle runtime")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     ProcessWorkQueueRecipeBundle {
         submit_commands,
         evidence: project(

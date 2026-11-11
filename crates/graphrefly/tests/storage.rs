@@ -31,7 +31,7 @@ use graphrefly::{
     CascadingCacheStatus, ChangeEnvelopeOptions, ChangeLifecycle, Codec, ContentAddressedKvOptions,
     ContentAddressedMode, FileAppendLogOptions, FileBackendOptions, GraphCheckpointFactory,
     JsonCodec, KvStorageTier, KvVersionedRead, Message, Node, ObserveEventFrame,
-    ObserveEventFrameOptions, ObserveMessage, OpenPersistentReactiveIndexOptions,
+    ObserveEventFrameOptions, OpenPersistentReactiveIndexOptions,
     OpenPersistentReactiveListOptions, OpenPersistentReactiveLogOptions,
     OpenPersistentReactiveMapOptions, PersistReactiveCollectionOptions, PromotionPolicy,
     ReactiveCascadingCacheOptions, ReactiveCollectionChangeFrame, ReactiveCollectionKind,
@@ -1933,11 +1933,13 @@ fn attach_observe_event_log_persists_mapped_data_frames_in_observe_order() {
     let mut handle = attach_observe_event_log(
         &g,
         Rc::new(log.clone()),
-        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
-            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
-            _ => None,
+        AttachObserveEventLogOptions::from_map(|event| {
+            event.msgs.iter().find_map(|msg| match msg {
+                Message::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+                _ => None,
+            })
         })
-        .with_path("count")
+        .with_ids(["count"])
         .with_stream("audit"),
     );
 
@@ -2034,11 +2036,13 @@ fn observe_event_log_flush_keeps_failed_frame_for_retry() {
     let handle = attach_observe_event_log(
         &g,
         Rc::new(log),
-        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
-            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
-            _ => None,
+        AttachObserveEventLogOptions::from_map(|event| {
+            event.msgs.iter().find_map(|msg| match msg {
+                Message::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+                _ => None,
+            })
         })
-        .with_path("count"),
+        .with_ids(["count"]),
     );
 
     count.set(1);
@@ -2078,11 +2082,13 @@ fn observe_event_log_rollback_drops_queued_frames_before_flush() {
     let handle = attach_observe_event_log(
         &g,
         Rc::new(log.clone()),
-        AttachObserveEventLogOptions::from_map(|event| match &event.msg {
-            ObserveMessage::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
-            _ => None,
+        AttachObserveEventLogOptions::from_map(|event| {
+            event.msgs.iter().find_map(|msg| match msg {
+                Message::Data(value) => value.as_ref().downcast_ref::<i32>().copied(),
+                _ => None,
+            })
         })
-        .with_path("count"),
+        .with_ids(["count"]),
     );
 
     count.set(1);
@@ -2979,22 +2985,22 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     assert_eq!(*statuses.borrow(), vec![CascadingCacheStatus::Idle]);
     request.set("user:1".to_owned());
 
-    let snap = g.describe();
+    let snap = g.topology();
     let mut ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
     ids.sort_unstable();
     assert_eq!(
         ids,
         vec!["cache.events", "cache.status", "cache.value", "request"]
     );
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "request".to_owned(),
         to: "cache.events".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "cache.events".to_owned(),
         to: "cache.status".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::DescribeEdge {
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "cache.events".to_owned(),
         to: "cache.value".to_owned(),
     }));

@@ -248,7 +248,7 @@ fn remote_call_sends_request_facts_and_projects_later_response() {
         "D147: late/unknown responses are bridge facts but not remote_call results"
     );
 
-    let snapshot = g.describe();
+    let snapshot = g.topology();
     assert!(snapshot.nodes.iter().any(|node| node.id == "rpc/responses"));
     assert!(snapshot.nodes.iter().any(|node| node.id == "rpc/results"));
     assert!(snapshot
@@ -686,7 +686,7 @@ fn remote_responder_invokes_sync_handler_and_sends_response_through_bridge_comma
         "remote responder command helper must publish DATA facts, not protocol ERROR"
     );
 
-    let snapshot = g.describe();
+    let snapshot = g.topology();
     assert!(snapshot
         .edges
         .iter()
@@ -962,7 +962,7 @@ fn remote_responder_release_detaches_response_commands_from_long_lived_bridge() 
 
     assert!(g.find("responder/responseCommands").is_none());
     assert!(!g
-        .describe()
+        .topology()
         .edges
         .iter()
         .any(|edge| { edge.from == "responder/responseCommands" && edge.to == "bridge/command" }));

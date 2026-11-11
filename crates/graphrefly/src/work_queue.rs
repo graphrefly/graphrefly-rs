@@ -1589,7 +1589,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
     );
     let ack_release =
         attach_message_bus_deferred_command_sink(graph, &opts.bus, &admission_ack_commands);
-    let runtime_release = graph.retain(&runtime, &format!("{name}.workQueue.runtime"));
+    let runtime_release = graph.hold(&runtime);
     WorkQueue {
         name,
         queue_id,

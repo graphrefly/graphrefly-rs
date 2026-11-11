@@ -744,14 +744,34 @@ impl Graph {
         self.emit_topology_mount_changed(at);
     }
 
-    /// Static point-in-time inspection snapshot (D39 first cut).
-    pub fn describe(&self) -> DescribeSnapshot {
-        self.describe_opts(DescribeOpts::default())
+    /// The graph's topology as data (R-graph-surface@1, R-node@2): every node in
+    /// creation order as `{ id, kind, deps, quiet }` and nothing else; `deps` are the
+    /// current dependencies, a ctx.rewire's included. A value or a status is read from
+    /// the node. It activates nothing and runs nothing.
+    pub fn describe(&self) -> Vec<DescribeNode> {
+        self.topology_with_prefix("")
+            .nodes
+            .into_iter()
+            .map(|node| DescribeNode {
+                id: node.id,
+                kind: node.kind,
+                deps: node.deps,
+                quiet: node.quiet,
+            })
+            .collect()
     }
 
-    /// Updates or reads `describe_opts`.
-    pub fn describe_opts(&self, opts: DescribeOpts) -> DescribeSnapshot {
-        let snap = self.describe_with_prefix("");
+    /// This package's own topology view for rendering and diagnostics: describe's
+    /// nodes with their factory, name and annotations, the edges and the mounted
+    /// graphs (D39). Not part of R-graph-surface; values and status are read from the
+    /// node.
+    pub fn topology(&self) -> TopologySnapshot {
+        self.topology_opts(TopologyOpts::default())
+    }
+
+    /// Updates or reads `topology_opts`.
+    pub fn topology_opts(&self, opts: TopologyOpts) -> TopologySnapshot {
+        let snap = self.topology_with_prefix("");
         if let Some(explain) = opts.explain {
             explain_subset(snap, &explain)
         } else {
@@ -759,20 +779,60 @@ impl Graph {
         }
     }
 
-    /// Read-only observation egress for every currently registered node in this graph.
-    pub fn observe(&self) -> ObserveStream {
-        ObserveStream {
-            graph: self.clone(),
-            path: None,
+    /// Subscribes `sink` to each node in `ids` as an ordinary subscriber
+    /// (R-graph-surface@1): a cold node is activated and stays active while observed,
+    /// and each array a node delivers reaches `sink` as `{ id, msgs }`, in delivery
+    /// order, its START array first. Returns the stop; after it, nothing more reaches
+    /// `sink`, also in the middle of a wave.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an id names no node of this graph.
+    pub fn observe(
+        &self,
+        ids: &[&str],
+        sink: impl Fn(&ObserveEvent<'_>) + 'static,
+    ) -> Box<dyn FnOnce()> {
+        let cores: Vec<(String, Core)> = ids
+            .iter()
+            .map(|id| {
+                let core = self.core_at(id);
+                let core = core.unwrap_or_else(|| panic!("observe: no node '{id}'"));
+                ((*id).to_owned(), core)
+            })
+            .collect();
+        let stopped = Rc::new(Cell::new(false));
+        let sink = Rc::new(sink);
+        let mut stops = Vec::with_capacity(cores.len());
+        for (id, core) in cores {
+            let stopped = stopped.clone();
+            let sink = sink.clone();
+            stops.push(Node::<AnyValue>::from_core(core).subscribe(
+                move |msgs: &[Message<AnyValue>]| {
+                    if !stopped.get() {
+                        sink(&ObserveEvent { id: &id, msgs });
+                    }
+                },
+            ));
         }
+        Box::new(move || {
+            stopped.set(true);
+            for stop in stops {
+                stop();
+            }
+        })
     }
 
-    /// Read-only observation egress for a single registered id or a `::` subtree prefix.
-    pub fn observe_path(&self, path: &str) -> ObserveStream {
-        ObserveStream {
-            graph: self.clone(),
-            path: Some(path.to_owned()),
-        }
+    /// Holds the node `id` active as a subscriber that ignores what it receives
+    /// (R-graph-surface@1); returns the release. Each retain is its own subscription.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `id` names no node of this graph.
+    pub fn retain(&self, id: &str) -> Box<dyn FnOnce()> {
+        let core = self.core_at(id);
+        let core = core.unwrap_or_else(|| panic!("retain: no node '{id}'"));
+        Node::<AnyValue>::from_core(core).subscribe(|_| {})
     }
 
     /// D145 read-only topology lifecycle egress over the existing graph registry.
@@ -1080,9 +1140,6 @@ impl Graph {
                 retired.insert(id.clone());
             }
         }
-        for core in &release_cores {
-            core.detach_graph_observer_subscribers_for_release();
-        }
         let mut pending = release_cores.iter().rev().cloned().collect::<Vec<_>>();
         let mut first_panic = None;
         while !pending.is_empty() {
@@ -1124,10 +1181,29 @@ impl Graph {
         );
     }
 
-    pub(crate) fn retain<T: 'static>(&self, node: &Node<T>, reason: &str) -> Box<dyn FnOnce()> {
+    /// The node registered as `id`, looking through a mounted graph for a
+    /// `mount::id` path (mounting is this package's own).
+    fn core_at(&self, id: &str) -> Option<Core> {
+        if let Some(core) = self.inner.by_id.borrow().get(id).cloned() {
+            return Some(core);
+        }
+        let (at, rest) = id.split_once("::")?;
+        let child = self
+            .inner
+            .mounts
+            .borrow()
+            .iter()
+            .find(|m| m.at == at)
+            .map(|m| m.graph.clone())?;
+        child.core_at(rest)
+    }
+
+    /// Holds `node` active, as [`Graph::retain`] does, for a bundle that has the
+    /// handle rather than the id.
+    pub(crate) fn hold<T: 'static>(&self, node: &Node<T>) -> Box<dyn FnOnce()> {
         assert!(
             node.erased().same_graph_arena(&self.inner.arena),
-            "graph: cannot retain node for {reason}; node belongs to a different graph"
+            "graph: cannot hold a node of a different graph"
         );
         node.subscribe(|_| {})
     }
@@ -1366,7 +1442,7 @@ impl Graph {
         self.inner.topology_delivering.set(false);
     }
 
-    fn describe_with_prefix(&self, prefix: &str) -> DescribeSnapshot {
+    fn topology_with_prefix(&self, prefix: &str) -> TopologySnapshot {
         let entries = self.inner.entries.borrow().clone();
         let mut nodes = Vec::with_capacity(entries.len());
         let mut edges = Vec::new();
@@ -1387,17 +1463,15 @@ impl Graph {
                 })
                 .collect();
             for dep_id in &deps {
-                edges.push(DescribeEdge {
+                edges.push(TopologyEdge {
                     from: dep_id.clone(),
                     to: id.clone(),
                 });
             }
-            nodes.push(DescribeNode {
+            nodes.push(TopologyNode {
                 id,
                 name: entry.name.clone(),
                 factory: entry.factory.clone(),
-                status: entry.core.status(),
-                value: entry.core.cache_any().as_ref().map(describe_value),
                 kind: DescribeKind::of(&entry.core),
                 deps,
                 quiet: entry.core.is_quiet(),
@@ -1431,17 +1505,15 @@ impl Graph {
                 })
                 .collect();
             for dep_id in &deps {
-                edges.push(DescribeEdge {
+                edges.push(TopologyEdge {
                     from: dep_id.clone(),
                     to: id.clone(),
                 });
             }
-            nodes.push(DescribeNode {
+            nodes.push(TopologyNode {
                 id,
                 name: None,
                 factory: core.factory().unwrap_or_else(|| "?".to_owned()),
-                status: core.status(),
-                value: core.cache_any().as_ref().map(describe_value),
                 kind: DescribeKind::of(&core),
                 deps,
                 quiet: core.is_quiet(),
@@ -1455,12 +1527,12 @@ impl Graph {
             .iter()
             .map(|m| {
                 let mount_path = format!("{prefix}{}", m.at);
-                let mut child = m.graph.describe_with_prefix(&format!("{mount_path}::"));
+                let mut child = m.graph.topology_with_prefix(&format!("{mount_path}::"));
                 child.name = Some(mount_path);
                 child
             })
             .collect::<Vec<_>>();
-        DescribeSnapshot {
+        TopologySnapshot {
             name: self.inner.name.clone(),
             nodes,
             edges,
@@ -1469,77 +1541,6 @@ impl Graph {
             } else {
                 Some(subgraphs)
             },
-        }
-    }
-
-    fn observe_targets(
-        &self,
-        path: Option<&str>,
-        sink: impl Fn(ObserveEvent) + 'static,
-    ) -> GraphObserver {
-        let targets = self.observe_target_entries(path);
-        let clock = self.inner.clock.clone();
-        let sink = Rc::new(sink);
-        let mut observer = GraphObserver {
-            unsubs: Vec::with_capacity(targets.len()),
-        };
-        for (path, core) in targets {
-            let sink = sink.clone();
-            let clock = clock.clone();
-            let subscribed = catch_unwind(AssertUnwindSafe(|| {
-                Node::<AnyValue>::from_core(core).subscribe_graph_observer(
-                    move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
-                        for msg in msgs {
-                            let seq = clock.get();
-                            clock.set(seq + 1);
-                            sink(ObserveEvent {
-                                path: path.clone(),
-                                msg: ObserveMessage::from_message(msg),
-                                seq,
-                            });
-                        }
-                    },
-                )
-            }));
-            let unsub = match subscribed {
-                Ok(unsub) => unsub,
-                Err(payload) => {
-                    for unsub in observer.unsubs.drain(..).flatten() {
-                        unsub();
-                    }
-                    resume_unwind(payload);
-                }
-            };
-            observer.unsubs.push(Some(unsub));
-        }
-        observer
-    }
-
-    fn observe_target_entries(&self, path: Option<&str>) -> Vec<(String, Core)> {
-        let mut all = Vec::new();
-        self.collect_observe_entries("", &mut all);
-        if let Some(path) = path {
-            let prefix = format!("{path}::");
-            all.into_iter()
-                .filter(|(id, _)| id == path || id.starts_with(&prefix))
-                .collect()
-        } else {
-            all
-        }
-    }
-
-    fn collect_observe_entries(&self, prefix: &str, out: &mut Vec<(String, Core)>) {
-        out.extend(
-            self.inner
-                .entries
-                .borrow()
-                .iter()
-                .map(|entry| (format!("{prefix}{}", entry.id), entry.core.clone())),
-        );
-        for mount in self.inner.mounts.borrow().iter() {
-            mount
-                .graph
-                .collect_observe_entries(&format!("{prefix}{}::", mount.at), out);
         }
     }
 
@@ -1565,8 +1566,8 @@ pub fn graph_opts(opts: GraphOptions) -> Graph {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// `DescribeOpts` data container.
-pub struct DescribeOpts {
+/// `TopologyOpts` data container.
+pub struct TopologyOpts {
     /// `explain` field for explain.
     pub explain: Option<Explain>,
 }
@@ -1721,30 +1722,40 @@ impl GraphNode {
 
 /// D39 describe snapshot: flat nodes/edges plus mounted subgraphs.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DescribeSnapshot {
+pub struct TopologySnapshot {
     /// `name` field for name.
     pub name: Option<String>,
     /// `nodes` field for nodes.
-    pub nodes: Vec<DescribeNode>,
+    pub nodes: Vec<TopologyNode>,
     /// `edges` field for edges.
-    pub edges: Vec<DescribeEdge>,
+    pub edges: Vec<TopologyEdge>,
     /// `subgraphs` field for subgraphs.
-    pub subgraphs: Option<Vec<DescribeSnapshot>>,
+    pub subgraphs: Option<Vec<TopologySnapshot>>,
+}
+
+/// One node of [`Graph::describe`] (R-graph-surface@1): exactly its id, kind,
+/// current dependencies and whether it is quiet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeNode {
+    /// The node's id in the graph.
+    pub id: String,
+    /// A state or a computed node.
+    pub kind: DescribeKind,
+    /// The current dependencies' ids, in order.
+    pub deps: Vec<String>,
+    /// Whether the node is quiet (R-wave@2).
+    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// `DescribeNode` data container.
-pub struct DescribeNode {
+/// `TopologyNode` data container.
+pub struct TopologyNode {
     /// `id` field for id.
     pub id: String,
     /// `name` field for name.
     pub name: Option<String>,
     /// `factory` field for factory.
     pub factory: String,
-    /// `status` field for status.
-    pub status: Status,
-    /// `value` field for value.
-    pub value: Option<DescribeValue>,
     /// Whether the node is a state or a computed node (R-node@2).
     pub kind: DescribeKind,
     /// The current dependencies, in order (R-node@2).
@@ -1755,7 +1766,7 @@ pub struct DescribeNode {
     pub meta: Option<BTreeMap<String, String>>,
 }
 
-/// What kind of node a [`DescribeNode`] is (R-node@2).
+/// What kind of node a [`TopologyNode`] is (R-node@2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescribeKind {
     /// A state node: no function and no dependencies.
@@ -1775,86 +1786,22 @@ impl DescribeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// `DescribeEdge` data container.
-pub struct DescribeEdge {
+/// `TopologyEdge` data container.
+pub struct TopologyEdge {
     /// `from` field for from.
     pub from: String,
     /// `to` field for to.
     pub to: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-/// `DescribeValue` variants.
-pub enum DescribeValue {
-    /// `Bool` variant.
-    Bool(bool),
-    /// `I64` variant.
-    I64(i64),
-    /// `U64` variant.
-    U64(u64),
-    /// `F64` variant.
-    F64(f64),
-    /// `String` variant.
-    String(String),
-    /// `Opaque` variant.
-    Opaque,
-}
-
-#[derive(Clone)]
-/// `ObserveEvent` data container.
-pub struct ObserveEvent {
-    /// `path` field for path.
-    pub path: String,
-    /// `msg` field for msg.
-    pub msg: ObserveMessage,
-    /// `seq` field for seq.
-    pub seq: u64,
-}
-
-#[derive(Clone)]
-/// `ObserveMessage` variants.
-pub enum ObserveMessage {
-    /// `Start` variant.
-    Start,
-    /// `Pending` variant.
-    Pending,
-    /// `Data` variant.
-    Data(AnyValue),
-    /// `Resolved` variant.
-    Resolved,
-    /// `Invalidate` variant.
-    Invalidate,
-    /// `Complete` variant.
-    Complete,
-    /// `Error` variant.
-    Error(String),
-}
-
-impl ObserveMessage {
-    fn from_message(msg: &Message<AnyValue>) -> Self {
-        match msg {
-            Message::Start => ObserveMessage::Start,
-            Message::Pending => ObserveMessage::Pending,
-            Message::Data(value) => ObserveMessage::Data(value.clone()),
-            Message::Resolved => ObserveMessage::Resolved,
-            Message::Invalidate => ObserveMessage::Invalidate,
-            Message::Complete => ObserveMessage::Complete,
-            Message::Error(error) => ObserveMessage::Error(format!("{error}")),
-        }
-    }
-
-    /// Updates or reads `kind`.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            ObserveMessage::Start => "START",
-            ObserveMessage::Pending => "PENDING",
-            ObserveMessage::Data(_) => "DATA",
-            ObserveMessage::Resolved => "RESOLVED",
-            ObserveMessage::Invalidate => "INVALIDATE",
-            ObserveMessage::Complete => "COMPLETE",
-            ObserveMessage::Error(_) => "ERROR",
-        }
-    }
+/// One array a node delivered to [`Graph::observe`] (R-graph-surface@1): no tier and
+/// no sequence; events arrive in delivery order.
+#[derive(Clone, Copy)]
+pub struct ObserveEvent<'a> {
+    /// The observed node's id.
+    pub id: &'a str,
+    /// The array, as the node delivered it.
+    pub msgs: &'a [Message<AnyValue>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1887,11 +1834,6 @@ pub struct TopologyEvent {
     pub seq: u64,
 }
 
-/// `GraphObserver` data container.
-pub struct GraphObserver {
-    unsubs: Vec<Option<Box<dyn FnOnce()>>>,
-}
-
 /// `GraphTopologyObserver` data container.
 pub struct GraphTopologyObserver {
     graph: Graph,
@@ -1900,24 +1842,10 @@ pub struct GraphTopologyObserver {
 }
 
 #[derive(Clone)]
-/// `ObserveStream` data container.
-pub struct ObserveStream {
-    graph: Graph,
-    path: Option<String>,
-}
-
-#[derive(Clone)]
 /// `TopologyStream` data container.
 pub struct TopologyStream {
     graph: Graph,
     path: Option<String>,
-}
-
-impl ObserveStream {
-    /// Updates or reads `subscribe`.
-    pub fn subscribe(&self, sink: impl Fn(ObserveEvent) + 'static) -> GraphObserver {
-        self.graph.observe_targets(self.path.as_deref(), sink)
-    }
 }
 
 impl TopologyStream {
@@ -1949,21 +1877,6 @@ impl TopologyStream {
             graph: self.graph.clone(),
             id,
             active: true,
-        }
-    }
-}
-
-impl GraphObserver {
-    /// Updates or reads `unsubscribe`.
-    pub fn unsubscribe(mut self) {
-        self.unsubscribe_all();
-    }
-
-    fn unsubscribe_all(&mut self) {
-        for unsub in &mut self.unsubs {
-            if let Some(unsub) = unsub.take() {
-                unsub();
-            }
         }
     }
 }
@@ -2015,12 +1928,6 @@ impl Drop for GraphTopologyObserver {
     }
 }
 
-impl Drop for GraphObserver {
-    fn drop(&mut self) {
-        self.unsubscribe_all();
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// `NodeProfile` data container.
 pub struct NodeProfile {
@@ -2043,7 +1950,7 @@ pub struct Profile {
     pub nodes: BTreeMap<String, NodeProfile>,
 }
 
-fn explain_subset(snapshot: DescribeSnapshot, explain: &Explain) -> DescribeSnapshot {
+fn explain_subset(snapshot: TopologySnapshot, explain: &Explain) -> TopologySnapshot {
     let snapshot = flatten_describe_snapshot(snapshot);
     let mut fwd: HashMap<String, Vec<String>> = HashMap::new();
     let mut rev: HashMap<String, Vec<String>> = HashMap::new();
@@ -2058,7 +1965,7 @@ fn explain_subset(snapshot: DescribeSnapshot, explain: &Explain) -> DescribeSnap
     let from_reach = reachable(&explain.from, &fwd);
     let to_reach = reachable(&explain.to, &rev);
     let on_path: HashSet<String> = from_reach.intersection(&to_reach).cloned().collect();
-    DescribeSnapshot {
+    TopologySnapshot {
         name: snapshot.name,
         nodes: snapshot
             .nodes
@@ -2074,7 +1981,7 @@ fn explain_subset(snapshot: DescribeSnapshot, explain: &Explain) -> DescribeSnap
     }
 }
 
-fn flatten_describe_snapshot(mut snapshot: DescribeSnapshot) -> DescribeSnapshot {
+fn flatten_describe_snapshot(mut snapshot: TopologySnapshot) -> TopologySnapshot {
     if let Some(subgraphs) = snapshot.subgraphs.take() {
         for child in subgraphs {
             let mut child = flatten_describe_snapshot(child);
@@ -2104,43 +2011,6 @@ fn topology_path_matches(event_path: &str, path: &str) -> bool {
 
 fn prefix_topology_path(prefix: &str, path: &str) -> String {
     format!("{prefix}::{path}")
-}
-
-fn describe_value(value: &AnyValue) -> DescribeValue {
-    let value = value.as_ref();
-    if let Some(v) = value.downcast_ref::<bool>() {
-        DescribeValue::Bool(*v)
-    } else if let Some(v) = value.downcast_ref::<i8>() {
-        DescribeValue::I64(i64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<i16>() {
-        DescribeValue::I64(i64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<i32>() {
-        DescribeValue::I64(i64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<i64>() {
-        DescribeValue::I64(*v)
-    } else if let Some(v) = value.downcast_ref::<isize>() {
-        DescribeValue::I64(*v as i64)
-    } else if let Some(v) = value.downcast_ref::<u8>() {
-        DescribeValue::U64(u64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<u16>() {
-        DescribeValue::U64(u64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<u32>() {
-        DescribeValue::U64(u64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<u64>() {
-        DescribeValue::U64(*v)
-    } else if let Some(v) = value.downcast_ref::<usize>() {
-        DescribeValue::U64(*v as u64)
-    } else if let Some(v) = value.downcast_ref::<f32>() {
-        DescribeValue::F64(f64::from(*v))
-    } else if let Some(v) = value.downcast_ref::<f64>() {
-        DescribeValue::F64(*v)
-    } else if let Some(v) = value.downcast_ref::<String>() {
-        DescribeValue::String(v.clone())
-    } else if let Some(v) = value.downcast_ref::<&'static str>() {
-        DescribeValue::String((*v).to_owned())
-    } else {
-        DescribeValue::Opaque
-    }
 }
 
 #[cfg(test)]
@@ -2220,64 +2090,16 @@ mod tests {
     }
 
     #[test]
-    fn release_nodes_detaches_only_graph_observer_subscribers() {
-        let g = graph();
-        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
-        let child = group.state_opts(1, GraphNodeOpts::named("child/value"));
-        let unrelated = g.state_opts(10, GraphNodeOpts::named("unrelated"));
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let event_sink = events.clone();
-        let observer = g
-            .observe()
-            .subscribe(move |event| event_sink.borrow_mut().push(event));
-
-        group.release();
-
-        assert!(
-            g.find("child/value").is_none(),
-            "D122: released group nodes disappear from find"
-        );
-        assert!(
-            !g.describe()
-                .nodes
-                .iter()
-                .any(|entry| entry.id == "child/value"),
-            "D122: released group nodes disappear from describe"
-        );
-
-        unrelated.set(11);
-        observer.unsubscribe();
-
-        let events = events.borrow();
-        assert!(
-            events
-                .iter()
-                .any(|event| event.path == "unrelated"
-                    && matches!(event.msg, ObserveMessage::Data(_))),
-            "D557: graph observer remains an ordinary observer and keeps unrelated subscriptions"
-        );
-        assert!(
-            events.iter().all(|event| event.path != "child/value"
-                || !matches!(
-                    event.msg,
-                    ObserveMessage::Complete | ObserveMessage::Error(_)
-                )),
-            "D527: release does not synthesize protocol terminals"
-        );
-        drop(child);
-    }
-
-    #[test]
     fn release_nodes_still_rejects_public_subscribers() {
         let g = graph();
         let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
         let child = group.state_opts(1, GraphNodeOpts::named("child/value"));
         let public_subscriber = child.subscribe(|_| {});
-        let observer = g.observe().subscribe(|_| {});
+        let observer = g.observe(&["child/value"], |_| {});
 
         let result = catch_unwind(AssertUnwindSafe(|| group.release()));
 
-        observer.unsubscribe();
+        observer();
         public_subscriber();
         group.release();
         assert!(result.is_err());
@@ -2285,16 +2107,5 @@ mod tests {
             g.find("child/value").is_none(),
             "after public subscriber detaches, release can proceed"
         );
-    }
-
-    #[test]
-    fn graph_observer_unsubscribe_after_release_is_stale_safe() {
-        let g = graph();
-        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
-        let _child = group.state_opts(1, GraphNodeOpts::named("child/value"));
-        let observer = g.observe().subscribe(|_| {});
-
-        group.release();
-        observer.unsubscribe();
     }
 }

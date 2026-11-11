@@ -366,9 +366,7 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
             "workQueueScheduledReadinessProjector",
         ),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&runtime, "WorkQueueScheduledReadinessBundle runtime")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     WorkQueueScheduledReadinessBundle {
         readiness_schedules: project_fact(
             graph,
@@ -480,9 +478,7 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
             "workQueueReadinessHandoffProjector",
         ),
     );
-    let held = crate::graph::Held::new(vec![
-        graph.retain(&runtime, "WorkQueueReadinessHandoffBundle runtime")
-    ]);
+    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     WorkQueueReadinessHandoffBundle {
         candidates: project_fact(
             graph,

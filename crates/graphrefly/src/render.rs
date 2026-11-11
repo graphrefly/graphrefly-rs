@@ -1,8 +1,8 @@
-//! Pure renderers over `DescribeSnapshot` (D39/D40).
+//! Pure renderers over `TopologySnapshot` (D39/D40).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::graph::{DescribeEdge, DescribeNode, DescribeSnapshot, DescribeValue};
+use crate::graph::{TopologyEdge, TopologyNode, TopologySnapshot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// `DiagramDirection` variants.
@@ -38,14 +38,14 @@ impl DiagramDirection {
     }
 }
 
-/// Creates or computes `describe_to_mermaid`.
-pub fn describe_to_mermaid(snapshot: &DescribeSnapshot) -> String {
-    describe_to_mermaid_with_direction(snapshot, DiagramDirection::default())
+/// Creates or computes `topology_to_mermaid`.
+pub fn topology_to_mermaid(snapshot: &TopologySnapshot) -> String {
+    topology_to_mermaid_with_direction(snapshot, DiagramDirection::default())
 }
 
-/// Creates or computes `describe_to_mermaid_with_direction`.
-pub fn describe_to_mermaid_with_direction(
-    snapshot: &DescribeSnapshot,
+/// Creates or computes `topology_to_mermaid_with_direction`.
+pub fn topology_to_mermaid_with_direction(
+    snapshot: &TopologySnapshot,
     direction: DiagramDirection,
 ) -> String {
     let (nodes, edges) = flatten(snapshot);
@@ -82,19 +82,19 @@ pub fn mermaid_live_url(source: &str) -> String {
     )
 }
 
-/// Creates or computes `describe_to_mermaid_url`.
-pub fn describe_to_mermaid_url(snapshot: &DescribeSnapshot) -> String {
-    mermaid_live_url(&describe_to_mermaid(snapshot))
+/// Creates or computes `topology_to_mermaid_url`.
+pub fn topology_to_mermaid_url(snapshot: &TopologySnapshot) -> String {
+    mermaid_live_url(&topology_to_mermaid(snapshot))
 }
 
-/// Creates or computes `describe_to_d2`.
-pub fn describe_to_d2(snapshot: &DescribeSnapshot) -> String {
-    describe_to_d2_with_direction(snapshot, DiagramDirection::default())
+/// Creates or computes `topology_to_d2`.
+pub fn topology_to_d2(snapshot: &TopologySnapshot) -> String {
+    topology_to_d2_with_direction(snapshot, DiagramDirection::default())
 }
 
-/// Creates or computes `describe_to_d2_with_direction`.
-pub fn describe_to_d2_with_direction(
-    snapshot: &DescribeSnapshot,
+/// Creates or computes `topology_to_d2_with_direction`.
+pub fn topology_to_d2_with_direction(
+    snapshot: &TopologySnapshot,
     direction: DiagramDirection,
 ) -> String {
     let (nodes, edges) = flatten(snapshot);
@@ -119,8 +119,8 @@ pub fn describe_to_d2_with_direction(
     lines.join("\n")
 }
 
-/// Creates or computes `describe_to_pretty`.
-pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
+/// Creates or computes `topology_to_pretty`.
+pub fn topology_to_pretty(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut lines = vec![
         format!(
@@ -130,13 +130,7 @@ pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
         "Nodes:".to_owned(),
     ];
     for node in sorted_nodes(nodes) {
-        lines.push(format!(
-            "- {} ({}/{}): {}",
-            node.id,
-            node.factory,
-            node.status.label(),
-            format_value(&node)
-        ));
+        lines.push(format!("- {} ({})", node.id, node.factory));
     }
     lines.push("Edges:".to_owned());
     for edge in sorted_edges(edges) {
@@ -145,8 +139,8 @@ pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
     lines.join("\n")
 }
 
-/// Creates or computes `describe_to_ascii`.
-pub fn describe_to_ascii(snapshot: &DescribeSnapshot, include_values: bool) -> String {
+/// Creates or computes `topology_to_ascii`.
+pub fn topology_to_ascii(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut outgoing: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for edge in sorted_edges(edges) {
@@ -157,29 +151,17 @@ pub fn describe_to_ascii(snapshot: &DescribeSnapshot, include_values: bool) -> S
         snapshot.name.as_deref().unwrap_or("(anonymous)")
     )];
     for node in sorted_nodes(nodes) {
-        let value = if include_values {
-            format!(" {}", format_value(&node))
-        } else {
-            String::new()
-        };
         let to = outgoing
             .get(&node.id)
             .map(|targets| targets.join(", "))
             .unwrap_or_else(|| "-".to_owned());
-        lines.push(format!(
-            "{} [{}/{}{}] -> {}",
-            node.id,
-            node.factory,
-            node.status.label(),
-            value,
-            to
-        ));
+        lines.push(format!("{} [{}] -> {}", node.id, node.factory, to));
     }
     lines.join("\n")
 }
 
-/// Creates or computes `describe_to_json`.
-pub fn describe_to_json(snapshot: &DescribeSnapshot) -> String {
+/// Creates or computes `topology_to_json`.
+pub fn topology_to_json(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut out = String::new();
     out.push_str("{\n");
@@ -213,7 +195,7 @@ pub fn describe_to_json(snapshot: &DescribeSnapshot) -> String {
     out
 }
 
-fn flatten(snapshot: &DescribeSnapshot) -> (Vec<DescribeNode>, Vec<DescribeEdge>) {
+fn flatten(snapshot: &TopologySnapshot) -> (Vec<TopologyNode>, Vec<TopologyEdge>) {
     let mut nodes = snapshot.nodes.clone();
     let mut edges = snapshot.edges.clone();
     for child in snapshot.subgraphs.iter().flatten() {
@@ -224,12 +206,12 @@ fn flatten(snapshot: &DescribeSnapshot) -> (Vec<DescribeNode>, Vec<DescribeEdge>
     (nodes, edges)
 }
 
-fn sorted_nodes(mut nodes: Vec<DescribeNode>) -> Vec<DescribeNode> {
+fn sorted_nodes(mut nodes: Vec<TopologyNode>) -> Vec<TopologyNode> {
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     nodes
 }
 
-fn sorted_edges(edges: Vec<DescribeEdge>) -> Vec<DescribeEdge> {
+fn sorted_edges(edges: Vec<TopologyEdge>) -> Vec<TopologyEdge> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for edge in edges {
@@ -241,7 +223,7 @@ fn sorted_edges(edges: Vec<DescribeEdge>) -> Vec<DescribeEdge> {
     out
 }
 
-fn node_json(node: &DescribeNode) -> String {
+fn node_json(node: &TopologyNode) -> String {
     let mut fields = vec![
         format!("\"deps\":{}", string_array_json(&node.deps)),
         format!("\"factory\":\"{}\"", json_escape(&node.factory)),
@@ -258,10 +240,6 @@ fn node_json(node: &DescribeNode) -> String {
     if let Some(name) = &node.name {
         fields.push(format!("\"name\":\"{}\"", json_escape(name)));
     }
-    fields.push(format!("\"status\":\"{}\"", node.status.label()));
-    if let Some(value) = &node.value {
-        fields.push(format!("\"value\":{}", value_json(value)));
-    }
     format!("{{{}}}", fields.join(","))
 }
 
@@ -274,30 +252,6 @@ fn string_array_json(values: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
-}
-
-fn value_json(value: &DescribeValue) -> String {
-    match value {
-        DescribeValue::Bool(v) => v.to_string(),
-        DescribeValue::I64(v) => v.to_string(),
-        DescribeValue::U64(v) => v.to_string(),
-        DescribeValue::F64(v) if v.is_finite() => v.to_string(),
-        DescribeValue::F64(_) => "\"[non-finite]\"".to_owned(),
-        DescribeValue::String(v) => format!("\"{}\"", json_escape(v)),
-        DescribeValue::Opaque => "\"[Opaque]\"".to_owned(),
-    }
-}
-
-fn format_value(node: &DescribeNode) -> String {
-    match &node.value {
-        None => "<SENTINEL>".to_owned(),
-        Some(DescribeValue::Bool(v)) => v.to_string(),
-        Some(DescribeValue::I64(v)) => v.to_string(),
-        Some(DescribeValue::U64(v)) => v.to_string(),
-        Some(DescribeValue::F64(v)) => v.to_string(),
-        Some(DescribeValue::String(v)) => format!("\"{}\"", json_escape(v)),
-        Some(DescribeValue::Opaque) => "[Opaque]".to_owned(),
-    }
 }
 
 fn escape_quoted(value: &str) -> String {
