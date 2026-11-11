@@ -91,6 +91,7 @@ pub mod batch;
 pub mod cascading_cache;
 pub mod checkpoint;
 pub mod combinators;
+mod command_messaging;
 pub mod composition;
 pub mod cqrs;
 pub mod ctx;
