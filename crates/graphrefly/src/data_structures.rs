@@ -763,7 +763,8 @@ impl<T: Clone + 'static> ReactiveList<T> {
             .insert("collection".to_owned(), "reactiveList".to_owned());
         let src_core = src.erased();
         let folder = graph.init_node::<ListChange<T>>(op, vec![src_core.clone()], opts);
-        let unsub = folder.subscribe(|_| {});
+        // The fold is held active, through the graph's retain, until it is disposed.
+        let unsub = graph.hold(&folder);
         let slot = {
             let mut disposers = self.disposers.borrow_mut();
             let slot = disposers.len();
@@ -1469,7 +1470,8 @@ impl<T: Clone + 'static> ReactiveLog<T> {
             .insert("collection".to_owned(), "reactiveLog".to_owned());
         let src_core = src.erased();
         let folder = graph.init_node::<LogChange<T>>(op, vec![src_core.clone()], opts);
-        let unsub = folder.subscribe(|_| {});
+        // The fold is held active, through the graph's retain, until it is disposed.
+        let unsub = graph.hold(&folder);
         let slot = {
             let mut disposers = self.disposers.borrow_mut();
             let slot = disposers.len();
