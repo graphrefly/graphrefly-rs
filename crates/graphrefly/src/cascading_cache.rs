@@ -189,6 +189,8 @@ pub struct ReactiveCascadingCache<V: Clone + 'static> {
     pub status: Node<CascadingCacheStatus>,
     /// `events` field for events.
     pub events: Node<CascadingCacheEvent<V>>,
+    /// The driver nodes hold the request sequence that orders fills (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -443,10 +445,18 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
         },
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&events, "ReactiveCascadingCache events"),
+        graph.retain(&status, "ReactiveCascadingCache status"),
+        graph.retain(&value, "ReactiveCascadingCache value"),
+    ]);
+
     ReactiveCascadingCache {
         value,
         status,
         events,
+
+        _held: held,
     }
 }
 

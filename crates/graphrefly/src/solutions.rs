@@ -385,6 +385,8 @@ pub struct AgenticMemoryKgProjectionBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryKgProjectionCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,6 +525,8 @@ pub struct AgenticMemoryRetentionBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryRetentionCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -718,6 +722,8 @@ pub struct AgenticMemoryConsolidationBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryConsolidationCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -859,6 +865,8 @@ pub struct AgenticMemoryContextPackingBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryContextPackingCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -984,6 +992,8 @@ pub struct AgenticMemoryBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryCursor>,
+    /// The projection holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 /// Creates or computes `validate_agentic_memory_kind`.
@@ -1214,6 +1224,10 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/context")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&projection, "AgenticMemoryBundle projection")
+    ]);
+
     AgenticMemoryBundle {
         records_input: records,
         query_input: query,
@@ -1259,6 +1273,8 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
         fragments,
         context,
         retrieval,
+
+        _held: held,
     }
 }
 
@@ -1408,6 +1424,10 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "AgenticMemoryKgProjectionBundle snapshot")
+    ]);
+
     AgenticMemoryKgProjectionBundle {
         records_input: records,
         drafts_input: drafts,
@@ -1440,6 +1460,8 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryKgProjectionSnapshot| snapshot.cursor.clone(),
         ),
         snapshot,
+
+        _held: held,
     }
 }
 
@@ -1582,6 +1604,10 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "AgenticMemoryRetentionBundle snapshot")
+    ]);
+
     AgenticMemoryRetentionBundle {
         records_input: records,
         commands_input: commands,
@@ -1628,6 +1654,8 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.cursor.clone(),
         ),
         snapshot,
+
+        _held: held,
     }
 }
 
@@ -1716,6 +1744,9 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
         vec![requests.erased(), outcomes.erased()],
         named_solution_node_opts(format!("{name}/snapshot")),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "AgenticMemoryConsolidationBundle snapshot")
+    ]);
     AgenticMemoryConsolidationBundle {
         requests_input: requests,
         outcomes_input: outcomes,
@@ -1764,6 +1795,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.cursor.clone(),
         ),
         snapshot,
+        _held: held,
     }
 }
 
@@ -1834,6 +1866,10 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
         named_solution_node_opts(format!("{name}/snapshot")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "AgenticMemoryContextPackingBundle snapshot")
+    ]);
+
     AgenticMemoryContextPackingBundle {
         context_input: context,
         texts_input: texts,
@@ -1867,6 +1903,8 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryContextPackingSnapshot| snapshot.cursor.clone(),
         ),
         snapshot,
+
+        _held: held,
     }
 }
 

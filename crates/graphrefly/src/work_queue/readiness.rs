@@ -231,6 +231,8 @@ pub struct WorkQueueScheduledReadinessBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
+    /// The runtime holds the emitted-key dedupe and the audit sequence (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -246,6 +248,8 @@ pub struct WorkQueueReadinessHandoffBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
+    /// The runtime holds the emitted-key dedupe and the audit sequence (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -362,6 +366,9 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
             "workQueueScheduledReadinessProjector",
         ),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&runtime, "WorkQueueScheduledReadinessBundle runtime")
+    ]);
     WorkQueueScheduledReadinessBundle {
         readiness_schedules: project_fact(
             graph,
@@ -413,6 +420,7 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
                 _ => None,
             },
         ),
+        _held: held,
     }
 }
 
@@ -472,6 +480,9 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
             "workQueueReadinessHandoffProjector",
         ),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&runtime, "WorkQueueReadinessHandoffBundle runtime")
+    ]);
     WorkQueueReadinessHandoffBundle {
         candidates: project_fact(
             graph,
@@ -523,6 +534,7 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
                 _ => None,
             },
         ),
+        _held: held,
     }
 }
 

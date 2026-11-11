@@ -137,6 +137,8 @@ pub struct CqrsMessagingRecipeBundle<TCommand, TEvent> {
     pub outbox_commands: Option<Node<MessageBusCommand<CqrsEvent<TEvent>>>>,
     /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// The ack commands hold the pending deliveries an ack is matched against (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -226,12 +228,16 @@ pub fn cqrs_messaging_recipe<
             cqrs_event_outbox_commands(graph, events, topic, format!("{name}/outboxCommands"))
         })
     });
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&ack_commands, "CqrsMessagingRecipeBundle ack_commands")
+    ]);
     CqrsMessagingRecipeBundle {
         delivered_commands,
         commands,
         ack_commands,
         outbox_commands,
         issues,
+        _held: held,
     }
 }
 

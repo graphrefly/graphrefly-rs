@@ -311,6 +311,8 @@ pub struct KnowledgeGraphReducerBundle {
     pub errors: Node<Vec<KnowledgeGraphError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<KnowledgeGraphCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 /// `ShardKey` type alias.
@@ -892,6 +894,8 @@ pub struct MemoryRetrievalBundle<T> {
     pub errors: Node<Vec<MemoryRetrievalError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<MemoryRetrievalCursor>,
+    /// The snapshot holds the evaluation cursor (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug)]
@@ -1024,6 +1028,10 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
         named_graph_node_opts(format!("{name}/snapshot")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "MemoryRetrievalBundle snapshot")
+    ]);
+
     MemoryRetrievalBundle {
         fragments_input: fragments,
         query_input: query,
@@ -1070,6 +1078,8 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
             |snapshot| snapshot.cursor.clone(),
         ),
         snapshot,
+
+        _held: held,
     }
 }
 
@@ -1158,6 +1168,10 @@ pub fn knowledge_graph_reducer_bundle(
         named_graph_node_opts(format!("{name}/snapshot")),
     );
 
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&snapshot, "KnowledgeGraphReducerBundle snapshot")
+    ]);
+
     KnowledgeGraphReducerBundle {
         assertions_input: assertions,
         policy_input: policy,
@@ -1218,6 +1232,8 @@ pub fn knowledge_graph_reducer_bundle(
             |snapshot| snapshot.cursor.clone(),
         ),
         snapshot,
+
+        _held: held,
     }
 }
 

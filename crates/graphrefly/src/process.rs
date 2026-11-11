@@ -8,7 +8,7 @@
 pub mod messaging;
 pub mod work_queue;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -664,7 +664,7 @@ pub struct ProcessBundle<
     pub cursor: Node<ProcessCursor>,
     command_sources: Rc<crate::fan_in::FanInSources>,
     command_id: String,
-    _retains: Rc<Vec<ProcessRetain>>,
+    _retains: Rc<crate::graph::Held>,
 }
 
 impl<TCommand: Clone + 'static, TState, TEvent, TEffect>
@@ -674,26 +674,6 @@ impl<TCommand: Clone + 'static, TState, TEvent, TEffect>
     pub fn dispatch(&self, command: ProcessCommand<TCommand>) -> ProcessCommand<TCommand> {
         self.command.set(command.clone());
         command
-    }
-}
-
-struct ProcessRetain {
-    release: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
-}
-
-impl ProcessRetain {
-    fn new(release: Box<dyn FnOnce()>) -> Self {
-        Self {
-            release: std::cell::RefCell::new(Some(release)),
-        }
-    }
-}
-
-impl Drop for ProcessRetain {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.borrow_mut().take() {
-            release();
-        }
     }
 }
 
@@ -772,7 +752,7 @@ pub struct ProcessEffectRunnerBundle<
     name: String,
     command_sources: Rc<crate::fan_in::FanInSources>,
     released: Cell<bool>,
-    retains: RefCell<Vec<ProcessRetain>>,
+    retains: Rc<crate::graph::Held>,
 }
 
 impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'static>
@@ -789,8 +769,7 @@ impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'stat
             &self.command_sources,
             self.commands.erased(),
         );
-        let active_retains = self.retains.replace(Vec::new());
-        drop(active_retains);
+        self.retains.release();
         self.released.set(true);
         self.graph.release_nodes(
             &[
@@ -1017,17 +996,15 @@ pub fn process_bundle<
         },
     );
 
-    let retains = Rc::new(vec![
-        ProcessRetain::new(graph.retain(&runtime, &format!("{name}.process.runtime"))),
-        ProcessRetain::new(graph.retain(&state, &format!("{name}.process.state"))),
-        ProcessRetain::new(graph.retain(&events, &format!("{name}.process.events"))),
-        ProcessRetain::new(graph.retain(&audit, &format!("{name}.process.audit"))),
-        ProcessRetain::new(
-            graph.retain(&effect_request, &format!("{name}.process.effect_request")),
-        ),
-        ProcessRetain::new(graph.retain(&status, &format!("{name}.process.status"))),
-        ProcessRetain::new(graph.retain(&error, &format!("{name}.process.error"))),
-        ProcessRetain::new(graph.retain(&cursor, &format!("{name}.process.cursor"))),
+    let retains = crate::graph::Held::new(vec![
+        graph.retain(&runtime, &format!("{name}.process.runtime")),
+        graph.retain(&state, &format!("{name}.process.state")),
+        graph.retain(&events, &format!("{name}.process.events")),
+        graph.retain(&audit, &format!("{name}.process.audit")),
+        graph.retain(&effect_request, &format!("{name}.process.effect_request")),
+        graph.retain(&status, &format!("{name}.process.status")),
+        graph.retain(&error, &format!("{name}.process.error")),
+        graph.retain(&cursor, &format!("{name}.process.cursor")),
     ]);
 
     ProcessBundle {
@@ -1249,7 +1226,7 @@ where
         name,
         command_sources: process.command_sources.clone(),
         released: Cell::new(false),
-        retains: RefCell::new(retains),
+        retains: crate::graph::Held::new(retains),
     }
 }
 
@@ -1419,19 +1396,19 @@ fn retain_effect_runner_nodes<TCommand, TEffect, TResult>(
     graph: &Graph,
     nodes: EffectRunnerNodeRefs<'_, TCommand, TEffect, TResult>,
     name: &str,
-) -> Vec<ProcessRetain>
+) -> Vec<Box<dyn FnOnce()>>
 where
     TCommand: 'static,
     TEffect: 'static,
     TResult: 'static,
 {
     vec![
-        ProcessRetain::new(graph.retain(nodes.requests, &format!("{name}.effect_runner.requests"))),
-        ProcessRetain::new(graph.retain(nodes.outcomes, &format!("{name}.effect_runner.outcomes"))),
-        ProcessRetain::new(graph.retain(nodes.runtime, &format!("{name}.effect_runner.runtime"))),
-        ProcessRetain::new(graph.retain(nodes.commands, &format!("{name}.effect_runner.commands"))),
-        ProcessRetain::new(graph.retain(nodes.status, &format!("{name}.effect_runner.status"))),
-        ProcessRetain::new(graph.retain(nodes.errors, &format!("{name}.effect_runner.errors"))),
+        graph.retain(nodes.requests, &format!("{name}.effect_runner.requests")),
+        graph.retain(nodes.outcomes, &format!("{name}.effect_runner.outcomes")),
+        graph.retain(nodes.runtime, &format!("{name}.effect_runner.runtime")),
+        graph.retain(nodes.commands, &format!("{name}.effect_runner.commands")),
+        graph.retain(nodes.status, &format!("{name}.effect_runner.status")),
+        graph.retain(nodes.errors, &format!("{name}.effect_runner.errors")),
     ]
 }
 

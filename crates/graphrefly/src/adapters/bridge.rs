@@ -511,6 +511,9 @@ pub struct WireBridgeBundle<TOutbound: Clone + 'static, TInbound: Clone + 'stati
     pub cursor: Node<u64>,
     /// `attempts` field for attempts.
     pub attempts: Node<WireBridgeAttempt>,
+    /// The event fold and status hold the bridge's sequence, cursors and pending
+    /// sends; the bundle keeps them active for its whole life (review Q13).
+    _held: Rc<crate::graph::Held>,
 }
 
 impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOutbound, TInbound> {
@@ -733,6 +736,9 @@ pub struct RemoteCallBundle<TRequest: Clone + 'static, TResponse: Clone + 'stati
     pub errors: Node<RemoteCallError>,
     /// `timeouts` field for timeouts.
     pub timeouts: Node<RemoteCallTimeout>,
+    /// The response correlation and dedupe ledgers, held for the bundle's life
+    /// (review Q13).
+    _held: Rc<crate::graph::Held>,
 }
 
 impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRequest, TResponse> {
@@ -955,6 +961,8 @@ pub struct RemoteResponderBundle<TRequest: Clone + 'static, TResponse: Clone + '
     command_writer: RefCell<Option<Box<dyn FnOnce()>>>,
     bridge_command: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
     released: Cell<bool>,
+    /// The status counters, held until the bundle is released (review Q13).
+    held: Rc<crate::graph::Held>,
 }
 
 impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
@@ -968,6 +976,7 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
         if let Some(stop) = self.command_writer.borrow_mut().take() {
             stop();
         }
+        self.held.release();
         let release = catch_unwind(AssertUnwindSafe(|| {
             self.graph.release_nodes(
                 &[
@@ -1092,6 +1101,10 @@ where
     let errors = project_errors(graph, &events, &name);
     let cursor = project_cursor(graph, &events, &name);
     let attempts = project_attempts(graph, &events, &name);
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&events, "wire_bridge events ledger"),
+        graph.retain(&status, "wire_bridge status ledger"),
+    ]);
     WireBridgeBundle {
         command,
         outbound,
@@ -1103,6 +1116,7 @@ where
         errors,
         cursor,
         attempts,
+        _held: held,
     }
 }
 
@@ -1145,6 +1159,11 @@ where
         &name,
     );
     let errors = remote_call_errors_node(graph, &responses, &timeouts, &bridge.events, &name);
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&responses, "remote_call responses ledger"),
+        graph.retain(&status, "remote_call status ledger"),
+        graph.retain(&errors, "remote_call errors ledger"),
+    ]);
     RemoteCallBundle {
         bridge_command: bridge.command.clone(),
         responses,
@@ -1152,6 +1171,7 @@ where
         status,
         errors,
         timeouts,
+        _held: held,
     }
 }
 
@@ -1176,6 +1196,8 @@ where
     // The response commands reach the bridge as writes of its command state, from a
     // sink (graphrefly:D803): no edge, no host-level rewire.
     let command_writer = write_commands_into(&response_commands, &bridge.command);
+    let held =
+        crate::graph::Held::new(vec![graph.retain(&status, "remote_responder status ledger")]);
     RemoteResponderBundle {
         events,
         response_commands,
@@ -1186,6 +1208,7 @@ where
         command_writer: RefCell::new(Some(command_writer)),
         bridge_command: bridge.command.clone(),
         released: Cell::new(false),
+        held,
     }
 }
 

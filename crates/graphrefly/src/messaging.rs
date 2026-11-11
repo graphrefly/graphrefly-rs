@@ -1039,7 +1039,7 @@ pub struct MessageBus<T = AnyValue> {
     pub issues: Node<DataIssue>,
     state: Rc<RefCell<MessageBusState<T>>>,
     command_sources: Rc<crate::fan_in::FanInSources>,
-    _runtime_retain: Rc<RetainNode>,
+    _runtime_retain: Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -1047,26 +1047,6 @@ pub struct MessageBus<T = AnyValue> {
 pub struct ToTopicBundle<T> {
     /// `commands` field for commands.
     pub commands: Node<MessageBusCommand<T>>,
-}
-
-struct RetainNode {
-    release: RefCell<Option<Box<dyn FnOnce()>>>,
-}
-
-impl RetainNode {
-    fn new(release: Box<dyn FnOnce()>) -> Self {
-        Self {
-            release: RefCell::new(Some(release)),
-        }
-    }
-}
-
-impl Drop for RetainNode {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.borrow_mut().take() {
-            release();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1206,9 +1186,9 @@ impl<T: Clone + 'static> MessageBus<T> {
             },
             node_opts(format!("{name}/runtime"), "messageBusRuntime"),
         );
-        let runtime_retain = Rc::new(RetainNode::new(
-            graph.retain(&runtime, &format!("{name}.messageBus.runtime")),
-        ));
+        let runtime_retain = crate::graph::Held::new(vec![
+            graph.retain(&runtime, &format!("{name}.messageBus.runtime"))
+        ]);
         let messages = graph.node_opts::<MessageEnvelope<T>, _>(
             vec![runtime.erased()],
             move |ctx| {

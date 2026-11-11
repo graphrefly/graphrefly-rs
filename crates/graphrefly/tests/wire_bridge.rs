@@ -1022,3 +1022,38 @@ fn remote_responder_release_is_retryable_when_external_subscriber_blocks_release
     responder.release();
     assert!(g.find("responder/status").is_none());
 }
+
+/// Review Q13 — the bridge's sequence is a cursor: it does not restart from 1 when
+/// every subscriber leaves and a new one arrives; the bundle owns its ledger.
+#[test]
+fn bridge_sequence_survives_its_subscribers_leaving() {
+    let g = graph();
+    let bridge =
+        wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-q13", "bridge"));
+    let seqs = Rc::new(RefCell::new(Vec::<u64>::new()));
+    let record = |seqs: Rc<RefCell<Vec<u64>>>| {
+        bridge
+            .outbound
+            .subscribe(move |msgs: &[Message<graphrefly::AnyValue>]| {
+                if msgs.iter().any(|m| matches!(m, Message::Start)) {
+                    return;
+                }
+                for msg in msgs {
+                    if let Message::Data(v) = msg {
+                        if let Some(env) =
+                            v.downcast_ref::<graphrefly::WireBridgeEnvelope<String>>()
+                        {
+                            seqs.borrow_mut().push(env.metadata.seq);
+                        }
+                    }
+                }
+            })
+    };
+    let stop = record(seqs.clone());
+    bridge.send("a".to_owned(), None, None);
+    bridge.send("b".to_owned(), None, None);
+    stop();
+    let _again = record(seqs.clone());
+    bridge.send("c".to_owned(), None, None);
+    assert_eq!(*seqs.borrow(), vec![1, 2, 3]);
+}

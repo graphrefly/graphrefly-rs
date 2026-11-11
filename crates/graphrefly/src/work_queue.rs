@@ -950,27 +950,7 @@ pub struct WorkQueue<T> {
     state: Rc<RefCell<RuntimeState<T>>>,
     graph: Graph,
     _admission_ack_commands: Node<MessageBusCommand<WorkQueueSubmit<T>>>,
-    _retain: Rc<WorkQueueRetain>,
-}
-
-struct WorkQueueRetain {
-    releases: RefCell<Vec<Box<dyn FnOnce()>>>,
-}
-
-impl WorkQueueRetain {
-    fn new(releases: Vec<Box<dyn FnOnce()>>) -> Self {
-        Self {
-            releases: RefCell::new(releases),
-        }
-    }
-}
-
-impl Drop for WorkQueueRetain {
-    fn drop(&mut self) {
-        for release in self.releases.borrow_mut().drain(..) {
-            release();
-        }
-    }
+    _retain: Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -1623,7 +1603,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
         state,
         graph: graph.clone(),
         _admission_ack_commands: admission_ack_commands,
-        _retain: Rc::new(WorkQueueRetain::new(vec![runtime_release, ack_release])),
+        _retain: crate::graph::Held::new(vec![runtime_release, ack_release]),
     }
 }
 

@@ -423,6 +423,34 @@ impl TopologyGroup {
     }
 }
 
+/// Subscriptions that hold a bundle's nodes active for as long as the bundle lives
+/// (review Q13): a ledger that carries idempotency, a cursor or an audit sequence then
+/// does not reset when the bundle's own subscribers leave. Dropping the last handle
+/// releases them.
+#[derive(Default)]
+pub(crate) struct Held(RefCell<Vec<Box<dyn FnOnce()>>>);
+
+impl Held {
+    /// Holds each release until the guard drops.
+    pub(crate) fn new(releases: Vec<Box<dyn FnOnce()>>) -> Rc<Self> {
+        Rc::new(Self(RefCell::new(releases)))
+    }
+
+    /// Releases what it holds now, before the guard drops (a bundle's own release).
+    pub(crate) fn release(&self) {
+        let releases = std::mem::take(&mut *self.0.borrow_mut());
+        for release in releases {
+            release();
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl Graph {
     /// Creates or computes `new`.
     pub fn new(opts: GraphOptions) -> Self {

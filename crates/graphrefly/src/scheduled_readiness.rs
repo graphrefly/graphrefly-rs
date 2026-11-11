@@ -217,6 +217,8 @@ pub struct ScheduledReadinessBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<ScheduledReadinessViews>,
+    /// The runtime holds the emitted and issue keys and the audit sequence (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -324,6 +326,9 @@ pub fn scheduled_readiness_projector(
         },
         node_opts(format!("{name}/runtime"), "scheduledReadinessProjector"),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&runtime, "ScheduledReadinessBundle runtime")
+    ]);
     ScheduledReadinessBundle {
         pending: project_fact(
             graph,
@@ -395,6 +400,7 @@ pub fn scheduled_readiness_projector(
                 _ => None,
             },
         ),
+        _held: held,
     }
 }
 

@@ -163,6 +163,8 @@ pub struct ProcessWorkQueueRecipeBundle<TEffect> {
     pub issues: Node<DataIssue>,
     /// `audit` field for audit.
     pub audit: Node<ProcessQueueAuditRecord>,
+    /// The runtime holds the audit sequence and the terminal-record dedupe (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -220,6 +222,9 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&runtime, "ProcessWorkQueueRecipeBundle runtime")
+    ]);
     ProcessWorkQueueRecipeBundle {
         submit_commands,
         evidence: project(
@@ -258,6 +263,7 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
                 _ => None,
             },
         ),
+        _held: held,
     }
 }
 

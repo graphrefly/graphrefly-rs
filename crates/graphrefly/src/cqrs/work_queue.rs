@@ -191,6 +191,8 @@ pub struct CqrsWorkQueueRecipeBundle<TCommand> {
     pub commands: Node<WorkQueueCommand<CqrsQueuedCommandPayload<TCommand>>>,
     /// `issues` field for issues.
     pub issues: Node<DataIssue>,
+    /// The runtime holds the terminal-claim dedupe and the active claims (review Q13).
+    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -257,6 +259,9 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
+    let held = crate::graph::Held::new(vec![
+        graph.retain(&runtime, "CqrsWorkQueueRecipeBundle runtime")
+    ]);
     CqrsWorkQueueRecipeBundle {
         attempts: project(
             graph,
@@ -294,6 +299,7 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
                 _ => None,
             },
         ),
+        _held: held,
     }
 }
 

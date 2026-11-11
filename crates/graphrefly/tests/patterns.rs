@@ -619,7 +619,9 @@ fn memory_retrieval_bundle_keeps_storage_controls_out_of_surface() {
 
     assert!(g.find("memory/snapshot").is_some());
     assert!(g.find("memory/ranked").is_some());
-    assert_eq!(bundle.snapshot.cache(), None);
+    // The bundle holds its snapshot, whose evaluation cursor must not restart when
+    // subscribers come and go (review Q13), so it is active from the start.
+    assert_eq!(bundle.snapshot.cache().unwrap().cursor.evaluation, 1);
 }
 
 #[test]

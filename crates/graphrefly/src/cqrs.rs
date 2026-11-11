@@ -408,7 +408,7 @@ pub struct CqrsBundle<TCommand = crate::protocol::AnyValue, TEvent = crate::prot
     pub audit: Node<CqrsAuditRecord>,
     /// `cursor` field for cursor.
     pub cursor: Node<CqrsCursor>,
-    _retains: Rc<Vec<CqrsRetain>>,
+    _retains: Rc<crate::graph::Held>,
 }
 
 impl<TCommand: Clone + 'static, TEvent: Clone + 'static> CqrsBundle<TCommand, TEvent> {
@@ -416,26 +416,6 @@ impl<TCommand: Clone + 'static, TEvent: Clone + 'static> CqrsBundle<TCommand, TE
     pub fn dispatch(&self, command: CqrsCommand<TCommand>) -> CqrsCommand<TCommand> {
         self.command.set(command.clone());
         command
-    }
-}
-
-struct CqrsRetain {
-    release: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
-}
-
-impl CqrsRetain {
-    fn new(release: Box<dyn FnOnce()>) -> Self {
-        Self {
-            release: std::cell::RefCell::new(Some(release)),
-        }
-    }
-}
-
-impl Drop for CqrsRetain {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.borrow_mut().take() {
-            release();
-        }
     }
 }
 
@@ -551,13 +531,13 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
         },
     );
 
-    let retains = Rc::new(vec![
-        CqrsRetain::new(graph.retain(&runtime, &format!("{name}.cqrs.runtime"))),
-        CqrsRetain::new(graph.retain(&events, &format!("{name}.cqrs.events"))),
-        CqrsRetain::new(graph.retain(&status, &format!("{name}.cqrs.status"))),
-        CqrsRetain::new(graph.retain(&errors, &format!("{name}.cqrs.errors"))),
-        CqrsRetain::new(graph.retain(&audit, &format!("{name}.cqrs.audit"))),
-        CqrsRetain::new(graph.retain(&cursor, &format!("{name}.cqrs.cursor"))),
+    let retains = crate::graph::Held::new(vec![
+        graph.retain(&runtime, &format!("{name}.cqrs.runtime")),
+        graph.retain(&events, &format!("{name}.cqrs.events")),
+        graph.retain(&status, &format!("{name}.cqrs.status")),
+        graph.retain(&errors, &format!("{name}.cqrs.errors")),
+        graph.retain(&audit, &format!("{name}.cqrs.audit")),
+        graph.retain(&cursor, &format!("{name}.cqrs.cursor")),
     ]);
 
     CqrsBundle {
@@ -659,7 +639,7 @@ pub struct CqrsProjection<TState> {
     pub status: Node<CqrsProjectionStatus>,
     /// `errors` field for errors.
     pub errors: Node<CqrsProjectionError>,
-    _retains: Rc<Vec<CqrsRetain>>,
+    _retains: Rc<crate::graph::Held>,
 }
 
 /// Creates or computes `cqrs_projection`.
@@ -779,11 +759,11 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
         vec![frames.erased()],
         GraphNodeOpts::named(format!("{name}/errors")),
     );
-    let retains = Rc::new(vec![
-        CqrsRetain::new(graph.retain(&frames, &format!("{name}.cqrsProjection.frames"))),
-        CqrsRetain::new(graph.retain(&value, &format!("{name}.cqrsProjection.value"))),
-        CqrsRetain::new(graph.retain(&status, &format!("{name}.cqrsProjection.status"))),
-        CqrsRetain::new(graph.retain(&errors, &format!("{name}.cqrsProjection.errors"))),
+    let retains = crate::graph::Held::new(vec![
+        graph.retain(&frames, &format!("{name}.cqrsProjection.frames")),
+        graph.retain(&value, &format!("{name}.cqrsProjection.value")),
+        graph.retain(&status, &format!("{name}.cqrsProjection.status")),
+        graph.retain(&errors, &format!("{name}.cqrsProjection.errors")),
     ]);
     CqrsProjection {
         frames,
