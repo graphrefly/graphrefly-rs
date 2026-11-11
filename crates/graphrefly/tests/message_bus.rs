@@ -116,9 +116,9 @@ fn main() {
     let dead = bus.dead_letter();
     let topic = bus.topic("orders");
 
-    let _ = catalog.snapshot.pull_id().expect("catalog pull id");
-    let _ = dead.snapshot.pull_id().expect("dead-letter pull id");
-    let _ = topic.snapshot.pull_id().expect("topic pull id");
+    let _ = &catalog.snapshot_request;
+    let _ = &dead.snapshot_request;
+    let _ = &topic.snapshot_request;
 }
 "#,
     );
@@ -142,7 +142,7 @@ fn main() {
     let _ = &sub.status;
     let _ = &sub.issues;
 
-    let _ = sub.available.pull_id().expect("available pull id");
+    let _ = &sub.available_request;
 
     let _ = sub.ack(1, None);
     let _ = sub.seek(2, None);
@@ -169,8 +169,8 @@ fn main() {
     let catalog = bus.catalog();
     let dead = bus.dead_letter();
 
-    let _ = catalog.snapshot.pull_id().expect("catalog pull id");
-    let _ = dead.snapshot.pull_id().expect("dead-letter pull id");
+    let _ = &catalog.snapshot_request;
+    let _ = &dead.snapshot_request;
 
     let sub = bus.subscription(MessageBusSubscriptionOptions::new("orders", "worker-a"));
     let _ = sub.ack(1, None);

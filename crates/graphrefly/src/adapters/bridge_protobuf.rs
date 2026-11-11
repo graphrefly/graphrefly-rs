@@ -119,8 +119,9 @@ pub struct CanonicalWireEdgeFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// `CanonicalWireEdgeKind` variants.
 pub enum CanonicalWireEdgeKind {
-    /// `Dirty` variant.
-    Dirty,
+    /// `Pending` variant (`WIRE_EDGE_KIND_PENDING = 1`, formerly DIRTY; the
+    /// number is unchanged, graphrefly:D798).
+    Pending,
     /// `Data` variant.
     Data,
 }
@@ -668,11 +669,11 @@ fn parse_wire_edge_frame(bytes: &[u8]) -> Result<CanonicalWireEdgeFrame, Canonic
             if value.is_some() {
                 return Err(CanonicalProtobufError::new(
                     CanonicalProtobufErrorCategory::InvalidWireEdge,
-                    "DIRTY WireEdgeFrame must not carry value",
+                    "PENDING WireEdgeFrame must not carry value",
                 ));
             }
             Ok(CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id,
                 cause_id,
                 value: None,
@@ -775,10 +776,12 @@ fn validate_wire_edge_frame(frame: &CanonicalWireEdgeFrame) -> Result<(), Canoni
         ));
     }
     match frame.kind {
-        CanonicalWireEdgeKind::Dirty if frame.value.is_some() => Err(CanonicalProtobufError::new(
-            CanonicalProtobufErrorCategory::InvalidWireEdge,
-            "DIRTY WireEdgeFrame must not carry value",
-        )),
+        CanonicalWireEdgeKind::Pending if frame.value.is_some() => {
+            Err(CanonicalProtobufError::new(
+                CanonicalProtobufErrorCategory::InvalidWireEdge,
+                "PENDING WireEdgeFrame must not carry value",
+            ))
+        }
         CanonicalWireEdgeKind::Data if frame.value.is_none() => Err(CanonicalProtobufError::new(
             CanonicalProtobufErrorCategory::InvalidWireEdge,
             "DATA WireEdgeFrame requires value",
@@ -824,7 +827,7 @@ fn encode_wire_edge_frame(frame: &CanonicalWireEdgeFrame) -> Vec<u8> {
     out.varint_field(
         1,
         match frame.kind {
-            CanonicalWireEdgeKind::Dirty => 1,
+            CanonicalWireEdgeKind::Pending => 1,
             CanonicalWireEdgeKind::Data => 2,
         },
     );

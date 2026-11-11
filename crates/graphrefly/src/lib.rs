@@ -75,7 +75,6 @@ pub mod environment;
 pub mod graph;
 pub mod higher_order;
 #[doc(hidden)]
-pub mod host_boundary;
 mod identity;
 pub mod json;
 pub mod messaging;
@@ -85,6 +84,7 @@ pub mod patterns;
 pub mod process;
 pub mod protocol;
 pub mod render;
+mod request;
 pub mod resilience;
 pub mod scheduled_readiness;
 pub mod solutions;
@@ -246,14 +246,14 @@ pub use messaging::{
     MessageBusAvailableParams, MessageBusCatalogEntry, MessageBusCatalogPage,
     MessageBusCatalogParams, MessageBusCommand, MessageBusCursor, MessageBusDeadLetterEntry,
     MessageBusDeadLetterPage, MessageBusDeadLetterParams, MessageBusDedupeAction,
-    MessageBusDedupePolicy, MessageBusOptions, MessageBusPullProjection, MessageBusRetentionPolicy,
+    MessageBusDedupePolicy, MessageBusOptions, MessageBusProjection, MessageBusRetentionPolicy,
     MessageBusStatus, MessageBusStatusKind, MessageBusSubscription, MessageBusSubscriptionFrom,
     MessageBusSubscriptionOptions, MessageBusTopicPage, MessageBusTopicParams,
     MessageBusTopicPolicy, MessageBusTopicProjection, MessageEnvelope, ToTopicBundle, TopicMessage,
     CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC, SPAWNS_TOPIC,
     STANDARD_TOPICS, TODOS_TOPIC,
 };
-pub use node::{Core, Node, NodeOpts, Pausable, Status};
+pub use node::{Core, Node, NodeOpts, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
@@ -287,7 +287,7 @@ pub use process::{
     ProcessEventDraft, ProcessReducer, ProcessReducerFn, ProcessReduction, ProcessRuntimeFact,
     ProcessStatus, ProcessStatusState,
 };
-pub use protocol::{AnyValue, GraphError, Handle, LockId, Message, PullDemand, Tier, Wave};
+pub use protocol::{AnyValue, GraphError, Handle, Message, Wave};
 pub use render::{
     describe_to_ascii, describe_to_d2, describe_to_d2_with_direction, describe_to_json,
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,

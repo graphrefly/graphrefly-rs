@@ -57,8 +57,7 @@ fn collect_shapes<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<
         }
         Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     seen
 }
@@ -545,12 +544,8 @@ fn source_primitives_cover_empty_never_and_throw_error() {
             value.as_ref().downcast_ref::<i32>().expect("of emits i32")
         )),
         Message::Complete => single_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Error(_)
-        | Message::Pause(_)
-        | Message::Resume(_)
-        | Message::Pull(_)
-        | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+        Message::Error(_) => {}
     });
     assert_eq!(*single_events.borrow(), vec!["DATA:7", "COMPLETE"]);
     assert_eq!(single.status(), graphrefly::Status::Completed);
@@ -571,12 +566,8 @@ fn source_primitives_cover_empty_never_and_throw_error() {
                 .expect("from_iter emits i32")
         )),
         Message::Complete => iter_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Error(_)
-        | Message::Pause(_)
-        | Message::Resume(_)
-        | Message::Pull(_)
-        | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+        Message::Error(_) => {}
     });
     assert_eq!(
         *iter_events.borrow(),
@@ -704,29 +695,6 @@ fn sync_value_from_helpers_fail_closed_on_terminal_mixed_windows() {
     assert_eq!(
         single_sync_value_from(&data_then_error_single),
         Err(SyncValueFromError::Error("after data".to_owned()))
-    );
-
-    let teardown: Node<i32> = g.init_node(
-        Operator::new("syncTeardown", |ctx| {
-            ctx.down(vec![Message::Teardown]);
-        }),
-        vec![],
-        GraphNodeOpts::named("sync_teardown"),
-    );
-    assert_eq!(
-        first_sync_value_from(&teardown),
-        Err(SyncValueFromError::Teardown)
-    );
-    let teardown_single: Node<i32> = g.init_node(
-        Operator::new("syncTeardownSingle", |ctx| {
-            ctx.down(vec![Message::Teardown]);
-        }),
-        vec![],
-        GraphNodeOpts::named("sync_teardown_single"),
-    );
-    assert_eq!(
-        single_sync_value_from(&teardown_single),
-        Err(SyncValueFromError::Teardown)
     );
 }
 
@@ -1311,8 +1279,7 @@ fn time_helpers_cancel_armed_clock_on_unsubscribe() {
         Message::Data(_) => timeout_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => timeout_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => timeout_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     assert_eq!(
         driver
@@ -1345,8 +1312,7 @@ fn time_helpers_cancel_armed_clock_on_unsubscribe() {
         Message::Data(_) => buffer_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => buffer_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => buffer_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     assert_eq!(
         driver
@@ -1547,8 +1513,7 @@ fn process_driver_cancel_suppresses_late_completion() {
         Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     unsubscribe();
@@ -1617,8 +1582,7 @@ fn http_driver_cancel_suppresses_late_completion() {
         Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     unsubscribe();
@@ -1823,8 +1787,7 @@ fn from_sse_http_stream_callback_can_complete_before_cancel_is_returned() {
         }
         Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     assert_eq!(
@@ -2132,8 +2095,7 @@ fn from_webhook_unsubscribe_cancels_registration_and_suppresses_late_events() {
         Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     unsubscribe();
@@ -2264,8 +2226,7 @@ fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
         Message::Data(_) => future_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => future_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => future_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     assert_eq!(
         driver
@@ -2301,8 +2262,7 @@ fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
         Message::Data(_) => stream_sink.borrow_mut().push("DATA".to_owned()),
         Message::Complete => stream_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => stream_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     assert_eq!(
         driver
@@ -2548,8 +2508,7 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
         )),
         Message::Complete => first_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(error) => first_sink.borrow_mut().push(format!("ERROR:{error}")),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     src.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
@@ -2575,8 +2534,7 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
         )),
         Message::Complete => second_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(error) => second_sink.borrow_mut().push(format!("ERROR:{error}")),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     assert!(
@@ -3140,8 +3098,7 @@ fn tap_callback_panic_becomes_error_and_seals_output() {
         )),
         Message::Error(error) => sink.borrow_mut().push(format!("ERROR:{error}")),
         Message::Complete => sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     assert_eq!(
@@ -3408,8 +3365,7 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
         }
         Message::Complete => scan_shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => scan_shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     assert_eq!(*scan_data.borrow(), vec![1, 3, 6]);
     assert_eq!(
@@ -3937,8 +3893,7 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
         }
         Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
         Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Dirty | Message::Resolved | Message::Invalidate => {}
-        Message::Pause(_) | Message::Resume(_) | Message::Pull(_) | Message::Teardown => {}
+        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     assert_eq!(*data.borrow(), vec![10, 11, 20, 21, 30, 31]);

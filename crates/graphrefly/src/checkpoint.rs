@@ -406,6 +406,18 @@ pub fn default_restore_registry() -> GraphRestoreRegistry {
         GraphRestoreEntry::descriptor(ReactiveMapSnapshotRestoreDescriptor),
         GraphRestoreEntry::descriptor(ReactiveIndexDeltaRestoreDescriptor),
         GraphRestoreEntry::descriptor(ReactiveIndexSnapshotRestoreDescriptor),
+        GraphRestoreEntry::descriptor(CollectionSnapshotRequestRestoreDescriptor(
+            "reactiveList.snapshotRequest",
+        )),
+        GraphRestoreEntry::descriptor(CollectionSnapshotRequestRestoreDescriptor(
+            "reactiveLog.snapshotRequest",
+        )),
+        GraphRestoreEntry::descriptor(CollectionSnapshotRequestRestoreDescriptor(
+            "reactiveMap.snapshotRequest",
+        )),
+        GraphRestoreEntry::descriptor(CollectionSnapshotRequestRestoreDescriptor(
+            "reactiveIndex.snapshotRequest",
+        )),
     ])
 }
 
@@ -732,6 +744,20 @@ pub struct ReactiveMapSnapshotRestoreDescriptor;
 pub struct ReactiveIndexDeltaRestoreDescriptor;
 /// `ReactiveIndexSnapshotRestoreDescriptor` data container.
 pub struct ReactiveIndexSnapshotRestoreDescriptor;
+
+/// Restores a collection's snapshot request state, which the collection's delta
+/// restore rebuilds with the collection (graphrefly-rs:D1 (1)).
+struct CollectionSnapshotRequestRestoreDescriptor(&'static str);
+
+impl GraphRestoreDescriptor for CollectionSnapshotRequestRestoreDescriptor {
+    fn ref_(&self) -> &str {
+        self.0
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        collection_existing_definition(ctx, self.0, ".snapshotRequest")
+    }
+}
 
 impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
     fn ref_(&self) -> &str {
@@ -1098,8 +1124,10 @@ fn is_non_authoritative_collection_helper(kind: Option<&str>) -> bool {
         Some(
             "collection_delta"
                 | "collection_snapshot"
+                | "collection_snapshot_request"
                 | "collection_view_delta"
                 | "collection_view_snapshot"
+                | "collection_view_snapshot_request"
         )
     )
 }
@@ -2102,15 +2130,8 @@ mod tests {
 
     #[test]
     fn checkpoint_and_restore_reject_non_quiescent_statuses() {
-        let g = crate::graph::graph();
-        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        source.down(vec![Message::Dirty]);
-
-        let err = g
-            .checkpoint()
-            .expect_err("checkpoint cannot preserve in-flight wave bookkeeping yet");
-        assert!(err.to_string().contains("non-quiescent status 'dirty'"));
-
+        // A host cannot leave a node pending between waves (PENDING is the kernel's,
+        // R-wave), so only a tampered checkpoint carries a non-quiescent status.
         let g = crate::graph::graph();
         g.state_opts(json!(1), GraphNodeOpts::named("source"));
         let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");

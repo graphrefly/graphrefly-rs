@@ -234,7 +234,7 @@ fn decode_trace_row(
             row.edge_id = Some(frame.edge_id.clone());
             row.cause_id = Some(frame.cause_id.clone());
             row.wire_edge_kind = Some(match frame.kind {
-                CanonicalWireEdgeKind::Dirty => "dirty",
+                CanonicalWireEdgeKind::Pending => "pending",
                 CanonicalWireEdgeKind::Data => "data",
             });
             row.value_hex_prefix = frame.value.as_deref().map(hex_prefix);
@@ -617,8 +617,8 @@ fn c1_rust_two_graph_mixed_locality_bridge_diamond_is_coherent() {
     assert_eq!(
         trace_wire_edge_steps(&trace, "stimulus", "g1_to_g2"),
         vec![
-            ("a-to-b".to_owned(), "dirty".to_owned()),
-            ("a-to-c".to_owned(), "dirty".to_owned()),
+            ("a-to-b".to_owned(), "pending".to_owned()),
+            ("a-to-c".to_owned(), "pending".to_owned()),
             ("a-to-b".to_owned(), "data".to_owned()),
             ("a-to-c".to_owned(), "data".to_owned()),
         ],
@@ -635,8 +635,8 @@ fn c1_rust_two_graph_mixed_locality_bridge_diamond_is_coherent() {
     assert_eq!(
         trace_wire_edge_steps(&trace, "stimulus", "g2_to_g1"),
         vec![
-            ("b-to-d".to_owned(), "dirty".to_owned()),
-            ("c-to-d".to_owned(), "dirty".to_owned()),
+            ("b-to-d".to_owned(), "pending".to_owned()),
+            ("c-to-d".to_owned(), "pending".to_owned()),
             ("b-to-d".to_owned(), "data".to_owned()),
             ("c-to-d".to_owned(), "data".to_owned()),
         ],

@@ -182,13 +182,13 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
         frames,
         vec![
             CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: "a".to_owned(),
                 cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: "b".to_owned(),
                 cause_id: cause_id.clone(),
                 value: None,
@@ -210,7 +210,7 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
 
     bridge.inbound.set(wire_edge_envelope(
         1,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c1",
         None,
@@ -224,12 +224,12 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
     ));
     assert!(
         inbound_a.borrow().is_empty(),
-        "DATA must not release before every DIRTY arrives"
+        "DATA must not release before every PENDING arrives"
     );
 
     bridge.inbound.set(wire_edge_envelope(
         3,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "b",
         "c1",
         None,
@@ -486,8 +486,8 @@ fn wire_edge_group_outbound_initial_bootstrap_allows_one_current_cohort() {
             .map(|frame| (frame.kind, frame.edge_id.as_str(), frame.cause_id.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (CanonicalWireEdgeKind::Dirty, "a", cause_id.as_str()),
-            (CanonicalWireEdgeKind::Dirty, "b", cause_id.as_str()),
+            (CanonicalWireEdgeKind::Pending, "a", cause_id.as_str()),
+            (CanonicalWireEdgeKind::Pending, "b", cause_id.as_str()),
             (CanonicalWireEdgeKind::Data, "a", cause_id.as_str()),
             (CanonicalWireEdgeKind::Data, "b", cause_id.as_str()),
         ],
@@ -615,13 +615,13 @@ fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
         frames,
         vec![
             CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: "a".to_owned(),
                 cause_id: cause_id.clone(),
                 value: None,
             },
             CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: "b".to_owned(),
                 cause_id: cause_id.clone(),
                 value: None,
@@ -716,7 +716,7 @@ fn wire_edge_group_outbound_duplicate_edge_data_latest_wins_before_cohort_comple
     source_a.set(vec![2]);
     assert!(
         outbound.borrow().is_empty(),
-        "partial fresh cohort must not emit DIRTY/DATA wire frames"
+        "partial fresh cohort must not emit PENDING/DATA wire frames"
     );
 
     source_b.set(vec![3]);
@@ -822,8 +822,8 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
     let issues = collect_data(&group.issues);
 
     for (seq, kind, edge_id, cause_id, value) in [
-        (1, CanonicalWireEdgeKind::Dirty, "a", "c1", None),
-        (2, CanonicalWireEdgeKind::Dirty, "b", "c1", None),
+        (1, CanonicalWireEdgeKind::Pending, "a", "c1", None),
+        (2, CanonicalWireEdgeKind::Pending, "b", "c1", None),
         (3, CanonicalWireEdgeKind::Data, "a", "c1", Some(vec![1])),
         (4, CanonicalWireEdgeKind::Data, "b", "c1", Some(vec![2])),
     ] {
@@ -837,7 +837,7 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
 
     bridge.inbound.set(wire_edge_envelope(
         5,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c2",
         None,
@@ -873,7 +873,7 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
 
     bridge.inbound.set(wire_edge_envelope(
         7,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "b",
         "c2",
         None,
@@ -881,7 +881,7 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
     assert_eq!(
         *seen_join.borrow(),
         vec![vec![1, 2]],
-        "second partial DIRTY still must not release a mixed local fan-in"
+        "second partial PENDING still must not release a mixed local fan-in"
     );
 
     bridge.inbound.set(wire_edge_envelope(
@@ -946,8 +946,8 @@ fn wire_edge_group_release_delivery_abort_does_not_tombstone_cause_before_cohort
     let _keep_aborting_observer = aborting_observer.subscribe(|_| {});
 
     for (seq, kind, edge_id, cause_id, value) in [
-        (1, CanonicalWireEdgeKind::Dirty, "a", "c1", None),
-        (2, CanonicalWireEdgeKind::Dirty, "b", "c1", None),
+        (1, CanonicalWireEdgeKind::Pending, "a", "c1", None),
+        (2, CanonicalWireEdgeKind::Pending, "b", "c1", None),
         (3, CanonicalWireEdgeKind::Data, "a", "c1", Some(vec![1])),
         (4, CanonicalWireEdgeKind::Data, "b", "c1", Some(vec![2])),
     ] {
@@ -989,24 +989,24 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             "unknown",
             WireEdgeGroupIssueCode::UnknownEdge,
             vec![CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: "z".to_owned(),
                 cause_id: "c1".to_owned(),
                 value: None,
             }],
         ),
         (
-            "duplicate-dirty",
-            WireEdgeGroupIssueCode::DuplicateDirty,
+            "duplicate-pending",
+            WireEdgeGroupIssueCode::DuplicatePending,
             vec![
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
@@ -1018,13 +1018,13 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             WireEdgeGroupIssueCode::DuplicateData,
             vec![
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "b".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
@@ -1044,8 +1044,8 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             ],
         ),
         (
-            "data-before-dirty",
-            WireEdgeGroupIssueCode::DataBeforeDirty,
+            "data-before-pending",
+            WireEdgeGroupIssueCode::DataBeforePending,
             vec![CanonicalWireEdgeFrame {
                 kind: CanonicalWireEdgeKind::Data,
                 edge_id: "a".to_owned(),
@@ -1058,13 +1058,13 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             WireEdgeGroupIssueCode::CompetingCause,
             vec![
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "b".to_owned(),
                     cause_id: "c2".to_owned(),
                     value: None,
@@ -1076,7 +1076,7 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             WireEdgeGroupIssueCode::MalformedFrame,
             vec![
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
@@ -1088,7 +1088,7 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "b".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
@@ -1112,19 +1112,19 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
             WireEdgeGroupIssueCode::CompetingCause,
             vec![
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "a".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "z".to_owned(),
                     cause_id: "c2".to_owned(),
                     value: None,
                 },
                 CanonicalWireEdgeFrame {
-                    kind: CanonicalWireEdgeKind::Dirty,
+                    kind: CanonicalWireEdgeKind::Pending,
                     edge_id: "b".to_owned(),
                     cause_id: "c1".to_owned(),
                     value: None,
@@ -1205,8 +1205,8 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
     let status = collect_data(&group.status);
 
     for (seq, kind, edge_id, value) in [
-        (1, CanonicalWireEdgeKind::Dirty, "a", None),
-        (2, CanonicalWireEdgeKind::Dirty, "b", None),
+        (1, CanonicalWireEdgeKind::Pending, "a", None),
+        (2, CanonicalWireEdgeKind::Pending, "b", None),
         (3, CanonicalWireEdgeKind::Data, "a", Some(vec![1])),
         (4, CanonicalWireEdgeKind::Data, "b", Some(vec![2])),
     ] {
@@ -1220,12 +1220,12 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
         WireEdgeGroupStatusState::Released
     );
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
-    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
 
     for (seq, kind, edge_id, value) in [
-        (5, CanonicalWireEdgeKind::Dirty, "a", None),
-        (6, CanonicalWireEdgeKind::Dirty, "b", None),
+        (5, CanonicalWireEdgeKind::Pending, "a", None),
+        (6, CanonicalWireEdgeKind::Pending, "b", None),
         (7, CanonicalWireEdgeKind::Data, "a", Some(vec![10])),
         (8, CanonicalWireEdgeKind::Data, "b", Some(vec![20])),
     ] {
@@ -1239,7 +1239,7 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
         issue.cause_id.as_deref() == Some("c1")
             && matches!(
                 issue.code,
-                WireEdgeGroupIssueCode::DuplicateDirty | WireEdgeGroupIssueCode::DuplicateData
+                WireEdgeGroupIssueCode::DuplicatePending | WireEdgeGroupIssueCode::DuplicateData
             )
     }));
     assert_eq!(
@@ -1247,7 +1247,7 @@ fn wire_edge_group_released_cause_id_replay_is_issue_not_second_release() {
         WireEdgeGroupStatusState::Issues
     );
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
-    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
 }
 
@@ -1275,13 +1275,13 @@ fn wire_edge_group_failed_cause_replay_is_issue_not_resurrection() {
     let status = collect_data(&group.status);
 
     for (seq, kind, edge_id, value) in [
-        (1, CanonicalWireEdgeKind::Dirty, "a", None),
-        (2, CanonicalWireEdgeKind::Dirty, "b", None),
+        (1, CanonicalWireEdgeKind::Pending, "a", None),
+        (2, CanonicalWireEdgeKind::Pending, "b", None),
         (3, CanonicalWireEdgeKind::Data, "a", Some(vec![1])),
         (4, CanonicalWireEdgeKind::Data, "a", Some(vec![2])),
         (5, CanonicalWireEdgeKind::Data, "b", Some(vec![3])),
-        (6, CanonicalWireEdgeKind::Dirty, "a", None),
-        (7, CanonicalWireEdgeKind::Dirty, "b", None),
+        (6, CanonicalWireEdgeKind::Pending, "a", None),
+        (7, CanonicalWireEdgeKind::Pending, "b", None),
         (8, CanonicalWireEdgeKind::Data, "a", Some(vec![4])),
         (9, CanonicalWireEdgeKind::Data, "b", Some(vec![5])),
     ] {
@@ -1305,7 +1305,7 @@ fn wire_edge_group_failed_cause_replay_is_issue_not_resurrection() {
         WireEdgeGroupStatusState::Issues
     );
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
-    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
     assert_ne!(group.issues.status(), graphrefly::Status::Errored);
     assert_ne!(group.status.status(), graphrefly::Status::Errored);
@@ -1329,7 +1329,7 @@ fn wire_edge_group_replay_tombstones_are_bounded_recent_memory() {
     let release = |seq: &mut u64, cause_id: &str, value: u8| {
         bridge.inbound.set(wire_edge_envelope(
             *seq,
-            CanonicalWireEdgeKind::Dirty,
+            CanonicalWireEdgeKind::Pending,
             "a",
             cause_id,
             None,
@@ -1348,14 +1348,14 @@ fn wire_edge_group_replay_tombstones_are_bounded_recent_memory() {
     release(&mut seq, "c1", 1);
     bridge.inbound.set(wire_edge_envelope(
         seq,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c1",
         None,
     ));
     assert!(issues.borrow().iter().any(|issue| {
         issue.cause_id.as_deref() == Some("c1")
-            && issue.code == WireEdgeGroupIssueCode::DuplicateDirty
+            && issue.code == WireEdgeGroupIssueCode::DuplicatePending
     }));
 
     for n in 2_u16..=1026 {
@@ -1394,7 +1394,7 @@ fn wire_edge_group_status_and_issues_only_cover_malformed_and_competing_causes()
 
     bridge.inbound.set(wire_edge_envelope(
         1,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c1",
         None,
@@ -1408,14 +1408,14 @@ fn wire_edge_group_status_and_issues_only_cover_malformed_and_competing_causes()
     ));
     bridge.inbound.set(wire_edge_envelope(
         3,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c2",
         None,
     ));
     bridge.inbound.set(wire_edge_envelope(
         4,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "b",
         "c3",
         None,
@@ -1461,14 +1461,14 @@ fn wire_edge_group_status_first_subscription_still_releases_inbound() {
 
     bridge.inbound.set(wire_edge_envelope(
         1,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "a",
         "c1",
         None,
     ));
     bridge.inbound.set(wire_edge_envelope(
         2,
-        CanonicalWireEdgeKind::Dirty,
+        CanonicalWireEdgeKind::Pending,
         "b",
         "c1",
         None,
@@ -1495,7 +1495,7 @@ fn wire_edge_group_status_first_subscription_still_releases_inbound() {
         WireEdgeGroupStatusState::Released
     );
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
-    assert_eq!(status.borrow().last().unwrap().dirty, 0);
+    assert_eq!(status.borrow().last().unwrap().pending, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
 }
 
@@ -2032,15 +2032,11 @@ fn remote_responder_invokes_sync_handler_and_sends_response_through_bridge_comma
         command_msgs_sink.borrow_mut().push(match msg {
             Message::Data(_) => "DATA",
             Message::Start => "START",
-            Message::Pause(_) => "PAUSE",
-            Message::Resume(_) => "RESUME",
-            Message::Pull(_) => "PULL",
-            Message::Dirty => "DIRTY",
+            Message::Pending => "PENDING",
             Message::Resolved => "RESOLVED",
             Message::Invalidate => "INVALIDATE",
             Message::Complete => "COMPLETE",
             Message::Error(_) => "ERROR",
-            Message::Teardown => "TEARDOWN",
         });
     });
 

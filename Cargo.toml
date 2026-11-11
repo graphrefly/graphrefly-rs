@@ -16,6 +16,11 @@
 resolver = "2"
 members  = [
     "crates/graphrefly",
+]
+# graphrefly:D800: Python writes its own kernel and builds against graphrefly-rs
+# cf02fc9 until then. The binding gets no new work and is out of the workspace
+# build; the crate is removed once Python no longer imports graphrefly._native.
+exclude  = [
     "crates/graphrefly-bindings-py",
 ]
 

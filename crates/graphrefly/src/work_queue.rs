@@ -21,7 +21,8 @@ use crate::messaging::{
     MessageBusSubscriptionFrom, MessageBusSubscriptionOptions, MessageEnvelope,
 };
 use crate::node::{Core, Node, NodeOpts};
-use crate::protocol::{LockId, Message, PullDemand};
+use crate::protocol::Message;
+use crate::request::requested;
 use crate::resilience::{BackoffPolicy, RetryPolicy};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -902,12 +903,14 @@ pub struct WorkQueueDeadLetterParams {
 }
 
 #[derive(Clone)]
-/// `WorkQueueProjection` data container.
-pub struct WorkQueueProjection<TPage> {
+/// `WorkQueueProjection` data container: a page that is delivered once per write
+/// of its request state.
+pub struct WorkQueueProjection<TPage, TRequest = ()> {
     /// `snapshot` field for snapshot.
     pub snapshot: Node<TPage>,
-    /// `snapshot_pull_id` field for snapshot pull id.
-    pub snapshot_pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one page with the written
+    /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<TRequest>,
     /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
     /// `issues` field for issues.
@@ -919,8 +922,9 @@ pub struct WorkQueueProjection<TPage> {
 pub struct WorkQueueAvailableProjection<T> {
     /// `available` field for available.
     pub available: Node<WorkQueueAvailablePage<T>>,
-    /// `available_pull_id` field for available pull id.
-    pub available_pull_id: LockId,
+    /// Request state for `available`: each write asks for one page with the
+    /// written params (graphrefly-rs:D1 (1)).
+    pub available_request: Node<WorkQueueAvailableParams>,
     /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
     /// `issues` field for issues.
@@ -1214,24 +1218,24 @@ impl<T: Clone + 'static> WorkQueue<T> {
         &self,
         name: Option<impl Into<String>>,
     ) -> WorkQueueAvailableProjection<T> {
-        let available_pull_id = LockId::new(format!("{}/available", self.name));
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/available", self.name));
+        let available_request = self.request_state::<WorkQueueAvailableParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<WorkQueueAvailablePage<T>, _>(
-            vec![self.records.erased()],
+            vec![self.records.erased(), available_request.erased()],
             move |ctx| {
-                let params = pull_params::<WorkQueueAvailableParams>(ctx);
+                let Some(params) = requested::<WorkQueueAvailableParams>(ctx, 1) else {
+                    return;
+                };
                 ctx.emit(available_page(&state.borrow(), &params));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/available", self.name)),
-                "workQueueAvailable",
-                available_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "workQueueAvailable"),
         );
         WorkQueueAvailableProjection {
             available: snapshot,
-            available_pull_id,
+            available_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
@@ -1252,32 +1256,34 @@ impl<T: Clone + 'static> WorkQueue<T> {
         name: Option<impl Into<String>>,
     ) -> WorkQueueProjection<WorkQueueWorkSnapshot<T>> {
         let work_id = work_id.into();
-        let snapshot_pull_id = LockId::new(format!("{}/{work_id}/snapshot", self.name));
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/{work_id}", self.name));
+        let snapshot_request = self.request_state::<()>(&projection_name);
         let state = self.state.clone();
         let work_id_for_fn = work_id.clone();
         let snapshot = self.graph.node_opts::<WorkQueueWorkSnapshot<T>, _>(
-            vec![self.records.erased()],
+            vec![self.records.erased(), snapshot_request.erased()],
             move |ctx| {
-                let _ = ctx.pull();
+                if requested::<()>(ctx, 1).is_none() {
+                    return;
+                }
                 ctx.emit(work_snapshot(&state.borrow(), &work_id_for_fn));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/{work_id}", self.name)),
-                "workQueueWorkSnapshot",
-                snapshot_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "workQueueWorkSnapshot"),
         );
         WorkQueueProjection {
             snapshot,
-            snapshot_pull_id,
+            snapshot_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
     }
 
     /// Updates or reads `dead_letter`.
-    pub fn dead_letter(&self) -> WorkQueueProjection<WorkQueueDeadLetterPage<T>> {
+    pub fn dead_letter(
+        &self,
+    ) -> WorkQueueProjection<WorkQueueDeadLetterPage<T>, WorkQueueDeadLetterParams> {
         self.dead_letter_named(None::<String>)
     }
 
@@ -1285,28 +1291,36 @@ impl<T: Clone + 'static> WorkQueue<T> {
     pub fn dead_letter_named(
         &self,
         name: Option<impl Into<String>>,
-    ) -> WorkQueueProjection<WorkQueueDeadLetterPage<T>> {
-        let snapshot_pull_id = LockId::new(format!("{}/deadLetter", self.name));
+    ) -> WorkQueueProjection<WorkQueueDeadLetterPage<T>, WorkQueueDeadLetterParams> {
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/deadLetter", self.name));
+        let snapshot_request = self.request_state::<WorkQueueDeadLetterParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<WorkQueueDeadLetterPage<T>, _>(
-            vec![self.records.erased()],
+            vec![self.records.erased(), snapshot_request.erased()],
             move |ctx| {
-                let params = pull_params::<WorkQueueDeadLetterParams>(ctx);
+                let Some(params) = requested::<WorkQueueDeadLetterParams>(ctx, 1) else {
+                    return;
+                };
                 ctx.emit(dead_letter_page(&state.borrow(), &params));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/deadLetter", self.name)),
-                "workQueueDeadLetter",
-                snapshot_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "workQueueDeadLetter"),
         );
         WorkQueueProjection {
             snapshot,
-            snapshot_pull_id,
+            snapshot_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
+    }
+
+    /// The request state a projection declares as its dependency (graphrefly-rs:D1 (1)).
+    fn request_state<P: 'static>(&self, projection_name: &str) -> Node<P> {
+        self.graph.state_empty_opts(node_opts(
+            format!("{projection_name}/request"),
+            "workQueueProjectionRequest",
+        ))
     }
 
     fn publish_command(&self, command: WorkQueueCommand<T>) -> WorkQueueCommand<T> {
@@ -1450,7 +1464,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
             opts.bus.status.erased(),
         ],
         {
-            let admission_pull_id = admission.available_pull_id.clone();
+            let admission_request = admission.available_request.erased();
             let topic = opts.topic.clone();
             let subscription_id = opts.subscription_id.clone();
             move |ctx| {
@@ -1469,16 +1483,14 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     }
                 }
                 if should_pull {
-                    ctx.up_next_toward(
-                        0,
-                        vec![Message::Pull(PullDemand::with_params(
-                            admission_pull_id.clone(),
-                            MessageBusAvailableParams {
-                                limit: Some(100),
-                                after_seq: None,
-                            },
-                        ))],
-                    );
+                    // A request is a write to the projection's request state, made
+                    // after the current wave (graphrefly-rs:D1 (1)).
+                    admission_request.request_down_next(vec![Message::Data(Rc::new(
+                        MessageBusAvailableParams {
+                            limit: Some(100),
+                            after_seq: None,
+                        },
+                    ))]);
                 }
             }
         },
@@ -3319,13 +3331,6 @@ fn record_queue_id<T>(record: &WorkQueueRecord<T>) -> &str {
     }
 }
 
-fn pull_params<T: Clone + Default + 'static>(ctx: &Ctx) -> T {
-    ctx.pull()
-        .and_then(|pull| pull.params::<T>())
-        .map(|params| (*params).clone())
-        .unwrap_or_default()
-}
-
 fn timestamp_or_zero(now: &Rc<dyn Fn() -> u64>) -> u64 {
     catch_unwind(AssertUnwindSafe(|| now())).unwrap_or(0)
 }
@@ -3350,13 +3355,8 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     opts
 }
 
-fn pull_node_opts(
-    name: impl Into<String>,
-    factory: impl Into<String>,
-    pull_id: LockId,
-) -> GraphNodeOpts {
+fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
-    opts.node.pull_id = Some(pull_id);
     opts.node.partial = true;
     opts
 }

@@ -5,25 +5,26 @@
 //! forgot-to-commit class of bugs, and the three languages align naturally.
 //! `bctx.rollback()` is an explicit escape hatch within the closure.
 //!
-//! ## Interaction with the tier table (D34)
+//! ## Interaction with message classes
 //!
-//! Batch-deferred tiers (`>= Value`, see [`crate::protocol::Tier::is_batch_deferred`])
-//! are held until the batch commits, then flushed as the committed boundary;
-//! immediate tiers (`< Value`) still propagate within the batch. The deferred
-//! self-rewire drain (`ctx.rewire_next`, D47) applies AT the committed boundary —
-//! never on an un-committed/paused view (C-11/C-22; pause drain timing = B24).
+//! Value and later classes (DATA, RESOLVED, INVALIDATE, COMPLETE, ERROR) are held
+//! until the batch commits, then flushed as the committed boundary; a PENDING prefix
+//! still propagates within the batch. The deferred self-rewire drain
+//! (`ctx.rewire_next`, D47) applies AT the committed boundary — never on an
+//! un-committed view (C-11/C-22). graphrefly:D797 replaces this with a batch that
+//! delivers nothing before its commit (graphrefly-rs:D797-KERNEL-MIGRATION-RS
+//! phases 2 and 5).
 //!
 //! Conformance touchpoints: C-3 (INVALIDATE fan-in idempotency exercised via
-//! batch), C-19 (undirty timing), and C-22 (batch-before-rewire).
+//! batch) and C-22 (batch-before-rewire).
 
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::host_boundary::is_host_boundary_abort_payload;
 use crate::node::{
-    boundary_root_for, clear_all_deferred_boundary_root, clear_deferred_boundary_root,
-    drain_committed_boundary_root, BatchTarget, BoundaryRoot, Core,
+    boundary_root_for, clear_deferred_boundary_root, drain_committed_boundary_root, BatchTarget,
+    BoundaryRoot, Core,
 };
 use crate::protocol::{AnyValue, Wave};
 
@@ -259,34 +260,17 @@ fn drain_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryR
     for root in core_roots {
         let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
         if let Err(payload) = result {
-            if is_host_boundary_abort_payload(payload.as_ref()) {
-                clear_all_boundary_for_roots(core_roots, task_roots);
-                resume_unwind(payload);
-            }
             remember_first_boundary_panic(&mut escaped, Err(payload));
         }
     }
     for root in task_roots {
         let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
         if let Err(payload) = result {
-            if is_host_boundary_abort_payload(payload.as_ref()) {
-                clear_all_boundary_for_roots(core_roots, task_roots);
-                resume_unwind(payload);
-            }
             remember_first_boundary_panic(&mut escaped, Err(payload));
         }
     }
     if let Some(e) = escaped {
         std::panic::resume_unwind(e);
-    }
-}
-
-fn clear_all_boundary_for_roots(core_roots: &[BoundaryRoot], task_roots: &[BoundaryRoot]) {
-    for root in core_roots {
-        clear_all_deferred_boundary_root(root);
-    }
-    for root in task_roots {
-        clear_all_deferred_boundary_root(root);
     }
 }
 

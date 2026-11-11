@@ -21,7 +21,8 @@ use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::canonical_tuple_key;
 use crate::json::JsonValue;
 use crate::node::{Core, Node, NodeOpts};
-use crate::protocol::{AnyValue, LockId};
+use crate::protocol::AnyValue;
+use crate::request::requested;
 
 /// `constant` constant.
 pub const PROMPTS_TOPIC: &str = "prompts";
@@ -944,7 +945,7 @@ pub struct MessageBusAvailablePage<T = AnyValue> {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// `MessageBusCatalogParams` data container.
 pub struct MessageBusCatalogParams {
     /// `limit` field for limit.
@@ -955,7 +956,7 @@ pub struct MessageBusCatalogParams {
     pub include_closed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// `MessageBusDeadLetterParams` data container.
 pub struct MessageBusDeadLetterParams {
     /// `limit` field for limit.
@@ -968,7 +969,7 @@ pub struct MessageBusDeadLetterParams {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// `MessageBusTopicParams` data container.
 pub struct MessageBusTopicParams {
     /// `limit` field for limit.
@@ -977,7 +978,7 @@ pub struct MessageBusTopicParams {
     pub after_seq: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// `MessageBusAvailableParams` data container.
 pub struct MessageBusAvailableParams {
     /// `limit` field for limit.
@@ -987,12 +988,14 @@ pub struct MessageBusAvailableParams {
 }
 
 #[derive(Clone)]
-/// `MessageBusPullProjection` data container.
-pub struct MessageBusPullProjection<TPage> {
+/// `MessageBusProjection` data container: a page that is delivered once per write
+/// of its request state.
+pub struct MessageBusProjection<TPage, TRequest> {
     /// `snapshot` field for snapshot.
     pub snapshot: Node<TPage>,
-    /// `snapshot_pull_id` field for snapshot pull id.
-    pub snapshot_pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one page with the written
+    /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<TRequest>,
     /// `status` field for status.
     pub status: Node<MessageBusStatus>,
     /// `issues` field for issues.
@@ -1000,15 +1003,17 @@ pub struct MessageBusPullProjection<TPage> {
 }
 
 /// `MessageBusTopicProjection` type alias.
-pub type MessageBusTopicProjection<T = AnyValue> = MessageBusPullProjection<MessageBusTopicPage<T>>;
+pub type MessageBusTopicProjection<T = AnyValue> =
+    MessageBusProjection<MessageBusTopicPage<T>, MessageBusTopicParams>;
 
 #[derive(Clone)]
 /// `MessageBusSubscription` data container.
 pub struct MessageBusSubscription<T = AnyValue> {
     /// `available` field for available.
     pub available: Node<MessageBusAvailablePage<T>>,
-    /// `available_pull_id` field for available pull id.
-    pub available_pull_id: LockId,
+    /// Request state for `available`: each write asks for one page with the
+    /// written params (graphrefly-rs:D1 (1)).
+    pub available_request: Node<MessageBusAvailableParams>,
     /// `cursor` field for cursor.
     pub cursor: Node<MessageBusCursor>,
     /// `status` field for status.
@@ -1313,36 +1318,32 @@ impl<T: Clone + 'static> MessageBus<T> {
     ) -> MessageBusTopicProjection<T> {
         let topic = topic.into();
         assert_topic_key(&topic, "messageBus.topic");
-        let snapshot_pull_id = LockId::new(format!("{}/{topic}/topicSnapshot", self.name));
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/{topic}/topic", self.name));
+        let snapshot_request = self.request_state::<MessageBusTopicParams>(&projection_name);
         let state = self.state.clone();
         let topic_for_fn = topic.clone();
         let snapshot = self.graph.node_opts::<MessageBusTopicPage<T>, _>(
-            vec![self.messages.erased()],
+            vec![self.messages.erased(), snapshot_request.erased()],
             move |ctx| {
-                let params =
-                    pull_params::<MessageBusTopicParams>(ctx).unwrap_or(MessageBusTopicParams {
-                        limit: None,
-                        after_seq: None,
-                    });
+                let Some(params) = requested::<MessageBusTopicParams>(ctx, 1) else {
+                    return;
+                };
                 ctx.emit(topic_page(&state.borrow(), &topic_for_fn, &params));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/{topic}/topic", self.name)),
-                "messageBusTopicProjection",
-                snapshot_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "messageBusTopicProjection"),
         );
-        MessageBusPullProjection {
+        MessageBusProjection {
             snapshot,
-            snapshot_pull_id,
+            snapshot_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
     }
 
     /// Updates or reads `catalog`.
-    pub fn catalog(&self) -> MessageBusPullProjection<MessageBusCatalogPage> {
+    pub fn catalog(&self) -> MessageBusProjection<MessageBusCatalogPage, MessageBusCatalogParams> {
         self.catalog_named(None::<String>)
     }
 
@@ -1350,38 +1351,34 @@ impl<T: Clone + 'static> MessageBus<T> {
     pub fn catalog_named(
         &self,
         name: Option<impl Into<String>>,
-    ) -> MessageBusPullProjection<MessageBusCatalogPage> {
-        let snapshot_pull_id = LockId::new(format!("{}/catalogSnapshot", self.name));
+    ) -> MessageBusProjection<MessageBusCatalogPage, MessageBusCatalogParams> {
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/catalog", self.name));
+        let snapshot_request = self.request_state::<MessageBusCatalogParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<MessageBusCatalogPage, _>(
-            vec![self.status.erased()],
+            vec![self.status.erased(), snapshot_request.erased()],
             move |ctx| {
-                let params = pull_params::<MessageBusCatalogParams>(ctx).unwrap_or(
-                    MessageBusCatalogParams {
-                        limit: None,
-                        after_topic: None,
-                        include_closed: false,
-                    },
-                );
+                let Some(params) = requested::<MessageBusCatalogParams>(ctx, 1) else {
+                    return;
+                };
                 ctx.emit(catalog_page(&state.borrow(), &params));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/catalog", self.name)),
-                "messageBusCatalog",
-                snapshot_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "messageBusCatalog"),
         );
-        MessageBusPullProjection {
+        MessageBusProjection {
             snapshot,
-            snapshot_pull_id,
+            snapshot_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
     }
 
     /// Updates or reads `dead_letter`.
-    pub fn dead_letter(&self) -> MessageBusPullProjection<MessageBusDeadLetterPage<T>> {
+    pub fn dead_letter(
+        &self,
+    ) -> MessageBusProjection<MessageBusDeadLetterPage<T>, MessageBusDeadLetterParams> {
         self.dead_letter_named(None::<String>)
     }
 
@@ -1389,32 +1386,29 @@ impl<T: Clone + 'static> MessageBus<T> {
     pub fn dead_letter_named(
         &self,
         name: Option<impl Into<String>>,
-    ) -> MessageBusPullProjection<MessageBusDeadLetterPage<T>> {
-        let snapshot_pull_id = LockId::new(format!("{}/deadLetterSnapshot", self.name));
+    ) -> MessageBusProjection<MessageBusDeadLetterPage<T>, MessageBusDeadLetterParams> {
+        let projection_name = name
+            .map(Into::into)
+            .unwrap_or_else(|| format!("{}/deadLetter", self.name));
+        let snapshot_request = self.request_state::<MessageBusDeadLetterParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<MessageBusDeadLetterPage<T>, _>(
-            vec![self.issues.erased(), self.status.erased()],
+            vec![
+                self.issues.erased(),
+                self.status.erased(),
+                snapshot_request.erased(),
+            ],
             move |ctx| {
-                let params = pull_params::<MessageBusDeadLetterParams>(ctx).unwrap_or(
-                    MessageBusDeadLetterParams {
-                        limit: None,
-                        after_entry_seq: None,
-                        topic: None,
-                        code: None,
-                    },
-                );
+                let Some(params) = requested::<MessageBusDeadLetterParams>(ctx, 2) else {
+                    return;
+                };
                 ctx.emit(dead_letter_page(&state.borrow(), &params));
             },
-            pull_node_opts(
-                name.map(Into::into)
-                    .unwrap_or_else(|| format!("{}/deadLetter", self.name)),
-                "messageBusDeadLetter",
-                snapshot_pull_id.clone(),
-            ),
+            request_node_opts(projection_name, "messageBusDeadLetter"),
         );
-        MessageBusPullProjection {
+        MessageBusProjection {
             snapshot,
-            snapshot_pull_id,
+            snapshot_request,
             status: self.status.clone(),
             issues: self.issues.clone(),
         }
@@ -1425,35 +1419,33 @@ impl<T: Clone + 'static> MessageBus<T> {
         assert_topic_key(&opts.topic, "messageBus.subscription");
         assert_non_empty(&opts.subscription_id, "messageBus.subscriptionId");
         let (sub, opened, issue) = ensure_subscription(&mut self.state.borrow_mut(), &opts);
-        let available_pull_id = LockId::new(format!(
-            "{}/{}/{}/available",
-            self.name, opts.topic, opts.subscription_id
-        ));
         let projection_name = opts
             .name
             .clone()
             .unwrap_or_else(|| format!("{}/{}/{}", self.name, opts.topic, opts.subscription_id));
+        let available_request = self
+            .request_state::<MessageBusAvailableParams>(&format!("{projection_name}/available"));
         let available_state = self.state.clone();
         let available_sub = sub.clone();
         let available = self.graph.node_opts::<MessageBusAvailablePage<T>, _>(
-            vec![self.messages.erased(), self.status.erased()],
+            vec![
+                self.messages.erased(),
+                self.status.erased(),
+                available_request.erased(),
+            ],
             move |ctx| {
-                let params = pull_params::<MessageBusAvailableParams>(ctx).unwrap_or(
-                    MessageBusAvailableParams {
-                        limit: None,
-                        after_seq: None,
-                    },
-                );
+                let Some(params) = requested::<MessageBusAvailableParams>(ctx, 2) else {
+                    return;
+                };
                 ctx.emit(available_page(
                     &available_state.borrow(),
                     &available_sub,
                     &params,
                 ));
             },
-            pull_node_opts(
+            request_node_opts(
                 format!("{projection_name}/available"),
                 "messageBusSubscriptionAvailable",
-                available_pull_id.clone(),
             ),
         );
         let cursor_state = self.state.clone();
@@ -1505,7 +1497,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         }
         MessageBusSubscription {
             available,
-            available_pull_id,
+            available_request,
             cursor,
             status: self.status.clone(),
             issues: self.issues.clone(),
@@ -1513,6 +1505,14 @@ impl<T: Clone + 'static> MessageBus<T> {
             topic: sub.topic,
             subscription_id: sub.subscription_id,
         }
+    }
+
+    /// The request state a projection declares as its dependency (graphrefly-rs:D1 (1)).
+    fn request_state<P: 'static>(&self, projection_name: &str) -> Node<P> {
+        self.graph.state_empty_opts(node_opts(
+            format!("{projection_name}/request"),
+            "messageBusProjectionRequest",
+        ))
     }
 
     fn publish_command(&self, command: MessageBusCommand<T>) -> MessageBusCommand<T> {
@@ -2431,12 +2431,6 @@ fn ensure_subscription<T>(
     (sub, true, issue)
 }
 
-fn pull_params<T: Clone + 'static>(ctx: &Ctx) -> Option<T> {
-    ctx.pull()
-        .and_then(|pull| pull.params::<T>())
-        .map(|params| (*params).clone())
-}
-
 fn make_topic_state<T>() -> TopicState<T> {
     TopicState {
         closed: false,
@@ -2519,13 +2513,8 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     opts
 }
 
-fn pull_node_opts(
-    name: impl Into<String>,
-    factory: impl Into<String>,
-    pull_id: LockId,
-) -> GraphNodeOpts {
+fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
-    opts.node.pull_id = Some(pull_id);
     opts.node.partial = true;
     opts
 }
@@ -2549,7 +2538,6 @@ fn is_reachable_upstream(from: &Core, target: &Core) -> bool {
 mod clean_slate_tests {
     use super::*;
     use crate::graph::graph;
-    use crate::protocol::{Message, PullDemand};
 
     #[test]
     fn message_bus_core_exposes_clean_slate_nodes() {
@@ -2612,27 +2600,17 @@ mod clean_slate_tests {
 
         bus.publish("orders", "o1".to_owned(), None, None, None);
         bus.publish("missing", "x".to_owned(), None, None, None);
-        catalog.snapshot.up(vec![Message::Pull(PullDemand::new(
-            catalog.snapshot_pull_id.clone(),
-        ))]);
-        topic
-            .snapshot
-            .up(vec![Message::Pull(PullDemand::with_params(
-                topic.snapshot_pull_id.clone(),
-                MessageBusTopicParams {
-                    limit: Some(1),
-                    after_seq: None,
-                },
-            ))]);
-        dead.snapshot.up(vec![Message::Pull(PullDemand::with_params(
-            dead.snapshot_pull_id.clone(),
-            MessageBusDeadLetterParams {
-                limit: None,
-                after_entry_seq: None,
-                topic: None,
-                code: Some("unknown-topic".to_owned()),
-            },
-        ))]);
+        catalog.snapshot_request.set(Default::default());
+        topic.snapshot_request.set(MessageBusTopicParams {
+            limit: Some(1),
+            after_seq: None,
+        });
+        dead.snapshot_request.set(MessageBusDeadLetterParams {
+            limit: None,
+            after_entry_seq: None,
+            topic: None,
+            code: Some("unknown-topic".to_owned()),
+        });
 
         assert_eq!(catalog.snapshot.cache().unwrap().topics[0].topic, "orders");
         assert_eq!(topic.snapshot.cache().unwrap().messages[0].payload, "o1");
@@ -2657,13 +2635,10 @@ mod clean_slate_tests {
 
         bus.publish("orders", "o1".to_owned(), None, None, None);
         bus.publish("orders", "o2".to_owned(), None, None, None);
-        sub.available.up(vec![Message::Pull(PullDemand::with_params(
-            sub.available_pull_id.clone(),
-            MessageBusAvailableParams {
-                limit: Some(1),
-                after_seq: Some(1),
-            },
-        ))]);
+        sub.available_request.set(MessageBusAvailableParams {
+            limit: Some(1),
+            after_seq: Some(1),
+        });
 
         let page = sub.available.cache().unwrap();
         assert_eq!(page.messages[0].seq, 2);
@@ -2730,15 +2705,12 @@ mod clean_slate_tests {
                 .from(MessageBusSubscriptionFrom::Seq(1)),
         );
         let _cursor = sub.cursor.subscribe(|_| {});
-        dead.snapshot.up(vec![Message::Pull(PullDemand::with_params(
-            dead.snapshot_pull_id.clone(),
-            MessageBusDeadLetterParams {
-                limit: None,
-                after_entry_seq: None,
-                topic: Some("orders".to_owned()),
-                code: Some("cursor-out-of-range".to_owned()),
-            },
-        ))]);
+        dead.snapshot_request.set(MessageBusDeadLetterParams {
+            limit: None,
+            after_entry_seq: None,
+            topic: Some("orders".to_owned()),
+            code: Some("cursor-out-of-range".to_owned()),
+        });
 
         assert_eq!(bus.issues.cache().unwrap().code, "cursor-out-of-range");
         assert_eq!(sub.cursor.cache().unwrap().next_seq, 2);

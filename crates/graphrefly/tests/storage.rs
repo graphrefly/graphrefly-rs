@@ -34,7 +34,7 @@ use graphrefly::{
     ObserveEventFrame, ObserveEventFrameOptions, ObserveMessage,
     OpenPersistentReactiveIndexOptions, OpenPersistentReactiveListOptions,
     OpenPersistentReactiveLogOptions, OpenPersistentReactiveMapOptions,
-    PersistReactiveCollectionOptions, PromotionPolicy, PullDemand, ReactiveCascadingCacheOptions,
+    PersistReactiveCollectionOptions, PromotionPolicy, ReactiveCascadingCacheOptions,
     ReactiveCollectionChangeFrame, ReactiveCollectionKind, ReactiveCollectionPersistenceStatus,
     ReactiveCollectionRestoreSource, ReactiveCollectionSnapshotFrame, ReactiveIndexOptions,
     ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions, ReadThroughErrorStage,
@@ -109,16 +109,12 @@ fn message_kinds<T: 'static>(node: &Node<T>) -> KindLog {
     let unsub = node.subscribe(move |msg| {
         let kind = match msg {
             Message::Start => "START",
-            Message::Pause(_) => "PAUSE",
-            Message::Resume(_) => "RESUME",
-            Message::Pull(_) => "PULL",
-            Message::Dirty => "DIRTY",
+            Message::Pending => "PENDING",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
             Message::Invalidate => "INVALIDATE",
             Message::Complete => "COMPLETE",
             Message::Error(_) => "ERROR",
-            Message::Teardown => "TEARDOWN",
         };
         sink.borrow_mut().push(kind);
     });
@@ -1405,8 +1401,7 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         ReactiveMapOptions::named("map").graph(view_graph.clone()),
     );
     let view = map.select(|value, _key| *value > 1);
-    view.snapshot
-        .up(vec![Message::Pull(PullDemand::new(view.pull_id.clone()))]);
+    view.snapshot_request.set(());
     let view_checkpoint = view_graph.checkpoint().expect("view checkpoint succeeds");
     let view_by_id = view_checkpoint
         .nodes

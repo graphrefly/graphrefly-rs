@@ -3,9 +3,8 @@ use std::rc::Rc;
 
 use graphrefly::{
     graph, message_bus, work_queue, BackoffPolicy, DataIssue, Message, MessageBusOptions,
-    PullDemand, RetryPolicy, WorkQueue, WorkQueueAvailableParams, WorkQueueClaimOptions,
-    WorkQueueDerivedState, WorkQueueOptions, WorkQueueRecord, WorkQueueSubmit,
-    WorkQueueSubmitOptions,
+    RetryPolicy, WorkQueue, WorkQueueAvailableParams, WorkQueueClaimOptions, WorkQueueDerivedState,
+    WorkQueueOptions, WorkQueueRecord, WorkQueueSubmit, WorkQueueSubmitOptions,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,9 +240,8 @@ fn explicit_expiry_retry_and_dead_letter_are_recorded() {
         WorkQueueRecord::WorkDeadLettered { reason, .. } if reason == "attempts-exhausted"
     )));
     let dead = queue.dead_letter();
-    dead.snapshot.up(vec![Message::Pull(PullDemand::new(
-        dead.snapshot_pull_id.clone(),
-    ))]);
+    let _dead_sub = dead.snapshot.subscribe(|_| {});
+    dead.snapshot_request.set(Default::default());
     assert_eq!(dead.snapshot.cache().unwrap().entries.len(), 1);
 }
 
@@ -263,35 +261,25 @@ fn read_projections_are_pull_only_and_do_not_mutate_lifecycle() {
     );
     let available = queue.available();
     let work = queue.work("custom");
+    let _available_sub = available.available.subscribe(|_| {});
+    let _work_sub = work.snapshot.subscribe(|_| {});
 
-    available
-        .available
-        .up(vec![Message::Pull(PullDemand::with_params(
-            available.available_pull_id.clone(),
-            WorkQueueAvailableParams {
-                now_ms: Some(0),
-                ..WorkQueueAvailableParams::default()
-            },
-        ))]);
+    available.available_request.set(WorkQueueAvailableParams {
+        now_ms: Some(0),
+        ..WorkQueueAvailableParams::default()
+    });
     assert_eq!(available.available.cache().unwrap().items, Vec::new());
 
-    available
-        .available
-        .up(vec![Message::Pull(PullDemand::with_params(
-            available.available_pull_id.clone(),
-            WorkQueueAvailableParams {
-                now_ms: Some(10),
-                ..WorkQueueAvailableParams::default()
-            },
-        ))]);
+    available.available_request.set(WorkQueueAvailableParams {
+        now_ms: Some(10),
+        ..WorkQueueAvailableParams::default()
+    });
     assert_eq!(
         available.available.cache().unwrap().items[0].work_id,
         "custom"
     );
 
-    work.snapshot.up(vec![Message::Pull(PullDemand::new(
-        work.snapshot_pull_id.clone(),
-    ))]);
+    work.snapshot_request.set(());
     assert_eq!(
         work.snapshot.cache().unwrap().state,
         Some(WorkQueueDerivedState::Scheduled)
@@ -301,9 +289,7 @@ fn read_projections_are_pull_only_and_do_not_mutate_lifecycle() {
         work.snapshot.cache().unwrap().state,
         Some(WorkQueueDerivedState::Scheduled)
     );
-    work.snapshot.up(vec![Message::Pull(PullDemand::new(
-        work.snapshot_pull_id.clone(),
-    ))]);
+    work.snapshot_request.set(());
     assert_eq!(
         work.snapshot.cache().unwrap().state,
         Some(WorkQueueDerivedState::Canceled)
@@ -366,31 +352,22 @@ fn available_pagination_uses_the_same_admission_order_cursor_as_pages() {
         },
     );
     let available = queue.available();
+    let _available_sub = available.available.subscribe(|_| {});
 
-    available
-        .available
-        .up(vec![Message::Pull(PullDemand::with_params(
-            available.available_pull_id.clone(),
-            WorkQueueAvailableParams {
-                limit: Some(1),
-                ..WorkQueueAvailableParams::default()
-            },
-        ))]);
+    available.available_request.set(WorkQueueAvailableParams {
+        limit: Some(1),
+        ..WorkQueueAvailableParams::default()
+    });
     let page1 = available.available.cache().unwrap();
     assert_eq!(page1.items[0].work_id, "z-first");
     assert!(page1.has_more);
 
-    available
-        .available
-        .up(vec![Message::Pull(PullDemand::with_params(
-            available.available_pull_id.clone(),
-            WorkQueueAvailableParams {
-                limit: Some(1),
-                after_work_id: page1.next_after_work_id,
-                after_admission_seq: page1.next_after_admission_seq,
-                ..WorkQueueAvailableParams::default()
-            },
-        ))]);
+    available.available_request.set(WorkQueueAvailableParams {
+        limit: Some(1),
+        after_work_id: page1.next_after_work_id,
+        after_admission_seq: page1.next_after_admission_seq,
+        ..WorkQueueAvailableParams::default()
+    });
     let page2 = available.available.cache().unwrap();
     assert_eq!(page2.items[0].work_id, "a-second");
     assert!(!page2.has_more);

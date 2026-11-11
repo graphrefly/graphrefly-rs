@@ -58,8 +58,9 @@ where
                 .checked_add(1)
                 .expect("worker_derived invocation generation overflow");
             latest_invocation.set(invocation);
+            // Nothing to send: the kernel settles a pending node that sent
+            // nothing with its own RESOLVED (R-wave).
             let Some(input) = prepare(ctx) else {
-                ctx.down(vec![Message::Resolved]);
                 return;
             };
             let Some(driver) = ctx.local_async_driver() else {

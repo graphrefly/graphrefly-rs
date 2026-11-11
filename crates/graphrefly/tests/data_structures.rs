@@ -8,8 +8,8 @@ use std::rc::Rc;
 use graphrefly::{
     graph, merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
     scan_log, GraphNodeOpts, IndexChange, IndexRow, ListChange, LogChange, MapChange, Message,
-    Node, PullDemand, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions,
-    ReactiveMapOptions, TopologyEvent, TopologyEventKind,
+    Node, ReactiveIndexOptions, ReactiveListOptions, ReactiveLogOptions, ReactiveMapOptions,
+    TopologyEvent, TopologyEventKind,
 };
 
 type DataCollector<T> = (Rc<RefCell<Vec<T>>>, Box<dyn FnOnce()>);
@@ -38,36 +38,29 @@ fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static 
     let _keep = node.subscribe(move |msg| {
         seen_sink.borrow_mut().push(match msg {
             Message::Start => "START",
-            Message::Pause(_) => "PAUSE",
-            Message::Resume(_) => "RESUME",
-            Message::Pull(_) => "PULL",
-            Message::Dirty => "DIRTY",
+            Message::Pending => "PENDING",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
             Message::Invalidate => "INVALIDATE",
             Message::Complete => "COMPLETE",
             Message::Error(_) => "ERROR",
-            Message::Teardown => "TEARDOWN",
         });
     });
     seen
 }
 
 fn demand_snapshot<T: Clone + 'static>(list: &graphrefly::ReactiveList<T>) {
-    list.snapshot
-        .up(vec![Message::Pull(PullDemand::new(list.pull_id.clone()))]);
+    list.snapshot_request.set(());
 }
 
 fn demand_log_snapshot<T: Clone + 'static>(log: &graphrefly::ReactiveLog<T>) {
-    log.snapshot
-        .up(vec![Message::Pull(PullDemand::new(log.pull_id.clone()))]);
+    log.snapshot_request.set(());
 }
 
 fn demand_view_snapshot<C: Clone + 'static, S: Clone + 'static>(
     view: &graphrefly::ReactiveView<C, S>,
 ) {
-    view.snapshot
-        .up(vec![Message::Pull(PullDemand::new(view.pull_id.clone()))]);
+    view.snapshot_request.set(());
 }
 
 fn demand_index_snapshot<K, S, V>(index: &graphrefly::ReactiveIndex<K, S, V>)
@@ -76,9 +69,7 @@ where
     S: Clone + Ord + 'static,
     V: Clone + 'static,
 {
-    index
-        .snapshot
-        .up(vec![Message::Pull(PullDemand::new(index.pull_id.clone()))]);
+    index.snapshot_request.set(());
 }
 
 fn demand_map_snapshot<K, V>(map: &graphrefly::ReactiveMap<K, V>)
@@ -86,8 +77,7 @@ where
     K: Clone + Ord + std::fmt::Debug + 'static,
     V: Clone + 'static,
 {
-    map.snapshot
-        .up(vec![Message::Pull(PullDemand::new(map.pull_id.clone()))]);
+    map.snapshot_request.set(());
 }
 
 fn btree<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> BTreeMap<K, V> {
@@ -146,7 +136,7 @@ fn reactive_list_delta_and_quick_reads() {
         .copied()
         .collect::<Vec<_>>()
         .chunks_exact(2)
-        .all(|pair| pair == ["DIRTY", "DATA"]));
+        .all(|pair| pair == ["PENDING", "DATA"]));
     assert!(list.is_empty());
     assert_eq!(list.at(0), None);
 }
@@ -155,7 +145,10 @@ fn reactive_list_delta_and_quick_reads() {
 fn reactive_list_snapshot_is_pull_driven_and_coalesces_no_change_demand() {
     let list = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
     let other = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
-    assert_ne!(list.pull_id, other.pull_id);
+    assert!(!list
+        .snapshot_request
+        .erased()
+        .ptr_eq(&other.snapshot_request.erased()));
     let snapshots = collect_data(&list.snapshot);
 
     list.append(1);
@@ -303,7 +296,10 @@ fn reactive_log_page_is_light_view_and_lazy_pull() {
     let log = reactive_log::<i32>(vec![1, 2, 3, 4], ReactiveLogOptions::named("log").graph(g));
     let page = log.page(1, 2);
     let same = log.page(1, 2);
-    assert_eq!(page.pull_id, same.pull_id);
+    assert!(page
+        .snapshot_request
+        .erased()
+        .ptr_eq(&same.snapshot_request.erased()));
     let (page_deltas, unsub_page_deltas) = collect_data_with_unsub(&page.delta);
     let (pages, unsub_pages) = collect_data_with_unsub(&page.snapshot);
 
@@ -320,10 +316,12 @@ fn reactive_log_page_is_light_view_and_lazy_pull() {
 
     unsub_pages();
     unsub_page_deltas();
+    // Read the identity before dispose: a released node's handle cannot be re-taken.
+    let page_request = page.snapshot_request.erased();
     page.dispose();
     let rebuilt = log.page(1, 2);
     assert!(
-        rebuilt.pull_id != page.pull_id,
+        !rebuilt.snapshot_request.erased().ptr_eq(&page_request),
         "disposing a memoized page removes it from the memo table"
     );
     rebuilt.dispose();
@@ -486,7 +484,10 @@ fn reactive_index_range_memo_uses_structural_keys_not_debug_text() {
     let (first_seen, unsub_first) = collect_data_with_unsub(&first.snapshot);
     let (second_seen, unsub_second) = collect_data_with_unsub(&second.snapshot);
 
-    assert_ne!(first.pull_id, second.pull_id);
+    assert!(!first
+        .snapshot_request
+        .erased()
+        .ptr_eq(&second.snapshot_request.erased()));
     index.upsert(DebugCollisionKey(4), 4, 40);
     demand_view_snapshot(&first);
     demand_view_snapshot(&second);
@@ -626,12 +627,15 @@ fn reactive_log_dispose_releases_memoized_page_views() {
 }
 
 #[test]
-fn graphless_light_views_mint_distinct_pull_ids() {
+fn graphless_light_views_mint_distinct_snapshot_requests() {
     let log = reactive_log::<i32>(vec![1, 2, 3], ReactiveLogOptions::default());
     let first = log.page(0, 1);
     let second = log.page(1, 1);
 
-    assert_ne!(first.pull_id, second.pull_id);
+    assert!(!first
+        .snapshot_request
+        .erased()
+        .ptr_eq(&second.snapshot_request.erased()));
 
     first.dispose();
     second.dispose();
@@ -709,7 +713,10 @@ fn reactive_map_select_is_light_view_and_lazy_pull() {
     let is_even: StringNumberPredicate = Rc::new(|value, _| *value % 2 == 0);
     let view = map.select_by(is_even.clone());
     let same = map.select_by(is_even);
-    assert_eq!(same.pull_id, view.pull_id);
+    assert!(same
+        .snapshot_request
+        .erased()
+        .ptr_eq(&view.snapshot_request.erased()));
     let (view_deltas, unsub_view_deltas) = collect_data_with_unsub(&view.delta);
     let (selected, unsub_selected) = collect_data_with_unsub(&view.snapshot);
 
@@ -733,10 +740,12 @@ fn reactive_map_select_is_light_view_and_lazy_pull() {
 
     unsub_selected();
     unsub_view_deltas();
+    // Read the identity before dispose: a released node's handle cannot be re-taken.
+    let view_request = view.snapshot_request.erased();
     view.dispose();
 
     let fresh = map.select(|value, _| *value > 0);
-    assert_ne!(fresh.pull_id, view.pull_id);
+    assert!(!fresh.snapshot_request.erased().ptr_eq(&view_request));
     fresh.dispose();
 }
 
@@ -807,7 +816,18 @@ fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
     observer.unsubscribe();
 
     let events = events.borrow();
-    assert_eq!(events.len(), 2);
+    // The snapshot's request state (graphrefly-rs:D1 (1)) is released with the view.
+    assert_eq!(events.len(), 3);
+    let request = events
+        .iter()
+        .find(|event| event.path == "map.select#0.snapshotRequest")
+        .expect("request state released with the view");
+    assert_eq!(request.kind, TopologyEventKind::NodeReleased);
+    let events: Vec<_> = events
+        .iter()
+        .filter(|event| event.path != "map.select#0.snapshotRequest")
+        .cloned()
+        .collect();
     assert_eq!(events[0].kind, TopologyEventKind::NodeReleased);
     assert_eq!(events[0].path, "map.select#0.delta");
     assert_eq!(
@@ -822,8 +842,13 @@ fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
         events[1].factory.as_deref(),
         Some("reactiveMap.select.snapshot")
     );
-    assert_eq!(events[1].deps, vec!["map.select#0.delta".to_owned()]);
-    assert_eq!(events[1].seq, 1);
+    assert_eq!(
+        events[1].deps,
+        vec![
+            "map.select#0.delta".to_owned(),
+            "map.select#0.snapshotRequest".to_owned()
+        ]
+    );
     assert!(g.find("map.select#0.delta").is_none());
     assert!(g.find("map.select#0.snapshot").is_none());
     let describe = g.describe();
@@ -1065,7 +1090,10 @@ fn unnamed_graph_reactive_lists_get_distinct_public_ids() {
     let a = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default().graph(g.clone()));
     let b = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default().graph(g.clone()));
 
-    assert_ne!(a.pull_id, b.pull_id);
+    assert!(!a
+        .snapshot_request
+        .erased()
+        .ptr_eq(&b.snapshot_request.erased()));
     let snap = g.describe();
     let ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
     assert_eq!(ids.iter().filter(|id| id.ends_with(".delta")).count(), 2);

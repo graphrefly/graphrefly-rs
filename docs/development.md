@@ -170,7 +170,7 @@ existing constraints; root rules and owner decisions still govern meaning.
    comment).
 6. **`#[must_use]` on value-returning public fns; `clippy::pedantic` warn-by-default.**
    Allow per-need with a comment, never silently.
-7. **Public ids behind newtypes** (`LockId`, `Handle`, future `NodeId`) — never raw ints.
+7. **Public ids behind newtypes** (`Handle`, future `NodeId`) — never raw ints.
 
 
 ## Workflow and command observation

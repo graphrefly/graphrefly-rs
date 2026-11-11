@@ -28,7 +28,7 @@ use crate::environment::{
     WebSocketRequest, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 use crate::node::Node;
-use crate::node::{NodeOpts, Pausable};
+use crate::node::NodeOpts;
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, GraphError, Message};
 
@@ -81,8 +81,6 @@ pub enum SyncValueFromError {
     Error(String),
     /// The node stayed live after the synchronous subscribe/current-drain window.
     Pending,
-    /// The node synchronously tore down without a successful value result.
-    Teardown,
     /// The node emitted more than one DATA value before completing.
     TooManyValues,
     /// The typed node delivered DATA that could not be downcast to `T`.
@@ -95,7 +93,6 @@ impl fmt::Display for SyncValueFromError {
             Self::CompleteWithoutData => f.write_str("node completed before emitting DATA"),
             Self::Error(error) => write!(f, "node emitted ERROR: {error}"),
             Self::Pending => f.write_str("node did not synchronously emit a final value"),
-            Self::Teardown => f.write_str("node tore down before emitting a value result"),
             Self::TooManyValues => f.write_str("node emitted more than one DATA value"),
             Self::ValueTypeMismatch => f.write_str("node emitted DATA with an unexpected type"),
         }
@@ -148,7 +145,6 @@ struct SyncValueCapture<T> {
     value_count: usize,
     error: Option<String>,
     completed: bool,
-    torn_down: bool,
     type_mismatch: bool,
 }
 
@@ -159,7 +155,6 @@ impl<T> Default for SyncValueCapture<T> {
             value_count: 0,
             error: None,
             completed: false,
-            torn_down: false,
             type_mismatch: false,
         }
     }
@@ -188,16 +183,7 @@ where
             Message::Complete => {
                 self.completed = true;
             }
-            Message::Teardown => {
-                self.torn_down = true;
-            }
-            Message::Start
-            | Message::Dirty
-            | Message::Resolved
-            | Message::Invalidate
-            | Message::Pause(_)
-            | Message::Resume(_)
-            | Message::Pull(_) => {}
+            Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
         }
     }
 
@@ -207,9 +193,6 @@ where
         }
         if let Some(error) = &self.error {
             return Err(SyncValueFromError::Error(error.clone()));
-        }
-        if self.torn_down {
-            return Err(SyncValueFromError::Teardown);
         }
         if let Some(value) = self.first.take() {
             return Ok(value);
@@ -226,9 +209,6 @@ where
         }
         if let Some(error) = &self.error {
             return Err(SyncValueFromError::Error(error.clone()));
-        }
-        if self.torn_down {
-            return Err(SyncValueFromError::Teardown);
         }
         if !self.completed {
             return Err(SyncValueFromError::Pending);
@@ -280,7 +260,6 @@ fn process_source(factory: &'static str, command: ProcessCommand) -> Operator<Pr
         factory,
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -338,7 +317,6 @@ pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
         "fromHttp",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -388,7 +366,6 @@ pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
         "fromSSE",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -728,7 +705,6 @@ pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSoc
         "fromWebSocket",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -792,7 +768,6 @@ pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<
         "fromWebhook",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -1099,7 +1074,6 @@ where
     Operator::with_opts(
         "fromFSWatch",
         NodeOpts {
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -1609,7 +1583,6 @@ pub fn from_cron_with_options(expr: &str, opts: FromCronOptions) -> Operator<Cro
     Operator::with_opts(
         "fromCron",
         NodeOpts {
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -1811,7 +1784,6 @@ where
     Operator::with_opts(
         "fromGitHook",
         NodeOpts {
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -1893,7 +1865,6 @@ fn timer_source(factory: &'static str, ms: u64) -> Operator<u64> {
     Operator::with_opts(
         factory,
         NodeOpts {
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -1937,7 +1908,6 @@ pub fn interval(ms: u64) -> Operator<u64> {
     Operator::with_opts(
         "interval",
         NodeOpts {
-            pausable: Pausable::False,
             ..NodeOpts::default()
         },
         move |ctx| {

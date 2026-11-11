@@ -1,19 +1,19 @@
 //! The fn-body context — the substrate↔user-fn boundary (D8).
 //!
-//! A node fn receives a [`Ctx`] and communicates **only** through it: no
-//! `actions.emit/forward/backward`, the whole surface unifies on `up`/`down`.
-//! Values cross erased as [`AnyValue`]; the typed `data`/`emit` helpers downcast.
+//! A node fn receives a [`Ctx`] and communicates **only** through it: `down` is
+//! the function's only output (R-invocation). Nothing travels up the graph
+//! (R-messages): there is no `up`. Values cross erased as [`AnyValue`]; the typed
+//! `data`/`emit` helpers downcast.
 //!
-//! Slice scope: `down` (DATA/DIRTY/RESOLVED/INVALIDATE/terminal), typed `data`/
-//! `emit`, `state`, and the cleanup hooks (`on_deactivation` + `on_invalidate`).
-//! `up` validates control/demand-only (R-ctx-up) and self-handles PAUSE/RESUME/PULL; the
-//! INVALIDATE-at-depless-source terminus (D38, C-7) is deferred. See `CLEAN-SLATE.md`.
+//! Slice scope: `down` (DATA/INVALIDATE/terminal; PENDING and RESOLVED are the
+//! kernel's and are rejected), typed `data`/`emit`, `state`, and the cleanup hooks
+//! (`on_deactivation` + `on_invalidate`). See `CLEAN-SLATE.md`.
 
 use std::rc::Rc;
 
 use crate::node::{Core, Node, NodeOpts, RewireRequest};
 use crate::operators::Operator;
-use crate::protocol::{AnyValue, Message, PullDemand, Wave};
+use crate::protocol::{reject_kernel_only_output, AnyValue, Message, Wave};
 
 /// A dep's terminal state, visible to the fn via [`Ctx::terminal`]
 /// (R-deps-terminal / C-15). `None` ⇔ the dep is live; `Some(..)` ⇔ it COMPLETEd
@@ -79,16 +79,11 @@ pub(crate) struct DepRecord {
 pub struct Ctx {
     pub(crate) node: Core,
     dep_records: Vec<DepRecord>,
-    pull: Option<PullDemand>,
 }
 
 impl Ctx {
-    pub(crate) fn new(node: Core, dep_records: Vec<DepRecord>, pull: Option<PullDemand>) -> Self {
-        Self {
-            node,
-            dep_records,
-            pull,
-        }
+    pub(crate) fn new(node: Core, dep_records: Vec<DepRecord>) -> Self {
+        Self { node, dep_records }
     }
 
     pub(crate) fn dep_records(&self) -> &[DepRecord] {
@@ -148,37 +143,21 @@ impl Ctx {
     }
 
     /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean):
-    /// the protocol DIRTY-before-DATA framing is synthesized by the substrate.
+    /// the PENDING prefix is the kernel's (R-wave).
     pub fn emit<T: 'static>(&self, v: T) {
         self.node.down(vec![Message::Data(Rc::new(v))]);
     }
 
-    /// Emit a raw wave downstream toward sinks (the ctx-level power surface, DR-1).
+    /// Emit a raw array downstream toward sinks (the ctx-level power surface, DR-1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `msgs` contains PENDING or RESOLVED, which only the kernel sends
+    /// (R-wave, R-failure); nothing of the array is applied. Uncaught, the panic is
+    /// the node's ERROR.
     pub fn down(&self, msgs: Wave<AnyValue>) {
+        reject_kernel_only_output(&msgs);
         self.node.down(msgs);
-    }
-
-    /// Emit upstream toward deps — control tiers only (R-ctx-up). Validates the
-    /// kind; the terminus actions (PAUSE lockset / INVALIDATE honor) are deferred.
-    pub fn up(&self, msgs: Wave<AnyValue>) {
-        self.node.up(msgs, None);
-    }
-
-    /// Directed upstream control along one declared dep edge (R-up-routing).
-    pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
-        self.node.up(msgs, Some(toward_dep));
-    }
-
-    /// Defer an upstream control wave to the committed wave boundary (R-rewire-deferred).
-    /// This is the self-demand path for pull nodes: `PULL({pullId, params?})` routes
-    /// after the current fn settles, avoiding D37 mid-wave re-entry.
-    pub fn up_next(&self, msgs: Wave<AnyValue>) {
-        self.node.request_up_next(msgs, None);
-    }
-
-    /// Directed form of [`Ctx::up_next`].
-    pub fn up_next_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
-        self.node.request_up_next(msgs, Some(toward_dep));
     }
 
     /// Read this node's private cross-wave state (R-ctx-state / D23), typed.
@@ -194,12 +173,6 @@ impl Ctx {
     /// Keep `state` across the fresh-lifecycle wipe (R-ctx-state / D29).
     pub fn state_persist(&self, on: bool) {
         self.node.set_state_persist(on);
-    }
-
-    /// Holder-visible context for a PULL-caused invocation (D272). Absent for
-    /// normal dep-settle, activation, pause replay, terminal, and non-pull runs.
-    pub fn pull(&self) -> Option<&PullDemand> {
-        self.pull.as_ref()
     }
 
     /// Release external resources on deactivation (R-cleanup-hooks / D28). Fires once.
@@ -292,8 +265,7 @@ impl Ctx {
 /// An owned, `'static` late-emit handle obtained via [`Ctx::defer`] — the async-pool
 /// boundary. An async node fn stashes one and emits LATER (the deferred result of
 /// async work). The emit re-enters the wave engine as a FRESH external wave (its own
-/// wave-owner / D30 catch boundary; the leading DIRTY is synthesized like any external
-/// tier-3 emit, R-dirty-before-data). Holds the node handle ([`Core`] = an `Rc`) + the
+/// wave-owner / D30 catch boundary; the leading PENDING is the kernel's, R-wave). Holds the node handle ([`Core`] = an `Rc`) + the
 /// dep snapshot at defer time.
 pub struct DeferredCtx {
     node: Core,
@@ -346,19 +318,15 @@ impl DeferredCtx {
         self.node.owned_down(vec![Message::Data(Rc::new(v))]);
     }
 
-    /// Emit a raw wave downstream as the deferred async result (the ctx-level power
+    /// Emit a raw array downstream as the deferred async result (the ctx-level power
     /// surface, DR-1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `msgs` contains PENDING or RESOLVED, which only the kernel sends
+    /// (R-wave); nothing of the array is applied.
     pub fn down(&self, msgs: Wave<AnyValue>) {
+        reject_kernel_only_output(&msgs);
         self.node.owned_down(msgs);
-    }
-
-    /// Emit upstream through the node's LIVE topology at emission time (R-rewire-async-live-edge).
-    pub fn up(&self, msgs: Wave<AnyValue>) {
-        self.node.owned_up(msgs, None);
-    }
-
-    /// Directed form of [`DeferredCtx::up`].
-    pub fn up_toward(&self, toward_dep: usize, msgs: Wave<AnyValue>) {
-        self.node.owned_up(msgs, Some(toward_dep));
     }
 }

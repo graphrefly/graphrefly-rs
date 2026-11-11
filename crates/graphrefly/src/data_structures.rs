@@ -1,15 +1,14 @@
 //! Reactive data structures (B53 / D54 / D60), starting with `reactive_list`.
 //!
 //! These are per-language product surfaces (D6/D24), not conformance scenarios.
-//! The substrate pull behavior is reused through `NodeOpts::pull_id`; no protocol
-//! tier/message semantics live here.
+//! A snapshot is asked for by writing its request state node, which it declares
+//! as a dependency (graphrefly-rs:D1 (1)); no protocol message semantics live here.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Number, Value};
@@ -18,7 +17,8 @@ use crate::checkpoint::register_backend_state_contributor;
 use crate::graph::{Graph, GraphNodeOpts, RestoreFactoryMeta, TopologyGroupOptions};
 use crate::node::{Node, NodeOpts};
 use crate::operators::{init_node, Operator};
-use crate::protocol::{LockId, Message};
+use crate::protocol::Message;
+use crate::request::requested;
 
 type Disposer = Box<dyn FnOnce()>;
 type DisposerSlots = Rc<RefCell<Vec<Option<Disposer>>>>;
@@ -31,8 +31,6 @@ type IndexRangeMemo<K, S, V> = Rc<RefCell<Vec<((K, K), IndexRangeView<K, S, V>)>
 type MapSelectView<K, V> = ReactiveView<MapChange<K, V>, BTreeMap<K, V>>;
 type MapSelectPredicate<K, V> = Rc<dyn Fn(&V, &K) -> bool>;
 type MapSelectMemo<K, V> = Rc<RefCell<Vec<(MapSelectPredicate<K, V>, MapSelectView<K, V>)>>>;
-
-static VIEW_PULL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct ViewFactories {
@@ -764,8 +762,9 @@ pub struct ReactiveList<T> {
     pub delta: Node<ListChange<T>>,
     /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<T>>,
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one snapshot delivery
+    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<()>,
     backend: ListBackend<T>,
     max_size: Option<usize>,
     graph: Option<Graph>,
@@ -786,10 +785,6 @@ impl<T: Clone + 'static> ReactiveList<T> {
             .name
             .clone()
             .unwrap_or_else(|| format!("reactiveList@{token:x}"));
-        let pull_id = LockId::new(format!(
-            "{id_prefix}.snapshot@{:x}",
-            backend.instance_token()
-        ));
         let restorable =
             options.graph.is_some() && options.name.is_some() && options.max_size.is_none();
         let delta = make_delta_node::<T>(options.graph.as_ref(), &id_prefix, restorable);
@@ -799,18 +794,24 @@ impl<T: Clone + 'static> ReactiveList<T> {
                 vec_to_checkpoint_json(backend_for_checkpoint.snapshot())
             });
         }
+        let snapshot_request = make_snapshot_request_node(
+            options.graph.as_ref(),
+            &id_prefix,
+            "reactiveList.snapshotRequest",
+            restorable,
+        );
         let snapshot = make_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
-            pull_id.clone(),
+            &snapshot_request,
             restorable,
         );
         Self {
             delta,
             snapshot,
-            pull_id,
+            snapshot_request,
             backend,
             max_size: options.max_size,
             graph: options.graph,
@@ -966,8 +967,9 @@ pub struct ReactiveLog<T> {
     pub delta: Node<LogChange<T>>,
     /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<T>>,
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one snapshot delivery
+    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<()>,
     backend: LogBackend<T>,
     graph: Option<Graph>,
     id_prefix: String,
@@ -983,8 +985,9 @@ pub struct ReactiveView<C, S> {
     pub delta: Node<C>,
     /// `snapshot` field for snapshot.
     pub snapshot: Node<S>,
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one snapshot delivery
+    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<()>,
     disposed: Rc<Cell<bool>>,
     dispose_action: ViewDisposeAction,
 }
@@ -996,8 +999,9 @@ pub struct ReactiveIndex<K, S, V> {
     pub delta: Node<IndexChange<K, S, V>>,
     /// `snapshot` field for snapshot.
     pub snapshot: Node<Vec<IndexRow<K, S, V>>>,
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one snapshot delivery
+    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<()>,
     backend: IndexBackend<K, S, V>,
     graph: Option<Graph>,
     id_prefix: String,
@@ -1012,8 +1016,9 @@ pub struct ReactiveMap<K, V> {
     pub delta: Node<MapChange<K, V>>,
     /// `snapshot` field for snapshot.
     pub snapshot: Node<BTreeMap<K, V>>,
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
+    /// Request state for `snapshot`: each write asks for one snapshot delivery
+    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    pub snapshot_request: Node<()>,
     backend: MapBackend<K, V>,
     graph: Option<Graph>,
     id_prefix: String,
@@ -1035,10 +1040,6 @@ where
             .name
             .clone()
             .unwrap_or_else(|| format!("reactiveIndex@{token:x}"));
-        let pull_id = LockId::new(format!(
-            "{id_prefix}.snapshot@{:x}",
-            backend.instance_token()
-        ));
         let restorable = options.graph.is_some() && options.name.is_some();
         let delta =
             make_index_delta_node::<K, S, V>(options.graph.as_ref(), &id_prefix, restorable);
@@ -1048,18 +1049,24 @@ where
                 index_rows_to_checkpoint_json(backend_for_checkpoint.snapshot())
             });
         }
+        let snapshot_request = make_snapshot_request_node(
+            options.graph.as_ref(),
+            &id_prefix,
+            "reactiveIndex.snapshotRequest",
+            restorable,
+        );
         let snapshot = make_index_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
-            pull_id.clone(),
+            &snapshot_request,
             restorable,
         );
         Self {
             delta,
             snapshot,
-            pull_id,
+            snapshot_request,
             backend,
             graph: options.graph,
             id_prefix,
@@ -1209,10 +1216,6 @@ where
             .name
             .clone()
             .unwrap_or_else(|| format!("reactiveMap@{token:x}"));
-        let pull_id = LockId::new(format!(
-            "{id_prefix}.snapshot@{:x}",
-            backend.instance_token()
-        ));
         let restorable = options.graph.is_some() && options.name.is_some();
         let delta = make_map_delta_node::<K, V>(options.graph.as_ref(), &id_prefix, restorable);
         if restorable {
@@ -1221,18 +1224,24 @@ where
                 map_entries_to_checkpoint_json(backend_for_checkpoint.entries_snapshot())
             });
         }
+        let snapshot_request = make_snapshot_request_node(
+            options.graph.as_ref(),
+            &id_prefix,
+            "reactiveMap.snapshotRequest",
+            restorable,
+        );
         let snapshot = make_map_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
-            pull_id.clone(),
+            &snapshot_request,
             restorable,
         );
         Self {
             delta,
             snapshot,
-            pull_id,
+            snapshot_request,
             backend,
             graph: options.graph,
             id_prefix,
@@ -1382,7 +1391,7 @@ impl<C, S> Clone for ReactiveView<C, S> {
         Self {
             delta: self.delta.clone(),
             snapshot: self.snapshot.clone(),
-            pull_id: self.pull_id.clone(),
+            snapshot_request: self.snapshot_request.clone(),
             disposed: self.disposed.clone(),
             dispose_action: self.dispose_action.clone(),
         }
@@ -1412,10 +1421,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
             .name
             .clone()
             .unwrap_or_else(|| format!("reactiveLog@{token:x}"));
-        let pull_id = LockId::new(format!(
-            "{id_prefix}.snapshot@{:x}",
-            backend.instance_token()
-        ));
         let restorable = options.graph.is_some() && options.name.is_some();
         let delta = make_log_delta_node::<T>(
             options.graph.as_ref(),
@@ -1429,18 +1434,24 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 vec_to_checkpoint_json(backend_for_checkpoint.snapshot())
             });
         }
+        let snapshot_request = make_snapshot_request_node(
+            options.graph.as_ref(),
+            &id_prefix,
+            "reactiveLog.snapshotRequest",
+            restorable,
+        );
         let snapshot = make_log_snapshot_node(
             options.graph.as_ref(),
             &id_prefix,
             &delta,
             &backend,
-            pull_id.clone(),
+            &snapshot_request,
             restorable,
         );
         Self {
             delta,
             snapshot,
-            pull_id,
+            snapshot_request,
             backend,
             graph: options.graph,
             id_prefix,
@@ -1945,7 +1956,7 @@ fn make_snapshot_node<T: Clone + 'static>(
     id_prefix: &str,
     delta: &Node<ListChange<T>>,
     backend: &ListBackend<T>,
-    pull_id: LockId,
+    request: &Node<()>,
     restorable: bool,
 ) -> Node<Vec<T>> {
     let backend = backend.clone();
@@ -1953,10 +1964,12 @@ fn make_snapshot_node<T: Clone + 'static>(
         "reactiveList.snapshot",
         NodeOpts {
             partial: true,
-            pull_id: Some(pull_id),
             ..NodeOpts::default()
         },
         move |ctx| {
+            if requested::<()>(ctx, 1).is_none() {
+                return;
+            }
             let version = backend.version();
             let last = ctx.state_get::<u64>().map(|v| *v);
             if last == Some(version) {
@@ -1969,7 +1982,7 @@ fn make_snapshot_node<T: Clone + 'static>(
     match graph {
         Some(graph) => graph.init_node(
             op,
-            vec![delta.erased()],
+            vec![delta.erased(), request.erased()],
             collection_node_opts(
                 id_prefix,
                 "snapshot",
@@ -1978,7 +1991,11 @@ fn make_snapshot_node<T: Clone + 'static>(
                 restorable,
             ),
         ),
-        None => init_node(op, vec![delta.erased()], NodeOpts::default()),
+        None => init_node(
+            op,
+            vec![delta.erased(), request.erased()],
+            NodeOpts::default(),
+        ),
     }
 }
 
@@ -1987,7 +2004,7 @@ fn make_log_snapshot_node<T: Clone + 'static>(
     id_prefix: &str,
     delta: &Node<LogChange<T>>,
     backend: &LogBackend<T>,
-    pull_id: LockId,
+    request: &Node<()>,
     restorable: bool,
 ) -> Node<Vec<T>> {
     let backend = backend.clone();
@@ -1995,10 +2012,12 @@ fn make_log_snapshot_node<T: Clone + 'static>(
         "reactiveLog.snapshot",
         NodeOpts {
             partial: true,
-            pull_id: Some(pull_id),
             ..NodeOpts::default()
         },
         move |ctx| {
+            if requested::<()>(ctx, 1).is_none() {
+                return;
+            }
             let version = backend.version();
             let last = ctx.state_get::<u64>().map(|v| *v);
             if last == Some(version) {
@@ -2011,7 +2030,7 @@ fn make_log_snapshot_node<T: Clone + 'static>(
     match graph {
         Some(graph) => graph.init_node(
             op,
-            vec![delta.erased()],
+            vec![delta.erased(), request.erased()],
             collection_node_opts(
                 id_prefix,
                 "snapshot",
@@ -2020,7 +2039,11 @@ fn make_log_snapshot_node<T: Clone + 'static>(
                 restorable,
             ),
         ),
-        None => init_node(op, vec![delta.erased()], NodeOpts::default()),
+        None => init_node(
+            op,
+            vec![delta.erased(), request.erased()],
+            NodeOpts::default(),
+        ),
     }
 }
 
@@ -2033,7 +2056,7 @@ fn make_index_snapshot_node<
     id_prefix: &str,
     delta: &Node<IndexChange<K, S, V>>,
     backend: &IndexBackend<K, S, V>,
-    pull_id: LockId,
+    request: &Node<()>,
     restorable: bool,
 ) -> Node<Vec<IndexRow<K, S, V>>> {
     let backend = backend.clone();
@@ -2041,10 +2064,12 @@ fn make_index_snapshot_node<
         "reactiveIndex.snapshot",
         NodeOpts {
             partial: true,
-            pull_id: Some(pull_id),
             ..NodeOpts::default()
         },
         move |ctx| {
+            if requested::<()>(ctx, 1).is_none() {
+                return;
+            }
             let version = backend.version();
             let last = ctx.state_get::<u64>().map(|v| *v);
             if last == Some(version) {
@@ -2057,7 +2082,7 @@ fn make_index_snapshot_node<
     match graph {
         Some(graph) => graph.init_node(
             op,
-            vec![delta.erased()],
+            vec![delta.erased(), request.erased()],
             collection_node_opts(
                 id_prefix,
                 "snapshot",
@@ -2066,7 +2091,11 @@ fn make_index_snapshot_node<
                 restorable,
             ),
         ),
-        None => init_node(op, vec![delta.erased()], NodeOpts::default()),
+        None => init_node(
+            op,
+            vec![delta.erased(), request.erased()],
+            NodeOpts::default(),
+        ),
     }
 }
 
@@ -2075,7 +2104,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     id_prefix: &str,
     delta: &Node<MapChange<K, V>>,
     backend: &MapBackend<K, V>,
-    pull_id: LockId,
+    request: &Node<()>,
     restorable: bool,
 ) -> Node<BTreeMap<K, V>> {
     let backend = backend.clone();
@@ -2083,10 +2112,12 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
         "reactiveMap.snapshot",
         NodeOpts {
             partial: true,
-            pull_id: Some(pull_id),
             ..NodeOpts::default()
         },
         move |ctx| {
+            if requested::<()>(ctx, 1).is_none() {
+                return;
+            }
             let version = backend.version();
             let last = ctx.state_get::<u64>().map(|v| *v);
             if last == Some(version) {
@@ -2099,7 +2130,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     match graph {
         Some(graph) => graph.init_node(
             op,
-            vec![delta.erased()],
+            vec![delta.erased(), request.erased()],
             collection_node_opts(
                 id_prefix,
                 "snapshot",
@@ -2108,12 +2139,36 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
                 restorable,
             ),
         ),
-        None => init_node(op, vec![delta.erased()], NodeOpts::default()),
+        None => init_node(
+            op,
+            vec![delta.erased(), request.erased()],
+            NodeOpts::default(),
+        ),
     }
 }
 
 fn node_name(prefix: &str, suffix: &str) -> String {
     format!("{prefix}.{suffix}")
+}
+
+/// The request state a collection snapshot declares as its dependency
+/// (graphrefly-rs:D1 (1)).
+fn make_snapshot_request_node(
+    graph: Option<&Graph>,
+    id_prefix: &str,
+    restore_ref: &str,
+    restorable: bool,
+) -> Node<()> {
+    match graph {
+        Some(graph) => graph.state_empty_opts(collection_node_opts(
+            id_prefix,
+            "snapshotRequest",
+            "collection_snapshot_request",
+            restore_ref,
+            restorable,
+        )),
+        None => Node::state_empty(),
+    }
 }
 
 fn collection_node_opts(
@@ -2307,25 +2362,35 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
         }
         None => init_node(delta_op, vec![parent_delta.erased()], NodeOpts::default()),
     };
-    let pull_id = LockId::new(match &name {
-        Some(name) => format!("{name}.snapshot"),
-        None => format!(
-            "{}.snapshot#{}",
-            factories.group,
-            VIEW_PULL_SEQ.fetch_add(1, Ordering::Relaxed)
-        ),
-    });
+    let snapshot_request: Node<()> = match group.as_ref() {
+        Some(group) => {
+            let mut opts = graph_node_opts_with_optional_name(
+                name.as_ref().map(|n| format!("{n}.snapshotRequest")),
+            );
+            opts.meta.insert(
+                "kind".to_owned(),
+                "collection_view_snapshot_request".to_owned(),
+            );
+            opts.meta
+                .insert("factory".to_owned(), factories.group.to_owned());
+            group.state_empty_opts(opts)
+        }
+        None => Node::state_empty(),
+    };
     let snapshot_op = Operator::with_opts(
         factories.snapshot,
         NodeOpts {
             partial: true,
-            pull_id: Some(pull_id.clone()),
             ..NodeOpts::default()
         },
         move |ctx| {
+            if requested::<()>(ctx, 1).is_none() {
+                return;
+            }
             ctx.emit(materialize_snapshot());
         },
     );
+    let snapshot_deps = vec![delta.erased(), snapshot_request.erased()];
     let snapshot = match group.as_ref() {
         Some(group) => {
             let mut opts =
@@ -2334,12 +2399,13 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
                 .insert("kind".to_owned(), "collection_view_snapshot".to_owned());
             opts.meta
                 .insert("factory".to_owned(), factories.group.to_owned());
-            group.init_node(snapshot_op, vec![delta.erased()], opts)
+            group.init_node(snapshot_op, snapshot_deps, opts)
         }
-        None => init_node(snapshot_op, vec![delta.erased()], NodeOpts::default()),
+        None => init_node(snapshot_op, snapshot_deps, NodeOpts::default()),
     };
     let delta_core = delta.erased();
     let snapshot_core = snapshot.erased();
+    let request_core = snapshot_request.erased();
     let group_for_dispose = group.clone();
     let on_dispose = Rc::new(RefCell::new(on_dispose));
     let dispose_action = Rc::new(move || {
@@ -2347,7 +2413,9 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             group.release_with_reason(factories.group);
         } else {
             assert!(
-                snapshot_core.release_runtime_for_graph() && delta_core.release_runtime_for_graph(),
+                snapshot_core.release_runtime_for_graph()
+                    && request_core.release_runtime_for_graph()
+                    && delta_core.release_runtime_for_graph(),
                 "reactive view: cannot release runtime; view is not quiescent (D124)"
             );
         }
@@ -2358,7 +2426,7 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     ReactiveView {
         delta,
         snapshot,
-        pull_id,
+        snapshot_request,
         disposed: Rc::new(Cell::new(false)),
         dispose_action,
     }

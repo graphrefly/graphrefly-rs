@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
 use crate::dispatcher::Dispatcher;
-use crate::node::{Core, GraphArena, Node, NodeOpts, Pausable};
+use crate::node::{Core, GraphArena, Node, NodeOpts};
 use crate::protocol::{AnyValue, Message};
 
 /// A free-standing operator/source definition.
@@ -559,9 +559,7 @@ fn is_complete(terminal: Option<&DepTerminal>) -> bool {
 fn is_default_node_opts(opts: &NodeOpts) -> bool {
     opts.factory.is_none()
         && opts.pool == Default::default()
-        && opts.pausable == Pausable::True
         && !opts.partial
-        && opts.pull_id.is_none()
         && opts.complete_when_deps_complete
         && opts.error_when_deps_error
         && !opts.terminal_as_real_input
@@ -580,14 +578,8 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     if caller.pool != default.pool {
         opts.pool = caller.pool;
     }
-    if caller.pausable != default.pausable {
-        opts.pausable = caller.pausable;
-    }
     if caller.partial {
         opts.partial = true;
-    }
-    if caller.pull_id.is_some() {
-        opts.pull_id = caller.pull_id;
     }
     if caller.complete_when_deps_complete != default.complete_when_deps_complete {
         opts.complete_when_deps_complete = caller.complete_when_deps_complete;

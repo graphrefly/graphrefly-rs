@@ -17,7 +17,7 @@ use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::environment::EnvironmentDrivers;
 use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
 use crate::operators::Operator;
-use crate::protocol::{AnyValue, LockId, Message, PullDemand, Tier};
+use crate::protocol::{AnyValue, Message};
 use crate::versioning::{NodeVersion, NodeVersioningPolicy};
 
 /// Graph construction options.
@@ -1392,7 +1392,6 @@ impl Graph {
                     sink(ObserveEvent {
                         path: path.clone(),
                         msg: ObserveMessage::from_message(msg),
-                        tier: msg.tier(),
                         seq,
                     });
                 })
@@ -1648,8 +1647,6 @@ pub struct ObserveEvent {
     pub path: String,
     /// `msg` field for msg.
     pub msg: ObserveMessage,
-    /// `tier` field for tier.
-    pub tier: Tier,
     /// `seq` field for seq.
     pub seq: u64,
 }
@@ -1659,14 +1656,8 @@ pub struct ObserveEvent {
 pub enum ObserveMessage {
     /// `Start` variant.
     Start,
-    /// `Pause` variant.
-    Pause(LockId),
-    /// `Resume` variant.
-    Resume(LockId),
-    /// `Pull` variant.
-    Pull(PullDemand),
-    /// `Dirty` variant.
-    Dirty,
+    /// `Pending` variant.
+    Pending,
     /// `Data` variant.
     Data(AnyValue),
     /// `Resolved` variant.
@@ -1677,24 +1668,18 @@ pub enum ObserveMessage {
     Complete,
     /// `Error` variant.
     Error(String),
-    /// `Teardown` variant.
-    Teardown,
 }
 
 impl ObserveMessage {
     fn from_message(msg: &Message<AnyValue>) -> Self {
         match msg {
             Message::Start => ObserveMessage::Start,
-            Message::Pause(lock) => ObserveMessage::Pause(lock.clone()),
-            Message::Resume(lock) => ObserveMessage::Resume(lock.clone()),
-            Message::Pull(demand) => ObserveMessage::Pull(demand.clone()),
-            Message::Dirty => ObserveMessage::Dirty,
+            Message::Pending => ObserveMessage::Pending,
             Message::Data(value) => ObserveMessage::Data(value.clone()),
             Message::Resolved => ObserveMessage::Resolved,
             Message::Invalidate => ObserveMessage::Invalidate,
             Message::Complete => ObserveMessage::Complete,
             Message::Error(error) => ObserveMessage::Error(format!("{error}")),
-            Message::Teardown => ObserveMessage::Teardown,
         }
     }
 
@@ -1702,16 +1687,12 @@ impl ObserveMessage {
     pub fn kind(&self) -> &'static str {
         match self {
             ObserveMessage::Start => "START",
-            ObserveMessage::Pause(_) => "PAUSE",
-            ObserveMessage::Resume(_) => "RESUME",
-            ObserveMessage::Pull(_) => "PULL",
-            ObserveMessage::Dirty => "DIRTY",
+            ObserveMessage::Pending => "PENDING",
             ObserveMessage::Data(_) => "DATA",
             ObserveMessage::Resolved => "RESOLVED",
             ObserveMessage::Invalidate => "INVALIDATE",
             ObserveMessage::Complete => "COMPLETE",
             ObserveMessage::Error(_) => "ERROR",
-            ObserveMessage::Teardown => "TEARDOWN",
         }
     }
 }
@@ -2109,7 +2090,7 @@ mod tests {
             events.iter().all(|event| event.path != "child/value"
                 || !matches!(
                     event.msg,
-                    ObserveMessage::Complete | ObserveMessage::Error(_) | ObserveMessage::Teardown
+                    ObserveMessage::Complete | ObserveMessage::Error(_)
                 )),
             "D527: release does not synthesize protocol terminals"
         );

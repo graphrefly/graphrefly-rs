@@ -23,12 +23,12 @@ use graphrefly::{
     LocalHttpDriver, LocalHttpStreamDriver, LocalProcessDriver, MemoryFragment,
     MemoryRetrievalQuery, Message, MessageBusOptions, MessageBusStatusKind, OutboundAdapterOptions,
     OutboundEvent, OutboundState, OutboundStatus, PersistAgenticMemoryRecordsOptions,
-    ProcessCommand, ProcessResult, PullDemand, ReactiveMapOptions, RetryEvent, RetryPolicy,
-    RetryState, ScheduledReadinessClock, ScheduledReadinessOptions, SseEvent, SseRequest,
-    SyncValueFromError, TimeoutStatus, TopicMessage, WebSocketRequest, WebSocketSend,
-    WorkQueueClaimOptions, WorkQueueOptions, WorkQueueReadinessCandidateKind,
-    WorkQueueReadinessHandoffOptions, WorkQueueRecord, WorkQueueScheduledReadinessOptions,
-    WorkQueueSubmit, WorkQueueSubmitOptions, PROMPTS_TOPIC, STANDARD_TOPICS,
+    ProcessCommand, ProcessResult, ReactiveMapOptions, RetryEvent, RetryPolicy, RetryState,
+    ScheduledReadinessClock, ScheduledReadinessOptions, SseEvent, SseRequest, SyncValueFromError,
+    TimeoutStatus, TopicMessage, WebSocketRequest, WebSocketSend, WorkQueueClaimOptions,
+    WorkQueueOptions, WorkQueueReadinessCandidateKind, WorkQueueReadinessHandoffOptions,
+    WorkQueueRecord, WorkQueueScheduledReadinessOptions, WorkQueueSubmit, WorkQueueSubmitOptions,
+    PROMPTS_TOPIC, STANDARD_TOPICS,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
@@ -690,9 +690,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     });
 
     map_store.set("c".to_owned(), 3);
-    selected.snapshot.up(vec![Message::Pull(PullDemand::new(
-        selected.pull_id.clone(),
-    ))]);
+    selected.snapshot_request.set(());
 
     assert_eq!(
         selected_snapshots.borrow().last().cloned().unwrap(),

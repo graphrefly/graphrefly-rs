@@ -1230,12 +1230,12 @@ pub enum WireEdgeGroupIssueCode {
     MissingSnapshot,
     /// `UnknownEdge` variant.
     UnknownEdge,
-    /// `DuplicateDirty` variant.
-    DuplicateDirty,
+    /// `DuplicatePending` variant.
+    DuplicatePending,
     /// `DuplicateData` variant.
     DuplicateData,
-    /// `DataBeforeDirty` variant.
-    DataBeforeDirty,
+    /// `DataBeforePending` variant.
+    DataBeforePending,
     /// `CompetingCause` variant.
     CompetingCause,
     /// `MalformedFrame` variant.
@@ -1251,9 +1251,9 @@ impl WireEdgeGroupIssueCode {
         match self {
             Self::MissingSnapshot => "wire-edge-group-missing-snapshot",
             Self::UnknownEdge => "wire-edge-group-unknown-edge",
-            Self::DuplicateDirty => "wire-edge-group-duplicate-dirty",
+            Self::DuplicatePending => "wire-edge-group-duplicate-pending",
             Self::DuplicateData => "wire-edge-group-duplicate-data",
-            Self::DataBeforeDirty => "wire-edge-group-data-before-dirty",
+            Self::DataBeforePending => "wire-edge-group-data-before-pending",
             Self::CompetingCause => "wire-edge-group-competing-cause",
             Self::MalformedFrame => "wire-edge-group-malformed-frame",
             Self::IncompleteCause => "wire-edge-group-incomplete-cause",
@@ -1298,8 +1298,8 @@ pub struct WireEdgeGroupStatus {
     pub expected_edges: Vec<String>,
     /// `active_cause_id` field for active cause id.
     pub active_cause_id: Option<String>,
-    /// `dirty` field for dirty.
-    pub dirty: usize,
+    /// `pending` field for pending.
+    pub pending: usize,
     /// `data` field for data.
     pub data: usize,
     /// `released` field for released.
@@ -1518,7 +1518,7 @@ enum WireEdgeGroupGate {
     },
     Progress {
         cause_id: String,
-        dirty: usize,
+        pending: usize,
         data: usize,
     },
     Release {
@@ -1587,7 +1587,7 @@ impl WireEdgeGroupCauseTombstones {
 #[derive(Clone, Default)]
 struct WireEdgeGroupGateState {
     active_cause_id: Option<String>,
-    dirty: HashSet<String>,
+    pending: HashSet<String>,
     data: BTreeMap<String, Vec<u8>>,
     failed: WireEdgeGroupCauseTombstones,
     released: WireEdgeGroupCauseTombstones,
@@ -1857,7 +1857,7 @@ fn emit_wire_edge_group_outbound(
     for edge in edges {
         ctx.emit(WireEdgeGroupEvent::Outbound {
             command: wire_edge_group_send(CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Dirty,
+                kind: CanonicalWireEdgeKind::Pending,
                 edge_id: edge.edge_id.clone(),
                 cause_id: cause_id.clone(),
                 value: None,
@@ -1990,9 +1990,9 @@ fn validate_wire_edge_group_frame(
         ));
     }
     match frame.kind {
-        CanonicalWireEdgeKind::Dirty if frame.value.is_some() => Some(wire_edge_group_issue(
+        CanonicalWireEdgeKind::Pending if frame.value.is_some() => Some(wire_edge_group_issue(
             WireEdgeGroupIssueCode::MalformedFrame,
-            format!("{name}: DIRTY wire-edge frame must not carry value bytes"),
+            format!("{name}: PENDING wire-edge frame must not carry value bytes"),
             Some(frame.edge_id.clone()),
             Some(frame.cause_id.clone()),
             None,
@@ -2004,7 +2004,7 @@ fn validate_wire_edge_group_frame(
             Some(frame.cause_id.clone()),
             None,
         )),
-        CanonicalWireEdgeKind::Dirty | CanonicalWireEdgeKind::Data => None,
+        CanonicalWireEdgeKind::Pending | CanonicalWireEdgeKind::Data => None,
     }
 }
 
@@ -2070,7 +2070,7 @@ fn wire_edge_group_gate_state(ctx: &Ctx) -> Rc<RefCell<WireEdgeGroupGateState>> 
 fn wire_edge_group_gate_reset(state: &Rc<RefCell<WireEdgeGroupGateState>>) {
     let mut state = state.borrow_mut();
     state.active_cause_id = None;
-    state.dirty.clear();
+    state.pending.clear();
     state.data.clear();
 }
 
@@ -2150,14 +2150,14 @@ fn wire_edge_group_progress(
     let state = state.borrow();
     ctx.emit(WireEdgeGroupGate::Progress {
         cause_id,
-        dirty: state.dirty.len(),
+        pending: state.pending.len(),
         data: state.data.len(),
     });
 }
 
 fn emit_replayed_wire_edge_group_cause(ctx: &Ctx, name: &str, frame: &CanonicalWireEdgeFrame) {
     let code = match frame.kind {
-        CanonicalWireEdgeKind::Dirty => WireEdgeGroupIssueCode::DuplicateDirty,
+        CanonicalWireEdgeKind::Pending => WireEdgeGroupIssueCode::DuplicatePending,
         CanonicalWireEdgeKind::Data => WireEdgeGroupIssueCode::DuplicateData,
     };
     ctx.emit(WireEdgeGroupGate::Issue {
@@ -2227,15 +2227,15 @@ fn reduce_wire_edge_group_frame(
         return;
     }
     match frame.kind {
-        CanonicalWireEdgeKind::Dirty => {
+        CanonicalWireEdgeKind::Pending => {
             if active.is_none() {
                 state.borrow_mut().active_cause_id = Some(frame.cause_id.clone());
             }
-            if !state.borrow_mut().dirty.insert(frame.edge_id.clone()) {
+            if !state.borrow_mut().pending.insert(frame.edge_id.clone()) {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
-                        WireEdgeGroupIssueCode::DuplicateDirty,
-                        format!("{name}: duplicate DIRTY for edge {}", frame.edge_id),
+                        WireEdgeGroupIssueCode::DuplicatePending,
+                        format!("{name}: duplicate PENDING for edge {}", frame.edge_id),
                         Some(frame.edge_id.clone()),
                         Some(frame.cause_id.clone()),
                         None,
@@ -2250,7 +2250,7 @@ fn reduce_wire_edge_group_frame(
             if state.borrow().active_cause_id.is_none() {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
-                        WireEdgeGroupIssueCode::DataBeforeDirty,
+                        WireEdgeGroupIssueCode::DataBeforePending,
                         format!(
                             "{name}: DATA for edge {} arrived without an active cause",
                             frame.edge_id
@@ -2263,12 +2263,12 @@ fn reduce_wire_edge_group_frame(
                 wire_edge_group_gate_fail(state, Some(frame.cause_id.clone()));
                 return;
             }
-            if !state.borrow().dirty.contains(&frame.edge_id) {
+            if !state.borrow().pending.contains(&frame.edge_id) {
                 ctx.emit(WireEdgeGroupGate::Issue {
                     issue: wire_edge_group_issue(
-                        WireEdgeGroupIssueCode::DataBeforeDirty,
+                        WireEdgeGroupIssueCode::DataBeforePending,
                         format!(
-                            "{name}: DATA for edge {} arrived before DIRTY",
+                            "{name}: DATA for edge {} arrived before PENDING",
                             frame.edge_id
                         ),
                         Some(frame.edge_id.clone()),
@@ -2295,7 +2295,7 @@ fn reduce_wire_edge_group_frame(
             let value = frame.value.clone().unwrap_or_default();
             let ready = {
                 let state = state.borrow();
-                state.dirty.len() == expected_ids.len()
+                state.pending.len() == expected_ids.len()
                     && state.data.len().saturating_add(1) == expected_ids.len()
             };
             if ready {
@@ -2333,7 +2333,7 @@ fn wire_edge_group_status_fn(expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'stat
                 state: WireEdgeGroupStatusState::Idle,
                 expected_edges: expected_ids.clone(),
                 active_cause_id: None,
-                dirty: 0,
+                pending: 0,
                 data: 0,
                 released: 0,
                 issues: 0,
@@ -2353,25 +2353,25 @@ fn wire_edge_group_status_fn(expected_ids: Vec<String>) -> impl Fn(&Ctx) + 'stat
                 WireEdgeGroupGate::Issue { issue } => {
                     status.state = WireEdgeGroupStatusState::Issues;
                     status.active_cause_id = None;
-                    status.dirty = 0;
+                    status.pending = 0;
                     status.data = 0;
                     status.issues = status.issues.saturating_add(1);
                     status.last_issue = Some(issue.clone());
                 }
                 WireEdgeGroupGate::Progress {
                     cause_id,
-                    dirty,
+                    pending,
                     data,
                 } => {
                     status.state = WireEdgeGroupStatusState::Collecting;
                     status.active_cause_id = Some(cause_id.clone());
-                    status.dirty = *dirty;
+                    status.pending = *pending;
                     status.data = *data;
                 }
                 WireEdgeGroupGate::Release { cause_id, count } => {
                     status.state = WireEdgeGroupStatusState::Released;
                     status.active_cause_id = None;
-                    status.dirty = 0;
+                    status.pending = 0;
                     status.data = 0;
                     status.released = status
                         .released

@@ -17,34 +17,6 @@ use std::rc::Rc;
 /// boundary.
 pub type AnyValue = Rc<dyn std::any::Any>;
 
-/// Caller-chosen opaque pause-lock identifier (D10).
-///
-/// `[[PAUSE, lock_id]]` — the caller generates the id; the same id is
-/// idempotent; `RESUME` of an unknown id is a no-op. Multiple independent pause
-/// sources hold distinct ids in a node's lockset so they cannot fight each other
-/// (R-pause-lockset). Opaque on purpose — the substrate never interprets it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LockId(pub String);
-
-impl LockId {
-    /// Creates or computes `new`.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
-impl From<String> for LockId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for LockId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
-
 /// A pool-relative pool callback handle — **pure data, no methods** (D7).
 ///
 /// `(pool_id, handle_id)` per D7/DR-2; the Rust pool adds a local `generation`
@@ -71,170 +43,67 @@ pub struct Handle {
 /// `Box<dyn Error>` / `Exception`. Single-thread (D22) ⇒ no `Send + Sync` bound.
 pub type GraphError = Box<dyn std::error::Error + 'static>;
 
-/// Explicit pull demand payload (D269/D272).
-///
-/// Params are holder-visible context for the pullId-holder invocation. They are
-/// never DATA-up and never become a second dep-value input channel.
-#[derive(Clone)]
-pub struct PullDemand {
-    /// `pull_id` field for pull id.
-    pub pull_id: LockId,
-    /// `params` field for params.
-    pub params: Option<AnyValue>,
-}
-
-impl PullDemand {
-    #[must_use]
-    /// Creates or computes `new`.
-    pub fn new(pull_id: impl Into<LockId>) -> Self {
-        Self {
-            pull_id: pull_id.into(),
-            params: None,
-        }
-    }
-
-    #[must_use]
-    /// Creates or computes `with_params`.
-    pub fn with_params<T: 'static>(pull_id: impl Into<LockId>, params: T) -> Self {
-        Self {
-            pull_id: pull_id.into(),
-            params: Some(Rc::new(params)),
-        }
-    }
-
-    #[must_use]
-    /// Updates or reads `params`.
-    pub fn params<T: 'static>(&self) -> Option<Rc<T>> {
-        self.params.clone().and_then(|p| p.downcast::<T>().ok())
-    }
-}
-
-impl std::fmt::Debug for PullDemand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PullDemand")
-            .field("pull_id", &self.pull_id)
-            .field("params", &self.params.as_ref().map(|_| "<params>"))
-            .finish()
-    }
-}
-
-/// The 7-tier const table (D34, amends R-tier numbering).
-///
-/// Ordering encodes **priority + batch timing**: `immediate` (`< Value`) flows
-/// during the current wave; `batch-deferred` (`>= Value`) is held to the batch
-/// commit / wave boundary. PAUSE/RESUME sit *below* DIRTY (control before
-/// notification); PULL joins that existing control/demand tier (D269). `START`
-/// is the handshake type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Tier {
-    /// 0 — subscribe handshake (`START`).
-    Start = 0,
-    /// 1 — control/demand (`PAUSE` / `RESUME` / `PULL`).
-    Control = 1,
-    /// 2 — notification (`DIRTY`).
-    Notification = 2,
-    /// 3 — value (`DATA` / `RESOLVED`).
-    Value = 3,
-    /// 4 — settle (`INVALIDATE`).
-    Settle = 4,
-    /// 5 — terminal (`COMPLETE` / `ERROR`).
-    Terminal = 5,
-    /// 6 — teardown (`TEARDOWN`).
-    Teardown = 6,
-}
-
-impl Tier {
-    #[inline]
-    /// Updates or reads `as_u8`.
-    pub fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    /// Immediate tiers (`< Value`) propagate during the current wave (D34).
-    #[inline]
-    pub fn is_immediate(self) -> bool {
-        (self as u8) < (Tier::Value as u8)
-    }
-
-    /// Batch-deferred tiers (`>= Value`) are held to the wave/batch boundary (D34).
-    #[inline]
-    pub fn is_batch_deferred(self) -> bool {
-        !self.is_immediate()
-    }
-
-    /// Pause buffering holds the settle slice: value-tier DATA/RESOLVED plus INVALIDATE.
-    #[inline]
-    pub fn is_pause_buffered(self) -> bool {
-        matches!(self, Tier::Value | Tier::Settle)
-    }
-}
-
-/// One protocol message. A `Vec<Message<T>>` ([`Wave`]) is one wave (D8) and may
-/// mix tiers. The closed set is 11 kinds (D9 + D269 + the `Start` handshake);
-/// adding a kind is a constitutional change (`/spec-amend`).
+/// One protocol message (R-messages). The type set is closed: START, PENDING,
+/// DATA, RESOLVED, INVALIDATE, COMPLETE and ERROR (graphrefly:D797, active by
+/// graphrefly:D798). Messages travel only downstream; there is no upward channel
+/// and no control message: pausing, demand or restart is a write to a state node
+/// the target declares as a dependency (R-no-imperative). TEARDOWN, PAUSE, RESUME
+/// and PULL are not representable.
 ///
 /// `Debug` is hand-written to print only the **kind tag** (not the payload), so
 /// `Message<AnyValue>` — whose payload `Rc<dyn Any>` is not `Debug` — stays
-/// assertable: tests compare wave *shapes* like `["DIRTY", "DATA"]`.
+/// assertable: tests compare array *shapes* like `["PENDING", "DATA"]`.
 pub enum Message<T> {
-    /// Subscribe handshake (substrate-internal, not a user `ctx.up` kind).
+    /// Subscribe handshake, followed by the node's snapshot (R-subscription).
     Start,
-    /// Acquire a pause lock (control, up-allowed).
-    Pause(LockId),
-    /// Release a pause lock (control, up-allowed).
-    Resume(LockId),
-    /// Demand one pull delivery from the matching pullId holder (control/demand,
-    /// up-allowed). `RESUME` is pause-lock release only (D269).
-    Pull(PullDemand),
-    /// Dirty notification — phase 1 of the two-phase wave (notification, up-allowed).
-    Dirty,
-    /// A real value (value tier, **down-only**). Absence-of-DATA is the SENTINEL
-    /// (`None` per D16), represented at the node's per-dep cache, not as a message.
+    /// Kernel-only first message of each settling array (R-wave); formerly DIRTY.
+    /// Node output containing PENDING is rejected.
+    Pending,
+    /// A real value. Absence of DATA is the SENTINEL (`None` per D16), represented
+    /// at the node's per-dependency record, not as a message.
     Data(T),
-    /// Settle with no value change (value tier, **down-only**).
+    /// Settles a pending node that sent nothing (R-wave). Kernel-only: node output
+    /// containing RESOLVED is rejected (graphrefly:D799).
     Resolved,
-    /// Invalidate-request — cache-drop, fire `onInvalidate`, cascade (settle,
-    /// up-allowed: a depless source honors it at the terminus per D38/R-up-at-source).
+    /// Removes the retained value of a node that has one (R-invalidation).
     Invalidate,
-    /// Terminal success (**down-only**).
+    /// Clean end of the node's current instance (R-terminals).
     Complete,
-    /// Terminal failure carrying the untyped error (**down-only**, D31).
+    /// Error end of the node's current instance, carrying the untyped error (D31).
     Error(GraphError),
-    /// Teardown (up-allowed; a depless source drops it per D38).
-    Teardown,
 }
 
 impl<T> Message<T> {
-    /// The tier of this message per the D34 const table.
-    pub fn tier(&self) -> Tier {
+    /// The message's class rank in R-messages order: START, PENDING, value (DATA,
+    /// RESOLVED), INVALIDATE, terminal (COMPLETE, ERROR).
+    #[inline]
+    pub(crate) fn class_rank(&self) -> u8 {
         match self {
-            Message::Start => Tier::Start,
-            Message::Pause(_) | Message::Resume(_) | Message::Pull(_) => Tier::Control,
-            Message::Dirty => Tier::Notification,
-            Message::Data(_) | Message::Resolved => Tier::Value,
-            Message::Invalidate => Tier::Settle,
-            Message::Complete | Message::Error(_) => Tier::Terminal,
-            Message::Teardown => Tier::Teardown,
+            Message::Start => 0,
+            Message::Pending => 1,
+            Message::Data(_) | Message::Resolved => 2,
+            Message::Invalidate => 3,
+            Message::Complete | Message::Error(_) => 4,
         }
     }
 
-    /// Whether this kind may travel **upstream** via `ctx.up` (R-ctx-up).
-    ///
-    /// Control/demand-tier only: `DIRTY` / `PAUSE` / `RESUME` / `PULL` /
-    /// `INVALIDATE` / `TEARDOWN`.
-    /// `DATA` / `RESOLVED` / `COMPLETE` / `ERROR` are down-only. `START` is a
-    /// substrate handshake, not a user `ctx.up` kind.
-    pub fn is_up_allowed(&self) -> bool {
-        matches!(
-            self,
-            Message::Dirty
-                | Message::Pause(_)
-                | Message::Resume(_)
-                | Message::Pull(_)
-                | Message::Invalidate
-                | Message::Teardown
-        )
+    /// Whether this message is a value (DATA or RESOLVED) or a later class, the part
+    /// of an array a batch holds until its commit.
+    #[inline]
+    pub(crate) fn is_settling(&self) -> bool {
+        self.class_rank() >= 2
+    }
+
+    /// Whether this message is COMPLETE or ERROR.
+    #[inline]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Message::Complete | Message::Error(_))
+    }
+
+    /// Whether only the kernel may send this message (PENDING and RESOLVED, R-wave).
+    #[inline]
+    pub fn is_kernel_only(&self) -> bool {
+        matches!(self, Message::Pending | Message::Resolved)
     }
 }
 
@@ -242,76 +111,55 @@ impl<T> std::fmt::Debug for Message<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Message::Start => "START",
-            Message::Pause(_) => "PAUSE",
-            Message::Resume(_) => "RESUME",
-            Message::Pull(_) => "PULL",
-            Message::Dirty => "DIRTY",
+            Message::Pending => "PENDING",
             Message::Data(_) => "DATA",
             Message::Resolved => "RESOLVED",
             Message::Invalidate => "INVALIDATE",
             Message::Complete => "COMPLETE",
             Message::Error(_) => "ERROR",
-            Message::Teardown => "TEARDOWN",
         })
     }
 }
 
-/// One wave — a single `msgs` array, may mix tiers (D8).
+/// One array of messages delivered by one call (R-wave).
 pub type Wave<T> = Vec<Message<T>>;
+
+/// Rejects node output that only the kernel may send (R-wave, R-failure).
+///
+/// PENDING and RESOLVED are the kernel's alone; an array carrying either is
+/// rejected before anything of it is applied. The rejection panics, the Rust
+/// form of a throw from `ctx.down`: uncaught, it becomes the node's ERROR at
+/// the wave boundary.
+pub(crate) fn reject_kernel_only_output<T>(msgs: &[Message<T>]) {
+    if let Some(m) = msgs.iter().find(|m| m.is_kernel_only()) {
+        panic!(
+            "node output may not contain {m:?}: PENDING and RESOLVED are sent only by the kernel (R-wave)"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Pin the D34 tier table: ordering + the immediate/batch-deferred cut at Value.
+    // R-messages: the class order of the closed set.
     #[test]
-    fn tier_table_numbering_and_cut() {
-        assert_eq!(Tier::Start.as_u8(), 0);
-        assert_eq!(Tier::Control.as_u8(), 1);
-        assert_eq!(Tier::Notification.as_u8(), 2);
-        assert_eq!(Tier::Value.as_u8(), 3);
-        assert_eq!(Tier::Settle.as_u8(), 4);
-        assert_eq!(Tier::Terminal.as_u8(), 5);
-        assert_eq!(Tier::Teardown.as_u8(), 6);
-
-        // immediate < Value; batch-deferred >= Value.
-        for t in [Tier::Start, Tier::Control, Tier::Notification] {
-            assert!(t.is_immediate(), "{t:?} should be immediate");
-        }
-        for t in [Tier::Value, Tier::Settle, Tier::Terminal, Tier::Teardown] {
-            assert!(t.is_batch_deferred(), "{t:?} should be batch-deferred");
-        }
+    fn class_rank_follows_message_class_order() {
+        assert_eq!(Message::<i32>::Start.class_rank(), 0);
+        assert_eq!(Message::<i32>::Pending.class_rank(), 1);
+        assert_eq!(Message::Data(1).class_rank(), 2);
+        assert_eq!(Message::<i32>::Resolved.class_rank(), 2);
+        assert_eq!(Message::<i32>::Invalidate.class_rank(), 3);
+        assert_eq!(Message::<i32>::Complete.class_rank(), 4);
     }
 
+    // R-wave: PENDING and RESOLVED are kernel-only.
     #[test]
-    fn message_tier_mapping() {
-        assert_eq!(Message::<i32>::Dirty.tier(), Tier::Notification);
-        assert_eq!(Message::Data(1).tier(), Tier::Value);
-        assert_eq!(Message::<i32>::Resolved.tier(), Tier::Value);
-        assert_eq!(
-            Message::<i32>::Pause(LockId::new("a")).tier(),
-            Tier::Control
-        );
-        assert_eq!(
-            Message::<i32>::Pull(PullDemand::new("p")).tier(),
-            Tier::Control
-        );
-        assert_eq!(Message::<i32>::Teardown.tier(), Tier::Teardown);
-    }
-
-    // R-ctx-up: control-tier kinds are up-allowed; value/terminal are down-only.
-    #[test]
-    fn up_allowed_is_control_tier_only() {
-        assert!(Message::<i32>::Dirty.is_up_allowed());
-        assert!(Message::<i32>::Pause(LockId::new("l")).is_up_allowed());
-        assert!(Message::<i32>::Resume(LockId::new("l")).is_up_allowed());
-        assert!(Message::<i32>::Pull(PullDemand::new("p")).is_up_allowed());
-        assert!(Message::<i32>::Invalidate.is_up_allowed());
-        assert!(Message::<i32>::Teardown.is_up_allowed());
-
-        assert!(!Message::Data(1).is_up_allowed());
-        assert!(!Message::<i32>::Resolved.is_up_allowed());
-        assert!(!Message::<i32>::Complete.is_up_allowed());
-        assert!(!Message::<i32>::Start.is_up_allowed());
+    fn kernel_only_messages_are_pending_and_resolved() {
+        assert!(Message::<i32>::Pending.is_kernel_only());
+        assert!(Message::<i32>::Resolved.is_kernel_only());
+        assert!(!Message::Data(1).is_kernel_only());
+        assert!(!Message::<i32>::Invalidate.is_kernel_only());
+        assert!(!Message::<i32>::Complete.is_kernel_only());
     }
 }

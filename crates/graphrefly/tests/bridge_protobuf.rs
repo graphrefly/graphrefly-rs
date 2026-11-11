@@ -121,7 +121,7 @@ fn positive_vectors_decode_validate_and_reencode_byte_equal() {
         if record.id == "positive.data.wire_edge_dirty" {
             match &decoded.payload {
                 CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) => {
-                    assert_eq!(frame.kind, CanonicalWireEdgeKind::Dirty);
+                    assert_eq!(frame.kind, CanonicalWireEdgeKind::Pending);
                     assert!(frame.value.is_none());
                 }
                 _ => panic!("{} decoded to the wrong payload", record.id),

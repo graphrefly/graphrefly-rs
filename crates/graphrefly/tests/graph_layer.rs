@@ -12,10 +12,10 @@ use graphrefly::{
     DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher,
     Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
     GraphCheckpointJson, GraphCheckpointValue, GraphNodeOpts, GraphOptions, GraphRestoreDefinition,
-    GraphRestoreEntry, IslandReport, LockId, Message, Node, NodeOpts, NodeVersion,
-    NodeVersioningPolicy, Pausable, ProfileSummaryOptions, ReachableDirection, ReachableOptions,
-    ReactiveListOptions, RestoreFactoryMeta, RestoreGraphOptions, Status, Tier, TopologyEvent,
-    TopologyEventKind, TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
+    GraphRestoreEntry, IslandReport, Message, Node, NodeOpts, NodeVersion, NodeVersioningPolicy,
+    ProfileSummaryOptions, ReachableDirection, ReachableOptions, ReactiveListOptions,
+    RestoreFactoryMeta, RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind,
+    TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -142,7 +142,7 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
     let events = observed.borrow();
     assert!(events
         .iter()
-        .any(|e| e.path == "raw" && e.msg.kind() == "DATA" && e.tier == Tier::Value));
+        .any(|e| e.path == "raw" && e.msg.kind() == "DATA"));
     assert!(events.iter().any(|e| {
         e.path == "source"
             && matches!(&e.msg, graphrefly::ObserveMessage::Data(v) if v.as_ref().downcast_ref::<i32>() == Some(&7))
@@ -457,7 +457,7 @@ fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
 }
 
 #[test]
-fn topology_group_release_rejects_external_deps_subscribers_and_dirty_nodes() {
+fn topology_group_release_rejects_external_deps_and_subscribers() {
     let g = graph();
 
     let dep_group = g.topology_group_opts(TopologyGroupOptions::named("dep"));
@@ -485,15 +485,8 @@ fn topology_group_release_rejects_external_deps_subscribers_and_dirty_nodes() {
     sub_group.release();
     assert!(sub_group.is_released());
     assert!(g.find("sub.child").is_none());
-
-    let dirty_group = g.topology_group_opts(TopologyGroupOptions::named("dirty"));
-    let dirty =
-        dirty_group.node_opts::<i32, _>(vec![], |_| {}, GraphNodeOpts::named("dirty.child"));
-    dirty.down(vec![Message::Dirty]);
-    assert_eq!(dirty.status(), Status::Dirty);
-    assert!(catch_unwind(AssertUnwindSafe(|| dirty_group.release())).is_err());
-    assert!(!dirty_group.is_released());
-    assert!(g.find("dirty.child").is_some());
+    // A host cannot leave a node pending between waves (PENDING is the kernel's,
+    // R-wave), so the former dirty-node release case is not reachable from the host.
 }
 
 #[test]
@@ -1380,23 +1373,6 @@ fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpe
         vec![vec![vec![1]], vec![vec![2, 3]]]
     );
     assert_eq!(*seen_prev.borrow(), vec![None, Some(1)]);
-
-    let pause = LockId::new("coalesce");
-    sum.up(vec![Message::Pause(pause.clone())]);
-    source.down(vec![Message::Data(Rc::new(4i32))]);
-    source.down(vec![
-        Message::Data(Rc::new(5i32)),
-        Message::Data(Rc::new(6i32)),
-    ]);
-    assert_eq!(sum.cache(), Some(5));
-    sum.up(vec![Message::Resume(pause)]);
-
-    assert_eq!(sum.cache(), Some(15));
-    assert_eq!(
-        *seen_wave_batches.borrow(),
-        vec![vec![vec![1]], vec![vec![2, 3]], vec![vec![4], vec![5, 6]]]
-    );
-    assert_eq!(*seen_prev.borrow(), vec![None, Some(1), Some(3)]);
 }
 
 #[test]
@@ -1920,7 +1896,7 @@ fn operator_caller_opts_do_not_drop_intrinsic_partial_flag() {
     let right = g.state_empty_opts::<i32>(GraphNodeOpts::named("right"));
     let mut opts = GraphNodeOpts::named("merged");
     opts.node = NodeOpts {
-        pausable: Pausable::False,
+        factory: Some("callerFactory".to_owned()),
         ..NodeOpts::default()
     };
     let merged = g.init_node(merge::<i32>(), vec![left.erased(), right.erased()], opts);
