@@ -311,8 +311,6 @@ pub struct KnowledgeGraphReducerBundle {
     pub errors: Node<Vec<KnowledgeGraphError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<KnowledgeGraphCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 /// `ShardKey` type alias.
@@ -894,8 +892,6 @@ pub struct MemoryRetrievalBundle<T> {
     pub errors: Node<Vec<MemoryRetrievalError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<MemoryRetrievalCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug)]
@@ -919,116 +915,128 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
     let name = opts.name.unwrap_or_else(|| "memoryRetrieval".to_owned());
     let fragments = opts.fragments;
     let query = opts.query;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
-        Operator::with_opts("memoryRetrievalSnapshot", pattern_node_config(), |ctx| {
-            let evaluation = ctx
-                .state_get::<u64>()
-                .map(|evaluation| *evaluation + 1)
-                .unwrap_or(1);
-            let raw_fragments = ctx
-                .dep(0)
-                .value::<Vec<MemoryFragment<T>>>()
-                .map(|fragments| (*fragments).clone())
-                .unwrap_or_default();
-            let raw_query = ctx
-                .dep(1)
-                .value::<MemoryRetrievalQuery>()
-                .map(|query| (*query).clone())
-                .unwrap_or_default();
-            let query_errors = validate_query(&raw_query);
-            let current_query = if query_errors.is_empty() {
-                raw_query
-            } else {
-                MemoryRetrievalQuery::default()
-            };
-            let mut valid = Vec::new();
-            let mut seen = HashSet::new();
-            let mut errors = query_errors;
+        Operator::with_opts(
+            "memoryRetrievalSnapshot",
+            crate::ledger::write_back_json(pattern_node_config()),
+            |ctx| {
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
+                let raw_fragments = ctx
+                    .dep(0)
+                    .value::<Vec<MemoryFragment<T>>>()
+                    .map(|fragments| (*fragments).clone())
+                    .unwrap_or_default();
+                let raw_query = ctx
+                    .dep(1)
+                    .value::<MemoryRetrievalQuery>()
+                    .map(|query| (*query).clone())
+                    .unwrap_or_default();
+                let query_errors = validate_query(&raw_query);
+                let current_query = if query_errors.is_empty() {
+                    raw_query
+                } else {
+                    MemoryRetrievalQuery::default()
+                };
+                let mut valid = Vec::new();
+                let mut seen = HashSet::new();
+                let mut errors = query_errors;
 
-            for (index, fragment) in raw_fragments.into_iter().enumerate() {
-                let fragment_errors = validate_fragment(&fragment);
-                if !fragment_errors.is_empty() {
-                    errors.push(PendingMemoryRetrievalError {
-                        code: MemoryRetrievalErrorCode::InvalidFragment,
-                        message: "memory_retrieval_bundle: invalid memory fragment".to_owned(),
-                        index: Some(index),
-                        fragment_id: Some(fragment.id.clone()),
-                        validation_errors: fragment_errors,
-                    });
-                    continue;
+                for (index, fragment) in raw_fragments.into_iter().enumerate() {
+                    let fragment_errors = validate_fragment(&fragment);
+                    if !fragment_errors.is_empty() {
+                        errors.push(PendingMemoryRetrievalError {
+                            code: MemoryRetrievalErrorCode::InvalidFragment,
+                            message: "memory_retrieval_bundle: invalid memory fragment".to_owned(),
+                            index: Some(index),
+                            fragment_id: Some(fragment.id.clone()),
+                            validation_errors: fragment_errors,
+                        });
+                        continue;
+                    }
+                    if !seen.insert(fragment.id.clone()) {
+                        errors.push(PendingMemoryRetrievalError {
+                            code: MemoryRetrievalErrorCode::DuplicateFragmentId,
+                            message: "memory_retrieval_bundle: duplicate fragment id".to_owned(),
+                            index: Some(index),
+                            fragment_id: Some(fragment.id.clone()),
+                            validation_errors: vec![format!(
+                                "duplicate fragment id '{}'",
+                                fragment.id
+                            )],
+                        });
+                        continue;
+                    }
+                    valid.push(fragment);
                 }
-                if !seen.insert(fragment.id.clone()) {
-                    errors.push(PendingMemoryRetrievalError {
-                        code: MemoryRetrievalErrorCode::DuplicateFragmentId,
-                        message: "memory_retrieval_bundle: duplicate fragment id".to_owned(),
-                        index: Some(index),
-                        fragment_id: Some(fragment.id.clone()),
-                        validation_errors: vec![format!("duplicate fragment id '{}'", fragment.id)],
-                    });
-                    continue;
-                }
-                valid.push(fragment);
-            }
 
-            let ranked = if errors
-                .iter()
-                .any(|error| !is_recoverable_fragment_error(error))
-            {
-                Vec::new()
-            } else {
-                rank_fragments(&valid, &current_query)
-            };
-            let cursor = MemoryRetrievalCursor {
-                evaluation,
-                valid_fragments: valid.len(),
-                invalid_fragments: errors
+                let ranked = if errors
                     .iter()
-                    .filter(|error| is_recoverable_fragment_error(error))
-                    .count(),
-                result_count: ranked.len(),
-            };
-            ctx.state_set(evaluation);
-            let status = MemoryRetrievalStatus {
-                state: status_state(&errors, ranked.len()),
-                query: current_query.clone(),
-                cursor: cursor.clone(),
-            };
-            let indexed = MemoryRetrievalIndex {
-                ids: valid.iter().map(|fragment| fragment.id.clone()).collect(),
-                by_id: valid
-                    .iter()
-                    .map(|fragment| (fragment.id.clone(), fragment.clone()))
-                    .collect(),
-                cursor: cursor.clone(),
-            };
-            let errors = errors
-                .into_iter()
-                .map(|error| MemoryRetrievalError {
-                    code: error.code,
-                    message: error.message,
-                    index: error.index,
-                    fragment_id: error.fragment_id,
-                    validation_errors: error.validation_errors,
+                    .any(|error| !is_recoverable_fragment_error(error))
+                {
+                    Vec::new()
+                } else {
+                    rank_fragments(&valid, &current_query)
+                };
+                let cursor = MemoryRetrievalCursor {
+                    evaluation,
+                    valid_fragments: valid.len(),
+                    invalid_fragments: errors
+                        .iter()
+                        .filter(|error| is_recoverable_fragment_error(error))
+                        .count(),
+                    result_count: ranked.len(),
+                };
+                crate::ledger::store(ctx, &evaluation);
+                let status = MemoryRetrievalStatus {
+                    state: status_state(&errors, ranked.len()),
+                    query: current_query.clone(),
                     cursor: cursor.clone(),
-                })
-                .collect();
-            ctx.emit(MemoryRetrievalSnapshot {
-                fragments: valid,
-                indexed,
-                ranked: MemoryAnswer {
-                    query: current_query,
-                    results: ranked,
-                },
-                status,
-                errors,
-                cursor,
-            });
-        }),
-        vec![fragments.erased(), query.erased()],
+                };
+                let indexed = MemoryRetrievalIndex {
+                    ids: valid.iter().map(|fragment| fragment.id.clone()).collect(),
+                    by_id: valid
+                        .iter()
+                        .map(|fragment| (fragment.id.clone(), fragment.clone()))
+                        .collect(),
+                    cursor: cursor.clone(),
+                };
+                let errors = errors
+                    .into_iter()
+                    .map(|error| MemoryRetrievalError {
+                        code: error.code,
+                        message: error.message,
+                        index: error.index,
+                        fragment_id: error.fragment_id,
+                        validation_errors: error.validation_errors,
+                        cursor: cursor.clone(),
+                    })
+                    .collect();
+                ctx.emit(MemoryRetrievalSnapshot {
+                    fragments: valid,
+                    indexed,
+                    ranked: MemoryAnswer {
+                        query: current_query,
+                        results: ranked,
+                    },
+                    status,
+                    errors,
+                    cursor,
+                });
+            },
+        ),
+        {
+            let mut deps = vec![fragments.erased(), query.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_graph_node_opts(format!("{name}/snapshot")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     MemoryRetrievalBundle {
         fragments_input: fragments,
@@ -1076,8 +1084,6 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
             |snapshot| snapshot.cursor.clone(),
         ),
         snapshot,
-
-        _held: held,
     }
 }
 
@@ -1094,15 +1100,18 @@ pub fn knowledge_graph_reducer_bundle(
         deps.push(policy.erased());
     }
     let has_policy = policy.is_some();
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
         Operator::with_opts(
             "knowledgeGraphReducerSnapshot",
-            pattern_node_config(),
+            crate::ledger::write_back_json(pattern_node_config()),
             move |ctx| {
-                let evaluation = ctx
-                    .state_get::<u64>()
-                    .map(|evaluation| *evaluation + 1)
-                    .unwrap_or(1);
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
                 let raw_assertions = ctx
                     .dep(0)
                     .value::<Vec<KnowledgeAssertion>>()
@@ -1149,7 +1158,7 @@ pub fn knowledge_graph_reducer_bundle(
                     },
                     cursor: cursor.clone(),
                 };
-                ctx.state_set(evaluation);
+                crate::ledger::store(ctx, &evaluation);
                 ctx.emit(KnowledgeGraphSnapshot {
                     assertions: reduced.assertions,
                     entities: reduced.entities,
@@ -1162,11 +1171,13 @@ pub fn knowledge_graph_reducer_bundle(
                 });
             },
         ),
-        deps,
+        {
+            let mut deps = deps;
+            deps.push(ledger.erased());
+            deps
+        },
         named_graph_node_opts(format!("{name}/snapshot")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     KnowledgeGraphReducerBundle {
         assertions_input: assertions,
@@ -1228,8 +1239,6 @@ pub fn knowledge_graph_reducer_bundle(
             |snapshot| snapshot.cursor.clone(),
         ),
         snapshot,
-
-        _held: held,
     }
 }
 

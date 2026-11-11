@@ -4,9 +4,7 @@
 //! clock facts produce eligibility/deadline visibility. It never runs timers,
 //! claims work, executes providers, or mutates domain lifecycle records.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
@@ -217,8 +215,6 @@ pub struct ScheduledReadinessBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<ScheduledReadinessViews>,
-    /// The runtime holds the emitted and issue keys and the audit sequence (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -266,7 +262,16 @@ enum ScheduledReadinessFact {
     Views(ScheduledReadinessViews),
 }
 
-#[derive(Default)]
+/// The emitted and issue keys and the audit sequence: a ledger the bundle owns
+/// (review Q13). The schedules and views are the lifetime's cache.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ScheduledReadinessLedger {
+    emitted_keys: BTreeSet<String>,
+    issue_keys: BTreeSet<String>,
+    audit_seq: u64,
+}
+
+#[derive(Default, Clone)]
 struct ScheduledReadinessState {
     schedules: BTreeMap<String, ScheduledReadinessRequested>,
     pending_by_id: BTreeMap<String, ScheduledReadinessPending>,
@@ -293,13 +298,30 @@ pub fn scheduled_readiness_projector(
     let mut deps = Vec::with_capacity(opts.schedules.len() + opts.clocks.len());
     deps.extend(opts.schedules.iter().map(Node::erased));
     deps.extend(opts.clocks.iter().map(Node::erased));
-    let state = Rc::new(RefCell::new(ScheduledReadinessState::default()));
+    let ledger_dep = deps.len();
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(ScheduledReadinessLedger::default()).unwrap_or_default(),
+    );
+    deps.push(ledger.erased());
     let runtime = graph.node_opts::<ScheduledReadinessFact, _>(
         deps,
         {
-            let state = state.clone();
             move |ctx| {
-                let mut state = state.borrow_mut();
+                let mut state = ctx
+                    .state_get::<ScheduledReadinessState>()
+                    .map(|state| (*state).clone())
+                    .unwrap_or_else(|| {
+                        let ledger: ScheduledReadinessLedger =
+                            crate::ledger::from_ledger(ctx, ledger_dep);
+                        ScheduledReadinessState {
+                            emitted_keys: ledger.emitted_keys,
+                            issue_keys: ledger.issue_keys,
+                            audit_seq: ledger.audit_seq,
+                            ..ScheduledReadinessState::default()
+                        }
+                    });
                 for index in 0..schedule_count {
                     for schedule in ctx.dep(index).values::<ScheduledReadinessRequested>() {
                         retain_schedule(ctx, &mut state, (*schedule).clone());
@@ -322,11 +344,21 @@ pub fn scheduled_readiness_projector(
                         now_ms: state.now_ms,
                     }),
                 );
+                ctx.state_set(state);
             }
         },
-        node_opts(format!("{name}/runtime"), "scheduledReadinessProjector"),
+        {
+            let mut opts = node_opts(format!("{name}/runtime"), "scheduledReadinessProjector");
+            opts.node = crate::ledger::write_back(opts.node, |state: &ScheduledReadinessState| {
+                serde_json::json!({
+                    "emitted_keys": state.emitted_keys,
+                    "issue_keys": state.issue_keys,
+                    "audit_seq": state.audit_seq,
+                })
+            });
+            opts
+        },
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     ScheduledReadinessBundle {
         pending: project_fact(
             graph,
@@ -398,7 +430,6 @@ pub fn scheduled_readiness_projector(
                 _ => None,
             },
         ),
-        _held: held,
     }
 }
 

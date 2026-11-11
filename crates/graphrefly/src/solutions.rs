@@ -385,8 +385,6 @@ pub struct AgenticMemoryKgProjectionBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryKgProjectionCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -525,8 +523,6 @@ pub struct AgenticMemoryRetentionBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryRetentionCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -722,8 +718,6 @@ pub struct AgenticMemoryConsolidationBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryConsolidationCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -865,8 +859,6 @@ pub struct AgenticMemoryContextPackingBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryContextPackingCursor>,
-    /// The snapshot holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -992,8 +984,6 @@ pub struct AgenticMemoryBundle<T> {
     pub errors: Node<Vec<AgenticMemoryError>>,
     /// `cursor` field for cursor.
     pub cursor: Node<AgenticMemoryCursor>,
-    /// The projection holds the evaluation cursor (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 /// Creates or computes `validate_agentic_memory_kind`.
@@ -1094,105 +1084,116 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
     let name = opts.name.unwrap_or_else(|| "agenticMemory".to_owned());
     let records = opts.records;
     let query = opts.query;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/projectionLedger"),
+        serde_json::json!(0),
+    );
     let projection = graph.init_node(
-        Operator::with_opts("agenticMemoryProjection", solution_node_config(), |ctx| {
-            let evaluation = ctx
-                .state_get::<u64>()
-                .map(|evaluation| *evaluation + 1)
-                .unwrap_or(1);
-            let raw_records = ctx
-                .dep(0)
-                .value::<Vec<AgenticMemoryRecord<T>>>()
-                .map(|records| (*records).clone())
-                .unwrap_or_default();
-            let mut records = Vec::new();
-            let mut fragments = Vec::new();
-            let mut metadata_by_fragment_id = BTreeMap::new();
-            let mut sources = Vec::new();
-            let mut pending_errors = Vec::<PendingAgenticMemoryError>::new();
-            let mut seen_record_ids = HashSet::<FactId>::new();
-            let mut seen_fragment_ids = HashSet::<FactId>::new();
+        Operator::with_opts(
+            "agenticMemoryProjection",
+            crate::ledger::write_back_json(solution_node_config()),
+            |ctx| {
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
+                let raw_records = ctx
+                    .dep(0)
+                    .value::<Vec<AgenticMemoryRecord<T>>>()
+                    .map(|records| (*records).clone())
+                    .unwrap_or_default();
+                let mut records = Vec::new();
+                let mut fragments = Vec::new();
+                let mut metadata_by_fragment_id = BTreeMap::new();
+                let mut sources = Vec::new();
+                let mut pending_errors = Vec::<PendingAgenticMemoryError>::new();
+                let mut seen_record_ids = HashSet::<FactId>::new();
+                let mut seen_fragment_ids = HashSet::<FactId>::new();
 
-            for (index, record) in raw_records.into_iter().enumerate() {
-                let validation = validate_agentic_memory_record(&record);
-                if !validation.ok {
-                    pending_errors.push(PendingAgenticMemoryError {
-                        code: AgenticMemoryErrorCode::InvalidRecord,
-                        index: Some(index),
-                        record_id: Some(record.id.clone()),
-                        fragment_id: Some(record.fragment.id.clone()),
-                        validation_errors: validation.errors,
+                for (index, record) in raw_records.into_iter().enumerate() {
+                    let validation = validate_agentic_memory_record(&record);
+                    if !validation.ok {
+                        pending_errors.push(PendingAgenticMemoryError {
+                            code: AgenticMemoryErrorCode::InvalidRecord,
+                            index: Some(index),
+                            record_id: Some(record.id.clone()),
+                            fragment_id: Some(record.fragment.id.clone()),
+                            validation_errors: validation.errors,
+                        });
+                        continue;
+                    }
+                    if !seen_record_ids.insert(record.id.clone()) {
+                        pending_errors.push(PendingAgenticMemoryError {
+                            code: AgenticMemoryErrorCode::DuplicateRecordId,
+                            index: Some(index),
+                            record_id: Some(record.id.clone()),
+                            fragment_id: Some(record.fragment.id.clone()),
+                            validation_errors: vec![format!("duplicate record id '{}'", record.id)],
+                        });
+                        continue;
+                    }
+                    if !seen_fragment_ids.insert(record.fragment.id.clone()) {
+                        pending_errors.push(PendingAgenticMemoryError {
+                            code: AgenticMemoryErrorCode::DuplicateFragmentId,
+                            index: Some(index),
+                            record_id: Some(record.id.clone()),
+                            fragment_id: Some(record.fragment.id.clone()),
+                            validation_errors: vec![format!(
+                                "duplicate fragment id '{}'",
+                                record.fragment.id
+                            )],
+                        });
+                        continue;
+                    }
+                    let metadata = record_metadata(&record);
+                    metadata_by_fragment_id
+                        .entry(record.fragment.id.clone())
+                        .or_insert_with(|| metadata.clone());
+                    sources.push(AgenticMemorySourceProjection {
+                        fragment_id: record.fragment.id.clone(),
+                        sources: record.fragment.sources.clone(),
+                        parent_fragment_id: record.fragment.parent_fragment_id.clone(),
+                        provenance: record.fragment.provenance.clone(),
+                        metadata,
                     });
-                    continue;
+                    fragments.push(record.fragment.clone());
+                    records.push(record);
                 }
-                if !seen_record_ids.insert(record.id.clone()) {
-                    pending_errors.push(PendingAgenticMemoryError {
-                        code: AgenticMemoryErrorCode::DuplicateRecordId,
-                        index: Some(index),
-                        record_id: Some(record.id.clone()),
-                        fragment_id: Some(record.fragment.id.clone()),
-                        validation_errors: vec![format!("duplicate record id '{}'", record.id)],
-                    });
-                    continue;
-                }
-                if !seen_fragment_ids.insert(record.fragment.id.clone()) {
-                    pending_errors.push(PendingAgenticMemoryError {
-                        code: AgenticMemoryErrorCode::DuplicateFragmentId,
-                        index: Some(index),
-                        record_id: Some(record.id.clone()),
-                        fragment_id: Some(record.fragment.id.clone()),
-                        validation_errors: vec![format!(
-                            "duplicate fragment id '{}'",
-                            record.fragment.id
-                        )],
-                    });
-                    continue;
-                }
-                let metadata = record_metadata(&record);
-                metadata_by_fragment_id
-                    .entry(record.fragment.id.clone())
-                    .or_insert_with(|| metadata.clone());
-                sources.push(AgenticMemorySourceProjection {
-                    fragment_id: record.fragment.id.clone(),
-                    sources: record.fragment.sources.clone(),
-                    parent_fragment_id: record.fragment.parent_fragment_id.clone(),
-                    provenance: record.fragment.provenance.clone(),
-                    metadata,
+
+                let cursor = AgenticMemoryCursor {
+                    evaluation,
+                    valid_records: records.len(),
+                    invalid_records: pending_errors.len(),
+                    projected_fragments: fragments.len(),
+                    result_count: 0,
+                };
+                crate::ledger::store(ctx, &evaluation);
+                let errors = pending_errors
+                    .into_iter()
+                    .map(|error| AgenticMemoryError {
+                        code: error.code,
+                        message: "agentic_memory_bundle: invalid agentic memory record".to_owned(),
+                        index: error.index,
+                        record_id: error.record_id,
+                        fragment_id: error.fragment_id,
+                        validation_errors: error.validation_errors,
+                        cursor: cursor.clone(),
+                    })
+                    .collect();
+                ctx.emit(AgenticMemoryProjection {
+                    records,
+                    fragments,
+                    metadata_by_fragment_id,
+                    sources,
+                    errors,
+                    cursor,
                 });
-                fragments.push(record.fragment.clone());
-                records.push(record);
-            }
-
-            let cursor = AgenticMemoryCursor {
-                evaluation,
-                valid_records: records.len(),
-                invalid_records: pending_errors.len(),
-                projected_fragments: fragments.len(),
-                result_count: 0,
-            };
-            ctx.state_set(evaluation);
-            let errors = pending_errors
-                .into_iter()
-                .map(|error| AgenticMemoryError {
-                    code: error.code,
-                    message: "agentic_memory_bundle: invalid agentic memory record".to_owned(),
-                    index: error.index,
-                    record_id: error.record_id,
-                    fragment_id: error.fragment_id,
-                    validation_errors: error.validation_errors,
-                    cursor: cursor.clone(),
-                })
-                .collect();
-            ctx.emit(AgenticMemoryProjection {
-                records,
-                fragments,
-                metadata_by_fragment_id,
-                sources,
-                errors,
-                cursor,
-            });
-        }),
-        vec![records.erased()],
+            },
+        ),
+        {
+            let mut deps = vec![records.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_solution_node_opts(format!("{name}/projection")),
     );
     let fragments = agentic_projection(
@@ -1223,8 +1224,6 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
         vec![projection.erased(), retrieval.snapshot.erased()],
         named_solution_node_opts(format!("{name}/context")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&projection)]);
 
     AgenticMemoryBundle {
         records_input: records,
@@ -1271,8 +1270,6 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
         fragments,
         context,
         retrieval,
-
-        _held: held,
     }
 }
 
@@ -1286,12 +1283,15 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
         .unwrap_or_else(|| "agenticMemoryKgProjection".to_owned());
     let records = opts.records;
     let drafts = opts.drafts;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
-        Operator::with_opts("agenticMemoryKgProjection", solution_node_config(), |ctx| {
-            let evaluation = ctx
-                .state_get::<u64>()
-                .map(|evaluation| *evaluation + 1)
-                .unwrap_or(1);
+        Operator::with_opts("agenticMemoryKgProjection", crate::ledger::write_back_json(solution_node_config()), |ctx| {
+            let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
             let raw_records = ctx
                 .dep(0).value::<Vec<AgenticMemoryRecord<T>>>()
                 .map(|records| (*records).clone())
@@ -1397,7 +1397,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
                 ),
                 cursor: cursor.clone(),
             };
-            ctx.state_set(evaluation);
+            crate::ledger::store(ctx, &evaluation);
             let errors = pending_errors
                 .into_iter()
                 .map(|error| AgenticMemoryError {
@@ -1418,11 +1418,13 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
                 cursor,
             });
         }),
-        vec![records.erased(), drafts.erased()],
+        {
+            let mut deps = vec![records.erased(), drafts.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_solution_node_opts(format!("{name}/snapshot")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryKgProjectionBundle {
         records_input: records,
@@ -1456,8 +1458,6 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryKgProjectionSnapshot| snapshot.cursor.clone(),
         ),
         snapshot,
-
-        _held: held,
     }
 }
 
@@ -1471,136 +1471,146 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
         .unwrap_or_else(|| "agenticMemoryRetention".to_owned());
     let records = opts.records;
     let commands = opts.commands;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
-        Operator::with_opts("agenticMemoryRetention", solution_node_config(), |ctx| {
-            let evaluation = ctx
-                .state_get::<u64>()
-                .map(|evaluation| *evaluation + 1)
-                .unwrap_or(1);
-            let raw_records = ctx
-                .dep(0)
-                .value::<Vec<AgenticMemoryRecord<T>>>()
-                .map(|records| (*records).clone())
-                .unwrap_or_default();
-            let raw_commands = ctx
-                .dep(1)
-                .value::<Vec<AgenticMemoryRetentionCommand>>()
-                .map(|commands| (*commands).clone())
-                .unwrap_or_default();
-            let valid_records = valid_record_index(raw_records);
-            let invalid_record_errors = valid_records.errors.len();
-            let mut pending_errors = valid_records.errors;
-            let mut archived = HashSet::<FactId>::new();
-            let mut consolidation_requests = Vec::new();
-            let mut seen_command_ids = HashSet::<FactId>::new();
-            let mut valid_commands = 0usize;
+        Operator::with_opts(
+            "agenticMemoryRetention",
+            crate::ledger::write_back_json(solution_node_config()),
+            |ctx| {
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
+                let raw_records = ctx
+                    .dep(0)
+                    .value::<Vec<AgenticMemoryRecord<T>>>()
+                    .map(|records| (*records).clone())
+                    .unwrap_or_default();
+                let raw_commands = ctx
+                    .dep(1)
+                    .value::<Vec<AgenticMemoryRetentionCommand>>()
+                    .map(|commands| (*commands).clone())
+                    .unwrap_or_default();
+                let valid_records = valid_record_index(raw_records);
+                let invalid_record_errors = valid_records.errors.len();
+                let mut pending_errors = valid_records.errors;
+                let mut archived = HashSet::<FactId>::new();
+                let mut consolidation_requests = Vec::new();
+                let mut seen_command_ids = HashSet::<FactId>::new();
+                let mut valid_commands = 0usize;
 
-            for (index, command) in raw_commands.into_iter().enumerate() {
-                let mut validation_errors = validate_retention_command(&command);
-                if seen_command_ids.contains(&command.id) {
-                    validation_errors
-                        .push(format!("duplicate retention command id '{}'", command.id));
-                }
-                if !valid_records.by_record_id.contains_key(&command.record_id) {
-                    validation_errors.push(format!(
-                        "record_id '{}' does not reference a valid record",
-                        command.record_id
-                    ));
-                }
-                if !validation_errors.is_empty() {
-                    pending_errors.push(PendingAgenticMemoryError {
-                        code: if validation_errors
-                            .iter()
-                            .any(|error| error.starts_with("duplicate retention command id"))
-                        {
-                            AgenticMemoryErrorCode::DuplicateRetentionCommandId
-                        } else {
-                            AgenticMemoryErrorCode::InvalidRetentionCommand
-                        },
-                        index: Some(index),
-                        record_id: Some(command.record_id),
-                        fragment_id: None,
-                        validation_errors,
-                    });
-                    continue;
-                }
-                seen_command_ids.insert(command.id.clone());
-                valid_commands += 1;
-                match command.kind {
-                    AgenticMemoryRetentionCommandKind::Archive => {
-                        archived.insert(command.record_id);
+                for (index, command) in raw_commands.into_iter().enumerate() {
+                    let mut validation_errors = validate_retention_command(&command);
+                    if seen_command_ids.contains(&command.id) {
+                        validation_errors
+                            .push(format!("duplicate retention command id '{}'", command.id));
                     }
-                    AgenticMemoryRetentionCommandKind::Restore => {
-                        archived.remove(&command.record_id);
+                    if !valid_records.by_record_id.contains_key(&command.record_id) {
+                        validation_errors.push(format!(
+                            "record_id '{}' does not reference a valid record",
+                            command.record_id
+                        ));
                     }
-                    AgenticMemoryRetentionCommandKind::RequestConsolidation => {
-                        let record = valid_records
-                            .by_record_id
-                            .get(&command.record_id)
-                            .expect("command validation checked record existence");
-                        consolidation_requests.push(AgenticMemoryConsolidationRequest {
-                            command_id: command.id,
-                            record_id: command.record_id,
-                            fragment_id: record.fragment.id.clone(),
-                            reason: command.reason,
+                    if !validation_errors.is_empty() {
+                        pending_errors.push(PendingAgenticMemoryError {
+                            code: if validation_errors
+                                .iter()
+                                .any(|error| error.starts_with("duplicate retention command id"))
+                            {
+                                AgenticMemoryErrorCode::DuplicateRetentionCommandId
+                            } else {
+                                AgenticMemoryErrorCode::InvalidRetentionCommand
+                            },
+                            index: Some(index),
+                            record_id: Some(command.record_id),
+                            fragment_id: None,
+                            validation_errors,
                         });
+                        continue;
+                    }
+                    seen_command_ids.insert(command.id.clone());
+                    valid_commands += 1;
+                    match command.kind {
+                        AgenticMemoryRetentionCommandKind::Archive => {
+                            archived.insert(command.record_id);
+                        }
+                        AgenticMemoryRetentionCommandKind::Restore => {
+                            archived.remove(&command.record_id);
+                        }
+                        AgenticMemoryRetentionCommandKind::RequestConsolidation => {
+                            let record = valid_records
+                                .by_record_id
+                                .get(&command.record_id)
+                                .expect("command validation checked record existence");
+                            consolidation_requests.push(AgenticMemoryConsolidationRequest {
+                                command_id: command.id,
+                                record_id: command.record_id,
+                                fragment_id: record.fragment.id.clone(),
+                                reason: command.reason,
+                            });
+                        }
                     }
                 }
-            }
 
-            let mut active_records = Vec::new();
-            let mut archived_records = Vec::new();
-            for record in valid_records.in_order {
-                if archived.contains(&record.id) {
-                    archived_records.push(record);
-                } else {
-                    active_records.push(record);
+                let mut active_records = Vec::new();
+                let mut archived_records = Vec::new();
+                for record in valid_records.in_order {
+                    if archived.contains(&record.id) {
+                        archived_records.push(record);
+                    } else {
+                        active_records.push(record);
+                    }
                 }
-            }
-            let cursor = AgenticMemoryRetentionCursor {
-                evaluation,
-                valid_records: active_records.len() + archived_records.len(),
-                valid_commands,
-                invalid_commands: pending_errors.len().saturating_sub(invalid_record_errors),
-                active_records: active_records.len(),
-                archived_records: archived_records.len(),
-                consolidation_requests: consolidation_requests.len(),
-            };
-            let status = AgenticMemoryRetentionStatus {
-                state: projection_state(
-                    pending_errors.len(),
-                    active_records.len() + archived_records.len(),
-                    active_records.len() + archived_records.len(),
-                ),
-                cursor: cursor.clone(),
-            };
-            ctx.state_set(evaluation);
-            let errors = pending_errors
-                .into_iter()
-                .map(|error| AgenticMemoryError {
-                    code: error.code,
-                    message: "agentic_memory_retention_bundle: invalid retention input".to_owned(),
-                    index: error.index,
-                    record_id: error.record_id,
-                    fragment_id: error.fragment_id,
-                    validation_errors: error.validation_errors,
-                    cursor: retention_error_cursor(&cursor),
-                })
-                .collect();
-            ctx.emit(AgenticMemoryRetentionSnapshot {
-                active_records,
-                archived_records,
-                consolidation_requests,
-                status,
-                errors,
-                cursor,
-            });
-        }),
-        vec![records.erased(), commands.erased()],
+                let cursor = AgenticMemoryRetentionCursor {
+                    evaluation,
+                    valid_records: active_records.len() + archived_records.len(),
+                    valid_commands,
+                    invalid_commands: pending_errors.len().saturating_sub(invalid_record_errors),
+                    active_records: active_records.len(),
+                    archived_records: archived_records.len(),
+                    consolidation_requests: consolidation_requests.len(),
+                };
+                let status = AgenticMemoryRetentionStatus {
+                    state: projection_state(
+                        pending_errors.len(),
+                        active_records.len() + archived_records.len(),
+                        active_records.len() + archived_records.len(),
+                    ),
+                    cursor: cursor.clone(),
+                };
+                crate::ledger::store(ctx, &evaluation);
+                let errors = pending_errors
+                    .into_iter()
+                    .map(|error| AgenticMemoryError {
+                        code: error.code,
+                        message: "agentic_memory_retention_bundle: invalid retention input"
+                            .to_owned(),
+                        index: error.index,
+                        record_id: error.record_id,
+                        fragment_id: error.fragment_id,
+                        validation_errors: error.validation_errors,
+                        cursor: retention_error_cursor(&cursor),
+                    })
+                    .collect();
+                ctx.emit(AgenticMemoryRetentionSnapshot {
+                    active_records,
+                    archived_records,
+                    consolidation_requests,
+                    status,
+                    errors,
+                    cursor,
+                });
+            },
+        ),
+        {
+            let mut deps = vec![records.erased(), commands.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_solution_node_opts(format!("{name}/snapshot")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryRetentionBundle {
         records_input: records,
@@ -1648,8 +1658,6 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.cursor.clone(),
         ),
         snapshot,
-
-        _held: held,
     }
 }
 
@@ -1663,15 +1671,18 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
         .unwrap_or_else(|| "agenticMemoryConsolidation".to_owned());
     let requests = opts.requests;
     let outcomes = opts.outcomes;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
         Operator::with_opts(
             "agenticMemoryConsolidation",
-            solution_node_config(),
+            crate::ledger::write_back_json(solution_node_config()),
             |ctx| {
-                let evaluation = ctx
-                    .state_get::<u64>()
-                    .map(|evaluation| *evaluation + 1)
-                    .unwrap_or(1);
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
                 let requests = ctx
                     .dep(0)
                     .value::<Vec<AgenticMemoryConsolidationRequest>>()
@@ -1724,7 +1735,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
                     },
                     cursor: cursor.clone(),
                 };
-                ctx.state_set(evaluation);
+                crate::ledger::store(ctx, &evaluation);
                 ctx.emit(AgenticMemoryConsolidationSnapshot {
                     results: projected.results,
                     proposed_record_drafts: projected.proposed_record_drafts,
@@ -1735,10 +1746,13 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
                 });
             },
         ),
-        vec![requests.erased(), outcomes.erased()],
+        {
+            let mut deps = vec![requests.erased(), outcomes.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_solution_node_opts(format!("{name}/snapshot")),
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
     AgenticMemoryConsolidationBundle {
         requests_input: requests,
         outcomes_input: outcomes,
@@ -1787,7 +1801,6 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryConsolidationSnapshot<T>| snapshot.cursor.clone(),
         ),
         snapshot,
-        _held: held,
     }
 }
 
@@ -1802,15 +1815,18 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
     let context = opts.context;
     let texts = opts.texts;
     let policy = opts.policy;
+    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/snapshotLedger"),
+        serde_json::json!(0),
+    );
     let snapshot = graph.init_node(
         Operator::with_opts(
             "agenticMemoryContextPacking",
-            solution_node_config(),
+            crate::ledger::write_back_json(solution_node_config()),
             |ctx| {
-                let evaluation = ctx
-                    .state_get::<u64>()
-                    .map(|evaluation| *evaluation + 1)
-                    .unwrap_or(1);
+                let evaluation = crate::ledger::load::<u64>(ctx, ctx.dep_len() - 1) + 1;
                 let context = ctx
                     .dep(0)
                     .value::<AgenticMemoryContext<T>>()
@@ -1832,7 +1848,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
                     state,
                     cursor: cursor.clone(),
                 };
-                ctx.state_set(evaluation);
+                crate::ledger::store(ctx, &evaluation);
                 let errors = pending_errors
                     .drain(..)
                     .map(|error| AgenticMemoryError {
@@ -1854,11 +1870,13 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
                 });
             },
         ),
-        vec![context.erased(), texts.erased(), policy.erased()],
+        {
+            let mut deps = vec![context.erased(), texts.erased(), policy.erased()];
+            deps.push(ledger.erased());
+            deps
+        },
         named_solution_node_opts(format!("{name}/snapshot")),
     );
-
-    let held = crate::graph::Held::new(vec![graph.hold(&snapshot)]);
 
     AgenticMemoryContextPackingBundle {
         context_input: context,
@@ -1893,8 +1911,6 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
             |snapshot: &AgenticMemoryContextPackingSnapshot| snapshot.cursor.clone(),
         ),
         snapshot,
-
-        _held: held,
     }
 }
 

@@ -191,8 +191,6 @@ pub struct CqrsWorkQueueRecipeBundle<TCommand> {
     pub commands: Node<WorkQueueCommand<CqrsQueuedCommandPayload<TCommand>>>,
     /// `issues` field for issues.
     pub issues: Node<DataIssue>,
-    /// The runtime holds the terminal-claim dedupe and the active claims (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -209,6 +207,27 @@ struct CqrsQueueState<TCommand> {
     active_claims: BTreeMap<String, Vec<CqrsWorkQueueAttempt<TCommand>>>,
     errors: BTreeMap<String, CqrsError<TCommand>>,
     terminal_claims: BTreeSet<String>,
+}
+
+/// The part of [`CqrsQueueState`] that must outlive a lifetime: the terminal-claim
+/// dedupe, in the bundle's ledger (review Q13). Payloads, active claims and errors
+/// carry the command type and are the lifetime's own work.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct CqrsQueueLedger {
+    terminal_claims: BTreeSet<String>,
+}
+
+impl<TCommand> CqrsQueueState<TCommand> {
+    fn from_ledger(ledger: CqrsQueueLedger) -> Self {
+        Self {
+            terminal_claims: ledger.terminal_claims,
+            ..Self::default()
+        }
+    }
+
+    fn ledger_json(&self) -> serde_json::Value {
+        serde_json::json!({ "terminal_claims": self.terminal_claims })
+    }
 }
 
 impl<TCommand> Default for CqrsQueueState<TCommand> {
@@ -232,13 +251,21 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
     if let Some(errors) = &opts.errors {
         deps.push(errors.erased());
     }
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(CqrsQueueLedger::default()).unwrap_or_default(),
+    );
+    deps.push(ledger.erased());
     let runtime = graph.node_opts::<CqrsQueueFact<TCommand>, _>(
         deps,
         move |ctx| {
             let mut state = ctx
                 .state_get::<CqrsQueueState<TCommand>>()
                 .map(|state| (*state).clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    CqrsQueueState::from_ledger(crate::ledger::from_ledger(ctx, ctx.dep_len() - 1))
+                });
             for record in ctx
                 .dep(0)
                 .values::<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>()
@@ -257,9 +284,13 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
             }
             ctx.state_set(state);
         },
-        GraphNodeOpts::named(format!("{name}/runtime")),
+        {
+            let mut opts = GraphNodeOpts::named(format!("{name}/runtime"));
+            opts.node =
+                crate::ledger::write_back(opts.node, CqrsQueueState::<TCommand>::ledger_json);
+            opts
+        },
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     CqrsWorkQueueRecipeBundle {
         attempts: project(
             graph,
@@ -297,7 +328,6 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
                 _ => None,
             },
         ),
-        _held: held,
     }
 }
 

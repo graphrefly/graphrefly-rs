@@ -78,6 +78,7 @@ pub mod higher_order;
 #[doc(hidden)]
 mod identity;
 pub mod json;
+mod ledger;
 pub mod lifetime;
 pub mod messaging;
 pub mod node;

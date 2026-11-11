@@ -163,8 +163,6 @@ pub struct ProcessWorkQueueRecipeBundle<TEffect> {
     pub issues: Node<DataIssue>,
     /// `audit` field for audit.
     pub audit: Node<ProcessQueueAuditRecord>,
-    /// The runtime holds the audit sequence and the terminal-record dedupe (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -180,6 +178,32 @@ struct ProcessQueueState<TEffect> {
     payloads: BTreeMap<String, ProcessQueuedEffectPayload<TEffect>>,
     terminal_records: BTreeSet<String>,
     audit_seq: u64,
+}
+
+/// The part of [`ProcessQueueState`] that must outlive a lifetime: the terminal-record
+/// dedupe and the audit sequence, in the bundle's ledger (review Q13). The payloads
+/// are the lifetime's own work.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ProcessQueueLedger {
+    terminal_records: BTreeSet<String>,
+    audit_seq: u64,
+}
+
+impl<TEffect> ProcessQueueState<TEffect> {
+    fn from_ledger(ledger: ProcessQueueLedger) -> Self {
+        Self {
+            payloads: BTreeMap::new(),
+            terminal_records: ledger.terminal_records,
+            audit_seq: ledger.audit_seq,
+        }
+    }
+
+    fn ledger_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "terminal_records": self.terminal_records,
+            "audit_seq": self.audit_seq,
+        })
+    }
 }
 
 impl<TEffect> Default for ProcessQueueState<TEffect> {
@@ -205,13 +229,20 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
             format!("{name}/submitCommands"),
         )
     });
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(ProcessQueueLedger::default()).unwrap_or_default(),
+    );
     let runtime = graph.node_opts::<ProcessQueueFact, _>(
-        vec![opts.records.erased()],
+        vec![opts.records.erased(), ledger.erased()],
         move |ctx| {
             let mut state = ctx
                 .state_get::<ProcessQueueState<TEffect>>()
                 .map(|state| (*state).clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    ProcessQueueState::from_ledger(crate::ledger::from_ledger(ctx, 1))
+                });
             for record in ctx
                 .dep(0)
                 .values::<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>()
@@ -220,9 +251,13 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
             }
             ctx.state_set(state);
         },
-        GraphNodeOpts::named(format!("{name}/runtime")),
+        {
+            let mut opts = GraphNodeOpts::named(format!("{name}/runtime"));
+            opts.node =
+                crate::ledger::write_back(opts.node, ProcessQueueState::<TEffect>::ledger_json);
+            opts
+        },
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     ProcessWorkQueueRecipeBundle {
         submit_commands,
         evidence: project(
@@ -261,7 +296,6 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
                 _ => None,
             },
         ),
-        _held: held,
     }
 }
 

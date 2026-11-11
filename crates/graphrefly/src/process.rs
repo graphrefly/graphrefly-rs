@@ -8,7 +8,7 @@
 pub mod messaging;
 pub mod work_queue;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -664,7 +664,6 @@ pub struct ProcessBundle<
     pub cursor: Node<ProcessCursor>,
     command_sources: Rc<crate::fan_in::FanInSources>,
     command_id: String,
-    _retains: Rc<crate::graph::Held>,
 }
 
 impl<TCommand: Clone + 'static, TState, TEvent, TEffect>
@@ -752,7 +751,7 @@ pub struct ProcessEffectRunnerBundle<
     name: String,
     command_sources: Rc<crate::fan_in::FanInSources>,
     released: Cell<bool>,
-    retains: Rc<crate::graph::Held>,
+    retains: RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
 impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'static>
@@ -769,7 +768,9 @@ impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'stat
             &self.command_sources,
             self.commands.erased(),
         );
-        self.retains.release();
+        for release in self.retains.take() {
+            release();
+        }
         self.released.set(true);
         self.graph.release_nodes(
             &[
@@ -996,7 +997,13 @@ pub fn process_bundle<
         },
     );
 
-    let retains = crate::graph::Held::new(vec![
+    // Held for the graph's life with retain (R-graph-surface@1): these nodes must keep
+
+    // processing what is written into their command states, which keep only the last
+
+    // write.
+
+    let _held_for_graph_life = [
         graph.hold(&runtime),
         graph.hold(&state),
         graph.hold(&events),
@@ -1005,7 +1012,7 @@ pub fn process_bundle<
         graph.hold(&status),
         graph.hold(&error),
         graph.hold(&cursor),
-    ]);
+    ];
 
     ProcessBundle {
         command,
@@ -1018,7 +1025,6 @@ pub fn process_bundle<
         cursor,
         command_sources,
         command_id,
-        _retains: retains,
     }
 }
 
@@ -1225,7 +1231,7 @@ where
         name,
         command_sources: process.command_sources.clone(),
         released: Cell::new(false),
-        retains: crate::graph::Held::new(retains),
+        retains: RefCell::new(retains),
     }
 }
 

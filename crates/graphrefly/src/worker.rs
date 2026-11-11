@@ -201,9 +201,15 @@ mod tests {
                 .edges
                 .iter()
                 .any(|edge| edge.from == "source" && edge.to == "worker"));
-            assert!(snap.nodes.iter().any(|node| node.id == "worker"
-                && node.factory == "workerDerived"
-                && node.status.cache == crate::CacheStatus::Ready));
+            assert!(snap
+                .nodes
+                .iter()
+                .any(|node| node.id == "worker" && node.factory == "workerDerived"));
+            // The status is read from the node (R-graph-surface@1).
+            assert_eq!(
+                g.find("worker").unwrap().status().cache,
+                crate::CacheStatus::Ready
+            );
         });
     }
 

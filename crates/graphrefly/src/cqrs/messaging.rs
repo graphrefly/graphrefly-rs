@@ -14,7 +14,7 @@ use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::messaging::{DataIssue, MessageBusAvailablePage, MessageBusCommand, MessageEnvelope};
 use crate::node::Node;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `MessageBusDelivery` data container.
 pub struct MessageBusDelivery {
     /// `topic` field for topic.
@@ -137,8 +137,6 @@ pub struct CqrsMessagingRecipeBundle<TCommand, TEvent> {
     pub outbox_commands: Option<Node<MessageBusCommand<CqrsEvent<TEvent>>>>,
     /// `issues` field for issues.
     pub issues: Node<DataIssue>,
-    /// The ack commands hold the pending deliveries an ack is matched against (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -147,7 +145,9 @@ enum CqrsMessagingFact<TCommand> {
     Issue(DataIssue),
 }
 
-#[derive(Clone, Default)]
+/// The pending deliveries an ack is matched against: a ledger the bundle owns
+/// (review Q13), kept as JSON.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct AckState {
     deliveries: BTreeMap<String, Vec<MessageBusDelivery>>,
 }
@@ -228,14 +228,12 @@ pub fn cqrs_messaging_recipe<
             cqrs_event_outbox_commands(graph, events, topic, format!("{name}/outboxCommands"))
         })
     });
-    let held = crate::graph::Held::new(vec![graph.hold(&ack_commands)]);
     CqrsMessagingRecipeBundle {
         delivered_commands,
         commands,
         ack_commands,
         outbox_commands,
         issues,
-        _held: held,
     }
 }
 
@@ -262,13 +260,16 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
     if let Some(issues) = &opts.issues {
         deps.push(issues.erased());
     }
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{}/ledger", opts.name),
+        serde_json::to_value(AckState::default()).unwrap_or_default(),
+    );
+    deps.push(ledger.erased());
     graph.node_opts::<MessageBusCommand<TCommand>, _>(
         deps,
         move |ctx| {
-            let mut state = ctx
-                .state_get::<AckState>()
-                .map(|state| (*state).clone())
-                .unwrap_or_default();
+            let mut state: AckState = crate::ledger::load(ctx, ctx.dep_len() - 1);
             for delivered in ctx.dep(0).values::<CqrsDeliveredCommand<TCommand>>() {
                 state
                     .deliveries
@@ -304,9 +305,13 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                 }
                 ctx.emit_all(emitted);
             }
-            ctx.state_set(state);
+            crate::ledger::store(ctx, &state);
         },
-        GraphNodeOpts::named(opts.name),
+        {
+            let mut node_opts = GraphNodeOpts::named(opts.name);
+            node_opts.node = crate::ledger::write_back_json(node_opts.node);
+            node_opts
+        },
     )
 }
 

@@ -2990,8 +2990,19 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     ids.sort_unstable();
     assert_eq!(
         ids,
-        vec!["cache.events", "cache.status", "cache.value", "request"]
+        vec![
+            "cache.events",
+            "cache.ledger",
+            "cache.status",
+            "cache.value",
+            "request"
+        ]
     );
+    // The request sequence is a ledger the bundle owns (review Q13).
+    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+        from: "cache.ledger".to_owned(),
+        to: "cache.events".to_owned(),
+    }));
     assert!(snap.edges.contains(&graphrefly::TopologyEdge {
         from: "request".to_owned(),
         to: "cache.events".to_owned(),

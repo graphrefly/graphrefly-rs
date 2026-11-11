@@ -189,11 +189,11 @@ pub struct ReactiveCascadingCache<V: Clone + 'static> {
     pub status: Node<CascadingCacheStatus>,
     /// `events` field for events.
     pub events: Node<CascadingCacheEvent<V>>,
-    /// The driver nodes hold the request sequence that orders fills (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// The request sequence and latest key: a ledger the bundle owns (review Q13), kept
+/// as JSON.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct DriverState {
     seq: u64,
     latest_key: Option<String>,
@@ -237,6 +237,13 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
         event_deps.len() - 1
     });
 
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{base_name}.ledger"),
+        serde_json::to_value(DriverState::default()).unwrap_or_default(),
+    );
+    let mut event_deps = event_deps;
+    event_deps.push(ledger.erased());
     let events = graph.node_opts::<CascadingCacheEvent<V>, _>(
         event_deps,
         {
@@ -245,10 +252,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             let load = load.clone();
             let base_promote_to = promote_to.clone();
             move |ctx| {
-                let mut st = ctx
-                    .state_get::<DriverState>()
-                    .map(|s| (*s).clone())
-                    .unwrap_or_default();
+                let mut st: DriverState = crate::ledger::load(ctx, ctx.dep_len() - 1);
                 let current_policy = policy_index
                     .and_then(|idx| ctx.dep(idx).value::<CascadingCachePolicy>())
                     .map(|p| (*p).clone());
@@ -313,15 +317,13 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                     }
                 }
 
-                ctx.state_set(st);
+                crate::ledger::store(ctx, &st);
             }
         },
         GraphNodeOpts {
             name: Some(format!("{base_name}.events")),
             meta: meta.clone(),
-            node: NodeOpts {
-                ..NodeOpts::default()
-            },
+            node: crate::ledger::write_back_json(NodeOpts::default()),
             ..GraphNodeOpts::default()
         },
     );
@@ -445,18 +447,10 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
         },
     );
 
-    let held = crate::graph::Held::new(vec![
-        graph.hold(&events),
-        graph.hold(&status),
-        graph.hold(&value),
-    ]);
-
     ReactiveCascadingCache {
         value,
         status,
         events,
-
-        _held: held,
     }
 }
 

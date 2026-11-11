@@ -408,7 +408,6 @@ pub struct CqrsBundle<TCommand = crate::protocol::AnyValue, TEvent = crate::prot
     pub audit: Node<CqrsAuditRecord>,
     /// `cursor` field for cursor.
     pub cursor: Node<CqrsCursor>,
-    _retains: Rc<crate::graph::Held>,
 }
 
 impl<TCommand: Clone + 'static, TEvent: Clone + 'static> CqrsBundle<TCommand, TEvent> {
@@ -531,14 +530,20 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
         },
     );
 
-    let retains = crate::graph::Held::new(vec![
+    // Held for the graph's life with retain (R-graph-surface@1): these nodes must keep
+
+    // processing what is written into their command states, which keep only the last
+
+    // write.
+
+    let _held_for_graph_life = [
         graph.hold(&runtime),
         graph.hold(&events),
         graph.hold(&status),
         graph.hold(&errors),
         graph.hold(&audit),
         graph.hold(&cursor),
-    ]);
+    ];
 
     CqrsBundle {
         command,
@@ -548,7 +553,6 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
         errors,
         audit,
         cursor,
-        _retains: retains,
     }
 }
 
@@ -639,7 +643,6 @@ pub struct CqrsProjection<TState> {
     pub status: Node<CqrsProjectionStatus>,
     /// `errors` field for errors.
     pub errors: Node<CqrsProjectionError>,
-    _retains: Rc<crate::graph::Held>,
 }
 
 /// Creates or computes `cqrs_projection`.
@@ -759,18 +762,20 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
         vec![frames.erased()],
         GraphNodeOpts::named(format!("{name}/errors")),
     );
-    let retains = crate::graph::Held::new(vec![
+    // Held for the graph's life with retain (R-graph-surface@1): these nodes must keep
+    // processing what is written into their command states, which keep only the last
+    // write.
+    let _held_for_graph_life = [
         graph.hold(&frames),
         graph.hold(&value),
         graph.hold(&status),
         graph.hold(&errors),
-    ]);
+    ];
     CqrsProjection {
         frames,
         value,
         status,
         errors,
-        _retains: retains,
     }
 }
 

@@ -5,9 +5,7 @@
 //! workQueue-owned candidate/status material. It does not append queue lifecycle
 //! records and does not claim, expire, cancel, complete, or fail work.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
@@ -231,8 +229,6 @@ pub struct WorkQueueScheduledReadinessBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
-    /// The runtime holds the emitted-key dedupe and the audit sequence (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -248,8 +244,6 @@ pub struct WorkQueueReadinessHandoffBundle {
     pub audit: Node<ScheduledReadinessAuditRecord>,
     /// `views` field for views.
     pub views: Node<WorkQueueReadinessViews>,
-    /// The runtime holds the emitted-key dedupe and the audit sequence (review Q13).
-    _held: std::rc::Rc<crate::graph::Held>,
 }
 
 #[derive(Clone)]
@@ -296,7 +290,7 @@ enum WorkQueueReadinessFact {
     Views(WorkQueueReadinessViews),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TranslatorState {
     schedules_by_id: BTreeMap<String, ScheduledReadinessRequested>,
     status_by_id: BTreeMap<String, WorkQueueReadinessStatus>,
@@ -316,7 +310,7 @@ struct QueueWorkState {
     lease_expires_at_ms: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HandoffState {
     works_by_id: BTreeMap<(String, String), QueueWorkState>,
     ready_by_id: BTreeMap<String, ScheduledReadinessReady>,
@@ -324,6 +318,18 @@ struct HandoffState {
     status_by_id: BTreeMap<String, WorkQueueReadinessStatus>,
     emitted: BTreeSet<String>,
     audit_seq: u64,
+}
+
+/// The emitted-key dedupe and the audit sequence of a readiness runtime: a ledger the
+/// bundle owns (review Q13). The views the runtime keeps are the lifetime's cache.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ReadinessLedger {
+    emitted: BTreeSet<String>,
+    audit_seq: u64,
+}
+
+fn readiness_ledger(emitted: &BTreeSet<String>, audit_seq: u64) -> serde_json::Value {
+    serde_json::json!({ "emitted": emitted, "audit_seq": audit_seq })
 }
 
 /// Creates or computes `work_queue_scheduled_readiness_projector`.
@@ -335,15 +341,29 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
         .name
         .clone()
         .unwrap_or_else(|| "workQueueScheduledReadiness".to_owned());
-    let deps = opts.records.iter().map(Node::erased).collect::<Vec<_>>();
+    let mut deps = opts.records.iter().map(Node::erased).collect::<Vec<_>>();
     let dep_count = opts.records.len();
-    let state = Rc::new(RefCell::new(TranslatorState::default()));
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(ReadinessLedger::default()).unwrap_or_default(),
+    );
+    deps.push(ledger.erased());
     let runtime = graph.node_opts::<WorkQueueReadinessFact, _>(
         deps,
         {
-            let state = state.clone();
             move |ctx| {
-                let mut state = state.borrow_mut();
+                let mut state = ctx
+                    .state_get::<TranslatorState>()
+                    .map(|state| (*state).clone())
+                    .unwrap_or_else(|| {
+                        let ledger: ReadinessLedger = crate::ledger::from_ledger(ctx, dep_count);
+                        TranslatorState {
+                            emitted: ledger.emitted,
+                            audit_seq: ledger.audit_seq,
+                            ..TranslatorState::default()
+                        }
+                    });
                 for index in 0..dep_count {
                     for record in ctx.dep(index).values::<WorkQueueRecord<T>>() {
                         if let Some(schedule) = schedule_from_record(record.as_ref()) {
@@ -359,14 +379,20 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
                         status_by_id: state.status_by_id.clone(),
                     }),
                 );
+                ctx.state_set(state);
             }
         },
-        node_opts(
-            format!("{name}/runtime"),
-            "workQueueScheduledReadinessProjector",
-        ),
+        {
+            let mut opts = node_opts(
+                format!("{name}/runtime"),
+                "workQueueScheduledReadinessProjector",
+            );
+            opts.node = crate::ledger::write_back(opts.node, |state: &TranslatorState| {
+                readiness_ledger(&state.emitted, state.audit_seq)
+            });
+            opts
+        },
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     WorkQueueScheduledReadinessBundle {
         readiness_schedules: project_fact(
             graph,
@@ -418,7 +444,6 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
                 _ => None,
             },
         ),
-        _held: held,
     }
 }
 
@@ -438,13 +463,28 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
     deps.extend(opts.records.iter().map(Node::erased));
     deps.extend(opts.ready.iter().map(Node::erased));
     deps.extend(opts.overdue.iter().map(Node::erased));
-    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let ledger_dep = deps.len();
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(ReadinessLedger::default()).unwrap_or_default(),
+    );
+    deps.push(ledger.erased());
     let runtime = graph.node_opts::<WorkQueueReadinessFact, _>(
         deps,
         {
-            let state = state.clone();
             move |ctx| {
-                let mut state = state.borrow_mut();
+                let mut state = ctx
+                    .state_get::<HandoffState>()
+                    .map(|state| (*state).clone())
+                    .unwrap_or_else(|| {
+                        let ledger: ReadinessLedger = crate::ledger::from_ledger(ctx, ledger_dep);
+                        HandoffState {
+                            emitted: ledger.emitted,
+                            audit_seq: ledger.audit_seq,
+                            ..HandoffState::default()
+                        }
+                    });
                 for index in 0..record_count {
                     for record in ctx.dep(index).values::<WorkQueueRecord<T>>() {
                         apply_record(&mut state, record.as_ref());
@@ -471,14 +511,20 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
                         status_by_id: state.status_by_id.clone(),
                     }),
                 );
+                ctx.state_set(state);
             }
         },
-        node_opts(
-            format!("{name}/runtime"),
-            "workQueueReadinessHandoffProjector",
-        ),
+        {
+            let mut opts = node_opts(
+                format!("{name}/runtime"),
+                "workQueueReadinessHandoffProjector",
+            );
+            opts.node = crate::ledger::write_back(opts.node, |state: &HandoffState| {
+                readiness_ledger(&state.emitted, state.audit_seq)
+            });
+            opts
+        },
     );
-    let held = crate::graph::Held::new(vec![graph.hold(&runtime)]);
     WorkQueueReadinessHandoffBundle {
         candidates: project_fact(
             graph,
@@ -530,7 +576,6 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
                 _ => None,
             },
         ),
-        _held: held,
     }
 }
 

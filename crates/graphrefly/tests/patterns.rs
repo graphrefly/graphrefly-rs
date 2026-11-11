@@ -353,7 +353,12 @@ fn memory_retrieval_bundle_exposes_snapshot_and_projection_topology() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
         deps_by_id["memory/snapshot"],
-        vec!["fragments".to_owned(), "query".to_owned()]
+        vec![
+            "fragments".to_owned(),
+            "query".to_owned(),
+            // The evaluation cursor's ledger is a visible edge (review Q13).
+            "memory/snapshotLedger".to_owned()
+        ]
     );
     for projection in [
         "memory/fragments",
@@ -619,9 +624,7 @@ fn memory_retrieval_bundle_keeps_storage_controls_out_of_surface() {
 
     assert!(g.find("memory/snapshot").is_some());
     assert!(g.find("memory/ranked").is_some());
-    // The bundle holds its snapshot, whose evaluation cursor must not restart when
-    // subscribers come and go (review Q13), so it is active from the start.
-    assert_eq!(bundle.snapshot.cache().unwrap().cursor.evaluation, 1);
+    assert_eq!(bundle.snapshot.cache(), None);
 }
 
 #[test]
@@ -1950,4 +1953,31 @@ fn open_persistent_agentic_memory_records_uses_initial_and_rejects_corruption() 
         },
     )
     .is_err());
+}
+
+/// Review Q13 — the evaluation cursor is a ledger the bundle owns: the snapshot node
+/// deactivates as usual, and its next lifetime continues the cursor.
+#[test]
+fn memory_retrieval_cursor_continues_across_lifetimes() {
+    let g = graph();
+    let fragments = g.state_opts(
+        Vec::<MemoryFragment<String>>::new(),
+        GraphNodeOpts::named("fragments"),
+    );
+    let query = g.state_opts(
+        MemoryRetrievalQuery::default(),
+        GraphNodeOpts::named("query"),
+    );
+    let bundle = memory_retrieval_bundle(
+        &g,
+        MemoryRetrievalBundleOptions::new(fragments, query.clone()).named("memory"),
+    );
+    let evaluation = || bundle.snapshot.cache().unwrap().cursor.evaluation;
+    let stop = bundle.snapshot.subscribe(|_| {});
+    query.set(MemoryRetrievalQuery::default());
+    assert_eq!(evaluation(), 2);
+    stop();
+    assert_eq!(bundle.snapshot.cache(), None, "the snapshot deactivated");
+    let _again = bundle.snapshot.subscribe(|_| {});
+    assert_eq!(evaluation(), 3, "the next lifetime continues the cursor");
 }

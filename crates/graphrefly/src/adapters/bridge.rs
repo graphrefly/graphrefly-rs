@@ -410,7 +410,7 @@ pub struct WireBridgeAttempt {
     pub max_attempts: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `WireBridgeStatusState` variants.
 pub enum WireBridgeStatusState {
     /// `Idle` variant.
@@ -429,7 +429,7 @@ pub enum WireBridgeStatusState {
     Exhausted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `WireBridgeStatus` data container.
 pub struct WireBridgeStatus {
     /// `session_id` field for session id.
@@ -511,9 +511,6 @@ pub struct WireBridgeBundle<TOutbound: Clone + 'static, TInbound: Clone + 'stati
     pub cursor: Node<u64>,
     /// `attempts` field for attempts.
     pub attempts: Node<WireBridgeAttempt>,
-    /// The event fold and status hold the bridge's sequence, cursors and pending
-    /// sends; the bundle keeps them active for its whole life (review Q13).
-    _held: Rc<crate::graph::Held>,
 }
 
 impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOutbound, TInbound> {
@@ -654,7 +651,7 @@ pub struct RemoteCallError {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `RemoteCallStatusState` variants.
 pub enum RemoteCallStatusState {
     /// `Idle` variant.
@@ -671,7 +668,7 @@ pub enum RemoteCallStatusState {
     BridgeErrored,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `RemoteCallStatus` data container.
 pub struct RemoteCallStatus {
     /// `state` field for state.
@@ -736,9 +733,6 @@ pub struct RemoteCallBundle<TRequest: Clone + 'static, TResponse: Clone + 'stati
     pub errors: Node<RemoteCallError>,
     /// `timeouts` field for timeouts.
     pub timeouts: Node<RemoteCallTimeout>,
-    /// The response correlation and dedupe ledgers, held for the bundle's life
-    /// (review Q13).
-    _held: Rc<crate::graph::Held>,
 }
 
 impl<TRequest: Clone + 'static, TResponse: Clone + 'static> RemoteCallBundle<TRequest, TResponse> {
@@ -839,7 +833,7 @@ pub enum RemoteResponderEvent<TRequest, TResponse> {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `RemoteResponderStatusState` variants.
 pub enum RemoteResponderStatusState {
     /// `Idle` variant.
@@ -852,7 +846,7 @@ pub enum RemoteResponderStatusState {
     Errored,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// `RemoteResponderStatus` data container.
 pub struct RemoteResponderStatus {
     /// `state` field for state.
@@ -961,8 +955,6 @@ pub struct RemoteResponderBundle<TRequest: Clone + 'static, TResponse: Clone + '
     command_writer: RefCell<Option<Box<dyn FnOnce()>>>,
     bridge_command: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
     released: Cell<bool>,
-    /// The status counters, held until the bundle is released (review Q13).
-    held: Rc<crate::graph::Held>,
 }
 
 impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
@@ -976,7 +968,6 @@ impl<TRequest: Clone + 'static, TResponse: Clone + 'static>
         if let Some(stop) = self.command_writer.borrow_mut().take() {
             stop();
         }
-        self.held.release();
         let release = catch_unwind(AssertUnwindSafe(|| {
             self.graph.release_nodes(
                 &[
@@ -1051,6 +1042,25 @@ struct PendingEnvelope<T> {
     retry_due_at_ms: Option<u64>,
 }
 
+/// The bridge's sequence and cursors: a ledger the bundle owns (review Q13). The
+/// pending sends carry the payload type and are the lifetime's own work.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BridgeLedger {
+    next_seq: u64,
+    cursor: u64,
+    remote_cursor: u64,
+}
+
+impl Default for BridgeLedger {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            cursor: 0,
+            remote_cursor: 0,
+        }
+    }
+}
+
 struct BridgeState<T> {
     active: bool,
     next_seq: u64,
@@ -1094,6 +1104,10 @@ where
     };
     let events =
         wire_bridge_events_node(graph, &command, &inbound_node, name.clone(), opts.clone());
+    // The event fold must keep receiving: the inbound state keeps only its last
+    // envelope, so an inactive fold would miss what arrives meanwhile. It is held for
+    // the graph's life (R-graph-surface@1 retain); its ledger is the sequence's owner.
+    let _receiving = graph.retain(&format!("{name}/events"));
     let outbound = project_outbound(graph, &events, &name);
     let acks = project_acks(graph, &events, &name);
     let nacks = project_nacks(graph, &events, &name);
@@ -1101,7 +1115,6 @@ where
     let errors = project_errors(graph, &events, &name);
     let cursor = project_cursor(graph, &events, &name);
     let attempts = project_attempts(graph, &events, &name);
-    let held = crate::graph::Held::new(vec![graph.hold(&events), graph.hold(&status)]);
     WireBridgeBundle {
         command,
         outbound,
@@ -1113,7 +1126,6 @@ where
         errors,
         cursor,
         attempts,
-        _held: held,
     }
 }
 
@@ -1156,11 +1168,6 @@ where
         &name,
     );
     let errors = remote_call_errors_node(graph, &responses, &timeouts, &bridge.events, &name);
-    let held = crate::graph::Held::new(vec![
-        graph.hold(&responses),
-        graph.hold(&status),
-        graph.hold(&errors),
-    ]);
     RemoteCallBundle {
         bridge_command: bridge.command.clone(),
         responses,
@@ -1168,7 +1175,6 @@ where
         status,
         errors,
         timeouts,
-        _held: held,
     }
 }
 
@@ -1193,7 +1199,6 @@ where
     // The response commands reach the bridge as writes of its command state, from a
     // sink (graphrefly:D803): no edge, no host-level rewire.
     let command_writer = write_commands_into(&response_commands, &bridge.command);
-    let held = crate::graph::Held::new(vec![graph.hold(&status)]);
     RemoteResponderBundle {
         events,
         response_commands,
@@ -1204,7 +1209,6 @@ where
         command_writer: RefCell::new(Some(command_writer)),
         bridge_command: bridge.command.clone(),
         released: Cell::new(false),
-        held,
     }
 }
 
@@ -1252,13 +1256,24 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
+    // The pending-request correlation: a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/responsesLedger"),
+        serde_json::Value::Null,
+    );
     graph.node_opts::<RemoteCallResponse<TResponse>, _>(
-        vec![commands.erased(), events.erased(), timeouts.erased()],
+        vec![
+            commands.erased(),
+            events.erased(),
+            timeouts.erased(),
+            ledger.erased(),
+        ],
         |ctx| {
-            let state = remote_call_responses_state(ctx);
+            let mut working: RemoteCallResponsesState = crate::ledger::load(ctx, ctx.dep_len() - 1);
             let mut ready = Vec::new();
             {
-                let mut state = state.borrow_mut();
+                let state = &mut working;
                 let preview_requests = ctx
                     .dep(0)
                     .values::<WireBridgeCommand<RemoteCallRequest<TRequest>>>()
@@ -1334,38 +1349,34 @@ where
                     state.pending.remove_by_request_id(&timeout.request_id);
                 }
             }
+            crate::ledger::store(ctx, &working);
             let mut emitted = Vec::new();
             for response in ready {
                 emitted.push(response);
             }
             ctx.emit_all(emitted);
         },
-        no_terminal_graph_opts(format!("{name}/responses")),
+        {
+            let mut opts = no_terminal_graph_opts(format!("{name}/responses"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct RemoteCallResponsesState {
     pending: RemoteCallPendingState,
 }
 
-fn remote_call_responses_state(ctx: &Ctx) -> Rc<RefCell<RemoteCallResponsesState>> {
-    if let Some(state) = ctx.state_get::<RefCell<RemoteCallResponsesState>>() {
-        return state;
-    }
-    ctx.state_set(RefCell::new(RemoteCallResponsesState::default()));
-    ctx.state_get::<RefCell<RemoteCallResponsesState>>()
-        .expect("remote call responses state was just installed")
-}
-
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct RemoteCallPendingRequest {
     operation: String,
     request_id: String,
     seq: Option<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct RemoteCallPendingState {
     request_ids: HashSet<String>,
     by_request_id: HashMap<String, RemoteCallPendingRequest>,
@@ -1511,7 +1522,7 @@ fn remote_call_request_key(request: &RemoteCallPendingRequest) -> String {
     format!("{}\u{0}{}", request.operation, request.request_id)
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct RemoteResponderCursor {
     cursor: u64,
     remote_cursor: u64,
@@ -1631,6 +1642,12 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
+    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/statusLedger"),
+        serde_json::Value::Null,
+    );
     graph.node_opts::<RemoteCallStatus, _>(
         vec![
             commands.erased(),
@@ -1638,13 +1655,11 @@ where
             responses.erased(),
             results.erased(),
             timeouts.erased(),
+            ledger.erased(),
         ],
         |ctx| {
-            let mut reducer = ctx
-                .state_get::<RemoteCallStatusReducer>()
-                .map_or_else(RemoteCallStatusReducer::default, |reducer| {
-                    (*reducer).clone()
-                });
+            let mut reducer =
+                crate::ledger::load::<RemoteCallStatusReducer>(ctx, ctx.dep_len() - 1);
             for command in ctx
                 .dep(0)
                 .values::<WireBridgeCommand<RemoteCallRequest<TRequest>>>()
@@ -1821,14 +1836,18 @@ where
                 reducer.status.timeouts = reducer.status.timeouts.saturating_add(1);
             }
             reducer.status.pending = reducer.pending.len();
-            ctx.state_set(reducer.clone());
+            crate::ledger::store(ctx, &reducer);
             ctx.emit(reducer.status);
         },
-        no_terminal_graph_opts(format!("{name}/status")),
+        {
+            let mut opts = no_terminal_graph_opts(format!("{name}/status"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct RemoteCallStatusReducer {
     status: RemoteCallStatus,
     pending: RemoteCallPendingState,
@@ -1868,14 +1887,16 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
+    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/errorsLedger"),
+        serde_json::Value::Null,
+    );
     graph.node_opts::<RemoteCallError, _>(
-        vec![responses.erased(), timeouts.erased(), events.erased()],
+        vec![responses.erased(), timeouts.erased(), events.erased(), ledger.erased()],
         |ctx| {
-            let mut pending = ctx
-                .state_get::<RemoteCallPendingState>()
-                .map_or_else(RemoteCallPendingState::default, |pending| {
-                    (*pending).clone()
-                });
+            let mut pending = crate::ledger::load::<RemoteCallPendingState>(ctx, ctx.dep_len() - 1);
             for event in ctx.dep(2).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
             >() {
@@ -2002,9 +2023,13 @@ where
                     _ => {}
                 }
             }
-            ctx.state_set(pending);
+            crate::ledger::store(ctx, &pending);
         },
-        no_terminal_graph_opts(format!("{name}/errors")),
+        {
+            let mut opts = no_terminal_graph_opts(format!("{name}/errors"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
@@ -2039,12 +2064,16 @@ where
     TResponse: Clone + 'static,
 {
     let session_id = bridge.inbound.session_id().to_owned();
+    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/cursorLedger"),
+        serde_json::Value::Null,
+    );
     graph.node_opts::<RemoteResponderEvent<TRequest, TResponse>, _>(
-        vec![bridge.inbound.erased()],
+        vec![bridge.inbound.erased(), ledger.erased()],
         move |ctx| {
-            let mut cursor = ctx
-                .state_get::<RemoteResponderCursor>()
-                .map_or_else(RemoteResponderCursor::default, |cursor| (*cursor).clone());
+            let mut cursor = crate::ledger::load::<RemoteResponderCursor>(ctx, ctx.dep_len() - 1);
             let mut emitted = Vec::new();
             for value in raw_data(ctx, 0) {
                 let ingress = match value.downcast::<WireBridgeIngress<RemoteCallRequest<TRequest>>>()
@@ -2128,9 +2157,13 @@ where
                 });
             }
             ctx.emit_all(emitted);
-            ctx.state_set(cursor);
+            crate::ledger::store(ctx, &cursor);
         },
-        no_terminal_graph_opts(format!("{name}/events")),
+        {
+            let mut opts = no_terminal_graph_opts(format!("{name}/events"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
@@ -2219,12 +2252,17 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
+    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/statusLedger"),
+        serde_json::Value::Null,
+    );
     graph.node_opts::<RemoteResponderStatus, _>(
-        vec![events.erased()],
+        vec![events.erased(), ledger.erased()],
         |ctx| {
-            let mut status = ctx
-                .state_get::<RemoteResponderStatus>()
-                .map_or_else(initial_remote_responder_status, |status| (*status).clone());
+            let mut status =
+                crate::ledger::load_or(ctx, ctx.dep_len() - 1, initial_remote_responder_status);
             for event in ctx
                 .dep(0)
                 .values::<RemoteResponderEvent<TRequest, TResponse>>()
@@ -2265,10 +2303,14 @@ where
                     }
                 }
             }
-            ctx.state_set(status.clone());
+            crate::ledger::store(ctx, &status);
             ctx.emit(status);
         },
-        no_terminal_graph_opts(format!("{name}/status")),
+        {
+            let mut opts = no_terminal_graph_opts(format!("{name}/status"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
@@ -2386,27 +2428,43 @@ where
         .now_ms
         .clone()
         .unwrap_or_else(|| Rc::new(|| 0_u64) as Rc<dyn Fn() -> u64>);
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/ledger"),
+        serde_json::to_value(BridgeLedger::default()).unwrap_or_default(),
+    );
     let event_opts = GraphNodeOpts {
         name: Some(format!("{name}/events")),
-        node: NodeOpts {
-            complete: Policy::Manual,
-            error: Policy::Manual,
-            ..NodeOpts::default()
-        }
-        // The lifetime's cleanup marks the bridge state inactive (R-lifetime@2).
-        .with_setup(|_| {
-            crate::lifetime::cleanup(|closing| {
-                if let Some(state) = closing.state_get::<RefCell<BridgeState<TOutbound>>>() {
-                    let mut state = state.borrow_mut();
-                    state.active = false;
-                    state.pending.clear();
-                }
-            })
-        }),
+        // The lifetime's cleanup writes the sequence and cursors back to the ledger,
+        // then marks the bridge state inactive and drops the pending sends.
+        node: crate::ledger::write_back(
+            NodeOpts {
+                complete: Policy::Manual,
+                error: Policy::Manual,
+                ..NodeOpts::default()
+            }
+            .with_setup(|_| {
+                crate::lifetime::cleanup(|closing| {
+                    if let Some(state) = closing.state_get::<RefCell<BridgeState<TOutbound>>>() {
+                        let mut state = state.borrow_mut();
+                        state.active = false;
+                        state.pending.clear();
+                    }
+                })
+            }),
+            |state: &RefCell<BridgeState<TOutbound>>| {
+                let state = state.borrow();
+                serde_json::json!({
+                    "next_seq": state.next_seq,
+                    "cursor": state.cursor,
+                    "remote_cursor": state.remote_cursor,
+                })
+            },
+        ),
         ..GraphNodeOpts::default()
     };
     graph.node_opts::<WireBridgeEvent<TOutbound, TInbound>, _>(
-        vec![command.erased(), inbound.erased()],
+        vec![command.erased(), inbound.erased(), ledger.erased()],
         move |ctx| {
             let state = bridge_state::<TOutbound>(ctx);
             state.borrow_mut().active = true;
@@ -2466,11 +2524,12 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
     if let Some(state) = ctx.state_get::<RefCell<BridgeState<T>>>() {
         return state;
     }
+    let ledger: BridgeLedger = crate::ledger::from_ledger(ctx, ctx.dep_len() - 1);
     let state = RefCell::new(BridgeState::<T> {
         active: true,
-        next_seq: 1,
-        cursor: 0,
-        remote_cursor: 0,
+        next_seq: ledger.next_seq,
+        cursor: ledger.cursor,
+        remote_cursor: ledger.remote_cursor,
         pending: BTreeMap::new(),
     });
     ctx.state_set(state);
@@ -3147,19 +3206,35 @@ where
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
+    // The status counters are an audit ledger the bundle owns (review Q13).
+    let ledger = crate::ledger::Ledger::new(
+        graph,
+        format!("{name}/statusLedger"),
+        serde_json::to_value(initial_status(&session_id)).unwrap_or_default(),
+    );
     graph.node_opts::<WireBridgeStatus, _>(
-        vec![events.erased()],
+        vec![events.erased(), ledger.erased()],
         move |ctx| {
-            let mut next = ctx
-                .state_get::<WireBridgeStatus>()
-                .map_or_else(|| initial_status(&session_id), |status| (*status).clone());
+            let mut next: WireBridgeStatus = ctx
+                .state_get::<serde_json::Value>()
+                .and_then(|v| serde_json::from_value((*v).clone()).ok())
+                .or_else(|| {
+                    ctx.dep(1)
+                        .value::<serde_json::Value>()
+                        .and_then(|v| serde_json::from_value((*v).clone()).ok())
+                })
+                .unwrap_or_else(|| initial_status(&session_id));
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 next = reduce_status(next, event.as_ref());
             }
-            ctx.state_set(next.clone());
+            crate::ledger::store(ctx, &next);
             ctx.emit(next);
         },
-        GraphNodeOpts::named(format!("{name}/status")),
+        {
+            let mut opts = GraphNodeOpts::named(format!("{name}/status"));
+            opts.node = crate::ledger::write_back_json(opts.node);
+            opts
+        },
     )
 }
 
@@ -3582,11 +3657,18 @@ mod tests {
                 "bridge/errors",
                 "bridge/events",
                 "bridge/inbound",
+                "bridge/ledger",
                 "bridge/nacks",
                 "bridge/outbound",
                 "bridge/status",
+                "bridge/statusLedger",
             ]
         );
+        // The sequence and the status counters are ledgers the bundle owns (Q13).
+        assert!(snap
+            .edges
+            .iter()
+            .any(|edge| edge.from == "bridge/ledger" && edge.to == "bridge/events"));
         assert!(snap
             .edges
             .iter()

@@ -423,34 +423,6 @@ impl TopologyGroup {
     }
 }
 
-/// Subscriptions that hold a bundle's nodes active for as long as the bundle lives
-/// (review Q13): a ledger that carries idempotency, a cursor or an audit sequence then
-/// does not reset when the bundle's own subscribers leave. Dropping the last handle
-/// releases them.
-#[derive(Default)]
-pub(crate) struct Held(RefCell<Vec<Box<dyn FnOnce()>>>);
-
-impl Held {
-    /// Holds each release until the guard drops.
-    pub(crate) fn new(releases: Vec<Box<dyn FnOnce()>>) -> Rc<Self> {
-        Rc::new(Self(RefCell::new(releases)))
-    }
-
-    /// Releases what it holds now, before the guard drops (a bundle's own release).
-    pub(crate) fn release(&self) {
-        let releases = std::mem::take(&mut *self.0.borrow_mut());
-        for release in releases {
-            release();
-        }
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 impl Graph {
     /// Creates or computes `new`.
     pub fn new(opts: GraphOptions) -> Self {
@@ -1201,11 +1173,10 @@ impl Graph {
     /// Holds `node` active, as [`Graph::retain`] does, for a bundle that has the
     /// handle rather than the id.
     pub(crate) fn hold<T: 'static>(&self, node: &Node<T>) -> Box<dyn FnOnce()> {
-        assert!(
-            node.erased().same_graph_arena(&self.inner.arena),
-            "graph: cannot hold a node of a different graph"
-        );
-        node.subscribe(|_| {})
+        let id = self
+            .registered_id_for_core(&node.erased(), "")
+            .expect("graph: cannot hold a node this graph has not registered");
+        self.retain(&id)
     }
 
     fn assert_graph_local_deps(&self, deps: &[Core], label: &str) {
