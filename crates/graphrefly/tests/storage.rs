@@ -1381,8 +1381,9 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
     );
     let err = unsupported.checkpoint().unwrap_err();
     assert!(
-        err.to_string().contains("not strict JSON compatible"),
-        "unsupported host-ish backend values fail rather than widening D160 implicitly"
+        err.to_string()
+            .starts_with("not restorable: unsupported.delta: its private state is not JSON"),
+        "unsupported host-ish backend values are refused, not widened implicitly: {err}"
     );
 
     let local_only = graph();
@@ -1397,11 +1398,18 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
         .iter()
         .find(|node| node.id == "capped.delta")
         .expect("capped list delta exists");
+    // A capped list carries its maxSize in its recipe, as a capped log does.
     assert!(matches!(
-        capped.factory,
-        GraphCheckpointFactory::LocalOnly { .. }
+        &capped.factory,
+        GraphCheckpointFactory::RegistryRef { config: Some(config), .. }
+            if config["maxSize"] == serde_json::json!(2)
     ));
-    assert_eq!(capped.private_state, None);
+    let restored = restore_graph(
+        checkpoint,
+        graphrefly::RestoreGraphOptions::new(graphrefly::default_restore_registry()),
+    )
+    .expect("a capped list restores");
+    assert!(restored.find("capped.delta").is_some());
 }
 
 #[test]

@@ -752,8 +752,8 @@ impl<T: Clone + 'static> ReactiveList<T> {
             .name
             .clone()
             .unwrap_or_else(|| format!("reactiveList@{token:x}"));
-        let restorable = options.name.is_some() && options.max_size.is_none();
-        let delta = make_delta_node::<T>(graph, &id_prefix, restorable);
+        let restorable = options.name.is_some();
+        let delta = make_delta_node::<T>(graph, &id_prefix, restorable, options.max_size);
         if restorable {
             let backend_for_checkpoint = backend.clone();
             register_backend_state_json(&delta, move || {
@@ -1850,15 +1850,17 @@ fn make_delta_node<T: Clone + 'static>(
     graph: &Graph,
     id_prefix: &str,
     restorable: bool,
+    max_size: Option<usize>,
 ) -> Node<ListChange<T>> {
     graph.empty_source(
         "reactiveList.delta",
-        collection_node_opts(
+        collection_node_opts_with_restore_config(
             id_prefix,
             "delta",
             "collection_delta",
             "reactiveList.delta",
             restorable,
+            max_size.map(|max_size| json!({ "maxSize": max_size })),
         ),
     )
 }

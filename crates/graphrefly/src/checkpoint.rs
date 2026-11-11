@@ -410,6 +410,19 @@ pub fn default_restore_registry() -> GraphRestoreRegistry {
     GraphRestoreRegistry::new([
         GraphRestoreEntry::descriptor(StateRestoreDescriptor),
         GraphRestoreEntry::descriptor(MapJsonRestoreDescriptor),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("of")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("fromIter")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("empty")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("never")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("throwError")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("take")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("skip")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("elementAt")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("firstAny")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("lastAny")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("merge")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("valve")),
+        GraphRestoreEntry::descriptor(OperatorRestoreDescriptor("takeUntil")),
         GraphRestoreEntry::descriptor(ReactiveListDeltaRestoreDescriptor),
         GraphRestoreEntry::descriptor(ReactiveListSnapshotRestoreDescriptor),
         GraphRestoreEntry::descriptor(ReactiveLogDeltaRestoreDescriptor),
@@ -468,7 +481,14 @@ pub enum RestoreNodeKind {
     NodeJson(NodeFn),
     /// `Custom` variant.
     Custom(Rc<CustomRestoreFn>),
+    /// A `derived` node: the registry gives the value-level callback, and restore
+    /// builds the node with the same sugar and gate as [`crate::Graph::derived`]. A
+    /// derived definition brings no setup.
+    Derived(Rc<DerivedRestoreFn>),
 }
+
+/// The value-level callback a [`RestoreNodeKind::Derived`] definition gives.
+pub type DerivedRestoreFn = dyn Fn(&crate::graph::Values<'_>) -> Option<GraphCheckpointJson>;
 
 /// `RestoreNodeDefinition` data container.
 pub struct RestoreNodeDefinition {
@@ -509,6 +529,73 @@ impl GraphRestoreDescriptor for StateRestoreDescriptor {
             factory: "state".to_owned(),
             kind: RestoreNodeKind::StateJson,
             opts: restored_opts(ctx.checkpoint)?,
+        })
+    }
+}
+
+/// A built-in operator or source, rebuilt over JSON values from its recipe config
+/// (R-checkpoint@1): the operator's own policies and setup come with it.
+pub struct OperatorRestoreDescriptor(pub &'static str);
+
+impl OperatorRestoreDescriptor {
+    fn operator(
+        &self,
+        ctx: &RestoreDefineCtx<'_>,
+    ) -> RestoreResult<crate::operators::Operator<Value>> {
+        let field = |name: &str| ctx.config.and_then(|config| config.get(name)).cloned();
+        let count = |name: &str| {
+            field(name)
+                .and_then(|v| v.as_u64())
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| not_restorable(ctx.id, &format!("its recipe has no '{name}' count")))
+        };
+        Ok(match self.0 {
+            "of" => crate::sources::of(
+                field("value").ok_or_else(|| not_restorable(ctx.id, "its recipe has no value"))?,
+            ),
+            "fromIter" => crate::sources::from_iter(
+                field("items")
+                    .and_then(|v| v.as_array().cloned())
+                    .ok_or_else(|| not_restorable(ctx.id, "its recipe has no items"))?,
+            ),
+            "empty" => crate::sources::empty(),
+            "never" => crate::sources::never(),
+            "throwError" => crate::sources::throw_error(
+                field("error")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            ),
+            "take" => crate::operators::take(count("n")?),
+            "skip" => crate::operators::skip(count("n")?),
+            "elementAt" => crate::operators::element_at(count("index")?),
+            "firstAny" => crate::operators::first_any(),
+            "lastAny" => crate::operators::last_any(),
+            "merge" => crate::operators::merge(),
+            "valve" => crate::operators::valve(),
+            "takeUntil" => crate::combinators::take_until(),
+            other => {
+                return Err(not_restorable(
+                    ctx.id,
+                    &format!("no built-in operator '{other}'"),
+                ))
+            }
+        })
+    }
+}
+
+impl GraphRestoreDescriptor for OperatorRestoreDescriptor {
+    fn ref_(&self) -> &str {
+        self.0
+    }
+
+    fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        let op = self.operator(&ctx)?;
+        let mut opts = restored_opts(ctx.checkpoint)?;
+        opts.node = op.opts.clone();
+        Ok(RestoreNodeDefinition {
+            factory: op.factory.to_owned(),
+            kind: RestoreNodeKind::NodeJson(op.body.clone()),
+            opts,
         })
     }
 }
@@ -779,16 +866,26 @@ impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
+        let max_size = collection_log_max_size_config(ctx.config, ctx.config_version, self.ref_())?;
         collection_delta_definition(
             ctx,
             "reactiveList.delta",
             ".delta",
-            false,
-            |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+            true,
+            move |graph: &Graph, base: String, node: &GraphCheckpointNode| {
+                let state = backend_array(node, "reactiveList.delta")?;
+                if max_size.is_some_and(|max_size| state.len() > max_size) {
+                    return Err(not_restorable(
+                        &node.id,
+                        "its saved list exceeds its recipe's maxSize",
+                    ));
+                }
+                let mut options = crate::data_structures::ReactiveListOptions::named(base);
+                if let Some(max_size) = max_size {
+                    options = options.max_size(max_size);
+                }
                 let collection = crate::data_structures::reactive_list::<GraphCheckpointJson>(
-                    graph,
-                    backend_array(node, "reactiveList.delta")?,
-                    crate::data_structures::ReactiveListOptions::named(base),
+                    graph, state, options,
                 );
                 Ok(collection.delta.erased())
             },
@@ -1075,18 +1172,21 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             from: dep.clone(),
             to: entry.id.clone(),
         }));
-        let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))?;
+        let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))
+            .map_err(|_| not_restorable(&entry.id, "its private state is not JSON"))?;
         let helper = is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
         let values = if helper {
             Vec::new()
         } else {
-            values_to_json(&runtime.values, &format!("{}.values", entry.id))?
+            values_to_json(&runtime.values, &format!("{}.values", entry.id))
+                .map_err(|_| not_restorable(&entry.id, "its retained values are not JSON"))?
         };
         let private_state = match (backend, &runtime.private_state, helper) {
             (Some(backend), _, _) => Some(backend),
-            (None, Some(state), false) => {
-                Some(any_to_json(state, &format!("{}.privateState", entry.id))?)
-            }
+            (None, Some(state), false) => Some(
+                any_to_json(state, &format!("{}.privateState", entry.id))
+                    .map_err(|_| not_restorable(&entry.id, "its private state is not JSON"))?,
+            ),
             _ => None,
         };
         let received = runtime
@@ -1104,7 +1204,10 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                                 values_to_json(
                                     &input.values,
                                     &format!("{}.received[{i}]", entry.id),
-                                )?
+                                )
+                                .map_err(|_| {
+                                    not_restorable(&entry.id, "the values it received are not JSON")
+                                })?
                             },
                             terminal: terminal_to_json(input.ended.as_ref()),
                         })
@@ -1205,8 +1308,14 @@ fn checkpoint_factory(entry: &CheckpointEntry, is_state: bool) -> GraphCheckpoin
     }
     GraphCheckpointFactory::LocalOnly {
         name: entry.factory.clone(),
-        reason: "the node's instance carries no recipe".to_owned(),
+        reason: "built or replaced without a recipe".to_owned(),
     }
+}
+
+/// The refusal of a node that a checkpoint cannot carry or a restore cannot rebuild
+/// (R-checkpoint@1): `not restorable: <id>: <reason>`, the same text in every package.
+fn not_restorable(id: &str, reason: &str) -> GraphRestoreError {
+    GraphRestoreError::new(format!("not restorable: {id}: {reason}"))
 }
 
 fn values_to_json(values: &[AnyValue], path: &str) -> RestoreResult<Vec<GraphCheckpointJson>> {
@@ -1254,15 +1363,25 @@ pub(crate) fn same_values(a: &[AnyValue], b: &[AnyValue]) -> bool {
         })
 }
 
+/// `value` as checkpoint JSON, if it is one of the types a checkpoint carries; an
+/// operator's recipe config is only made from such a value.
+pub(crate) fn json_of<T: 'static>(value: &T) -> Option<GraphCheckpointJson> {
+    dyn_to_json(value, "recipe").ok()
+}
+
 fn any_to_json(value: &AnyValue, path: &str) -> RestoreResult<GraphCheckpointJson> {
+    dyn_to_json(value.as_ref(), path)
+}
+
+fn dyn_to_json(value: &dyn std::any::Any, path: &str) -> RestoreResult<GraphCheckpointJson> {
     let encoder = CHECKPOINT_JSON_ENCODERS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| GraphRestoreError::new("checkpoint JSON encoder registry poisoned"))?
-        .get(&value.as_ref().type_id())
+        .get(&value.type_id())
         .cloned();
     if let Some(encoder) = encoder {
-        let out = encoder(value.as_ref(), path)?;
+        let out = encoder(value, path)?;
         validate_checkpoint_json(&out, path)?;
         return Ok(out);
     }
@@ -1387,11 +1506,11 @@ fn prepare_checkpoint(
             }
         }
         let descriptor = match &node.factory {
-            GraphCheckpointFactory::LocalOnly { name, reason } => {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' uses local-only factory '{}' ({reason})",
-                    node.id, name
-                )));
+            GraphCheckpointFactory::LocalOnly { .. } => {
+                return Err(not_restorable(
+                    &node.id,
+                    "local-only, built or replaced without a recipe",
+                ));
             }
             GraphCheckpointFactory::RegistryRef { ref_, .. } => {
                 registry.descriptor(ref_).ok_or_else(|| {
@@ -1676,6 +1795,24 @@ fn build_node(
             )
             .erased(),
         RestoreNodeKind::Custom(restore) => restore(graph)?,
+        RestoreNodeKind::Derived(callback) => {
+            if definition.opts.node.setup.is_some() {
+                return Err(not_restorable(
+                    id,
+                    "a derived definition gives a value-level callback and no setup",
+                ));
+            }
+            let body: NodeFn = Rc::new(move |ctx: &Ctx| crate::graph::run_derived(ctx, &*callback));
+            graph
+                .restore_node_with_id(
+                    id.to_owned(),
+                    definition.factory,
+                    deps.clone(),
+                    body,
+                    definition.opts,
+                )
+                .erased()
+        }
     };
     let restored_deps = core.deps();
     if restored_deps.len() != deps.len()
@@ -1808,7 +1945,10 @@ mod tests {
         let err = g
             .checkpoint()
             .expect_err("negative zero is not strict canonical JSON");
-        assert!(err.to_string().contains("strict canonical JSON"));
+        assert_eq!(
+            err.to_string(),
+            "not restorable: source: its retained values are not JSON"
+        );
 
         let g = crate::graph::graph();
         g.state_opts(json!(1), GraphNodeOpts::named("source"));

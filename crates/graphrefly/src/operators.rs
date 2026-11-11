@@ -20,6 +20,9 @@ pub struct Operator<T> {
     pub body: Rc<dyn Fn(&Ctx)>,
     /// `opts` field for opts.
     pub opts: NodeOpts,
+    /// The recipe a node built from this operator carries when its caller gives none,
+    /// so a checkpoint can rebuild it from the built-in registry (R-checkpoint@1).
+    pub(crate) recipe: Option<crate::graph::RestoreFactoryMeta>,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -29,6 +32,7 @@ impl<T> Clone for Operator<T> {
             factory: self.factory,
             body: self.body.clone(),
             opts: self.opts.clone(),
+            recipe: self.recipe.clone(),
             _t: PhantomData,
         }
     }
@@ -53,9 +57,32 @@ impl<T> Operator<T> {
             factory,
             body: Rc::new(body),
             opts,
+            recipe: None,
             _t: PhantomData,
         }
     }
+
+    /// This operator with the recipe `ref_` (and `config`), which the built-in
+    /// restore registry rebuilds.
+    pub(crate) fn with_recipe(mut self, ref_: &str, config: Option<serde_json::Value>) -> Self {
+        self.recipe = Some(crate::graph::RestoreFactoryMeta {
+            ref_: ref_.to_owned(),
+            config,
+            config_version: None,
+        });
+        self
+    }
+}
+
+/// A counting operator's count: its private state, a `usize`, or the JSON number a
+/// restored instance holds (restored private state is JSON, graphrefly-rs:D9).
+fn saved_count(ctx: &Ctx) -> usize {
+    ctx.state_get::<usize>().map(|v| *v).unwrap_or_else(|| {
+        ctx.state_get::<serde_json::Value>()
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0)
+    })
 }
 
 pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
@@ -120,12 +147,16 @@ pub fn scan<S: 'static, T: Clone + 'static>(
 
 /// take: emit the first `n` DATA values, then COMPLETE.
 pub fn take<S: Clone + 'static>(n: usize) -> Operator<S> {
+    take_op::<S>(n).with_recipe("take", Some(serde_json::json!({ "n": n })))
+}
+
+fn take_op<S: Clone + 'static>(n: usize) -> Operator<S> {
     Operator::new("take", move |ctx| {
         if n == 0 {
             ctx.down(vec![Message::Complete]);
             return;
         }
-        let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
+        let mut count = saved_count(ctx);
         if count >= n {
             return;
         }
@@ -176,6 +207,10 @@ pub fn distinct_until_changed<S: Clone + 'static>(
 
 /// merge: interleave DATA from any dep.
 pub fn merge<T: Clone + 'static>() -> Operator<T> {
+    merge_op::<T>().with_recipe("merge", None)
+}
+
+fn merge_op<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "merge",
         NodeOpts {
@@ -240,8 +275,12 @@ pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
 
 /// skip: drop the first `n` DATA occurrences, then pass through.
 pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
+    skip_op::<S>(n).with_recipe("skip", Some(serde_json::json!({ "n": n })))
+}
+
+fn skip_op<S: Clone + 'static>(n: usize) -> Operator<S> {
     Operator::new("skip", move |ctx| {
-        let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
+        let mut count = saved_count(ctx);
         for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
             for value in wave {
@@ -295,6 +334,10 @@ pub fn first<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operato
 
 /// first_any: emit the first value, then COMPLETE.
 pub fn first_any<S: Clone + 'static>() -> Operator<S> {
+    first_any_op::<S>().with_recipe("firstAny", None)
+}
+
+fn first_any_op<S: Clone + 'static>() -> Operator<S> {
     first(|_: &S| true)
 }
 
@@ -328,6 +371,10 @@ pub fn last<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
 
 /// last_any: emit the last value on source COMPLETE.
 pub fn last_any<S: Clone + 'static>() -> Operator<S> {
+    last_any_op::<S>().with_recipe("lastAny", None)
+}
+
+fn last_any_op<S: Clone + 'static>() -> Operator<S> {
     last(|_: &S| true)
 }
 
@@ -358,6 +405,10 @@ pub fn find<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
 
 /// element_at: emit the zero-based `index` value, then COMPLETE; out of range -> bare COMPLETE.
 pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
+    element_at_op::<S>(index).with_recipe("elementAt", Some(serde_json::json!({ "index": index })))
+}
+
+fn element_at_op<S: Clone + 'static>(index: usize) -> Operator<S> {
     Operator::with_opts(
         "elementAt",
         NodeOpts {
@@ -365,7 +416,7 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
             ..NodeOpts::default()
         },
         move |ctx| {
-            let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
+            let mut count = saved_count(ctx);
             for value in ctx.dep(0).values::<S>() {
                 if count == index {
                     ctx.down(vec![
@@ -523,6 +574,10 @@ pub fn catch_error<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) ->
 
 /// valve: forward source DATA while boolean control dep is true.
 pub fn valve<S: Clone + 'static>() -> Operator<S> {
+    valve_op::<S>().with_recipe("valve", None)
+}
+
+fn valve_op<S: Clone + 'static>() -> Operator<S> {
     Operator::with_opts(
         "valve",
         NodeOpts {

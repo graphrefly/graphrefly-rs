@@ -309,8 +309,10 @@ fn process_bundle_checkpoint_is_refused_for_non_json_values() {
         .checkpoint()
         .expect_err("typed process values are not JSON");
     assert!(
-        err.to_string().contains("not strict JSON compatible"),
-        "{err}"
+        err.to_string().starts_with("not restorable: ")
+            && err.to_string().contains("not JSON")
+            && !err.to_string().contains("serde"),
+        "a clear refusal naming the node: {err}"
     );
 }
 

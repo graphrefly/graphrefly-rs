@@ -63,28 +63,47 @@ impl CloseSlot {
 
 /// of: emit one value and COMPLETE on activation.
 pub fn of<T: Clone + 'static>(value: T) -> Operator<T> {
-    Operator::new("of", move |ctx| {
+    let config =
+        crate::checkpoint::json_of(&value).map(|value| serde_json::json!({ "value": value }));
+    let op = Operator::new("of", move |ctx| {
         let out: AnyValue = Rc::new(value.clone());
         ctx.down(vec![Message::Data(out), Message::Complete]);
-    })
+    });
+    match config {
+        Some(config) => op.with_recipe("of", Some(config)),
+        None => op,
+    }
 }
 
 /// from_iter: on activation, send every item in order and then COMPLETE, as one
 /// array, so a subscriber's snapshot carries all of them (R-subscription).
 pub fn from_iter<T: Clone + 'static>(items: impl IntoIterator<Item = T>) -> Operator<T> {
     let values: Vec<T> = items.into_iter().collect();
-    Operator::new("fromIter", move |ctx| {
+    let config = values
+        .iter()
+        .map(crate::checkpoint::json_of)
+        .collect::<Option<Vec<_>>>()
+        .map(|items| serde_json::json!({ "items": items }));
+    let op = Operator::new("fromIter", move |ctx| {
         let mut out: Vec<Message<AnyValue>> = values
             .iter()
             .map(|value| Message::Data(Rc::new(value.clone()) as AnyValue))
             .collect();
         out.push(Message::Complete);
         ctx.down(out);
-    })
+    });
+    match config {
+        Some(config) => op.with_recipe("fromIter", Some(config)),
+        None => op,
+    }
 }
 
 /// empty: COMPLETE immediately with no DATA.
 pub fn empty<T: 'static>() -> Operator<T> {
+    empty_op::<T>().with_recipe("empty", None)
+}
+
+fn empty_op<T: 'static>() -> Operator<T> {
     Operator::new("empty", |ctx| {
         ctx.down(vec![Message::Complete]);
     })
@@ -92,15 +111,21 @@ pub fn empty<T: 'static>() -> Operator<T> {
 
 /// never: activate and remain silent until deactivation.
 pub fn never<T: 'static>() -> Operator<T> {
+    never_op::<T>().with_recipe("never", None)
+}
+
+fn never_op<T: 'static>() -> Operator<T> {
     Operator::new("never", |_| {})
 }
 
 /// throw_error: terminate with ERROR on activation.
 pub fn throw_error<T: 'static>(err: impl Into<String>) -> Operator<T> {
     let err = err.into();
+    let config = serde_json::json!({ "error": err });
     Operator::new("throwError", move |ctx| {
         ctx.down(vec![Message::Error(err.clone().into())]);
     })
+    .with_recipe("throwError", Some(config))
 }
 
 /// Host-boundary result for [`first_sync_value_from`] and [`single_sync_value_from`].

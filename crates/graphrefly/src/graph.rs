@@ -99,8 +99,9 @@ impl GraphNodeOpts {
     }
 }
 
-/// An effect's latest per-run cleanup, kept in its private state.
-struct EffectCleanup(RefCell<Option<Box<dyn FnOnce()>>>);
+/// An effect's latest per-run cleanup, shared by its function and its lifetime's
+/// cleanup; not private state, so a checkpoint never meets it.
+type EffectCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 /// Graph-owned topology/release group options (D152).
 #[derive(Debug, Clone, Default)]
@@ -595,15 +596,7 @@ impl Graph {
             self.inner.dispatcher.clone(),
             deps,
             opts.node.clone(),
-            move |ctx| {
-                if !sugar_gate(ctx) {
-                    return;
-                }
-                let values = Values::new(ctx.dep_records());
-                if let Some(value) = f(&values) {
-                    ctx.emit(value);
-                }
-            },
+            move |ctx| run_derived(ctx, &f),
         );
         self.add(node, "derived", opts)
     }
@@ -628,15 +621,18 @@ impl Graph {
     ) -> Node<()> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("effect"));
         let mut node_opts = opts.node.clone();
-        // The effect keeps its latest per-run cleanup in private state; the lifetime's
-        // cleanup runs it (R-lifetime@2). A caller's own setup still runs first.
+        // The effect keeps its latest per-run cleanup outside its private state, which a
+        // checkpoint carries and a closure cannot be; the lifetime's cleanup runs it
+        // (R-lifetime@2). Lifetimes of one instance follow each other, so one slot per
+        // instance serves them all. A caller's own setup still runs first.
+        let latest_cleanup: EffectCleanup = Rc::new(RefCell::new(None));
+        let run_slot = latest_cleanup.clone();
         let user_setup = node_opts.setup.take();
         let node_opts = node_opts.with_setup(move |ctx| {
             let user_cleanup = user_setup.as_ref().and_then(|setup| (setup.0)(ctx));
+            let latest_cleanup = latest_cleanup.clone();
             crate::lifetime::cleanup(move |closing| {
-                let latest = closing
-                    .state_get::<EffectCleanup>()
-                    .and_then(|slot| slot.0.borrow_mut().take());
+                let latest = latest_cleanup.borrow_mut().take();
                 if let Some(latest) = latest {
                     latest();
                 }
@@ -655,7 +651,7 @@ impl Graph {
                     return;
                 }
                 let values = Values::new(ctx.dep_records());
-                ctx.state_set(EffectCleanup(RefCell::new(f(&values))));
+                *run_slot.borrow_mut() = f(&values);
             },
         );
         self.add(node, "effect", opts)
@@ -680,6 +676,10 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<T> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or(op.factory));
+        let mut opts = opts;
+        if opts.restore.is_none() {
+            opts.restore = op.recipe.clone();
+        }
         let node = crate::operators::init_node_in_arena_with_dispatcher(
             op.clone(),
             &self.inner.arena,
@@ -1557,6 +1557,18 @@ pub struct Explain {
 /// dependency sent DATA in this invocation. A dependency's latest value is kept while
 /// the gate waits, so the first callback sees every value. A node with no
 /// dependencies runs on its first run.
+/// One run of a `derived` node: behind the gate, the callback's value, if any, is the
+/// node's DATA. Shared with restore, so a restored derived is the same sugar.
+pub(crate) fn run_derived<T: 'static>(ctx: &Ctx, f: &dyn Fn(&Values<'_>) -> Option<T>) {
+    if !sugar_gate(ctx) {
+        return;
+    }
+    let values = Values::new(ctx.dep_records());
+    if let Some(value) = f(&values) {
+        ctx.emit(value);
+    }
+}
+
 fn sugar_gate(ctx: &Ctx) -> bool {
     let mut fresh = ctx.dep_len() == 0;
     for dep in ctx.deps() {

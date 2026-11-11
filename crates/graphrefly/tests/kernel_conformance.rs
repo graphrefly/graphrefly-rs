@@ -2949,7 +2949,7 @@ fn c38_capture_and_restore() {
         .checkpoint()
         .unwrap_err()
         .to_string()
-        .contains("not strict JSON"));
+        .starts_with("not restorable: typed: its retained values are not JSON"));
     let bad_state = graphrefly::graph();
     let src = bad_state.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
     let holder = bad_state.node_opts::<serde_json::Value, _>(
@@ -2958,11 +2958,10 @@ fn c38_capture_and_restore() {
         with_recipe("holder", "c38-fwd"),
     );
     let _uh = holder.subscribe(|_| {});
-    assert!(bad_state
-        .checkpoint()
-        .unwrap_err()
-        .to_string()
-        .contains("not strict JSON"));
+    assert_eq!(
+        bad_state.checkpoint().unwrap_err().to_string(),
+        "not restorable: holder: its private state is not JSON"
+    );
 }
 
 /// C-38 — the replace and rewire clauses: the recipe belongs to the instance, a node
@@ -4089,4 +4088,261 @@ fn queued_rewires_cannot_commit_a_cycle() {
             "rewire: the node would depend on itself (R-request-order)".to_owned()
         )]
     );
+}
+
+/// R-checkpoint@1 with derived sugar — a restored derived is rebuilt with the same
+/// sugar and gate: a dependency that only ended brings no new DATA, so the restored
+/// node does not compute again; a dependency that changed does. A derived definition
+/// that brings a setup is refused.
+mod restored_derived {
+    use super::*;
+    use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
+    use graphrefly::{
+        restore_graph, restore_registry, restored_opts, GraphNodeOpts, GraphRestoreEntry,
+        GraphRestoreResult, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition,
+        RestoreNodeKind, StateRestoreDescriptor,
+    };
+    use serde_json::{json, Value};
+
+    struct Double {
+        runs: Rc<Cell<usize>>,
+        with_setup: bool,
+    }
+
+    impl GraphRestoreDescriptor for Double {
+        fn ref_(&self) -> &str {
+            "double"
+        }
+
+        fn define(&self, ctx: RestoreDefineCtx<'_>) -> GraphRestoreResult<RestoreNodeDefinition> {
+            let mut opts = restored_opts(ctx.checkpoint)?;
+            if self.with_setup {
+                opts.node = opts.node.with_setup(|_| None);
+            }
+            let runs = self.runs.clone();
+            Ok(RestoreNodeDefinition {
+                factory: "derived".to_owned(),
+                kind: RestoreNodeKind::Derived(Rc::new(move |values| {
+                    runs.set(runs.get() + 1);
+                    Some(json!(values.value::<Value>(0)?.as_i64()? * 2))
+                })),
+                opts,
+            })
+        }
+    }
+
+    fn registry(runs: &Rc<Cell<usize>>, with_setup: bool) -> graphrefly::GraphRestoreRegistry {
+        restore_registry([
+            GraphRestoreEntry::descriptor(StateRestoreDescriptor),
+            GraphRestoreEntry::descriptor(Double {
+                runs: runs.clone(),
+                with_setup,
+            }),
+        ])
+    }
+
+    fn checkpoint() -> graphrefly::GraphCheckpoint {
+        let g = graphrefly::graph();
+        let s = g.state_opts(json!(1), GraphNodeOpts::named("s"));
+        let mut opts = GraphNodeOpts::named("d");
+        opts.restore = Some(RestoreFactoryMeta::registry_ref("double"));
+        let d = g.derived_opts::<Value, _>(
+            vec![s.erased()],
+            |values| Some(json!(values.value::<Value>(0)?.as_i64()? * 2)),
+            opts,
+        );
+        let _u = d.subscribe(|_| {});
+        assert_eq!(d.cache(), Some(json!(2)));
+        g.checkpoint().expect("a JSON derived is captured")
+    }
+
+    #[test]
+    fn a_restored_derived_keeps_its_gate() {
+        let runs = Rc::new(Cell::new(0));
+        let r = restore_graph(
+            checkpoint(),
+            RestoreGraphOptions::new(registry(&runs, false)),
+        )
+        .expect("restores");
+        let rs = r.find("s").unwrap().as_state::<Value>().unwrap();
+        let rd = r.find("d").unwrap().as_node::<Value>();
+        rs.complete();
+        let _u = rd.subscribe(|_| {});
+        assert_eq!(runs.get(), 0, "an end alone is no new DATA: no recompute");
+        assert_eq!(rd.cache(), Some(json!(2)), "the saved value is kept");
+        assert_eq!(rd.status().output, graphrefly::OutputStatus::Completed);
+
+        let runs = Rc::new(Cell::new(0));
+        let r = restore_graph(
+            checkpoint(),
+            RestoreGraphOptions::new(registry(&runs, false)),
+        )
+        .expect("restores");
+        let rs = r.find("s").unwrap().as_state::<Value>().unwrap();
+        let rd = r.find("d").unwrap().as_node::<Value>();
+        let _u = rd.subscribe(|_| {});
+        rs.set(json!(5));
+        assert_eq!(runs.get(), 1);
+        assert_eq!(rd.cache(), Some(json!(10)));
+    }
+
+    #[test]
+    fn a_derived_definition_with_a_setup_is_refused() {
+        let runs = Rc::new(Cell::new(0));
+        let err = match restore_graph(
+            checkpoint(),
+            RestoreGraphOptions::new(registry(&runs, true)),
+        ) {
+            Ok(_) => panic!("a derived definition with a setup is refused"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "not restorable: d: a derived definition gives a value-level callback and no setup"
+        );
+    }
+
+    #[test]
+    fn a_local_only_node_is_refused_at_restore() {
+        let g = graphrefly::graph();
+        let s = g.state_opts(json!(1), GraphNodeOpts::named("s"));
+        let _local = g.node_opts::<Value, _>(
+            vec![s.erased()],
+            forward_json,
+            GraphNodeOpts::named("local"),
+        );
+        let checkpoint = g
+            .checkpoint()
+            .expect("capture takes a local-only node as such");
+        let err = match restore_graph(
+            checkpoint,
+            RestoreGraphOptions::new(restore_registry([GraphRestoreEntry::descriptor(
+                StateRestoreDescriptor,
+            )])),
+        ) {
+            Ok(_) => panic!("a local-only node is refused"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "not restorable: local: local-only, built or replaced without a recipe"
+        );
+    }
+
+    fn forward_json(ctx: &graphrefly::Ctx) {
+        if let Some(v) = ctx.dep(0).value::<Value>() {
+            ctx.emit((*v).clone());
+        }
+    }
+
+    #[test]
+    fn a_non_json_private_state_is_refused_at_capture() {
+        let g = graphrefly::graph();
+        let s = g.state_opts(json!(1), GraphNodeOpts::named("s"));
+        let n = g.node_opts::<Value, _>(
+            vec![s.erased()],
+            |ctx| ctx.state_set(std::time::Duration::from_secs(1)),
+            GraphNodeOpts::named("n"),
+        );
+        let _u = n.subscribe(|_| {});
+        let err = g
+            .checkpoint()
+            .expect_err("a non-JSON private state is refused");
+        assert_eq!(
+            err.to_string(),
+            "not restorable: n: its private state is not JSON"
+        );
+    }
+
+    #[test]
+    fn an_effect_that_ran_does_not_block_a_checkpoint() {
+        let g = graphrefly::graph();
+        let s = g.state_opts(json!(1), GraphNodeOpts::named("s"));
+        let ran = Rc::new(Cell::new(0));
+        let effect = {
+            let ran = ran.clone();
+            g.effect(vec![s.erased()], move |_| {
+                let ran = ran.clone();
+                Some(Box::new(move || ran.set(ran.get() + 1)) as Box<dyn FnOnce()>)
+            })
+        };
+        let stop = effect.subscribe(|_| {});
+        s.set(json!(2));
+        assert!(
+            g.checkpoint().is_ok(),
+            "the effect's cleanup is not private state"
+        );
+        stop();
+        assert_eq!(ran.get(), 1, "the latest cleanup still runs at the close");
+    }
+}
+
+/// R-checkpoint@1 — the built-in operators and sources whose values and state are JSON
+/// carry a recipe, and the default registry rebuilds them with their own policies.
+#[test]
+fn built_in_operators_and_sources_restore_from_their_recipes() {
+    use graphrefly::{
+        default_restore_registry, element_at, from_iter, merge, of, restore_graph, skip, take,
+        GraphCheckpointFactory, GraphNodeOpts, RestoreGraphOptions,
+    };
+    use serde_json::{json, Value};
+    let g = graphrefly::graph();
+    let src = g.init_node(
+        from_iter(vec![json!(1), json!(2), json!(3)]),
+        vec![],
+        GraphNodeOpts::named("src"),
+    );
+    let one = g.init_node(of(json!("x")), vec![], GraphNodeOpts::named("one"));
+    let live = g.state_opts(json!(0), GraphNodeOpts::named("live"));
+    let firsts = g.init_node(
+        take::<Value>(3),
+        vec![live.erased()],
+        GraphNodeOpts::named("firsts"),
+    );
+    let later = g.init_node(
+        skip::<Value>(1),
+        vec![live.erased()],
+        GraphNodeOpts::named("later"),
+    );
+    let third = g.init_node(
+        element_at::<Value>(2),
+        vec![src.erased()],
+        GraphNodeOpts::named("third"),
+    );
+    let both = g.init_node(
+        merge::<Value>(),
+        vec![src.erased(), one.erased()],
+        GraphNodeOpts::named("both"),
+    );
+    let keep: Vec<_> = [&firsts, &later, &third, &both]
+        .iter()
+        .map(|n| n.subscribe(|_| {}))
+        .collect();
+    live.set(json!(1));
+    let checkpoint = g.checkpoint().expect("JSON operators are captured");
+    for id in ["src", "one", "firsts", "later", "third", "both"] {
+        let node = checkpoint.nodes.iter().find(|n| n.id == id).unwrap();
+        assert!(
+            matches!(node.factory, GraphCheckpointFactory::RegistryRef { .. }),
+            "{id} carries a recipe"
+        );
+    }
+    drop(keep);
+    let r = restore_graph(
+        checkpoint,
+        RestoreGraphOptions::new(default_restore_registry()),
+    )
+    .expect("the default registry rebuilds them");
+    let rlive = r.find("live").unwrap().as_state::<Value>().unwrap();
+    let rfirsts = r.find("firsts").unwrap().as_node::<Value>();
+    let rthird = r.find("third").unwrap().as_node::<Value>();
+    let _u = (rfirsts.subscribe(|_| {}), rthird.subscribe(|_| {}));
+    rlive.set(json!(2));
+    assert_eq!(
+        rfirsts.cache(),
+        Some(json!(2)),
+        "take(3) goes on from its saved count: 0 and 1 before, 2 after"
+    );
+    assert_eq!(rfirsts.status().output, graphrefly::OutputStatus::Completed);
+    assert_eq!(rthird.cache(), Some(json!(3)));
 }

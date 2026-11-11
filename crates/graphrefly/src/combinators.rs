@@ -392,6 +392,10 @@ pub fn sample<T: Clone + 'static>() -> Operator<T> {
 
 /// take_until: forward source values until notifier DATA arrives, then COMPLETE.
 pub fn take_until<T: Clone + 'static>() -> Operator<T> {
+    take_until_op::<T>().with_recipe("takeUntil", None)
+}
+
+fn take_until_op<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "takeUntil",
         NodeOpts {
