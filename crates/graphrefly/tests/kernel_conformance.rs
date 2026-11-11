@@ -213,6 +213,13 @@ fn forward_i32(ctx: &graphrefly::Ctx) {
     }
 }
 
+/// A kernel node's function that forwards each array of its one dependency's values.
+fn forward_arrays_i32(ctx: &graphrefly::Ctx) {
+    for wave in ctx.dep(0).waves::<i32>() {
+        ctx.emit_all(wave.iter().map(|v| **v));
+    }
+}
+
 fn record_arrays<T: 'static>(node: &Node<T>) -> (Rc<RefCell<Vec<Vec<String>>>>, Unsub) {
     let log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
     let sink = log.clone();
@@ -1274,12 +1281,10 @@ fn c44_a_wave_of_terminals_holds_a_fan_in() {
     let g = graphrefly::graph();
     for (complete, invalidate) in [(Manual, Auto), (Auto, Manual)] {
         let s = g.state::<i32>(1);
-        let b = g.node::<i32, _>(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
-        });
-        let c = g.node::<i32, _>(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
-        });
+        // Forwarders of what S sends: under auto COMPLETE they also run on S's
+        // COMPLETE alone (review Q12) and send nothing for it.
+        let b = g.node::<i32, _>(vec![s.erased()], forward_arrays_i32);
+        let c = g.node::<i32, _>(vec![s.erased()], forward_arrays_i32);
         let runs = Rc::new(RefCell::new(Vec::<(
             Option<String>,
             Option<String>,
@@ -2795,8 +2800,8 @@ fn c38_capture_and_restore() {
     let (log, _u) = record_arrays(&rp);
     assert_eq!(
         counters.p_runs.get(),
-        runs,
-        "auto COMPLETE: the end alone runs nothing"
+        runs + 1,
+        "auto COMPLETE: the run that sees the last terminal calls the function (review Q12)"
     );
     assert_eq!(rp.status().output, OutputStatus::Completed);
     assert_eq!(rp.cache(), Some(json!(1)), "the saved value is kept");
@@ -3765,4 +3770,39 @@ fn failures_go_to_stderr_without_a_reporter_and_only_to_the_reporter_with_one() 
     );
     let reported = run("reported");
     assert!(!reported.contains("graphrefly: sink failed"), "{reported}");
+}
+
+/// Review Q12 (graphrefly:D806, R-terminals@1, C-17) — under auto COMPLETE the run that
+/// sees the last dependency's terminal calls the function, also when that terminal is
+/// its only input, and the node completes after it.
+#[test]
+fn auto_complete_runs_the_function_on_the_last_terminal() {
+    let g = graphrefly::graph();
+    let a = g.state(1i32);
+    let b = g.state(2i32);
+    let runs = Rc::new(RefCell::new(Vec::<(Option<String>, Option<String>)>::new()));
+    let n = {
+        let runs = runs.clone();
+        g.node::<i32, _>(vec![a.erased(), b.erased()], move |ctx| {
+            runs.borrow_mut().push((
+                terminal_name(ctx.dep(0).terminal()),
+                terminal_name(ctx.dep(1).terminal()),
+            ));
+        })
+    };
+    let (log, _u) = record_arrays(&n);
+    runs.borrow_mut().clear();
+    a.complete();
+    assert!(
+        runs.borrow().is_empty(),
+        "A's COMPLETE alone, with B open, is no input"
+    );
+    b.complete();
+    assert_eq!(
+        *runs.borrow(),
+        vec![(None, Some("COMPLETE".to_owned()))],
+        "the run that sees the last terminal, B's COMPLETE alone, calls the function once"
+    );
+    assert_eq!(n.status().output, graphrefly::OutputStatus::Completed);
+    assert!(arrays(&log).iter().flatten().any(|k| k == "COMPLETE"));
 }

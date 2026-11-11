@@ -3003,9 +3003,21 @@ impl Core {
                 })
             });
             let invalidate_input = invalidated && cfg.invalidate == Policy::Manual;
-            let runs = values || terminal_input || invalidate_input;
             let all_ended =
                 !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
+            // Under auto COMPLETE the node completes after the run that sees the last
+            // terminal, so that run happens even when the terminal is its only input
+            // (R-terminals@1, C-17; graphrefly:D806, review Q12).
+            let last_terminal = cfg.complete == Policy::Auto
+                && all_ended
+                && e.state.inputs.iter().any(|input| {
+                    input
+                        .frames
+                        .iter()
+                        .flatten()
+                        .any(|m| m.terminal().is_some())
+                });
+            let runs = values || terminal_input || invalidate_input || last_terminal;
             Some(SettlePlan::Run {
                 invalidated: invalidated && cfg.invalidate == Policy::Auto,
                 runs,
