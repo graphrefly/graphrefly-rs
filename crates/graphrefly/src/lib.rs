@@ -31,30 +31,56 @@
 //!
 //! - **D22** — a graph is a single-thread causal/concurrency domain. This crate
 //!   is therefore `!Send + !Sync`: state lives behind `Rc<RefCell<…>>`, **not**
-//!   `Arc<Mutex<…>>`. The actor model is dropped. Parallelism = pool callback or
-//!   multi-graph + wire bridge.
-//! - **F-SYNC-CORE** — the wave-protocol core is synchronous; `dispatcher.invoke`
-//!   is `fn(&Ctx)` returning `()`. Async lives only in pools (LocalAsync) and the
-//!   wire bridge.
-//! - **F-DISPATCH-ALL** — every node fn goes through the dispatcher; no inline-fn
-//!   bypass.
-//! - **D4** — 8-verb closed set (node/graph/batch/state + producer/derived/effect/
-//!   mount). Operators are `node` sugar, per-language, never in parity (D6/D24).
-//! - **D8** — the fn boundary is `ctx.up(msgs)` / `ctx.down(msgs)`; one `msgs`
-//!   array = one wave. `ctx.up` is control-tier only (R-ctx-up).
+//!   `Arc<Mutex<…>>`. Parallelism = pool callback or several graphs joined by the
+//!   wire bridge. Each graph has its own wave, request queue and batch
+//!   (R-graph-domain@3).
+//! - **F-SYNC-CORE** — the wave core is synchronous; a node function is
+//!   `Fn(&Ctx)` returning `()`. Async lives in pools (LocalAsync) and the wire bridge.
+//! - **F-DISPATCH-ALL** — every node function goes through the dispatcher.
 //!
-//! ## Clean-slate scope (what this crate builds)
+//! ## The kernel and its graph (graphrefly:D797)
 //!
-//! A self-contained Rust package (D32): protocol + node + dispatcher (LocalSync +
-//! LocalAsync pools) + ctx + batch + rewire, graph-layer Rust API, graph-owned
-//! 8-verb sugar, find/describe/observe/profile, operators, sources, storage
-//! helpers, app-infra helpers, environment adapters, and wire-bridge helpers.
-//! Operators remain per-language graph-layer sugar (D6/D24), not protocol verbs.
+//! Every node belongs to a [`Graph`]: build it with `graph.state`, `graph.node`
+//! (the ctx-level kernel node), `graph.producer`, or the value-level sugar
+//! `graph.derived` and `graph.effect`, which wait until every dependency has a
+//! value (graphrefly:D797 (9)). A function reads each dependency through
+//! [`Ctx::dep`] and sends arrays with [`Ctx::down`] (or [`Ctx::emit`], one DATA
+//! array per call). The graph layer is [`Graph::find`], [`Graph::describe`] (exactly
+//! `{ id, kind, deps, quiet }` per node), [`Graph::observe`] and [`Graph::retain`]
+//! (R-graph-surface@1); [`Graph::checkpoint`] and [`restore_graph`] save and
+//! rebuild a graph's state (R-checkpoint@1), refusing what they cannot carry with
+//! `not restorable: <id>: <reason>`.
 //!
-//! > **Status:** the Rust package-local API surface is implemented in this crate;
-//! > the language-neutral authority remains `~/src/graphrefly`. Use this rustdoc
-//! > for Rust API syntax and package-local behavior notes, and use the shared
-//! > authority repo for protocol rules and cross-runtime conformance status.
+//! ```
+//! use std::cell::RefCell;
+//! use std::rc::Rc;
+//! use graphrefly::{AnyValue, Message};
+//!
+//! let g = graphrefly::graph();
+//! let a = g.state(1i32);
+//! let doubled = g.derived::<i32, _>(vec![a.erased()], |values| {
+//!     Some(*values.value::<i32>(0)? * 2)
+//! });
+//! let seen = Rc::new(RefCell::new(Vec::new()));
+//! let sink = seen.clone();
+//! let stop = doubled.subscribe(move |msgs: &[Message<AnyValue>]| {
+//!     for msg in msgs {
+//!         if let Message::Data(v) = msg {
+//!             sink.borrow_mut().push(*v.downcast_ref::<i32>().unwrap());
+//!         }
+//!     }
+//! });
+//! g.batch(|_| {
+//!     a.set(2);
+//!     a.set(3);
+//! });
+//! assert_eq!(*seen.borrow(), vec![2, 6], "the batch is one wave");
+//! stop();
+//! ```
+//!
+//! Operators, sources, collections and the bundles (CQRS, process, work queue,
+//! message bus, agentic memory) are this package's sugar over the kernel, not
+//! protocol verbs (D6/D24).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

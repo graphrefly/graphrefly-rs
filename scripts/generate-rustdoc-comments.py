@@ -29,6 +29,23 @@ STALE_PATTERNS = [
     "port-model authority",
     "cross-track ledger",
     "graphrefly-ts-owned shared docs",
+    # Retired by graphrefly:D797 and the migration review (graphrefly-rs:D11).
+    "ctx.up(",
+    "up_next",
+    "upNext",
+    "onDeactivation",
+    "onInvalidate",
+    "resubscribable",
+    "rewire_next",
+    "replace_deps",
+    "ctx.data::<",
+    "ctx.batch::<",
+    "observe_path",
+    "ObserveMessage",
+    "DescribeValue",
+    "NodeVersion",
+    "R-dirty-before-data",
+    "first-run gate holds",
 ]
 
 

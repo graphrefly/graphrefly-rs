@@ -6,27 +6,32 @@
 //! graph handle + node id), `!Send + !Sync`.
 //!
 //! Values cross the substrate **erased** as [`AnyValue`] (`Rc<dyn Any>`) — the
-//! Rust analogue of TS's `unknown` (per-language impl, `CLEAN-SLATE.md`). A typed
-//! [`Node<T>`] facade re-types the boundary (downcast at `cache`/`data`).
+//! Rust analogue of TS's `unknown`. A typed [`Node<T>`] facade re-types the boundary
+//! (downcast at `cache` and in [`crate::ctx::DepView`]).
 //!
 //! ## Borrow discipline (the Rust-vs-TS divergence)
 //!
 //! TS has no runtime borrow check; here the wave engine must never hold a
-//! `RefCell` borrow across a call that re-enters a node — `ctx.down` re-enters
-//! the running node, and delivery re-enters downstream nodes. The rule throughout
+//! `RefCell` borrow across a call that may re-enter the arena: a function, a sink,
+//! a setup or a cleanup. The rule throughout
 //! is **clone the callable out, drop the borrow, then call** (subscribers,
 //! dispatcher fns, dep handles). Short `borrow_mut` scopes mutate; calls happen
 //! borrow-free.
 //!
-//! ## Current substrate scope
+//! ## What the kernel does (graphrefly:D797, R-wave@2, R-lifetime@2)
 //!
-//! The active substrate covers state / producer / derived nodes, two-phase
-//! DIRTY-to-DATA delivery, diamond joins, first-run gating, push-on-subscribe,
-//! lazy activation, ROM/RAM, INVALIDATE, PAUSE/RESUME locksets and pause modes,
-//! COMPLETE/ERROR/TEARDOWN terminal behavior, batch commit/rollback, LocalAsync
-//! boundaries, the request queue, ctx.rewire and replace (R-request-order@2), and
-//! panic-to-ERROR recovery at the wave boundary. Every occurrence remains DATA;
-//! no-emit functions settle with substrate-synthesized undirty RESOLVED (D49).
+//! Seven message types travel down the graph only: START, PENDING, DATA, RESOLVED,
+//! INVALIDATE, COMPLETE and ERROR; START, PENDING and RESOLVED are the kernel's own.
+//! Each `ctx.down` call is one array; a wave marks the sender's cone pending, every
+//! node settles once on everything the wave brought, and a pending node that sent
+//! nothing gets one RESOLVED. A node has an instance (dependencies, function,
+//! setup, recipe) and lifetimes: a lifetime opens at the first subscriber, runs the
+//! setup, then the function on the dependencies' snapshots (there is no first-run
+//! gate in the kernel), and closes when the last subscriber leaves or the node ends,
+//! releasing its dependencies, running its cleanup and dropping its private state.
+//! Requests made during a wave (host writes, subscribes, replaces, rewires, a
+//! batch's commit) wait and run in order after it. Activation, delivery and closing
+//! run with a constant stack depth, however long the graph (review Q15).
 
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -4162,18 +4167,16 @@ impl<T: 'static> Node<T> {
         self.core.status()
     }
 
-    /// Subscribe a sink; returns an unsubscribe handle (call it to detach; the node
-    /// deactivates when the last subscriber leaves, R-rom-ram).
+    /// Subscribes `sink`; returns the unsubscribe, which detaches it when called (the
+    /// node closes its lifetime when its last subscriber leaves, R-lifetime@2).
     ///
-    /// This is also a wave-owner boundary: the activation cascade it drives runs under
-    /// the D30 catch, so a panicking activation surfaces as `[[ERROR,e]]` instead of
-    /// escaping the subscribe call. Even on that error path the returned handle is a
-    /// REAL unsubscribe. During a wave or in a batch body the subscription is a request
-    /// that runs after the wave or the commit (R-request-order@2).
-    ///
-    /// Panics (R-terminal / D17): subscribing to a non-resubscribable **terminal** node
-    /// is rejected — the stream is permanently over. (Resubscribable opt-in reset is a
-    /// later slice.)
+    /// The sink receives every array the node delivers, the first one being START
+    /// with the node's retained values and, if it has ended, its terminal
+    /// (R-subscription). An ended node can be subscribed: it gives that snapshot and
+    /// sends nothing more. During a wave, or in a batch body, the subscription and the
+    /// unsubscribe are requests that run after the wave or the commit
+    /// (R-request-order@2), so a sink that unsubscribes itself still receives the rest
+    /// of that wave. A panicking sink goes to the graph's host reporter (R-failure@3).
     pub fn subscribe(&self, sink: impl Fn(&[Msg]) + 'static) -> Unsub {
         self.subscribe_with_kind(sink, SubscriberKind::External)
     }
@@ -4526,7 +4529,7 @@ mod tests {
         assert_eq!(s.cache(), Some(1));
 
         s.set(2);
-        // external tier-3 emit synthesizes a leading DIRTY (R-dirty-before-data).
+        // the kernel's PENDING prefix leads the host write's DATA (R-wave).
         assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "DATA"]);
         assert_eq!(s.cache(), Some(2));
         assert_eq!(s.status().cache, crate::CacheStatus::Ready);
@@ -4659,7 +4662,7 @@ mod tests {
         let p = g.producer::<i32, _>(|ctx| ctx.emit(42i32));
         let (log, sink) = recorder();
         let _u = p.subscribe(sink);
-        // activation-exempt: the first run during subscribe needs no preceding DIRTY.
+        // the first run's output is the START snapshot: no PENDING precedes it.
         assert_eq!(*log.borrow(), vec!["START", "DATA"]);
         assert_eq!(p.cache(), Some(42));
     }
@@ -4729,7 +4732,7 @@ mod tests {
         a.set(2); // B=3, C=20, D=23 — D fires EXACTLY once (R-diamond)
         assert_eq!(d_runs.get(), 1);
         assert_eq!(d.cache(), Some(23));
-        // two-phase: DIRTY (phase 1, from the cascade) precedes DATA (phase 2). No glitch.
+        // the PENDING mark precedes the DATA: D settles once on both of its inputs.
         assert_eq!(*log.borrow(), vec!["START", "PENDING", "DATA"]);
 
         a.set(5); // B=6, C=50, D=56 — once more
@@ -5309,7 +5312,7 @@ mod tests {
     #[test]
     fn touched_arena_pin_dedupes_same_node_within_wave() {
         // DR-8/B54 owner-execution: repeated callbacks to one node in a single wave
-        // need one arena lifetime pin + one unwind-reset entry. DIRTY, DATA, and
+        // need one arena lifetime pin + one unwind-reset entry. PENDING, DATA, and
         // run_wave may all touch the same node; duplicate pins only add hot-path tax.
         let arena = GraphArena::new();
         let graph = arena.0.clone();
