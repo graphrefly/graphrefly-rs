@@ -1192,7 +1192,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let runtime = graph.node_opts::<RuntimeEvent<T>, _>(
             vec![commands.erased()],
             move |ctx| {
-                for command in ctx.batch::<MessageBusCommand<T>>(0) {
+                for command in ctx.dep(0).values::<MessageBusCommand<T>>() {
                     let events = {
                         let mut state = runtime_state.borrow_mut();
                         reduce_message_bus_command(&mut state, (*command).clone())
@@ -1210,7 +1210,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let messages = graph.node_opts::<MessageEnvelope<T>, _>(
             vec![runtime.erased()],
             move |ctx| {
-                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Message(message) = event.as_ref() {
                         ctx.emit(message.clone());
                     }
@@ -1221,7 +1221,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let status = graph.node_opts::<MessageBusStatus, _>(
             vec![runtime.erased()],
             move |ctx| {
-                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Status(status) = event.as_ref() {
                         ctx.emit(status.clone());
                     }
@@ -1232,7 +1232,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let issues = graph.node_opts::<DataIssue, _>(
             vec![runtime.erased()],
             move |ctx| {
-                for event in ctx.batch::<RuntimeEvent<T>>(0) {
+                for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Issue(issue) = event.as_ref() {
                         ctx.emit(issue.clone());
                     }
@@ -1455,7 +1455,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let cursor = self.graph.node_opts::<MessageBusCursor, _>(
             vec![self.status.erased()],
             move |ctx| {
-                for status in ctx.batch::<MessageBusStatus>(0) {
+                for status in ctx.dep(0).values::<MessageBusStatus>() {
                     let subscription_moved = status.topic.as_deref()
                         == Some(cursor_sub.topic.as_str())
                         && status.subscription_id.as_deref()
@@ -1587,7 +1587,7 @@ pub fn to_topic<T: Clone + 'static>(
     let commands = graph.node_opts::<MessageBusCommand<T>, _>(
         vec![source.erased()],
         move |ctx| {
-            for value in ctx.batch::<T>(0) {
+            for value in ctx.dep(0).values::<T>() {
                 ctx.emit(MessageBusCommand::Publish {
                     topic: topic_for_fn.clone(),
                     payload: (*value).clone(),

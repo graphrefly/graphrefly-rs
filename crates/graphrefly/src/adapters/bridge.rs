@@ -1241,13 +1241,14 @@ where
             {
                 let mut state = state.borrow_mut();
                 let preview_requests = ctx
-                    .batch::<WireBridgeCommand<RemoteCallRequest<TRequest>>>(0)
+                    .dep(0)
+                    .values::<WireBridgeCommand<RemoteCallRequest<TRequest>>>()
                     .into_iter()
                     .filter_map(|command| pending_request_from_command(command.as_ref()))
                     .collect::<Vec<_>>();
-                let has_invalid_bridge_event = ctx.batch::<
+                let has_invalid_bridge_event = ctx.dep(1).values::<
                     WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >(1)
+                >()
                 .into_iter()
                 .any(|event| {
                     matches!(
@@ -1263,18 +1264,18 @@ where
                         let _ = state.pending.insert(request);
                     }
                 }
-                for event in ctx.batch::<
+                for event in ctx.dep(1).values::<
                     WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >(1) {
+                >() {
                     if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                         if let Some(request) = pending_request_from_envelope(envelope) {
                             let _ = state.pending.insert(request);
                         }
                     }
                 }
-                for event in ctx.batch::<
+                for event in ctx.dep(1).values::<
                     WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >(1) {
+                >() {
                     match event.as_ref() {
                         WireBridgeEvent::Invalid { .. } => {
                             state.pending.remove_all_unbound();
@@ -1310,7 +1311,7 @@ where
                         _ => {}
                     }
                 }
-                for timeout in ctx.batch::<RemoteCallTimeout>(2) {
+                for timeout in ctx.dep(2).values::<RemoteCallTimeout>() {
                     state.pending.remove_by_request_id(&timeout.request_id);
                 }
             }
@@ -1575,7 +1576,7 @@ where
     graph.node_opts::<RemoteCallResult<TResponse>, _>(
         vec![responses.erased()],
         |ctx| {
-            for response in ctx.batch::<RemoteCallResponse<TResponse>>(0) {
+            for response in ctx.dep(0).values::<RemoteCallResponse<TResponse>>() {
                 if let RemoteCallResponse::Result {
                     operation,
                     request_id,
@@ -1621,7 +1622,10 @@ where
                 .map_or_else(RemoteCallStatusReducer::default, |reducer| {
                     (*reducer).clone()
                 });
-            for command in ctx.batch::<WireBridgeCommand<RemoteCallRequest<TRequest>>>(0) {
+            for command in ctx
+                .dep(0)
+                .values::<WireBridgeCommand<RemoteCallRequest<TRequest>>>()
+            {
                 if let Some(request) = pending_request_from_command(command.as_ref()) {
                     reducer.status.state = RemoteCallStatusState::Requested;
                     reducer.status.operation = Some(request.operation.clone());
@@ -1634,9 +1638,9 @@ where
                     }
                 }
             }
-            for event in ctx.batch::<
+            for event in ctx.dep(1).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(1) {
+            >() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     if let Some(request) = pending_request_from_envelope(envelope) {
                         reducer.status.state = RemoteCallStatusState::Requested;
@@ -1655,9 +1659,9 @@ where
                     }
                 }
             }
-            for event in ctx.batch::<
+            for event in ctx.dep(1).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(1) {
+            >() {
                 match event.as_ref() {
                     WireBridgeEvent::Invalid { .. } => {
                         reducer.pending.remove_all_unbound();
@@ -1742,7 +1746,7 @@ where
                     _ => {}
                 }
             }
-            for response in ctx.batch::<RemoteCallResponse<TResponse>>(2) {
+            for response in ctx.dep(2).values::<RemoteCallResponse<TResponse>>() {
                 match response.as_ref() {
                     RemoteCallResponse::Result { .. } => {}
                     RemoteCallResponse::Error {
@@ -1773,7 +1777,7 @@ where
                     }
                 }
             }
-            for result in ctx.batch::<RemoteCallResult<TResponse>>(3) {
+            for result in ctx.dep(3).values::<RemoteCallResult<TResponse>>() {
                 let removed = reducer.pending.remove_by_request_id(&result.request_id);
                 if removed.as_ref().is_none_or(|request| request.seq.is_none()) {
                     reducer
@@ -1785,7 +1789,7 @@ where
                 reducer.status.request_id = Some(result.request_id.clone());
                 reducer.status.completed = reducer.status.completed.saturating_add(1);
             }
-            for timeout in ctx.batch::<RemoteCallTimeout>(4) {
+            for timeout in ctx.dep(4).values::<RemoteCallTimeout>() {
                 reducer.status.state = RemoteCallStatusState::TimedOut;
                 reducer.status.operation = timeout.operation.clone();
                 reducer.status.request_id = Some(timeout.request_id.clone());
@@ -1849,9 +1853,9 @@ where
                 .map_or_else(RemoteCallPendingState::default, |pending| {
                     (*pending).clone()
                 });
-            for event in ctx.batch::<
+            for event in ctx.dep(2).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(2) {
+            >() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     if let Some(request) = pending_request_from_envelope(envelope) {
                         if !pending.insert(request.clone()) {
@@ -1868,7 +1872,7 @@ where
                 }
             }
             let mut accepted_response_counts = HashMap::new();
-            for response in ctx.batch::<RemoteCallResponse<TResponse>>(0) {
+            for response in ctx.dep(0).values::<RemoteCallResponse<TResponse>>() {
                 *accepted_response_counts
                     .entry(remote_call_response_key(response.as_ref()))
                     .or_insert(0usize) += 1;
@@ -1891,7 +1895,7 @@ where
                     RemoteCallResponse::Status { .. } => {}
                 }
             }
-            for timeout in ctx.batch::<RemoteCallTimeout>(1) {
+            for timeout in ctx.dep(1).values::<RemoteCallTimeout>() {
                 pending.remove_by_request_id(&timeout.request_id);
                 ctx.emit(RemoteCallError {
                     operation: timeout.operation.clone(),
@@ -1899,9 +1903,9 @@ where
                     error: timeout.error.clone(),
                 });
             }
-            for event in ctx.batch::<
+            for event in ctx.dep(2).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >(2) {
+            >() {
                 match event.as_ref() {
                     WireBridgeEvent::Nack {
                         outbound, error, ..
@@ -2134,7 +2138,10 @@ where
     graph.node_opts::<WireBridgeCommand<RemoteCallResponse<TResponse>>, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<RemoteResponderEvent<TRequest, TResponse>>(0) {
+            for event in ctx
+                .dep(0)
+                .values::<RemoteResponderEvent<TRequest, TResponse>>()
+            {
                 match event.as_ref() {
                     RemoteResponderEvent::Response { command, .. } => ctx.emit(command.clone()),
                     RemoteResponderEvent::Rejected {
@@ -2161,7 +2168,10 @@ where
     graph.node_opts::<RemoteCallRequest<TRequest>, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<RemoteResponderEvent<TRequest, TResponse>>(0) {
+            for event in ctx
+                .dep(0)
+                .values::<RemoteResponderEvent<TRequest, TResponse>>()
+            {
                 if let RemoteResponderEvent::Request { request, .. } = event.as_ref() {
                     ctx.emit(request.clone());
                 }
@@ -2186,7 +2196,10 @@ where
             let mut status = ctx
                 .state_get::<RemoteResponderStatus>()
                 .map_or_else(initial_remote_responder_status, |status| (*status).clone());
-            for event in ctx.batch::<RemoteResponderEvent<TRequest, TResponse>>(0) {
+            for event in ctx
+                .dep(0)
+                .values::<RemoteResponderEvent<TRequest, TResponse>>()
+            {
                 match event.as_ref() {
                     RemoteResponderEvent::Response {
                         request_id,
@@ -2253,7 +2266,10 @@ where
     graph.node_opts::<RemoteCallError, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<RemoteResponderEvent<TRequest, TResponse>>(0) {
+            for event in ctx
+                .dep(0)
+                .values::<RemoteResponderEvent<TRequest, TResponse>>()
+            {
                 match event.as_ref() {
                     RemoteResponderEvent::Response {
                         request_id,
@@ -2399,7 +2415,7 @@ where
                     }),
                 }
             }
-            if let Some(terminal) = ctx.terminal(1) {
+            if let Some(terminal) = ctx.dep(1).terminal() {
                 let error = match terminal {
                     DepTerminal::Complete => format!(
                         "{session_id}: inbound protocol COMPLETE is local misuse; remote completion must arrive as a DATA envelope fact"
@@ -2432,10 +2448,14 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
 }
 
 fn raw_data(ctx: &Ctx, dep: usize) -> Vec<AnyValue> {
-    ctx.wave_data()
-        .get(dep)
-        .map(|waves| waves.iter().flat_map(|wave| wave.iter().cloned()).collect())
-        .unwrap_or_default()
+    if dep >= ctx.dep_len() {
+        return Vec::new();
+    }
+    ctx.dep(dep)
+        .raw_waves()
+        .iter()
+        .flat_map(|wave| wave.iter().cloned())
+        .collect()
 }
 
 fn process_command<TOutbound, TInbound>(
@@ -3008,7 +3028,7 @@ where
     graph.node_opts::<WireBridgeEnvelope<TOutbound>, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     ctx.emit(envelope.clone());
                 }
@@ -3030,7 +3050,7 @@ where
     graph.node_opts::<WireBridgeAck<TInbound>, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Ack {
                     ack_for_seq,
                     envelope,
@@ -3060,7 +3080,7 @@ where
     graph.node_opts::<WireBridgeNack<TInbound>, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Nack {
                     ack_for_seq,
                     envelope,
@@ -3096,7 +3116,7 @@ where
             let mut next = ctx
                 .state_get::<WireBridgeStatus>()
                 .map_or_else(|| initial_status(&session_id), |status| (*status).clone());
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 next = reduce_status(next, event.as_ref());
             }
             ctx.state_set(next.clone());
@@ -3227,7 +3247,7 @@ where
     graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 match event.as_ref() {
                     WireBridgeEvent::Nack { error, .. }
                     | WireBridgeEvent::Exhausted { error, .. }
@@ -3278,7 +3298,7 @@ where
     graph.node_opts::<u64, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Cursor { cursor } = event.as_ref() {
                     ctx.emit(*cursor);
                 }
@@ -3300,7 +3320,7 @@ where
     graph.node_opts::<WireBridgeAttempt, _>(
         vec![events.erased()],
         |ctx| {
-            for event in ctx.batch::<WireBridgeEvent<TOutbound, TInbound>>(0) {
+            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     if should_track_ack(envelope.envelope_type) {
                         ctx.emit(WireBridgeAttempt {
@@ -3702,7 +3722,7 @@ mod tests {
         let observed = g.node_opts::<usize, _>(
             vec![bridge.inbound.erased()],
             move |ctx| {
-                let len = ctx.batch::<WireBridgeIngress<String>>(0).len();
+                let len = ctx.dep(0).values::<WireBridgeIngress<String>>().len();
                 batch_sizes_sink.borrow_mut().push(len);
                 ctx.emit(len);
             },

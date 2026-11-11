@@ -92,9 +92,9 @@ fn c26_message_set_is_closed() {
     let control = Node::<bool>::state(false);
     let source = Node::<i32>::state(1);
     let target = Node::<i32>::derived(vec![source.erased(), control.erased()], |ctx| {
-        let held = ctx.data::<bool>(1).is_some_and(|held| *held);
+        let held = ctx.dep(1).value::<bool>().is_some_and(|held| *held);
         if !held {
-            if let Some(v) = ctx.data::<i32>(0) {
+            if let Some(v) = ctx.dep(0).value::<i32>() {
                 ctx.emit(*v);
             }
         }
@@ -135,7 +135,7 @@ fn c42_rejected_output_is_applied_nowhere_and_uncaught_is_error() {
             assert!(rejected, "ctx.down must reject kernel-only output");
             rejections_in_fn.set(rejections_in_fn.get() + 1);
         }
-        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        let v = ctx.dep(0).value::<i32>().map_or(0, |v| *v);
         ctx.emit(v * 10);
     });
     let (log, _u) = record(&n);
@@ -180,7 +180,7 @@ fn c12c_function_sending_resolved_ends_with_error() {
     let n = Node::<i32>::derived(vec![input.erased()], move |ctx| {
         if flag.get() {
             ctx.down(vec![Message::Resolved]);
-        } else if let Some(v) = ctx.data::<i32>(0) {
+        } else if let Some(v) = ctx.dep(0).value::<i32>() {
             ctx.emit(*v);
         }
     });
@@ -316,7 +316,7 @@ fn c16_quiet_node_absorbs_waves_and_publishes_later() {
                 .state_get::<Vec<i32>>()
                 .map(|v| (*v).clone())
                 .unwrap_or_default();
-            held.extend(ctx.batch::<i32>(0).iter().map(|v| **v));
+            held.extend(ctx.dep(0).values::<i32>().iter().map(|v| **v));
             ctx.state_set(held);
             *slot.borrow_mut() = Some(ctx.defer());
         },
@@ -402,18 +402,20 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
                 ..graphrefly::NodeOpts::default()
             },
             move |ctx| {
-                ids_ok.set(ids_ok.get() && ctx.dep_is(0, &a_core) && ctx.dep_is(1, &b_core));
+                ids_ok.set(ids_ok.get() && ctx.dep(0).is(&a_core) && ctx.dep(1).is(&b_core));
                 seen.borrow_mut().push((
-                    ctx.batches::<i32>(0)
+                    ctx.dep(0)
+                        .waves::<i32>()
                         .iter()
                         .map(|w| w.iter().map(|v| **v).collect())
                         .collect(),
-                    ctx.batches::<i32>(1)
+                    ctx.dep(1)
+                        .waves::<i32>()
                         .iter()
                         .map(|w| w.iter().map(|v| **v).collect())
                         .collect(),
-                    terminal_name(ctx.terminal(0)),
-                    terminal_name(ctx.terminal(1)),
+                    terminal_name(ctx.dep(0).terminal()),
+                    terminal_name(ctx.dep(1).terminal()),
                 ));
             },
         )
@@ -462,7 +464,8 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
             },
             move |ctx| {
                 empties.borrow_mut().push(
-                    ctx.batches::<i32>(0)
+                    ctx.dep(0)
+                        .waves::<i32>()
                         .iter()
                         .map(|w| w.iter().map(|v| **v).collect())
                         .collect(),
@@ -492,8 +495,8 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
             move |ctx| {
                 let (o, l) = payloads.get();
                 payloads.set((
-                    o + ctx.batch::<Option<i32>>(0).len(),
-                    l + ctx.batch::<Vec<i32>>(1).len(),
+                    o + ctx.dep(0).values::<Option<i32>>().len(),
+                    l + ctx.dep(1).values::<Vec<i32>>().len(),
                 ));
             },
         )
@@ -509,14 +512,16 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
 #[test]
 fn c41_snapshot_is_the_last_array_that_carried_data() {
     let a = Node::<i32>::state(0);
-    let n = Node::<i32>::derived(vec![a.erased()], |ctx| match *ctx.data::<i32>(0).unwrap() {
-        1 => ctx.down(vec![Message::Data(Rc::new(1i32) as AnyValue)]),
-        2 => ctx.down(vec![
-            Message::Data(Rc::new(2i32) as AnyValue),
-            Message::Data(Rc::new(3i32) as AnyValue),
-        ]),
-        4 => ctx.down(vec![Message::Invalidate]),
-        _ => {} // sends nothing: the kernel's RESOLVED
+    let n = Node::<i32>::derived(vec![a.erased()], |ctx| {
+        match *ctx.dep(0).value::<i32>().unwrap() {
+            1 => ctx.down(vec![Message::Data(Rc::new(1i32) as AnyValue)]),
+            2 => ctx.down(vec![
+                Message::Data(Rc::new(2i32) as AnyValue),
+                Message::Data(Rc::new(3i32) as AnyValue),
+            ]),
+            4 => ctx.down(vec![Message::Invalidate]),
+            _ => {} // sends nothing: the kernel's RESOLVED
+        }
     });
     let (_first, u1) = record_arrays(&n);
     a.set(1);
@@ -531,7 +536,8 @@ fn c41_snapshot_is_the_last_array_that_carried_data() {
         let first_waves = first_waves.clone();
         Node::<i32>::derived(vec![n.erased()], move |ctx| {
             first_waves.borrow_mut().push(
-                ctx.batches::<i32>(0)
+                ctx.dep(0)
+                    .waves::<i32>()
                     .iter()
                     .map(|w| w.iter().map(|v| **v).collect())
                     .collect(),
@@ -583,7 +589,7 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
             ..graphrefly::NodeOpts::default()
         },
         |ctx| {
-            if ctx.batch::<i32>(0).iter().any(|v| **v == 1) {
+            if ctx.dep(0).values::<i32>().iter().any(|v| **v == 1) {
                 ctx.down(vec![
                     Message::Data(Rc::new(23i32) as AnyValue),
                     Message::Data(Rc::new(23i32) as AnyValue),
@@ -593,17 +599,19 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
         },
     );
     let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
     });
     let c = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
     });
     let d_runs = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
     let d = {
         let runs = d_runs.clone();
         Node::<i32>::derived(vec![b.erased(), c.erased()], move |ctx| {
-            runs.borrow_mut()
-                .push((*ctx.data::<i32>(0).unwrap(), *ctx.data::<i32>(1).unwrap()));
+            runs.borrow_mut().push((
+                *ctx.dep(0).value::<i32>().unwrap(),
+                *ctx.dep(1).value::<i32>().unwrap(),
+            ));
         })
     };
     let (s1, _u1) = record_arrays(&a);
@@ -624,7 +632,7 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
 
     // Separate calls stay separate arrays, each with its own prefix.
     let separate = Node::<i32>::derived(vec![trigger.erased()], |ctx| {
-        if *ctx.data::<i32>(0).unwrap() == 2 {
+        if *ctx.dep(0).value::<i32>().unwrap() == 2 {
             for v in [23i32, 23, 30] {
                 ctx.down(vec![Message::Data(Rc::new(v) as AnyValue)]);
             }
@@ -653,7 +661,7 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
     // [DATA 1, INVALIDATE, DATA 2, DATA 3] goes out as [PENDING, INVALIDATE] then
     // [PENDING, DATA 2, DATA 3].
     let split = Node::<i32>::derived(vec![trigger.erased()], |ctx| {
-        if *ctx.data::<i32>(0).unwrap() == 3 {
+        if *ctx.dep(0).value::<i32>().unwrap() == 3 {
             ctx.down(vec![
                 Message::Data(Rc::new(1i32) as AnyValue),
                 Message::Invalidate,
@@ -695,7 +703,7 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
 fn c44_kernel_adds_only_the_settling_resolved_and_quiet_nodes_hold_no_wave() {
     let a = Node::<i32>::state(0);
     let f = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        let v = *ctx.data::<i32>(0).unwrap();
+        let v = *ctx.dep(0).value::<i32>().unwrap();
         if v % 2 == 0 {
             ctx.emit(v);
         }
@@ -711,7 +719,7 @@ fn c44_kernel_adds_only_the_settling_resolved_and_quiet_nodes_hold_no_wave() {
             },
             move |ctx| {
                 *slot.borrow_mut() = Some(ctx.defer());
-                if ctx.batch::<i32>(0).iter().any(|v| **v == 2) {
+                if ctx.dep(0).values::<i32>().iter().any(|v| **v == 2) {
                     ctx.emit(200);
                 }
             },
@@ -728,8 +736,8 @@ fn c44_kernel_adds_only_the_settling_resolved_and_quiet_nodes_hold_no_wave() {
             },
             move |ctx| {
                 let pair = (
-                    ctx.data::<i32>(0).map_or(-1, |v| *v),
-                    ctx.data::<i32>(1).map(|v| *v),
+                    ctx.dep(0).value::<i32>().map_or(-1, |v| *v),
+                    ctx.dep(1).value::<i32>().map(|v| *v),
                 );
                 runs.borrow_mut().push(pair);
                 // D retains a value, so an INVALIDATE is effective at D (R-invalidation).
@@ -845,10 +853,10 @@ fn c3_invalidate_through_a_diamond() {
     for policy in [Auto, Manual] {
         let s = Node::<i32>::state(1);
         let b = Node::<i32>::derived(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let c = Node::<i32>::derived(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 10)
         });
         let runs = Rc::new(RefCell::new(Vec::<(i32, bool, bool)>::new()));
         let d = {
@@ -859,14 +867,16 @@ fn c3_invalidate_through_a_diamond() {
                 move |ctx| {
                     let count = ctx.state_get::<i32>().map_or(0, |n| *n) + 1;
                     ctx.state_set(count);
-                    let inv = (ctx.invalidated(0), ctx.invalidated(1));
+                    let inv = (ctx.dep(0).invalidated(), ctx.dep(1).invalidated());
                     runs.borrow_mut().push((count, inv.0, inv.1));
                     if inv.0 || inv.1 {
                         // Manual policy: the function decides; here it clears its value.
                         ctx.down(vec![Message::Invalidate]);
                         return;
                     }
-                    if let (Some(x), Some(y)) = (ctx.data::<i32>(0), ctx.data::<i32>(1)) {
+                    if let (Some(x), Some(y)) =
+                        (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>())
+                    {
                         ctx.emit(*x + *y);
                     }
                 },
@@ -930,12 +940,12 @@ fn c15_dependency_terminal_settles_its_pending_mark() {
         let a = Node::<i32>::state(1);
         let a2 = Node::<i32>::state(10);
         let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
-            if let Some(v) = ctx.batch::<i32>(0).last() {
+            if let Some(v) = ctx.dep(0).values::<i32>().last() {
                 ctx.emit(**v);
             }
         });
         let c = Node::<i32>::derived(vec![a2.erased()], |ctx| {
-            if let Some(v) = ctx.batch::<i32>(0).last() {
+            if let Some(v) = ctx.dep(0).values::<i32>().last() {
                 ctx.emit(**v);
             }
         });
@@ -947,8 +957,8 @@ fn c15_dependency_terminal_settles_its_pending_mark() {
                 opts(Manual, Manual, Auto),
                 move |ctx| {
                     runs.borrow_mut().push((
-                        terminal_name(ctx.terminal(0)),
-                        ctx.batch::<i32>(1).iter().map(|v| **v).collect(),
+                        terminal_name(ctx.dep(0).terminal()),
+                        ctx.dep(1).values::<i32>().iter().map(|v| **v).collect(),
                     ));
                 },
             )
@@ -1019,8 +1029,8 @@ fn c17_ended_dependency_counts_toward_auto_complete() {
                 opts(Auto, Manual, Auto),
                 move |ctx| {
                     runs.borrow_mut().push((
-                        terminal_name(ctx.terminal(0)),
-                        terminal_name(ctx.terminal(1)),
+                        terminal_name(ctx.dep(0).terminal()),
+                        terminal_name(ctx.dep(1).terminal()),
                     ));
                 },
             )
@@ -1102,11 +1112,12 @@ fn c36_input_arrays_and_terminal_admission() {
         let seen = seen.clone();
         Node::<i32>::derived_opts(vec![a.erased()], opts(Manual, Auto, Auto), move |ctx| {
             seen.borrow_mut().push((
-                ctx.batches::<i32>(0)
+                ctx.dep(0)
+                    .waves::<i32>()
                     .iter()
                     .map(|w| w.iter().map(|v| **v).collect())
                     .collect(),
-                terminal_name(ctx.terminal(0)),
+                terminal_name(ctx.dep(0).terminal()),
             ));
         })
     };
@@ -1127,7 +1138,7 @@ fn c36_input_arrays_and_terminal_admission() {
     // balancing RESOLVED.
     let (a, slot) = driven();
     let d = Node::<i32>::derived_opts(vec![a.erased()], opts(Auto, Auto, Auto), |ctx| {
-        if let Some(v) = ctx.batch::<i32>(0).last() {
+        if let Some(v) = ctx.dep(0).values::<i32>().last() {
             ctx.emit(**v);
         }
     });
@@ -1152,7 +1163,7 @@ fn c36_input_arrays_and_terminal_admission() {
         let runs = runs.clone();
         Node::<i32>::derived_opts(vec![a.erased()], opts(Auto, Auto, Auto), move |ctx| {
             runs.set(runs.get() + 1);
-            if let Some(v) = ctx.batch::<i32>(0).last() {
+            if let Some(v) = ctx.dep(0).values::<i32>().last() {
                 ctx.emit(**v);
             }
         })
@@ -1188,7 +1199,9 @@ fn c40_ended_node_can_be_subscribed_and_depended_on() {
     let d = {
         let d_runs = d_runs.clone();
         Node::<i32>::derived_opts(vec![s.erased()], opts(Auto, Auto, Auto), move |ctx| {
-            d_runs.borrow_mut().push(*ctx.data::<i32>(0).unwrap());
+            d_runs
+                .borrow_mut()
+                .push(*ctx.dep(0).value::<i32>().unwrap());
         })
     };
     let _ud = d.subscribe(|_| {});
@@ -1214,7 +1227,9 @@ fn c40_ended_node_can_be_subscribed_and_depended_on() {
     let m = {
         let m_seen = m_seen.clone();
         Node::<i32>::derived_opts(vec![t.erased()], opts(Manual, Manual, Auto), move |ctx| {
-            m_seen.borrow_mut().push(terminal_name(ctx.terminal(0)));
+            m_seen
+                .borrow_mut()
+                .push(terminal_name(ctx.dep(0).terminal()));
         })
     };
     let _um = m.subscribe(|_| {});
@@ -1237,10 +1252,10 @@ fn c44_a_wave_of_terminals_holds_a_fan_in() {
     for (complete, invalidate) in [(Manual, Auto), (Auto, Manual)] {
         let s = Node::<i32>::state(1);
         let b = Node::<i32>::derived(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let c = Node::<i32>::derived(vec![s.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let runs = Rc::new(RefCell::new(Vec::<(
             Option<String>,
@@ -1255,10 +1270,10 @@ fn c44_a_wave_of_terminals_holds_a_fan_in() {
                 opts(complete, Auto, invalidate),
                 move |ctx| {
                     runs.borrow_mut().push((
-                        terminal_name(ctx.terminal(0)),
-                        terminal_name(ctx.terminal(1)),
-                        ctx.invalidated(0),
-                        ctx.invalidated(1),
+                        terminal_name(ctx.dep(0).terminal()),
+                        terminal_name(ctx.dep(1).terminal()),
+                        ctx.dep(0).invalidated(),
+                        ctx.dep(1).invalidated(),
                     ));
                 },
             )
@@ -1341,7 +1356,7 @@ fn c34_terminal_fanout_closes_the_lifetime() {
             }),
             move |ctx| {
                 s_runs.set(s_runs.get() + 1);
-                if *ctx.data::<i32>(0).unwrap() == 1 {
+                if *ctx.dep(0).value::<i32>().unwrap() == 1 {
                     ctx.down(vec![data(1), Message::Complete]);
                 }
             },
@@ -1445,7 +1460,9 @@ fn auto_error_applies_an_earlier_invalidate_first() {
                 opts(Auto, Auto, invalidate),
                 move |ctx| {
                     runs.set(runs.get() + 1);
-                    if let (Some(x), Some(y)) = (ctx.data::<i32>(0), ctx.data::<i32>(1)) {
+                    if let (Some(x), Some(y)) =
+                        (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>())
+                    {
                         ctx.emit(*x + *y);
                     }
                 },
@@ -1490,7 +1507,7 @@ use graphrefly::{CacheStatus, Lifecycle, OutputStatus};
 fn c4_async_result_is_a_later_wave_and_dropped_after_close() {
     let a = Node::<i32>::state(1);
     let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 10)
     });
     // C answers its first run at once, and later runs through async work.
     type Work = Rc<RefCell<Vec<(graphrefly::DeferredCtx, i32)>>>;
@@ -1498,7 +1515,7 @@ fn c4_async_result_is_a_later_wave_and_dropped_after_close() {
     let c = {
         let work = work.clone();
         Node::<i32>::derived(vec![a.erased()], move |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
+            let v = *ctx.dep(0).value::<i32>().unwrap();
             if ctx.state_get::<bool>().is_none() {
                 ctx.state_set(true);
                 ctx.emit(v * 100);
@@ -1511,7 +1528,10 @@ fn c4_async_result_is_a_later_wave_and_dropped_after_close() {
     let d = {
         let d_runs = d_runs.clone();
         Node::<i32>::derived(vec![b.erased(), c.erased()], move |ctx| {
-            let pair = (*ctx.data::<i32>(0).unwrap(), *ctx.data::<i32>(1).unwrap());
+            let pair = (
+                *ctx.dep(0).value::<i32>().unwrap(),
+                *ctx.dep(1).value::<i32>().unwrap(),
+            );
             d_runs.borrow_mut().push(pair);
         })
     };
@@ -1577,7 +1597,7 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
                 graphrefly::cleanup(move |_| events.borrow_mut().push("P cleanup".into()))
             }),
             |ctx| {
-                if let Some(v) = ctx.data::<i32>(0) {
+                if let Some(v) = ctx.dep(0).value::<i32>() {
                     ctx.emit(*v)
                 }
             },
@@ -1619,7 +1639,7 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
             move |ctx| {
                 n_runs.set(n_runs.get() + 1);
                 *late.borrow_mut() = Some(ctx.defer());
-                if let Some(v) = ctx.data::<i32>(0) {
+                if let Some(v) = ctx.dep(0).value::<i32>() {
                     ctx.state_set((*v, Dropped(state_dropped.clone())));
                     ctx.emit(*v);
                 }
@@ -1731,7 +1751,7 @@ fn named(name: &str) -> graphrefly::GraphNodeOpts {
 fn c6_write_to_own_upstream_is_a_later_request() {
     let s = Node::<i32>::state_empty();
     let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap() + 1)
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1)
     });
     let running = Rc::new(Cell::new(false));
     let reentered = Rc::new(Cell::new(false));
@@ -1741,7 +1761,7 @@ fn c6_write_to_own_upstream_is_a_later_request() {
         Node::<()>::derived(vec![d.erased()], move |ctx| {
             reentered.set(reentered.get() || running.get());
             running.set(true);
-            let v = *ctx.data::<i32>(0).unwrap();
+            let v = *ctx.dep(0).value::<i32>().unwrap();
             if v < 3 {
                 s.set(v);
             }
@@ -1753,7 +1773,8 @@ fn c6_write_to_own_upstream_is_a_later_request() {
         let scan_runs = scan_runs.clone();
         Node::<i32>::derived(vec![s.erased()], move |ctx| {
             scan_runs.set(scan_runs.get() + 1);
-            let total = ctx.state_get::<i32>().map_or(0, |t| *t) + *ctx.data::<i32>(0).unwrap();
+            let total =
+                ctx.state_get::<i32>().map_or(0, |t| *t) + *ctx.dep(0).value::<i32>().unwrap();
             ctx.state_set(total);
             ctx.emit(total);
         })
@@ -1822,7 +1843,7 @@ fn c11_a_node_rewires_itself_for_its_lifetime() {
                 op_runs.set(op_runs.get() + 1);
                 let runs = ctx.state_get::<usize>().map_or(0, |n| *n) + 1;
                 ctx.state_set(runs);
-                let inner = match ctx.data::<i32>(0).map(|v| *v) {
+                let inner = match ctx.dep(0).value::<i32>().map(|v| *v) {
                     Some(1) => Some(a.clone()),
                     Some(2) => Some(b.clone()),
                     _ => None,
@@ -1831,7 +1852,7 @@ fn c11_a_node_rewires_itself_for_its_lifetime() {
                     ctx.rewire(vec![s_core.clone(), inner]);
                 }
                 if ctx.dep_len() > 1 {
-                    for x in ctx.batch::<i32>(1) {
+                    for x in ctx.dep(1).values::<i32>() {
                         ctx.emit(*x);
                     }
                 }
@@ -1914,8 +1935,8 @@ fn c35_rewire_keeps_the_instance_and_runs_between_waves() {
                 // Reads its dependencies by id.
                 let mut out = None;
                 for i in 0..ctx.dep_len() {
-                    if ctx.dep_is(i, &ids.0) || ctx.dep_is(i, &ids.1) || ctx.dep_is(i, &ids.2) {
-                        if let Some(v) = ctx.batch::<i32>(i).last() {
+                    if ctx.dep(i).is(&ids.0) || ctx.dep(i).is(&ids.1) || ctx.dep(i).is(&ids.2) {
+                        if let Some(v) = ctx.dep(i).values::<i32>().last() {
                             out = Some(**v);
                         }
                     }
@@ -2127,7 +2148,7 @@ fn c40_replace_gives_an_ended_node_a_new_instance() {
     let s = Node::<i32>::state(1);
     s.complete();
     let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
     });
     let (log, _u) = record_arrays(&d);
     assert_eq!(d.status().output, OutputStatus::Completed);
@@ -2135,7 +2156,7 @@ fn c40_replace_gives_an_ended_node_a_new_instance() {
     log.borrow_mut().clear();
     d.replace(
         vec![s2.erased()],
-        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() * 2),
+        |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 2),
         graphrefly::ReplaceOpts::default(),
     );
     assert_eq!(arrays(&log), vec![shape(&["START", "DATA"])]);
@@ -2161,7 +2182,7 @@ fn c33_requests_wait_and_closed_lifetime_staging_is_dropped() {
         let unsub = unsub.clone();
         let flag = still_subscribed_in_run.clone();
         Node::<i32>::derived(vec![a.erased()], move |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
+            let v = *ctx.dep(0).value::<i32>().unwrap();
             if v == 2 {
                 if let Some(u) = unsub.borrow_mut().take() {
                     u();
@@ -2231,7 +2252,7 @@ fn c29_batch_delivers_nothing_before_commit() {
             vec![a.erased()],
             move |ctx| {
                 *kept.borrow_mut() = Some(ctx.defer());
-                if let Some(v) = ctx.batch::<i32>(0).last() {
+                if let Some(v) = ctx.dep(0).values::<i32>().last() {
                     ctx.emit(**v);
                 }
             },
@@ -2501,16 +2522,16 @@ mod c38 {
         move |ctx| {
             counters.p_runs.set(counters.p_runs.get() + 1);
             for i in 0..ctx.dep_len() {
-                counters
-                    .p_inputs
-                    .borrow_mut()
-                    .push((ctx.batch::<Json>(i).len(), ctx.terminal(i).is_some()));
+                counters.p_inputs.borrow_mut().push((
+                    ctx.dep(i).values::<Json>().len(),
+                    ctx.dep(i).terminal().is_some(),
+                ));
             }
             let mut total = ctx
                 .state_get::<Json>()
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let batch = ctx.batch::<Json>(0);
+            let batch = ctx.dep(0).values::<Json>();
             for v in &batch {
                 total += v.as_i64().unwrap_or(0);
             }
@@ -2522,7 +2543,7 @@ mod c38 {
     }
 
     fn fwd(ctx: &graphrefly::Ctx) {
-        if let Some(v) = ctx.batch::<Json>(0).last() {
+        if let Some(v) = ctx.dep(0).values::<Json>().last() {
             ctx.emit((**v).clone());
         }
     }
@@ -2852,7 +2873,7 @@ fn c38_capture_and_restore() {
     let ln = local.node_opts::<serde_json::Value, _>(
         vec![la.erased()],
         |ctx| {
-            if let Some(v) = ctx.batch::<serde_json::Value>(0).last() {
+            if let Some(v) = ctx.dep(0).values::<serde_json::Value>().last() {
                 ctx.emit((**v).clone());
             }
         },
@@ -2908,7 +2929,7 @@ fn c38_replace_and_rewire_are_restored_as_the_instance() {
     let g = graphrefly::graph();
     let a = g.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
     let fwd = |ctx: &graphrefly::Ctx| {
-        if let Some(v) = ctx.batch::<serde_json::Value>(0).last() {
+        if let Some(v) = ctx.dep(0).values::<serde_json::Value>().last() {
             ctx.emit((**v).clone());
         }
     };
@@ -3300,7 +3321,7 @@ fn quiet_output_after_its_lifetime_closed_is_dropped() {
         })
     };
     let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
-        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        let v = ctx.dep(0).value::<i32>().map_or(0, |v| *v);
         ctx.emit(v * 10);
     });
     *q_unsub.borrow_mut() = Some(q.subscribe(|_| {}));
@@ -3327,7 +3348,7 @@ fn quiet_output_runs_in_request_order() {
         })
     };
     let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
-        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        let v = ctx.dep(0).value::<i32>().map_or(0, |v| *v);
         ctx.emit(v + 100);
     });
     let sink = |name: &'static str| {
@@ -3355,11 +3376,11 @@ fn quiet_auto_invalidate_settles_a_diamond_once() {
     let g = graphrefly::graph();
     let a = state_in(&g, 1i32);
     let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
-        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        let v = ctx.dep(0).value::<i32>().map_or(0, |v| *v);
         ctx.emit(v);
     });
     let fwd = |ctx: &graphrefly::Ctx| {
-        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        let v = ctx.dep(0).value::<i32>().map_or(0, |v| *v);
         ctx.emit(v);
     };
     let b = derived_in::<i32>(&g, vec![q.erased()], graphrefly::NodeOpts::default(), fwd);

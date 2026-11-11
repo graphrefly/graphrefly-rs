@@ -162,10 +162,10 @@ fn bytes_of(value: &AnyValue, id: &str, edge: &str) -> Vec<u8> {
 /// arrays that carried DATA, in order, then a terminal.
 fn brought(ctx: &Ctx, i: usize, id: &str, edge: &str) -> Vec<Vec<CanonicalWireMessage>> {
     let mut arrays = Vec::new();
-    if ctx.invalidated(i) {
+    if ctx.dep(i).invalidated() {
         arrays.push(vec![CanonicalWireMessage::Invalidate]);
     }
-    for array in ctx.wave_data()[i] {
+    for array in ctx.dep(i).raw_waves() {
         if !array.is_empty() {
             arrays.push(
                 array
@@ -175,7 +175,7 @@ fn brought(ctx: &Ctx, i: usize, id: &str, edge: &str) -> Vec<Vec<CanonicalWireMe
             );
         }
     }
-    match ctx.terminal(i) {
+    match ctx.dep(i).terminal() {
         Some(DepTerminal::Complete) => arrays.push(vec![CanonicalWireMessage::Complete]),
         Some(DepTerminal::Error(message)) => arrays.push(vec![CanonicalWireMessage::Error(
             message.as_bytes().to_vec(),
@@ -354,7 +354,7 @@ fn gate_fn(group: String, declared: BTreeSet<String>) -> impl Fn(&Ctx) + 'static
             .unwrap_or_default();
         let mut released = Vec::new();
         let mut issues = Vec::new();
-        for frame in ctx.batch::<WireEdgeCause>(0) {
+        for frame in ctx.dep(0).values::<WireEdgeCause>() {
             if frame.group != group {
                 continue; // another group's frame on the same channel
             }
@@ -530,13 +530,14 @@ fn to_message(m: &CanonicalWireMessage) -> Message<AnyValue> {
 /// snapshot.
 fn inbound_fn(edge: String) -> impl Fn(&Ctx) + 'static {
     move |ctx| {
-        let gates = ctx.batch::<WireEdgeGateValue>(0);
+        let gates = ctx.dep(0).values::<WireEdgeGateValue>();
         if ctx.state_get::<bool>().is_none() {
             ctx.state_set(true);
-            let last = gates
-                .last()
-                .map(|g| g.view.clone())
-                .or_else(|| ctx.data::<WireEdgeGateValue>(0).map(|g| g.view.clone()));
+            let last = gates.last().map(|g| g.view.clone()).or_else(|| {
+                ctx.dep(0)
+                    .value::<WireEdgeGateValue>()
+                    .map(|g| g.view.clone())
+            });
             if let Some(view) = last {
                 if let Some(seen) = view.get(&edge) {
                     let mut out: Vec<Message<AnyValue>> = seen
@@ -575,7 +576,8 @@ fn issues_fn(ctx: &Ctx) {
         return;
     }
     let issues: Vec<WireEdgeIssue> = ctx
-        .batch::<WireEdgeGateValue>(0)
+        .dep(0)
+        .values::<WireEdgeGateValue>()
         .iter()
         .flat_map(|g| g.issues.clone())
         .collect();

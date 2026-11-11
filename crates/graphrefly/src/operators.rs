@@ -98,7 +98,7 @@ pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
 /// map: emit `fn(value)` for every upstream DATA occurrence.
 pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T> {
     Operator::new("map", move |ctx| {
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             ctx.emit_all(wave.iter().map(|value| f(value.as_ref())));
         }
     })
@@ -107,7 +107,7 @@ pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T>
 /// filter: forward values matching `pred`; skipped waves settle as undirty RESOLVED.
 pub fn filter<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("filter", move |ctx| {
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             ctx.emit_all(
                 wave.iter()
                     .filter(|value| pred(value.as_ref()))
@@ -127,7 +127,7 @@ pub fn scan<S: 'static, T: Clone + 'static>(
             .state_get::<T>()
             .map(|v| (*v).clone())
             .unwrap_or_else(|| seed.clone());
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::with_capacity(wave.len());
             for value in wave {
                 acc = reducer(acc, value.as_ref());
@@ -150,7 +150,7 @@ pub fn take<S: Clone + 'static>(n: usize) -> Operator<S> {
         if count >= n {
             return;
         }
-        'waves: for wave in ctx.batches::<S>(0) {
+        'waves: for wave in ctx.dep(0).waves::<S>() {
             let mut out: Wave<AnyValue> = Vec::new();
             for value in wave {
                 count += 1;
@@ -178,7 +178,7 @@ pub fn distinct_until_changed<S: Clone + 'static>(
 ) -> Operator<S> {
     Operator::new("distinctUntilChanged", move |ctx| {
         let mut last = ctx.state_get::<S>().map(|v| (*v).clone());
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
             for value in wave {
                 if last.as_ref().is_some_and(|prev| eq(prev, value.as_ref())) {
@@ -205,7 +205,7 @@ pub fn merge<T: Clone + 'static>() -> Operator<T> {
         },
         move |ctx| {
             for i in 0..ctx.dep_len() {
-                for wave in ctx.batches::<T>(i) {
+                for wave in ctx.dep(i).waves::<T>() {
                     ctx.emit_all(wave.iter().map(|value| (**value).clone()));
                 }
             }
@@ -229,11 +229,11 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
                 .state_get::<T>()
                 .map(|v| (*v).clone())
                 .unwrap_or_else(|| seed.clone());
-            for value in ctx.batch::<S>(0) {
+            for value in ctx.dep(0).values::<S>() {
                 acc = reducer(acc, value.as_ref());
             }
             ctx.state_set(acc.clone());
-            if is_complete(ctx.terminal(0)) {
+            if is_complete(ctx.dep(0).terminal()) {
                 ctx.down(vec![Message::Data(Rc::new(acc)), Message::Complete]);
             }
         },
@@ -244,7 +244,7 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
 pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
     Operator::new("pairwise", move |ctx| {
         let mut prev = ctx.state_get::<S>().map(|v| (*v).clone());
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
             for value in wave {
                 if let Some(p) = prev.clone() {
@@ -264,7 +264,7 @@ pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
 pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
     Operator::new("skip", move |ctx| {
         let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
             for value in wave {
                 if count < n {
@@ -282,7 +282,7 @@ pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
 /// take_while: emit while `pred` holds; first failed value completes without emission.
 pub fn take_while<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("takeWhile", move |ctx| {
-        for wave in ctx.batches::<S>(0) {
+        for wave in ctx.dep(0).waves::<S>() {
             let mut out: Wave<AnyValue> = Vec::new();
             for value in wave {
                 if pred(value.as_ref()) {
@@ -303,7 +303,7 @@ pub fn take_while<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Op
 /// first: emit the first value matching `pred` (or the first value), then COMPLETE.
 pub fn first<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("first", move |ctx| {
-        for value in ctx.batch::<S>(0) {
+        for value in ctx.dep(0).values::<S>() {
             if pred(value.as_ref()) {
                 ctx.down(vec![
                     Message::Data(Rc::new((*value).clone())),
@@ -329,12 +329,12 @@ pub fn last<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
             ..NodeOpts::default()
         },
         move |ctx| {
-            for value in ctx.batch::<S>(0) {
+            for value in ctx.dep(0).values::<S>() {
                 if pred(value.as_ref()) {
                     ctx.state_set((*value).clone());
                 }
             }
-            if is_complete(ctx.terminal(0)) {
+            if is_complete(ctx.dep(0).terminal()) {
                 if let Some(value) = ctx.state_get::<S>() {
                     ctx.down(vec![
                         Message::Data(Rc::new((*value).clone())),
@@ -362,7 +362,7 @@ pub fn find<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
             ..NodeOpts::default()
         },
         move |ctx| {
-            for value in ctx.batch::<S>(0) {
+            for value in ctx.dep(0).values::<S>() {
                 if pred(value.as_ref()) {
                     ctx.down(vec![
                         Message::Data(Rc::new((*value).clone())),
@@ -371,7 +371,7 @@ pub fn find<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
                     return;
                 }
             }
-            if is_complete(ctx.terminal(0)) {
+            if is_complete(ctx.dep(0).terminal()) {
                 ctx.down(vec![Message::Complete]);
             }
         },
@@ -388,7 +388,7 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
         },
         move |ctx| {
             let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
-            for value in ctx.batch::<S>(0) {
+            for value in ctx.dep(0).values::<S>() {
                 if count == index {
                     ctx.down(vec![
                         Message::Data(Rc::new((*value).clone())),
@@ -399,7 +399,7 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
                 count += 1;
             }
             ctx.state_set(count);
-            if is_complete(ctx.terminal(0)) {
+            if is_complete(ctx.dep(0).terminal()) {
                 ctx.down(vec![Message::Complete]);
             }
         },
@@ -409,7 +409,7 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
 /// tap: run a side-effect for each DATA occurrence and pass values through unchanged.
 pub fn tap<S: Clone + 'static>(f: impl Fn(&S) + 'static) -> Operator<S> {
     Operator::new("tap", move |ctx| {
-        for value in ctx.batch::<S>(0) {
+        for value in ctx.dep(0).values::<S>() {
             f(value.as_ref());
             ctx.emit((*value).clone());
         }
@@ -428,7 +428,7 @@ pub fn on_first_data_where<S: Clone + 'static>(
 ) -> Operator<S> {
     Operator::new("onFirstData", move |ctx| {
         let mut fired = ctx.state_get::<bool>().is_some_and(|v| *v);
-        for value in ctx.batch::<S>(0) {
+        for value in ctx.dep(0).values::<S>() {
             if !fired && where_pred(value.as_ref()) {
                 fired = true;
                 f(value.as_ref());
@@ -479,7 +479,7 @@ pub fn settle_by<S: Clone + 'static>(
         }
         st.waves += 1;
         let mut saw_change = false;
-        for value in ctx.batch::<S>(0) {
+        for value in ctx.dep(0).values::<S>() {
             let next = (*value).clone();
             if st.last.as_ref().is_none_or(|prev| !equals(prev, &next)) {
                 saw_change = true;
@@ -518,10 +518,10 @@ pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Oper
             ..NodeOpts::default()
         },
         move |ctx| {
-            for value in ctx.batch::<S>(0) {
+            for value in ctx.dep(0).values::<S>() {
                 ctx.emit((*value).clone());
             }
-            match ctx.terminal(0) {
+            match ctx.dep(0).terminal() {
                 Some(DepTerminal::Complete) => ctx.down(vec![Message::Complete]),
                 Some(DepTerminal::Error(error)) => ctx.emit(recover(error.as_ref())),
                 None => {}
@@ -545,7 +545,7 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
             ..NodeOpts::default()
         },
         move |ctx| {
-            match ctx.terminal(0) {
+            match ctx.dep(0).terminal() {
                 Some(DepTerminal::Complete) => {
                     ctx.down(vec![Message::Complete]);
                     return;
@@ -557,16 +557,16 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
                 None => {}
             }
 
-            let control = ctx.data::<bool>(1).is_some_and(|v| *v);
+            let control = ctx.dep(1).value::<bool>().is_some_and(|v| *v);
             if !control {
                 return;
             }
 
-            let source_batch = ctx.batch::<S>(0);
+            let source_batch = ctx.dep(0).values::<S>();
             if source_batch.is_empty() {
-                let control_fired = !ctx.batch::<bool>(1).is_empty();
+                let control_fired = !ctx.dep(1).values::<bool>().is_empty();
                 if control_fired {
-                    if let Some(latest) = ctx.data::<S>(0) {
+                    if let Some(latest) = ctx.dep(0).value::<S>() {
                         ctx.emit((*latest).clone());
                     }
                 }

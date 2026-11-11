@@ -341,7 +341,7 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
             move |ctx| {
                 let mut state = state.borrow_mut();
                 for index in 0..dep_count {
-                    for record in ctx.batch::<WorkQueueRecord<T>>(index) {
+                    for record in ctx.dep(index).values::<WorkQueueRecord<T>>() {
                         if let Some(schedule) = schedule_from_record(record.as_ref()) {
                             emit_translated_schedule(ctx, &mut state, schedule);
                         }
@@ -444,7 +444,7 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
             move |ctx| {
                 let mut state = state.borrow_mut();
                 for index in 0..record_count {
-                    for record in ctx.batch::<WorkQueueRecord<T>>(index) {
+                    for record in ctx.dep(index).values::<WorkQueueRecord<T>>() {
                         apply_record(&mut state, record.as_ref());
                     }
                 }
@@ -452,12 +452,12 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
                     handoff_ready_inner(ctx, &mut state, &ready);
                 }
                 for index in ready_start..overdue_start {
-                    for ready in ctx.batch::<ScheduledReadinessReady>(index) {
+                    for ready in ctx.dep(index).values::<ScheduledReadinessReady>() {
                         handoff_ready(ctx, &mut state, ready.as_ref());
                     }
                 }
                 for index in overdue_start..(overdue_start + opts.overdue.len()) {
-                    for overdue in ctx.batch::<ScheduledReadinessOverdue>(index) {
+                    for overdue in ctx.dep(index).values::<ScheduledReadinessOverdue>() {
                         handoff_overdue(ctx, &mut state, overdue.as_ref());
                     }
                 }
@@ -552,7 +552,7 @@ pub fn work_queue_lease_expiration_command_projector<T: Clone + 'static>(
         opts.candidates.iter().map(Node::erased).collect(),
         move |ctx| {
             for index in 0..dep_count {
-                for candidate in ctx.batch::<WorkQueueReadinessCandidate>(index) {
+                for candidate in ctx.dep(index).values::<WorkQueueReadinessCandidate>() {
                     if let Some(command) =
                         work_queue_lease_expiration_command::<T>(candidate.as_ref(), &prefix)
                     {
@@ -1348,7 +1348,7 @@ fn project_fact<T: Clone + 'static>(
     graph.node_opts::<T, _>(
         vec![runtime.erased()],
         move |ctx| {
-            for fact in ctx.batch::<WorkQueueReadinessFact>(0) {
+            for fact in ctx.dep(0).values::<WorkQueueReadinessFact>() {
                 if let Some(value) = select(&fact) {
                     ctx.emit(value);
                 }

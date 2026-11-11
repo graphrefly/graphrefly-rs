@@ -155,7 +155,7 @@ pub struct NodeOpts {
     pub error: Policy,
     /// The INVALIDATE policy (R-invalidation). Auto: an input's INVALIDATE invalidates
     /// the node without running its function. Manual: it is the function's input
-    /// ([`Ctx::invalidated`]), and the node keeps its values until the function clears
+    /// ([`DepView::invalidated`](crate::ctx::DepView::invalidated)), and the node keeps its values until the function clears
     /// them or sends INVALIDATE itself.
     pub invalidate: Policy,
     /// D109 node runtime versioning policy. `None` means the package default V0; graph-owned
@@ -371,12 +371,15 @@ struct ArenaNodeKey {
     node: NodeKey,
 }
 
-#[derive(Clone)]
-pub(crate) struct CoreIdentity {
+/// A node's identity: which node of which graph, stable for the node's life
+/// (R-invocation@2: each input says which dependency it is). [`Core::identity`]
+/// gives a node's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeIdentity {
     arena_key: ArenaNodeKey,
 }
 
-impl CoreIdentity {
+impl NodeIdentity {
     pub(crate) fn from_core(core: &Core) -> Self {
         Self {
             arena_key: core.arena_node_key(),
@@ -2297,6 +2300,12 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
 }
 
 impl Core {
+    /// This node's identity.
+    #[must_use]
+    pub fn identity(&self) -> NodeIdentity {
+        NodeIdentity::from_core(self)
+    }
+
     /// True when both handles name the same node (same graph arena, id and slot
     /// generation).
     #[must_use]
@@ -3543,7 +3552,7 @@ impl Core {
                     .iter()
                     .zip(&n.deps)
                     .map(|(input, dep)| DepRecord {
-                        dep: CoreIdentity::from_core(dep),
+                        dep: NodeIdentity::from_core(dep),
                         wave_data: input
                             .frames
                             .iter()
@@ -4150,7 +4159,7 @@ impl<T: 'static> Node<T> {
     }
 
     /// A derived node over erased deps. The fn reads deps positionally via
-    /// `ctx.data::<U>(i)` and emits via `ctx.emit`. The first-run gate holds the fn
+    /// `ctx.dep(i).value::<U>()` and emits via `ctx.emit`. The first-run gate holds the fn
     /// until every dep has settled (R-first-run-gate). A fn that returns WITHOUT
     /// emitting (filter-reject) makes the substrate synthesize an undirty RESOLVED
     /// (D49 / R-resolved-undirty).
@@ -4676,7 +4685,7 @@ mod tests {
             vec![source.erased()],
             NodeOpts::default(),
             |ctx| {
-                let _ = ctx.data::<i32>(0).unwrap();
+                let _ = ctx.dep(0).value::<i32>().unwrap();
             },
         );
         let _u = derived.subscribe(
@@ -4718,7 +4727,7 @@ mod tests {
             let mid: Node<i32> = Node::derived_opts(
                 vec![a.erased()],
                 with_cleanup(move || flag.set(true)),
-                |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() + 1),
+                |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1),
             );
             let _sub = mid.subscribe(|_| {}); // activates mid: setup + fn, subscribes to a
             assert!(!deactivated.get());
@@ -4752,8 +4761,8 @@ mod tests {
         let r2 = runs.clone();
         let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
             r2.set(r2.get() + 1);
-            let x = *ctx.data::<i32>(0).unwrap();
-            let y = *ctx.data::<i32>(1).unwrap();
+            let x = *ctx.dep(0).value::<i32>().unwrap();
+            let y = *ctx.dep(1).value::<i32>().unwrap();
             ctx.emit(x + y);
         });
         let (log, sink) = recorder();
@@ -4785,16 +4794,16 @@ mod tests {
         // A → B, A → C, B → D, C → D. D must join once per A update, glitch-free.
         let a = Node::<i32>::state_empty();
         let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + 1)
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1)
         });
         let c: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 10)
         });
         let d_runs = Rc::new(Cell::new(0usize));
         let dr = d_runs.clone();
         let d: Node<i32> = Node::derived(vec![b.erased(), c.erased()], move |ctx| {
             dr.set(dr.get() + 1);
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + *ctx.dep(1).value::<i32>().unwrap());
         });
         let (log, sink) = recorder();
         let _u = d.subscribe(sink);
@@ -4814,7 +4823,7 @@ mod tests {
     fn rom_ram_deactivation_clears_compute_cache() {
         let a = Node::<i32>::state(7); // ROM: state node retains across disconnect
         let dbl: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 2)
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 2)
         });
         let (_log, sink) = recorder();
         let u = dbl.subscribe(sink);
@@ -4894,7 +4903,7 @@ mod tests {
         let a = Node::<i32>::state(1);
         let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
             ctx.state_set(Node::<i32>::state(99));
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
         });
         let _u = d.subscribe(|_| {});
 
@@ -5061,7 +5070,7 @@ mod tests {
                 if let Some(refs) = refs_slot.borrow().as_ref() {
                     observed_refs.set(refs.get());
                 }
-                ctx.emit(*ctx.data::<i32>(0).unwrap());
+                ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             }
         });
         *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
@@ -5115,7 +5124,7 @@ mod tests {
             let runs = runs.clone();
             move |ctx| {
                 runs.set(runs.get() + 1);
-                ctx.emit(*ctx.data::<i32>(0).unwrap());
+                ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             }
         });
         let _u = derived.subscribe(|_| {});
@@ -5136,7 +5145,7 @@ mod tests {
             let notes = notes.clone();
             Node::derived(vec![s.erased()], move |ctx| {
                 notes.borrow_mut().push(ctx.seed::<i32>().map(|n| *n));
-                ctx.emit(*ctx.data::<i32>(0).unwrap());
+                ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             })
         };
         d.core.restore_seed(NodeSeed {
@@ -5206,7 +5215,7 @@ mod tests {
             &arena,
             vec![source.erased()],
             NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+            |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap()),
         );
         let weak = derived.core.downgrade();
         let refs_before = derived.core.refs.get();
@@ -5554,10 +5563,10 @@ mod tests {
         // extra counted Core clones for traversal.
         let a = Node::<i32>::state(1);
         let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let c: Node<i32> = Node::derived(vec![b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let before = (a.core.refs.get(), b.core.refs.get(), c.core.refs.get());
 
@@ -5631,7 +5640,7 @@ mod tests {
             &arena,
             vec![source.erased()],
             NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+            |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap()),
         );
 
         // Current and declared dependencies each hold the dep (R-request-order@2).
@@ -5676,7 +5685,7 @@ mod tests {
             &arena,
             vec![source.erased()],
             NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() + 1),
+            |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1),
         );
         // The caller's handle, plus current and declared dependencies.
         assert_eq!(refs.get(), 3);
@@ -5732,11 +5741,11 @@ mod tests {
 
     #[test]
     fn core_identity_does_not_match_reused_slot_generation() {
-        // CoreIdentity is used by queued remove requests: it must be graph+generation
+        // NodeIdentity is used by queued remove requests: it must be graph+generation
         // identity, not just a slot id, or a stale remove could target a later occupant.
         let arena = GraphArena::new();
         let old = Node::<i32>::state_in_arena(&arena, 1);
-        let old_identity = CoreIdentity::from_core(&old.core);
+        let old_identity = NodeIdentity::from_core(&old.core);
         let old_key = old.core.key();
         drop(old);
 
@@ -5946,7 +5955,7 @@ mod tests {
             Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
         let source = Node::<i32>::state_empty();
         let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             panic!("panic after subscriber callback");
         });
         let log = Rc::new(RefCell::new(Vec::<String>::new()));

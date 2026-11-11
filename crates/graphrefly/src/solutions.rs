@@ -1091,7 +1091,8 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
                 .map(|evaluation| *evaluation + 1)
                 .unwrap_or(1);
             let raw_records = ctx
-                .data::<Vec<AgenticMemoryRecord<T>>>(0)
+                .dep(0)
+                .value::<Vec<AgenticMemoryRecord<T>>>()
                 .map(|records| (*records).clone())
                 .unwrap_or_default();
             let mut records = Vec::new();
@@ -1198,10 +1199,10 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
     );
     let context = graph.init_node(
         Operator::with_opts("agenticMemoryContext", solution_node_config(), |ctx| {
-            let Some(projection) = ctx.data::<AgenticMemoryProjection<T>>(0) else {
+            let Some(projection) = ctx.dep(0).value::<AgenticMemoryProjection<T>>() else {
                 return;
             };
-            let Some(snapshot) = ctx.data::<MemoryRetrievalSnapshot<T>>(1) else {
+            let Some(snapshot) = ctx.dep(1).value::<MemoryRetrievalSnapshot<T>>() else {
                 return;
             };
             ctx.emit(context_from_snapshot(
@@ -1278,11 +1279,11 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
                 .map(|evaluation| *evaluation + 1)
                 .unwrap_or(1);
             let raw_records = ctx
-                .data::<Vec<AgenticMemoryRecord<T>>>(0)
+                .dep(0).value::<Vec<AgenticMemoryRecord<T>>>()
                 .map(|records| (*records).clone())
                 .unwrap_or_default();
             let raw_drafts = ctx
-                .data::<Vec<AgenticMemoryKgAssertionDraft>>(1)
+                .dep(1).value::<Vec<AgenticMemoryKgAssertionDraft>>()
                 .map(|drafts| (*drafts).clone())
                 .unwrap_or_default();
             let valid_records = valid_record_index(raw_records);
@@ -1459,11 +1460,13 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
                 .map(|evaluation| *evaluation + 1)
                 .unwrap_or(1);
             let raw_records = ctx
-                .data::<Vec<AgenticMemoryRecord<T>>>(0)
+                .dep(0)
+                .value::<Vec<AgenticMemoryRecord<T>>>()
                 .map(|records| (*records).clone())
                 .unwrap_or_default();
             let raw_commands = ctx
-                .data::<Vec<AgenticMemoryRetentionCommand>>(1)
+                .dep(1)
+                .value::<Vec<AgenticMemoryRetentionCommand>>()
                 .map(|commands| (*commands).clone())
                 .unwrap_or_default();
             let valid_records = valid_record_index(raw_records);
@@ -1648,11 +1651,13 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
                     .map(|evaluation| *evaluation + 1)
                     .unwrap_or(1);
                 let requests = ctx
-                    .data::<Vec<AgenticMemoryConsolidationRequest>>(0)
+                    .dep(0)
+                    .value::<Vec<AgenticMemoryConsolidationRequest>>()
                     .map(|requests| (*requests).clone())
                     .unwrap_or_default();
                 let outcomes = ctx
-                    .data::<Vec<AgenticMemoryConsolidationOutcome<T>>>(1)
+                    .dep(1)
+                    .value::<Vec<AgenticMemoryConsolidationOutcome<T>>>()
                     .map(|outcomes| (*outcomes).clone())
                     .unwrap_or_default();
                 let projected = project_consolidation_outcomes(requests, outcomes);
@@ -1783,14 +1788,17 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
                     .map(|evaluation| *evaluation + 1)
                     .unwrap_or(1);
                 let context = ctx
-                    .data::<AgenticMemoryContext<T>>(0)
+                    .dep(0)
+                    .value::<AgenticMemoryContext<T>>()
                     .map(|context| (*context).clone());
                 let text_facts = ctx
-                    .data::<Vec<AgenticMemoryTextProjection>>(1)
+                    .dep(1)
+                    .value::<Vec<AgenticMemoryTextProjection>>()
                     .map(|texts| (*texts).clone())
                     .unwrap_or_default();
                 let policy = ctx
-                    .data::<AgenticMemoryContextPackingPolicy>(2)
+                    .dep(2)
+                    .value::<AgenticMemoryContextPackingPolicy>()
                     .map(|policy| (*policy).clone())
                     .unwrap_or_default();
                 let (packed_context, mut pending_errors, state) =
@@ -1876,7 +1884,7 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
-            for projection in ctx.batch::<AgenticMemoryProjection<T>>(0) {
+            for projection in ctx.dep(0).values::<AgenticMemoryProjection<T>>() {
                 ctx.emit(select(projection.as_ref()));
             }
         }),
@@ -1899,7 +1907,7 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
-            for context in ctx.batch::<AgenticMemoryContext<T>>(0) {
+            for context in ctx.dep(0).values::<AgenticMemoryContext<T>>() {
                 ctx.emit(select(context.as_ref()));
             }
         }),
@@ -1922,7 +1930,7 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
-            for snapshot in ctx.batch::<S>(0) {
+            for snapshot in ctx.dep(0).values::<S>() {
                 ctx.emit(select(snapshot.as_ref()));
             }
         }),

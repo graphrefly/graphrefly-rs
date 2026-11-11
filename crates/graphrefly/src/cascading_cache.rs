@@ -248,14 +248,14 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                     .map(|s| (*s).clone())
                     .unwrap_or_default();
                 let current_policy = policy_index
-                    .and_then(|idx| ctx.data::<CascadingCachePolicy>(idx))
+                    .and_then(|idx| ctx.dep(idx).value::<CascadingCachePolicy>())
                     .map(|p| (*p).clone());
                 let effective_promote_to = current_policy
                     .as_ref()
                     .and_then(|p| p.promote_to.clone())
                     .unwrap_or_else(|| base_promote_to.clone());
 
-                for key in ctx.batch::<String>(0) {
+                for key in ctx.dep(0).values::<String>() {
                     start_lookup(
                         ctx,
                         &mut st,
@@ -271,7 +271,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                 }
 
                 if let Some(idx) = invalidate_index {
-                    for key in ctx.batch::<String>(idx) {
+                    for key in ctx.dep(idx).values::<String>() {
                         start_lookup(
                             ctx,
                             &mut st,
@@ -287,12 +287,12 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                     }
                 }
 
-                if ctx.batch::<String>(0).is_empty()
+                if ctx.dep(0).values::<String>().is_empty()
                     && invalidate_index
-                        .map(|idx| ctx.batch::<String>(idx).is_empty())
+                        .map(|idx| ctx.dep(idx).values::<String>().is_empty())
                         .unwrap_or(true)
                     && policy_index
-                        .map(|idx| !ctx.batch::<CascadingCachePolicy>(idx).is_empty())
+                        .map(|idx| !ctx.dep(idx).values::<CascadingCachePolicy>().is_empty())
                         .unwrap_or(false)
                 {
                     if let Some(key) = st.latest_key.clone() {
@@ -332,7 +332,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                 .state_get::<SeqState>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            for event in ctx.batch::<CascadingCacheEvent<V>>(0) {
+            for event in ctx.dep(0).values::<CascadingCacheEvent<V>>() {
                 match event.as_ref() {
                     CascadingCacheEvent::Request { key, request_seq }
                     | CascadingCacheEvent::Invalidate { key, request_seq } => {
@@ -401,7 +401,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                 .state_get::<SeqState>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
-            for event in ctx.batch::<CascadingCacheEvent<V>>(0) {
+            for event in ctx.dep(0).values::<CascadingCacheEvent<V>>() {
                 match event.as_ref() {
                     CascadingCacheEvent::Request { request_seq, .. } => {
                         st.seq = *request_seq;

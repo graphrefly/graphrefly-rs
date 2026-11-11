@@ -539,7 +539,7 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
         })?;
         let definition = ctx.resolve_definition(fn_ref)?;
         let body: NodeFn = Rc::new(move |ctx: &Ctx| {
-            for value in ctx.batch::<GraphCheckpointJson>(0) {
+            for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                 match definition.call(value.as_ref()) {
                     Ok(out) => ctx.emit(out),
                     Err(err) => panic!("{err}"),
@@ -1713,7 +1713,7 @@ mod tests {
                         .state_get::<GraphCheckpointJson>()
                         .and_then(|v| v.as_i64())
                         .unwrap_or(40);
-                    for _ in ctx.batch::<GraphCheckpointJson>(0) {
+                    for _ in ctx.dep(0).values::<GraphCheckpointJson>() {
                         acc += 1;
                         ctx.emit(json!(acc));
                     }
@@ -1737,7 +1737,7 @@ mod tests {
                     .state_get::<GraphCheckpointJson>()
                     .and_then(|v| v.as_i64())
                     .unwrap_or(40);
-                for _ in ctx.batch::<GraphCheckpointJson>(0) {
+                for _ in ctx.dep(0).values::<GraphCheckpointJson>() {
                     acc += 1;
                     ctx.emit(json!(acc));
                 }
@@ -1848,7 +1848,7 @@ mod tests {
         let doubled = g.node_opts::<GraphCheckpointJson, _>(
             vec![source.erased()],
             |ctx| {
-                for value in ctx.batch::<GraphCheckpointJson>(0) {
+                for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                     ctx.emit(json!(value.as_i64().expect("number input") * 2));
                 }
             },
@@ -1909,7 +1909,7 @@ mod tests {
         let memo = g.node_opts::<GraphCheckpointJson, _>(
             vec![source.erased()],
             |ctx| {
-                for value in ctx.batch::<GraphCheckpointJson>(0) {
+                for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                     ctx.emit(value.as_ref().clone());
                 }
             },

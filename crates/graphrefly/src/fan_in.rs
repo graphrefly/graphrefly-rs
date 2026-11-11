@@ -49,12 +49,12 @@ impl FanInSources {
         move |ctx| {
             let wanted = me.sources.borrow().clone();
             let current = ctx.dep_len() == wanted.len()
-                && wanted.iter().enumerate().all(|(i, dep)| ctx.dep_is(i, dep));
+                && wanted.iter().enumerate().all(|(i, dep)| ctx.dep(i).is(dep));
             if !current {
                 ctx.rewire(wanted);
             }
             for i in 0..ctx.dep_len() {
-                for value in ctx.batch::<T>(i) {
+                for value in ctx.dep(i).values::<T>() {
                     ctx.emit((*value).clone());
                 }
             }

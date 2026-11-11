@@ -173,7 +173,7 @@ mod tests {
             let doubled = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 move |value| {
                     *worker_thread_for_compute
                         .lock()
@@ -250,7 +250,7 @@ mod tests {
             let worker = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 |_value| Err::<i32, _>("worker failed"),
                 GraphNodeOpts::named("worker"),
             );
@@ -290,7 +290,7 @@ mod tests {
             let worker = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 |_value| -> Result<i32, String> { panic!("worker boom") },
                 GraphNodeOpts::named("worker"),
             );
@@ -331,7 +331,7 @@ mod tests {
             let worker = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 |value| {
                     if value == 1 {
                         std::thread::sleep(Duration::from_millis(75));
@@ -363,7 +363,7 @@ mod tests {
                 &g,
                 vec![source.erased()],
                 |ctx| {
-                    let value = *ctx.data::<i32>(0)?;
+                    let value = *ctx.dep(0).value::<i32>()?;
                     (value != 0).then_some(value)
                 },
                 |value| {
@@ -394,7 +394,7 @@ mod tests {
             let worker = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 |value| {
                     std::thread::sleep(Duration::from_millis(25));
                     Ok::<_, String>(value * 3)
@@ -419,7 +419,7 @@ mod tests {
         let worker = worker_derived(
             &g,
             vec![source.erased()],
-            |ctx| ctx.data::<i32>(0).map(|v| *v),
+            |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
             Ok::<_, String>,
             GraphNodeOpts::named("worker"),
         );
@@ -459,7 +459,7 @@ mod tests {
         let worker = worker_derived(
             &g,
             vec![source.erased()],
-            |ctx| ctx.data::<i32>(0).map(|v| *v),
+            |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
             Ok::<_, String>,
             GraphNodeOpts::named("worker"),
         );
@@ -500,7 +500,7 @@ mod tests {
             let worker = worker_derived(
                 &g,
                 vec![source.erased()],
-                |ctx| ctx.data::<i32>(0).map(|v| *v),
+                |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
                 move |value| {
                     compute_runs_for_worker.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, String>(value)
@@ -526,7 +526,7 @@ mod tests {
         let worker = worker_derived(
             &g,
             vec![source.erased()],
-            |ctx| ctx.data::<i32>(0).map(|v| *v),
+            |ctx| ctx.dep(0).value::<i32>().map(|v| *v),
             Ok::<_, String>,
             GraphNodeOpts::named("worker"),
         );

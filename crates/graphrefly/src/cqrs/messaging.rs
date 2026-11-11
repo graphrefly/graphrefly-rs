@@ -164,7 +164,7 @@ pub fn cqrs_messaging_recipe<
     let runtime = graph.node_opts::<CqrsMessagingFact<TCommand>, _>(
         vec![opts.deliveries.erased()],
         move |ctx| {
-            for page in ctx.batch::<MessageBusAvailablePage<TPayload>>(0) {
+            for page in ctx.dep(0).values::<MessageBusAvailablePage<TPayload>>() {
                 for message in &page.messages {
                     let delivery = message_delivery(page.as_ref(), message);
                     if let Some(command) = (policy.command)(message, &delivery) {
@@ -263,14 +263,14 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                 .state_get::<AckState>()
                 .map(|state| (*state).clone())
                 .unwrap_or_default();
-            for delivered in ctx.batch::<CqrsDeliveredCommand<TCommand>>(0) {
+            for delivered in ctx.dep(0).values::<CqrsDeliveredCommand<TCommand>>() {
                 state
                     .deliveries
                     .entry(delivered.command.id.clone())
                     .or_default()
                     .push(delivered.delivery.clone());
             }
-            for status in ctx.batch::<CqrsStatus>(1) {
+            for status in ctx.dep(1).values::<CqrsStatus>() {
                 if status.state == CqrsStatusState::Rejected && !opts.ack_rejected {
                     continue;
                 }
@@ -285,7 +285,7 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                 }
             }
             if opts.issues.is_some() {
-                for issue in ctx.batch::<DataIssue>(2) {
+                for issue in ctx.dep(2).values::<DataIssue>() {
                     if let Some(delivery) = issue_delivery(&issue) {
                         ctx.emit(ack_command::<TCommand>(
                             &delivery,
@@ -331,7 +331,7 @@ pub fn cqrs_event_outbox_commands<TEvent: Clone + 'static>(
     graph.node_opts::<MessageBusCommand<CqrsEvent<TEvent>>, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<CqrsEvent<TEvent>>(0) {
+            for event in ctx.dep(0).values::<CqrsEvent<TEvent>>() {
                 ctx.emit(MessageBusCommand::Publish {
                     topic: topic.clone(),
                     payload: (*event).clone(),
@@ -354,7 +354,7 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx: &Ctx| {
-            for fact in ctx.batch::<TIn>(0) {
+            for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
                     ctx.emit(value);
                 }

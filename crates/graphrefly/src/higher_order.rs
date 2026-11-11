@@ -212,14 +212,14 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
         return;
     }
 
-    if is_complete(ctx.terminal(0)) {
+    if is_complete(ctx.dep_if(0).and_then(|d| d.terminal())) {
         st.source_done = true;
     }
 
     let mut to_remove = Vec::new();
     let mut survivors = Vec::new();
     for (i, inner) in st.inners.iter().enumerate() {
-        if is_complete(ctx.terminal(i + 1)) {
+        if is_complete(ctx.dep_if(i + 1).and_then(|d| d.terminal())) {
             push_unique(&mut to_remove, inner.clone());
         } else {
             survivors.push(inner.clone());
@@ -228,7 +228,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     st.inners = survivors;
 
     let mut to_add = Vec::new();
-    let source_batch = ctx.batch::<TIn>(0);
+    let source_batch = ctx.dep_if(0).map_or_else(Vec::new, |d| d.values::<TIn>());
     if !source_batch.is_empty() {
         match mode {
             Mode::Switch => {
@@ -368,7 +368,7 @@ fn run_repeat_body<T: 'static>(ctx: &Ctx, factory: &Rc<dyn Fn() -> Node<T>>, cou
         return;
     }
 
-    if st.inner.is_some() && is_complete(ctx.terminal(0)) {
+    if st.inner.is_some() && is_complete(ctx.dep_if(0).and_then(|d| d.terminal())) {
         let old = st.inner.take().expect("repeat inner was checked as Some");
         ctx.rewire_remove(old);
         if st.round + 1 < count {
@@ -437,12 +437,10 @@ fn cleanup_all_inners<TIn: Clone + 'static>(ctx: &Ctx, st: &mut MapState<TIn>) {
 }
 
 fn forward_data(ctx: &Ctx, dep: usize) {
-    for wave in ctx
-        .wave_data()
-        .get(dep)
-        .into_iter()
-        .flat_map(|waves| waves.iter())
-    {
+    if dep >= ctx.dep_len() {
+        return;
+    }
+    for wave in ctx.dep_if(dep).map_or(&[][..], |d| d.raw_waves()) {
         for value in wave {
             ctx.down(vec![Message::Data(value.clone())]);
         }
@@ -451,7 +449,7 @@ fn forward_data(ctx: &Ctx, dep: usize) {
 
 fn first_error_terminal(ctx: &Ctx) -> Option<String> {
     for i in 0..ctx.dep_len() {
-        if let Some(DepTerminal::Error(error)) = ctx.terminal(i) {
+        if let Some(DepTerminal::Error(error)) = ctx.dep_if(i).and_then(|d| d.terminal()) {
             return Some(error.to_string());
         }
     }

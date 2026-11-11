@@ -210,7 +210,10 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
                 .state_get::<ProcessQueueState<TEffect>>()
                 .map(|state| (*state).clone())
                 .unwrap_or_default();
-            for record in ctx.batch::<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>(0) {
+            for record in ctx
+                .dep(0)
+                .values::<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>()
+            {
                 reduce_record(ctx, &mut state, &record);
             }
             ctx.state_set(state);
@@ -283,7 +286,7 @@ pub fn process_effect_submit_commands<TEffect: Clone + 'static>(
     graph.node_opts::<WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>>, _>(
         vec![effect_requests.erased()],
         move |ctx| {
-            for effect in ctx.batch::<ProcessEffectRequest<TEffect>>(0) {
+            for effect in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 ctx.emit(process_effect_submit_command((*effect).clone()));
             }
         },
@@ -471,7 +474,7 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx| {
-            for fact in ctx.batch::<TIn>(0) {
+            for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
                     ctx.emit(value);
                 }

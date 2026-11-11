@@ -14,7 +14,8 @@ use crate::ctx::Ctx;
 /// Several requests written before one run collapse to the last one, as several
 /// demands in one wave did.
 pub(crate) fn requested<P: Clone + 'static>(ctx: &Ctx, request_dep: usize) -> Option<P> {
-    ctx.batch::<P>(request_dep)
+    ctx.dep(request_dep)
+        .values::<P>()
         .last()
         .map(|params| (**params).clone())
 }

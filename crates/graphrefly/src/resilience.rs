@@ -290,7 +290,7 @@ pub fn retry_status_node(
                 delay_ms: None,
                 state: RetryState::Idle,
             };
-            for event in ctx.batch::<RetryEvent>(0) {
+            for event in ctx.dep(0).values::<RetryEvent>() {
                 next = match event.as_ref() {
                     RetryEvent::Attempt { attempt } => RetryStatus {
                         attempt: *attempt,
@@ -360,7 +360,7 @@ pub fn breaker_status_node(
                 },
                 |value| (*value).clone(),
             );
-            for event in ctx.batch::<RetryEvent>(0) {
+            for event in ctx.dep(0).values::<RetryEvent>() {
                 match event.as_ref() {
                     RetryEvent::Success { .. } => {
                         status = BreakerStatus {
@@ -418,7 +418,7 @@ where
                 state.count = 0;
                 state.reset_at_ms = current.saturating_add(window_ms);
             }
-            for value in ctx.batch::<T>(0) {
+            for value in ctx.dep(0).values::<T>() {
                 let kind = if state.count < max {
                     state.count = state.count.saturating_add(1);
                     state.allowed = state.allowed.saturating_add(1);
@@ -446,7 +446,7 @@ where
     let allowed = graph.node_opts::<T, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<RateLimitEvent<T>>(0) {
+            for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 if matches!(event.kind, RateLimitEventKind::Allowed) {
                     ctx.emit(event.value.clone());
                 }
@@ -457,7 +457,7 @@ where
     let dropped = graph.node_opts::<T, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<RateLimitEvent<T>>(0) {
+            for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 if matches!(event.kind, RateLimitEventKind::Dropped) {
                     ctx.emit(event.value.clone());
                 }
@@ -468,7 +468,7 @@ where
     let status = graph.node_opts::<RateLimitStatus, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<RateLimitEvent<T>>(0) {
+            for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 ctx.emit(event.status.clone());
             }
         },
@@ -495,11 +495,11 @@ where
     let node = timeout(source, ms);
     let status = graph.node_opts::<TimeoutStatus, _>(
         vec![node.erased()],
-        move |ctx| match ctx.terminal(0) {
+        move |ctx| match ctx.dep(0).terminal() {
             Some(DepTerminal::Complete) => ctx.emit(TimeoutStatus::Completed),
             Some(DepTerminal::Error(_)) => ctx.emit(TimeoutStatus::Errored),
             None => {
-                if !ctx.batch::<T>(0).is_empty() {
+                if !ctx.dep(0).values::<T>().is_empty() {
                     ctx.emit(TimeoutStatus::Running);
                 }
             }
@@ -509,7 +509,7 @@ where
     let errors = graph.node_opts::<String, _>(
         vec![node.erased()],
         move |ctx| {
-            if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+            if let Some(DepTerminal::Error(error)) = ctx.dep(0).terminal() {
                 ctx.emit(error.to_string());
             }
         },

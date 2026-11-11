@@ -508,7 +508,7 @@ fn websocket_session_events(
             let out = Rc::new(ctx.defer());
             let driver = ctx.environment().websocket_driver();
             let async_driver = ctx.local_async_driver();
-            for command in ctx.batch::<WebSocketSessionCommand>(0) {
+            for command in ctx.dep(0).values::<WebSocketSessionCommand>() {
                 match command.as_ref() {
                     WebSocketSessionCommand::Start => {
                         start_websocket_session_attempt(WebSocketSessionStart {
@@ -982,7 +982,7 @@ fn websocket_session_nodes(
     let inbound = graph.node_opts::<WebSocketSessionInbound, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Message(message) = event.as_ref() {
                     ctx.emit(message.clone());
                 }
@@ -993,7 +993,7 @@ fn websocket_session_nodes(
     let lifecycle = graph.node_opts::<WebSocketSessionLifecycle, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 match event.as_ref() {
                     WebSocketSessionEvent::Attempt {
                         attempt,
@@ -1049,7 +1049,7 @@ fn websocket_session_nodes(
     let outbound = graph.node_opts::<WebSocketSessionOutbound, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Outbound(fact) = event.as_ref() {
                     ctx.emit(fact.clone());
                 }
@@ -1072,7 +1072,7 @@ fn websocket_session_nodes(
                 },
                 |status| (*status).clone(),
             );
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 next = reduce_websocket_session_status(&next, event.as_ref());
             }
             ctx.state_set(next.clone());
@@ -1083,7 +1083,7 @@ fn websocket_session_nodes(
     let errors = graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 match event.as_ref() {
                     WebSocketSessionEvent::Retry { error, .. }
                     | WebSocketSessionEvent::Error { error, .. }
@@ -1103,7 +1103,7 @@ fn websocket_session_nodes(
     let attempts = graph.node_opts::<u32, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<WebSocketSessionEvent>(0) {
+            for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Attempt { attempt, .. } = event.as_ref() {
                     ctx.emit(*attempt);
                 }
@@ -1515,7 +1515,7 @@ where
             let (active, cancels) = (lifetime.active.clone(), lifetime.cancels.clone());
             let out = Rc::new(ctx.defer());
             let async_driver = ctx.local_async_driver();
-            for value in ctx.batch::<T>(0) {
+            for value in ctx.dep(0).values::<T>() {
                 start_attempt(StartArgs {
                     value: (*value).clone(),
                     attempt: 1,
@@ -1527,7 +1527,7 @@ where
                     send: send.clone(),
                 });
             }
-            match ctx.terminal(0) {
+            match ctx.dep(0).terminal() {
                 Some(DepTerminal::Complete) => ctx.emit(OutboundEvent::<T, R>::UpstreamComplete),
                 Some(DepTerminal::Error(error)) => ctx.emit(OutboundEvent::<T, R>::UpstreamError {
                     error: error.to_string(),
@@ -1728,12 +1728,12 @@ where
             let mut next = ctx
                 .state_get::<OutboundStatus>()
                 .map_or_else(OutboundStatus::default, |value| (*value).clone());
-            for event in ctx.batch::<OutboundEvent<T, R>>(0) {
+            for event in ctx.dep(0).values::<OutboundEvent<T, R>>() {
                 next = reduce_status(&next, event.as_ref());
             }
             ctx.state_set(next.clone());
             ctx.emit(next);
-            if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+            if let Some(DepTerminal::Error(error)) = ctx.dep(0).terminal() {
                 ctx.down(vec![Message::Error(error.to_string().into())]);
             }
         },
@@ -1742,7 +1742,7 @@ where
     let attempts = graph.node_opts::<u32, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<OutboundEvent<T, R>>(0) {
+            for event in ctx.dep(0).values::<OutboundEvent<T, R>>() {
                 match event.as_ref() {
                     OutboundEvent::Attempt { attempt, .. }
                     | OutboundEvent::Retry { attempt, .. }
@@ -1757,7 +1757,7 @@ where
     let errors = graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
-            for event in ctx.batch::<OutboundEvent<T, R>>(0) {
+            for event in ctx.dep(0).values::<OutboundEvent<T, R>>() {
                 match event.as_ref() {
                     OutboundEvent::Retry { error, .. }
                     | OutboundEvent::Exhausted { error, .. }

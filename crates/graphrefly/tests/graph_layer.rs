@@ -124,7 +124,7 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
     let source = g.producer_opts::<i32, _>(|ctx| ctx.emit(7i32), GraphNodeOpts::named("source"));
     let raw = g.node_opts::<i32, _>(
         vec![source.erased()],
-        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() + 1),
+        |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1),
         GraphNodeOpts::named("raw"),
     );
 
@@ -207,7 +207,7 @@ fn observe_topology_deps_changed_matches_describe_edges() {
     let b = g.state_opts(2i32, GraphNodeOpts::named("b"));
     let d = g.node_opts::<i32, _>(
         vec![a.erased()],
-        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap()),
         GraphNodeOpts::named("d"),
     );
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
@@ -219,7 +219,7 @@ fn observe_topology_deps_changed_matches_describe_edges() {
     d.replace(
         vec![b.erased()],
         |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
         },
         graphrefly::ReplaceOpts::default(),
     );
@@ -284,13 +284,13 @@ fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
     let b = child.state_opts(2i32, GraphNodeOpts::named("b"));
     let d = child.node_opts::<i32, _>(
         vec![a.erased()],
-        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap()),
         GraphNodeOpts::named("d"),
     );
     d.replace(
         vec![b.erased()],
         |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
+            ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
         },
         graphrefly::ReplaceOpts::default(),
     );
@@ -1155,7 +1155,7 @@ fn restore_registry_definitions_rebuild_declared_json_map_nodes() {
     let doubled = g.node_opts::<GraphCheckpointJson, _>(
         vec![source.erased()],
         |ctx| {
-            for value in ctx.batch::<GraphCheckpointJson>(0) {
+            for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                 ctx.emit(json!(value.as_i64().expect("number input") * 2));
             }
         },
@@ -1434,7 +1434,7 @@ fn substrate_derived_rejects_cross_arena_deps() {
     let graph_owned = g.state(1i32);
 
     let _bad = graphrefly::Node::<i32>::derived(vec![graph_owned.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
+        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
     });
 }
 
@@ -1448,7 +1448,7 @@ fn substrate_rewire_rejects_cross_arena_deps() {
 
     target.replace(
         vec![source.erased()],
-        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap()),
         graphrefly::ReplaceOpts::default(),
     );
 }

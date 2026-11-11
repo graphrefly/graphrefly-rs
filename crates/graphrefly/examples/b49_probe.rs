@@ -92,7 +92,7 @@ fn typed_vs_erased_probe(hops: usize, waves: usize, protocol_waves: usize, runs:
 
     let source = Node::<f64>::state(0.0);
     let derived = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
-        ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+        ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
     });
     let sink_count = Rc::new(Cell::new(0u64));
     let sc = sink_count.clone();
@@ -188,7 +188,7 @@ fn fanout_probe(fanout: usize, waves: usize, runs: usize) {
     let mut unsubs: Vec<Box<dyn FnOnce()>> = Vec::with_capacity(fanout);
     for _ in 0..fanout {
         let d = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
-            ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+            ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let c = sink_count.clone();
         let u = d.subscribe(move |_| c.set(c.get().wrapping_add(1)));
@@ -224,7 +224,7 @@ fn invalidate_probe(fanout: usize, waves: usize, runs: usize) {
     let mut unsubs: Vec<Box<dyn FnOnce()>> = Vec::with_capacity(fanout);
     for _ in 0..fanout {
         let d = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
-            ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+            ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let c = inv_count.clone();
         let u = d.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
@@ -280,7 +280,7 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
     let mut mids = Vec::with_capacity(legs);
     for _ in 0..legs {
         let m = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
-            ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+            ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         mids.push(m);
     }
@@ -291,7 +291,7 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
         jr.set(jr.get() + 1);
         let mut acc = 0.0;
         for i in 0..ctx.dep_len() {
-            acc += *ctx.data::<f64>(i).unwrap();
+            acc += *ctx.dep(i).value::<f64>().unwrap();
         }
         ctx.emit(acc);
     });
@@ -338,7 +338,7 @@ fn frontier_probe(sources_n: usize, waves: usize, runs: usize) {
     for _ in 0..sources_n {
         let s = Node::<f64>::state(0.0);
         let d = Node::<f64>::derived(vec![s.erased()], |ctx: &Ctx| {
-            ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+            ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let u = d.subscribe(|_| {});
         sources.push(s);
@@ -405,7 +405,7 @@ fn retained_heap_probe(rounds: usize, nodes_per_round: usize, payload_bytes: usi
                 let n = Node::<usize>::derived(vec![source.erased()], move |ctx: &Ctx| {
                     black_box(payload.len());
                     black_box(&token);
-                    ctx.emit(*ctx.data::<usize>(0).unwrap() + 1);
+                    ctx.emit(*ctx.dep(0).value::<usize>().unwrap() + 1);
                 });
                 // Activate once so retention checks include active dep/subscription lifecycle.
                 let u = n.subscribe(|_| {});
@@ -445,7 +445,7 @@ fn rewire_probe(iterations: usize, runs: usize) {
     let a = Node::<f64>::state(1.0);
     let b = Node::<f64>::state(2.0);
     let out = Node::<f64>::derived(vec![a.erased()], |ctx: &Ctx| {
-        ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+        ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
     });
     let counter = Rc::new(Cell::new(0u64));
     let c = counter.clone();
@@ -457,7 +457,7 @@ fn rewire_probe(iterations: usize, runs: usize) {
                 out.replace(
                     vec![a.erased()],
                     |ctx: &Ctx| {
-                        ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+                        ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
                     },
                     graphrefly::ReplaceOpts::default(),
                 );
@@ -466,7 +466,7 @@ fn rewire_probe(iterations: usize, runs: usize) {
                 out.replace(
                     vec![b.erased()],
                     |ctx: &Ctx| {
-                        ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
+                        ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
                     },
                     graphrefly::ReplaceOpts::default(),
                 );

@@ -48,14 +48,17 @@ fn run_fixture(label: &str, source: &str) -> std::process::Output {
     let dir = temp_dir(label);
     write_fixture(&dir, source);
 
-    Command::new(cargo_bin())
+    let output = Command::new(cargo_bin())
         .arg("run")
         .arg("--quiet")
         .arg("--manifest-path")
         .arg(dir.join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", dir.join("target"))
         .output()
-        .expect("cargo fixture can run")
+        .expect("cargo fixture can run");
+    // Each fixture builds the whole crate (about 340 MB): remove it once run.
+    let _ = fs::remove_dir_all(&dir);
+    output
 }
 
 fn assert_fixture_compiles(label: &str, source: &str) {

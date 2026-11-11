@@ -910,7 +910,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
                 ..NodeOpts::default()
             },
             move |ctx| {
-                for value in ctx.batch::<T>(0) {
+                for value in ctx.dep(0).values::<T>() {
                     let value = (*value).clone();
                     backend.append(value.clone());
                     delta.down(vec![Message::Data(Rc::new(ListChange::Append { value }))]);
@@ -1611,7 +1611,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ..NodeOpts::default()
             },
             move |ctx| {
-                let changes = ctx.batch::<LogChange<T>>(0);
+                let changes = ctx.dep(0).values::<LogChange<T>>();
                 let appended = changes
                     .iter()
                     .map(|change| match change.as_ref() {
@@ -1673,7 +1673,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ..NodeOpts::default()
             },
             move |ctx| {
-                for value in ctx.batch::<T>(0) {
+                for value in ctx.dep(0).values::<T>() {
                     let value = (*value).clone();
                     let trimmed = backend.append(value.clone());
                     delta.down(vec![Message::Data(Rc::new(LogChange::Append { value }))]);
@@ -1856,7 +1856,7 @@ pub fn merge_reactive_logs<T: Clone + 'static>(logs: Vec<ReactiveLog<T>>) -> Nod
         },
         move |ctx| {
             for i in 0..logs.len() {
-                for change in ctx.batch::<LogChange<T>>(i) {
+                for change in ctx.dep(i).values::<LogChange<T>>() {
                     ctx.emit((*change).clone());
                 }
             }
@@ -2353,7 +2353,7 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             ..NodeOpts::default()
         },
         move |ctx| {
-            for change in ctx.batch::<C>(0) {
+            for change in ctx.dep(0).values::<C>() {
                 ctx.emit((*change).clone());
             }
         },

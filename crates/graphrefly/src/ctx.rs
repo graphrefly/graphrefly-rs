@@ -19,7 +19,7 @@ use crate::node::{Core, LifetimeRewire, Node, NodeOpts};
 use crate::operators::Operator;
 use crate::protocol::{reject_kernel_only_output, AnyValue, Message, Wave};
 
-/// A dep's terminal state, visible to the fn via [`Ctx::terminal`]
+/// A dep's terminal state, visible to the fn via [`DepView::terminal`]
 /// (R-deps-terminal / C-15). `None` ⇔ the dep is live; `Some(..)` ⇔ it COMPLETEd
 /// or ERRORed. Read by `terminalAsRealInput` operators (rescue/reduce/*Map) that
 /// treat an inner terminal as a real input rather than an absorbed settle.
@@ -43,7 +43,7 @@ pub enum DepTerminal {
 #[derive(Clone)]
 pub(crate) struct DepRecord {
     /// Which node this dependency is (R-invocation: ctx.deps[i] gives its id).
-    pub(crate) dep: crate::node::CoreIdentity,
+    pub(crate) dep: crate::node::NodeIdentity,
     /// The arrays this dependency delivered to this invocation, each as its DATA
     /// payloads in order (a RESOLVED array is empty), keeping array boundaries
     /// (R-invocation).
@@ -58,6 +58,98 @@ pub(crate) struct DepRecord {
     /// An INVALIDATE arrived on this input in this invocation; set only under the
     /// manual INVALIDATE policy (R-invalidation).
     pub(crate) invalidated: bool,
+}
+
+/// One dependency's input to an invocation (R-invocation@2: `ctx.deps[i]`), from
+/// [`Ctx::dep`] or [`DeferredCtx::dep`]: which dependency it is, the arrays it
+/// delivered to this invocation, its terminal, its latest value and whether an
+/// INVALIDATE arrived on it. This is the function's only per-dependency read.
+#[derive(Clone, Copy)]
+pub struct DepView<'a> {
+    record: &'a DepRecord,
+}
+
+impl<'a> DepView<'a> {
+    /// Which dependency this is.
+    #[must_use]
+    pub fn id(&self) -> crate::node::NodeIdentity {
+        self.record.dep
+    }
+
+    /// Whether this dependency is `node`.
+    #[must_use]
+    pub fn is(&self, node: &Core) -> bool {
+        self.record.dep.matches(node)
+    }
+
+    /// The arrays this dependency delivered to this invocation, each as its DATA
+    /// payloads in order: a RESOLVED array is empty, and what came before an
+    /// INVALIDATE is not shown.
+    #[must_use]
+    pub fn raw_waves(&self) -> &'a [Vec<AnyValue>] {
+        &self.record.wave_data
+    }
+
+    /// [`DepView::raw_waves`], typed: each array's DATA payloads that are a `U`.
+    #[must_use]
+    pub fn waves<U: 'static>(&self) -> Vec<Vec<Rc<U>>> {
+        self.record
+            .wave_data
+            .iter()
+            .map(|wave| {
+                wave.iter()
+                    .filter_map(|v| v.clone().downcast::<U>().ok())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every DATA payload of this invocation's arrays, in order, typed.
+    #[must_use]
+    pub fn values<U: 'static>(&self) -> Vec<Rc<U>> {
+        self.waves().into_iter().flatten().collect()
+    }
+
+    /// The dependency's latest value: the last DATA it delivered, in this invocation
+    /// or before; `None` if it holds none (or it is not a `U`).
+    #[must_use]
+    pub fn value<U: 'static>(&self) -> Option<Rc<U>> {
+        self.record
+            .latest
+            .clone()
+            .and_then(|a| a.downcast::<U>().ok())
+    }
+
+    /// Whether the dependency holds a value.
+    #[must_use]
+    pub fn has(&self) -> bool {
+        self.record.latest.is_some()
+    }
+
+    /// The dependency's terminal, if it has ended.
+    #[must_use]
+    pub fn terminal(&self) -> Option<&'a DepTerminal> {
+        self.record.terminal.as_ref()
+    }
+
+    /// Whether an INVALIDATE arrived on this input in this invocation, under the
+    /// manual INVALIDATE policy (R-invalidation); always false under the auto
+    /// policy, where the kernel handles the INVALIDATE without running the function.
+    #[must_use]
+    pub fn invalidated(&self) -> bool {
+        self.record.invalidated
+    }
+}
+
+/// The view of dependency `i` of `records`.
+#[track_caller]
+fn dep_view(records: &[DepRecord], i: usize) -> DepView<'_> {
+    let n = records.len();
+    DepView {
+        record: records
+            .get(i)
+            .unwrap_or_else(|| panic!("ctx.dep({i}): the node has {n} dependencies")),
+    }
 }
 
 /// The single argument to a node fn. All emission is explicit via [`Ctx::down`] /
@@ -110,34 +202,26 @@ impl Ctx {
         &self.dep_records
     }
 
-    /// The raw input surface (R-invocation): per dependency, the arrays it delivered
-    /// to this invocation, each as its DATA payloads in order. A RESOLVED array is
-    /// empty; what came before an INVALIDATE is not shown.
-    pub fn wave_data(&self) -> Vec<&[Vec<AnyValue>]> {
-        self.dep_records
-            .iter()
-            .map(|record| record.wave_data.as_slice())
-            .collect()
-    }
-
-    /// Terminal metadata for dep `i`, separate from `wave_data` (R-fn-contract / D77).
-    pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
-        self.dep_records.get(i).and_then(|r| r.terminal.as_ref())
-    }
-
-    /// Whether dependency `i` of this invocation is `node` (R-invocation: each input
-    /// says which dependency it is).
+    /// Dependency `i`'s input to this invocation (R-invocation@2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `i` is not one of the node's dependencies.
+    #[track_caller]
     #[must_use]
-    pub fn dep_is(&self, i: usize, node: &Core) -> bool {
-        self.dep_records.get(i).is_some_and(|r| r.dep.matches(node))
+    pub fn dep(&self, i: usize) -> DepView<'_> {
+        dep_view(&self.dep_records, i)
     }
 
-    /// Whether an INVALIDATE arrived on dependency `i` in this invocation, under the
-    /// manual INVALIDATE policy (R-invalidation); always false under the auto policy,
-    /// where the kernel handles the INVALIDATE without running the function.
-    #[must_use]
-    pub fn invalidated(&self, i: usize) -> bool {
-        self.dep_records.get(i).is_some_and(|r| r.invalidated)
+    /// Dependency `i`'s input, or `None` past the current dependencies: for nodes
+    /// that rewire themselves, whose dependency count changes between runs.
+    pub(crate) fn dep_if(&self, i: usize) -> Option<DepView<'_>> {
+        self.dep_records.get(i).map(|record| DepView { record })
+    }
+
+    /// Every dependency's input to this invocation, in order.
+    pub fn deps(&self) -> impl Iterator<Item = DepView<'_>> {
+        self.dep_records.iter().map(|record| DepView { record })
     }
 
     /// Number of declared deps in this fn invocation.
@@ -148,39 +232,6 @@ impl Ctx {
     /// True iff no deps are declared.
     pub fn deps_empty(&self) -> bool {
         self.dep_records.is_empty()
-    }
-
-    /// Typed read of dep `i`'s latest DATA, downcast to `U` (SENTINEL → `None`).
-    /// Returns `Rc<U>` (shared, no value clone). Data flows through messages —
-    /// this reads the wave snapshot, never peeks the dep's `.cache` (R-data-not-peek).
-    pub fn data<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
-        self.dep_records
-            .get(i)
-            .and_then(|r| r.latest.clone())
-            .and_then(|a| a.downcast::<U>().ok())
-    }
-
-    /// Typed read of dep `i`'s accumulated DATA grouped by upstream wave.
-    pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
-        self.dep_records
-            .get(i)
-            .map(|r| {
-                r.wave_data
-                    .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|v| v.clone().downcast::<U>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Typed DATA payloads dep `i` delivered in this invocation, flattened across
-    /// upstream waves. This is a derived helper; raw occurrence shape lives in `wave_data`.
-    pub fn batch<U: 'static>(&self, i: usize) -> Vec<Rc<U>> {
-        self.batches(i).into_iter().flatten().collect()
     }
 
     /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean).
@@ -367,48 +418,15 @@ impl DeferredCtx {
             .request_lifetime_rewire(self.lifetime, LifetimeRewire::Set(deps));
     }
 
-    /// The raw input surface captured at defer time (R-invocation).
-    pub fn wave_data(&self) -> Vec<&[Vec<AnyValue>]> {
-        self.dep_records
-            .iter()
-            .map(|record| record.wave_data.as_slice())
-            .collect()
-    }
-
-    /// Terminal metadata for dep `i`, separate from captured `wave_data`.
-    pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
-        self.dep_records.get(i).and_then(|r| r.terminal.as_ref())
-    }
-
-    /// Typed read of dep `i`'s latest DATA at defer time (SENTINEL → `None`).
-    pub fn data<U: 'static>(&self, i: usize) -> Option<Rc<U>> {
-        self.dep_records
-            .get(i)
-            .and_then(|r| r.latest.clone())
-            .and_then(|a| a.downcast::<U>().ok())
-    }
-
-    /// Typed read of dep `i`'s captured DATA grouped by upstream wave.
-    pub fn batches<U: 'static>(&self, i: usize) -> Vec<Vec<Rc<U>>> {
-        self.dep_records
-            .get(i)
-            .map(|r| {
-                r.wave_data
-                    .iter()
-                    .map(|wave| {
-                        wave.iter()
-                            .filter_map(|v| v.clone().downcast::<U>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Typed DATA payloads dep `i` delivered in the captured invocation, flattened
-    /// across upstream waves.
-    pub fn batch<U: 'static>(&self, i: usize) -> Vec<Rc<U>> {
-        self.batches(i).into_iter().flatten().collect()
+    /// Dependency `i`'s input to the invocation this ctx was kept from.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `i` is not one of the node's dependencies.
+    #[track_caller]
+    #[must_use]
+    pub fn dep(&self, i: usize) -> DepView<'_> {
+        dep_view(&self.dep_records, i)
     }
 
     /// Emit one typed DATA downstream as the deferred async result.

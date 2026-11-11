@@ -299,12 +299,12 @@ pub fn scheduled_readiness_projector(
             move |ctx| {
                 let mut state = state.borrow_mut();
                 for index in 0..schedule_count {
-                    for schedule in ctx.batch::<ScheduledReadinessRequested>(index) {
+                    for schedule in ctx.dep(index).values::<ScheduledReadinessRequested>() {
                         retain_schedule(ctx, &mut state, (*schedule).clone());
                     }
                 }
                 for index in schedule_count..(schedule_count + opts.clocks.len()) {
-                    for clock in ctx.batch::<ScheduledReadinessClock>(index) {
+                    for clock in ctx.dep(index).values::<ScheduledReadinessClock>() {
                         retain_clock(ctx, &mut state, (*clock).clone());
                     }
                 }
@@ -992,7 +992,7 @@ fn project_fact<T: Clone + 'static>(
     graph.node_opts::<T, _>(
         vec![runtime.erased()],
         move |ctx| {
-            for fact in ctx.batch::<ScheduledReadinessFact>(0) {
+            for fact in ctx.dep(0).values::<ScheduledReadinessFact>() {
                 if let Some(value) = select(&fact) {
                     ctx.emit(value);
                 }

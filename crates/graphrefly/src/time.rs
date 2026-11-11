@@ -29,9 +29,11 @@ fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
                 ..crate::node::NodeOpts::default()
             },
             move |ctx| {
-                if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+                if let Some(DepTerminal::Error(error)) = ctx.dep_if(0).and_then(|d| d.terminal()) {
                     ctx.down(vec![Message::Error(error.to_string().into())]);
-                } else if dep_has_data(ctx, 0) || is_complete(ctx.terminal(0)) {
+                } else if dep_has_data(ctx, 0)
+                    || is_complete(ctx.dep_if(0).and_then(|d| d.terminal()))
+                {
                     ctx.down(vec![
                         Message::Data(Rc::new(value.clone())),
                         Message::Complete,
@@ -131,7 +133,9 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64) {
     let mut set_to_timer_only = false;
     let mut complete = false;
 
-    if st.timer.is_some() && (dep_has_data(ctx, timer_dep) || is_complete(ctx.terminal(timer_dep)))
+    if st.timer.is_some()
+        && (dep_has_data(ctx, timer_dep)
+            || is_complete(ctx.dep_if(timer_dep).and_then(|d| d.terminal())))
     {
         if let Some(timer) = st.timer.take() {
             to_remove.push(timer);
@@ -157,7 +161,7 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64) {
     }
 
     if !st.source_done {
-        let source_batch = ctx.batch::<S>(0);
+        let source_batch = ctx.dep_if(0).map_or_else(Vec::new, |d| d.values::<S>());
         if st.timer.is_none() {
             if let Some(value) = source_batch.first() {
                 ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
@@ -167,7 +171,7 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64) {
             }
         }
 
-        if is_complete(ctx.terminal(0)) {
+        if is_complete(ctx.dep_if(0).and_then(|d| d.terminal())) {
             st.source_done = true;
             if st.timer.is_some() {
                 set_to_timer_only = true;
@@ -241,8 +245,9 @@ fn run_audit_body<S: Clone + 'static>(ctx: &Ctx, duration_selector: &AuditProjec
             suppress_next_notifier: false,
         });
 
-    let source_batch = ctx.batch::<S>(0);
-    let notifier_signaled = dep_has_data(ctx, 1) || is_complete(ctx.terminal(1));
+    let source_batch = ctx.dep_if(0).map_or_else(Vec::new, |d| d.values::<S>());
+    let notifier_signaled =
+        dep_has_data(ctx, 1) || is_complete(ctx.dep_if(1).and_then(|d| d.terminal()));
     let notifier_fired = st.window_open && notifier_signaled && !st.suppress_next_notifier;
     let fired_notifier = notifier_fired.then(|| st.notifier.clone()).flatten();
     if st.window_open && notifier_signaled && st.suppress_next_notifier {
@@ -279,7 +284,7 @@ fn run_audit_body<S: Clone + 'static>(ctx: &Ctx, duration_selector: &AuditProjec
         st.latest = Some((**value).clone());
     }
 
-    if is_complete(ctx.terminal(0)) {
+    if is_complete(ctx.dep_if(0).and_then(|d| d.terminal())) {
         if let Some(value) = st.latest.clone() {
             ctx.down(vec![Message::Data(Rc::new(value))]);
         }
@@ -358,18 +363,18 @@ fn run_timeout_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, initial_timer: &Core
 
     // A failed clock (no driver) ends the helper before anything is forwarded: at a
     // first run the clock's ERROR and the source's snapshot arrive together.
-    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+    if let Some(DepTerminal::Error(error)) = ctx.dep_if(0).and_then(|d| d.terminal()) {
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Error(error.to_string().into())]);
         return;
     }
 
-    let source_batch = ctx.batch::<S>(1);
+    let source_batch = ctx.dep_if(1).map_or_else(Vec::new, |d| d.values::<S>());
     for value in &source_batch {
         ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
     }
 
-    if is_complete(ctx.terminal(1)) {
+    if is_complete(ctx.dep_if(1).and_then(|d| d.terminal())) {
         if let Some(timer) = st.timer.take() {
             ctx.rewire_remove(timer);
         }
@@ -378,7 +383,7 @@ fn run_timeout_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, initial_timer: &Core
         return;
     }
 
-    if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
+    if let Some(DepTerminal::Error(error)) = ctx.dep_if(1).and_then(|d| d.terminal()) {
         if let Some(timer) = st.timer.take() {
             ctx.rewire_remove(timer);
         }
@@ -400,7 +405,7 @@ fn run_timeout_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, initial_timer: &Core
         return;
     }
 
-    if dep_has_data(ctx, 0) || is_complete(ctx.terminal(0)) {
+    if dep_has_data(ctx, 0) || is_complete(ctx.dep_if(0).and_then(|d| d.terminal())) {
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Error(
             format!("timeout: no value within {ms}ms").into(),
@@ -442,11 +447,11 @@ fn run_buffer_time_body<S: Clone + 'static>(ctx: &Ctx, initial_interval: &Core) 
             interval: Some(initial_interval.clone()),
         });
 
-    for value in ctx.batch::<S>(1) {
+    for value in ctx.dep_if(1).map_or_else(Vec::new, |d| d.values::<S>()) {
         st.buffer.push((*value).clone());
     }
 
-    if is_complete(ctx.terminal(1)) {
+    if is_complete(ctx.dep_if(1).and_then(|d| d.terminal())) {
         if !st.buffer.is_empty() {
             ctx.down(vec![Message::Data(Rc::new(st.buffer.clone()))]);
         }
@@ -461,7 +466,7 @@ fn run_buffer_time_body<S: Clone + 'static>(ctx: &Ctx, initial_interval: &Core) 
         return;
     }
 
-    if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
+    if let Some(DepTerminal::Error(error)) = ctx.dep_if(1).and_then(|d| d.terminal()) {
         if let Some(interval) = st.interval.take() {
             ctx.rewire_remove(interval);
         }
@@ -473,7 +478,7 @@ fn run_buffer_time_body<S: Clone + 'static>(ctx: &Ctx, initial_interval: &Core) 
         return;
     }
 
-    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+    if let Some(DepTerminal::Error(error)) = ctx.dep_if(0).and_then(|d| d.terminal()) {
         ctx.state_set(BufferTimeState::<S> {
             buffer: Vec::new(),
             interval: None,
@@ -520,9 +525,12 @@ fn time_helper_opts() -> NodeOpts {
 }
 
 fn dep_has_data(ctx: &Ctx, dep: usize) -> bool {
-    ctx.wave_data()
-        .get(dep)
-        .is_some_and(|waves| waves.iter().any(|wave| !wave.is_empty()))
+    dep < ctx.dep_len()
+        && ctx
+            .dep_if(dep)
+            .map_or(&[][..], |d| d.raw_waves())
+            .iter()
+            .any(|wave| !wave.is_empty())
 }
 
 fn is_complete(term: Option<&DepTerminal>) -> bool {
@@ -530,7 +538,7 @@ fn is_complete(term: Option<&DepTerminal>) -> bool {
 }
 
 fn first_error(ctx: &Ctx) -> Option<String> {
-    (0..ctx.dep_len()).find_map(|i| match ctx.terminal(i) {
+    (0..ctx.dep_len()).find_map(|i| match ctx.dep_if(i).and_then(|d| d.terminal()) {
         Some(DepTerminal::Error(error)) => Some(error.to_string()),
         _ => None,
     })

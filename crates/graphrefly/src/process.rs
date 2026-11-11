@@ -909,7 +909,7 @@ pub fn process_bundle<
                         Err(message) => {
                             let mut recovery =
                                 RuntimeState::cursor_recovery(initial_state_json.clone());
-                            for command in ctx.batch::<ProcessCommand<TCommand>>(0) {
+                            for command in ctx.dep(0).values::<ProcessCommand<TCommand>>() {
                                 for fact in failure::<TCommand, TState, TEvent, TEffect>(
                                     &mut recovery,
                                     Some((*command).clone()),
@@ -924,7 +924,7 @@ pub fn process_bundle<
                     },
                     None => RuntimeState::new(initial_state_json.clone()),
                 };
-                for command in ctx.batch::<ProcessCommand<TCommand>>(0) {
+                for command in ctx.dep(0).values::<ProcessCommand<TCommand>>() {
                     for fact in reduce_process_command_fact(
                         &mut state,
                         (*command).clone(),
@@ -1061,7 +1061,7 @@ where
 
     let requests = graph.init_node::<ProcessEffectRequest<TEffect>>(
         Operator::with_opts("processEffectRunnerRequests", no_terminal_opts(), |ctx| {
-            for request in ctx.batch::<ProcessEffectRequest<TEffect>>(0) {
+            for request in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 ctx.emit((*request).clone());
             }
         }),
@@ -1075,7 +1075,7 @@ where
             let outcome_count = outcome_deps.len();
             move |ctx: &Ctx| {
                 for index in 0..outcome_count {
-                    for outcome in ctx.batch::<ProcessEffectOutcome<TResult>>(index) {
+                    for outcome in ctx.dep(index).values::<ProcessEffectOutcome<TResult>>() {
                         match process_effect_outcome_command(
                             outcome.as_ref(),
                             command_payload.as_ref(),
@@ -1137,7 +1137,7 @@ where
                 .map_or_else(ProcessEffectRunnerCounters::default, |state| {
                     (*state).clone()
                 });
-            for request in ctx.batch::<ProcessEffectRequest<TEffect>>(0) {
+            for request in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 counters.requested += 1;
                 ctx.emit(ProcessEffectRunnerStatus {
                     state: ProcessEffectRunnerStatusState::Requested,
@@ -1150,7 +1150,10 @@ where
                     rejected: counters.rejected,
                 });
             }
-            for fact in ctx.batch::<ProcessEffectRunnerFact<TCommand, TResult>>(1) {
+            for fact in ctx
+                .dep(1)
+                .values::<ProcessEffectRunnerFact<TCommand, TResult>>()
+            {
                 match fact.as_ref() {
                     ProcessEffectRunnerFact::Command(command, payload) => {
                         counters.commanded += 1;
@@ -1377,7 +1380,10 @@ where
 {
     graph.init_node::<TOut>(
         Operator::with_opts(factory, no_terminal_opts(), move |ctx: &Ctx| {
-            for fact in ctx.batch::<ProcessEffectRunnerFact<TCommand, TResult>>(0) {
+            for fact in ctx
+                .dep(0)
+                .values::<ProcessEffectRunnerFact<TCommand, TResult>>()
+            {
                 if let Some(selected) = select(fact.as_ref()) {
                     ctx.emit(selected);
                 }
@@ -1865,7 +1871,10 @@ fn runtime_projection<
 ) -> Node<TOut> {
     graph.init_node::<TOut>(
         Operator::with_opts(factory, no_terminal_opts(), move |ctx: &Ctx| {
-            for fact in ctx.batch::<ProcessRuntimeFact<TState, TEvent, TEffect, TCommand>>(0) {
+            for fact in ctx
+                .dep(0)
+                .values::<ProcessRuntimeFact<TState, TEvent, TEffect, TCommand>>()
+            {
                 if let Some(selected) = select(fact.as_ref()) {
                     ctx.emit(selected);
                 }

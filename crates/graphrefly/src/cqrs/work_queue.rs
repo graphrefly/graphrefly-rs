@@ -237,17 +237,20 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
                 .state_get::<CqrsQueueState<TCommand>>()
                 .map(|state| (*state).clone())
                 .unwrap_or_default();
-            for record in ctx.batch::<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>(0) {
+            for record in ctx
+                .dep(0)
+                .values::<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>()
+            {
                 reduce_record(ctx, &mut state, &record, &opts);
             }
             if opts.errors.is_some() {
-                for error in ctx.batch::<CqrsError<TCommand>>(2) {
+                for error in ctx.dep(2).values::<CqrsError<TCommand>>() {
                     if let Some(command) = &error.command {
                         state.errors.insert(command.id.clone(), (*error).clone());
                     }
                 }
             }
-            for status in ctx.batch::<CqrsStatus>(1) {
+            for status in ctx.dep(1).values::<CqrsStatus>() {
                 reduce_status(ctx, &mut state, &status, &opts);
             }
             ctx.state_set(state);
@@ -627,7 +630,7 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx| {
-            for fact in ctx.batch::<TIn>(0) {
+            for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
                     ctx.emit(value);
                 }

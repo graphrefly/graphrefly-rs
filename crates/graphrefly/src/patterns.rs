@@ -922,11 +922,13 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
                 .map(|evaluation| *evaluation + 1)
                 .unwrap_or(1);
             let raw_fragments = ctx
-                .data::<Vec<MemoryFragment<T>>>(0)
+                .dep(0)
+                .value::<Vec<MemoryFragment<T>>>()
                 .map(|fragments| (*fragments).clone())
                 .unwrap_or_default();
             let raw_query = ctx
-                .data::<MemoryRetrievalQuery>(1)
+                .dep(1)
+                .value::<MemoryRetrievalQuery>()
                 .map(|query| (*query).clone())
                 .unwrap_or_default();
             let query_errors = validate_query(&raw_query);
@@ -1094,11 +1096,13 @@ pub fn knowledge_graph_reducer_bundle(
                     .map(|evaluation| *evaluation + 1)
                     .unwrap_or(1);
                 let raw_assertions = ctx
-                    .data::<Vec<KnowledgeAssertion>>(0)
+                    .dep(0)
+                    .value::<Vec<KnowledgeAssertion>>()
                     .map(|assertions| (*assertions).clone())
                     .unwrap_or_default();
                 let policy = if has_policy {
-                    ctx.data::<KnowledgeGraphPolicy>(1)
+                    ctx.dep(1)
+                        .value::<KnowledgeGraphPolicy>()
                         .map(|policy| (*policy).clone())
                         .unwrap_or_default()
                 } else {
@@ -1230,7 +1234,7 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, pattern_node_config(), move |ctx| {
-            for snapshot in ctx.batch::<KnowledgeGraphSnapshot>(0) {
+            for snapshot in ctx.dep(0).values::<KnowledgeGraphSnapshot>() {
                 ctx.emit(select(snapshot.as_ref()));
             }
         }),
@@ -1431,7 +1435,7 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, pattern_node_config(), move |ctx| {
-            for snapshot in ctx.batch::<MemoryRetrievalSnapshot<T>>(0) {
+            for snapshot in ctx.dep(0).values::<MemoryRetrievalSnapshot<T>>() {
                 ctx.emit(select(snapshot.as_ref()));
             }
         }),

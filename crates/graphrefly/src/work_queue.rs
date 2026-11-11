@@ -1474,16 +1474,19 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
             let topic = opts.topic.clone();
             let subscription_id = opts.subscription_id.clone();
             move |ctx| {
-                for page in ctx.batch::<MessageBusAvailablePage<WorkQueueSubmit<T>>>(0) {
+                for page in ctx
+                    .dep(0)
+                    .values::<MessageBusAvailablePage<WorkQueueSubmit<T>>>()
+                {
                     ctx.emit((*page).clone());
                 }
-                let mut should_pull = !ctx.batch::<String>(1).is_empty();
-                for message in ctx.batch::<MessageEnvelope<WorkQueueSubmit<T>>>(2) {
+                let mut should_pull = !ctx.dep(1).values::<String>().is_empty();
+                for message in ctx.dep(2).values::<MessageEnvelope<WorkQueueSubmit<T>>>() {
                     if message.topic == topic {
                         should_pull = true;
                     }
                 }
-                for status in ctx.batch::<MessageBusStatus>(3) {
+                for status in ctx.dep(3).values::<MessageBusStatus>() {
                     if should_poll_admission(&status, &topic, &subscription_id) {
                         should_pull = true;
                     }
@@ -1517,7 +1520,10 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
     let runtime = graph.node_opts::<QueueEvent<T>, _>(
         vec![commands.erased(), admission_pages.erased()],
         move |ctx| {
-            for page in ctx.batch::<MessageBusAvailablePage<WorkQueueSubmit<T>>>(1) {
+            for page in ctx
+                .dep(1)
+                .values::<MessageBusAvailablePage<WorkQueueSubmit<T>>>()
+            {
                 for message in &page.messages {
                     let now_ms = timestamp_or_zero(&runtime_opts.now);
                     let events = {
@@ -1529,7 +1535,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     }
                 }
             }
-            for command in ctx.batch::<WorkQueueCommand<T>>(0) {
+            for command in ctx.dep(0).values::<WorkQueueCommand<T>>() {
                 let now_ms = command
                     .now_ms()
                     .unwrap_or_else(|| timestamp_or_zero(&runtime_opts.now));
@@ -1551,7 +1557,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
     let records = graph.node_opts::<WorkQueueRecord<T>, _>(
         vec![runtime.erased()],
         move |ctx| {
-            for event in ctx.batch::<QueueEvent<T>>(0) {
+            for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Record(record) = event.as_ref() {
                     ctx.emit(record.clone());
                 }
@@ -1562,7 +1568,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
     let status = graph.node_opts::<WorkQueueStatus, _>(
         vec![runtime.erased()],
         move |ctx| {
-            for event in ctx.batch::<QueueEvent<T>>(0) {
+            for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Status(status) = event.as_ref() {
                     ctx.emit(status.clone());
                 }
@@ -1573,7 +1579,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
     let issues = graph.node_opts::<DataIssue, _>(
         vec![runtime.erased()],
         move |ctx| {
-            for event in ctx.batch::<QueueEvent<T>>(0) {
+            for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Issue(issue) = event.as_ref() {
                     ctx.emit(issue.clone());
                 }
@@ -1585,7 +1591,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
         vec![records.erased()],
         {
             move |ctx| {
-                for record in ctx.batch::<WorkQueueRecord<T>>(0) {
+                for record in ctx.dep(0).values::<WorkQueueRecord<T>>() {
                     if let Some(command) = admission_ack_command(&record) {
                         ctx.emit(command);
                     }
@@ -1630,7 +1636,7 @@ fn work_queue_command_body<T: Clone + 'static>(
 ) -> impl Fn(&Ctx) + 'static {
     move |ctx| {
         for index in 0..command_source_count {
-            for command in ctx.batch::<WorkQueueCommand<T>>(index) {
+            for command in ctx.dep(index).values::<WorkQueueCommand<T>>() {
                 ctx.emit((*command).clone());
             }
         }

@@ -473,7 +473,7 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
                     .state_get::<Value>()
                     .map(|value| RuntimeState::from_json(value.as_ref()))
                     .unwrap_or_else(|| RuntimeState::from_json(&runtime_seed));
-                for command in ctx.batch::<CqrsCommand<TCommand>>(0) {
+                for command in ctx.dep(0).values::<CqrsCommand<TCommand>>() {
                     for fact in reduce_command_fact(
                         &mut state,
                         (*command).clone(),
@@ -679,7 +679,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                     .unwrap_or_else(|| ProjectionState {
                         value: initial.clone(),
                     });
-                for event in ctx.batch::<CqrsEvent<TEvent>>(0) {
+                for event in ctx.dep(0).values::<CqrsEvent<TEvent>>() {
                     if let Some(filter) = event_filter.as_ref() {
                         if !filter.contains(&event.event_type) {
                             continue;
@@ -721,7 +721,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
     );
     let value = graph.init_node::<TState>(
         Operator::with_opts("cqrsProjectionValue", no_terminal_opts(), |ctx: &Ctx| {
-            for frame in ctx.batch::<CqrsProjectionFrame<TState>>(0) {
+            for frame in ctx.dep(0).values::<CqrsProjectionFrame<TState>>() {
                 if let CqrsProjectionFrame::Value { state, .. } = frame.as_ref() {
                     ctx.emit(state.clone());
                 }
@@ -732,7 +732,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
     );
     let status = graph.init_node::<CqrsProjectionStatus>(
         Operator::with_opts("cqrsProjectionStatus", no_terminal_opts(), |ctx: &Ctx| {
-            for frame in ctx.batch::<CqrsProjectionFrame<TState>>(0) {
+            for frame in ctx.dep(0).values::<CqrsProjectionFrame<TState>>() {
                 match frame.as_ref() {
                     CqrsProjectionFrame::Value {
                         event_id, cursor, ..
@@ -756,7 +756,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
     );
     let errors = graph.init_node::<CqrsProjectionError>(
         Operator::with_opts("cqrsProjectionErrors", no_terminal_opts(), |ctx: &Ctx| {
-            for frame in ctx.batch::<CqrsProjectionFrame<TState>>(0) {
+            for frame in ctx.dep(0).values::<CqrsProjectionFrame<TState>>() {
                 if let CqrsProjectionFrame::Error(error) = frame.as_ref() {
                     ctx.emit(error.clone());
                 }
@@ -1087,7 +1087,7 @@ fn runtime_projection<TCommand: Clone + 'static, TEvent: Clone + 'static, TOut: 
 ) -> Node<TOut> {
     graph.init_node::<TOut>(
         Operator::with_opts(factory, no_terminal_opts(), move |ctx: &Ctx| {
-            for fact in ctx.batch::<CqrsRuntimeFact<TCommand, TEvent>>(0) {
+            for fact in ctx.dep(0).values::<CqrsRuntimeFact<TCommand, TEvent>>() {
                 if let Some(selected) = select(fact.as_ref()) {
                     ctx.emit(selected);
                 }

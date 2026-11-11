@@ -210,15 +210,15 @@ where
             ..NodeOpts::default()
         },
         move |ctx: &Ctx| {
-            if let Some(rules) = ctx.data::<R>(rules_index) {
-                for value in ctx.batch::<T>(source_index) {
+            if let Some(rules) = ctx.dep(rules_index).value::<R>() {
+                for value in ctx.dep(source_index).values::<T>() {
                     if classifier(rules.as_ref(), value.as_ref()) {
                         ctx.emit((*value).clone());
                     }
                 }
             }
 
-            match ctx.terminal(source_index) {
+            match ctx.dep(source_index).terminal() {
                 Some(DepTerminal::Complete) => ctx.down(vec![Message::Complete]),
                 Some(DepTerminal::Error(error)) => {
                     ctx.down(vec![Message::Error(error.to_string().into())]);

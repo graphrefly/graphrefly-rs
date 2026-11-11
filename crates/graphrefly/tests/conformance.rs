@@ -44,7 +44,7 @@ fn record<T: 'static>(node: &Node<T>) -> (Log, Unsub) {
 #[test]
 fn c17_absorbed_error_counts_terminal_for_auto_complete() {
     fn fwd(ctx: &Ctx) {
-        let v = ctx.data::<i32>(0).map(|r| *r).unwrap_or(0);
+        let v = ctx.dep(0).value::<i32>().map(|r| *r).unwrap_or(0);
         ctx.emit(v);
     }
 

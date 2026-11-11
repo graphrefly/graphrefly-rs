@@ -194,7 +194,7 @@ pub use cqrs::{
     CqrsProjectionFrame, CqrsProjectionOptions, CqrsProjectionReducer, CqrsProjectionStatus,
     CqrsProjectionStatusState, CqrsRuntimeFact, CqrsStatus, CqrsStatusState,
 };
-pub use ctx::{Ctx, DeferredCtx, DepTerminal};
+pub use ctx::{Ctx, DeferredCtx, DepTerminal, DepView};
 pub use data_structures::{
     merge_reactive_logs, reactive_index, reactive_list, reactive_log, reactive_map,
     restore_reactive_index, restore_reactive_list, restore_reactive_log, restore_reactive_map,
@@ -261,8 +261,8 @@ pub use messaging::{
     STANDARD_TOPICS, TODOS_TOPIC,
 };
 pub use node::{
-    CacheStatus, Core, Lifecycle, Node, NodeDefinition, NodeOpts, OutputStatus, Policy,
-    ReplaceOpts, State, StateWrite, Status,
+    CacheStatus, Core, Lifecycle, Node, NodeDefinition, NodeIdentity, NodeOpts, OutputStatus,
+    Policy, ReplaceOpts, State, StateWrite, Status,
 };
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,

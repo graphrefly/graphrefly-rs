@@ -60,7 +60,7 @@ fn bytes_node(g: &Graph, name: &str, deps: Vec<graphrefly::Core>, add: u8) -> No
     g.node_opts::<Vec<u8>, _>(
         deps,
         move |ctx| {
-            if let Some(v) = ctx.data::<Vec<u8>>(0) {
+            if let Some(v) = ctx.dep(0).value::<Vec<u8>>() {
                 ctx.emit(vec![byte(&v) + add]);
             }
         },
@@ -97,7 +97,9 @@ fn c1_cross_graph_diamond_runs_its_fan_in_once() {
         g1.node_opts::<Vec<u8>, _>(
             vec![gbc_in.inbound["b"].erased(), gbc_in.inbound["c"].erased()],
             move |ctx| {
-                if let (Some(b), Some(c)) = (ctx.data::<Vec<u8>>(0), ctx.data::<Vec<u8>>(1)) {
+                if let (Some(b), Some(c)) =
+                    (ctx.dep(0).value::<Vec<u8>>(), ctx.dep(1).value::<Vec<u8>>())
+                {
                     d_runs.borrow_mut().push((byte(&b), byte(&c)));
                     ctx.emit(vec![byte(&b), byte(&c)]);
                 }
@@ -201,7 +203,7 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
     let x = s.node_opts::<Vec<u8>, _>(
         vec![tx.erased()],
         |ctx| {
-            if let Some(v) = ctx.data::<Vec<u8>>(0) {
+            if let Some(v) = ctx.dep(0).value::<Vec<u8>>() {
                 if v[0] == 99 {
                     ctx.down(vec![Message::Data(Rc::new(vec![99u8]) as AnyValue)]);
                     ctx.down(vec![Message::Data(Rc::new(vec![100u8]) as AnyValue)]);
@@ -230,8 +232,8 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
             vec![gin.inbound["x"].erased(), gin.inbound["y"].erased()],
             move |ctx| {
                 f_runs.borrow_mut().push((
-                    ctx.data::<Vec<u8>>(0).map(|v| v[0]),
-                    ctx.data::<Vec<u8>>(1).map(|v| v[0]),
+                    ctx.dep(0).value::<Vec<u8>>().map(|v| v[0]),
+                    ctx.dep(1).value::<Vec<u8>>().map(|v| v[0]),
                 ));
             },
             GraphNodeOpts {
