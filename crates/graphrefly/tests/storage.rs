@@ -3223,7 +3223,7 @@ fn reactive_cascading_cache_load_panic_becomes_error_events_not_terminal_error()
 
     request.set("k".to_owned());
 
-    assert_eq!(cache.events.status(), graphrefly::Status::Settled);
+    assert_eq!(cache.events.status().cache, graphrefly::CacheStatus::Ready);
     assert_eq!(
         statuses.borrow().last(),
         Some(&CascadingCacheStatus::Error {

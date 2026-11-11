@@ -434,14 +434,12 @@ fn collect_describe_ids(snapshot: &DescribeSnapshot, ids: &mut BTreeSet<String>)
 }
 
 fn status_rank(status: Status) -> usize {
-    match status {
-        Status::Sentinel => 0,
-        Status::Pending => 1,
-        Status::Dirty => 2,
-        Status::Settled => 3,
-        Status::Resolved => 4,
-        Status::Completed => 5,
-        Status::Errored => 6,
+    match status.label() {
+        "empty" => 0,
+        "stale" => 1,
+        "ready" => 2,
+        "completed" => 3,
+        _ => 4,
     }
 }
 

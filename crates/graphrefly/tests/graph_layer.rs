@@ -129,7 +129,7 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
     );
 
     let found = g.find("source").expect("registered source is findable");
-    assert_eq!(found.status(), Status::Sentinel);
+    assert_eq!(found.status().cache, graphrefly::CacheStatus::Empty);
 
     let observed = Rc::new(RefCell::new(Vec::new()));
     let observed_sink = observed.clone();
@@ -157,7 +157,7 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
     let source_node = snap.nodes.iter().find(|n| n.id == "source").unwrap();
     let raw_node = snap.nodes.iter().find(|n| n.id == "raw").unwrap();
     assert_eq!(source_node.factory, "producer");
-    assert_eq!(source_node.status, Status::Settled);
+    assert_eq!(source_node.status.cache, graphrefly::CacheStatus::Ready);
     assert_eq!(source_node.value, Some(DescribeValue::I64(7)));
     assert_eq!(raw_node.factory, "node");
     assert_eq!(raw_node.deps, vec!["source"]);
@@ -892,7 +892,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "x".to_owned(),
                 name: None,
                 factory: "state".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec![],
@@ -902,7 +906,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "y".to_owned(),
                 name: None,
                 factory: "derived".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec![],
@@ -942,7 +950,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "x".to_owned(),
                 name: None,
                 factory: "state".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec!["missing".to_owned()],
@@ -952,7 +964,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "y".to_owned(),
                 name: None,
                 factory: "derived".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec![],
@@ -991,7 +1007,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "a".to_owned(),
                 name: None,
                 factory: "node".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec!["b".to_owned()],
@@ -1001,7 +1021,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 id: "b".to_owned(),
                 name: None,
                 factory: "node".to_owned(),
-                status: Status::Sentinel,
+                status: Status {
+                    cache: graphrefly::CacheStatus::Empty,
+                    output: graphrefly::OutputStatus::Open,
+                    lifecycle: graphrefly::Lifecycle::Inactive,
+                },
                 value: None,
                 version: None,
                 deps: vec!["a".to_owned()],
@@ -1077,7 +1101,10 @@ fn checkpoint_uses_neutral_schema_and_restores_fresh_json_state() {
     )
     .expect("fresh restore succeeds");
     let restored_count = restored.find("count").expect("restored node is registered");
-    assert_eq!(restored_count.status(), Status::Settled);
+    assert_eq!(
+        restored_count.status().cache,
+        graphrefly::CacheStatus::Ready
+    );
     assert_eq!(json_cache(restored_count.clone()), json!(2));
 
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -1416,7 +1443,7 @@ fn state_empty_describe_omits_sentinel_value() {
     let snap = g.describe();
     let empty = snap.nodes.iter().find(|n| n.id == "empty").unwrap();
     assert_eq!(empty.value, None);
-    assert_eq!(empty.status, Status::Sentinel);
+    assert_eq!(empty.status.cache, graphrefly::CacheStatus::Empty);
 
     state.set(3i32);
     let snap = g.describe();
@@ -1455,8 +1482,8 @@ fn describe_explain_and_renderers_are_pure_snapshot_functions() {
     let snap = g.describe();
     assert!(describe_to_mermaid(&snap).contains("flowchart LR"));
     assert!(describe_to_d2(&snap).contains("direction: right"));
-    assert!(describe_to_pretty(&snap).contains("source (state/Settled): 1"));
-    assert!(describe_to_ascii(&snap, true).contains("source [state/Settled 1] -> mapped"));
+    assert!(describe_to_pretty(&snap).contains("source (state/ready): 1"));
+    assert!(describe_to_ascii(&snap, true).contains("source [state/ready 1] -> mapped"));
     assert!(describe_to_json(&snap).contains("\"id\":\"source\""));
     assert!(describe_to_mermaid_url(&snap).starts_with("https://mermaid.live/edit#base64:"));
 }
@@ -1493,9 +1520,9 @@ fn renderers_respect_direction_and_ascii_value_toggle() {
 
     let without_values = describe_to_ascii(&snap, false);
     let with_values = describe_to_ascii(&snap, true);
-    assert!(without_values.contains("source [state/Settled] -> sink"));
-    assert!(!without_values.contains("source [state/Settled 1] -> sink"));
-    assert!(with_values.contains("source [state/Settled 1] -> sink"));
+    assert!(without_values.contains("source [state/ready] -> sink"));
+    assert!(!without_values.contains("source [state/ready 1] -> sink"));
+    assert!(with_values.contains("source [state/ready 1] -> sink"));
 }
 
 #[test]
@@ -1679,7 +1706,10 @@ fn profile_counts_graph_registered_invokes_when_enabled() {
     assert!(profile.total_invokes >= 2);
     assert_eq!(profile.nodes["source"].invokes, 0);
     assert!(profile.nodes["doubled"].invokes >= 2);
-    assert_eq!(profile.nodes["doubled"].status, Status::Settled);
+    assert_eq!(
+        profile.nodes["doubled"].status.cache,
+        graphrefly::CacheStatus::Ready
+    );
 }
 
 #[test]
@@ -1718,7 +1748,10 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
     );
     let profile = panics.profile();
     assert_eq!(profile.nodes["bad"].invokes, 1);
-    assert_eq!(profile.nodes["bad"].status, Status::Errored);
+    assert_eq!(
+        profile.nodes["bad"].status.output,
+        graphrefly::OutputStatus::Errored
+    );
 }
 
 #[test]
@@ -1753,7 +1786,7 @@ fn profile_summary_rolls_up_existing_profile_and_describe_facts() {
         summary
             .by_status
             .iter()
-            .find(|entry| entry.status == Status::Settled)
+            .find(|entry| entry.status.cache == graphrefly::CacheStatus::Ready)
             .map(|entry| entry.count),
         Some(2)
     );
@@ -1808,7 +1841,10 @@ fn profile_summary_does_not_activate_cold_nodes_or_create_topology_events() {
     assert_eq!(summary.total_invokes, 0);
     assert_eq!(summary.hot_nodes[0].path, "cold");
     assert_eq!(summary.hot_nodes[0].invokes, 0);
-    assert_eq!(summary.hot_nodes[0].status, Status::Sentinel);
+    assert_eq!(
+        summary.hot_nodes[0].status.cache,
+        graphrefly::CacheStatus::Empty
+    );
 }
 
 #[test]
@@ -1906,7 +1942,10 @@ fn scan_and_take_preserve_occurrence_semantics() {
         });
 
     assert_eq!(*seen.borrow(), vec![1, 2, 3]);
-    assert_eq!(first_three.status(), Status::Completed);
+    assert_eq!(
+        first_three.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 }
 
 #[test]

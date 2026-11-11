@@ -1111,8 +1111,14 @@ fn wire_edge_group_fail_closed_cases_are_issues_not_terminals() {
         }
         assert!(inbound_a.borrow().is_empty());
         assert!(issues.borrow().iter().any(|issue| issue.code == code));
-        assert_ne!(group.issues.status(), graphrefly::Status::Errored);
-        assert_ne!(group.status.status(), graphrefly::Status::Errored);
+        assert_ne!(
+            group.issues.status().output,
+            graphrefly::OutputStatus::Errored
+        );
+        assert_ne!(
+            group.status.status().output,
+            graphrefly::OutputStatus::Errored
+        );
     }
 }
 
@@ -1241,8 +1247,14 @@ fn wire_edge_group_failed_cause_replay_is_issue_not_resurrection() {
     assert_eq!(status.borrow().last().unwrap().active_cause_id, None);
     assert_eq!(status.borrow().last().unwrap().pending, 0);
     assert_eq!(status.borrow().last().unwrap().data, 0);
-    assert_ne!(group.issues.status(), graphrefly::Status::Errored);
-    assert_ne!(group.status.status(), graphrefly::Status::Errored);
+    assert_ne!(
+        group.issues.status().output,
+        graphrefly::OutputStatus::Errored
+    );
+    assert_ne!(
+        group.status.status().output,
+        graphrefly::OutputStatus::Errored
+    );
 }
 
 #[test]
@@ -1367,8 +1379,14 @@ fn wire_edge_group_status_and_issues_only_cover_malformed_and_competing_causes()
         status.borrow().last().unwrap().state,
         WireEdgeGroupStatusState::Issues
     );
-    assert_ne!(group.issues.status(), graphrefly::Status::Errored);
-    assert_ne!(group.status.status(), graphrefly::Status::Errored);
+    assert_ne!(
+        group.issues.status().output,
+        graphrefly::OutputStatus::Errored
+    );
+    assert_ne!(
+        group.status.status().output,
+        graphrefly::OutputStatus::Errored
+    );
 }
 
 #[test]

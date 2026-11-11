@@ -77,6 +77,7 @@ pub mod higher_order;
 #[doc(hidden)]
 mod identity;
 pub mod json;
+pub mod lifetime;
 pub mod messaging;
 pub mod node;
 pub mod operators;
@@ -239,6 +240,7 @@ pub use json::{
     u128_to_non_negative_decimal_string, Codec, DecimalIntegerString, JsonCodec, JsonCodecError,
     JsonCodecResult, JsonValue, NonNegativeDecimalIntegerString, StrictJsonCodec,
 };
+pub use lifetime::{cleanup, AbortSignal, Cleanup, CleanupCtx, Setup};
 pub use messaging::{
     event_message, is_json_schema_valid, message_bus, to_topic, validate_json_schema,
     validate_topic_message_payload, DataIssue, EventMessage, EventMessageOptions, JsonSchema,
@@ -254,7 +256,7 @@ pub use messaging::{
     CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC, SPAWNS_TOPIC,
     STANDARD_TOPICS, TODOS_TOPIC,
 };
-pub use node::{Core, Node, NodeOpts, Policy, State, Status};
+pub use node::{CacheStatus, Core, Lifecycle, Node, NodeOpts, OutputStatus, Policy, State, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,

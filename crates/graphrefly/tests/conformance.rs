@@ -22,7 +22,7 @@ use graphrefly::{
     graph, restore_graph, restore_registry, Core, Ctx, DeferredCtx, DepTerminal,
     GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreEntry, Message, Node, NodeOpts,
     NodeVersion, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind,
-    StateRestoreDescriptor, Status,
+    StateRestoreDescriptor,
 };
 use serde_json::json;
 
@@ -130,10 +130,12 @@ fn make_inner(seed: Option<i32>) -> Inner {
     let activated = Rc::new(Cell::new(false));
     let deactivated = Rc::new(Cell::new(false));
     let (dc, act, deact) = (dctx.clone(), activated.clone(), deactivated.clone());
-    let node = Node::<i32>::producer(move |ctx| {
-        act.set(true);
+    let opts = graphrefly::NodeOpts::default().with_setup(move |_| {
         let d = deact.clone();
-        ctx.on_deactivation(move || d.set(true));
+        graphrefly::cleanup(move |_| d.set(true))
+    });
+    let node = Node::<i32>::producer_opts(opts, move |ctx| {
+        act.set(true);
         *dc.borrow_mut() = Some(ctx.defer());
         if let Some(s) = seed {
             ctx.emit(s);
@@ -294,7 +296,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
             ia_deact.get(),
             "the completed inner is removed → deactivated (input torn down)"
         );
-        assert_ne!(op.status(), Status::Completed); // OP stays live (S live, cwdc:false)
+        assert_ne!(op.status().output, graphrefly::OutputStatus::Completed); // OP stays live (S live, cwdc:false)
         assert!(!kinds(&log).contains(&"COMPLETE".to_string()));
     }
 
@@ -387,7 +389,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
             result.is_ok(),
             "the D37 reject is converted to ERROR, not escaped"
         );
-        assert_eq!(op.status(), Status::Errored);
+        assert_eq!(op.status().output, graphrefly::OutputStatus::Errored);
     }
 
     // ── (variant) D62: terminal seals output but still drains queued topology. ──
@@ -420,7 +422,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let (log, _u) = record(&op);
         log.borrow_mut().clear();
         s.set(1);
-        assert_eq!(op.status(), Status::Completed);
+        assert_eq!(op.status().output, graphrefly::OutputStatus::Completed);
         assert!(
             inner_act.get(),
             "the queued subscribe_dep drained even though OP became terminal"
@@ -458,45 +460,6 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         );
         assert_eq!(op.cache(), Some(1));
     }
-}
-
-/// C-14 — cleanup hooks are per-run (R-cleanup-hooks / D28 clarification). A fn that
-/// registers onInvalidate + onDeactivation on EVERY run: the substrate clears both hook
-/// lists before each run, so after K runs an INVALIDATE fires onInvalidate exactly once
-/// (the latest run's) and deactivation fires onDeactivation exactly once — NOT K times.
-#[test]
-fn c14_cleanup_hooks_are_per_run() {
-    let flush = Rc::new(Cell::new(0usize));
-    let cleanup = Rc::new(Cell::new(0usize));
-    let s = Node::<i32>::state(0);
-    let d = {
-        let f = flush.clone();
-        let c = cleanup.clone();
-        Node::<i32>::derived(vec![s.erased()], move |ctx| {
-            let f2 = f.clone();
-            ctx.on_invalidate(move || f2.set(f2.get() + 1));
-            let c2 = c.clone();
-            ctx.on_deactivation(move || c2.set(c2.get() + 1));
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
-        })
-    };
-    let (_log, u) = record(&d); // run 1 (activation, s=0)
-    s.set(1); // run 2 — re-registers (prior run's hooks cleared)
-    s.set(2); // run 3 — re-registers (D has now run 3×)
-
-    s.invalidate(); // fires onInvalidate ONCE (run-3's), not 3×
-    assert_eq!(
-        flush.get(),
-        1,
-        "onInvalidate fires once after K runs, not K times (D28 per-run lifecycle)"
-    );
-
-    u(); // D loses its last subscriber → deactivates → fires onDeactivation ONCE (run-3's)
-    assert_eq!(
-        cleanup.get(),
-        1,
-        "onDeactivation fires once (the latest run's), not K times"
-    );
 }
 
 /// C-8 — intra-graph runtime rewire (R-rewire / D42). Surgical Option-C: subscribe_dep
@@ -569,11 +532,11 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         );
         let (_log, _u) = record(&d);
         c.error("boom"); // absorbed; B still live → not yet all-terminal
-        assert_ne!(d.status(), Status::Completed);
-        assert_ne!(d.status(), Status::Errored); // error_when_deps_error:false → no auto-ERROR
+        assert_ne!(d.status().output, graphrefly::OutputStatus::Completed);
+        assert_ne!(d.status().output, graphrefly::OutputStatus::Errored); // error_when_deps_error:false → no auto-ERROR
         b.set(1);
         b.complete(); // B terminal → ALL deps terminal (C errored) → COMPLETE
-        assert_eq!(d.status(), Status::Completed);
+        assert_eq!(d.status().output, graphrefly::OutputStatus::Completed);
     }
 
     // (b) complete-then-error: B completes, then C errors LAST → still auto-COMPLETEs (ERROR-arm mirror).
@@ -591,9 +554,9 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         let (_log, _u) = record(&d);
         b.set(1);
         b.complete(); // B terminal; C still live → not yet all-terminal
-        assert_ne!(d.status(), Status::Completed);
+        assert_ne!(d.status().output, graphrefly::OutputStatus::Completed);
         c.error("boom"); // C absorbed-error LANDS LAST → all terminal → COMPLETE
-        assert_eq!(d.status(), Status::Completed); // ERROR-absorbed arm mirrors the COMPLETE arm (B42)
+        assert_eq!(d.status().output, graphrefly::OutputStatus::Completed); // ERROR-absorbed arm mirrors the COMPLETE arm (B42)
     }
 
     // (c) default error_when_deps_error:true → auto-ERRORs on a dep error (absorbed path gated off).
@@ -603,7 +566,7 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         let d = Node::<i32>::derived_opts(vec![b.erased(), c.erased()], NodeOpts::default(), fwd);
         let (_log, _u) = record(&d);
         c.error("boom"); // auto-cascade → ERROR before any complete-check
-        assert_eq!(d.status(), Status::Errored);
+        assert_eq!(d.status().output, graphrefly::OutputStatus::Errored);
     }
 }
 

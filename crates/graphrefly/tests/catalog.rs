@@ -590,12 +590,16 @@ fn producer_source(
 ) -> ProducerSource {
     let out: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
     let slot = out.clone();
+    let mut opts = opts;
+    if let Some(cleanup) = cleanup {
+        opts.node = opts.node.with_setup(move |_| {
+            let cleanup = cleanup.clone();
+            graphrefly::cleanup(move |_| cleanup.set(cleanup.get() + 1))
+        });
+    }
     let node = g.producer_opts(
         move |ctx| {
             *slot.borrow_mut() = Some(ctx.defer());
-            if let Some(cleanup) = cleanup.clone() {
-                ctx.on_deactivation(move || cleanup.set(cleanup.get() + 1));
-            }
         },
         opts,
     );
@@ -625,7 +629,7 @@ fn source_primitives_cover_empty_never_and_throw_error() {
             }
         });
     assert_eq!(*single_events.borrow(), vec!["DATA:7", "COMPLETE"]);
-    assert_eq!(single.status(), graphrefly::Status::Completed);
+    assert_eq!(single.status().output, graphrefly::OutputStatus::Completed);
 
     let iter = g.init_node(
         from_iter(vec![1i32, 2, 3]),
@@ -655,15 +659,15 @@ fn source_primitives_cover_empty_never_and_throw_error() {
         *iter_events.borrow(),
         vec!["DATA:1", "DATA:2", "DATA:3", "COMPLETE"]
     );
-    assert_eq!(iter.status(), graphrefly::Status::Completed);
+    assert_eq!(iter.status().output, graphrefly::OutputStatus::Completed);
 
     let done = g.init_node(empty::<i32>(), vec![], GraphNodeOpts::named("empty"));
     assert_eq!(*collect_shapes::<i32>(&done).borrow(), vec!["COMPLETE"]);
-    assert_eq!(done.status(), graphrefly::Status::Completed);
+    assert_eq!(done.status().output, graphrefly::OutputStatus::Completed);
 
     let silent = g.init_node(never::<i32>(), vec![], GraphNodeOpts::named("never"));
     assert!(collect_shapes::<i32>(&silent).borrow().is_empty());
-    assert_eq!(silent.status(), graphrefly::Status::Sentinel);
+    assert_eq!(silent.status().cache, graphrefly::CacheStatus::Empty);
 
     let failed = g.init_node(
         throw_error::<i32>("boom"),
@@ -684,7 +688,7 @@ fn source_primitives_cover_empty_never_and_throw_error() {
             }
         });
     assert_eq!(*failed_events.borrow(), vec!["ERROR:boom"]);
-    assert_eq!(failed.status(), graphrefly::Status::Errored);
+    assert_eq!(failed.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -1280,7 +1284,7 @@ fn fs_watch_source_rejects_empty_paths_and_reports_missing_driver() {
         *collect_errors::<FsEvent>(&watched).borrow(),
         vec!["fromFSWatch: missing local async driver".to_owned()]
     );
-    assert_eq!(watched.status(), graphrefly::Status::Errored);
+    assert_eq!(watched.status().output, graphrefly::OutputStatus::Errored);
     fs::remove_dir_all(dir).ok();
 }
 
@@ -1455,7 +1459,7 @@ fn missing_driver_reports_source_activation_error() {
     let g = graph();
     let timed = g.init_node(timer(1), vec![], GraphNodeOpts::named("timer_missing"));
     assert_eq!(*collect_shapes::<u64>(&timed).borrow(), vec!["ERROR"]);
-    assert_eq!(timed.status(), graphrefly::Status::Errored);
+    assert_eq!(timed.status().output, graphrefly::OutputStatus::Errored);
 
     let future = g.init_node(
         future_local(|| async { Ok::<_, io::Error>(7i32) }),
@@ -1741,7 +1745,7 @@ fn eager_http_driver_cleanup_installs_returned_cancel_after_sync_completion() {
         1,
         "sync driver completion must still release the returned cancel handle"
     );
-    assert_eq!(http.status(), graphrefly::Status::Completed);
+    assert_eq!(http.status().output, graphrefly::OutputStatus::Completed);
     assert_eq!(
         http.cache().expect("http response is cached").body,
         b"https://example.test/eager".to_vec()
@@ -1935,7 +1939,7 @@ fn from_sse_http_stream_callback_can_complete_before_cancel_is_returned() {
         }]
     );
     assert_eq!(*shapes.borrow(), vec!["DATA", "COMPLETE"]);
-    assert_eq!(sse.status(), graphrefly::Status::Completed);
+    assert_eq!(sse.status().output, graphrefly::OutputStatus::Completed);
 }
 
 #[test]
@@ -2340,7 +2344,7 @@ fn local_future_and_stream_sources_emit_via_driver_boundary() {
     let stream_seen = collect_data(&stream);
     driver.poll_futures();
     assert_eq!(*stream_seen.borrow(), vec![1, 2, 3]);
-    assert_eq!(stream.status(), graphrefly::Status::Completed);
+    assert_eq!(stream.status().output, graphrefly::OutputStatus::Completed);
 }
 
 #[test]
@@ -2452,7 +2456,7 @@ fn local_future_and_stream_sources_route_errors_into_protocol() {
     let future_seen = collect_shapes::<i32>(&future);
     driver.poll_futures();
     assert_eq!(*future_seen.borrow(), vec!["ERROR"]);
-    assert_eq!(future.status(), graphrefly::Status::Errored);
+    assert_eq!(future.status().output, graphrefly::OutputStatus::Errored);
 
     let stream = g.init_node(
         stream_local(|| {
@@ -2470,7 +2474,7 @@ fn local_future_and_stream_sources_route_errors_into_protocol() {
     driver.poll_futures();
     assert_eq!(*stream_shapes.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(*stream_data.borrow(), vec![1]);
-    assert_eq!(stream.status(), graphrefly::Status::Errored);
+    assert_eq!(stream.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -2625,12 +2629,15 @@ fn throttle_waits_for_open_window_before_source_complete() {
         vec!["DATA"],
         "throttle is exhaustMap-shaped: source COMPLETE waits for the live window dep"
     );
-    assert_eq!(throttled.status(), graphrefly::Status::Settled);
+    assert_eq!(throttled.status().cache, graphrefly::CacheStatus::Ready);
 
     driver.fire_sleepers();
 
     assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
-    assert_eq!(throttled.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        throttled.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 }
 
 #[test]
@@ -2713,7 +2720,10 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
         vec!["COMPLETE"],
         "the retained helper timer should close the pending completion window"
     );
-    assert_eq!(throttled.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        throttled.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 }
 
 #[test]
@@ -2737,7 +2747,7 @@ fn audit_time_flushes_pending_value_on_source_complete() {
 
     assert_eq!(*data.borrow(), vec![7]);
     assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
-    assert_eq!(audited.status(), graphrefly::Status::Completed);
+    assert_eq!(audited.status().output, graphrefly::OutputStatus::Completed);
 }
 
 #[test]
@@ -2854,7 +2864,7 @@ fn audit_selector_panic_errors_and_seals_output() {
     notifier.set(());
     src.set(2);
 
-    assert_eq!(audited.status(), graphrefly::Status::Errored);
+    assert_eq!(audited.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(*data.borrow(), vec![1]);
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
 
@@ -2943,8 +2953,8 @@ fn timeout_cached_source_forwards_cached_value_then_times_out_after_deadline() {
 
     assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(
-        timed.status(),
-        graphrefly::Status::Errored,
+        timed.status().output,
+        graphrefly::OutputStatus::Errored,
         "cached source DATA should not satisfy future idle deadlines forever"
     );
 }
@@ -3214,7 +3224,7 @@ fn time_operator_missing_driver_routes_timer_error() {
     src.set(1);
 
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
-    assert_eq!(delayed.status(), graphrefly::Status::Errored);
+    assert_eq!(delayed.status().output, graphrefly::OutputStatus::Errored);
 
     let src = g.state_empty::<i32>();
     let debounced = g.init_node(
@@ -3225,7 +3235,7 @@ fn time_operator_missing_driver_routes_timer_error() {
     let seen = collect_shapes::<i32>(&debounced);
     src.set(1);
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
-    assert_eq!(debounced.status(), graphrefly::Status::Errored);
+    assert_eq!(debounced.status().output, graphrefly::OutputStatus::Errored);
 
     let src = g.state_empty::<i32>();
     let throttled = g.init_node(
@@ -3237,8 +3247,8 @@ fn time_operator_missing_driver_routes_timer_error() {
     src.set(1);
     assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(
-        throttled.status(),
-        graphrefly::Status::Errored,
+        throttled.status().output,
+        graphrefly::OutputStatus::Errored,
         "throttle emits the leading value, then the helper timer reports the missing driver"
     );
 
@@ -3251,7 +3261,7 @@ fn time_operator_missing_driver_routes_timer_error() {
     let seen = collect_shapes::<i32>(&audited);
     src.set(1);
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
-    assert_eq!(audited.status(), graphrefly::Status::Errored);
+    assert_eq!(audited.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -3293,7 +3303,7 @@ fn tap_callback_panic_becomes_error_and_seals_output() {
         vec!["ERROR"],
         "a panicking callback is the node's ERROR; what the run sent before it is dropped (R-failure)"
     );
-    assert_eq!(tapped.status(), graphrefly::Status::Errored);
+    assert_eq!(tapped.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -3311,7 +3321,7 @@ fn single_dep_catalog_preserves_occurrences_and_terminal_inputs() {
         GraphNodeOpts::named("sum"),
     );
     assert_eq!(*collect_data(&sum).borrow(), vec![7]);
-    assert_eq!(sum.status(), graphrefly::Status::Completed);
+    assert_eq!(sum.status().output, graphrefly::OutputStatus::Completed);
 
     let src = g.init_node(
         from_iter(vec![1i32, 2, 3]),
@@ -3341,7 +3351,7 @@ fn single_dep_catalog_preserves_occurrences_and_terminal_inputs() {
         GraphNodeOpts::named("take_while"),
     );
     assert_eq!(*collect_data(&until).borrow(), vec![2, 3]);
-    assert_eq!(until.status(), graphrefly::Status::Completed);
+    assert_eq!(until.status().output, graphrefly::OutputStatus::Completed);
 
     let src = g.init_node(
         from_iter(vec![9i32, 8, 7]),
@@ -3354,7 +3364,7 @@ fn single_dep_catalog_preserves_occurrences_and_terminal_inputs() {
         GraphNodeOpts::named("first"),
     );
     assert_eq!(*collect_data(&first).borrow(), vec![9]);
-    assert_eq!(first.status(), graphrefly::Status::Completed);
+    assert_eq!(first.status().output, graphrefly::OutputStatus::Completed);
 
     let src = g.init_node(
         from_iter(vec![1i32, 2, 3]),
@@ -3367,7 +3377,7 @@ fn single_dep_catalog_preserves_occurrences_and_terminal_inputs() {
         GraphNodeOpts::named("find"),
     );
     assert_eq!(*collect_data(&found).borrow(), vec![2]);
-    assert_eq!(found.status(), graphrefly::Status::Completed);
+    assert_eq!(found.status().output, graphrefly::OutputStatus::Completed);
 
     let src = g.init_node(
         from_iter(vec![4i32, 5, 6]),
@@ -3409,7 +3419,10 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
         GraphNodeOpts::named("first_predicate"),
     );
     assert_eq!(*collect_data(&first_even).borrow(), vec![2]);
-    assert_eq!(first_even.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        first_even.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 
     let src = g.init_node(
         from_iter(vec![1i32, 2, 3]),
@@ -3422,7 +3435,10 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
         GraphNodeOpts::named("last_predicate"),
     );
     assert_eq!(*collect_data(&last_even).borrow(), vec![2]);
-    assert_eq!(last_even.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        last_even.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 
     let src = g.init_node(
         from_iter(vec![1i32, 2]),
@@ -3487,8 +3503,11 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
     let recovered_seen = collect_data(&recovered);
     source.error("boom");
     assert_eq!(*recovered_seen.borrow(), vec![1, 42]);
-    assert_ne!(recovered.status(), graphrefly::Status::Completed);
-    assert_ne!(recovered.status(), graphrefly::Status::Errored);
+    assert_ne!(
+        recovered.status().output,
+        graphrefly::OutputStatus::Completed
+    );
+    assert_ne!(recovered.status().output, graphrefly::OutputStatus::Errored);
 
     let first_seen = Rc::new(Cell::new(0));
     let first_seen_sink = first_seen.clone();
@@ -3561,7 +3580,7 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
         *scan_shapes.borrow(),
         vec!["DATA", "DATA", "DATA", "COMPLETE"]
     );
-    assert_eq!(scanned.status(), graphrefly::Status::Completed);
+    assert_eq!(scanned.status().output, graphrefly::OutputStatus::Completed);
 
     let left = g.state_empty::<i32>();
     let right = g.state_empty::<i32>();
@@ -3611,8 +3630,11 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
 
     assert_eq!(*recovered_seen.borrow(), vec![7, 42]);
     assert_eq!(*recovered_shapes.borrow(), vec!["DATA", "DATA"]);
-    assert_ne!(recovered.status(), graphrefly::Status::Completed);
-    assert_ne!(recovered.status(), graphrefly::Status::Errored);
+    assert_ne!(
+        recovered.status().output,
+        graphrefly::OutputStatus::Completed
+    );
+    assert_ne!(recovered.status().output, graphrefly::OutputStatus::Errored);
 
     let source = g.state_empty::<i32>();
     let recovered = g.init_node(
@@ -3625,7 +3647,7 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
     source.error("boom");
 
     assert_eq!(*shapes.borrow(), vec!["ERROR"]);
-    assert_eq!(recovered.status(), graphrefly::Status::Errored);
+    assert_eq!(recovered.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -3671,8 +3693,11 @@ fn side_effect_error_and_gate_operators_are_graph_visible() {
     let recovered_seen = collect_data(&recovered);
     source.error("boom");
     assert_eq!(*recovered_seen.borrow(), vec![1, 99]);
-    assert_ne!(recovered.status(), graphrefly::Status::Completed);
-    assert_ne!(recovered.status(), graphrefly::Status::Errored);
+    assert_ne!(
+        recovered.status().output,
+        graphrefly::OutputStatus::Completed
+    );
+    assert_ne!(recovered.status().output, graphrefly::OutputStatus::Errored);
 
     let source = g.state(10i32);
     let control = g.state_empty::<bool>();
@@ -4106,7 +4131,10 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
         3,
         "repeat must call the factory once per round"
     );
-    assert_eq!(repeated.status(), graphrefly::Status::Completed);
+    assert_eq!(
+        repeated.status().output,
+        graphrefly::OutputStatus::Completed
+    );
 
     let factories = g
         .describe()
@@ -4155,7 +4183,7 @@ fn higher_order_repeat_inner_error_detaches_and_seals_output() {
 
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(cleanup.get(), 1, "inner ERROR should detach the live round");
-    assert_eq!(repeated.status(), graphrefly::Status::Errored);
+    assert_eq!(repeated.status().output, graphrefly::OutputStatus::Errored);
 
     let after_error = shapes.borrow().len();
     inners.borrow()[0].set(2i32);
@@ -4195,7 +4223,7 @@ fn higher_order_repeat_factory_panic_errors_after_cleaning_completed_round() {
 
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(calls.get(), 2);
-    assert_eq!(repeated.status(), graphrefly::Status::Errored);
+    assert_eq!(repeated.status().output, graphrefly::OutputStatus::Errored);
 }
 
 #[test]
@@ -4259,13 +4287,17 @@ fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
             move |v| {
                 let value = *v * 10;
                 let switch_cleanups = switch_cleanups.clone();
-                g.producer(move |ctx| {
-                    ctx.on_deactivation({
-                        let switch_cleanups = switch_cleanups.clone();
-                        move || switch_cleanups.set(switch_cleanups.get() + 1)
-                    });
-                    ctx.emit(value);
-                })
+                g.producer_opts(
+                    move |ctx| ctx.emit(value),
+                    GraphNodeOpts::default().with_node(graphrefly::NodeOpts::default().with_setup(
+                        move |_| {
+                            let switch_cleanups = switch_cleanups.clone();
+                            graphrefly::cleanup(move |_| {
+                                switch_cleanups.set(switch_cleanups.get() + 1)
+                            })
+                        },
+                    )),
+                )
             }
         }),
         vec![source.erased()],
@@ -4450,7 +4482,7 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     inner_0.set(10);
     inner_1.set(20);
     assert_eq!(*seen.borrow(), vec![10, 20]);
-    assert_ne!(merged.status(), graphrefly::Status::Completed);
+    assert_ne!(merged.status().output, graphrefly::OutputStatus::Completed);
 
     inner_0.complete();
     assert_eq!(
@@ -4463,7 +4495,7 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     assert_eq!(*seen.borrow(), vec![10, 20, 30]);
     inner_1.complete();
     inner_2.complete();
-    assert_eq!(merged.status(), graphrefly::Status::Completed);
+    assert_eq!(merged.status().output, graphrefly::OutputStatus::Completed);
 }
 
 #[test]
@@ -4493,10 +4525,10 @@ fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
     });
     inner.set(10);
     assert_eq!(*seen.borrow(), vec![10]);
-    assert_ne!(merged.status(), graphrefly::Status::Completed);
+    assert_ne!(merged.status().output, graphrefly::OutputStatus::Completed);
 
     inner.complete();
-    assert_eq!(merged.status(), graphrefly::Status::Completed);
+    assert_eq!(merged.status().output, graphrefly::OutputStatus::Completed);
 }
 
 #[test]
@@ -4600,7 +4632,7 @@ fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     inner_a.set(10i32);
     source.error("source boom");
 
-    assert_eq!(merged.status(), graphrefly::Status::Errored);
+    assert_eq!(merged.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(cleanup_a.get(), 1, "source ERROR should detach inner A");
     assert_eq!(cleanup_b.get(), 1, "source ERROR should detach inner B");
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
@@ -4643,7 +4675,7 @@ fn higher_order_projector_panic_cleans_live_inners() {
     inner.set(10i32);
     source.set(2i32);
 
-    assert_eq!(merged.status(), graphrefly::Status::Errored);
+    assert_eq!(merged.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(cleanup.get(), 1, "projector panic should detach live inner");
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
 
@@ -4681,7 +4713,7 @@ fn higher_order_switch_projector_panic_detaches_previous_inner() {
     inner.set(10i32);
     source.set(2i32);
 
-    assert_eq!(switched.status(), graphrefly::Status::Errored);
+    assert_eq!(switched.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(
         cleanup.get(),
         1,

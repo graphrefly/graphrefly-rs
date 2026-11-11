@@ -14,7 +14,7 @@ use crate::environment::{
     WebSocketDriverEvent, WebSocketEvent, WebSocketRequest, WebSocketSend, WebSocketSendResult,
 };
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::{Node, Policy};
+use crate::node::{Node, NodeOpts, Policy};
 use crate::protocol::{GraphError, Message};
 use crate::resilience::RetryPolicy;
 
@@ -556,7 +556,16 @@ fn websocket_session_events(
                 }
             }
         },
-        GraphNodeOpts::named(format!("{events_name}/events")),
+        GraphNodeOpts::named(format!("{events_name}/events")).with_node(
+            // The lifetime's cleanup deactivates the session state (R-lifetime@2).
+            NodeOpts::default().with_setup(|_| {
+                crate::lifetime::cleanup(|closing| {
+                    if let Some(state) = closing.state_get::<WebSocketSessionStateCell>() {
+                        deactivate_websocket_session_state(&state);
+                    }
+                })
+            }),
+        ),
     )
 }
 
@@ -1194,10 +1203,6 @@ fn init_websocket_session_state(ctx: &Ctx) -> WebSocketSessionStateCell {
         send_cancels: Vec::new(),
         retry_cancels: Vec::new(),
     })));
-    let cleanup_state = state.clone();
-    ctx.on_deactivation(move || {
-        deactivate_websocket_session_state(&cleanup_state);
-    });
     ctx.state_set(state.clone());
     state
 }
@@ -1504,18 +1509,10 @@ where
                 )]);
                 return;
             };
-            let active = Rc::new(Cell::new(true));
-            let cancels = Rc::new(RefCell::new(Vec::<CancelSlot>::new()));
-            let cleanup_active = active.clone();
-            let cleanup_cancels = cancels.clone();
-            ctx.on_deactivation(move || {
-                cleanup_active.set(false);
-                for slot in cleanup_cancels.borrow_mut().drain(..) {
-                    if let Some(cancel) = slot.borrow_mut().take() {
-                        cancel();
-                    }
-                }
-            });
+            let lifetime = ctx
+                .state_get::<OutboundLifetime>()
+                .expect("outbound setup installs its lifetime state");
+            let (active, cancels) = (lifetime.active.clone(), lifetime.cancels.clone());
             let out = Rc::new(ctx.defer());
             let async_driver = ctx.local_async_driver();
             for value in ctx.batch::<T>(0) {
@@ -1538,8 +1535,33 @@ where
                 None => {}
             }
         },
-        GraphNodeOpts::named(name),
+        GraphNodeOpts::named(name).with_node(NodeOpts::default().with_setup(|ctx| {
+            // One active flag and one cancel list per lifetime; the cleanup stops
+            // every attempt the lifetime started (R-lifetime@2).
+            ctx.state_set(OutboundLifetime {
+                active: Rc::new(Cell::new(true)),
+                cancels: Rc::new(RefCell::new(Vec::new())),
+            });
+            crate::lifetime::cleanup(|closing| {
+                if let Some(lifetime) = closing.state_get::<OutboundLifetime>() {
+                    lifetime.active.set(false);
+                    let slots: Vec<CancelSlot> = lifetime.cancels.borrow_mut().drain(..).collect();
+                    for slot in slots {
+                        let cancel = slot.borrow_mut().take();
+                        if let Some(cancel) = cancel {
+                            cancel();
+                        }
+                    }
+                }
+            })
+        })),
     )
+}
+
+/// An outbound node's per-lifetime state, kept in its private state.
+struct OutboundLifetime {
+    active: Rc<Cell<bool>>,
+    cancels: CancelSlots,
 }
 
 struct StartArgs<T: Clone + 'static, R: Clone + 'static> {

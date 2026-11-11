@@ -9,8 +9,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-/// Cancels driver-owned work. Dropping it intentionally does nothing; sources
-/// register it with `ctx.on_deactivation` so teardown is explicit.
+/// Cancels driver-owned work. Dropping it intentionally does nothing; sources call
+/// it from their lifetime cleanup (R-lifetime@2) so teardown is explicit.
 pub type DriverCancel = Box<dyn FnOnce()>;
 
 /// Local, single-thread async/time driver.

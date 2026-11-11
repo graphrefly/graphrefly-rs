@@ -317,7 +317,6 @@ fn process_bundle_keeps_runtime_state_checkpoint_friendly() {
         GraphCheckpointValue::Data { data } => data,
         GraphCheckpointValue::Sentinel => panic!("runtime ctx state is persisted"),
     };
-    assert!(runtime.ctx_state.persist);
     assert_eq!(data["eventSeq"], 1);
     assert_eq!(data["commandCount"], 1);
     assert_eq!(data["seenEventIds"][0], process_event_id("cmd-1", 1));

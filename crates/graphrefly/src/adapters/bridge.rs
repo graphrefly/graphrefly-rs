@@ -1106,7 +1106,6 @@ struct PendingEnvelope<T> {
 
 struct BridgeState<T> {
     active: bool,
-    cleanup_installed: bool,
     next_seq: u64,
     cursor: u64,
     remote_cursor: u64,
@@ -3796,7 +3795,17 @@ where
             complete: Policy::Manual,
             error: Policy::Manual,
             ..NodeOpts::default()
-        },
+        }
+        // The lifetime's cleanup marks the bridge state inactive (R-lifetime@2).
+        .with_setup(|_| {
+            crate::lifetime::cleanup(|closing| {
+                if let Some(state) = closing.state_get::<RefCell<BridgeState<TOutbound>>>() {
+                    let mut state = state.borrow_mut();
+                    state.active = false;
+                    state.pending.clear();
+                }
+            })
+        }),
         ..GraphNodeOpts::default()
     };
     graph.node_opts::<WireBridgeEvent<TOutbound, TInbound>, _>(
@@ -3804,7 +3813,6 @@ where
         move |ctx| {
             let state = bridge_state::<TOutbound>(ctx);
             state.borrow_mut().active = true;
-            install_cleanup(ctx, state.clone());
             for value in raw_data(ctx, 1) {
                 match value.downcast::<WireBridgeIngress<TInbound>>() {
                     Ok(ingress) => process_inbound(
@@ -3859,7 +3867,6 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
     }
     let state = RefCell::new(BridgeState::<T> {
         active: true,
-        cleanup_installed: false,
         next_seq: 1,
         cursor: 0,
         remote_cursor: 0,
@@ -3868,19 +3875,6 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
     ctx.state_set(state);
     ctx.state_get::<RefCell<BridgeState<T>>>()
         .expect("bridge state was just installed")
-}
-
-fn install_cleanup<T: Clone + 'static>(ctx: &Ctx, state: Rc<RefCell<BridgeState<T>>>) {
-    if state.borrow().cleanup_installed {
-        return;
-    }
-    state.borrow_mut().cleanup_installed = true;
-    ctx.on_deactivation(move || {
-        let mut state = state.borrow_mut();
-        state.active = false;
-        state.cleanup_installed = false;
-        state.pending.clear();
-    });
 }
 
 fn raw_data(ctx: &Ctx, dep: usize) -> Vec<AnyValue> {
@@ -5243,8 +5237,8 @@ mod tests {
         ));
 
         assert_eq!(bridge.cursor.cache(), Some(1));
-        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
-        assert_ne!(bridge.status.status(), crate::node::Status::Errored);
+        assert_ne!(bridge.events.status().output, crate::OutputStatus::Errored);
+        assert_ne!(bridge.status.status().output, crate::OutputStatus::Errored);
     }
 
     #[test]
@@ -5268,13 +5262,16 @@ mod tests {
             bridge.status.cache().unwrap().state,
             WireBridgeStatusState::Errored
         );
-        assert_ne!(bridge.status.status(), crate::node::Status::Errored);
+        assert_ne!(bridge.status.status().output, crate::OutputStatus::Errored);
 
         bridge.close(None, None);
         let status = bridge.status.cache().unwrap();
         assert_eq!(status.state, WireBridgeStatusState::Closed);
         assert_eq!(status.pending, 1);
-        assert_ne!(bridge.status.status(), crate::node::Status::Completed);
+        assert_ne!(
+            bridge.status.status().output,
+            crate::OutputStatus::Completed
+        );
 
         bridge.inbound.set(envelope(
             "session-a",
@@ -5288,7 +5285,10 @@ mod tests {
         assert_eq!(status.state, WireBridgeStatusState::Closed);
         assert_eq!(status.pending, 0);
         assert_eq!(status.acked, 1);
-        assert_ne!(bridge.status.status(), crate::node::Status::Completed);
+        assert_ne!(
+            bridge.status.status().output,
+            crate::OutputStatus::Completed
+        );
     }
 
     #[test]
@@ -5424,7 +5424,7 @@ mod tests {
             bridge.errors.cache(),
             Some("wireBridge: ack-timeout command attempt must be positive".to_owned())
         );
-        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+        assert_ne!(bridge.events.status().output, crate::OutputStatus::Errored);
 
         bridge
             .command
@@ -5437,7 +5437,7 @@ mod tests {
             bridge.errors.cache(),
             Some("wireBridge: ack-timeout command seq must be positive".to_owned())
         );
-        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+        assert_ne!(bridge.events.status().output, crate::OutputStatus::Errored);
     }
 
     #[test]
@@ -5471,7 +5471,7 @@ mod tests {
             .status
             .cache()
             .is_none_or(|status| status.state == WireBridgeStatusState::Idle));
-        assert_ne!(bridge.events.status(), crate::node::Status::Errored);
+        assert_ne!(bridge.events.status().output, crate::OutputStatus::Errored);
     }
 
     #[test]

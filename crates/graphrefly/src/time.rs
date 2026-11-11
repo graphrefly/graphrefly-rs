@@ -122,7 +122,6 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
 }
 
 fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCell) {
-    ctx.state_persist(true);
     let mut st = ctx
         .state_get::<ThrottleState>()
         .map(|v| (*v).clone())

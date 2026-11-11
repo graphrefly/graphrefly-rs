@@ -251,7 +251,6 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
                 reduce_status(ctx, &mut state, &status, &opts);
             }
             ctx.state_set(state);
-            ctx.state_persist(true);
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );

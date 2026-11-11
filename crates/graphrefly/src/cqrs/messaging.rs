@@ -295,7 +295,6 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                 }
             }
             ctx.state_set(state);
-            ctx.state_persist(true);
         },
         {
             // Every delivery is folded as it arrives, before any status exists: the

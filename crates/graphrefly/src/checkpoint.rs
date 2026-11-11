@@ -20,7 +20,7 @@ use crate::ctx::Ctx;
 use crate::dispatcher::NodeFn;
 use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
 use crate::json::validate_strict_json_value;
-use crate::node::{Core, NodeRestoreRuntime, Status};
+use crate::node::{Core, NodeRestoreRuntime, OutputStatus};
 use crate::protocol::AnyValue;
 use crate::versioning::{
     node_version_to_json, validate_node_version_json, verify_restored_node_version,
@@ -139,8 +139,6 @@ pub struct GraphCheckpointLifecycle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// `GraphCheckpointCtxState` data container.
 pub struct GraphCheckpointCtxState {
-    /// `persist` field for persist.
-    pub persist: bool,
     /// `value` field for value.
     pub value: GraphCheckpointValue,
 }
@@ -1014,7 +1012,11 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
     let mut edges = Vec::new();
     for entry in &entries {
         let runtime = entry.core.checkpoint_runtime();
-        ensure_quiescent_status(runtime.status, &entry.id, "checkpoint")?;
+        ensure_quiescent_status(
+            status_from_str(runtime.status.label(), &entry.id)?,
+            &entry.id,
+            "checkpoint",
+        )?;
         let deps = entry.core.deps();
         let dep_ids = deps
             .iter()
@@ -1043,7 +1045,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             id: entry.id.clone(),
             name: entry.name.clone(),
             factory: checkpoint_factory(entry),
-            status: status_to_str(runtime.status).to_owned(),
+            status: runtime.status.label().to_owned(),
             deps: dep_ids,
             value: if non_authoritative_collection_helper {
                 GraphCheckpointValue::Sentinel
@@ -1053,9 +1055,9 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             backend_state,
             version: runtime.version.as_ref().map(node_version_to_json),
             terminal: if runtime.terminal {
-                match runtime.status {
-                    Status::Completed => GraphCheckpointTerminal::Complete,
-                    Status::Errored => {
+                match runtime.status.output {
+                    OutputStatus::Completed => GraphCheckpointTerminal::Complete,
+                    OutputStatus::Errored => {
                         return Err(GraphRestoreError::new(format!(
                             "checkpoint: ERROR payload for node '{}' is unavailable; cannot serialize a placeholder",
                             entry.id
@@ -1071,7 +1073,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                 has_called_fn_once: runtime.has_called_fn_once,
             },
             ctx_state: GraphCheckpointCtxState {
-                persist: runtime.ctx_state_persist,
                 value: if non_authoritative_collection_helper {
                     GraphCheckpointValue::Sentinel
                 } else {
@@ -1482,8 +1483,8 @@ fn construct_prepared(
             .expect("built map only contains prepared nodes")
             .checkpoint;
         let (cache, has_data) = restore_value(&node.value);
-        let (terminal, status) = restore_terminal(node)?;
-        let (ctx_state, ctx_state_persist) = restore_ctx_state(&node.ctx_state);
+        let terminal = restore_terminal(node)?;
+        let ctx_state = restore_ctx_state(&node.ctx_state);
         let restored_version = verify_restored_node_version(
             &core.versioning_policy(),
             node.version.as_ref(),
@@ -1496,12 +1497,10 @@ fn construct_prepared(
             cache,
             has_data,
             version: restored_version,
-            status,
             terminal,
             activated: node.lifecycle.activated,
             has_called_fn_once: node.lifecycle.has_called_fn_once,
             ctx_state,
-            ctx_state_persist,
         });
     }
     Ok(graph)
@@ -1587,31 +1586,35 @@ fn restore_value(value: &GraphCheckpointValue) -> (Option<AnyValue>, bool) {
     }
 }
 
-fn restore_ctx_state(state: &GraphCheckpointCtxState) -> (Option<AnyValue>, bool) {
+fn restore_ctx_state(state: &GraphCheckpointCtxState) -> Option<AnyValue> {
     let (value, has_data) = restore_value(&state.value);
-    (if has_data { value } else { None }, state.persist)
+    if has_data {
+        value
+    } else {
+        None
+    }
 }
 
-fn restore_terminal(node: &GraphCheckpointNode) -> RestoreResult<(bool, Status)> {
+fn restore_terminal(node: &GraphCheckpointNode) -> RestoreResult<bool> {
     let status = status_from_str(&node.status, &node.id)?;
     match &node.terminal {
         GraphCheckpointTerminal::None => {
-            if status.is_terminal() {
+            if matches!(status, SavedStatus::Completed | SavedStatus::Errored) {
                 return Err(GraphRestoreError::new(format!(
                     "restore_graph: node '{}' terminal status requires terminal state",
                     node.id
                 )));
             }
-            Ok((false, status))
+            Ok(false)
         }
         GraphCheckpointTerminal::Complete => {
-            if status != Status::Completed {
+            if status != SavedStatus::Completed {
                 return Err(GraphRestoreError::new(format!(
                     "restore_graph: node '{}' COMPLETE terminal requires completed status",
                     node.id
                 )));
             }
-            Ok((true, status))
+            Ok(true)
         }
         GraphCheckpointTerminal::Error { .. } => Err(GraphRestoreError::new(format!(
             "restore_graph: node '{}' carries ERROR terminal payload, which Rust restore cannot preserve yet",
@@ -1620,38 +1623,33 @@ fn restore_terminal(node: &GraphCheckpointNode) -> RestoreResult<(bool, Status)>
     }
 }
 
-fn status_to_str(status: Status) -> &'static str {
-    match status {
-        Status::Sentinel => "sentinel",
-        Status::Pending => "pending",
-        Status::Dirty => "dirty",
-        Status::Settled => "settled",
-        Status::Resolved => "resolved",
-        Status::Completed => "completed",
-        Status::Errored => "errored",
-    }
+/// The saved form of a node's derived status ([`Status::label`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedStatus {
+    Empty,
+    Stale,
+    Ready,
+    Completed,
+    Errored,
 }
 
-fn status_from_str(status: &str, id: &str) -> RestoreResult<Status> {
+fn status_from_str(status: &str, id: &str) -> RestoreResult<SavedStatus> {
     match status {
-        "sentinel" => Ok(Status::Sentinel),
-        "pending" => Ok(Status::Pending),
-        "dirty" => Ok(Status::Dirty),
-        "settled" => Ok(Status::Settled),
-        "resolved" => Ok(Status::Resolved),
-        "completed" => Ok(Status::Completed),
-        "errored" => Ok(Status::Errored),
+        "empty" => Ok(SavedStatus::Empty),
+        "stale" => Ok(SavedStatus::Stale),
+        "ready" => Ok(SavedStatus::Ready),
+        "completed" => Ok(SavedStatus::Completed),
+        "errored" => Ok(SavedStatus::Errored),
         _ => Err(GraphRestoreError::new(format!(
             "restore_graph: node '{id}' has invalid status '{status}'"
         ))),
     }
 }
 
-fn ensure_quiescent_status(status: Status, id: &str, op: &str) -> RestoreResult<()> {
-    if matches!(status, Status::Pending | Status::Dirty) {
+fn ensure_quiescent_status(status: SavedStatus, id: &str, op: &str) -> RestoreResult<()> {
+    if status == SavedStatus::Stale {
         return Err(GraphRestoreError::new(format!(
-            "{op}: node '{id}' has non-quiescent status '{status}' that cannot be checkpoint-restored yet",
-            status = status_to_str(status)
+            "{op}: node '{id}' has non-quiescent status 'stale' that cannot be checkpoint-restored yet"
         )));
     }
     Ok(())
@@ -2143,7 +2141,7 @@ mod tests {
         let g = crate::graph::graph();
         g.state_opts(json!(1), GraphNodeOpts::named("source"));
         let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        checkpoint.nodes[0].status = "pending".to_owned();
+        checkpoint.nodes[0].status = "stale".to_owned();
 
         let err = match restore_graph(
             checkpoint,
@@ -2152,7 +2150,7 @@ mod tests {
             Ok(_) => panic!("restore must reject non-quiescent checkpoint status"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("non-quiescent status 'pending'"));
+        assert!(err.to_string().contains("non-quiescent status 'stale'"));
     }
 
     #[test]

@@ -131,10 +131,10 @@ pub fn describe_to_pretty(snapshot: &DescribeSnapshot) -> String {
     ];
     for node in sorted_nodes(nodes) {
         lines.push(format!(
-            "- {} ({}/{:?}): {}",
+            "- {} ({}/{}): {}",
             node.id,
             node.factory,
-            node.status,
+            node.status.label(),
             format_value(&node)
         ));
     }
@@ -167,8 +167,12 @@ pub fn describe_to_ascii(snapshot: &DescribeSnapshot, include_values: bool) -> S
             .map(|targets| targets.join(", "))
             .unwrap_or_else(|| "-".to_owned());
         lines.push(format!(
-            "{} [{}/{:?}{}] -> {}",
-            node.id, node.factory, node.status, value, to
+            "{} [{}/{}{}] -> {}",
+            node.id,
+            node.factory,
+            node.status.label(),
+            value,
+            to
         ));
     }
     lines.join("\n")
@@ -254,7 +258,7 @@ fn node_json(node: &DescribeNode) -> String {
     if let Some(name) = &node.name {
         fields.push(format!("\"name\":\"{}\"", json_escape(name)));
     }
-    fields.push(format!("\"status\":\"{:?}\"", node.status));
+    fields.push(format!("\"status\":\"{}\"", node.status.label()));
     if let Some(value) = &node.value {
         fields.push(format!("\"value\":{}", value_json(value)));
     }

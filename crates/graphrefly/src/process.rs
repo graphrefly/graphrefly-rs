@@ -902,7 +902,6 @@ pub fn process_bundle<
     let runtime = graph.init_node::<ProcessRuntimeFact<TState, TEvent, TEffect, TCommand>>(
         Operator::with_opts("processRuntime", no_terminal_opts(), {
             move |ctx: &Ctx| {
-                ctx.state_persist(true);
                 let mut state = match ctx.state_get::<Value>() {
                     Some(value) => match RuntimeState::from_json(value.as_ref()) {
                         Ok(state) => state,

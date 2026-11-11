@@ -214,7 +214,6 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
                 reduce_record(ctx, &mut state, &record);
             }
             ctx.state_set(state);
-            ctx.state_persist(true);
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );

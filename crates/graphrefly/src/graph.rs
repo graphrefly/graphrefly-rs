@@ -82,7 +82,16 @@ impl GraphNodeOpts {
             ..Self::default()
         }
     }
+
+    /// Returns these options with `node` as the substrate options.
+    pub fn with_node(mut self, node: NodeOpts) -> Self {
+        self.node = node;
+        self
+    }
 }
+
+/// An effect's latest per-run cleanup, kept in its private state.
+struct EffectCleanup(RefCell<Option<Box<dyn FnOnce()>>>);
 
 /// Graph-owned topology/release group options (D152).
 #[derive(Debug, Clone, Default)]
@@ -560,7 +569,8 @@ impl Graph {
         self.add(node, "derived", opts)
     }
 
-    /// Value-level sink sugar. A returned cleanup is registered as onDeactivation.
+    /// Value-level sink sugar. A run's returned cleanup replaces the previous run's and
+    /// runs when the lifetime closes (R-lifetime@2).
     pub fn effect<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -577,16 +587,32 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<()> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("effect"));
+        let mut node_opts = self.apply_default_node_opts(opts.node.clone());
+        // The effect keeps its latest per-run cleanup in private state; the lifetime's
+        // cleanup runs it (R-lifetime@2). A caller's own setup still runs first.
+        let user_setup = node_opts.setup.take();
+        let node_opts = node_opts.with_setup(move |ctx| {
+            let user_cleanup = user_setup.as_ref().and_then(|setup| (setup.0)(ctx));
+            crate::lifetime::cleanup(move |closing| {
+                let latest = closing
+                    .state_get::<EffectCleanup>()
+                    .and_then(|slot| slot.0.borrow_mut().take());
+                if let Some(latest) = latest {
+                    latest();
+                }
+                if let Some(user_cleanup) = user_cleanup {
+                    user_cleanup(closing);
+                }
+            })
+        });
         let node = Node::derived_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            self.apply_default_node_opts(opts.node.clone()),
+            node_opts,
             move |ctx| {
                 let values = Values::new(ctx.dep_records());
-                if let Some(cleanup) = f(&values) {
-                    ctx.on_deactivation(cleanup);
-                }
+                ctx.state_set(EffectCleanup(RefCell::new(f(&values))));
             },
         );
         self.add(node, "effect", opts)
@@ -2002,59 +2028,71 @@ mod tests {
 
     use super::*;
 
+    /// A producer whose lifetime cleanup runs `on_close`.
+    fn producer_with_cleanup(g: &Graph, name: &str, on_close: Rc<dyn Fn()>) -> Node<i32> {
+        g.producer_opts(
+            |_| {},
+            GraphNodeOpts::named(name).with_node(NodeOpts::default().with_setup(move |_| {
+                let on_close = on_close.clone();
+                crate::lifetime::cleanup(move |_| on_close())
+            })),
+        )
+    }
+
     #[test]
-    fn release_nodes_hides_registry_and_releases_remaining_after_cleanup_panic() {
-        let g = graph();
-        let panic_node = g.state_opts(1, GraphNodeOpts::named("panic"));
-        let later_node = g.state_opts(2, GraphNodeOpts::named("later"));
-        let later_released = Rc::new(Cell::new(false));
-        let flag = later_released.clone();
-        panic_node
-            .erased()
-            .register_on_deactivation(Box::new(|| panic!("cleanup boom")));
-        later_node
-            .erased()
-            .register_on_deactivation(Box::new(move || flag.set(true)));
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            g.release_nodes(&[later_node.erased(), panic_node.erased()], "test");
+    fn release_nodes_after_a_cleanup_panic_releases_every_node() {
+        // R-failure@3: a cleanup's panic goes to the host reporter and the close
+        // completes, so a later node's cleanup still runs and the release succeeds.
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let previous = crate::set_host_reporter(Some({
+            let reports = reports.clone();
+            Rc::new(move |f: &crate::HostFailure| reports.borrow_mut().push(f.clone()))
         }));
+        let g = graph();
+        let panic_node = producer_with_cleanup(&g, "panic", Rc::new(|| panic!("cleanup boom")));
+        let later_released = Rc::new(Cell::new(false));
+        let later_node = producer_with_cleanup(&g, "later", {
+            let flag = later_released.clone();
+            Rc::new(move || flag.set(true))
+        });
+        let u1 = panic_node.subscribe(|_| {});
+        let u2 = later_node.subscribe(|_| {});
+        u1();
+        u2();
+        g.release_nodes(&[later_node.erased(), panic_node.erased()], "test");
+        crate::set_host_reporter(previous);
 
-        assert!(result.is_err());
-        assert!(
-            g.find("panic").is_none() && g.find("later").is_none(),
-            "D122: cleanup panic must not leave graph registry pointing at released slots"
-        );
-        assert!(
-            later_released.get(),
-            "a cleanup panic in one released node must not skip later nodes in the group"
+        assert!(g.find("panic").is_none() && g.find("later").is_none());
+        assert!(later_released.get());
+        assert_eq!(
+            *reports.borrow(),
+            vec![crate::HostFailure {
+                source: "cleanup".into(),
+                error: "cleanup boom".into()
+            }]
         );
     }
 
     #[test]
-    fn release_nodes_emits_node_released_even_when_cleanup_panics_after_commit() {
+    fn release_nodes_emits_node_released_after_a_cleanup_panic() {
         let g = graph();
-        let panic_node = g.state_opts(1, GraphNodeOpts::named("panic"));
-        panic_node
-            .erased()
-            .register_on_deactivation(Box::new(|| panic!("cleanup boom")));
+        let panic_node = producer_with_cleanup(&g, "panic", Rc::new(|| panic!("cleanup boom")));
+        let u = panic_node.subscribe(|_| {});
+        u();
         let events = Rc::new(RefCell::new(Vec::new()));
         let event_sink = events.clone();
         let observer = g
             .observe_topology()
             .subscribe(move |event| event_sink.borrow_mut().push(event));
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            g.release_nodes(&[panic_node.erased()], "test");
-        }));
+        g.release_nodes(&[panic_node.erased()], "test");
 
         observer.unsubscribe();
-        assert!(result.is_err());
         let events = events.borrow();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, TopologyEventKind::NodeReleased);
         assert_eq!(events[0].path, "panic");
-        assert_eq!(events[0].factory.as_deref(), Some("state"));
+        assert_eq!(events[0].factory.as_deref(), Some("producer"));
         assert_eq!(events[0].deps, Vec::<String>::new());
         assert_eq!(events[0].seq, 0);
         assert!(g.find("panic").is_none());

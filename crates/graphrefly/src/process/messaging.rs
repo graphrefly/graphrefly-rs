@@ -291,7 +291,6 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
                 }
             }
             ctx.state_set(state);
-            ctx.state_persist(true);
         },
         GraphNodeOpts::named(opts.name),
     )

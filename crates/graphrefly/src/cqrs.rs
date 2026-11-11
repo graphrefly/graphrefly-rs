@@ -473,7 +473,6 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
                     .state_get::<Value>()
                     .map(|value| RuntimeState::from_json(value.as_ref()))
                     .unwrap_or_else(|| RuntimeState::from_json(&runtime_seed));
-                ctx.state_persist(true);
                 for command in ctx.batch::<CqrsCommand<TCommand>>(0) {
                     for fact in reduce_command_fact(
                         &mut state,
@@ -680,7 +679,6 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                     .unwrap_or_else(|| ProjectionState {
                         value: initial.clone(),
                     });
-                ctx.state_persist(true);
                 for event in ctx.batch::<CqrsEvent<TEvent>>(0) {
                     if let Some(filter) = event_filter.as_ref() {
                         if !filter.contains(&event.event_type) {

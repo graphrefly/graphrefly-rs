@@ -51,36 +51,70 @@ use crate::versioning::{
     ResolvedNodeVersioningPolicy, RestoredNodeVersion,
 };
 
-/// Node lifecycle status (R-status-enum) — the source of truth for cache freshness.
+/// A node's cache status (R-node): no retained value, a pending mark it received or
+/// sent in the current wave is unsettled, or ready.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Status {
-    /// No DATA yet — cache absent (SENTINEL = `None`, D16). Also the
-    /// awaiting-first-run-gate state in this slice.
-    Sentinel,
-    /// Reserved by R-status-enum; not assigned in this slice (the awaiting-gate
-    /// state is represented as `Sentinel`, matching the TS reference).
-    Pending,
-    /// Phase-1 DIRTY received — the prior cached value is stale.
-    Dirty,
-    /// Settled with a fresh value this wave.
-    Settled,
-    /// Undirty settle (R-resolved-undirty / D49): DIRTY'd but produced no new
-    /// occurrence; a carried-over cached value stays fresh.
-    Resolved,
-    /// Terminal success — final (deferred slice).
+pub enum CacheStatus {
+    /// No retained value.
+    Empty,
+    /// A pending mark of the current wave is unsettled.
+    Stale,
+    /// A retained value and no unsettled pending mark.
+    Ready,
+}
+
+/// A node's output status (R-node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputStatus {
+    /// The node has not ended.
+    Open,
+    /// The node ended with COMPLETE.
     Completed,
-    /// Terminal failure — final (deferred slice).
+    /// The node ended with ERROR.
     Errored,
 }
 
+/// A node's lifecycle status (R-node, R-lifetime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lifecycle {
+    /// No open lifetime.
+    Inactive,
+    /// A lifetime is open.
+    Active,
+    /// The lifetime's cleanup is running.
+    Closing,
+}
+
+/// A node's status, derived from what it holds and never stored (R-node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Status {
+    /// Empty, stale or ready.
+    pub cache: CacheStatus,
+    /// Open, completed or errored.
+    pub output: OutputStatus,
+    /// Inactive, active or closing.
+    pub lifecycle: Lifecycle,
+}
+
 impl Status {
-    /// Cached value is fresh (`settled` / `resolved`).
+    /// The cache holds a value and no pending mark is unsettled.
     pub fn is_fresh(self) -> bool {
-        matches!(self, Status::Settled | Status::Resolved)
+        self.cache == CacheStatus::Ready
     }
-    /// Terminal status (`completed` / `errored`) — D17 terminal-is-forever.
+    /// The node has ended (COMPLETE or ERROR).
     pub fn is_terminal(self) -> bool {
-        matches!(self, Status::Completed | Status::Errored)
+        self.output != OutputStatus::Open
+    }
+    /// A short label: the output if ended, otherwise the cache (`empty`, `stale`,
+    /// `ready`, `completed`, `errored`).
+    pub fn label(self) -> &'static str {
+        match (self.output, self.cache) {
+            (OutputStatus::Completed, _) => "completed",
+            (OutputStatus::Errored, _) => "errored",
+            (OutputStatus::Open, CacheStatus::Empty) => "empty",
+            (OutputStatus::Open, CacheStatus::Stale) => "stale",
+            (OutputStatus::Open, CacheStatus::Ready) => "ready",
+        }
     }
 }
 
@@ -130,6 +164,20 @@ pub struct NodeOpts {
     /// D109 node runtime versioning policy. `None` means the package default V0; graph-owned
     /// nodes may inherit a graph default before construction.
     pub versioning: Option<NodeVersioningPolicy>,
+    /// The instance's setup (R-lifetime@2): runs once per lifetime, before the
+    /// function's first run in it, and may return the lifetime's cleanup.
+    pub setup: Option<crate::lifetime::Setup>,
+}
+
+impl NodeOpts {
+    /// Returns these options with `setup` as the node's setup (R-lifetime@2).
+    pub fn with_setup(
+        mut self,
+        setup: impl Fn(&Ctx) -> Option<crate::lifetime::Cleanup> + 'static,
+    ) -> Self {
+        self.setup = Some(crate::lifetime::Setup::new(setup));
+        self
+    }
 }
 
 /// Defaults: COMPLETE/ERROR auto-cascade ON (combineLatest-style), terminal-as-input OFF
@@ -146,6 +194,7 @@ impl Default for NodeOpts {
             error: Policy::Auto,
             invalidate: Policy::Auto,
             versioning: None,
+            setup: None,
         }
     }
 }
@@ -998,7 +1047,6 @@ struct NodeValueState {
     /// The DATA values of the last array that carried any (R-subscription).
     values: Vec<AnyValue>,
     has_data: bool,
-    status: Status,
     terminal: bool,
     /// The terminal this node ended with, carried by its snapshot (R-subscription).
     ended: Option<DepTerminal>,
@@ -1010,7 +1058,6 @@ impl NodeValueState {
             cache: None,
             values: Vec::new(),
             has_data: false,
-            status: Status::Sentinel,
             terminal: false,
             ended: None,
         }
@@ -1064,6 +1111,7 @@ struct NodeConfigSlot {
     error: Policy,
     invalidate: Policy,
     versioning: Option<NodeVersioningPolicy>,
+    setup: Option<crate::lifetime::Setup>,
 }
 
 impl NodeConfigSlot {
@@ -1075,6 +1123,7 @@ impl NodeConfigSlot {
             error: opts.error,
             invalidate: opts.invalidate,
             versioning: opts.versioning.clone(),
+            setup: opts.setup.clone(),
         }
     }
 
@@ -1123,10 +1172,12 @@ struct NodeAux {
     subscribers: Vec<SubscriberEntry>,
     next_sub_id: u64,
     activated: bool,
+    /// The current lifetime's private state (R-lifetime@2).
     state: Option<AnyValue>,
-    state_persist: bool,
-    on_deactivation: Vec<Box<dyn FnOnce()>>,
-    on_invalidate: Vec<Rc<dyn Fn()>>,
+    /// The open lifetime, if any.
+    lifetime: Option<crate::lifetime::Lifetime>,
+    /// The closing lifetime's cleanup is running.
+    closing: bool,
 }
 
 impl NodeAux {
@@ -1136,9 +1187,8 @@ impl NodeAux {
             next_sub_id: 0,
             activated: false,
             state: None,
-            state_persist: false,
-            on_deactivation: Vec::new(),
-            on_invalidate: Vec::new(),
+            lifetime: None,
+            closing: false,
         }
     }
 }
@@ -1152,19 +1202,16 @@ pub(crate) struct NodeCheckpointRuntime {
     pub activated: bool,
     pub has_called_fn_once: bool,
     pub ctx_state: Option<AnyValue>,
-    pub ctx_state_persist: bool,
 }
 
 pub(crate) struct NodeRestoreRuntime {
     pub cache: Option<AnyValue>,
     pub has_data: bool,
     pub version: RestoredNodeVersion,
-    pub status: Status,
     pub terminal: bool,
     pub activated: bool,
     pub has_called_fn_once: bool,
     pub ctx_state: Option<AnyValue>,
-    pub ctx_state_persist: bool,
 }
 
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
@@ -1185,7 +1232,7 @@ struct NodeInner;
 /// with no subscriber-driven deactivation) would otherwise leave its sink in each
 /// dep's `subscribers` list forever — the dep would never deactivate and would do
 /// wasted work emitting to a dead `Weak`. Running the remaining `dep_unsubs` here
-/// removes those entries, and firing `on_deactivation` releases external resources
+/// removes those entries, and running the lifetime's cleanup releases external resources
 /// (mirroring what GC + finalizers do in TS). Safe: at drop the refcount is 0 (no
 /// live borrow on `self`); each unsub touches a *dep* node (a different `RefCell`),
 /// recursively deactivating up the DAG (terminates); idempotent with `deactivate`
@@ -1209,12 +1256,28 @@ impl NodeInner {
         if let Some(handle) = call.handle {
             call.dispatcher.unregister(handle);
         }
+        // The lifetime closes in R-lifetime@2 order: abort, release, cleanup, state.
+        let lifetime = aux.lifetime.take();
+        if let Some(lt) = &lifetime {
+            lt.signal.abort();
+        }
         for u in edges.unsubs.drain(..).flatten() {
-            u();
+            run_reported("release", u);
         }
-        for h in std::mem::take(&mut aux.on_deactivation) {
-            h();
+        if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
+            let cctx = crate::lifetime::CleanupCtx {
+                state: aux.state.clone(),
+            };
+            run_reported("cleanup", move || cleanup(&cctx));
         }
+        aux.state = None;
+    }
+}
+
+/// Runs `f`; a panic goes to the host reporter as `source` (R-failure@3).
+fn run_reported(source: &str, f: impl FnOnce()) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
+        crate::report::report(source, payload.as_ref());
     }
 }
 
@@ -1926,7 +1989,7 @@ impl Drop for WaveGuard {
 
 /// Clear `in_dep_mutation` on scope exit — including a panic unwind during a rewire
 /// (QA-F1). A user fn can panic mid-rewire (an added dep's activation fn, or a removed
-/// dep's onDeactivation hook); the wave-owner catch's wave-flag reset does NOT
+/// dep's activation); the wave-owner catch's wave-flag reset does NOT
 /// cover `in_dep_mutation` (and may not include the rewiring node in its touched-set), so
 /// without this RAII a caught rewire panic would wedge the node forever (every future
 /// recompute deferred + every future rewire rejected as reentrant). Mirrors the TS arm's
@@ -2449,8 +2512,37 @@ impl Core {
         self.with_inner_edges(|_n, e| e.value.cache.clone())
     }
 
+    /// Derived from what the node holds (R-node); never stored.
     pub(crate) fn status(&self) -> Status {
-        self.with_inner_edges(|_n, e| e.value.status)
+        let (cache, output) = self.with_inner_edges(|_n, e| {
+            let cache = if !e.value.has_data {
+                CacheStatus::Empty
+            } else if e.wave.pending || e.state.pending > 0 {
+                CacheStatus::Stale
+            } else {
+                CacheStatus::Ready
+            };
+            let output = match &e.value.ended {
+                None => OutputStatus::Open,
+                Some(DepTerminal::Complete) => OutputStatus::Completed,
+                Some(DepTerminal::Error(_)) => OutputStatus::Errored,
+            };
+            (cache, output)
+        });
+        let lifecycle = self.with_aux(|a| {
+            if a.closing {
+                Lifecycle::Closing
+            } else if a.activated {
+                Lifecycle::Active
+            } else {
+                Lifecycle::Inactive
+            }
+        });
+        Status {
+            cache,
+            output,
+            lifecycle,
+        }
     }
 
     pub(crate) fn version(&self) -> Option<NodeVersion> {
@@ -2482,9 +2574,7 @@ impl Core {
             .get(key.id.0)
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore edge slot");
-        e.value.status != Status::Dirty
-            && e.value.status != Status::Pending
-            && e.state.pending == 0
+        e.state.pending == 0
             && !e.wave.inside_run_wave
             && !e.wave.in_dep_mutation
             && !e.wave.pending
@@ -2538,16 +2628,16 @@ impl Core {
 
     pub(crate) fn checkpoint_runtime(&self) -> NodeCheckpointRuntime {
         let version = self.version();
+        let status = self.status();
         self.with_node_state_aux_mut(|_n, _c, _cfg, r, e, a| NodeCheckpointRuntime {
             cache: e.value.cache.clone(),
             has_data: e.value.has_data,
             version,
-            status: e.value.status,
+            status,
             terminal: e.value.terminal,
             activated: a.activated,
             has_called_fn_once: r.has_called_fn_once,
             ctx_state: a.state.clone(),
-            ctx_state_persist: a.state_persist,
         })
     }
 
@@ -2556,7 +2646,6 @@ impl Core {
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, r, e, a| {
             e.value.cache = state.cache;
             e.value.has_data = state.has_data;
-            e.value.status = state.status;
             e.value.terminal = state.terminal;
             e.value.values = e.value.cache.iter().cloned().collect();
             e.wave = NodeWaveState::new();
@@ -2566,9 +2655,7 @@ impl Core {
             r.has_called_fn_once = state.has_called_fn_once;
             a.activated = should_activate;
             a.state = state.ctx_state;
-            a.state_persist = state.ctx_state_persist;
-            a.on_deactivation.clear();
-            a.on_invalidate.clear();
+            a.lifetime = should_activate.then(crate::lifetime::Lifetime::open);
             n.deps.clone()
         });
         if should_activate {
@@ -2659,7 +2746,6 @@ impl Core {
                 e.value.values = vec![v.clone()];
                 e.value.cache = Some(v);
                 e.value.has_data = true;
-                e.value.status = Status::Settled;
             }
             Core {
                 graph: arena.0.clone(),
@@ -2752,6 +2838,7 @@ impl Core {
         }
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
             a.activated = true;
+            a.lifetime = Some(crate::lifetime::Lifetime::open());
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
             // real box its callback captures.
@@ -2809,36 +2896,54 @@ impl Core {
     }
 
     fn deactivate(&self) {
-        let (unsubs, hooks) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
+        let (unsubs, lifetime) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
             a.activated = false;
+            let lifetime = a.lifetime.take();
+            if let Some(lt) = &lifetime {
+                lt.signal.abort();
+            }
             let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
             e.idx_boxes.clear();
-            let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut a.on_deactivation);
             // A computed node clears its retained values on deactivation; a state node
-            // keeps them (R-lifetime).
+            // keeps them, and so does an ended node (R-lifetime).
             let is_compute = c.handle.is_some() || !n.deps.is_empty();
             if is_compute && !e.value.terminal {
                 e.value.clear_values();
-                e.value.status = Status::Sentinel;
             }
             e.state = DepState::new(n.deps.len());
             e.wave.pending = false;
             e.wave.run_out.clear();
             r.has_called_fn_once = false;
-            // Control + INVALIDATE hooks are fresh-lifecycle (R-cleanup-hooks / D28):
-            // the next activation re-registers them from the fn body.
-            a.on_invalidate.clear();
-            if !a.state_persist {
-                a.state = None;
-            }
-            (unsubs, hooks)
+            (unsubs, lifetime)
         });
+        self.finish_close(unsubs, lifetime);
+    }
+
+    /// The rest of closing a lifetime, after its signal was aborted (R-lifetime@2):
+    /// release the dependencies, run the cleanup, which may still read the private
+    /// state, then drop the private state. Each step's panic goes to the host
+    /// reporter and the close completes.
+    fn finish_close(&self, unsubs: Vec<Unsub>, lifetime: Option<crate::lifetime::Lifetime>) {
         for u in unsubs {
-            u();
+            run_reported("release", u);
         }
-        for h in hooks {
-            h();
+        if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
+            let cctx = crate::lifetime::CleanupCtx {
+                state: self.get_state(),
+            };
+            self.with_aux_mut(|a| a.closing = true);
+            run_reported("cleanup", move || cleanup(&cctx));
+            self.with_aux_mut(|a| a.closing = false);
         }
+        let state = self.with_aux_mut(|a| a.state.take());
+        // Dropping private state may drop captured handles: after the arena borrow.
+        drop(state);
+    }
+
+    /// Whether `id` is this node's open lifetime: output and requests through a ctx
+    /// of a closed lifetime are dropped (R-lifetime@2).
+    pub(crate) fn lifetime_open(&self, id: u64) -> bool {
+        self.with_aux(|a| a.lifetime.as_ref().is_some_and(|lt| lt.id == id))
     }
 
     // ── upstream receive (R-wave) ──
@@ -2890,7 +2995,6 @@ impl Core {
                 return false;
             }
             e.wave.pending = true;
-            e.value.status = Status::Dirty;
             true
         });
         if propagate {
@@ -3452,8 +3556,8 @@ impl Core {
         }
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
-        let (handle, dispatcher, ctx, old_on_invalidate, old_on_deactivation) = self
-            .with_node_state_aux_mut(|n, c, cfg, r, e, a| {
+        let (handle, dispatcher, ctx, setup) =
+            self.with_node_state_aux_mut(|n, c, cfg, r, e, a| {
                 let invalidate_manual = cfg.invalidate == Policy::Manual;
                 let dep_records: Vec<DepRecord> = e
                     .state
@@ -3489,22 +3593,53 @@ impl Core {
                 e.wave.inside_run_wave = true;
                 e.wave.run_out.clear();
                 e.wave.emit_open = false;
+                // A run belongs to the open lifetime; the setup runs before the
+                // lifetime's first run (R-lifetime@2).
+                let lifetime = a
+                    .lifetime
+                    .get_or_insert_with(crate::lifetime::Lifetime::open);
+                let setup = if lifetime.setup_done {
+                    None
+                } else {
+                    lifetime.setup_done = true;
+                    cfg.setup.clone()
+                };
                 (
                     c.handle.expect("invoke ⇒ handle present"),
                     c.dispatcher.clone(),
-                    Ctx::new(self.borrowed_view(), dep_records),
-                    std::mem::take(&mut a.on_invalidate),
-                    std::mem::take(&mut a.on_deactivation),
+                    Ctx::new(
+                        self.borrowed_view(),
+                        dep_records,
+                        lifetime.id,
+                        lifetime.signal.clone(),
+                    ),
+                    setup,
                 )
             });
-        // Dropping user hooks may drop captured `Core`s. Do that after releasing the
-        // graph-arena borrow, or the captured handle's `Drop` can re-enter `GraphCore`.
-        drop(old_on_invalidate);
-        drop(old_on_deactivation);
         // D30: this is the innermost node whose fn runs.
         wave_set_blamed(self);
         let guard = WaveGuard(DeferredNodeAction::from_core(self));
-        let result = catch_unwind(AssertUnwindSafe(|| dispatcher.invoke(handle, &ctx)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(setup) = setup {
+                // What the setup sends is part of this run's output; its panic ends the
+                // node as the function's does.
+                let cleanup = (setup.0)(&ctx);
+                let lifetime = ctx.lifetime_id();
+                let unplaced = self.with_aux_mut(|a| match &mut a.lifetime {
+                    Some(lt) if lt.id == lifetime => {
+                        lt.cleanup = cleanup;
+                        None
+                    }
+                    _ => cleanup,
+                });
+                // The lifetime closed while its setup ran: release what it opened.
+                if let Some(cleanup) = unplaced {
+                    let cctx = crate::lifetime::CleanupCtx { state: None };
+                    run_reported("cleanup", move || cleanup(&cctx));
+                }
+            }
+            dispatcher.invoke(handle, &ctx)
+        }));
         drop(guard); // clears inside_run_wave
         let out = self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.run_out));
         match result {
@@ -3594,7 +3729,6 @@ impl Core {
             }
             let mut kept = Vec::with_capacity(frame.len());
             let mut values = Vec::new();
-            let mut invalidate_hooks: Vec<Rc<dyn Fn()>> = Vec::new();
             for m in frame {
                 match &m {
                     Message::Data(value) => {
@@ -3604,32 +3738,20 @@ impl Core {
                         let (_n, e) = g.get_node_and_edges_mut(self.key());
                         e.value.cache = Some(value.clone());
                         e.value.has_data = true;
-                        e.value.status = Status::Settled;
                         values.push(value.clone());
                     }
-                    Message::Resolved => {
-                        self.with_inner_edges_mut(|_, e| {
-                            e.value.status = if e.value.has_data {
-                                Status::Resolved
-                            } else {
-                                Status::Sentinel
-                            };
-                        });
-                    }
+                    Message::Resolved => {}
                     Message::Invalidate => {
-                        let hooks = self.with_inner_edges_aux_mut(|_, e, a| {
-                            if !e.value.has_data {
-                                return None;
-                            }
+                        // A node with no value drops an INVALIDATE (R-invalidation).
+                        let had_value = self.with_inner_edges_mut(|_, e| {
+                            let had = e.value.has_data;
                             e.value.clear_values();
-                            e.value.status = Status::Sentinel;
-                            Some(a.on_invalidate.clone())
+                            had
                         });
-                        let Some(hooks) = hooks else {
+                        if !had_value {
                             continue;
-                        };
+                        }
                         values.clear();
-                        invalidate_hooks.extend(hooks);
                     }
                     Message::Complete | Message::Error(_) => {
                         let ended = match &m {
@@ -3638,22 +3760,12 @@ impl Core {
                         };
                         self.with_inner_edges_mut(|_, e| {
                             e.value.terminal = true;
-                            e.value.status = if matches!(ended, DepTerminal::Error(_)) {
-                                Status::Errored
-                            } else {
-                                Status::Completed
-                            };
                             e.value.ended = Some(ended);
                         });
                     }
                     Message::Start | Message::Pending => continue,
                 }
                 kept.push(m);
-            }
-            // Invalidate hooks run borrow-free, before the INVALIDATE goes out
-            // (R-cleanup-hooks).
-            for f in invalidate_hooks {
-                f();
             }
             if !values.is_empty() {
                 self.with_inner_edges_mut(|_, e| e.value.values = values);
@@ -3716,22 +3828,19 @@ impl Core {
     /// releases its dependencies, runs its cleanup and drops its private state, and
     /// keeps its values, terminal and subscribers.
     fn close_ended_lifetime(&self) {
-        let (unsubs, hooks) = self.with_inner_edges_aux_mut(|n, e, a| {
+        let (unsubs, lifetime) = self.with_inner_edges_aux_mut(|n, e, a| {
+            let lifetime = a.lifetime.take();
+            if let Some(lt) = &lifetime {
+                lt.signal.abort();
+            }
             for b in &e.idx_boxes {
                 b.set(-1);
             }
             let unsubs: Vec<Unsub> = e.unsubs.iter_mut().filter_map(Option::take).collect();
             e.state = DepState::new(n.deps.len());
-            a.on_invalidate.clear();
-            a.state = None;
-            (unsubs, std::mem::take(&mut a.on_deactivation))
+            (unsubs, lifetime)
         });
-        for u in unsubs {
-            u();
-        }
-        for h in hooks {
-            h();
-        }
+        self.finish_close(unsubs, lifetime);
     }
 
     /// External deferred emit — the async-pool late-emit path used by
@@ -3774,16 +3883,10 @@ impl Core {
         self.with_aux(|a| a.state.clone())
     }
     pub(crate) fn set_state(&self, v: AnyValue) {
-        self.with_aux_mut(|a| a.state = Some(v));
-    }
-    pub(crate) fn set_state_persist(&self, on: bool) {
-        self.with_aux_mut(|a| a.state_persist = on);
-    }
-    pub(crate) fn register_on_deactivation(&self, f: Box<dyn FnOnce()>) {
-        self.with_aux_mut(|a| a.on_deactivation.push(f));
-    }
-    pub(crate) fn register_on_invalidate(&self, f: Rc<dyn Fn()>) {
-        self.with_aux_mut(|a| a.on_invalidate.push(f));
+        // The old value may hold the last handle to another node: drop it after the
+        // arena borrow.
+        let old = self.with_aux_mut(|a| a.state.replace(v));
+        drop(old);
     }
 
     /// A state node: no function and no dependencies.
@@ -4116,7 +4219,7 @@ impl<T: 'static> Node<T> {
 
     /// The node's lifecycle status (R-status-enum).
     pub fn status(&self) -> Status {
-        self.core.with_inner_edges(|_n, e| e.value.status)
+        self.core.status()
     }
 
     /// Read-only node runtime version metadata (D109).
@@ -4322,6 +4425,15 @@ mod tests {
     /// Collect a subscriber's message-kind tags into a shared Vec for shape asserts.
     type KindLog = Rc<RefCell<Vec<String>>>;
 
+    /// Node options whose setup returns a cleanup that runs `f`.
+    fn with_cleanup(f: impl Fn() + 'static) -> NodeOpts {
+        let f = Rc::new(f);
+        NodeOpts::default().with_setup(move |_| {
+            let f = f.clone();
+            crate::lifetime::cleanup(move |_| f())
+        })
+    }
+
     fn recorder() -> (KindLog, impl Fn(&[Msg]) + 'static) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let l2 = log.clone();
@@ -4333,11 +4445,20 @@ mod tests {
 
     #[test]
     fn status_freshness_and_terminality() {
-        assert!(Status::Settled.is_fresh());
-        assert!(Status::Resolved.is_fresh());
-        assert!(!Status::Dirty.is_fresh());
-        assert!(Status::Completed.is_terminal());
-        assert!(!Status::Settled.is_terminal());
+        let status = |cache, output| Status {
+            cache,
+            output,
+            lifecycle: Lifecycle::Active,
+        };
+        assert!(status(CacheStatus::Ready, OutputStatus::Open).is_fresh());
+        assert!(!status(CacheStatus::Stale, OutputStatus::Open).is_fresh());
+        assert!(!status(CacheStatus::Empty, OutputStatus::Open).is_fresh());
+        assert!(status(CacheStatus::Ready, OutputStatus::Completed).is_terminal());
+        assert!(!status(CacheStatus::Ready, OutputStatus::Open).is_terminal());
+        assert_eq!(
+            status(CacheStatus::Ready, OutputStatus::Errored).label(),
+            "errored"
+        );
     }
 
     #[test]
@@ -4353,7 +4474,7 @@ mod tests {
         // external tier-3 emit synthesizes a leading DIRTY (R-dirty-before-data).
         assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "DATA"]);
         assert_eq!(s.cache(), Some(2));
-        assert_eq!(s.status(), Status::Settled);
+        assert_eq!(s.status().cache, crate::CacheStatus::Ready);
     }
 
     #[test]
@@ -4393,13 +4514,13 @@ mod tests {
         let _u = s.subscribe(sink);
         s.set(5); // unchanged value → still DATA (never absorbed to RESOLVED)
         assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "DATA"]);
-        assert_eq!(s.status(), Status::Settled);
+        assert_eq!(s.status().cache, crate::CacheStatus::Ready);
         s.set(5); // again → still DATA
         assert_eq!(
             *log.borrow(),
             vec!["START", "DATA", "PENDING", "DATA", "PENDING", "DATA"]
         );
-        assert_eq!(s.status(), Status::Settled);
+        assert_eq!(s.status().cache, crate::CacheStatus::Ready);
     }
 
     #[test]
@@ -4437,7 +4558,7 @@ mod tests {
                 2
             ]
         );
-        assert_ne!(derived.status(), Status::Errored);
+        assert_ne!(derived.status().output, crate::OutputStatus::Errored);
         assert!(
             !derived.core.with_inner_edges(|_, e| e.wave.inside_run_wave),
             "the wave guard is clear after the wave"
@@ -4452,18 +4573,18 @@ mod tests {
         let a = Node::<i32>::state(1);
         {
             let flag = deactivated.clone();
-            let mid: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
-                let f = flag.clone();
-                ctx.on_deactivation(move || f.set(true));
-                ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
-            });
-            let _sub = mid.subscribe(|_| {}); // activates mid: runs fn (registers hook) + subscribes to a
+            let mid: Node<i32> = Node::derived_opts(
+                vec![a.erased()],
+                with_cleanup(move || flag.set(true)),
+                |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() + 1),
+            );
+            let _sub = mid.subscribe(|_| {}); // activates mid: setup + fn, subscribes to a
             assert!(!deactivated.get());
             // `mid` + `_sub` drop here → mid's Core refcount hits 0 → Drop runs cleanup.
         }
         assert!(
             deactivated.get(),
-            "dropping an active node fires its on_deactivation + detaches from deps (D1)"
+            "dropping an active node runs its lifetime cleanup + detaches from deps (D1)"
         );
         // `a` survived (still held), its sink was removed; a fresh subscribe still works.
         let (log, sink) = recorder();
@@ -4556,12 +4677,12 @@ mod tests {
         let (_log, sink) = recorder();
         let u = dbl.subscribe(sink);
         assert_eq!(dbl.cache(), Some(14));
-        assert_eq!(dbl.status(), Status::Settled);
+        assert_eq!(dbl.status().cache, crate::CacheStatus::Ready);
 
         u(); // last subscriber leaves → dbl deactivates
              // RAM: compute node cleared its cache; ROM: state node kept its value.
         assert_eq!(dbl.cache(), None);
-        assert_eq!(dbl.status(), Status::Sentinel);
+        assert_eq!(dbl.status().cache, crate::CacheStatus::Empty);
         assert_eq!(a.cache(), Some(7));
     }
 
@@ -4572,7 +4693,7 @@ mod tests {
         let s = Node::<i32>::state(1);
         let _u = s.subscribe(|_| {});
         s.down(vec![Message::Complete]);
-        assert_eq!(s.status(), Status::Completed);
+        assert_eq!(s.status().output, crate::OutputStatus::Completed);
         let (log, sink) = recorder();
         let _u2 = s.subscribe(sink);
         assert_eq!(*log.borrow(), vec!["START", "DATA", "COMPLETE"]);
@@ -4624,57 +4745,19 @@ mod tests {
     }
 
     #[test]
-    fn run_wave_hook_clear_drops_captured_core_borrow_free() {
-        // B49/D71 regression: clearing per-run hooks must drop the old user closures
-        // AFTER releasing the GraphCore borrow. A hook may capture the last handle to
+    fn private_state_replace_drops_captured_core_borrow_free() {
+        // B49/D71 regression: replacing private state must drop the old value AFTER
+        // releasing the GraphCore borrow. The old value may hold the last handle to
         // another node; dropping that handle re-enters Core::drop on the same arena.
         let a = Node::<i32>::state(1);
         let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            let held = Node::<i32>::state(99);
-            ctx.on_invalidate(move || {
-                let _ = held.status();
-            });
+            ctx.state_set(Node::<i32>::state(99));
             ctx.emit(*ctx.data::<i32>(0).unwrap());
         });
         let _u = d.subscribe(|_| {});
 
         a.set(2);
         assert_eq!(d.cache(), Some(2));
-    }
-
-    #[test]
-    fn on_invalidate_unsubscribe_affects_current_broadcast_snapshot() {
-        // R-cleanup-hooks / R-invalidate-idempotent: onInvalidate runs before the
-        // downstream INVALIDATE broadcast. If the hook detaches a subscriber, the
-        // current broadcast must snapshot after that detach rather than deliver to
-        // a stale pre-hook subscriber list.
-        let src = Node::<i32>::state(1);
-        let victim_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
-        let d: Node<i32> = {
-            let victim_unsub = victim_unsub.clone();
-            Node::derived(vec![src.erased()], move |ctx| {
-                let victim_unsub = victim_unsub.clone();
-                ctx.on_invalidate(move || {
-                    if let Some(unsub) = victim_unsub.borrow_mut().take() {
-                        unsub();
-                    }
-                });
-                ctx.emit(*ctx.data::<i32>(0).unwrap());
-            })
-        };
-        let _keepalive = d.subscribe(|_| {});
-        let (log, sink) = recorder();
-        let victim = d.subscribe(sink);
-        *victim_unsub.borrow_mut() = Some(victim);
-        log.borrow_mut().clear();
-
-        src.down(vec![Message::Invalidate]);
-
-        assert_eq!(
-            log.borrow().iter().filter(|m| *m == "INVALIDATE").count(),
-            0,
-            "a subscriber detached by onInvalidate must not receive the same INVALIDATE"
-        );
     }
 
     #[test]
@@ -4713,13 +4796,13 @@ mod tests {
         // returned to the free list.
         let free_before = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let p = Node::<i32>::producer(|ctx| {
-                ctx.on_deactivation(|| panic!("cleanup boom"));
+            let p = Node::<i32>::producer_opts(with_cleanup(|| panic!("cleanup boom")), |ctx| {
                 ctx.emit(1i32);
             });
             let _u = p.subscribe(|_| {});
         }));
-        assert!(result.is_err());
+        // R-failure@3: the cleanup's panic goes to the host reporter.
+        assert!(result.is_ok());
         let free_after = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
         assert!(
             free_after > free_before,
@@ -4730,7 +4813,7 @@ mod tests {
     #[test]
     fn drop_unregisters_fn_even_when_cleanup_hook_panics() {
         // DR-8/B54 side-table cleanup regression: the call slot must unregister before
-        // user cleanup hooks run, or a panicking onDeactivation strands the dispatcher
+        // the lifetime cleanup runs, or a panicking cleanup strands the dispatcher
         // fn slot and every Core/resource captured by the fn.
         struct DropFlag(Rc<Cell<bool>>);
         impl Drop for DropFlag {
@@ -4744,16 +4827,21 @@ mod tests {
             let fn_dropped = fn_dropped.clone();
             move || {
                 let guard = DropFlag(fn_dropped);
-                let p = Node::<i32>::producer(move |ctx| {
-                    let _keep = &guard;
-                    ctx.on_deactivation(|| panic!("cleanup boom"));
-                    ctx.emit(1i32);
-                });
+                let p = Node::<i32>::producer_opts(
+                    with_cleanup(|| panic!("cleanup boom")),
+                    move |ctx| {
+                        let _keep = &guard;
+                        ctx.emit(1i32);
+                    },
+                );
                 let _u = p.subscribe(|_| {});
             }
         }));
 
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "the cleanup's panic goes to the host reporter"
+        );
         assert!(
             fn_dropped.get(),
             "dispatcher unregister must drop fn captures even if user cleanup panics"
@@ -4813,7 +4901,7 @@ mod tests {
         // A stale weak dep-callback entry is a no-op and must not disturb the new node.
         old_weak.receive_from_dep(0, &[Message::Start]);
         assert_eq!(second.cache(), Some(2));
-        assert_eq!(second.status(), Status::Settled);
+        assert_eq!(second.status().cache, crate::CacheStatus::Ready);
     }
 
     #[test]
@@ -4893,7 +4981,7 @@ mod tests {
         source.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
 
         assert_eq!(runs.get(), 1, "the run sees the DATA before the COMPLETE");
-        assert_eq!(derived.status(), Status::Completed);
+        assert_eq!(derived.status().output, crate::OutputStatus::Completed);
     }
 
     #[test]
@@ -5668,7 +5756,7 @@ mod tests {
 
         drain_committed_boundary(&reused.core);
 
-        assert_eq!(reused.status(), Status::Settled);
+        assert_eq!(reused.status().cache, crate::CacheStatus::Ready);
         assert_eq!(
             reused.cache(),
             Some(2),
@@ -6081,8 +6169,8 @@ mod tests {
 
         assert_eq!(reused.cache(), Some(2));
         assert_eq!(
-            reused.status(),
-            Status::Settled,
+            reused.status().cache,
+            crate::CacheStatus::Ready,
             "stale ExternalRewire token must not disturb the reused slot occupant"
         );
         assert!(
@@ -6302,7 +6390,7 @@ mod tests {
         // R-failure: a panic in the function is the node's ERROR, and what it sent
         // before the panic is dropped, so the subscriber sees no DATA.
         assert!(held.borrow().is_some());
-        assert_eq!(derived.status(), Status::Errored);
+        assert_eq!(derived.status().output, crate::OutputStatus::Errored);
         assert!(
             log.borrow().iter().any(|k| k == "ERROR"),
             "a panicking function ends its node with ERROR"
@@ -6339,13 +6427,13 @@ mod tests {
         );
 
         assert_eq!(
-            reused.status(),
-            Status::Settled,
+            reused.status().cache,
+            crate::CacheStatus::Ready,
             "stale generation key must not ERROR/reset the reused slot occupant"
         );
         assert_eq!(
-            owner.status(),
-            Status::Errored,
+            owner.status().output,
+            crate::OutputStatus::Errored,
             "stale blame falls back to the live wave owner"
         );
     }
@@ -6383,13 +6471,13 @@ mod tests {
         outer.set(1);
 
         assert_eq!(
-            outer.status(),
-            Status::Settled,
+            outer.status().cache,
+            crate::CacheStatus::Ready,
             "outer same-slot node must not receive the nested arena's recovery ERROR"
         );
         assert_eq!(
-            panicker.status(),
-            Status::Errored,
+            panicker.status().output,
+            crate::OutputStatus::Errored,
             "panic recovery should blame the nested arena node that ran the fn"
         );
     }
@@ -6624,51 +6712,44 @@ mod tests {
     }
 
     #[test]
-    fn rewire_removed_cleanup_panic_ends_node_and_releases_remaining_edges() {
-        // QA regression for the DR-8/B54 no-kept fast path: a panicking removed-dep
-        // deactivation hook must not drop later old-edge Unsub handles without running
-        // them. The broader half-applied-rewire panic class is tracked by B16; this
-        // test pins the new fast path to the slow path's cleanup ownership behavior.
+    fn rewire_removed_cleanup_panic_is_reported_and_releases_remaining_edges() {
+        // R-failure@3: a removed dependency's cleanup panic goes to the host reporter;
+        // the rewire completes, the later old edge is released and the node stays open.
         let b_deactivated = Rc::new(Cell::new(false));
-        let a = Node::<i32>::producer(|ctx| {
-            ctx.on_deactivation(|| panic!("removed cleanup boom"));
-            ctx.emit(1i32);
-        });
+        let a =
+            Node::<i32>::producer_opts(with_cleanup(|| panic!("removed cleanup boom")), |ctx| {
+                ctx.emit(1i32);
+            });
         let b = {
-            let b_deactivated = b_deactivated.clone();
-            Node::<i32>::producer(move |ctx| {
-                let flag = b_deactivated.clone();
-                ctx.on_deactivation(move || flag.set(true));
+            let flag = b_deactivated.clone();
+            Node::<i32>::producer_opts(with_cleanup(move || flag.set(true)), |ctx| {
                 ctx.emit(2i32);
             })
         };
         let c = Node::<i32>::state(10);
         let e = Node::<i32>::state(20);
 
-        {
-            let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
-                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-            });
-            let _u = d.subscribe(|_| {});
-            assert_eq!(d.cache(), Some(3));
-            assert_eq!(b.core.subscriber_count(), 1);
+        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+        });
+        let _u = d.subscribe(|_| {});
+        assert_eq!(d.cache(), Some(3));
+        assert_eq!(b.core.subscriber_count(), 1);
 
-            d.replace_deps(vec![c.erased(), e.erased()], |ctx| {
-                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-            });
-            // R-terminals: the cleanup panic becomes ERROR on the rewiring node, which
-            // ends it and closes its lifetime, so the later old edge is released at once.
-            assert_eq!(d.status(), Status::Errored);
-            assert!(
-                b_deactivated.get(),
-                "ending the rewiring node runs the remaining old-edge unsubscribe"
-            );
-            assert_eq!(
-                b.core.subscriber_count(),
-                0,
-                "remaining old edge is not leaked after the node ends"
-            );
-        }
+        d.replace_deps(vec![c.erased(), e.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
+        });
+        assert_eq!(d.status().output, crate::OutputStatus::Open);
+        assert_eq!(d.cache(), Some(30));
+        assert!(
+            b_deactivated.get(),
+            "the later old edge's cleanup still runs"
+        );
+        assert_eq!(
+            b.core.subscriber_count(),
+            0,
+            "the later old edge is released"
+        );
     }
 
     #[test]
@@ -6763,7 +6844,7 @@ mod tests {
         // under the auto COMPLETE policy the node ends once every dep has completed.
         let term: Node<i32> = Node::producer(|ctx| ctx.down(vec![Message::Complete]));
         let _ut = term.subscribe(|_| {});
-        assert_eq!(term.status(), Status::Completed);
+        assert_eq!(term.status().output, crate::OutputStatus::Completed);
         let a = Node::<i32>::state(1);
         let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.data::<i32>(0).unwrap())
@@ -6771,12 +6852,12 @@ mod tests {
         let _u = d.subscribe(|_| {});
         d.subscribe_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
         assert_ne!(
-            d.status(),
-            Status::Completed,
+            d.status().output,
+            crate::OutputStatus::Completed,
             "a live dep keeps the node open"
         );
         a.down(vec![Message::Complete]);
-        assert_eq!(d.status(), Status::Completed);
+        assert_eq!(d.status().output, crate::OutputStatus::Completed);
     }
 
     #[test]
@@ -6798,7 +6879,7 @@ mod tests {
         *slot.borrow_mut() = Some(d.clone());
         let (log, sink) = recorder();
         let _u = d.subscribe(sink); // activate → fn → mid-fn subscribe_dep → reject → wave-owner → ERROR
-        assert_eq!(d.status(), Status::Errored);
+        assert_eq!(d.status().output, crate::OutputStatus::Errored);
         assert!(
             log.borrow().iter().any(|k| k == "ERROR"),
             "mid-fn rewire surfaces as ERROR (got {:?})",
@@ -6869,14 +6950,14 @@ mod tests {
 
         // R-failure: the panic in boom's first run is boom's ERROR; nothing unwinds into
         // the rewire, and boom stays d's (ended) dependency.
-        assert_eq!(boom.status(), Status::Errored);
+        assert_eq!(boom.status().output, crate::OutputStatus::Errored);
         assert_eq!(boom.core.subscriber_count(), 1);
 
         // d is NOT terminal; the QA-F1 guard cleared in_dep_mutation on the unwind so
         // d is not wedged.
         assert_ne!(
-            d.status(),
-            Status::Errored,
+            d.status().output,
+            crate::OutputStatus::Errored,
             "d absorbs the dep error (errorWhenDepsError:false) and survives the rewire panic"
         );
 
@@ -6970,7 +7051,7 @@ mod tests {
 
         assert_eq!(node.version(), before);
         assert_eq!(node.cache(), None);
-        assert_eq!(node.status(), Status::Errored);
+        assert_eq!(node.status().output, crate::OutputStatus::Errored);
     }
 
     #[test]

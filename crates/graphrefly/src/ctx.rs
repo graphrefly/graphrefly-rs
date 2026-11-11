@@ -6,11 +6,15 @@
 //! `data`/`emit` helpers downcast.
 //!
 //! Slice scope: `down` (DATA/INVALIDATE/terminal; START, PENDING and RESOLVED are the
-//! kernel's and are rejected), typed `data`/`emit`, `state`, and the cleanup hooks
-//! (`on_deactivation` + `on_invalidate`). See `CLEAN-SLATE.md`.
+//! kernel's and are rejected), typed `data`/`emit`, the lifetime's private state and
+//! abort signal (R-lifetime@2). A function registers no cleanup: what must last for
+//! the lifetime is opened by the node's setup ([`crate::NodeOpts::with_setup`]).
+//! Every ctx belongs to one lifetime; output through a closed lifetime's ctx is
+//! dropped.
 
 use std::rc::Rc;
 
+use crate::lifetime::AbortSignal;
 use crate::node::{Core, Node, NodeOpts, RewireRequest};
 use crate::operators::Operator;
 use crate::protocol::{reject_kernel_only_output, AnyValue, Message, Wave};
@@ -61,11 +65,36 @@ pub(crate) struct DepRecord {
 pub struct Ctx {
     pub(crate) node: Core,
     dep_records: Vec<DepRecord>,
+    lifetime: u64,
+    signal: AbortSignal,
 }
 
 impl Ctx {
-    pub(crate) fn new(node: Core, dep_records: Vec<DepRecord>) -> Self {
-        Self { node, dep_records }
+    pub(crate) fn new(
+        node: Core,
+        dep_records: Vec<DepRecord>,
+        lifetime: u64,
+        signal: AbortSignal,
+    ) -> Self {
+        Self {
+            node,
+            dep_records,
+            lifetime,
+            signal,
+        }
+    }
+
+    pub(crate) fn lifetime_id(&self) -> u64 {
+        self.lifetime
+    }
+
+    fn open(&self) -> bool {
+        self.node.lifetime_open(self.lifetime)
+    }
+
+    /// The lifetime's abort signal (R-lifetime@2), aborted when the lifetime closes.
+    pub fn signal(&self) -> AbortSignal {
+        self.signal.clone()
     }
 
     pub(crate) fn dep_records(&self) -> &[DepRecord] {
@@ -149,11 +178,16 @@ impl Ctx {
     /// Consecutive emits of one run join one array, closed by any `down` (Rust sugar;
     /// graphrefly:D797 (9)); the PENDING prefix is the kernel's (R-wave).
     pub fn emit<T: 'static>(&self, v: T) {
-        self.node.emit_value(Rc::new(v));
+        if self.open() {
+            self.node.emit_value(Rc::new(v));
+        }
     }
 
     /// Emits each of `values`, as [`Ctx::emit`] does: they join the run's open array.
     pub fn emit_all<T: 'static>(&self, values: impl IntoIterator<Item = T>) {
+        if !self.open() {
+            return;
+        }
         for v in values {
             self.node.emit_value(Rc::new(v));
         }
@@ -168,34 +202,25 @@ impl Ctx {
     /// Uncaught, the panic is the node's ERROR.
     pub fn down(&self, msgs: Wave<AnyValue>) {
         reject_kernel_only_output(&msgs);
-        self.node.down(msgs);
+        if self.open() {
+            self.node.down(msgs);
+        }
     }
 
-    /// Read this node's private cross-wave state (R-ctx-state / D23), typed.
+    /// Read the lifetime's private state (R-lifetime@2), typed. It lasts across the
+    /// lifetime's waves, INVALIDATE included, and is dropped when the lifetime closes.
     pub fn state_get<S: 'static>(&self) -> Option<Rc<S>> {
+        if !self.open() {
+            return None;
+        }
         self.node.get_state().and_then(|a| a.downcast::<S>().ok())
     }
 
-    /// Set this node's private cross-wave state (R-ctx-state).
+    /// Set the lifetime's private state (R-lifetime@2); dropped through a closed ctx.
     pub fn state_set<S: 'static>(&self, v: S) {
-        self.node.set_state(Rc::new(v));
-    }
-
-    /// Keep `state` across the fresh-lifecycle wipe (R-ctx-state / D29).
-    pub fn state_persist(&self, on: bool) {
-        self.node.set_state_persist(on);
-    }
-
-    /// Release external resources on deactivation (R-cleanup-hooks / D28). Fires once.
-    pub fn on_deactivation(&self, f: impl FnOnce() + 'static) {
-        self.node.register_on_deactivation(Box::new(f));
-    }
-
-    /// Flush external state on INVALIDATE (R-cleanup-hooks / D28). Re-callable: fires
-    /// once per INVALIDATE wave. INVALIDATE is lifecycle-continue (R-ctx-state / D29) —
-    /// it does NOT wipe `ctx.state`, so any internal reset must be done here.
-    pub fn on_invalidate(&self, f: impl Fn() + 'static) {
-        self.node.register_on_invalidate(Rc::new(f));
+        if self.open() {
+            self.node.set_state(Rc::new(v));
+        }
     }
 
     /// Graph-local async/time driver for source bodies (D111).
@@ -235,6 +260,9 @@ impl Ctx {
     /// this is NOT the D37 mid-fn reject. Higher-order operators (*Map) use this to wire
     /// runtime-created inner nodes as VISIBLE self-deps. `f` re-pairs the deps (SD-1 pairing).
     pub fn rewire_next_subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+        if !self.open() {
+            return;
+        }
         self.node
             .request_rewire_next(RewireRequest::Add(dep, Rc::new(f)));
     }
@@ -243,9 +271,12 @@ impl Ctx {
     /// boundary, unsubscribe from it + swap the fn. If the identity is already absent at apply time, the
     /// request is a full no-op, including no fn swap, so stale duplicate unsubscribes cannot desync
     /// the live dep/fn pairing. A successful unsubscribe DRAINS the dep's edge + tears down its source
-    /// on last-subscriber (onDeactivation) = the switchMap/abortInFlight cancellation + memory
+    /// on last-subscriber (its lifetime cleanup) = the switchMap/abortInFlight cancellation + memory
     /// bounding (D47 beta).
     pub fn rewire_next_unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+        if !self.open() {
+            return;
+        }
         self.node
             .request_rewire_next(RewireRequest::remove(&dep, Rc::new(f)));
     }
@@ -254,6 +285,9 @@ impl Ctx {
     /// the fn at the boundary (the switch-variant — removes-before-adds keeps the tracked inner
     /// list aligned across boundary waves).
     pub fn rewire_next_replace_deps<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) {
+        if !self.open() {
+            return;
+        }
         self.node
             .request_rewire_next(RewireRequest::Set(deps, Rc::new(f)));
     }
@@ -269,6 +303,8 @@ impl Ctx {
         DeferredCtx {
             node: self.node.clone(),
             dep_records: self.dep_records.clone(),
+            lifetime: self.lifetime,
+            signal: self.signal.clone(),
         }
     }
 }
@@ -281,9 +317,16 @@ impl Ctx {
 pub struct DeferredCtx {
     node: Core,
     dep_records: Vec<DepRecord>,
+    lifetime: u64,
+    signal: AbortSignal,
 }
 
 impl DeferredCtx {
+    /// The lifetime's abort signal (R-lifetime@2).
+    pub fn signal(&self) -> AbortSignal {
+        self.signal.clone()
+    }
+
     /// The raw input surface captured at defer time (R-invocation).
     pub fn wave_data(&self) -> Vec<&[Vec<AnyValue>]> {
         self.dep_records
@@ -330,7 +373,9 @@ impl DeferredCtx {
 
     /// Emit one typed DATA downstream as the deferred async result.
     pub fn emit<T: 'static>(&self, v: T) {
-        self.node.owned_down(vec![Message::Data(Rc::new(v))]);
+        if self.node.lifetime_open(self.lifetime) {
+            self.node.owned_down(vec![Message::Data(Rc::new(v))]);
+        }
     }
 
     /// Emit a raw array downstream as the deferred async result (the ctx-level power
@@ -342,6 +387,9 @@ impl DeferredCtx {
     /// (R-wave); nothing of the array is applied.
     pub fn down(&self, msgs: Wave<AnyValue>) {
         reject_kernel_only_output(&msgs);
-        self.node.owned_down(msgs);
+        // Output through a closed lifetime's ctx is dropped (R-lifetime@2).
+        if self.node.lifetime_open(self.lifetime) {
+            self.node.owned_down(msgs);
+        }
     }
 }

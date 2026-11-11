@@ -50,7 +50,19 @@ where
             complete: Policy::Manual,
             pool: PoolKind::Async,
             ..NodeOpts::default()
-        },
+        }
+        // The latest run's cancel lives in private state; the lifetime's cleanup runs
+        // it (R-lifetime@2).
+        .with_setup(|_| {
+            crate::lifetime::cleanup(|closing| {
+                let cancel = closing
+                    .state_get::<LatestCancel>()
+                    .and_then(|slot| slot.0.borrow_mut().take());
+                if let Some(cancel) = cancel {
+                    cancel();
+                }
+            })
+        }),
         move |ctx| {
             let latest_invocation = latest_invocation.clone();
             let invocation = latest_invocation
@@ -99,11 +111,14 @@ where
                     )]),
                 }
             }));
-            ctx.on_deactivation(cancel);
+            ctx.state_set(LatestCancel(std::cell::RefCell::new(Some(cancel))));
         },
     );
     graph.init_node(op, deps, opts)
 }
+
+/// The latest worker run's cancel, kept in private state.
+struct LatestCancel(std::cell::RefCell<Option<crate::async_driver::DriverCancel>>);
 
 #[cfg(test)]
 mod tests {
@@ -189,7 +204,7 @@ mod tests {
                 .any(|edge| edge.from == "source" && edge.to == "worker"));
             assert!(snap.nodes.iter().any(|node| node.id == "worker"
                 && node.factory == "workerDerived"
-                && node.status == Status::Settled));
+                && node.status.cache == crate::CacheStatus::Ready));
         });
     }
 
@@ -257,7 +272,10 @@ mod tests {
 
             source.set(1);
 
-            wait_until("worker error", || worker.status() == Status::Errored).await;
+            wait_until("worker error", || {
+                worker.status().output == crate::OutputStatus::Errored
+            })
+            .await;
             assert_eq!(&*errors.borrow(), &["worker failed".to_owned()]);
         });
     }
@@ -294,7 +312,10 @@ mod tests {
 
             source.set(1);
 
-            wait_until("worker panic error", || worker.status() == Status::Errored).await;
+            wait_until("worker panic error", || {
+                worker.status().output == crate::OutputStatus::Errored
+            })
+            .await;
             assert_eq!(errors.borrow().len(), 1);
             assert!(errors.borrow()[0].contains("worker_derived: worker task failed"));
         });
@@ -359,7 +380,7 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(120)).await;
             assert_eq!(worker.cache(), None);
-            assert_eq!(worker.status(), Status::Sentinel);
+            assert_eq!(worker.status().cache, crate::CacheStatus::Empty);
         });
     }
 
@@ -386,7 +407,7 @@ mod tests {
             source.down(vec![Message::Data(Rc::new(7i32)), Message::Complete]);
 
             wait_until("worker result after dep complete", || {
-                worker.cache() == Some(21) && worker.status() == Status::Settled
+                worker.cache() == Some(21) && worker.status().cache == crate::CacheStatus::Ready
             })
             .await;
         });

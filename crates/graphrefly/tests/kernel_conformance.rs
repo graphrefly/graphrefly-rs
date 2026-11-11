@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use graphrefly::{AnyValue, Message, Node, Status};
+use graphrefly::{AnyValue, Message, Node};
 
 type Log = Rc<RefCell<Vec<String>>>;
 type Unsub = Box<dyn FnOnce()>;
@@ -163,7 +163,7 @@ fn c42_rejected_output_is_applied_nowhere_and_uncaught_is_error() {
         ctx.down(vec![Message::Pending]);
     });
     let (log, _u) = record(&m);
-    assert_eq!(m.status(), Status::Errored);
+    assert_eq!(m.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(kinds(&log), vec!["START", "ERROR"]);
 
     // The host writes only through a state's `set`, `invalidate`, `complete` and
@@ -190,7 +190,7 @@ fn c12c_function_sending_resolved_ends_with_error() {
 
     sends_resolved.set(true);
     input.set(2);
-    assert_eq!(n.status(), Status::Errored);
+    assert_eq!(n.status().output, graphrefly::OutputStatus::Errored);
     let seen = kinds(&log);
     assert_eq!(seen.last().map(String::as_str), Some("ERROR"));
     assert!(
@@ -279,7 +279,11 @@ fn c12_occurrences_stay_data_and_kernel_resolved_settles_silence() {
     let runs_before = dependent_runs.get();
     for v in 1..=3 {
         input.set(v);
-        assert_ne!(dependent.status(), Status::Dirty, "never left pending");
+        assert_ne!(
+            dependent.status().cache,
+            graphrefly::CacheStatus::Stale,
+            "never left pending"
+        );
     }
     assert_eq!(
         arrays(&silent_log),
@@ -334,7 +338,11 @@ fn c16_quiet_node_absorbs_waves_and_publishes_later() {
 
     for v in 1..=3 {
         a.set(v);
-        assert_ne!(e.status(), Status::Dirty, "E is never left waiting");
+        assert_ne!(
+            e.status().cache,
+            graphrefly::CacheStatus::Stale,
+            "E is never left waiting"
+        );
     }
     assert!(
         arrays(&q_log).is_empty(),
@@ -814,6 +822,15 @@ fn send(slot: &Rc<RefCell<Option<graphrefly::DeferredCtx>>>, wave: Vec<Message<A
     slot.borrow_mut().get_or_insert(ctx);
 }
 
+/// Node options whose setup returns a cleanup that runs `f` (R-lifetime@2).
+fn with_cleanup(f: impl Fn() + 'static) -> graphrefly::NodeOpts {
+    let f = Rc::new(f);
+    graphrefly::NodeOpts::default().with_setup(move |_| {
+        let f = f.clone();
+        graphrefly::cleanup(move |_| f())
+    })
+}
+
 fn data(v: i32) -> Message<AnyValue> {
     Message::Data(Rc::new(v) as AnyValue)
 }
@@ -976,7 +993,11 @@ fn c15_dependency_terminal_settles_its_pending_mark() {
         vec![(Some("ERROR boom".to_owned()), vec![30])],
         "(c) one run sees B's ERROR and C's value"
     );
-    assert_ne!(d.status(), Status::Errored, "manual ERROR: D stays open");
+    assert_ne!(
+        d.status().output,
+        graphrefly::OutputStatus::Errored,
+        "manual ERROR: D stays open"
+    );
 }
 
 /// C-17 — an ended dependency counts toward auto COMPLETE, whatever ended it and in
@@ -1017,7 +1038,7 @@ fn c17_ended_dependency_counts_toward_auto_complete() {
         let end_c = || {
             let before = ctrl_runs.get();
             c.error("e");
-            assert_eq!(dctrl.status(), Status::Errored);
+            assert_eq!(dctrl.status().output, graphrefly::OutputStatus::Errored);
             assert_eq!(ctrl_runs.get(), before, "Dctrl ends without running");
         };
         if c_first {
@@ -1027,14 +1048,26 @@ fn c17_ended_dependency_counts_toward_auto_complete() {
                 &(None, Some("ERROR e".to_owned())),
                 "D's function sees C's ERROR as input"
             );
-            assert_ne!(d.status(), Status::Completed, "D stays open");
+            assert_ne!(
+                d.status().output,
+                graphrefly::OutputStatus::Completed,
+                "D stays open"
+            );
             send(&b_slot, vec![data(1), Message::Complete]);
         } else {
             send(&b_slot, vec![data(1), Message::Complete]);
-            assert_ne!(d.status(), Status::Completed, "C is still open");
+            assert_ne!(
+                d.status().output,
+                graphrefly::OutputStatus::Completed,
+                "C is still open"
+            );
             end_c();
         }
-        assert_eq!(d.status(), Status::Completed, "c_first={c_first}");
+        assert_eq!(
+            d.status().output,
+            graphrefly::OutputStatus::Completed,
+            "c_first={c_first}"
+        );
         // ctx.terminal is the terminal in this invocation (R-invocation@2), so the
         // last run sees only the terminal that arrived last.
         let last_seen = if c_first {
@@ -1082,8 +1115,8 @@ fn c36_input_arrays_and_terminal_admission() {
         vec![(vec![vec![20]], Some("COMPLETE".to_owned()))]
     );
     assert_ne!(
-        d.status(),
-        Status::Completed,
+        d.status().output,
+        graphrefly::OutputStatus::Completed,
         "d stays open until its fn ends it"
     );
 
@@ -1106,7 +1139,7 @@ fn c36_input_arrays_and_terminal_admission() {
         !flat.iter().any(|k| k == "RESOLVED"),
         "no balancing RESOLVED"
     );
-    assert_eq!(d.status(), Status::Completed);
+    assert_eq!(d.status().output, graphrefly::OutputStatus::Completed);
 
     // [DATA 7, INVALIDATE] goes out as [PENDING, INVALIDATE]; under auto INVALIDATE d
     // does not run, and both lose their values.
@@ -1158,8 +1191,8 @@ fn c40_ended_node_can_be_subscribed_and_depended_on() {
     let _ud = d.subscribe(|_| {});
     assert_eq!(*d_runs.borrow(), vec![1], "D runs once on S's snapshot");
     assert_eq!(
-        d.status(),
-        Status::Completed,
+        d.status().output,
+        graphrefly::OutputStatus::Completed,
         "and completes after that run"
     );
 
@@ -1171,7 +1204,7 @@ fn c40_ended_node_can_be_subscribed_and_depended_on() {
         })
     };
     let _ue = e.subscribe(|_| {});
-    assert_eq!(e.status(), Status::Errored);
+    assert_eq!(e.status().output, graphrefly::OutputStatus::Errored);
     assert_eq!(e_runs.get(), 0, "E ends with ERROR e without running");
 
     let m_seen = Rc::new(RefCell::new(Vec::<Option<String>>::new()));
@@ -1183,7 +1216,11 @@ fn c40_ended_node_can_be_subscribed_and_depended_on() {
     };
     let _um = m.subscribe(|_| {});
     assert_eq!(*m_seen.borrow(), vec![Some("ERROR e".to_owned())]);
-    assert_ne!(m.status(), Status::Errored, "M stays open");
+    assert_ne!(
+        m.status().output,
+        graphrefly::OutputStatus::Errored,
+        "M stays open"
+    );
 
     let refused = catch_unwind(AssertUnwindSafe(|| s.set(2)));
     assert!(refused.is_err(), "the set on S is refused");
@@ -1265,32 +1302,48 @@ fn c34_terminal_fanout_closes_the_lifetime() {
         Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
     }));
 
+    let close_order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
     // T is a source with no other dependent; its release is visible as its cleanup.
     let t_released = Rc::new(Cell::new(false));
     let t_slot: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
     let t = {
         let t_released = t_released.clone();
         let keep = t_slot.clone();
-        Node::<i32>::producer(move |ctx| {
-            let t_released = t_released.clone();
-            ctx.on_deactivation(move || t_released.set(true));
-            *keep.borrow_mut() = Some(ctx.defer());
-            ctx.emit(0);
-        })
+        Node::<i32>::producer_opts(
+            with_cleanup({
+                let close_order = close_order.clone();
+                move || {
+                    t_released.set(true);
+                    close_order.borrow_mut().push("T");
+                }
+            }),
+            move |ctx| {
+                *keep.borrow_mut() = Some(ctx.defer());
+                ctx.emit(0);
+            },
+        )
     };
     let cleanup = Rc::new(Cell::new(0usize));
     let s_runs = Rc::new(Cell::new(0usize));
     let s = {
         let cleanup = cleanup.clone();
         let s_runs = s_runs.clone();
-        Node::<i32>::derived(vec![t.erased()], move |ctx| {
-            s_runs.set(s_runs.get() + 1);
-            let cleanup = cleanup.clone();
-            ctx.on_deactivation(move || cleanup.set(cleanup.get() + 1));
-            if *ctx.data::<i32>(0).unwrap() == 1 {
-                ctx.down(vec![data(1), Message::Complete]);
-            }
-        })
+        Node::<i32>::derived_opts(
+            vec![t.erased()],
+            with_cleanup({
+                let close_order = close_order.clone();
+                move || {
+                    cleanup.set(cleanup.get() + 1);
+                    close_order.borrow_mut().push("S");
+                }
+            }),
+            move |ctx| {
+                s_runs.set(s_runs.get() + 1);
+                if *ctx.data::<i32>(0).unwrap() == 1 {
+                    ctx.down(vec![data(1), Message::Complete]);
+                }
+            },
+        )
     };
     let x_log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
     let z_log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1335,8 +1388,17 @@ fn c34_terminal_fanout_closes_the_lifetime() {
     assert_eq!(arrays(&y_log), vec![full.clone()], "Y gets the whole array");
     assert_eq!(cleanup.get(), 1, "S's lifetime closes: its cleanup runs");
     assert!(t_released.get(), "S releases T, which deactivates");
+    assert_eq!(
+        *close_order.borrow(),
+        vec!["T", "S"],
+        "S releases T before its own cleanup runs (R-lifetime@2)"
+    );
     assert_eq!(s.cache(), Some(1), "S keeps its value");
-    assert_eq!(s.status(), Status::Completed, "and its COMPLETE");
+    assert_eq!(
+        s.status().output,
+        graphrefly::OutputStatus::Completed,
+        "and its COMPLETE"
+    );
     let z_first = z_log.borrow().first().cloned();
     assert_eq!(
         z_first,
@@ -1358,7 +1420,11 @@ fn c34_terminal_fanout_closes_the_lifetime() {
         }],
         "X's throw goes to the host reporter"
     );
-    assert_eq!(s.status(), Status::Completed, "and is not S's ERROR");
+    assert_eq!(
+        s.status().output,
+        graphrefly::OutputStatus::Completed,
+        "and is not S's ERROR"
+    );
     graphrefly::set_host_reporter(previous);
 }
 
@@ -1399,8 +1465,248 @@ fn auto_error_applies_an_earlier_invalidate_first() {
             matches!((inv, err), (Some(i), Some(e)) if i < e),
             "{invalidate:?}: INVALIDATE goes out before the ERROR, got {flat:?}"
         );
-        assert_eq!(runs.get(), before, "{invalidate:?}: the function does not run");
-        assert_eq!(d.cache(), None, "{invalidate:?}: the ended node holds no value");
-        assert_eq!(d.status(), Status::Errored);
+        assert_eq!(
+            runs.get(),
+            before,
+            "{invalidate:?}: the function does not run"
+        );
+        assert_eq!(
+            d.cache(),
+            None,
+            "{invalidate:?}: the ended node holds no value"
+        );
+        assert_eq!(d.status().output, graphrefly::OutputStatus::Errored);
     }
+}
+
+// ── Phase 4: lifetime setup, signal and close order ──────────────────────────
+
+use graphrefly::{CacheStatus, Lifecycle, OutputStatus};
+
+/// C-4 — a sync leg and an async leg: the async result is a later wave, nothing
+/// waits across it, and a result arriving after the lifetime closed is dropped.
+#[test]
+fn c4_async_result_is_a_later_wave_and_dropped_after_close() {
+    let a = Node::<i32>::state(1);
+    let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
+    });
+    // C answers its first run at once, and later runs through async work.
+    type Work = Rc<RefCell<Vec<(graphrefly::DeferredCtx, i32)>>>;
+    let work: Work = Rc::new(RefCell::new(Vec::new()));
+    let c = {
+        let work = work.clone();
+        Node::<i32>::derived(vec![a.erased()], move |ctx| {
+            let v = *ctx.data::<i32>(0).unwrap();
+            if ctx.state_get::<bool>().is_none() {
+                ctx.state_set(true);
+                ctx.emit(v * 100);
+            } else {
+                work.borrow_mut().push((ctx.defer(), v * 100));
+            }
+        })
+    };
+    let d_runs = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
+    let d = {
+        let d_runs = d_runs.clone();
+        Node::<i32>::derived(vec![b.erased(), c.erased()], move |ctx| {
+            let pair = (*ctx.data::<i32>(0).unwrap(), *ctx.data::<i32>(1).unwrap());
+            d_runs.borrow_mut().push(pair);
+        })
+    };
+    let (c_log, uc) = record_arrays(&c);
+    let ud = d.subscribe(|_| {});
+    d_runs.borrow_mut().clear();
+    c_log.borrow_mut().clear();
+
+    a.set(2);
+    assert_eq!(arrays(&c_log), vec![shape(&["PENDING", "RESOLVED"])]);
+    assert_eq!(
+        *d_runs.borrow(),
+        vec![(20, 100)],
+        "B's new value, C's old one"
+    );
+    assert_ne!(
+        d.status().cache,
+        CacheStatus::Stale,
+        "no PENDING stays open"
+    );
+
+    let (ctx, v) = work.borrow_mut().remove(0);
+    ctx.emit(v);
+    assert_eq!(
+        *d_runs.borrow(),
+        vec![(20, 100), (20, 200)],
+        "a new wave from C"
+    );
+
+    // Write again, then close C's lifetime before the result arrives.
+    a.set(3);
+    let (late, v) = work.borrow_mut().remove(0);
+    uc();
+    ud();
+    assert_eq!(c.status().lifecycle, Lifecycle::Inactive);
+    late.emit(v);
+    late.down(vec![data(v)]);
+    assert_eq!(c.cache(), None, "the late result is dropped");
+}
+
+/// C-33 — a closed lifetime revokes its ctx, and cleanup failures stay isolated
+/// (the lifetime clauses; the request-queue clauses land in phase 5).
+#[test]
+fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
+    struct Dropped(Rc<Cell<bool>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let previous = graphrefly::set_host_reporter(Some({
+        let reports = reports.clone();
+        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
+    }));
+    let events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let a = Node::<i32>::state(1);
+    let p = {
+        let events = events.clone();
+        Node::<i32>::derived_opts(
+            vec![a.erased()],
+            graphrefly::NodeOpts::default().with_setup(move |_| {
+                let events = events.clone();
+                graphrefly::cleanup(move |_| events.borrow_mut().push("P cleanup".into()))
+            }),
+            |ctx| {
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.emit(*v)
+                }
+            },
+        )
+    };
+    let n_handle: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
+    let signals: Rc<RefCell<Vec<graphrefly::AbortSignal>>> = Rc::new(RefCell::new(Vec::new()));
+    let late: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let state_dropped = Rc::new(Cell::new(false));
+    let n_runs = Rc::new(Cell::new(0usize));
+    let n = {
+        let events = events.clone();
+        let n_handle = n_handle.clone();
+        let signals = signals.clone();
+        let late = late.clone();
+        let state_dropped = state_dropped.clone();
+        let n_runs = n_runs.clone();
+        Node::<i32>::derived_opts(
+            vec![p.erased()],
+            graphrefly::NodeOpts {
+                partial: true,
+                ..graphrefly::NodeOpts::default()
+            }
+            .with_setup(move |ctx| {
+                events.borrow_mut().push("N setup".into());
+                signals.borrow_mut().push(ctx.signal());
+                let events = events.clone();
+                let n_handle = n_handle.clone();
+                graphrefly::cleanup(move |closing| {
+                    let ran_on = closing.state_get::<(i32, Dropped)>().map(|state| state.0);
+                    let lifecycle = n_handle.borrow().as_ref().map(|n| n.status().lifecycle);
+                    events
+                        .borrow_mut()
+                        .push(format!("N cleanup {ran_on:?} {lifecycle:?}"));
+                    panic!("N cleanup boom");
+                })
+            }),
+            move |ctx| {
+                n_runs.set(n_runs.get() + 1);
+                *late.borrow_mut() = Some(ctx.defer());
+                if let Some(v) = ctx.data::<i32>(0) {
+                    ctx.state_set((*v, Dropped(state_dropped.clone())));
+                    ctx.emit(*v);
+                }
+            },
+        )
+    };
+    *n_handle.borrow_mut() = Some(n.clone());
+
+    // Status is derived: inactive with an empty cache before the subscription.
+    let before = n.status();
+    assert_eq!(
+        (before.lifecycle, before.cache, before.output),
+        (Lifecycle::Inactive, CacheStatus::Empty, OutputStatus::Open)
+    );
+    let u = n.subscribe(|_| {});
+    let active = n.status();
+    assert_eq!(
+        (active.lifecycle, active.cache),
+        (Lifecycle::Active, CacheStatus::Ready)
+    );
+    assert_eq!(
+        *events.borrow(),
+        vec!["N setup".to_owned()],
+        "setup before the first run"
+    );
+
+    // A second run runs no setup and drops no cleanup.
+    a.set(2);
+    assert_eq!(n_runs.get(), 2);
+    assert_eq!(*events.borrow(), vec!["N setup".to_owned()]);
+    a.invalidate();
+    assert_eq!(
+        n.status().cache,
+        CacheStatus::Empty,
+        "empty after the INVALIDATE"
+    );
+    a.set(3);
+    assert_eq!(n.cache(), Some(3));
+
+    // Deactivation: P's cleanup first (released dependency), then N's, which reads
+    // the last run's value, sees `closing`, and throws to the host reporter.
+    state_dropped.set(false);
+    u();
+    assert_eq!(
+        *events.borrow(),
+        vec![
+            "N setup".to_owned(),
+            "P cleanup".to_owned(),
+            "N cleanup Some(3) Some(Closing)".to_owned(),
+        ]
+    );
+    assert_eq!(
+        *reports.borrow(),
+        vec![graphrefly::HostFailure {
+            source: "cleanup".into(),
+            error: "N cleanup boom".into()
+        }]
+    );
+    assert_eq!(
+        n.status().lifecycle,
+        Lifecycle::Inactive,
+        "the close completes"
+    );
+    assert!(
+        signals.borrow()[0].is_aborted(),
+        "the old signal is aborted"
+    );
+    assert!(state_dropped.get(), "private state is dropped");
+
+    // The old ctx.down is dropped.
+    let old = late.borrow_mut().take().unwrap();
+    old.down(vec![data(999)]);
+    assert_eq!(n.cache(), None);
+
+    // A new lifetime: distinct signal, setup again, fresh snapshots.
+    let (log, _u2) = record_values(&n);
+    assert_eq!(events.borrow().last().map(String::as_str), Some("N setup"));
+    assert_eq!(signals.borrow().len(), 2);
+    assert!(!signals.borrow()[1].is_aborted());
+    assert_eq!(
+        *log.borrow(),
+        vec![vec![3]],
+        "fresh snapshot, not the dropped 999"
+    );
+
+    a.complete();
+    assert_eq!(n.status().output, OutputStatus::Completed);
+    graphrefly::set_host_reporter(previous);
+    n_handle.borrow_mut().take();
 }

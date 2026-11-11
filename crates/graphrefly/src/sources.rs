@@ -32,6 +32,35 @@ use crate::node::NodeOpts;
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, GraphError, Message};
 
+/// A source whose work is opened by its setup (R-lifetime@2): `body` runs once per
+/// lifetime, before the (empty) function's first run, with that run's ctx, and hands
+/// the lifetime's cleanup to `on_close`.
+fn source_op<T: 'static>(
+    factory: &'static str,
+    opts: NodeOpts,
+    body: impl Fn(&crate::ctx::Ctx, &CloseSlot) + 'static,
+) -> Operator<T> {
+    Operator::with_opts(
+        factory,
+        opts.with_setup(move |ctx| {
+            let on_close = CloseSlot::default();
+            body(ctx, &on_close);
+            on_close.0.take()
+        }),
+        |_| {},
+    )
+}
+
+/// Receives a source setup's lifetime cleanup.
+#[derive(Default)]
+struct CloseSlot(RefCell<Option<crate::lifetime::Cleanup>>);
+
+impl CloseSlot {
+    fn set(&self, f: impl FnOnce() + 'static) {
+        *self.0.borrow_mut() = Some(Box::new(move |_| f()));
+    }
+}
+
 /// of: emit one value and COMPLETE on activation.
 pub fn of<T: Clone + 'static>(value: T) -> Operator<T> {
     Operator::new("of", move |ctx| {
@@ -266,13 +295,13 @@ fn process_source(factory: &'static str, command: ProcessCommand) -> Operator<Pr
         !command.program.is_empty(),
         "{factory}: program must be a non-empty string"
     );
-    Operator::with_opts(
+    source_op(
         factory,
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.environment().process_driver() else {
                 ctx.down(vec![Message::Error(
                     format!("{factory}: missing process driver").into(),
@@ -283,7 +312,7 @@ fn process_source(factory: &'static str, command: ProcessCommand) -> Operator<Pr
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
@@ -323,13 +352,13 @@ pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
         !request.method.is_empty(),
         "fromHttp: method must be non-empty"
     );
-    Operator::with_opts(
+    source_op(
         "fromHttp",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.environment().http_driver() else {
                 ctx.down(vec![Message::Error("fromHttp: missing http driver".into())]);
                 return;
@@ -338,7 +367,7 @@ pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
@@ -372,18 +401,18 @@ pub fn from_sse(url: impl Into<String>) -> Operator<SseEvent> {
 /// Creates or computes `from_sse_with_options`.
 pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
     assert!(!request.url.is_empty(), "fromSSE: url must be non-empty");
-    Operator::with_opts(
+    source_op(
         "fromSSE",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let active = Rc::new(Cell::new(true));
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
@@ -711,13 +740,13 @@ pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSoc
         !request.url.is_empty(),
         "fromWebSocket: url must be non-empty"
     );
-    Operator::with_opts(
+    source_op(
         "fromWebSocket",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.environment().websocket_driver() else {
                 ctx.down(vec![Message::Error(
                     "fromWebSocket: missing websocket driver".into(),
@@ -728,7 +757,7 @@ pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSoc
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
@@ -774,13 +803,13 @@ pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<
         !registration.id.is_empty(),
         "fromWebhook: id must be non-empty"
     );
-    Operator::with_opts(
+    source_op(
         "fromWebhook",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.environment().webhook_driver() else {
                 ctx.down(vec![Message::Error(
                     "fromWebhook: missing webhook driver".into(),
@@ -791,7 +820,7 @@ pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<
             let cancel_slot: Rc<RefCell<Option<DriverCancel>>> = Rc::new(RefCell::new(None));
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_work(&cleanup_active, &cleanup_cancel);
             });
             let out = ctx.defer();
@@ -1081,12 +1110,12 @@ where
         .map(|path| watch_root(absolutize(path.into())))
         .collect();
     assert!(!roots.is_empty(), "from_fs_watch: paths must not be empty");
-    Operator::with_opts(
+    source_op(
         "fromFSWatch",
         NodeOpts {
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "fromFSWatch: missing local async driver".into(),
@@ -1161,7 +1190,7 @@ where
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
             let cleanup_watcher = watcher_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_fs_watch(&cleanup_active, &cleanup_cancel, &cleanup_watcher);
             });
 
@@ -1590,12 +1619,12 @@ pub fn from_cron_with_options(expr: &str, opts: FromCronOptions) -> Operator<Cro
     let now = opts
         .now
         .unwrap_or_else(|| Rc::new(default_cron_tick_utc) as Rc<dyn Fn() -> CronTick>);
-    Operator::with_opts(
+    source_op(
         "fromCron",
         NodeOpts {
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "fromCron: missing local async driver".into(),
@@ -1631,7 +1660,7 @@ pub fn from_cron_with_options(expr: &str, opts: FromCronOptions) -> Operator<Cro
             *cancel_slot.borrow_mut() = Some(cancel);
             let cleanup_active = active.clone();
             let cleanup_cancel = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_interval(&cleanup_active, &cleanup_cancel);
             });
 
@@ -1791,12 +1820,12 @@ where
         "from_git_hook: max_consecutive_errors must be positive"
     );
     let repo_path = absolutize(repo_path.into());
-    Operator::with_opts(
+    source_op(
         "fromGitHook",
         NodeOpts {
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "fromGitHook: missing local async driver".into(),
@@ -1845,7 +1874,7 @@ where
             *cancel_slot.borrow_mut() = Some(cancel);
             let active_cleanup = active.clone();
             let cancel_cleanup = cancel_slot.clone();
-            ctx.on_deactivation(move || {
+            on_close.set(move || {
                 cleanup_driver_interval(&active_cleanup, &cancel_cleanup);
             });
 
@@ -1872,12 +1901,12 @@ where
 
 fn timer_source(factory: &'static str, ms: u64) -> Operator<u64> {
     let duration = Duration::from_millis(ms);
-    Operator::with_opts(
+    source_op(
         factory,
         NodeOpts {
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     format!("{factory}: missing local async driver").into(),
@@ -1891,7 +1920,7 @@ fn timer_source(factory: &'static str, ms: u64) -> Operator<u64> {
                     out.down(vec![Message::Data(Rc::new(0u64)), Message::Complete]);
                 }),
             );
-            ctx.on_deactivation(cancel);
+            on_close.set(cancel);
         },
     )
 }
@@ -1915,12 +1944,12 @@ pub fn from_timer(ms: u64) -> Operator<u64> {
 /// Requires a graph-local driver (D111); missing driver reports ERROR on activation.
 pub fn interval(ms: u64) -> Operator<u64> {
     let period = Duration::from_millis(ms);
-    Operator::with_opts(
+    source_op(
         "interval",
         NodeOpts {
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "interval: missing local async driver".into(),
@@ -1935,7 +1964,7 @@ pub fn interval(ms: u64) -> Operator<u64> {
                 out.down(vec![Message::Data(Rc::new(next))]);
             });
             let cancel = driver.interval(period, tick);
-            ctx.on_deactivation(cancel);
+            on_close.set(cancel);
         },
     )
 }
@@ -1951,13 +1980,13 @@ where
     E: Error + 'static,
     Fut: Future<Output = Result<T, E>> + 'static,
 {
-    Operator::with_opts(
+    source_op(
         "futureLocal",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "futureLocal: missing local async driver".into(),
@@ -1972,7 +2001,7 @@ where
                     Err(error) => out.down(vec![Message::Error(error.into())]),
                 }
             }));
-            ctx.on_deactivation(cancel);
+            on_close.set(cancel);
         },
     )
 }
@@ -1986,13 +2015,13 @@ where
     E: Error + 'static,
     S: Stream<Item = Result<T, E>> + 'static,
 {
-    Operator::with_opts(
+    source_op(
         "streamLocal",
         NodeOpts {
             pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
-        move |ctx| {
+        move |ctx, on_close| {
             let Some(driver) = ctx.local_async_driver() else {
                 ctx.down(vec![Message::Error(
                     "streamLocal: missing local async driver".into(),
@@ -2017,7 +2046,7 @@ where
                     }
                 }
             }));
-            ctx.on_deactivation(cancel);
+            on_close.set(cancel);
         },
     )
 }
