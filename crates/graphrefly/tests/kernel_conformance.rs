@@ -3149,7 +3149,7 @@ fn driven_in(g: &graphrefly::Graph) -> (Node<i32>, Rc<RefCell<Option<graphrefly:
 
 /// R-failure@3 with R-graph-domain@2: the host reporter is the graph's `report` option.
 /// A failure goes to its own graph's reporter, never another's, and a graph without a
-/// reporter keeps nothing of its failures.
+/// reporter keeps nothing of its failures (it writes them to standard error).
 #[test]
 fn host_reporter_is_the_graph_option() {
     let g = graphrefly::graph();
@@ -3714,4 +3714,55 @@ fn multi_value_sources_keep_every_value_in_the_snapshot() {
     );
     let (snap, _u) = record_values(&both);
     assert_eq!(snap.borrow()[0], vec![1, 2, 3, 4]);
+}
+
+/// Review Q9 (R-failure@3) — with no `report` option a failure is written to standard
+/// error; with one, it goes to the reporter only. Checked in a child run of this test,
+/// whose standard error is captured.
+#[test]
+fn failures_go_to_stderr_without_a_reporter_and_only_to_the_reporter_with_one() {
+    const CHILD: &str = "GRAPHREFLY_Q9_CHILD";
+    let name = "failures_go_to_stderr_without_a_reporter_and_only_to_the_reporter_with_one";
+    if let Some(mode) = std::env::var_os(CHILD) {
+        let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+        let g = if mode == "reported" {
+            reporting_graph(&reports)
+        } else {
+            graphrefly::graph()
+        };
+        let s = g.state(0i32);
+        let _u = s.subscribe(|msgs: &[Message<AnyValue>]| {
+            if msgs
+                .iter()
+                .any(|m| matches!(m, Message::Data(v) if v.downcast_ref::<i32>() == Some(&1)))
+            {
+                panic!("q9 sink");
+            }
+        });
+        s.set(1);
+        if mode == "reported" {
+            assert_eq!(reports.borrow().len(), 1);
+        }
+        return;
+    }
+    let run = |mode: &str| {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, mode)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let plain = run("plain");
+    assert!(
+        plain.contains("graphrefly: sink failed: q9 sink"),
+        "{plain}"
+    );
+    let reported = run("reported");
+    assert!(!reported.contains("graphrefly: sink failed"), "{reported}");
 }

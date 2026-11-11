@@ -31,8 +31,9 @@ pub struct GraphOptions {
     /// `environment` field for environment.
     pub environment: EnvironmentDrivers,
     /// The host reporter (R-failure@3): failures in this graph with no caller and no
-    /// node to end, such as a panicking sink or cleanup, go to it. Without one they
-    /// are dropped; a panicking reporter is ignored (graphrefly-rs:D6).
+    /// node to end, such as a panicking sink or cleanup, go to it, and only to it.
+    /// Without one they are written to standard error (review Q9); a panicking
+    /// reporter is ignored (graphrefly-rs:D6).
     pub report: Option<crate::HostReporter>,
 }
 
