@@ -25,101 +25,63 @@ use crate::storage::{
 
 type Disposer = Box<dyn FnOnce()>;
 
-/// `constant` constant.
 pub const AGENTIC_MEMORY_RECORD_SNAPSHOT_FORMAT: &str = "graphrefly.agenticMemory.records.snapshot";
-/// `constant` constant.
 pub const AGENTIC_MEMORY_RECORD_CHANGE_FORMAT: &str = "graphrefly.agenticMemory.records.change";
-/// `constant` constant.
 pub const AGENTIC_MEMORY_RECORD_STORAGE_FRAME_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// `AgenticMemoryRecordsPersistenceStatus` variants.
 pub enum AgenticMemoryRecordsPersistenceStatus {
-    /// `Starting` variant.
     Starting,
-    /// `Ready` variant.
     Ready,
-    /// `Flushing` variant.
     Flushing,
-    /// `Errored` variant.
     Errored,
-    /// `Disposed` variant.
     Disposed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// `AgenticMemoryRecordsPersistenceCursor` data container.
 pub struct AgenticMemoryRecordsPersistenceCursor {
-    /// `change_seq` field for change seq.
     pub change_seq: Option<u64>,
-    /// `snapshot_writes` field for snapshot writes.
     pub snapshot_writes: usize,
-    /// `change_writes` field for change writes.
     pub change_writes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// `AgenticMemoryRecordsPersistenceStatusFact` data container.
 pub struct AgenticMemoryRecordsPersistenceStatusFact {
-    /// `state` field for state.
     pub state: AgenticMemoryRecordsPersistenceStatus,
-    /// `pending` field for pending.
     pub pending: usize,
-    /// `writes` field for writes.
     pub writes: usize,
-    /// `errors` field for errors.
     pub errors: usize,
-    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryRecordsPersistenceCursor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// `AgenticMemoryRecordsPersistenceErrorFact` data container.
 pub struct AgenticMemoryRecordsPersistenceErrorFact {
-    /// `phase` field for phase.
     pub phase: String,
-    /// `message` field for message.
     pub message: String,
-    /// `cursor` field for cursor.
     pub cursor: AgenticMemoryRecordsPersistenceCursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-/// `AgenticMemoryRecordsRestoreState` data container.
 pub struct AgenticMemoryRecordsRestoreState {
-    /// `records` field for records.
     pub records: Vec<AgenticMemoryRecord<JsonValue>>,
-    /// `snapshot_found` field for snapshot found.
     pub snapshot_found: bool,
-    /// `changes_applied` field for changes applied.
     pub changes_applied: usize,
-    /// `cursor` field for cursor.
     pub cursor: Option<u64>,
-    /// `source` field for source.
     pub source: String,
 }
 
 #[derive(Clone, Default)]
-/// `LoadAgenticMemoryRecordsStateOptions` data container.
 pub struct LoadAgenticMemoryRecordsStateOptions<'a> {
-    /// `storage_prefix` field for storage prefix.
     pub storage_prefix: Option<&'a str>,
-    /// `snapshot_key` field for snapshot key.
     pub snapshot_key: Option<&'a str>,
-    /// `change_log` field for change log.
     pub change_log: Option<&'a dyn AppendLogStorageTier<Value>>,
 }
 
 #[derive(Clone)]
-/// `PersistAgenticMemoryRecordsOptions` data container.
 pub struct PersistAgenticMemoryRecordsOptions {
-    /// `name` field for name.
     pub name: Option<String>,
-    /// `storage_prefix` field for storage prefix.
     pub storage_prefix: Option<String>,
-    /// `snapshot_key` field for snapshot key.
     pub snapshot_key: Option<String>,
-    /// `snapshot_store` field for snapshot store.
     pub snapshot_store: Rc<dyn KvStorageTier<Value>>,
     /// Optional append-only change log.
     ///
@@ -127,12 +89,10 @@ pub struct PersistAgenticMemoryRecordsOptions {
     /// fencing, and conflict repair belong in a future adapter decision; this
     /// sidecar loads only contiguous frames and reports gaps as corruption.
     pub change_log: Option<Rc<dyn AppendLogStorageTier<Value>>>,
-    /// `snapshot_on_attach` field for snapshot on attach.
     pub snapshot_on_attach: bool,
 }
 
 impl PersistAgenticMemoryRecordsOptions {
-    /// Creates or computes `new`.
     pub fn new(
         snapshot_store: Rc<dyn KvStorageTier<Value>>,
         storage_prefix: impl Into<String>,
@@ -148,15 +108,10 @@ impl PersistAgenticMemoryRecordsOptions {
     }
 }
 
-/// `AgenticMemoryRecordsPersistence` data container.
 pub struct AgenticMemoryRecordsPersistence {
-    /// `ready` field for ready.
     pub ready: Node<bool>,
-    /// `status` field for status.
     pub status: Node<Value>,
-    /// `error` field for error.
     pub error: Node<Value>,
-    /// `cursor` field for cursor.
     pub cursor: Node<Value>,
     flush: Rc<dyn Fn() -> StorageResult<()>>,
     snapshot: Rc<dyn Fn() -> StorageResult<()>>,
@@ -164,24 +119,20 @@ pub struct AgenticMemoryRecordsPersistence {
 }
 
 impl AgenticMemoryRecordsPersistence {
-    /// Updates or reads `flush`.
     pub fn flush(&self) -> StorageResult<()> {
         (self.flush)()
     }
 
-    /// Updates or reads `snapshot`.
     pub fn snapshot(&self) -> StorageResult<()> {
         (self.snapshot)()
     }
 
-    /// Updates or reads `dispose`.
     pub fn dispose(&self) {
         if let Some(dispose) = self.dispose.borrow_mut().take() {
             dispose();
         }
     }
 
-    /// Updates or reads `cursor_fact`.
     pub fn cursor_fact(&self) -> StorageResult<AgenticMemoryRecordsPersistenceCursor> {
         parse_cursor_fact(
             &self.cursor.cache().ok_or_else(|| {
@@ -199,29 +150,19 @@ impl Drop for AgenticMemoryRecordsPersistence {
     }
 }
 
-/// `OpenPersistentAgenticMemoryRecords` data container.
 pub struct OpenPersistentAgenticMemoryRecords {
-    /// `records` field for records.
     pub records: State<Vec<AgenticMemoryRecord<JsonValue>>>,
-    /// `persistence` field for persistence.
     pub persistence: AgenticMemoryRecordsPersistence,
-    /// `loaded` field for loaded.
     pub loaded: AgenticMemoryRecordsRestoreState,
 }
 
-/// `OpenPersistentAgenticMemoryRecordsOptions` data container.
 pub struct OpenPersistentAgenticMemoryRecordsOptions {
-    /// `graph` field for graph.
     pub graph: Graph,
-    /// `name` field for name.
     pub name: Option<String>,
-    /// `initial` field for initial.
     pub initial: Vec<AgenticMemoryRecord<JsonValue>>,
-    /// `persistence` field for persistence.
     pub persistence: PersistAgenticMemoryRecordsOptions,
 }
 
-/// Creates or computes `agentic_memory_records_snapshot_key`.
 pub fn agentic_memory_records_snapshot_key(storage_prefix: &str) -> StorageResult<String> {
     if storage_prefix.is_empty() {
         return Err(StorageError::backend("storage_prefix must be non-empty"));
@@ -229,7 +170,6 @@ pub fn agentic_memory_records_snapshot_key(storage_prefix: &str) -> StorageResul
     Ok(format!("{storage_prefix}/records.snapshot"))
 }
 
-/// Creates or computes `agentic_memory_record_snapshot_frame`.
 pub fn agentic_memory_record_snapshot_frame(
     records: &[AgenticMemoryRecord<JsonValue>],
     change_cursor: Option<u64>,
@@ -250,7 +190,6 @@ pub fn agentic_memory_record_snapshot_frame(
     }))
 }
 
-/// Creates or computes `agentic_memory_record_change_frame`.
 pub fn agentic_memory_record_change_frame(
     records: &[AgenticMemoryRecord<JsonValue>],
 ) -> StorageResult<Value> {
@@ -265,7 +204,6 @@ pub fn agentic_memory_record_change_frame(
     }))
 }
 
-/// Creates or computes `load_agentic_memory_records_state`.
 pub fn load_agentic_memory_records_state(
     snapshot_store: &dyn KvStorageTier<Value>,
     options: LoadAgenticMemoryRecordsStateOptions<'_>,
@@ -322,7 +260,6 @@ pub fn load_agentic_memory_records_state(
     })
 }
 
-/// Creates or computes `persist_agentic_memory_records`.
 pub fn persist_agentic_memory_records(
     graph: &Graph,
     records: &Node<Vec<AgenticMemoryRecord<JsonValue>>>,
@@ -601,7 +538,6 @@ fn persist_agentic_memory_records_with_cursor(
     })
 }
 
-/// Creates or computes `open_persistent_agentic_memory_records`.
 pub fn open_persistent_agentic_memory_records(
     options: OpenPersistentAgenticMemoryRecordsOptions,
 ) -> StorageResult<OpenPersistentAgenticMemoryRecords> {

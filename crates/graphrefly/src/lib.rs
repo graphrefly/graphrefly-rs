@@ -83,7 +83,6 @@
 //! protocol verbs (D6/D24).
 
 #![forbid(unsafe_code)]
-#![deny(missing_docs)]
 
 pub mod adapters;
 pub mod async_driver;

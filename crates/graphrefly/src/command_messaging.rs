@@ -6,15 +6,10 @@
 //! module instantiates [`command_messaging_recipe`] with its own types.
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-/// `MessageBusDelivery` data container.
 pub struct MessageBusDelivery {
-    /// `topic` field for topic.
     pub topic: String,
-    /// `seq` field for seq.
     pub seq: u64,
-    /// `subscription_id` field for subscription id.
     pub subscription_id: String,
-    /// `command_id` field for command id.
     pub command_id: String,
 }
 
@@ -53,32 +48,23 @@ macro_rules! command_messaging_recipe {
         pub use crate::command_messaging::MessageBusDelivery;
 
         #[derive(Debug, Clone, PartialEq)]
-        /// `DeliveredCommand` data container.
         pub struct $DeliveredCommand<TCommand> {
-            /// `command` field for command.
             pub command: $Command<TCommand>,
-            /// `delivery` field for delivery.
             pub delivery: MessageBusDelivery,
         }
 
-        /// `MessageCommandFn` type alias.
         pub type $MessageCommandFn<TPayload, TCommand> = Rc<
             dyn Fn(&MessageEnvelope<TPayload>, &MessageBusDelivery) -> Option<$Command<TCommand>>,
         >;
 
         #[derive(Clone)]
-        /// `MessagingPolicy` data container.
         pub struct $MessagingPolicy<TPayload, TCommand> {
-            /// `command` field for command.
             pub command: $MessageCommandFn<TPayload, TCommand>,
-            /// `ack_rejected` field for ack rejected.
             pub ack_rejected: bool,
-            /// `outbox_topic` field for outbox topic.
             pub outbox_topic: Option<String>,
         }
 
         impl<TPayload, TCommand> $MessagingPolicy<TPayload, TCommand> {
-            /// Creates or computes `new`.
             pub fn new(
                 command: impl Fn(
                         &MessageEnvelope<TPayload>,
@@ -93,13 +79,11 @@ macro_rules! command_messaging_recipe {
                 }
             }
 
-            /// Updates or reads `ack_rejected`.
             pub fn ack_rejected(mut self, ack_rejected: bool) -> Self {
                 self.ack_rejected = ack_rejected;
                 self
             }
 
-            /// Updates or reads `with_outbox_topic`.
             pub fn with_outbox_topic(mut self, topic: impl Into<String>) -> Self {
                 self.outbox_topic = Some(topic.into());
                 self
@@ -107,22 +91,15 @@ macro_rules! command_messaging_recipe {
         }
 
         #[derive(Clone)]
-        /// `MessagingRecipeOptions` data container.
         pub struct $MessagingRecipeOptions<TPayload, TCommand, TEvent> {
-            /// `name` field for name.
             pub name: String,
-            /// `deliveries` field for deliveries.
             pub deliveries: Node<MessageBusAvailablePage<TPayload>>,
-            /// `status` field for status.
             pub status: Node<$Status>,
-            /// `events` field for events.
             pub events: Option<Node<$Event<TEvent>>>,
-            /// `policy` field for policy.
             pub policy: $MessagingPolicy<TPayload, TCommand>,
         }
 
         impl<TPayload, TCommand, TEvent> $MessagingRecipeOptions<TPayload, TCommand, TEvent> {
-            /// Creates or computes `new`.
             pub fn new(
                 deliveries: impl Into<Node<MessageBusAvailablePage<TPayload>>>,
                 status: impl Into<Node<$Status>>,
@@ -139,13 +116,11 @@ macro_rules! command_messaging_recipe {
                 }
             }
 
-            /// Updates or reads `named`.
             pub fn named(mut self, name: impl Into<String>) -> Self {
                 self.name = name.into();
                 self
             }
 
-            /// Updates or reads `with_events`.
             pub fn with_events(mut self, events: impl Into<Node<$Event<TEvent>>>) -> Self {
                 let events: Node<$Event<TEvent>> = events.into();
                 self.events = Some(events);
@@ -154,17 +129,11 @@ macro_rules! command_messaging_recipe {
         }
 
         #[derive(Clone)]
-        /// `MessagingRecipeBundle` data container.
         pub struct $MessagingRecipeBundle<TCommand, TEvent> {
-            /// `delivered_commands` field for delivered commands.
             pub delivered_commands: Node<$DeliveredCommand<TCommand>>,
-            /// `commands` field for commands.
             pub commands: Node<$Command<TCommand>>,
-            /// `ack_commands` field for ack commands.
             pub ack_commands: Node<MessageBusCommand<TCommand>>,
-            /// `outbox_commands` field for outbox commands.
             pub outbox_commands: Option<Node<MessageBusCommand<$Event<TEvent>>>>,
-            /// `issues` field for issues.
             pub issues: Node<DataIssue>,
         }
 
@@ -181,7 +150,6 @@ macro_rules! command_messaging_recipe {
             deliveries: BTreeMap<String, Vec<MessageBusDelivery>>,
         }
 
-        /// Creates or computes `messaging_recipe`.
         pub fn $messaging_recipe<
             TPayload: Clone + 'static,
             TCommand: Clone + 'static,
@@ -266,21 +234,14 @@ macro_rules! command_messaging_recipe {
             }
         }
 
-        /// `MessageAckOptions` data container.
         pub struct $MessageAckOptions<TCommand> {
-            /// `name` field for name.
             pub name: String,
-            /// `delivered_commands` field for delivered commands.
             pub delivered_commands: Node<$DeliveredCommand<TCommand>>,
-            /// `status` field for status.
             pub status: Node<$Status>,
-            /// `issues` field for issues.
             pub issues: Option<Node<DataIssue>>,
-            /// `ack_rejected` field for ack rejected.
             pub ack_rejected: bool,
         }
 
-        /// Creates or computes `message_ack_commands`.
         pub fn $message_ack_commands<TCommand: Clone + 'static>(
             graph: &Graph,
             opts: $MessageAckOptions<TCommand>,
@@ -356,7 +317,6 @@ macro_rules! command_messaging_recipe {
             )
         }
 
-        /// Creates or computes `event_outbox_commands`.
         pub fn $event_outbox_commands<TEvent: Clone + 'static>(
             graph: &Graph,
             events: impl Into<Node<$Event<TEvent>>>,

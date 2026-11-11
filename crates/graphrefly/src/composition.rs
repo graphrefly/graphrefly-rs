@@ -18,7 +18,6 @@ pub struct Pipe<T> {
     current: Node<T>,
 }
 
-/// Creates or computes `pipe`.
 pub fn pipe<T: 'static>(graph: &Graph, source: impl Into<Node<T>>) -> Pipe<T> {
     let source: Node<T> = source.into();
     Pipe {
@@ -28,12 +27,10 @@ pub fn pipe<T: 'static>(graph: &Graph, source: impl Into<Node<T>>) -> Pipe<T> {
 }
 
 impl<T: 'static> Pipe<T> {
-    /// Updates or reads `through`.
     pub fn through<U: 'static>(self, op: Operator<U>) -> Pipe<U> {
         self.through_opts(op, GraphNodeOpts::default())
     }
 
-    /// Updates or reads `through_opts`.
     pub fn through_opts<U: 'static>(self, op: Operator<U>, opts: GraphNodeOpts) -> Pipe<U> {
         let current = self.graph.init_node(op, vec![self.current.erased()], opts);
         Pipe {
@@ -42,25 +39,19 @@ impl<T: 'static> Pipe<T> {
         }
     }
 
-    /// Updates or reads `done`.
     pub fn done(self) -> Node<T> {
         self.current
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// `StratifyRule` data container.
 pub struct StratifyRule<R> {
-    /// `name` field for name.
     pub name: String,
-    /// `rule` field for rule.
     pub rule: R,
-    /// `meta` field for meta.
     pub meta: BTreeMap<String, String>,
 }
 
 impl<R> StratifyRule<R> {
-    /// Creates or computes `new`.
     pub fn new(name: impl Into<String>, rule: R) -> Self {
         Self {
             name: name.into(),
@@ -69,7 +60,6 @@ impl<R> StratifyRule<R> {
         }
     }
 
-    /// Updates or reads `meta`.
     pub fn meta(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.meta.insert(key.into(), value.into());
         self
@@ -77,13 +67,9 @@ impl<R> StratifyRule<R> {
 }
 
 #[derive(Clone, Debug)]
-/// `StratifyOptions` data container.
 pub struct StratifyOptions {
-    /// `prefix` field for prefix.
     pub prefix: String,
-    /// `rules` field for rules.
     pub rules: GraphNodeOpts,
-    /// `branches` field for branches.
     pub branches: BTreeMap<String, GraphNodeOpts>,
 }
 
@@ -98,15 +84,11 @@ impl Default for StratifyOptions {
 }
 
 #[derive(Clone)]
-/// `Stratified` data container.
 pub struct Stratified<T, R> {
-    /// `rules` field for rules.
     pub rules: State<Vec<StratifyRule<R>>>,
-    /// `branches` field for branches.
     pub branches: BTreeMap<String, Node<T>>,
 }
 
-/// Creates or computes `stratify_branch`.
 pub fn stratify_branch<T, R, F>(
     graph: &Graph,
     source: &Node<T>,
@@ -123,7 +105,6 @@ where
     graph.init_node(op, vec![source.erased(), rules.erased()], opts)
 }
 
-/// Creates or computes `stratify`.
 pub fn stratify<T, R, F>(
     graph: &Graph,
     source: &Node<T>,

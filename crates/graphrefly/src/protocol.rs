@@ -28,9 +28,7 @@ pub type AnyValue = Rc<dyn std::any::Any>;
 /// (see `CLEAN-SLATE.md`). A node is NOT a handle; a handle is inert routing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle {
-    /// `pool_id` field for pool id.
     pub pool_id: u32,
-    /// `handle_id` field for handle id.
     pub handle_id: u32,
     /// Local slotmap generation (B32, per-language) — NOT in the protocol IDL.
     pub generation: u32,

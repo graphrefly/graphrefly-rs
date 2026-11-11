@@ -92,14 +92,13 @@ jobs:
           GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec
           RUSTFLAGS: "-D warnings"
 
-      - name: Rustdoc mechanical generator check
-        run: scripts/generate-rustdoc-comments.py --check-stale
+      - name: Stale doc-phrase check
+        run: scripts/check-stale-phrases.py
 
-      - name: Cargo doc (graphrefly-rs all features; missing docs + links)
+      - name: Cargo doc (graphrefly-rs all features; links)
         run: cargo doc -p graphrefly-rs --all-features --no-deps
         env:
-          # `-D warnings` keeps rustdoc warnings fatal; the crate also has
-          # `#![deny(missing_docs)]`, so every public Rust API must carry docs.
+          # `-D warnings` keeps rustdoc warnings, broken links included, fatal.
           RUSTDOCFLAGS: "-D warnings"
 
   # ---------------------------------------------------------------------

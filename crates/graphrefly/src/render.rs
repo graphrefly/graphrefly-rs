@@ -5,16 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{TopologyEdge, TopologyNode, TopologySnapshot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-/// `DiagramDirection` variants.
 pub enum DiagramDirection {
-    /// `Td` variant.
     Td,
     #[default]
-    /// `Lr` variant.
     Lr,
-    /// `Bt` variant.
     Bt,
-    /// `Rl` variant.
     Rl,
 }
 
@@ -38,12 +33,10 @@ impl DiagramDirection {
     }
 }
 
-/// Creates or computes `topology_to_mermaid`.
 pub fn topology_to_mermaid(snapshot: &TopologySnapshot) -> String {
     topology_to_mermaid_with_direction(snapshot, DiagramDirection::default())
 }
 
-/// Creates or computes `topology_to_mermaid_with_direction`.
 pub fn topology_to_mermaid_with_direction(
     snapshot: &TopologySnapshot,
     direction: DiagramDirection,
@@ -70,7 +63,6 @@ pub fn topology_to_mermaid_with_direction(
     lines.join("\n")
 }
 
-/// Creates or computes `mermaid_live_url`.
 pub fn mermaid_live_url(source: &str) -> String {
     let payload = format!(
         "{{\"autoSync\":true,\"code\":\"{}\",\"mermaid\":{{\"theme\":\"default\"}}}}",
@@ -82,17 +74,14 @@ pub fn mermaid_live_url(source: &str) -> String {
     )
 }
 
-/// Creates or computes `topology_to_mermaid_url`.
 pub fn topology_to_mermaid_url(snapshot: &TopologySnapshot) -> String {
     mermaid_live_url(&topology_to_mermaid(snapshot))
 }
 
-/// Creates or computes `topology_to_d2`.
 pub fn topology_to_d2(snapshot: &TopologySnapshot) -> String {
     topology_to_d2_with_direction(snapshot, DiagramDirection::default())
 }
 
-/// Creates or computes `topology_to_d2_with_direction`.
 pub fn topology_to_d2_with_direction(
     snapshot: &TopologySnapshot,
     direction: DiagramDirection,
@@ -119,7 +108,6 @@ pub fn topology_to_d2_with_direction(
     lines.join("\n")
 }
 
-/// Creates or computes `topology_to_pretty`.
 pub fn topology_to_pretty(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut lines = vec![
@@ -139,7 +127,6 @@ pub fn topology_to_pretty(snapshot: &TopologySnapshot) -> String {
     lines.join("\n")
 }
 
-/// Creates or computes `topology_to_ascii`.
 pub fn topology_to_ascii(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut outgoing: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -160,7 +147,6 @@ pub fn topology_to_ascii(snapshot: &TopologySnapshot) -> String {
     lines.join("\n")
 }
 
-/// Creates or computes `topology_to_json`.
 pub fn topology_to_json(snapshot: &TopologySnapshot) -> String {
     let (nodes, edges) = flatten(snapshot);
     let mut out = String::new();

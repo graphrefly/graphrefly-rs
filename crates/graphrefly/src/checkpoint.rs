@@ -53,49 +53,31 @@ use crate::protocol::AnyValue;
 /// `graphrefly.checkpoint.v2` (a string TS used for a different layout) included.
 pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly-rs/checkpoint@1";
 
-/// `GraphCheckpointJson` type alias.
 pub type GraphCheckpointJson = Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-/// `GraphCheckpointTerminal` variants.
 pub enum GraphCheckpointTerminal {
     #[serde(rename = "none")]
-    /// `None` variant.
     None,
     #[serde(rename = "COMPLETE")]
-    /// `Complete` variant.
     Complete,
     #[serde(rename = "ERROR")]
-    /// `Error` variant.
-    Error {
-        /// `error` field for `Error`.
-        error: GraphCheckpointJson,
-    },
+    Error { error: GraphCheckpointJson },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-/// `GraphCheckpointFactory` variants.
 pub enum GraphCheckpointFactory {
     #[serde(rename = "registry-ref")]
-    /// `RegistryRef` variant.
     RegistryRef {
         #[serde(rename = "ref")]
-        /// `ref_` field for ref.
         ref_: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        /// `config` field for config.
         config: Option<GraphCheckpointJson>,
     },
     #[serde(rename = "local-only")]
-    /// `LocalOnly` variant.
-    LocalOnly {
-        /// `name` field for `LocalOnly`.
-        name: String,
-        /// `reason` field for `LocalOnly`.
-        reason: String,
-    },
+    LocalOnly { name: String, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,37 +123,25 @@ pub struct GraphCheckpointInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// `GraphCheckpointEdge` data container.
 pub struct GraphCheckpointEdge {
-    /// `from` field for from.
     pub from: String,
-    /// `to` field for to.
     pub to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// `GraphCheckpointMount` data container.
 pub struct GraphCheckpointMount {
-    /// `at` field for at.
     pub at: String,
-    /// `checkpoint` field for checkpoint.
     pub checkpoint: GraphCheckpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// `GraphCheckpoint` data container.
 pub struct GraphCheckpoint {
-    /// `version` field for version.
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// `name` field for name.
     pub name: Option<String>,
-    /// `nodes` field for nodes.
     pub nodes: Vec<GraphCheckpointNode>,
-    /// `edges` field for edges.
     pub edges: Vec<GraphCheckpointEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// `mounts` field for mounts.
     pub mounts: Option<Vec<GraphCheckpointMount>>,
 }
 
@@ -186,11 +156,9 @@ pub(crate) struct CheckpointEntry {
 }
 
 #[derive(Debug, Clone)]
-/// `GraphRestoreError` data container.
 pub struct GraphRestoreError(String);
 
 impl GraphRestoreError {
-    /// Creates or computes `new`.
     pub fn new(msg: impl Into<String>) -> Self {
         Self(msg.into())
     }
@@ -204,7 +172,6 @@ impl fmt::Display for GraphRestoreError {
 
 impl Error for GraphRestoreError {}
 
-/// `GraphRestoreResult` type alias.
 pub type GraphRestoreResult<T> = Result<T, GraphRestoreError>;
 type RestoreResult<T> = GraphRestoreResult<T>;
 type JsonDefinitionFn = dyn Fn(&GraphCheckpointJson) -> RestoreResult<GraphCheckpointJson>;
@@ -283,15 +250,12 @@ fn checkpoint_backend_state(core: &Core, path: &str) -> RestoreResult<Option<Gra
 }
 
 #[derive(Clone)]
-/// `GraphRestoreDefinition` data container.
 pub struct GraphRestoreDefinition {
-    /// `ref_` field for ref.
     pub ref_: String,
     f: Rc<JsonDefinitionFn>,
 }
 
 impl GraphRestoreDefinition {
-    /// Creates or computes `json`.
     pub fn json(
         ref_: impl Into<String>,
         f: impl Fn(&GraphCheckpointJson) -> RestoreResult<GraphCheckpointJson> + 'static,
@@ -309,41 +273,32 @@ impl GraphRestoreDefinition {
 
 /// `GraphRestoreDescriptor` behavior contract.
 pub trait GraphRestoreDescriptor {
-    /// Updates or reads `ref_`.
     fn ref_(&self) -> &str;
-    /// Updates or reads `define`.
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition>;
 }
 
 #[derive(Clone)]
-/// `GraphRestoreEntry` variants.
 pub enum GraphRestoreEntry {
-    /// `Descriptor` variant.
     Descriptor(Rc<dyn GraphRestoreDescriptor>),
-    /// `Definition` variant.
     Definition(GraphRestoreDefinition),
 }
 
 impl GraphRestoreEntry {
-    /// Creates or computes `descriptor`.
     pub fn descriptor(d: impl GraphRestoreDescriptor + 'static) -> Self {
         Self::Descriptor(Rc::new(d))
     }
 
-    /// Creates or computes `definition`.
     pub fn definition(d: GraphRestoreDefinition) -> Self {
         Self::Definition(d)
     }
 }
 
 #[derive(Clone, Default)]
-/// `GraphRestoreRegistry` data container.
 pub struct GraphRestoreRegistry {
     entries: BTreeMap<String, GraphRestoreEntry>,
 }
 
 impl GraphRestoreRegistry {
-    /// Creates or computes `try_new`.
     pub fn try_new(entries: impl IntoIterator<Item = GraphRestoreEntry>) -> RestoreResult<Self> {
         let mut out = Self::default();
         for entry in entries {
@@ -360,7 +315,6 @@ impl GraphRestoreRegistry {
         Ok(out)
     }
 
-    /// Creates or computes `new`.
     pub fn new(entries: impl IntoIterator<Item = GraphRestoreEntry>) -> Self {
         Self::try_new(entries).expect("restore registry must not contain duplicate refs")
     }
@@ -380,14 +334,12 @@ impl GraphRestoreRegistry {
     }
 }
 
-/// Creates or computes `restore_registry`.
 pub fn restore_registry(
     entries: impl IntoIterator<Item = GraphRestoreEntry>,
 ) -> GraphRestoreRegistry {
     GraphRestoreRegistry::new(entries)
 }
 
-/// Creates or computes `default_restore_registry`.
 pub fn default_restore_registry() -> GraphRestoreRegistry {
     GraphRestoreRegistry::new([
         GraphRestoreEntry::descriptor(StateRestoreDescriptor),
@@ -428,21 +380,15 @@ pub fn default_restore_registry() -> GraphRestoreRegistry {
     ])
 }
 
-/// `RestoreDefineCtx` data container.
 pub struct RestoreDefineCtx<'a> {
-    /// `id` field for id.
     pub id: &'a str,
-    /// `deps` field for deps.
     pub deps: &'a [String],
-    /// `config` field for config.
     pub config: Option<&'a GraphCheckpointJson>,
-    /// `checkpoint` field for checkpoint.
     pub checkpoint: &'a GraphCheckpointNode,
     registry: &'a GraphRestoreRegistry,
 }
 
 impl RestoreDefineCtx<'_> {
-    /// Updates or reads `resolve_definition`.
     pub fn resolve_definition(&self, ref_: &str) -> RestoreResult<GraphRestoreDefinition> {
         self.registry.definition(ref_).ok_or_else(|| {
             GraphRestoreError::new(format!(
@@ -453,13 +399,9 @@ impl RestoreDefineCtx<'_> {
     }
 }
 
-/// `RestoreNodeKind` variants.
 pub enum RestoreNodeKind {
-    /// `StateJson` variant.
     StateJson,
-    /// `NodeJson` variant.
     NodeJson(NodeFn),
-    /// `Custom` variant.
     Custom(Rc<CustomRestoreFn>),
     /// A `derived` node: the registry gives the value-level callback, and restore
     /// builds the node with the same sugar and gate as [`crate::Graph::derived`]. A
@@ -470,17 +412,12 @@ pub enum RestoreNodeKind {
 /// The value-level callback a [`RestoreNodeKind::Derived`] definition gives.
 pub type DerivedRestoreFn = dyn Fn(&crate::graph::Values<'_>) -> Option<GraphCheckpointJson>;
 
-/// `RestoreNodeDefinition` data container.
 pub struct RestoreNodeDefinition {
-    /// `factory` field for factory.
     pub factory: String,
-    /// `kind` field for kind.
     pub kind: RestoreNodeKind,
-    /// `opts` field for opts.
     pub opts: GraphNodeOpts,
 }
 
-/// `StateRestoreDescriptor` data container.
 pub struct StateRestoreDescriptor;
 
 impl GraphRestoreDescriptor for StateRestoreDescriptor {
@@ -575,7 +512,6 @@ impl GraphRestoreDescriptor for OperatorRestoreDescriptor {
     }
 }
 
-/// `MapJsonRestoreDescriptor` data container.
 pub struct MapJsonRestoreDescriptor;
 
 impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
@@ -789,21 +725,13 @@ fn index_rows(
     Ok(out)
 }
 
-/// `ReactiveListDeltaRestoreDescriptor` data container.
 pub struct ReactiveListDeltaRestoreDescriptor;
-/// `ReactiveListSnapshotRestoreDescriptor` data container.
 pub struct ReactiveListSnapshotRestoreDescriptor;
-/// `ReactiveLogDeltaRestoreDescriptor` data container.
 pub struct ReactiveLogDeltaRestoreDescriptor;
-/// `ReactiveLogSnapshotRestoreDescriptor` data container.
 pub struct ReactiveLogSnapshotRestoreDescriptor;
-/// `ReactiveMapDeltaRestoreDescriptor` data container.
 pub struct ReactiveMapDeltaRestoreDescriptor;
-/// `ReactiveMapSnapshotRestoreDescriptor` data container.
 pub struct ReactiveMapSnapshotRestoreDescriptor;
-/// `ReactiveIndexDeltaRestoreDescriptor` data container.
 pub struct ReactiveIndexDeltaRestoreDescriptor;
-/// `ReactiveIndexSnapshotRestoreDescriptor` data container.
 pub struct ReactiveIndexSnapshotRestoreDescriptor;
 
 /// Restores a collection's snapshot request state, which the collection's delta
@@ -1028,16 +956,12 @@ fn collection_existing_definition(
 }
 
 #[derive(Clone)]
-/// `RestoreGraphOptions` data container.
 pub struct RestoreGraphOptions {
-    /// `registry` field for registry.
     pub registry: GraphRestoreRegistry,
-    /// `graph` field for graph.
     pub graph: GraphOptions,
 }
 
 impl RestoreGraphOptions {
-    /// Creates or computes `new`.
     pub fn new(registry: GraphRestoreRegistry) -> Self {
         Self {
             registry,
@@ -1385,7 +1309,6 @@ fn validate_checkpoint_json(value: &GraphCheckpointJson, path: &str) -> RestoreR
         .map_err(|err| GraphRestoreError::new(format!("checkpoint: {err}")))
 }
 
-/// Creates or computes `restored_opts`.
 pub fn restored_opts(node: &GraphCheckpointNode) -> RestoreResult<GraphNodeOpts> {
     let meta = node
         .meta

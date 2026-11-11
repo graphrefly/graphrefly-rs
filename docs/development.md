@@ -75,19 +75,10 @@ tests. If an example is illustrative only, mark it as such in the rustdoc block.
 Run `mise exec -- cargo fmt --all --check` after touching Rust files, including
 rustdoc comments.
 
-For broad missing-doc coverage, use the mechanical generator instead of
-hand-editing large comment batches:
-
-```bash
-scripts/generate-rustdoc-comments.py --apply
-mise exec -- cargo fmt --all
-```
-
-The generator runs rustdoc with `-D missing_docs`, parses the resulting
-diagnostics, and inserts neutral template comments only for items rustdoc reports.
-It preserves existing docs and is a no-op when the public surface is already
-covered. Use `scripts/generate-rustdoc-comments.py --check-stale` to combine the
-missing-doc gate with the active-source stale-phrase scan used in CI.
+Public items carry docs where the docs say something; there is no generator of
+placeholder comments and no `missing_docs` lint (review §4.2 of the D797
+migration removed 3,600 template lines). `scripts/check-stale-phrases.py`, run in
+CI, fails when active source names a concept the D797 kernel retired.
 
 ## Docs.rs And Releases
 
